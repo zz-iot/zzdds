@@ -1,0 +1,94 @@
+// Realistic DDS sensor-data topic types — for integration testing.
+//
+// Exercises: nested modules, struct composition, typedef sequences,
+//            enums, boolean and double members, string members.
+
+module Sensors {
+
+    // ── Sensor identity ───────────────────────────────────────────────────────
+    typedef long SensorId_t;
+
+    enum SensorKind {
+        SENSOR_TEMPERATURE,
+        SENSOR_HUMIDITY,
+        SENSOR_PRESSURE,
+        SENSOR_ACCELEROMETER,
+        SENSOR_GYROSCOPE
+    };
+
+    struct SensorMetadata {
+        SensorId_t id;
+        SensorKind kind;
+        string     location;
+        string     unit;
+    };
+
+    // ── Timestamp (seconds + nanoseconds since epoch) ─────────────────────────
+    struct Timestamp {
+        long          sec;
+        unsigned long nanosec;
+    };
+
+    // ── Scalar reading ────────────────────────────────────────────────────────
+    struct ScalarReading {
+        SensorMetadata metadata;
+        double         value;
+        Timestamp      stamp;
+        boolean        valid;
+    };
+
+    // ── Vector reading (3-axis) ───────────────────────────────────────────────
+    struct Vec3 {
+        double x;
+        double y;
+        double z;
+    };
+
+    struct VectorReading {
+        SensorMetadata metadata;
+        Vec3           value;
+        Timestamp      stamp;
+        boolean        valid;
+    };
+
+    // ── Sequences ─────────────────────────────────────────────────────────────
+    typedef sequence<ScalarReading> ScalarReadingSeq;
+    typedef sequence<VectorReading> VectorReadingSeq;
+    typedef sequence<SensorId_t>   SensorIdSeq;
+
+    // ── Aggregated weather station snapshot ───────────────────────────────────
+    struct WeatherSnapshot {
+        SensorId_t id;
+        string     location;
+        double     temperature_c;
+        double     humidity_pct;
+        double     pressure_hpa;
+        double     wind_speed_ms;
+        double     wind_direction_deg;
+        Timestamp  stamp;
+        boolean    all_sensors_valid;
+    };
+
+    typedef sequence<WeatherSnapshot> WeatherSnapshotSeq;
+
+    // ── Quality indicator ─────────────────────────────────────────────────────
+    enum QualityLevel {
+        QUALITY_EXCELLENT,
+        QUALITY_GOOD,
+        QUALITY_FAIR,
+        QUALITY_POOR,
+        QUALITY_INVALID
+    };
+
+    struct DiagnosticReport {
+        SensorId_t   sensor_id;
+        QualityLevel quality;
+        long         error_count;
+        long         sample_count;
+        Timestamp    last_update;
+        string       description;
+    };
+
+    typedef sequence<DiagnosticReport> DiagnosticReportSeq;
+
+};

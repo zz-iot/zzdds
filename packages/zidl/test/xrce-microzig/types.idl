@@ -1,0 +1,8 @@
+// Minimal bounded DDS-XRCE profile fixture for MicroZig-facing Zig codegen.
+
+@final
+struct CounterStatus {
+    @key unsigned long counter;
+    string<16> board;
+    sequence<octet, 8> payload;
+};

@@ -1,0 +1,48 @@
+// Interop test types for zidl-rt ↔ Cyclone DDS cross-validation.
+//
+// These types cover the cases from CLAUDE.md's interop strategy:
+//   - @final struct with all primitive types
+//   - @final struct with @key, string, and sequence
+//   - @appendable struct (XCDR2 DHEADER)
+//   - @final struct with nested struct
+
+module Interop {
+
+  // ── Type 1: all primitive scalars ─────────────────────────────────────────
+  // Tests primitive CDR encoding and XCDR2 alignment (4-byte cap).
+  @final
+  struct Primitives {
+    long      x;     // i32
+    float     y;     // f32
+    boolean   flag;  // bool
+    octet     b;     // u8
+    double    d;     // f64
+    short     s;     // i16
+    long long ll;    // i64
+  };
+
+  // ── Type 2: @key, string, sequence ────────────────────────────────────────
+  // Tests variable-length fields.  @final so no DHEADER.
+  @final
+  struct Message {
+    @key long   sensor_id;
+    string      label;
+    sequence<long> values;
+  };
+
+  // ── Type 3: @appendable (XCDR2 DHEADER required) ─────────────────────────
+  // Exercises the 4-byte DHEADER that precedes every @appendable instance.
+  @appendable
+  struct Point {
+    long x;
+    long y;
+  };
+
+  // ── Type 4: nested struct ─────────────────────────────────────────────────
+  @final
+  struct Outer {
+    Primitives inner;
+    long tag;
+  };
+
+};

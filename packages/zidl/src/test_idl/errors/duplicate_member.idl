@@ -1,0 +1,10 @@
+// Error corpus: duplicate struct member — triggers duplicate_definition.
+//
+// Expected: exactly 1 semantic diagnostic (duplicate_definition for 'x').
+
+module Test {
+    struct Foo {
+        long x;
+        long x;
+    };
+};

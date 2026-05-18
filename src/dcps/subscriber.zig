@@ -1,0 +1,400 @@
+//! SubscriberImpl — DCPS Subscriber implementation.
+//!
+//! A Subscriber groups DataReaders and provides access control.
+//!
+//! Entity lifecycle:
+//!   create_datareader   → allocates DataReaderImpl + ProtocolReader via participant cbs
+//!   delete_datareader   → destroys DataReaderImpl + retracts from discovery via participant cbs
+
+const std = @import("std");
+const DDS = @import("zzdds_generated").DDS;
+const nil = @import("nil.zig");
+const proto = @import("../protocol/interface.zig");
+const reader_mod = @import("reader.zig");
+const waitset = @import("waitset.zig");
+const Mutex = @import("../util/mutex.zig").Mutex;
+const time_mod = @import("../util/time.zig");
+
+/// Callbacks from the owning DomainParticipant, supplied at construction time.
+pub const ParticipantCbs = struct {
+    ctx: *anyopaque,
+
+    /// Allocate and start an RTPS ProtocolReader for a topic.
+    create_proto_reader: *const fn (
+        ctx: *anyopaque,
+        topic_name: []const u8,
+        type_name: []const u8,
+        qos: DDS.DataReaderQos,
+        handle: DDS.InstanceHandle_t,
+    ) anyerror!proto.ProtocolReader,
+
+    /// Tear down the ProtocolReader identified by handle.
+    destroy_proto_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t) void,
+
+    /// Assign a fresh unique InstanceHandle_t.
+    next_handle: *const fn (ctx: *anyopaque) DDS.InstanceHandle_t,
+
+    /// Register an incompatible-QoS notification callback for a reader.
+    /// Called once per DataReader after create_proto_reader succeeds.
+    /// Participant stores the callback and invokes it when a discovered writer's
+    /// QoS is incompatible with this reader's requested QoS.
+    register_incompat_qos: *const fn (
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        notify_fn: *const fn (notify_ctx: *anyopaque, policy_id: i32) void,
+    ) void,
+
+    /// Register a subscription-matched notification callback for a reader.
+    /// Participant calls this when a remote DataWriter matches or unmatches.
+    register_matched_notify: *const fn (
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        notify_fn: *const fn (notify_ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void,
+    ) void,
+
+    /// Announce the reader identified by handle to the discovery layer.
+    /// Called after register_incompat_qos so that synchronous discovery
+    /// callbacks (e.g. DirectDiscovery) fire with the incompat callback already set.
+    announce_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8) void,
+
+    /// Clock passed to DataReaderImpl for DEADLINE interval timers.
+    timer_clock: time_mod.Clock,
+
+    /// Register a timer-check callback (DEADLINE) for a reader.
+    /// Called once per DataReader after create_proto_reader succeeds.
+    register_timer_notify: *const fn (
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        notify_fn: *const fn (notify_ctx: *anyopaque, now_ns: i64) void,
+    ) void,
+};
+
+pub const SubscriberImpl = struct {
+    alloc: std.mem.Allocator,
+    participant: DDS.DomainParticipant,
+    cbs: ParticipantCbs,
+    qos: DDS.SubscriberQos,
+    listener: DDS.SubscriberListener,
+    listener_mask: DDS.StatusMask,
+    instance_handle: DDS.InstanceHandle_t,
+    status_changes: DDS.StatusMask,
+    status_cond: ?*waitset.StatusConditionImpl,
+
+    default_dr_qos: DDS.DataReaderQos,
+
+    /// Active DataReader instances owned by this subscriber; guarded by `mu`.
+    readers: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl),
+    mu: Mutex,
+
+    const Self = @This();
+
+    pub fn init(
+        alloc: std.mem.Allocator,
+        participant: DDS.DomainParticipant,
+        cbs: ParticipantCbs,
+        qos: DDS.SubscriberQos,
+        listener: DDS.SubscriberListener,
+        mask: DDS.StatusMask,
+        handle: DDS.InstanceHandle_t,
+    ) !*Self {
+        const self = try alloc.create(Self);
+        self.* = .{
+            .alloc = alloc,
+            .participant = participant,
+            .cbs = cbs,
+            .qos = qos,
+            .listener = listener,
+            .listener_mask = mask,
+            .instance_handle = handle,
+            .status_changes = 0,
+            .status_cond = null,
+            .default_dr_qos = .{},
+            .readers = .empty,
+            .mu = .{},
+        };
+        const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
+        self.status_cond = sc;
+        return self;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.status_cond) |sc| sc.deinit();
+        for (self.readers.items) |r| {
+            self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
+            r.deinit();
+        }
+        self.readers.deinit(self.alloc);
+        self.alloc.destroy(self);
+    }
+
+    pub fn toDDSSubscriber(self: *Self) DDS.Subscriber {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn toEntity(self: *Self) DDS.Entity {
+        return .{ .ptr = self, .vtable = &entity_vtable };
+    }
+
+    // ── Entity vtable ─────────────────────────────────────────────────────────
+
+    const entity_vtable = DDS.Entity.Vtable{
+        .enable = vtEnable,
+        .get_statuscondition = vtGetStatusCond,
+        .get_status_changes = vtGetStatusChanges,
+        .get_instance_handle = vtGetHandle,
+        .deinit = vtDeinit,
+    };
+
+    // ── DDS.Subscriber vtable ─────────────────────────────────────────────────
+
+    const vtable = DDS.Subscriber.Vtable{
+        .enable = vtEnable,
+        .get_statuscondition = vtGetStatusCond,
+        .get_status_changes = vtGetStatusChanges,
+        .get_instance_handle = vtGetHandle,
+        .create_datareader = vtCreateDataReader,
+        .delete_datareader = vtDeleteDataReader,
+        .delete_contained_entities = vtDeleteContained,
+        .lookup_datareader = vtLookupDataReader,
+        .get_datareaders = vtGetDataReaders,
+        .notify_datareaders = vtNotifyDataReaders,
+        .set_qos = vtSetQos,
+        .get_qos = vtGetQos,
+        .set_listener = vtSetListener,
+        .get_listener = vtGetListener,
+        .begin_access = vtBeginAccess,
+        .end_access = vtEndAccess,
+        .get_participant = vtGetParticipant,
+        .set_default_datareader_qos = vtSetDefaultDrQos,
+        .get_default_datareader_qos = vtGetDefaultDrQos,
+        .copy_from_topic_qos = vtCopyFromTopicQos,
+        .deinit = vtDeinit,
+    };
+
+    fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
+        const self = cast(ctx);
+        if (self.status_cond) |sc| return sc.toDDSStatusCondition();
+        return nil.nil_status_condition;
+    }
+
+    fn vtGetStatusChanges(ctx: *anyopaque) DDS.StatusMask {
+        return cast(ctx).status_changes;
+    }
+
+    fn vtGetHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
+        return cast(ctx).instance_handle;
+    }
+
+    fn vtCreateDataReader(
+        ctx: *anyopaque,
+        a_topic: DDS.TopicDescription,
+        qos: DDS.DataReaderQos,
+        a_listener: DDS.DataReaderListener,
+        mask: DDS.StatusMask,
+    ) DDS.DataReader {
+        const self = cast(ctx);
+        const sub_handle = self.cbs.next_handle(self.cbs.ctx);
+        const topic_name = a_topic.get_name();
+        const type_name = a_topic.get_type_name();
+        const pr = self.cbs.create_proto_reader(
+            self.cbs.ctx,
+            topic_name,
+            type_name,
+            qos,
+            sub_handle,
+        ) catch return nil.nil_datareader;
+        const dr = reader_mod.DataReaderImpl.init(
+            self.alloc,
+            a_topic,
+            self.toDDSSubscriber(),
+            pr,
+            qos,
+            a_listener,
+            mask,
+            sub_handle,
+            self.cbs.timer_clock,
+        ) catch {
+            self.cbs.destroy_proto_reader(self.cbs.ctx, sub_handle);
+            return nil.nil_datareader;
+        };
+        self.cbs.register_incompat_qos(
+            self.cbs.ctx,
+            sub_handle,
+            dr,
+            reader_mod.DataReaderImpl.notifyIncompatibleQos,
+        );
+        self.cbs.register_matched_notify(
+            self.cbs.ctx,
+            sub_handle,
+            dr,
+            reader_mod.DataReaderImpl.notifySubscriptionMatched,
+        );
+        self.cbs.register_timer_notify(
+            self.cbs.ctx,
+            sub_handle,
+            dr,
+            reader_mod.DataReaderImpl.checkTimersFn,
+        );
+        self.cbs.announce_reader(self.cbs.ctx, sub_handle, self.qos.partition.name.items);
+        self.mu.lock();
+        self.readers.append(self.alloc, dr) catch {
+            self.mu.unlock();
+            self.cbs.destroy_proto_reader(self.cbs.ctx, sub_handle);
+            dr.deinit();
+            return nil.nil_datareader;
+        };
+        self.mu.unlock();
+        return dr.toDDSDataReader();
+    }
+
+    fn vtDeleteDataReader(ctx: *anyopaque, a_datareader: DDS.DataReader) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.readers.items, 0..) |r, i| {
+            if (r.toDDSDataReader().ptr == a_datareader.ptr) {
+                _ = self.readers.swapRemove(i);
+                self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
+                r.deinit();
+                return DDS.RETCODE_OK;
+            }
+        }
+        return DDS.RETCODE_BAD_PARAMETER;
+    }
+
+    fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.readers.items) |r| {
+            self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
+            r.deinit();
+        }
+        self.readers.clearRetainingCapacity();
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtLookupDataReader(ctx: *anyopaque, topic_name: []const u8) DDS.DataReader {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.readers.items) |r| {
+            if (std.mem.eql(u8, r.topic_desc.get_name(), topic_name)) {
+                return r.toDDSDataReader();
+            }
+        }
+        return nil.nil_datareader;
+    }
+
+    fn vtGetDataReaders(
+        ctx: *anyopaque,
+        readers: *DDS.DataReaderSeq,
+        sample_states: DDS.SampleStateMask,
+        view_states: DDS.ViewStateMask,
+        instance_states: DDS.InstanceStateMask,
+    ) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        readers.clearRetainingCapacity();
+        // Pending samples are always NOT_READ / NEW / ALIVE.
+        // Include a reader only when its pending-data states overlap the masks.
+        const want_not_read = (sample_states & DDS.NOT_READ_SAMPLE_STATE) != 0;
+        const want_new = (view_states & DDS.NEW_VIEW_STATE) != 0;
+        const want_alive = (instance_states & DDS.ALIVE_INSTANCE_STATE) != 0;
+        for (self.readers.items) |r| {
+            if (want_not_read and want_new and want_alive and r.hasPendingData()) {
+                readers.append(self.alloc, r.toDDSDataReader()) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            }
+        }
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtNotifyDataReaders(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.readers.items) |r| {
+            if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                const dr = r.toDDSDataReader();
+                r.listener.vtable.on_data_available(r.listener.ptr, dr);
+            }
+        }
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtSetQos(ctx: *anyopaque, qos: DDS.SubscriberQos) DDS.ReturnCode_t {
+        cast(ctx).qos = qos;
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtGetQos(ctx: *anyopaque, qos: *DDS.SubscriberQos) DDS.ReturnCode_t {
+        qos.* = cast(ctx).qos;
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtSetListener(ctx: *anyopaque, a_listener: DDS.SubscriberListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.listener = a_listener;
+        self.listener_mask = mask;
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtGetListener(ctx: *anyopaque) DDS.SubscriberListener {
+        return cast(ctx).listener;
+    }
+
+    fn vtBeginAccess(_: *anyopaque) DDS.ReturnCode_t {
+        return DDS.RETCODE_OK;
+    }
+    fn vtEndAccess(_: *anyopaque) DDS.ReturnCode_t {
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtGetParticipant(ctx: *anyopaque) DDS.DomainParticipant {
+        return cast(ctx).participant;
+    }
+
+    fn vtSetDefaultDrQos(ctx: *anyopaque, qos: DDS.DataReaderQos) DDS.ReturnCode_t {
+        cast(ctx).default_dr_qos = qos;
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtGetDefaultDrQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
+        qos.* = cast(ctx).default_dr_qos;
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtCopyFromTopicQos(_: *anyopaque, dr_qos: *DDS.DataReaderQos, topic_qos: DDS.TopicQos) DDS.ReturnCode_t {
+        // Copy the subset of TopicQos fields that apply to DataReader.
+        dr_qos.durability = topic_qos.durability;
+        dr_qos.deadline = topic_qos.deadline;
+        dr_qos.latency_budget = topic_qos.latency_budget;
+        dr_qos.liveliness = topic_qos.liveliness;
+        dr_qos.reliability = topic_qos.reliability;
+        dr_qos.destination_order = topic_qos.destination_order;
+        dr_qos.history = topic_qos.history;
+        dr_qos.resource_limits = topic_qos.resource_limits;
+        dr_qos.ownership = topic_qos.ownership;
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtDeinit(ctx: *anyopaque) void {
+        cast(ctx).deinit();
+    }
+
+    fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
+        return cast(entity_ptr).status_changes;
+    }
+
+    fn cast(ctx: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ctx));
+    }
+};

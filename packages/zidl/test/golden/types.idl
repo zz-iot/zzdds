@@ -1,0 +1,50 @@
+// test/golden/types.idl
+// Representative test IDL used for golden output and integration tests.
+// Covers: @final/@appendable structs, all IDL primitive types, string,
+// bounded string, sequence, array, enum, @key, nested struct, one interface
+// for --generate-interfaces testing.
+
+enum Color {
+    RED,
+    GREEN,
+    BLUE
+};
+
+@final
+struct Point {
+    long x;
+    long y;
+};
+
+@final
+struct Sample {
+    @key unsigned long id;
+    boolean b;
+    octet u8_val;
+    short s16_val;
+    unsigned short u16_val;
+    long s32_val;
+    unsigned long u32_val;
+    long long s64_val;
+    unsigned long long u64_val;
+    float f32_val;
+    double f64_val;
+    string str;
+    string<32> bstr;
+    sequence<long> nums;
+    long arr[3];
+    Color clr;
+    Point nested;
+};
+
+@appendable
+struct Frame {
+    unsigned long seq_num;
+    string topic;
+};
+
+interface Greeter {
+    string greet(in string name);
+    void reset();
+    readonly attribute long count;
+};

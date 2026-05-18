@@ -1,0 +1,16 @@
+.{
+    .name = .zidl_xrce_microzig_fixture,
+    .version = "0.0.0",
+    .fingerprint = 0xa39e00e911377888,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{
+        .zidl_rt = .{
+            .path = "../../packages/zidl-rt",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "test.zig",
+    },
+}

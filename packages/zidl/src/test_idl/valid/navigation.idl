@@ -1,0 +1,159 @@
+// Realistic DDS navigation topic types — for integration testing.
+//
+// Exercises: multiple modules, cross-module references, struct composition,
+//            nested structs, enums, unsigned types, fixed-size array members,
+//            typedef sequences, forward declarations.
+
+module Nav {
+
+    // ── Coordinate types ──────────────────────────────────────────────────────
+    struct GeoPoint {
+        double latitude_deg;
+        double longitude_deg;
+        double altitude_m;
+    };
+
+    struct CartesianPoint {
+        double x;
+        double y;
+        double z;
+    };
+
+    struct EulerAngles {
+        double roll_rad;
+        double pitch_rad;
+        double yaw_rad;
+    };
+
+    struct Quaternion {
+        double w;
+        double x;
+        double y;
+        double z;
+    };
+
+    // ── Velocity / acceleration ───────────────────────────────────────────────
+    struct Velocity3D {
+        double north_ms;
+        double east_ms;
+        double down_ms;
+    };
+
+    struct Acceleration3D {
+        double x_ms2;
+        double y_ms2;
+        double z_ms2;
+    };
+
+    // ── Timestamp ─────────────────────────────────────────────────────────────
+    struct NavTimestamp {
+        long          sec;
+        unsigned long nanosec;
+    };
+
+    // ── GPS / GNSS ─────────────────────────────────────────────────────────────
+    enum GnssFixType {
+        GNSS_FIX_NONE,
+        GNSS_FIX_2D,
+        GNSS_FIX_3D,
+        GNSS_FIX_RTK_FLOAT,
+        GNSS_FIX_RTK_FIXED
+    };
+
+    struct GnssState {
+        GeoPoint     position;
+        Velocity3D   velocity;
+        GnssFixType  fix_type;
+        long         satellites_used;
+        long         satellites_visible;
+        double       hdop;
+        double       vdop;
+        double       pdop;
+        NavTimestamp stamp;
+    };
+
+    // ── Inertial navigation ───────────────────────────────────────────────────
+    struct ImuReading {
+        Acceleration3D linear_accel;
+        Acceleration3D angular_rate;    // rad/s in x/y/z fields
+        NavTimestamp   stamp;
+        boolean        calibrated;
+    };
+
+    // ── Fused navigation state ────────────────────────────────────────────────
+    enum NavMode {
+        NAV_MODE_IDLE,
+        NAV_MODE_INITIALIZING,
+        NAV_MODE_GPS_ONLY,
+        NAV_MODE_FUSED,
+        NAV_MODE_DEAD_RECKONING,
+        NAV_MODE_FAILED
+    };
+
+    struct NavState {
+        GeoPoint     position;
+        Velocity3D   velocity;
+        EulerAngles  attitude;
+        Quaternion   attitude_quat;
+        NavMode      mode;
+        NavTimestamp stamp;
+        boolean      position_valid;
+        boolean      velocity_valid;
+        boolean      attitude_valid;
+        double       horizontal_accuracy_m;
+        double       vertical_accuracy_m;
+    };
+
+    // ── Waypoint and route ────────────────────────────────────────────────────
+    typedef long WaypointId_t;
+
+    struct Waypoint {
+        WaypointId_t id;
+        GeoPoint     position;
+        double       heading_deg;
+        double       speed_ms;
+        string       label;
+    };
+
+    typedef sequence<Waypoint> WaypointSeq;
+
+    struct Route {
+        long         route_id;
+        WaypointSeq  waypoints;
+        long         active_index;
+        boolean      loop;
+        string       name;
+    };
+
+    // ── Obstacle ──────────────────────────────────────────────────────────────
+    enum ObstacleKind {
+        OBSTACLE_STATIC,
+        OBSTACLE_DYNAMIC,
+        OBSTACLE_UNKNOWN
+    };
+
+    struct Obstacle {
+        long            obstacle_id;
+        CartesianPoint  position;
+        Velocity3D      velocity;
+        ObstacleKind    kind;
+        double          confidence;
+        NavTimestamp    stamp;
+    };
+
+    typedef sequence<Obstacle>   ObstacleSeq;
+    typedef sequence<NavState>   NavStateSeq;
+    typedef sequence<GnssState>  GnssStateSeq;
+    typedef sequence<ImuReading> ImuReadingSeq;
+
+    // ── Covariance matrix (6x6 packed upper-triangle) ─────────────────────────
+    struct PosVelCovariance {
+        double data[21];     // upper triangle of 6x6 symmetric matrix
+    };
+
+    struct NavStateWithCovariance {
+        NavState          state;
+        PosVelCovariance  covariance;
+    };
+
+};

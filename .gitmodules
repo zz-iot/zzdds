@@ -1,0 +1,3 @@
+[submodule "packages/zidl"]
+	path = packages/zidl
+	url = https://github.com/zz-iot/zidl.git

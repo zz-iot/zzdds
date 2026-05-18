@@ -1,0 +1,12 @@
+.{
+    .name = .zidl_rt,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.15.1",
+    // Regenerate with `zig build` after first checkout.
+    .fingerprint = 0xca4c5063b54fc3c1,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

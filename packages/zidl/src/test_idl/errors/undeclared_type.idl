@@ -1,0 +1,9 @@
+// Error corpus: reference to undeclared type — triggers undeclared_identifier.
+//
+// Expected: exactly 1 semantic diagnostic (undeclared_identifier for 'GhostType').
+
+module Test {
+    struct Bar {
+        GhostType value;
+    };
+};

@@ -1,0 +1,314 @@
+// DDS DCPS core type system — reconstructed for zidl corpus tests.
+// Derived from OMG DDS v1.4 (formal-15-04-10) Annex A and
+// DDS-XTYPES v1.3 (formal-20-02-04).
+//
+// Exercises: modules, typedefs, array typedefs, sequence typedefs, enums,
+// structs, const declarations, @topic, @key, @optional, @nested annotations,
+// cross-type references within a module.
+
+module DDS {
+
+  // ── Primitive aliases ───────────────────────────────────────────────────────
+
+  typedef long          ReturnCode_t;
+  typedef long          QosPolicyId_t;
+  typedef long long     InstanceHandle_t;
+  typedef long          DomainId_t;
+  typedef long          BuiltinTopicKey_t[3];
+
+  typedef sequence<octet>           OctetSeq;
+  typedef sequence<string>          StringSeq;
+  typedef sequence<InstanceHandle_t> InstanceHandleSeq;
+
+  // ── Time and duration ───────────────────────────────────────────────────────
+
+  @nested
+  struct Duration_t {
+    long          sec;
+    unsigned long nanosec;
+  };
+
+  @nested
+  struct Time_t {
+    long          sec;
+    unsigned long nanosec;
+  };
+
+  // ── QoS policy kinds (enums) ────────────────────────────────────────────────
+
+  enum DurabilityQosPolicyKind {
+    VOLATILE_DURABILITY_QOS,
+    TRANSIENT_LOCAL_DURABILITY_QOS,
+    TRANSIENT_DURABILITY_QOS,
+    PERSISTENT_DURABILITY_QOS
+  };
+
+  enum PresentationQosPolicyAccessScopeKind {
+    INSTANCE_PRESENTATION_QOS,
+    TOPIC_PRESENTATION_QOS,
+    GROUP_PRESENTATION_QOS
+  };
+
+  enum OwnershipQosPolicyKind {
+    SHARED_OWNERSHIP_QOS,
+    EXCLUSIVE_OWNERSHIP_QOS
+  };
+
+  enum LivelinessQosPolicyKind {
+    AUTOMATIC_LIVELINESS_QOS,
+    MANUAL_BY_PARTICIPANT_LIVELINESS_QOS,
+    MANUAL_BY_TOPIC_LIVELINESS_QOS
+  };
+
+  enum ReliabilityQosPolicyKind {
+    BEST_EFFORT_RELIABILITY_QOS,
+    RELIABLE_RELIABILITY_QOS
+  };
+
+  enum DestinationOrderQosPolicyKind {
+    BY_RECEPTION_TIMESTAMP_DESTINATIONORDER_QOS,
+    BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS
+  };
+
+  enum HistoryQosPolicyKind {
+    KEEP_LAST_HISTORY_QOS,
+    KEEP_ALL_HISTORY_QOS
+  };
+
+  // ── QoS policy structs ──────────────────────────────────────────────────────
+
+  @nested
+  struct UserDataQosPolicy {
+    OctetSeq value;
+  };
+
+  @nested
+  struct TopicDataQosPolicy {
+    OctetSeq value;
+  };
+
+  @nested
+  struct GroupDataQosPolicy {
+    OctetSeq value;
+  };
+
+  @nested
+  struct TransportPriorityQosPolicy {
+    long value;
+  };
+
+  @nested
+  struct LifespanQosPolicy {
+    Duration_t duration;
+  };
+
+  @nested
+  struct DurabilityQosPolicy {
+    DurabilityQosPolicyKind kind;
+  };
+
+  @nested
+  struct DurabilityServiceQosPolicy {
+    Duration_t              service_cleanup_delay;
+    HistoryQosPolicyKind    history_kind;
+    long                    history_depth;
+    long                    max_samples;
+    long                    max_instances;
+    long                    max_samples_per_instance;
+  };
+
+  @nested
+  struct PresentationQosPolicy {
+    PresentationQosPolicyAccessScopeKind access_scope;
+    boolean                              coherent_access;
+    boolean                              ordered_access;
+  };
+
+  @nested
+  struct DeadlineQosPolicy {
+    Duration_t period;
+  };
+
+  @nested
+  struct LatencyBudgetQosPolicy {
+    Duration_t duration;
+  };
+
+  @nested
+  struct OwnershipQosPolicy {
+    OwnershipQosPolicyKind kind;
+  };
+
+  @nested
+  struct OwnershipStrengthQosPolicy {
+    long value;
+  };
+
+  @nested
+  struct LivelinessQosPolicy {
+    LivelinessQosPolicyKind kind;
+    Duration_t              lease_duration;
+  };
+
+  @nested
+  struct TimeBasedFilterQosPolicy {
+    Duration_t minimum_separation;
+  };
+
+  @nested
+  struct PartitionQosPolicy {
+    StringSeq name;
+  };
+
+  @nested
+  struct ReliabilityQosPolicy {
+    ReliabilityQosPolicyKind kind;
+    Duration_t               max_blocking_time;
+  };
+
+  @nested
+  struct DestinationOrderQosPolicy {
+    DestinationOrderQosPolicyKind kind;
+  };
+
+  @nested
+  struct HistoryQosPolicy {
+    HistoryQosPolicyKind kind;
+    long                 depth;
+  };
+
+  @nested
+  struct ResourceLimitsQosPolicy {
+    long max_samples;
+    long max_instances;
+    long max_samples_per_instance;
+  };
+
+  @nested
+  struct EntityFactoryQosPolicy {
+    boolean autoenable_created_entities;
+  };
+
+  @nested
+  struct WriterDataLifecycleQosPolicy {
+    boolean autodispose_unregistered_instances;
+  };
+
+  @nested
+  struct ReaderDataLifecycleQosPolicy {
+    Duration_t autopurge_nowriter_samples_delay;
+    Duration_t autopurge_disposed_samples_delay;
+  };
+
+  // ── Built-in topic data ─────────────────────────────────────────────────────
+
+  @topic
+  struct ParticipantBuiltinTopicData {
+    @key
+    BuiltinTopicKey_t key;
+    UserDataQosPolicy user_data;
+  };
+
+  @topic
+  struct TopicBuiltinTopicData {
+    @key
+    BuiltinTopicKey_t          key;
+    string                     name;
+    string                     type_name;
+    DurabilityQosPolicy        durability;
+    DurabilityServiceQosPolicy durability_service;
+    DeadlineQosPolicy          deadline;
+    LatencyBudgetQosPolicy     latency_budget;
+    LivelinessQosPolicy        liveliness;
+    ReliabilityQosPolicy       reliability;
+    TransportPriorityQosPolicy transport_priority;
+    LifespanQosPolicy          lifespan;
+    DestinationOrderQosPolicy  destination_order;
+    HistoryQosPolicy           history;
+    ResourceLimitsQosPolicy    resource_limits;
+    OwnershipQosPolicy         ownership;
+    TopicDataQosPolicy         topic_data;
+  };
+
+  @topic
+  struct PublicationBuiltinTopicData {
+    @key
+    BuiltinTopicKey_t          key;
+    BuiltinTopicKey_t          participant_key;
+    string                     topic_name;
+    string                     type_name;
+    DurabilityQosPolicy        durability;
+    DurabilityServiceQosPolicy durability_service;
+    DeadlineQosPolicy          deadline;
+    LatencyBudgetQosPolicy     latency_budget;
+    LivelinessQosPolicy        liveliness;
+    ReliabilityQosPolicy       reliability;
+    LifespanQosPolicy          lifespan;
+    UserDataQosPolicy          user_data;
+    OwnershipQosPolicy         ownership;
+    OwnershipStrengthQosPolicy ownership_strength;
+    DestinationOrderQosPolicy  destination_order;
+    PresentationQosPolicy      presentation;
+    PartitionQosPolicy         partition;
+    TopicDataQosPolicy         topic_data;
+    GroupDataQosPolicy         group_data;
+  };
+
+  @topic
+  struct SubscriptionBuiltinTopicData {
+    @key
+    BuiltinTopicKey_t         key;
+    BuiltinTopicKey_t         participant_key;
+    string                    topic_name;
+    string                    type_name;
+    DurabilityQosPolicy       durability;
+    DeadlineQosPolicy         deadline;
+    LatencyBudgetQosPolicy    latency_budget;
+    LivelinessQosPolicy       liveliness;
+    ReliabilityQosPolicy      reliability;
+    OwnershipQosPolicy        ownership;
+    DestinationOrderQosPolicy destination_order;
+    UserDataQosPolicy         user_data;
+    TimeBasedFilterQosPolicy  time_based_filter;
+    PresentationQosPolicy     presentation;
+    PartitionQosPolicy        partition;
+    TopicDataQosPolicy        topic_data;
+    GroupDataQosPolicy        group_data;
+  };
+
+  // ── Sample state constants ──────────────────────────────────────────────────
+
+  typedef long SampleStateKind;
+  const SampleStateKind READ_SAMPLE_STATE     = 1;
+  const SampleStateKind NOT_READ_SAMPLE_STATE = 2;
+
+  typedef long ViewStateKind;
+  const ViewStateKind NEW_VIEW_STATE         = 1;
+  const ViewStateKind NOT_NEW_VIEW_STATE     = 2;
+
+  typedef long InstanceStateKind;
+  const InstanceStateKind ALIVE_INSTANCE_STATE                = 1;
+  const InstanceStateKind NOT_ALIVE_DISPOSED_INSTANCE_STATE   = 2;
+  const InstanceStateKind NOT_ALIVE_NO_WRITERS_INSTANCE_STATE = 4;
+
+  // ── SampleInfo ──────────────────────────────────────────────────────────────
+
+  @nested
+  struct SampleInfo {
+    SampleStateKind   sample_state;
+    ViewStateKind     view_state;
+    InstanceStateKind instance_state;
+    boolean           valid_data;
+    Time_t            source_timestamp;
+    InstanceHandle_t  instance_handle;
+    InstanceHandle_t  publication_handle;
+    long              disposed_generation_count;
+    long              no_writers_generation_count;
+    long              sample_rank;
+    long              generation_rank;
+    long              absolute_generation_rank;
+  };
+
+  typedef sequence<SampleInfo> SampleInfoSeq;
+
+}; // module DDS

@@ -1,0 +1,227 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-progress runs for the same ref on new pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Shared setup fragments ────────────────────────────────────────────────────
+# The zzdds unit-test jobs and the interop jobs share the same Zig install and
+# submodule bootstrap.  GitHub Actions has no native "include" for steps, so
+# the steps are just repeated; keep them in sync if you add new prerequisites.
+
+jobs:
+  # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
+  test-linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load zidl deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ZIDL_DEPLOY_KEY }}
+
+      - name: Fetch submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Check formatting
+        run: zig fmt --check src/ idl/ test/
+
+      - name: Test
+        run: zig build test
+
+      - name: Test (TSan)
+        run: zig build test-tsan
+
+  # ── Unit tests: remaining platforms (independent of interop) ──────────────
+  test-other:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+          - name: macOS ARM64
+            os: macos-latest
+          - name: Windows x86_64
+            os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load zidl deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ZIDL_DEPLOY_KEY }}
+
+      - name: Fetch submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Allow inbound UDP (Windows)
+        if: runner.os == 'Windows'
+        run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
+
+      - name: Test
+        run: zig build test
+
+  # ── Interop: Zenzen DDS vs Zenzen DDS ─────────────────────────────────────
+  #
+  # Checkout layout (relative to $GITHUB_WORKSPACE):
+  #   zzdds/      — this repo
+  #   dds-rtps/   — zz-iot/dds-rtps fork, zenzen branch
+  #
+  # The packages/zzdds symlink inside zenzen-zig points four levels up:
+  #   dds-rtps/srcZig/zenzen-zig/packages/zzdds -> ../../../../zzdds
+  # which resolves to $GITHUB_WORKSPACE/zzdds — exactly our checkout path.
+
+  self-interop:
+    name: self-interop (dds-rtps)
+    needs: test-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+
+      - name: Load zidl deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ZIDL_DEPLOY_KEY }}
+
+      - name: Fetch submodules
+        working-directory: zzdds
+        run: git submodule update --init --recursive
+
+      - name: Check out dds-rtps (zenzen branch)
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/dds-rtps
+          ref: zenzen
+          path: dds-rtps
+
+      - name: Wire packages/zzdds symlink
+        run: |
+          mkdir -p dds-rtps/srcZig/zenzen-zig/packages
+          ln -s ../../../../zzdds dds-rtps/srcZig/zenzen-zig/packages/zzdds
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Install Python dependencies
+        run: pip install pexpect junitparser
+
+      - name: Build shape_main (ReleaseSafe)
+        working-directory: dds-rtps/srcZig/zenzen-zig
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run self-interop suite
+        working-directory: dds-rtps
+        run: |
+          python3 interoperability_report.py \
+            -P srcZig/zenzen-zig/zig-out/bin/zenzen_dds-0.0.0_shape_main_linux \
+            -S srcZig/zenzen-zig/zig-out/bin/zenzen_dds-0.0.0_shape_main_linux \
+            -o /tmp/interop-results.xml
+
+      - name: Check results
+        run: python3 zzdds/scripts/check_interop_results.py /tmp/interop-results.xml
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-results
+          path: /tmp/interop-results.xml
+
+  self-interop-tsan:
+    name: self-interop (dds-rtps) + TSAN
+    needs: test-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+
+      - name: Load zidl deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ZIDL_DEPLOY_KEY }}
+
+      - name: Fetch submodules
+        working-directory: zzdds
+        run: git submodule update --init --recursive
+
+      - name: Check out dds-rtps (zenzen branch)
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/dds-rtps
+          ref: zenzen
+          path: dds-rtps
+
+      - name: Wire packages/zzdds symlink
+        run: |
+          mkdir -p dds-rtps/srcZig/zenzen-zig/packages
+          ln -s ../../../../zzdds dds-rtps/srcZig/zenzen-zig/packages/zzdds
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Install Python dependencies
+        run: pip install pexpect junitparser
+
+      - name: Build shape_main (Debug + ThreadSanitizer)
+        working-directory: dds-rtps/srcZig/zenzen-zig
+        run: zig build -Doptimize=Debug -Dsanitize-thread
+
+      - name: Run self-interop suite (TSan)
+        working-directory: dds-rtps
+        env:
+          # TSAN writes its race report to stderr, which pexpect captures via
+          # the pty — so the report ends up inside the JUnit XML failure message
+          # and is displayed by check_interop_results.py below.
+          # abort_on_error=1 kills the process on the first race, causing
+          # pexpect to see an unexpected exit and mark the test as failed.
+          TSAN_OPTIONS: abort_on_error=1
+        run: |
+          python3 interoperability_report.py \
+            -P srcZig/zenzen-zig/zig-out/bin/zenzen_dds-0.0.0_shape_main_linux \
+            -S srcZig/zenzen-zig/zig-out/bin/zenzen_dds-0.0.0_shape_main_linux \
+            -o /tmp/interop-tsan-results.xml
+
+      - name: Check results
+        run: python3 zzdds/scripts/check_interop_results.py /tmp/interop-tsan-results.xml
+
+      - name: Upload TSan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-tsan-results
+          path: /tmp/interop-tsan-results.xml

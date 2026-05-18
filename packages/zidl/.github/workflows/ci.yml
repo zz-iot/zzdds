@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-progress runs for the same ref on new pushes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+          - name: macOS ARM64
+            os: macos-latest
+          # Uncomment to add Intel macOS coverage (uses more CI minutes):
+          # - name: macOS x86_64
+          #   os: macos-13
+          - name: Windows x86_64
+            os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          # setup-zig caches both the Zig toolchain and the global Zig cache
+          # automatically; no separate actions/cache step is needed.
+
+      # Format check is platform-independent; run once on Linux only.
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: zig fmt --check src/ packages/ tools/ test/xrce-microzig/
+
+      # ── Core tests ────────────────────────────────────────────────────────
+
+      - name: Test (main)
+        run: zig build test
+
+      - name: Test (zidl-rt)
+        run: zig build test
+        working-directory: packages/zidl-rt
+
+      - name: Test (zidl-cdr)
+        run: zig build test
+        working-directory: packages/zidl-cdr
+
+      # ── Integration tests ─────────────────────────────────────────────────
+      # C and C++ use Zig's bundled clang/clang++; no external compiler needed.
+      # Java requires javac/java; GitHub-hosted runners include a JDK on all
+      # platforms.  If javac is not found, build.zig skips Java with a warning.
+
+      - name: Integration tests
+        run: zig build integration-test
+
+      # ── Interop tests ─────────────────────────────────────────────────────
+      # Expected CDR bytes are hardcoded in zig_interop_test.zig; no Cyclone
+      # DDS installation needed.  `zig build interop-test` works on all platforms.
+
+      - name: Interop tests
+        run: zig build interop-test
+
+      # ── MicroZig-facing XRCE codegen ─────────────────────────────────────
+      # zidl itself runs on Zig 0.16.0, but MicroZig currently requires Zig
+      # 0.15.1.  Generate a bounded XRCE fixture with the 0.15.1 output mode,
+      # then switch toolchains and compile the generated package.
+
+      - name: Generate XRCE MicroZig fixture
+        if: matrix.os == 'ubuntu-latest'
+        run: zig build run -- -b zig --profile xrce --zig-version 0.15.1 -o test/xrce-microzig/generated test/xrce-microzig/types.idl
+
+      - name: Install Zig 0.15.1
+        if: matrix.os == 'ubuntu-latest'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.1"
+
+      - name: Test XRCE MicroZig fixture
+        if: matrix.os == 'ubuntu-latest'
+        run: zig build test
+        working-directory: test/xrce-microzig

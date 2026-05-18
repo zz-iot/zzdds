@@ -1,0 +1,102 @@
+// IDL for RTPS 2.5 built-in discovery types.
+//
+// Source: RTPS 2.5 §8.5 / §9.6.2, Table 9.14.
+//
+// ── Wire encoding note ──────────────────────────────────────────────────────
+// These types are serialized using PL_CDR (Parameter List CDR) as described
+// in RTPS 2.5 §9.6.2.  The @id annotations carry the PID values from
+// Table 9.14.
+//
+// RTPS uses *repeated parameters* for list-valued fields: one PID entry is
+// written per element, all sharing the same PID value.  The @pl_repeated
+// annotation instructs the zidl Zig backend to emit this encoding:
+//   serialize:   one (pid, len, value) triplet per sequence element
+//   deserialize: accumulate each occurrence into the sequence
+//
+// ── PID constant index ──────────────────────────────────────────────────────
+// Numeric PID values are defined in src/rtps/pid.zig (PidTable).
+
+// ── Primitive wire types (inline; no include) ─────────────────────────────
+
+// RTPS ProtocolVersion_t (§8.3.3.1)
+@final struct ProtocolVersion_t { octet major; octet minor; };
+
+// RTPS VendorId_t (§8.3.3.2)
+@final struct VendorId_t { octet vendorId[2]; };
+
+// RTPS Locator_t (§9.3.2 Table 9.19)
+// Note: the RTPS field is named "port" but that is a reserved IDL 4.2 keyword;
+// renamed to port_number here.  Wire layout is unchanged (4-byte unsigned long).
+@final struct Locator_t {
+    long          kind;
+    unsigned long port_number;
+    octet         address[16];
+};
+
+// DDS Duration_t (sec + nanosec)
+@final struct Duration_t { long sec; unsigned long nanosec; };
+
+// ── SPDPdiscoveredParticipantData (§8.5.3.2, §9.6.2.1) ─────────────────────
+//
+// Carried in DATA submessages on the SPDP built-in endpoints.
+
+@mutable
+struct SPDPdiscoveredParticipantData {
+    @id(0x0015) @optional ProtocolVersion_t  protocolVersion;
+    @id(0x0016) @optional VendorId_t         vendorId;
+    @id(0x0050)           octet              guidPrefix[12];  // PID_PARTICIPANT_GUID
+    @id(0x0058)           unsigned long      builtinEndpointSet;
+    @id(0x0077) @optional unsigned long      builtinEndpointQos;
+    @id(0x0002) @optional Duration_t         leaseDuration;
+    @id(0x0032) @optional @pl_repeated sequence<Locator_t> metatrafficUnicastLocatorList;
+    @id(0x0033) @optional @pl_repeated sequence<Locator_t> metatrafficMulticastLocatorList;
+    @id(0x002F) @optional @pl_repeated sequence<Locator_t> defaultUnicastLocatorList;
+    @id(0x0048) @optional @pl_repeated sequence<Locator_t> defaultMulticastLocatorList;
+    @id(0x002C) @optional sequence<octet>   userData;
+    @id(0x0062) @optional string            participantName; // PID_ENTITY_NAME
+};
+
+// ── DiscoveredWriterData (§8.5.4.2, §9.6.2.2) ───────────────────────────────
+//
+// SEDP publications topic: describes a DataWriter endpoint.
+
+@mutable
+struct DiscoveredWriterData {
+    @id(0x005A)           octet         writerGuid[16];       // PID_ENDPOINT_GUID
+    @id(0x0005)           string        topicName;
+    @id(0x0007)           string        typeName;
+    @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;
+    @id(0x0030) @optional @pl_repeated sequence<Locator_t> multicastLocatorList;
+    @id(0x001A) @optional unsigned long reliabilityKind;      // 0=best_effort 1=reliable
+    @id(0x001D) @optional unsigned long durabilityKind;
+    @id(0x001B) @optional unsigned long livelinessKind;
+    @id(0x001F) @optional unsigned long ownershipKind;
+    @id(0x0006) @optional long          ownershipStrength;
+    @id(0x0023) @optional Duration_t    deadline;
+    @id(0x0027) @optional Duration_t    latencyBudget;
+    @id(0x0025) @optional unsigned long destinationOrder;
+    @id(0x0043) @optional boolean       expectsInlineQos;
+    @id(0x0075) @optional sequence<octet> typeInformation;    // XTypes TypeInformation
+};
+
+// ── DiscoveredReaderData (§8.5.4.3, §9.6.2.3) ───────────────────────────────
+//
+// SEDP subscriptions topic: describes a DataReader endpoint.
+
+@mutable
+struct DiscoveredReaderData {
+    @id(0x005A)           octet         readerGuid[16];       // PID_ENDPOINT_GUID
+    @id(0x0005)           string        topicName;
+    @id(0x0007)           string        typeName;
+    @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;
+    @id(0x0030) @optional @pl_repeated sequence<Locator_t> multicastLocatorList;
+    @id(0x001A) @optional unsigned long reliabilityKind;
+    @id(0x001D) @optional unsigned long durabilityKind;
+    @id(0x001B) @optional unsigned long livelinessKind;
+    @id(0x001F) @optional unsigned long ownershipKind;
+    @id(0x0023) @optional Duration_t    deadline;
+    @id(0x0027) @optional Duration_t    latencyBudget;
+    @id(0x0025) @optional unsigned long destinationOrder;
+    @id(0x0035) @optional sequence<string> partition;         // PID_PARTITION
+    @id(0x0075) @optional sequence<octet> typeInformation;
+};

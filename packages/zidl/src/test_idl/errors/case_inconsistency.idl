@@ -1,0 +1,11 @@
+// Error corpus: case-inconsistent identifier use — triggers case_inconsistency.
+//
+// 'MyLongType' is declared with that exact casing; 'MyLONGTYPE' refers to the
+// same identifier with different case.
+//
+// Expected: exactly 1 semantic diagnostic (case_inconsistency).
+
+module Test {
+    typedef long MyLongType;
+    typedef MyLONGTYPE AliasType;
+};

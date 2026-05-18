@@ -1,0 +1,16 @@
+// HelloWorldData — interop test type.
+// Same IDL as the Cyclone DDS "Hello World" example so both sides agree on the
+// type name and CDR layout.
+//
+// CDR layout (little-endian, as written by Zenzen DDS with CDR_LE encapsulation):
+//   00 01 00 00              — encapsulation header (CDR_LE)
+//   <userID: int32 LE>       — 4 bytes at offset 4
+//   <message length: u32 LE> — 4 bytes at offset 8 (number of bytes incl. NUL)
+//   <message bytes + NUL>    — variable length at offset 12
+
+module HelloWorldData {
+    struct Msg {
+        @key long userID;
+        string message;
+    };
+};
