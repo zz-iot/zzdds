@@ -91,8 +91,8 @@ jobs:
   #   zzdds/      — this repo
   #   dds-rtps/   — zz-iot/dds-rtps fork, zenzen branch
   #
-  # The packages/zzdds symlink inside zenzen-zig points four levels up:
-  #   dds-rtps/srcZig/zenzen-zig/packages/zzdds -> ../../../../zzdds
+  # The packages/zzdds symlink inside zzdds points four levels up:
+  #   dds-rtps/srcZig/zzdds/packages/zzdds -> ../../../../zzdds
   # which resolves to $GITHUB_WORKSPACE/zzdds — exactly our checkout path.
 
   self-interop:
@@ -124,8 +124,8 @@ jobs:
 
       - name: Wire packages/zzdds symlink
         run: |
-          mkdir -p dds-rtps/srcZig/zenzen-zig/packages
-          ln -s ../../../../zzdds dds-rtps/srcZig/zenzen-zig/packages/zzdds
+          mkdir -p dds-rtps/srcZig/zzdds/packages
+          ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -136,15 +136,15 @@ jobs:
         run: pip install pexpect junitparser
 
       - name: Build shape_main (ReleaseSafe)
-        working-directory: dds-rtps/srcZig/zenzen-zig
+        working-directory: dds-rtps/srcZig/zzdds
         run: zig build -Doptimize=ReleaseSafe
 
       - name: Run self-interop suite
         working-directory: dds-rtps
         run: |
           python3 interoperability_report.py \
-            -P srcZig/zenzen-zig/zig-out/bin/zenzen_dds-0.0.0_shape_main_linux \
-            -S srcZig/zenzen-zig/zig-out/bin/zenzen_dds-0.0.0_shape_main_linux \
+            -P srcZig/zzdds/zig-out/bin/zzdds-0.0.0_shape_main_linux \
+            -S srcZig/zzdds/zig-out/bin/zzdds-0.0.0_shape_main_linux \
             -o /tmp/interop-results.xml
 
       - name: Check results
@@ -186,8 +186,8 @@ jobs:
 
       - name: Wire packages/zzdds symlink
         run: |
-          mkdir -p dds-rtps/srcZig/zenzen-zig/packages
-          ln -s ../../../../zzdds dds-rtps/srcZig/zenzen-zig/packages/zzdds
+          mkdir -p dds-rtps/srcZig/zzdds/packages
+          ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -198,8 +198,8 @@ jobs:
         run: pip install pexpect junitparser
 
       - name: Build shape_main (Debug + ThreadSanitizer)
-        working-directory: dds-rtps/srcZig/zenzen-zig
-        run: zig build -Doptimize=Debug -Dsanitize-thread
+        working-directory: dds-rtps/srcZig/zzdds
+        run: zig build -Doptimize=Debug -Dlog-level=info -Dsanitize-thread
 
       - name: Run self-interop suite (TSan)
         working-directory: dds-rtps
@@ -212,8 +212,8 @@ jobs:
           TSAN_OPTIONS: abort_on_error=1
         run: |
           python3 interoperability_report.py \
-            -P srcZig/zenzen-zig/zig-out/bin/zenzen_dds-0.0.0_shape_main_linux \
-            -S srcZig/zenzen-zig/zig-out/bin/zenzen_dds-0.0.0_shape_main_linux \
+            -P srcZig/zzdds/zig-out/bin/zzdds-0.0.0_shape_main_linux \
+            -S srcZig/zzdds/zig-out/bin/zzdds-0.0.0_shape_main_linux \
             -o /tmp/interop-tsan-results.xml
 
       - name: Check results
