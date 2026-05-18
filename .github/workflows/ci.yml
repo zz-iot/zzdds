@@ -199,7 +199,7 @@ jobs:
 
       - name: Build shape_main (Debug + ThreadSanitizer)
         working-directory: dds-rtps/srcZig/zenzen-zig
-        run: zig build -Doptimize=Debug -Dsanitize-thread
+        run: zig build -Doptimize=Debug -Dlog-level=info -Dsanitize-thread
 
       - name: Run self-interop suite (TSan)
         working-directory: dds-rtps
