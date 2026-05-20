@@ -2,6 +2,7 @@
 zig-out/
 zig-cache/
 .zig-cache/
+zig-pkg/
 build-tmp/
 # Stray test binaries dropped by `zig test src/root.zig` in the repo root.
 /root

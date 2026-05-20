@@ -8,9 +8,7 @@ pub fn build(b: *std.Build) void {
 
     const zidl_dep = b.dependency("zidl", .{ .target = target, .optimize = optimize });
     const zidl_exe = zidl_dep.artifact("zidl");
-
-    const zidl_rt_dep = b.dependency("zidl_rt", .{ .target = target });
-    const zidl_rt_mod = zidl_rt_dep.module("zidl-rt");
+    const zidl_rt_mod = zidl_dep.module("zidl_rt");
 
     // ── Code generation: idl/dcps.idl → generated/dcps.zig ───────────────────
 
@@ -22,8 +20,8 @@ pub fn build(b: *std.Build) void {
     // Argument order: zidl -b zig ... -o <output_dir> <input.idl>
     const gen_dcps = b.addRunArtifact(zidl_exe);
     gen_dcps.addArgs(&.{
-        "-b",                    "zig",
-        "--generate-interfaces", "--split-files",
+        "-b",                      "zig",
+        "--generate-interfaces",   "--split-files",
         "-o",
     });
     // addOutputDirectoryArg injects the cache-managed output path as the next arg.
@@ -44,7 +42,7 @@ pub fn build(b: *std.Build) void {
     // ── Code generation: idl/rtps_discovery.idl → generated/rtps_discovery.zig ─
     //
     // Generates PL_CDR serialize/deserialize for SPDP/SEDP discovery types.
-    // --pl-cdr:                 emit serializePlCdr / deserializeFromPlCdr
+    // --zig-pl-cdr:             emit serializePlCdr / deserializeFromPlCdr
     // --no-typesupport:         omit DataWriter/DataReader/TypeSupport scaffolding
     // --no-typeobject-support:  omit XTypes TypeObject/TypeIdentifier constants
     // --split-files:            one file per top-level module (here: single flat file)
@@ -54,7 +52,7 @@ pub fn build(b: *std.Build) void {
     const gen_rtps_disc = b.addRunArtifact(zidl_exe);
     gen_rtps_disc.addArgs(&.{
         "-b",                      "zig",
-        "--pl-cdr",                "--no-typesupport",
+        "--zig-pl-cdr",            "--no-typesupport",
         "--no-typeobject-support", "--split-files",
         "-o",
     });
