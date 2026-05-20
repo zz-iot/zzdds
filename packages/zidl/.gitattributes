@@ -1,3 +1,0 @@
-# Keep text files normalized to LF across all platforms so bytewise golden
-# comparisons are stable on Windows checkouts too.
-* text=auto eol=lf
