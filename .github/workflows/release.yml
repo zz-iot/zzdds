@@ -1,0 +1,251 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version prefix (semver, e.g. 0.1.0)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run — run tests and interop but skip version bump, tag, and release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # ── Validate inputs and compute the full version tag ──────────────────────
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      zig_version: ${{ steps.ver.outputs.zig_version }}
+      full_version: ${{ steps.ver.outputs.full_version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version tag
+        id: ver
+        run: |
+          ZIG_VER=$(grep 'minimum_zig_version' build.zig.zon | sed 's/.*"\(.*\)".*/\1/')
+          FULL_VERSION="${{ inputs.version }}-zig.${ZIG_VER}"
+          TAG="v${FULL_VERSION}"
+          echo "zig_version=${ZIG_VER}"       >> $GITHUB_OUTPUT
+          echo "full_version=${FULL_VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}"                   >> $GITHUB_OUTPUT
+          echo "Tag will be: ${TAG}"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.ver.outputs.zig_version }}
+
+      - name: Verify Zig version matches minimum_zig_version
+        run: |
+          ACTUAL=$(zig version)
+          EXPECTED="${{ steps.ver.outputs.zig_version }}"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: runner Zig is ${ACTUAL}, build.zig.zon requires ${EXPECTED}"
+            exit 1
+          fi
+          echo "Zig version verified: ${ACTUAL}"
+
+      - name: Check tag does not already exist
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}"; then
+            echo "ERROR: tag ${TAG} already exists on origin"
+            exit 1
+          fi
+
+  # ── Full test suite (same matrix as CI) ───────────────────────────────────
+  test:
+    name: ${{ matrix.name }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+          - name: macOS ARM64
+            os: macos-latest
+          - name: Windows x86_64
+            os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ needs.prepare.outputs.zig_version }}
+
+      - name: Verify Zig version
+        shell: bash
+        run: |
+          ACTUAL=$(zig version)
+          EXPECTED="${{ needs.prepare.outputs.zig_version }}"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: runner Zig is ${ACTUAL}, expected ${EXPECTED}"
+            exit 1
+          fi
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: zig fmt --check src/ test/
+
+      - name: Allow inbound UDP (Windows)
+        if: runner.os == 'Windows'
+        run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
+
+      - name: Test
+        run: zig build test
+
+      - name: Test (TSan)
+        if: matrix.os == 'ubuntu-latest'
+        run: zig build test-tsan
+
+  # ── Self-interop gate (same as CI) ────────────────────────────────────────
+  # Uses the stable binary name (no -Ddds-version) — the versioned name is for
+  # official dds-rtps submission, not the CI gate.
+  self-interop:
+    name: self-interop (dds-rtps)
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+
+      - name: Check out dds-rtps (zenzen branch)
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/dds-rtps
+          ref: zenzen
+          path: dds-rtps
+
+      - name: Wire packages/zzdds symlink
+        run: |
+          mkdir -p dds-rtps/srcZig/zzdds/packages
+          ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ needs.prepare.outputs.zig_version }}
+
+      - name: Install Python dependencies
+        run: pip install pexpect junitparser
+
+      - name: Build shape_main (ReleaseSafe)
+        working-directory: dds-rtps/srcZig/zzdds
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run self-interop suite
+        working-directory: dds-rtps
+        run: |
+          python3 interoperability_report.py \
+            -P srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
+            -S srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
+            -o /tmp/interop-results.xml
+
+      - name: Check results
+        run: python3 zzdds/scripts/check_interop_results.py /tmp/interop-results.xml
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-interop-results
+          path: /tmp/interop-results.xml
+
+  # ── Version bump, tag, and GitHub release ─────────────────────────────────
+  publish:
+    name: Publish
+    needs: [prepare, self-interop]
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.dry_run }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version in build.zig.zon
+        env:
+          FULL_VERSION: ${{ needs.prepare.outputs.full_version }}
+        run: |
+          sed -i 's/\.version = "[^"]*"/.version = "'"${FULL_VERSION}"'"/' build.zig.zon
+
+      - name: Commit and push version bump
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add build.zig.zon
+          git commit -m "release: ${TAG}"
+          git push
+
+      - name: Create and push tag
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          git tag "${TAG}"
+          git push origin "${TAG}"
+
+      - name: Generate changelog
+        id: changelog
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            LOG=$(git log "${PREV_TAG}..HEAD~1" --pretty=format:"- %s" --no-merges)
+          else
+            LOG=$(git log HEAD~1 --pretty=format:"- %s" --no-merges)
+          fi
+          {
+            echo "log<<EOF"
+            echo "$LOG"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          ZIG_VERSION: ${{ needs.prepare.outputs.zig_version }}
+          CHANGELOG: ${{ steps.changelog.outputs.log }}
+        run: |
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --notes "## Changes
+          ${CHANGELOG}
+
+          ## Zig compatibility
+          Built with and requires Zig \`${ZIG_VERSION}\`.
+
+          ## Using zzdds as a Zig package
+          \`\`\`
+          zig fetch --save https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz
+          \`\`\`"
+
+      - name: Bump to post-release dev version
+        env:
+          FULL_VERSION: ${{ needs.prepare.outputs.full_version }}
+        run: |
+          sed -i 's/\.version = "[^"]*"/.version = "'"${FULL_VERSION}-dev"'"/' build.zig.zon
+          git add build.zig.zon
+          git commit -m "chore: begin post-${{ needs.prepare.outputs.tag }} development"
+          git push
