@@ -22,17 +22,9 @@ and are handled throughout the source:
 
 ## Build Dependency Layout
 
-`build.zig.zon` uses path dependencies pointing at the sibling `zidl` repo:
-
-```
-zz-dev/
-  zidl/          ← zidl compiler + packages
-  zz-dds/        ← this repo
-    build.zig.zon  references "../zidl" and "../zidl/packages/zidl-rt"
-```
-
-Both repos must be checked out as siblings under the same parent for local development.
-CI should clone them into the same directory structure.
+`build.zig.zon` fetches `zidl` from GitHub as a URL dependency. Running `zig build`
+downloads and unpacks it into `.zig-cache/` automatically; no sibling repository checkout
+is required. The `zig-pkg/` directory (gitignored) holds any manually pre-fetched archives.
 
 ## Generated Code
 
@@ -41,7 +33,7 @@ CI should clone them into the same directory structure.
 | IDL | Output module | Flags |
 |---|---|---|
 | `idl/dcps.idl` | `zzdds_generated` | `-b zig --generate-interfaces --split-files` |
-| `idl/rtps_discovery.idl` | `zzdds_disc_generated` | `-b zig --pl-cdr --no-typesupport --no-typeobject-support --split-files` |
+| `idl/rtps_discovery.idl` | `zzdds_disc_generated` | `-b zig --zig-pl-cdr --no-typesupport --no-typeobject-support --split-files` |
 
 Output goes into the Zig build cache (not checked in). Run `zig build gen-only` to inspect
 generated output without running the full compilation.

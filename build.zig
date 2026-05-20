@@ -20,8 +20,8 @@ pub fn build(b: *std.Build) void {
     // Argument order: zidl -b zig ... -o <output_dir> <input.idl>
     const gen_dcps = b.addRunArtifact(zidl_exe);
     gen_dcps.addArgs(&.{
-        "-b",                      "zig",
-        "--generate-interfaces",   "--split-files",
+        "-b",                    "zig",
+        "--generate-interfaces", "--split-files",
         "-o",
     });
     // addOutputDirectoryArg injects the cache-managed output path as the next arg.
@@ -95,12 +95,12 @@ pub fn build(b: *std.Build) void {
         "guid_filter",
         b.option(bool, "guid-filter", "Include GUID-prefix filtering in wire trace (default: false; only meaningful with wire-trace)") orelse false,
     );
-    const xtypes = b.option(bool, "xtypes", "Include DDS-XTypes support: DataRepresentationQosPolicy, PID_TYPE_INFORMATION in SEDP, TypeLookup service (default: true)") orelse true;
+    const xtypes = b.option(bool, "xtypes", "Include partial DDS-XTypes support: DataRepresentationQosPolicy and optional PID_TYPE_INFORMATION in SEDP; no TypeLookup service (default: true)") orelse true;
     build_options.addOption(bool, "xtypes", xtypes);
     build_options.addOption(
         bool,
         "content_subscription_profile",
-        b.option(bool, "content-subscription-profile", "Enable Content-Subscription profile: ContentFilteredTopic expression evaluation, QueryCondition filtering, MultiTopic (DDS v1.4 Annex A, default: true)") orelse true,
+        b.option(bool, "content-subscription-profile", "Enable Content-Subscription profile parser/evaluator for ContentFilteredTopic and QueryCondition; MultiTopic not implemented (DDS v1.4 Annex A, default: true)") orelse true,
     );
     // Pass ZZDDS_XTYPES preprocessor define to zidl so dcps.idl gates XTypes
     // content (DataRepresentationQosPolicy and its uses) at code-generation time.
@@ -160,10 +160,11 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    // `zig build test-fuzz` — compile-check fuzz targets and run corpus regression.
+    // `zig build test-fuzz` — compile-check fuzz targets. Corpus regression
+    // runs under `zig build test` via ordinary Zig tests in test/fuzz/.
     // For actual fuzzing: take the .o produced by `zig build-obj` and link with
     //   clang -fsanitize=fuzzer,address <obj> -lc -o fuzz_<name>
-    const fuzz_step = b.step("test-fuzz", "Compile fuzz targets + run corpus tests (see test/fuzz/*.zig for libFuzzer usage)");
+    const fuzz_step = b.step("test-fuzz", "Compile-check fuzz targets (see test/fuzz/*.zig for libFuzzer usage)");
     for (fuzz_test_files) |src| {
         const fuzz_obj = b.addObject(.{
             .name = std.fs.path.stem(src),

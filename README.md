@@ -1,27 +1,26 @@
 # Zenzen DDS — Zig-native OMG DDS Implementation
 
 A spec-compliant, extensible implementation of the OMG DDS v1.4 DCPS standard written in Zig,
-with RTPS 2.5 wire interoperability, DDS-Security 1.2 support, and language bindings generated
-via `zidl --generate-interfaces`.
+with RTPS 2.5 wire interoperability and language bindings generated via `zidl --generate-interfaces`.
 
 ## Goals
 
 - Full DDS v1.4 DCPS compliance (formal/15-04-10)
-- RTPS 2.5 wire interoperability with Cyclone DDS, FastDDS, RTI Connext
+- RTPS 2.5 wire interoperability verified with Cyclone DDS and OpenDDS; FastDDS and RTI Connext planned
 - Pluggable transport (UDP default; TCP, SHMEM, custom hardware planned)
 - Pluggable discovery (SPDP/SEDP default; static config, centralized broker planned)
-- Pluggable security (DDS Security v1.2 — Authentication, AccessControl, Cryptographic)
+- Pluggable security (DDS Security v1.2 — security plugin interface + noop; full implementation planned)
 - Language bindings via `zidl --generate-interfaces` — C, C++, Java, eventually C#
 - Unified configuration: programmatic API > env vars > config file > built-in defaults
 - DCPS interfaces generated from IDL at build time (not checked in)
 
 ## Build
 
-Requires Zig 0.16.0. The zidl sibling repo (`../zidl`) must be present; it is referenced as
-a path dependency in `build.zig.zon`.
+Requires Zig 0.16.0. The `zidl` compiler is fetched automatically as a URL dependency via
+`build.zig.zon`; no sibling checkout is required.
 
 ```sh
-zig build           # generate DCPS interfaces + compile library
+zig build           # generate DCPS interfaces + compile default interop executables
 ```
 
 Build-time feature flags (all optional):
@@ -33,14 +32,15 @@ zig build -Dinterface-monitor=false             # enumerate NICs once at startup
 zig build -Dwire-trace=true                     # include RTPS wire trace subsystem
 zig build -Dwire-trace=true -Dguid-filter=true  # wire trace + GUID-prefix filter
 zig build -Dxtypes=false                        # exclude DDS-XTypes support
+zig build -Dcontent-subscription-profile=false  # disable ContentFilteredTopic/QueryCondition SQL parser/evaluator
 ```
 
 ## Testing
 
 ```sh
-zig build test           # all unit + integration tests (~170 tests)
+zig build test           # all unit + integration tests (400+ tests)
 zig build test-tsan      # same tests under ThreadSanitizer
-zig build test-fuzz      # compile fuzz targets + run corpus regression
+zig build test-fuzz      # compile-check fuzz targets; corpus regression runs in zig build test
 zig build gen-only       # codegen only (inspect zidl output without compiling)
 ```
 
@@ -75,8 +75,8 @@ RTPS Protocol Layer (message framing, history cache, StatefulWriter/Reader,
       ↓ uses (independently) ↓
 [Transport Plugin]         [Discovery Plugin]         [Security Plugins]
  UDP (default)              SPDP/SEDP (default)        noop (default)
- TCP (planned)              static config              DDS-Security v1.2
- SHMEM (planned)            centralized broker
+ TCP (planned)              static config (planned)    DDS-Security v1.2 (planned)
+ SHMEM (planned)            centralized broker (planned)
  custom hardware
 ```
 
@@ -107,10 +107,15 @@ test/
   fuzz/                   # Corpus regression (RTPS parser, PL_CDR deserializer)
   interop/                # Wire interop vs Cyclone DDS / OpenDDS
 docs/
+  overview.md             # Documentation index
   architecture.md         # Design decisions, plugin interfaces, config, logging, wire trace
+  implementation_status.md# What is and isn't implemented; known limitations
+  testing.md              # How to run the test suite
   dev-notes.md            # Zig 0.16.0 API notes, developer gotchas
-  dev-plan.md             # Phase-by-phase development plan and open questions
-  rtps-reference.md       # RTPS 2.5 wire format quick reference
+  roadmap.md              # Phase 33 + planned work + deferred items
+  decisions.md            # Stable design decisions with rationale
+  reference/
+    rtps-reference.md     # RTPS 2.5 spec quick reference (contributor reference, not authoritative for code)
   design/                 # Focused design notes (history cache, message builder, security, threads, testing)
 ```
 
@@ -131,10 +136,12 @@ docs/
 
 ## Implementation Status
 
-See [`docs/dev-plan.md`](docs/dev-plan.md) for the full phase-by-phase plan and open questions.
+See [`docs/implementation_status.md`](docs/implementation_status.md) for a full accounting
+of what is and isn't implemented, plus known limitations.
 
-Current status: Phases 0–27 complete. Phase 27 is a partial implementation —
-`ignore_participant()` is fully functional; `ignore_topic()` / `ignore_publication()` /
-`ignore_subscription()` are normative stubs returning `OK` (per-spec acceptable, full
-filter-on-delivery is a future phase). Wire interop confirmed against Cyclone DDS and OpenDDS
-(all scenarios including DATA_FRAG fragmentation).
+Summary: RTPS 2.5 framing, StatefulWriter/Reader reliability, SPDP/SEDP discovery,
+QoS policy definitions/matching with broad runtime enforcement, WaitSet/Conditions,
+instance lifecycle, DATA_FRAG fragmentation, ContentFilteredTopic parser/evaluator
+support, and wire interop with Cyclone DDS and OpenDDS are present. DDS-Security is a
+skeleton (plugin interface + noop pass-through only). See [`docs/roadmap.md`](docs/roadmap.md)
+for planned work and known gaps.

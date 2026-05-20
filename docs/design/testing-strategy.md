@@ -2,11 +2,11 @@
 
 ## Guiding Principles
 
-**Interop over conformance.** The real bar is working correctly with Cyclone DDS, FastDDS, and
-RTI Connext — not passing a spec-derived test suite. We aim to be conservative in what we send
-and liberal in what we accept. Where Zenzen DDS goes beyond the spec (flow control, rate
-limiting, embedded-specific extensions), tests exist at the RTPS layer, not the spec-assertion
-layer. No formal conformance harness.
+**Interop over conformance.** The current verified bar is working correctly with Cyclone DDS
+and OpenDDS; FastDDS and RTI Connext remain planned interop targets. We aim to be
+conservative in what we send and liberal in what we accept. Where Zenzen DDS goes beyond the
+spec, tests exist at the RTPS layer, not the spec-assertion layer. No formal conformance
+harness.
 
 **Avoid sleeping in tests.** Every `time_mod.sleepNs(...)` in a test is CI latency and a
 potential flake. Time-dependent behavior (lease expiry, heartbeat timers, deadline) is tested
@@ -57,17 +57,19 @@ of real UDP or the imprecision of wall-clock timing.
 
 **Mock transport interface** (`src/transport/mock.zig`):
 
-The mock implements the same `Transport` vtable as `UdpTransport`. Key behaviors:
+The mock implements the same `Transport` vtable as `UdpTransport`. A `MockNetwork` owns the
+shared routing fabric; individual `MockTransport` instances join that network with their
+test-chosen locators. Key behaviors:
 - `send(locator, data)` enqueues the packet into a per-destination queue rather than
   sending it over a socket.
 - `listen(port, handler)` registers a handler; no socket is created.
-- `deliver()` drains the send queue and calls registered handlers directly — the test
-  controls exactly when packets arrive.
-- Configuration: per-sender drop rate, fixed reorder delay, duplication count. Composable
-  with a `ManualClock` to produce deterministic timer-driven scenarios.
+- `MockNetwork.deliverAll()` drains one delivery round across all member transports.
+- `MockTransport.deliver()` drains one transport's queue.
+- Configuration lives on `MockNetwork.Config`: `drop_nth` drops every Nth packet, and
+  `dupe_count` delivers extra copies.
 
-Two mock transport instances wired together replace the loopback UDP pair: no port
-allocation, no bind, no threads, no timing sensitivity.
+Two mock transport instances in the same `MockNetwork` replace the loopback UDP pair: no
+port allocation, no bind, no threads, no timing sensitivity.
 
 **What lives here:**
 - SPDP: participant announcement, discovery, lease expiry (advance clock past lease
@@ -78,7 +80,7 @@ allocation, no bind, no threads, no timing sensitivity.
 - Packet loss scenarios: drop DATA, verify NACK-triggered retransmit
 - Reordering: deliver DATA[3] before DATA[2], verify buffering and gap fill
 - Partition/rejoin: stop delivering → lease expires → reconnect → history replay
-- Config flag behavior: `enable_ipv6 = false`, `enable_interface_monitor = false` —
+- Config flag behavior: `-Dipv6=false`, `-Dinterface-monitor=false` —
   verify the transport path changes without needing real interfaces
 - Future: flow control backpressure, rate limiter, send-window exhaustion
 
@@ -86,15 +88,16 @@ allocation, no bind, no threads, no timing sensitivity.
 
 ### Tier 3 — Live interop (cross-process, external vendor)
 
-Run by `zig build interop-test`. Requires vendor implementations (Cyclone DDS, FastDDS).
-Runs in CI nightly or on-demand; not required for PR merge.
+Run by `zig build interop-test-cyclone` or `zig build interop-test-opendds`. Requires the
+corresponding vendor implementation. FastDDS and RTI Connext scenarios are planned but do
+not have build steps yet. Runs in CI nightly or on-demand; not required for PR merge.
 
 **What lives here:**
 - Cyclone DDS: Zenzen DDS writer → Cyclone reader; Cyclone writer → Zenzen DDS reader
-- FastDDS: same scenarios (future)
-- RTI Connext: same (future; requires license)
-- Security handshake (future, when DDS Security plugin is implemented)
-- Fragmentation: large payloads exceeding RTPS max message size (future)
+- OpenDDS: same scenarios (implemented)
+- FastDDS: same scenarios (planned)
+- RTI Connext: same (planned; requires license)
+- Security handshake (planned, when DDS Security plugin is implemented)
 
 **Execution model:** `test/interop/Makefile` launches peer processes, runs scenarios,
 asserts outcomes. Each scenario is a self-contained process pair with a timeout. The
@@ -104,7 +107,8 @@ Makefile is the only place with real `sleep` calls (startup ordering).
 
 ### Tier 4 — Adversarial (fuzz and sanitizer)
 
-Run nightly or on-demand. Separate `zig build test-fuzz` and `zig build test-tsan` steps.
+Run nightly or on-demand. `zig build test-fuzz` compile-checks the fuzz entry points;
+corpus regression tests run as ordinary Zig tests under `zig build test`.
 
 **Fuzz targets** (`test/fuzz/`):
 
@@ -120,8 +124,9 @@ memory read.
 - `fuzz_cdr_payload.zig` (future) — lower priority; CDR payloads are currently opaque bytes, but
   once we have type-safe binding layers this becomes important
 
-Implementation: each fuzz target is a standalone Zig executable with a `pub fn
-fuzzOne(data: []const u8) void` entry point wired to libFuzzer via a thin C shim.
+Implementation: each fuzz target exposes `pub fn fuzzOne(data: []const u8) void`.
+`zig build test-fuzz` compile-checks those targets; runnable libFuzzer executables are
+built manually by compiling the Zig source to an object and linking with LLVM's libFuzzer.
 Corpus lives in `test/fuzz/corpus/`.
 
 As DDS Security is implemented, add fuzz targets for the authentication and crypto layers;
@@ -147,19 +152,7 @@ detection — these are always active in `zig build test` at no additional cost.
 
 ## Clock Abstraction
 
-### Why
-
-Every time-dependent behavior in Zenzen DDS — lease expiry, heartbeat period, NACK
-suppression delay, deadline QoS, lifespan QoS — currently calls `time_mod.nanoTimestamp()`
-or `time_mod.sleepNs()`, which are hardcoded to `CLOCK_REALTIME` on Linux. This makes
-timer-driven tests slow (real wall-clock sleeping) and non-deterministic (subject to
-scheduler jitter), and it makes the code unportable to RTOSes that expose a different
-clock API.
-
-### Design
-
-Add a `Clock` vtable to `util/time.zig`, following the same vtable pattern as `Transport`
-and `Discovery`:
+The `Clock` vtable is implemented in `util/time.zig` (added in Phase 31):
 
 ```zig
 pub const Clock = struct {
@@ -176,30 +169,23 @@ pub const Clock = struct {
 };
 ```
 
-### Implementations
+Four implementations are provided:
 
-**`RealtimeClock`** — current behavior; wraps `CLOCK_REALTIME` via `std.os.linux.clock_gettime`.
-Default for production use.
+**`RealtimeClock`** — wraps `CLOCK_REALTIME`. Available but not used for internal timers.
 
-**`MonotonicClock`** — wraps `CLOCK_MONOTONIC`. Preferred for all internal timers (lease,
-heartbeat, deadline) because it is not affected by NTP step adjustments or `settimeofday`.
-On RTOSes this maps to the monotonic system tick counter. Should become the default for
-all timer paths.
+**`MonotonicClock`** — wraps `CLOCK_MONOTONIC`. Default for all internal timers (lease,
+heartbeat, deadline) — unaffected by NTP step adjustments or `settimeofday`.
 
-**`ManualClock`** — test-only. Wraps an `std.atomic.Value(i64)` initialized to an arbitrary
-epoch. `sleep_ns` is a no-op (or optionally advances the clock by the requested amount,
-for scenarios where "sleeping" should advance simulated time). Tests call `clock.advance(ns)`
-to drive timers forward without any real elapsed time.
+**`BoottimeClock`** — wraps `CLOCK_BOOTTIME`. Available; useful for embedded suspend/resume
+scenarios.
 
-**RTOS / custom hardware** — an integrator provides their own `Clock` implementation
-wrapping whatever API their platform exposes. The vtable is the only contract.
+**`ManualClock`** — test-only. Tests call `clock.advance(ns)` or `clock.set(ns)` to drive
+timers forward. `sleep_ns` waits for the logical clock to advance, waking periodically so
+timer threads can observe shutdown flags.
 
-### Migration
-
-`DomainParticipantFactoryImpl`, `SpdpEndpoints`, `SedpEndpoints`, and the RTPS state
-machines all acquire a `Clock` from the factory at construction. The existing free functions
-`nanoTimestamp()` and `sleepNs()` in `util/time.zig` remain as shims backed by
-`RealtimeClock` for call sites that don't yet need configurability.
+`DomainParticipantFactoryImpl` selects the clock by name via `ClockRegistry`
+(`timer_clock_name` config field; default: `"monotonic"`). See `src/util/clock_registry.zig`
+and `docs/architecture.md`.
 
 ---
 
@@ -208,43 +194,31 @@ machines all acquire a `Clock` from the factory at construction. The existing fr
 ### Interface (`src/transport/mock.zig`)
 
 ```zig
-pub const MockTransport = struct {
-    alloc:   std.mem.Allocator,
-    mu:      mutex_mod.Mutex,
-    queue:   std.ArrayListUnmanaged(Packet),
-    handlers: std.AutoHashMapUnmanaged(u32, ReceiveHandler),
-
-    pub const Packet = struct {
-        dest_port: u32,
-        data:      []u8,        // owned by MockTransport
-        src_loc:   Locator,
-    };
-
+pub const MockNetwork = struct {
     pub const Config = struct {
-        drop_rate:    f32 = 0.0,   // 0.0 = no drops, 1.0 = drop all
-        dupe_count:   u32 = 0,     // extra copies delivered per packet
-        // Future: reorder_window: u32
+        drop_nth: u32 = 0,     // 0 = never drop; N = drop every Nth packet
+        dupe_count: u32 = 0,   // extra copies delivered per packet
     };
 
-    config: Config,
+    pub fn setConfig(self: *MockNetwork, cfg: Config) void { ... }
 
-    /// Deliver all queued packets to their registered handlers.
-    /// Call from the test to advance the protocol state.
+    /// Deliver one round across all member transports.
+    /// Packets enqueued during this call arrive on the next deliverAll().
+    pub fn deliverAll(self: *MockNetwork) void { ... }
+};
+
+pub const MockTransport = struct {
+    /// Deliver all packets currently queued for this transport.
     pub fn deliver(self: *MockTransport) void { ... }
 
-    /// Deliver only packets destined for `port`.
-    pub fn deliverPort(self: *MockTransport, port: u32) void { ... }
-
-    /// Drop all queued packets without delivering them (simulate partition).
-    pub fn dropAll(self: *MockTransport) void { ... }
-
+    pub fn queueLen(self: *MockTransport) usize { ... }
     pub fn transport(self: *MockTransport) Transport { ... }
 };
 ```
 
-Tests construct two `MockTransport` instances — one for each participant — and wire them
-so that each instance's `send` enqueues into the other's queue. `deliver()` calls then
-simulate network delivery with precise test control.
+Tests construct one `MockNetwork`, then create one `MockTransport` per participant with
+distinct locators. `deliverAll()` calls simulate network delivery with precise test
+control.
 
 ### Integration point
 
@@ -263,8 +237,8 @@ for tests that don't need the full DCPS stack.
 | Bounds + overflow checks | Zig Debug mode (default for test) | Always |
 | ThreadSanitizer | `root_module.sanitize_thread = true` | `zig build test-tsan` (PRs, nightly) |
 | LLVM coverage | `zig test` + `-fprofile-instr-generate`; `llvm-cov report` | Nightly CI script |
-| libFuzzer | Standalone fuzz executables in `test/fuzz/` | Nightly; manual on parser changes |
-| Live interop | `zig build interop-test`; external vendor binaries | Nightly or on-demand |
+| libFuzzer | Source entry points in `test/fuzz/`; runnable executables are built manually with LLVM's libFuzzer | Nightly; manual on parser changes |
+| Live interop | `zig build interop-test-cyclone` / `interop-test-opendds` | Nightly or on-demand |
 
 **On static analysis:** Zig's compiler eliminates many C-style static analysis targets
 (buffer overruns caught by bounds checks, no silent integer promotions, no implicit casts
@@ -284,9 +258,9 @@ auditable. Formal verification tooling for Zig is not yet mature enough to plan 
 
 **Spec conformance harness.** A system that maps OMG spec section numbers to executable
 assertions sounds attractive but is expensive to maintain and often diverges from what
-real implementations actually do. Real-world interop with Cyclone, FastDDS, and RTI
-is a stronger signal than passing a conformance suite that no peer implementation was
-tested against.
+real implementations actually do. Real-world interop with Cyclone DDS and OpenDDS is a
+stronger signal than passing a conformance suite that no peer implementation was tested
+against; FastDDS and RTI Connext remain planned targets.
 
 **Network simulation** (ns-3, CORE, etc.). The mock transport covers the protocol-level
 conditions that matter (loss, reorder, duplication) without requiring a network simulator.
@@ -299,11 +273,12 @@ Physical-layer behavior (MTU, congestion, asymmetric latency) is out of scope.
 ## CI Structure (Target)
 
 ```
-zig build test          ← Tier 1 + Tier 2; always runs; < 30s
-zig build test-tsan     ← Tier 1 + Tier 2 under TSan; PRs and nightly
-zig build interop-test  ← Tier 3; nightly or on-demand; requires vendor installs
-zig build test-fuzz     ← Tier 4 fuzz harness launch; nightly; no timeout
+zig build test                  ← Tier 1 + Tier 2; always runs; < 30s
+zig build test-tsan             ← Tier 1 + Tier 2 under TSan; PRs and nightly
+zig build interop-test-cyclone  ← Tier 3; requires Cyclone DDS at CYCLONE_ROOT
+zig build interop-test-opendds  ← Tier 3; requires OpenDDS at OPENDDS_ROOT
+zig build test-fuzz             ← Tier 4 fuzz harness compile-check
 ```
 
-Coverage reports and fuzz corpus updates are artifacts, not gates. TSan clean is a
-merge requirement once the Tier 2 mock transport suite exists.
+Coverage reports and fuzz corpus updates are artifacts, not gates. TSan clean should be a
+merge requirement for changes that touch transport, discovery, WaitSet, or shared DCPS state.

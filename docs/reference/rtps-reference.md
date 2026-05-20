@@ -1,5 +1,11 @@
 # RTPS 2.5 Quick Reference
 
+> **Not authoritative for implementation constants.** This is a contributor quick-reference
+> extracted from the spec and source to avoid re-opening the PDF. For values actually used
+> in code, see `src/rtps/pid.zig` (PIDs), `src/rtps/guid.zig` (entity IDs), and
+> `docs/architecture.md` (encoding identifiers). If this file and source disagree, source
+> wins.
+
 Extracted from [formal/22-04-01](https://www.omg.org/spec/DDSI-RTPS/2.5/PDF) (OMG RTPS 2.5).
 Section numbers reference the PDF directly.
 
@@ -35,7 +41,8 @@ Domain 0 example:
 ### §9.6.2.4 — Default multicast group and SPDP rate
 
 - Default SPDP multicast address: **239.255.0.1** (for domain 0; fourth octet = domainId + 1 by convention)
-- Default SPDP announcement period: **30 seconds**
+- Spec default SPDP announcement period: **30 seconds**. Zenzen DDS currently defaults to
+  `participant.announcement_period_ms = 3000` (3 seconds).
 
 ---
 
@@ -57,8 +64,9 @@ p2p_builtin_participant_msg_writer:   { key={00,02,00}, kind=0xC2 }
 p2p_builtin_participant_msg_reader:   { key={00,02,00}, kind=0xC7 }
 ```
 
-Note: `p2p_builtin_participant_message_writer/reader` are used by the Writer Liveliness
-Protocol (§8.4.13) and are not yet in `src/rtps/guid.zig`.
+These entity IDs are defined in `src/rtps/guid.zig`. The `p2p_builtin_participant_message_writer/reader`
+endpoints are used by the Writer Liveliness Protocol (§8.4.13); the entity IDs are defined
+but the WLP endpoint is not yet instantiated (see `docs/roadmap.md`).
 
 ---
 
@@ -77,10 +85,9 @@ it has instantiated. The field appears in `SPDPdiscoveredParticipantData.availab
 |   5 | DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR | SEDP subscriptions reader       |
 |  10 | BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_WRITER | P2P liveliness writer       |
 |  11 | BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_READER | P2P liveliness reader       |
-|  28 | DISC_BUILTIN_ENDPOINT_TOPICS_ANNOUNCER      | SEDP topics writer               |
-|  29 | DISC_BUILTIN_ENDPOINT_TOPICS_DETECTOR       | SEDP topics reader               |
 
-Typical bitmask for a full participant: `0x3C0000 | 0x3F` = bits 0-5 + 10-11 set.
+Zenzen DDS currently advertises bits 0-5 (`0x0000003F`). The P2P liveliness bits are
+defined in source but not set because the WLP endpoint is not instantiated.
 
 ---
 
@@ -163,55 +170,57 @@ they are derivable from the surrounding RTPS framing:
 Discovery data is serialized as a **ParameterList** (PL_CDR_LE encoding): a sequence of
 `{ PID: u16_le, length: u16_le, value: [length]u8 }` records, terminated by PID_SENTINEL.
 
-### Core PIDs (Table 9.18)
+### Current implementation PIDs (`src/rtps/pid.zig`)
 
 | PID    | Name                              | Type / Notes                                    |
 |--------|-----------------------------------|-------------------------------------------------|
-| 0x0001 | PID_USER_DATA                     | OctetSeq                                        |
-| 0x0002 | PID_TOPIC_NAME                    | string (4-byte len + chars + pad)               |
-| 0x0003 | PID_TYPE_NAME                     | string                                          |
-| 0x0004 | PID_GROUP_DATA                    | OctetSeq                                        |
-| 0x0005 | PID_TOPIC_DATA                    | OctetSeq                                        |
-| 0x0006 | PID_DURABILITY                    | DurabilityQosPolicyKind (u32)                   |
-| 0x001D | PID_DURABILITY_SERVICE            | DurabilityServiceQosPolicy                      |
-| 0x0023 | PID_DEADLINE                      | Duration_t (2×i32)                              |
+| 0x0000 | PID_PAD                           | Padding                                         |
+| 0x0001 | PID_SENTINEL                      | End of ParameterList; length = 0                |
+| 0x0002 | PID_PARTICIPANT_LEASE_DURATION    | Duration_t                                      |
+| 0x0004 | PID_TIME_BASED_FILTER             | Duration_t                                      |
+| 0x0005 | PID_TOPIC_NAME                    | string                                          |
+| 0x0006 | PID_OWNERSHIP_STRENGTH            | i32                                             |
+| 0x0007 | PID_TYPE_NAME                     | string                                          |
+| 0x0015 | PID_PROTOCOL_VERSION              | ProtocolVersion_t (2 bytes + 2 pad)             |
+| 0x0016 | PID_VENDORID                      | VendorId_t (2 bytes + 2 pad)                    |
+| 0x001A | PID_RELIABILITY                   | ReliabilityQosPolicyKind + max_blocking_time    |
+| 0x001B | PID_LIVELINESS                    | LivelinessQosPolicyKind + Duration_t            |
+| 0x001D | PID_DURABILITY                    | DurabilityQosPolicyKind                         |
+| 0x001E | PID_DURABILITY_SERVICE            | DurabilityServiceQosPolicy                      |
+| 0x001F | PID_OWNERSHIP                     | OwnershipQosPolicyKind                          |
+| 0x0021 | PID_PRESENTATION                  | PresentationQosPolicy                           |
+| 0x0023 | PID_DEADLINE                      | Duration_t                                      |
+| 0x0025 | PID_DESTINATION_ORDER             | DestinationOrderQosPolicyKind                   |
 | 0x0027 | PID_LATENCY_BUDGET                | Duration_t                                      |
-| 0x001B | PID_LIVELINESS                    | LivelinessQosPolicyKind (u32) + Duration_t      |
-| 0x001A | PID_RELIABILITY                   | ReliabilityQosPolicyKind (u32) + max_blocking_time (Duration_t) |
-| 0x0049 | PID_LIFESPAN                      | Duration_t                                      |
-| 0x0025 | PID_DESTINATION_ORDER             | DestinationOrderQosPolicyKind (u32)             |
-| 0x0040 | PID_HISTORY                       | HistoryQosPolicyKind (u32) + depth (i32)        |
-| 0x0041 | PID_RESOURCE_LIMITS               | ResourceLimitsQosPolicy (3×i32)                 |
-| 0x002B | PID_OWNERSHIP                     | OwnershipQosPolicyKind (u32)                    |
-| 0x006F | PID_OWNERSHIP_STRENGTH            | i32                                             |
-| 0x002C | PID_TIME_BASED_FILTER             | Duration_t                                      |
-| 0x0021 | PID_PARTITION                     | StringSeq (u32 count + strings)                 |
-| 0x002E | PID_PRESENTATION                  | PresentationQosPolicy (kind u32 + 2 booleans)   |
-| 0x0044 | PID_TRANSPORT_PRIORITY            | i32                                             |
-| 0x0058 | PID_DATA_REPRESENTATION           | OctetSeq (list of u16 encoding IDs)             |
-| 0x0073 | PID_TYPE_CONSISTENCY_ENFORCEMENT  | TypeConsistencyEnforcementQosPolicy             |
-| 0x000F | PID_BUILTIN_ENDPOINT_SET          | u32 (BuiltinEndpointSet_t bitmask)              |
-| 0x000C | PID_PARTICIPANT_MANUAL_LIVELINESS_COUNT | i32 (Count_t)                            |
-| 0x0059 | PID_PARTICIPANT_BUILTIN_ENDPOINTS | u32                                             |
-| 0x0031 | PID_PARTICIPANT_LEASE_DURATION    | Duration_t                                      |
-| 0x0050 | PID_PARTICIPANT_GUID              | GUID_t (16 bytes)                               |
-| 0x0043 | PID_PARTICIPANT_ENTITYID          | EntityId_t (4 bytes)                            |
-| 0x0015 | PID_GROUP_GUID                    | GUID_t                                          |
-| 0x0016 | PID_GROUP_ENTITYID                | EntityId_t                                      |
-| 0x0011 | PID_METATRAFFIC_MULTICAST_LOCATOR | Locator_t (24 bytes, big-endian kind/port)      |
-| 0x0012 | PID_METATRAFFIC_UNICAST_LOCATOR   | Locator_t                                       |
-| 0x0031 | PID_DEFAULT_UNICAST_LOCATOR       | Locator_t                                       |
-| 0x0048 | PID_DEFAULT_MULTICAST_LOCATOR     | Locator_t                                       |
-| 0x001F | PID_MULTICAST_LOCATOR             | Locator_t (SEDP endpoint locators)              |
+| 0x002B | PID_LIFESPAN                      | Duration_t                                      |
+| 0x002C | PID_USER_DATA                     | OctetSeq                                        |
+| 0x002E | PID_TOPIC_DATA                    | OctetSeq                                        |
 | 0x002F | PID_UNICAST_LOCATOR               | Locator_t                                       |
-| 0x0034 | PID_CONTENT_FILTER_PROPERTY       | ContentFilterProperty_t                         |
-| 0x0035 | PID_PROPERTY_LIST                 | PropertySeq                                     |
-| 0x0060 | PID_TYPE_MAX_SIZE_SERIALIZED      | i32                                             |
-| 0x0014 | PID_PROTOCOL_VERSION              | ProtocolVersion_t (2 bytes + 2 pad)             |
-| 0x0016 | PID_VENDOR_ID                     | VendorId_t (2 bytes + 2 pad)                    |
-| 0x0001 | PID_SENTINEL                      | (no value; PID=0x0001, length=0)                |
+| 0x0030 | PID_MULTICAST_LOCATOR             | Locator_t                                       |
+| 0x0031 | PID_DEFAULT_UNICAST_LOCATOR       | Locator_t                                       |
+| 0x0032 | PID_METATRAFFIC_UNICAST_LOCATOR   | Locator_t                                       |
+| 0x0033 | PID_METATRAFFIC_MULTICAST_LOCATOR | Locator_t                                       |
+| 0x0034 | PID_PARTICIPANT_MANUAL_LIVELINESS_COUNT | Count_t                                  |
+| 0x0035 | PID_PARTITION                     | StringSeq                                       |
+| 0x0040 | PID_HISTORY                       | HistoryQosPolicyKind + depth                    |
+| 0x0041 | PID_RESOURCE_LIMITS               | ResourceLimitsQosPolicy                         |
+| 0x0043 | PID_EXPECTS_INLINE_QOS            | boolean                                         |
+| 0x0044 | PID_PARTICIPANT_BUILTIN_ENDPOINTS | u32                                             |
+| 0x0048 | PID_DEFAULT_MULTICAST_LOCATOR     | Locator_t                                       |
+| 0x0049 | PID_TRANSPORT_PRIORITY            | i32                                             |
+| 0x0050 | PID_PARTICIPANT_GUID              | GUID_t                                          |
+| 0x0052 | PID_GROUP_GUID                    | GUID_t                                          |
+| 0x0055 | PID_CONTENT_FILTER_INFO           | ContentFilterInfo_t                             |
+| 0x0056 | PID_GROUP_DATA / PID_COHERENT_SET | Spec-version conflict; code currently defines both |
+| 0x0058 | PID_BUILTIN_ENDPOINT_SET          | BuiltinEndpointSet_t bitmask                    |
+| 0x005A | PID_ENDPOINT_GUID                 | GUID_t                                          |
+| 0x0062 | PID_ENTITY_NAME                   | string                                          |
+| 0x0073 | PID_DATA_REPRESENTATION           | sequence of XTypes data representation IDs      |
+| 0x0075 | PID_TYPE_INFORMATION              | CDR-encoded XTypes TypeInformation blob         |
+| 0x0077 | PID_BUILTIN_ENDPOINT_QOS          | Builtin endpoint QoS                            |
 
-**Note:** PID_SENTINEL = 0x0001 (length field = 0). PID_PAD = 0x0000.
+Vendor-specific Zenzen DDS PIDs use the vendor range: `0x8001`
+(`ZZDDS_SHMEM_UNICAST_LOCATOR`) and `0x8002` (`ZZDDS_SHMEM_ZC_LOCATOR`).
 
 Locator_t wire format (Table 9.19, 24 bytes, **big-endian** for kind and port):
 ```
@@ -226,11 +235,15 @@ These PIDs appear in the inlineQos of DATA/DATA_FRAG submessages:
 
 | PID    | Name                    | Type / Notes                              |
 |--------|-------------------------|-------------------------------------------|
+| 0x0055 | PID_CONTENT_FILTER_INFO | ContentFilterInfo_t (for filtered writers)|
+| 0x0057 | PID_DIRECTED_WRITE      | GUID_t (targeted reader GUID)             |
+| 0x0061 | PID_ORIGINAL_WRITER_INFO| OriginalWriterInfo_t                      |
+| 0x0063 | PID_GROUP_COHERENT_SET  | Group coherent set marker                 |
+| 0x0064 | PID_GROUP_SEQ_NUM       | Group sequence number                     |
+| 0x0065 | PID_WRITER_GROUP_INFO   | Writer group info                         |
+| 0x0066 | PID_SECURE_WRITER_GROUP_INFO | Secure writer group info             |
 | 0x0070 | PID_KEY_HASH            | [16]u8 (MD5 key hash or padded key)       |
 | 0x0071 | PID_STATUS_INFO         | StatusInfo_t (u32, 4 bytes)               |
-| 0x0062 | PID_DIRECTED_WRITE      | GUID_t (targeted reader GUID)             |
-| 0x0063 | PID_ORIGINAL_WRITER_INFO| OriginalWriterInfo_t                      |
-| 0x0064 | PID_CONTENT_FILTER_INFO | ContentFilterInfo_t (for filtered writers)|
 
 ---
 
@@ -401,14 +414,16 @@ Key compatibility rules:
 
 ## §9.3.1.5 — GuidPrefix Requirement
 
-The first two bytes of a GuidPrefix MUST equal the participant's VendorId bytes.
+The RTPS spec requires the first two bytes of a GuidPrefix to equal the participant's
+VendorId bytes.
 
-For Zenzen DDS (VendorId = `{0x01, 0x23}`):
-- `guidPrefix[0]` must be `0x01`
-- `guidPrefix[1]` must be `0x23`
-- Bytes 2–11: implementation-defined (random or host-based)
+Current implementation status:
+- `src/rtps/message/header.zig` uses header `VENDOR_ID = {0x01, 0x23}`.
+- `src/rtps/pid.zig` uses SPDP `ZZDDS_VENDOR_ID = {0x99, 0x99}`.
+- `src/util/guid_gen.zig` does not currently force either value into `guidPrefix[0..2]`.
 
-This constraint is checked by remote participants to identify Zenzen DDS traffic.
+Before publishing interop results, register a permanent vendor ID with OMG, make the header
+and SPDP vendor IDs agree, and update GUID-prefix generation to preserve that value.
 
 ---
 
