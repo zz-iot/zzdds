@@ -19,8 +19,9 @@ transport(s), discovery plugin, security plugins, and config.
 **History cache stores bytes, not structs.** Both writer and reader caches hold serialized CDR
 payloads. See `docs/design/history-cache.md`.
 
-**Send path is zero-copy (scatter-gather).** `CacheChange.data` is read-only; headers are built
-on the stack; `sendmsg()` assembles everything via iovec. See `docs/design/rtps-message-builder.md`.
+**Send path uses iovec assembly.** `CacheChange.data` is read-only (`[]const u8`); headers
+are built on the stack. The iovec list is flattened to a stack buffer at the transport
+boundary (`Transport.send`). See `docs/design/rtps-message-builder.md`.
 
 **Configuration precedence (highest to lowest):**
 `Programmatic API → Environment variables (ZZDDS_*) → Config file (TOML) → Built-in defaults`
@@ -36,7 +37,8 @@ Config file search order: `$ZZDDS_CONFIG` → `./zzdds.toml` → `~/.config/zzdd
 | `-Dinterface-monitor` | true | Enumerate NICs once at startup |
 | `-Dwire-trace` | false | `Tracer` is zero-size; all trace calls are dead-code eliminated |
 | `-Dguid-filter` | false | No GUID-prefix filter in wire trace (only meaningful with wire-trace) |
-| `-Dxtypes` | true | Suppress `PID_TYPE_INFORMATION` in SEDP; `registerTypeInfo()` is a no-op |
+| `-Dxtypes` | true | When false: suppress `PID_TYPE_INFORMATION` in SEDP announcements. Note: no TypeLookup service is implemented; XTypes type discovery from remote participants is not supported regardless of this flag. |
+| `-Dcontent-subscription-profile` | true | When false: disable the ContentFilteredTopic/QueryCondition SQL parser and evaluator (DDS v1.4 Annex A). MultiTopic is not implemented. |
 
 Usage in source: `const opts = @import("build_options"); if (opts.wire_trace) { ... }`
 
@@ -105,12 +107,88 @@ on_reader_discovered / on_reader_lost
 ### Security (`src/security/interface.zig`)
 
 Three sub-plugins: Authentication, AccessControl, Cryptographic. Default: `security/noop.zig`.
-Security intercepts at the RTPS/DCPS boundary; the noop path is branch-free pass-through.
-See `docs/design/security-pipeline.md` for the protection scope model.
+The security interface is plumbed through the RTPS/DCPS boundary but has no active
+enforcement in the current data path — only the noop pass-through is implemented.
+See `docs/design/security-pipeline.md` for the intended protection scope model.
+
+### IntraProcessDelivery (`src/delivery/intraprocess.zig`)
+
+A bundle that wires `MemoryTransport` and `DirectDiscovery` together for deterministic
+in-process testing. Used by all DCPS-level tests added in Phase 29 and later.
+
+```zig
+var delivery = try IntraProcessDelivery.init(alloc);
+defer delivery.deinit();
+
+const t_w = try delivery.newTransport();
+const d_w = try delivery.newDiscovery();
+var factory_w = try DomainParticipantFactoryImpl.init(
+    alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .random, .{});
+```
+
+Each participant gets its own `MemoryTransport` and `DirectDiscovery` instance from the
+shared `MemoryBus` / `DiscoveryBus`. Endpoint matching and data delivery are synchronous
+with no timer threads. BEST_EFFORT QoS is fully supported; use `MockTransport` for
+RELIABLE protocol-level tests (see `docs/design/testing-strategy.md`).
+
+### MemoryTransport (`src/transport/memory.zig`)
+
+Synchronous in-process transport. `send()` delivers immediately via a shared `MemoryBus`
+port→handler map — no queue, no `deliverAll()` pump. Assigns each participant a fake
+IPv4 address derived from its participant ID for locator routing.
+
+### DirectDiscovery (`src/discovery/direct.zig`)
+
+In-process discovery without SPDP/SEDP. When a writer or reader is announced, all
+participants sharing the `DiscoveryBus` are notified synchronously, triggering immediate
+QoS matching. No UDP packets, no timer threads, no leases.
+
+### LossyTransport (`src/transport/lossy.zig`)
+
+A transport shim that wraps any `Transport` and applies a `PacketPolicy` to each outgoing
+`send()`. Built-in policies:
+
+- `DropEveryNth` — drop every Nth packet (deterministic, 1-indexed)
+- `DropRate` — drop each packet with probability p (0.0–1.0)
+- `DropFirst` — drop the first N packets then pass all remaining
+
+```zig
+var policy = LossyTransport.DropEveryNth.init(3);
+var lossy = try LossyTransport.init(alloc, inner_transport, policy.packetPolicy());
+defer lossy.deinit(alloc);
+```
+
+Used in RELIABLE retransmit and NACK-triggered resend tests.
+
+### ClockRegistry (`src/util/clock_registry.zig`)
+
+Maps string names to `Clock` instances. Pre-populated with `"default"` / `"monotonic"` /
+`"realtime"` / `"boottime"`. The `timer_clock_name` config field selects which clock
+`DomainParticipantFactoryImpl` uses for all internal timers. Custom clocks can be registered
+before creating a factory.
+
+### ContentFilteredTopic evaluator (`src/dcps/filter.zig`)
+
+SQL-subset parser and evaluator for `ContentFilteredTopic.filter_expression`. Gated by the
+`-Dcontent-subscription-profile` build option. When false, parsed expressions are disabled
+and the evaluator returns "match".
+
+Supported grammar: comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`), `BETWEEN`,
+`AND`, `OR`, `NOT`, parameter references (`%0`–`%99`), and dot-path field names.
+
+The `FieldAccessor` vtable lets a typed wrapper or generated deserializer supply field
+values without the filter module depending on generated code. The generic `DataReader`
+does not yet apply these expressions automatically in `read()` / `take()`; current tests
+call `ContentFilteredTopicImpl.matchSample()` manually after `takeRaw()`.
 
 ---
 
 ## Configuration Schema (`src/config/schema.zig`)
+
+The table below mirrors the full in-memory schema. Programmatic configuration can set all
+fields. TOML/env coverage currently lags the schema: `file.zig` / `resolve.zig` do not yet
+parse or override `participant.timer_clock_name`, the `[rtps]` section, or the UDP
+`meta_unicast_port` / `data_unicast_port` / `data_port_separate` fields.
 
 ```toml
 [domain]
@@ -121,6 +199,10 @@ name = ""                   # empty = auto
 lease_duration_ms = 10000
 announcement_period_ms = 3000
 guid_strategy = "random"    # "random" | "host_based"
+timer_clock_name = "default" # clock used for all timers: "default" | "monotonic" | "realtime" | "boottime"
+
+[rtps]
+fragment_size = 16384       # max RTPS message size before DATA_FRAG splitting (bytes)
 
 [transport.udp]
 enabled = true
@@ -139,6 +221,11 @@ data_unicast_offset = 11    # D3
 # null = auto-assign (try min_valid..max_valid until bind succeeds)
 participant_id = null
 
+# Override computed port numbers (null = use RTPS formula)
+meta_unicast_port = null
+data_unicast_port = null
+data_port_separate = true   # false = use meta port for data traffic too
+
 # Interface names ("eth0") or IPs ("192.168.1.5"). Empty = all interfaces.
 interfaces = []
 
@@ -153,7 +240,7 @@ recv_buffer_size = 0          # 0 = OS default
 interface_poll_interval_ms = 5000
 
 [discovery]
-kind = "spdp"           # "spdp" | "static" | "broker" | custom
+kind = "spdp"           # "spdp" (implemented) | "static" | "broker" (planned) | custom
 initial_peers = []      # e.g. ["192.168.1.100:7400"]
 static_config_file = ""
 

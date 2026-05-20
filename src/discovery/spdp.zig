@@ -71,8 +71,9 @@ pub const KnownParticipant = struct {
 // ── SpdpEndpoints ─────────────────────────────────────────────────────────────
 
 /// SPDP built-in endpoints + background timer thread.
-/// Implements the Discovery vtable (announce_writer/reader are stubs that
-/// delegate to the SEDP layer set via `setSedp()`).
+/// Implements SPDP participant discovery only. Endpoint announce/retract vtable
+/// methods are no-ops here; `SpdpSedpDiscovery` composes this with `SedpEndpoints`
+/// and routes endpoint discovery calls to SEDP.
 pub const SpdpEndpoints = struct {
     alloc: std.mem.Allocator,
     transport: Transport,

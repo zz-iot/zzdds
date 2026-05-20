@@ -1,24 +1,48 @@
-# Thread Model and TypeObject Registration
+# Thread Model and Type Information
 
-## Thread model
+## Current Thread Ownership
 
-**Default: background threads per domain.**
+The default UDP/SPDP path is multi-threaded:
 
-- One receive thread per bound transport port
-- One timer thread for lease monitoring and deadline tracking
-- Listener/callback invocations happen on the receive thread (user must not block)
-- `WaitSet.wait()` blocks the calling thread
+- `UdpTransport` owns one receive thread per active socket/port.
+- `SpdpSedpDiscovery` owns an SPDP timer thread for periodic participant
+  announcements and lease checks.
+- `StatefulWriter` starts a heartbeat thread when the first matched reader is added.
+- The polling `InterfaceMonitor` owns a polling thread when interface monitoring is enabled.
+- `trace.AsyncRingSink` owns an optional flush thread when the application starts it.
 
-**Embedded / single-threaded use:** expose `DomainParticipant.drive(timeout)` which
-processes pending I/O and timers from the caller's thread. This requires the transport
-to support non-blocking poll. (Not yet implemented; design must not preclude it.)
+DCPS deadline and liveliness checks are not driven by a participant-owned timer thread in
+the current implementation. `DomainParticipantImpl.checkTimers()` walks active writers and
+readers and fires deadline/liveliness status updates. Tests call it directly with a
+`ManualClock`; production code that needs these status callbacks must arrange to call it
+from its own timer loop until a participant timer driver is added.
 
-## TypeObject registration
+Listener callbacks may run on transport receive threads in the live UDP path. With
+`MemoryTransport` + `DirectDiscovery`, callbacks happen synchronously on the caller's
+thread. Application listeners should avoid blocking and should not call back into APIs that
+would invert locks held by the receive path.
 
-zidl generates `type_object`, `equivalence_hash`, and `type_identifier` constants on each
-generated struct type. `TypeSupport.register_type(participant)` stashes the TypeObject
-bytes in `DomainParticipant.type_registry`.
+`WaitSet.wait()` blocks only the calling thread.
 
-SEDP includes TypeObjects in `DiscoveredWriterData` for remote type matching per
-DDS-XTypes §7.6. This enables schema-evolution scenarios where a reader holds a different
-type version than the writer.
+## Single-Threaded Direction
+
+An embedded/single-threaded API such as `DomainParticipant.drive(timeout)` is not
+implemented. The design should keep this possible by preserving non-blocking seams for
+transport polling and by keeping timer checks explicit through `checkTimers()`.
+
+## Type Information Registration
+
+Current XTypes support is limited to optional TypeInformation advertisement:
+
+- `DomainParticipantImpl.registerTypeInfo(type_name, cdr)` stores a CDR-encoded
+  TypeInformation blob by type name.
+- SEDP writer announcements can include `PID_TYPE_INFORMATION` when `-Dxtypes=true` and a
+  blob has been registered for the type.
+- SEDP reader announcements deliberately omit `PID_TYPE_INFORMATION` because peers such as
+  OpenDDS may initiate TypeLookup when they see it.
+- No TypeLookup service, TypeObject exchange, or remote schema-evolution matching is
+  implemented.
+
+The future TypeSupport work in `docs/roadmap.md` should provide generated key extraction,
+serialization callbacks, and a better bridge between zidl-generated type metadata and this
+registry.

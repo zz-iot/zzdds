@@ -1,5 +1,10 @@
 # Security Transformation Pipeline
 
+> **Status: Not yet implemented.** The current codebase has the security plugin interface
+> (`src/security/interface.zig`) and a noop pass-through (`security/noop.zig`). No real
+> Authentication, AccessControl, or Cryptographic enforcement is in the data path. The
+> send pipeline described below is the intended design for a future implementation.
+
 DDS Security v1.2 (formal/25-03-06) defines **three independent protection scopes**, any
 combination of which can be enabled simultaneously.
 
@@ -46,14 +51,15 @@ Governed by `RTPS_PROTECTION_KIND`.
   reader has its own session key (negotiated during Authentication). Same plaintext →
   different ciphertexts per reader. Mitigation: readers sharing a governance/multicast group
   can share a key; hardware AES-GCM is fast (~1 ns/byte on modern CPUs).
-- **Noop path: zero overhead.** The `Cryptographic.encode_payload` vtable for the noop
-  plugin returns a pointer to the original bytes — no allocation, no copy.
+- **Noop path target: zero overhead.** The desired `Cryptographic.encode_payload` shape for
+  the noop plugin is a borrowed slice of the original bytes — no allocation, no copy. The
+  current interface has not reached that shape yet; see the limitation below.
 
-## Encode_payload signature (needs revision before Phase 9)
+## Known limitation: encode_payload allocates on the noop path
 
 The current `Cryptographic.encode_payload` signature writes into an `ArrayListUnmanaged`,
-which forces an allocation even on the noop path. Before Phase 9, replace with a
-tagged-union return:
+which forces an allocation even on the noop path. A tagged-union return would eliminate
+this:
 
 ```zig
 const EncodeResult = union(enum) {
@@ -62,23 +68,24 @@ const EncodeResult = union(enum) {
 };
 ```
 
-This eliminates the allocation hot path when security is disabled.
+This optimization is deferred until a real Cryptographic implementation is underway,
+since it requires changing the vtable signature across the interface boundary.
 
 ## Send pipeline
 
 ```
 No security (noop):
-  scatter-gather iovecs → sendmsg()   [zero payload copies]
+  iovec list → flatten to stack buffer → Transport.send()
 
-Payload protection only:
+Payload protection only (planned):
   encrypt(CacheChange.data) → temp crypt_buf
-  scatter-gather [headers | crypt_buf] → sendmsg()
+  iovec list [headers | crypt_buf] → flatten → Transport.send()
 
-Submessage protection:
+Submessage protection (planned):
   build DATA into temp_buf → encrypt → SEC_PREFIX + SEC_BODY + SEC_POSTFIX
-  scatter-gather [headers | encrypted triple] → sendmsg()
+  iovec list [headers | encrypted triple] → flatten → Transport.send()
 
-Message protection (outermost):
+Message protection (planned, outermost):
   all submessage work → encrypt entire payload → [RTPS hdr | SEC_* | MAC]
 ```
 
