@@ -60,6 +60,37 @@ path calls `key_hash` instead of relying on the optional inline QoS `key_hash` f
 For Zig-native types, a thin wrapper adapts the generated `computeKeyHash`. This is the
 prerequisite for all non-Zig language bindings.
 
+**`initial_peers` config wiring** — `discovery.initial_peers` is schema-defined and
+documented in `docs/architecture.md` but is not connected in `src/discovery/spdp.zig`.
+When wired, the SPDP writer should send unicast announcements to each listed locator at
+startup, before the first multicast interval fires.
+
+**Static and broker discovery plugins** — `src/discovery/interface.zig` and the config
+schema reserve `static` and `broker` discovery kinds, but only SPDP/SEDP and direct in-process
+discovery are implemented. Either implement static config loading and broker client support
+or remove the advertised config surface before v1.
+
+**NACK_FRAG / HEARTBEAT_FRAG stale-count suppression** — The RTPS spec requires that
+receivers ignore NACK_FRAG and HEARTBEAT_FRAG submessages whose `count` is not strictly
+greater than the last accepted `count`. Both handlers currently ignore the `count`
+parameter (`src/rtps/writer_sm.zig:792`, `src/rtps/reader_sm.zig:461`). Add per-proxy
+`last_nack_frag_count` / `last_hb_frag_count` tracking and drop stale submessages.
+
+**MTU-aware fragment sizing** — `rtps.fragment_size` is a static config value today.
+Add an interface-MTU/path-MTU aware default that accounts for IP, UDP, RTPS, and future
+security overhead, while preserving the explicit override for deterministic tests.
+
+**`wait_for_historical_data` for TRANSIENT_LOCAL** — `DataReader.wait_for_historical_data()`
+currently returns `RETCODE_UNSUPPORTED` (`src/dcps/reader.zig:959-962`). The correct
+behavior is to block until the reader has received all history from every matched
+TRANSIENT_LOCAL writer, or the timeout expires. Prerequisite: reliable history delivery
+must be fully flushed before the call returns.
+
+**Built-in topic and discovered-topic completion** — `get_builtin_subscriber()` exposes
+in-memory DataReaders and discovery callbacks push participant/publication/subscription
+samples. Finish `DCPSTopic`, `get_discovered_topics()`, `get_discovered_topic_data()`, and
+`contains_entity()` from the participant discovery state.
+
 **FastDDS wire interop** — HelloWorldData pub/sub and fragmented scenarios. Deferred until
 the dds-rtps self-interop suite confirms the RTPS/DCPS stack is clean.
 
@@ -72,6 +103,11 @@ without waiting for a full announcement period.
 `StatelessWriter.sendAll()` (and `StatefulWriter`) with a selector that prefers loopback
 for local peers and unicast over multicast when the remote is reachable unicast. A
 GUID-to-selected-locator cache amortizes selection cost.
+
+**GUID generation platform coverage** — the current fallback paths keep unsupported targets
+building, but they are not production target support. For each supported OS, provide real
+entropy, PID, and monotonic-clock implementations; align GUID-prefix vendor bytes with the
+registered VendorId work in Phase 33.
 
 **`on_publication_matched` RELIABLE readiness contract** — current implementation fires
 on SEDP discovery. A protocol-ready contract would fire on the first AckNack from a reader
@@ -101,10 +137,19 @@ cross-vendor type discovery.
 - **DDS-XRCE** — embedded profile; separate project or downstream fork.
 - **TRANSIENT / PERSISTENT durability** — requires a persistence service; deferred.
 - **MultiTopic** — complex; deferred.
+- **Coherent changes and publication suspension** — `Publisher.begin_coherent_changes()`,
+  `end_coherent_changes()`, `suspend_publications()`, and `resume_publications()` all return
+  `RETCODE_UNSUPPORTED`. Full implementation requires GROUP-scope coherent delivery tracking;
+  deferred alongside GroupPresentation.
+- **`ignore_topic` / `ignore_publication` / `ignore_subscription`** — current normative stubs
+  return `RETCODE_OK` per spec (ignoring an already-discovered entity is permitted to be a
+  no-op). Full filter-on-delivery at the receive path is deferred.
 - **GroupPresentation** (PRESENTATION QoS `access_scope = GROUP`) — deferred.
 - **Platform-specific InterfaceMonitors** — `monitor/netlink.zig` (Linux) and
   `monitor/pf_route.zig` (macOS) deferred; polling monitor is sufficient.
 - **TCP / SHMEM transports** — deferred; UDP covers current use cases.
+- **Other protocol/discovery plugins** — QUIC, MQTT, custom hardware channels, and
+  mDNS/DNS-SD are extension points only; no v1 implementation is planned.
 - **PKCS#11** — out of scope for v1; security plugin interface must not preclude it.
 
 ---

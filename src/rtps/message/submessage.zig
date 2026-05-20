@@ -212,7 +212,8 @@ pub const ParameterId = enum(u16) {
     status_info = 0x0071,
     type_max_size_serialized = 0x0060,
     entity_name = 0x0062,
-    // Vendor-specific IDs use 0x8000+ range; skip for now.
+    // Vendor-specific IDs use the 0x8000+ range and remain unmodeled unless
+    // a future extension explicitly claims them.
     _,
 };
 

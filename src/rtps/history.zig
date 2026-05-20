@@ -87,7 +87,8 @@ pub const HistoryCache = struct {
     /// Add a new change, copying `data`. Returns the assigned sequence number.
     /// For KEEP_LAST, trims oldest entries when the cache is full.
     /// Note: KEEP_LAST depth is applied globally (not per-instance); full
-    /// per-instance tracking is deferred to Phase 7.
+    /// per-instance tracking is deferred until generated key extraction is
+    /// available throughout the receive/write path.
     pub fn addWriterChange(
         self: *Self,
         kind: ChangeKind,

@@ -25,6 +25,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `DirectDiscovery` (in-process, synchronous) | Complete | `src/discovery/direct.zig` |
 | Static config discovery | Not implemented | — |
 | Centralized broker discovery | Not implemented | — |
+| mDNS / DNS-SD discovery | Not implemented | Extension point only |
 
 ## RTPS Protocol
 
@@ -36,7 +37,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `StatelessWriter` / `StatelessReader` (best-effort) | Complete | Same files |
 | HEARTBEAT / ACKNACK / GAP | Complete | |
 | DATA_FRAG fragmentation + reassembly | Complete | `StatefulWriter` splits, `StatefulReader` reassembles |
-| HEARTBEAT_FRAG / NACK_FRAG | Complete | |
+| HEARTBEAT_FRAG / NACK_FRAG | Partial | Fragment ACK/retransmit works; stale-count suppression is not implemented |
 | Writer Liveliness Protocol (P2P endpoints) | Entity IDs defined; endpoint not instantiated | `src/rtps/guid.zig:82-83` |
 
 ## DCPS
@@ -45,7 +46,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 |---|---|---|
 | `DomainParticipantFactory` | Complete | Not a singleton |
 | `DomainParticipant` | Complete | |
-| `Publisher` / `Subscriber` | Complete | |
+| `Publisher` / `Subscriber` | Partial | `begin_coherent_changes`, `end_coherent_changes`, `suspend_publications`, `resume_publications` return `RETCODE_UNSUPPORTED` |
 | `DataWriter` / `DataReader` | Complete | |
 | `Topic` | Complete | |
 | `ContentFilteredTopic` lifecycle + parser/evaluator | Partial | API, expression storage, parser, and manual evaluator are present; automatic filtering in `DataReader.read()` / `take()` is not wired yet |
@@ -60,9 +61,10 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | Instance lifecycle (ALIVE / DISPOSED / UNREGISTERED) | Complete | |
 | `read()` / `take()` with all state filters | Complete | |
 | `SampleInfo` (all fields) | Complete | |
-| `get_builtin_subscriber` / built-in topics | Stub returning nil | |
+| `get_builtin_subscriber` / built-in topics | Partial | Built-in Subscriber/DataReaders exist; participant/publication/subscription samples are pushed from discovery callbacks; `DCPSTopic` is not populated |
 | `ignore_topic` / `ignore_publication` / `ignore_subscription` | Normative stubs returning `OK` | |
 | `wait_for_historical_data` (TRANSIENT_LOCAL) | Returns `RETCODE_UNSUPPORTED` | `reader.zig:959-962` |
+| `get_discovered_topics` / `get_discovered_topic_data` / `contains_entity` | Not implemented | Topic APIs return empty/`BAD_PARAMETER`; `contains_entity` always returns `false` |
 
 ## Security
 
@@ -114,6 +116,17 @@ parse expressions, and `ContentFilteredTopicImpl.matchSample()` can evaluate an 
 against a supplied `FieldAccessor`. The generic `DataReader` does not yet deserialize raw
 CDR samples and apply those expressions automatically during `read()` / `take()`.
 
+**Fragment control stale-count suppression.** `HEARTBEAT_FRAG` and `NACK_FRAG` are parsed
+and acted on, but their handlers currently ignore the RTPS `count` field. Stale or duplicate
+fragment-control submessages can therefore trigger redundant NACKs/retransmits until
+per-proxy count tracking is added.
+
+**Built-in topic coverage.** `get_builtin_subscriber()` returns a real built-in Subscriber
+when initialization succeeds, and discovery callbacks push `DCPSParticipant`,
+`DCPSPublication`, and `DCPSSubscription` samples. `DCPSTopic` is created but not populated;
+`get_discovered_topics()` returns an empty sequence; `get_discovered_topic_data()` returns
+`BAD_PARAMETER`; `contains_entity()` always returns `false`.
+
 **Transport scatter-gather not fully zero-copy.** The iovec list is assembled without
 copying but is flattened to a `[65536]u8` stack buffer at the `Transport.send()` boundary.
 The `Transport` vtable has no vectored-send method. See `docs/design/rtps-message-builder.md`.
@@ -125,10 +138,25 @@ would eliminate this allocation. Deferred until a real Cryptographic implementat
 **Config TOML coverage.** Not all `schema.zig` fields have environment variable (`ZZDDS_*`)
 mappings. `resolve.zig` covers the most commonly used fields; a full audit is deferred.
 
+**MTU-aware fragment sizing.** `rtps.fragment_size` is static. There is no interface-MTU or
+path-MTU based auto-calculation, so deployments must configure a conservative value manually
+when they need to avoid IP-level fragmentation.
+
+**GUID generation platform fallbacks.** `.random` uses OS entropy on Linux, BSD, and Apple
+platforms, but unsupported OS tags fall back to a clock/counter-seeded CSPRNG. `.host_based`
+uses PID/time on supported OSes and PID `0` plus a constant clock seed on unsupported OSes.
+Add target-specific entropy, PID, and monotonic-clock support before claiming production
+support for those targets.
+
 **Vendor ID placeholders are inconsistent.** The RTPS message header currently uses
 `{0x01, 0x23}`, SPDP writes `{0x99, 0x99}`, and GUID prefix generation does not force the
 prefix's first two bytes to match either placeholder. Register a real vendor ID and make
 these paths agree before publishing interop results.
+
+**`initial_peers` config not connected.** `discovery.initial_peers` is present in the
+configuration schema and documented in `docs/architecture.md`, but `src/discovery/spdp.zig`
+does not read it. SPDP discovery relies entirely on multicast; unicast peer targeting at
+startup is not yet implemented.
 
 **`PID_COHERENT_SET` / `PID_GROUP_DATA` conflict.** `pid.zig` notes that `0x0056` is
 assigned to both `COHERENT_SET` and `GROUP_DATA` in some spec versions. The current

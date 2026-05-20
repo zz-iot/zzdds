@@ -2,7 +2,7 @@
 //!
 //! DDS `create_*` operations that fail must return a "nil" entity.  Because
 //! the generated vtable types (DDS.DomainParticipant, DDS.Publisher, etc.)
-//! use non-optional `ptr: *anyopaque`, we provide stub vtables that return
+//! use non-optional `ptr: *anyopaque`, we provide nil-object vtables that return
 //! RETCODE_ERROR for every method.  The nil entity's `ptr` points to
 //! `nil_storage`, a distinguishable sentinel address.
 //!
@@ -65,7 +65,7 @@ fn nilGetHandle(_: *anyopaque) DDS.InstanceHandle_t {
 }
 fn nilDeinit(_: *anyopaque) void {}
 
-// ── Nil Listener stubs ────────────────────────────────────────────────────────
+// ── Nil Listener no-op callbacks ──────────────────────────────────────────────
 
 fn topicListenerDeinit(_: *anyopaque) void {}
 fn dwListenerDeadlineMissed(_: *anyopaque, _: DDS.DataWriter, _: DDS.OfferedDeadlineMissedStatus) void {}
