@@ -10,11 +10,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# ── Shared setup fragments ────────────────────────────────────────────────────
-# The zzdds unit-test jobs and the interop jobs share the same Zig install and
-# submodule bootstrap.  GitHub Actions has no native "include" for steps, so
-# the steps are just repeated; keep them in sync if you add new prerequisites.
-
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
   test-linux:
@@ -24,21 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Load zidl deploy key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.ZIDL_DEPLOY_KEY }}
-
-      - name: Fetch submodules
-        run: git submodule update --init --recursive
-
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
           version: "0.16.0"
 
       - name: Check formatting
-        run: zig fmt --check src/ idl/ test/
+        run: zig fmt --check src/ test/
 
       - name: Test
         run: zig build test
@@ -64,14 +51,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Load zidl deploy key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.ZIDL_DEPLOY_KEY }}
-
-      - name: Fetch submodules
-        run: git submodule update --init --recursive
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -106,15 +85,6 @@ jobs:
         with:
           path: zzdds
 
-      - name: Load zidl deploy key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.ZIDL_DEPLOY_KEY }}
-
-      - name: Fetch submodules
-        working-directory: zzdds
-        run: git submodule update --init --recursive
-
       - name: Check out dds-rtps (zenzen branch)
         uses: actions/checkout@v4
         with:
@@ -143,8 +113,8 @@ jobs:
         working-directory: dds-rtps
         run: |
           python3 interoperability_report.py \
-            -P srcZig/zzdds/zig-out/bin/zzdds-0.0.0_shape_main_linux \
-            -S srcZig/zzdds/zig-out/bin/zzdds-0.0.0_shape_main_linux \
+            -P srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
+            -S srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
             -o /tmp/interop-results.xml
 
       - name: Check results
@@ -167,15 +137,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: zzdds
-
-      - name: Load zidl deploy key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.ZIDL_DEPLOY_KEY }}
-
-      - name: Fetch submodules
-        working-directory: zzdds
-        run: git submodule update --init --recursive
 
       - name: Check out dds-rtps (zenzen branch)
         uses: actions/checkout@v4
@@ -212,8 +173,8 @@ jobs:
           TSAN_OPTIONS: abort_on_error=1
         run: |
           python3 interoperability_report.py \
-            -P srcZig/zzdds/zig-out/bin/zzdds-0.0.0_shape_main_linux \
-            -S srcZig/zzdds/zig-out/bin/zzdds-0.0.0_shape_main_linux \
+            -P srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
+            -S srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
             -o /tmp/interop-tsan-results.xml
 
       - name: Check results
