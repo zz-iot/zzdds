@@ -238,7 +238,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
         while (pad > 0) : (pad -= 1) try buf.append(alloc, 0);
     }
 
-    // PID_PARTITION (0x0035): CDR sequence<string>. Omitted when default (empty list).
+    // PID_PARTITION (0x0029): CDR sequence<string>. Omitted when default (empty list).
     if (ann.qos.partition_names.len > 0) {
         try writePartitionPid(alloc, &buf, ann.qos.partition_names);
     }
@@ -322,7 +322,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // we don't implement.  Cyclone falls back to type-name matching when the
     // remote reader has no TypeInformation, so S2 still passes.
 
-    // PID_PARTITION (0x0035): CDR sequence<string>. Omitted when default (empty list).
+    // PID_PARTITION (0x0029): CDR sequence<string>. Omitted when default (empty list).
     if (ann.qos.partition_names.len > 0) {
         try writePartitionPid(alloc, &buf, ann.qos.partition_names);
     }
@@ -451,7 +451,7 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoin
                     }
                 }
             },
-            PidTable.PARTITION => {
+            PidTable.PARTITION, PidTable.PARTITION_LEGACY => {
                 // CDR sequence<string>: seq_len(4) + N × (str_len(4) + chars + null + pad)
                 if (v.len >= 4) {
                     const count = readU32LE(v, le);

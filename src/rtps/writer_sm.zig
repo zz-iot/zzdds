@@ -222,6 +222,9 @@ pub const ReaderProxy = struct {
     /// TRANSIENT_LOCAL+ (gets full history). Set to cache.next_sn at match
     /// time for VOLATILE writers (late joiners skip historical data).
     start_sn: SequenceNumber,
+    /// Last accepted NACK_FRAG count for stale-submessage suppression (§8.3.8.12).
+    /// Null until the first NACK_FRAG from this reader is accepted.
+    last_nack_frag_count: ?i32,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -239,6 +242,7 @@ pub const ReaderProxy = struct {
             .reliable = reliable,
             .highest_acked_sn = 0,
             .start_sn = 1,
+            .last_nack_frag_count = null,
         };
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
@@ -789,7 +793,6 @@ pub const StatefulWriter = struct {
         frag_set: msg.submessage.FragmentNumberSet,
         count: i32,
     ) void {
-        _ = count; // TODO: stale NACK_FRAG suppression (similar to HEARTBEAT count)
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -799,6 +802,14 @@ pub const StatefulWriter = struct {
 
         for (self.reader_proxies.items) |*rp| {
             if (!rp.guid.eql(reader_guid)) continue;
+
+            // Stale NACK_FRAG suppression (§8.3.8.12): ignore if count is not
+            // strictly greater than the last accepted count from this reader.
+            if (rp.last_nack_frag_count) |last| {
+                const diff: i32 = @bitCast(@as(u32, @bitCast(count)) -% @as(u32, @bitCast(last)));
+                if (diff <= 0) return;
+            }
+            rp.last_nack_frag_count = count;
             const locs = rp.effectiveLocators();
             if (locs.len == 0) return;
 

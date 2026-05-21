@@ -70,11 +70,6 @@ schema reserve `static` and `broker` discovery kinds, but only SPDP/SEDP and dir
 discovery are implemented. Either implement static config loading and broker client support
 or remove the advertised config surface before v1.
 
-**NACK_FRAG / HEARTBEAT_FRAG stale-count suppression** — The RTPS spec requires that
-receivers ignore NACK_FRAG and HEARTBEAT_FRAG submessages whose `count` is not strictly
-greater than the last accepted `count`. Both handlers currently ignore the `count`
-parameter (`src/rtps/writer_sm.zig:792`, `src/rtps/reader_sm.zig:461`). Add per-proxy
-`last_nack_frag_count` / `last_hb_frag_count` tracking and drop stale submessages.
 
 **MTU-aware fragment sizing** — `rtps.fragment_size` is a static config value today.
 Add an interface-MTU/path-MTU aware default that accounts for IP, UDP, RTPS, and future

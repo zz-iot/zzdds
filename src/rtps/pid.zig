@@ -45,9 +45,12 @@ pub const PidTable = struct {
     pub const DESTINATION_ORDER: u16 = 0x0025;
     pub const TIME_BASED_FILTER: u16 = 0x0004;
     pub const PRESENTATION: u16 = 0x0021;
-    pub const PARTITION: u16 = 0x0035;
+    pub const PARTITION: u16 = 0x0029;
+    /// Legacy value used by pre-RTPS-2.5 implementations (now PID_CONTENT_FILTER_PROPERTY).
+    /// Accept on receive for backward compatibility; always emit PARTITION (0x0029).
+    pub const PARTITION_LEGACY: u16 = 0x0035;
     pub const TOPIC_DATA: u16 = 0x002E;
-    pub const GROUP_DATA: u16 = 0x0056;
+    pub const GROUP_DATA: u16 = 0x002D;
     pub const USER_DATA: u16 = 0x002C;
     pub const HISTORY: u16 = 0x0040;
     pub const RESOURCE_LIMITS: u16 = 0x0041;
@@ -65,7 +68,7 @@ pub const PidTable = struct {
     pub const EXPECTS_INLINE_QOS: u16 = 0x0043;
     pub const PARTICIPANT_BUILTIN_ENDPOINTS: u16 = 0x0044;
     pub const CONTENT_FILTER_INFO: u16 = 0x0055;
-    pub const COHERENT_SET: u16 = 0x0056; // same value as GROUP_DATA in some versions; verify
+    pub const COHERENT_SET: u16 = 0x0056;
 
     // ── Type identity (DDS-XTypes §7.6) ──────────────────────────────────────
     pub const TYPE_INFORMATION: u16 = 0x0075;
@@ -97,5 +100,5 @@ pub const BuiltinEndpointSet = struct {
 // ── RTPS VendorId for Zenzen DDS ────────────────────────────────────────────────
 
 /// RTPS VendorId_t (§8.3.3.1) for Zenzen DDS.
-/// TBD: register with OMG. Placeholder 0x9999 used during development.
-pub const ZZDDS_VENDOR_ID: [2]u8 = .{ 0x99, 0x99 };
+/// TODO: register with OMG before v1.0. Placeholder value used during development.
+pub const ZZDDS_VENDOR_ID: [2]u8 = .{ 0x01, 0x23 };

@@ -37,7 +37,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `StatelessWriter` / `StatelessReader` (best-effort) | Complete | Same files |
 | HEARTBEAT / ACKNACK / GAP | Complete | |
 | DATA_FRAG fragmentation + reassembly | Complete | `StatefulWriter` splits, `StatefulReader` reassembles |
-| HEARTBEAT_FRAG / NACK_FRAG | Partial | Fragment ACK/retransmit works; stale-count suppression is not implemented |
+| HEARTBEAT_FRAG / NACK_FRAG | Complete | Fragment ACK/retransmit; per-proxy stale-count suppression (§8.3.8.12–13) |
 | Writer Liveliness Protocol (P2P endpoints) | Entity IDs defined; endpoint not instantiated | `src/rtps/guid.zig:82-83` |
 
 ## DCPS
@@ -116,10 +116,6 @@ parse expressions, and `ContentFilteredTopicImpl.matchSample()` can evaluate an 
 against a supplied `FieldAccessor`. The generic `DataReader` does not yet deserialize raw
 CDR samples and apply those expressions automatically during `read()` / `take()`.
 
-**Fragment control stale-count suppression.** `HEARTBEAT_FRAG` and `NACK_FRAG` are parsed
-and acted on, but their handlers currently ignore the RTPS `count` field. Stale or duplicate
-fragment-control submessages can therefore trigger redundant NACKs/retransmits until
-per-proxy count tracking is added.
 
 **Built-in topic coverage.** `get_builtin_subscriber()` returns a real built-in Subscriber
 when initialization succeeds, and discovery callbacks push `DCPSParticipant`,
@@ -148,16 +144,16 @@ uses PID/time on supported OSes and PID `0` plus a constant clock seed on unsupp
 Add target-specific entropy, PID, and monotonic-clock support before claiming production
 support for those targets.
 
-**Vendor ID placeholders are inconsistent.** The RTPS message header currently uses
-`{0x01, 0x23}`, SPDP writes `{0x99, 0x99}`, and GUID prefix generation does not force the
-prefix's first two bytes to match either placeholder. Register a real vendor ID and make
-these paths agree before publishing interop results.
+**Vendor ID placeholder pending OMG registration.** Both `pid.zig` and `src/rtps/message/header.zig`
+use `{0x01, 0x23}` consistently. GUID prefix generation does not force the prefix's first two bytes
+to match the vendor ID placeholder. Register a real vendor ID before publishing official interop results.
 
 **`initial_peers` config not connected.** `discovery.initial_peers` is present in the
 configuration schema and documented in `docs/architecture.md`, but `src/discovery/spdp.zig`
 does not read it. SPDP discovery relies entirely on multicast; unicast peer targeting at
 startup is not yet implemented.
 
-**`PID_COHERENT_SET` / `PID_GROUP_DATA` conflict.** `pid.zig` notes that `0x0056` is
-assigned to both `COHERENT_SET` and `GROUP_DATA` in some spec versions. The current
-implementation uses `0x0056` for `GROUP_DATA`. Verify against RTPS 2.5 §Table 9.14.
+**`PID_GROUP_DATA` wire value.** `pid.zig` defines `GROUP_DATA = 0x002D` per RTPS 2.5 Table 9.18.
+The constant is present but not yet serialized in SEDP announcements; when GROUP_DATA serialization
+is added, confirm that peers expect `0x002D` (not the historical `0x0056` used by some older
+implementations).
