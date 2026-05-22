@@ -353,7 +353,7 @@ const DecodedEndpoint = struct {
     }
 };
 
-fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoint {
+fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool) !DecodedEndpoint {
     if (payload.len < 4) return error.TooShort;
     const le = (payload[1] & 0x01) != 0;
 
@@ -369,7 +369,9 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoin
         for (partitions.items) |name| alloc.free(name);
         partitions.deinit(alloc);
     }
-    var qos = QosSnapshot{};
+    // DDS spec defaults: DataWriter reliability = RELIABLE (1), DataReader = BEST_EFFORT (0).
+    // Implementations may omit PID_RELIABILITY when it matches the default.
+    var qos = QosSnapshot{ .reliability_kind = if (is_writer) 1 else 0 };
 
     var pos: usize = 4;
     while (pos + 4 <= payload.len) {
@@ -625,7 +627,7 @@ pub const SedpEndpoints = struct {
             self.transport,
             .keep_last,
             1,
-            false,
+            true, // SEDP builtin readers are RELIABLE (RTPS §8.5)
         );
         self.pub_reader.?.setTracer(self.tracer);
         self.pub_reader.?.setCallback(.{ .ctx = self, .on_data = onPubData });
@@ -648,7 +650,7 @@ pub const SedpEndpoints = struct {
             self.transport,
             .keep_last,
             1,
-            false,
+            true, // SEDP builtin readers are RELIABLE (RTPS §8.5)
         );
         self.sub_reader.?.setTracer(self.tracer);
         self.sub_reader.?.setCallback(.{ .ctx = self, .on_data = onSubData });
@@ -892,7 +894,7 @@ pub const SedpEndpoints = struct {
 
     fn handleEndpointChange(self: *Self, ch: *const CacheChange, is_writer: bool) void {
         if (ch.kind != .alive) return;
-        var ep = decodeEndpoint(self.alloc, ch.data) catch return;
+        var ep = decodeEndpoint(self.alloc, ch.data, is_writer) catch return;
         defer ep.deinit();
 
         const cbs = self.callbacks orelse return;
