@@ -87,7 +87,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 |---|---|---|
 | Cyclone DDS | Verified | pub/sub, fragmented (DATA_FRAG), all RELIABLE/BEST_EFFORT combos |
 | OpenDDS | Verified | pub/sub, fragmented |
-| FastDDS | Planned | — |
+| FastDDS | Verified | bidirectional; all 48 dds-rtps test cases pass in both directions |
 | RTI Connext | Planned (requires license) | — |
 
 ## Test Coverage
@@ -102,9 +102,10 @@ See `docs/testing.md` for how to run the full suite.
 
 **Generated key extraction for keyed topics.** `DataReader` now uses an `owner_map`
 keyed by `InstanceHandle_t`, so OWNERSHIP is per-instance when incoming changes carry a
-real `key_hash`. The remaining gap is generated key extraction/hash generation for typed
-samples and interop paths. Until `zidl-rt` provides `deserializeKey` / `computeKeyHash`,
-keyed samples that arrive with the nil key hash collapse to the same instance handle.
+real `key_hash`. The remaining gap is a TypeSupport registration mechanism in zzdds: `zidl`
+generates `deserializeKey` / `computeKeyHash` for keyed IDL types (confirmed in
+`zidl/test/golden/zig/types.zig`), but the zzdds receive path does not yet call them.
+Keyed samples that arrive with the nil key hash collapse to the same instance handle.
 
 **Per-instance timing/history accounting.** `TIME_BASED_FILTER` (`tbf_last_ns`) is still
 global per reader, and RTPS `KEEP_LAST` depth is still global per history cache. Both

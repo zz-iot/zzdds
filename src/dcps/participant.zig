@@ -423,6 +423,17 @@ const DiscoveredParticipant = struct {
     handle: DDS.InstanceHandle_t,
 };
 
+/// Callback table registered per type name via registerTypeSupport().
+/// Used to compute key hashes from CDR payloads when a received change
+/// carries no inline-QoS key_hash.  Keyed types should register this to
+/// enable per-instance OWNERSHIP, TIME_BASED_FILTER, and SampleInfo tracking.
+pub const TypeSupport = struct {
+    /// Compute the 16-byte DDS key hash from a CDR-encoded payload.
+    /// `payload` includes the 4-byte encapsulation header (as received from
+    /// the wire).  Return `zeroes([16]u8)` for keyless types.
+    compute_key_hash: *const fn (payload: []const u8) [16]u8,
+};
+
 const ActiveWriter = struct {
     handle: DDS.InstanceHandle_t,
     guid: Guid,
@@ -448,6 +459,7 @@ const ActiveReader = struct {
     incompat_qos: ?IncompatQosNotify = null,
     matched_notify: ?MatchedNotify = null,
     timer_check: ?TimerNotify = null,
+    key_hash_fn: ?*const fn ([]const u8) [16]u8 = null,
 };
 
 // ── DomainParticipantImpl ────────────────────────────────────────────────────
@@ -489,6 +501,10 @@ pub const DomainParticipantImpl = struct {
     /// Maps type_name → CDR-encoded XTypes TypeInformation blob.
     /// Populated by registerTypeInfo(); consulted when announcing writers/readers.
     type_info_registry: std.StringHashMapUnmanaged([]const u8),
+
+    /// Maps type_name → TypeSupport callbacks.
+    /// Populated by registerTypeSupport(); consulted when a received change has no inline key_hash.
+    type_support_registry: std.StringHashMapUnmanaged(TypeSupport),
 
     default_pub_qos: DDS.PublisherQos,
     default_sub_qos: DDS.SubscriberQos,
@@ -557,6 +573,7 @@ pub const DomainParticipantImpl = struct {
             .ignored_prefixes = .empty,
             .builtin_sub = null,
             .type_info_registry = .empty,
+            .type_support_registry = .empty,
             .default_pub_qos = .{},
             .default_sub_qos = .{},
             .default_topic_qos = .{},
@@ -717,6 +734,7 @@ pub const DomainParticipantImpl = struct {
         cfts.deinit(self.alloc);
 
         self.type_info_registry.deinit(self.alloc);
+        self.type_support_registry.deinit(self.alloc);
 
         // Any remaining active writers/readers (normally all removed by pub/sub deinit).
         for (self.active_writers.items) |*aw| aw.proto.deinit();
@@ -736,6 +754,13 @@ pub const DomainParticipantImpl = struct {
     /// Associate a CDR-encoded XTypes TypeInformation blob with a type name.
     /// The caller owns `cdr`; it must remain valid for the lifetime of the participant.
     /// Called before creating DataWriters/DataReaders for the type.
+    /// Register TypeSupport callbacks for a type name.
+    /// Call before creating DataReaders for the type.  The caller must ensure
+    /// `type_name` remains valid for the lifetime of the participant.
+    pub fn registerTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) void {
+        self.type_support_registry.put(self.alloc, type_name, ts) catch {};
+    }
+
     pub fn registerTypeInfo(self: *Self, type_name: []const u8, cdr: []const u8) void {
         if (!build_opts.xtypes) return;
         self.type_info_registry.put(self.alloc, type_name, cdr) catch {};
@@ -913,6 +938,10 @@ pub const DomainParticipantImpl = struct {
                 .topic_name = topic_name,
                 .type_name = type_name,
                 .qos = qos,
+                .key_hash_fn = if (self.type_support_registry.get(type_name)) |ts|
+                    ts.compute_key_hash
+                else
+                    null,
             });
         }
 
@@ -1063,13 +1092,22 @@ pub const DomainParticipantImpl = struct {
                     };
                     const ts = current_ts;
                     // Deliver to all active readers; each filters by writer match.
+                    // If the change carries no inline key_hash and the reader's type has
+                    // a registered TypeSupport, compute the hash from the payload now.
+                    const nil_hash = std.mem.zeroes([16]u8);
                     self.mu.lock();
                     for (self.active_readers.items) |*ar| {
+                        const kh = if (!std.mem.eql(u8, &key_hash, &nil_hash))
+                            key_hash
+                        else if (ar.key_hash_fn) |f|
+                            f(d.serialized_payload)
+                        else
+                            key_hash;
                         ar.proto.handleIncomingChange(
                             writer_guid,
                             d.writer_sn,
                             ts,
-                            key_hash,
+                            kh,
                             d.serialized_payload,
                             kind,
                         );
