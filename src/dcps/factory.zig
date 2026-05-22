@@ -4,7 +4,7 @@
 //! plugin, and security plugins. Multiple factory instances may coexist in a process.
 //!
 //! Usage:
-//!   var factory = try DomainParticipantFactoryImpl.init(alloc, transport, discovery, security, .random, .{});
+//!   var factory = try DomainParticipantFactoryImpl.init(alloc, transport, discovery, security, .spec_random, .{});
 //!   defer factory.deinit();
 //!   const dp = factory.toDDSFactory().create_participant(0, .{}, nil_dp_listener, 0);
 //!   defer dp.deinit();

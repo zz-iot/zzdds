@@ -135,7 +135,7 @@ fn applyEnv(allocator: std.mem.Allocator, cfg: *schema.Config) void {
     if (envU32("ZZDDS_PARTICIPANT_LEASE_DURATION_MS")) |v| cfg.participant.lease_duration_ms = v;
     if (envU32("ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS")) |v| cfg.participant.announcement_period_ms = v;
     if (envStr("ZZDDS_PARTICIPANT_GUID_STRATEGY")) |v| {
-        if (std.mem.eql(u8, v, "random")) cfg.participant.guid_strategy = .random else if (std.mem.eql(u8, v, "host_based")) cfg.participant.guid_strategy = .host_based;
+        if (std.mem.eql(u8, v, "spec_random")) cfg.participant.guid_strategy = .spec_random else if (std.mem.eql(u8, v, "host_based")) cfg.participant.guid_strategy = .host_based else if (std.mem.eql(u8, v, "fully_random")) cfg.participant.guid_strategy = .fully_random;
     }
 
     // [transport.udp]

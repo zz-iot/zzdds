@@ -25,11 +25,16 @@ pub const DomainConfig = struct {
 };
 
 pub const GuidStrategy = enum {
-    /// 12 cryptographically-random bytes (default). Safe, simple, no host info leaked.
-    random,
-    /// IP[4] + PID[4] + monotonic-timestamp[4]. Deterministic and Wireshark-friendly,
-    /// but reveals host information. Useful for testing and debugging.
+    /// VendorId[2] + random[10] (default). Spec-compliant per RTPS §9.3.1.5: first two
+    /// bytes identify the vendor; remaining 10 bytes are OS entropy. Wireshark and DDS
+    /// analyzers can identify the implementation from any GUID in a capture.
+    spec_random,
+    /// StartTime[4] + PID[4] + counter[2] with VendorId[2] prefix. Deterministic and
+    /// Wireshark-friendly; useful for debugging. Reveals host information (start time, PID).
     host_based,
+    /// 12 cryptographically-random bytes. No vendor stamp; maximises privacy at the cost
+    /// of spec non-compliance. Use when exposing the vendor identity is undesirable.
+    fully_random,
 };
 
 pub const ParticipantConfig = struct {
@@ -42,7 +47,7 @@ pub const ParticipantConfig = struct {
     /// Should be << lease_duration_ms.
     announcement_period_ms: u32 = 3_000,
     /// Strategy for generating the 12-byte GUID prefix.
-    guid_strategy: GuidStrategy = .random,
+    guid_strategy: GuidStrategy = .spec_random,
     /// Name of the clock to use for internal interval timers (deadline,
     /// liveliness, SPDP lease). Must be registered in the factory's
     /// ClockRegistry. Built-in names: "default", "monotonic", "realtime",

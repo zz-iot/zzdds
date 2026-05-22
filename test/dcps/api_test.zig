@@ -84,7 +84,7 @@ const Harness = struct {
             t.transport(),
             noopDiscovery(),
             noop_security,
-            .random,
+            .spec_random,
             .{},
         );
         return .{ .net = net, .transport = t, .factory = factory };

@@ -1,33 +1,50 @@
 //! GUID prefix generation strategies.
 //!
-//! Two strategies are available (selected via Config.participant.guid_strategy):
+//! Three strategies are available (selected via Config.participant.guid_strategy):
 //!
-//!   .random      (default) — 12 random bytes from OS entropy.
-//!                            Safe, simple, no host information leaked.
+//!   .spec_random  (default) — VendorId[2] + random[10].
+//!                             Complies with RTPS §9.3.1.5 (guidPrefix[0..2] = VendorId).
+//!                             Wireshark and DDS analyzers can identify the implementation
+//!                             from any GUID in a capture. No host information leaked.
 //!
-//!   .host_based             — StartTime[4] + PID[4] + monotonic-counter[4].
-//!                            Deterministic layout useful for Wireshark debugging
-//!                            and test fixtures that need stable GUIDs from the
-//!                            same process.
+//!   .host_based              — VendorId[2] + StartTime[4] + PID[4] + counter[2].
+//!                             Deterministic and Wireshark-friendly. Useful for debugging
+//!                             and test fixtures that need stable GUIDs from the same
+//!                             process. Reveals start time and PID.
 //!
-//! Both strategies guarantee uniqueness in practice.
+//!   .fully_random            — 12 cryptographically-random bytes. No vendor stamp.
+//!                             Use when exposing the vendor identity is undesirable.
+//!
+//! All strategies guarantee uniqueness in practice.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const GuidPrefix = @import("../rtps/guid.zig").GuidPrefix;
 const GuidStrategy = @import("../config/schema.zig").GuidStrategy;
+const VENDOR_ID = @import("../rtps/pid.zig").ZZDDS_VENDOR_ID;
 
 /// Generate a GUID prefix using the given strategy.
 pub fn generate(strategy: GuidStrategy) GuidPrefix {
     return switch (strategy) {
-        .random => generateRandom(),
+        .spec_random => generateSpecRandom(),
         .host_based => generateHostBased(),
+        .fully_random => generateFullyRandom(),
     };
 }
 
-// ── Random strategy ───────────────────────────────────────────────────────────
+// ── spec_random strategy ──────────────────────────────────────────────────────
 
-fn generateRandom() GuidPrefix {
+fn generateSpecRandom() GuidPrefix {
+    var prefix: GuidPrefix = undefined;
+    prefix.bytes[0] = VENDOR_ID[0];
+    prefix.bytes[1] = VENDOR_ID[1];
+    fillOsRandom(prefix.bytes[2..]);
+    return prefix;
+}
+
+// ── fully_random strategy ─────────────────────────────────────────────────────
+
+fn generateFullyRandom() GuidPrefix {
     var prefix: GuidPrefix = undefined;
     fillOsRandom(&prefix.bytes);
     return prefix;
@@ -68,7 +85,7 @@ fn tryOsEntropy(buf: []u8) bool {
     }
 }
 
-// ── Host-based strategy ───────────────────────────────────────────────────────
+// ── host_based strategy ───────────────────────────────────────────────────────
 
 /// Monotonic counter — shared across all generate() calls in this process.
 var counter_state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
@@ -100,31 +117,21 @@ fn monoNs() u64 {
                 @as(u64, @intCast(ts.nsec));
         },
         .macos, .ios, .watchos, .tvos => {
-            // clock_gettime(CLOCK_MONOTONIC) is available on Apple platforms.
             var ts: std.c.timespec = undefined;
             _ = std.c.clock_gettime(.MONOTONIC, &ts);
             return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
                 @as(u64, @intCast(ts.nsec));
         },
         .windows => {
-            // RtlQueryPerformanceCounter returns the QPC tick count — a
-            // monotonic, high-resolution counter that increments on every call.
-            // Using it as a seed source guarantees distinct seeds even when two
-            // generate() calls happen within the same millisecond.
             var counter: std.os.windows.LARGE_INTEGER = undefined;
             _ = std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter);
             return @bitCast(counter);
         },
-        else => {
-            // Platform not yet supported: return a non-zero constant so the
-            // counter alone still provides uniqueness within the process.
-            return 0xdeadbeefcafe0000;
-        },
+        else => return 0xdeadbeefcafe0000,
     }
 }
 
-/// Platform PID. Returns 0 on unsupported platforms; counter provides
-/// uniqueness within a process regardless.
+/// Platform PID. Returns 0 on unsupported platforms.
 fn currentPid() u32 {
     return switch (builtin.os.tag) {
         .linux => @intCast(std.os.linux.getpid()),
@@ -136,62 +143,75 @@ fn currentPid() u32 {
 fn generateHostBased() GuidPrefix {
     var prefix: GuidPrefix = undefined;
 
-    // [0..4]: lower 32 bits of process start monotonic timestamp.
-    std.mem.writeInt(u32, prefix.bytes[0..4], @truncate(startNs()), .little);
+    // [0..2]: VendorId — identifies this implementation per RTPS §9.3.1.5.
+    prefix.bytes[0] = VENDOR_ID[0];
+    prefix.bytes[1] = VENDOR_ID[1];
 
-    // [4..8]: OS process ID.
-    std.mem.writeInt(u32, prefix.bytes[4..8], currentPid(), .little);
+    // [2..6]: lower 32 bits of process start monotonic timestamp.
+    std.mem.writeInt(u32, prefix.bytes[2..6], @truncate(startNs()), .little);
 
-    // [8..12]: monotonic counter — unique even when start_time + PID collide.
-    std.mem.writeInt(u32, prefix.bytes[8..12], nextCounter(), .little);
+    // [6..10]: OS process ID.
+    std.mem.writeInt(u32, prefix.bytes[6..10], currentPid(), .little);
+
+    // [10..12]: monotonic counter — unique even when start_time + PID collide.
+    // 16-bit range (65 535) is more than sufficient for participants per process.
+    std.mem.writeInt(u16, prefix.bytes[10..12], @truncate(nextCounter()), .little);
 
     return prefix;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-test "random strategy produces non-zero prefix" {
-    const p = generate(.random);
-    var all_zero = true;
-    for (p.bytes) |b| if (b != 0) {
-        all_zero = false;
-        break;
-    };
-    try std.testing.expect(!all_zero);
+test "spec_random prefix has correct vendor bytes" {
+    const p = generate(.spec_random);
+    try std.testing.expectEqual(VENDOR_ID[0], p.bytes[0]);
+    try std.testing.expectEqual(VENDOR_ID[1], p.bytes[1]);
 }
 
-test "random strategy produces unique prefixes" {
-    const a = generate(.random);
-    const b = generate(.random);
+test "spec_random strategy produces unique prefixes" {
+    const a = generate(.spec_random);
+    const b = generate(.spec_random);
     try std.testing.expect(!std.mem.eql(u8, &a.bytes, &b.bytes));
 }
 
-test "host_based strategy produces non-zero prefix" {
-    const p = generate(.host_based);
+test "fully_random strategy produces non-zero prefix" {
+    const p = generate(.fully_random);
     var all_zero = true;
     for (p.bytes) |b| if (b != 0) {
         all_zero = false;
         break;
     };
     try std.testing.expect(!all_zero);
+}
+
+test "fully_random strategy produces unique prefixes" {
+    const a = generate(.fully_random);
+    const b = generate(.fully_random);
+    try std.testing.expect(!std.mem.eql(u8, &a.bytes, &b.bytes));
+}
+
+test "host_based prefix has correct vendor bytes" {
+    const p = generate(.host_based);
+    try std.testing.expectEqual(VENDOR_ID[0], p.bytes[0]);
+    try std.testing.expectEqual(VENDOR_ID[1], p.bytes[1]);
 }
 
 test "host_based counter increments between calls" {
     const a = generate(.host_based);
     const b = generate(.host_based);
-    const ca = std.mem.readInt(u32, a.bytes[8..12], .little);
-    const cb = std.mem.readInt(u32, b.bytes[8..12], .little);
+    const ca = std.mem.readInt(u16, a.bytes[10..12], .little);
+    const cb = std.mem.readInt(u16, b.bytes[10..12], .little);
     try std.testing.expect(cb > ca);
 }
 
 test "host_based PID bytes are consistent within process" {
     const a = generate(.host_based);
     const b = generate(.host_based);
-    try std.testing.expectEqual(a.bytes[4..8].*, b.bytes[4..8].*);
+    try std.testing.expectEqual(a.bytes[6..10].*, b.bytes[6..10].*);
 }
 
 test "host_based start-timestamp bytes are consistent within process" {
     const a = generate(.host_based);
     const b = generate(.host_based);
-    try std.testing.expectEqual(a.bytes[0..4].*, b.bytes[0..4].*);
+    try std.testing.expectEqual(a.bytes[2..6].*, b.bytes[2..6].*);
 }
