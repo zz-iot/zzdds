@@ -856,13 +856,19 @@ pub const SedpEndpoints = struct {
                         if (self.pub_reader) |pr|
                             pr.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
                     } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
-                        if (self.sub_reader) |sr| {
+                        if (self.sub_reader) |sr|
                             sr.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
-                            // Release pending changes blocked by a gap the writer won't fill.
-                            // OpenDDS's sub_writer may advertise first_sn that it cannot
-                            // retransmit (KEEP_LAST eviction), so we unblock after one round.
-                            sr.forceDeliverPending(wguid, hb.last_sn);
-                        }
+                    }
+                },
+                .gap => |g| {
+                    const wid = g.writer_entity_id;
+                    const wguid = Guid{ .prefix = src_prefix, .entity_id = wid };
+                    if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
+                        if (self.pub_reader) |pr|
+                            pr.handleGap(wguid, g.gap_start, g.gap_list);
+                    } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
+                        if (self.sub_reader) |sr|
+                            sr.handleGap(wguid, g.gap_start, g.gap_list);
                     }
                 },
                 .acknack => |an| {
