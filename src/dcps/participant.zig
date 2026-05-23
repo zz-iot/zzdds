@@ -97,6 +97,9 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
     .handle_heartbeat_frag = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: u32, _: i32) void {}
     }.f,
+    .handle_gap = struct {
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumberSet) void {}
+    }.f,
     .deinit = struct {
         fn f(_: *anyopaque) void {}
     }.f,
@@ -1188,6 +1191,17 @@ pub const DomainParticipantImpl = struct {
                             nf.fragment_number_state,
                             nf.count,
                         );
+                    }
+                    self.mu.unlock();
+                },
+                .gap => |g| {
+                    const writer_guid = Guid{
+                        .prefix = src_prefix,
+                        .entity_id = g.writer_entity_id,
+                    };
+                    self.mu.lock();
+                    for (self.active_readers.items) |*ar| {
+                        ar.proto.handleGap(writer_guid, g.gap_start, g.gap_list);
                     }
                     self.mu.unlock();
                 },

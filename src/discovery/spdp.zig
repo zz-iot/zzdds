@@ -275,8 +275,9 @@ pub const SpdpEndpoints = struct {
 
     // ── Transport receive callback ────────────────────────────────────────────
 
-    fn onReceive(ctx: *anyopaque, data: []const u8, _: Locator) void {
+    fn onReceive(ctx: *anyopaque, data: []const u8, from: Locator) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        _ = from;
 
         // Parse the RTPS message.
         var it = parser_mod.MessageIterator.init(data) catch return;

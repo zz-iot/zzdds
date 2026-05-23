@@ -1130,9 +1130,12 @@ fn createMulticastSocket(addr_kind: i32, port: u16, recv_buf: u32) !posix.socket
     const family: u32 = if (addr_kind == LocatorKind.udp_v4) posix.AF.INET else posix.AF.INET6;
     const fd = try socketCreate(family, posix.SOCK.DGRAM);
     errdefer socketClose(fd);
+    // SO_REUSEADDR (not SO_REUSEPORT) lets multiple processes bind to the same
+    // multicast port while preserving fan-out delivery: every joined socket
+    // receives every multicast datagram. SO_REUSEPORT switches to hash-based
+    // load balancing (one socket per datagram), which breaks multi-publisher
+    // discovery — each sender's SPDP packets land on only one of N participants.
     try sockOptInt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
-    if (comptime builtin.os.tag != .windows)
-        sockOptInt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1) catch {};
     if (recv_buf > 0) sockOptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @intCast(recv_buf)) catch {};
 
     if (addr_kind == LocatorKind.udp_v4) {

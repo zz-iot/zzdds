@@ -687,11 +687,6 @@ pub const SedpEndpoints = struct {
         const uc = data.metatraffic_unicast_locators;
         const mc = data.metatraffic_multicast_locators;
 
-        log.sedp.debug("sedp: onParticipantDiscovered prefix={x} eps=0x{x} uc_count={d}", .{
-            data.guid.prefix.bytes, eps, uc.len,
-        });
-        for (uc) |loc| log.sedp.debug("sedp:   metatraffic_unicast_locator={any}", .{loc});
-
         // Cache the participant's default data locators so endpoints that omit
         // explicit locators in their SEDP announcement can fall back to them.
         // Lock is released before calling addMatchedWriter/addMatchedReader to
@@ -798,8 +793,9 @@ pub const SedpEndpoints = struct {
 
     // ── Transport receive callback ────────────────────────────────────────────
 
-    fn onReceive(ctx: *anyopaque, data: []const u8, _: Locator) void {
+    fn onReceive(ctx: *anyopaque, data: []const u8, from: Locator) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        _ = from;
         var it = parser_mod.MessageIterator.init(data) catch return;
         var param_buf: [32]@import("../rtps/message/submessage.zig").InlineQosParam = undefined;
 
@@ -860,8 +856,13 @@ pub const SedpEndpoints = struct {
                         if (self.pub_reader) |pr|
                             pr.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
                     } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
-                        if (self.sub_reader) |sr|
+                        if (self.sub_reader) |sr| {
                             sr.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                            // Release pending changes blocked by a gap the writer won't fill.
+                            // OpenDDS's sub_writer may advertise first_sn that it cannot
+                            // retransmit (KEEP_LAST eviction), so we unblock after one round.
+                            sr.forceDeliverPending(wguid, hb.last_sn);
+                        }
                     }
                 },
                 .acknack => |an| {

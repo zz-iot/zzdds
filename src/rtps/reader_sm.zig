@@ -714,6 +714,42 @@ pub const StatefulReader = struct {
         }
     }
 
+    /// Deliver buffered pending changes by gap-filling any unreachable SNs that
+    /// precede the lowest pending SN.  Intended for use by SEDP discovery where
+    /// the remote writer may advertise first_sn that it cannot actually retransmit
+    /// (e.g., KEEP_LAST eviction with non-compliant first_sn in HEARTBEAT).
+    ///
+    /// Only gap-fills SNs strictly below the lowest pending SN so that it never
+    /// creates a phantom delivery for a SN whose real payload has not yet arrived.
+    /// Must only be called from SEDP, not from user-data StatefulReaders.
+    pub fn forceDeliverPending(self: *Self, writer_guid: Guid, through_sn: SequenceNumber) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        for (self.writer_proxies.items) |*wp| {
+            if (!wp.guid.eql(writer_guid)) continue;
+            if (wp.pending_changes.items.len == 0) return;
+
+            var lowest: SequenceNumber = std.math.maxInt(SequenceNumber);
+            for (wp.pending_changes.items) |pc| {
+                if (pc.sequence_number < lowest) lowest = pc.sequence_number;
+            }
+
+            const next = wp.received.cumulativeAck() + 1;
+            if (lowest <= next) return; // already contiguous; normal path will handle it
+            if (lowest > through_sn) return; // pending is beyond writer's advertised range
+
+            log.rtps.debug("reader_sm: forceDeliverPending: gap-fill [{}, {})", .{ next, lowest });
+            const prev = wp.received.cumulativeAck();
+            var sn = next;
+            while (sn < lowest) : (sn += 1) {
+                _ = wp.received.insert(self.alloc, sn) catch {};
+            }
+            self.deliverPendingLocked(wp, prev);
+            return;
+        }
+    }
+
     fn sendAckNackLocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber) void {
         const locs = wp.effectiveLocators();
         if (locs.len == 0) return;
