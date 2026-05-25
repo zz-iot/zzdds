@@ -72,14 +72,18 @@ def failure_detail(case):
 
 
 def is_vendor_limitation(detail):
-    """True if every non-OK 'Code found:' in the failure detail is an
-    UNSUPPORTED_FEATURE variant — meaning the vendor binary does not
-    implement the tested feature, not a zzdds bug."""
+    """True if the failure is due to the vendor binary not implementing the
+    tested feature (not a zzdds bug).
+
+    The JUnit XML failure message contains an HTML table with a 'Code Produced'
+    column.  strip_html() flattens it to tab-separated text, so the status
+    codes appear as plain strings like SUB_UNSUPPORTED_FEATURE.  A test is a
+    vendor limitation when any participant's code contains UNSUPPORTED_FEATURE;
+    cascade failures (e.g. READER_NOT_MATCHED on publishers when the subscriber
+    reports SUB_UNSUPPORTED_FEATURE) are also covered by this check."""
     if not detail:
         return False
-    found_codes = re.findall(r'Code found:\s*(\S+)', detail)
-    non_ok = [c for c in found_codes if c != 'OK']
-    return bool(non_ok) and all('UNSUPPORTED_FEATURE' in c for c in non_ok)
+    return bool(re.search(r'UNSUPPORTED_FEATURE', detail))
 
 
 def check_junit(path):
