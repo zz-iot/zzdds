@@ -81,7 +81,7 @@ pub fn main() !void {
         transport,
         discovery,
         security,
-        .random,
+        .spec_random,
         .{ .rtps = .{ .fragment_size = FRAG_SIZE } },
     );
     defer factory.deinit();

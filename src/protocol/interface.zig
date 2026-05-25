@@ -288,6 +288,15 @@ pub const ProtocolReader = struct {
             count: i32,
         ) void,
 
+        /// Called when a GAP submessage arrives. Marks the listed SNs as
+        /// irreversibly unavailable so the reader stops NACKing them.
+        handle_gap: *const fn (
+            ctx: *anyopaque,
+            writer_guid: Guid,
+            gap_start: SequenceNumber,
+            gap_list: SequenceNumberSet,
+        ) void,
+
         /// Destroy this reader and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
     };
@@ -367,6 +376,15 @@ pub const ProtocolReader = struct {
         count: i32,
     ) void {
         self.vtable.handle_heartbeat_frag(self.ctx, writer_guid, writer_sn, last_frag_num, count);
+    }
+
+    pub fn handleGap(
+        self: ProtocolReader,
+        writer_guid: Guid,
+        gap_start: SequenceNumber,
+        gap_list: SequenceNumberSet,
+    ) void {
+        self.vtable.handle_gap(self.ctx, writer_guid, gap_start, gap_list);
     }
 
     pub fn deinit(self: ProtocolReader) void {

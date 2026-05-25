@@ -4,6 +4,7 @@
 
 pub const DomainParticipantFactoryImpl = @import("factory.zig").DomainParticipantFactoryImpl;
 pub const DomainParticipantImpl = @import("participant.zig").DomainParticipantImpl;
+pub const TypeSupport = @import("participant.zig").TypeSupport;
 pub const PublisherImpl = @import("publisher.zig").PublisherImpl;
 pub const SubscriberImpl = @import("subscriber.zig").SubscriberImpl;
 pub const DataWriterImpl = @import("writer.zig").DataWriterImpl;

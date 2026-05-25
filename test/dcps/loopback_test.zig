@@ -75,7 +75,7 @@ fn runLoopback(
         udp_w.transport(),
         disc_w.toDiscovery(),
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     defer {
@@ -108,7 +108,7 @@ fn runLoopback(
         udp_r.transport(),
         disc_r.toDiscovery(),
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     defer {
@@ -247,7 +247,7 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
         udp_w.transport(),
         disc_w.toDiscovery(),
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     defer {
@@ -279,7 +279,7 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
         udp_r.transport(),
         disc_r.toDiscovery(),
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     defer {

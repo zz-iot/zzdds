@@ -224,6 +224,7 @@ pub const RtpsProtocolReader = struct {
         .handle_heartbeat = vtHandleHeartbeat,
         .handle_data_frag = vtHandleDataFrag,
         .handle_heartbeat_frag = vtHandleHeartbeatFrag,
+        .handle_gap = vtHandleGap,
         .deinit = vtDeinit,
     };
 
@@ -335,6 +336,16 @@ pub const RtpsProtocolReader = struct {
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.reader.handleHeartbeatFrag(writer_guid, writer_sn, last_frag_num, count);
+    }
+
+    fn vtHandleGap(
+        ctx: *anyopaque,
+        writer_guid: Guid,
+        gap_start: history_mod.SequenceNumber,
+        gap_list: submsg_mod.SequenceNumberSet,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.reader.handleGap(writer_guid, gap_start, gap_list);
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

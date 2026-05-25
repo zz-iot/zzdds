@@ -62,7 +62,7 @@ fn runMockLoopback(
         mock_r.transport(),
         disc_r.toDiscovery(),
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     defer {
@@ -102,7 +102,7 @@ fn runMockLoopback(
         mock_w.transport(),
         disc_w.toDiscovery(),
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     defer {
@@ -220,7 +220,7 @@ test "mock_loopback: incompatible QoS — best_effort writer vs reliable reader"
         mock_r.transport(),
         disc_r.toDiscovery(),
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     defer {
@@ -257,7 +257,7 @@ test "mock_loopback: incompatible QoS — best_effort writer vs reliable reader"
         mock_w.transport(),
         disc_w.toDiscovery(),
         noop_security,
-        .random,
+        .spec_random,
         .{},
     );
     defer {

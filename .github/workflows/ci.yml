@@ -4,11 +4,29 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      vendor_filter:
+        description: '"default" = gated vendors only; "all" = every vendor in the pinned release'
+        required: false
+        default: default
+        type: choice
+        options:
+          - default
+          - all
+  schedule:
+    # Weekly full-vendor interop sweep — Mondays 06:00 UTC
+    - cron: '0 6 * * 1'
 
 # Cancel in-progress runs for the same ref on new pushes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# Pinned omg-dds/dds-rtps release used for vendor interop binaries.
+# Bump this tag when you want to pick up a new release (may change the vendor list).
+env:
+  INTEROP_RELEASE_TAG: v2.1.2026
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -64,6 +82,65 @@ jobs:
       - name: Test
         run: zig build test
 
+  # ── Resolve vendor matrix ──────────────────────────────────────────────────
+  #
+  # Queries the pinned omg-dds/dds-rtps release for *_shape_main_linux assets,
+  # filters to the gated set (or all), and emits a JSON vendor matrix.
+  # Runs in parallel with the self-interop jobs; vendor-interop jobs wait for both.
+
+  setup-matrix:
+    name: Resolve vendor matrix
+    needs: test-linux
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+
+    steps:
+      - name: Build vendor matrix
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VENDOR_FILTER: ${{ github.event_name == 'schedule' && 'all' || inputs.vendor_filter || 'default' }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          tag = os.environ['INTEROP_RELEASE_TAG']
+          vendor_filter = os.environ.get('VENDOR_FILTER', 'default')
+
+          # Asset-name prefixes included in the gated (default) CI set.
+          # Extend when a new partner reaches a known-good interop state.
+          DEFAULT_PREFIXES = [
+              'connext_dds',
+              'eclipse_cyclone',
+              'eprosima_fastdds',
+              'opendds',
+          ]
+
+          result = subprocess.run(
+              ['gh', 'api', f'repos/omg-dds/dds-rtps/releases/tags/{tag}',
+               '--jq', '[.assets[] | select(.name | endswith("_shape_main_linux.zip")) | .name]'],
+              capture_output=True, text=True, check=True,
+          )
+          assets = json.loads(result.stdout)
+
+          if vendor_filter != 'all':
+              assets = [a for a in assets if any(a.startswith(p) for p in DEFAULT_PREFIXES)]
+
+          if not assets:
+              print('::error::No vendor binaries matched — check INTEROP_RELEASE_TAG and DEFAULT_PREFIXES', flush=True)
+              sys.exit(1)
+
+          matrix = [
+              {'asset': a, 'binary': a[:-4], 'name': a.replace('_shape_main_linux.zip', '')}
+              for a in assets
+          ]
+          print(f'Vendors ({vendor_filter}): {[m["name"] for m in matrix]}', flush=True)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'matrix={json.dumps(matrix)}\n')
+          PYEOF
+
   # ── Interop: Zenzen DDS vs Zenzen DDS ─────────────────────────────────────
   #
   # Checkout layout (relative to $GITHUB_WORKSPACE):
@@ -73,11 +150,14 @@ jobs:
   # The packages/zzdds symlink inside zzdds points four levels up:
   #   dds-rtps/srcZig/zzdds/packages/zzdds -> ../../../../zzdds
   # which resolves to $GITHUB_WORKSPACE/zzdds — exactly our checkout path.
+  #
+  # ubuntu-22.04: vendor prebuilt binaries require this image; use the same
+  # runner here so the zzdds binary we upload is glibc-compatible with it.
 
   self-interop:
     name: self-interop (dds-rtps)
     needs: test-linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Check out zzdds
@@ -107,7 +187,14 @@ jobs:
 
       - name: Build shape_main (ReleaseSafe)
         working-directory: dds-rtps/srcZig/zzdds
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+
+      - name: Upload zzdds binary (for vendor-interop jobs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: zzdds-shape-linux-normal
+          path: dds-rtps/srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux
+          retention-days: 1
 
       - name: Run self-interop suite
         working-directory: dds-rtps
@@ -130,7 +217,7 @@ jobs:
   self-interop-tsan:
     name: self-interop (dds-rtps) + TSAN
     needs: test-linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Check out zzdds
@@ -160,7 +247,14 @@ jobs:
 
       - name: Build shape_main (Debug + ThreadSanitizer)
         working-directory: dds-rtps/srcZig/zzdds
-        run: zig build -Doptimize=Debug -Dlog-level=info -Dsanitize-thread
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=Debug -Dlog-level=info -Dsanitize-thread
+
+      - name: Upload zzdds binary (TSan, for vendor-interop-tsan jobs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: zzdds-shape-linux-tsan
+          path: dds-rtps/srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux
+          retention-days: 1
 
       - name: Run self-interop suite (TSan)
         working-directory: dds-rtps
@@ -186,3 +280,167 @@ jobs:
         with:
           name: interop-tsan-results
           path: /tmp/interop-tsan-results.xml
+
+  # ── Interop: Zenzen DDS vs vendor (normal) ────────────────────────────────
+  #
+  # Matrix: vendor (dynamic, from pinned release) × direction (pub | sub)
+  #   pub: zzdds publishes, vendor subscribes   (-P zzdds -S vendor)
+  #   sub: vendor publishes, zzdds subscribes   (-P vendor -S zzdds)
+  #
+  # Each combination runs on its own runner so jobs are fully parallel and
+  # there are no UDP port conflicts between vendors.
+  #
+  # Gated on self-interop so vendor jobs only start when zzdds is self-consistent.
+
+  vendor-interop-normal:
+    name: "${{ matrix.vendor.name }} / ${{ matrix.direction }}"
+    needs: [setup-matrix, self-interop]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        vendor: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        direction: [pub, sub]
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+
+      - name: Check out dds-rtps (zenzen branch)
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/dds-rtps
+          ref: zenzen
+          path: dds-rtps
+
+      - name: Install Python dependencies
+        run: pip install pexpect junitparser
+
+      - name: Download zzdds binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zzdds-shape-linux-normal
+          path: bins/
+
+      - name: Download vendor binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ${{ env.INTEROP_RELEASE_TAG }} \
+            --repo omg-dds/dds-rtps \
+            --pattern "${{ matrix.vendor.asset }}" \
+            -D bins/
+          unzip -o bins/${{ matrix.vendor.asset }} -d bins/
+
+      - name: Make binaries executable
+        run: chmod +x bins/zzdds_shape_main_linux bins/${{ matrix.vendor.binary }}
+
+      - name: Run interop (${{ matrix.direction }})
+        working-directory: dds-rtps
+        run: |
+          ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
+          VENDOR="$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}"
+          if [ "${{ matrix.direction }}" = "pub" ]; then
+            PUB="$ZZDDS"; SUB="$VENDOR"
+          else
+            PUB="$VENDOR"; SUB="$ZZDDS"
+          fi
+          python3 interoperability_report.py -P "$PUB" -S "$SUB" \
+            -o /tmp/interop-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Check results
+        run: |
+          python3 zzdds/scripts/check_interop_results.py \
+            /tmp/interop-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-${{ matrix.vendor.name }}-${{ matrix.direction }}
+          path: /tmp/interop-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+  # ── Interop: Zenzen DDS (TSan) vs vendor ──────────────────────────────────
+  #
+  # Same structure as vendor-interop-normal but uses the TSan-instrumented zzdds.
+  # A race causes the process to abort (TSAN_OPTIONS=abort_on_error=1), which
+  # pexpect sees as EOF; the test is marked failed and the TSAN report is embedded
+  # in the JUnit failure message, surfaced by check_interop_results.py.
+  #
+  # continue-on-error: true — TSan failures are high priority but don't gate PRs.
+  # Gated on self-interop-tsan, which itself must pass first.
+
+  vendor-interop-tsan:
+    name: "TSan: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
+    needs: [setup-matrix, self-interop-tsan]
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        vendor: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        direction: [pub, sub]
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+
+      - name: Check out dds-rtps (zenzen branch)
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/dds-rtps
+          ref: zenzen
+          path: dds-rtps
+
+      - name: Install Python dependencies
+        run: pip install pexpect junitparser
+
+      - name: Download zzdds binary (TSan)
+        uses: actions/download-artifact@v4
+        with:
+          name: zzdds-shape-linux-tsan
+          path: bins/
+
+      - name: Download vendor binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ${{ env.INTEROP_RELEASE_TAG }} \
+            --repo omg-dds/dds-rtps \
+            --pattern "${{ matrix.vendor.asset }}" \
+            -D bins/
+          unzip -o bins/${{ matrix.vendor.asset }} -d bins/
+
+      - name: Make binaries executable
+        run: chmod +x bins/zzdds_shape_main_linux bins/${{ matrix.vendor.binary }}
+
+      - name: Run interop TSan (${{ matrix.direction }})
+        working-directory: dds-rtps
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+        run: |
+          ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
+          VENDOR="$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}"
+          if [ "${{ matrix.direction }}" = "pub" ]; then
+            PUB="$ZZDDS"; SUB="$VENDOR"
+          else
+            PUB="$VENDOR"; SUB="$ZZDDS"
+          fi
+          python3 interoperability_report.py -P "$PUB" -S "$SUB" \
+            -o /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Check results
+        run: |
+          python3 zzdds/scripts/check_interop_results.py \
+            /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Upload TSan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}
+          path: /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml

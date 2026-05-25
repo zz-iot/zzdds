@@ -241,10 +241,11 @@ pub const SpdpEndpoints = struct {
 
         // Listen on SPDP multicast port and join the multicast group.
         const listen_locator = Locator.udp4(.{ 0, 0, 0, 0 }, self.spdp_multicast_port);
-        try self.transport.listen(&listen_locator, ReceiveHandler{
+        // Non-fatal: writer still sends and unicast paths remain open if this fails.
+        self.transport.listen(&listen_locator, ReceiveHandler{
             .ctx = self,
             .on_receive = onReceive,
-        });
+        }) catch |err| log.spdp.warn("spdp: listen failed: {}", .{err});
         for (local.metatraffic_multicast_locators) |loc| {
             self.transport.joinMulticast(&loc) catch |err| {
                 log.spdp.warn("spdp: joinMulticast failed: {}", .{err});
@@ -275,8 +276,9 @@ pub const SpdpEndpoints = struct {
 
     // ── Transport receive callback ────────────────────────────────────────────
 
-    fn onReceive(ctx: *anyopaque, data: []const u8, _: Locator) void {
+    fn onReceive(ctx: *anyopaque, data: []const u8, from: Locator) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        _ = from;
 
         // Parse the RTPS message.
         var it = parser_mod.MessageIterator.init(data) catch return;

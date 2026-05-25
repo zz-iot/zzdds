@@ -148,7 +148,7 @@ jobs:
 
       - name: Build shape_main (ReleaseSafe)
         working-directory: dds-rtps/srcZig/zzdds
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 
       - name: Run self-interop suite
         working-directory: dds-rtps

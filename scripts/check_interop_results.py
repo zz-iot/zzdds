@@ -71,17 +71,37 @@ def failure_detail(case):
     return '\n'.join(parts) if parts else None
 
 
+def is_vendor_limitation(detail):
+    """True if the failure is due to the vendor binary not implementing the
+    tested feature (not a zzdds bug).
+
+    The JUnit XML failure message contains an HTML table with a 'Code Produced'
+    column.  strip_html() flattens it to tab-separated text, so the status
+    codes appear as plain strings like SUB_UNSUPPORTED_FEATURE.  A test is a
+    vendor limitation when any participant's code contains UNSUPPORTED_FEATURE;
+    cascade failures (e.g. READER_NOT_MATCHED on publishers when the subscriber
+    reports SUB_UNSUPPORTED_FEATURE) are also covered by this check."""
+    if not detail:
+        return False
+    return bool(re.search(r'UNSUPPORTED_FEATURE', detail))
+
+
 def check_junit(path):
-    """Return (total, failing_cases) where failing_cases is a list of TestCase."""
+    """Return (total, real_failures, vendor_skipped) as lists of TestCase."""
     xml = junitparser.JUnitXml.fromfile(path)
     total = 0
-    failing = []
+    real_failures = []
+    vendor_skipped = []
     for suite in xml:
         for case in suite:
             total += 1
             if case.result:
-                failing.append(case)
-    return total, failing
+                detail = failure_detail(case)
+                if is_vendor_limitation(detail):
+                    vendor_skipped.append(case)
+                else:
+                    real_failures.append(case)
+    return total, real_failures, vendor_skipped
 
 
 def print_tsan_logs(log_dir):
@@ -110,20 +130,26 @@ def main():
 
     ok = True
 
-    total, failing = check_junit(args.report)
-    passed = total - len(failing)
-    print(f"Interop results: {passed}/{total} passed")
+    total, real_failures, vendor_skipped = check_junit(args.report)
+    passed = total - len(real_failures) - len(vendor_skipped)
+    print(f"Interop results: {passed}/{total} passed"
+          + (f", {len(vendor_skipped)} vendor-skipped" if vendor_skipped else ""))
 
-    if failing:
+    if vendor_skipped:
+        print("VENDOR LIMITATION (not a zzdds failure):")
+        for case in vendor_skipped:
+            print(f"  SKIP  {case.name}")
+
+    if real_failures:
         ok = False
         print("FAILURES:")
-        for case in failing:
+        for case in real_failures:
             print(f"  FAIL  {case.name}")
             gha_error(f"Interop test failed: {case.name}")
 
         # One collapsible group per failing test containing the full captured
         # shape_main output (includes ThreadSanitizer warnings if present).
-        for case in failing:
+        for case in real_failures:
             detail = failure_detail(case)
             if detail:
                 gha_group(f"Output: {case.name}")

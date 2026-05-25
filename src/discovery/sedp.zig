@@ -238,7 +238,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
         while (pad > 0) : (pad -= 1) try buf.append(alloc, 0);
     }
 
-    // PID_PARTITION (0x0035): CDR sequence<string>. Omitted when default (empty list).
+    // PID_PARTITION (0x0029): CDR sequence<string>. Omitted when default (empty list).
     if (ann.qos.partition_names.len > 0) {
         try writePartitionPid(alloc, &buf, ann.qos.partition_names);
     }
@@ -322,7 +322,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // we don't implement.  Cyclone falls back to type-name matching when the
     // remote reader has no TypeInformation, so S2 still passes.
 
-    // PID_PARTITION (0x0035): CDR sequence<string>. Omitted when default (empty list).
+    // PID_PARTITION (0x0029): CDR sequence<string>. Omitted when default (empty list).
     if (ann.qos.partition_names.len > 0) {
         try writePartitionPid(alloc, &buf, ann.qos.partition_names);
     }
@@ -353,7 +353,7 @@ const DecodedEndpoint = struct {
     }
 };
 
-fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoint {
+fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool) !DecodedEndpoint {
     if (payload.len < 4) return error.TooShort;
     const le = (payload[1] & 0x01) != 0;
 
@@ -369,7 +369,9 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoin
         for (partitions.items) |name| alloc.free(name);
         partitions.deinit(alloc);
     }
-    var qos = QosSnapshot{};
+    // DDS spec defaults: DataWriter reliability = RELIABLE (1), DataReader = BEST_EFFORT (0).
+    // Implementations may omit PID_RELIABILITY when it matches the default.
+    var qos = QosSnapshot{ .reliability_kind = if (is_writer) 1 else 0 };
 
     var pos: usize = 4;
     while (pos + 4 <= payload.len) {
@@ -451,7 +453,7 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoin
                     }
                 }
             },
-            PidTable.PARTITION => {
+            PidTable.PARTITION, PidTable.PARTITION_LEGACY => {
                 // CDR sequence<string>: seq_len(4) + N × (str_len(4) + chars + null + pad)
                 if (v.len >= 4) {
                     const count = readU32LE(v, le);
@@ -625,7 +627,7 @@ pub const SedpEndpoints = struct {
             self.transport,
             .keep_last,
             1,
-            false,
+            true, // SEDP builtin readers are RELIABLE (RTPS §8.5)
         );
         self.pub_reader.?.setTracer(self.tracer);
         self.pub_reader.?.setCallback(.{ .ctx = self, .on_data = onPubData });
@@ -648,7 +650,7 @@ pub const SedpEndpoints = struct {
             self.transport,
             .keep_last,
             1,
-            false,
+            true, // SEDP builtin readers are RELIABLE (RTPS §8.5)
         );
         self.sub_reader.?.setTracer(self.tracer);
         self.sub_reader.?.setCallback(.{ .ctx = self, .on_data = onSubData });
@@ -684,11 +686,6 @@ pub const SedpEndpoints = struct {
         const eps = data.builtin_endpoint_set;
         const uc = data.metatraffic_unicast_locators;
         const mc = data.metatraffic_multicast_locators;
-
-        log.sedp.debug("sedp: onParticipantDiscovered prefix={x} eps=0x{x} uc_count={d}", .{
-            data.guid.prefix.bytes, eps, uc.len,
-        });
-        for (uc) |loc| log.sedp.debug("sedp:   metatraffic_unicast_locator={any}", .{loc});
 
         // Cache the participant's default data locators so endpoints that omit
         // explicit locators in their SEDP announcement can fall back to them.
@@ -796,8 +793,9 @@ pub const SedpEndpoints = struct {
 
     // ── Transport receive callback ────────────────────────────────────────────
 
-    fn onReceive(ctx: *anyopaque, data: []const u8, _: Locator) void {
+    fn onReceive(ctx: *anyopaque, data: []const u8, from: Locator) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        _ = from;
         var it = parser_mod.MessageIterator.init(data) catch return;
         var param_buf: [32]@import("../rtps/message/submessage.zig").InlineQosParam = undefined;
 
@@ -862,6 +860,17 @@ pub const SedpEndpoints = struct {
                             sr.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
                     }
                 },
+                .gap => |g| {
+                    const wid = g.writer_entity_id;
+                    const wguid = Guid{ .prefix = src_prefix, .entity_id = wid };
+                    if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
+                        if (self.pub_reader) |pr|
+                            pr.handleGap(wguid, g.gap_start, g.gap_list);
+                    } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
+                        if (self.sub_reader) |sr|
+                            sr.handleGap(wguid, g.gap_start, g.gap_list);
+                    }
+                },
                 .acknack => |an| {
                     const rid = an.reader_entity_id;
                     const rguid = Guid{ .prefix = src_prefix, .entity_id = rid };
@@ -892,7 +901,7 @@ pub const SedpEndpoints = struct {
 
     fn handleEndpointChange(self: *Self, ch: *const CacheChange, is_writer: bool) void {
         if (ch.kind != .alive) return;
-        var ep = decodeEndpoint(self.alloc, ch.data) catch return;
+        var ep = decodeEndpoint(self.alloc, ch.data, is_writer) catch return;
         defer ep.deinit();
 
         const cbs = self.callbacks orelse return;

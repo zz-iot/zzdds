@@ -59,7 +59,7 @@ const Fixture = struct {
             t_w.transport(),
             d_w.toDiscovery(),
             noop_security,
-            .random,
+            .spec_random,
             .{},
         );
         errdefer factory_w.deinit();
@@ -77,7 +77,7 @@ const Fixture = struct {
             t_r.transport(),
             d_r.toDiscovery(),
             noop_security,
-            .random,
+            .spec_random,
             .{},
         );
         errdefer factory_r.deinit();

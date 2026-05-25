@@ -148,6 +148,9 @@ pub const WriterProxy = struct {
     /// Last accepted heartbeat count for duplicate suppression (§8.3.5.10).
     /// Null until the first heartbeat from this writer is accepted.
     last_hb_count: ?i32,
+    /// Last accepted HEARTBEAT_FRAG count for stale-submessage suppression (§8.3.8.13).
+    /// Null until the first HEARTBEAT_FRAG from this writer is accepted.
+    last_hb_frag_count: ?i32,
     /// True when the remote writer offers RELIABLE delivery.
     reliable: bool,
     /// In-progress fragment reassembly, keyed by writer sequence number.
@@ -170,6 +173,7 @@ pub const WriterProxy = struct {
             .pending_changes = .empty,
             .ack_count = 0,
             .last_hb_count = null,
+            .last_hb_frag_count = null,
             .reassembly = .empty,
             .reliable = reliable,
         };
@@ -458,13 +462,22 @@ pub const StatefulReader = struct {
         writer_guid: Guid,
         writer_sn: SequenceNumber,
         last_frag_num: msg.submessage.FragmentNumber,
-        _: i32, // count — TODO: stale HB_FRAG suppression
+        count: i32,
     ) void {
         self.mu.lock();
         defer self.mu.unlock();
 
         for (self.writer_proxies.items) |*wp| {
             if (!wp.guid.eql(writer_guid)) continue;
+
+            // Stale HEARTBEAT_FRAG suppression (§8.3.8.13): ignore if count is not
+            // strictly greater than the last accepted count from this writer.
+            if (wp.last_hb_frag_count) |last| {
+                const diff: i32 = @bitCast(@as(u32, @bitCast(count)) -% @as(u32, @bitCast(last)));
+                if (diff <= 0) return;
+            }
+            wp.last_hb_frag_count = count;
+
             if (wp.received.contains(writer_sn)) return; // already delivered
 
             const entry_ptr = wp.reassembly.getPtr(writer_sn);
@@ -726,8 +739,9 @@ pub const StatefulReader = struct {
             false, // not final: we may send again after timeout
         );
         for (locs) |loc| {
-            writer_sm.sendIovecs(self.transport, &loc, b.iovecs()) catch |err| {
-                log.rtps.warn("StatefulReader.sendAckNack: {}", .{err});
+            writer_sm.sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                error.UnsupportedLocatorKind => {},
+                else => log.rtps.warn("StatefulReader.sendAckNack: {}", .{err}),
             };
         }
     }

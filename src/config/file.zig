@@ -278,8 +278,9 @@ fn parseEnum(comptime T: type, val: []const u8, map: anytype) Error!T {
 
 fn parseGuidStrategy(val: []const u8) Error!schema.GuidStrategy {
     return parseEnum(schema.GuidStrategy, val, .{
-        .{ "random", schema.GuidStrategy.random },
+        .{ "spec_random", schema.GuidStrategy.spec_random },
         .{ "host_based", schema.GuidStrategy.host_based },
+        .{ "fully_random", schema.GuidStrategy.fully_random },
     });
 }
 

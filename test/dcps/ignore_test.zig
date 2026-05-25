@@ -81,7 +81,7 @@ const Harness = struct {
             h.transport.transport(),
             h.disc.toDiscovery(),
             noop_security,
-            .random,
+            .spec_random,
             .{},
         );
         return h;

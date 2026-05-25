@@ -11,13 +11,13 @@
 //!   const t_w = try delivery.newTransport();
 //!   const d_w = try delivery.newDiscovery();
 //!   var factory_w = try DomainParticipantFactoryImpl.init(
-//!       alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .random, .{});
+//!       alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
 //!   defer { factory_w.deinit(); d_w.deinit(); t_w.deinit(); }
 //!
 //!   const t_r = try delivery.newTransport();
 //!   const d_r = try delivery.newDiscovery();
 //!   var factory_r = try DomainParticipantFactoryImpl.init(
-//!       alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .random, .{});
+//!       alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
 //!   defer { factory_r.deinit(); d_r.deinit(); t_r.deinit(); }
 //!
 //! Endpoint matching is immediate and synchronous when writers/readers are created.

@@ -73,7 +73,7 @@ pub fn main() !void {
         transport,
         discovery,
         security,
-        .random,
+        .spec_random,
         .{},
     );
     defer factory.deinit();

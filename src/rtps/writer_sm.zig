@@ -196,8 +196,9 @@ pub const StatelessWriter = struct {
                     .key_hash = ch.key_hash,
                     .data_len = @intCast(ch.data.len),
                 } });
-                sendIovecs(self.transport, &rl.locator, builder.iovecs()) catch |err| {
-                    log.rtps.warn("StatelessWriter.sendAll: send error: {}", .{err});
+                sendIovecs(self.transport, &rl.locator, builder.iovecs()) catch |err| switch (err) {
+                    error.UnsupportedLocatorKind => {},
+                    else => log.rtps.warn("StatelessWriter.sendAll: send error: {}", .{err}),
                 };
             }
         }
@@ -222,6 +223,15 @@ pub const ReaderProxy = struct {
     /// TRANSIENT_LOCAL+ (gets full history). Set to cache.next_sn at match
     /// time for VOLATILE writers (late joiners skip historical data).
     start_sn: SequenceNumber,
+    /// Last accepted NACK_FRAG count for stale-submessage suppression (§8.3.8.12).
+    /// Null until the first NACK_FRAG from this reader is accepted.
+    last_nack_frag_count: ?i32,
+    /// When true, suppress all DATA sends to this proxy until it acknowledges
+    /// our leading HEARTBEAT with an ACKNACK. Cleared on the first ACKNACK.
+    /// Ensures the reader knows our sequence number range (first_sn) before
+    /// receiving any DATA, preventing premature delivery of live samples by a
+    /// reader that has not yet seen our history range.
+    awaiting_first_ack: bool,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -239,6 +249,8 @@ pub const ReaderProxy = struct {
             .reliable = reliable,
             .highest_acked_sn = 0,
             .start_sn = 1,
+            .last_nack_frag_count = null,
+            .awaiting_first_ack = false,
         };
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
@@ -395,6 +407,12 @@ pub const StatefulWriter = struct {
         try self.reader_proxies.append(self.alloc, proxy);
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
         if (!self.replay_on_match) new_rp.start_sn = self.cache.next_sn;
+        // Set awaiting_first_ack before replay so the flag is visible to any
+        // write() that acquires mu after we release it.  The replay sends
+        // directly to the proxy (not through sendChangeToAllLocked) so it is
+        // unaffected by the flag itself.
+        if (new_rp.reliable and self.replay_on_match and self.cache.changes.items.len > 0)
+            new_rp.awaiting_first_ack = true;
         if (self.replay_on_match) self.replayHistoryToProxyLocked(new_rp) else if (new_rp.reliable) self.sendHeartbeatToProxyLocked(new_rp);
         // Start the periodic heartbeat thread on the first matched reader so
         // that dropped DATA or HEARTBEAT packets can be recovered via NACK.
@@ -420,6 +438,13 @@ pub const StatefulWriter = struct {
             rp.guid.entity_id.entity_key,
             rp.guid.entity_id.entity_kind,
         });
+        // Send HEARTBEAT before any DATA so the reader knows first_sn before
+        // samples arrive. Without this, a reader that has not yet seen a heartbeat
+        // from this writer may deliver the first DATA it receives immediately,
+        // without knowing that earlier samples (e.g. SN=1) are expected.
+        // BEST_EFFORT readers never AckNack; skip to avoid synchronous re-entry
+        // deadlock when using in-process (MemoryTransport) delivery.
+        if (rp.reliable) self.sendHeartbeatToProxyLocked(rp);
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.cache.changes.items) |*ch| {
             self.tracer.submit(.{ .send_data = .{
@@ -448,19 +473,13 @@ pub const StatefulWriter = struct {
                     .status_info = statusInfoFromKind(ch.kind),
                 }, ch.data);
                 for (locs) |loc| {
-                    sendIovecs(self.transport, &loc, b.iovecs()) catch |err| {
-                        log.rtps.warn("StatefulWriter.addMatchedReader: replay error: {}", .{err});
+                    sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                        error.UnsupportedLocatorKind => {},
+                        else => log.rtps.warn("StatefulWriter.addMatchedReader: replay error: {}", .{err}),
                     };
                 }
             }
         }
-        // After replaying data, send a non-final Heartbeat so the reader knows
-        // the full SN range and sends an ACKNACK. This is required for RTPS
-        // reliable delivery: some implementations (e.g. OpenDDS) buffer received
-        // data until a Heartbeat confirms the writer's sequence number range.
-        // BEST_EFFORT readers never AckNack; skip to avoid synchronous re-entry
-        // deadlock when using in-process (MemoryTransport) delivery.
-        if (rp.reliable) self.sendHeartbeatToProxyLocked(rp);
     }
 
     /// Send a Heartbeat to a single reader proxy (called under mu).
@@ -486,8 +505,9 @@ pub const StatefulWriter = struct {
             false, // non-final: reader must reply with ACKNACK
         );
         for (locs) |loc| {
-            sendIovecs(self.transport, &loc, b.iovecs()) catch |err| {
-                log.rtps.warn("StatefulWriter.addMatchedReader: heartbeat error: {}", .{err});
+            sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                error.UnsupportedLocatorKind => {},
+                else => log.rtps.warn("StatefulWriter.addMatchedReader: heartbeat error: {}", .{err}),
             };
         }
     }
@@ -561,8 +581,9 @@ pub const StatefulWriter = struct {
                 .flags = if (final) 2 else 0,
             } });
             for (locs) |loc| {
-                sendIovecs(self.transport, &loc, b.iovecs()) catch |err| {
-                    log.rtps.warn("StatefulWriter.sendHeartbeat: {}", .{err});
+                sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                    error.UnsupportedLocatorKind => {},
+                    else => log.rtps.warn("StatefulWriter.sendHeartbeat: {}", .{err}),
                 };
             }
         }
@@ -587,6 +608,7 @@ pub const StatefulWriter = struct {
         for (self.reader_proxies.items) |*rp| {
             if (!rp.guid.eql(reader_guid)) continue;
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
+            if (rp.awaiting_first_ack) rp.awaiting_first_ack = false;
 
             self.tracer.submit(.{ .recv_acknack = .{
                 .src_prefix = reader_guid.prefix,
@@ -686,6 +708,7 @@ pub const StatefulWriter = struct {
         const hb_count_snap = self.hb_count;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.reader_proxies.items) |*rp| {
+            if (rp.awaiting_first_ack) continue;
             const locs = rp.effectiveLocators();
             if (locs.len == 0) continue;
             log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{
@@ -789,7 +812,6 @@ pub const StatefulWriter = struct {
         frag_set: msg.submessage.FragmentNumberSet,
         count: i32,
     ) void {
-        _ = count; // TODO: stale NACK_FRAG suppression (similar to HEARTBEAT count)
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -799,6 +821,14 @@ pub const StatefulWriter = struct {
 
         for (self.reader_proxies.items) |*rp| {
             if (!rp.guid.eql(reader_guid)) continue;
+
+            // Stale NACK_FRAG suppression (§8.3.8.12): ignore if count is not
+            // strictly greater than the last accepted count from this reader.
+            if (rp.last_nack_frag_count) |last| {
+                const diff: i32 = @bitCast(@as(u32, @bitCast(count)) -% @as(u32, @bitCast(last)));
+                if (diff <= 0) return;
+            }
+            rp.last_nack_frag_count = count;
             const locs = rp.effectiveLocators();
             if (locs.len == 0) return;
 
