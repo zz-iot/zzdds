@@ -187,7 +187,7 @@ jobs:
 
       - name: Build shape_main (ReleaseSafe)
         working-directory: dds-rtps/srcZig/zzdds
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 
       - name: Upload zzdds binary (for vendor-interop jobs)
         uses: actions/upload-artifact@v4
@@ -247,7 +247,7 @@ jobs:
 
       - name: Build shape_main (Debug + ThreadSanitizer)
         working-directory: dds-rtps/srcZig/zzdds
-        run: zig build -Doptimize=Debug -Dlog-level=info -Dsanitize-thread
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=Debug -Dlog-level=info -Dsanitize-thread
 
       - name: Upload zzdds binary (TSan, for vendor-interop-tsan jobs)
         uses: actions/upload-artifact@v4

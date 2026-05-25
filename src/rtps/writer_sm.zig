@@ -380,10 +380,11 @@ pub const StatefulWriter = struct {
     /// skipped for re-matches; the periodic heartbeat thread will resync the
     /// reader at the next interval.
     ///
-    /// For new readers: when `replay_on_match` is true (TRANSIENT_LOCAL+), the
-    /// full history cache is replayed.  For VOLATILE writers `start_sn` is set to
-    /// the writer's next SN so the reader only sees future data, and a Heartbeat
-    /// is sent to communicate this range.
+    /// For new readers: when `replay_on_match` is true and the reader is reliable,
+    /// a non-final Heartbeat announces the available SN range and the reader drives
+    /// history delivery via NACK/retransmit.  Best-effort readers get an immediate
+    /// push (no NACK mechanism).  For VOLATILE writers `start_sn` is set to the
+    /// writer's next SN so the reader only sees future data.
     pub fn addMatchedReader(self: *Self, proxy: ReaderProxy) !void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -407,20 +408,17 @@ pub const StatefulWriter = struct {
         try self.reader_proxies.append(self.alloc, proxy);
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
         if (!self.replay_on_match) new_rp.start_sn = self.cache.next_sn;
-        if (self.replay_on_match) self.replayHistoryToProxyLocked(new_rp) else if (new_rp.reliable) self.sendHeartbeatToProxyLocked(new_rp);
-        // For reliable TRANSIENT_LOCAL readers with history to protect, suppress
-        // live DATA from sendChangeToAllLocked until the reader responds to the
-        // leading HEARTBEAT with an ACKNACK.  This prevents a live sample
-        // (written after addMatchedReader returns) from being delivered by the
-        // reader before history samples arrive, which would cause
-        // DATA_NOT_CORRECT errors on readers that have not yet seen our
-        // [first_sn, last_sn] range.  Replay and NACK-driven retransmits are
-        // unaffected — they send directly, bypassing this guard.
-        // Only applies when there is existing history to replay; an empty
-        // cache means the reader is joining a fresh writer and will correctly
-        // see live samples as SN=1.
-        if (new_rp.reliable and self.replay_on_match and self.cache.changes.items.len > 0)
+        if (self.replay_on_match and new_rp.reliable and self.cache.changes.items.len > 0) {
+            // Gate live DATA before announcing the range: reader drives history
+            // delivery via NACK so history arrives before any live samples.
             new_rp.awaiting_first_ack = true;
+            self.sendHeartbeatToProxyLocked(new_rp);
+        } else if (self.replay_on_match) {
+            // Best-effort reader (no NACK) or empty history: push immediately.
+            self.replayHistoryToProxyLocked(new_rp);
+        } else if (new_rp.reliable) {
+            self.sendHeartbeatToProxyLocked(new_rp);
+        }
         // Start the periodic heartbeat thread on the first matched reader so
         // that dropped DATA or HEARTBEAT packets can be recovered via NACK.
         if (self.hb_thread == null) {

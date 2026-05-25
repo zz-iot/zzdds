@@ -386,14 +386,13 @@ test "late_join: KEEP_LAST-2 writer fills firstSN virtual gap on HEARTBEAT" {
 }
 
 test "loss_recovery: DATA dropped, HEARTBEAT triggers NACK, retransmit delivers" {
-    // LossyTransport drops the first 3 sends (DATA 1-3 during replay) but
-    // forwards the 4th (HEARTBEAT).  The reader proxy is added AFTER the HB
-    // has been ignored, so the initial NACK from addMatchedWriter drives
-    // retransmit in the following rounds.
+    // LossyTransport drops the first 1 send (initial HB from addMatchedReader).
+    // The writer proxy is added AFTER Round 1, so the initial NACK from
+    // addMatchedWriter drives retransmit in the following rounds.
     //
-    // Round 1: HEARTBEAT arrives; reader has no writer proxy → ignored.
+    // Round 1: nothing arrives (initial HB was dropped).
     // addMatchedWriter: reader sends initial NACK(cumAck=0) → mt_w queue.
-    // Round 2: NACK → writer retransmits DATA(1,2,3) + HEARTBEAT (seqs 5-8).
+    // Round 2: NACK → writer retransmits DATA(1,2,3) + HEARTBEAT.
     // Round 3: retransmitted DATA arrives → reader delivers all three.
     const alloc = testing.allocator;
 
@@ -401,8 +400,8 @@ test "loss_recovery: DATA dropped, HEARTBEAT triggers NACK, retransmit delivers"
     defer net.deinit();
 
     // The lossy shim sits between the writer and the MockNetwork.
-    // It drops the first 3 sends (DATA 1-3) and forwards everything after
-    // (the HEARTBEAT at send seq 4, and all retransmits).
+    // It drops the first 1 send (the initial HB from addMatchedReader) and
+    // forwards everything after (all retransmits).
     //
     // mt_r is created first so it is first in the MockNetwork member list.
     // Delivery order [mt_r, mt_w] means mt_w→mt_r costs one extra round,
@@ -412,7 +411,7 @@ test "loss_recovery: DATA dropped, HEARTBEAT triggers NACK, retransmit delivers"
     const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
     defer mt_w.deinit();
 
-    var drop = DropFirst.init(3);
+    var drop = DropFirst.init(1);
     const lossy = try LossyTransport.init(alloc, mt_w.transport(), drop.packetPolicy());
     defer lossy.deinit(alloc);
 
@@ -447,17 +446,15 @@ test "loss_recovery: DATA dropped, HEARTBEAT triggers NACK, retransmit delivers"
     try write(writer, "two");
     try write(writer, "three");
 
-    // addMatchedReader triggers replay: DATA(1,2,3) dropped by lossy shim (seqs 1-3),
-    // HEARTBEAT forwarded (seq 4) → enqueued in mt_r.
-    // The reader proxy is NOT added yet so the reader will ignore the HEARTBEAT.
+    // addMatchedReader sends HB(c=1) → dropped by lossy shim (seq 1).
+    // awaiting_first_ack=true; no DATA sent yet.
     const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
     try writer.addMatchedReader(rp);
 
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
-    try testing.expectEqual(@as(u64, 3), lossy.dropped.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), lossy.dropped.load(.monotonic));
 
-    // Round 1: reader receives HEARTBEAT(1,3) but has no writer proxy → ignores it.
-    //          Nothing queued in mt_w; 0 samples delivered.
+    // Round 1: nothing to deliver (initial HB was dropped); 0 samples.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
@@ -480,8 +477,8 @@ test "loss_recovery: DATA dropped, HEARTBEAT triggers NACK, retransmit delivers"
     try testing.expectEqualSlices(u8, "two", col.samples.items[1]);
     try testing.expectEqualSlices(u8, "three", col.samples.items[2]);
 
-    // Sanity: exactly 3 drops (the initial DATA packets), none thereafter.
-    try testing.expectEqual(@as(u64, 3), lossy.dropped.load(.monotonic));
+    // Sanity: exactly 1 drop (the initial HB), none thereafter.
+    try testing.expectEqual(@as(u64, 1), lossy.dropped.load(.monotonic));
 }
 
 test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
@@ -489,24 +486,21 @@ test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
     // The reader re-derives the same NACK from its received set on every
     // non-final heartbeat, so recovery succeeds as soon as one gets through.
     //
-    // Writer→reader: DropFirst(3) — with HEARTBEAT-before-DATA replay ordering,
-    //   this drops HB(c=1)+DATA(1)+DATA(2); DATA(3) is forwarded (seq 4).
+    // Writer→reader: DropFirst(1) — drops HB(c=1) from addMatchedReader.
     // Reader→writer: DropFirst(1) — drops the initial NACK from addMatchedWriter.
     //
     // deliverAll() delivers member transports sequentially (mt_r then mt_w), so a
     // packet generated in mt_r's delivery slot (e.g. a NACK sent in response to a
     // HB) can be processed by mt_w in the same round.
     //
-    //   addMatchedReader : HB(c=1) dropped (seq 1); DATA(1,2) dropped (seqs 2-3);
-    //                      DATA(3) queued in mt_r (seq 4).  awaiting_first_ack=true.
+    //   addMatchedReader : HB(c=1) dropped (seq 1).  awaiting_first_ack=true.
     //   addMatchedWriter : NACK-1 dropped by lossy_r.
-    //   Round 1          : mt_r delivers DATA(3) → buffered (SN3 out-of-order).
-    //                      No HB arrives, so no re-NACK is generated.
-    //   sendHeartbeat    : HB(1,3,c=2) forwarded (seq 5, DropFirst exhausted).
-    //   Round 2          : mt_r delivers HB → reader re-derives NACK(1,2)
+    //   Round 1          : nothing to deliver (HB and NACK both dropped).
+    //   sendHeartbeat    : HB(1,3,c=2) forwarded (DropFirst(1) exhausted).
+    //   Round 2          : mt_r delivers HB → reader re-derives NACK(1,2,3)
     //                      (DropFirst(1) exhausted → passes to mt_w); mt_w delivers
-    //                      NACK → clears awaiting_first_ack, retransmits DATA(1,2).
-    //   Round 3          : DATA(1,2) arrive → SN1,SN2 delivered; SN3 unblocked → 3 total.
+    //                      NACK → clears awaiting_first_ack, retransmits DATA(1,2,3).
+    //   Round 3          : DATA(1,2,3) arrive → all three delivered.
     const alloc = testing.allocator;
 
     const net = try MockNetwork.init(alloc);
@@ -517,7 +511,7 @@ test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
     const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
     defer mt_w.deinit();
 
-    var drop_data = DropFirst.init(3);
+    var drop_data = DropFirst.init(1);
     const lossy_w = try LossyTransport.init(alloc, mt_w.transport(), drop_data.packetPolicy());
     defer lossy_w.deinit(alloc);
 
@@ -554,7 +548,7 @@ test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
     try write(writer, "two");
     try write(writer, "three");
 
-    // Replay: DATA(1-3) dropped (lossy_w seqs 1-3); HB(1,3) forwarded (seq 4).
+    // addMatchedReader sends HB(c=1) → dropped by lossy_w (seq 1). awaiting_first_ack=true.
     const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
     try writer.addMatchedReader(rp);
 
@@ -562,33 +556,32 @@ test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
     const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
     try reader.addMatchedWriter(wp);
 
-    try testing.expectEqual(@as(u64, 3), lossy_w.dropped.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), lossy_w.dropped.load(.monotonic));
     try testing.expectEqual(@as(u64, 1), lossy_r.dropped.load(.monotonic));
 
-    // Round 1: DATA(3) arrives at reader → buffered (SN3 out-of-order, cumAck=0).
-    //          No HB arrived, so no re-NACK is generated.
+    // Round 1: nothing to deliver (HB and NACK both dropped before reaching the network).
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Simulate the writer's periodic heartbeat (the replay HB was dropped).
-    // seq 5: forwarded by lossy_w (DropFirst(3) exhausted after seq 3).
+    // Simulate the writer's periodic heartbeat (the initial HB was dropped).
+    // Forwarded by lossy_w (DropFirst(1) exhausted after seq 1).
     writer.sendHeartbeat(false);
 
-    // Round 2: HB(1,3,c=2) → reader re-derives NACK(1,2) (DropFirst(1) exhausted →
+    // Round 2: HB(1,3,c=2) → reader re-derives NACK(1,2,3) (DropFirst(1) exhausted →
     //          passes to mt_w); mt_w delivers NACK → clears awaiting_first_ack,
-    //          retransmits DATA(1,2) + trailing HB (seqs 6-8, all forwarded).
+    //          retransmits DATA(1,2,3) + trailing HB (all forwarded).
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Round 3: DATA(1,2) arrive → deliver "one","two"; SN3 already buffered → "three".
+    // Round 3: DATA(1,2,3) arrive → deliver "one","two","three".
     net.deliverAll();
     try testing.expectEqual(@as(usize, 3), col.samples.items.len);
     try testing.expectEqualSlices(u8, "one", col.samples.items[0]);
     try testing.expectEqualSlices(u8, "two", col.samples.items[1]);
     try testing.expectEqualSlices(u8, "three", col.samples.items[2]);
 
-    // Exactly 3 writer-side drops (HB+DATA(1,2) from replay) and 1 reader-side drop.
-    try testing.expectEqual(@as(u64, 3), lossy_w.dropped.load(.monotonic));
+    // Exactly 1 writer-side drop (initial HB) and 1 reader-side drop (initial NACK).
+    try testing.expectEqual(@as(u64, 1), lossy_w.dropped.load(.monotonic));
     try testing.expectEqual(@as(u64, 1), lossy_r.dropped.load(.monotonic));
 }
 
@@ -599,19 +592,17 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
     // reader re-derives the same missing-SN bitmap from its unchanged received set
     // and the third NACK reaches the writer, completing recovery.
     //
-    // Writer→reader: DropFirst(3) — with HEARTBEAT-before-DATA replay ordering,
-    //   drops HB(c=1)+DATA(1)+DATA(2); DATA(3) is forwarded (seq 4).
+    // Writer→reader: DropFirst(1) — drops HB(c=1) from addMatchedReader.
     // Reader→writer: DropFirst(2) — drops the first two NACKs.
     //
-    //   addMatchedReader : HB(c=1) dropped; DATA(1,2) dropped; DATA(3) queued.
-    //                      awaiting_first_ack=true.
+    //   addMatchedReader : HB(c=1) dropped.  awaiting_first_ack=true.
     //   addMatchedWriter : NACK-1 dropped.
-    //   Round 1          : DATA(3) buffered; no HB arrives; no NACK triggered.
-    //   sendHeartbeat    : HB(1,3,c=2) forwarded (seq 5).
+    //   Round 1          : nothing to deliver (HB and NACK both dropped).
+    //   sendHeartbeat    : HB(1,3,c=2) forwarded (DropFirst(1) exhausted).
     //   Round 2          : HB(1,3,c=2) → NACK-2 dropped; writer stays silent.
     //   [periodic HB]    : handleHeartbeat(c=3) called directly → NACK-3 passes.
-    //   Round 3          : NACK-3 → clears awaiting_first_ack, retransmits DATA(1,2).
-    //   Round 4          : DATA(1,2) arrive; SN3 unblocked → 3 samples.
+    //   Round 3          : NACK-3 → clears awaiting_first_ack, retransmits DATA(1,2,3).
+    //   Round 4          : DATA(1,2,3) arrive → 3 samples.
     const alloc = testing.allocator;
 
     const net = try MockNetwork.init(alloc);
@@ -622,7 +613,7 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
     const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
     defer mt_w.deinit();
 
-    var drop_data = DropFirst.init(3);
+    var drop_data = DropFirst.init(1);
     const lossy_w = try LossyTransport.init(alloc, mt_w.transport(), drop_data.packetPolicy());
     defer lossy_w.deinit(alloc);
 
@@ -664,14 +655,13 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
     const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
     try reader.addMatchedWriter(wp);
 
-    // Round 1: DATA(3) buffered at reader (cumAck=0, out-of-order). No HB arrived,
-    //          so no re-NACK is generated; writer stays silent.
+    // Round 1: nothing to deliver (initial HB and NACK both dropped).
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
     try testing.expectEqual(@as(u64, 1), lossy_r.dropped.load(.monotonic));
 
-    // Simulate writer periodic heartbeat #1 (replay HB was dropped).
-    // seq 5: forwarded (DropFirst(3) exhausted after seq 3).
+    // Simulate writer periodic heartbeat #1 (initial HB was dropped).
+    // Forwarded (DropFirst(1) exhausted after seq 1).
     writer.sendHeartbeat(false);
 
     // Round 2: HB(1,3,c=2) → reader re-derives NACK(1,2) → NACK-2 dropped by
@@ -684,18 +674,18 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
     // missing-SN bitmap; DropFirst(2) is exhausted so NACK-3 is forwarded into mt_w.
     reader.handleHeartbeat(W1_GUID, 1, 3, 3, false);
 
-    // Round 3: NACK-3 → clears awaiting_first_ack, retransmits DATA(1,2) + trailing HB.
+    // Round 3: NACK-3 → clears awaiting_first_ack, retransmits DATA(1,2,3) + trailing HB.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Round 4: DATA(1,2) arrive → deliver "one","two"; SN3 unblocked → "three".
+    // Round 4: DATA(1,2,3) arrive → deliver "one","two","three".
     net.deliverAll();
     try testing.expectEqual(@as(usize, 3), col.samples.items.len);
     try testing.expectEqualSlices(u8, "one", col.samples.items[0]);
     try testing.expectEqualSlices(u8, "two", col.samples.items[1]);
     try testing.expectEqualSlices(u8, "three", col.samples.items[2]);
 
-    try testing.expectEqual(@as(u64, 3), lossy_w.dropped.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), lossy_w.dropped.load(.monotonic));
     try testing.expectEqual(@as(u64, 2), lossy_r.dropped.load(.monotonic));
 }
 
