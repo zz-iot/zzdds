@@ -739,8 +739,9 @@ pub const StatefulReader = struct {
             false, // not final: we may send again after timeout
         );
         for (locs) |loc| {
-            writer_sm.sendIovecs(self.transport, &loc, b.iovecs()) catch |err| {
-                log.rtps.warn("StatefulReader.sendAckNack: {}", .{err});
+            writer_sm.sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                error.UnsupportedLocatorKind => {},
+                else => log.rtps.warn("StatefulReader.sendAckNack: {}", .{err}),
             };
         }
     }

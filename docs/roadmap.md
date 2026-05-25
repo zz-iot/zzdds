@@ -95,7 +95,12 @@ without waiting for a full announcement period.
 **LocatorSelector abstraction** — replace the flat per-locator blast in
 `StatelessWriter.sendAll()` (and `StatefulWriter`) with a selector that prefers loopback
 for local peers and unicast over multicast when the remote is reachable unicast. A
-GUID-to-selected-locator cache amortizes selection cost.
+GUID-to-selected-locator cache amortizes selection cost. When building the selector,
+filter out locator kinds the active transport does not support rather than attempting
+sends and swallowing the error; this eliminates the pty-buffer pressure that caused
+Durability_17 failures against Connext. Pair with a one-time debug log (per unsupported
+kind encountered) so that the locator kinds a vendor is advertising remain observable
+when debugging interop issues without flooding production output.
 
 **GUID generation platform coverage** — the current fallback paths keep unsupported targets
 building, but they are not production target support. For each supported OS, provide real
