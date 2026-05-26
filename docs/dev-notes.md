@@ -37,3 +37,8 @@ is required. The `zig-pkg/` directory (gitignored) holds any manually pre-fetche
 
 Output goes into the Zig build cache (not checked in). Run `zig build gen-only` to inspect
 generated output without running the full compilation.
+
+`idl/rtps_discovery.idl` is a derived zidl schema for RTPS discovery ParameterList
+records, not a verbatim OMG IDL file. Keep its primitive wire types aligned with RTPS
+2.5 §9.3.2: RTPS `Duration_t` is `seconds + fraction` (`fraction / 2^32` seconds),
+not DDS `sec + nanosec`.

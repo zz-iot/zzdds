@@ -42,6 +42,13 @@ only. No DCPS or SEDP callbacks fire unless the participant was previously expir
 (`is_new = true` after lease expiry). This prevents history replay churn from
 re-announcements during normal operation.
 
+**RTPS ParameterList durations are RTPS durations, not DDS durations.**
+DDS `Duration_t` is `sec + nanosec`, but RTPS 2.5 ParameterList duration values are
+`seconds + fraction`, where `fraction` is in units of `1/2^32` seconds. SPDP/SEDP
+decode wire durations as `RtpsDuration`, then convert to DDS `Duration` before lease
+or QoS logic. Omitted `PID_DEADLINE` means DDS default infinite; explicit `{0,0}` means
+RTPS `DURATION_ZERO` and is not normalized to infinite.
+
 **BEST_EFFORT replay-on-new-proxy: not implemented.**
 Interop tests use RELIABLE — the correct tool for guaranteed delivery. If BEST_EFFORT
 replay is ever added, it should be an explicit policy choice, not a default behavior.
@@ -121,9 +128,8 @@ Config file search: `$ZZDDS_CONFIG` → `./zzdds.toml` → `~/.config/zzdds/conf
 **GUID prefix strategy: `.random` default, `.host_based` optional.**
 `.random`: 12 OS-entropy bytes on supported platforms, with a clock/counter fallback on
 unsupported targets. `.host_based`: process start timestamp + PID + counter — useful for
-Wireshark correlation and deterministic tests. The current generator does not force the
-first two GUID-prefix bytes to match the RTPS `VendorId`; vendor-byte cleanup is tracked
-in `docs/implementation_status.md` and `docs/roadmap.md`.
+Wireshark correlation and deterministic tests. Both paths embed `ZZDDS_VENDOR_ID` into
+`guidPrefix[0..2]` (RTPS §9.3.1.5); see `src/util/guid_gen.zig`.
 
 ---
 

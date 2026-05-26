@@ -135,9 +135,20 @@ fn readString(b: []const u8, le: bool) []const u8 {
     const end = 4 + slen - 1; // strip null
     return b[4..end];
 }
-fn readDuration(b: []const u8, le: bool) time_mod.Duration {
+fn readDeadlineDuration(b: []const u8, le: bool) time_mod.Duration {
     if (b.len < 8) return time_mod.Duration.infinite;
-    return .{ .sec = readI32LE(b[0..], le), .nanosec = readU32LE(b[4..], le) };
+    const wire = time_mod.RtpsDuration{ .seconds = readI32LE(b[0..], le), .fraction = readU32LE(b[4..], le) };
+    return wire.toDuration();
+}
+
+fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
+    const wire = time_mod.RtpsDuration.fromDuration(duration);
+    try writeI32Le(alloc, buf, wire.seconds);
+    try writeU32Le(alloc, buf, wire.fraction);
+}
+
+fn snapshotDeadlineDuration(qos: QosSnapshot) time_mod.Duration {
+    return .{ .sec = qos.deadline_sec, .nanosec = qos.deadline_nanosec };
 }
 
 // ── DiscoveredWriterData encoding ─────────────────────────────────────────────
@@ -188,16 +199,14 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     // PID_RELIABILITY is 12 bytes: kind (4) + max_blocking_time Duration_t (8).
     try writePidHdr(alloc, &buf, PidTable.RELIABILITY, 12);
     try writeU32Le(alloc, &buf, @as(u32, ann.qos.reliability_kind) + 1);
-    try writeI32Le(alloc, &buf, 0); // max_blocking_time.sec = 0
-    try writeU32Le(alloc, &buf, 0); // max_blocking_time.nanosec = 0
+    try writeRtpsDuration(alloc, &buf, time_mod.Duration.zero); // max_blocking_time
     try writePidHdr(alloc, &buf, PidTable.DURABILITY, 4);
     try writeU32Le(alloc, &buf, ann.qos.durability_kind);
     // PID_DEADLINE: only emitted when not INFINITE; omitting INFINITE avoids
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeI32Le(alloc, &buf, ann.qos.deadline_sec);
-        try writeU32Le(alloc, &buf, ann.qos.deadline_nanosec);
+        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
     // Cyclone and OpenDDS use different on-wire representations for Duration_t
@@ -290,8 +299,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // PID_RELIABILITY is 12 bytes: kind (4) + max_blocking_time Duration_t (8).
     try writePidHdr(alloc, &buf, PidTable.RELIABILITY, 12);
     try writeU32Le(alloc, &buf, @as(u32, ann.qos.reliability_kind) + 1);
-    try writeI32Le(alloc, &buf, 0); // max_blocking_time.sec = 0
-    try writeU32Le(alloc, &buf, 0); // max_blocking_time.nanosec = 0
+    try writeRtpsDuration(alloc, &buf, time_mod.Duration.zero); // max_blocking_time
     try writePidHdr(alloc, &buf, PidTable.DURABILITY, 4);
     try writeU32Le(alloc, &buf, ann.qos.durability_kind);
     try writePidHdr(alloc, &buf, PidTable.OWNERSHIP, 4);
@@ -312,8 +320,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeI32Le(alloc, &buf, ann.qos.deadline_sec);
-        try writeU32Le(alloc, &buf, ann.qos.deadline_nanosec);
+        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
 
@@ -422,7 +429,7 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
             },
             PidTable.DEADLINE => {
                 if (v.len >= 8) {
-                    const dur = readDuration(v, le);
+                    const dur = readDeadlineDuration(v, le);
                     qos.deadline_sec = dur.sec;
                     qos.deadline_nanosec = dur.nanosec;
                 }
@@ -1022,4 +1029,24 @@ fn makeCacheChange(
         .key_hash = std.mem.zeroes([16]u8),
         .data = @constCast(data),
     };
+}
+
+test "readDeadlineDuration preserves explicit zero QoS duration" {
+    const bytes = [_]u8{0} ** 8;
+    try std.testing.expectEqual(time_mod.Duration.zero, readDeadlineDuration(&bytes, true));
+}
+
+test "readDeadlineDuration normalizes max-fraction QoS duration to DDS infinite" {
+    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff };
+    try std.testing.expect(readDeadlineDuration(&bytes, true).isInfinite());
+}
+
+test "readDeadlineDuration preserves finite QoS duration" {
+    const wire = time_mod.RtpsDuration.fromDuration(.{ .sec = 3, .nanosec = 1_000_000 });
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(i32, bytes[0..4], wire.seconds, .little);
+    std.mem.writeInt(u32, bytes[4..8], wire.fraction, .little);
+    const dur = readDeadlineDuration(&bytes, true);
+    try std.testing.expectEqual(@as(i32, 3), dur.sec);
+    try std.testing.expect(dur.nanosec >= 999_999 and dur.nanosec <= 1_000_000);
 }

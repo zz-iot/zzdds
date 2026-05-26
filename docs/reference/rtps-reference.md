@@ -93,6 +93,18 @@ defined in source but not set because the WLP endpoint is not instantiated.
 
 ## §9.6.3.2 — Discovery Type IDL
 
+RTPS 2.5 defines logical discovery data types, then maps their serialized form to
+ParameterList records. The checked-in `idl/rtps_discovery.idl` is a project-local
+derived schema for zidl PL_CDR generation; it is not copied normative IDL. The
+normative pieces to keep aligned are the RTPS primitive types, PID values, and
+PID-to-field mappings in §9.3.2 and §9.6.3.2.
+
+Important duration distinction:
+- DDS/DCPS `Duration_t` is `sec + nanosec`; DDS infinite is `{0x7fffffff, 0x7fffffff}`.
+- RTPS wire `Duration_t` is `seconds + fraction`, where `fraction` is in units of `1/2^32` seconds; RTPS infinite is `{0x7fffffff, 0xffffffff}`.
+- `PID_DEADLINE`, `PID_PARTICIPANT_LEASE_DURATION`, and other RTPS ParameterList duration values use the RTPS wire representation. Convert to DDS duration semantics before QoS matching.
+- If `PID_DEADLINE` is omitted, DDS default deadline is infinite. If it is explicitly present as `{0,0}`, that is RTPS `DURATION_ZERO`, not infinite.
+
 ### SPDPdiscoveredParticipantData
 
 ```idl
@@ -176,23 +188,23 @@ Discovery data is serialized as a **ParameterList** (PL_CDR_LE encoding): a sequ
 |--------|-----------------------------------|-------------------------------------------------|
 | 0x0000 | PID_PAD                           | Padding                                         |
 | 0x0001 | PID_SENTINEL                      | End of ParameterList; length = 0                |
-| 0x0002 | PID_PARTICIPANT_LEASE_DURATION    | Duration_t                                      |
-| 0x0004 | PID_TIME_BASED_FILTER             | Duration_t                                      |
+| 0x0002 | PID_PARTICIPANT_LEASE_DURATION    | RTPS Duration_t (`seconds` + `fraction`)        |
+| 0x0004 | PID_TIME_BASED_FILTER             | RTPS Duration_t (`seconds` + `fraction`)        |
 | 0x0005 | PID_TOPIC_NAME                    | string                                          |
 | 0x0006 | PID_OWNERSHIP_STRENGTH            | i32                                             |
 | 0x0007 | PID_TYPE_NAME                     | string                                          |
 | 0x0015 | PID_PROTOCOL_VERSION              | ProtocolVersion_t (2 bytes + 2 pad)             |
 | 0x0016 | PID_VENDORID                      | VendorId_t (2 bytes + 2 pad)                    |
 | 0x001A | PID_RELIABILITY                   | ReliabilityQosPolicyKind + max_blocking_time    |
-| 0x001B | PID_LIVELINESS                    | LivelinessQosPolicyKind + Duration_t            |
+| 0x001B | PID_LIVELINESS                    | LivelinessQosPolicyKind + RTPS Duration_t       |
 | 0x001D | PID_DURABILITY                    | DurabilityQosPolicyKind                         |
 | 0x001E | PID_DURABILITY_SERVICE            | DurabilityServiceQosPolicy                      |
 | 0x001F | PID_OWNERSHIP                     | OwnershipQosPolicyKind                          |
 | 0x0021 | PID_PRESENTATION                  | PresentationQosPolicy                           |
-| 0x0023 | PID_DEADLINE                      | Duration_t                                      |
+| 0x0023 | PID_DEADLINE                      | DeadlineQosPolicy / RTPS Duration_t             |
 | 0x0025 | PID_DESTINATION_ORDER             | DestinationOrderQosPolicyKind                   |
-| 0x0027 | PID_LATENCY_BUDGET                | Duration_t                                      |
-| 0x002B | PID_LIFESPAN                      | Duration_t                                      |
+| 0x0027 | PID_LATENCY_BUDGET                | RTPS Duration_t (`seconds` + `fraction`)        |
+| 0x002B | PID_LIFESPAN                      | RTPS Duration_t (`seconds` + `fraction`)        |
 | 0x002C | PID_USER_DATA                     | OctetSeq                                        |
 | 0x002E | PID_TOPIC_DATA                    | OctetSeq                                        |
 | 0x002F | PID_UNICAST_LOCATOR               | Locator_t                                       |
@@ -486,6 +498,7 @@ bit 1 = I (Invalidate): 1=timestamp is invalid (no timestamp field present)
 | VendorId_t           | 2            | [2]u8                                    |
 | RtpsTimestamp        | 8            | u32 seconds + u32 fraction (1/2^32 s)    |
 | Duration_t (DCPS)    | 8            | i32 sec + u32 nanosec                    |
+| RtpsDuration         | 8            | i32 seconds + u32 fraction (1/2^32 s)    |
 | BuiltinEndpointSet_t | 4            | u32 bitmask                              |
 | StatusInfo_t         | 4            | u32 flags                                |
 | Header               | 20           | PROTOCOL_ID[4] + version[2] + vendor[2] + prefix[12] |

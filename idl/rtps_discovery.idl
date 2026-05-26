@@ -1,6 +1,8 @@
-// IDL for RTPS 2.5 built-in discovery types.
+// Derived IDL for RTPS 2.5 built-in discovery ParameterList data.
 //
-// Source: RTPS 2.5 §8.5 / §9.6.2, Table 9.14.
+// Source: RTPS 2.5 §8.5 / §9.3.2 / §9.6.2 / Tables 9.18-9.19.
+// This is not copied normative IDL. It expresses the spec's ParameterList
+// mapping using zidl @id annotations so generated code can read/write PL_CDR.
 //
 // ── Wire encoding note ──────────────────────────────────────────────────────
 // These types are serialized using PL_CDR (Parameter List CDR) as described
@@ -33,8 +35,8 @@
     octet         address[16];
 };
 
-// DDS Duration_t (sec + nanosec)
-@final struct Duration_t { long sec; unsigned long nanosec; };
+// RTPS Duration_t (§9.3.2): fraction is in units of 1/2^32 seconds.
+@final struct Duration_t { long seconds; unsigned long fraction; };
 
 // ── SPDPdiscoveredParticipantData (§8.5.3.2, §9.6.2.1) ─────────────────────
 //

@@ -1,6 +1,6 @@
 //! Time and duration types.
 //!
-//! Two representations are used:
+//! Three representations are used:
 //!
 //!   Time_t / Duration_t  — DDS DCPS §2.2.1 (sec: i32, nanosec: u32).
 //!                          Used in QoS policies and the DCPS API.
@@ -8,6 +8,9 @@
 //!   RtpsTimestamp        — RTPS 2.5 §9.3.2 (seconds: u32, fraction: u32).
 //!                          Fraction is 1/2^32 seconds (not nanoseconds!).
 //!                          Used in INFO_TS submessages.
+//!
+//!   RtpsDuration         — RTPS 2.5 §9.3.2 (seconds: i32, fraction: u32).
+//!                          Used by RTPS ParameterList Duration_t values.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -132,6 +135,48 @@ pub const RtpsTimestamp = extern struct {
     /// Current wall-clock time as an RTPS Timestamp.
     pub fn now() RtpsTimestamp {
         return fromTime(Time.now());
+    }
+};
+
+/// RTPS Duration_t (RTPS §9.3.2).
+/// seconds: signed seconds.
+/// fraction: sub-second duration, units of 1/2^32 seconds (NOT nanoseconds).
+pub const RtpsDuration = extern struct {
+    seconds: i32,
+    fraction: u32,
+
+    /// RTPS §9.3.2: DURATION_ZERO
+    pub const zero: RtpsDuration = .{ .seconds = 0, .fraction = 0 };
+    /// RTPS §9.3.2: DURATION_INFINITE
+    pub const infinite: RtpsDuration = .{ .seconds = 0x7fff_ffff, .fraction = 0xffff_ffff };
+
+    pub fn isInfinite(self: RtpsDuration) bool {
+        return self.seconds == infinite.seconds and self.fraction == infinite.fraction;
+    }
+
+    /// Convert a DDS/DCPS Duration to an RTPS wire Duration.
+    pub fn fromDuration(d: Duration) RtpsDuration {
+        if (d.isInfinite()) return infinite;
+        const frac: u64 = @as(u64, d.nanosec) * 0x1_0000_0000 / std.time.ns_per_s;
+        return .{
+            .seconds = d.sec,
+            .fraction = @intCast(frac),
+        };
+    }
+
+    /// Convert an RTPS wire Duration to a DDS/DCPS Duration.
+    pub fn toDuration(self: RtpsDuration) Duration {
+        if (self.isInfinite()) return Duration.infinite;
+        var sec = self.seconds;
+        var ns: u32 = @intCast((@as(u64, self.fraction) * std.time.ns_per_s + 0x8000_0000) / 0x1_0000_0000);
+        if (ns == std.time.ns_per_s) {
+            sec += 1;
+            ns = 0;
+        }
+        return .{
+            .sec = sec,
+            .nanosec = ns,
+        };
     }
 };
 
@@ -384,6 +429,26 @@ test "RtpsTimestamp.fromTime round-trip approximate" {
     try std.testing.expectEqual(t.sec, t2.sec);
     // Fraction conversion loses < 1ns; accept up to 1ns error.
     const diff: i64 = @as(i64, t.nanosec) - @as(i64, t2.nanosec);
+    try std.testing.expect(diff >= -1 and diff <= 1);
+}
+
+test "RtpsDuration size is 8 bytes" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(RtpsDuration));
+}
+
+test "RtpsDuration infinite uses RTPS max fraction" {
+    const rt = RtpsDuration.fromDuration(Duration.infinite);
+    try std.testing.expectEqual(@as(i32, 0x7fff_ffff), rt.seconds);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), rt.fraction);
+    try std.testing.expect(rt.toDuration().isInfinite());
+}
+
+test "RtpsDuration fromDuration round-trip approximate" {
+    const d = Duration{ .sec = 3, .nanosec = 500_000_000 };
+    const rt = RtpsDuration.fromDuration(d);
+    const d2 = rt.toDuration();
+    try std.testing.expectEqual(d.sec, d2.sec);
+    const diff: i64 = @as(i64, d.nanosec) - @as(i64, d2.nanosec);
     try std.testing.expect(diff >= -1 and diff <= 1);
 }
 

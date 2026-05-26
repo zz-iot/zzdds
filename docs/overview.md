@@ -43,7 +43,7 @@ designed the way they are, not step-by-step implementation plans.
 build.zig, build.zig.zon
 idl/
   dcps.idl                # DDS v1.4 §2.3.3 normative IDL
-  rtps_discovery.idl      # SPDP/SEDP discovery types (PL_CDR serialization)
+  rtps_discovery.idl      # Derived RTPS discovery ParameterList schema for zidl PL_CDR
 src/
   root.zig, log.zig, trace.zig
   config/                 # Schema, TOML parser, config precedence resolver
