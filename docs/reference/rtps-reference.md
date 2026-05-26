@@ -201,7 +201,7 @@ Discovery data is serialized as a **ParameterList** (PL_CDR_LE encoding): a sequ
 | 0x001E | PID_DURABILITY_SERVICE            | DurabilityServiceQosPolicy                      |
 | 0x001F | PID_OWNERSHIP                     | OwnershipQosPolicyKind                          |
 | 0x0021 | PID_PRESENTATION                  | PresentationQosPolicy                           |
-| 0x0023 | PID_DEADLINE                      | DeadlineQosPolicy / RTPS Duration_t             |
+| 0x0023 | PID_DEADLINE                      | RTPS Duration_t (`seconds` + `fraction`)        |
 | 0x0025 | PID_DESTINATION_ORDER             | DestinationOrderQosPolicyKind                   |
 | 0x0027 | PID_LATENCY_BUDGET                | RTPS Duration_t (`seconds` + `fraction`)        |
 | 0x002B | PID_LIFESPAN                      | RTPS Duration_t (`seconds` + `fraction`)        |

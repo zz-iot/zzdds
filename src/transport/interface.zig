@@ -144,7 +144,7 @@ pub const Locator = union(enum) {
     pub fn isInvalidOrReserved(self: Locator) bool {
         return switch (self) {
             .invalid => true,
-            .custom => |c| c.kind == LocatorKind.invalid or c.kind == LocatorKind.reserved,
+            .custom => |c| c.kind == LocatorKind.reserved,
             else => false,
         };
     }

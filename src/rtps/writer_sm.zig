@@ -741,6 +741,7 @@ pub const StatefulWriter = struct {
                 }, ch.data);
                 for (locs) |loc| {
                     sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                        // SEDP already filtered proxy locators to those canReach(); this is defence-in-depth.
                         error.UnsupportedLocatorKind => {},
                         else => log.rtps.warn("StatefulWriter.write: send error: {}", .{err}),
                     };
@@ -793,7 +794,7 @@ pub const StatefulWriter = struct {
                 .data_size = data_size,
             }, ch.data[offset..][0..this_len]);
             for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
-                error.UnsupportedLocatorKind => {},
+                error.UnsupportedLocatorKind => {}, // same defence-in-depth as DATA path above
                 else => log.rtps.warn("StatefulWriter: DATA_FRAG {}/{} send error: {}", .{ frag_num, num_frags, err }),
             };
         }

@@ -178,6 +178,15 @@ pub const RtpsDuration = extern struct {
             .nanosec = ns,
         };
     }
+
+    /// Append the RTPS wire encoding (seconds LE i32, fraction LE u32) to buf.
+    pub fn appendLE(self: RtpsDuration, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+        var tmp: [4]u8 = undefined;
+        std.mem.writeInt(i32, &tmp, self.seconds, .little);
+        try buf.appendSlice(alloc, &tmp);
+        std.mem.writeInt(u32, &tmp, self.fraction, .little);
+        try buf.appendSlice(alloc, &tmp);
+    }
 };
 
 // ── Monotonic / boottime helpers ──────────────────────────────────────────────

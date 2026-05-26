@@ -142,9 +142,7 @@ fn readDeadlineDuration(b: []const u8, le: bool) time_mod.Duration {
 }
 
 fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
-    const wire = time_mod.RtpsDuration.fromDuration(duration);
-    try writeI32Le(alloc, buf, wire.seconds);
-    try writeU32Le(alloc, buf, wire.fraction);
+    try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
 }
 
 fn snapshotDeadlineDuration(qos: QosSnapshot) time_mod.Duration {
@@ -993,29 +991,10 @@ pub const SedpEndpoints = struct {
     }
 
     fn filterReachableLocators(self: *Self, locators: []const Locator, context: []const u8) []Locator {
-        var out: std.ArrayList(Locator) = .empty;
-        for (locators) |loc| {
-            if (loc.isInvalidOrReserved()) continue;
-            if (self.transport.canReach(&loc)) {
-                out.append(self.alloc, loc) catch {
-                    out.deinit(self.alloc);
-                    return &.{};
-                };
-                continue;
-            }
-            // Unknown custom locators are opaque extension/vendor locators.
-            // If no configured transport claims them, ignore them without
-            // promoting them into endpoint proxies.
-            if (loc.isOpaqueCustom()) continue;
-            self.warnUnsupportedLocatorOnce(loc, context);
-        }
-        return out.toOwnedSlice(self.alloc) catch {
-            out.deinit(self.alloc);
-            return &.{};
-        };
+        return iface.filterReachableLocators(self.alloc, locators, self.transport, context, self);
     }
 
-    fn warnUnsupportedLocatorOnce(self: *Self, loc: Locator, context: []const u8) void {
+    pub fn warnUnsupportedLocatorOnce(self: *Self, loc: Locator, context: []const u8) void {
         const kind = loc.wireKind();
         self.unsupported_locator_mu.lock();
         defer self.unsupported_locator_mu.unlock();
@@ -1103,5 +1082,6 @@ test "readDeadlineDuration preserves finite QoS duration" {
     std.mem.writeInt(u32, bytes[4..8], wire.fraction, .little);
     const dur = readDeadlineDuration(&bytes, true);
     try std.testing.expectEqual(@as(i32, 3), dur.sec);
+    // 2^32-fraction can't represent 1ms exactly; round-trip is within 1 ns.
     try std.testing.expect(dur.nanosec >= 999_999 and dur.nanosec <= 1_000_000);
 }

@@ -387,29 +387,10 @@ pub const SpdpEndpoints = struct {
     }
 
     fn filterReachableLocators(self: *Self, locators: []const Locator, context: []const u8) []Locator {
-        var out: std.ArrayList(Locator) = .empty;
-        for (locators) |loc| {
-            if (loc.isInvalidOrReserved()) continue;
-            if (self.transport.canReach(&loc)) {
-                out.append(self.alloc, loc) catch {
-                    out.deinit(self.alloc);
-                    return &.{};
-                };
-                continue;
-            }
-            // Unknown custom locators are opaque extension/vendor locators.
-            // If no configured transport claims them, ignore them without
-            // promoting them into participant or endpoint locator lists.
-            if (loc.isOpaqueCustom()) continue;
-            self.warnUnsupportedLocatorOnce(loc, context);
-        }
-        return out.toOwnedSlice(self.alloc) catch {
-            out.deinit(self.alloc);
-            return &.{};
-        };
+        return iface.filterReachableLocators(self.alloc, locators, self.transport, context, self);
     }
 
-    fn warnUnsupportedLocatorOnce(self: *Self, loc: Locator, context: []const u8) void {
+    pub fn warnUnsupportedLocatorOnce(self: *Self, loc: Locator, context: []const u8) void {
         const kind = loc.wireKind();
         self.unsupported_locator_mu.lock();
         defer self.unsupported_locator_mu.unlock();
@@ -723,9 +704,7 @@ fn writeLocator(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), loc: Locator)
 }
 
 fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
-    const wire = time_mod.RtpsDuration.fromDuration(duration);
-    try writeI32Le(alloc, buf, wire.seconds);
-    try writeU32Le(alloc, buf, wire.fraction);
+    try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
 }
 
 // ── PL-CDR read helpers ───────────────────────────────────────────────────────
