@@ -369,14 +369,12 @@ jobs:
   # pexpect sees as EOF; the test is marked failed and the TSAN report is embedded
   # in the JUnit failure message, surfaced by check_interop_results.py.
   #
-  # continue-on-error: true — TSan failures are high priority but don't gate PRs.
   # Gated on self-interop-tsan, which itself must pass first.
 
   vendor-interop-tsan:
     name: "TSan: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
     needs: [setup-matrix, self-interop-tsan]
     runs-on: ubuntu-22.04
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
