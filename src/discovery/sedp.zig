@@ -135,9 +135,14 @@ fn readString(b: []const u8, le: bool) []const u8 {
     const end = 4 + slen - 1; // strip null
     return b[4..end];
 }
-fn readDuration(b: []const u8, le: bool) time_mod.Duration {
+fn readDeadlineDuration(b: []const u8, le: bool) time_mod.Duration {
     if (b.len < 8) return time_mod.Duration.infinite;
-    return .{ .sec = readI32LE(b[0..], le), .nanosec = readU32LE(b[4..], le) };
+    const dur = time_mod.Duration{ .sec = readI32LE(b[0..], le), .nanosec = readU32LE(b[4..], le) };
+    // Some generated/vendor bindings encode an unset Duration_t as {0,0}.
+    // DEADLINE's DDS default is infinite, so normalize that wire value before
+    // compatibility matching so default peers don't appear incompatible.
+    if (dur.sec == 0 and dur.nanosec == 0) return time_mod.Duration.infinite;
+    return dur;
 }
 
 // ── DiscoveredWriterData encoding ─────────────────────────────────────────────
@@ -422,7 +427,7 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
             },
             PidTable.DEADLINE => {
                 if (v.len >= 8) {
-                    const dur = readDuration(v, le);
+                    const dur = readDeadlineDuration(v, le);
                     qos.deadline_sec = dur.sec;
                     qos.deadline_nanosec = dur.nanosec;
                 }
@@ -1022,4 +1027,16 @@ fn makeCacheChange(
         .key_hash = std.mem.zeroes([16]u8),
         .data = @constCast(data),
     };
+}
+
+test "readDeadlineDuration normalizes zero QoS duration to DDS infinite" {
+    const bytes = [_]u8{0} ** 8;
+    try std.testing.expect(readDeadlineDuration(&bytes, true).isInfinite());
+}
+
+test "readDeadlineDuration preserves finite QoS duration" {
+    const bytes = [_]u8{ 0x03, 0, 0, 0, 0x40, 0x42, 0x0f, 0 };
+    const dur = readDeadlineDuration(&bytes, true);
+    try std.testing.expectEqual(@as(i32, 3), dur.sec);
+    try std.testing.expectEqual(@as(u32, 1_000_000), dur.nanosec);
 }
