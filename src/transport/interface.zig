@@ -119,6 +119,36 @@ pub const Locator = union(enum) {
         return std.meta.eql(a, b);
     }
 
+    /// Return the RTPS wire locator kind represented by this locator.
+    pub fn wireKind(self: Locator) i32 {
+        return switch (self) {
+            .invalid => LocatorKind.invalid,
+            .udp_v4 => LocatorKind.udp_v4,
+            .udp_v6 => LocatorKind.udp_v6,
+            .shmem => LocatorKind.shmem,
+            .shmem_zc => LocatorKind.shmem_zc,
+            .custom => |c| c.kind,
+        };
+    }
+
+    /// Opaque custom locators are preserved only when an active transport
+    /// explicitly claims them. Otherwise they are assumed to be foreign
+    /// vendor-specific locators and are ignored.
+    pub fn isOpaqueCustom(self: Locator) bool {
+        return switch (self) {
+            .custom => true,
+            else => false,
+        };
+    }
+
+    pub fn isInvalidOrReserved(self: Locator) bool {
+        return switch (self) {
+            .invalid => true,
+            .custom => |c| c.kind == LocatorKind.invalid or c.kind == LocatorKind.reserved,
+            else => false,
+        };
+    }
+
     /// Encode to the RTPS wire format. Call only at the RTPS message boundary.
     pub fn toRtpsWire(self: Locator) LocatorWire {
         return switch (self) {

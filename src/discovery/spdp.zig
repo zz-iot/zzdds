@@ -86,6 +86,8 @@ pub const SpdpEndpoints = struct {
     // Known remote participants (protected by mu)
     mu: Mutex,
     known: std.AutoHashMap(GuidPrefix, KnownParticipant),
+    unsupported_locator_mu: Mutex,
+    unsupported_locator_kinds: std.AutoHashMap(i32, void),
 
     // Timer thread
     timer_thread: ?std.Thread,
@@ -139,6 +141,8 @@ pub const SpdpEndpoints = struct {
             }),
             .mu = .{},
             .known = std.AutoHashMap(GuidPrefix, KnownParticipant).init(alloc),
+            .unsupported_locator_mu = .{},
+            .unsupported_locator_kinds = std.AutoHashMap(i32, void).init(alloc),
             .timer_thread = null,
             .shutdown = std.atomic.Value(bool).init(false),
             .announcement_period_ms = announcement_period_ms,
@@ -160,6 +164,9 @@ pub const SpdpEndpoints = struct {
         var it = self.known.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit();
         self.known.deinit();
+        self.unsupported_locator_mu.lock();
+        self.unsupported_locator_kinds.deinit();
+        self.unsupported_locator_mu.unlock();
         self.alloc.destroy(self);
     }
 
@@ -321,6 +328,7 @@ pub const SpdpEndpoints = struct {
             log.spdp.warn("spdp: decode error: {}", .{err});
             return;
         };
+        self.filterKnownParticipantLocators(&kp);
         kp.expires_ns = self.clock.nowNs() +
             @as(i64, @intCast(kp.data.lease_duration_ms)) * std.time.ns_per_ms;
 
@@ -357,6 +365,61 @@ pub const SpdpEndpoints = struct {
             }
             const until_ns = self.clock.nowNs() + 2 * @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
             self.fast_announce_until_ns.store(until_ns, .release);
+        }
+    }
+
+    fn filterKnownParticipantLocators(self: *Self, kp: *KnownParticipant) void {
+        const old_meta_uc = kp.data.metatraffic_unicast_locators;
+        kp.data.metatraffic_unicast_locators = self.filterReachableLocators(old_meta_uc, "metatraffic unicast");
+        self.alloc.free(old_meta_uc);
+
+        const old_meta_mc = kp.data.metatraffic_multicast_locators;
+        kp.data.metatraffic_multicast_locators = self.filterReachableLocators(old_meta_mc, "metatraffic multicast");
+        self.alloc.free(old_meta_mc);
+
+        const old_data_uc = kp.data.default_unicast_locators;
+        kp.data.default_unicast_locators = self.filterReachableLocators(old_data_uc, "default unicast");
+        self.alloc.free(old_data_uc);
+
+        const old_data_mc = kp.data.default_multicast_locators;
+        kp.data.default_multicast_locators = self.filterReachableLocators(old_data_mc, "default multicast");
+        self.alloc.free(old_data_mc);
+    }
+
+    fn filterReachableLocators(self: *Self, locators: []const Locator, context: []const u8) []Locator {
+        var out: std.ArrayList(Locator) = .empty;
+        for (locators) |loc| {
+            if (loc.isInvalidOrReserved()) continue;
+            if (self.transport.canReach(&loc)) {
+                out.append(self.alloc, loc) catch {
+                    out.deinit(self.alloc);
+                    return &.{};
+                };
+                continue;
+            }
+            // Unknown custom locators are opaque extension/vendor locators.
+            // If no configured transport claims them, ignore them without
+            // promoting them into participant or endpoint locator lists.
+            if (loc.isOpaqueCustom()) continue;
+            self.warnUnsupportedLocatorOnce(loc, context);
+        }
+        return out.toOwnedSlice(self.alloc) catch {
+            out.deinit(self.alloc);
+            return &.{};
+        };
+    }
+
+    fn warnUnsupportedLocatorOnce(self: *Self, loc: Locator, context: []const u8) void {
+        const kind = loc.wireKind();
+        self.unsupported_locator_mu.lock();
+        defer self.unsupported_locator_mu.unlock();
+        const gop = self.unsupported_locator_kinds.getOrPut(kind) catch return;
+        if (!gop.found_existing) {
+            log.spdp.warn("spdp: ignoring unsupported {s} locator kind={d}/0x{x}", .{
+                context,
+                kind,
+                @as(u32, @bitCast(kind)),
+            });
         }
     }
 

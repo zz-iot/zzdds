@@ -84,6 +84,37 @@ test "Locator round-trips through LocatorWire (udp4)" {
     try std.testing.expect(orig.eql(back));
 }
 
+test "LocatorWire preserves unknown locator kinds as custom" {
+    const wire = LocatorWire{
+        .kind = 0x4000_0001,
+        .port = 7411,
+        .address = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 192, 168, 1, 5 },
+    };
+    const loc = wire.toLocator();
+
+    try std.testing.expect(loc == .custom);
+    try std.testing.expectEqual(@as(i32, 0x4000_0001), loc.wireKind());
+    try std.testing.expect(loc.isOpaqueCustom());
+    try std.testing.expect(!loc.isInvalidOrReserved());
+    try std.testing.expectEqual(wire, loc.toRtpsWire());
+}
+
+test "Locator reserved and invalid classification" {
+    const invalid: Locator = .invalid;
+    try std.testing.expect(invalid.isInvalidOrReserved());
+    try std.testing.expect(!invalid.isOpaqueCustom());
+
+    const reserved = (LocatorWire{
+        .kind = LocatorKind.reserved,
+        .port = 0,
+        .address = std.mem.zeroes([16]u8),
+    }).toLocator();
+    try std.testing.expect(reserved == .custom);
+    try std.testing.expect(reserved.isOpaqueCustom());
+    try std.testing.expect(reserved.isInvalidOrReserved());
+    try std.testing.expectEqual(LocatorKind.reserved, reserved.wireKind());
+}
+
 test "spdpMulticastLocator domain 0 → 239.255.0.1" {
     const loc = spdpMulticastLocator(.{ 239, 255, 0 }, 0, 7400);
     try std.testing.expectEqual([4]u8{ 239, 255, 0, 1 }, loc.udp_v4.addr);
