@@ -86,6 +86,8 @@ pub const SpdpEndpoints = struct {
     // Known remote participants (protected by mu)
     mu: Mutex,
     known: std.AutoHashMap(GuidPrefix, KnownParticipant),
+    unsupported_locator_mu: Mutex,
+    unsupported_locator_kinds: std.AutoHashMap(i32, void),
 
     // Timer thread
     timer_thread: ?std.Thread,
@@ -139,6 +141,8 @@ pub const SpdpEndpoints = struct {
             }),
             .mu = .{},
             .known = std.AutoHashMap(GuidPrefix, KnownParticipant).init(alloc),
+            .unsupported_locator_mu = .{},
+            .unsupported_locator_kinds = std.AutoHashMap(i32, void).init(alloc),
             .timer_thread = null,
             .shutdown = std.atomic.Value(bool).init(false),
             .announcement_period_ms = announcement_period_ms,
@@ -160,6 +164,9 @@ pub const SpdpEndpoints = struct {
         var it = self.known.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit();
         self.known.deinit();
+        self.unsupported_locator_mu.lock();
+        self.unsupported_locator_kinds.deinit();
+        self.unsupported_locator_mu.unlock();
         self.alloc.destroy(self);
     }
 
@@ -321,6 +328,7 @@ pub const SpdpEndpoints = struct {
             log.spdp.warn("spdp: decode error: {}", .{err});
             return;
         };
+        self.filterKnownParticipantLocators(&kp);
         kp.expires_ns = self.clock.nowNs() +
             @as(i64, @intCast(kp.data.lease_duration_ms)) * std.time.ns_per_ms;
 
@@ -357,6 +365,42 @@ pub const SpdpEndpoints = struct {
             }
             const until_ns = self.clock.nowNs() + 2 * @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
             self.fast_announce_until_ns.store(until_ns, .release);
+        }
+    }
+
+    fn filterKnownParticipantLocators(self: *Self, kp: *KnownParticipant) void {
+        const old_meta_uc = kp.data.metatraffic_unicast_locators;
+        kp.data.metatraffic_unicast_locators = self.filterReachableLocators(old_meta_uc, "metatraffic unicast");
+        self.alloc.free(old_meta_uc);
+
+        const old_meta_mc = kp.data.metatraffic_multicast_locators;
+        kp.data.metatraffic_multicast_locators = self.filterReachableLocators(old_meta_mc, "metatraffic multicast");
+        self.alloc.free(old_meta_mc);
+
+        const old_data_uc = kp.data.default_unicast_locators;
+        kp.data.default_unicast_locators = self.filterReachableLocators(old_data_uc, "default unicast");
+        self.alloc.free(old_data_uc);
+
+        const old_data_mc = kp.data.default_multicast_locators;
+        kp.data.default_multicast_locators = self.filterReachableLocators(old_data_mc, "default multicast");
+        self.alloc.free(old_data_mc);
+    }
+
+    fn filterReachableLocators(self: *Self, locators: []const Locator, context: []const u8) []Locator {
+        return iface.filterReachableLocators(self.alloc, locators, self.transport, context, self);
+    }
+
+    pub fn warnUnsupportedLocatorOnce(self: *Self, loc: Locator, context: []const u8) void {
+        const kind = loc.wireKind();
+        self.unsupported_locator_mu.lock();
+        defer self.unsupported_locator_mu.unlock();
+        const gop = self.unsupported_locator_kinds.getOrPut(kind) catch return;
+        if (!gop.found_existing) {
+            log.spdp.warn("spdp: ignoring unsupported {s} locator kind={d}/0x{x}", .{
+                context,
+                kind,
+                @as(u32, @bitCast(kind)),
+            });
         }
     }
 
@@ -476,12 +520,13 @@ fn encodeSpdpParticipant(alloc: std.mem.Allocator, ann: *const ParticipantAnnoun
     try writePidHdr(alloc, &buf, PidTable.BUILTIN_ENDPOINT_SET, 4);
     try writeU32Le(alloc, &buf, ann.builtin_endpoint_set);
 
-    // PID_PARTICIPANT_LEASE_DURATION (0x0002): Duration_t (sec i32, nanosec u32) = 8 bytes
+    // PID_PARTICIPANT_LEASE_DURATION (0x0002): RTPS Duration_t (seconds + fraction) = 8 bytes
     try writePidHdr(alloc, &buf, PidTable.PARTICIPANT_LEASE_DURATION, 8);
-    const lease_sec: i32 = @intCast(ann.lease_duration_ms / 1000);
-    const lease_ns: u32 = (ann.lease_duration_ms % 1000) * 1_000_000;
-    try writeI32Le(alloc, &buf, lease_sec);
-    try writeU32Le(alloc, &buf, lease_ns);
+    const lease = time_mod.Duration{
+        .sec = @intCast(ann.lease_duration_ms / 1000),
+        .nanosec = (ann.lease_duration_ms % 1000) * 1_000_000,
+    };
+    try writeRtpsDuration(alloc, &buf, lease);
 
     // Metatraffic unicast locators (one PID entry per locator)
     for (ann.metatraffic_unicast_locators) |loc| {
@@ -571,9 +616,12 @@ pub fn decodeSpdpParticipant(
             },
             PidTable.PARTICIPANT_LEASE_DURATION => {
                 if (v.len >= 8) {
-                    const sec = readI32LE(v[0..], le);
-                    const ns = readU32LE(v[4..], le);
-                    lease_ms = @as(u32, @intCast(@max(0, sec))) * 1000 + ns / 1_000_000;
+                    const lease = readRtpsDuration(v, le).toDuration();
+                    lease_ms = if (lease.isInfinite()) std.math.maxInt(u32) else blk: {
+                        const ns = lease.toNs() orelse break :blk std.math.maxInt(u32);
+                        if (ns <= 0) break :blk 0;
+                        break :blk @intCast(@min(@as(i64, std.math.maxInt(u32)), @divTrunc(ns, std.time.ns_per_ms)));
+                    };
                 }
             },
             PidTable.BUILTIN_ENDPOINT_SET => {
@@ -655,6 +703,10 @@ fn writeLocator(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), loc: Locator)
     try buf.appendSlice(alloc, &w.address);
 }
 
+fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
+    try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
+}
+
 // ── PL-CDR read helpers ───────────────────────────────────────────────────────
 
 fn readU16LE(buf: []const u8, le: bool) u16 {
@@ -667,6 +719,10 @@ fn readU32LE(buf: []const u8, le: bool) u32 {
 
 fn readI32LE(buf: []const u8, le: bool) i32 {
     return @bitCast(readU32LE(buf, le));
+}
+
+fn readRtpsDuration(buf: []const u8, le: bool) time_mod.RtpsDuration {
+    return .{ .seconds = readI32LE(buf[0..], le), .fraction = readU32LE(buf[4..], le) };
 }
 
 fn readLocator(buf: []const u8, le: bool) Locator {

@@ -18,6 +18,7 @@ const std = @import("std");
 const transport = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const Locator = transport.Locator;
+const Transport = transport.Transport;
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
@@ -208,3 +209,38 @@ pub const Discovery = struct {
         self.vtable.deinit(self.ctx);
     }
 };
+
+// ── Shared discovery utilities ────────────────────────────────────────────────
+
+/// Filter a locator slice to those reachable by tr, allocating a new slice.
+/// Silently drops opaque custom locators that no transport claims.
+/// Logs a once-per-kind warning for known-but-unreachable kinds via warn_self,
+/// which must implement warnUnsupportedLocatorOnce(self, Locator, []const u8).
+pub fn filterReachableLocators(
+    alloc: std.mem.Allocator,
+    locators: []const Locator,
+    tr: Transport,
+    context: []const u8,
+    warn_self: anytype,
+) []Locator {
+    var out: std.ArrayList(Locator) = .empty;
+    for (locators) |loc| {
+        if (loc.isInvalidOrReserved()) continue;
+        if (tr.canReach(&loc)) {
+            out.append(alloc, loc) catch {
+                out.deinit(alloc);
+                return &.{};
+            };
+            continue;
+        }
+        // Unknown custom locators are opaque extension/vendor locators.
+        // If no configured transport claims them, ignore them without
+        // promoting them into participant or endpoint locator lists.
+        if (loc.isOpaqueCustom()) continue;
+        warn_self.warnUnsupportedLocatorOnce(loc, context);
+    }
+    return out.toOwnedSlice(alloc) catch {
+        out.deinit(alloc);
+        return &.{};
+    };
+}

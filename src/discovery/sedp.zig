@@ -135,9 +135,18 @@ fn readString(b: []const u8, le: bool) []const u8 {
     const end = 4 + slen - 1; // strip null
     return b[4..end];
 }
-fn readDuration(b: []const u8, le: bool) time_mod.Duration {
+fn readDeadlineDuration(b: []const u8, le: bool) time_mod.Duration {
     if (b.len < 8) return time_mod.Duration.infinite;
-    return .{ .sec = readI32LE(b[0..], le), .nanosec = readU32LE(b[4..], le) };
+    const wire = time_mod.RtpsDuration{ .seconds = readI32LE(b[0..], le), .fraction = readU32LE(b[4..], le) };
+    return wire.toDuration();
+}
+
+fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
+    try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
+}
+
+fn snapshotDeadlineDuration(qos: QosSnapshot) time_mod.Duration {
+    return .{ .sec = qos.deadline_sec, .nanosec = qos.deadline_nanosec };
 }
 
 // ── DiscoveredWriterData encoding ─────────────────────────────────────────────
@@ -188,16 +197,14 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     // PID_RELIABILITY is 12 bytes: kind (4) + max_blocking_time Duration_t (8).
     try writePidHdr(alloc, &buf, PidTable.RELIABILITY, 12);
     try writeU32Le(alloc, &buf, @as(u32, ann.qos.reliability_kind) + 1);
-    try writeI32Le(alloc, &buf, 0); // max_blocking_time.sec = 0
-    try writeU32Le(alloc, &buf, 0); // max_blocking_time.nanosec = 0
+    try writeRtpsDuration(alloc, &buf, time_mod.Duration.zero); // max_blocking_time
     try writePidHdr(alloc, &buf, PidTable.DURABILITY, 4);
     try writeU32Le(alloc, &buf, ann.qos.durability_kind);
     // PID_DEADLINE: only emitted when not INFINITE; omitting INFINITE avoids
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeI32Le(alloc, &buf, ann.qos.deadline_sec);
-        try writeU32Le(alloc, &buf, ann.qos.deadline_nanosec);
+        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
     // Cyclone and OpenDDS use different on-wire representations for Duration_t
@@ -290,8 +297,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // PID_RELIABILITY is 12 bytes: kind (4) + max_blocking_time Duration_t (8).
     try writePidHdr(alloc, &buf, PidTable.RELIABILITY, 12);
     try writeU32Le(alloc, &buf, @as(u32, ann.qos.reliability_kind) + 1);
-    try writeI32Le(alloc, &buf, 0); // max_blocking_time.sec = 0
-    try writeU32Le(alloc, &buf, 0); // max_blocking_time.nanosec = 0
+    try writeRtpsDuration(alloc, &buf, time_mod.Duration.zero); // max_blocking_time
     try writePidHdr(alloc, &buf, PidTable.DURABILITY, 4);
     try writeU32Le(alloc, &buf, ann.qos.durability_kind);
     try writePidHdr(alloc, &buf, PidTable.OWNERSHIP, 4);
@@ -312,8 +318,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeI32Le(alloc, &buf, ann.qos.deadline_sec);
-        try writeU32Le(alloc, &buf, ann.qos.deadline_nanosec);
+        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
 
@@ -422,7 +427,7 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
             },
             PidTable.DEADLINE => {
                 if (v.len >= 8) {
-                    const dur = readDuration(v, le);
+                    const dur = readDeadlineDuration(v, le);
                     qos.deadline_sec = dur.sec;
                     qos.deadline_nanosec = dur.nanosec;
                 }
@@ -537,6 +542,8 @@ pub const SedpEndpoints = struct {
     // Cached default locators per participant (RTPS: endpoints inherit these
     // when DiscoveredWriter/ReaderData omits explicit locator PIDs).
     participant_locs: std.AutoHashMap(GuidPrefix, ParticipantLocators),
+    unsupported_locator_mu: Mutex,
+    unsupported_locator_kinds: std.AutoHashMap(i32, void),
 
     const Self = @This();
 
@@ -556,6 +563,8 @@ pub const SedpEndpoints = struct {
             .meta_unicast_port = 0,
             .local_prefix = GuidPrefix.unknown,
             .participant_locs = std.AutoHashMap(GuidPrefix, ParticipantLocators).init(alloc),
+            .unsupported_locator_mu = .{},
+            .unsupported_locator_kinds = std.AutoHashMap(i32, void).init(alloc),
             .spdp_relay_ctx = null,
             .spdp_relay_fn = null,
         };
@@ -572,6 +581,9 @@ pub const SedpEndpoints = struct {
         while (it.next()) |entry| entry.value_ptr.deinit();
         self.participant_locs.deinit();
         self.participant_locs_mu.unlock();
+        self.unsupported_locator_mu.lock();
+        self.unsupported_locator_kinds.deinit();
+        self.unsupported_locator_mu.unlock();
         self.alloc.destroy(self);
     }
 
@@ -684,8 +696,12 @@ pub const SedpEndpoints = struct {
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const eps = data.builtin_endpoint_set;
-        const uc = data.metatraffic_unicast_locators;
-        const mc = data.metatraffic_multicast_locators;
+        const uc = self.filterReachableLocators(data.metatraffic_unicast_locators, "metatraffic unicast");
+        defer self.alloc.free(uc);
+        const mc = self.filterReachableLocators(data.metatraffic_multicast_locators, "metatraffic multicast");
+        defer self.alloc.free(mc);
+        const data_uc = self.filterReachableLocators(data.default_unicast_locators, "default unicast");
+        const data_mc = self.filterReachableLocators(data.default_multicast_locators, "default multicast");
 
         // Cache the participant's default data locators so endpoints that omit
         // explicit locators in their SEDP announcement can fall back to them.
@@ -695,13 +711,15 @@ pub const SedpEndpoints = struct {
             self.participant_locs_mu.lock();
             const gop = self.participant_locs.getOrPut(data.guid.prefix) catch {
                 self.participant_locs_mu.unlock();
+                self.alloc.free(data_uc);
+                self.alloc.free(data_mc);
                 return;
             };
             if (gop.found_existing) gop.value_ptr.deinit();
             gop.value_ptr.* = .{
                 .alloc = self.alloc,
-                .unicast = self.alloc.dupe(Locator, data.default_unicast_locators) catch &.{},
-                .multicast = self.alloc.dupe(Locator, data.default_multicast_locators) catch &.{},
+                .unicast = data_uc,
+                .multicast = data_mc,
             };
             self.participant_locs_mu.unlock();
         }
@@ -921,19 +939,24 @@ pub const SedpEndpoints = struct {
         defer if (pl_uc_copy) |s| self.alloc.free(s);
         defer if (pl_mc_copy) |s| self.alloc.free(s);
 
-        const eff_uc: []const Locator = if (ep.unicast.len > 0)
-            ep.unicast
+        const ep_uc = self.filterReachableLocators(ep.unicast, "endpoint unicast");
+        defer self.alloc.free(ep_uc);
+        const ep_mc = self.filterReachableLocators(ep.multicast, "endpoint multicast");
+        defer self.alloc.free(ep_mc);
+
+        const eff_uc: []const Locator = if (ep_uc.len > 0)
+            ep_uc
         else if (pl_uc_copy) |s|
             s
         else
-            ep.unicast;
+            ep_uc;
 
-        const eff_mc: []const Locator = if (ep.multicast.len > 0)
-            ep.multicast
+        const eff_mc: []const Locator = if (ep_mc.len > 0)
+            ep_mc
         else if (pl_mc_copy) |s|
             s
         else
-            ep.multicast;
+            ep_mc;
 
         if (is_writer) {
             const wd = WriterData{
@@ -964,6 +987,24 @@ pub const SedpEndpoints = struct {
                 .multicast_locators = eff_mc,
             };
             cbs.on_reader_discovered(cbs.ctx, &rd);
+        }
+    }
+
+    fn filterReachableLocators(self: *Self, locators: []const Locator, context: []const u8) []Locator {
+        return iface.filterReachableLocators(self.alloc, locators, self.transport, context, self);
+    }
+
+    pub fn warnUnsupportedLocatorOnce(self: *Self, loc: Locator, context: []const u8) void {
+        const kind = loc.wireKind();
+        self.unsupported_locator_mu.lock();
+        defer self.unsupported_locator_mu.unlock();
+        const gop = self.unsupported_locator_kinds.getOrPut(kind) catch return;
+        if (!gop.found_existing) {
+            log.sedp.warn("sedp: ignoring unsupported {s} locator kind={d}/0x{x}", .{
+                context,
+                kind,
+                @as(u32, @bitCast(kind)),
+            });
         }
     }
 };
@@ -1022,4 +1063,25 @@ fn makeCacheChange(
         .key_hash = std.mem.zeroes([16]u8),
         .data = @constCast(data),
     };
+}
+
+test "readDeadlineDuration preserves explicit zero QoS duration" {
+    const bytes = [_]u8{0} ** 8;
+    try std.testing.expectEqual(time_mod.Duration.zero, readDeadlineDuration(&bytes, true));
+}
+
+test "readDeadlineDuration normalizes max-fraction QoS duration to DDS infinite" {
+    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff };
+    try std.testing.expect(readDeadlineDuration(&bytes, true).isInfinite());
+}
+
+test "readDeadlineDuration preserves finite QoS duration" {
+    const wire = time_mod.RtpsDuration.fromDuration(.{ .sec = 3, .nanosec = 1_000_000 });
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(i32, bytes[0..4], wire.seconds, .little);
+    std.mem.writeInt(u32, bytes[4..8], wire.fraction, .little);
+    const dur = readDeadlineDuration(&bytes, true);
+    try std.testing.expectEqual(@as(i32, 3), dur.sec);
+    // 2^32-fraction can't represent 1ms exactly; round-trip is within 1 ns.
+    try std.testing.expect(dur.nanosec >= 999_999 and dur.nanosec <= 1_000_000);
 }

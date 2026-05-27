@@ -45,14 +45,16 @@ fn buildPayload(alloc: std.mem.Allocator, p: GuidPrefix, lease_ms: u32) ![]u8 {
     try buf.appendSlice(alloc, &p.bytes);
     try buf.appendSlice(alloc, &.{ 0x00, 0x00, 0x01, 0xc1 }); // participant entity_id
 
-    // PID_PARTICIPANT_LEASE_DURATION (0x0002), length = 8: sec (i32 LE) + ns (u32 LE)
-    const sec: u32 = lease_ms / 1000;
-    const ns: u32 = (lease_ms % 1000) * 1_000_000;
+    // PID_PARTICIPANT_LEASE_DURATION (0x0002), length = 8: RTPS seconds + fraction.
+    const lease = time_mod.RtpsDuration.fromDuration(.{
+        .sec = @intCast(lease_ms / 1000),
+        .nanosec = (lease_ms % 1000) * 1_000_000,
+    });
     try buf.appendSlice(alloc, &.{ 0x02, 0x00, 0x08, 0x00 });
     var tmp: [4]u8 = undefined;
-    std.mem.writeInt(u32, &tmp, sec, .little);
+    std.mem.writeInt(i32, &tmp, lease.seconds, .little);
     try buf.appendSlice(alloc, &tmp);
-    std.mem.writeInt(u32, &tmp, ns, .little);
+    std.mem.writeInt(u32, &tmp, lease.fraction, .little);
     try buf.appendSlice(alloc, &tmp);
 
     // PID_SENTINEL (0x0001), length = 0

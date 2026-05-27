@@ -146,8 +146,9 @@ Add target-specific entropy, PID, and monotonic-clock support before claiming pr
 support for those targets.
 
 **Vendor ID placeholder pending OMG registration.** Both `pid.zig` and `src/rtps/message/header.zig`
-use `{0x01, 0x23}` consistently. GUID prefix generation does not force the prefix's first two bytes
-to match the vendor ID placeholder. Register a real vendor ID before publishing official interop results.
+use `{0x01, 0x23}` consistently, and `src/util/guid_gen.zig` already embeds those bytes into
+`guidPrefix[0..2]` (RTPS §9.3.1.5). The sole remaining step is registering with OMG and updating
+the two-byte constant.
 
 **`initial_peers` config not connected.** `discovery.initial_peers` is present in the
 configuration schema and documented in `docs/architecture.md`, but `src/discovery/spdp.zig`
