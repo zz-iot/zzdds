@@ -453,6 +453,11 @@ pub const StatefulWriter = struct {
         // BEST_EFFORT readers never AckNack; skip to avoid synchronous re-entry
         // deadlock when using in-process (MemoryTransport) delivery.
         if (rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
+        // Reliable readers use NACK-driven history delivery: the HB above
+        // announces the range; the reader's NACK drives actual DATA sends.
+        // Eager DATA without the reader's writer-proxy context can cause
+        // out-of-order delivery on the remote side before gap detection fires.
+        if (rp.reliable) return;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.cache.changes.items) |*ch| {
             self.tracer.submit(.{ .send_data = .{
