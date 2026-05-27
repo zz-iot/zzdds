@@ -681,7 +681,9 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
     // missing-SN bitmap; DropFirst(2) is exhausted so NACK-3 is forwarded into mt_w.
     reader.handleHeartbeat(W1_GUID, 1, 3, 3, false);
 
-    // Round 3: NACK-3 → clears awaiting_first_ack, retransmits DATA(1,2) + trailing HB.
+    // Round 3: NACK-3 → retransmits DATA(1,2,3) + trailing HB.
+    //          awaiting_first_ack stays true (cumAck=0 < history_floor_sn=3); no live
+    //          writes are pending so this has no observable effect.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 

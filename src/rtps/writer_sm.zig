@@ -453,16 +453,6 @@ pub const StatefulWriter = struct {
         // BEST_EFFORT readers never AckNack; skip to avoid synchronous re-entry
         // deadlock when using in-process (MemoryTransport) delivery.
         if (rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
-        // For reliable readers: send HB only and let the NACK cycle handle data
-        // delivery.  The proxy on the remote side may not yet exist when the
-        // HB+DATA burst arrives (SEDP matching is async), so eagerly sending DATA
-        // risks the reader receiving samples before it has seen any HB — causing
-        // immediate delivery without gap detection on some implementations.
-        // The NACK triggered by the HB proves the proxy exists and gives us a
-        // chance to send a leading HB (in handleAckNack) before retransmitting,
-        // guaranteeing the reader has context before any DATA arrives.
-        // BEST_EFFORT readers never NACK, so we must still send DATA eagerly.
-        if (rp.reliable) return;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.cache.changes.items) |*ch| {
             self.tracer.submit(.{ .send_data = .{
