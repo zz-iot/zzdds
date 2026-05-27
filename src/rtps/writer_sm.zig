@@ -226,12 +226,17 @@ pub const ReaderProxy = struct {
     /// Last accepted NACK_FRAG count for stale-submessage suppression (§8.3.8.12).
     /// Null until the first NACK_FRAG from this reader is accepted.
     last_nack_frag_count: ?i32,
-    /// When true, suppress all DATA sends to this proxy until it acknowledges
-    /// our leading HEARTBEAT with an ACKNACK. Cleared on the first ACKNACK.
-    /// Ensures the reader knows our sequence number range (first_sn) before
-    /// receiving any DATA, preventing premature delivery of live samples by a
-    /// reader that has not yet seen our history range.
+    /// When true, suppress all DATA sends to this proxy until it sends a
+    /// non-final ACKNACK with highest_sn >= history_floor_sn.  Cleared only
+    /// on a non-final NACK so that RTI Connext has time to flush its durability
+    /// history buffer to the DataReader before the first live sample arrives.
+    /// A final NACK means "I'm satisfied" — not "send me live data" — so it
+    /// must not clear this flag.
     awaiting_first_ack: bool,
+    /// cache.maxSn() at the time this proxy was created with awaiting_first_ack.
+    /// Threshold for clearing awaiting_first_ack: the reader's cumulative ack
+    /// must reach this SN on a non-final NACK before live data is unblocked.
+    history_floor_sn: SequenceNumber,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -251,6 +256,7 @@ pub const ReaderProxy = struct {
             .start_sn = 1,
             .last_nack_frag_count = null,
             .awaiting_first_ack = false,
+            .history_floor_sn = 0,
         };
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
@@ -411,9 +417,11 @@ pub const StatefulWriter = struct {
         // write() that acquires mu after we release it.  The replay sends
         // directly to the proxy (not through sendChangeToAllLocked) so it is
         // unaffected by the flag itself.
-        if (new_rp.reliable and self.replay_on_match and self.cache.changes.items.len > 0)
+        if (new_rp.reliable and self.replay_on_match and self.cache.changes.items.len > 0) {
             new_rp.awaiting_first_ack = true;
-        if (self.replay_on_match) self.replayHistoryToProxyLocked(new_rp) else if (new_rp.reliable) self.sendHeartbeatToProxyLocked(new_rp);
+            new_rp.history_floor_sn = self.cache.maxSn();
+        }
+        if (self.replay_on_match) self.replayHistoryToProxyLocked(new_rp) else if (new_rp.reliable) self.sendHeartbeatToProxyLocked(new_rp, false);
         // Start the periodic heartbeat thread on the first matched reader so
         // that dropped DATA or HEARTBEAT packets can be recovered via NACK.
         if (self.hb_thread == null) {
@@ -444,7 +452,17 @@ pub const StatefulWriter = struct {
         // without knowing that earlier samples (e.g. SN=1) are expected.
         // BEST_EFFORT readers never AckNack; skip to avoid synchronous re-entry
         // deadlock when using in-process (MemoryTransport) delivery.
-        if (rp.reliable) self.sendHeartbeatToProxyLocked(rp);
+        if (rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
+        // For reliable readers: send HB only and let the NACK cycle handle data
+        // delivery.  The proxy on the remote side may not yet exist when the
+        // HB+DATA burst arrives (SEDP matching is async), so eagerly sending DATA
+        // risks the reader receiving samples before it has seen any HB — causing
+        // immediate delivery without gap detection on some implementations.
+        // The NACK triggered by the HB proves the proxy exists and gives us a
+        // chance to send a leading HB (in handleAckNack) before retransmitting,
+        // guaranteeing the reader has context before any DATA arrives.
+        // BEST_EFFORT readers never NACK, so we must still send DATA eagerly.
+        if (rp.reliable) return;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.cache.changes.items) |*ch| {
             self.tracer.submit(.{ .send_data = .{
@@ -485,7 +503,9 @@ pub const StatefulWriter = struct {
     /// Send a Heartbeat to a single reader proxy (called under mu).
     /// Uses rp.start_sn as the floor for first_sn so VOLATILE readers see
     /// the correct range and do not NACK data written before they matched.
-    fn sendHeartbeatToProxyLocked(self: *Self, rp: *const ReaderProxy) void {
+    /// `final=true` tells the reader it need not reply (used to signal
+    /// history-delivery completion before live data begins flowing).
+    fn sendHeartbeatToProxyLocked(self: *Self, rp: *const ReaderProxy, final: bool) void {
         const locs = rp.effectiveLocators();
         if (locs.len == 0) return;
         self.hb_count += 1;
@@ -502,7 +522,7 @@ pub const StatefulWriter = struct {
             first_sn,
             last_sn,
             self.hb_count,
-            false, // non-final: reader must reply with ACKNACK
+            final,
         );
         for (locs) |loc| {
             sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
@@ -608,7 +628,16 @@ pub const StatefulWriter = struct {
         for (self.reader_proxies.items) |*rp| {
             if (!rp.guid.eql(reader_guid)) continue;
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
-            if (rp.awaiting_first_ack) rp.awaiting_first_ack = false;
+            // Only unblock live data once the reader sends a NON-FINAL NACK
+            // with highest_sn at or past the history floor.  A non-final NACK
+            // means RTI is actively requesting live samples (it has finished
+            // flushing durability history to the DataReader and is now asking
+            // for more).  A final NACK ("I'm satisfied") must NOT clear the
+            // flag: RTI may still be flushing history internally when it sends
+            // a final NACK, and unblocking there races live DATA ahead of [1].
+            if (rp.awaiting_first_ack and !is_final and highest_sn >= rp.history_floor_sn) {
+                rp.awaiting_first_ack = false;
+            }
 
             self.tracer.submit(.{ .recv_acknack = .{
                 .src_prefix = reader_guid.prefix,
@@ -675,6 +704,17 @@ pub const StatefulWriter = struct {
             // Per §8.3.7.1.2: non-final AckNack requires sending ALL changes
             // with SN >= nack_set.base not yet acknowledged by this proxy.
             if (!is_final) {
+                // Send a HEARTBEAT before the burst so the reader learns
+                // [first_sn, last_sn] before DATA arrives.  A reader proxy
+                // that was just created (e.g. NACK with base=0 as first contact)
+                // has no prior HB context; receiving DATA without it can cause
+                // immediate delivery without gap detection.  Only sent when
+                // there are changes to retransmit to avoid a non-final
+                // ACKNACK ↔ HEARTBEAT busyloop when the cache has nothing at
+                // or beyond nack_set.base.
+                const effective_base = @max(nack_set.base, rp.start_sn);
+                if (self.cache.maxSn() >= effective_base and rp.reliable)
+                    self.sendHeartbeatToProxyLocked(rp, false);
                 for (self.cache.changes.items) |*ch| {
                     if (ch.sequence_number < nack_set.base) continue;
                     if (ch.sequence_number < rp.start_sn) continue;
@@ -691,7 +731,7 @@ pub const StatefulWriter = struct {
             // that early SNs are permanently evicted (virtual GAP unblocks buffered
             // pending changes).  Only sent when data was actually retransmitted to
             // avoid an AckNack ↔ Heartbeat busyloop when there is nothing to send.
-            if (retransmit_count > 0 and rp.reliable) self.sendHeartbeatToProxyLocked(rp);
+            if (retransmit_count > 0 and rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
         }
     }
 
@@ -753,7 +793,7 @@ pub const StatefulWriter = struct {
                 // Skip for BEST_EFFORT proxies: they never send AckNack, and sending
                 // a Heartbeat would trigger a synchronous AckNack round-trip when
                 // using MemoryTransport, re-entering the writer's mutex.
-                if (rp.reliable) self.sendHeartbeatToProxyLocked(rp);
+                if (rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
             }
         }
     }
