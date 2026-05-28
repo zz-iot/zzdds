@@ -223,6 +223,12 @@ pub const ReaderProxy = struct {
     /// TRANSIENT_LOCAL+ (gets full history). Set to cache.next_sn at match
     /// time for VOLATILE writers (late joiners skip historical data).
     start_sn: SequenceNumber,
+    /// Last accepted ACKNACK count for stale-submessage suppression (§8.3.7.1).
+    /// Null until the first ACKNACK that causes a retransmit is accepted.
+    /// Updated only when data or a trailing HB is actually sent; this lets a
+    /// reader that repeats the same count (to probe availability) keep getting
+    /// processed until our reply is successfully delivered.
+    last_ack_nack_count: ?i32,
     /// Last accepted NACK_FRAG count for stale-submessage suppression (§8.3.8.12).
     /// Null until the first NACK_FRAG from this reader is accepted.
     last_nack_frag_count: ?i32,
@@ -254,6 +260,7 @@ pub const ReaderProxy = struct {
             .reliable = reliable,
             .highest_acked_sn = 0,
             .start_sn = 1,
+            .last_ack_nack_count = null,
             .last_nack_frag_count = null,
             .suppress_live_data = false,
             .history_floor_sn = 0,
@@ -520,6 +527,11 @@ pub const StatefulWriter = struct {
         self.hb_count += 1;
         const cache_first = self.cache.minSn();
         const first_sn = @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
+        // Guard: RTPS requires first_sn <= last_sn (except the empty-cache
+        // convention first=1, last=0).  A capped last_sn combined with
+        // KEEP_LAST eviction can push cache_first past last_sn — skip the HB
+        // rather than send a malformed submessage.
+        if (last_sn > 0 and first_sn > last_sn) return;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
@@ -629,21 +641,44 @@ pub const StatefulWriter = struct {
         count: i32,
         is_final: bool,
     ) void {
+        // Validity checks (§8.3.7.1.3): drop ill-formed ACKNACKs silently.
+        // Note: base=0 is non-conformant per spec (must be >= 1) but RTI Connext
+        // uses it as a "I've received nothing" probe.  We accept it; SN=0 is never
+        // in cache so it is harmless.  Negative base is definitively malformed.
+        if (nack_set.base < 0) return;
+        if (nack_set.num_bits > 256) return; // spec maximum bitmap size
+
         self.mu.lock();
         defer self.mu.unlock();
 
         for (self.reader_proxies.items) |*rp| {
             if (!rp.guid.eql(reader_guid)) continue;
+            // Stale / duplicate suppression — only while suppress_live_data is
+            // inactive.  While suppress is set, allowing duplicate NACKs to trigger
+            // retransmits gives the remote DataReader more time to flush history
+            // before the first live sample arrives (empirically required for RTI
+            // Connext TRANSIENT_LOCAL durability).  Once live data is unblocked,
+            // dedup prevents the two-interface duplicate storm.
+            if (!rp.suppress_live_data) {
+                if (rp.last_ack_nack_count) |last| {
+                    const diff: i32 = @bitCast(@as(u32, @bitCast(count)) -% @as(u32, @bitCast(last)));
+                    if (diff <= 0) continue; // stale or duplicate
+                }
+            }
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
-            // Only unblock live data once the reader sends a NON-FINAL NACK
-            // with highest_sn at or past the history floor.  A non-final NACK
-            // means RTI is actively requesting live samples (it has finished
-            // flushing durability history to the DataReader and is now asking
-            // for more).  A final NACK ("I'm satisfied") must NOT clear the
-            // flag: RTI may still be flushing history internally when it sends
-            // a final NACK, and unblocking there races live DATA ahead of [1].
-            if (rp.suppress_live_data and !is_final and highest_sn >= rp.history_floor_sn) {
-                rp.suppress_live_data = false;
+            // Clear suppress_live_data when either:
+            // (a) The reader sends a NON-FINAL NACK with cumAck >= history floor:
+            //     RTI is actively requesting live samples, meaning its DataReader
+            //     has finished flushing history.  A FINAL NACK must NOT clear
+            //     the flag because RTI may still be flushing internally then.
+            // (b) KEEP_LAST eviction has moved the entire cache past the floor:
+            //     there is no history left to protect, so suppressing live data
+            //     serves no purpose and would produce malformed capped HBs.
+            if (rp.suppress_live_data) {
+                const evicted_past_floor = self.cache.minSn() > rp.history_floor_sn;
+                if (evicted_past_floor or (!is_final and highest_sn >= rp.history_floor_sn)) {
+                    rp.suppress_live_data = false;
+                }
             }
 
             self.tracer.submit(.{ .recv_acknack = .{
@@ -744,6 +779,7 @@ pub const StatefulWriter = struct {
             // While suppress_live_data, cap last_sn at history_floor_sn: the reader
             // needs the gap signal (first_sn for KEEP_LAST) but must not learn about
             // live SNs before the DataReader has flushed history.
+            if (retransmit_count > 0) rp.last_ack_nack_count = count;
             if (retransmit_count > 0 and rp.reliable) {
                 if (rp.suppress_live_data) {
                     self.sendHeartbeatToProxyLockedCapped(rp, false, rp.history_floor_sn);

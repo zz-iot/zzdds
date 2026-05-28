@@ -623,6 +623,11 @@ pub const StatefulReader = struct {
         count: i32,
         final: bool,
     ) void {
+        // Validity checks (§8.3.7.5.3): drop ill-formed Heartbeats silently.
+        // first_sn must be >= 1; last_sn must be >= first_sn - 1 (the only
+        // exception is the empty-cache convention: first_sn=1, last_sn=0).
+        if (first_sn <= 0 or last_sn < first_sn - 1) return;
+
         self.mu.lock();
         defer self.mu.unlock();
 
