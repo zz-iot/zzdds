@@ -233,6 +233,7 @@ pub const RtpsProtocolReader = struct {
         self.reader.setCallback(.{
             .ctx = cb.ctx,
             .on_data = cb.on_data,
+            .on_sample_lost = cb.on_sample_lost,
         });
     }
 
@@ -302,6 +303,10 @@ pub const RtpsProtocolReader = struct {
             .key_hash = key_hash,
             .data = serialized_payload,
         };
+        // Signal liveliness: this writer is alive.
+        if (self.writer_match_cb) |cb| {
+            if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+        }
         // handleData stores a copy in the cache; on error just drop.
         self.reader.handleData(writer_guid, change) catch {};
     }
@@ -315,6 +320,10 @@ pub const RtpsProtocolReader = struct {
         final: bool,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // A heartbeat also proves the writer is alive.
+        if (self.writer_match_cb) |cb| {
+            if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+        }
         self.reader.handleHeartbeat(writer_guid, first_sn, last_sn, count, final);
     }
 

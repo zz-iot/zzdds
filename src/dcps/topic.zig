@@ -196,13 +196,17 @@ pub const TopicImpl = struct {
 
 // ── ContentFilteredTopicImpl ──────────────────────────────────────────────────
 
+/// Returns the ContentFilteredTopicImpl if `td` was created from a CFT, else null.
+/// Used by the subscriber to detect CFT topics at DataReader creation time.
+pub fn asCft(td: DDS.TopicDescription) ?*ContentFilteredTopicImpl {
+    if (td.vtable == &ContentFilteredTopicImpl.td_vtable) {
+        return @ptrCast(@alignCast(td.ptr));
+    }
+    return null;
+}
+
 /// A ContentFilteredTopic restricts the set of samples delivered to a DataReader
 /// to those that match a filter expression (SQL-subset on topic fields).
-///
-/// Filter expression evaluation against raw CDR payloads is deferred until typed
-/// DataReader wrappers are in place; the DataReader receives all samples for now.
-/// The create/delete lifecycle, TopicDescription view, and parameter accessors
-/// are fully functional.
 pub const ContentFilteredTopicImpl = struct {
     alloc: std.mem.Allocator,
     name: []u8, // owned

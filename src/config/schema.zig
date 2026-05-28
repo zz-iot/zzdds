@@ -151,6 +151,14 @@ pub const UdpConfig = struct {
     ///   Simpler; all interfaces share one socket per port; locator list less precise.
     bind_wildcard: bool = false,
 
+    // ── Initial peers ─────────────────────────────────────────────────────────
+
+    /// List of "ip:port" strings for unicast peers that should be contacted at
+    /// startup regardless of multicast discovery.  Useful when multicast is
+    /// disabled or unreliable.  Each entry is parsed and added as a reader
+    /// locator on the SPDP StatelessWriter during participant.start().
+    initial_peers: []const []const u8 = &.{},
+
     // ── Misc ──────────────────────────────────────────────────────────────────
 
     /// Receive buffer size hint (bytes). 0 = OS default.

@@ -27,26 +27,13 @@ wire issue).
 with RTPS §9.3.1.5). The only remaining step is to register with OMG and update the
 two-byte constant once a real ID is assigned. No structural changes needed.
 
-**TypeSupport callback registration** (prerequisite for language bindings)
+**C-ABI TypeSupport** (prerequisite for non-Zig language bindings)
 
-The application registers a type with the participant via C-ABI function pointers:
-```c
-typedef struct {
-    const char *type_name;
-    int  (*serialize)(const void *sample, uint8_t *buf, size_t *len);
-    int  (*deserialize)(const uint8_t *buf, size_t len, void *sample_out);
-    void (*key_hash)(const uint8_t *buf, size_t len, uint8_t hash[16]);
-} ZzddsTypeSupport;
-```
-`participant.registerType(ZzddsTypeSupport)` stores callbacks by type name. The receive
-path calls `key_hash` instead of relying on the optional inline QoS `key_hash` field.
-For Zig-native types, a thin wrapper adapts the generated `computeKeyHash`. This is the
-prerequisite for all non-Zig language bindings.
-
-**`initial_peers` config wiring** — `discovery.initial_peers` is schema-defined and
-documented in `docs/architecture.md` but is not connected in `src/discovery/spdp.zig`.
-When wired, the SPDP writer should send unicast announcements to each listed locator at
-startup, before the first multicast interval fires.
+Zig-native TypeSupport (`participant.registerTypeSupport()` with `compute_key_hash` and
+optional `get_field`) is fully implemented. What's still missing for non-Zig language
+bindings is a stable C-ABI shim that maps C function pointers to the Zig TypeSupport
+vtable, analogous to the pattern used for transport and security plugins.  This is
+prerequisite for the C binding and everything downstream of it.
 
 **Static and broker discovery plugins** — `src/discovery/interface.zig` and the config
 schema reserve `static` and `broker` discovery kinds, but only SPDP/SEDP and direct in-process
