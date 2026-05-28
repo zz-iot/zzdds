@@ -190,12 +190,12 @@ pub const DataReaderImpl = struct {
     owner_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, OwnerEntry) = .empty,
 
     // ── TIME_BASED_FILTER tracking ────────────────────────────────────────────
-    // Guarded by `mu`. Per-instance tracking deferred; currently applied
-    // globally (correct for keyless topics with one instance).
+    // Guarded by `mu`. Per-instance: each instance independently tracks the
+    // source timestamp of its last delivered sample.
 
-    /// Source timestamp (ns) of the last sample that passed the TBF window.
-    /// null = no sample delivered yet; first sample always passes.
-    tbf_last_ns: ?i64 = null,
+    /// Source timestamp (ns) of the last sample that passed the TBF window,
+    /// keyed by instance handle. Absent = no sample delivered yet for that instance.
+    tbf_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, i64) = .empty,
 
     // ── Instance lifecycle tracking ───────────────────────────────────────────
     // Guarded by `mu`.
@@ -266,6 +266,7 @@ pub const DataReaderImpl = struct {
         // Drain pending queue.
         for (self.pending.items) |p| p.deinit();
         self.pending.deinit(self.alloc);
+        self.tbf_map.deinit(self.alloc);
         self.writer_strengths.deinit(self.alloc);
         self.writer_liveliness.deinit(self.alloc);
         self.owner_map.deinit(self.alloc);
@@ -390,19 +391,19 @@ pub const DataReaderImpl = struct {
         }
 
         // TIME_BASED_FILTER: suppress samples whose source timestamp is within
-        // minimum_separation of the last delivered sample's source timestamp.
+        // minimum_separation of the last delivered sample for this instance.
         const min_sep = self.qos.time_based_filter.minimum_separation;
         if (min_sep.sec != 0 or min_sep.nanosec != 0) {
             const src_ns = change.source_timestamp.toTime().toNs();
             const sep_ns = @as(i64, min_sep.sec) * std.time.ns_per_s + @as(i64, min_sep.nanosec);
-            if (self.tbf_last_ns) |last| {
+            if (self.tbf_map.get(ih)) |last| {
                 if (src_ns - last < sep_ns) {
                     self.mu.unlock();
                     self.alloc.free(copy);
                     return;
                 }
             }
-            self.tbf_last_ns = src_ns;
+            self.tbf_map.put(self.alloc, ih, src_ns) catch {};
         }
 
         // CONTENT_FILTER: drop samples that do not match the CFT expression.
@@ -411,6 +412,28 @@ pub const DataReaderImpl = struct {
                 self.mu.unlock();
                 self.alloc.free(copy);
                 return;
+            }
+        }
+
+        // KEEP_LAST: if history depth is limited, evict the oldest pending sample
+        // for this instance when the per-instance count reaches depth.  This is a
+        // silent replacement, not a rejection — on_sample_rejected is NOT fired.
+        if (self.qos.history.kind == .KEEP_LAST_HISTORY_QOS) {
+            const depth: usize = @intCast(@max(1, self.qos.history.depth));
+            var instance_count: usize = 0;
+            for (self.pending.items) |pc| {
+                if (pc.info.instance_handle == ih) instance_count += 1;
+            }
+            if (instance_count >= depth) {
+                // Remove oldest pending sample for this instance.
+                var i: usize = 0;
+                while (i < self.pending.items.len) : (i += 1) {
+                    if (self.pending.items[i].info.instance_handle == ih) {
+                        const evicted = self.pending.orderedRemove(i);
+                        evicted.deinit();
+                        break;
+                    }
+                }
             }
         }
 

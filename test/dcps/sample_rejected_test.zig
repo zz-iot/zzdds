@@ -152,6 +152,7 @@ test "sample_rejected: max_samples poll path" {
     defer fx.deinit();
 
     var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.resource_limits.max_samples = 1;
 
     const dw = fx.makeWriter();
@@ -173,6 +174,7 @@ test "sample_rejected: change resets after poll" {
     defer fx.deinit();
 
     var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.resource_limits.max_samples = 1;
 
     const dw = fx.makeWriter();
@@ -197,6 +199,7 @@ test "sample_rejected: total_count accumulates across multiple rejections" {
     defer fx.deinit();
 
     var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.resource_limits.max_samples = 1;
 
     const dw = fx.makeWriter();
@@ -219,6 +222,7 @@ test "sample_rejected: listener fires on rejection" {
     defer fx.deinit();
 
     var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.resource_limits.max_samples = 1;
 
     var captured = DDS.SampleRejectedStatus{};
@@ -242,6 +246,7 @@ test "sample_rejected: listener change is 1 per event even when poll change woul
     defer fx.deinit();
 
     var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.resource_limits.max_samples = 1;
 
     var captured = DDS.SampleRejectedStatus{};
@@ -264,6 +269,7 @@ test "sample_rejected: max_samples_per_instance limit" {
     defer fx.deinit();
 
     var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.resource_limits.max_samples_per_instance = 1;
 
     const dw = fx.makeWriter();

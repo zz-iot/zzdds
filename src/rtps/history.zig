@@ -85,10 +85,8 @@ pub const HistoryCache = struct {
     // ── Writer-side ───────────────────────────────────────────────────────────
 
     /// Add a new change, copying `data`. Returns the assigned sequence number.
-    /// For KEEP_LAST, trims oldest entries when the cache is full.
-    /// Note: KEEP_LAST depth is applied globally (not per-instance); full
-    /// per-instance tracking is deferred until generated key extraction is
-    /// available throughout the receive/write path.
+    /// For KEEP_LAST, trims the oldest entry for `instance_handle` when that
+    /// instance's count reaches `depth`, leaving other instances untouched.
     pub fn addWriterChange(
         self: *Self,
         kind: ChangeKind,
@@ -114,7 +112,7 @@ pub const HistoryCache = struct {
             .data = data_copy,
         };
 
-        try self.trimForKeepLast();
+        self.trimForKeepLast(instance_handle);
         try self.changes.append(self.alloc, ch);
         return sn;
     }
@@ -136,7 +134,7 @@ pub const HistoryCache = struct {
         var owned = ch;
         owned.data = data_copy;
 
-        try self.trimForKeepLast();
+        self.trimForKeepLast(ch.instance_handle);
         try self.changes.append(self.alloc, owned);
     }
 
@@ -213,11 +211,24 @@ pub const HistoryCache = struct {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    fn trimForKeepLast(self: *Self) !void {
+    fn trimForKeepLast(self: *Self, ih: InstanceHandle) void {
         if (self.kind != .keep_last) return;
-        while (self.changes.items.len >= self.depth) {
-            const oldest = self.changes.orderedRemove(0);
-            self.alloc.free(oldest.data);
+        // Count how many changes we already have for this instance.
+        var count: usize = 0;
+        for (self.changes.items) |*ch| {
+            if (std.mem.eql(u8, &ch.instance_handle, &ih)) count += 1;
+        }
+        // Evict the oldest entry for this instance until count < depth.
+        while (count >= self.depth) {
+            var i: usize = 0;
+            while (i < self.changes.items.len) : (i += 1) {
+                if (std.mem.eql(u8, &self.changes.items[i].instance_handle, &ih)) {
+                    const evicted = self.changes.orderedRemove(i);
+                    self.alloc.free(evicted.data);
+                    count -= 1;
+                    break;
+                }
+            }
         }
     }
 };
@@ -305,6 +316,46 @@ test "HistoryCache minSn maxSn" {
 
     try testing.expectEqual(@as(SequenceNumber, 1), cache.minSn());
     try testing.expectEqual(@as(SequenceNumber, 2), cache.maxSn());
+}
+
+test "HistoryCache KEEP_LAST per-instance: depth=1 evicts per-instance not globally" {
+    var cache = HistoryCache.init(testing.allocator, .keep_last, 1);
+    defer cache.deinit();
+
+    const g = makeGuid(7);
+    var ih_a: InstanceHandle = std.mem.zeroes([16]u8);
+    var ih_b: InstanceHandle = std.mem.zeroes([16]u8);
+    ih_a[0] = 0xAA;
+    ih_b[0] = 0xBB;
+
+    // Write one change for instance A, one for instance B.
+    const sn_a1 = try cache.addWriterChange(.alive, g, ZERO_TS, ih_a, NIL_KH, "a1");
+    const sn_b1 = try cache.addWriterChange(.alive, g, ZERO_TS, ih_b, NIL_KH, "b1");
+    try testing.expectEqual(@as(usize, 2), cache.len()); // both retained
+
+    // Write a second change for instance A — should evict a1 but not b1.
+    _ = try cache.addWriterChange(.alive, g, ZERO_TS, ih_a, NIL_KH, "a2");
+    try testing.expectEqual(@as(usize, 2), cache.len());
+    try testing.expectEqual(@as(?*const CacheChange, null), cache.getChange(sn_a1));
+    try testing.expect(cache.getChange(sn_b1) != null);
+}
+
+test "HistoryCache KEEP_LAST per-instance: depth=2 independent per instance" {
+    var cache = HistoryCache.init(testing.allocator, .keep_last, 2);
+    defer cache.deinit();
+
+    const g = makeGuid(8);
+    var ih_a: InstanceHandle = std.mem.zeroes([16]u8);
+    ih_a[0] = 0xAA;
+
+    const sn1 = try cache.addWriterChange(.alive, g, ZERO_TS, ih_a, NIL_KH, "1");
+    const sn2 = try cache.addWriterChange(.alive, g, ZERO_TS, ih_a, NIL_KH, "2");
+    try testing.expectEqual(@as(usize, 2), cache.len());
+    // Third write: evicts sn1 (oldest for ih_a), keeps sn2 and new.
+    _ = try cache.addWriterChange(.alive, g, ZERO_TS, ih_a, NIL_KH, "3");
+    try testing.expectEqual(@as(usize, 2), cache.len());
+    try testing.expectEqual(@as(?*const CacheChange, null), cache.getChange(sn1));
+    try testing.expect(cache.getChange(sn2) != null);
 }
 
 test "HistoryCache addReaderChange deduplication" {

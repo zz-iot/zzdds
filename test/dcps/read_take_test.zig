@@ -189,7 +189,9 @@ test "takeFiltered: removes only NOT_READ samples when filter applied" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
 
@@ -218,7 +220,9 @@ test "takeFiltered: max_samples limits how many are removed" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
@@ -238,7 +242,9 @@ test "takeFiltered: view_state mask selects NEW_VIEW only" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
 
     // Two samples: first has NEW_VIEW, second has NOT_NEW_VIEW.
     try writeAlive(pair.dw);
@@ -260,7 +266,9 @@ test "takeFiltered: instance_state mask selects ALIVE only" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
 
     try writeAlive(pair.dw);
     // Drain the alive sample first so queue is at a known state, then dispose.
@@ -290,7 +298,9 @@ test "readRaw: ANY masks returns all samples" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
 

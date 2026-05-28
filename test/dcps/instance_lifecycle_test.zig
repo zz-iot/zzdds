@@ -166,7 +166,9 @@ test "sample_info: second alive sample has NOT_NEW_VIEW" {
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
 

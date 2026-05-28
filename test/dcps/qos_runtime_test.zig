@@ -569,6 +569,76 @@ test "ownership: EXCLUSIVE — owner transfer when current owner is removed" {
     try testing.expectEqualSlices(u8, &PAYLOAD_C, samples[1]);
 }
 
+// ── KEEP_LAST reader per-instance tests ──────────────────────────────────────
+
+fn writeRawKeyed(dw: *DataWriterImpl, payload: []const u8, key: u8) !void {
+    var kh = std.mem.zeroes([16]u8);
+    kh[0] = key;
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), kh, kh, payload);
+}
+
+test "keep_last: reader depth=1 silently replaces oldest for same instance (no rejection)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_LAST_HISTORY_QOS;
+    dr_qos.history.depth = 1;
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    // Three writes for the same instance — reader depth=1 should keep only the latest.
+    try writeRawKeyed(pair.dw, &PAYLOAD_A, 0x01);
+    try writeRawKeyed(pair.dw, &PAYLOAD_B, 0x01);
+    try writeRawKeyed(pair.dw, &PAYLOAD_C, 0x01);
+
+    // Only one sample in pending; no rejection should have been triggered.
+    try testing.expectEqual(@as(usize, 1), pendingCount(pair.dr));
+    var rej_status = DDS.SampleRejectedStatus{};
+    _ = pair.dr.toDDSDataReader().vtable.get_sample_rejected_status(pair.dr.toDDSDataReader().ptr, &rej_status);
+    try testing.expectEqual(@as(i32, 0), rej_status.total_count);
+
+    const samples = try drainSamples(alloc, pair.dr);
+    defer {
+        for (samples) |s| alloc.free(s);
+        alloc.free(samples);
+    }
+    try testing.expectEqual(@as(usize, 1), samples.len);
+    try testing.expectEqualSlices(u8, &PAYLOAD_C, samples[0]);
+}
+
+test "keep_last: reader depth=1 per-instance — two instances are independent" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_LAST_HISTORY_QOS;
+    dr_qos.history.depth = 1;
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    // Instance 0x01: two writes → only latest kept.
+    // Instance 0x02: one write → retained.
+    try writeRawKeyed(pair.dw, &PAYLOAD_A, 0x01);
+    try writeRawKeyed(pair.dw, &PAYLOAD_B, 0x02);
+    try writeRawKeyed(pair.dw, &PAYLOAD_C, 0x01); // replaces A for instance 0x01
+
+    // Two samples total: latest for each instance.
+    try testing.expectEqual(@as(usize, 2), pendingCount(pair.dr));
+}
+
 // ── TIME_BASED_FILTER tests ───────────────────────────────────────────────────
 //
 // Uses fixed source timestamps (seconds field of RtpsTimestamp) so tests are
@@ -584,6 +654,12 @@ fn writeRawAt(dw: *DataWriterImpl, payload: []const u8, secs: u32) !void {
     );
 }
 
+fn writeRawAtKeyed(dw: *DataWriterImpl, payload: []const u8, secs: u32, key: u8) !void {
+    var kh = std.mem.zeroes([16]u8);
+    kh[0] = key;
+    _ = try dw.writeRaw(.alive, .{ .seconds = secs, .fraction = 0 }, kh, kh, payload);
+}
+
 test "time_based_filter: zero separation (default) — all samples pass" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
@@ -594,6 +670,7 @@ test "time_based_filter: zero separation (default) — all samples pass" {
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     // minimum_separation = 0 (default) → no filtering
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
@@ -621,6 +698,7 @@ test "time_based_filter: samples within minimum_separation are suppressed" {
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.time_based_filter.minimum_separation = .{ .sec = 1, .nanosec = 0 };
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
@@ -649,6 +727,7 @@ test "time_based_filter: sample after minimum_separation is delivered" {
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.time_based_filter.minimum_separation = .{ .sec = 1, .nanosec = 0 };
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
@@ -678,6 +757,7 @@ test "time_based_filter: multiple suppressions then delivery after window" {
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.time_based_filter.minimum_separation = .{ .sec = 2, .nanosec = 0 };
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
@@ -697,6 +777,42 @@ test "time_based_filter: multiple suppressions then delivery after window" {
     try testing.expectEqual(@as(usize, 2), samples.len);
     try testing.expectEqualSlices(u8, &PAYLOAD_A, samples[0]);
     try testing.expectEqualSlices(u8, &PAYLOAD_A, samples[1]);
+}
+
+test "time_based_filter: per-instance — instances have independent TBF windows" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.time_based_filter.minimum_separation = .{ .sec = 5, .nanosec = 0 };
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    // t=0 instance A: passes (first for A).
+    // t=0 instance B: passes (first for B — independent window).
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_A, 0, 0x01);
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_B, 0, 0x02);
+    // t=3 instance A: within A's 5s window → dropped.
+    // t=3 instance B: within B's 5s window → dropped.
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_C, 3, 0x01);
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_C, 3, 0x02);
+    // t=6 instance A: outside A's 5s window → passes.
+    // t=6 instance B: outside B's 5s window → passes.
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_A, 6, 0x01);
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_B, 6, 0x02);
+
+    const samples = try drainSamples(alloc, pair.dr);
+    defer {
+        for (samples) |s| alloc.free(s);
+        alloc.free(samples);
+    }
+    try testing.expectEqual(@as(usize, 4), samples.len);
 }
 
 // ── DEADLINE and LIVELINESS tests ─────────────────────────────────────────────
