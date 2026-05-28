@@ -334,7 +334,7 @@ pub const StatefulReader = struct {
         // BEST_EFFORT writers (no periodic heartbeats per §8.4.15) this is the only
         // trigger that compensates for the race between writer-side replay and
         // reader-side proxy setup.
-        self.sendAckNackLocked(new_wp, 0);
+        self.sendAckNackLocked(new_wp, 0, false);
     }
 
     pub fn removeMatchedWriter(self: *Self, guid: Guid) void {
@@ -623,6 +623,11 @@ pub const StatefulReader = struct {
         count: i32,
         final: bool,
     ) void {
+        // Validity checks (§8.3.7.5.3): drop ill-formed Heartbeats silently.
+        // first_sn must be >= 1; last_sn must be >= first_sn - 1 (the only
+        // exception is the empty-cache convention: first_sn=1, last_sn=0).
+        if (first_sn <= 0 or last_sn < first_sn - 1) return;
+
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -671,7 +676,7 @@ pub const StatefulReader = struct {
             // Send ACKNACK if: non-final heartbeat, or we have missing SNs.
             const has_missing = wp.received.cumulativeAck() < last_sn;
             if (!final or has_missing) {
-                self.sendAckNackLocked(wp, last_sn);
+                self.sendAckNackLocked(wp, last_sn, !has_missing);
             }
         }
     }
@@ -714,7 +719,7 @@ pub const StatefulReader = struct {
         }
     }
 
-    fn sendAckNackLocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber) void {
+    fn sendAckNackLocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber, final: bool) void {
         const locs = wp.effectiveLocators();
         if (locs.len == 0) return;
         wp.ack_count += 1;
@@ -726,7 +731,7 @@ pub const StatefulReader = struct {
             .base_sn = sns.base,
             .bitmap = sns,
             .count = wp.ack_count,
-            .final = false,
+            .final = final,
         } });
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
@@ -736,7 +741,7 @@ pub const StatefulReader = struct {
             wp.guid.entity_id,
             sns,
             wp.ack_count,
-            false, // not final: we may send again after timeout
+            final,
         );
         for (locs) |loc| {
             writer_sm.sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
