@@ -232,9 +232,9 @@ pub const ReaderProxy = struct {
     /// history buffer to the DataReader before the first live sample arrives.
     /// A final NACK means "I'm satisfied" — not "send me live data" — so it
     /// must not clear this flag.
-    awaiting_first_ack: bool,
-    /// cache.maxSn() at the time this proxy was created with awaiting_first_ack.
-    /// Threshold for clearing awaiting_first_ack: the reader's cumulative ack
+    suppress_live_data: bool,
+    /// cache.maxSn() at the time this proxy was created with suppress_live_data.
+    /// Threshold for clearing suppress_live_data: the reader's cumulative ack
     /// must reach this SN on a non-final NACK before live data is unblocked.
     history_floor_sn: SequenceNumber,
 
@@ -255,7 +255,7 @@ pub const ReaderProxy = struct {
             .highest_acked_sn = 0,
             .start_sn = 1,
             .last_nack_frag_count = null,
-            .awaiting_first_ack = false,
+            .suppress_live_data = false,
             .history_floor_sn = 0,
         };
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
@@ -413,12 +413,12 @@ pub const StatefulWriter = struct {
         try self.reader_proxies.append(self.alloc, proxy);
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
         if (!self.replay_on_match) new_rp.start_sn = self.cache.next_sn;
-        // Set awaiting_first_ack before replay so the flag is visible to any
+        // Set suppress_live_data before replay so the flag is visible to any
         // write() that acquires mu after we release it.  The replay sends
         // directly to the proxy (not through sendChangeToAllLocked) so it is
         // unaffected by the flag itself.
         if (new_rp.reliable and self.replay_on_match and self.cache.changes.items.len > 0) {
-            new_rp.awaiting_first_ack = true;
+            new_rp.suppress_live_data = true;
             new_rp.history_floor_sn = self.cache.maxSn();
         }
         if (self.replay_on_match) self.replayHistoryToProxyLocked(new_rp) else if (new_rp.reliable) self.sendHeartbeatToProxyLocked(new_rp, false);
@@ -501,13 +501,25 @@ pub const StatefulWriter = struct {
     /// `final=true` tells the reader it need not reply (used to signal
     /// history-delivery completion before live data begins flowing).
     fn sendHeartbeatToProxyLocked(self: *Self, rp: *const ReaderProxy, final: bool) void {
+        const cache_last = self.cache.maxSn();
+        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, cache_last);
+    }
+
+    /// Like sendHeartbeatToProxyLocked but caps last_sn at `last_sn_cap`.
+    /// Used while suppress_live_data to avoid revealing live SNs to a reader
+    /// whose DataReader has not yet flushed the history replay.
+    fn sendHeartbeatToProxyLockedCapped(self: *Self, rp: *const ReaderProxy, final: bool, last_sn_cap: SequenceNumber) void {
+        const cache_last = self.cache.maxSn();
+        const capped = if (cache_last > 0) @min(cache_last, last_sn_cap) else cache_last;
+        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, capped);
+    }
+
+    fn sendHeartbeatToProxyLockedWithLastSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber) void {
         const locs = rp.effectiveLocators();
         if (locs.len == 0) return;
         self.hb_count += 1;
         const cache_first = self.cache.minSn();
-        const cache_last = self.cache.maxSn();
         const first_sn = @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
-        const last_sn = if (cache_last == 0) 0 else cache_last;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
@@ -630,8 +642,8 @@ pub const StatefulWriter = struct {
             // for more).  A final NACK ("I'm satisfied") must NOT clear the
             // flag: RTI may still be flushing history internally when it sends
             // a final NACK, and unblocking there races live DATA ahead of [1].
-            if (rp.awaiting_first_ack and !is_final and highest_sn >= rp.history_floor_sn) {
-                rp.awaiting_first_ack = false;
+            if (rp.suppress_live_data and !is_final and highest_sn >= rp.history_floor_sn) {
+                rp.suppress_live_data = false;
             }
 
             self.tracer.submit(.{ .recv_acknack = .{
@@ -699,20 +711,23 @@ pub const StatefulWriter = struct {
             // Per §8.3.7.1.2: non-final AckNack requires sending ALL changes
             // with SN >= nack_set.base not yet acknowledged by this proxy.
             if (!is_final) {
-                // Send a HEARTBEAT before the burst so the reader learns
-                // [first_sn, last_sn] before DATA arrives.  A reader proxy
-                // that was just created (e.g. NACK with base=0 as first contact)
-                // has no prior HB context; receiving DATA without it can cause
-                // immediate delivery without gap detection.  Only sent when
-                // there are changes to retransmit to avoid a non-final
-                // ACKNACK ↔ HEARTBEAT busyloop when the cache has nothing at
-                // or beyond nack_set.base.
-                const effective_base = @max(nack_set.base, rp.start_sn);
-                if (self.cache.maxSn() >= effective_base and rp.reliable)
-                    self.sendHeartbeatToProxyLocked(rp, false);
+                // While suppress_live_data: do NOT send the pre-burst HB that
+                // would reveal the live range (last_sn > history_floor_sn).
+                // The reader already knows [first_sn, history_floor_sn] from
+                // the HB sent during replayHistoryToProxyLocked; re-announcing
+                // the full live range here would prompt the reader to NACK for
+                // live data before its DataReader has flushed history.
+                if (!rp.suppress_live_data) {
+                    const effective_base = @max(nack_set.base, rp.start_sn);
+                    if (self.cache.maxSn() >= effective_base and rp.reliable)
+                        self.sendHeartbeatToProxyLocked(rp, false);
+                }
                 for (self.cache.changes.items) |*ch| {
                     if (ch.sequence_number < nack_set.base) continue;
                     if (ch.sequence_number < rp.start_sn) continue;
+                    // While suppress_live_data: skip live SNs beyond history_floor_sn.
+                    // Sending live data here races with the DataReader's history flush.
+                    if (rp.suppress_live_data and ch.sequence_number > rp.history_floor_sn) continue;
                     // Skip if already covered by the NACK bitmap above.
                     const offset = ch.sequence_number - nack_set.base;
                     if (offset < nack_set.num_bits and nack_set.contains(ch.sequence_number)) continue;
@@ -726,7 +741,16 @@ pub const StatefulWriter = struct {
             // that early SNs are permanently evicted (virtual GAP unblocks buffered
             // pending changes).  Only sent when data was actually retransmitted to
             // avoid an AckNack ↔ Heartbeat busyloop when there is nothing to send.
-            if (retransmit_count > 0 and rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
+            // While suppress_live_data, cap last_sn at history_floor_sn: the reader
+            // needs the gap signal (first_sn for KEEP_LAST) but must not learn about
+            // live SNs before the DataReader has flushed history.
+            if (retransmit_count > 0 and rp.reliable) {
+                if (rp.suppress_live_data) {
+                    self.sendHeartbeatToProxyLockedCapped(rp, false, rp.history_floor_sn);
+                } else {
+                    self.sendHeartbeatToProxyLocked(rp, false);
+                }
+            }
         }
     }
 
@@ -743,7 +767,7 @@ pub const StatefulWriter = struct {
         const hb_count_snap = self.hb_count;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.reader_proxies.items) |*rp| {
-            if (rp.awaiting_first_ack) continue;
+            if (rp.suppress_live_data) continue;
             const locs = rp.effectiveLocators();
             if (locs.len == 0) continue;
             log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{

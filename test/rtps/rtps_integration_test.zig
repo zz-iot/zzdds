@@ -393,10 +393,12 @@ test "loss_recovery: initial HB dropped, initial NACK from addMatchedWriter trig
     // NACK(base=1, num_bits=0, final=false) which is enough to trigger the
     // writer's non-final NACK handler to send HB+DATA(1,2,3).
     //
-    // addMatchedReader : HB(c=1) dropped (seq 1).  awaiting_first_ack=true.
+    // addMatchedReader : HB(c=1) dropped (seq 1).  suppress_live_data=true.
     // addMatchedWriter : initial NACK(base=1, empty bitmap) → mt_w queue.
-    // Round 1          : NACK → writer sends HB(c=2)+DATA(1,2,3)+trailing HB.
-    //                    awaiting_first_ack unchanged (cumAck=0 < floor=3).
+    // Round 1          : NACK (empty bitmap) → non-final tail loop sends DATA(1,2,3)
+    //                    + trailing HB(c=2) capped at floor=3; pre-burst HB skipped
+    //                    (suppress_live_data=true). suppress_live_data unchanged
+    //                    (highest_sn=0 < floor=3).
     // Round 2          : DATA(1,2,3) arrive → all three delivered.
     const alloc = testing.allocator;
 
@@ -455,12 +457,12 @@ test "loss_recovery: initial HB dropped, initial NACK from addMatchedWriter trig
     const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
     try reader.addMatchedWriter(wp);
 
-    // Round 1: initial NACK → writer sends HB(c=2)+DATA(1,2,3)+trailing HB.
-    //          mt_r was empty at round start so no delivery yet.
+    // Round 1: NACK (empty bitmap) → tail loop sends DATA(1,2,3) + trailing HB(c=2).
+    //          (pre-burst HB skipped: suppress_live_data=true). No delivery yet.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Round 2: reader gets HB+DATA(1,2,3) → all three delivered.
+    // Round 2: reader gets DATA(1,2,3) + trailing HB → all three delivered.
     net.deliverAll();
 
     try testing.expectEqual(@as(usize, 3), col.samples.items.len);
@@ -484,14 +486,15 @@ test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
     // packet generated in mt_r's delivery slot (e.g. a NACK sent in response to a
     // HB) can be processed by mt_w in the same round.
     //
-    //   addMatchedReader : HB(c=1) dropped (seq 1). awaiting_first_ack=true.
+    //   addMatchedReader : HB(c=1) dropped (seq 1). suppress_live_data=true.
     //   addMatchedWriter : NACK-1 dropped by lossy_r.
     //   Round 1          : nothing arrives at reader or writer.
     //   sendHeartbeat    : HB(c=2) forwarded (DropFirst(1) exhausted).
     //   Round 2          : mt_r delivers HB → reader sees missing SNs 1,2,3,
     //                      sends NACK(1,2,3); DropFirst(1) exhausted → passes to mt_w;
-    //                      mt_w delivers NACK → clears awaiting_first_ack,
-    //                      retransmits DATA(1,2,3) + trailing HB.
+    //                      mt_w delivers NACK → bitmap loop sends DATA(1,2,3)
+    //                      + trailing HB(c=3) capped at floor=3.
+    //                      (suppress_live_data unchanged: highest_sn=0 < floor=3)
     //   Round 3          : DATA(1,2,3) arrive → all three delivered.
     const alloc = testing.allocator;
 
@@ -540,7 +543,7 @@ test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
     try write(writer, "two");
     try write(writer, "three");
 
-    // addMatchedReader sends HB(c=1) → dropped (seq 1). awaiting_first_ack=true.
+    // addMatchedReader sends HB(c=1) → dropped (seq 1). suppress_live_data=true.
     const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
     try writer.addMatchedReader(rp);
 
@@ -560,8 +563,8 @@ test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
     writer.sendHeartbeat(false);
 
     // Round 2: HB(c=2) → reader sees missing SNs 1,2,3, sends NACK(1,2,3);
-    //          DropFirst(1) exhausted → passes to mt_w; mt_w delivers NACK → clears
-    //          awaiting_first_ack, retransmits DATA(1,2,3) + trailing HB (all forwarded).
+    //          DropFirst(1) exhausted → passes to mt_w; mt_w delivers NACK →
+    //          bitmap loop sends DATA(1,2,3) + trailing HB(c=3) capped at floor=3.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
@@ -587,14 +590,15 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
     // Writer→reader: DropFirst(1) — drops the initial HB from addMatchedReader.
     // Reader→writer: DropFirst(2) — drops the first two NACKs.
     //
-    //   addMatchedReader : HB(c=1) dropped (seq 1). awaiting_first_ack=true.
+    //   addMatchedReader : HB(c=1) dropped (seq 1). suppress_live_data=true.
     //   addMatchedWriter : NACK-1 dropped.
     //   Round 1          : nothing arrives at reader or writer.
     //   sendHeartbeat    : HB(c=2) forwarded (DropFirst(1) exhausted).
     //   Round 2          : HB(c=2) → reader sees missing SNs 1,2,3, sends NACK(1,2,3);
     //                      NACK-2 dropped.
     //   [periodic HB]    : handleHeartbeat(c=3) called directly → NACK-3 passes.
-    //   Round 3          : NACK-3 → clears awaiting_first_ack, retransmits DATA(1,2,3).
+    //   Round 3          : NACK-3 → bitmap loop sends DATA(1,2,3) + trailing HB(c=3)
+    //                      capped at floor=3. (suppress_live_data unchanged: highest_sn=0 < floor=3)
     //   Round 4          : DATA(1,2,3) arrive → all 3 samples delivered.
     const alloc = testing.allocator;
 
@@ -667,8 +671,7 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
     // DropFirst(2) is exhausted so NACK-3 is forwarded into mt_w.
     reader.handleHeartbeat(W1_GUID, 1, 3, 3, false);
 
-    // Round 3: NACK-3 → clears awaiting_first_ack (highest_sn=3 >= floor=3),
-    //          retransmits DATA(1,2,3) + trailing HB.
+    // Round 3: NACK-3 → bitmap loop sends DATA(1,2,3) + trailing HB(c=3) capped at floor=3.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
