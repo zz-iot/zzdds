@@ -49,7 +49,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `Publisher` / `Subscriber` | Partial | `begin_coherent_changes`, `end_coherent_changes`, `suspend_publications`, `resume_publications` return `RETCODE_UNSUPPORTED` |
 | `DataWriter` / `DataReader` | Complete | |
 | `Topic` | Complete | |
-| `ContentFilteredTopic` lifecycle + parser/evaluator | Partial | API, expression storage, parser, and manual evaluator are present; automatic filtering in `DataReader.read()` / `take()` is not wired yet |
+| `ContentFilteredTopic` lifecycle + parser/evaluator | Complete | API, parser, evaluator, and delivery-time filtering all wired; types must register `TypeSupport.get_field` for field-level filtering |
 | `WaitSet` | Complete | |
 | `ReadCondition` | Complete | |
 | `QueryCondition` | Partial | State-mask condition + query string/parameter storage; SQL expression evaluation is deferred |
@@ -58,12 +58,15 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | All 22 QoS policies represented + matched | Mostly complete | Runtime enforcement is broad, but keyed-instance behavior still has gaps; see known limitations |
 | OWNERSHIP QoS enforcement | Partial | Per-instance when `CacheChange.key_hash` is populated; generated key extraction/hash support is still needed |
 | `on_publication_matched` / `on_subscription_matched` | Complete | `src/dcps/writer.zig:230-254`, `reader.zig:673-703` |
+| `SampleLostStatus` / `on_sample_lost` | Complete | GAP-derived loss counting in `reader_sm.zig`; callback thread via `DataCallback.on_sample_lost` |
+| `LivelinessChangedStatus` / `on_liveliness_changed` | Complete | Per-writer lease tracking in `DataReaderImpl`; expiry detected in `checkTimersFn` |
+| `initial_peers` config wiring | Complete | `src/config/schema.zig`, `spdp.zig` |
 | Instance lifecycle (ALIVE / DISPOSED / UNREGISTERED) | Complete | |
 | `read()` / `take()` with all state filters | Complete | |
 | `SampleInfo` (all fields) | Complete | |
 | `get_builtin_subscriber` / built-in topics | Partial | Built-in Subscriber/DataReaders exist; participant/publication/subscription samples are pushed from discovery callbacks; `DCPSTopic` is not populated |
 | `ignore_topic` / `ignore_publication` / `ignore_subscription` | Normative stubs returning `OK` | |
-| `wait_for_historical_data` (TRANSIENT_LOCAL) | Returns `RETCODE_UNSUPPORTED` | `reader.zig:959-962` |
+| `wait_for_historical_data` (TRANSIENT_LOCAL) | Returns `RETCODE_UNSUPPORTED` | `reader.zig` |
 | `get_discovered_topics` / `get_discovered_topic_data` / `contains_entity` | Not implemented | Topic APIs return empty/`BAD_PARAMETER`; `contains_entity` always returns `false` |
 
 ## Security
@@ -100,23 +103,16 @@ See `docs/testing.md` for how to run the full suite.
 
 ## Known Limitations
 
-**Generated key extraction for keyed topics.** `DataReader` now uses an `owner_map`
-keyed by `InstanceHandle_t`, so OWNERSHIP is per-instance when incoming changes carry a
-real `key_hash`. The remaining gap is a TypeSupport registration mechanism in zzdds: `zidl`
-generates `deserializeKey` / `computeKeyHash` for keyed IDL types (confirmed in
-`zidl/test/golden/zig/types.zig`), but the zzdds receive path does not yet call them.
-Keyed samples that arrive with the nil key hash collapse to the same instance handle.
+**Generated key extraction for keyed topics.** `TypeSupport` registration is implemented
+(`participant.registerTypeSupport()`). The receive path calls the registered `compute_key_hash`
+when a sample arrives without an inline-QoS key hash. Applications must call
+`registerTypeSupport` with their type's hash function (zidl-generated types expose this as
+`MyType.computeKeyHash`); without it, keyed samples collapse to the same instance handle.
 
 **Per-instance timing/history accounting.** `TIME_BASED_FILTER` (`tbf_last_ns`) is still
 global per reader, and RTPS `KEEP_LAST` depth is still global per history cache. Both
 should become per-instance once generated key extraction is available throughout the data
 path.
-
-**Content-filter integration.** `ContentFilteredTopic` and `QueryCondition` can store and
-parse expressions, and `ContentFilteredTopicImpl.matchSample()` can evaluate an expression
-against a supplied `FieldAccessor`. The generic `DataReader` does not yet deserialize raw
-CDR samples and apply those expressions automatically during `read()` / `take()`.
-
 
 **Built-in topic coverage.** `get_builtin_subscriber()` returns a real built-in Subscriber
 when initialization succeeds, and discovery callbacks push `DCPSParticipant`,
@@ -149,11 +145,6 @@ support for those targets.
 use `{0x01, 0x23}` consistently, and `src/util/guid_gen.zig` already embeds those bytes into
 `guidPrefix[0..2]` (RTPS §9.3.1.5). The sole remaining step is registering with OMG and updating
 the two-byte constant.
-
-**`initial_peers` config not connected.** `discovery.initial_peers` is present in the
-configuration schema and documented in `docs/architecture.md`, but `src/discovery/spdp.zig`
-does not read it. SPDP discovery relies entirely on multicast; unicast peer targeting at
-startup is not yet implemented.
 
 **`PID_GROUP_DATA` wire value.** `pid.zig` defines `GROUP_DATA = 0x002D` per RTPS 2.5 Table 9.18.
 The constant is present but not yet serialized in SEDP announcements; when GROUP_DATA serialization

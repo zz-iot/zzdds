@@ -44,6 +44,7 @@ pub const Locator = iface.Locator;
 pub const DataCallback = struct {
     ctx: *anyopaque,
     on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
+    on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
 };
 
 // ── StatelessReader ───────────────────────────────────────────────────────────
@@ -704,18 +705,26 @@ pub const StatefulReader = struct {
             const prev_highest = wp.received.cumulativeAck();
             var sn: SequenceNumber = gap_start;
             const bitmap_end: SequenceNumber = gap_list.base + @as(i64, gap_list.num_bits);
+            var lost_count: i32 = 0;
             // SNs in [gap_start, gap_list.base-1] are all irreversibly missing.
             while (sn < gap_list.base) : (sn += 1) {
+                if (!wp.received.contains(sn)) lost_count += 1;
                 _ = wp.received.insert(self.alloc, sn) catch {};
             }
             // SNs in [gap_list.base, bitmap_end-1] where the bit is set are missing.
             while (sn < bitmap_end) : (sn += 1) {
                 if (gap_list.contains(sn)) {
+                    if (!wp.received.contains(sn)) lost_count += 1;
                     _ = wp.received.insert(self.alloc, sn) catch {};
                 }
             }
             // Deliver any buffered pending changes that are now contiguous.
             if (self.reliable) self.deliverPendingLocked(wp, prev_highest);
+            if (lost_count > 0) {
+                if (self.callback) |cb| {
+                    if (cb.on_sample_lost) |f| f(cb.ctx, lost_count);
+                }
+            }
         }
     }
 

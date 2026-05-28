@@ -11,6 +11,8 @@ const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const reader_mod = @import("reader.zig");
+const topic_mod = @import("topic.zig");
+const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
@@ -70,6 +72,13 @@ pub const ParticipantCbs = struct {
         notify_ctx: *anyopaque,
         notify_fn: *const fn (notify_ctx: *anyopaque, now_ns: i64) void,
     ) void,
+
+    /// Look up the optional get_field function for a given type name.
+    /// Returns null when no TypeSupport with a get_field fn is registered.
+    get_field_fn: *const fn (
+        ctx: *anyopaque,
+        type_name: []const u8,
+    ) ?*const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue,
 };
 
 pub const SubscriberImpl = struct {
@@ -242,6 +251,13 @@ pub const SubscriberImpl = struct {
             dr,
             reader_mod.DataReaderImpl.checkTimersFn,
         );
+        // Wire up ContentFilteredTopic if the topic description is a CFT and we
+        // have a get_field function registered for this type.
+        if (topic_mod.asCft(a_topic)) |cft| {
+            if (self.cbs.get_field_fn(self.cbs.ctx, type_name)) |get_field| {
+                dr.cft_filter = .{ .cft_ptr = cft, .get_field_fn = get_field };
+            }
+        }
         self.cbs.announce_reader(self.cbs.ctx, sub_handle, self.qos.partition.name.items);
         self.mu.lock();
         self.readers.append(self.alloc, dr) catch {

@@ -54,6 +54,8 @@ pub const MatchedWriterInfo = struct {
     reliability: ReliabilityKind,
     /// Only meaningful when the remote writer has EXCLUSIVE ownership.
     ownership_strength: i32 = 0,
+    /// Liveliness lease duration in nanoseconds; 0 = infinite (no expiry tracking).
+    liveliness_lease_ns: i64 = 0,
 };
 
 // ── Data delivery callback ────────────────────────────────────────────────────
@@ -64,6 +66,9 @@ pub const MatchedWriterInfo = struct {
 pub const DataCallback = struct {
     ctx: *anyopaque,
     on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
+    /// Optional: called when gap processing marks `count` sequence numbers as
+    /// irreversibly lost (never delivered). Called under the same lock as on_data.
+    on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
 };
 
 // ── ProtocolWriter ────────────────────────────────────────────────────────────
@@ -208,6 +213,9 @@ pub const WriterMatchCallback = struct {
     ctx: *anyopaque,
     on_writer_matched: *const fn (ctx: *anyopaque, info: *const MatchedWriterInfo) void,
     on_writer_unmatched: *const fn (ctx: *anyopaque, guid: Guid) void,
+    /// Optional: called when a DATA or HEARTBEAT is received from the writer,
+    /// indicating the writer is still alive. Used for LIVELINESS tracking.
+    on_writer_alive: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
 };
 
 // ── ProtocolReader ────────────────────────────────────────────────────────────

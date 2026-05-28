@@ -25,6 +25,7 @@ const log_mod = @import("../log.zig");
 const publisher_mod = @import("publisher.zig");
 const subscriber_mod = @import("subscriber.zig");
 const topic_mod = @import("topic.zig");
+const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const adapters = @import("../rtps/protocol_adapters.zig");
@@ -198,6 +199,11 @@ const BuiltinSubscriberState = struct {
             .timer_clock = participant.timer_clock,
             .register_timer_notify = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void) void {}
+            }.f,
+            .get_field_fn = struct {
+                fn f(_: *anyopaque, _: []const u8) ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue {
+                    return null;
+                }
             }.f,
         };
 
@@ -435,6 +441,10 @@ pub const TypeSupport = struct {
     /// `payload` includes the 4-byte encapsulation header (as received from
     /// the wire).  Return `zeroes([16]u8)` for keyless types.
     compute_key_hash: *const fn (payload: []const u8) [16]u8,
+    /// Optional: extract a named field value from a raw CDR payload.
+    /// Used to evaluate ContentFilteredTopic expressions at delivery time.
+    /// null = CFT evaluation deferred to the typed DataReader layer.
+    get_field: ?*const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue = null,
 };
 
 const ActiveWriter = struct {
@@ -687,6 +697,7 @@ pub const DomainParticipantImpl = struct {
             .default_multicast_locators = &.{},
             .lease_duration_ms = part_cfg.lease_duration_ms,
             .builtin_endpoint_set = BUILTIN_ENDPOINTS,
+            .initial_peers = udp_cfg.initial_peers,
         };
         try self.discovery.start(&ann, &self.disc_callbacks);
 
@@ -1284,12 +1295,19 @@ pub const DomainParticipantImpl = struct {
                 .{ .name = ar.partition_names },
             );
             if (!part_result.isCompatible()) continue;
+            const ll_sec = data.qos.liveliness_lease_sec;
+            const ll_ns = data.qos.liveliness_lease_nanosec;
+            const lease_ns: i64 = if (ll_sec == 0x7fff_ffff)
+                0 // infinite — no expiry tracking
+            else
+                @as(i64, ll_sec) * std.time.ns_per_s + @as(i64, ll_ns);
             const info = proto.MatchedWriterInfo{
                 .guid = data.guid,
                 .unicast_locators = data.unicast_locators,
                 .multicast_locators = data.multicast_locators,
                 .reliability = if (data.qos.reliability_kind == 1) .reliable else .best_effort,
                 .ownership_strength = data.qos.ownership_strength,
+                .liveliness_lease_ns = lease_ns,
             };
             ar.proto.addMatchedWriter(&info) catch {};
             if (ar.matched_notify) |cb|
@@ -1585,6 +1603,17 @@ pub const DomainParticipantImpl = struct {
         };
     }
 
+    fn subGetFieldFn(
+        ctx: *anyopaque,
+        type_name: []const u8,
+    ) ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.type_support_registry.get(type_name)) |ts| return ts.get_field;
+        return null;
+    }
+
     fn makeSubCbs(self: *Self) subscriber_mod.ParticipantCbs {
         return .{
             .ctx = self,
@@ -1596,6 +1625,7 @@ pub const DomainParticipantImpl = struct {
             .announce_reader = subAnnounceProtoReader,
             .timer_clock = self.timer_clock,
             .register_timer_notify = subRegisterReaderTimerNotify,
+            .get_field_fn = subGetFieldFn,
         };
     }
 

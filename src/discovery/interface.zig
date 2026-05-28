@@ -35,6 +35,8 @@ pub const QosSnapshot = struct {
     history_kind: u8 = 0, // 0=keep_last, 1=keep_all
     history_depth: i32 = 1,
     liveliness_kind: u8 = 0, // 0=automatic, 1=manual_by_participant, 2=manual_by_topic
+    liveliness_lease_sec: i32 = 0x7fff_ffff, // default = infinite
+    liveliness_lease_nanosec: u32 = 0x7fff_ffff,
     ownership_kind: u8 = 0, // 0=shared, 1=exclusive
     ownership_strength: i32 = 0, // only meaningful when ownership_kind=exclusive
     destination_order_kind: u8 = 0, // 0=by_reception_timestamp, 1=by_source_timestamp
@@ -62,6 +64,10 @@ pub const ParticipantAnnouncement = struct {
     /// Lease duration in milliseconds. Remote peer removes this participant
     /// from its view if no announcement is received within this window.
     lease_duration_ms: u32,
+    /// Additional unicast peers to contact at startup (IP:port strings).
+    /// Forwarded from the UDP config; used by SPDP to seed unicast locators
+    /// on networks without multicast.
+    initial_peers: []const []const u8 = &.{},
     /// Bit mask of built-in endpoints this participant supports (RTPS §8.5.4.2).
     builtin_endpoint_set: u32,
 };

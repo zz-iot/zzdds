@@ -424,6 +424,11 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
             },
             PidTable.LIVELINESS => {
                 if (v.len >= 4) qos.liveliness_kind = @intCast(readU32LE(v, le));
+                if (v.len >= 12) {
+                    const dur = readDeadlineDuration(v[4..], le);
+                    qos.liveliness_lease_sec = dur.sec;
+                    qos.liveliness_lease_nanosec = dur.nanosec;
+                }
             },
             PidTable.DEADLINE => {
                 if (v.len >= 8) {

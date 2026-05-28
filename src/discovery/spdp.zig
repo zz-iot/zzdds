@@ -244,7 +244,15 @@ pub const SpdpEndpoints = struct {
             try self.writer.?.addReaderLocator(.{ .locator = loc });
         }
 
-        // Also register any initial_peers from config (not yet plumbed; skip for now).
+        // Register initial_peers as unicast reader-locators so SPDP announcements
+        // are sent directly to each configured peer at startup.
+        for (local.initial_peers) |peer_str| {
+            if (parseLocatorStr(peer_str)) |loc| {
+                self.writer.?.addReaderLocator(.{ .locator = loc }) catch {};
+            } else {
+                log.spdp.warn("spdp: ignoring unparseable initial_peer '{s}'", .{peer_str});
+            }
+        }
 
         // Listen on SPDP multicast port and join the multicast group.
         const listen_locator = Locator.udp4(.{ 0, 0, 0, 0 }, self.spdp_multicast_port);
@@ -723,6 +731,22 @@ fn readI32LE(buf: []const u8, le: bool) i32 {
 
 fn readRtpsDuration(buf: []const u8, le: bool) time_mod.RtpsDuration {
     return .{ .seconds = readI32LE(buf[0..], le), .fraction = readU32LE(buf[4..], le) };
+}
+
+/// Parse "a.b.c.d:port" into a UDP4 Locator. Returns null on any parse failure.
+fn parseLocatorStr(s: []const u8) ?Locator {
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch return null;
+    var addr: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s[0..colon], '.');
+    var i: usize = 0;
+    while (it.next()) |part| {
+        if (i >= 4) return null;
+        addr[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+        i += 1;
+    }
+    if (i != 4) return null;
+    return Locator.udp4(addr, port);
 }
 
 fn readLocator(buf: []const u8, le: bool) Locator {

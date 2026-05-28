@@ -17,12 +17,48 @@ const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const history_mod = @import("../rtps/history.zig");
+const filter_mod = @import("filter.zig");
+const topic_mod = @import("topic.zig");
 const waitset = @import("waitset.zig");
 const writer_mod = @import("writer.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 
 const Guid = proto.Guid;
+
+/// CFT filter state held on the DataReaderImpl.
+/// Non-null only when the reader was created from a ContentFilteredTopic and a
+/// get_field function is available for this type.
+pub const CftFilterState = struct {
+    cft_ptr: *topic_mod.ContentFilteredTopicImpl,
+    get_field_fn: *const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue,
+
+    pub fn matches(self: *const CftFilterState, payload: []const u8) bool {
+        var ctx = FieldCtx{ .payload = payload, .get_fn = self.get_field_fn };
+        const accessor = filter_mod.FieldAccessor{
+            .ctx = &ctx,
+            .get = FieldCtx.get,
+        };
+        return self.cft_ptr.matchSample(accessor);
+    }
+
+    const FieldCtx = struct {
+        payload: []const u8,
+        get_fn: *const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+
+        fn get(ctx: *anyopaque, field: []const u8) ?filter_mod.FilterValue {
+            const self: *const FieldCtx = @ptrCast(@alignCast(ctx));
+            return self.get_fn(self.payload, field);
+        }
+    };
+};
+
+/// Per-writer liveliness tracking entry.
+const WriterLivelinessEntry = struct {
+    lease_ns: i64, // 0 = infinite (no expiry)
+    last_alive_ns: i64,
+    is_alive: bool,
+};
 
 fn durationIsActive(d: DDS.Duration_t) bool {
     if (d.sec == 0 and d.nanosec == 0) return false;
@@ -122,6 +158,25 @@ pub const DataReaderImpl = struct {
     pending: std.ArrayListUnmanaged(PendingChange),
     mu: Mutex,
 
+    /// ContentFilteredTopic filter; null when no CFT or no get_field fn registered.
+    /// Set once after init by the subscriber; read-only thereafter.
+    cft_filter: ?CftFilterState = null,
+
+    /// SampleLost status counters. Guarded by `mu`.
+    sample_lost_total: i32 = 0,
+    sample_lost_total_change: i32 = 0,
+
+    /// LivelinessChanged status counters. Guarded by `mu`.
+    liveliness_alive_count: i32 = 0,
+    liveliness_alive_count_change: i32 = 0,
+    liveliness_not_alive_count: i32 = 0,
+    liveliness_not_alive_count_change: i32 = 0,
+    liveliness_last_handle: DDS.InstanceHandle_t = 0,
+
+    /// Per-writer liveliness state for writers with a finite lease.
+    /// Guarded by `mu`.
+    writer_liveliness: std.AutoHashMapUnmanaged(Guid, WriterLivelinessEntry) = .empty,
+
     // ── OWNERSHIP tracking ────────────────────────────────────────────────────
     // Only used when qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS.
     // Guarded by `mu`.
@@ -186,12 +241,14 @@ pub const DataReaderImpl = struct {
         proto_reader.setDataCallback(.{
             .ctx = self,
             .on_data = onDataCb,
+            .on_sample_lost = onSampleLostCb,
         });
-        // Register writer-match callback for OWNERSHIP tracking.
+        // Register writer-match callback for OWNERSHIP and LIVELINESS tracking.
         proto_reader.setWriterMatchCallback(.{
             .ctx = self,
             .on_writer_matched = onWriterMatchedCb,
             .on_writer_unmatched = onWriterUnmatchedCb,
+            .on_writer_alive = onWriterAliveCb,
         });
         // Wire up StatusCondition.
         const sc = try waitset.StatusConditionImpl.init(
@@ -210,6 +267,7 @@ pub const DataReaderImpl = struct {
         for (self.pending.items) |p| p.deinit();
         self.pending.deinit(self.alloc);
         self.writer_strengths.deinit(self.alloc);
+        self.writer_liveliness.deinit(self.alloc);
         self.owner_map.deinit(self.alloc);
         self.seen_instances.deinit(self.alloc);
         // NOTE: proto_reader lifecycle is owned by the participant (via
@@ -347,6 +405,15 @@ pub const DataReaderImpl = struct {
             self.tbf_last_ns = src_ns;
         }
 
+        // CONTENT_FILTER: drop samples that do not match the CFT expression.
+        if (self.cft_filter) |*cft| {
+            if (!cft.matches(change.data)) {
+                self.mu.unlock();
+                self.alloc.free(copy);
+                return;
+            }
+        }
+
         // RESOURCE_LIMITS: check all three limits in priority order.
         // Rejection is notified via on_sample_rejected; sample is dropped.
         const rl = self.qos.resource_limits;
@@ -465,8 +532,36 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
-        // Per-instance ownership is re-evaluated at receive time; no global
-        // re-election needed here.
+        // Track liveliness for writers with a finite lease.
+        if (info.liveliness_lease_ns > 0) {
+            self.writer_liveliness.put(self.alloc, info.guid, .{
+                .lease_ns = info.liveliness_lease_ns,
+                .last_alive_ns = self.timer_clock.nowNs(),
+                .is_alive = true,
+            }) catch {};
+            self.liveliness_alive_count += 1;
+            self.liveliness_alive_count_change += 1;
+            self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+            self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+        }
+    }
+
+    fn onWriterAliveCb(ctx: *anyopaque, guid: Guid) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.writer_liveliness.getPtr(guid)) |entry| {
+            entry.last_alive_ns = self.timer_clock.nowNs();
+            if (!entry.is_alive) {
+                entry.is_alive = true;
+                self.liveliness_alive_count += 1;
+                self.liveliness_alive_count_change += 1;
+                self.liveliness_not_alive_count -= 1;
+                self.liveliness_not_alive_count_change -= 1;
+                self.liveliness_last_handle = writer_mod.guidToHandle(guid);
+                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            }
+        }
     }
 
     fn onWriterUnmatchedCb(ctx: *anyopaque, guid: Guid) void {
@@ -474,6 +569,18 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         _ = self.writer_strengths.remove(guid);
+        // Clean up liveliness tracking for this writer.
+        if (self.writer_liveliness.fetchRemove(guid)) |kv| {
+            if (kv.value.is_alive) {
+                self.liveliness_alive_count -= 1;
+                self.liveliness_alive_count_change -= 1;
+            } else {
+                self.liveliness_not_alive_count -= 1;
+                self.liveliness_not_alive_count_change -= 1;
+            }
+            self.liveliness_last_handle = writer_mod.guidToHandle(guid);
+            self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+        }
         // Release ownership of any instances this writer held.  Collect keys
         // first (can't remove while iterating), then remove.  The next sample
         // from any remaining writer for those instances will re-claim them.
@@ -708,6 +815,58 @@ pub const DataReaderImpl = struct {
         }
     }
 
+    /// Called by the on_sample_lost DataCallback when GAP processing marks SNs as lost.
+    fn onSampleLostCb(ctx: *anyopaque, count: i32) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.notifySampleLost(count);
+    }
+
+    pub fn notifySampleLost(self: *Self, count: i32) void {
+        self.mu.lock();
+        self.sample_lost_total += count;
+        self.sample_lost_total_change += count;
+        self.status_changes |= DDS.SAMPLE_LOST_STATUS;
+        const fire = self.listener_mask & DDS.SAMPLE_LOST_STATUS != 0;
+        if (fire) {
+            self.sample_lost_total_change = 0;
+            self.status_changes &= ~DDS.SAMPLE_LOST_STATUS;
+        }
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        if (fire) {
+            self.listener.vtable.on_sample_lost(
+                self.listener.ptr,
+                self.toDDSDataReader(),
+                .{
+                    .total_count = self.sample_lost_total,
+                    .total_count_change = count,
+                },
+            );
+        }
+    }
+
+    fn notifyLivelinessChanged(self: *Self) void {
+        self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        if (self.listener_mask & DDS.LIVELINESS_CHANGED_STATUS != 0) {
+            const status = DDS.LivelinessChangedStatus{
+                .alive_count = self.liveliness_alive_count,
+                .not_alive_count = self.liveliness_not_alive_count,
+                .alive_count_change = self.liveliness_alive_count_change,
+                .not_alive_count_change = self.liveliness_not_alive_count_change,
+                .last_publication_handle = self.liveliness_last_handle,
+            };
+            self.liveliness_alive_count_change = 0;
+            self.liveliness_not_alive_count_change = 0;
+            self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
+            self.listener.vtable.on_liveliness_changed(
+                self.listener.ptr,
+                self.toDDSDataReader(),
+                status,
+            );
+        }
+    }
+
     /// Fire on_requested_deadline_missed if the listener is registered for it.
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyDeadlineMissed(self: *Self) void {
@@ -730,18 +889,42 @@ pub const DataReaderImpl = struct {
     }
 
     /// Called by participant.checkTimers() for each active reader.
-    /// Checks DEADLINE; fires on_requested_deadline_missed when threshold is exceeded.
+    /// Checks DEADLINE and LIVELINESS lease expiry; fires notifications when thresholds exceeded.
     /// Called while participant.mu is held; must not re-enter participant.
     pub fn checkTimersFn(ctx: *anyopaque, now_ns: i64) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+
+        // DEADLINE check.
         const dl = self.qos.deadline.period;
-        if (!durationIsActive(dl)) return;
-        const period_ns = @as(i64, dl.sec) * std.time.ns_per_s + @as(i64, dl.nanosec);
-        const last = self.last_received_ns.load(.monotonic);
-        if (now_ns - last >= period_ns) {
-            self.last_received_ns.store(now_ns, .monotonic);
-            self.notifyDeadlineMissed();
+        if (durationIsActive(dl)) {
+            const period_ns = @as(i64, dl.sec) * std.time.ns_per_s + @as(i64, dl.nanosec);
+            const last = self.last_received_ns.load(.monotonic);
+            if (now_ns - last >= period_ns) {
+                self.last_received_ns.store(now_ns, .monotonic);
+                self.notifyDeadlineMissed();
+            }
         }
+
+        // LIVELINESS lease expiry check.
+        self.mu.lock();
+        var liveliness_changed = false;
+        var it = self.writer_liveliness.iterator();
+        while (it.next()) |kv| {
+            const entry = kv.value_ptr;
+            if (!entry.is_alive) continue;
+            if (entry.lease_ns <= 0) continue;
+            if (now_ns - entry.last_alive_ns >= entry.lease_ns) {
+                entry.is_alive = false;
+                self.liveliness_alive_count -= 1;
+                self.liveliness_alive_count_change -= 1;
+                self.liveliness_not_alive_count += 1;
+                self.liveliness_not_alive_count_change += 1;
+                self.liveliness_last_handle = writer_mod.guidToHandle(kv.key_ptr.*);
+                liveliness_changed = true;
+            }
+        }
+        self.mu.unlock();
+        if (liveliness_changed) self.notifyLivelinessChanged();
     }
 
     // ── Entity vtable ─────────────────────────────────────────────────────────
@@ -901,8 +1084,20 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtGetLivelinessChanged(_: *anyopaque, status: *DDS.LivelinessChangedStatus) DDS.ReturnCode_t {
-        status.* = .{};
+    fn vtGetLivelinessChanged(ctx: *anyopaque, status: *DDS.LivelinessChangedStatus) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        status.* = .{
+            .alive_count = self.liveliness_alive_count,
+            .not_alive_count = self.liveliness_not_alive_count,
+            .alive_count_change = self.liveliness_alive_count_change,
+            .not_alive_count_change = self.liveliness_not_alive_count_change,
+            .last_publication_handle = self.liveliness_last_handle,
+        };
+        self.liveliness_alive_count_change = 0;
+        self.liveliness_not_alive_count_change = 0;
+        self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
         return DDS.RETCODE_OK;
     }
 
@@ -948,8 +1143,16 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtGetSampleLost(_: *anyopaque, status: *DDS.SampleLostStatus) DDS.ReturnCode_t {
-        status.* = .{};
+    fn vtGetSampleLost(ctx: *anyopaque, status: *DDS.SampleLostStatus) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        status.* = .{
+            .total_count = self.sample_lost_total,
+            .total_count_change = self.sample_lost_total_change,
+        };
+        self.sample_lost_total_change = 0;
+        self.status_changes &= ~DDS.SAMPLE_LOST_STATUS;
         return DDS.RETCODE_OK;
     }
 
