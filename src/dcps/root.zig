@@ -8,6 +8,7 @@ pub const TypeSupport = @import("participant.zig").TypeSupport;
 pub const PublisherImpl = @import("publisher.zig").PublisherImpl;
 pub const SubscriberImpl = @import("subscriber.zig").SubscriberImpl;
 pub const DataWriterImpl = @import("writer.zig").DataWriterImpl;
+pub const guidToHandle = @import("writer.zig").guidToHandle;
 pub const DataReaderImpl = @import("reader.zig").DataReaderImpl;
 pub const TakenSample = @import("reader.zig").TakenSample;
 pub const TopicImpl = @import("topic.zig").TopicImpl;

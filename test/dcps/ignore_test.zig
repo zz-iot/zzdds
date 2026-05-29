@@ -16,6 +16,7 @@ const DomainParticipantFactoryImpl = dcps.DomainParticipantFactoryImpl;
 const DomainParticipantImpl = dcps.DomainParticipantImpl;
 const DataReaderImpl = dcps.DataReaderImpl;
 const TopicImpl = dcps.TopicImpl;
+const guidToHandle = dcps.guidToHandle;
 const nil = dcps;
 
 const Discovery = iface.Discovery;
@@ -306,7 +307,7 @@ test "ignore_participant: reader from ignored prefix not matched to writer" {
     try testing.expectEqual(@as(usize, 0), dw_impl.matchedReaderCount());
 }
 
-test "ignore_topic/publication/subscription: stubs return OK" {
+test "ignore_topic: bad handle returns BAD_PARAMETER" {
     var h = try Harness.init();
     defer h.deinit();
 
@@ -314,7 +315,141 @@ test "ignore_topic/publication/subscription: stubs return OK" {
     const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
     defer _ = dpf.delete_participant(dp);
 
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_topic(dp.ptr, 1));
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, 1));
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, 1));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dp.vtable.ignore_topic(dp.ptr, 0x7FFF_FFFF));
+}
+
+test "ignore_topic: writer for ignored topic not matched to reader" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const topic = dp.vtable.create_topic(dp.ptr, "IgnoredTopic", "T", .{}, nil.nil_topic_listener, 0);
+    const topic_handle = topic.vtable.get_instance_handle(topic.ptr);
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dr = sub.vtable.create_datareader(
+        sub.ptr,
+        @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription(),
+        dr_qos,
+        nil.nil_dr_listener,
+        0,
+    );
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_topic(dp.ptr, topic_handle));
+    h.fireWriterDiscovered(dp_impl, makePrefix(0xE0), "IgnoredTopic", "T");
+    try testing.expectEqual(@as(usize, 0), dr_impl.matchedWriterCount());
+}
+
+test "ignore_topic: reader for ignored topic not matched to writer" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const topic = dp.vtable.create_topic(dp.ptr, "IgnoredTopic", "T", .{}, nil.nil_topic_listener, 0);
+    const topic_handle = topic.vtable.get_instance_handle(topic.ptr);
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, dw_qos, nil.nil_dw_listener, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const dw_impl: *dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_topic(dp.ptr, topic_handle));
+    h.fireReaderDiscovered(dp_impl, makePrefix(0xE1), "IgnoredTopic", "T");
+    try testing.expectEqual(@as(usize, 0), dw_impl.matchedReaderCount());
+}
+
+test "ignore_publication: ignored writer not matched to reader" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const topic = dp.vtable.create_topic(dp.ptr, "PubTopic", "T", .{}, nil.nil_topic_listener, 0);
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dr = sub.vtable.create_datareader(
+        sub.ptr,
+        @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription(),
+        dr_qos,
+        nil.nil_dr_listener,
+        0,
+    );
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    // Pre-compute the handle for the writer we will fire.
+    const prefix = makePrefix(0xE2);
+    const writer_guid = Guid{
+        .prefix = prefix,
+        .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
+    };
+    const pub_handle = guidToHandle(writer_guid);
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, pub_handle));
+    h.fireWriterDiscovered(dp_impl, prefix, "PubTopic", "T");
+    try testing.expectEqual(@as(usize, 0), dr_impl.matchedWriterCount());
+}
+
+test "ignore_subscription: ignored reader not matched to writer" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const topic = dp.vtable.create_topic(dp.ptr, "SubTopic", "T", .{}, nil.nil_topic_listener, 0);
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, dw_qos, nil.nil_dw_listener, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const dw_impl: *dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    // Pre-compute the handle for the reader we will fire.
+    const prefix = makePrefix(0xE3);
+    const reader_guid = Guid{
+        .prefix = prefix,
+        .entity_id = .{ .entity_key = .{ 0, 0, 4 }, .entity_kind = 0x07 },
+    };
+    const sub_handle = guidToHandle(reader_guid);
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, sub_handle));
+    h.fireReaderDiscovered(dp_impl, prefix, "SubTopic", "T");
+    try testing.expectEqual(@as(usize, 0), dw_impl.matchedReaderCount());
+}
+
+test "ignore_publication/subscription: duplicate call is idempotent" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, 42));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, 42));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, 42));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, 42));
 }

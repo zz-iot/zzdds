@@ -563,6 +563,18 @@ pub const DomainParticipantImpl = struct {
     /// these prefixes are silently dropped.  Guarded by mu.
     ignored_prefixes: std.ArrayListUnmanaged(GuidPrefix),
 
+    /// Topic names passed to ignore_topic(); discovery events for these topics
+    /// are silently dropped.  Owned strings.  Guarded by mu.
+    ignored_topic_names: std.ArrayListUnmanaged([]const u8),
+
+    /// Handles of remote publications passed to ignore_publication().
+    /// Derived via guidToHandle(remote_writer_guid).  Guarded by mu.
+    ignored_publication_handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t),
+
+    /// Handles of remote subscriptions passed to ignore_subscription().
+    /// Derived via guidToHandle(remote_reader_guid).  Guarded by mu.
+    ignored_subscription_handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t),
+
     /// Topics discovered via SEDP writer/reader announcements, deduped by
     /// (topic_name, type_name).  Backing strings are owned.  Guarded by mu.
     discovered_topics: std.ArrayListUnmanaged(DiscoveredTopic),
@@ -644,6 +656,9 @@ pub const DomainParticipantImpl = struct {
             .active_readers = .empty,
             .discovered_participants = .empty,
             .ignored_prefixes = .empty,
+            .ignored_topic_names = .empty,
+            .ignored_publication_handles = .empty,
+            .ignored_subscription_handles = .empty,
             .discovered_topics = .empty,
             .builtin_sub = null,
             .type_info_registry = .empty,
@@ -818,6 +833,10 @@ pub const DomainParticipantImpl = struct {
         self.active_readers.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
         self.ignored_prefixes.deinit(self.alloc);
+        for (self.ignored_topic_names.items) |n| self.alloc.free(n);
+        self.ignored_topic_names.deinit(self.alloc);
+        self.ignored_publication_handles.deinit(self.alloc);
+        self.ignored_subscription_handles.deinit(self.alloc);
         for (self.discovered_topics.items) |dt| {
             self.alloc.free(dt.topic_name);
             self.alloc.free(dt.type_name);
@@ -1346,6 +1365,19 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
+        const pub_handle = writer_mod.guidToHandle(data.guid);
+        for (self.ignored_publication_handles.items) |h| {
+            if (h == pub_handle) {
+                self.mu.unlock();
+                return;
+            }
+        }
+        for (self.ignored_topic_names.items) |n| {
+            if (std.mem.eql(u8, n, data.topic_name)) {
+                self.mu.unlock();
+                return;
+            }
+        }
         for (self.active_readers.items) |*ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, ar.type_name, data.type_name)) continue;
@@ -1446,6 +1478,19 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         for (self.ignored_prefixes.items) |p| {
             if (p.eql(data.guid.prefix)) {
+                self.mu.unlock();
+                return;
+            }
+        }
+        const sub_handle = writer_mod.guidToHandle(data.guid);
+        for (self.ignored_subscription_handles.items) |h| {
+            if (h == sub_handle) {
+                self.mu.unlock();
+                return;
+            }
+        }
+        for (self.ignored_topic_names.items) |n| {
+            if (std.mem.eql(u8, n, data.topic_name)) {
                 self.mu.unlock();
                 return;
             }
@@ -2179,16 +2224,57 @@ pub const DomainParticipantImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtIgnoreTopic(_: *anyopaque, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
-        // Normative stub — full filter-on-delivery is a future phase.
+    fn vtIgnoreTopic(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        // Resolve handle → topic name from local topics or discovered topics.
+        var found_name: ?[]const u8 = null;
+        for (self.topics.items) |t| {
+            if (t.instance_handle == handle) {
+                found_name = t.topic_name;
+                break;
+            }
+        }
+        if (found_name == null) {
+            for (self.discovered_topics.items) |dt| {
+                if (dt.handle == handle) {
+                    found_name = dt.topic_name;
+                    break;
+                }
+            }
+        }
+        const name = found_name orelse return DDS.RETCODE_BAD_PARAMETER;
+        for (self.ignored_topic_names.items) |n| {
+            if (std.mem.eql(u8, n, name)) return DDS.RETCODE_OK;
+        }
+        const owned = self.alloc.dupe(u8, name) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.ignored_topic_names.append(self.alloc, owned) catch {
+            self.alloc.free(owned);
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        };
         return DDS.RETCODE_OK;
     }
 
-    fn vtIgnorePublication(_: *anyopaque, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+    fn vtIgnorePublication(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.ignored_publication_handles.items) |h| {
+            if (h == handle) return DDS.RETCODE_OK;
+        }
+        self.ignored_publication_handles.append(self.alloc, handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
-    fn vtIgnoreSubscription(_: *anyopaque, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+    fn vtIgnoreSubscription(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.ignored_subscription_handles.items) |h| {
+            if (h == handle) return DDS.RETCODE_OK;
+        }
+        self.ignored_subscription_handles.append(self.alloc, handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
