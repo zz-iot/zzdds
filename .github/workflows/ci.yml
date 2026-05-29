@@ -125,7 +125,7 @@ jobs:
           make -C /tmp/kcov-build -j$(nproc)
 
       - name: Install kcov
-        run: sudo make -C /tmp/kcov-build install
+        run: sudo cp /tmp/kcov-build/src/kcov /usr/local/bin/kcov
 
       - name: Build test binaries
         run: zig build emit-tests
