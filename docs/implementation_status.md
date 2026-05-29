@@ -66,8 +66,8 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `SampleInfo` (all fields) | Complete | |
 | `get_builtin_subscriber` / built-in topics | Complete | Built-in Subscriber/DataReaders exist; participant/publication/subscription/topic samples are pushed; `DCPSTopic` populated from `vtCreateTopic` and SEDP callbacks |
 | `ignore_participant` | Complete | Removes from discovered list; adds to ignore list; subsequent SPDP announcements from that prefix are dropped |
-| `ignore_topic` / `ignore_publication` / `ignore_subscription` | Normative stubs returning `OK` | Full filter-on-delivery deferred |
-| `wait_for_historical_data` (TRANSIENT_LOCAL) | Returns `RETCODE_UNSUPPORTED` | `reader.zig` |
+| `ignore_topic` / `ignore_publication` / `ignore_subscription` | Complete | Topic name stored and checked in discovery callbacks; publication/subscription handles stored and checked via `guidToHandle`; `ignore_topic` returns `BAD_PARAMETER` for unknown handles |
+| `wait_for_historical_data` (TRANSIENT_LOCAL) | Complete | Per-matched-writer history floor from first HEARTBEAT; 1 ms poll with deadline |
 | `get_discovered_participants` / `get_discovered_participant_data` | Complete | `participant.zig` |
 | `get_discovered_topics` / `get_discovered_topic_data` | Complete | Populated from SEDP writer/reader callbacks; deduplicated by (topic_name, type_name); QoS subset from wire data |
 | `contains_entity` | Complete | Checks participant, publishers, subscribers, topics, writers, readers |
@@ -120,11 +120,6 @@ is not reached: remote peers send inline `PID_KEY_HASH`, and Zig users with gene
 register TypeSupport. The clean long-term answer for the fallback is XTypes TypeLookup,
 which would allow key field layout to be discovered from wire metadata without
 pre-registration.
-
-**Built-in topic coverage.** All four built-in DataReaders (`DCPSParticipant`, `DCPSPublication`,
-`DCPSSubscription`, `DCPSTopic`) are populated. `DCPSTopic` receives samples when local topics
-are created and when SEDP announces remote writers/readers. `get_discovered_topics()`,
-`get_discovered_topic_data()`, and `contains_entity()` are fully implemented.
 
 **Transport scatter-gather not fully zero-copy.** The iovec list is assembled without
 copying but is flattened to a `[65536]u8` stack buffer at the `Transport.send()` boundary.

@@ -1201,13 +1201,27 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtWaitForHistorical(ctx: *anyopaque, _: DDS.Duration_t) DDS.ReturnCode_t {
-        // VOLATILE durability has no historical data to wait for; return immediately.
-        // TRANSIENT_LOCAL / TRANSIENT / PERSISTENT would need to wait for history
-        // delivery from matched writers — not yet implemented.
+    fn vtWaitForHistorical(ctx: *anyopaque, max_wait: DDS.Duration_t) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (self.qos.durability.kind == .VOLATILE_DURABILITY_QOS) return DDS.RETCODE_OK;
-        return DDS.RETCODE_UNSUPPORTED;
+
+        const POLL_NS: u64 = 1_000_000; // 1 ms
+        const deadline_ns: ?i64 = if (max_wait.sec == DDS.DURATION_INFINITE_SEC and
+            max_wait.nanosec == DDS.DURATION_INFINITE_NSEC)
+            null
+        else blk: {
+            break :blk time_mod.nanoTimestamp() +
+                @as(i64, max_wait.sec) * std.time.ns_per_s +
+                @as(i64, max_wait.nanosec);
+        };
+
+        while (true) {
+            if (self.proto_reader.historicalDelivered()) return DDS.RETCODE_OK;
+            if (deadline_ns) |dl| {
+                if (time_mod.nanoTimestamp() >= dl) return DDS.RETCODE_TIMEOUT;
+            }
+            time_mod.sleepNs(POLL_NS);
+        }
     }
 
     fn vtGetMatchedPubs(ctx: *anyopaque, handles: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {

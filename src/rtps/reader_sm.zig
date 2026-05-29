@@ -154,6 +154,13 @@ pub const WriterProxy = struct {
     last_hb_frag_count: ?i32,
     /// True when the remote writer offers RELIABLE delivery.
     reliable: bool,
+    /// Highest sequence number of the writer's history at match time, as reported in the
+    /// first HEARTBEAT.  Only meaningful when history_established is true.
+    history_floor_sn: SequenceNumber,
+    /// False when this writer offered TRANSIENT_LOCAL history that has not yet been fully
+    /// delivered to this reader.  Set to true on the first accepted HEARTBEAT; also true
+    /// by default for writers that do not require history tracking.
+    history_established: bool,
     /// In-progress fragment reassembly, keyed by writer sequence number.
     /// Each entry accumulates DATA_FRAG payloads until complete, then delivers
     /// the assembled change through the normal handleData path.
@@ -177,6 +184,8 @@ pub const WriterProxy = struct {
             .last_hb_frag_count = null,
             .reassembly = .empty,
             .reliable = reliable,
+            .history_floor_sn = 0,
+            .history_established = true,
         };
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
@@ -647,7 +656,16 @@ pub const StatefulReader = struct {
                     continue; // stale or duplicate
                 }
             }
+            const is_first_hb = wp.last_hb_count == null;
             wp.last_hb_count = count;
+
+            // On the first HEARTBEAT from a transient-local writer, record last_sn as
+            // the floor: the reader needs to receive every SN up to that point before
+            // wait_for_historical_data can return.
+            if (is_first_hb and !wp.history_established) {
+                wp.history_floor_sn = last_sn;
+                wp.history_established = true;
+            }
 
             self.tracer.submit(.{ .recv_heartbeat = .{
                 .src_prefix = writer_guid.prefix,
@@ -726,6 +744,20 @@ pub const StatefulReader = struct {
                 }
             }
         }
+    }
+
+    /// Returns true when all matched writers with history_expected have delivered their
+    /// complete history (cumulativeAck >= history_floor_sn).  Writers without history
+    /// tracking (history_established = true from the start) are always counted as done.
+    /// Returns true immediately when no writers are matched.
+    pub fn historicalDelivered(self: *Self) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.writer_proxies.items) |*wp| {
+            if (!wp.history_established) return false;
+            if (wp.received.cumulativeAck() < wp.history_floor_sn) return false;
+        }
+        return true;
     }
 
     fn sendAckNackLocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber, final: bool) void {

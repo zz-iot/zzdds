@@ -258,6 +258,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/matched_status_test.zig",
         "test/dcps/sample_rejected_test.zig",
         "test/dcps/type_support_test.zig",
+        "test/dcps/wait_for_historical_test.zig",
     };
     for (dcps_test_files) |src| {
         const t = b.addTest(.{

@@ -101,6 +101,11 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
     .handle_gap = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumberSet) void {}
     }.f,
+    .historical_delivered = struct {
+        fn f(_: *anyopaque) bool {
+            return true;
+        }
+    }.f,
     .deinit = struct {
         fn f(_: *anyopaque) void {}
     }.f,
@@ -1406,6 +1411,7 @@ pub const DomainParticipantImpl = struct {
                 .reliability = if (data.qos.reliability_kind == 1) .reliable else .best_effort,
                 .ownership_strength = data.qos.ownership_strength,
                 .liveliness_lease_ns = lease_ns,
+                .history_expected = data.qos.durability_kind > 0 and data.qos.reliability_kind == 1,
             };
             ar.proto.addMatchedWriter(&info) catch {};
             if (ar.matched_notify) |cb|
