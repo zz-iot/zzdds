@@ -108,7 +108,9 @@ jobs:
         id: cache-kcov
         uses: actions/cache@v4
         with:
-          path: /tmp/kcov-build
+          path: |
+            /tmp/kcov-src
+            /tmp/kcov-build
           key: kcov-v42-${{ runner.os }}
 
       - name: Build kcov
