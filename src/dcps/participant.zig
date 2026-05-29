@@ -417,7 +417,7 @@ fn pushBuiltinTopicCdr(
 /// Deterministic BuiltinTopicKey_t derived from the topic name.
 /// Three independent FNV-1a passes with different initial values.
 fn topicNameToKey(topic_name: []const u8) DDS.BuiltinTopicKey_t {
-    const ivs = [3]u32{ 2166136261, 0x811c9dc5, 0xd95c1265 };
+    const ivs = [3]u32{ 0xd95c1265, 0x811c9dc5, 0x40503259 };
     var vals: [3]i32 = undefined;
     for (&vals, ivs) |*v, iv| {
         var h: u32 = iv;
