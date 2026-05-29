@@ -52,7 +52,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `ContentFilteredTopic` lifecycle + parser/evaluator | Complete | API, parser, evaluator, and delivery-time filtering all wired; types must register `TypeSupport.get_field` for field-level filtering |
 | `WaitSet` | Complete | |
 | `ReadCondition` | Complete | |
-| `QueryCondition` | Partial | State-mask condition + query string/parameter storage; SQL expression evaluation is deferred |
+| `QueryCondition` | Complete | State-mask + SQL expression evaluated at read/take time via `filter.zig`; requires `TypeSupport.get_field` for field access; without it all samples pass through |
 | `StatusCondition` | Complete | |
 | `GuardCondition` | Complete | |
 | All 22 QoS policies represented + matched | Mostly complete | Runtime enforcement is broad, but keyed-instance behavior still has gaps; see known limitations |
@@ -65,8 +65,10 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `read()` / `take()` with all state filters | Complete | |
 | `SampleInfo` (all fields) | Complete | |
 | `get_builtin_subscriber` / built-in topics | Partial | Built-in Subscriber/DataReaders exist; participant/publication/subscription samples are pushed from discovery callbacks; `DCPSTopic` is not populated |
-| `ignore_topic` / `ignore_publication` / `ignore_subscription` | Normative stubs returning `OK` | |
+| `ignore_participant` | Complete | Removes from discovered list; adds to ignore list; subsequent SPDP announcements from that prefix are dropped |
+| `ignore_topic` / `ignore_publication` / `ignore_subscription` | Normative stubs returning `OK` | Full filter-on-delivery deferred |
 | `wait_for_historical_data` (TRANSIENT_LOCAL) | Returns `RETCODE_UNSUPPORTED` | `reader.zig` |
+| `get_discovered_participants` / `get_discovered_participant_data` | Complete | `participant.zig` |
 | `get_discovered_topics` / `get_discovered_topic_data` / `contains_entity` | Not implemented | Topic APIs return empty/`BAD_PARAMETER`; `contains_entity` always returns `false` |
 
 ## Security
@@ -109,10 +111,14 @@ when a sample arrives without an inline-QoS key hash. Applications must call
 `registerTypeSupport` with their type's hash function (zidl-generated types expose this as
 `MyType.computeKeyHash`); without it, keyed samples collapse to the same instance handle.
 
-**Per-instance timing/history accounting.** `TIME_BASED_FILTER` (`tbf_last_ns`) is still
-global per reader, and RTPS `KEEP_LAST` depth is still global per history cache. Both
-should become per-instance once generated key extraction is available throughout the data
-path.
+**Per-instance timing/history accounting.** `TIME_BASED_FILTER` and RTPS `KEEP_LAST` are
+both enforced per-instance at the DCPS layer. Key hash resolution on the receive path
+follows: inline `PID_KEY_HASH` QoS (standard behavior of all real DDS implementations) →
+registered `TypeSupport.compute_key_hash` → all-zeros (NIL). In practice the NIL fallback
+is not reached: remote peers send inline `PID_KEY_HASH`, and Zig users with generated types
+register TypeSupport. The clean long-term answer for the fallback is XTypes TypeLookup,
+which would allow key field layout to be discovered from wire metadata without
+pre-registration.
 
 **Built-in topic coverage.** `get_builtin_subscriber()` returns a real built-in Subscriber
 when initialization succeeds, and discovery callbacks push `DCPSParticipant`,

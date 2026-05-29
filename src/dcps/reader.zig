@@ -108,6 +108,16 @@ fn matchesSample(
     return true;
 }
 
+fn matchesQuery(
+    pc: PendingChange,
+    maybe_qc: ?*const waitset.QueryConditionImpl,
+    get_field_fn: ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+) bool {
+    const qc = maybe_qc orelse return true;
+    const gff = get_field_fn orelse return true;
+    return qc.matchSample(pc.data, gff);
+}
+
 pub const DataReaderImpl = struct {
     alloc: std.mem.Allocator,
     topic_desc: DDS.TopicDescription,
@@ -161,6 +171,11 @@ pub const DataReaderImpl = struct {
     /// ContentFilteredTopic filter; null when no CFT or no get_field fn registered.
     /// Set once after init by the subscriber; read-only thereafter.
     cft_filter: ?CftFilterState = null,
+
+    /// Field accessor for QueryCondition evaluation at read/take time.
+    /// Set from TypeSupport.get_field when available; null otherwise.
+    /// Set once after init by the subscriber; read-only thereafter.
+    get_field_fn: ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue = null,
 
     /// SampleLost status counters. Guarded by `mu`.
     sample_lost_total: i32 = 0,
@@ -697,6 +712,7 @@ pub const DataReaderImpl = struct {
         instance_mask: DDS.InstanceStateMask,
         max_samples: i32,
         maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -705,6 +721,7 @@ pub const DataReaderImpl = struct {
         for (self.pending.items) |*pc| {
             if (count >= limit) break;
             if (!matchesSample(pc.*, sample_mask, view_mask, instance_mask, maybe_ih)) continue;
+            if (!matchesQuery(pc.*, maybe_qc, self.get_field_fn)) continue;
             const clone = try self.alloc.dupe(u8, pc.data);
             errdefer self.alloc.free(clone);
             try out.append(self.alloc, .{ .data = clone, .info = pc.info });
@@ -727,6 +744,7 @@ pub const DataReaderImpl = struct {
         instance_mask: DDS.InstanceStateMask,
         max_samples: i32,
         maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -736,7 +754,8 @@ pub const DataReaderImpl = struct {
         var match_count: usize = 0;
         for (self.pending.items) |pc| {
             if (match_count >= limit) break;
-            if (matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih)) match_count += 1;
+            if (matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
+                matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
         }
         try out.ensureUnusedCapacity(self.alloc, match_count);
 
@@ -744,7 +763,10 @@ pub const DataReaderImpl = struct {
         var write: usize = 0;
         var taken: usize = 0;
         for (self.pending.items) |pc| {
-            if (taken < limit and matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih)) {
+            if (taken < limit and
+                matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
+                matchesQuery(pc, maybe_qc, self.get_field_fn))
+            {
                 out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info });
                 taken += 1;
             } else {

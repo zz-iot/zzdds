@@ -14,6 +14,9 @@ const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
+const QueryConditionImpl = zzdds.dcps.QueryConditionImpl;
+const TypeSupport = zzdds.dcps.TypeSupport;
+const filter_mod = zzdds.dcps.filter;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const nil = zzdds.dcps;
 const noop_security = zzdds.noop_security.noop_security_plugins;
@@ -1222,4 +1225,191 @@ test "liveliness: MANUAL_BY_PARTICIPANT — write() does not reset the lease" {
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
     try testing.expectEqual(@as(i32, 1), count);
+}
+
+// ── QueryCondition tests ──────────────────────────────────────────────────────
+
+fn qcNilKeyHash(_: []const u8) [16]u8 {
+    return std.mem.zeroes([16]u8);
+}
+
+// Per-payload get_field used by the TypeSupport — payload is passed directly
+// by the subscriber machinery when it calls subGetFieldFn.
+fn qcCdrGetField(payload: []const u8, field: []const u8) ?filter_mod.FilterValue {
+    if (std.mem.eql(u8, field, "value")) {
+        if (payload.len > 4) return .{ .int = payload[4] };
+    }
+    return null;
+}
+
+test "query_condition: readRaw with SQL filter returns only matching samples" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // Register TypeSupport with get_field BEFORE creating the reader.
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    dp_impl.registerTypeSupport("QosType", .{
+        .compute_key_hash = qcNilKeyHash,
+        .get_field = qcCdrGetField,
+    });
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    // PAYLOAD_A: value = 0xAA = 170; PAYLOAD_B: value = 0xBB = 187.
+    try writeRaw(pair.dw, &PAYLOAD_A);
+    try writeRaw(pair.dw, &PAYLOAD_B);
+
+    // QueryCondition: only value = 170 (0xAA).
+    const dr_dds = pair.dr.toDDSDataReader();
+    const qc = dr_dds.vtable.create_querycondition(
+        dr_dds.ptr,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "value = 170",
+        DDS.StringSeq.empty,
+    );
+    defer qc.deinit();
+    const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
+
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer {
+        for (out.items) |s| alloc.free(s.data);
+        out.deinit(alloc);
+    }
+    try pair.dr.readRaw(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, qc_impl);
+
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u8, 0xAA), out.items[0].data[4]);
+    // Both samples remain in pending (readRaw does not remove them).
+    try testing.expectEqual(@as(usize, 2), pendingCount(pair.dr));
+}
+
+test "query_condition: takeFiltered with SQL filter removes only matching samples" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    dp_impl.registerTypeSupport("QosType", .{
+        .compute_key_hash = qcNilKeyHash,
+        .get_field = qcCdrGetField,
+    });
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    try writeRaw(pair.dw, &PAYLOAD_A); // value = 0xAA = 170
+    try writeRaw(pair.dw, &PAYLOAD_B); // value = 0xBB = 187
+    try writeRaw(pair.dw, &PAYLOAD_C); // value = 0xCC = 204
+
+    // Take only samples where value <> 187 (excludes PAYLOAD_B).
+    const dr_dds = pair.dr.toDDSDataReader();
+    const qc = dr_dds.vtable.create_querycondition(
+        dr_dds.ptr,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "value <> 187",
+        DDS.StringSeq.empty,
+    );
+    defer qc.deinit();
+    const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
+
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer {
+        for (out.items) |s| alloc.free(s.data);
+        out.deinit(alloc);
+    }
+    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, qc_impl);
+
+    // A and C are taken; B remains.
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqual(@as(usize, 1), pendingCount(pair.dr));
+}
+
+test "query_condition: parameter substitution with %0" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    dp_impl.registerTypeSupport("QosType", .{
+        .compute_key_hash = qcNilKeyHash,
+        .get_field = qcCdrGetField,
+    });
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    try writeRaw(pair.dw, &PAYLOAD_A); // value = 170
+    try writeRaw(pair.dw, &PAYLOAD_B); // value = 187
+
+    // Create QC with parameterised expression, bound to "170".
+    var params = DDS.StringSeq.empty;
+    try params.append(alloc, "170");
+    defer params.deinit(alloc);
+
+    const dr_dds = pair.dr.toDDSDataReader();
+    const qc = dr_dds.vtable.create_querycondition(
+        dr_dds.ptr,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "value = %0",
+        params,
+    );
+    defer qc.deinit();
+    const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
+
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer {
+        for (out.items) |s| alloc.free(s.data);
+        out.deinit(alloc);
+    }
+    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, qc_impl);
+
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u8, 0xAA), out.items[0].data[4]);
+}
+
+test "query_condition: no TypeSupport registered — all samples pass through" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // Intentionally do NOT register TypeSupport — get_field_fn will be null.
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    try writeRaw(pair.dw, &PAYLOAD_A); // value = 170
+    try writeRaw(pair.dw, &PAYLOAD_B); // value = 187
+
+    const dr_dds = pair.dr.toDDSDataReader();
+    const qc = dr_dds.vtable.create_querycondition(
+        dr_dds.ptr,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "value = 170",
+        DDS.StringSeq.empty,
+    );
+    defer qc.deinit();
+    const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
+
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer {
+        for (out.items) |s| alloc.free(s.data);
+        out.deinit(alloc);
+    }
+    // Without get_field_fn, matchesQuery returns true for all — both pass.
+    try pair.dr.readRaw(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, qc_impl);
+
+    try testing.expectEqual(@as(usize, 2), out.items.len);
 }
