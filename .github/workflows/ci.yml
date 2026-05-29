@@ -82,6 +82,62 @@ jobs:
       - name: Test
         run: zig build test
 
+  # ── Coverage ──────────────────────────────────────────────────────────────
+  #
+  # Builds all test binaries to zig-out/tests/, runs each through kcov
+  # (DWARF-based instrumentation — no compiler changes needed), and uploads
+  # the merged cobertura.xml to Codecov.
+  #
+  # Runs on the same trigger as the test jobs; gated on test-linux so coverage
+  # only uploads when the suite is green.
+
+  coverage:
+    name: Coverage
+    needs: test-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Cache kcov build
+        id: cache-kcov
+        uses: actions/cache@v4
+        with:
+          path: /tmp/kcov-build
+          key: kcov-v42-${{ runner.os }}
+
+      - name: Build kcov
+        if: steps.cache-kcov.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y binutils-dev libdw-dev libcurl4-openssl-dev zlib1g-dev libiberty-dev cmake
+          git clone --depth=1 --branch v42 https://github.com/SimonKagstrom/kcov.git /tmp/kcov-src
+          cmake -S /tmp/kcov-src -B /tmp/kcov-build -DCMAKE_BUILD_TYPE=Release
+          make -C /tmp/kcov-build -j$(nproc)
+
+      - name: Install kcov
+        run: sudo make -C /tmp/kcov-build install
+
+      - name: Build test binaries
+        run: zig build emit-tests
+
+      - name: Run tests under kcov
+        run: |
+          mkdir -p coverage
+          for bin in zig-out/tests/*; do
+            kcov --include-path="$(pwd)/src" coverage/ "$bin" || true
+          done
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/kcov-merged/cobertura.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   # ── Resolve vendor matrix ──────────────────────────────────────────────────
   #
   # Queries the pinned omg-dds/dds-rtps release for *_shape_main_linux assets,

@@ -1,0 +1,14 @@
+coverage:
+  status:
+    project:
+      default:
+        # Don't fail PRs on coverage drop until a baseline is established.
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: true
