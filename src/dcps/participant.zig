@@ -2384,6 +2384,10 @@ pub const DomainParticipantImpl = struct {
         defer self.mu.unlock();
         for (self.discovered_topics.items) |dt| {
             if (dt.handle != handle) continue;
+            // name/type_name are slices into heap-allocated strings owned by the
+            // DiscoveredTopic entry.  They are valid for the participant's lifetime
+            // as long as no undiscovery path frees them.  If topic undiscovery is
+            // ever added, these fields must be duped into caller-owned storage instead.
             data.* = .{
                 .key = topicNameToKey(dt.topic_name),
                 .name = dt.topic_name,

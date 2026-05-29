@@ -546,6 +546,12 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             return;
         };
+        // Instance going non-alive: release per-instance filter/ownership state.
+        // If the instance is later re-registered, fresh entries will be created.
+        if (change.kind != .alive) {
+            _ = self.tbf_map.remove(ih);
+            _ = self.owner_map.remove(ih);
+        }
         self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
         // Wake any ReadCondition WaitSets while mu is held (safe: wakeNotify
         // only acquires WaitSet.cv_mu, never reader.mu).
