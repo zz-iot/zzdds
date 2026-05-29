@@ -134,12 +134,19 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
 
+    // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
+    const emit_tests_step = b.step("emit-tests", "Build test binaries for kcov coverage analysis");
+
     // Library self-tests
     const zzdds_tests = b.addTest(.{
+        .name = "zzdds_lib",
         .root_module = zzdds_mod,
     });
     const run_zzdds_tests = b.addRunArtifact(zzdds_tests);
     test_step.dependOn(&run_zzdds_tests.step);
+    emit_tests_step.dependOn(&b.addInstallArtifact(zzdds_tests, .{
+        .dest_dir = .{ .override = .{ .custom = "tests" } },
+    }).step);
 
     // Fuzz corpus regression tests (corpus cases run as ordinary Zig tests).
     // For libFuzzer use: zig build-obj the fuzz file, then link with
@@ -149,15 +156,21 @@ pub fn build(b: *std.Build) void {
         "test/fuzz/fuzz_plcdr.zig",
     };
     for (fuzz_test_files) |src| {
-        const t = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path(src),
-            .target = target,
-            .imports = &.{
-                .{ .name = "zzdds", .module = zzdds_mod },
-            },
-        }) });
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                },
+            }),
+        });
         t.root_module.link_libc = true;
         test_step.dependOn(&b.addRunArtifact(t).step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
     }
 
     // `zig build test-fuzz` — compile-check fuzz targets. Corpus regression
@@ -187,15 +200,21 @@ pub fn build(b: *std.Build) void {
         "test/discovery/sedp_test.zig",
     };
     for (discovery_test_files) |src| {
-        const t = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path(src),
-            .target = target,
-            .imports = &.{
-                .{ .name = "zzdds", .module = zzdds_mod },
-            },
-        }) });
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                },
+            }),
+        });
         t.root_module.link_libc = true;
         test_step.dependOn(&b.addRunArtifact(t).step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
     }
 
     // Per-subsystem test runners.
@@ -208,15 +227,21 @@ pub fn build(b: *std.Build) void {
         "test/rtps/rtps_integration_test.zig",
     };
     for (rtps_test_files) |src| {
-        const t = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path(src),
-            .target = target,
-            .imports = &.{
-                .{ .name = "zzdds", .module = zzdds_mod },
-            },
-        }) });
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                },
+            }),
+        });
         t.root_module.link_libc = true;
         test_step.dependOn(&b.addRunArtifact(t).step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
     }
 
     // DCPS-level integration tests (need both zzdds and zzdds_generated).
@@ -235,16 +260,22 @@ pub fn build(b: *std.Build) void {
         "test/dcps/type_support_test.zig",
     };
     for (dcps_test_files) |src| {
-        const t = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path(src),
-            .target = target,
-            .imports = &.{
-                .{ .name = "zzdds", .module = zzdds_mod },
-                .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-            },
-        }) });
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                    .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                },
+            }),
+        });
         t.root_module.link_libc = true;
         test_step.dependOn(&b.addRunArtifact(t).step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
     }
 
     // ── TSan test step ────────────────────────────────────────────────────────
