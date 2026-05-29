@@ -113,6 +113,9 @@ jobs:
             /tmp/kcov-build
           key: kcov-v42-${{ runner.os }}
 
+      - name: Install kcov runtime dependencies
+        run: sudo apt-get install -y libdw1 libcurl4
+
       - name: Build kcov
         if: steps.cache-kcov.outputs.cache-hit != 'true'
         run: |
