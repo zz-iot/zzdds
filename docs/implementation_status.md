@@ -64,12 +64,13 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | Instance lifecycle (ALIVE / DISPOSED / UNREGISTERED) | Complete | |
 | `read()` / `take()` with all state filters | Complete | |
 | `SampleInfo` (all fields) | Complete | |
-| `get_builtin_subscriber` / built-in topics | Partial | Built-in Subscriber/DataReaders exist; participant/publication/subscription samples are pushed from discovery callbacks; `DCPSTopic` is not populated |
+| `get_builtin_subscriber` / built-in topics | Complete | Built-in Subscriber/DataReaders exist; participant/publication/subscription/topic samples are pushed; `DCPSTopic` populated from `vtCreateTopic` and SEDP callbacks |
 | `ignore_participant` | Complete | Removes from discovered list; adds to ignore list; subsequent SPDP announcements from that prefix are dropped |
 | `ignore_topic` / `ignore_publication` / `ignore_subscription` | Normative stubs returning `OK` | Full filter-on-delivery deferred |
 | `wait_for_historical_data` (TRANSIENT_LOCAL) | Returns `RETCODE_UNSUPPORTED` | `reader.zig` |
 | `get_discovered_participants` / `get_discovered_participant_data` | Complete | `participant.zig` |
-| `get_discovered_topics` / `get_discovered_topic_data` / `contains_entity` | Not implemented | Topic APIs return empty/`BAD_PARAMETER`; `contains_entity` always returns `false` |
+| `get_discovered_topics` / `get_discovered_topic_data` | Complete | Populated from SEDP writer/reader callbacks; deduplicated by (topic_name, type_name); QoS subset from wire data |
+| `contains_entity` | Complete | Checks participant, publishers, subscribers, topics, writers, readers |
 
 ## Security
 
@@ -120,11 +121,10 @@ register TypeSupport. The clean long-term answer for the fallback is XTypes Type
 which would allow key field layout to be discovered from wire metadata without
 pre-registration.
 
-**Built-in topic coverage.** `get_builtin_subscriber()` returns a real built-in Subscriber
-when initialization succeeds, and discovery callbacks push `DCPSParticipant`,
-`DCPSPublication`, and `DCPSSubscription` samples. `DCPSTopic` is created but not populated;
-`get_discovered_topics()` returns an empty sequence; `get_discovered_topic_data()` returns
-`BAD_PARAMETER`; `contains_entity()` always returns `false`.
+**Built-in topic coverage.** All four built-in DataReaders (`DCPSParticipant`, `DCPSPublication`,
+`DCPSSubscription`, `DCPSTopic`) are populated. `DCPSTopic` receives samples when local topics
+are created and when SEDP announces remote writers/readers. `get_discovered_topics()`,
+`get_discovered_topic_data()`, and `contains_entity()` are fully implemented.
 
 **Transport scatter-gather not fully zero-copy.** The iovec list is assembled without
 copying but is flattened to a `[65536]u8` stack buffer at the `Transport.send()` boundary.
