@@ -1099,6 +1099,12 @@ pub const DataReaderImpl = struct {
         query_parameters: DDS.StringSeq,
     ) DDS.QueryCondition {
         const self = cast(ctx);
+        // A non-empty expression requires field-level access to evaluate.
+        // If no TypeSupport is registered for this reader's type, the filter
+        // cannot be evaluated and would silently pass every sample.  Return NIL
+        // rather than creating a condition that does nothing.
+        if (query_expression.len > 0 and self.get_field_fn == null)
+            return nil.nil_querycondition;
         const qc = waitset.QueryConditionImpl.init(
             self.alloc,
             self.toDDSDataReader(),

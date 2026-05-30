@@ -662,7 +662,17 @@ pub const QueryConditionImpl = struct {
         const self = cast(ctx);
         out.clearRetainingCapacity();
         for (self.query_parameters.items) |p| {
-            out.append(self.alloc, p) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            const copy = self.alloc.dupe(u8, p) catch {
+                for (out.items) |c| self.alloc.free(c);
+                out.clearRetainingCapacity();
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+            out.append(self.alloc, copy) catch {
+                self.alloc.free(copy);
+                for (out.items) |c| self.alloc.free(c);
+                out.clearRetainingCapacity();
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
         }
         return DDS.RETCODE_OK;
     }

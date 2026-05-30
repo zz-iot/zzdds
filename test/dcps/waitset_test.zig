@@ -658,9 +658,13 @@ test "QueryConditionImpl: get_query_parameters and set_query_parameters" {
 
     const dds_qc = qc.toDDSQueryCondition();
 
-    // Read back the initial parameters.
+    // Read back the initial parameters.  get_query_parameters returns owned
+    // copies; the caller must free each string before deinit-ing the seq.
     var out_params: DDS.StringSeq = .empty;
-    defer out_params.deinit(a);
+    defer {
+        for (out_params.items) |p| a.free(p);
+        out_params.deinit(a);
+    }
     const rc_get = dds_qc.get_query_parameters(&out_params);
     try testing.expectEqual(DDS.RETCODE_OK, rc_get);
     try testing.expectEqual(@as(usize, 2), out_params.items.len);
@@ -674,6 +678,8 @@ test "QueryConditionImpl: get_query_parameters and set_query_parameters" {
     const rc_set = dds_qc.set_query_parameters(new_params);
     try testing.expectEqual(DDS.RETCODE_OK, rc_set);
 
+    // Free owned copies from the first get before re-using out_params.
+    for (out_params.items) |p| a.free(p);
     out_params.clearRetainingCapacity();
     _ = dds_qc.get_query_parameters(&out_params);
     try testing.expectEqual(@as(usize, 1), out_params.items.len);

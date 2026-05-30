@@ -242,13 +242,28 @@ test "DataReader: create_readcondition and delete_readcondition" {
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.delete_readcondition(dr.ptr, rc));
 }
 
-test "DataReader: create_querycondition returns non-nil" {
+test "DataReader: create_querycondition with no TypeSupport and non-empty expression returns nil" {
+    // Without a registered TypeSupport, field access is unavailable and a
+    // non-empty SQL expression cannot be evaluated.  create_querycondition must
+    // return NIL rather than a condition that silently passes every sample.
     const alloc = testing.allocator;
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
     const qc = dr.vtable.create_querycondition(dr.ptr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "x = 1", DDS.StringSeq.empty);
+    try testing.expect(qc.ptr == nil.NIL_PTR);
+}
+
+test "DataReader: create_querycondition with empty expression succeeds without TypeSupport" {
+    // An empty SQL expression imposes no field constraints, so it is valid
+    // even when no TypeSupport is registered (it degrades to a ReadCondition).
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
+    const qc = dr.vtable.create_querycondition(dr.ptr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", DDS.StringSeq.empty);
     try testing.expect(qc.ptr != nil.NIL_PTR);
     qc.deinit();
 }
