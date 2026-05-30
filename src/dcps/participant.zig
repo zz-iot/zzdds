@@ -1080,6 +1080,8 @@ pub const DomainParticipantImpl = struct {
         const keep_last = qos.history.kind != .KEEP_ALL_HISTORY_QOS;
         // DDS spec: deadline default is DURATION_INFINITE; {0,0} from codegen means unset → treat as infinite.
         const dl_zero_w = qos.deadline.period.sec == 0 and qos.deadline.period.nanosec == 0;
+        // Liveliness lease: {0,0} from codegen means unset → treat as infinite.
+        const ll_zero_w = qos.liveliness.lease_duration.sec == 0 and qos.liveliness.lease_duration.nanosec == 0;
         return .{
             .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
             .durability_kind = @as(u8, @truncate(@intFromEnum(qos.durability.kind))),
@@ -1087,6 +1089,8 @@ pub const DomainParticipantImpl = struct {
             // DDS spec: KEEP_LAST depth must be >= 1; default 0 from codegen → clamp to 1.
             .history_depth = if (keep_last and qos.history.depth < 1) 1 else qos.history.depth,
             .liveliness_kind = @as(u8, @truncate(@intFromEnum(qos.liveliness.kind))),
+            .liveliness_lease_sec = if (ll_zero_w) 0x7fff_ffff else qos.liveliness.lease_duration.sec,
+            .liveliness_lease_nanosec = if (ll_zero_w) 0x7fff_ffff else qos.liveliness.lease_duration.nanosec,
             .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
             .ownership_strength = qos.ownership_strength.value,
             .destination_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,

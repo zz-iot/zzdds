@@ -1413,3 +1413,177 @@ test "query_condition: no TypeSupport registered — all samples pass through" {
 
     try testing.expectEqual(@as(usize, 2), out.items.len);
 }
+
+// ── Reader-side LIVELINESS_CHANGED tests ──────────────────────────────────────
+//
+// Reader tracks matched writers with finite liveliness leases via
+// onWriterMatchedCb. When checkTimers() finds a lease expired it calls
+// notifyLivelinessChanged() which fires the on_liveliness_changed listener.
+//
+// Uses a two-participant fixture: DirectDiscovery only cross-notifies between
+// separate participants, not same-participant endpoints.
+
+fn drOnLivelinessChanged(ctx: *anyopaque, _: DDS.DataReader, s: DDS.LivelinessChangedStatus) void {
+    @as(*DDS.LivelinessChangedStatus, @ptrCast(@alignCast(ctx))).* = s;
+}
+
+const dr_vtable_liveliness = DDS.DataReaderListener.Vtable{
+    .on_requested_deadline_missed = drNoopDeadline,
+    .on_requested_incompatible_qos = drNoopIncompat,
+    .on_sample_rejected = drNoopSampleRejected,
+    .on_liveliness_changed = drOnLivelinessChanged,
+    .on_data_available = drNoopDataAvail,
+    .on_subscription_matched = drNoopSubMatched,
+    .on_sample_lost = drNoopSampleLost,
+    .deinit = drNoopDeinit,
+};
+
+// Two-participant fixture sharing a ManualClock — both factories register the
+// same manual clock so reader timer_clock and writer timer_clock advance in sync.
+const TwoPartyTimerFixture = struct {
+    alloc: std.mem.Allocator,
+    delivery: IntraProcessDelivery,
+
+    t_w: *zzdds.intraprocess.MemoryTransport,
+    d_w: *zzdds.intraprocess.DirectDiscovery,
+    factory_w: *DomainParticipantFactoryImpl,
+    dp_w: DDS.DomainParticipant,
+    pub_: DDS.Publisher,
+
+    t_r: *zzdds.intraprocess.MemoryTransport,
+    d_r: *zzdds.intraprocess.DirectDiscovery,
+    factory_r: *DomainParticipantFactoryImpl,
+    dp_r: DDS.DomainParticipant,
+    dp_r_impl: *DomainParticipantImpl,
+    sub_: DDS.Subscriber,
+    topic_w: DDS.Topic,
+    topic_r: DDS.Topic,
+
+    fn init(alloc: std.mem.Allocator, clock: zzdds.util.time.Clock) !TwoPartyTimerFixture {
+        var delivery = try IntraProcessDelivery.init(alloc);
+        errdefer delivery.deinit();
+
+        var config = zzdds.config.Config{};
+        config.participant.timer_clock_name = "manual";
+
+        const t_w = try delivery.newTransport();
+        errdefer t_w.deinit();
+        const d_w = try delivery.newDiscovery();
+        errdefer d_w.deinit();
+        const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, config);
+        errdefer factory_w.deinit();
+        try factory_w.clock_registry.register("manual", clock);
+        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+        const pub_ = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
+        const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "LiveTopic", "LiveType", .{}, nil.nil_topic_listener, 0);
+
+        const t_r = try delivery.newTransport();
+        errdefer t_r.deinit();
+        const d_r = try delivery.newDiscovery();
+        errdefer d_r.deinit();
+        const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, config);
+        errdefer factory_r.deinit();
+        try factory_r.clock_registry.register("manual", clock);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+        const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
+        const sub_ = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
+        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "LiveTopic", "LiveType", .{}, nil.nil_topic_listener, 0);
+
+        return .{
+            .alloc = alloc,
+            .delivery = delivery,
+            .t_w = t_w,
+            .d_w = d_w,
+            .factory_w = factory_w,
+            .dp_w = dp_w,
+            .pub_ = pub_,
+            .t_r = t_r,
+            .d_r = d_r,
+            .factory_r = factory_r,
+            .dp_r = dp_r,
+            .dp_r_impl = dp_r_impl,
+            .sub_ = sub_,
+            .topic_w = topic_w,
+            .topic_r = topic_r,
+        };
+    }
+
+    fn deinit(self: *TwoPartyTimerFixture) void {
+        _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
+        _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.factory_w.deinit();
+        self.factory_r.deinit();
+        self.d_w.deinit();
+        self.d_r.deinit();
+        self.t_w.deinit();
+        self.t_r.deinit();
+        self.delivery.deinit();
+    }
+
+    fn makeWriter(self: *TwoPartyTimerFixture, qos: DDS.DataWriterQos) *DataWriterImpl {
+        const dw = self.pub_.vtable.create_datawriter(self.pub_.ptr, self.topic_w, qos, nil.nil_dw_listener, 0);
+        return @ptrCast(@alignCast(dw.ptr));
+    }
+
+    fn makeReader(self: *TwoPartyTimerFixture, listener: DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
+        const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
+        const dr = self.sub_.vtable.create_datareader(self.sub_.ptr, td, .{}, listener, mask);
+        return @ptrCast(@alignCast(dr.ptr));
+    }
+};
+
+test "liveliness: reader — on_liveliness_changed fires when writer lease expires" {
+    const alloc = testing.allocator;
+    var mc = ManualClock.init(0);
+    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    defer fx.deinit();
+
+    var captured = DDS.LivelinessChangedStatus{};
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
+    dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
+    _ = fx.makeWriter(dw_qos);
+    _ = fx.makeReader(
+        .{ .ptr = &captured, .vtable = &dr_vtable_liveliness },
+        DDS.LIVELINESS_CHANGED_STATUS,
+    );
+
+    // Lease not yet expired.
+    mc.advance(999_999_999);
+    fx.dp_r_impl.checkTimers();
+    try testing.expectEqual(@as(i32, 0), captured.not_alive_count);
+
+    // Advance past the 1 s lease — listener fires.
+    mc.advance(1);
+    fx.dp_r_impl.checkTimers();
+    try testing.expectEqual(@as(i32, 0), captured.alive_count);
+    try testing.expectEqual(@as(i32, 1), captured.not_alive_count);
+}
+
+test "liveliness: reader — get_liveliness_changed_status reflects writer match and expiry" {
+    const alloc = testing.allocator;
+    var mc = ManualClock.init(0);
+    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
+    dw_qos.liveliness.lease_duration = .{ .sec = 2, .nanosec = 0 };
+    _ = fx.makeWriter(dw_qos);
+    const dr = fx.makeReader(nil.nil_dr_listener, 0);
+
+    // After match, alive_count = 1 (writer has finite lease).
+    var status: DDS.LivelinessChangedStatus = undefined;
+    const dr_dds = dr.toDDSDataReader();
+    _ = dr_dds.vtable.get_liveliness_changed_status(dr_dds.ptr, &status);
+    try testing.expectEqual(@as(i32, 1), status.alive_count);
+    try testing.expectEqual(@as(i32, 0), status.not_alive_count);
+
+    // Expire the lease.
+    mc.advance(2 * std.time.ns_per_s);
+    fx.dp_r_impl.checkTimers();
+
+    _ = dr_dds.vtable.get_liveliness_changed_status(dr_dds.ptr, &status);
+    try testing.expectEqual(@as(i32, 0), status.alive_count);
+    try testing.expectEqual(@as(i32, 1), status.not_alive_count);
+}
