@@ -425,9 +425,12 @@ pub const DataReaderImpl = struct {
             }
         }
 
-        // CONTENT_FILTER: drop samples that do not match the CFT expression.
+        // CONTENT_FILTER: only alive samples are filtered. Lifecycle changes
+        // (dispose/unregister) must pass through regardless of the expression so
+        // that the subscriber's instance state machine stays consistent and the
+        // per-instance tbf_map/owner_map cleanup below is reached.
         if (self.cft_filter) |*cft| {
-            if (!cft.matches(change.data)) {
+            if (change.kind == .alive and !cft.matches(change.data)) {
                 self.mu.unlock();
                 self.alloc.free(copy);
                 return;
