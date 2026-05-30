@@ -172,7 +172,7 @@ jobs:
         run: |
           mkdir -p coverage
           for bin in zig-out/tests/*; do
-            kcov --include-path="$(pwd)/src" coverage/ "$bin" || true
+            kcov --include-path="$(pwd)/src" --exclude-line=unreachable,@panic coverage/ "$bin" || true
           done
 
       - name: Upload to Codecov
