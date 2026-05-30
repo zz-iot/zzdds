@@ -213,6 +213,7 @@ pub const HistoryCache = struct {
 
     fn trimForKeepLast(self: *Self, ih: InstanceHandle) void {
         if (self.kind != .keep_last) return;
+        if (self.depth == 0) return;
         // Count how many changes we already have for this instance.
         var count: usize = 0;
         for (self.changes.items) |*ch| {
