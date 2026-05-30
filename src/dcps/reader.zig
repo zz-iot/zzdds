@@ -454,6 +454,18 @@ pub const DataReaderImpl = struct {
 
         // RESOURCE_LIMITS: check all three limits in priority order.
         // Rejection is notified via on_sample_rejected; sample is dropped.
+        //
+        // Ordering invariant: KEEP_LAST eviction above must run first.  The
+        // three axes cannot produce a silent loss after that eviction:
+        //   max_instances   — only checked when ih is a NEW instance; KEEP_LAST
+        //                     only fires when ih already exists in pending, so
+        //                     post-eviction current_distinct+1 equals the
+        //                     pre-eviction count, which was already ≤ max_instances.
+        //   max_samples_per_instance — post-eviction per-instance count is depth-1;
+        //                     the spec QoS consistency rule (depth ≤ max_samples_per_instance)
+        //                     guarantees depth-1 < max_samples_per_instance.
+        //   max_samples     — eviction removes 1, addition adds 1; net zero, so
+        //                     the total never exceeds the pre-eviction level.
         const rl = self.qos.resource_limits;
         const reject_reason: ?DDS.SampleRejectedStatusKind = blk: {
             if (rl.max_instances > 0) {
