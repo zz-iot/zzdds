@@ -104,28 +104,66 @@ jobs:
         with:
           version: "0.16.0"
 
-      - name: Cache kcov build
+      - name: Cache kcov and patched elfutils
         id: cache-kcov
         uses: actions/cache@v4
         with:
           path: |
             /tmp/kcov-src
             /tmp/kcov-build
-          key: kcov-v42-${{ runner.os }}
+            /tmp/elfutils-patched
+          key: kcov-v42-elfutils-uleb128-${{ runner.os }}
 
-      - name: Install kcov runtime dependencies
-        run: sudo apt-get install -y libdw1 libcurl4
-
-      - name: Build kcov
+      - name: Install kcov build and runtime dependencies
         if: steps.cache-kcov.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get install -y binutils-dev libdw-dev libcurl4-openssl-dev zlib1g-dev libiberty-dev cmake
+          sudo apt-get install -y \
+            binutils-dev libdw-dev libcurl4-openssl-dev \
+            zlib1g-dev libiberty-dev cmake libcurl4
+
+      - name: Build patched elfutils and kcov
+        if: steps.cache-kcov.outputs.cache-hit != 'true'
+        run: |
+          # Patch elfutils 0.195: fix extended opcode length to use ULEB128
+          # (DWARF spec 6.2.5.3).  Zig 0.16.0 emits vendor extended opcodes
+          # with body length >= 128; libdw reads only the first ULEB byte,
+          # misidentifies the sub-opcode, and misparses the rest of the stream.
+          cd /tmp
+          wget -q https://sourceware.org/elfutils/ftp/0.195/elfutils-0.195.tar.bz2
+          tar xjf elfutils-0.195.tar.bz2
+          cat > /tmp/patch_elfutils.py << 'PYEOF'
+          import sys
+          fname = '/tmp/elfutils-0.195/libdw/dwarf_getsrclines.c'
+          with open(fname) as f:
+              s = f.read()
+          old = '\t  if (unlikely (lineendp - linep < 2))\n\t    goto invalid_data;\n\n\t  /* The length.  */\n\t  uint_fast8_t len = *linep++;'
+          new = '\t  if (unlikely (linep >= lineendp))\n\t    goto invalid_data;\n\n\t  /* Extended opcode length is ULEB128 per DWARF spec 6.2.5.3.  */\n\t  Dwarf_Word len;\n\t  get_uleb128 (len, linep, lineendp);'
+          if old not in s:
+              sys.exit('elfutils patch target not found')
+          with open(fname, 'w') as f:
+              f.write(s.replace(old, new, 1))
+          print('elfutils ULEB128 fix applied')
+          PYEOF
+          python3 /tmp/patch_elfutils.py
+          cd /tmp/elfutils-0.195
+          ./configure --prefix=/tmp/elfutils-patched \
+            --disable-nls --disable-debuginfod
+          make -j$(nproc)
+          make install
+          # Build kcov linked against patched elfutils
           git clone --depth=1 --branch v42 https://github.com/SimonKagstrom/kcov.git /tmp/kcov-src
-          cmake -S /tmp/kcov-src -B /tmp/kcov-build -DCMAKE_BUILD_TYPE=Release
+          cmake -S /tmp/kcov-src -B /tmp/kcov-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/tmp/elfutils-patched
           make -C /tmp/kcov-build -j$(nproc)
 
-      - name: Install kcov
-        run: sudo cp /tmp/kcov-build/src/kcov /usr/local/bin/kcov
+      - name: Install patched libdw and kcov
+        run: |
+          sudo install -m755 /tmp/elfutils-patched/lib/libdw-0.195.so \
+            /usr/local/lib/libdw-0.195.so
+          sudo ln -sf /usr/local/lib/libdw-0.195.so /usr/local/lib/libdw.so.1
+          sudo ldconfig
+          sudo cp /tmp/kcov-build/src/kcov /usr/local/bin/kcov
 
       - name: Build test binaries
         run: zig build emit-tests
