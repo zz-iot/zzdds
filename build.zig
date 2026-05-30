@@ -263,6 +263,8 @@ pub fn build(b: *std.Build) void {
         "test/dcps/pubsub_vtable_test.zig",
         "test/dcps/topic_vtable_test.zig",
         "test/dcps/reader_vtable_test.zig",
+        "test/dcps/factory_vtable_test.zig",
+        "test/dcps/writer_vtable_test.zig",
     };
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
