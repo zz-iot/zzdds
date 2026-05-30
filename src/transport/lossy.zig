@@ -294,3 +294,32 @@ test "DropEveryNth send_seq increments even for dropped packets" {
     try testing.expectEqual(@as(usize, 2), rec.sends.items.len);
     try testing.expectEqual(@as(u64, 4), lossy.send_seq.load(.monotonic));
 }
+
+test "LossyTransport: pass-through methods delegate to inner" {
+    var rec = RecordingCtx{};
+    defer rec.deinit(testing.allocator);
+
+    var policy = DropNone{};
+    const lossy = try LossyTransport.init(testing.allocator, rec.transport(), policy.packetPolicy());
+    defer lossy.deinit(testing.allocator);
+    const t = lossy.transport();
+
+    const dummy_rx = struct {
+        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+    };
+    var rx_ctx: u8 = 0;
+    const handler = ReceiveHandler{ .ctx = &rx_ctx, .on_receive = dummy_rx.f };
+    // Exercise the callback itself (RecordingCtx.vtListen is a no-op stub).
+    handler.on_receive(handler.ctx, &.{}, dummy_locator);
+
+    _ = t.canReach(&dummy_locator);
+    try t.listen(&dummy_locator, handler);
+    try t.joinMulticast(&dummy_locator);
+    t.leaveMulticast(&dummy_locator);
+    t.unlisten(&dummy_locator, handler);
+    var locs: std.ArrayListUnmanaged(Locator) = .empty;
+    defer locs.deinit(testing.allocator);
+    try t.unicastLocators(&locs, testing.allocator);
+    t.setLocatorChangeHandler(null);
+    t.close();
+}

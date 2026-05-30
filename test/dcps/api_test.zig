@@ -478,3 +478,50 @@ test "DCPS: contains_entity returns true for participant, topic, publisher, writ
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }
+
+test "DCPS: get_discovered_topics and get_discovered_topic_data work for locally-created topics" {
+    var h = try Harness.init(0x0E);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    _ = dp.vtable.create_topic(dp.ptr, "LocalTopic", "LocalType", .{}, nil.nil_topic_listener, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var handles = DDS.InstanceHandleSeq.empty;
+    defer handles.deinit(alloc);
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topics(dp.ptr, &handles));
+    try testing.expectEqual(@as(usize, 1), handles.items.len);
+
+    var data = DDS.TopicBuiltinTopicData{};
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles.items[0]));
+    try testing.expectEqualStrings("LocalTopic", data.name);
+    try testing.expectEqualStrings("LocalType", data.type_name);
+}
+
+test "DCPS: SEDP announcement for a locally-created topic does not produce a duplicate" {
+    var h = try Harness.init(0x0F);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    _ = dp.vtable.create_topic(dp.ptr, "DupTopic", "DupType", .{}, nil.nil_topic_listener, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    // Simulate SEDP discovering a writer on the same topic.
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    fireRemoteWriter(dp_impl, "DupTopic", "DupType");
+
+    var handles = DDS.InstanceHandleSeq.empty;
+    defer handles.deinit(alloc);
+    _ = dp.vtable.get_discovered_topics(dp.ptr, &handles);
+
+    // Should still be exactly one entry, not two.
+    try testing.expectEqual(@as(usize, 1), handles.items.len);
+}
