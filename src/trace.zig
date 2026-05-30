@@ -29,6 +29,7 @@ const sn_mod = @import("rtps/sequence_number.zig");
 const sub_mod = @import("rtps/message/submessage.zig");
 const time_mod = @import("util/time.zig");
 const mutex_mod = @import("util/mutex.zig");
+const sleepNs = time_mod.sleepNs;
 
 pub const GuidPrefix = guid_mod.GuidPrefix;
 pub const EntityId = guid_mod.EntityId;
@@ -545,7 +546,7 @@ pub const AsyncRingSink = struct {
 
     fn flushLoop(self: *Self) void {
         while (!self.stopping.load(.acquire)) {
-            std.Thread.sleep(FLUSH_INTERVAL_NS);
+            sleepNs(FLUSH_INTERVAL_NS);
             self.drainAll();
         }
         self.drainAll();
@@ -735,4 +736,182 @@ test "AsyncRingSink: dropped counter increments when ring is full" {
     const out = w.buffer[0..w.end];
     try testing.expect(std.mem.indexOf(u8, out, "\"t\":\"skipped\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"count\":2") != null);
+}
+
+// ── Helpers for remaining event types ────────────────────────────────────────
+
+const zero_sns = SequenceNumberSet{ .base = 1, .num_bits = 32, .bitmap = [8]u32{ 0x80000000, 0, 0, 0, 0, 0, 0, 0 } };
+
+fn testRecvDataEvent() TraceEvent {
+    return .{ .recv_data = .{ .src_prefix = zero_prefix, .writer_eid = zero_eid, .reader_eid = zero_eid, .sn = 7, .data_len = 8 } };
+}
+fn testSendHbEvent() TraceEvent {
+    return .{ .send_heartbeat = .{ .src_prefix = zero_prefix, .writer_eid = zero_eid, .reader_eid = zero_eid, .first_sn = 1, .last_sn = 5, .count = 2, .flags = 0x02 } };
+}
+fn testRecvHbEvent() TraceEvent {
+    return .{ .recv_heartbeat = .{ .src_prefix = zero_prefix, .writer_eid = zero_eid, .reader_eid = zero_eid, .first_sn = 1, .last_sn = 5, .count = 2, .flags = 0x02 } };
+}
+fn testSendAnEvent() TraceEvent {
+    return .{ .send_acknack = .{ .src_prefix = zero_prefix, .reader_eid = zero_eid, .writer_eid = zero_eid, .base_sn = 1, .bitmap = zero_sns, .count = 1, .final = true } };
+}
+fn testRecvAnEvent() TraceEvent {
+    return .{ .recv_acknack = .{ .src_prefix = zero_prefix, .reader_eid = zero_eid, .writer_eid = zero_eid, .base_sn = 1, .bitmap = zero_sns, .count = 1, .final = false } };
+}
+fn testSendGapEvent() TraceEvent {
+    return .{ .send_gap = .{ .src_prefix = zero_prefix, .writer_eid = zero_eid, .reader_eid = zero_eid, .gap_start = 3, .gap_list = zero_sns } };
+}
+fn testRecvGapEvent() TraceEvent {
+    return .{ .recv_gap = .{ .src_prefix = zero_prefix, .writer_eid = zero_eid, .reader_eid = zero_eid, .gap_start = 3, .gap_list = zero_sns } };
+}
+fn testInfoTsEvent() TraceEvent {
+    return .{ .recv_info_ts = .{ .timestamp = .{ .seconds = 100, .fraction = 200 } } };
+}
+fn testInfoDstEvent() TraceEvent {
+    return .{ .recv_info_dst = .{ .prefix = zero_prefix } };
+}
+fn testDataDupEvent() TraceEvent {
+    return .{ .recv_data_dup = .{ .src_prefix = zero_prefix, .writer_eid = zero_eid, .sn = 10 } };
+}
+fn testHbDupEvent() TraceEvent {
+    return .{ .recv_heartbeat_dup = .{ .src_prefix = zero_prefix, .writer_eid = zero_eid, .count = 3 } };
+}
+
+fn checkFmt(fmt: Format, event: TraceEvent, needle: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try formatEvent(&w, fmt, event);
+    const out = w.buffer[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, needle) != null);
+}
+
+// ── TraceEvent.srcPrefix ──────────────────────────────────────────────────────
+
+test "TraceEvent.srcPrefix: all variants" {
+    const p = GuidPrefix{ .bytes = .{0xAB} ** 12 };
+    const mk_data = TraceEvent{ .recv_data = .{ .src_prefix = p, .writer_eid = zero_eid, .reader_eid = zero_eid, .sn = 1, .data_len = 0 } };
+    try testing.expect(mk_data.srcPrefix().eql(p));
+    const mk_hb = TraceEvent{ .send_heartbeat = .{ .src_prefix = p, .writer_eid = zero_eid, .reader_eid = zero_eid, .first_sn = 1, .last_sn = 1, .count = 1, .flags = 0 } };
+    try testing.expect(mk_hb.srcPrefix().eql(p));
+    const mk_an = TraceEvent{ .recv_acknack = .{ .src_prefix = p, .reader_eid = zero_eid, .writer_eid = zero_eid, .base_sn = 1, .bitmap = zero_sns, .count = 1, .final = false } };
+    try testing.expect(mk_an.srcPrefix().eql(p));
+    const mk_gap = TraceEvent{ .send_gap = .{ .src_prefix = p, .writer_eid = zero_eid, .reader_eid = zero_eid, .gap_start = 1, .gap_list = zero_sns } };
+    try testing.expect(mk_gap.srcPrefix().eql(p));
+    const mk_dup = TraceEvent{ .recv_data_dup = .{ .src_prefix = p, .writer_eid = zero_eid, .sn = 1 } };
+    try testing.expect(mk_dup.srcPrefix().eql(p));
+    const mk_hbdup = TraceEvent{ .recv_heartbeat_dup = .{ .src_prefix = p, .writer_eid = zero_eid, .count = 1 } };
+    try testing.expect(mk_hbdup.srcPrefix().eql(p));
+    const mk_dst = TraceEvent{ .recv_info_dst = .{ .prefix = p } };
+    try testing.expect(mk_dst.srcPrefix().eql(p));
+    try testing.expect(testInfoTsEvent().srcPrefix().eql(GuidPrefix.unknown));
+    try testing.expect((TraceEvent{ .skipped = .{ .count = 1 } }).srcPrefix().eql(GuidPrefix.unknown));
+}
+
+// ── formatEvent: remaining event types ───────────────────────────────────────
+
+test "formatEvent: recv_data both formats" {
+    try checkFmt(.text, testRecvDataEvent(), "RECV DATA");
+    try checkFmt(.ndjson, testRecvDataEvent(), "\"t\":\"recv_data\"");
+}
+
+test "formatEvent: send_heartbeat and recv_heartbeat" {
+    try checkFmt(.text, testSendHbEvent(), "SEND HB");
+    try checkFmt(.ndjson, testSendHbEvent(), "\"t\":\"send_heartbeat\"");
+    try checkFmt(.text, testRecvHbEvent(), "RECV HB");
+    try checkFmt(.ndjson, testRecvHbEvent(), "\"t\":\"recv_heartbeat\"");
+}
+
+test "formatEvent: send_acknack and recv_acknack" {
+    try checkFmt(.text, testSendAnEvent(), "SEND AN");
+    try checkFmt(.ndjson, testSendAnEvent(), "\"t\":\"send_acknack\"");
+    try checkFmt(.text, testRecvAnEvent(), "RECV AN");
+    try checkFmt(.ndjson, testRecvAnEvent(), "\"t\":\"recv_acknack\"");
+}
+
+test "formatEvent: send_gap and recv_gap" {
+    try checkFmt(.text, testSendGapEvent(), "SEND GAP");
+    try checkFmt(.ndjson, testSendGapEvent(), "\"t\":\"send_gap\"");
+    try checkFmt(.text, testRecvGapEvent(), "RECV GAP");
+    try checkFmt(.ndjson, testRecvGapEvent(), "\"t\":\"recv_gap\"");
+}
+
+test "formatEvent: recv_info_ts both formats" {
+    try checkFmt(.text, testInfoTsEvent(), "INFO_TS");
+    try checkFmt(.ndjson, testInfoTsEvent(), "\"t\":\"recv_info_ts\"");
+}
+
+test "formatEvent: recv_info_dst both formats" {
+    try checkFmt(.text, testInfoDstEvent(), "INFO_DST");
+    try checkFmt(.ndjson, testInfoDstEvent(), "\"t\":\"recv_info_dst\"");
+}
+
+test "formatEvent: recv_data_dup both formats" {
+    try checkFmt(.text, testDataDupEvent(), "DATA(dup)");
+    try checkFmt(.ndjson, testDataDupEvent(), "\"t\":\"recv_data_dup\"");
+}
+
+test "formatEvent: recv_heartbeat_dup both formats" {
+    try checkFmt(.text, testHbDupEvent(), "HB(dup)");
+    try checkFmt(.ndjson, testHbDupEvent(), "\"t\":\"recv_heartbeat_dup\"");
+}
+
+test "formatEvent: skipped text format" {
+    try checkFmt(.text, .{ .skipped = .{ .count = 3 } }, "SKIPPED");
+}
+
+// ── NoopSink ──────────────────────────────────────────────────────────────────
+
+test "NoopSink: submit and deinit are no-ops" {
+    const s = NoopSink.sink();
+    s.submit(testDataEvent());
+    s.deinit(); // covers Sink.deinit forwarding and noopDeinit
+}
+
+// ── SyncSink.deinit ───────────────────────────────────────────────────────────
+
+test "SyncSink: deinit is a no-op" {
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var ss = SyncSink{ .writer = &w, .format = .text };
+    ss.sink().deinit(); // covers deinitFn
+}
+
+// ── AsyncRingSink via vtable deinit ───────────────────────────────────────────
+
+test "AsyncRingSink: deinit via vtable sink" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const ring = try AsyncRingSink.init(testing.allocator, 4, &w, .text);
+    ring.sink().submit(testDataEvent());
+    ring.sink().deinit(); // vtable path → deinitFn → ring.deinit()
+}
+
+// ── AsyncRingSink flush thread ────────────────────────────────────────────────
+
+test "AsyncRingSink: flush thread drains events" {
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const ring = try AsyncRingSink.init(testing.allocator, 16, &w, .text);
+    try ring.startFlushThread();
+    ring.sink().submit(testDataEvent());
+    // Wait for the flush thread's 5 ms sleep + drain cycle.
+    sleepNs(12 * std.time.ns_per_ms);
+    ring.deinit();
+    const out = w.buffer[0..w.end];
+    try testing.expect(out.len > 0);
+}
+
+// ── TracerActive ──────────────────────────────────────────────────────────────
+
+test "TracerActive.noop: submit is a no-op" {
+    var tc = TracerActive.noop();
+    tc.submit(testDataEvent()); // noop sink; must not crash
+}
+
+test "TracerActive: submit forwards event to sink" {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var ss = SyncSink{ .writer = &w, .format = .text };
+    const tc = TracerActive{ .s = ss.sink(), .f = .{} };
+    tc.submit(testDataEvent());
+    try testing.expect(std.mem.indexOf(u8, w.buffer[0..w.end], "SEND DATA") != null);
 }
