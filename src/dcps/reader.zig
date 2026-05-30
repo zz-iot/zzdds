@@ -1245,12 +1245,12 @@ pub const DataReaderImpl = struct {
         const self = cast(ctx);
         if (self.qos.durability.kind == .VOLATILE_DURABILITY_QOS) return DDS.RETCODE_OK;
 
-        const POLL_NS: u64 = 1_000_000; // 1 ms
+        const POLL_NS: i64 = 1_000_000; // 1 ms
         const deadline_ns: ?i64 = if (max_wait.sec == DDS.DURATION_INFINITE_SEC and
             max_wait.nanosec == DDS.DURATION_INFINITE_NSEC)
             null
         else blk: {
-            break :blk time_mod.nanoTimestamp() +
+            break :blk self.timer_clock.nowNs() +
                 @as(i64, max_wait.sec) * std.time.ns_per_s +
                 @as(i64, max_wait.nanosec);
         };
@@ -1258,9 +1258,9 @@ pub const DataReaderImpl = struct {
         while (true) {
             if (self.proto_reader.historicalDelivered()) return DDS.RETCODE_OK;
             if (deadline_ns) |dl| {
-                if (time_mod.nanoTimestamp() >= dl) return DDS.RETCODE_TIMEOUT;
+                if (self.timer_clock.nowNs() >= dl) return DDS.RETCODE_TIMEOUT;
             }
-            time_mod.sleepNs(POLL_NS);
+            self.timer_clock.sleepNs(POLL_NS);
         }
     }
 
