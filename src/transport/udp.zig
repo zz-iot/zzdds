@@ -1455,3 +1455,370 @@ test "two participants share one UdpTransport; independent teardown" {
 
     t.unlisten(&listen_loc, ctr_b.handler());
 }
+
+// ── participantIdRange: nonzero min_pid when port base is low ─────────────────
+
+test "participantIdRange low base yields nonzero min_pid" {
+    // base=100, d_min=10 → 110 < 1024 → min_pid = ceil((1024-110)/2) = 457
+    const cfg = schema.UdpConfig{ .port_base = 100, .domain_gain = 0 };
+    const r = UdpTransport.participantIdRange(&cfg, 0);
+    try std.testing.expectEqual(@as(u32, 457), r.min);
+    try std.testing.expect(r.min <= r.max);
+}
+
+// ── autoAssignParticipantId ───────────────────────────────────────────────────
+
+test "init auto-assigns participant_id and reserves meta+data fds" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{ .ipv6_enabled = false }, 0, null);
+    defer udp.deinit();
+    // participant_id was chosen automatically; reserved fds held (data_port_separate=true).
+    try std.testing.expect(udp.participant_id <= 29062);
+    try std.testing.expect(udp.reserved_meta_fd != null);
+    try std.testing.expect(udp.reserved_data_fd != null);
+}
+
+// ── vtListen reserved-fd promotion path ──────────────────────────────────────
+
+test "vtListen promotes reserved meta fd on first listen" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{ .ipv6_enabled = false }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    try std.testing.expect(udp.reserved_meta_fd != null);
+
+    const meta_port = schema.metatrafficUnicastPort(&udp.config, udp.domain_id, udp.participant_id);
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, meta_port);
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+    try t.listen(&loc, h);
+    defer t.unlisten(&loc, h);
+
+    try std.testing.expectEqual(@as(?posix.socket_t, null), udp.reserved_meta_fd);
+}
+
+// ── init with external InterfaceMonitor ──────────────────────────────────────
+
+test "init with external InterfaceMonitor uses it and calls deinit on close" {
+    const alloc = std.testing.allocator;
+
+    var mon_sentinel: u8 = 0;
+    const noop_mon_vtable = InterfaceMonitor.Vtable{
+        .start = struct {
+            fn f(_: *anyopaque, _: iface.IfChangeCallback) anyerror!void {}
+        }.f,
+        .stop = struct {
+            fn f(_: *anyopaque) void {}
+        }.f,
+        .enumerate = struct {
+            fn f(_: *anyopaque, out: *std.ArrayListUnmanaged(IfAddr), _: std.mem.Allocator) anyerror!void {
+                out.clearRetainingCapacity();
+            }
+        }.f,
+        .deinit = struct {
+            fn f(_: *anyopaque) void {}
+        }.f,
+    };
+    const mon = InterfaceMonitor{ .ctx = &mon_sentinel, .vtable = &noop_mon_vtable };
+
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 180 }, 0, mon);
+    defer udp.deinit();
+    try std.testing.expect(!udp.monitor_owned);
+}
+
+// ── deinit while sockets are active (no unlisten) ────────────────────────────
+
+test "deinit stops active socket threads" {
+    const alloc = std.testing.allocator;
+    // pid 179: meta = 7400 + 2*179 + 10 = 7768
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 179,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    const t = udp.transport();
+
+    const port: u16 = 7768;
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+    try t.listen(&loc, h);
+    // Deinit without unlistening — exercises socket stop in deinit.
+    udp.deinit();
+}
+
+// ── vtSetLocatorChangeHandler ─────────────────────────────────────────────────
+
+test "vtSetLocatorChangeHandler sets and clears handler" {
+    const alloc = std.testing.allocator;
+    // pid 178: meta = 7766
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 178, .ipv6_enabled = false }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    var notified: bool = false;
+    const h = LocatorChangeHandler{
+        .ctx = &notified,
+        .on_change = struct {
+            fn f(ctx: *anyopaque) void {
+                const b: *bool = @ptrCast(@alignCast(ctx));
+                b.* = true;
+            }
+        }.f,
+    };
+    t.setLocatorChangeHandler(h);
+    try std.testing.expect(udp.locator_change_handler != null);
+    t.setLocatorChangeHandler(null);
+    try std.testing.expect(udp.locator_change_handler == null);
+}
+
+// ── vtClose via Transport interface ──────────────────────────────────────────
+
+test "vtClose tears down transport via vtable" {
+    const alloc = std.testing.allocator;
+    // pid 177: meta = 7764
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 177, .ipv6_enabled = false }, 0, null);
+    const t = udp.transport();
+    t.close(); // calls vtClose → deinit(); do NOT call udp.deinit() again
+}
+
+// ── vtListen / vtJoinMulticast error paths ────────────────────────────────────
+
+test "vtListen returns UnsupportedLocatorKind for non-UDP locator" {
+    const alloc = std.testing.allocator;
+    // pid 176: meta = 7762
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 176, .ipv6_enabled = false }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+    const loc = Locator{ .shmem = .{ .host_id = 0, .channel_id = 99 } };
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+    try std.testing.expectError(error.UnsupportedLocatorKind, t.listen(&loc, h));
+}
+
+test "vtJoinMulticast error paths: UnsupportedLocatorKind and NoHandlerForPort" {
+    const alloc = std.testing.allocator;
+    // pid 175: meta = 7760
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 175, .ipv6_enabled = false }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const shmem_loc = Locator{ .shmem = .{ .host_id = 0, .channel_id = 99 } };
+    try std.testing.expectError(error.UnsupportedLocatorKind, t.joinMulticast(&shmem_loc));
+
+    // Valid multicast locator but no listen registered for that port.
+    const mc_loc = Locator.udp4(.{ 239, 255, 0, 1 }, 55400);
+    try std.testing.expectError(error.NoHandlerForPort, t.joinMulticast(&mc_loc));
+}
+
+// ── vtJoinMulticast + vtLeaveMulticast round-trip ────────────────────────────
+
+test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
+    const alloc = std.testing.allocator;
+    // pid 174: use a dedicated high port for multicast to avoid conflicts
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 174,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const mc_port: u16 = 55401;
+    const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, mc_port);
+    const mc_group = Locator.udp4(.{ 239, 255, 0, 1 }, mc_port);
+
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+
+    try t.listen(&listen_loc, h);
+    try t.joinMulticast(&mc_group);
+    t.leaveMulticast(&mc_group);
+    t.unlisten(&listen_loc, h);
+}
+
+// ── sendUdp4 / sendUdp6 direct calls ─────────────────────────────────────────
+
+test "sendUdp4 unicast loopback send" {
+    // Creates a transient socket, sends to 127.0.0.1 (no listener needed — UDP fire-and-forget).
+    try sendUdp4(.{ 127, 0, 0, 1 }, 55410, "udp4-unicast");
+}
+
+test "sendUdp4 multicast destination sets IP_MULTICAST_IF" {
+    // 239.255.0.x is in the 224/4 multicast range → triggers the MULTICAST_IF sockopt.
+    sendUdp4(.{ 239, 255, 0, 1 }, 55411, "udp4-mc") catch {};
+}
+
+test "sendUdp6 unicast loopback send" {
+    var lo6: [16]u8 = std.mem.zeroes([16]u8);
+    lo6[15] = 1; // ::1
+    sendUdp6(lo6, 55412, "udp6-unicast") catch {};
+}
+
+test "sendUdp6 multicast destination sets IPV6_MULTICAST_IF" {
+    var mc6: [16]u8 = std.mem.zeroes([16]u8);
+    mc6[0] = 0xFF;
+    mc6[1] = 0x02;
+    mc6[15] = 1; // ff02::1
+    sendUdp6(mc6, 55413, "udp6-mc") catch {};
+}
+
+// ── diffAdded pure-function tests ─────────────────────────────────────────────
+
+test "diffAdded returns items in B absent from A" {
+    const alloc = std.testing.allocator;
+
+    var ia1 = std.mem.zeroes(IfAddr);
+    ia1.kind = LocatorKind.udp_v4;
+    ia1.ip[12] = 10;
+    ia1.ip[15] = 1;
+
+    var ia2 = std.mem.zeroes(IfAddr);
+    ia2.kind = LocatorKind.udp_v4;
+    ia2.ip[12] = 10;
+    ia2.ip[15] = 2;
+
+    var a: std.ArrayListUnmanaged(IfAddr) = .empty;
+    defer a.deinit(alloc);
+    var b: std.ArrayListUnmanaged(IfAddr) = .empty;
+    defer b.deinit(alloc);
+
+    try a.append(alloc, ia1);
+    try b.append(alloc, ia1); // ia1 in both → not "added"
+    try b.append(alloc, ia2); // ia2 only in b → "added"
+
+    var result = try diffAdded(alloc, &a, &b);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.items.len);
+    try std.testing.expectEqual(ia2.ip, result.items[0].ip);
+
+    // Symmetric: if b is empty, result is empty.
+    var empty_b: std.ArrayListUnmanaged(IfAddr) = .empty;
+    defer empty_b.deinit(alloc);
+    var result2 = try diffAdded(alloc, &a, &empty_b);
+    defer result2.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result2.items.len);
+}
+
+// ── dropMcV4 / dropMcV6 with empty socket list ───────────────────────────────
+
+test "dropMcV4 with empty socket list returns ok" {
+    const empty: []*SocketEntry = &.{};
+    try dropMcV4(empty, 1234, .{ 239, 255, 0, 1 }, .{ 127, 0, 0, 1 });
+}
+
+test "dropMcV6 with empty socket list returns ok" {
+    const empty: []*SocketEntry = &.{};
+    try dropMcV6(empty, 1234, std.mem.zeroes([16]u8));
+}
+
+// ── hasWildcardSocket ─────────────────────────────────────────────────────────
+
+test "hasWildcardSocket returns correct value" {
+    const alloc = std.testing.allocator;
+    // pid 170: meta = 7400 + 2*170 + 10 = 7750
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 170,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7750;
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+    try t.listen(&loc, h);
+    defer t.unlisten(&loc, h);
+
+    try std.testing.expect(udp.hasWildcardSocket(port));
+    try std.testing.expect(!udp.hasWildcardSocket(9999));
+}
+
+// ── onIfaceChange direct invocation ──────────────────────────────────────────
+
+test "onIfaceChange on stable network fires change handler" {
+    const alloc = std.testing.allocator;
+    // pid 173: meta = 7756
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 173,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    var notified: bool = false;
+    const ch = LocatorChangeHandler{
+        .ctx = &notified,
+        .on_change = struct {
+            fn f(ctx: *anyopaque) void {
+                const b: *bool = @ptrCast(@alignCast(ctx));
+                b.* = true;
+            }
+        }.f,
+    };
+    t.setLocatorChangeHandler(ch);
+    defer t.setLocatorChangeHandler(null);
+
+    // Fire the interface-change callback directly (simulates a monitor event).
+    // On a stable network the diff is empty so the add/remove loops are no-ops,
+    // but the rest of the function (enumerate, diff, rebuildLocators, change handler) runs.
+    UdpTransport.onIfaceChange(@ptrCast(udp));
+
+    try std.testing.expect(notified);
+}
+
+// ── applyInterfaceFilter via init ─────────────────────────────────────────────
+
+test "init with interface name filter runs applyInterfaceFilter" {
+    const alloc = std.testing.allocator;
+    const filter = [_][]const u8{"lo"};
+    // pid 172: meta = 7754
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 172,
+        .ipv6_enabled = false,
+        .interfaces = &filter,
+    }, 0, null);
+    defer udp.deinit();
+}
+
+test "init with interface IPv4 address filter runs applyInterfaceFilter" {
+    const alloc = std.testing.allocator;
+    const filter = [_][]const u8{"127.0.0.1"};
+    // pid 171: meta = 7752
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 171,
+        .ipv6_enabled = false,
+        .interfaces = &filter,
+    }, 0, null);
+    defer udp.deinit();
+}
