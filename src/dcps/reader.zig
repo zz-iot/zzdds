@@ -599,15 +599,28 @@ pub const DataReaderImpl = struct {
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
         // Track liveliness for writers with a finite lease.
         if (info.liveliness_lease_ns > 0) {
+            const prev = self.writer_liveliness.get(info.guid);
             self.writer_liveliness.put(self.alloc, info.guid, .{
                 .lease_ns = info.liveliness_lease_ns,
                 .last_alive_ns = self.timer_clock.nowNs(),
                 .is_alive = true,
             }) catch {};
-            self.liveliness_alive_count += 1;
-            self.liveliness_alive_count_change += 1;
-            self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
-            self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            if (prev == null) {
+                // Newly matched writer.
+                self.liveliness_alive_count += 1;
+                self.liveliness_alive_count_change += 1;
+                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            } else if (!prev.?.is_alive) {
+                // Re-announced after lease expiry — same transition as onWriterAliveCb.
+                self.liveliness_alive_count += 1;
+                self.liveliness_alive_count_change += 1;
+                self.liveliness_not_alive_count -= 1;
+                self.liveliness_not_alive_count_change -= 1;
+                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            }
+            // else: re-announcement of an already-alive writer; update lease/timestamp only.
         }
     }
 

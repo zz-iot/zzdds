@@ -2047,6 +2047,35 @@ pub const DomainParticipantImpl = struct {
             t.deinit();
             return nil.nil_topic;
         };
+        // Register in discovered_topics so get_discovered_topics / get_discovered_topic_data
+        // work for locally-created topics.  The same (topic_name, type_name) dedup key used
+        // by the SEDP callbacks prevents a duplicate entry when the topic later appears on wire.
+        new_dt: {
+            for (self.discovered_topics.items) |dt| {
+                if (std.mem.eql(u8, dt.topic_name, topic_name) and
+                    std.mem.eql(u8, dt.type_name, type_name)) break :new_dt;
+            }
+            const tn = self.alloc.dupe(u8, topic_name) catch break :new_dt;
+            const tt = self.alloc.dupe(u8, type_name) catch {
+                self.alloc.free(tn);
+                break :new_dt;
+            };
+            const dt = DiscoveredTopic{
+                .topic_name = tn,
+                .type_name = tt,
+                .handle = topicToHandle(topic_name, type_name),
+                .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
+                .durability_kind = @as(u8, @intCast(@intFromEnum(qos.durability.kind))),
+                .liveliness_kind = @as(u8, @intCast(@intFromEnum(qos.liveliness.kind))),
+                .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
+                .dest_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
+            };
+            self.discovered_topics.append(self.alloc, dt) catch {
+                self.alloc.free(tn);
+                self.alloc.free(tt);
+                break :new_dt;
+            };
+        }
         const maybe_topic_dr: ?*reader_mod.DataReaderImpl =
             if (self.builtin_sub) |bs| bs.topic_dr else null;
         self.mu.unlock();
