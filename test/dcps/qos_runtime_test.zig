@@ -1378,7 +1378,7 @@ test "query_condition: parameter substitution with %0" {
     try testing.expectEqual(@as(u8, 0xAA), out.items[0].data[4]);
 }
 
-test "query_condition: no TypeSupport registered — all samples pass through" {
+test "query_condition: no TypeSupport registered — create_querycondition returns nil" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
@@ -1387,9 +1387,6 @@ test "query_condition: no TypeSupport registered — all samples pass through" {
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     const pair = fx.makeWriterReader(.{}, dr_qos);
-
-    try writeRaw(pair.dw, &PAYLOAD_A); // value = 170
-    try writeRaw(pair.dw, &PAYLOAD_B); // value = 187
 
     const dr_dds = pair.dr.toDDSDataReader();
     const qc = dr_dds.vtable.create_querycondition(
@@ -1400,18 +1397,9 @@ test "query_condition: no TypeSupport registered — all samples pass through" {
         "value = 170",
         DDS.StringSeq.empty,
     );
-    defer qc.deinit();
-    const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
-
-    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
-    defer {
-        for (out.items) |s| alloc.free(s.data);
-        out.deinit(alloc);
-    }
-    // Without get_field_fn, matchesQuery returns true for all — both pass.
-    try pair.dr.readRaw(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, qc_impl);
-
-    try testing.expectEqual(@as(usize, 2), out.items.len);
+    // Without TypeSupport the expression cannot be evaluated: NIL is returned
+    // rather than a condition that silently passes every sample.
+    try testing.expect(qc.ptr == nil.NIL_PTR);
 }
 
 // ── Reader-side LIVELINESS_CHANGED tests ──────────────────────────────────────
