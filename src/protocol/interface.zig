@@ -56,6 +56,10 @@ pub const MatchedWriterInfo = struct {
     ownership_strength: i32 = 0,
     /// Liveliness lease duration in nanoseconds; 0 = infinite (no expiry tracking).
     liveliness_lease_ns: i64 = 0,
+    /// True when the writer offers TRANSIENT_LOCAL (or stronger) durability with RELIABLE
+    /// reliability.  The reader must wait for history delivery before signalling completion
+    /// of wait_for_historical_data.
+    history_expected: bool = false,
 };
 
 // ── Data delivery callback ────────────────────────────────────────────────────
@@ -305,6 +309,12 @@ pub const ProtocolReader = struct {
             gap_list: SequenceNumberSet,
         ) void,
 
+        /// Returns true when all matched TRANSIENT_LOCAL writers have delivered their
+        /// complete history up to the floor sequence number established by the first
+        /// HEARTBEAT.  Writers that do not have history_expected set are always considered
+        /// delivered.  Returns true immediately when no writers are matched.
+        historical_delivered: *const fn (ctx: *anyopaque) bool,
+
         /// Destroy this reader and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
     };
@@ -393,6 +403,10 @@ pub const ProtocolReader = struct {
         gap_list: SequenceNumberSet,
     ) void {
         self.vtable.handle_gap(self.ctx, writer_guid, gap_start, gap_list);
+    }
+
+    pub fn historicalDelivered(self: ProtocolReader) bool {
+        return self.vtable.historical_delivered(self.ctx);
     }
 
     pub fn deinit(self: ProtocolReader) void {

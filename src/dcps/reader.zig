@@ -108,6 +108,16 @@ fn matchesSample(
     return true;
 }
 
+fn matchesQuery(
+    pc: PendingChange,
+    maybe_qc: ?*const waitset.QueryConditionImpl,
+    get_field_fn: ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+) bool {
+    const qc = maybe_qc orelse return true;
+    const gff = get_field_fn orelse return true;
+    return qc.matchSample(pc.data, gff);
+}
+
 pub const DataReaderImpl = struct {
     alloc: std.mem.Allocator,
     topic_desc: DDS.TopicDescription,
@@ -162,6 +172,11 @@ pub const DataReaderImpl = struct {
     /// Set once after init by the subscriber; read-only thereafter.
     cft_filter: ?CftFilterState = null,
 
+    /// Field accessor for QueryCondition evaluation at read/take time.
+    /// Set from TypeSupport.get_field when available; null otherwise.
+    /// Set once after init by the subscriber; read-only thereafter.
+    get_field_fn: ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue = null,
+
     /// SampleLost status counters. Guarded by `mu`.
     sample_lost_total: i32 = 0,
     sample_lost_total_change: i32 = 0,
@@ -190,12 +205,12 @@ pub const DataReaderImpl = struct {
     owner_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, OwnerEntry) = .empty,
 
     // ── TIME_BASED_FILTER tracking ────────────────────────────────────────────
-    // Guarded by `mu`. Per-instance tracking deferred; currently applied
-    // globally (correct for keyless topics with one instance).
+    // Guarded by `mu`. Per-instance: each instance independently tracks the
+    // source timestamp of its last delivered sample.
 
-    /// Source timestamp (ns) of the last sample that passed the TBF window.
-    /// null = no sample delivered yet; first sample always passes.
-    tbf_last_ns: ?i64 = null,
+    /// Source timestamp (ns) of the last sample that passed the TBF window,
+    /// keyed by instance handle. Absent = no sample delivered yet for that instance.
+    tbf_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, i64) = .empty,
 
     // ── Instance lifecycle tracking ───────────────────────────────────────────
     // Guarded by `mu`.
@@ -266,6 +281,7 @@ pub const DataReaderImpl = struct {
         // Drain pending queue.
         for (self.pending.items) |p| p.deinit();
         self.pending.deinit(self.alloc);
+        self.tbf_map.deinit(self.alloc);
         self.writer_strengths.deinit(self.alloc);
         self.writer_liveliness.deinit(self.alloc);
         self.owner_map.deinit(self.alloc);
@@ -389,33 +405,74 @@ pub const DataReaderImpl = struct {
             }
         }
 
-        // TIME_BASED_FILTER: suppress samples whose source timestamp is within
-        // minimum_separation of the last delivered sample's source timestamp.
+        // TIME_BASED_FILTER: suppress alive samples whose source timestamp is within
+        // minimum_separation of the last accepted sample for this instance.
+        // Lifecycle changes (dispose/unregister) bypass TBF: suppressing them would
+        // leave instance state stuck as ALIVE and leak tbf_map/owner_map entries.
+        // tbf_map is updated only after a successful append (below), so a sample
+        // rejected by CFT, resource-limits, or OOM does not advance the window.
         const min_sep = self.qos.time_based_filter.minimum_separation;
-        if (min_sep.sec != 0 or min_sep.nanosec != 0) {
-            const src_ns = change.source_timestamp.toTime().toNs();
+        const tbf_active = change.kind == .alive and (min_sep.sec != 0 or min_sep.nanosec != 0);
+        const tbf_src_ns: i64 = if (tbf_active) change.source_timestamp.toTime().toNs() else 0;
+        if (tbf_active) {
             const sep_ns = @as(i64, min_sep.sec) * std.time.ns_per_s + @as(i64, min_sep.nanosec);
-            if (self.tbf_last_ns) |last| {
-                if (src_ns - last < sep_ns) {
+            if (self.tbf_map.get(ih)) |last| {
+                if (tbf_src_ns - last < sep_ns) {
                     self.mu.unlock();
                     self.alloc.free(copy);
                     return;
                 }
             }
-            self.tbf_last_ns = src_ns;
         }
 
-        // CONTENT_FILTER: drop samples that do not match the CFT expression.
+        // CONTENT_FILTER: only alive samples are filtered. Lifecycle changes
+        // (dispose/unregister) must pass through regardless of the expression so
+        // that the subscriber's instance state machine stays consistent and the
+        // per-instance tbf_map/owner_map cleanup below is reached.
         if (self.cft_filter) |*cft| {
-            if (!cft.matches(change.data)) {
+            if (change.kind == .alive and !cft.matches(change.data)) {
                 self.mu.unlock();
                 self.alloc.free(copy);
                 return;
             }
         }
 
+        // KEEP_LAST: if history depth is limited, evict the oldest pending sample
+        // for this instance when the per-instance count reaches depth.  This is a
+        // silent replacement, not a rejection — on_sample_rejected is NOT fired.
+        if (self.qos.history.kind == .KEEP_LAST_HISTORY_QOS) {
+            const depth: usize = @intCast(@max(1, self.qos.history.depth));
+            var instance_count: usize = 0;
+            for (self.pending.items) |pc| {
+                if (pc.info.instance_handle == ih) instance_count += 1;
+            }
+            if (instance_count >= depth) {
+                // Remove oldest pending sample for this instance.
+                var i: usize = 0;
+                while (i < self.pending.items.len) : (i += 1) {
+                    if (self.pending.items[i].info.instance_handle == ih) {
+                        const evicted = self.pending.orderedRemove(i);
+                        evicted.deinit();
+                        break;
+                    }
+                }
+            }
+        }
+
         // RESOURCE_LIMITS: check all three limits in priority order.
         // Rejection is notified via on_sample_rejected; sample is dropped.
+        //
+        // Ordering invariant: KEEP_LAST eviction above must run first.  The
+        // three axes cannot produce a silent loss after that eviction:
+        //   max_instances   — only checked when ih is a NEW instance; KEEP_LAST
+        //                     only fires when ih already exists in pending, so
+        //                     post-eviction current_distinct+1 equals the
+        //                     pre-eviction count, which was already ≤ max_instances.
+        //   max_samples_per_instance — post-eviction per-instance count is depth-1;
+        //                     the spec QoS consistency rule (depth ≤ max_samples_per_instance)
+        //                     guarantees depth-1 < max_samples_per_instance.
+        //   max_samples     — eviction removes 1, addition adds 1; net zero, so
+        //                     the total never exceeds the pre-eviction level.
         const rl = self.qos.resource_limits;
         const reject_reason: ?DDS.SampleRejectedStatusKind = blk: {
             if (rl.max_instances > 0) {
@@ -508,6 +565,14 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             return;
         };
+        // Stamp the TBF window now that the sample is committed to pending.
+        if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
+        // Instance going non-alive: release per-instance filter/ownership state.
+        // If the instance is later re-registered, fresh entries will be created.
+        if (change.kind != .alive) {
+            _ = self.tbf_map.remove(ih);
+            _ = self.owner_map.remove(ih);
+        }
         self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
         // Wake any ReadCondition WaitSets while mu is held (safe: wakeNotify
         // only acquires WaitSet.cv_mu, never reader.mu).
@@ -534,15 +599,28 @@ pub const DataReaderImpl = struct {
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
         // Track liveliness for writers with a finite lease.
         if (info.liveliness_lease_ns > 0) {
+            const prev = self.writer_liveliness.get(info.guid);
             self.writer_liveliness.put(self.alloc, info.guid, .{
                 .lease_ns = info.liveliness_lease_ns,
                 .last_alive_ns = self.timer_clock.nowNs(),
                 .is_alive = true,
             }) catch {};
-            self.liveliness_alive_count += 1;
-            self.liveliness_alive_count_change += 1;
-            self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
-            self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            if (prev == null) {
+                // Newly matched writer.
+                self.liveliness_alive_count += 1;
+                self.liveliness_alive_count_change += 1;
+                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            } else if (!prev.?.is_alive) {
+                // Re-announced after lease expiry — same transition as onWriterAliveCb.
+                self.liveliness_alive_count += 1;
+                self.liveliness_alive_count_change += 1;
+                self.liveliness_not_alive_count -= 1;
+                self.liveliness_not_alive_count_change -= 1;
+                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            }
+            // else: re-announcement of an already-alive writer; update lease/timestamp only.
         }
     }
 
@@ -674,6 +752,7 @@ pub const DataReaderImpl = struct {
         instance_mask: DDS.InstanceStateMask,
         max_samples: i32,
         maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -682,6 +761,7 @@ pub const DataReaderImpl = struct {
         for (self.pending.items) |*pc| {
             if (count >= limit) break;
             if (!matchesSample(pc.*, sample_mask, view_mask, instance_mask, maybe_ih)) continue;
+            if (!matchesQuery(pc.*, maybe_qc, self.get_field_fn)) continue;
             const clone = try self.alloc.dupe(u8, pc.data);
             errdefer self.alloc.free(clone);
             try out.append(self.alloc, .{ .data = clone, .info = pc.info });
@@ -704,6 +784,7 @@ pub const DataReaderImpl = struct {
         instance_mask: DDS.InstanceStateMask,
         max_samples: i32,
         maybe_ih: ?DDS.InstanceHandle_t,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -713,7 +794,8 @@ pub const DataReaderImpl = struct {
         var match_count: usize = 0;
         for (self.pending.items) |pc| {
             if (match_count >= limit) break;
-            if (matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih)) match_count += 1;
+            if (matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
+                matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
         }
         try out.ensureUnusedCapacity(self.alloc, match_count);
 
@@ -721,7 +803,10 @@ pub const DataReaderImpl = struct {
         var write: usize = 0;
         var taken: usize = 0;
         for (self.pending.items) |pc| {
-            if (taken < limit and matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih)) {
+            if (taken < limit and
+                matchesSample(pc, sample_mask, view_mask, instance_mask, maybe_ih) and
+                matchesQuery(pc, maybe_qc, self.get_field_fn))
+            {
                 out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info });
                 taken += 1;
             } else {
@@ -1014,6 +1099,12 @@ pub const DataReaderImpl = struct {
         query_parameters: DDS.StringSeq,
     ) DDS.QueryCondition {
         const self = cast(ctx);
+        // A non-empty expression requires field-level access to evaluate.
+        // If no TypeSupport is registered for this reader's type, the filter
+        // cannot be evaluated and would silently pass every sample.  Return NIL
+        // rather than creating a condition that does nothing.
+        if (query_expression.len > 0 and self.get_field_fn == null)
+            return nil.nil_querycondition;
         const qc = waitset.QueryConditionImpl.init(
             self.alloc,
             self.toDDSDataReader(),
@@ -1156,13 +1247,27 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtWaitForHistorical(ctx: *anyopaque, _: DDS.Duration_t) DDS.ReturnCode_t {
-        // VOLATILE durability has no historical data to wait for; return immediately.
-        // TRANSIENT_LOCAL / TRANSIENT / PERSISTENT would need to wait for history
-        // delivery from matched writers — not yet implemented.
+    fn vtWaitForHistorical(ctx: *anyopaque, max_wait: DDS.Duration_t) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (self.qos.durability.kind == .VOLATILE_DURABILITY_QOS) return DDS.RETCODE_OK;
-        return DDS.RETCODE_UNSUPPORTED;
+
+        const POLL_NS: i64 = 1_000_000; // 1 ms
+        const deadline_ns: ?i64 = if (max_wait.sec == DDS.DURATION_INFINITE_SEC and
+            max_wait.nanosec == DDS.DURATION_INFINITE_NSEC)
+            null
+        else blk: {
+            break :blk self.timer_clock.nowNs() +
+                @as(i64, max_wait.sec) * std.time.ns_per_s +
+                @as(i64, max_wait.nanosec);
+        };
+
+        while (true) {
+            if (self.proto_reader.historicalDelivered()) return DDS.RETCODE_OK;
+            if (deadline_ns) |dl| {
+                if (self.timer_clock.nowNs() >= dl) return DDS.RETCODE_TIMEOUT;
+            }
+            self.timer_clock.sleepNs(POLL_NS);
+        }
     }
 
     fn vtGetMatchedPubs(ctx: *anyopaque, handles: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {

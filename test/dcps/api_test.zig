@@ -18,6 +18,8 @@ const noop_security = zzdds.noop_security.noop_security_plugins;
 const time_mod = zzdds.util.time;
 
 const DomainParticipantFactoryImpl = dcps.DomainParticipantFactoryImpl;
+const DomainParticipantImpl = dcps.DomainParticipantImpl;
+const DataReaderImpl = dcps.DataReaderImpl;
 const WaitSetImpl = dcps.WaitSetImpl;
 const GuardConditionImpl = dcps.GuardConditionImpl;
 const nil = dcps;
@@ -27,6 +29,8 @@ const WriterAnnouncement = iface.WriterAnnouncement;
 const ReaderAnnouncement = iface.ReaderAnnouncement;
 const Discovery = iface.Discovery;
 const Guid = iface.Guid;
+const GuidPrefix = zzdds.rtps.GuidPrefix;
+const EntityIds = zzdds.rtps.EntityIds;
 const MockNetwork = mock_tr.MockNetwork;
 const MockTransport = mock_tr.MockTransport;
 const Locator = mock_tr.Locator;
@@ -337,4 +341,187 @@ test "DCPS: get_statuscondition on DataWriter returns non-null condition" {
     try testing.expect(@intFromPtr(sc.ptr) != 0);
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
+}
+
+// ── DCPSTopic / get_discovered_topics / contains_entity ──────────────────────
+//
+// Injects synthetic discovery events via dp_impl.disc_callbacks directly,
+// matching the pattern used in ignore_test.zig.
+
+fn fireRemoteWriter(dp_impl: *DomainParticipantImpl, topic: []const u8, type_name: []const u8) void {
+    const pfx = GuidPrefix{ .bytes = .{ 0xAA, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    const data = iface.WriterData{
+        .guid = .{ .prefix = pfx, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 } },
+        .participant_guid = .{ .prefix = pfx, .entity_id = EntityIds.participant },
+        .topic_name = topic,
+        .type_name = type_name,
+        .qos = .{ .reliability_kind = 1, .durability_kind = 1 },
+        .unicast_locators = &.{},
+        .multicast_locators = &.{},
+        .type_object = &.{},
+    };
+    dp_impl.disc_callbacks.on_writer_discovered(dp_impl.disc_callbacks.ctx, &data);
+}
+
+test "DCPS: DCPSTopic reader receives a sample when a topic is created" {
+    var h = try Harness.init(0x0A);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const bs_sub = dp.vtable.get_builtin_subscriber(dp.ptr);
+    try testing.expect(@intFromPtr(bs_sub.ptr) != 0);
+
+    _ = dp.vtable.create_topic(dp.ptr, "MyTopic", "MyType", .{}, nil.nil_topic_listener, 0);
+
+    // The builtin DCPSTopic DataReader should now have one pending sample.
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    const topic_dr = dp_impl.builtin_sub.?.topic_dr;
+    const sample = topic_dr.takeRaw() orelse return error.NoSample;
+    defer alloc.free(sample.data);
+    try testing.expect(sample.data.len > 0);
+}
+
+test "DCPS: get_discovered_topics returns handle for a SEDP-discovered writer's topic" {
+    var h = try Harness.init(0x0B);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    fireRemoteWriter(dp_impl, "RemoteTopic", "RemoteType");
+
+    var handles = DDS.InstanceHandleSeq.empty;
+    defer handles.deinit(alloc);
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topics(dp.ptr, &handles));
+    try testing.expectEqual(@as(usize, 1), handles.items.len);
+    try testing.expect(handles.items[0] != 0);
+}
+
+test "DCPS: get_discovered_topic_data returns name and type_name for discovered topic" {
+    var h = try Harness.init(0x0C);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    fireRemoteWriter(dp_impl, "DiscTopic", "DiscType");
+
+    var handles = DDS.InstanceHandleSeq.empty;
+    defer handles.deinit(alloc);
+    _ = dp.vtable.get_discovered_topics(dp.ptr, &handles);
+    try testing.expectEqual(@as(usize, 1), handles.items.len);
+
+    var data = DDS.TopicBuiltinTopicData{};
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles.items[0]));
+    try testing.expectEqualStrings("DiscTopic", data.name);
+    try testing.expectEqualStrings("DiscType", data.type_name);
+
+    // Unknown handle returns BAD_PARAMETER.
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dp.vtable.get_discovered_topic_data(dp.ptr, &data, 0xDEAD));
+}
+
+test "DCPS: get_discovered_topics deduplicates same topic from multiple writers" {
+    var h = try Harness.init(0x0D);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    // Inject two writers for the same topic.
+    fireRemoteWriter(dp_impl, "SharedTopic", "SharedType");
+    fireRemoteWriter(dp_impl, "SharedTopic", "SharedType");
+
+    var handles = DDS.InstanceHandleSeq.empty;
+    defer handles.deinit(alloc);
+    _ = dp.vtable.get_discovered_topics(dp.ptr, &handles);
+    try testing.expectEqual(@as(usize, 1), handles.items.len);
+}
+
+test "DCPS: contains_entity returns true for participant, topic, publisher, writer" {
+    var h = try Harness.init(0x09);
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_handle = dp.vtable.get_instance_handle(dp.ptr);
+    try testing.expect(dp.vtable.contains_entity(dp.ptr, dp_handle));
+
+    const topic = dp.vtable.create_topic(dp.ptr, "T", "TT", .{}, nil.nil_topic_listener, 0);
+    const topic_handle = topic.vtable.get_instance_handle(topic.ptr);
+    try testing.expect(dp.vtable.contains_entity(dp.ptr, topic_handle));
+
+    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_handle = pub_.vtable.get_instance_handle(pub_.ptr);
+    try testing.expect(dp.vtable.contains_entity(dp.ptr, pub_handle));
+
+    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, .{}, nil.nil_dw_listener, 0);
+    const dw_handle = dw.vtable.get_instance_handle(dw.ptr);
+    try testing.expect(dp.vtable.contains_entity(dp.ptr, dw_handle));
+
+    // Unknown handle.
+    try testing.expect(!dp.vtable.contains_entity(dp.ptr, 0x7EAD_BEEF));
+
+    _ = dp.vtable.delete_contained_entities(dp.ptr);
+}
+
+test "DCPS: get_discovered_topics and get_discovered_topic_data work for locally-created topics" {
+    var h = try Harness.init(0x0E);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    _ = dp.vtable.create_topic(dp.ptr, "LocalTopic", "LocalType", .{}, nil.nil_topic_listener, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var handles = DDS.InstanceHandleSeq.empty;
+    defer handles.deinit(alloc);
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topics(dp.ptr, &handles));
+    try testing.expectEqual(@as(usize, 1), handles.items.len);
+
+    var data = DDS.TopicBuiltinTopicData{};
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles.items[0]));
+    try testing.expectEqualStrings("LocalTopic", data.name);
+    try testing.expectEqualStrings("LocalType", data.type_name);
+}
+
+test "DCPS: SEDP announcement for a locally-created topic does not produce a duplicate" {
+    var h = try Harness.init(0x0F);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    _ = dp.vtable.create_topic(dp.ptr, "DupTopic", "DupType", .{}, nil.nil_topic_listener, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    // Simulate SEDP discovering a writer on the same topic.
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    fireRemoteWriter(dp_impl, "DupTopic", "DupType");
+
+    var handles = DDS.InstanceHandleSeq.empty;
+    defer handles.deinit(alloc);
+    _ = dp.vtable.get_discovered_topics(dp.ptr, &handles);
+
+    // Should still be exactly one entry, not two.
+    try testing.expectEqual(@as(usize, 1), handles.items.len);
 }

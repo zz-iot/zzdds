@@ -14,6 +14,9 @@ const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
+const QueryConditionImpl = zzdds.dcps.QueryConditionImpl;
+const TypeSupport = zzdds.dcps.TypeSupport;
+const filter_mod = zzdds.dcps.filter;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const nil = zzdds.dcps;
 const noop_security = zzdds.noop_security.noop_security_plugins;
@@ -569,6 +572,76 @@ test "ownership: EXCLUSIVE — owner transfer when current owner is removed" {
     try testing.expectEqualSlices(u8, &PAYLOAD_C, samples[1]);
 }
 
+// ── KEEP_LAST reader per-instance tests ──────────────────────────────────────
+
+fn writeRawKeyed(dw: *DataWriterImpl, payload: []const u8, key: u8) !void {
+    var kh = std.mem.zeroes([16]u8);
+    kh[0] = key;
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), kh, kh, payload);
+}
+
+test "keep_last: reader depth=1 silently replaces oldest for same instance (no rejection)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_LAST_HISTORY_QOS;
+    dr_qos.history.depth = 1;
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    // Three writes for the same instance — reader depth=1 should keep only the latest.
+    try writeRawKeyed(pair.dw, &PAYLOAD_A, 0x01);
+    try writeRawKeyed(pair.dw, &PAYLOAD_B, 0x01);
+    try writeRawKeyed(pair.dw, &PAYLOAD_C, 0x01);
+
+    // Only one sample in pending; no rejection should have been triggered.
+    try testing.expectEqual(@as(usize, 1), pendingCount(pair.dr));
+    var rej_status = DDS.SampleRejectedStatus{};
+    _ = pair.dr.toDDSDataReader().vtable.get_sample_rejected_status(pair.dr.toDDSDataReader().ptr, &rej_status);
+    try testing.expectEqual(@as(i32, 0), rej_status.total_count);
+
+    const samples = try drainSamples(alloc, pair.dr);
+    defer {
+        for (samples) |s| alloc.free(s);
+        alloc.free(samples);
+    }
+    try testing.expectEqual(@as(usize, 1), samples.len);
+    try testing.expectEqualSlices(u8, &PAYLOAD_C, samples[0]);
+}
+
+test "keep_last: reader depth=1 per-instance — two instances are independent" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_LAST_HISTORY_QOS;
+    dr_qos.history.depth = 1;
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    // Instance 0x01: two writes → only latest kept.
+    // Instance 0x02: one write → retained.
+    try writeRawKeyed(pair.dw, &PAYLOAD_A, 0x01);
+    try writeRawKeyed(pair.dw, &PAYLOAD_B, 0x02);
+    try writeRawKeyed(pair.dw, &PAYLOAD_C, 0x01); // replaces A for instance 0x01
+
+    // Two samples total: latest for each instance.
+    try testing.expectEqual(@as(usize, 2), pendingCount(pair.dr));
+}
+
 // ── TIME_BASED_FILTER tests ───────────────────────────────────────────────────
 //
 // Uses fixed source timestamps (seconds field of RtpsTimestamp) so tests are
@@ -584,6 +657,12 @@ fn writeRawAt(dw: *DataWriterImpl, payload: []const u8, secs: u32) !void {
     );
 }
 
+fn writeRawAtKeyed(dw: *DataWriterImpl, payload: []const u8, secs: u32, key: u8) !void {
+    var kh = std.mem.zeroes([16]u8);
+    kh[0] = key;
+    _ = try dw.writeRaw(.alive, .{ .seconds = secs, .fraction = 0 }, kh, kh, payload);
+}
+
 test "time_based_filter: zero separation (default) — all samples pass" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
@@ -594,6 +673,7 @@ test "time_based_filter: zero separation (default) — all samples pass" {
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     // minimum_separation = 0 (default) → no filtering
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
@@ -621,6 +701,7 @@ test "time_based_filter: samples within minimum_separation are suppressed" {
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.time_based_filter.minimum_separation = .{ .sec = 1, .nanosec = 0 };
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
@@ -649,6 +730,7 @@ test "time_based_filter: sample after minimum_separation is delivered" {
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.time_based_filter.minimum_separation = .{ .sec = 1, .nanosec = 0 };
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
@@ -678,6 +760,7 @@ test "time_based_filter: multiple suppressions then delivery after window" {
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.time_based_filter.minimum_separation = .{ .sec = 2, .nanosec = 0 };
 
     const pair = fx.makeWriterReader(dw_qos, dr_qos);
@@ -697,6 +780,42 @@ test "time_based_filter: multiple suppressions then delivery after window" {
     try testing.expectEqual(@as(usize, 2), samples.len);
     try testing.expectEqualSlices(u8, &PAYLOAD_A, samples[0]);
     try testing.expectEqualSlices(u8, &PAYLOAD_A, samples[1]);
+}
+
+test "time_based_filter: per-instance — instances have independent TBF windows" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.time_based_filter.minimum_separation = .{ .sec = 5, .nanosec = 0 };
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+
+    // t=0 instance A: passes (first for A).
+    // t=0 instance B: passes (first for B — independent window).
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_A, 0, 0x01);
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_B, 0, 0x02);
+    // t=3 instance A: within A's 5s window → dropped.
+    // t=3 instance B: within B's 5s window → dropped.
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_C, 3, 0x01);
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_C, 3, 0x02);
+    // t=6 instance A: outside A's 5s window → passes.
+    // t=6 instance B: outside B's 5s window → passes.
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_A, 6, 0x01);
+    try writeRawAtKeyed(pair.dw, &PAYLOAD_B, 6, 0x02);
+
+    const samples = try drainSamples(alloc, pair.dr);
+    defer {
+        for (samples) |s| alloc.free(s);
+        alloc.free(samples);
+    }
+    try testing.expectEqual(@as(usize, 4), samples.len);
 }
 
 // ── DEADLINE and LIVELINESS tests ─────────────────────────────────────────────
@@ -1106,4 +1225,353 @@ test "liveliness: MANUAL_BY_PARTICIPANT — write() does not reset the lease" {
     mc.advance(std.time.ns_per_s / 2);
     fx.dp_impl.checkTimers();
     try testing.expectEqual(@as(i32, 1), count);
+}
+
+// ── QueryCondition tests ──────────────────────────────────────────────────────
+
+fn qcNilKeyHash(_: []const u8) [16]u8 {
+    return std.mem.zeroes([16]u8);
+}
+
+// Per-payload get_field used by the TypeSupport — payload is passed directly
+// by the subscriber machinery when it calls subGetFieldFn.
+fn qcCdrGetField(payload: []const u8, field: []const u8) ?filter_mod.FilterValue {
+    if (std.mem.eql(u8, field, "value")) {
+        if (payload.len > 4) return .{ .int = payload[4] };
+    }
+    return null;
+}
+
+test "query_condition: readRaw with SQL filter returns only matching samples" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // Register TypeSupport with get_field BEFORE creating the reader.
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    dp_impl.registerTypeSupport("QosType", .{
+        .compute_key_hash = qcNilKeyHash,
+        .get_field = qcCdrGetField,
+    });
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    // PAYLOAD_A: value = 0xAA = 170; PAYLOAD_B: value = 0xBB = 187.
+    try writeRaw(pair.dw, &PAYLOAD_A);
+    try writeRaw(pair.dw, &PAYLOAD_B);
+
+    // QueryCondition: only value = 170 (0xAA).
+    const dr_dds = pair.dr.toDDSDataReader();
+    const qc = dr_dds.vtable.create_querycondition(
+        dr_dds.ptr,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "value = 170",
+        DDS.StringSeq.empty,
+    );
+    defer qc.deinit();
+    const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
+
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer {
+        for (out.items) |s| alloc.free(s.data);
+        out.deinit(alloc);
+    }
+    try pair.dr.readRaw(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, qc_impl);
+
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u8, 0xAA), out.items[0].data[4]);
+    // Both samples remain in pending (readRaw does not remove them).
+    try testing.expectEqual(@as(usize, 2), pendingCount(pair.dr));
+}
+
+test "query_condition: takeFiltered with SQL filter removes only matching samples" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    dp_impl.registerTypeSupport("QosType", .{
+        .compute_key_hash = qcNilKeyHash,
+        .get_field = qcCdrGetField,
+    });
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    try writeRaw(pair.dw, &PAYLOAD_A); // value = 0xAA = 170
+    try writeRaw(pair.dw, &PAYLOAD_B); // value = 0xBB = 187
+    try writeRaw(pair.dw, &PAYLOAD_C); // value = 0xCC = 204
+
+    // Take only samples where value <> 187 (excludes PAYLOAD_B).
+    const dr_dds = pair.dr.toDDSDataReader();
+    const qc = dr_dds.vtable.create_querycondition(
+        dr_dds.ptr,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "value <> 187",
+        DDS.StringSeq.empty,
+    );
+    defer qc.deinit();
+    const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
+
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer {
+        for (out.items) |s| alloc.free(s.data);
+        out.deinit(alloc);
+    }
+    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, qc_impl);
+
+    // A and C are taken; B remains.
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqual(@as(usize, 1), pendingCount(pair.dr));
+}
+
+test "query_condition: parameter substitution with %0" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    dp_impl.registerTypeSupport("QosType", .{
+        .compute_key_hash = qcNilKeyHash,
+        .get_field = qcCdrGetField,
+    });
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    try writeRaw(pair.dw, &PAYLOAD_A); // value = 170
+    try writeRaw(pair.dw, &PAYLOAD_B); // value = 187
+
+    // Create QC with parameterised expression, bound to "170".
+    var params = DDS.StringSeq.empty;
+    try params.append(alloc, "170");
+    defer params.deinit(alloc);
+
+    const dr_dds = pair.dr.toDDSDataReader();
+    const qc = dr_dds.vtable.create_querycondition(
+        dr_dds.ptr,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "value = %0",
+        params,
+    );
+    defer qc.deinit();
+    const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
+
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer {
+        for (out.items) |s| alloc.free(s.data);
+        out.deinit(alloc);
+    }
+    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, qc_impl);
+
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u8, 0xAA), out.items[0].data[4]);
+}
+
+test "query_condition: no TypeSupport registered — create_querycondition returns nil" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // Intentionally do NOT register TypeSupport — get_field_fn will be null.
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+
+    const dr_dds = pair.dr.toDDSDataReader();
+    const qc = dr_dds.vtable.create_querycondition(
+        dr_dds.ptr,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "value = 170",
+        DDS.StringSeq.empty,
+    );
+    // Without TypeSupport the expression cannot be evaluated: NIL is returned
+    // rather than a condition that silently passes every sample.
+    try testing.expect(qc.ptr == nil.NIL_PTR);
+}
+
+// ── Reader-side LIVELINESS_CHANGED tests ──────────────────────────────────────
+//
+// Reader tracks matched writers with finite liveliness leases via
+// onWriterMatchedCb. When checkTimers() finds a lease expired it calls
+// notifyLivelinessChanged() which fires the on_liveliness_changed listener.
+//
+// Uses a two-participant fixture: DirectDiscovery only cross-notifies between
+// separate participants, not same-participant endpoints.
+
+fn drOnLivelinessChanged(ctx: *anyopaque, _: DDS.DataReader, s: DDS.LivelinessChangedStatus) void {
+    @as(*DDS.LivelinessChangedStatus, @ptrCast(@alignCast(ctx))).* = s;
+}
+
+const dr_vtable_liveliness = DDS.DataReaderListener.Vtable{
+    .on_requested_deadline_missed = drNoopDeadline,
+    .on_requested_incompatible_qos = drNoopIncompat,
+    .on_sample_rejected = drNoopSampleRejected,
+    .on_liveliness_changed = drOnLivelinessChanged,
+    .on_data_available = drNoopDataAvail,
+    .on_subscription_matched = drNoopSubMatched,
+    .on_sample_lost = drNoopSampleLost,
+    .deinit = drNoopDeinit,
+};
+
+// Two-participant fixture sharing a ManualClock — both factories register the
+// same manual clock so reader timer_clock and writer timer_clock advance in sync.
+const TwoPartyTimerFixture = struct {
+    alloc: std.mem.Allocator,
+    delivery: IntraProcessDelivery,
+
+    t_w: *zzdds.intraprocess.MemoryTransport,
+    d_w: *zzdds.intraprocess.DirectDiscovery,
+    factory_w: *DomainParticipantFactoryImpl,
+    dp_w: DDS.DomainParticipant,
+    pub_: DDS.Publisher,
+
+    t_r: *zzdds.intraprocess.MemoryTransport,
+    d_r: *zzdds.intraprocess.DirectDiscovery,
+    factory_r: *DomainParticipantFactoryImpl,
+    dp_r: DDS.DomainParticipant,
+    dp_r_impl: *DomainParticipantImpl,
+    sub_: DDS.Subscriber,
+    topic_w: DDS.Topic,
+    topic_r: DDS.Topic,
+
+    fn init(alloc: std.mem.Allocator, clock: zzdds.util.time.Clock) !TwoPartyTimerFixture {
+        var delivery = try IntraProcessDelivery.init(alloc);
+        errdefer delivery.deinit();
+
+        var config = zzdds.config.Config{};
+        config.participant.timer_clock_name = "manual";
+
+        const t_w = try delivery.newTransport();
+        errdefer t_w.deinit();
+        const d_w = try delivery.newDiscovery();
+        errdefer d_w.deinit();
+        const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, config);
+        errdefer factory_w.deinit();
+        try factory_w.clock_registry.register("manual", clock);
+        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+        const pub_ = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
+        const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "LiveTopic", "LiveType", .{}, nil.nil_topic_listener, 0);
+
+        const t_r = try delivery.newTransport();
+        errdefer t_r.deinit();
+        const d_r = try delivery.newDiscovery();
+        errdefer d_r.deinit();
+        const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, config);
+        errdefer factory_r.deinit();
+        try factory_r.clock_registry.register("manual", clock);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+        const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
+        const sub_ = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
+        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "LiveTopic", "LiveType", .{}, nil.nil_topic_listener, 0);
+
+        return .{
+            .alloc = alloc,
+            .delivery = delivery,
+            .t_w = t_w,
+            .d_w = d_w,
+            .factory_w = factory_w,
+            .dp_w = dp_w,
+            .pub_ = pub_,
+            .t_r = t_r,
+            .d_r = d_r,
+            .factory_r = factory_r,
+            .dp_r = dp_r,
+            .dp_r_impl = dp_r_impl,
+            .sub_ = sub_,
+            .topic_w = topic_w,
+            .topic_r = topic_r,
+        };
+    }
+
+    fn deinit(self: *TwoPartyTimerFixture) void {
+        _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
+        _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
+        self.factory_w.deinit();
+        self.factory_r.deinit();
+        self.d_w.deinit();
+        self.d_r.deinit();
+        self.t_w.deinit();
+        self.t_r.deinit();
+        self.delivery.deinit();
+    }
+
+    fn makeWriter(self: *TwoPartyTimerFixture, qos: DDS.DataWriterQos) *DataWriterImpl {
+        const dw = self.pub_.vtable.create_datawriter(self.pub_.ptr, self.topic_w, qos, nil.nil_dw_listener, 0);
+        return @ptrCast(@alignCast(dw.ptr));
+    }
+
+    fn makeReader(self: *TwoPartyTimerFixture, listener: DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
+        const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
+        const dr = self.sub_.vtable.create_datareader(self.sub_.ptr, td, .{}, listener, mask);
+        return @ptrCast(@alignCast(dr.ptr));
+    }
+};
+
+test "liveliness: reader — on_liveliness_changed fires when writer lease expires" {
+    const alloc = testing.allocator;
+    var mc = ManualClock.init(0);
+    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    defer fx.deinit();
+
+    var captured = DDS.LivelinessChangedStatus{};
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
+    dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
+    _ = fx.makeWriter(dw_qos);
+    _ = fx.makeReader(
+        .{ .ptr = &captured, .vtable = &dr_vtable_liveliness },
+        DDS.LIVELINESS_CHANGED_STATUS,
+    );
+
+    // Lease not yet expired.
+    mc.advance(999_999_999);
+    fx.dp_r_impl.checkTimers();
+    try testing.expectEqual(@as(i32, 0), captured.not_alive_count);
+
+    // Advance past the 1 s lease — listener fires.
+    mc.advance(1);
+    fx.dp_r_impl.checkTimers();
+    try testing.expectEqual(@as(i32, 0), captured.alive_count);
+    try testing.expectEqual(@as(i32, 1), captured.not_alive_count);
+}
+
+test "liveliness: reader — get_liveliness_changed_status reflects writer match and expiry" {
+    const alloc = testing.allocator;
+    var mc = ManualClock.init(0);
+    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
+    dw_qos.liveliness.lease_duration = .{ .sec = 2, .nanosec = 0 };
+    _ = fx.makeWriter(dw_qos);
+    const dr = fx.makeReader(nil.nil_dr_listener, 0);
+
+    // After match, alive_count = 1 (writer has finite lease).
+    var status: DDS.LivelinessChangedStatus = undefined;
+    const dr_dds = dr.toDDSDataReader();
+    _ = dr_dds.vtable.get_liveliness_changed_status(dr_dds.ptr, &status);
+    try testing.expectEqual(@as(i32, 1), status.alive_count);
+    try testing.expectEqual(@as(i32, 0), status.not_alive_count);
+
+    // Expire the lease.
+    mc.advance(2 * std.time.ns_per_s);
+    fx.dp_r_impl.checkTimers();
+
+    _ = dr_dds.vtable.get_liveliness_changed_status(dr_dds.ptr, &status);
+    try testing.expectEqual(@as(i32, 0), status.alive_count);
+    try testing.expectEqual(@as(i32, 1), status.not_alive_count);
 }

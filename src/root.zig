@@ -51,6 +51,8 @@ pub const util = struct {
 };
 
 test {
+    std.testing.log_level = .err;
+
     _ = @import("config/schema.zig");
     _ = @import("config/file.zig");
     _ = @import("config/resolve.zig");

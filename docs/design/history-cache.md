@@ -52,7 +52,8 @@ Neither upgrade requires changes to the `CacheChange` interface — only the all
 
 ## Known limitations
 
-- **KEEP_LAST history depth is global, not per-instance.** The current implementation tracks
-  the depth limit across all instances of a keyed type. Per-instance tracking requires
-  deserializing key fields to identify the instance, which in turn requires `deserializeKey`
-  support in `zidl-rt` (not yet available). See `docs/roadmap.md`.
+- **Per-instance behavior depends on a resolved instance handle.** `KEEP_LAST` eviction is
+  per-instance: the cache trims the oldest change with the same `instance_handle`. For
+  keyed data, that handle comes from inline `PID_KEY_HASH` or registered
+  `TypeSupport.compute_key_hash`. If neither is available, samples fall back to the NIL
+  handle and are treated as one instance.

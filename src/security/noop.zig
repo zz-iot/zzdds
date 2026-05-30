@@ -102,3 +102,36 @@ pub const noop_security_plugins = iface.SecurityPlugins{
     .access_control = noop_access_control,
     .cryptographic = noop_cryptographic,
 };
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+test "noop_security_plugins: all vtable functions reachable" {
+    const alloc = std.testing.allocator;
+    const sp = noop_security_plugins;
+    const auth = sp.authentication.?;
+    const ac = sp.access_control.?;
+    const cr = sp.cryptographic.?;
+
+    // Authentication
+    var handle: iface.IdentityHandle = 0;
+    var guid = std.mem.zeroes(iface.Guid);
+    try auth.vtable.validate_local_identity(auth.ctx, &handle, &guid, 0, guid);
+    try std.testing.expectEqual(@as(iface.IdentityHandle, 1), handle);
+    auth.vtable.deinit(auth.ctx);
+
+    // AccessControl
+    try std.testing.expect(ac.vtable.can_write(ac.ctx, 1, "T"));
+    try std.testing.expect(ac.vtable.can_read(ac.ctx, 1, "T"));
+    ac.vtable.deinit(ac.ctx);
+
+    // Cryptographic: encode then decode round-trips plaintext unchanged
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try cr.vtable.encode_payload(cr.ctx, "hello", &out, alloc);
+    try std.testing.expectEqualStrings("hello", out.items);
+    var decoded = std.ArrayListUnmanaged(u8).empty;
+    defer decoded.deinit(alloc);
+    try cr.vtable.decode_payload(cr.ctx, out.items, &decoded, alloc);
+    try std.testing.expectEqualStrings("hello", decoded.items);
+    cr.vtable.deinit(cr.ctx);
+}

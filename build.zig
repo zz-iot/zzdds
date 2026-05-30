@@ -194,10 +194,34 @@ pub fn build(b: *std.Build) void {
         fuzz_step.dependOn(&fuzz_obj.step); // just build; no install
     }
 
+    // Transport-layer tests.
+    const transport_test_files = [_][]const u8{
+        "test/transport/transport_interface_test.zig",
+        "test/transport/lossy_transport_test.zig",
+    };
+    for (transport_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(t).step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
+    }
+
     // Discovery-layer tests.
     const discovery_test_files = [_][]const u8{
         "test/discovery/spdp_lease_test.zig",
         "test/discovery/sedp_test.zig",
+        "test/discovery/discovery_interface_test.zig",
     };
     for (discovery_test_files) |src| {
         const t = b.addTest(.{
@@ -258,6 +282,13 @@ pub fn build(b: *std.Build) void {
         "test/dcps/matched_status_test.zig",
         "test/dcps/sample_rejected_test.zig",
         "test/dcps/type_support_test.zig",
+        "test/dcps/wait_for_historical_test.zig",
+        "test/dcps/waitset_test.zig",
+        "test/dcps/pubsub_vtable_test.zig",
+        "test/dcps/topic_vtable_test.zig",
+        "test/dcps/reader_vtable_test.zig",
+        "test/dcps/factory_vtable_test.zig",
+        "test/dcps/writer_vtable_test.zig",
     };
     for (dcps_test_files) |src| {
         const t = b.addTest(.{

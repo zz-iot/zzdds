@@ -249,8 +249,7 @@ pub const ContentFilteredTopicImpl = struct {
         }
 
         // Parse the filter expression (borrows slices from expr_copy).
-        const parsed = filter_mod.parse(alloc, expr_copy) catch null;
-        errdefer if (parsed) |ast| filter_mod.freeAst(alloc, ast);
+        const parsed = try filter_mod.parse(alloc, expr_copy);
 
         self.* = .{
             .alloc = alloc,

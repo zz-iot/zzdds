@@ -15,6 +15,7 @@
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
+const filter_mod = @import("filter.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const Condvar = @import("../util/condvar.zig").Condvar;
 const time_mod = @import("../util/time.zig");
@@ -510,10 +511,11 @@ const DDS_STATUS_MASK_ANY: DDS.StatusMask = 0x7FFF;
 
 // ── QueryConditionImpl ────────────────────────────────────────────────────────
 
-/// A QueryCondition is a ReadCondition augmented with a query expression and
-/// parameters.  The trigger semantics are identical to ReadCondition (has
-/// pending data matching the state masks).  SQL-subset expression evaluation
-/// against CDR payloads is deferred until typed DataReader wrappers exist.
+/// A QueryCondition is a ReadCondition augmented with a SQL-subset query
+/// expression and parameters.  The trigger semantics are identical to
+/// ReadCondition (has pending data matching the state masks).  SQL evaluation
+/// is applied at read/take time when a get_field function is available for
+/// the reader's type (registered via TypeSupport).
 ///
 /// WaitSet attachment: `toCondition()` returns the embedded ReadConditionImpl's
 /// condition interface, so WaitSetImpl.vtAttach handles it like a ReadCondition.
@@ -522,6 +524,11 @@ pub const QueryConditionImpl = struct {
     rc: ReadConditionImpl,
     query_expression: []u8,
     query_parameters: std.ArrayListUnmanaged([]u8),
+    /// Parsed AST of `query_expression`.  Null when the expression is empty
+    /// or the content_subscription_profile is disabled.  A malformed expression
+    /// returns error.ParseError from init, so the caller returns NIL.
+    /// AST node slices borrow from `query_expression`; free before it.
+    parsed_expr: ?*filter_mod.AstNode,
 
     const Self = @This();
 
@@ -555,6 +562,8 @@ pub const QueryConditionImpl = struct {
             try params.append(alloc, copy);
         }
 
+        const parsed = try filter_mod.parse(alloc, expr_copy);
+
         self.* = .{
             .alloc = alloc,
             .rc = .{
@@ -570,16 +579,41 @@ pub const QueryConditionImpl = struct {
             },
             .query_expression = expr_copy,
             .query_parameters = params,
+            .parsed_expr = parsed,
         };
         return self;
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
         for (self.query_parameters.items) |p| self.alloc.free(p);
         self.query_parameters.deinit(self.alloc);
         self.alloc.free(self.query_expression);
         self.alloc.destroy(self);
     }
+
+    /// Returns true if `payload` passes the query expression, or if the
+    /// expression cannot be evaluated (no field accessor or empty expression).
+    pub fn matchSample(
+        self: *const Self,
+        payload: []const u8,
+        get_field_fn: *const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+    ) bool {
+        var ctx = FieldCtx{ .payload = payload, .get_fn = get_field_fn };
+        const accessor = filter_mod.FieldAccessor{ .ctx = &ctx, .get = FieldCtx.get };
+        const params_slice: []const []const u8 = @ptrCast(self.query_parameters.items);
+        return filter_mod.eval(self.parsed_expr, accessor, params_slice);
+    }
+
+    const FieldCtx = struct {
+        payload: []const u8,
+        get_fn: *const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+
+        fn get(ctx: *anyopaque, field: []const u8) ?filter_mod.FilterValue {
+            const self: *const FieldCtx = @ptrCast(@alignCast(ctx));
+            return self.get_fn(self.payload, field);
+        }
+    };
 
     pub fn toDDSQueryCondition(self: *Self) DDS.QueryCondition {
         return .{ .ptr = self, .vtable = &vtable };
@@ -628,7 +662,17 @@ pub const QueryConditionImpl = struct {
         const self = cast(ctx);
         out.clearRetainingCapacity();
         for (self.query_parameters.items) |p| {
-            out.append(self.alloc, p) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            const copy = self.alloc.dupe(u8, p) catch {
+                for (out.items) |c| self.alloc.free(c);
+                out.clearRetainingCapacity();
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+            out.append(self.alloc, copy) catch {
+                self.alloc.free(copy);
+                for (out.items) |c| self.alloc.free(c);
+                out.clearRetainingCapacity();
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
         }
         return DDS.RETCODE_OK;
     }

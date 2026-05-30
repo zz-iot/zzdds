@@ -13,7 +13,7 @@
 |---|---|
 | [`testing.md`](testing.md) | How to run the test suite (all tiers) |
 | [`dev-notes.md`](dev-notes.md) | Zig 0.16.0 API notes, build dependency layout, generated code table |
-| [`roadmap.md`](roadmap.md) | Phase 33 remaining items, planned work, deferred items |
+| [`roadmap.md`](roadmap.md) | Completed Phase 33 summary, planned work, deferred items |
 | [`decisions.md`](decisions.md) | Stable design decisions with rationale |
 
 ## Design Notes (`docs/design/`)
@@ -60,7 +60,7 @@ test/
   rtps/                   # RTPS message-layer tests
   discovery/              # SPDP/SEDP tests
   fuzz/                   # Corpus regression (RTPS parser, PL_CDR deserializer)
-  interop/                # Wire interop vs Cyclone DDS / OpenDDS
+  interop/                # Local wire interop harness vs Cyclone DDS / OpenDDS
 docs/
   overview.md             # This file — documentation index
   architecture.md         # Layer model, plugin interfaces, config, logging, wire trace

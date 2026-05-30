@@ -225,6 +225,7 @@ pub const RtpsProtocolReader = struct {
         .handle_data_frag = vtHandleDataFrag,
         .handle_heartbeat_frag = vtHandleHeartbeatFrag,
         .handle_gap = vtHandleGap,
+        .historical_delivered = vtHistoricalDelivered,
         .deinit = vtDeinit,
     };
 
@@ -244,13 +245,16 @@ pub const RtpsProtocolReader = struct {
 
     fn vtAddMatchedWriter(ctx: *anyopaque, info: *const MatchedWriterInfo) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const proxy = try WriterProxy.init(
+        var proxy = try WriterProxy.init(
             self.alloc,
             info.guid,
             info.unicast_locators,
             info.multicast_locators,
             info.reliability == .reliable,
         );
+        // Mark the proxy as awaiting history delivery when the remote writer offers
+        // TRANSIENT_LOCAL (or stronger) history with RELIABLE reliability.
+        proxy.history_established = !info.history_expected;
         try self.reader.addMatchedWriter(proxy);
         if (self.writer_match_cb) |cb| cb.on_writer_matched(cb.ctx, info);
     }
@@ -355,6 +359,11 @@ pub const RtpsProtocolReader = struct {
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.reader.handleGap(writer_guid, gap_start, gap_list);
+    }
+
+    fn vtHistoricalDelivered(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.reader.historicalDelivered();
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

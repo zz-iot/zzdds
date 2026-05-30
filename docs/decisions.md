@@ -49,9 +49,10 @@ decode wire durations as `RtpsDuration`, then convert to DDS `Duration` before l
 or QoS logic. Omitted `PID_DEADLINE` means DDS default infinite; explicit `{0,0}` means
 RTPS `DURATION_ZERO` and is not normalized to infinite.
 
-**BEST_EFFORT replay-on-new-proxy: not implemented.**
-Interop tests use RELIABLE — the correct tool for guaranteed delivery. If BEST_EFFORT
-replay is ever added, it should be an explicit policy choice, not a default behavior.
+**BEST_EFFORT late-join replay is a TRANSIENT_LOCAL courtesy, not reliability.**
+For TRANSIENT_LOCAL writers, `StatefulWriter` replays the current writer cache to a newly
+matched BEST_EFFORT reader. This covers late joiners and in-process discovery races, but it
+is still BEST_EFFORT: there is no heartbeat/acknack recovery after packet loss.
 
 ---
 
@@ -86,11 +87,13 @@ Simple, correct, easy to audit. Future upgrade path: slab/pool per topic (bounde
 fragmentation) or ring-buffer of fixed-size blocks (embedded targets). Neither upgrade
 requires changes to the `CacheChange` interface.
 
-**ContentFilteredTopic: reader-side evaluator, not writer push-down.**
+**ContentFilteredTopic and QueryCondition: reader-side evaluator, not writer push-down.**
 The SQL-subset parser/evaluator is local to the reader side and uses a `FieldAccessor`
-provided by typed code. The generic `DataReader` does not yet call it automatically from
-`read()` / `take()` because raw CDR payloads need generated field access. Writer-side or
-transport push-down remains a future optimization if per-sample CPU cost becomes measurable.
+provided by typed code. `ContentFilteredTopic` filtering runs before samples enter the
+reader pending queue when the type has registered `TypeSupport.get_field`; `QueryCondition`
+expressions run at `read()` / `take()` time using the same accessor. Without a field
+accessor, expressions pass samples through. Writer-side or transport push-down remains a
+future optimization if per-sample CPU cost becomes measurable.
 
 **`DataReader.read()` semantics: copy first, loan upgrade path preserved.**
 `readRaw()` is non-destructive: marks samples `READ_SAMPLE_STATE` in-place, returns

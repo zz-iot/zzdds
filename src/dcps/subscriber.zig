@@ -251,10 +251,11 @@ pub const SubscriberImpl = struct {
             dr,
             reader_mod.DataReaderImpl.checkTimersFn,
         );
-        // Wire up ContentFilteredTopic if the topic description is a CFT and we
-        // have a get_field function registered for this type.
+        // Wire up get_field_fn for QueryCondition evaluation (always, when available).
+        dr.get_field_fn = self.cbs.get_field_fn(self.cbs.ctx, type_name);
+        // Wire up ContentFilteredTopic if the topic description is a CFT.
         if (topic_mod.asCft(a_topic)) |cft| {
-            if (self.cbs.get_field_fn(self.cbs.ctx, type_name)) |get_field| {
+            if (dr.get_field_fn) |get_field| {
                 dr.cft_filter = .{ .cft_ptr = cft, .get_field_fn = get_field };
             }
         }

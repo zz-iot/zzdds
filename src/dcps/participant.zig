@@ -101,6 +101,11 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
     .handle_gap = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumberSet) void {}
     }.f,
+    .historical_delivered = struct {
+        fn f(_: *anyopaque) bool {
+            return true;
+        }
+    }.f,
     .deinit = struct {
         fn f(_: *anyopaque) void {}
     }.f,
@@ -396,6 +401,51 @@ fn pushBuiltinSubscriptionCdr(
     dr.pushCdr(buf.items);
 }
 
+fn pushBuiltinTopicCdr(
+    alloc: std.mem.Allocator,
+    dr: *reader_mod.DataReaderImpl,
+    v: DDS.TopicBuiltinTopicData,
+) void {
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(alloc);
+    var w = zidl_rt.CdrWriter(.xcdr1).init(&buf, alloc);
+    w.writeEncapHeader() catch return;
+    DDS.TopicBuiltinTopicData.serialize(&w, v) catch return;
+    dr.pushCdr(buf.items);
+}
+
+/// Deterministic BuiltinTopicKey_t derived from the topic name.
+/// Three independent FNV-1a passes with different initial values.
+fn topicNameToKey(topic_name: []const u8) DDS.BuiltinTopicKey_t {
+    const ivs = [3]u32{ 0xd95c1265, 0x811c9dc5, 0x40503259 };
+    var vals: [3]i32 = undefined;
+    for (&vals, ivs) |*v, iv| {
+        var h: u32 = iv;
+        for (topic_name) |b| {
+            h ^= b;
+            h *%= 16777619;
+        }
+        v.* = @bitCast(h);
+    }
+    return .{ .value = vals };
+}
+
+/// Deterministic instance handle derived from topic name + type name.
+fn topicToHandle(topic_name: []const u8, type_name: []const u8) DDS.InstanceHandle_t {
+    var h: u32 = 2166136261;
+    for (topic_name) |b| {
+        h ^= b;
+        h *%= 16777619;
+    }
+    h ^= 0xFF;
+    for (type_name) |b| {
+        h ^= b;
+        h *%= 16777619;
+    }
+    const v: i32 = @intCast(h & 0x7FFF_FFFF);
+    return if (v == 0) 1 else v;
+}
+
 // ── Per-writer / per-reader tracking ─────────────────────────────────────────
 
 /// Callback registered by DataWriterImpl / DataReaderImpl so that the participant
@@ -430,6 +480,17 @@ const AssertNotify = struct {
 const DiscoveredParticipant = struct {
     guid: Guid,
     handle: DDS.InstanceHandle_t,
+};
+
+const DiscoveredTopic = struct {
+    topic_name: []const u8, // owned (heap-allocated)
+    type_name: []const u8, // owned (heap-allocated)
+    handle: DDS.InstanceHandle_t,
+    reliability_kind: u8,
+    durability_kind: u8,
+    liveliness_kind: u8,
+    ownership_kind: u8,
+    dest_order_kind: u8,
 };
 
 /// Callback table registered per type name via registerTypeSupport().
@@ -506,6 +567,22 @@ pub const DomainParticipantImpl = struct {
     /// GUID prefixes passed to ignore_participant(); all discovery events from
     /// these prefixes are silently dropped.  Guarded by mu.
     ignored_prefixes: std.ArrayListUnmanaged(GuidPrefix),
+
+    /// Topic names passed to ignore_topic(); discovery events for these topics
+    /// are silently dropped.  Owned strings.  Guarded by mu.
+    ignored_topic_names: std.ArrayListUnmanaged([]const u8),
+
+    /// Handles of remote publications passed to ignore_publication().
+    /// Derived via guidToHandle(remote_writer_guid).  Guarded by mu.
+    ignored_publication_handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t),
+
+    /// Handles of remote subscriptions passed to ignore_subscription().
+    /// Derived via guidToHandle(remote_reader_guid).  Guarded by mu.
+    ignored_subscription_handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t),
+
+    /// Topics discovered via SEDP writer/reader announcements, deduped by
+    /// (topic_name, type_name).  Backing strings are owned.  Guarded by mu.
+    discovered_topics: std.ArrayListUnmanaged(DiscoveredTopic),
 
     /// Built-in subscriber (DCPSParticipant / DCPSTopic / DCPSPublication /
     /// DCPSSubscription DataReaders). Created in init(); null on OOM.
@@ -584,6 +661,10 @@ pub const DomainParticipantImpl = struct {
             .active_readers = .empty,
             .discovered_participants = .empty,
             .ignored_prefixes = .empty,
+            .ignored_topic_names = .empty,
+            .ignored_publication_handles = .empty,
+            .ignored_subscription_handles = .empty,
+            .discovered_topics = .empty,
             .builtin_sub = null,
             .type_info_registry = .empty,
             .type_support_registry = .empty,
@@ -757,6 +838,15 @@ pub const DomainParticipantImpl = struct {
         self.active_readers.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
         self.ignored_prefixes.deinit(self.alloc);
+        for (self.ignored_topic_names.items) |n| self.alloc.free(n);
+        self.ignored_topic_names.deinit(self.alloc);
+        self.ignored_publication_handles.deinit(self.alloc);
+        self.ignored_subscription_handles.deinit(self.alloc);
+        for (self.discovered_topics.items) |dt| {
+            self.alloc.free(dt.topic_name);
+            self.alloc.free(dt.type_name);
+        }
+        self.discovered_topics.deinit(self.alloc);
 
         self.alloc.destroy(self);
     }
@@ -990,6 +1080,8 @@ pub const DomainParticipantImpl = struct {
         const keep_last = qos.history.kind != .KEEP_ALL_HISTORY_QOS;
         // DDS spec: deadline default is DURATION_INFINITE; {0,0} from codegen means unset → treat as infinite.
         const dl_zero_w = qos.deadline.period.sec == 0 and qos.deadline.period.nanosec == 0;
+        // Liveliness lease: {0,0} from codegen means unset → treat as infinite.
+        const ll_zero_w = qos.liveliness.lease_duration.sec == 0 and qos.liveliness.lease_duration.nanosec == 0;
         return .{
             .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
             .durability_kind = @as(u8, @truncate(@intFromEnum(qos.durability.kind))),
@@ -997,6 +1089,8 @@ pub const DomainParticipantImpl = struct {
             // DDS spec: KEEP_LAST depth must be >= 1; default 0 from codegen → clamp to 1.
             .history_depth = if (keep_last and qos.history.depth < 1) 1 else qos.history.depth,
             .liveliness_kind = @as(u8, @truncate(@intFromEnum(qos.liveliness.kind))),
+            .liveliness_lease_sec = if (ll_zero_w) 0x7fff_ffff else qos.liveliness.lease_duration.sec,
+            .liveliness_lease_nanosec = if (ll_zero_w) 0x7fff_ffff else qos.liveliness.lease_duration.nanosec,
             .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
             .ownership_strength = qos.ownership_strength.value,
             .destination_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
@@ -1280,6 +1374,19 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
+        const pub_handle = writer_mod.guidToHandle(data.guid);
+        for (self.ignored_publication_handles.items) |h| {
+            if (h == pub_handle) {
+                self.mu.unlock();
+                return;
+            }
+        }
+        for (self.ignored_topic_names.items) |n| {
+            if (std.mem.eql(u8, n, data.topic_name)) {
+                self.mu.unlock();
+                return;
+            }
+        }
         for (self.active_readers.items) |*ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, ar.type_name, data.type_name)) continue;
@@ -1308,14 +1415,56 @@ pub const DomainParticipantImpl = struct {
                 .reliability = if (data.qos.reliability_kind == 1) .reliable else .best_effort,
                 .ownership_strength = data.qos.ownership_strength,
                 .liveliness_lease_ns = lease_ns,
+                .history_expected = data.qos.durability_kind > 0 and data.qos.reliability_kind == 1,
             };
             ar.proto.addMatchedWriter(&info) catch {};
             if (ar.matched_notify) |cb|
                 cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
         }
         if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
+        // Register newly-seen topic in the discovered-topic registry.
+        var new_topic: ?DiscoveredTopic = null;
+        var push_topic_dr: ?*reader_mod.DataReaderImpl = null;
+        known: {
+            for (self.discovered_topics.items) |dt| {
+                if (std.mem.eql(u8, dt.topic_name, data.topic_name) and
+                    std.mem.eql(u8, dt.type_name, data.type_name)) break :known;
+            }
+            const tn = self.alloc.dupe(u8, data.topic_name) catch break :known;
+            const tt = self.alloc.dupe(u8, data.type_name) catch {
+                self.alloc.free(tn);
+                break :known;
+            };
+            const dt = DiscoveredTopic{
+                .topic_name = tn,
+                .type_name = tt,
+                .handle = topicToHandle(data.topic_name, data.type_name),
+                .reliability_kind = data.qos.reliability_kind,
+                .durability_kind = data.qos.durability_kind,
+                .liveliness_kind = data.qos.liveliness_kind,
+                .ownership_kind = data.qos.ownership_kind,
+                .dest_order_kind = data.qos.destination_order_kind,
+            };
+            self.discovered_topics.append(self.alloc, dt) catch {
+                self.alloc.free(tn);
+                self.alloc.free(tt);
+                break :known;
+            };
+            new_topic = dt;
+            if (self.builtin_sub) |bs| push_topic_dr = bs.topic_dr;
+        }
         self.mu.unlock();
         if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data);
+        if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
+            .key = topicNameToKey(dt.topic_name),
+            .name = dt.topic_name,
+            .type_name = dt.type_name,
+            .reliability = qosReliability(dt.reliability_kind),
+            .durability = qosDurability(dt.durability_kind),
+            .liveliness = qosLiveliness(dt.liveliness_kind),
+            .ownership = qosOwnership(dt.ownership_kind),
+            .destination_order = qosDestOrder(dt.dest_order_kind),
+        });
     }
 
     fn onWriterLost(ctx: *anyopaque, guid: disc.Guid) void {
@@ -1339,6 +1488,19 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         for (self.ignored_prefixes.items) |p| {
             if (p.eql(data.guid.prefix)) {
+                self.mu.unlock();
+                return;
+            }
+        }
+        const sub_handle = writer_mod.guidToHandle(data.guid);
+        for (self.ignored_subscription_handles.items) |h| {
+            if (h == sub_handle) {
+                self.mu.unlock();
+                return;
+            }
+        }
+        for (self.ignored_topic_names.items) |n| {
+            if (std.mem.eql(u8, n, data.topic_name)) {
                 self.mu.unlock();
                 return;
             }
@@ -1370,8 +1532,49 @@ pub const DomainParticipantImpl = struct {
                 cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
         }
         if (self.builtin_sub) |bs| push_dr = bs.sub_dr;
+        // Register newly-seen topic in the discovered-topic registry.
+        var new_topic: ?DiscoveredTopic = null;
+        var push_topic_dr: ?*reader_mod.DataReaderImpl = null;
+        known: {
+            for (self.discovered_topics.items) |dt| {
+                if (std.mem.eql(u8, dt.topic_name, data.topic_name) and
+                    std.mem.eql(u8, dt.type_name, data.type_name)) break :known;
+            }
+            const tn = self.alloc.dupe(u8, data.topic_name) catch break :known;
+            const tt = self.alloc.dupe(u8, data.type_name) catch {
+                self.alloc.free(tn);
+                break :known;
+            };
+            const dt = DiscoveredTopic{
+                .topic_name = tn,
+                .type_name = tt,
+                .handle = topicToHandle(data.topic_name, data.type_name),
+                .reliability_kind = data.qos.reliability_kind,
+                .durability_kind = data.qos.durability_kind,
+                .liveliness_kind = data.qos.liveliness_kind,
+                .ownership_kind = data.qos.ownership_kind,
+                .dest_order_kind = data.qos.destination_order_kind,
+            };
+            self.discovered_topics.append(self.alloc, dt) catch {
+                self.alloc.free(tn);
+                self.alloc.free(tt);
+                break :known;
+            };
+            new_topic = dt;
+            if (self.builtin_sub) |bs| push_topic_dr = bs.topic_dr;
+        }
         self.mu.unlock();
         if (push_dr) |dr| pushBuiltinSubscriptionCdr(self.alloc, dr, data);
+        if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
+            .key = topicNameToKey(dt.topic_name),
+            .name = dt.topic_name,
+            .type_name = dt.type_name,
+            .reliability = qosReliability(dt.reliability_kind),
+            .durability = qosDurability(dt.durability_kind),
+            .liveliness = qosLiveliness(dt.liveliness_kind),
+            .ownership = qosOwnership(dt.ownership_kind),
+            .destination_order = qosDestOrder(dt.dest_order_kind),
+        });
     }
 
     fn onReaderLost(ctx: *anyopaque, guid: disc.Guid) void {
@@ -1844,7 +2047,55 @@ pub const DomainParticipantImpl = struct {
             t.deinit();
             return nil.nil_topic;
         };
+        // Register in discovered_topics so get_discovered_topics / get_discovered_topic_data
+        // work for locally-created topics.  The same (topic_name, type_name) dedup key used
+        // by the SEDP callbacks prevents a duplicate entry when the topic later appears on wire.
+        new_dt: {
+            for (self.discovered_topics.items) |dt| {
+                if (std.mem.eql(u8, dt.topic_name, topic_name) and
+                    std.mem.eql(u8, dt.type_name, type_name)) break :new_dt;
+            }
+            const tn = self.alloc.dupe(u8, topic_name) catch break :new_dt;
+            const tt = self.alloc.dupe(u8, type_name) catch {
+                self.alloc.free(tn);
+                break :new_dt;
+            };
+            const dt = DiscoveredTopic{
+                .topic_name = tn,
+                .type_name = tt,
+                .handle = topicToHandle(topic_name, type_name),
+                .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
+                .durability_kind = @as(u8, @intCast(@intFromEnum(qos.durability.kind))),
+                .liveliness_kind = @as(u8, @intCast(@intFromEnum(qos.liveliness.kind))),
+                .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
+                .dest_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
+            };
+            self.discovered_topics.append(self.alloc, dt) catch {
+                self.alloc.free(tn);
+                self.alloc.free(tt);
+                break :new_dt;
+            };
+        }
+        const maybe_topic_dr: ?*reader_mod.DataReaderImpl =
+            if (self.builtin_sub) |bs| bs.topic_dr else null;
         self.mu.unlock();
+        if (maybe_topic_dr) |dr| pushBuiltinTopicCdr(self.alloc, dr, .{
+            .key = topicNameToKey(topic_name),
+            .name = topic_name,
+            .type_name = type_name,
+            .durability = qos.durability,
+            .durability_service = qos.durability_service,
+            .deadline = qos.deadline,
+            .latency_budget = qos.latency_budget,
+            .liveliness = qos.liveliness,
+            .reliability = qos.reliability,
+            .transport_priority = qos.transport_priority,
+            .lifespan = qos.lifespan,
+            .destination_order = qos.destination_order,
+            .history = qos.history,
+            .resource_limits = qos.resource_limits,
+            .ownership = qos.ownership,
+        });
         return t.toDDSTopic();
     }
 
@@ -2012,16 +2263,62 @@ pub const DomainParticipantImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtIgnoreTopic(_: *anyopaque, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
-        // Normative stub — full filter-on-delivery is a future phase.
+    fn vtIgnoreTopic(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        // Resolve handle → topic name from local topics or discovered topics.
+        var found_name: ?[]const u8 = null;
+        for (self.topics.items) |t| {
+            if (t.instance_handle == handle) {
+                found_name = t.topic_name;
+                break;
+            }
+        }
+        if (found_name == null) {
+            for (self.discovered_topics.items) |dt| {
+                if (dt.handle == handle) {
+                    found_name = dt.topic_name;
+                    break;
+                }
+            }
+        }
+        const name = found_name orelse return DDS.RETCODE_BAD_PARAMETER;
+        for (self.ignored_topic_names.items) |n| {
+            if (std.mem.eql(u8, n, name)) return DDS.RETCODE_OK;
+        }
+        const owned = self.alloc.dupe(u8, name) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.ignored_topic_names.append(self.alloc, owned) catch {
+            self.alloc.free(owned);
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        };
         return DDS.RETCODE_OK;
     }
 
-    fn vtIgnorePublication(_: *anyopaque, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+    fn vtIgnorePublication(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.ignored_publication_handles.items) |h| {
+            if (h == handle) return DDS.RETCODE_OK;
+        }
+        self.ignored_publication_handles.append(self.alloc, handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // NOTE: guards future onWriterDiscovered callbacks only. Existing matched
+        // writers (already added via addMatchedWriter) are not retroactively removed.
+        // This matches FastDDS/CycloneDDS behaviour; full retroactive unmatching would
+        // require iterating active_readers and calling removeMatchedWriter here.
         return DDS.RETCODE_OK;
     }
 
-    fn vtIgnoreSubscription(_: *anyopaque, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+    fn vtIgnoreSubscription(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.ignored_subscription_handles.items) |h| {
+            if (h == handle) return DDS.RETCODE_OK;
+        }
+        self.ignored_subscription_handles.append(self.alloc, handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // NOTE: guards future onReaderDiscovered callbacks only; see vtIgnorePublication.
         return DDS.RETCODE_OK;
     }
 
@@ -2102,22 +2399,58 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtGetDiscoveredTopics(
-        _: *anyopaque,
+        ctx: *anyopaque,
         handles: *DDS.InstanceHandleSeq,
     ) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
         handles.clearRetainingCapacity();
+        for (self.discovered_topics.items) |dt| {
+            handles.append(self.alloc, dt.handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        }
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDiscoveredTopicData(
-        _: *anyopaque,
-        _: *DDS.TopicBuiltinTopicData,
-        _: DDS.InstanceHandle_t,
+        ctx: *anyopaque,
+        data: *DDS.TopicBuiltinTopicData,
+        handle: DDS.InstanceHandle_t,
     ) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.discovered_topics.items) |dt| {
+            if (dt.handle != handle) continue;
+            // name/type_name are slices into heap-allocated strings owned by the
+            // DiscoveredTopic entry.  They are valid for the participant's lifetime
+            // as long as no undiscovery path frees them.  If topic undiscovery is
+            // ever added, these fields must be duped into caller-owned storage instead.
+            data.* = .{
+                .key = topicNameToKey(dt.topic_name),
+                .name = dt.topic_name,
+                .type_name = dt.type_name,
+                .reliability = qosReliability(dt.reliability_kind),
+                .durability = qosDurability(dt.durability_kind),
+                .liveliness = qosLiveliness(dt.liveliness_kind),
+                .ownership = qosOwnership(dt.ownership_kind),
+                .destination_order = qosDestOrder(dt.dest_order_kind),
+            };
+            return DDS.RETCODE_OK;
+        }
         return DDS.RETCODE_BAD_PARAMETER;
     }
 
-    fn vtContainsEntity(_: *anyopaque, _: DDS.InstanceHandle_t) bool {
+    fn vtContainsEntity(ctx: *anyopaque, handle: DDS.InstanceHandle_t) bool {
+        const self = cast(ctx);
+        if (self.instance_handle == handle) return true;
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.publishers.items) |p| if (p.instance_handle == handle) return true;
+        for (self.subscribers.items) |s| if (s.instance_handle == handle) return true;
+        for (self.topics.items) |t| if (t.instance_handle == handle) return true;
+        for (self.active_writers.items) |aw| if (aw.handle == handle) return true;
+        for (self.active_readers.items) |ar| if (ar.handle == handle) return true;
         return false;
     }
 

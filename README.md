@@ -1,6 +1,6 @@
 # Zenzen DDS — Zig-native DDS Implementation
 
-A spec-compliant Zig implementation of OMG DDS v1.4 DCPS with RTPS 2.5 wire interoperability.
+A Zig implementation of OMG DDS v1.4 DCPS with RTPS 2.5 wire interoperability.
 
 ## Goals
 
@@ -16,7 +16,7 @@ Requires Zig 0.16.0.
 
 ```sh
 zig build       # generate DCPS interfaces + compile
-zig build test  # 400+ unit and integration tests
+zig build test  # 600+ unit and integration tests
 ```
 
 ## Documentation

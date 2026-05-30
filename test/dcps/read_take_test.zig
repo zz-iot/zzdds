@@ -148,7 +148,7 @@ test "read: non-destructive, sample remains in queue for subsequent take" {
 
     var out1: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out1);
-    try pair.dr.readRaw(&out1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try pair.dr.readRaw(&out1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 1), out1.items.len);
 
     // Sample still in queue — take it.
@@ -167,20 +167,20 @@ test "read: marks sample as READ_SAMPLE_STATE in queue" {
     // First read: sample is NOT_READ; clone reflects that.
     var out1: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out1);
-    try pair.dr.readRaw(&out1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try pair.dr.readRaw(&out1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 1), out1.items.len);
     try testing.expectEqual(DDS.NOT_READ_SAMPLE_STATE, out1.items[0].info.sample_state);
 
     // Second read with NOT_READ filter: the sample is now READ, so it is skipped.
     var out2: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out2);
-    try pair.dr.readRaw(&out2, DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try pair.dr.readRaw(&out2, DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 0), out2.items.len);
 
     // Second read with READ filter: the sample is now READ, so it matches.
     var out3: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out3);
-    try pair.dr.readRaw(&out3, DDS.READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try pair.dr.readRaw(&out3, DDS.READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 1), out3.items.len);
     try testing.expectEqual(DDS.READ_SAMPLE_STATE, out3.items[0].info.sample_state);
 }
@@ -189,19 +189,21 @@ test "takeFiltered: removes only NOT_READ samples when filter applied" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
 
     // Read first sample (marks it READ, leaves both in queue).
     var read_out: std.ArrayListUnmanaged(TakenSample) = .empty;
-    try pair.dr.readRaw(&read_out, DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 1, null);
+    try pair.dr.readRaw(&read_out, DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 1, null, null);
     freeOut(alloc, &read_out);
 
     // takeFiltered with NOT_READ: should remove only the second sample.
     var take_out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &take_out);
-    try pair.dr.takeFiltered(&take_out, DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try pair.dr.takeFiltered(&take_out, DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 1), take_out.items.len);
     try testing.expectEqual(DDS.NOT_READ_SAMPLE_STATE, take_out.items[0].info.sample_state);
 
@@ -218,14 +220,16 @@ test "takeFiltered: max_samples limits how many are removed" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
 
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out);
-    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 2, null);
+    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 2, null, null);
     try testing.expectEqual(@as(usize, 2), out.items.len);
 
     // One sample remains.
@@ -238,7 +242,9 @@ test "takeFiltered: view_state mask selects NEW_VIEW only" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
 
     // Two samples: first has NEW_VIEW, second has NOT_NEW_VIEW.
     try writeAlive(pair.dw);
@@ -246,7 +252,7 @@ test "takeFiltered: view_state mask selects NEW_VIEW only" {
 
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out);
-    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.NEW_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.NEW_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqual(DDS.NEW_VIEW_STATE, out.items[0].info.view_state);
 
@@ -260,7 +266,9 @@ test "takeFiltered: instance_state mask selects ALIVE only" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
 
     try writeAlive(pair.dw);
     // Drain the alive sample first so queue is at a known state, then dispose.
@@ -274,7 +282,7 @@ test "takeFiltered: instance_state mask selects ALIVE only" {
     // takeFiltered with ALIVE only.
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out);
-    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ALIVE_INSTANCE_STATE, -1, null);
+    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ALIVE_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqual(DDS.ALIVE_INSTANCE_STATE, out.items[0].info.instance_state);
     try testing.expect(out.items[0].info.valid_data);
@@ -290,13 +298,15 @@ test "readRaw: ANY masks returns all samples" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
-    const pair = fx.makeWriterReader(.{}, .{});
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
     try writeAlive(pair.dw);
     try writeAlive(pair.dw);
 
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out);
-    try pair.dr.readRaw(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try pair.dr.readRaw(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     // Queue still has 2 samples.
     try testing.expect(pair.dr.hasPendingData());
@@ -310,6 +320,6 @@ test "takeFiltered: empty queue returns zero results" {
 
     var out: std.ArrayListUnmanaged(TakenSample) = .empty;
     defer freeOut(alloc, &out);
-    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }

@@ -431,11 +431,13 @@ VendorId bytes.
 
 Current implementation status:
 - `src/rtps/message/header.zig` uses header `VENDOR_ID = {0x01, 0x23}`.
-- `src/rtps/pid.zig` uses SPDP `ZZDDS_VENDOR_ID = {0x99, 0x99}`.
-- `src/util/guid_gen.zig` does not currently force either value into `guidPrefix[0..2]`.
+- `src/rtps/pid.zig` uses SPDP `ZZDDS_VENDOR_ID = {0x01, 0x23}`.
+- `src/util/guid_gen.zig` stamps those bytes into `guidPrefix[0..2]` for `.spec_random`
+  and `.host_based` GUID generation. `.fully_random` intentionally does not stamp vendor
+  bytes and is not the default participant strategy.
 
-Before publishing interop results, register a permanent vendor ID with OMG, make the header
-and SPDP vendor IDs agree, and update GUID-prefix generation to preserve that value.
+Before publishing a stable release, register a permanent vendor ID with OMG and update the
+two-byte placeholder in both header and SPDP constants.
 
 ---
 
