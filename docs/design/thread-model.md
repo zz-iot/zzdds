@@ -43,6 +43,8 @@ Current XTypes support is limited to optional TypeInformation advertisement:
 - No TypeLookup service, TypeObject exchange, or remote schema-evolution matching is
   implemented.
 
-The future TypeSupport work in `docs/roadmap.md` should provide generated key extraction,
-serialization callbacks, and a better bridge between zidl-generated type metadata and this
-registry.
+Zig-native `TypeSupport` registration is separate from TypeInformation advertisement:
+`participant.registerTypeSupport()` can provide `compute_key_hash` for keyed-instance
+handling and optional `get_field` access for ContentFilteredTopic/QueryCondition
+expressions. Remaining TypeSupport work is the C ABI/non-Zig binding bridge and eventual
+TypeLookup integration.

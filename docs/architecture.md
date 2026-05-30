@@ -167,7 +167,7 @@ Maps string names to `Clock` instances. Pre-populated with `"default"` / `"monot
 `DomainParticipantFactoryImpl` uses for all internal timers. Custom clocks can be registered
 before creating a factory.
 
-### ContentFilteredTopic evaluator (`src/dcps/filter.zig`)
+### ContentFilteredTopic and QueryCondition evaluator (`src/dcps/filter.zig`)
 
 SQL-subset parser and evaluator for `ContentFilteredTopic.filter_expression`. Gated by the
 `-Dcontent-subscription-profile` build option. When false, parsed expressions are disabled
@@ -177,9 +177,11 @@ Supported grammar: comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`), `BETWEE
 `AND`, `OR`, `NOT`, parameter references (`%0`–`%99`), and dot-path field names.
 
 The `FieldAccessor` vtable lets a typed wrapper or generated deserializer supply field
-values without the filter module depending on generated code. The generic `DataReader`
-does not yet apply these expressions automatically in `read()` / `take()`; current tests
-call `ContentFilteredTopicImpl.matchSample()` manually after `takeRaw()`.
+values without the filter module depending on generated code. Readers get that accessor
+from `TypeSupport.get_field`. `ContentFilteredTopic` readers apply the expression before
+enqueueing samples; `QueryCondition` applies its expression during `read()` / `take()`.
+If a type has no registered field accessor, expressions are treated as unevaluable and
+samples pass through.
 
 ---
 

@@ -2,11 +2,11 @@
 
 ## Guiding Principles
 
-**Interop over conformance.** The current verified bar is working correctly with Cyclone DDS
-and OpenDDS; FastDDS and RTI Connext remain planned interop targets. We aim to be
-conservative in what we send and liberal in what we accept. Where Zenzen DDS goes beyond the
-spec, tests exist at the RTPS layer, not the spec-assertion layer. No formal conformance
-harness.
+**Interop over conformance.** The verified bar is working correctly with Cyclone DDS,
+FastDDS, OpenDDS, and RTI Connext in the dds-rtps shape-main matrix. We aim to be
+conservative in what we send and liberal in what we accept. Where Zenzen DDS goes beyond
+the spec, tests exist at the RTPS layer, not the spec-assertion layer. No formal
+conformance harness.
 
 **Avoid sleeping in tests.** Every `time_mod.sleepNs(...)` in a test is CI latency and a
 potential flake. Time-dependent behavior (lease expiry, heartbeat timers, deadline) is tested
@@ -88,15 +88,16 @@ port allocation, no bind, no threads, no timing sensitivity.
 
 ### Tier 3 — Live interop (cross-process, external vendor)
 
-Run by `zig build interop-test-cyclone` or `zig build interop-test-opendds`. Requires the
-corresponding vendor implementation. FastDDS and RTI Connext scenarios are planned but do
-not have build steps yet. Runs in CI nightly or on-demand; not required for PR merge.
+The local developer targets are `zig build interop-test-cyclone` and
+`zig build interop-test-opendds`; they require the corresponding vendor implementation.
+CI also runs the dds-rtps `shape_main` matrix against pinned Cyclone DDS, FastDDS,
+OpenDDS, and RTI Connext binaries in both publish and subscribe directions.
 
 **What lives here:**
 - Cyclone DDS: Zenzen DDS writer → Cyclone reader; Cyclone writer → Zenzen DDS reader
-- OpenDDS: same scenarios (implemented)
-- FastDDS: same scenarios (planned)
-- RTI Connext: same (planned; requires license)
+- FastDDS: bidirectional dds-rtps matrix in CI
+- OpenDDS: local Makefile scenarios plus bidirectional dds-rtps matrix in CI
+- RTI Connext: bidirectional dds-rtps matrix in CI; external use requires a license
 - Security handshake (planned, when DDS Security plugin is implemented)
 
 **Execution model:** `test/interop/Makefile` launches peer processes, runs scenarios,
@@ -236,9 +237,9 @@ for tests that don't need the full DCPS stack.
 | GPA leak/UAF detection | `std.testing.allocator` in all tests | Always (`zig build test`) |
 | Bounds + overflow checks | Zig Debug mode (default for test) | Always |
 | ThreadSanitizer | `root_module.sanitize_thread = true` | `zig build test-tsan` (PRs, nightly) |
-| LLVM coverage | `zig test` + `-fprofile-instr-generate`; `llvm-cov report` | Nightly CI script |
+| kcov coverage | `zig build emit-tests` + kcov (built against patched elfutils for DWARF 5); report uploaded to Codecov | CI on every push |
 | libFuzzer | Source entry points in `test/fuzz/`; runnable executables are built manually with LLVM's libFuzzer | Nightly; manual on parser changes |
-| Live interop | `zig build interop-test-cyclone` / `interop-test-opendds` | Nightly or on-demand |
+| Live interop | local `zig build interop-test-cyclone` / `interop-test-opendds`; CI dds-rtps vendor matrix | PRs, nightly, or on-demand |
 
 **On static analysis:** Zig's compiler eliminates many C-style static analysis targets
 (buffer overruns caught by bounds checks, no silent integer promotions, no implicit casts
@@ -258,9 +259,9 @@ auditable. Formal verification tooling for Zig is not yet mature enough to plan 
 
 **Spec conformance harness.** A system that maps OMG spec section numbers to executable
 assertions sounds attractive but is expensive to maintain and often diverges from what
-real implementations actually do. Real-world interop with Cyclone DDS and OpenDDS is a
-stronger signal than passing a conformance suite that no peer implementation was tested
-against; FastDDS and RTI Connext remain planned targets.
+real implementations actually do. Real-world interop with Cyclone DDS, FastDDS, OpenDDS,
+and RTI Connext is a stronger signal than passing a conformance suite that no peer
+implementation was tested against.
 
 **Network simulation** (ns-3, CORE, etc.). The mock transport covers the protocol-level
 conditions that matter (loss, reorder, duplication) without requiring a network simulator.

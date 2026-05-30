@@ -308,10 +308,9 @@ pub const StatefulReader = struct {
     }
 
     /// Add a matched writer. For new writers, sends an initial non-final AckNack
-    /// to solicit available data (RTPS §8.4.10.3): the writer responds by
-    /// retransmitting any cached changes, necessary when the initial DATA/Heartbeat
-    /// may have been dropped. BEST_EFFORT writers do not retransmit, so skipping
-    /// the AckNack avoids a synchronous re-entry deadlock with in-process transports.
+    /// to solicit available data (RTPS §8.4.10.3): RELIABLE writers respond by
+    /// retransmitting missing cached changes, and TRANSIENT_LOCAL BEST_EFFORT
+    /// writers use this as a one-time cue to replay the currently cached history.
     ///
     /// Re-announcements from an already-matched writer act as lease refreshes:
     /// locators and metadata are updated but the received set, pending_changes,

@@ -7,9 +7,9 @@ see `docs/implementation_status.md`.
 
 ## Phase 33: dds-rtps Interop Validation — Complete
 
-All four vendors verified at 48/48 on the merge CI run. RTI Connext had one
-intermittently failing test that passed on the PR CI run before merge and was green again
-after a re-run on main; treated as a test-infrastructure flake, not a wire issue.
+All four vendors were verified at 48/48 in Phase 33 CI. RTI Connext had one
+intermittently failing run that was green after re-run; treated as a test-infrastructure
+flake, not a wire issue.
 
 *Completed in Phase 33:* self-interop CI job (48/48, gates release), zenzen vs zenzen
 100%, FastDDS bidirectional 48/48, OpenDDS bidirectional 48/48, RTI Connext 48/48,
@@ -40,21 +40,9 @@ schema reserve `static` and `broker` discovery kinds, but only SPDP/SEDP and dir
 discovery are implemented. Either implement static config loading and broker client support
 or remove the advertised config surface before v1.
 
-
 **MTU-aware fragment sizing** — `rtps.fragment_size` is a static config value today.
 Add an interface-MTU/path-MTU aware default that accounts for IP, UDP, RTPS, and future
 security overhead, while preserving the explicit override for deterministic tests.
-
-**`wait_for_historical_data` for TRANSIENT_LOCAL** — `DataReader.wait_for_historical_data()`
-currently returns `RETCODE_UNSUPPORTED` (`src/dcps/reader.zig:959-962`). The correct
-behavior is to block until the reader has received all history from every matched
-TRANSIENT_LOCAL writer, or the timeout expires. Prerequisite: reliable history delivery
-must be fully flushed before the call returns.
-
-**Built-in topic and discovered-topic completion** — `get_builtin_subscriber()` exposes
-in-memory DataReaders and discovery callbacks push participant/publication/subscription
-samples. Finish `DCPSTopic`, `get_discovered_topics()`, `get_discovered_topic_data()`, and
-`contains_entity()` from the participant discovery state.
 
 **SEDP-traffic-seen heuristic** — add `sedp_seen: bool` to `KnownParticipant`. On SPDP
 re-announcements from a participant whose `sedp_seen` is still false, send a targeted unicast
@@ -73,8 +61,8 @@ when debugging interop issues without flooding production output.
 
 **GUID generation platform coverage** — the current fallback paths keep unsupported targets
 building, but they are not production target support. For each supported OS, provide real
-entropy, PID, and monotonic-clock implementations; align GUID-prefix vendor bytes with the
-registered VendorId work in Phase 33.
+entropy, PID, and monotonic-clock implementations; keep GUID-prefix vendor bytes aligned
+with the OMG Vendor ID registration item above.
 
 **`on_publication_matched` RELIABLE readiness contract** — current implementation fires
 on SEDP discovery. A protocol-ready contract would fire on the first AckNack from a reader
@@ -96,6 +84,22 @@ First step: fix `Cryptographic.encode_payload` to use a tagged-union return (see
 **DDS-XTypes v1.3** — TypeObject/TypeIdentifier/TypeMapping; required for type-safe
 cross-vendor type discovery.
 
+**`swapRemove` / `orderedRemove` audit** — several hot paths use `orderedRemove` on
+`ArrayListUnmanaged` to delete a single element from the middle of a list, which is O(N) per
+call and O(N²) in loops.  The pattern is pre-existing and fine for the small lists seen
+today (proxy counts, condition slots), but should be fixed before the codebase scales.  A
+sweep of all `orderedRemove` call sites should replace them with `swapRemove` where order is
+not semantically required, or with an indexed/hash structure where it is.  Existing tests
+should catch any ordering dependency that is accidentally removed.
+
+**Condvar-based blocking in setup paths** — `wait_for_historical_data` and any other
+setup-time spin-poll (`std.time.sleep` in a retry loop) should be converted to condvar-based
+blocking.  The pattern to look for: a loop that sleeps a fixed interval then re-checks a
+shared flag.  Each such site should instead hold a `Mutex` + `Condvar` pair; the writer side
+signals the condvar when the condition becomes true, and the waiter unblocks immediately
+rather than sleeping up to one interval past the event.  `ManualClock`-driven tests in the
+existing suite should be extended to cover the condvar path.
+
 ---
 
 ## Deferred / Out of Scope for v1
@@ -108,9 +112,10 @@ cross-vendor type discovery.
   `end_coherent_changes()`, `suspend_publications()`, and `resume_publications()` all return
   `RETCODE_UNSUPPORTED`. Full implementation requires GROUP-scope coherent delivery tracking;
   deferred alongside GroupPresentation.
-- **`ignore_topic` / `ignore_publication` / `ignore_subscription`** — current normative stubs
-  return `RETCODE_OK` per spec (ignoring an already-discovered entity is permitted to be a
-  no-op). Full filter-on-delivery at the receive path is deferred.
+- **Retroactive unmatching for ignored publications/subscriptions** — the ignore APIs filter
+  future discovery callbacks today. Ignoring an already-discovered publication or
+  subscription is treated as a permitted no-op; actively removing existing RTPS proxies is
+  deferred unless a use case needs stricter behavior.
 - **GroupPresentation** (PRESENTATION QoS `access_scope = GROUP`) — deferred.
 - **Platform-specific InterfaceMonitors** — `monitor/netlink.zig` (Linux) and
   `monitor/pf_route.zig` (macOS) deferred; polling monitor is sufficient.

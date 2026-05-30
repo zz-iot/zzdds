@@ -524,8 +524,9 @@ pub const QueryConditionImpl = struct {
     rc: ReadConditionImpl,
     query_expression: []u8,
     query_parameters: std.ArrayListUnmanaged([]u8),
-    /// Parsed AST of `query_expression`.  Null when the expression is empty,
-    /// unparseable, or the content_subscription_profile is disabled.
+    /// Parsed AST of `query_expression`.  Null when the expression is empty
+    /// or the content_subscription_profile is disabled.  A malformed expression
+    /// returns error.ParseError from init, so the caller returns NIL.
     /// AST node slices borrow from `query_expression`; free before it.
     parsed_expr: ?*filter_mod.AstNode,
 
@@ -561,8 +562,7 @@ pub const QueryConditionImpl = struct {
             try params.append(alloc, copy);
         }
 
-        const parsed = filter_mod.parse(alloc, expr_copy) catch null;
-        errdefer if (parsed) |ast| filter_mod.freeAst(alloc, ast);
+        const parsed = try filter_mod.parse(alloc, expr_copy);
 
         self.* = .{
             .alloc = alloc,

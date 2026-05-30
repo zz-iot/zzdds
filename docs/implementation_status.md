@@ -56,18 +56,18 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `StatusCondition` | Complete | |
 | `GuardCondition` | Complete | |
 | All 22 QoS policies represented + matched | Mostly complete | Runtime enforcement is broad, but keyed-instance behavior still has gaps; see known limitations |
-| OWNERSHIP QoS enforcement | Partial | Per-instance when `CacheChange.key_hash` is populated; generated key extraction/hash support is still needed |
+| OWNERSHIP QoS enforcement | Partial | Per-instance when inline `PID_KEY_HASH` or registered `TypeSupport.compute_key_hash` is available; otherwise keyed samples collapse to the NIL instance handle |
 | `on_publication_matched` / `on_subscription_matched` | Complete | `src/dcps/writer.zig:230-254`, `reader.zig:673-703` |
 | `SampleLostStatus` / `on_sample_lost` | Complete | GAP-derived loss counting in `reader_sm.zig`; callback thread via `DataCallback.on_sample_lost` |
 | `LivelinessChangedStatus` / `on_liveliness_changed` | Complete | Per-writer lease tracking in `DataReaderImpl`; expiry detected in `checkTimersFn` |
 | `initial_peers` config wiring | Complete | `src/config/schema.zig`, `spdp.zig` |
 | Instance lifecycle (ALIVE / DISPOSED / UNREGISTERED) | Complete | |
 | `read()` / `take()` with all state filters | Complete | |
-| `SampleInfo` (all fields) | Complete | |
+| `SampleInfo` core fields | Mostly complete | Sample/view/instance state, source timestamp, instance/publication handles, and `valid_data` are populated; sample/generation rank fields currently remain at defaults |
 | `get_builtin_subscriber` / built-in topics | Complete | Built-in Subscriber/DataReaders exist; participant/publication/subscription/topic samples are pushed; `DCPSTopic` populated from `vtCreateTopic` and SEDP callbacks |
 | `ignore_participant` | Complete | Removes from discovered list; adds to ignore list; subsequent SPDP announcements from that prefix are dropped |
-| `ignore_topic` / `ignore_publication` / `ignore_subscription` | Complete | Topic name stored and checked in discovery callbacks; publication/subscription handles stored and checked via `guidToHandle`; `ignore_topic` returns `BAD_PARAMETER` for unknown handles |
-| `wait_for_historical_data` (TRANSIENT_LOCAL) | Complete | Per-matched-writer history floor from first HEARTBEAT; 1 ms poll with deadline |
+| `ignore_topic` / `ignore_publication` / `ignore_subscription` | Complete | Filters future discovery callbacks; publication/subscription ignores do not retroactively remove already-matched proxies |
+| `wait_for_historical_data` (TRANSIENT_LOCAL) | Complete | RELIABLE matched writers use a history floor from first HEARTBEAT; 1 ms poll with deadline; BEST_EFFORT has no guaranteed history wait |
 | `get_discovered_participants` / `get_discovered_participant_data` | Complete | `participant.zig` |
 | `get_discovered_topics` / `get_discovered_topic_data` | Complete | Populated from SEDP writer/reader callbacks; deduplicated by (topic_name, type_name); QoS subset from wire data |
 | `contains_entity` | Complete | Checks participant, publishers, subscribers, topics, writers, readers |
@@ -94,11 +94,11 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | Cyclone DDS | Verified | pub/sub, fragmented (DATA_FRAG), all RELIABLE/BEST_EFFORT combos |
 | OpenDDS | Verified | pub/sub, fragmented |
 | FastDDS | Verified | bidirectional; all 48 dds-rtps test cases pass in both directions |
-| RTI Connext | Planned (requires license) | — |
+| RTI Connext | Verified in CI | bidirectional dds-rtps matrix; requires licensed binary outside CI |
 
 ## Test Coverage
 
-`zig build test` runs 400+ unit/integration tests, including Tier 1 unit tests,
+`zig build test` runs 600+ unit/integration tests, including Tier 1 unit tests,
 Tier 2 mock/intraprocess DCPS tests, and fuzz corpus regression tests.
 See `docs/testing.md` for how to run the full suite.
 
@@ -112,14 +112,13 @@ when a sample arrives without an inline-QoS key hash. Applications must call
 `registerTypeSupport` with their type's hash function (zidl-generated types expose this as
 `MyType.computeKeyHash`); without it, keyed samples collapse to the same instance handle.
 
-**Per-instance timing/history accounting.** `TIME_BASED_FILTER` and RTPS `KEEP_LAST` are
-both enforced per-instance at the DCPS layer. Key hash resolution on the receive path
-follows: inline `PID_KEY_HASH` QoS (standard behavior of all real DDS implementations) →
-registered `TypeSupport.compute_key_hash` → all-zeros (NIL). In practice the NIL fallback
-is not reached: remote peers send inline `PID_KEY_HASH`, and Zig users with generated types
-register TypeSupport. The clean long-term answer for the fallback is XTypes TypeLookup,
-which would allow key field layout to be discovered from wire metadata without
-pre-registration.
+**Keyed-instance fallback for per-instance QoS/history.** `TIME_BASED_FILTER`, ownership,
+SampleInfo state, and `KEEP_LAST` all operate per resolved instance handle. Key hash
+resolution on the receive path follows: inline `PID_KEY_HASH` QoS (standard behavior of
+real DDS peers) → registered `TypeSupport.compute_key_hash` → all-zeros (NIL). If neither
+wire key-hash nor TypeSupport is available, keyed samples collapse to one fallback
+instance. The clean long-term answer for that fallback is XTypes TypeLookup, which would
+allow key field layout to be discovered from wire metadata without pre-registration.
 
 **Transport scatter-gather not fully zero-copy.** The iovec list is assembled without
 copying but is flattened to a `[65536]u8` stack buffer at the `Transport.send()` boundary.

@@ -3,7 +3,7 @@
 ## Quick start
 
 ```sh
-zig build test           # all tests (400+); < 30s on a modern machine
+zig build test           # all tests (600+); < 30s on a modern machine
 zig build test-tsan      # same tests under ThreadSanitizer
 zig build test-fuzz      # compile-check fuzz targets; corpus regression runs in zig build test
 ```
@@ -27,9 +27,11 @@ zig build test-fuzz      # compile-check fuzz targets; corpus regression runs in
 - `read()` / `take()` with all state filter combinations
 - `WaitSet` + `ReadCondition` + `StatusCondition` + `GuardCondition` + `QueryCondition` lifecycle/state-mask triggering
 - `on_publication_matched` / `on_subscription_matched` callbacks
-- `ContentFilteredTopic` expression parse + manual evaluator coverage
+- `ContentFilteredTopic` delivery-time filtering and `QueryCondition` read/take filtering
 - RESOURCE_LIMITS enforcement
-- QoS runtime enforcement (OWNERSHIP, DEADLINE, LATENCY_BUDGET, PARTITION, DURABILITY, TIME_BASED_FILTER, LIFESPAN)
+- QoS runtime enforcement (OWNERSHIP, DEADLINE, LATENCY_BUDGET, PARTITION, DURABILITY, TIME_BASED_FILTER, LIFESPAN, LIVELINESS)
+- `LivelinessChangedStatus` / `on_liveliness_changed` (reader-side per-writer lease expiry via ManualClock)
+- `SampleLostStatus` / `on_sample_lost`; `SampleRejectedStatus` / `on_sample_rejected`
 - Fuzz corpus regression (RTPS parser, PL-CDR deserializer)
 
 **Mock transport tests (in Tier 2 binary):**
@@ -66,7 +68,8 @@ compile-checks the fuzz targets but does not install runnable fuzz executables.
 
 ## Live interop tests
 
-Require an installed peer implementation. Not part of `zig build test`.
+The local developer targets require an installed peer implementation and are not part of
+`zig build test`.
 
 ```sh
 zig build interop-test-cyclone   # requires Cyclone DDS; set CYCLONE_ROOT or see test/interop/Makefile
@@ -76,6 +79,10 @@ zig build interop-test-opendds   # requires OpenDDS at OPENDDS_ROOT
 Each scenario is a self-contained process pair run by `test/interop/Makefile`:
 - Basic pub/sub (Zenzen writer → peer reader; peer writer → Zenzen reader)
 - Fragmented data (DATA_FRAG, large payload exceeding `fragment_size`)
+
+CI also gates the dds-rtps `shape_main` matrix against the pinned release binaries for
+Cyclone DDS, FastDDS, OpenDDS, and RTI Connext in both publish and subscribe directions,
+including ThreadSanitizer runs for the Zenzen DDS side.
 
 ## Test design philosophy
 
