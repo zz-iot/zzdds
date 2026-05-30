@@ -30,3 +30,8 @@ pub const nil_sub_listener = @import("nil.zig").nil_sub_listener;
 pub const nil_topic_listener = @import("nil.zig").nil_topic_listener;
 pub const nil_dw_listener = @import("nil.zig").nil_dw_listener;
 pub const nil_dr_listener = @import("nil.zig").nil_dr_listener;
+
+// Nil entity singletons and pointer sentinel.
+pub const NIL_PTR = @import("nil.zig").NIL_PTR;
+pub const nil_datawriter = @import("nil.zig").nil_datawriter;
+pub const nil_datareader = @import("nil.zig").nil_datareader;
