@@ -19,6 +19,8 @@ pub const GuardConditionImpl = @import("waitset.zig").GuardConditionImpl;
 pub const StatusConditionImpl = @import("waitset.zig").StatusConditionImpl;
 pub const ReadConditionImpl = @import("waitset.zig").ReadConditionImpl;
 pub const QueryConditionImpl = @import("waitset.zig").QueryConditionImpl;
+pub const DataNotifyFn = @import("waitset.zig").DataNotifyFn;
+pub const WakeupHandle = @import("waitset.zig").WakeupHandle;
 
 // Nil (no-op) listener singletons — pass these wherever a listener is required
 // but no callbacks are needed.
