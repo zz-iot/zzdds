@@ -405,20 +405,24 @@ pub const DataReaderImpl = struct {
             }
         }
 
-        // TIME_BASED_FILTER: suppress samples whose source timestamp is within
-        // minimum_separation of the last delivered sample for this instance.
+        // TIME_BASED_FILTER: suppress alive samples whose source timestamp is within
+        // minimum_separation of the last accepted sample for this instance.
+        // Lifecycle changes (dispose/unregister) bypass TBF: suppressing them would
+        // leave instance state stuck as ALIVE and leak tbf_map/owner_map entries.
+        // tbf_map is updated only after a successful append (below), so a sample
+        // rejected by CFT, resource-limits, or OOM does not advance the window.
         const min_sep = self.qos.time_based_filter.minimum_separation;
-        if (min_sep.sec != 0 or min_sep.nanosec != 0) {
-            const src_ns = change.source_timestamp.toTime().toNs();
+        const tbf_active = change.kind == .alive and (min_sep.sec != 0 or min_sep.nanosec != 0);
+        const tbf_src_ns: i64 = if (tbf_active) change.source_timestamp.toTime().toNs() else 0;
+        if (tbf_active) {
             const sep_ns = @as(i64, min_sep.sec) * std.time.ns_per_s + @as(i64, min_sep.nanosec);
             if (self.tbf_map.get(ih)) |last| {
-                if (src_ns - last < sep_ns) {
+                if (tbf_src_ns - last < sep_ns) {
                     self.mu.unlock();
                     self.alloc.free(copy);
                     return;
                 }
             }
-            self.tbf_map.put(self.alloc, ih, src_ns) catch {};
         }
 
         // CONTENT_FILTER: drop samples that do not match the CFT expression.
@@ -558,6 +562,8 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             return;
         };
+        // Stamp the TBF window now that the sample is committed to pending.
+        if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
         // Instance going non-alive: release per-instance filter/ownership state.
         // If the instance is later re-registered, fresh entries will be created.
         if (change.kind != .alive) {

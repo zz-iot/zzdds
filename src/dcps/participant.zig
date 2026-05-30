@@ -2274,6 +2274,10 @@ pub const DomainParticipantImpl = struct {
             if (h == handle) return DDS.RETCODE_OK;
         }
         self.ignored_publication_handles.append(self.alloc, handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // NOTE: guards future onWriterDiscovered callbacks only. Existing matched
+        // writers (already added via addMatchedWriter) are not retroactively removed.
+        // This matches FastDDS/CycloneDDS behaviour; full retroactive unmatching would
+        // require iterating active_readers and calling removeMatchedWriter here.
         return DDS.RETCODE_OK;
     }
 
@@ -2285,6 +2289,7 @@ pub const DomainParticipantImpl = struct {
             if (h == handle) return DDS.RETCODE_OK;
         }
         self.ignored_subscription_handles.append(self.alloc, handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // NOTE: guards future onReaderDiscovered callbacks only; see vtIgnorePublication.
         return DDS.RETCODE_OK;
     }
 
