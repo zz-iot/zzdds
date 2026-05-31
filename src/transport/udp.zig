@@ -501,10 +501,8 @@ pub const UdpTransport = struct {
         while (pid <= range.max) : (pid += 1) {
             const meta_port = schema.metatrafficUnicastPort(&self.config, self.domain_id, pid);
             const meta_fd = tryBindPort(meta_port) orelse continue;
-            // Only reserve a separate data fd when data_port_separate is true and the
-            // data port differs from the meta port (port overrides may collapse them).
             const data_port = schema.defaultUnicastPort(&self.config, self.domain_id, pid);
-            if (self.config.data_port_separate and data_port != meta_port) {
+            if (data_port != meta_port) {
                 const data_fd = tryBindPort(data_port) orelse {
                     socketClose(meta_fd);
                     continue;

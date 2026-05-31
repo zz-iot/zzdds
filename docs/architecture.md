@@ -190,7 +190,7 @@ samples pass through.
 The table below mirrors the full in-memory schema. Programmatic configuration can set all
 fields. TOML/env coverage currently lags the schema: `file.zig` / `resolve.zig` do not yet
 parse or override `participant.timer_clock_name`, the `[rtps]` section, or the UDP
-`meta_unicast_port` / `data_unicast_port` / `data_port_separate` fields.
+`meta_unicast_port` / `data_unicast_port` fields.
 
 ```toml
 [domain]
@@ -226,7 +226,6 @@ participant_id = null
 # Override computed port numbers (null = use RTPS formula)
 meta_unicast_port = null
 data_unicast_port = null
-data_port_separate = true   # false = use meta port for data traffic too
 
 # Interface names ("eth0") or IPs ("192.168.1.5"). Empty = all interfaces.
 interfaces = []
