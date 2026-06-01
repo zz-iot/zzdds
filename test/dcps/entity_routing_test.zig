@@ -135,6 +135,118 @@ const Msg = struct {
         try self.buf.appendSlice(alloc, &iq);
         try self.buf.appendSlice(alloc, payload);
     }
+
+    /// HEARTBEAT submessage (content = 28 bytes).
+    fn heartbeat(
+        self: *Msg,
+        alloc: std.mem.Allocator,
+        reader_eid: [4]u8,
+        writer_eid: [4]u8,
+    ) !void {
+        var smh = [_]u8{ 0x07, 0x01, 0, 0 }; // id=HEARTBEAT, LE
+        std.mem.writeInt(u16, smh[2..4], 28, .little);
+        try self.buf.appendSlice(alloc, &smh);
+        try self.buf.appendSlice(alloc, &reader_eid);
+        try self.buf.appendSlice(alloc, &writer_eid);
+        // firstSN = 1, lastSN = 0 (empty), count = 1
+        var payload: [20]u8 = undefined;
+        std.mem.writeInt(i32, payload[0..4], 0, .little); // firstSN high
+        std.mem.writeInt(u32, payload[4..8], 1, .little); // firstSN low
+        std.mem.writeInt(i32, payload[8..12], 0, .little); // lastSN high
+        std.mem.writeInt(u32, payload[12..16], 0, .little); // lastSN low
+        std.mem.writeInt(i32, payload[16..20], 1, .little); // count
+        try self.buf.appendSlice(alloc, &payload);
+    }
+
+    /// DATA_FRAG submessage (minimal: no inline QoS, 1-byte fragment payload).
+    /// content = extraFlags(2)+octetsToInlineQos(2)+readerEid(4)+writerEid(4)+sn(8)+
+    ///           fragStart(4)+fragCount(2)+fragSize(2)+dataSize(4)+payload = 32+payload.len
+    fn dataFrag(
+        self: *Msg,
+        alloc: std.mem.Allocator,
+        reader_eid: [4]u8,
+        writer_eid: [4]u8,
+        payload: []const u8,
+    ) !void {
+        const content_len: u16 = 32 + @as(u16, @intCast(payload.len));
+        var smh = [_]u8{ 0x16, 0x01, 0, 0 }; // DATA_FRAG id, LE
+        std.mem.writeInt(u16, smh[2..4], content_len, .little);
+        try self.buf.appendSlice(alloc, &smh);
+        try self.buf.appendSlice(alloc, &[_]u8{ 0, 0, 0x1C, 0 }); // extraFlags + octetsToInlineQos=28
+        try self.buf.appendSlice(alloc, &reader_eid);
+        try self.buf.appendSlice(alloc, &writer_eid);
+        var fields: [20]u8 = undefined;
+        std.mem.writeInt(i32, fields[0..4], 0, .little); // sn high
+        std.mem.writeInt(u32, fields[4..8], 1, .little); // sn low
+        std.mem.writeInt(u32, fields[8..12], 1, .little); // fragmentStartingNum
+        std.mem.writeInt(u16, fields[12..14], 1, .little); // fragmentsInSubmessage
+        std.mem.writeInt(u16, fields[14..16], @as(u16, @intCast(payload.len)), .little); // fragmentSize
+        std.mem.writeInt(u32, fields[16..20], @as(u32, @intCast(payload.len)), .little); // dataSize
+        try self.buf.appendSlice(alloc, &fields);
+        try self.buf.appendSlice(alloc, payload);
+    }
+
+    /// HEARTBEAT_FRAG submessage (content = 24 bytes).
+    fn heartbeatFrag(
+        self: *Msg,
+        alloc: std.mem.Allocator,
+        reader_eid: [4]u8,
+        writer_eid: [4]u8,
+    ) !void {
+        var smh = [_]u8{ 0x13, 0x01, 0, 0 }; // HEARTBEAT_FRAG id, LE
+        std.mem.writeInt(u16, smh[2..4], 24, .little);
+        try self.buf.appendSlice(alloc, &smh);
+        try self.buf.appendSlice(alloc, &reader_eid);
+        try self.buf.appendSlice(alloc, &writer_eid);
+        var fields: [16]u8 = undefined;
+        std.mem.writeInt(i32, fields[0..4], 0, .little); // sn high
+        std.mem.writeInt(u32, fields[4..8], 1, .little); // sn low
+        std.mem.writeInt(u32, fields[8..12], 1, .little); // lastFragmentNum
+        std.mem.writeInt(i32, fields[12..16], 1, .little); // count
+        try self.buf.appendSlice(alloc, &fields);
+    }
+
+    /// NACK_FRAG submessage (minimal: 0-bit fragment set, content = 28 bytes).
+    fn nackFrag(
+        self: *Msg,
+        alloc: std.mem.Allocator,
+        reader_eid: [4]u8,
+        writer_eid: [4]u8,
+    ) !void {
+        var smh = [_]u8{ 0x12, 0x01, 0, 0 }; // NACK_FRAG id, LE
+        std.mem.writeInt(u16, smh[2..4], 28, .little);
+        try self.buf.appendSlice(alloc, &smh);
+        try self.buf.appendSlice(alloc, &reader_eid);
+        try self.buf.appendSlice(alloc, &writer_eid);
+        var fields: [20]u8 = undefined;
+        std.mem.writeInt(i32, fields[0..4], 0, .little); // sn high
+        std.mem.writeInt(u32, fields[4..8], 1, .little); // sn low
+        std.mem.writeInt(u32, fields[8..12], 1, .little); // fragmentNumberState.base
+        std.mem.writeInt(u32, fields[12..16], 0, .little); // fragmentNumberState.numBits = 0
+        std.mem.writeInt(i32, fields[16..20], 1, .little); // count
+        try self.buf.appendSlice(alloc, &fields);
+    }
+
+    /// GAP submessage (minimal: 0-bit gap list, content = 28 bytes).
+    fn gap(
+        self: *Msg,
+        alloc: std.mem.Allocator,
+        reader_eid: [4]u8,
+        writer_eid: [4]u8,
+    ) !void {
+        var smh = [_]u8{ 0x08, 0x01, 0, 0 }; // GAP id, LE
+        std.mem.writeInt(u16, smh[2..4], 28, .little);
+        try self.buf.appendSlice(alloc, &smh);
+        try self.buf.appendSlice(alloc, &reader_eid);
+        try self.buf.appendSlice(alloc, &writer_eid);
+        var fields: [20]u8 = undefined;
+        std.mem.writeInt(i32, fields[0..4], 0, .little); // gapStart high
+        std.mem.writeInt(u32, fields[4..8], 1, .little); // gapStart low
+        std.mem.writeInt(i32, fields[8..12], 0, .little); // gapList.base high
+        std.mem.writeInt(u32, fields[12..16], 2, .little); // gapList.base low
+        std.mem.writeInt(u32, fields[16..20], 0, .little); // gapList.numBits = 0
+        try self.buf.appendSlice(alloc, &fields);
+    }
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────────────
@@ -282,6 +394,14 @@ const Fixture = struct {
             ar.guid.entity_id.entity_key[2],
             ar.guid.entity_id.entity_kind,
         };
+    }
+
+    /// Inject raw RTPS bytes to the writer participant's data port.
+    /// Used for submessages that target writers (e.g. NACK_FRAG).
+    fn injectToWriterSide(self: *Fixture, raw: []const u8) !void {
+        const port = self.dp_w_impl.data_listen_port;
+        const dest = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+        try self.injector.transport().send(&dest, raw);
     }
 };
 
@@ -504,4 +624,157 @@ test "entity_routing: dispatchDirectedWrite prefix mismatch delivers nothing" {
     try fx.inject(msg.bytes());
 
     try testing.expectEqual(@as(usize, 0), Fixture.pendingCount(dr));
+}
+
+// ── Coverage: submessage types not exercised by existing tests ────────────────
+
+test "entity_routing: HEARTBEAT ENTITYID_UNKNOWN fans out to all readers" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.makeWriter();
+    _ = fx.makeReader();
+
+    const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
+    const w_eid = fx.writerEid();
+
+    var msg = Msg{};
+    defer msg.deinit(alloc);
+    try msg.header(alloc, src_prefix);
+    // reader_entity_id = UNKNOWN → exercises the fan-out path (1278–1280).
+    try msg.heartbeat(alloc, [_]u8{ 0, 0, 0, 0 }, w_eid);
+    try fx.inject(msg.bytes());
+}
+
+test "entity_routing: DATA_FRAG ENTITYID_UNKNOWN fans out to all readers" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.makeWriter();
+    _ = fx.makeReader();
+
+    const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
+    const w_eid = fx.writerEid();
+
+    var msg = Msg{};
+    defer msg.deinit(alloc);
+    try msg.header(alloc, src_prefix);
+    try msg.dataFrag(alloc, [_]u8{ 0, 0, 0, 0 }, w_eid, &PAYLOAD);
+    try fx.inject(msg.bytes());
+}
+
+test "entity_routing: DATA_FRAG direct dispatch to specific reader" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.makeWriter();
+    _ = fx.makeReader();
+
+    const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
+    const w_eid = fx.writerEid();
+    const r_eid = fx.readerEid();
+
+    var msg = Msg{};
+    defer msg.deinit(alloc);
+    try msg.header(alloc, src_prefix);
+    try msg.dataFrag(alloc, r_eid, w_eid, &PAYLOAD);
+    try fx.inject(msg.bytes());
+}
+
+test "entity_routing: HEARTBEAT_FRAG ENTITYID_UNKNOWN fans out to all readers" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.makeWriter();
+    _ = fx.makeReader();
+
+    const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
+    const w_eid = fx.writerEid();
+
+    var msg = Msg{};
+    defer msg.deinit(alloc);
+    try msg.header(alloc, src_prefix);
+    try msg.heartbeatFrag(alloc, [_]u8{ 0, 0, 0, 0 }, w_eid);
+    try fx.inject(msg.bytes());
+}
+
+test "entity_routing: HEARTBEAT_FRAG direct dispatch to specific reader" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.makeWriter();
+    _ = fx.makeReader();
+
+    const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
+    const w_eid = fx.writerEid();
+    const r_eid = fx.readerEid();
+
+    var msg = Msg{};
+    defer msg.deinit(alloc);
+    try msg.header(alloc, src_prefix);
+    try msg.heartbeatFrag(alloc, r_eid, w_eid);
+    try fx.inject(msg.bytes());
+}
+
+test "entity_routing: NACK_FRAG routes to matched writer" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // makeWriter() creates the writer on dp_w; NACK_FRAG is sent by the reader side
+    // back to the writer side participant's data port.
+    _ = fx.makeWriter();
+    _ = fx.makeReader();
+
+    const src_prefix = fx.dp_r_impl.guid.prefix.bytes;
+    const w_eid = fx.writerEid();
+    const r_eid = fx.readerEid();
+
+    var msg = Msg{};
+    defer msg.deinit(alloc);
+    try msg.header(alloc, src_prefix);
+    try msg.nackFrag(alloc, r_eid, w_eid);
+    try fx.injectToWriterSide(msg.bytes());
+}
+
+test "entity_routing: GAP ENTITYID_UNKNOWN fans out to all readers" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.makeWriter();
+    _ = fx.makeReader();
+
+    const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
+    const w_eid = fx.writerEid();
+
+    var msg = Msg{};
+    defer msg.deinit(alloc);
+    try msg.header(alloc, src_prefix);
+    try msg.gap(alloc, [_]u8{ 0, 0, 0, 0 }, w_eid);
+    try fx.inject(msg.bytes());
+}
+
+test "entity_routing: GAP direct dispatch to specific reader" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.makeWriter();
+    _ = fx.makeReader();
+
+    const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
+    const w_eid = fx.writerEid();
+    const r_eid = fx.readerEid();
+
+    var msg = Msg{};
+    defer msg.deinit(alloc);
+    try msg.header(alloc, src_prefix);
+    try msg.gap(alloc, r_eid, w_eid);
+    try fx.inject(msg.bytes());
 }
