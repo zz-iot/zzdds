@@ -135,6 +135,10 @@ pub const UdpConfig = struct {
     meta_unicast_port: ?u16 = null,
     /// Override the default unicast (user data) port. null = use RTPS formula.
     data_unicast_port: ?u16 = null,
+    /// Override the metatraffic multicast port. null = use RTPS formula.
+    meta_multicast_port: ?u16 = null,
+    /// Override the default multicast (user data) port. null = use RTPS formula.
+    data_multicast_port: ?u16 = null,
 
     // ── Socket binding ────────────────────────────────────────────────────────
 
@@ -224,7 +228,8 @@ pub fn rtpsPort(udp: *const UdpConfig, domain_id: u32, participant_id: u32, offs
 }
 
 pub fn metatrafficMulticastPort(udp: *const UdpConfig, domain_id: u32) u16 {
-    return rtpsPort(udp, domain_id, 0, udp.meta_multicast_offset);
+    return udp.meta_multicast_port orelse
+        rtpsPort(udp, domain_id, 0, udp.meta_multicast_offset);
 }
 
 pub fn metatrafficUnicastPort(udp: *const UdpConfig, domain_id: u32, participant_id: u32) u16 {
@@ -233,7 +238,8 @@ pub fn metatrafficUnicastPort(udp: *const UdpConfig, domain_id: u32, participant
 }
 
 pub fn defaultMulticastPort(udp: *const UdpConfig, domain_id: u32) u16 {
-    return rtpsPort(udp, domain_id, 0, udp.data_multicast_offset);
+    return udp.data_multicast_port orelse
+        rtpsPort(udp, domain_id, 0, udp.data_multicast_offset);
 }
 
 pub fn defaultUnicastPort(udp: *const UdpConfig, domain_id: u32, participant_id: u32) u16 {
@@ -255,4 +261,31 @@ test "RTPS port formula defaults match spec §9.6.1.1 examples" {
     try std.testing.expectEqual(@as(u16, 7412), metatrafficUnicastPort(&udp, 0, 1));
     // Domain 1: metatraffic multicast = 7400+250 = 7650
     try std.testing.expectEqual(@as(u16, 7650), metatrafficMulticastPort(&udp, 1));
+}
+
+test "port overrides take precedence over formula" {
+    var udp = UdpConfig{};
+    udp.meta_multicast_port = 9000;
+    udp.meta_unicast_port = 9001;
+    udp.data_multicast_port = 9002;
+    udp.data_unicast_port = 9003;
+    try std.testing.expectEqual(@as(u16, 9000), metatrafficMulticastPort(&udp, 0));
+    try std.testing.expectEqual(@as(u16, 9001), metatrafficUnicastPort(&udp, 0, 0));
+    try std.testing.expectEqual(@as(u16, 9002), defaultMulticastPort(&udp, 0));
+    try std.testing.expectEqual(@as(u16, 9003), defaultUnicastPort(&udp, 0, 0));
+    // Overrides are domain/participant-agnostic.
+    try std.testing.expectEqual(@as(u16, 9000), metatrafficMulticastPort(&udp, 5));
+    try std.testing.expectEqual(@as(u16, 9001), metatrafficUnicastPort(&udp, 5, 3));
+}
+
+test "single-port collapse: all four overrides equal" {
+    var udp = UdpConfig{};
+    udp.meta_multicast_port = 7400;
+    udp.meta_unicast_port = 7400;
+    udp.data_multicast_port = 7400;
+    udp.data_unicast_port = 7400;
+    try std.testing.expectEqual(@as(u16, 7400), metatrafficMulticastPort(&udp, 0));
+    try std.testing.expectEqual(@as(u16, 7400), metatrafficUnicastPort(&udp, 0, 0));
+    try std.testing.expectEqual(@as(u16, 7400), defaultMulticastPort(&udp, 0));
+    try std.testing.expectEqual(@as(u16, 7400), defaultUnicastPort(&udp, 0, 0));
 }
