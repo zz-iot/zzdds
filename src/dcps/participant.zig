@@ -1178,6 +1178,7 @@ pub const DomainParticipantImpl = struct {
     fn dispatchDirectedWrite(
         self: *DomainParticipantImpl,
         dw_bytes: []const u8,
+        little_endian: bool,
         writer_guid: Guid,
         sn: anytype,
         ts: time_mod.RtpsTimestamp,
@@ -1186,7 +1187,8 @@ pub const DomainParticipantImpl = struct {
         kind: history_mod.ChangeKind,
     ) void {
         if (dw_bytes.len < 4) return;
-        const count = std.mem.readInt(u32, dw_bytes[0..4], .little);
+        const endian: std.builtin.Endian = if (little_endian) .little else .big;
+        const count = std.mem.readInt(u32, dw_bytes[0..4], endian);
         self.mu.lock();
         defer self.mu.unlock();
         var i: u32 = 0;
@@ -1246,7 +1248,7 @@ pub const DomainParticipantImpl = struct {
 
                     if (d.inline_qos) |iq| {
                         if (iq.get(.directed_write)) |dw_bytes| {
-                            dispatchDirectedWrite(self, dw_bytes, writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind);
+                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind);
                             continue;
                         }
                     }
