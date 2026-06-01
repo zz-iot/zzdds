@@ -135,11 +135,6 @@ pub const UdpConfig = struct {
     meta_unicast_port: ?u16 = null,
     /// Override the default unicast (user data) port. null = use RTPS formula.
     data_unicast_port: ?u16 = null,
-    /// When false, skip the second transport.listen() call for the data unicast port
-    /// in participant.start(). All user data flows through the metatraffic unicast
-    /// socket. Breaks interoperability with spec-compliant peers; use only when all
-    /// participants are zenzen_dds (single-port firewall deployments).
-    data_port_separate: bool = true,
 
     // ── Socket binding ────────────────────────────────────────────────────────
 

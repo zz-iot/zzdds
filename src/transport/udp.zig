@@ -501,10 +501,8 @@ pub const UdpTransport = struct {
         while (pid <= range.max) : (pid += 1) {
             const meta_port = schema.metatrafficUnicastPort(&self.config, self.domain_id, pid);
             const meta_fd = tryBindPort(meta_port) orelse continue;
-            // Only reserve a separate data fd when data_port_separate is true and the
-            // data port differs from the meta port (port overrides may collapse them).
             const data_port = schema.defaultUnicastPort(&self.config, self.domain_id, pid);
-            if (self.config.data_port_separate and data_port != meta_port) {
+            if (data_port != meta_port) {
                 const data_fd = tryBindPort(data_port) orelse {
                     socketClose(meta_fd);
                     continue;
@@ -1472,7 +1470,7 @@ test "init auto-assigns participant_id and reserves meta+data fds" {
     const alloc = std.testing.allocator;
     const udp = try UdpTransport.init(alloc, .{ .ipv6_enabled = false }, 0, null);
     defer udp.deinit();
-    // participant_id was chosen automatically; reserved fds held (data_port_separate=true).
+    // participant_id was chosen automatically; both meta and data fds reserved.
     try std.testing.expect(udp.participant_id <= 29062);
     try std.testing.expect(udp.reserved_meta_fd != null);
     try std.testing.expect(udp.reserved_data_fd != null);

@@ -706,17 +706,12 @@ pub const DomainParticipantImpl = struct {
         defer meta_locators.deinit(self.alloc);
         try self.transport.unicastLocators(&meta_locators, self.alloc);
 
-        // Data unicast locators. Three cases:
-        //   data_port_separate=false → reuse meta locators; no separate data socket
+        // Data unicast locators. Two cases:
         //   data_unicast_port override → fixed port for all interfaces
         //   default → meta port + (D3 - D1) offset
         var data_locators: std.ArrayListUnmanaged(Locator) = .empty;
         defer data_locators.deinit(self.alloc);
-        if (!udp_cfg.data_port_separate) {
-            // Single-port mode: data and meta share one socket.
-            try data_locators.appendSlice(self.alloc, meta_locators.items);
-            // data_listen_port stays 0 → start() skips the second listen() call.
-        } else if (udp_cfg.data_unicast_port) |dp| {
+        if (udp_cfg.data_unicast_port) |dp| {
             for (meta_locators.items) |loc| {
                 switch (loc) {
                     .udp_v4 => |u| try data_locators.append(self.alloc, Locator.udp4(u.addr, dp)),
