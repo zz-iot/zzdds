@@ -182,6 +182,13 @@ jobs:
           files: coverage/kcov-merged/cobertura.xml
           token: ${{ secrets.CODECOV_TOKEN }}
 
+      - name: Upload coverage report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcov-coverage
+          path: coverage/kcov-merged/
+          retention-days: 14
+
   # ── Resolve vendor matrix ──────────────────────────────────────────────────
   #
   # Queries the pinned omg-dds/dds-rtps release for *_shape_main_linux assets,
