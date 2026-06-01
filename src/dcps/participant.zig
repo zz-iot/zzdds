@@ -1224,6 +1224,9 @@ pub const DomainParticipantImpl = struct {
 
         var src_prefix = it.header.guid_prefix;
         var dst_prefix = GuidPrefix.unknown;
+        // Tracks the source timestamp supplied by the most recent INFO_TS submessage
+        // in this message, per RTPS §8.3.3.  Initialized to "now" so that DATA
+        // submessages without a preceding INFO_TS get the receive time.
         var current_ts: time_mod.RtpsTimestamp = time_mod.RtpsTimestamp.now();
 
         while (it.next(&param_buf) catch return) |sm| {
