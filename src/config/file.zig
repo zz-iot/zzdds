@@ -128,6 +128,14 @@ fn applyField(
                 cfg.transport.udp.data_multicast_offset = try parseU16(val);
             } else if (eql(key, "data_unicast_offset")) {
                 cfg.transport.udp.data_unicast_offset = try parseU16(val);
+            } else if (eql(key, "meta_unicast_port")) {
+                cfg.transport.udp.meta_unicast_port = try parseOptU16(val);
+            } else if (eql(key, "data_unicast_port")) {
+                cfg.transport.udp.data_unicast_port = try parseOptU16(val);
+            } else if (eql(key, "meta_multicast_port")) {
+                cfg.transport.udp.meta_multicast_port = try parseOptU16(val);
+            } else if (eql(key, "data_multicast_port")) {
+                cfg.transport.udp.data_multicast_port = try parseOptU16(val);
             } else if (eql(key, "participant_id")) {
                 cfg.transport.udp.participant_id = try parseOptU32(val);
             } else if (eql(key, "interfaces")) {
@@ -194,6 +202,11 @@ fn parseInt(comptime T: type, val: []const u8) Error!T {
 fn parseOptU32(val: []const u8) Error!?u32 {
     if (eql(val, "null")) return null;
     return try parseU32(val);
+}
+
+fn parseOptU16(val: []const u8) Error!?u16 {
+    if (eql(val, "null")) return null;
+    return try parseU16(val);
 }
 
 fn parseBool(val: []const u8) Error!bool {
@@ -518,4 +531,39 @@ test "string escape sequences" {
         \\name = "hello \"world\""
     );
     try std.testing.expectEqualStrings("hello \"world\"", cfg.participant.name);
+}
+
+test "parse port overrides" {
+    var cfg = schema.Config{};
+    try apply(std.testing.allocator, &cfg,
+        \\[transport.udp]
+        \\meta_unicast_port = 9001
+        \\data_unicast_port = 9002
+        \\meta_multicast_port = 9003
+        \\data_multicast_port = 9004
+    );
+    try std.testing.expectEqual(@as(?u16, 9001), cfg.transport.udp.meta_unicast_port);
+    try std.testing.expectEqual(@as(?u16, 9002), cfg.transport.udp.data_unicast_port);
+    try std.testing.expectEqual(@as(?u16, 9003), cfg.transport.udp.meta_multicast_port);
+    try std.testing.expectEqual(@as(?u16, 9004), cfg.transport.udp.data_multicast_port);
+}
+
+test "parse port override null resets override" {
+    var cfg = schema.Config{ .transport = .{ .udp = .{
+        .meta_unicast_port = 9001,
+        .data_unicast_port = 9002,
+        .meta_multicast_port = 9003,
+        .data_multicast_port = 9004,
+    } } };
+    try apply(std.testing.allocator, &cfg,
+        \\[transport.udp]
+        \\meta_unicast_port = null
+        \\data_unicast_port = null
+        \\meta_multicast_port = null
+        \\data_multicast_port = null
+    );
+    try std.testing.expectEqual(@as(?u16, null), cfg.transport.udp.meta_unicast_port);
+    try std.testing.expectEqual(@as(?u16, null), cfg.transport.udp.data_unicast_port);
+    try std.testing.expectEqual(@as(?u16, null), cfg.transport.udp.meta_multicast_port);
+    try std.testing.expectEqual(@as(?u16, null), cfg.transport.udp.data_multicast_port);
 }
