@@ -1470,7 +1470,7 @@ test "init auto-assigns participant_id and reserves meta+data fds" {
     const alloc = std.testing.allocator;
     const udp = try UdpTransport.init(alloc, .{ .ipv6_enabled = false }, 0, null);
     defer udp.deinit();
-    // participant_id was chosen automatically; reserved fds held (data_port_separate=true).
+    // participant_id was chosen automatically; both meta and data fds reserved.
     try std.testing.expect(udp.participant_id <= 29062);
     try std.testing.expect(udp.reserved_meta_fd != null);
     try std.testing.expect(udp.reserved_data_fd != null);
