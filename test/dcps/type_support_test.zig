@@ -241,7 +241,8 @@ test "TypeSupport: key_hash_fn set on reader when registered before reader creat
     const dp_impl = fx.dpImpl(fx.dp_r);
     dp_impl.mu.lock();
     var found_fn = false;
-    for (dp_impl.active_readers.items) |ar| {
+    var ar_it = dp_impl.active_readers.valueIterator();
+    while (ar_it.next()) |ar| {
         if (ar.key_hash_fn != null) found_fn = true;
     }
     dp_impl.mu.unlock();
@@ -260,7 +261,8 @@ test "TypeSupport: reader created before registration has no key_hash_fn" {
     const dp_impl = fx.dpImpl(fx.dp_r);
     dp_impl.mu.lock();
     var any_fn = false;
-    for (dp_impl.active_readers.items) |ar| {
+    var ar_it2 = dp_impl.active_readers.valueIterator();
+    while (ar_it2.next()) |ar| {
         if (ar.key_hash_fn != null) any_fn = true;
     }
     dp_impl.mu.unlock();

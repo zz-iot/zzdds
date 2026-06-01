@@ -558,8 +558,8 @@ pub const DomainParticipantImpl = struct {
     topics: std.ArrayListUnmanaged(*topic_mod.TopicImpl),
     cft_topics: std.ArrayListUnmanaged(*topic_mod.ContentFilteredTopicImpl),
 
-    active_writers: std.ArrayListUnmanaged(ActiveWriter),
-    active_readers: std.ArrayListUnmanaged(ActiveReader),
+    active_writers: std.AutoHashMapUnmanaged(u32, ActiveWriter),
+    active_readers: std.AutoHashMapUnmanaged(u32, ActiveReader),
 
     /// Cache of discovered remote participants; keyed by GUID, guarded by mu.
     discovered_participants: std.ArrayListUnmanaged(DiscoveredParticipant),
@@ -827,9 +827,11 @@ pub const DomainParticipantImpl = struct {
         self.type_support_registry.deinit(self.alloc);
 
         // Any remaining active writers/readers (normally all removed by pub/sub deinit).
-        for (self.active_writers.items) |*aw| aw.proto.deinit();
+        var wit = self.active_writers.valueIterator();
+        while (wit.next()) |aw| aw.proto.deinit();
         self.active_writers.deinit(self.alloc);
-        for (self.active_readers.items) |*ar| ar.proto.deinit();
+        var rit = self.active_readers.valueIterator();
+        while (rit.next()) |ar| ar.proto.deinit();
         self.active_readers.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
         self.ignored_prefixes.deinit(self.alloc);
@@ -947,7 +949,7 @@ pub const DomainParticipantImpl = struct {
         {
             self.mu.lock();
             defer self.mu.unlock();
-            try self.active_writers.append(self.alloc, .{
+            try self.active_writers.put(self.alloc, entityIdKey(guid.entity_id), .{
                 .handle = handle,
                 .guid = guid,
                 .proto = pw,
@@ -966,16 +968,15 @@ pub const DomainParticipantImpl = struct {
         var found_proto: ?proto.ProtocolWriter = null;
 
         self.mu.lock();
-        var i = self.active_writers.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.active_writers.items[i].handle == handle) {
-                found_guid = self.active_writers.items[i].guid;
-                found_proto = self.active_writers.items[i].proto;
-                _ = self.active_writers.swapRemove(i);
+        var writ = self.active_writers.valueIterator();
+        while (writ.next()) |aw| {
+            if (aw.handle == handle) {
+                found_guid = aw.guid;
+                found_proto = aw.proto;
                 break;
             }
         }
+        if (found_guid) |g| _ = self.active_writers.remove(entityIdKey(g.entity_id));
         self.mu.unlock();
 
         if (found_guid) |g| self.discovery.retractWriter(g);
@@ -1030,7 +1031,7 @@ pub const DomainParticipantImpl = struct {
         {
             self.mu.lock();
             defer self.mu.unlock();
-            try self.active_readers.append(self.alloc, .{
+            try self.active_readers.put(self.alloc, entityIdKey(guid.entity_id), .{
                 .handle = handle,
                 .guid = guid,
                 .proto = pr,
@@ -1053,16 +1054,15 @@ pub const DomainParticipantImpl = struct {
         var found_proto: ?proto.ProtocolReader = null;
 
         self.mu.lock();
-        var i = self.active_readers.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.active_readers.items[i].handle == handle) {
-                found_guid = self.active_readers.items[i].guid;
-                found_proto = self.active_readers.items[i].proto;
-                _ = self.active_readers.swapRemove(i);
+        var rrit = self.active_readers.valueIterator();
+        while (rrit.next()) |ar| {
+            if (ar.handle == handle) {
+                found_guid = ar.guid;
+                found_proto = ar.proto;
                 break;
             }
         }
+        if (found_guid) |g| _ = self.active_readers.remove(entityIdKey(g.entity_id));
         self.mu.unlock();
 
         if (found_guid) |g| self.discovery.retractReader(g);
@@ -1137,6 +1137,79 @@ pub const DomainParticipantImpl = struct {
 
     // ── User data receive dispatcher ──────────────────────────────────────────
     //
+    // ── userDataOnReceive helpers ─────────────────────────────────────────────
+
+    fn entityIdKey(id: EntityId) u32 {
+        return @bitCast([4]u8{ id.entity_key[0], id.entity_key[1], id.entity_key[2], id.entity_kind });
+    }
+
+    fn decodeChangeKind(iq: ?submsg_mod.InlineQos) history_mod.ChangeKind {
+        if (iq) |q| {
+            if (q.get(.status_info)) |si| {
+                if (si.len >= 4) {
+                    const v = std.mem.readInt(u32, si[0..4], .little);
+                    if (v & 0x1 != 0) return .not_alive_disposed;
+                    if (v & 0x2 != 0) return .not_alive_unregistered;
+                }
+            }
+        }
+        return .alive;
+    }
+
+    fn decodeKeyHash(iq: ?submsg_mod.InlineQos) [16]u8 {
+        if (iq) |q| {
+            if (q.get(.key_hash)) |kh| {
+                if (kh.len >= 16) {
+                    var h: [16]u8 = undefined;
+                    @memcpy(&h, kh[0..16]);
+                    return h;
+                }
+            }
+        }
+        return std.mem.zeroes([16]u8);
+    }
+
+    fn resolveKeyHash(kh: [16]u8, ar: *ActiveReader, payload: []const u8) [16]u8 {
+        if (!std.mem.eql(u8, &kh, &std.mem.zeroes([16]u8))) return kh;
+        if (ar.key_hash_fn) |f| return f(payload);
+        return kh;
+    }
+
+    fn dispatchDirectedWrite(
+        self: *DomainParticipantImpl,
+        dw_bytes: []const u8,
+        little_endian: bool,
+        writer_guid: Guid,
+        sn: anytype,
+        ts: time_mod.RtpsTimestamp,
+        key_hash: [16]u8,
+        payload: []const u8,
+        kind: history_mod.ChangeKind,
+    ) void {
+        if (dw_bytes.len < 4) return;
+        const endian: std.builtin.Endian = if (little_endian) .little else .big;
+        const count = std.mem.readInt(u32, dw_bytes[0..4], endian);
+        self.mu.lock();
+        defer self.mu.unlock();
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const offset = 4 + i * 16;
+            if (offset + 16 > dw_bytes.len) break;
+            var prefix: GuidPrefix = undefined;
+            @memcpy(&prefix.bytes, dw_bytes[offset..][0..12]);
+            if (!prefix.eql(self.guid.prefix)) continue;
+            const eid = EntityId{
+                .entity_key = dw_bytes[offset + 12 ..][0..3].*,
+                .entity_kind = dw_bytes[offset + 15],
+            };
+            const rkey = entityIdKey(eid);
+            if (self.active_readers.getPtr(rkey)) |ar| {
+                const kh = resolveKeyHash(key_hash, ar, payload);
+                ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind);
+            }
+        }
+    }
+
     // Called from the transport's receive thread on the data unicast port.
     // Parses each RTPS message and delivers DATA submessages to all active
     // readers; each ProtocolReader filters internally via isWriterMatched().
@@ -1148,7 +1221,9 @@ pub const DomainParticipantImpl = struct {
 
         var it = parser_mod.MessageIterator.init(raw) catch return;
         var param_buf: [32]submsg_mod.InlineQosParam = undefined;
-        const src_prefix = it.header.guid_prefix;
+
+        var src_prefix = it.header.guid_prefix;
+        var dst_prefix = GuidPrefix.unknown;
         // Tracks the source timestamp supplied by the most recent INFO_TS submessage
         // in this message, per RTPS §8.3.3.  Initialized to "now" so that DATA
         // submessages without a preceding INFO_TS get the receive time.
@@ -1159,149 +1234,127 @@ pub const DomainParticipantImpl = struct {
                 .info_ts => |info| {
                     current_ts = info.timestamp orelse time_mod.RtpsTimestamp.now();
                 },
+                .info_dst => |dst| {
+                    dst_prefix = dst.guid_prefix;
+                },
+                .info_src => |src| {
+                    src_prefix = src.guid_prefix;
+                },
                 .data => |d| {
-                    const writer_guid = Guid{
-                        .prefix = src_prefix,
-                        .entity_id = d.writer_entity_id,
-                    };
-                    // Parse status_info inline QoS → ChangeKind.
-                    // status_info is little-endian; bit 0 = DISPOSED, bit 1 = UNREGISTERED.
-                    const kind: history_mod.ChangeKind = blk: {
-                        if (d.inline_qos) |iq| {
-                            if (iq.get(.status_info)) |si| {
-                                if (si.len >= 4) {
-                                    const v = std.mem.readInt(u32, si[0..4], .little);
-                                    if (v & 0x1 != 0) break :blk .not_alive_disposed;
-                                    if (v & 0x2 != 0) break :blk .not_alive_unregistered;
-                                }
-                            }
-                        }
-                        break :blk .alive;
-                    };
-                    // ALIVE changes with no payload are noise; skip them.
-                    // NOT_ALIVE_* changes legitimately have empty payload (lifecycle only).
+                    if (!dst_prefix.eql(GuidPrefix.unknown) and
+                        !dst_prefix.eql(self.guid.prefix)) continue;
+
+                    const writer_guid = Guid{ .prefix = src_prefix, .entity_id = d.writer_entity_id };
+                    const kind = decodeChangeKind(d.inline_qos);
                     if (kind == .alive and d.serialized_payload.len == 0) continue;
-                    const key_hash: [16]u8 = blk: {
-                        if (d.inline_qos) |iq| {
-                            if (iq.get(.key_hash)) |kh| {
-                                if (kh.len >= 16) {
-                                    var h: [16]u8 = undefined;
-                                    @memcpy(&h, kh[0..16]);
-                                    break :blk h;
-                                }
-                            }
+                    const key_hash = decodeKeyHash(d.inline_qos);
+
+                    if (d.inline_qos) |iq| {
+                        if (iq.get(.directed_write)) |dw_bytes| {
+                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind);
+                            continue;
                         }
-                        break :blk std.mem.zeroes([16]u8);
-                    };
-                    const ts = current_ts;
-                    // Deliver to all active readers; each filters by writer match.
-                    // If the change carries no inline key_hash and the reader's type has
-                    // a registered TypeSupport, compute the hash from the payload now.
-                    const nil_hash = std.mem.zeroes([16]u8);
+                    }
+
                     self.mu.lock();
-                    for (self.active_readers.items) |*ar| {
-                        const kh = if (!std.mem.eql(u8, &key_hash, &nil_hash))
-                            key_hash
-                        else if (ar.key_hash_fn) |f|
-                            f(d.serialized_payload)
-                        else
-                            key_hash;
-                        ar.proto.handleIncomingChange(
-                            writer_guid,
-                            d.writer_sn,
-                            ts,
-                            kh,
-                            d.serialized_payload,
-                            kind,
-                        );
+                    if (d.reader_entity_id.eql(EntityIds.unknown)) {
+                        var fan_it = self.active_readers.valueIterator();
+                        while (fan_it.next()) |ar| {
+                            const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
+                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind);
+                        }
+                    } else {
+                        const rkey = entityIdKey(d.reader_entity_id);
+                        if (self.active_readers.getPtr(rkey)) |ar| {
+                            const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
+                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind);
+                        }
                     }
                     self.mu.unlock();
                 },
                 .heartbeat => |hb| {
-                    const writer_guid = Guid{
-                        .prefix = src_prefix,
-                        .entity_id = hb.writer_entity_id,
-                    };
+                    if (!dst_prefix.eql(GuidPrefix.unknown) and
+                        !dst_prefix.eql(self.guid.prefix)) continue;
+                    const writer_guid = Guid{ .prefix = src_prefix, .entity_id = hb.writer_entity_id };
                     self.mu.lock();
-                    for (self.active_readers.items) |*ar| {
-                        ar.proto.handleHeartbeat(
-                            writer_guid,
-                            hb.first_sn,
-                            hb.last_sn,
-                            hb.count,
-                            hb.isFinal(),
-                        );
+                    if (hb.reader_entity_id.eql(EntityIds.unknown)) {
+                        var fan_it = self.active_readers.valueIterator();
+                        while (fan_it.next()) |ar| {
+                            ar.proto.handleHeartbeat(writer_guid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                        }
+                    } else {
+                        const rkey = entityIdKey(hb.reader_entity_id);
+                        if (self.active_readers.getPtr(rkey)) |ar| {
+                            ar.proto.handleHeartbeat(writer_guid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                        }
                     }
                     self.mu.unlock();
                 },
                 .acknack => |an| {
-                    const reader_guid = Guid{
-                        .prefix = src_prefix,
-                        .entity_id = an.reader_entity_id,
-                    };
+                    if (!dst_prefix.eql(GuidPrefix.unknown) and
+                        !dst_prefix.eql(self.guid.prefix)) continue;
+                    const reader_guid = Guid{ .prefix = src_prefix, .entity_id = an.reader_entity_id };
                     self.mu.lock();
-                    for (self.active_writers.items) |*aw| {
-                        aw.proto.handleAckNack(
-                            reader_guid,
-                            an.reader_sn_state.base - 1,
-                            an.reader_sn_state,
-                            an.count,
-                            an.isFinal(),
-                        );
+                    const wkey = entityIdKey(an.writer_entity_id);
+                    if (self.active_writers.getPtr(wkey)) |aw| {
+                        aw.proto.handleAckNack(reader_guid, an.reader_sn_state.base - 1, an.reader_sn_state, an.count, an.isFinal());
                     }
                     self.mu.unlock();
                 },
                 .data_frag => |df| {
-                    const writer_guid = Guid{
-                        .prefix = src_prefix,
-                        .entity_id = df.writer_entity_id,
-                    };
+                    if (!dst_prefix.eql(GuidPrefix.unknown) and
+                        !dst_prefix.eql(self.guid.prefix)) continue;
+                    const writer_guid = Guid{ .prefix = src_prefix, .entity_id = df.writer_entity_id };
                     self.mu.lock();
-                    for (self.active_readers.items) |*ar| {
-                        ar.proto.handleDataFrag(writer_guid, df);
+                    if (df.reader_entity_id.eql(EntityIds.unknown)) {
+                        var fan_it = self.active_readers.valueIterator();
+                        while (fan_it.next()) |ar| ar.proto.handleDataFrag(writer_guid, df);
+                    } else {
+                        const rkey = entityIdKey(df.reader_entity_id);
+                        if (self.active_readers.getPtr(rkey)) |ar| ar.proto.handleDataFrag(writer_guid, df);
                     }
                     self.mu.unlock();
                 },
                 .heartbeat_frag => |hbf| {
-                    const writer_guid = Guid{
-                        .prefix = src_prefix,
-                        .entity_id = hbf.writer_entity_id,
-                    };
+                    if (!dst_prefix.eql(GuidPrefix.unknown) and
+                        !dst_prefix.eql(self.guid.prefix)) continue;
+                    const writer_guid = Guid{ .prefix = src_prefix, .entity_id = hbf.writer_entity_id };
                     self.mu.lock();
-                    for (self.active_readers.items) |*ar| {
-                        ar.proto.handleHeartbeatFrag(
-                            writer_guid,
-                            hbf.writer_sn,
-                            hbf.last_fragment_num,
-                            hbf.count,
-                        );
+                    if (hbf.reader_entity_id.eql(EntityIds.unknown)) {
+                        var fan_it = self.active_readers.valueIterator();
+                        while (fan_it.next()) |ar| {
+                            ar.proto.handleHeartbeatFrag(writer_guid, hbf.writer_sn, hbf.last_fragment_num, hbf.count);
+                        }
+                    } else {
+                        const rkey = entityIdKey(hbf.reader_entity_id);
+                        if (self.active_readers.getPtr(rkey)) |ar| {
+                            ar.proto.handleHeartbeatFrag(writer_guid, hbf.writer_sn, hbf.last_fragment_num, hbf.count);
+                        }
                     }
                     self.mu.unlock();
                 },
                 .nack_frag => |nf| {
-                    const reader_guid = Guid{
-                        .prefix = src_prefix,
-                        .entity_id = nf.reader_entity_id,
-                    };
+                    if (!dst_prefix.eql(GuidPrefix.unknown) and
+                        !dst_prefix.eql(self.guid.prefix)) continue;
+                    const reader_guid = Guid{ .prefix = src_prefix, .entity_id = nf.reader_entity_id };
                     self.mu.lock();
-                    for (self.active_writers.items) |*aw| {
-                        aw.proto.handleNackFrag(
-                            reader_guid,
-                            nf.writer_sn,
-                            nf.fragment_number_state,
-                            nf.count,
-                        );
+                    const wkey = entityIdKey(nf.writer_entity_id);
+                    if (self.active_writers.getPtr(wkey)) |aw| {
+                        aw.proto.handleNackFrag(reader_guid, nf.writer_sn, nf.fragment_number_state, nf.count);
                     }
                     self.mu.unlock();
                 },
                 .gap => |g| {
-                    const writer_guid = Guid{
-                        .prefix = src_prefix,
-                        .entity_id = g.writer_entity_id,
-                    };
+                    if (!dst_prefix.eql(GuidPrefix.unknown) and
+                        !dst_prefix.eql(self.guid.prefix)) continue;
+                    const writer_guid = Guid{ .prefix = src_prefix, .entity_id = g.writer_entity_id };
                     self.mu.lock();
-                    for (self.active_readers.items) |*ar| {
-                        ar.proto.handleGap(writer_guid, g.gap_start, g.gap_list);
+                    if (g.reader_entity_id.eql(EntityIds.unknown)) {
+                        var fan_it = self.active_readers.valueIterator();
+                        while (fan_it.next()) |ar| ar.proto.handleGap(writer_guid, g.gap_start, g.gap_list);
+                    } else {
+                        const rkey = entityIdKey(g.reader_entity_id);
+                        if (self.active_readers.getPtr(rkey)) |ar| ar.proto.handleGap(writer_guid, g.gap_start, g.gap_list);
                     }
                     self.mu.unlock();
                 },
@@ -1382,7 +1435,8 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
-        for (self.active_readers.items) |*ar| {
+        var ar_it = self.active_readers.valueIterator();
+        while (ar_it.next()) |ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, ar.type_name, data.type_name)) continue;
             const local_snap = readerQosSnapshot(ar.qos);
@@ -1467,7 +1521,8 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         const remote_handle = writer_mod.guidToHandle(guid);
-        for (self.active_readers.items) |*ar| {
+        var ar_it2 = self.active_readers.valueIterator();
+        while (ar_it2.next()) |ar| {
             const before = ar.proto.matchedWriterCount();
             ar.proto.removeMatchedWriter(guid);
             if (ar.proto.matchedWriterCount() < before) {
@@ -1500,7 +1555,8 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
-        for (self.active_writers.items) |*aw| {
+        var aw_it = self.active_writers.valueIterator();
+        while (aw_it.next()) |aw| {
             if (!std.mem.eql(u8, aw.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, aw.type_name, data.type_name)) continue;
             const local_snap = writerQosSnapshot(aw.qos);
@@ -1577,7 +1633,8 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         const remote_handle = writer_mod.guidToHandle(guid);
-        for (self.active_writers.items) |*aw| {
+        var aw_it2 = self.active_writers.valueIterator();
+        while (aw_it2.next()) |aw| {
             const before = aw.proto.matchedReaderCount();
             aw.proto.removeMatchedReader(guid);
             if (aw.proto.matchedReaderCount() < before) {
@@ -1601,7 +1658,8 @@ pub const DomainParticipantImpl = struct {
         {
             self.mu.lock();
             defer self.mu.unlock();
-            for (self.active_writers.items) |*aw| {
+            var aw_it3 = self.active_writers.valueIterator();
+            while (aw_it3.next()) |aw| {
                 if (aw.handle == handle) {
                     aw.partition_names = partition_names;
                     ann_opt = .{
@@ -1640,7 +1698,8 @@ pub const DomainParticipantImpl = struct {
         {
             self.mu.lock();
             defer self.mu.unlock();
-            for (self.active_readers.items) |*ar| {
+            var ar_it3 = self.active_readers.valueIterator();
+            while (ar_it3.next()) |ar| {
                 if (ar.handle == handle) {
                     ar.partition_names = partition_names;
                     ann_opt = .{
@@ -1676,7 +1735,8 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_writers.items) |*aw| {
+        var aw_it4 = self.active_writers.valueIterator();
+        while (aw_it4.next()) |aw| {
             if (aw.handle == handle) {
                 aw.incompat_qos = .{ .ctx = notify_ctx, .notify = notify_fn };
                 break;
@@ -1693,7 +1753,8 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_writers.items) |*aw| {
+        var aw_it5 = self.active_writers.valueIterator();
+        while (aw_it5.next()) |aw| {
             if (aw.handle == handle) {
                 aw.matched_notify = .{ .ctx = notify_ctx, .notify = notify_fn };
                 break;
@@ -1710,7 +1771,8 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_readers.items) |*ar| {
+        var ar_it4 = self.active_readers.valueIterator();
+        while (ar_it4.next()) |ar| {
             if (ar.handle == handle) {
                 ar.incompat_qos = .{ .ctx = notify_ctx, .notify = notify_fn };
                 break;
@@ -1727,7 +1789,8 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_readers.items) |*ar| {
+        var ar_it5 = self.active_readers.valueIterator();
+        while (ar_it5.next()) |ar| {
             if (ar.handle == handle) {
                 ar.matched_notify = .{ .ctx = notify_ctx, .notify = notify_fn };
                 break;
@@ -1744,7 +1807,8 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_writers.items) |*aw| {
+        var aw_it6 = self.active_writers.valueIterator();
+        while (aw_it6.next()) |aw| {
             if (aw.handle == handle) {
                 aw.timer_check = .{ .ctx = notify_ctx, .check = notify_fn };
                 break;
@@ -1761,7 +1825,8 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_writers.items) |*aw| {
+        var aw_it7 = self.active_writers.valueIterator();
+        while (aw_it7.next()) |aw| {
             if (aw.handle == handle) {
                 aw.liveliness_assert = .{ .ctx = notify_ctx, .assert_fn = assert_fn };
                 break;
@@ -1778,7 +1843,8 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_readers.items) |*ar| {
+        var ar_it6 = self.active_readers.valueIterator();
+        while (ar_it6.next()) |ar| {
             if (ar.handle == handle) {
                 ar.timer_check = .{ .ctx = notify_ctx, .check = notify_fn };
                 break;
@@ -1834,10 +1900,12 @@ pub const DomainParticipantImpl = struct {
         const now_ns = self.timer_clock.nowNs();
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_writers.items) |*aw| {
+        var aw_it8 = self.active_writers.valueIterator();
+        while (aw_it8.next()) |aw| {
             if (aw.timer_check) |cb| cb.check(cb.ctx, now_ns);
         }
-        for (self.active_readers.items) |*ar| {
+        var ar_it7 = self.active_readers.valueIterator();
+        while (ar_it7.next()) |ar| {
             if (ar.timer_check) |cb| cb.check(cb.ctx, now_ns);
         }
     }
@@ -2325,7 +2393,8 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.active_writers.items) |*aw| {
+        var aw_it9 = self.active_writers.valueIterator();
+        while (aw_it9.next()) |aw| {
             if (aw.liveliness_assert) |cb| cb.assert_fn(cb.ctx);
         }
         return DDS.RETCODE_OK;
@@ -2444,8 +2513,10 @@ pub const DomainParticipantImpl = struct {
         for (self.publishers.items) |p| if (p.instance_handle == handle) return true;
         for (self.subscribers.items) |s| if (s.instance_handle == handle) return true;
         for (self.topics.items) |t| if (t.instance_handle == handle) return true;
-        for (self.active_writers.items) |aw| if (aw.handle == handle) return true;
-        for (self.active_readers.items) |ar| if (ar.handle == handle) return true;
+        var aw_it10 = self.active_writers.valueIterator();
+        while (aw_it10.next()) |aw| if (aw.handle == handle) return true;
+        var ar_it8 = self.active_readers.valueIterator();
+        while (ar_it8.next()) |ar| if (ar.handle == handle) return true;
         return false;
     }
 
