@@ -597,7 +597,10 @@ pub const TcpTransport = struct {
             self.listen_port = 0;
             self.handler_mu.lock();
             for (self.handlers.items, 0..) |h, i| {
-                if (h.ctx == handler.ctx) { _ = self.handlers.swapRemove(i); break; }
+                if (h.ctx == handler.ctx) {
+                    _ = self.handlers.swapRemove(i);
+                    break;
+                }
             }
             self.handler_mu.unlock();
             return err;
