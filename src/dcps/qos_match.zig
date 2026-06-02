@@ -169,6 +169,22 @@ pub fn checkSnapshots(offered: disc.QosSnapshot, requested: disc.QosSnapshot) Ma
     if (offered.data_representation != requested.data_representation)
         return .{ .incompatible = .data_representation };
 
+    // PRESENTATION: publisher's access_scope must be >= subscriber's; ordered/coherent
+    // access requested by the subscriber must be offered by the publisher.
+    const pres_result = checkPresentation(
+        .{
+            .access_scope = @enumFromInt(@as(u32, offered.presentation_access_scope)),
+            .coherent_access = offered.coherent_access,
+            .ordered_access = offered.ordered_access,
+        },
+        .{
+            .access_scope = @enumFromInt(@as(u32, requested.presentation_access_scope)),
+            .coherent_access = requested.coherent_access,
+            .ordered_access = requested.ordered_access,
+        },
+    );
+    if (!pres_result.isCompatible()) return pres_result;
+
     return .compatible;
 }
 
