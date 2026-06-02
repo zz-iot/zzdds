@@ -297,11 +297,10 @@ const PortEntry = struct {
         {
             self.mu.lock();
             defer self.mu.unlock();
+            std.debug.assert(self.handlers.items.len <= snap.len);
             for (self.handlers.items) |h| {
-                if (count < snap.len) {
-                    snap[count] = h;
-                    count += 1;
-                }
+                snap[count] = h;
+                count += 1;
             }
         }
         for (snap[0..count]) |h| h.on_receive(h.ctx, buf, src);

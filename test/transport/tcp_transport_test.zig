@@ -301,7 +301,7 @@ test "tcp transport: vtClose tears down via vtable" {
     t.close(); // calls deinit(); do NOT call tcp.deinit() again
 }
 
-// ── vtJoinMulticast returns UnsupportedOperation ─────────────────────────────
+// ── vtJoinMulticast / vtLeaveMulticast ────────────────────────────────────────
 
 test "tcp transport: joinMulticast returns UnsupportedOperation" {
     const alloc = testing.allocator;
@@ -310,6 +310,85 @@ test "tcp transport: joinMulticast returns UnsupportedOperation" {
     const t = tcp.transport();
     const mc = Locator.udp4(.{ 239, 255, 0, 1 }, 7400);
     try testing.expectError(error.UnsupportedOperation, t.joinMulticast(&mc));
+}
+
+test "tcp transport: leaveMulticast is a no-op" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+    const mc = Locator.udp4(.{ 239, 255, 0, 1 }, 7400);
+    t.leaveMulticast(&mc); // must not crash
+}
+
+// ── vtSetLocatorChangeHandler ─────────────────────────────────────────────────
+
+test "tcp transport: vtSetLocatorChangeHandler sets and clears" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    var fired: bool = false;
+    const h = iface.LocatorChangeHandler{
+        .ctx = &fired,
+        .on_change = struct {
+            fn f(ctx: *anyopaque) void {
+                const b: *bool = @ptrCast(@alignCast(ctx));
+                b.* = true;
+            }
+        }.f,
+    };
+    t.setLocatorChangeHandler(h);
+    try testing.expect(tcp.locator_change_handler != null);
+    t.setLocatorChangeHandler(null);
+    try testing.expect(tcp.locator_change_handler == null);
+}
+
+// ── vtListen PortConflict rolls back handler ──────────────────────────────────
+
+test "tcp transport: vtListen PortConflict rolls back handler" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    var sentinel_a: u8 = 0;
+    var sentinel_b: u8 = 0;
+    const noop = struct {
+        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+    }.f;
+    const ha = iface.ReceiveHandler{ .ctx = &sentinel_a, .on_receive = noop };
+    const hb = iface.ReceiveHandler{ .ctx = &sentinel_b, .on_receive = noop };
+
+    // First listen: binds to an OS-assigned port.
+    const port = try listenAndGetPort(t, ha, alloc);
+    defer t.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), ha);
+
+    // Listen on a different port — must return PortConflict and NOT register hb.
+    const conflict_loc = Locator.tcp4(.{ 127, 0, 0, 1 }, port +% 1);
+    try testing.expectError(error.PortConflict, t.listen(&conflict_loc, hb));
+
+    // handlers list must still contain only ha.
+    tcp.handler_mu.lock();
+    defer tcp.handler_mu.unlock();
+    try testing.expectEqual(@as(usize, 1), tcp.handlers.items.len);
+    try testing.expectEqual(sentinel_a, @as(*u8, @ptrCast(@alignCast(tcp.handlers.items[0].ctx))).*);
+}
+
+// ── MessageTooLarge on oversized send ─────────────────────────────────────────
+
+test "tcp transport: vtSend rejects message larger than MAX_MSG_LEN" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    // Fake oversized slice: size check fires before any I/O so the pointer is never read.
+    const ptr: [*]const u8 = @ptrFromInt(0x1000);
+    const huge: []const u8 = ptr[0 .. 4 * 1024 * 1024 + 1];
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
+    try testing.expectError(error.MessageTooLarge, t.send(&dest, huge));
 }
 
 // ── Connection recovery: re-dial after connection close ──────────────────────
@@ -357,7 +436,7 @@ test "tcp transport: connection recovery after fd close" {
         var key = tcp_mod.RemoteKey{ .addr = std.mem.zeroes([16]u8), .port = port, .family = .v4 };
         @memcpy(key.addr[0..4], &[_]u8{ 127, 0, 0, 1 });
         const conn = client.connections.get(key);
-        if (conn) |co| _ = std.c.close(@intCast(co.fd));
+        if (conn) |co| _ = std.c.close(co.fd);
         client.conn_mu.unlock();
     }
 

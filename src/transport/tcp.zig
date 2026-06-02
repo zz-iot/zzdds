@@ -42,11 +42,78 @@ pub const LocatorChangeHandler = iface.LocatorChangeHandler;
 const MAX_MSG_LEN: u32 = 4 * 1024 * 1024; // 4 MiB sanity cap
 const POLL_TIMEOUT_MS: i32 = 50;
 
-// MSG_NOSIGNAL: suppress SIGPIPE on write to a closed socket (Linux only).
+// SHUT_RDWR: used to interrupt blocking accept()/recv() during shutdown.
+const SHUT_RDWR: c_int = 2;
+
+// MSG_NOSIGNAL: Linux-specific flag to suppress SIGPIPE on send(). On macOS/BSD
+// we set SO_NOSIGPIPE on the socket instead (see setSockNoSigPipe). On Windows
+// there is no SIGPIPE, so neither mechanism is needed.
 const MSG_NOSIGNAL: c_int = if (builtin.os.tag == .linux) 0x4000 else 0;
 
-// SHUT_RDWR: interrupt any blocking accept()/recv() on the socket.
-const SHUT_RDWR: c_int = 2;
+// SO_NOSIGPIPE: macOS/BSD per-socket equivalent of MSG_NOSIGNAL. 0 on other platforms.
+const SO_NOSIGPIPE: u32 = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos => 0x1022,
+    else => 0,
+};
+
+// ── Windows Winsock initialisation ───────────────────────────────────────────
+// Winsock requires WSAStartup before any socket call. Call once lazily.
+
+const wsa = if (builtin.os.tag == .windows) struct {
+    const WSADATA = [408]u8;
+    extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) c_int;
+    var initiated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var data: WSADATA = undefined;
+    fn ensure() void {
+        if (initiated.load(.acquire)) return;
+        _ = WSAStartup(0x0202, &data);
+        initiated.store(true, .release);
+    }
+} else struct {};
+
+/// INVALID_SOCKET sentinel: -1 on POSIX (c_int), ~0 pointer on Windows.
+const INVALID_SOCKET: posix.socket_t = if (builtin.os.tag == .windows)
+    @ptrFromInt(std.math.maxInt(usize))
+else
+    @as(posix.socket_t, -1);
+
+// ── Socket helpers (cross-platform) ──────────────────────────────────────────
+
+/// Create a TCP socket, handling the posix.socket_t←c_int conversion on Windows.
+fn socketCreate(family: u32, sock_type: u32) !posix.socket_t {
+    if (comptime builtin.os.tag == .windows) wsa.ensure();
+    const fd = c.socket(@intCast(family), @intCast(sock_type), 0);
+    if (fd < 0) return error.SocketCreateFailed;
+    if (comptime builtin.os.tag == .windows) {
+        return @ptrFromInt(@as(usize, @intCast(fd)));
+    }
+    return @intCast(fd);
+}
+
+fn socketClose(fd: posix.socket_t) void {
+    _ = c.close(fd);
+}
+
+fn socketShutdown(fd: posix.socket_t, how: c_int) void {
+    _ = c.shutdown(fd, how);
+}
+
+/// Accept an incoming connection. Returns null on any error (caller should check
+/// stopping flag to distinguish shutdown from real errors).
+fn socketAccept(fd: posix.socket_t, addr: *posix.sockaddr.storage, len: *posix.socklen_t) ?posix.socket_t {
+    const conn = c.accept(fd, @ptrCast(addr), len);
+    if (conn == INVALID_SOCKET) return null;
+    return conn;
+}
+
+/// Set SO_NOSIGPIPE on newly created sockets on macOS/BSD so that writes to a
+/// closed remote connection return EPIPE instead of raising SIGPIPE.
+fn setSockNoSigPipe(fd: posix.socket_t) void {
+    if (comptime SO_NOSIGPIPE != 0) {
+        var opt: i32 = 1;
+        _ = std.c.setsockopt(fd, posix.SOL.SOCKET, SO_NOSIGPIPE, &opt, @sizeOf(i32));
+    }
+}
 
 // ── IP address parsing ────────────────────────────────────────────────────────
 
@@ -112,7 +179,7 @@ fn sockaddrToRemoteKey(addr: *const posix.sockaddr) ?RemoteKey {
 fn readExact(fd: posix.socket_t, buf: []u8) !void {
     var off: usize = 0;
     while (off < buf.len) {
-        const n = c.recv(@intCast(fd), buf.ptr + off, buf.len - off, 0);
+        const n = c.recv(fd, buf.ptr + off, buf.len - off, 0);
         if (n < 0) {
             const err = posix.errno(n);
             if (err == .INTR) continue;
@@ -126,7 +193,7 @@ fn readExact(fd: posix.socket_t, buf: []u8) !void {
 fn writeAll(fd: posix.socket_t, data: []const u8) !void {
     var off: usize = 0;
     while (off < data.len) {
-        const n = c.send(@intCast(fd), data.ptr + off, data.len - off, @intCast(MSG_NOSIGNAL));
+        const n = c.send(fd, data.ptr + off, data.len - off, @intCast(MSG_NOSIGNAL));
         if (n < 0) {
             const err = posix.errno(n);
             if (err == .INTR) continue;
@@ -209,20 +276,21 @@ pub const TcpTransport = struct {
     pub fn deinit(self: *Self) void {
         self.stopping.store(true, .release);
 
-        // shutdown() before close() is required on Linux to interrupt any thread
-        // currently blocked in accept() or recv() on these fds. A bare close()
-        // leaves blocked threads running indefinitely (POSIX §2.9.7).
+        // shutdown() before close() is required to interrupt threads currently
+        // blocked in accept() or recv() on these fds. A bare close() leaves
+        // blocked threads running indefinitely (per POSIX §2.9.7; same on
+        // Windows with Winsock).
         {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
             if (self.listen_fd) |fd| {
-                _ = c.shutdown(@intCast(fd), SHUT_RDWR);
-                _ = c.close(@intCast(fd));
+                socketShutdown(fd, SHUT_RDWR);
+                socketClose(fd);
                 self.listen_fd = null;
             }
             for (self.all_connections.items) |conn| {
-                _ = c.shutdown(@intCast(conn.fd), SHUT_RDWR);
-                _ = c.close(@intCast(conn.fd));
+                socketShutdown(conn.fd, SHUT_RDWR);
+                socketClose(conn.fd);
             }
         }
 
@@ -254,11 +322,10 @@ pub const TcpTransport = struct {
         {
             self.handler_mu.lock();
             defer self.handler_mu.unlock();
+            std.debug.assert(self.handlers.items.len <= snap.len);
             for (self.handlers.items) |h| {
-                if (count < snap.len) {
-                    snap[count] = h;
-                    count += 1;
-                }
+                snap[count] = h;
+                count += 1;
             }
         }
         for (snap[0..count]) |h| h.on_receive(h.ctx, data, src);
@@ -292,6 +359,7 @@ pub const TcpTransport = struct {
 
     fn vtSend(ctx: *anyopaque, loc: *const Locator, data: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (data.len > MAX_MSG_LEN) return error.MessageTooLarge;
         const key = locatorToRemoteKey(loc) orelse return error.UnsupportedLocator;
 
         self.conn_mu.lock();
@@ -309,20 +377,31 @@ pub const TcpTransport = struct {
             };
             new_conn.owner = self;
             new_conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{new_conn}) catch |err| {
-                _ = c.close(@intCast(new_conn.fd));
+                socketClose(new_conn.fd);
                 self.alloc.destroy(new_conn);
                 self.conn_mu.unlock();
                 return err;
             };
             new_conn.thread_started = true;
+            // On OOM below: shutdown interrupts the recv thread, unlock before join
+            // to avoid deadlock (recv thread acquires conn_mu via removeConnection).
             self.connections.put(self.alloc, key, new_conn) catch |err| {
-                new_conn.thread_started = false;
-                _ = c.close(@intCast(new_conn.fd));
-                self.alloc.destroy(new_conn);
+                socketShutdown(new_conn.fd, SHUT_RDWR);
                 self.conn_mu.unlock();
+                new_conn.recv_thread.join();
+                socketClose(new_conn.fd);
+                self.alloc.destroy(new_conn);
                 return err;
             };
-            self.all_connections.append(self.alloc, new_conn) catch {};
+            self.all_connections.append(self.alloc, new_conn) catch |err| {
+                _ = self.connections.remove(key);
+                socketShutdown(new_conn.fd, SHUT_RDWR);
+                self.conn_mu.unlock();
+                new_conn.recv_thread.join();
+                socketClose(new_conn.fd);
+                self.alloc.destroy(new_conn);
+                return err;
+            };
             conn_opt = new_conn;
         }
 
@@ -352,19 +431,29 @@ pub const TcpTransport = struct {
         };
         new_conn.owner = self;
         new_conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{new_conn}) catch |err| {
-            _ = c.close(@intCast(new_conn.fd));
+            socketClose(new_conn.fd);
             self.alloc.destroy(new_conn);
             self.conn_mu.unlock();
             return err;
         };
         new_conn.thread_started = true;
         self.connections.put(self.alloc, key, new_conn) catch |err| {
-            _ = c.close(@intCast(new_conn.fd));
-            self.alloc.destroy(new_conn);
+            socketShutdown(new_conn.fd, SHUT_RDWR);
             self.conn_mu.unlock();
+            new_conn.recv_thread.join();
+            socketClose(new_conn.fd);
+            self.alloc.destroy(new_conn);
             return err;
         };
-        self.all_connections.append(self.alloc, new_conn) catch {};
+        self.all_connections.append(self.alloc, new_conn) catch |err| {
+            _ = self.connections.remove(key);
+            socketShutdown(new_conn.fd, SHUT_RDWR);
+            self.conn_mu.unlock();
+            new_conn.recv_thread.join();
+            socketClose(new_conn.fd);
+            self.alloc.destroy(new_conn);
+            return err;
+        };
         self.conn_mu.unlock();
 
         std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
@@ -399,7 +488,18 @@ pub const TcpTransport = struct {
 
         if (self.listen_fd != null) {
             // port=0 means "any"; otherwise must match the listening port.
-            if (port != 0 and self.listen_port != port) return error.PortConflict;
+            if (port != 0 and self.listen_port != port) {
+                // Roll back the handler we just registered.
+                self.handler_mu.lock();
+                for (self.handlers.items, 0..) |h, i| {
+                    if (h.ctx == handler.ctx) {
+                        _ = self.handlers.swapRemove(i);
+                        break;
+                    }
+                }
+                self.handler_mu.unlock();
+                return error.PortConflict;
+            }
             return; // already listening; handler added above
         }
 
@@ -419,13 +519,13 @@ pub const TcpTransport = struct {
                 .v4 => {
                     var sa: posix.sockaddr.in = undefined;
                     var sa_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-                    if (c.getsockname(@intCast(fd), @ptrCast(&sa), &sa_len) == 0)
+                    if (c.getsockname(fd, @ptrCast(&sa), &sa_len) == 0)
                         actual_port = std.mem.bigToNative(u16, sa.port);
                 },
                 .v6 => {
                     var sa: posix.sockaddr.in6 = undefined;
                     var sa_len: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
-                    if (c.getsockname(@intCast(fd), @ptrCast(&sa), &sa_len) == 0)
+                    if (c.getsockname(fd, @ptrCast(&sa), &sa_len) == 0)
                         actual_port = std.mem.bigToNative(u16, sa.port);
                 },
             }
@@ -543,27 +643,23 @@ fn acceptLoop(self: *TcpTransport) void {
         var client_addr: posix.sockaddr.storage = undefined;
         var client_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
 
-        const conn_fd_c = c.accept(
-            @intCast(listen_fd),
-            @ptrCast(&client_addr),
-            &client_len,
-        );
-        if (conn_fd_c < 0) {
+        const conn_fd = socketAccept(listen_fd, &client_addr, &client_len) orelse {
             if (self.stopping.load(.acquire)) return;
-            const err = posix.errno(conn_fd_c);
+            const err = posix.errno(@as(c_int, -1));
             if (err == .INTR or err == .AGAIN) continue :outer;
             log.transport.warn("tcp: accept error: {}", .{err});
             return;
-        }
-        const conn_fd: posix.socket_t = @intCast(conn_fd_c);
+        };
+
+        setSockNoSigPipe(conn_fd);
 
         const remote = sockaddrToRemoteKey(@ptrCast(&client_addr)) orelse {
-            _ = c.close(@intCast(conn_fd));
+            socketClose(conn_fd);
             continue;
         };
 
         const conn = self.alloc.create(TcpConnection) catch {
-            _ = c.close(@intCast(conn_fd));
+            socketClose(conn_fd);
             continue;
         };
         conn.* = .{
@@ -577,7 +673,7 @@ fn acceptLoop(self: *TcpTransport) void {
         };
 
         conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{conn}) catch {
-            _ = c.close(@intCast(conn_fd));
+            socketClose(conn_fd);
             self.alloc.destroy(conn);
             continue;
         };
@@ -626,13 +722,12 @@ fn recvLoop(conn: *TcpConnection) void {
 
 fn bindListenTcp(bind_address: []const u8, port: u16, family: AddrFamily) !posix.socket_t {
     const af: u32 = if (family == .v4) posix.AF.INET else posix.AF.INET6;
-    const fd_c = c.socket(@intCast(af), posix.SOCK.STREAM, 0);
-    if (fd_c < 0) return error.SocketCreateFailed;
-    const fd: posix.socket_t = @intCast(fd_c);
-    errdefer _ = c.close(@intCast(fd));
+    const fd = try socketCreate(af, posix.SOCK.STREAM);
+    errdefer socketClose(fd);
 
     var opt: i32 = 1;
-    _ = c.setsockopt(@intCast(fd), posix.SOL.SOCKET, posix.SO.REUSEADDR, &opt, @sizeOf(i32));
+    _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &opt, @sizeOf(i32));
+    setSockNoSigPipe(fd);
 
     switch (family) {
         .v4 => {
@@ -645,7 +740,7 @@ fn bindListenTcp(bind_address: []const u8, port: u16, family: AddrFamily) !posix
                 .port = std.mem.nativeToBig(u16, port),
                 .addr = bind_ip,
             };
-            if (c.bind(@intCast(fd), @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0)
+            if (c.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0)
                 return error.BindFailed;
         },
         .v6 => {
@@ -660,21 +755,21 @@ fn bindListenTcp(bind_address: []const u8, port: u16, family: AddrFamily) !posix
                 .addr = bind_ip,
                 .scope_id = 0,
             };
-            if (c.bind(@intCast(fd), @ptrCast(&addr), @sizeOf(posix.sockaddr.in6)) != 0)
+            if (c.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in6)) != 0)
                 return error.BindFailed;
         },
     }
 
-    if (c.listen(@intCast(fd), 16) != 0) return error.ListenFailed;
+    if (c.listen(fd, 16) != 0) return error.ListenFailed;
     return fd;
 }
 
 fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey) !*TcpConnection {
-    const family: u32 = if (key.family == .v4) posix.AF.INET else posix.AF.INET6;
-    const fd_c = c.socket(@intCast(family), posix.SOCK.STREAM, 0);
-    if (fd_c < 0) return error.SocketCreateFailed;
-    const fd: posix.socket_t = @intCast(fd_c);
-    errdefer _ = c.close(@intCast(fd));
+    const af: u32 = if (key.family == .v4) posix.AF.INET else posix.AF.INET6;
+    const fd = try socketCreate(af, posix.SOCK.STREAM);
+    errdefer socketClose(fd);
+
+    setSockNoSigPipe(fd);
 
     switch (key.family) {
         .v4 => {
@@ -683,7 +778,7 @@ fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey) !*TcpConnection {
                 .port = std.mem.nativeToBig(u16, key.port),
                 .addr = @bitCast(key.addr[0..4].*),
             };
-            if (c.connect(@intCast(fd), @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0)
+            if (c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) != 0)
                 return error.ConnectFailed;
         },
         .v6 => {
@@ -694,7 +789,7 @@ fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey) !*TcpConnection {
                 .addr = key.addr,
                 .scope_id = 0,
             };
-            if (c.connect(@intCast(fd), @ptrCast(&addr), @sizeOf(posix.sockaddr.in6)) != 0)
+            if (c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in6)) != 0)
                 return error.ConnectFailed;
         },
     }
