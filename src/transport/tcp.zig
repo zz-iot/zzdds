@@ -56,6 +56,25 @@ const SO_NOSIGPIPE: u32 = switch (builtin.os.tag) {
     else => 0,
 };
 
+// ── Windows WSAPoll wrapper ───────────────────────────────────────────────────
+// posix.pollfd and posix.POLL are broken on Windows in Zig 0.16.0 (ws2_32.zig
+// does not declare pollfd or POLL). Use WSAPoll directly on Windows.
+
+const WinPoll = if (builtin.os.tag == .windows) struct {
+    const WSAPOLLFD = extern struct {
+        fd: usize, // Windows SOCKET = UINT_PTR; @intFromPtr(posix.socket_t) gives this
+        events: i16,
+        revents: i16,
+    };
+    const POLLIN: i16 = 0x0300; // POLLRDNORM | POLLRDBAND
+
+    extern "ws2_32" fn WSAPoll(
+        fdArray: [*]WSAPOLLFD,
+        fds: std.os.windows.ULONG,
+        timeout: c_int,
+    ) callconv(.winapi) c_int;
+} else struct {};
+
 // ── Windows Winsock initialisation ───────────────────────────────────────────
 // Winsock requires WSAStartup before any socket call. Call once lazily.
 
@@ -102,8 +121,11 @@ fn socketShutdown(fd: posix.socket_t, how: c_int) void {
 /// stopping flag to distinguish shutdown from real errors).
 fn socketAccept(fd: posix.socket_t, addr: *posix.sockaddr.storage, len: *posix.socklen_t) ?posix.socket_t {
     const conn = c.accept(fd, @ptrCast(addr), len);
-    if (conn == INVALID_SOCKET) return null;
-    return conn;
+    if (conn < 0) return null;
+    if (comptime builtin.os.tag == .windows) {
+        return @ptrFromInt(@as(usize, @intCast(conn)));
+    }
+    return @intCast(conn);
 }
 
 /// Set SO_NOSIGPIPE on newly created sockets on macOS/BSD so that writes to a
@@ -631,14 +653,25 @@ fn acceptLoop(self: *TcpTransport) void {
         };
 
         // Poll with timeout so we check the stopping flag every 50 ms.
-        var pfds = [1]posix.pollfd{.{
-            .fd = listen_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch break;
-        if (n_ready == 0) continue; // timeout — re-check stopping
-        if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP/POLLNVAL
+        if (comptime builtin.os.tag == .windows) {
+            var pfds = [1]WinPoll.WSAPOLLFD{.{
+                .fd = @intFromPtr(listen_fd),
+                .events = WinPoll.POLLIN,
+                .revents = 0,
+            }};
+            const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
+            if (n <= 0) continue;
+            if (pfds[0].revents & WinPoll.POLLIN == 0) break;
+        } else {
+            var pfds = [1]posix.pollfd{.{
+                .fd = listen_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch break;
+            if (n_ready == 0) continue; // timeout — re-check stopping
+            if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP/POLLNVAL
+        }
 
         var client_addr: posix.sockaddr.storage = undefined;
         var client_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
@@ -691,14 +724,25 @@ fn acceptLoop(self: *TcpTransport) void {
 fn recvLoop(conn: *TcpConnection) void {
     outer: while (!conn.owner.stopping.load(.acquire)) {
         // Poll with timeout so the stopping flag is checked every 50 ms.
-        var pfds = [1]posix.pollfd{.{
-            .fd = conn.fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch break;
-        if (n_ready == 0) continue; // timeout
-        if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP
+        if (comptime builtin.os.tag == .windows) {
+            var pfds = [1]WinPoll.WSAPOLLFD{.{
+                .fd = @intFromPtr(conn.fd),
+                .events = WinPoll.POLLIN,
+                .revents = 0,
+            }};
+            const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
+            if (n <= 0) continue;
+            if (pfds[0].revents & WinPoll.POLLIN == 0) break;
+        } else {
+            var pfds = [1]posix.pollfd{.{
+                .fd = conn.fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch break;
+            if (n_ready == 0) continue; // timeout
+            if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP
+        }
 
         var len_buf: [4]u8 = undefined;
         readExact(conn.fd, &len_buf) catch break :outer;

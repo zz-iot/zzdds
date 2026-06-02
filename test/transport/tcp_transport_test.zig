@@ -391,6 +391,73 @@ test "tcp transport: vtSend rejects message larger than MAX_MSG_LEN" {
     try testing.expectError(error.MessageTooLarge, t.send(&dest, huge));
 }
 
+// ── vtSend to non-listening port returns ConnectFailed ───────────────────────
+
+test "tcp transport: vtSend returns ConnectFailed when no server" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+    // Port 1 is privileged and never has a listener in test environments.
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
+    try testing.expectError(error.ConnectFailed, t.send(&dest, "hello"));
+}
+
+// ── vtListen BindFailed rolls back handler ────────────────────────────────────
+
+test "tcp transport: vtListen BindFailed rolls back registered handler" {
+    const alloc = testing.allocator;
+    // 192.0.2.x is TEST-NET-1 (RFC 5737): routable but never local, so bind fails.
+    const tcp = try TcpTransport.init(alloc, .{ .bind_address = "192.0.2.1" });
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+    const loc = Locator.tcp4(.{ 192, 0, 2, 1 }, 0);
+    try testing.expectError(error.BindFailed, t.listen(&loc, h));
+
+    // Handler must have been rolled back — handlers list must be empty.
+    tcp.handler_mu.lock();
+    defer tcp.handler_mu.unlock();
+    try testing.expectEqual(@as(usize, 0), tcp.handlers.items.len);
+}
+
+// ── IPv6 with empty bind_address defaults to ::1 for advertisement ────────────
+
+test "tcp transport: IPv6 listen with empty bind_address advertises ::1" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{}); // bind_address = ""
+    defer tcp.deinit();
+    const st = tcp.transport();
+
+    var lo6 = std.mem.zeroes([16]u8);
+    lo6[15] = 1; // ::1
+    const port = listenAndGetPortV6(st, (ReceiveHandler{
+        .ctx = @as(*anyopaque, @ptrCast(&lo6)),
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    }), alloc) catch |err| switch (err) {
+        error.BindFailed => return, // IPv6 not available on this host
+        else => return err,
+    };
+
+    var locs: std.ArrayListUnmanaged(Locator) = .empty;
+    defer locs.deinit(alloc);
+    try st.unicastLocators(&locs, alloc);
+    try testing.expectEqual(@as(usize, 1), locs.items.len);
+    try testing.expect(locs.items[0] == .tcp_v6);
+    // empty bind_address → listen_addr defaults to ::1
+    try testing.expectEqual(@as(u8, 1), locs.items[0].tcp_v6.addr[15]);
+    try testing.expectEqual(port, locs.items[0].tcp_v6.port);
+}
+
 // ── Connection recovery: re-dial after connection close ──────────────────────
 
 test "tcp transport: connection recovery after fd close" {
