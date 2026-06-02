@@ -230,12 +230,23 @@ fn writeAll(fd: posix.socket_t, data: []const u8) !void {
 pub const TcpConnection = struct {
     alloc: std.mem.Allocator,
     fd: posix.socket_t,
+    /// Guards exactly-once close of `fd`. Both recvLoop (natural peer disconnect)
+    /// and deinit (forced shutdown) may try to close; the CAS ensures only one
+    /// succeeds and prevents double-close / fd-reuse hazards.
+    fd_open: std.atomic.Value(bool),
     remote: RemoteKey,
     send_mu: Mutex,
     recv_thread: std.Thread,
     thread_started: bool,
     owner: *TcpTransport,
 };
+
+/// Close `conn.fd` exactly once. Safe to call from both recvLoop and deinit.
+fn closeConnFdOnce(conn: *TcpConnection) void {
+    if (conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
+        socketClose(conn.fd);
+    }
+}
 
 // ── TcpTransport ──────────────────────────────────────────────────────────────
 
@@ -311,8 +322,11 @@ pub const TcpTransport = struct {
                 self.listen_fd = null;
             }
             for (self.all_connections.items) |conn| {
-                socketShutdown(conn.fd, SHUT_RDWR);
-                socketClose(conn.fd);
+                // Only shutdown+close if recvLoop hasn't already closed the fd.
+                if (conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
+                    socketShutdown(conn.fd, SHUT_RDWR);
+                    socketClose(conn.fd);
+                }
             }
         }
 
@@ -697,7 +711,10 @@ fn acceptLoop(self: *TcpTransport) void {
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
-            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch break;
+            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch |err| {
+                if (err == error.SignalInterrupt) continue :outer;
+                break;
+            };
             if (n_ready == 0) continue; // timeout — re-check stopping
             if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP/POLLNVAL
         }
@@ -730,6 +747,7 @@ fn acceptLoop(self: *TcpTransport) void {
         conn.* = .{
             .alloc = self.alloc,
             .fd = conn_fd,
+            .fd_open = std.atomic.Value(bool).init(true),
             .remote = remote,
             .send_mu = .{},
             .recv_thread = undefined,
@@ -786,7 +804,10 @@ fn recvLoop(conn: *TcpConnection) void {
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
-            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch break;
+            const n_ready = posix.poll(&pfds, POLL_TIMEOUT_MS) catch |err| {
+                if (err == error.SignalInterrupt) continue :outer;
+                break;
+            };
             if (n_ready == 0) continue; // timeout
             if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP
         }
@@ -807,6 +828,9 @@ fn recvLoop(conn: *TcpConnection) void {
     }
 
     conn.owner.removeConnection(conn);
+    // Close the fd immediately to release the OS resource. deinit will skip
+    // the close for this connection (fd_open CAS will return false).
+    closeConnFdOnce(conn);
 }
 
 // ── Socket helpers ────────────────────────────────────────────────────────────
@@ -889,6 +913,7 @@ fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey) !*TcpConnection {
     conn.* = .{
         .alloc = alloc,
         .fd = fd,
+        .fd_open = std.atomic.Value(bool).init(true),
         .remote = key,
         .send_mu = .{},
         .recv_thread = undefined,
