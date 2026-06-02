@@ -367,6 +367,19 @@ pub const TcpTransport = struct {
         for (snap[0..count]) |h| h.on_receive(h.ctx, data, src);
     }
 
+    /// Remove `handler` from the handlers list. Used by vtListen error paths
+    /// and vtUnlisten. Must be called WITHOUT conn_mu held.
+    fn rollbackHandler(self: *Self, handler: ReceiveHandler) void {
+        self.handler_mu.lock();
+        defer self.handler_mu.unlock();
+        for (self.handlers.items, 0..) |h, i| {
+            if (h.ctx == handler.ctx) {
+                _ = self.handlers.swapRemove(i);
+                break;
+            }
+        }
+    }
+
     fn removeConnection(self: *Self, conn: *TcpConnection) void {
         self.conn_mu.lock();
         defer self.conn_mu.unlock();
@@ -534,38 +547,23 @@ pub const TcpTransport = struct {
         };
         self.handler_mu.unlock();
 
+        // Use explicit unlocks (no defer) so conn_mu is always released before
+        // handler_mu is acquired — keeping a consistent lock ordering throughout.
         self.conn_mu.lock();
-        defer self.conn_mu.unlock();
 
         if (self.listen_fd != null) {
-            // port=0 means "any"; otherwise must match the listening port.
             if (port != 0 and self.listen_port != port) {
-                // Roll back the handler we just registered.
-                self.handler_mu.lock();
-                for (self.handlers.items, 0..) |h, i| {
-                    if (h.ctx == handler.ctx) {
-                        _ = self.handlers.swapRemove(i);
-                        break;
-                    }
-                }
-                self.handler_mu.unlock();
+                self.conn_mu.unlock();
+                self.rollbackHandler(handler);
                 return error.PortConflict;
             }
+            self.conn_mu.unlock();
             return; // already listening; handler added above
         }
 
         const fd = bindListenTcp(self.config.bind_address, port, family) catch |err| {
-            // Use ctx-equality scan rather than a last-index remove: a concurrent
-            // vtUnlisten could have called swapRemove between our append and this
-            // rollback, shifting which entry is at the tail.
-            self.handler_mu.lock();
-            for (self.handlers.items, 0..) |h, i| {
-                if (h.ctx == handler.ctx) {
-                    _ = self.handlers.swapRemove(i);
-                    break;
-                }
-            }
-            self.handler_mu.unlock();
+            self.conn_mu.unlock();
+            self.rollbackHandler(handler);
             return err;
         };
         self.listen_fd = fd;
@@ -618,20 +616,17 @@ pub const TcpTransport = struct {
         }
 
         self.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{self}) catch |err| {
-            // Roll back all committed state so the caller can retry cleanly.
+            // Clean up committed listen state under conn_mu, then release before
+            // taking handler_mu to maintain consistent lock ordering.
             socketClose(fd);
             self.listen_fd = null;
             self.listen_port = 0;
-            self.handler_mu.lock();
-            for (self.handlers.items, 0..) |h, i| {
-                if (h.ctx == handler.ctx) {
-                    _ = self.handlers.swapRemove(i);
-                    break;
-                }
-            }
-            self.handler_mu.unlock();
+            self.conn_mu.unlock();
+            self.rollbackHandler(handler);
             return err;
         };
+
+        self.conn_mu.unlock();
     }
 
     fn vtJoinMulticast(_: *anyopaque, _: *const Locator) anyerror!void {
