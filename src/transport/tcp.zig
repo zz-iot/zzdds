@@ -353,10 +353,16 @@ pub const TcpTransport = struct {
         for (snap[0..count]) |h| h.on_receive(h.ctx, data, src);
     }
 
-    fn removeConnection(self: *Self, key: RemoteKey) void {
+    fn removeConnection(self: *Self, conn: *TcpConnection) void {
         self.conn_mu.lock();
         defer self.conn_mu.unlock();
-        _ = self.connections.remove(key);
+        // Only remove the entry if the map still points to this exact connection.
+        // A replacement may have been inserted at the same key before this call
+        // (e.g. the old recv thread exits after vtSend already re-dialed) — in
+        // that case we must not evict the new connection.
+        if (self.connections.get(conn.remote)) |stored| {
+            if (stored == conn) _ = self.connections.remove(conn.remote);
+        }
     }
 
     /// Return an existing connection for `key` (or a same-host connection when
@@ -477,7 +483,7 @@ pub const TcpTransport = struct {
         // under the original key (e.g. port_A), not the requested key (port_B).
         // Removing by `key` would be a no-op, leaving the dead entry in the map
         // and causing ensureConnection to return the same dead connection again.
-        self.removeConnection(conn.remote);
+        self.removeConnection(conn);
         const new_conn = try self.ensureConnection(key);
 
         std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
@@ -800,7 +806,7 @@ fn recvLoop(conn: *TcpConnection) void {
         conn.owner.dispatchToHandlers(buf, src);
     }
 
-    conn.owner.removeConnection(conn.remote);
+    conn.owner.removeConnection(conn);
 }
 
 // ── Socket helpers ────────────────────────────────────────────────────────────

@@ -402,7 +402,7 @@ test "tcp transport: vtSend rejects message larger than MAX_MSG_LEN" {
 
 // ── vtSend to non-listening port returns ConnectFailed ───────────────────────
 
-test "tcp transport: vtSend returns ConnectFailed when no server" {
+test "tcp transport: vtSend returns ConnectFailed when no server (IPv4)" {
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});
     defer tcp.deinit();
@@ -412,9 +412,25 @@ test "tcp transport: vtSend returns ConnectFailed when no server" {
     try testing.expectError(error.ConnectFailed, t.send(&dest, "hello"));
 }
 
+test "tcp transport: vtSend returns ConnectFailed when no server (IPv6)" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+    var lo6 = std.mem.zeroes([16]u8);
+    lo6[15] = 1; // ::1
+    const dest = Locator.tcp6(lo6, 1);
+    t.send(&dest, "hello") catch |err| switch (err) {
+        error.ConnectFailed => return, // expected
+        error.SocketCreateFailed => return, // IPv6 not available on this host
+        else => return err,
+    };
+    return error.ExpectedConnectFailed;
+}
+
 // ── vtListen BindFailed rolls back handler ────────────────────────────────────
 
-test "tcp transport: vtListen BindFailed rolls back registered handler" {
+test "tcp transport: vtListen BindFailed rolls back registered handler (IPv4)" {
     const alloc = testing.allocator;
     // 192.0.2.x is TEST-NET-1 (RFC 5737): routable but never local, so bind fails.
     const tcp = try TcpTransport.init(alloc, .{ .bind_address = "192.0.2.1" });
@@ -432,6 +448,41 @@ test "tcp transport: vtListen BindFailed rolls back registered handler" {
     try testing.expectError(error.BindFailed, t.listen(&loc, h));
 
     // Handler must have been rolled back — handlers list must be empty.
+    tcp.handler_mu.lock();
+    defer tcp.handler_mu.unlock();
+    try testing.expectEqual(@as(usize, 0), tcp.handlers.items.len);
+}
+
+test "tcp transport: vtListen BindFailed rolls back registered handler (IPv6)" {
+    const alloc = testing.allocator;
+    // 2001:db8::/32 is the documentation prefix (RFC 3849): valid IPv6 syntax
+    // but not assigned to any local interface, so bind fails with EADDRNOTAVAIL.
+    const tcp = try TcpTransport.init(alloc, .{ .bind_address = "2001:db8::1" });
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+    var doc6 = std.mem.zeroes([16]u8);
+    // 2001:db8::1
+    doc6[0] = 0x20;
+    doc6[1] = 0x01;
+    doc6[2] = 0x0d;
+    doc6[3] = 0xb8;
+    doc6[15] = 1;
+    const loc = Locator.tcp6(doc6, 0);
+    t.listen(&loc, h) catch |err| switch (err) {
+        error.BindFailed => {}, // expected — address not assigned locally
+        error.SocketCreateFailed => return, // IPv6 not available on this host
+        else => return err,
+    };
+
+    // Handler must have been rolled back.
     tcp.handler_mu.lock();
     defer tcp.handler_mu.unlock();
     try testing.expectEqual(@as(usize, 0), tcp.handlers.items.len);
