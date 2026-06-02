@@ -472,7 +472,12 @@ pub const TcpTransport = struct {
         }
 
         // Write failed — remove the dead connection and re-dial once.
-        self.removeConnection(key);
+        // Use conn.remote (the actual stored key) rather than `key`: when the
+        // connection was obtained via reuse_connection_by_host, it is stored
+        // under the original key (e.g. port_A), not the requested key (port_B).
+        // Removing by `key` would be a no-op, leaving the dead entry in the map
+        // and causing ensureConnection to return the same dead connection again.
+        self.removeConnection(conn.remote);
         const new_conn = try self.ensureConnection(key);
 
         std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
@@ -585,7 +590,18 @@ pub const TcpTransport = struct {
             },
         }
 
-        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        self.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{self}) catch |err| {
+            // Roll back all committed state so the caller can retry cleanly.
+            socketClose(fd);
+            self.listen_fd = null;
+            self.listen_port = 0;
+            self.handler_mu.lock();
+            for (self.handlers.items, 0..) |h, i| {
+                if (h.ctx == handler.ctx) { _ = self.handlers.swapRemove(i); break; }
+            }
+            self.handler_mu.unlock();
+            return err;
+        };
     }
 
     fn vtJoinMulticast(_: *anyopaque, _: *const Locator) anyerror!void {
