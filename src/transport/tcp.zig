@@ -359,6 +359,76 @@ pub const TcpTransport = struct {
         _ = self.connections.remove(key);
     }
 
+    /// Return an existing connection for `key` (or a same-host connection when
+    /// reuse_connection_by_host is set), dialing a new one if none exists.
+    ///
+    /// The blocking `connect()` syscall is made WITHOUT holding conn_mu so that
+    /// concurrent sends to other peers, deinit, and acceptLoop are not blocked.
+    /// A TOCTOU race (two threads both see no connection and both dial) is resolved
+    /// by a re-check under the lock after dialing: the loser closes its socket and
+    /// returns the winner's connection.
+    fn ensureConnection(self: *Self, key: RemoteKey) !*TcpConnection {
+        // Fast path: connection already exists.
+        {
+            self.conn_mu.lock();
+            defer self.conn_mu.unlock();
+            if (self.connections.get(key)) |conn| return conn;
+            if (self.config.reuse_connection_by_host) {
+                if (self.findConnectionByHostLocked(key.addr, key.family)) |conn| return conn;
+            }
+        }
+
+        // Slow path: dial without holding conn_mu.
+        const new_conn = try dialConnection(self.alloc, key);
+        new_conn.owner = self;
+        new_conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{new_conn}) catch |err| {
+            socketClose(new_conn.fd);
+            self.alloc.destroy(new_conn);
+            return err;
+        };
+        new_conn.thread_started = true;
+
+        // Re-acquire to insert; handle concurrent dial (TOCTOU).
+        self.conn_mu.lock();
+
+        // Re-check: another thread may have connected to the same peer while we dialed.
+        const existing: ?*TcpConnection = self.connections.get(key) orelse
+            if (self.config.reuse_connection_by_host)
+                self.findConnectionByHostLocked(key.addr, key.family)
+            else
+                null;
+
+        if (existing) |winner_conn| {
+            // Lost the race — discard our connection and use the winner's.
+            socketShutdown(new_conn.fd, SHUT_RDWR);
+            self.conn_mu.unlock();
+            new_conn.recv_thread.join();
+            socketClose(new_conn.fd);
+            self.alloc.destroy(new_conn);
+            return winner_conn;
+        }
+
+        self.connections.put(self.alloc, key, new_conn) catch |err| {
+            socketShutdown(new_conn.fd, SHUT_RDWR);
+            self.conn_mu.unlock();
+            new_conn.recv_thread.join();
+            socketClose(new_conn.fd);
+            self.alloc.destroy(new_conn);
+            return err;
+        };
+        self.all_connections.append(self.alloc, new_conn) catch |err| {
+            _ = self.connections.remove(key);
+            socketShutdown(new_conn.fd, SHUT_RDWR);
+            self.conn_mu.unlock();
+            new_conn.recv_thread.join();
+            socketClose(new_conn.fd);
+            self.alloc.destroy(new_conn);
+            return err;
+        };
+        self.conn_mu.unlock();
+        return new_conn;
+    }
+
     fn findConnectionByHostLocked(self: *Self, addr: [16]u8, family: AddrFamily) ?*TcpConnection {
         var it = self.connections.valueIterator();
         while (it.next()) |conn_ptr| {
@@ -385,53 +455,9 @@ pub const TcpTransport = struct {
         if (data.len > MAX_MSG_LEN) return error.MessageTooLarge;
         const key = locatorToRemoteKey(loc) orelse return error.UnsupportedLocator;
 
-        self.conn_mu.lock();
+        const conn = try self.ensureConnection(key);
 
-        var conn_opt = self.connections.get(key);
-
-        if (conn_opt == null and self.config.reuse_connection_by_host) {
-            conn_opt = self.findConnectionByHostLocked(key.addr, key.family);
-        }
-
-        if (conn_opt == null) {
-            const new_conn = dialConnection(self.alloc, key) catch |err| {
-                self.conn_mu.unlock();
-                return err;
-            };
-            new_conn.owner = self;
-            new_conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{new_conn}) catch |err| {
-                socketClose(new_conn.fd);
-                self.alloc.destroy(new_conn);
-                self.conn_mu.unlock();
-                return err;
-            };
-            new_conn.thread_started = true;
-            // On OOM below: shutdown interrupts the recv thread, unlock before join
-            // to avoid deadlock (recv thread acquires conn_mu via removeConnection).
-            self.connections.put(self.alloc, key, new_conn) catch |err| {
-                socketShutdown(new_conn.fd, SHUT_RDWR);
-                self.conn_mu.unlock();
-                new_conn.recv_thread.join();
-                socketClose(new_conn.fd);
-                self.alloc.destroy(new_conn);
-                return err;
-            };
-            self.all_connections.append(self.alloc, new_conn) catch |err| {
-                _ = self.connections.remove(key);
-                socketShutdown(new_conn.fd, SHUT_RDWR);
-                self.conn_mu.unlock();
-                new_conn.recv_thread.join();
-                socketClose(new_conn.fd);
-                self.alloc.destroy(new_conn);
-                return err;
-            };
-            conn_opt = new_conn;
-        }
-
-        const conn = conn_opt.?;
-        self.conn_mu.unlock();
-
-        // Try to send. If the write fails (stale connection), remove it and re-dial once.
+        // Try to send. If the write fails (stale connection), remove and re-dial once.
         var len_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
         {
@@ -445,39 +471,9 @@ pub const TcpTransport = struct {
             if (send_ok) return;
         }
 
-        // Write failed — connection is dead. Remove it and re-dial once.
+        // Write failed — remove the dead connection and re-dial once.
         self.removeConnection(key);
-        self.conn_mu.lock();
-        const new_conn = dialConnection(self.alloc, key) catch |err| {
-            self.conn_mu.unlock();
-            return err;
-        };
-        new_conn.owner = self;
-        new_conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{new_conn}) catch |err| {
-            socketClose(new_conn.fd);
-            self.alloc.destroy(new_conn);
-            self.conn_mu.unlock();
-            return err;
-        };
-        new_conn.thread_started = true;
-        self.connections.put(self.alloc, key, new_conn) catch |err| {
-            socketShutdown(new_conn.fd, SHUT_RDWR);
-            self.conn_mu.unlock();
-            new_conn.recv_thread.join();
-            socketClose(new_conn.fd);
-            self.alloc.destroy(new_conn);
-            return err;
-        };
-        self.all_connections.append(self.alloc, new_conn) catch |err| {
-            _ = self.connections.remove(key);
-            socketShutdown(new_conn.fd, SHUT_RDWR);
-            self.conn_mu.unlock();
-            new_conn.recv_thread.join();
-            socketClose(new_conn.fd);
-            self.alloc.destroy(new_conn);
-            return err;
-        };
-        self.conn_mu.unlock();
+        const new_conn = try self.ensureConnection(key);
 
         std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
         new_conn.send_mu.lock();
