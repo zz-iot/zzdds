@@ -378,6 +378,15 @@ test "tcp transport: vtListen PortConflict rolls back handler" {
 
 // ── MessageTooLarge on oversized send ─────────────────────────────────────────
 
+test "tcp transport: vtSend rejects empty message" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
+    try testing.expectError(error.EmptyMessage, t.send(&dest, &.{}));
+}
+
 test "tcp transport: vtSend rejects message larger than MAX_MSG_LEN" {
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{});

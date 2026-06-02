@@ -381,6 +381,7 @@ pub const TcpTransport = struct {
 
     fn vtSend(ctx: *anyopaque, loc: *const Locator, data: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (data.len == 0) return error.EmptyMessage; // 0-length prefix triggers fatal framing error in recvLoop
         if (data.len > MAX_MSG_LEN) return error.MessageTooLarge;
         const key = locatorToRemoteKey(loc) orelse return error.UnsupportedLocator;
 
@@ -713,8 +714,23 @@ fn acceptLoop(self: *TcpTransport) void {
         conn.thread_started = true;
 
         self.conn_mu.lock();
-        self.connections.put(self.alloc, remote, conn) catch {};
-        self.all_connections.append(self.alloc, conn) catch {};
+        self.connections.put(self.alloc, remote, conn) catch {
+            socketShutdown(conn.fd, SHUT_RDWR);
+            self.conn_mu.unlock();
+            conn.recv_thread.join();
+            socketClose(conn.fd);
+            self.alloc.destroy(conn);
+            continue;
+        };
+        self.all_connections.append(self.alloc, conn) catch {
+            _ = self.connections.remove(remote);
+            socketShutdown(conn.fd, SHUT_RDWR);
+            self.conn_mu.unlock();
+            conn.recv_thread.join();
+            socketClose(conn.fd);
+            self.alloc.destroy(conn);
+            continue;
+        };
         self.conn_mu.unlock();
     }
 }
