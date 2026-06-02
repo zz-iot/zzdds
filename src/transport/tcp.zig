@@ -423,7 +423,9 @@ pub const TcpTransport = struct {
             socketShutdown(new_conn.fd, SHUT_RDWR);
             self.conn_mu.unlock();
             new_conn.recv_thread.join();
-            socketClose(new_conn.fd);
+            // recvLoop already called closeConnFdOnce before returning; use
+            // the same guard to avoid double-closing a potentially-reused fd.
+            closeConnFdOnce(new_conn);
             self.alloc.destroy(new_conn);
             return winner_conn;
         }
@@ -432,7 +434,7 @@ pub const TcpTransport = struct {
             socketShutdown(new_conn.fd, SHUT_RDWR);
             self.conn_mu.unlock();
             new_conn.recv_thread.join();
-            socketClose(new_conn.fd);
+            closeConnFdOnce(new_conn);
             self.alloc.destroy(new_conn);
             return err;
         };
@@ -441,7 +443,7 @@ pub const TcpTransport = struct {
             socketShutdown(new_conn.fd, SHUT_RDWR);
             self.conn_mu.unlock();
             new_conn.recv_thread.join();
-            socketClose(new_conn.fd);
+            closeConnFdOnce(new_conn);
             self.alloc.destroy(new_conn);
             return err;
         };
@@ -498,6 +500,11 @@ pub const TcpTransport = struct {
         // Removing by `key` would be a no-op, leaving the dead entry in the map
         // and causing ensureConnection to return the same dead connection again.
         self.removeConnection(conn);
+        // Mark the old fd as closed before re-dialing. ensureConnection may
+        // get the same fd number back from the OS. If the old recv thread
+        // later calls closeConnFdOnce, the CAS will see fd_open=false and
+        // skip the close, preventing it from closing the reused fd.
+        closeConnFdOnce(conn);
         const new_conn = try self.ensureConnection(key);
 
         std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
