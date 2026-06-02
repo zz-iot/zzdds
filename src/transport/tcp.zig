@@ -523,9 +523,16 @@ pub const TcpTransport = struct {
         }
 
         const fd = bindListenTcp(self.config.bind_address, port, family) catch |err| {
+            // Use ctx-equality scan rather than a last-index remove: a concurrent
+            // vtUnlisten could have called swapRemove between our append and this
+            // rollback, shifting which entry is at the tail.
             self.handler_mu.lock();
-            const n = self.handlers.items.len;
-            if (n > 0) _ = self.handlers.swapRemove(n - 1);
+            for (self.handlers.items, 0..) |h, i| {
+                if (h.ctx == handler.ctx) {
+                    _ = self.handlers.swapRemove(i);
+                    break;
+                }
+            }
             self.handler_mu.unlock();
             return err;
         };
@@ -677,8 +684,11 @@ fn acceptLoop(self: *TcpTransport) void {
             if (self.stopping.load(.acquire)) return;
             const err = posix.errno(@as(c_int, -1));
             if (err == .INTR or err == .AGAIN) continue :outer;
-            log.transport.warn("tcp: accept error: {}", .{err});
-            return;
+            // Transient errors (ECONNABORTED, EMFILE, ENOBUFS, …) should be
+            // retried; a permanent shutdown is signalled by the stopping flag
+            // or listen_fd going null, both checked at the top of the loop.
+            log.transport.warn("tcp: transient accept error: {}", .{err});
+            continue :outer;
         };
 
         setSockNoSigPipe(conn_fd);
