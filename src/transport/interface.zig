@@ -345,6 +345,10 @@ pub const LocatorChangeHandler = struct {
     on_change: *const fn (ctx: *anyopaque) void,
 };
 
+/// Maximum number of receive handlers supported by transports that snapshot
+/// handlers into fixed stack storage before dispatch.
+pub const MAX_RECEIVE_HANDLERS: usize = 64;
+
 // ── Transport vtable ──────────────────────────────────────────────────────────
 
 /// The Transport plugin vtable.

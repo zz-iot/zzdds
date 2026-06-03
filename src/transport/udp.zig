@@ -61,7 +61,6 @@ const IPV6_MULTICAST_IF: i32 = switch (builtin.os.tag) {
 };
 // IPPROTO_IPV6 = 41 on all platforms (ws2_32.IPPROTO has no IPV6 member in Zig 0.16.0).
 const IPPROTO_IPV6: i32 = 41;
-const MAX_RECEIVE_HANDLERS: usize = 64;
 
 const iface = @import("interface.zig");
 const schema = @import("../config/schema.zig");
@@ -74,6 +73,7 @@ pub const Transport = iface.Transport;
 pub const ReceiveHandler = iface.ReceiveHandler;
 pub const LocatorChangeHandler = iface.LocatorChangeHandler;
 pub const InterfaceMonitor = iface.InterfaceMonitor;
+const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
 // ── Windows Winsock initialisation ───────────────────────────────────────────
 // Winsock requires WSAStartup before any socket call. We call it once lazily.
