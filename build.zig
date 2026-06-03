@@ -198,6 +198,7 @@ pub fn build(b: *std.Build) void {
     const transport_test_files = [_][]const u8{
         "test/transport/transport_interface_test.zig",
         "test/transport/lossy_transport_test.zig",
+        "test/transport/tcp_transport_test.zig",
     };
     for (transport_test_files) |src| {
         const t = b.addTest(.{

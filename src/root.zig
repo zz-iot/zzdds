@@ -27,6 +27,7 @@ fn logFn(
 
 pub const transport = @import("transport/interface.zig");
 pub const udp_transport = @import("transport/udp.zig");
+pub const tcp_transport = @import("transport/tcp.zig");
 pub const mock_transport = @import("transport/mock.zig");
 pub const memory_transport = @import("transport/memory.zig");
 pub const lossy_transport = @import("transport/lossy.zig");
@@ -58,6 +59,7 @@ test {
     _ = @import("config/resolve.zig");
     _ = @import("transport/interface.zig");
     _ = @import("transport/udp.zig");
+    _ = @import("transport/tcp.zig");
     _ = @import("transport/mock.zig");
     _ = @import("transport/memory.zig");
     _ = @import("transport/lossy.zig");

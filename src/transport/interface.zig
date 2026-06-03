@@ -21,6 +21,10 @@ pub const LocatorKind = struct {
     pub const udp_v6: i32 = 2;
     pub const shmem: i32 = 0x01000000;
     pub const shmem_zc: i32 = 0x01000001;
+    /// Vendor-specific TCP/IPv4 locator kind (not yet IANA/OMG assigned).
+    pub const tcp_v4: i32 = 0x00000010;
+    /// Vendor-specific TCP/IPv6 locator kind (not yet IANA/OMG assigned).
+    pub const tcp_v6: i32 = 0x00000011;
 };
 
 // ── LocatorWire ───────────────────────────────────────────────────────────────
@@ -64,6 +68,14 @@ pub const LocatorWire = extern struct {
                 .host_id = std.mem.readInt(u64, self.address[0..8], .little),
                 .writer_entity = self.address[8..12].*,
             } },
+            LocatorKind.tcp_v4 => .{ .tcp_v4 = .{
+                .addr = self.address[12..16].*,
+                .port = @as(u16, @truncate(self.port)),
+            } },
+            LocatorKind.tcp_v6 => .{ .tcp_v6 = .{
+                .addr = self.address,
+                .port = @as(u16, @truncate(self.port)),
+            } },
             else => .{ .custom = .{
                 .kind = self.kind,
                 .port = self.port,
@@ -87,12 +99,16 @@ pub const Locator = union(enum) {
     udp_v6: Udp6,
     shmem: Shmem,
     shmem_zc: ShmemZc,
+    tcp_v4: Tcp4,
+    tcp_v6: Tcp6,
     custom: Custom,
 
     pub const Udp4 = struct { addr: [4]u8, port: u16 };
     pub const Udp6 = struct { addr: [16]u8, port: u16 };
     pub const Shmem = struct { host_id: u64, channel_id: u32 };
     pub const ShmemZc = struct { host_id: u64, writer_entity: [4]u8 };
+    pub const Tcp4 = struct { addr: [4]u8, port: u16 };
+    pub const Tcp6 = struct { addr: [16]u8, port: u16 };
     pub const Custom = struct { kind: i32, port: u32, address: [16]u8 };
 
     /// Construct a UDP/IPv4 locator.
@@ -103,6 +119,16 @@ pub const Locator = union(enum) {
     /// Construct a UDP/IPv6 locator.
     pub fn udp6(addr: [16]u8, port: u16) Locator {
         return .{ .udp_v6 = .{ .addr = addr, .port = port } };
+    }
+
+    /// Construct a TCP/IPv4 locator.
+    pub fn tcp4(addr: [4]u8, port: u16) Locator {
+        return .{ .tcp_v4 = .{ .addr = addr, .port = port } };
+    }
+
+    /// Construct a TCP/IPv6 locator.
+    pub fn tcp6(addr: [16]u8, port: u16) Locator {
+        return .{ .tcp_v6 = .{ .addr = addr, .port = port } };
     }
 
     /// True if this locator represents a multicast group address.
@@ -127,6 +153,8 @@ pub const Locator = union(enum) {
             .udp_v6 => LocatorKind.udp_v6,
             .shmem => LocatorKind.shmem,
             .shmem_zc => LocatorKind.shmem_zc,
+            .tcp_v4 => LocatorKind.tcp_v4,
+            .tcp_v6 => LocatorKind.tcp_v6,
             .custom => |c| c.kind,
         };
     }
@@ -191,6 +219,23 @@ pub const Locator = union(enum) {
                 w.address[10] = s.writer_entity[2];
                 w.address[11] = s.writer_entity[3];
                 break :blk w;
+            },
+            .tcp_v4 => |t| blk: {
+                var w = LocatorWire{
+                    .kind = LocatorKind.tcp_v4,
+                    .port = @as(u32, t.port),
+                    .address = std.mem.zeroes([16]u8),
+                };
+                w.address[12] = t.addr[0];
+                w.address[13] = t.addr[1];
+                w.address[14] = t.addr[2];
+                w.address[15] = t.addr[3];
+                break :blk w;
+            },
+            .tcp_v6 => |t| .{
+                .kind = LocatorKind.tcp_v6,
+                .port = @as(u32, t.port),
+                .address = t.addr,
             },
             .custom => |c| .{
                 .kind = c.kind,

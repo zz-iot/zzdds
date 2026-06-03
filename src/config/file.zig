@@ -25,7 +25,7 @@ pub const Error = error{
 
 // ── Section state machine ─────────────────────────────────────────────────────
 
-const Section = enum { root, domain, participant, transport_udp, discovery, qos_defaults };
+const Section = enum { root, domain, participant, transport_udp, transport_tcp, discovery, qos_defaults };
 
 fn parseSection(line: []const u8) ?Section {
     // line is already trimmed; starts with '[', must end with ']'
@@ -34,6 +34,7 @@ fn parseSection(line: []const u8) ?Section {
     if (eql(name, "domain")) return .domain;
     if (eql(name, "participant")) return .participant;
     if (eql(name, "transport.udp")) return .transport_udp;
+    if (eql(name, "transport.tcp")) return .transport_tcp;
     if (eql(name, "discovery")) return .discovery;
     if (eql(name, "qos.defaults")) return .qos_defaults;
     return null; // unknown section → skip
@@ -152,6 +153,13 @@ fn applyField(
                 cfg.transport.udp.recv_buffer_size = try parseU32(val);
             } else if (eql(key, "interface_poll_interval_ms")) {
                 cfg.transport.udp.interface_poll_interval_ms = try parseU32(val);
+            } else return error.UnknownKey;
+        },
+        .transport_tcp => {
+            if (eql(key, "bind_address")) {
+                cfg.transport.tcp.bind_address = try parseString(allocator, val);
+            } else if (eql(key, "reuse_connection_by_host")) {
+                cfg.transport.tcp.reuse_connection_by_host = try parseBool(val);
             } else return error.UnknownKey;
         },
         .discovery => {
@@ -546,6 +554,126 @@ test "parse port overrides" {
     try std.testing.expectEqual(@as(?u16, 9002), cfg.transport.udp.data_unicast_port);
     try std.testing.expectEqual(@as(?u16, 9003), cfg.transport.udp.meta_multicast_port);
     try std.testing.expectEqual(@as(?u16, 9004), cfg.transport.udp.data_multicast_port);
+}
+
+test "parse transport.udp gain and offset scalars" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = schema.Config{};
+    try apply(arena.allocator(), &cfg,
+        \\[transport.udp]
+        \\ipv4_enabled = false
+        \\domain_gain = 300
+        \\participant_gain = 4
+        \\meta_multicast_offset = 2
+        \\meta_unicast_offset = 12
+        \\data_multicast_offset = 3
+        \\data_unicast_offset = 13
+        \\interface_poll_interval_ms = 10000
+        \\multicast_group_v4 = "239.255.1.1"
+        \\multicast_group_v6 = "ff02::2"
+    );
+    try std.testing.expectEqual(false, cfg.transport.udp.ipv4_enabled);
+    try std.testing.expectEqual(@as(u16, 300), cfg.transport.udp.domain_gain);
+    try std.testing.expectEqual(@as(u16, 4), cfg.transport.udp.participant_gain);
+    try std.testing.expectEqual(@as(u16, 2), cfg.transport.udp.meta_multicast_offset);
+    try std.testing.expectEqual(@as(u16, 12), cfg.transport.udp.meta_unicast_offset);
+    try std.testing.expectEqual(@as(u16, 3), cfg.transport.udp.data_multicast_offset);
+    try std.testing.expectEqual(@as(u16, 13), cfg.transport.udp.data_unicast_offset);
+    try std.testing.expectEqual(@as(u32, 10000), cfg.transport.udp.interface_poll_interval_ms);
+    try std.testing.expectEqualStrings("239.255.1.1", cfg.transport.udp.multicast_group_v4);
+    try std.testing.expectEqualStrings("ff02::2", cfg.transport.udp.multicast_group_v6);
+}
+
+test "string escape sequences: backslash, newline, tab, carriage return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = schema.Config{};
+    try apply(arena.allocator(), &cfg,
+        \\[participant]
+        \\name = "a\\b\nc\td\re"
+    );
+    try std.testing.expectEqualStrings("a\\b\nc\td\re", cfg.participant.name);
+}
+
+test "string escape: unknown escape sequence returns InvalidValue" {
+    var cfg = schema.Config{};
+    try std.testing.expectError(error.InvalidValue, apply(std.testing.allocator, &cfg,
+        \\[participant]
+        \\name = "\z"
+    ));
+}
+
+test "string escape: unquoted value returns InvalidValue" {
+    var cfg = schema.Config{};
+    try std.testing.expectError(error.InvalidValue, apply(std.testing.allocator, &cfg,
+        \\[participant]
+        \\name = notquoted
+    ));
+}
+
+test "invalid value propagates as error (not silently skipped)" {
+    var cfg = schema.Config{};
+    try std.testing.expectError(error.InvalidValue, apply(std.testing.allocator, &cfg,
+        \\[transport.udp]
+        \\port_base = notanumber
+    ));
+}
+
+test "parse transport.tcp fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = schema.Config{};
+    try apply(arena.allocator(), &cfg,
+        \\[transport.tcp]
+        \\bind_address = "127.0.0.1"
+        \\reuse_connection_by_host = false
+    );
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.transport.tcp.bind_address);
+    try std.testing.expectEqual(false, cfg.transport.tcp.reuse_connection_by_host);
+}
+
+test "unknown key in transport.tcp section is skipped" {
+    var cfg = schema.Config{};
+    try apply(std.testing.allocator, &cfg,
+        \\[transport.tcp]
+        \\unknown_field = 42
+    );
+}
+
+test "unknown key in participant section is skipped" {
+    var cfg = schema.Config{};
+    try apply(std.testing.allocator, &cfg,
+        \\[participant]
+        \\unknown_field = 42
+    );
+}
+
+test "unknown key in discovery section is skipped" {
+    var cfg = schema.Config{};
+    try apply(std.testing.allocator, &cfg,
+        \\[discovery]
+        \\unknown_field = 42
+    );
+}
+
+test "unknown key in qos.defaults section is skipped" {
+    var cfg = schema.Config{};
+    try apply(std.testing.allocator, &cfg,
+        \\[qos.defaults]
+        \\unknown_field = 42
+    );
+}
+
+test "load() reads a TOML file from disk" {
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "zzdds_file_load_test.toml";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[domain]\nid = 77\n" });
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var cfg = schema.Config{};
+    try load(alloc, &cfg, path);
+    try std.testing.expectEqual(@as(u32, 77), cfg.domain.id);
 }
 
 test "parse port override null resets override" {

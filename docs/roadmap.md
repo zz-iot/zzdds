@@ -84,6 +84,18 @@ First step: fix `Cryptographic.encode_payload` to use a tagged-union return (see
 **DDS-XTypes v1.3** — TypeObject/TypeIdentifier/TypeMapping; required for type-safe
 cross-vendor type discovery.
 
+**Transport dispatch-snapshot cap** — `UdpTransport` (`PortEntry.dispatch`) and
+`TcpTransport` (`dispatchToHandlers`) snapshot registered handlers into a 64-element
+stack array before calling them, so dispatch can release the handler lock without
+holding it across callbacks. The cap is currently enforced with a `std.debug.assert`.
+64 handlers per port is sufficient for any realistic deployment today (one handler per
+participant sharing the transport), but the design should be revisited before the
+factory pattern makes it easy to spin up large numbers of participants. Options: a
+small inline-storage type that falls back to a heap buffer only when the inline array
+overflows (similar to a small-vector), or a two-phase dispatch that re-acquires the
+lock between calls with a generation counter to detect concurrent mutations. The goal
+is to remove the hard cap without introducing a heap allocation on the common path.
+
 **`swapRemove` / `orderedRemove` audit** — several hot paths use `orderedRemove` on
 `ArrayListUnmanaged` to delete a single element from the middle of a list, which is O(N) per
 call and O(N²) in loops.  The pattern is pre-existing and fine for the small lists seen
@@ -119,7 +131,7 @@ existing suite should be extended to cover the condvar path.
 - **GroupPresentation** (PRESENTATION QoS `access_scope = GROUP`) — deferred.
 - **Platform-specific InterfaceMonitors** — `monitor/netlink.zig` (Linux) and
   `monitor/pf_route.zig` (macOS) deferred; polling monitor is sufficient.
-- **TCP / SHMEM transports** — deferred; UDP covers current use cases.
+- **SHMEM transport** — deferred; UDP covers current use cases.
 - **Other protocol/discovery plugins** — QUIC, MQTT, custom hardware channels, and
   mDNS/DNS-SD are extension points only; no v1 implementation is planned.
 - **PKCS#11** — out of scope for v1; security plugin interface must not preclude it.
