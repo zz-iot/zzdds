@@ -186,9 +186,10 @@ test "tcp transport: fan-out to two handlers" {
 
 // ── Connection reuse by host ──────────────────────────────────────────────────
 
-test "tcp transport: connection reuse by host" {
+test "tcp transport: default does not reuse by host" {
     const alloc = testing.allocator;
 
+    var count_a: usize = 0;
     var count_b: usize = 0;
     const Counter = struct {
         n: *usize,
@@ -200,23 +201,73 @@ test "tcp transport: connection reuse by host" {
             return .{ .ctx = self, .on_receive = f };
         }
     };
+    var ca = Counter{ .n = &count_a };
     var cb = Counter{ .n = &count_b };
 
-    // Two servers on different OS-assigned ports (simulating discovery vs data port).
     const server_a = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server_a.deinit();
     const server_b = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server_b.deinit();
 
-    const port_a = try listenAndGetPort(server_a.transport(), cb.handler(), alloc);
+    const port_a = try listenAndGetPort(server_a.transport(), ca.handler(), alloc);
     const port_b = try listenAndGetPort(server_b.transport(), cb.handler(), alloc);
 
-    defer server_a.transport().unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port_a), cb.handler());
+    defer server_a.transport().unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port_a), ca.handler());
     defer server_b.transport().unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port_b), cb.handler());
 
     sleepMs(20);
 
-    // Client with reuse_connection_by_host = true (default).
+    const client = try TcpTransport.init(alloc, .{});
+    defer client.deinit();
+    const ct = client.transport();
+
+    const loc_a = Locator.tcp4(.{ 127, 0, 0, 1 }, port_a);
+    const loc_b = Locator.tcp4(.{ 127, 0, 0, 1 }, port_b);
+
+    try ct.send(&loc_a, "a");
+    try ct.send(&loc_b, "b");
+    sleepMs(100);
+
+    try testing.expectEqual(@as(usize, 1), count_a);
+    try testing.expectEqual(@as(usize, 1), count_b);
+    {
+        client.conn_mu.lock();
+        defer client.conn_mu.unlock();
+        try testing.expectEqual(@as(usize, 2), client.connections.count());
+    }
+}
+
+test "tcp transport: connection reuse by host is opt-in" {
+    const alloc = testing.allocator;
+
+    var count_a: usize = 0;
+    var count_b: usize = 0;
+    const Counter = struct {
+        n: *usize,
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.n.* += 1;
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = f };
+        }
+    };
+    var ca = Counter{ .n = &count_a };
+    var cb = Counter{ .n = &count_b };
+
+    const server_a = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server_a.deinit();
+    const server_b = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server_b.deinit();
+
+    const port_a = try listenAndGetPort(server_a.transport(), ca.handler(), alloc);
+    const port_b = try listenAndGetPort(server_b.transport(), cb.handler(), alloc);
+
+    defer server_a.transport().unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port_a), ca.handler());
+    defer server_b.transport().unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port_b), cb.handler());
+
+    sleepMs(20);
+
     const client = try TcpTransport.init(alloc, .{ .reuse_connection_by_host = true });
     defer client.deinit();
     const ct = client.transport();
@@ -224,18 +275,12 @@ test "tcp transport: connection reuse by host" {
     const loc_a = Locator.tcp4(.{ 127, 0, 0, 1 }, port_a);
     const loc_b = Locator.tcp4(.{ 127, 0, 0, 1 }, port_b);
 
-    // First send: dials server_a → establishes one connection.
     try ct.send(&loc_a, "discovery");
-    sleepMs(50);
-    {
-        client.conn_mu.lock();
-        defer client.conn_mu.unlock();
-        try testing.expectEqual(@as(usize, 1), client.connections.count());
-    }
-
-    // Second send to same host but different port: reuses the existing connection.
     try ct.send(&loc_b, "data");
-    sleepMs(50);
+    sleepMs(100);
+
+    try testing.expectEqual(@as(usize, 2), count_a);
+    try testing.expectEqual(@as(usize, 0), count_b);
     {
         client.conn_mu.lock();
         defer client.conn_mu.unlock();
@@ -290,6 +335,35 @@ test "tcp transport: unicastLocators before and after listen" {
     try testing.expectEqual(@as(usize, 1), locs.items.len);
     try testing.expectEqual(@as(u8, 127), locs.items[0].tcp_v4.addr[0]);
     try testing.expect(locs.items[0].tcp_v4.port > 0);
+}
+
+test "tcp transport: unlisten last handler stops listener" {
+    const alloc = testing.allocator;
+
+    const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+
+    const port = try listenAndGetPort(t, h, alloc);
+    const listen_loc = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+    t.unlisten(&listen_loc, h);
+
+    var locs: std.ArrayListUnmanaged(Locator) = .empty;
+    defer locs.deinit(alloc);
+    try t.unicastLocators(&locs, alloc);
+    try testing.expectEqual(@as(usize, 0), locs.items.len);
+
+    const client = try TcpTransport.init(alloc, .{});
+    defer client.deinit();
+    try testing.expectError(error.ConnectFailed, client.transport().send(&listen_loc, "after unlisten"));
 }
 
 // ── vtClose via Transport interface ──────────────────────────────────────────
@@ -374,6 +448,53 @@ test "tcp transport: vtListen PortConflict rolls back handler" {
     defer tcp.handler_mu.unlock();
     try testing.expectEqual(@as(usize, 1), tcp.handlers.items.len);
     try testing.expectEqual(sentinel_a, @as(*u8, @ptrCast(@alignCast(tcp.handlers.items[0].ctx))).*);
+}
+
+test "tcp transport: vtListen rejects different address family on active listener" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    var sentinel_a: u8 = 0;
+    var sentinel_b: u8 = 0;
+    const noop = struct {
+        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+    }.f;
+    const ha = iface.ReceiveHandler{ .ctx = &sentinel_a, .on_receive = noop };
+    const hb = iface.ReceiveHandler{ .ctx = &sentinel_b, .on_receive = noop };
+
+    const port = try listenAndGetPort(t, ha, alloc);
+    defer t.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), ha);
+
+    var lo6 = std.mem.zeroes([16]u8);
+    lo6[15] = 1;
+    try testing.expectError(error.PortConflict, t.listen(&Locator.tcp6(lo6, port), hb));
+}
+
+test "tcp transport: vtListen rejects more than 64 handlers" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    var ctxs: [65]u8 = undefined;
+    const noop = struct {
+        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+    }.f;
+
+    var loc = Locator.tcp4(.{ 127, 0, 0, 1 }, 0);
+    try t.listen(&loc, .{ .ctx = &ctxs[0], .on_receive = noop });
+    var locs: std.ArrayListUnmanaged(Locator) = .empty;
+    defer locs.deinit(alloc);
+    try t.unicastLocators(&locs, alloc);
+    loc = Locator.tcp4(.{ 127, 0, 0, 1 }, locs.items[0].tcp_v4.port);
+
+    var i: usize = 1;
+    while (i < 64) : (i += 1) {
+        try t.listen(&loc, .{ .ctx = &ctxs[i], .on_receive = noop });
+    }
+    try testing.expectError(error.TooManyHandlers, t.listen(&loc, .{ .ctx = &ctxs[64], .on_receive = noop }));
 }
 
 // ── MessageTooLarge on oversized send ─────────────────────────────────────────
@@ -488,9 +609,9 @@ test "tcp transport: vtListen BindFailed rolls back registered handler (IPv6)" {
     try testing.expectEqual(@as(usize, 0), tcp.handlers.items.len);
 }
 
-// ── IPv6 with empty bind_address defaults to ::1 for advertisement ────────────
+// ── Empty bind_address uses the concrete listen locator for advertisement ─────
 
-test "tcp transport: IPv6 listen with empty bind_address advertises ::1" {
+test "tcp transport: IPv6 listen with empty bind_address advertises locator address" {
     const alloc = testing.allocator;
     const tcp = try TcpTransport.init(alloc, .{}); // bind_address = ""
     defer tcp.deinit();
@@ -513,9 +634,24 @@ test "tcp transport: IPv6 listen with empty bind_address advertises ::1" {
     try st.unicastLocators(&locs, alloc);
     try testing.expectEqual(@as(usize, 1), locs.items.len);
     try testing.expect(locs.items[0] == .tcp_v6);
-    // empty bind_address → listen_addr defaults to ::1
     try testing.expectEqual(@as(u8, 1), locs.items[0].tcp_v6.addr[15]);
     try testing.expectEqual(port, locs.items[0].tcp_v6.port);
+}
+
+test "tcp transport: empty bind_address rejects wildcard advertise locator" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+    try testing.expectError(error.WildcardAdvertiseAddress, t.listen(&Locator.tcp4(.{ 0, 0, 0, 0 }, 0), h));
 }
 
 // ── Connection recovery: re-dial after connection close ──────────────────────

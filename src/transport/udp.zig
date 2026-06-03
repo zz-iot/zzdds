@@ -61,6 +61,7 @@ const IPV6_MULTICAST_IF: i32 = switch (builtin.os.tag) {
 };
 // IPPROTO_IPV6 = 41 on all platforms (ws2_32.IPPROTO has no IPV6 member in Zig 0.16.0).
 const IPPROTO_IPV6: i32 = 41;
+const MAX_RECEIVE_HANDLERS: usize = 64;
 
 const iface = @import("interface.zig");
 const schema = @import("../config/schema.zig");
@@ -272,6 +273,7 @@ const PortEntry = struct {
     fn addHandler(self: *PortEntry, h: ReceiveHandler) !void {
         self.mu.lock();
         defer self.mu.unlock();
+        if (self.handlers.items.len >= MAX_RECEIVE_HANDLERS) return error.TooManyHandlers;
         try self.handlers.append(self.alloc, h);
     }
 
@@ -292,7 +294,7 @@ const PortEntry = struct {
     fn dispatch(ctx: *anyopaque, buf: []const u8, src: Locator) void {
         const self: *PortEntry = @ptrCast(@alignCast(ctx));
         // Snapshot handler list under mu so we can call without holding mu.
-        var snap: [64]ReceiveHandler = undefined;
+        var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
         var count: usize = 0;
         {
             self.mu.lock();

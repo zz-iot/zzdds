@@ -11,7 +11,7 @@
 //! handles both discovery and user data — no meta/data port distinction at
 //! the transport level.
 //!
-//! Connection reuse: when reuse_connection_by_host is set (default), vtSend
+//! Connection reuse: when reuse_connection_by_host is set, vtSend
 //! to a remote (host, port_B) reuses an existing connection to (host, port_A)
 //! rather than opening a second TCP stream. Useful when the discovery locator
 //! and the data locator resolve to the same physical host.
@@ -41,6 +41,7 @@ pub const LocatorChangeHandler = iface.LocatorChangeHandler;
 
 const MAX_MSG_LEN: u32 = 4 * 1024 * 1024; // 4 MiB sanity cap
 const POLL_TIMEOUT_MS: i32 = 50;
+const MAX_RECEIVE_HANDLERS: usize = 64;
 
 // SHUT_RDWR: used to interrupt blocking accept()/recv() during shutdown.
 const SHUT_RDWR: c_int = 2;
@@ -145,6 +146,14 @@ fn parseIpv4(s: []const u8) ![4]u8 {
 
 fn parseIpv6(s: []const u8) ![16]u8 {
     return (try std.Io.net.Ip6Address.parse(s, 0)).bytes;
+}
+
+fn isZeroV4(addr: [4]u8) bool {
+    return std.mem.eql(u8, &addr, &[_]u8{0} ** 4);
+}
+
+fn isZeroV6(addr: [16]u8) bool {
+    return std.mem.eql(u8, &addr, &[_]u8{0} ** 16);
 }
 
 // ── RemoteKey ─────────────────────────────────────────────────────────────────
@@ -353,7 +362,7 @@ pub const TcpTransport = struct {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn dispatchToHandlers(self: *Self, data: []const u8, src: Locator) void {
-        var snap: [64]ReceiveHandler = undefined;
+        var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
         var count: usize = 0;
         {
             self.handler_mu.lock();
@@ -378,6 +387,30 @@ pub const TcpTransport = struct {
                 break;
             }
         }
+    }
+
+    fn removeHandler(self: *Self, handler: ReceiveHandler) bool {
+        self.handler_mu.lock();
+        defer self.handler_mu.unlock();
+        for (self.handlers.items, 0..) |h, i| {
+            if (h.ctx == handler.ctx) {
+                _ = self.handlers.swapRemove(i);
+                break;
+            }
+        }
+        return self.handlers.items.len == 0;
+    }
+
+    fn closeListenerLocked(self: *Self) ?std.Thread {
+        if (self.listen_fd) |fd| {
+            socketShutdown(fd, SHUT_RDWR);
+            socketClose(fd);
+            self.listen_fd = null;
+        }
+        self.listen_port = 0;
+        const t = self.accept_thread;
+        self.accept_thread = null;
+        return t;
     }
 
     fn removeConnection(self: *Self, conn: *TcpConnection) void {
@@ -541,6 +574,10 @@ pub const TcpTransport = struct {
         };
 
         self.handler_mu.lock();
+        if (self.handlers.items.len >= MAX_RECEIVE_HANDLERS) {
+            self.handler_mu.unlock();
+            return error.TooManyHandlers;
+        }
         self.handlers.append(self.alloc, handler) catch |err| {
             self.handler_mu.unlock();
             return err;
@@ -552,6 +589,11 @@ pub const TcpTransport = struct {
         self.conn_mu.lock();
 
         if (self.listen_fd != null) {
+            if (self.listen_family != family) {
+                self.conn_mu.unlock();
+                self.rollbackHandler(handler);
+                return error.PortConflict;
+            }
             if (port != 0 and self.listen_port != port) {
                 self.conn_mu.unlock();
                 self.rollbackHandler(handler);
@@ -589,28 +631,43 @@ pub const TcpTransport = struct {
         self.listen_port = actual_port;
         self.listen_family = family;
 
-        // Resolve advertisement address from config or fall back to loopback.
+        // Resolve advertisement address from config, or from the concrete listen
+        // locator when the socket binds all interfaces. Avoid advertising loopback
+        // just because bind_address is empty.
         self.listen_addr = std.mem.zeroes([16]u8);
         const ba = self.config.bind_address;
         switch (family) {
             .v4 => {
                 const ip: [4]u8 = if (ba.len > 0)
-                    (parseIpv4(ba) catch .{ 127, 0, 0, 1 })
-                else
-                    .{ 127, 0, 0, 1 };
+                    parseIpv4(ba) catch unreachable
+                else switch (locator.*) {
+                    .tcp_v4 => |l| if (isZeroV4(l.addr)) {
+                        socketShutdown(fd, SHUT_RDWR);
+                        socketClose(fd);
+                        self.listen_fd = null;
+                        self.listen_port = 0;
+                        self.conn_mu.unlock();
+                        self.rollbackHandler(handler);
+                        return error.WildcardAdvertiseAddress;
+                    } else l.addr,
+                    else => unreachable,
+                };
                 @memcpy(self.listen_addr[0..4], &ip);
             },
             .v6 => {
                 self.listen_addr = if (ba.len > 0)
-                    (parseIpv6(ba) catch blk: {
-                        var lo6 = std.mem.zeroes([16]u8);
-                        lo6[15] = 1;
-                        break :blk lo6;
-                    })
-                else blk: {
-                    var lo6 = std.mem.zeroes([16]u8);
-                    lo6[15] = 1; // ::1
-                    break :blk lo6;
+                    parseIpv6(ba) catch unreachable
+                else switch (locator.*) {
+                    .tcp_v6 => |l| if (isZeroV6(l.addr)) {
+                        socketShutdown(fd, SHUT_RDWR);
+                        socketClose(fd);
+                        self.listen_fd = null;
+                        self.listen_port = 0;
+                        self.conn_mu.unlock();
+                        self.rollbackHandler(handler);
+                        return error.WildcardAdvertiseAddress;
+                    } else l.addr,
+                    else => unreachable,
                 };
             },
         }
@@ -637,14 +694,16 @@ pub const TcpTransport = struct {
 
     fn vtUnlisten(ctx: *anyopaque, _: *const Locator, handler: ReceiveHandler) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.handler_mu.lock();
-        defer self.handler_mu.unlock();
-        for (self.handlers.items, 0..) |h, i| {
-            if (h.ctx == handler.ctx) {
-                _ = self.handlers.swapRemove(i);
-                break;
-            }
+        if (!self.removeHandler(handler)) return;
+
+        var accept_thread: ?std.Thread = null;
+        self.conn_mu.lock();
+        if (!self.stopping.load(.acquire)) {
+            accept_thread = self.closeListenerLocked();
         }
+        self.conn_mu.unlock();
+
+        if (accept_thread) |t| t.join();
     }
 
     fn vtUnicastLocators(ctx: *anyopaque, out: *std.ArrayListUnmanaged(Locator), alloc: std.mem.Allocator) anyerror!void {
