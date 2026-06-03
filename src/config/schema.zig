@@ -74,9 +74,9 @@ pub const TcpConfig = struct {
     bind_address: []const u8 = "",
 
     /// When true, attempt to reuse an existing connection to a remote host even if
-    /// the locator port differs from the currently connected port. Allows a discovery
-    /// connection (to meta port) to carry user data without opening a second stream.
-    reuse_connection_by_host: bool = true,
+    /// the locator port differs from the currently connected port. This is unsafe
+    /// when multiple participants share one host, so it is opt-in.
+    reuse_connection_by_host: bool = false,
 };
 
 pub const UdpConfig = struct {

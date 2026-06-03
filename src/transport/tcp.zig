@@ -11,7 +11,7 @@
 //! handles both discovery and user data — no meta/data port distinction at
 //! the transport level.
 //!
-//! Connection reuse: when reuse_connection_by_host is set (default), vtSend
+//! Connection reuse: when reuse_connection_by_host is set, vtSend
 //! to a remote (host, port_B) reuses an existing connection to (host, port_A)
 //! rather than opening a second TCP stream. Useful when the discovery locator
 //! and the data locator resolve to the same physical host.
@@ -36,6 +36,7 @@ pub const LocatorKind = iface.LocatorKind;
 pub const Transport = iface.Transport;
 pub const ReceiveHandler = iface.ReceiveHandler;
 pub const LocatorChangeHandler = iface.LocatorChangeHandler;
+const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -147,6 +148,14 @@ fn parseIpv6(s: []const u8) ![16]u8 {
     return (try std.Io.net.Ip6Address.parse(s, 0)).bytes;
 }
 
+fn isZeroV4(addr: [4]u8) bool {
+    return std.mem.eql(u8, &addr, &[_]u8{0} ** 4);
+}
+
+fn isZeroV6(addr: [16]u8) bool {
+    return std.mem.eql(u8, &addr, &[_]u8{0} ** 16);
+}
+
 // ── RemoteKey ─────────────────────────────────────────────────────────────────
 
 /// Hash-map key: identifies a remote TCP endpoint.
@@ -254,7 +263,7 @@ pub const TcpTransport = struct {
     alloc: std.mem.Allocator,
     config: schema.TcpConfig,
 
-    /// Guards connections, all_connections, listen_fd, listen_port.
+    /// Guards connections, all_connections, listen_fd, listen_port, listen_* state.
     conn_mu: Mutex,
     /// Active connections keyed by remote endpoint (for vtSend lookup).
     connections: std.AutoHashMapUnmanaged(RemoteKey, *TcpConnection),
@@ -275,6 +284,9 @@ pub const TcpTransport = struct {
     /// Resolved bind address for locator advertisement.
     /// IPv4: bytes [0..4]; IPv6: all 16 bytes. Set in vtListen from bind_address or defaults.
     listen_addr: [16]u8,
+    /// Incremented whenever the listen socket lifecycle changes. Accept threads
+    /// use this to detect closed/reopened listeners even if the OS reuses fd values.
+    listen_generation: u64,
 
     accept_thread: ?std.Thread,
     stopping: std.atomic.Value(bool),
@@ -298,6 +310,7 @@ pub const TcpTransport = struct {
             .listen_port = 0,
             .listen_family = .v4,
             .listen_addr = std.mem.zeroes([16]u8),
+            .listen_generation = 0,
             .accept_thread = null,
             .stopping = std.atomic.Value(bool).init(false),
             .lch_mu = .{},
@@ -313,14 +326,11 @@ pub const TcpTransport = struct {
         // blocked in accept() or recv() on these fds. A bare close() leaves
         // blocked threads running indefinitely (per POSIX §2.9.7; same on
         // Windows with Winsock).
+        var accept_thread: ?std.Thread = null;
         {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
-            if (self.listen_fd) |fd| {
-                socketShutdown(fd, SHUT_RDWR);
-                socketClose(fd);
-                self.listen_fd = null;
-            }
+            accept_thread = self.closeListenerLocked();
             for (self.all_connections.items) |conn| {
                 // Only shutdown+close if recvLoop hasn't already closed the fd.
                 if (conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
@@ -330,7 +340,7 @@ pub const TcpTransport = struct {
             }
         }
 
-        if (self.accept_thread) |t| t.join();
+        if (accept_thread) |t| t.join();
 
         // Join recv threads then free. Recv threads may call removeConnection
         // (acquires conn_mu) after their fd is closed — conn_mu is released
@@ -353,7 +363,7 @@ pub const TcpTransport = struct {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn dispatchToHandlers(self: *Self, data: []const u8, src: Locator) void {
-        var snap: [64]ReceiveHandler = undefined;
+        var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
         var count: usize = 0;
         {
             self.handler_mu.lock();
@@ -367,17 +377,43 @@ pub const TcpTransport = struct {
         for (snap[0..count]) |h| h.on_receive(h.ctx, data, src);
     }
 
-    /// Remove `handler` from the handlers list. Used by vtListen error paths
-    /// and vtUnlisten. Must be called WITHOUT conn_mu held.
-    fn rollbackHandler(self: *Self, handler: ReceiveHandler) void {
-        self.handler_mu.lock();
-        defer self.handler_mu.unlock();
+    fn removeHandlerFromListLocked(self: *Self, handler: ReceiveHandler) void {
         for (self.handlers.items, 0..) |h, i| {
             if (h.ctx == handler.ctx) {
                 _ = self.handlers.swapRemove(i);
                 break;
             }
         }
+    }
+
+    /// Remove `handler` from the handlers list. Used by vtListen error paths.
+    /// May be called with or without conn_mu held; it only takes handler_mu.
+    fn rollbackHandler(self: *Self, handler: ReceiveHandler) void {
+        self.handler_mu.lock();
+        defer self.handler_mu.unlock();
+        self.removeHandlerFromListLocked(handler);
+    }
+
+    fn appendHandlerLocked(self: *Self, handler: ReceiveHandler) !void {
+        self.handler_mu.lock();
+        defer self.handler_mu.unlock();
+        if (self.handlers.items.len >= MAX_RECEIVE_HANDLERS) return error.TooManyHandlers;
+        try self.handlers.append(self.alloc, handler);
+    }
+
+    fn closeListenerLocked(self: *Self) ?std.Thread {
+        if (self.listen_fd) |fd| {
+            socketShutdown(fd, SHUT_RDWR);
+            socketClose(fd);
+            self.listen_fd = null;
+        }
+        self.listen_port = 0;
+        self.listen_family = .v4;
+        self.listen_addr = std.mem.zeroes([16]u8);
+        self.listen_generation +%= 1;
+        const t = self.accept_thread;
+        self.accept_thread = null;
+        return t;
     }
 
     fn removeConnection(self: *Self, conn: *TcpConnection) void {
@@ -540,33 +576,40 @@ pub const TcpTransport = struct {
             else => unreachable,
         };
 
-        self.handler_mu.lock();
-        self.handlers.append(self.alloc, handler) catch |err| {
-            self.handler_mu.unlock();
-            return err;
-        };
-        self.handler_mu.unlock();
-
-        // Use explicit unlocks (no defer) so conn_mu is always released before
-        // handler_mu is acquired — keeping a consistent lock ordering throughout.
         self.conn_mu.lock();
 
         if (self.listen_fd != null) {
-            if (port != 0 and self.listen_port != port) {
+            if (self.listen_family != family) {
                 self.conn_mu.unlock();
-                self.rollbackHandler(handler);
                 return error.PortConflict;
             }
+            if (port != 0 and self.listen_port != port) {
+                self.conn_mu.unlock();
+                return error.PortConflict;
+            }
+            self.appendHandlerLocked(handler) catch |err| {
+                self.conn_mu.unlock();
+                return err;
+            };
             self.conn_mu.unlock();
             return; // already listening; handler added above
         }
 
-        const fd = bindListenTcp(self.config.bind_address, port, family) catch |err| {
+        const advertise_addr = resolveAdvertiseAddress(self.config.bind_address, locator, family) catch |err| {
             self.conn_mu.unlock();
-            self.rollbackHandler(handler);
             return err;
         };
-        self.listen_fd = fd;
+
+        self.appendHandlerLocked(handler) catch |err| {
+            self.conn_mu.unlock();
+            return err;
+        };
+
+        const fd = bindListenTcp(self.config.bind_address, port, family) catch |err| {
+            self.rollbackHandler(handler);
+            self.conn_mu.unlock();
+            return err;
+        };
 
         // When port=0, read back the OS-assigned port via getsockname.
         var actual_port = port;
@@ -586,43 +629,16 @@ pub const TcpTransport = struct {
                 },
             }
         }
+        self.listen_fd = fd;
         self.listen_port = actual_port;
         self.listen_family = family;
-
-        // Resolve advertisement address from config or fall back to loopback.
-        self.listen_addr = std.mem.zeroes([16]u8);
-        const ba = self.config.bind_address;
-        switch (family) {
-            .v4 => {
-                const ip: [4]u8 = if (ba.len > 0)
-                    (parseIpv4(ba) catch .{ 127, 0, 0, 1 })
-                else
-                    .{ 127, 0, 0, 1 };
-                @memcpy(self.listen_addr[0..4], &ip);
-            },
-            .v6 => {
-                self.listen_addr = if (ba.len > 0)
-                    (parseIpv6(ba) catch blk: {
-                        var lo6 = std.mem.zeroes([16]u8);
-                        lo6[15] = 1;
-                        break :blk lo6;
-                    })
-                else blk: {
-                    var lo6 = std.mem.zeroes([16]u8);
-                    lo6[15] = 1; // ::1
-                    break :blk lo6;
-                };
-            },
-        }
+        self.listen_addr = advertise_addr;
+        self.listen_generation +%= 1;
 
         self.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{self}) catch |err| {
-            // Clean up committed listen state under conn_mu, then release before
-            // taking handler_mu to maintain consistent lock ordering.
-            socketClose(fd);
-            self.listen_fd = null;
-            self.listen_port = 0;
-            self.conn_mu.unlock();
+            _ = self.closeListenerLocked();
             self.rollbackHandler(handler);
+            self.conn_mu.unlock();
             return err;
         };
 
@@ -637,14 +653,19 @@ pub const TcpTransport = struct {
 
     fn vtUnlisten(ctx: *anyopaque, _: *const Locator, handler: ReceiveHandler) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        var accept_thread: ?std.Thread = null;
+        self.conn_mu.lock();
         self.handler_mu.lock();
-        defer self.handler_mu.unlock();
-        for (self.handlers.items, 0..) |h, i| {
-            if (h.ctx == handler.ctx) {
-                _ = self.handlers.swapRemove(i);
-                break;
-            }
+        self.removeHandlerFromListLocked(handler);
+        const no_handlers = self.handlers.items.len == 0;
+        self.handler_mu.unlock();
+
+        if (!self.stopping.load(.acquire)) {
+            if (no_handlers) accept_thread = self.closeListenerLocked();
         }
+        self.conn_mu.unlock();
+
+        if (accept_thread) |t| t.join();
     }
 
     fn vtUnicastLocators(ctx: *anyopaque, out: *std.ArrayListUnmanaged(Locator), alloc: std.mem.Allocator) anyerror!void {
@@ -691,16 +712,19 @@ const tcp_vtable = Transport.Vtable{
 
 fn acceptLoop(self: *TcpTransport) void {
     outer: while (!self.stopping.load(.acquire)) {
-        const listen_fd = blk: {
+        const listen_snapshot = blk: {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
-            break :blk self.listen_fd orelse return;
+            break :blk .{
+                .fd = self.listen_fd orelse return,
+                .generation = self.listen_generation,
+            };
         };
 
         // Poll with timeout so we check the stopping flag every 50 ms.
         if (comptime builtin.os.tag == .windows) {
             var pfds = [1]WinPoll.WSAPOLLFD{.{
-                .fd = @intFromPtr(listen_fd),
+                .fd = @intFromPtr(listen_snapshot.fd),
                 .events = WinPoll.POLLIN,
                 .revents = 0,
             }};
@@ -709,7 +733,7 @@ fn acceptLoop(self: *TcpTransport) void {
             if (pfds[0].revents & WinPoll.POLLIN == 0) break;
         } else {
             var pfds = [1]posix.pollfd{.{
-                .fd = listen_fd,
+                .fd = listen_snapshot.fd,
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
@@ -724,7 +748,16 @@ fn acceptLoop(self: *TcpTransport) void {
         var client_addr: posix.sockaddr.storage = undefined;
         var client_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
 
-        const conn_fd = socketAccept(listen_fd, &client_addr, &client_len) orelse {
+        self.conn_mu.lock();
+        if (self.listen_fd == null or
+            self.listen_fd.? != listen_snapshot.fd or
+            self.listen_generation != listen_snapshot.generation)
+        {
+            self.conn_mu.unlock();
+            return;
+        }
+        const conn_fd = socketAccept(listen_snapshot.fd, &client_addr, &client_len) orelse {
+            self.conn_mu.unlock();
             if (self.stopping.load(.acquire)) return;
             const err = posix.errno(@as(c_int, -1));
             if (err == .INTR or err == .AGAIN) continue :outer;
@@ -734,6 +767,7 @@ fn acceptLoop(self: *TcpTransport) void {
             log.transport.warn("tcp: transient accept error: {}", .{err});
             continue :outer;
         };
+        self.conn_mu.unlock();
 
         setSockNoSigPipe(conn_fd);
 
@@ -836,6 +870,30 @@ fn recvLoop(conn: *TcpConnection) void {
 }
 
 // ── Socket helpers ────────────────────────────────────────────────────────────
+
+fn resolveAdvertiseAddress(bind_address: []const u8, locator: *const Locator, family: AddrFamily) ![16]u8 {
+    var out = std.mem.zeroes([16]u8);
+    switch (family) {
+        .v4 => {
+            const ip: [4]u8 = if (bind_address.len > 0)
+                try parseIpv4(bind_address)
+            else switch (locator.*) {
+                .tcp_v4 => |l| if (isZeroV4(l.addr)) return error.WildcardAdvertiseAddress else l.addr,
+                else => unreachable,
+            };
+            @memcpy(out[0..4], &ip);
+        },
+        .v6 => {
+            out = if (bind_address.len > 0)
+                try parseIpv6(bind_address)
+            else switch (locator.*) {
+                .tcp_v6 => |l| if (isZeroV6(l.addr)) return error.WildcardAdvertiseAddress else l.addr,
+                else => unreachable,
+            };
+        },
+    }
+    return out;
+}
 
 fn bindListenTcp(bind_address: []const u8, port: u16, family: AddrFamily) !posix.socket_t {
     const af: u32 = if (family == .v4) posix.AF.INET else posix.AF.INET6;

@@ -73,6 +73,7 @@ pub const Transport = iface.Transport;
 pub const ReceiveHandler = iface.ReceiveHandler;
 pub const LocatorChangeHandler = iface.LocatorChangeHandler;
 pub const InterfaceMonitor = iface.InterfaceMonitor;
+const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
 // ── Windows Winsock initialisation ───────────────────────────────────────────
 // Winsock requires WSAStartup before any socket call. We call it once lazily.
@@ -272,6 +273,7 @@ const PortEntry = struct {
     fn addHandler(self: *PortEntry, h: ReceiveHandler) !void {
         self.mu.lock();
         defer self.mu.unlock();
+        if (self.handlers.items.len >= MAX_RECEIVE_HANDLERS) return error.TooManyHandlers;
         try self.handlers.append(self.alloc, h);
     }
 
@@ -292,7 +294,7 @@ const PortEntry = struct {
     fn dispatch(ctx: *anyopaque, buf: []const u8, src: Locator) void {
         const self: *PortEntry = @ptrCast(@alignCast(ctx));
         // Snapshot handler list under mu so we can call without holding mu.
-        var snap: [64]ReceiveHandler = undefined;
+        var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
         var count: usize = 0;
         {
             self.mu.lock();

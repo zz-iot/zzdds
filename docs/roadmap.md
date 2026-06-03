@@ -87,7 +87,7 @@ cross-vendor type discovery.
 **Transport dispatch-snapshot cap** — `UdpTransport` (`PortEntry.dispatch`) and
 `TcpTransport` (`dispatchToHandlers`) snapshot registered handlers into a 64-element
 stack array before calling them, so dispatch can release the handler lock without
-holding it across callbacks. The cap is currently enforced with a `std.debug.assert`.
+holding it across callbacks. The cap is currently enforced when registering handlers.
 64 handlers per port is sufficient for any realistic deployment today (one handler per
 participant sharing the transport), but the design should be revisited before the
 factory pattern makes it easy to spin up large numbers of participants. Options: a
