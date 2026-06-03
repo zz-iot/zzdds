@@ -1,5 +1,7 @@
 # Zenzen DDS — Zig-native DDS Implementation
 
+[![codecov](https://codecov.io/gh/zz-iot/zzdds/graph/badge.svg)](https://codecov.io/gh/zz-iot/zzdds)
+
 A Zig implementation of OMG DDS v1.4 DCPS with RTPS 2.5 wire interoperability.
 
 ## Goals
