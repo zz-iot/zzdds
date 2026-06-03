@@ -276,7 +276,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen
+          ref: zenzen-v2.1.2026
           path: dds-rtps
 
       - name: Wire packages/zzdds symlink
@@ -336,7 +336,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen
+          ref: zenzen-v2.1.2026
           path: dds-rtps
 
       - name: Wire packages/zzdds symlink
@@ -419,7 +419,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen
+          ref: zenzen-v2.1.2026
           path: dds-rtps
 
       - name: Install Python dependencies
@@ -498,7 +498,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen
+          ref: zenzen-v2.1.2026
           path: dds-rtps
 
       - name: Install Python dependencies
