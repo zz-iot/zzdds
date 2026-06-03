@@ -769,7 +769,7 @@ fn acceptLoop(self: *TcpTransport) void {
             socketShutdown(conn.fd, SHUT_RDWR);
             self.conn_mu.unlock();
             conn.recv_thread.join();
-            socketClose(conn.fd);
+            closeConnFdOnce(conn); // recvLoop may have already closed; CAS prevents double-close
             self.alloc.destroy(conn);
             continue;
         };
@@ -778,7 +778,7 @@ fn acceptLoop(self: *TcpTransport) void {
             socketShutdown(conn.fd, SHUT_RDWR);
             self.conn_mu.unlock();
             conn.recv_thread.join();
-            socketClose(conn.fd);
+            closeConnFdOnce(conn);
             self.alloc.destroy(conn);
             continue;
         };

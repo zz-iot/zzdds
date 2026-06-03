@@ -70,10 +70,6 @@ pub const TransportConfig = struct {
 };
 
 pub const TcpConfig = struct {
-    /// Local port to listen on. null = OS-assigned (not useful for peers that need
-    /// a fixed address to connect to, but fine for outbound-only use).
-    listen_port: ?u16 = null,
-
     /// Interface address to bind the listen socket to. "" = INADDR_ANY (all interfaces).
     bind_address: []const u8 = "",
 

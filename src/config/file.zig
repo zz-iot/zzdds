@@ -25,7 +25,7 @@ pub const Error = error{
 
 // ── Section state machine ─────────────────────────────────────────────────────
 
-const Section = enum { root, domain, participant, transport_udp, discovery, qos_defaults };
+const Section = enum { root, domain, participant, transport_udp, transport_tcp, discovery, qos_defaults };
 
 fn parseSection(line: []const u8) ?Section {
     // line is already trimmed; starts with '[', must end with ']'
@@ -34,6 +34,7 @@ fn parseSection(line: []const u8) ?Section {
     if (eql(name, "domain")) return .domain;
     if (eql(name, "participant")) return .participant;
     if (eql(name, "transport.udp")) return .transport_udp;
+    if (eql(name, "transport.tcp")) return .transport_tcp;
     if (eql(name, "discovery")) return .discovery;
     if (eql(name, "qos.defaults")) return .qos_defaults;
     return null; // unknown section → skip
@@ -152,6 +153,13 @@ fn applyField(
                 cfg.transport.udp.recv_buffer_size = try parseU32(val);
             } else if (eql(key, "interface_poll_interval_ms")) {
                 cfg.transport.udp.interface_poll_interval_ms = try parseU32(val);
+            } else return error.UnknownKey;
+        },
+        .transport_tcp => {
+            if (eql(key, "bind_address")) {
+                cfg.transport.tcp.bind_address = try parseString(allocator, val);
+            } else if (eql(key, "reuse_connection_by_host")) {
+                cfg.transport.tcp.reuse_connection_by_host = try parseBool(val);
             } else return error.UnknownKey;
         },
         .discovery => {
@@ -610,6 +618,27 @@ test "invalid value propagates as error (not silently skipped)" {
         \\[transport.udp]
         \\port_base = notanumber
     ));
+}
+
+test "parse transport.tcp fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = schema.Config{};
+    try apply(arena.allocator(), &cfg,
+        \\[transport.tcp]
+        \\bind_address = "127.0.0.1"
+        \\reuse_connection_by_host = false
+    );
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.transport.tcp.bind_address);
+    try std.testing.expectEqual(false, cfg.transport.tcp.reuse_connection_by_host);
+}
+
+test "unknown key in transport.tcp section is skipped" {
+    var cfg = schema.Config{};
+    try apply(std.testing.allocator, &cfg,
+        \\[transport.tcp]
+        \\unknown_field = 42
+    );
 }
 
 test "unknown key in participant section is skipped" {
