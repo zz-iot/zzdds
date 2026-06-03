@@ -126,11 +126,11 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch)
+      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen
+          ref: zenzen-v2.1.2026
           path: dds-rtps
 
       - name: Wire packages/zzdds symlink

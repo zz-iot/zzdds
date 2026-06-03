@@ -252,7 +252,7 @@ jobs:
   #
   # Checkout layout (relative to $GITHUB_WORKSPACE):
   #   zzdds/      — this repo
-  #   dds-rtps/   — zz-iot/dds-rtps fork, zenzen branch
+  #   dds-rtps/   — zz-iot/dds-rtps fork, zenzen branch based on latest omg-dds/dds-rtps release
   #
   # The packages/zzdds symlink inside zzdds points four levels up:
   #   dds-rtps/srcZig/zzdds/packages/zzdds -> ../../../../zzdds
@@ -272,7 +272,7 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch)
+      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
@@ -332,7 +332,7 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch)
+      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
@@ -415,7 +415,7 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch)
+      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
@@ -494,7 +494,7 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch)
+      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
