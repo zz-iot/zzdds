@@ -404,6 +404,76 @@ test "SEDP: announcement before peer discovery is replayed after onParticipantDi
     try testing.expect(remote.rec.writers_found.items[0].guid.eql(writer_guid));
 }
 
+test "SEDP: WriterAnnouncement with non-default PRESENTATION round-trips correctly" {
+    // Verifies that PID_PRESENTATION (0x0021) is encoded when non-default and that
+    // the decoded QosSnapshot carries the correct access_scope / coherent / ordered
+    // values, guarding against byte-layout regressions.
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x11);
+    var remote = try Participant.init(net, 0x12);
+    defer local.deinit();
+    defer remote.deinit();
+
+    local.discoverPeer(0x12);
+    remote.discoverPeer(0x11);
+
+    try local.sedp.announceWriter(&.{
+        .guid = makeGuid(0x11, 0x10),
+        .participant_guid = makeGuid(0x11, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{
+            .presentation_access_scope = 1, // TOPIC
+            .coherent_access = false,
+            .ordered_access = true,
+        },
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+    const w = &remote.rec.writers_found.items[0];
+    try testing.expectEqual(@as(u8, 1), w.qos.presentation_access_scope);
+    try testing.expectEqual(false, w.qos.coherent_access);
+    try testing.expectEqual(true, w.qos.ordered_access);
+}
+
+test "SEDP: ReaderAnnouncement with non-default PRESENTATION round-trips correctly" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x13);
+    var remote = try Participant.init(net, 0x14);
+    defer local.deinit();
+    defer remote.deinit();
+
+    local.discoverPeer(0x14);
+    remote.discoverPeer(0x13);
+
+    try local.sedp.announceReader(&.{
+        .guid = makeGuid(0x13, 0x20),
+        .participant_guid = makeGuid(0x13, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{
+            .presentation_access_scope = 2, // GROUP
+            .coherent_access = true,
+            .ordered_access = true,
+        },
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 1), remote.rec.readers_found.items.len);
+    const r = &remote.rec.readers_found.items[0];
+    try testing.expectEqual(@as(u8, 2), r.qos.presentation_access_scope);
+    try testing.expectEqual(true, r.qos.coherent_access);
+    try testing.expectEqual(true, r.qos.ordered_access);
+}
+
 test "SEDP: second onParticipantDiscovered replaces proxy without adding a duplicate" {
     // A second onParticipantDiscovered for the same peer (e.g. after SPDP lease
     // re-expiry) replaces the existing proxy in place rather than appending a new

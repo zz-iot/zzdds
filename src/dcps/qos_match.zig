@@ -71,8 +71,10 @@ pub const MatchResult = union(enum) {
 ///   DURABILITY, DEADLINE, LATENCY_BUDGET, OWNERSHIP, LIVELINESS,
 ///   RELIABILITY, DESTINATION_ORDER.
 ///
-/// PRESENTATION and PARTITION are Publisher/Subscriber-level; use
-/// `checkPresentation` and `checkPartition` separately for those.
+/// PRESENTATION (access_scope, coherent/ordered access) is Publisher/Subscriber-
+/// level and is not checked here; use `checkPresentation` directly, or rely on
+/// `checkSnapshots` which embeds PRESENTATION fields from the discovery snapshot.
+/// PARTITION is also Publisher/Subscriber-level; use `checkPartition` separately.
 pub fn checkWriterReader(
     offered: *const qos.DataWriterQos,
     requested: *const qos.DataReaderQos,
@@ -123,13 +125,13 @@ pub fn checkWriterReader(
 /// Compare two QosSnapshots for writer-reader compatibility.
 ///
 /// Covers the policies captured in QosSnapshot: DURABILITY, OWNERSHIP,
-/// LIVELINESS kind, RELIABILITY, DESTINATION_ORDER.
+/// LIVELINESS kind, RELIABILITY, DESTINATION_ORDER, DEADLINE,
+/// DATA_REPRESENTATION, and PRESENTATION (access_scope, coherent_access,
+/// ordered_access).
 ///
-/// DEADLINE, LATENCY_BUDGET, and LIVELINESS.lease_duration are not present in
-/// QosSnapshot and are treated as spec defaults (infinite / zero), which are
-/// always mutually compatible.  If either endpoint configures non-default values
-/// for these policies, the check will not detect the incompatibility; full typed
-/// QoS matching requires extending QosSnapshot (tracked in Phase 22).
+/// LATENCY_BUDGET and LIVELINESS.lease_duration are not present in QosSnapshot
+/// and are treated as spec defaults (infinite / zero), which are always mutually
+/// compatible.
 pub fn checkSnapshots(offered: disc.QosSnapshot, requested: disc.QosSnapshot) MatchResult {
     // DURABILITY: offered.kind >= requested.kind (higher ordinal = stronger guarantee)
     if (offered.durability_kind < requested.durability_kind)
@@ -169,21 +171,16 @@ pub fn checkSnapshots(offered: disc.QosSnapshot, requested: disc.QosSnapshot) Ma
     if (offered.data_representation != requested.data_representation)
         return .{ .incompatible = .data_representation };
 
-    // PRESENTATION: publisher's access_scope must be >= subscriber's; ordered/coherent
-    // access requested by the subscriber must be offered by the publisher.
-    const pres_result = checkPresentation(
-        .{
-            .access_scope = @enumFromInt(@as(u32, offered.presentation_access_scope)),
-            .coherent_access = offered.coherent_access,
-            .ordered_access = offered.ordered_access,
-        },
-        .{
-            .access_scope = @enumFromInt(@as(u32, requested.presentation_access_scope)),
-            .coherent_access = requested.coherent_access,
-            .ordered_access = requested.ordered_access,
-        },
-    );
-    if (!pres_result.isCompatible()) return pres_result;
+    // PRESENTATION: publisher's access_scope must be >= subscriber's (instance=0 <
+    // topic=1 < group=2); coherent/ordered access requested by the subscriber must
+    // be offered by the publisher.  We compare raw integers to avoid @enumFromInt
+    // relying on a [0,2] invariant that the type system cannot enforce on a u8 field.
+    if (offered.presentation_access_scope < requested.presentation_access_scope)
+        return .{ .incompatible = .presentation };
+    if (requested.coherent_access and !offered.coherent_access)
+        return .{ .incompatible = .presentation };
+    if (requested.ordered_access and !offered.ordered_access)
+        return .{ .incompatible = .presentation };
 
     return .compatible;
 }
@@ -538,4 +535,27 @@ test "checkSnapshots: destination_order mismatch → incompatible" {
     const requested = disc.QosSnapshot{ .destination_order_kind = 1 };
     const res = checkSnapshots(offered, requested);
     try std.testing.expectEqual(MatchResult{ .incompatible = .destination_order }, res);
+}
+
+test "checkSnapshots: PRESENTATION scope weaker → incompatible" {
+    const offered = disc.QosSnapshot{ .presentation_access_scope = 0 }; // instance
+    const requested = disc.QosSnapshot{ .presentation_access_scope = 1 }; // topic
+    const res = checkSnapshots(offered, requested);
+    try std.testing.expectEqual(MatchResult{ .incompatible = .presentation }, res);
+}
+
+test "checkSnapshots: PRESENTATION ordered_access requested but not offered → incompatible" {
+    const offered = disc.QosSnapshot{ .presentation_access_scope = 1, .ordered_access = false };
+    const requested = disc.QosSnapshot{ .presentation_access_scope = 1, .ordered_access = true };
+    const res = checkSnapshots(offered, requested);
+    try std.testing.expectEqual(MatchResult{ .incompatible = .presentation }, res);
+}
+
+test "checkSnapshots: PRESENTATION compatible when scope and flags match" {
+    const snap = disc.QosSnapshot{
+        .presentation_access_scope = 1, // topic
+        .coherent_access = true,
+        .ordered_access = true,
+    };
+    try std.testing.expect(checkSnapshots(snap, snap).isCompatible());
 }
