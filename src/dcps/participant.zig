@@ -199,7 +199,7 @@ const BuiltinSubscriberState = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
             }.f,
             .announce_reader = struct {
-                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8) void {}
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) void {}
             }.f,
             .timer_clock = participant.timer_clock,
             .register_timer_notify = struct {
@@ -516,6 +516,7 @@ const ActiveWriter = struct {
     type_name: []const u8,
     qos: DDS.DataWriterQos,
     partition_names: []const []const u8 = &.{}, // publisher's partition names (borrowed)
+    presentation: DDS.PresentationQosPolicy = .{},
     incompat_qos: ?IncompatQosNotify = null,
     matched_notify: ?MatchedNotify = null,
     timer_check: ?TimerNotify = null,
@@ -530,6 +531,7 @@ const ActiveReader = struct {
     type_name: []const u8,
     qos: DDS.DataReaderQos,
     partition_names: []const []const u8 = &.{}, // subscriber's partition names (borrowed)
+    presentation: DDS.PresentationQosPolicy = .{},
     incompat_qos: ?IncompatQosNotify = null,
     matched_notify: ?MatchedNotify = null,
     timer_check: ?TimerNotify = null,
@@ -1071,7 +1073,7 @@ pub const DomainParticipantImpl = struct {
 
     // ── QoS → discovery snapshot conversion ──────────────────────────────────
 
-    fn writerQosSnapshot(qos: DDS.DataWriterQos) disc.QosSnapshot {
+    fn writerQosSnapshot(qos: DDS.DataWriterQos, presentation: DDS.PresentationQosPolicy) disc.QosSnapshot {
         const keep_last = qos.history.kind != .KEEP_ALL_HISTORY_QOS;
         // DDS spec: deadline default is DURATION_INFINITE; {0,0} from codegen means unset → treat as infinite.
         const dl_zero_w = qos.deadline.period.sec == 0 and qos.deadline.period.nanosec == 0;
@@ -1095,10 +1097,13 @@ pub const DomainParticipantImpl = struct {
                 1,
             .deadline_sec = if (dl_zero_w) 0x7fff_ffff else qos.deadline.period.sec,
             .deadline_nanosec = if (dl_zero_w) 0x7fff_ffff else qos.deadline.period.nanosec,
+            .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
+            .coherent_access = presentation.coherent_access,
+            .ordered_access = presentation.ordered_access,
         };
     }
 
-    fn readerQosSnapshot(qos: DDS.DataReaderQos) disc.QosSnapshot {
+    fn readerQosSnapshot(qos: DDS.DataReaderQos, presentation: DDS.PresentationQosPolicy) disc.QosSnapshot {
         const keep_last = qos.history.kind != .KEEP_ALL_HISTORY_QOS;
         // DDS spec: deadline default is DURATION_INFINITE; {0,0} from codegen means unset → treat as infinite.
         const dl_zero_r = qos.deadline.period.sec == 0 and qos.deadline.period.nanosec == 0;
@@ -1118,6 +1123,9 @@ pub const DomainParticipantImpl = struct {
             // zzdds stores raw CDR bytes and interop programs parse both XCDR1/2.
             .deadline_sec = if (dl_zero_r) 0x7fff_ffff else qos.deadline.period.sec,
             .deadline_nanosec = if (dl_zero_r) 0x7fff_ffff else qos.deadline.period.nanosec,
+            .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
+            .coherent_access = presentation.coherent_access,
+            .ordered_access = presentation.ordered_access,
         };
     }
 
@@ -1439,7 +1447,7 @@ pub const DomainParticipantImpl = struct {
         while (ar_it.next()) |ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, ar.type_name, data.type_name)) continue;
-            const local_snap = readerQosSnapshot(ar.qos);
+            const local_snap = readerQosSnapshot(ar.qos, ar.presentation);
             const result = qm_mod.checkSnapshots(data.qos, local_snap);
             if (!result.isCompatible()) {
                 if (ar.incompat_qos) |cb|
@@ -1559,7 +1567,7 @@ pub const DomainParticipantImpl = struct {
         while (aw_it.next()) |aw| {
             if (!std.mem.eql(u8, aw.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, aw.type_name, data.type_name)) continue;
-            const local_snap = writerQosSnapshot(aw.qos);
+            const local_snap = writerQosSnapshot(aw.qos, aw.presentation);
             const result = qm_mod.checkSnapshots(local_snap, data.qos);
             if (!result.isCompatible()) {
                 if (aw.incompat_qos) |cb|
@@ -1646,7 +1654,7 @@ pub const DomainParticipantImpl = struct {
 
     // ── ParticipantCbs factory helpers ────────────────────────────────────────
 
-    fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8) void {
+    fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
         // Find the writer and snapshot its announcement fields outside the lock.
         var ann_opt: ?struct {
@@ -1654,6 +1662,7 @@ pub const DomainParticipantImpl = struct {
             topic_name: []const u8,
             type_name: []const u8,
             qos: DDS.DataWriterQos,
+            presentation: DDS.PresentationQosPolicy,
         } = null;
         {
             self.mu.lock();
@@ -1662,11 +1671,13 @@ pub const DomainParticipantImpl = struct {
             while (aw_it3.next()) |aw| {
                 if (aw.handle == handle) {
                     aw.partition_names = partition_names;
+                    aw.presentation = presentation;
                     ann_opt = .{
                         .guid = aw.guid,
                         .topic_name = aw.topic_name,
                         .type_name = aw.type_name,
                         .qos = aw.qos,
+                        .presentation = presentation,
                     };
                     break;
                 }
@@ -1674,7 +1685,7 @@ pub const DomainParticipantImpl = struct {
         }
         const ann = ann_opt orelse return;
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
-        var snap = writerQosSnapshot(ann.qos);
+        var snap = writerQosSnapshot(ann.qos, ann.presentation);
         snap.partition_names = partition_names;
         self.discovery.announceWriter(&disc.WriterAnnouncement{
             .guid = ann.guid,
@@ -1687,13 +1698,14 @@ pub const DomainParticipantImpl = struct {
         }) catch {};
     }
 
-    fn subAnnounceProtoReader(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8) void {
+    fn subAnnounceProtoReader(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
         var ann_opt: ?struct {
             guid: Guid,
             topic_name: []const u8,
             type_name: []const u8,
             qos: DDS.DataReaderQos,
+            presentation: DDS.PresentationQosPolicy,
         } = null;
         {
             self.mu.lock();
@@ -1702,11 +1714,13 @@ pub const DomainParticipantImpl = struct {
             while (ar_it3.next()) |ar| {
                 if (ar.handle == handle) {
                     ar.partition_names = partition_names;
+                    ar.presentation = presentation;
                     ann_opt = .{
                         .guid = ar.guid,
                         .topic_name = ar.topic_name,
                         .type_name = ar.type_name,
                         .qos = ar.qos,
+                        .presentation = presentation,
                     };
                     break;
                 }
@@ -1714,7 +1728,7 @@ pub const DomainParticipantImpl = struct {
         }
         const ann = ann_opt orelse return;
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
-        var snap = readerQosSnapshot(ann.qos);
+        var snap = readerQosSnapshot(ann.qos, ann.presentation);
         snap.partition_names = partition_names;
         self.discovery.announceReader(&disc.ReaderAnnouncement{
             .guid = ann.guid,

@@ -62,7 +62,7 @@ pub const ParticipantCbs = struct {
     /// Announce the writer identified by handle to the discovery layer.
     /// Called after register_incompat_qos so that synchronous discovery
     /// callbacks (e.g. DirectDiscovery) fire with the incompat callback already set.
-    announce_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8) void,
+    announce_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void,
 
     /// Clock passed to DataWriterImpl for DEADLINE and LIVELINESS interval timers.
     timer_clock: time_mod.Clock,
@@ -264,7 +264,7 @@ pub const PublisherImpl = struct {
             dw,
             writer_mod.DataWriterImpl.assertLivelinessFn,
         );
-        self.cbs.announce_writer(self.cbs.ctx, pub_handle, self.qos.partition.name.items);
+        self.cbs.announce_writer(self.cbs.ctx, pub_handle, self.qos.partition.name.items, self.qos.presentation);
         self.mu.lock();
         self.writers.append(self.alloc, dw) catch {
             self.mu.unlock();

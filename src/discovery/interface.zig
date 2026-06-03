@@ -47,6 +47,10 @@ pub const QosSnapshot = struct {
     // Publisher/Subscriber partition names. Empty = default partition ("").
     // Points into memory owned by the source (DecodedEndpoint or ActiveWriter/Reader).
     partition_names: []const []const u8 = &.{},
+    // PRESENTATION QoS (Publisher/Subscriber level): 0=instance, 1=topic, 2=group
+    presentation_access_scope: u8 = 0,
+    coherent_access: bool = false,
+    ordered_access: bool = false,
 };
 
 /// Information about the local participant broadcast to remote peers.

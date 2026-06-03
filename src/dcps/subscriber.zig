@@ -59,7 +59,7 @@ pub const ParticipantCbs = struct {
     /// Announce the reader identified by handle to the discovery layer.
     /// Called after register_incompat_qos so that synchronous discovery
     /// callbacks (e.g. DirectDiscovery) fire with the incompat callback already set.
-    announce_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8) void,
+    announce_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void,
 
     /// Clock passed to DataReaderImpl for DEADLINE interval timers.
     timer_clock: time_mod.Clock,
@@ -259,7 +259,7 @@ pub const SubscriberImpl = struct {
                 dr.cft_filter = .{ .cft_ptr = cft, .get_field_fn = get_field };
             }
         }
-        self.cbs.announce_reader(self.cbs.ctx, sub_handle, self.qos.partition.name.items);
+        self.cbs.announce_reader(self.cbs.ctx, sub_handle, self.qos.partition.name.items, self.qos.presentation);
         self.mu.lock();
         self.readers.append(self.alloc, dr) catch {
             self.mu.unlock();

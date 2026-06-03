@@ -200,6 +200,15 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     try writeRtpsDuration(alloc, &buf, time_mod.Duration.zero); // max_blocking_time
     try writePidHdr(alloc, &buf, PidTable.DURABILITY, 4);
     try writeU32Le(alloc, &buf, ann.qos.durability_kind);
+    // PID_PRESENTATION: access_scope(u32) + coherent_access(u8) + ordered_access(u8) + pad(2) = 8 bytes.
+    // Only emit when non-default (any field non-zero) to avoid breaking peers that don't parse it.
+    if (ann.qos.presentation_access_scope != 0 or ann.qos.coherent_access or ann.qos.ordered_access) {
+        try writePidHdr(alloc, &buf, PidTable.PRESENTATION, 8);
+        try writeU32Le(alloc, &buf, ann.qos.presentation_access_scope);
+        try buf.append(alloc, @intFromBool(ann.qos.coherent_access));
+        try buf.append(alloc, @intFromBool(ann.qos.ordered_access));
+        try buf.appendSlice(alloc, &[_]u8{ 0, 0 }); // padding
+    }
     // PID_DEADLINE: only emitted when not INFINITE; omitting INFINITE avoids
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
@@ -302,6 +311,14 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     try writeU32Le(alloc, &buf, ann.qos.durability_kind);
     try writePidHdr(alloc, &buf, PidTable.OWNERSHIP, 4);
     try writeU32Le(alloc, &buf, ann.qos.ownership_kind);
+    // PID_PRESENTATION: access_scope(u32) + coherent_access(u8) + ordered_access(u8) + pad(2) = 8 bytes.
+    if (ann.qos.presentation_access_scope != 0 or ann.qos.coherent_access or ann.qos.ordered_access) {
+        try writePidHdr(alloc, &buf, PidTable.PRESENTATION, 8);
+        try writeU32Le(alloc, &buf, ann.qos.presentation_access_scope);
+        try buf.append(alloc, @intFromBool(ann.qos.coherent_access));
+        try buf.append(alloc, @intFromBool(ann.qos.ordered_access));
+        try buf.appendSlice(alloc, &[_]u8{ 0, 0 }); // padding
+    }
 
     // PID_DATA_REPRESENTATION: emit exactly the configured representation so that
     // remote writers can detect incompatible data_representation QoS.
@@ -451,6 +468,14 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
             },
             PidTable.DESTINATION_ORDER => {
                 if (v.len >= 4) qos.destination_order_kind = @intCast(readU32LE(v, le));
+            },
+            PidTable.PRESENTATION => {
+                // access_scope(u32) + coherent_access(u8) + ordered_access(u8) = 6 bytes minimum
+                if (v.len >= 6) {
+                    qos.presentation_access_scope = @intCast(@min(readU32LE(v, le), 2));
+                    qos.coherent_access = v[4] != 0;
+                    qos.ordered_access = v[5] != 0;
+                }
             },
             PidTable.DATA_REPRESENTATION => {
                 // seq_len (4) + first id (2) — only the first value matters for matching
