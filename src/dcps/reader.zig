@@ -166,7 +166,22 @@ pub const DataReaderImpl = struct {
 
     /// Pending incoming samples; guarded by `mu`.
     pending: std.ArrayListUnmanaged(PendingChange),
+    /// Working buffer for the currently-receiving coherent set.
+    /// Samples are appended here as they arrive. When the end marker is received
+    /// the entire list is moved (zero-copy) into `coherent_committed` as one entry.
+    coherent_wip: std.ArrayListUnmanaged(PendingChange),
+    /// Queue of complete coherent sets awaiting delivery via begin_access().
+    /// Each element is one complete set (filled when its end marker arrives).
+    /// commitCoherentPendingLocked() pops ONLY the first entry per call so that
+    /// each begin_access/end_access cycle exposes exactly one coherent set,
+    /// even when multiple sets accumulated during a late-join history replay.
+    coherent_committed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(PendingChange)),
+    /// True when `coherent_committed` contains at least one complete set.
+    coherent_committed_ready: bool,
     mu: Mutex,
+
+    /// Presentation QoS from the owning Subscriber; set once after init.
+    subscriber_presentation: DDS.PresentationQosPolicy = .{},
 
     /// ContentFilteredTopic filter; null when no CFT or no get_field fn registered.
     /// Set once after init by the subscriber; read-only thereafter.
@@ -247,6 +262,9 @@ pub const DataReaderImpl = struct {
             .status_cond = null,
             .data_notifiers = .empty,
             .pending = .empty,
+            .coherent_wip = .empty,
+            .coherent_committed = .empty,
+            .coherent_committed_ready = false,
             .mu = .{},
             .timer_clock = timer_clock,
             .last_received_ns = .init(timer_clock.nowNs()),
@@ -278,9 +296,16 @@ pub const DataReaderImpl = struct {
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
         self.data_notifiers.deinit(self.alloc);
-        // Drain pending queue.
+        // Drain pending queues (including coherent buffers).
         for (self.pending.items) |p| p.deinit();
         self.pending.deinit(self.alloc);
+        for (self.coherent_wip.items) |p| p.deinit();
+        self.coherent_wip.deinit(self.alloc);
+        for (self.coherent_committed.items) |*s| {
+            for (s.items) |p| p.deinit();
+            s.deinit(self.alloc);
+        }
+        self.coherent_committed.deinit(self.alloc);
         self.tbf_map.deinit(self.alloc);
         self.writer_strengths.deinit(self.alloc);
         self.writer_liveliness.deinit(self.alloc);
@@ -435,6 +460,63 @@ pub const DataReaderImpl = struct {
                 self.alloc.free(copy);
                 return;
             }
+        }
+
+        // COHERENT SET BUFFERING: when the subscriber has coherent_access and the
+        // change carries PID_COHERENT_SET, buffer until the end marker arrives.
+        // "End marker" = the sample whose own SN equals the set's declared last SN.
+        //
+        // GROUP_PRESENTATION: do NOT auto-commit; mark the set complete and let
+        // Subscriber.begin_access() commit all readers atomically (cross-reader
+        // coordination avoids a race where the subscriber reads between individual
+        // reader commits).
+        // INSTANCE/TOPIC: auto-commit when the end marker arrives (per-reader
+        // coordination is sufficient).
+        if (self.subscriber_presentation.coherent_access and
+            change.coherent_set_sn != null)
+        {
+            const states = self.determineStatesLocked(ih, change.kind);
+            const src_time = change.source_timestamp.toTime();
+            const pc = PendingChange{
+                .data = copy,
+                .alloc = self.alloc,
+                .info = .{
+                    .sample_state = DDS.NOT_READ_SAMPLE_STATE,
+                    .view_state = states.view,
+                    .instance_state = states.instance_state,
+                    .source_timestamp = .{ .sec = src_time.sec, .nanosec = src_time.nanosec },
+                    .instance_handle = ih,
+                    .publication_handle = writer_mod.guidToHandle(change.writer_guid),
+                    .valid_data = change.kind == .alive,
+                },
+            };
+            if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
+            if (change.kind != .alive) {
+                _ = self.tbf_map.remove(ih);
+                _ = self.owner_map.remove(ih);
+            }
+            self.coherent_wip.append(self.alloc, pc) catch {
+                self.mu.unlock();
+                self.alloc.free(copy);
+                return;
+            };
+            const is_set_end = (change.sequence_number == change.coherent_set_sn.?);
+            if (is_set_end) {
+                // Zero-copy: take ownership of wip and enqueue it as one complete
+                // set in coherent_committed.  Subscriber.begin_access() pops one
+                // set at a time so consecutive sets are never merged into a single
+                // delivery window (important for late-join history replay).
+                var completed_set = self.coherent_wip;
+                self.coherent_wip = .empty;
+                self.coherent_committed.append(self.alloc, completed_set) catch {
+                    for (completed_set.items) |cppc| cppc.deinit();
+                    completed_set.deinit(self.alloc);
+                };
+                self.coherent_committed_ready = true;
+            }
+            self.mu.unlock();
+            self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
+            return;
         }
 
         // KEEP_LAST: if history depth is limited, evict the oldest pending sample
@@ -674,6 +756,25 @@ pub const DataReaderImpl = struct {
         for (to_remove[0..n_remove]) |ih| {
             _ = self.owner_map.remove(ih);
         }
+    }
+
+    /// Expose the OLDEST committed coherent set to `pending`.
+    /// Called by Subscriber.vtBeginAccess() while self.mu is held.
+    /// Pops exactly one complete set from the front of the queue; if more sets
+    /// remain, coherent_committed_ready stays true so the next begin_access call
+    /// can deliver the next set.  This ensures each begin_access/end_access cycle
+    /// delivers exactly one coherent set regardless of how many accumulated.
+    /// Caller fires data-available callbacks AFTER releasing mu.
+    pub fn commitCoherentPendingLocked(self: *Self) void {
+        if (self.coherent_committed.items.len == 0) return;
+        var first_set = self.coherent_committed.orderedRemove(0);
+        for (first_set.items) |cppc| {
+            self.pending.append(self.alloc, cppc) catch {};
+        }
+        first_set.deinit(self.alloc);
+        self.coherent_committed_ready = self.coherent_committed.items.len > 0;
+        self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        for (self.data_notifiers.items) |n| n.on_data(n.ctx);
     }
 
     /// Returns true if there is at least one pending sample.

@@ -231,6 +231,15 @@ pub const MessageBuilder = struct {
         /// 0x00000001 = NOT_ALIVE_DISPOSED, 0x00000002 = NOT_ALIVE_UNREGISTERED.
         /// null = omit (normal alive DATA).
         status_info: ?u32 = null,
+        /// PID_COHERENT_SET inline QoS (RTPS §9.6.3.7).
+        /// Value = last writer SN in this coherent set.  null = not part of a coherent set.
+        coherent_set_sn: ?SequenceNumber = null,
+        /// PID_GROUP_SEQ_NUM: per-publisher monotonically-increasing group counter.
+        /// null = omit (non-GROUP coherent, or no coherent set).
+        group_seq_num: ?SequenceNumber = null,
+        /// PID_GROUP_COHERENT_SET: last group sequence number in this group coherent set.
+        /// null = omit.
+        group_coherent_sn: ?SequenceNumber = null,
     };
 
     /// Add a DATA submessage. `payload` is the full SerializedPayload
@@ -240,7 +249,9 @@ pub const MessageBuilder = struct {
         params: DataParams,
         payload: []const u8,
     ) void {
-        const has_iqos = params.key_hash != null or params.status_info != null;
+        const has_iqos = params.key_hash != null or params.status_info != null or
+            params.coherent_set_sn != null or params.group_seq_num != null or
+            params.group_coherent_sn != null;
         // D and K are mutually exclusive (RTPS §9.4.5.3): set D for data, K for key-only.
         var flags: u8 = sub.FLAG_ENDIANNESS |
             if (params.is_key) sub.DataFlags.key_flag else sub.DataFlags.data_present;
@@ -251,11 +262,17 @@ pub const MessageBuilder = struct {
         //             + writerEntityId(4) + writerSN(8) = 20 bytes.
         var fixed_len: usize = 20;
         // Inline QoS parameters (each: 2-byte PID + 2-byte length + value):
-        //   PID_KEY_HASH:    4 hdr + 16 value = 20 bytes
-        //   PID_STATUS_INFO: 4 hdr + 4 value  = 8 bytes
-        //   PID_SENTINEL:    4 bytes
+        //   PID_KEY_HASH:            4 hdr + 16 value = 20 bytes
+        //   PID_STATUS_INFO:         4 hdr + 4 value  = 8 bytes
+        //   PID_GROUP_SEQ_NUM:       4 hdr + 8 value  = 12 bytes
+        //   PID_COHERENT_SET:        4 hdr + 8 value  = 12 bytes
+        //   PID_GROUP_COHERENT_SET:  4 hdr + 8 value  = 12 bytes
+        //   PID_SENTINEL:            4 bytes
         if (params.key_hash != null) fixed_len += 20;
         if (params.status_info != null) fixed_len += 8;
+        if (params.group_seq_num != null) fixed_len += 12; // PID_GROUP_SEQ_NUM
+        if (params.coherent_set_sn != null) fixed_len += 12; // PID_COHERENT_SET
+        if (params.group_coherent_sn != null) fixed_len += 12; // PID_GROUP_COHERENT_SET
         if (has_iqos) fixed_len += 4; // PID_SENTINEL
 
         const total_content = fixed_len + payload.len;
@@ -282,6 +299,21 @@ pub const MessageBuilder = struct {
             self.scratch.writeU8(0);
             self.scratch.writeU8(0);
             self.scratch.writeU8(@truncate(si));
+        }
+        if (params.group_seq_num) |gsn| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_seq_num));
+            self.scratch.writeU16Le(8);
+            self.scratch.writeSequenceNumber(gsn);
+        }
+        if (params.coherent_set_sn) |csn| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.coherent_set));
+            self.scratch.writeU16Le(8);
+            self.scratch.writeSequenceNumber(csn);
+        }
+        if (params.group_coherent_sn) |gcs| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_coherent_set));
+            self.scratch.writeU16Le(8);
+            self.scratch.writeSequenceNumber(gcs);
         }
         if (has_iqos) {
             self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.sentinel));

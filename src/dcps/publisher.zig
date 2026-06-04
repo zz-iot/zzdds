@@ -103,6 +103,10 @@ pub const PublisherImpl = struct {
     writers: std.ArrayListUnmanaged(*writer_mod.DataWriterImpl),
     mu: Mutex,
 
+    /// Nesting counter for begin/end_coherent_changes.  The coherent set on the
+    /// underlying writers is opened at depth 0→1 and closed at depth 1→0.
+    coherent_depth: u32,
+
     const Self = @This();
 
     pub fn init(
@@ -128,6 +132,7 @@ pub const PublisherImpl = struct {
             .default_dw_qos = .{},
             .writers = .empty,
             .mu = .{},
+            .coherent_depth = 0,
         };
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
@@ -336,17 +341,44 @@ pub const PublisherImpl = struct {
         return cast(ctx).listener;
     }
 
-    fn vtSuspendPublications(_: *anyopaque) DDS.ReturnCode_t {
-        return DDS.RETCODE_UNSUPPORTED;
+    fn vtSuspendPublications(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.writers.items) |w| w.proto_writer.beginCoherentSet();
+        return DDS.RETCODE_OK;
     }
-    fn vtResumePublications(_: *anyopaque) DDS.ReturnCode_t {
-        return DDS.RETCODE_UNSUPPORTED;
+
+    fn vtResumePublications(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        // emit_pid=false: suspended publications are just delayed, not grouped.
+        for (self.writers.items) |w| w.proto_writer.endCoherentSet(false);
+        return DDS.RETCODE_OK;
     }
-    fn vtBeginCoherent(_: *anyopaque) DDS.ReturnCode_t {
-        return DDS.RETCODE_UNSUPPORTED;
+
+    fn vtBeginCoherent(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.coherent_depth == 0) {
+            for (self.writers.items) |w| w.proto_writer.beginCoherentSet();
+        }
+        self.coherent_depth += 1;
+        return DDS.RETCODE_OK;
     }
-    fn vtEndCoherent(_: *anyopaque) DDS.ReturnCode_t {
-        return DDS.RETCODE_UNSUPPORTED;
+
+    fn vtEndCoherent(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.coherent_depth == 0) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        self.coherent_depth -= 1;
+        if (self.coherent_depth == 0) {
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(true);
+        }
+        return DDS.RETCODE_OK;
     }
 
     fn vtWaitForAck(ctx: *anyopaque, timeout: DDS.Duration_t) DDS.ReturnCode_t {

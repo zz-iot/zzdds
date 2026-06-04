@@ -323,6 +323,14 @@ pub const StatefulWriter = struct {
     /// Null until the first reader proxy is added.
     hb_thread: ?std.Thread,
     hb_stopping: std.atomic.Value(bool),
+    /// When true, write() defers DATA sends and accumulates SNs in
+    /// coherent_pending_sns.  Cleared by endCoherentSet().
+    coherent_active: bool,
+    /// SNs written since the last beginCoherentSet() call; flushed in endCoherentSet().
+    coherent_pending_sns: std.ArrayListUnmanaged(SequenceNumber),
+    /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
+    /// Incremented by N after each group coherent set of N samples is flushed.
+    group_seq_num_counter: i64,
 
     const Self = @This();
 
@@ -354,6 +362,9 @@ pub const StatefulWriter = struct {
             .replay_on_match = replay_on_match,
             .hb_thread = null,
             .hb_stopping = std.atomic.Value(bool).init(false),
+            .coherent_active = false,
+            .coherent_pending_sns = .empty,
+            .group_seq_num_counter = 0,
         };
         return self;
     }
@@ -370,6 +381,7 @@ pub const StatefulWriter = struct {
         }
         for (self.reader_proxies.items) |*rp| rp.deinit(self.alloc);
         self.reader_proxies.deinit(self.alloc);
+        self.coherent_pending_sns.deinit(self.alloc);
         self.cache.deinit();
         self.alloc.destroy(self);
     }
@@ -567,6 +579,8 @@ pub const StatefulWriter = struct {
     }
 
     /// Store a new change and send it immediately to all matched readers.
+    /// When a coherent set is active (beginCoherentSet called), the DATA send
+    /// is deferred until endCoherentSet().
     pub fn write(
         self: *Self,
         kind: ChangeKind,
@@ -578,7 +592,9 @@ pub const StatefulWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
         const sn = try self.cache.addWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, data);
-        if (self.cache.getChange(sn)) |ch| {
+        if (self.coherent_active) {
+            try self.coherent_pending_sns.append(self.alloc, sn);
+        } else if (self.cache.getChange(sn)) |ch| {
             self.sendChangeToAllLocked(ch);
         }
         return sn;
@@ -723,6 +739,9 @@ pub const StatefulWriter = struct {
                             .writer_sn = ch.sequence_number,
                             .is_key = ch.kind != .alive,
                             .status_info = statusInfoFromKind(ch.kind),
+                            .coherent_set_sn = ch.coherent_set_sn,
+                            .group_seq_num = ch.group_seq_num,
+                            .group_coherent_sn = ch.group_coherent_sn,
                         }, ch.data);
                         for (proxy.effectiveLocators()) |loc| sendIovecs(w.transport, &loc, b.iovecs()) catch {};
                     }
@@ -740,6 +759,8 @@ pub const StatefulWriter = struct {
                 }) {
                     if (!nack_set.contains(sn)) continue;
                     if (sn < rp.start_sn) continue;
+                    // Don't retransmit changes that are still inside a coherent window.
+                    if (self.isCoherentPendingSn(sn)) continue;
                     const ch = self.cache.getChange(sn) orelse continue;
                     retransmitChange(self, rp, ch, &scratch);
                     retransmit_count += 1;
@@ -763,6 +784,8 @@ pub const StatefulWriter = struct {
                 for (self.cache.changes.items) |*ch| {
                     if (ch.sequence_number < nack_set.base) continue;
                     if (ch.sequence_number < rp.start_sn) continue;
+                    // Don't retransmit changes that are still inside a coherent window.
+                    if (self.isCoherentPendingSn(ch.sequence_number)) continue;
                     // While suppress_live_data: skip live SNs beyond history_floor_sn.
                     // Sending live data here races with the DataReader's history flush.
                     if (rp.suppress_live_data and ch.sequence_number > rp.history_floor_sn) continue;
@@ -837,6 +860,9 @@ pub const StatefulWriter = struct {
                         null,
                     .is_key = ch.kind != .alive,
                     .status_info = statusInfoFromKind(ch.kind),
+                    .coherent_set_sn = ch.coherent_set_sn,
+                    .group_seq_num = ch.group_seq_num,
+                    .group_coherent_sn = ch.group_coherent_sn,
                 }, ch.data);
                 for (locs) |loc| {
                     sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
@@ -967,6 +993,79 @@ pub const StatefulWriter = struct {
             for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
             return;
         }
+    }
+
+    /// Returns true if `sn` is inside the current coherent window and should
+    /// not be sent or retransmitted until endCoherentSet() is called.
+    fn isCoherentPendingSn(self: *const Self, sn: SequenceNumber) bool {
+        if (!self.coherent_active) return false;
+        for (self.coherent_pending_sns.items) |pending| {
+            if (pending == sn) return true;
+        }
+        return false;
+    }
+
+    /// Start a coherent set.  Subsequent write() calls accumulate changes in
+    /// coherent_pending_sns without sending DATA immediately.
+    pub fn beginCoherentSet(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.coherent_active = true;
+    }
+
+    /// Flush a coherent set.  When `emit_pid` is true (begin/end_coherent_changes),
+    /// each pending CacheChange is patched with inline QoS:
+    ///   PID_COHERENT_SET      = last writer SN in this coherent set
+    ///   PID_GROUP_SEQ_NUM     = per-publisher group counter (starts at 1, never reuses writer SN)
+    ///   PID_GROUP_COHERENT_SET = last group SN in this group coherent set
+    /// When false (resume_publications), the changes are sent without PIDs.
+    pub fn endCoherentSet(self: *Self, emit_pid: bool) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.coherent_active = false;
+        if (self.coherent_pending_sns.items.len == 0) return;
+        const last_sn = self.coherent_pending_sns.items[self.coherent_pending_sns.items.len - 1];
+        const n: i64 = @intCast(self.coherent_pending_sns.items.len);
+        if (emit_pid) {
+            // Only assign group sequence numbers when there are readers — the GSN
+            // counter must start at 1 for the FIRST sample a reader sees, not at
+            // whatever the writer's write count was before the reader matched.
+            // With VOLATILE durability, new readers never see pre-match samples,
+            // so holding the counter at 0 until the first reader joins is correct.
+            const has_readers = self.reader_proxies.items.len > 0;
+            if (has_readers) {
+                const base_gsn = self.group_seq_num_counter;
+                const last_gsn = base_gsn + n;
+                for (self.coherent_pending_sns.items, 1..) |sn, i| {
+                    const gsn: i64 = base_gsn + @as(i64, @intCast(i));
+                    for (self.cache.changes.items) |*ch| {
+                        if (ch.sequence_number == sn) {
+                            ch.coherent_set_sn = last_sn;
+                            ch.group_seq_num = gsn;
+                            ch.group_coherent_sn = last_gsn;
+                            break;
+                        }
+                    }
+                }
+                self.group_seq_num_counter += n;
+            } else {
+                // No readers yet — still mark coherent_set_sn for retransmit consistency.
+                for (self.coherent_pending_sns.items) |sn| {
+                    for (self.cache.changes.items) |*ch| {
+                        if (ch.sequence_number == sn) {
+                            ch.coherent_set_sn = last_sn;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for (self.coherent_pending_sns.items) |sn| {
+            if (self.cache.getChange(sn)) |ch| {
+                self.sendChangeToAllLocked(ch);
+            }
+        }
+        self.coherent_pending_sns.clearRetainingCapacity();
     }
 
     /// Background thread: sends a non-final HEARTBEAT every HB_INTERVAL_MS ms.

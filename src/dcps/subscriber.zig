@@ -253,6 +253,8 @@ pub const SubscriberImpl = struct {
         );
         // Wire up get_field_fn for QueryCondition evaluation (always, when available).
         dr.get_field_fn = self.cbs.get_field_fn(self.cbs.ctx, type_name);
+        // Store subscriber's presentation QoS for coherent-set buffering decisions.
+        dr.subscriber_presentation = self.qos.presentation;
         // Wire up ContentFilteredTopic if the topic description is a CFT.
         if (topic_mod.asCft(a_topic)) |cft| {
             if (dr.get_field_fn) |get_field| {
@@ -368,9 +370,51 @@ pub const SubscriberImpl = struct {
         return cast(ctx).listener;
     }
 
-    fn vtBeginAccess(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtBeginAccess(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        // For GROUP_PRESENTATION coherent subscribers, commit all complete coherent
+        // sets from all readers atomically so the application sees a consistent view.
+        // Lock order: subscriber.mu → reader.mu (safe: receive thread never holds
+        // subscriber.mu when acquiring reader.mu).
+        if (!self.qos.presentation.coherent_access) return DDS.RETCODE_OK;
+
+        // Collect readers that need notification (fire callbacks outside the lock).
+        var notify_buf: [64]*reader_mod.DataReaderImpl = undefined;
+        var n_notify: usize = 0;
+
+        self.mu.lock();
+        // Only commit if ALL readers have a complete coherent set ready.
+        // Partial commits (some readers ready, others not) would deliver an
+        // incomplete group to the application.
+        var all_ready = true;
+        for (self.readers.items) |r| {
+            r.mu.lock();
+            if (!r.coherent_committed_ready) all_ready = false;
+            r.mu.unlock();
+        }
+        if (all_ready and self.readers.items.len > 0) {
+            for (self.readers.items) |r| {
+                r.mu.lock();
+                r.commitCoherentPendingLocked();
+                if (n_notify < notify_buf.len) {
+                    notify_buf[n_notify] = r;
+                    n_notify += 1;
+                }
+                r.mu.unlock();
+            }
+        }
+        self.mu.unlock();
+
+        for (notify_buf[0..n_notify]) |r| {
+            r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
+            if (r.status_cond) |sc| sc.notifyWakeup();
+            if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                r.listener.vtable.on_data_available(r.listener.ptr, r.toDDSDataReader());
+            }
+        }
         return DDS.RETCODE_OK;
     }
+
     fn vtEndAccess(_: *anyopaque) DDS.ReturnCode_t {
         return DDS.RETCODE_OK;
     }

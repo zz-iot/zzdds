@@ -81,6 +81,8 @@ pub const RtpsProtocolWriter = struct {
         .handle_nack_frag = vtHandleNackFrag,
         .all_acked = vtAllAcked,
         .cache_len = vtCacheLen,
+        .begin_coherent_set = vtBeginCoherentSet,
+        .end_coherent_set = vtEndCoherentSet,
         .deinit = vtDeinit,
     };
 
@@ -167,6 +169,16 @@ pub const RtpsProtocolWriter = struct {
         self.writer.mu.lock();
         defer self.writer.mu.unlock();
         return self.writer.cache.len();
+    }
+
+    fn vtBeginCoherentSet(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.beginCoherentSet();
+    }
+
+    fn vtEndCoherentSet(ctx: *anyopaque, emit_pid: bool) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.endCoherentSet(emit_pid);
     }
 
     fn vtDeinit(ctx: *anyopaque) void {
@@ -295,6 +307,7 @@ pub const RtpsProtocolReader = struct {
         key_hash: [16]u8,
         serialized_payload: []const u8,
         kind: history_mod.ChangeKind,
+        coherent_set_sn: ?history_mod.SequenceNumber,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.reader.isWriterMatched(writer_guid)) return;
@@ -306,6 +319,7 @@ pub const RtpsProtocolReader = struct {
             .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
             .key_hash = key_hash,
             .data = serialized_payload,
+            .coherent_set_sn = coherent_set_sn,
         };
         // Signal liveliness: this writer is alive.
         if (self.writer_match_cb) |cb| {

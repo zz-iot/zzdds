@@ -48,6 +48,15 @@ pub const CacheChange = struct {
     key_hash: [16]u8,
     /// Serialized payload (encap header + CDR). Empty for NOT_ALIVE_* changes.
     data: []const u8,
+    /// When non-null, this change is part of a coherent set.
+    /// Value = last writer SN in the coherent set; emitted as PID_COHERENT_SET.
+    coherent_set_sn: ?SequenceNumber = null,
+    /// Per-publisher monotonically-increasing group sequence number for this
+    /// sample; emitted as PID_GROUP_SEQ_NUM.  null = not part of a group coherent set.
+    group_seq_num: ?SequenceNumber = null,
+    /// Last group sequence number in this group coherent set; emitted as
+    /// PID_GROUP_COHERENT_SET.  Equals group_seq_num for the last sample in the set.
+    group_coherent_sn: ?SequenceNumber = null,
 };
 
 // ── HistoryCache ──────────────────────────────────────────────────────────────

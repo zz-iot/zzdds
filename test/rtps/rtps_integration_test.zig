@@ -1233,3 +1233,158 @@ test "acknack_dedup: same count after retransmit is suppressed; new count is pro
     try testing.expectEqual(@as(usize, 2), col.samples.items.len);
     try testing.expectEqualSlices(u8, "two", col.samples.items[1]);
 }
+
+test "coherent_set: writes deferred until endCoherentSet" {
+    // Verifies that writes during a coherent set are not sent until
+    // endCoherentSet() is called, and that coherent_set_sn is patched
+    // on each CacheChange to the last SN in the set.
+    //
+    // A RELIABLE reader proxy is matched before the coherent window opens.
+    // During the window: addMatchedReader sends an initial HB (no DATA).
+    // Each writer.write() call accumulates the SN without calling sendChangeToAllLocked.
+    // After endCoherentSet(true): all 3 DATAs are flushed with coherent_set_sn=3.
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
+    defer mt_w.deinit();
+    const mt_r = try MockTransport.init(alloc, net, &.{R1_LOC});
+    defer mt_r.deinit();
+
+    // replay_on_match=false (VOLATILE): no history replay; start_sn = next_sn at match.
+    // This avoids the suppress_live_data machinery which complicates the test.
+    const writer = try StatefulWriter.init(
+        alloc,
+        W1_GUID,
+        mt_w.transport(),
+        .keep_all,
+        0,
+        EntityIds.unknown,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer writer.deinit();
+
+    const reader = try StatefulReader.init(alloc, R1_GUID, mt_r.transport(), .keep_all, 0, true);
+    defer reader.deinit();
+
+    var col = Collector.init(alloc);
+    defer col.deinit();
+    reader.setCallback(col.callback());
+
+    var wd = WriterDispatch{ .writer = writer };
+    var rd = ReaderDispatch{ .reader = reader };
+    try mt_w.transport().listen(&W1_LOC, wd.makeHandler());
+    try mt_r.transport().listen(&R1_LOC, rd.makeHandler());
+
+    // Match reader and writer.
+    const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
+    try writer.addMatchedReader(rp);
+    const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
+    try reader.addMatchedWriter(wp);
+
+    // Drain the initial HB (from VOLATILE addMatchedReader sending an empty range HB).
+    net.deliverAll();
+    net.deliverAll(); // second round for the reader's ACKNACK response
+
+    // Begin coherent set: writes are now deferred.
+    writer.beginCoherentSet();
+    try write(writer, "alpha");
+    try write(writer, "beta");
+    try write(writer, "gamma");
+
+    // No DATA should have been sent yet — all are pending in coherent_pending_sns.
+    // Any packets in the queue are at most HBs from the RELIABLE send path
+    // (sendChangeToAllLocked is not called during coherent mode).
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 0), col.samples.items.len);
+
+    // Verify coherent_set_sn is null before end (changes are still deferred).
+    writer.mu.lock();
+    for (writer.cache.changes.items) |*ch| {
+        try testing.expectEqual(@as(?SequenceNumber, null), ch.coherent_set_sn);
+    }
+    writer.mu.unlock();
+
+    // End coherent set with emit_pid=true: patch all 3 changes and flush DATA.
+    writer.endCoherentSet(true);
+
+    // Verify coherent_set_sn is patched to last SN (3) on all 3 changes.
+    writer.mu.lock();
+    for (writer.cache.changes.items) |*ch| {
+        try testing.expectEqual(@as(?SequenceNumber, 3), ch.coherent_set_sn);
+    }
+    writer.mu.unlock();
+
+    // Deliver the 3 DATA packets (plus HBs); reader should receive all 3 samples.
+    net.deliverAll();
+    net.deliverAll(); // second round for HB/NACK/retransmit exchange
+    try testing.expectEqual(@as(usize, 3), col.samples.items.len);
+    try testing.expectEqualSlices(u8, "alpha", col.samples.items[0]);
+    try testing.expectEqualSlices(u8, "beta", col.samples.items[1]);
+    try testing.expectEqualSlices(u8, "gamma", col.samples.items[2]);
+}
+
+test "coherent_set: emit_pid=false sends without PID_COHERENT_SET" {
+    // Verifies that endCoherentSet(false) flushes pending writes but does NOT
+    // patch coherent_set_sn on the CacheChanges (used for suspend_publications).
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
+    defer mt_w.deinit();
+    const mt_r = try MockTransport.init(alloc, net, &.{R1_LOC});
+    defer mt_r.deinit();
+
+    const writer = try StatefulWriter.init(
+        alloc,
+        W1_GUID,
+        mt_w.transport(),
+        .keep_all,
+        0,
+        EntityIds.unknown,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer writer.deinit();
+
+    const reader = try StatefulReader.init(alloc, R1_GUID, mt_r.transport(), .keep_all, 0, true);
+    defer reader.deinit();
+
+    var col = Collector.init(alloc);
+    defer col.deinit();
+    reader.setCallback(col.callback());
+
+    var wd = WriterDispatch{ .writer = writer };
+    var rd = ReaderDispatch{ .reader = reader };
+    try mt_w.transport().listen(&W1_LOC, wd.makeHandler());
+    try mt_r.transport().listen(&R1_LOC, rd.makeHandler());
+
+    const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
+    try writer.addMatchedReader(rp);
+    const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
+    try reader.addMatchedWriter(wp);
+    net.deliverAll();
+    net.deliverAll();
+
+    writer.beginCoherentSet();
+    try write(writer, "x");
+    try write(writer, "y");
+
+    // End with emit_pid=false: changes sent but coherent_set_sn stays null.
+    writer.endCoherentSet(false);
+
+    writer.mu.lock();
+    for (writer.cache.changes.items) |*ch| {
+        try testing.expectEqual(@as(?SequenceNumber, null), ch.coherent_set_sn);
+    }
+    writer.mu.unlock();
+
+    net.deliverAll();
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 2), col.samples.items.len);
+}

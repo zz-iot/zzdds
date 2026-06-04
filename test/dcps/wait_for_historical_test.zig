@@ -285,9 +285,9 @@ test "wait_for_historical_data: returns OK after history fully delivered (data b
     var payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0xAB, 0xCD };
 
     // Deliver SN=1,2,3 before the first HEARTBEAT arrives.
-    dr_impl.proto_reader.handleIncomingChange(writer_guid, 1, ts, kh, &payload, .alive);
-    dr_impl.proto_reader.handleIncomingChange(writer_guid, 2, ts, kh, &payload, .alive);
-    dr_impl.proto_reader.handleIncomingChange(writer_guid, 3, ts, kh, &payload, .alive);
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 1, ts, kh, &payload, .alive, null);
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 2, ts, kh, &payload, .alive, null);
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 3, ts, kh, &payload, .alive, null);
 
     // Before HB: history_established=false → timeout.
     const rc1 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
@@ -339,12 +339,12 @@ test "wait_for_historical_data: returns OK once pending data fills history floor
     try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc1);
 
     // Deliver SN=1 only — still short of floor (2).
-    dr_impl.proto_reader.handleIncomingChange(writer_guid, 1, ts, kh, &payload, .alive);
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 1, ts, kh, &payload, .alive, null);
     const rc2 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc2);
 
     // Deliver SN=2 — cumulativeAck=2 >= floor=2 → OK.
-    dr_impl.proto_reader.handleIncomingChange(writer_guid, 2, ts, kh, &payload, .alive);
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 2, ts, kh, &payload, .alive, null);
     const rc3 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc3);
 }

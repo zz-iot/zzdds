@@ -87,7 +87,7 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: std.mem.Allocator, _: *std.ArrayListUnmanaged(proto.Guid)) anyerror!void {}
     }.f,
     .handle_incoming_change = struct {
-        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind) void {}
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber) void {}
     }.f,
     .handle_heartbeat = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool) void {}
@@ -1179,6 +1179,21 @@ pub const DomainParticipantImpl = struct {
         return std.mem.zeroes([16]u8);
     }
 
+    fn decodeCoherentSetSn(iq: ?submsg_mod.InlineQos) ?history_mod.SequenceNumber {
+        if (iq) |q| {
+            if (q.get(.coherent_set)) |cs| {
+                if (cs.len >= 8) {
+                    const high = std.mem.readInt(i32, cs[0..4], .little);
+                    const low = std.mem.readInt(u32, cs[4..8], .little);
+                    const h: i64 = @as(i64, high) << 32;
+                    const l: i64 = @as(i64, low);
+                    return h | l;
+                }
+            }
+        }
+        return null;
+    }
+
     fn resolveKeyHash(kh: [16]u8, ar: *ActiveReader, payload: []const u8) [16]u8 {
         if (!std.mem.eql(u8, &kh, &std.mem.zeroes([16]u8))) return kh;
         if (ar.key_hash_fn) |f| return f(payload);
@@ -1195,6 +1210,7 @@ pub const DomainParticipantImpl = struct {
         key_hash: [16]u8,
         payload: []const u8,
         kind: history_mod.ChangeKind,
+        coherent_set_sn: ?history_mod.SequenceNumber,
     ) void {
         if (dw_bytes.len < 4) return;
         const endian: std.builtin.Endian = if (little_endian) .little else .big;
@@ -1215,7 +1231,7 @@ pub const DomainParticipantImpl = struct {
             const rkey = entityIdKey(eid);
             if (self.active_readers.getPtr(rkey)) |ar| {
                 const kh = resolveKeyHash(key_hash, ar, payload);
-                ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind);
+                ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind, coherent_set_sn);
             }
         }
     }
@@ -1258,10 +1274,11 @@ pub const DomainParticipantImpl = struct {
                     const kind = decodeChangeKind(d.inline_qos);
                     if (kind == .alive and d.serialized_payload.len == 0) continue;
                     const key_hash = decodeKeyHash(d.inline_qos);
+                    const coherent_set_sn = decodeCoherentSetSn(d.inline_qos);
 
                     if (d.inline_qos) |iq| {
                         if (iq.get(.directed_write)) |dw_bytes| {
-                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind);
+                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind, coherent_set_sn);
                             continue;
                         }
                     }
@@ -1271,13 +1288,13 @@ pub const DomainParticipantImpl = struct {
                         var fan_it = self.active_readers.valueIterator();
                         while (fan_it.next()) |ar| {
                             const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
-                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind);
+                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn);
                         }
                     } else {
                         const rkey = entityIdKey(d.reader_entity_id);
                         if (self.active_readers.getPtr(rkey)) |ar| {
                             const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
-                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind);
+                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn);
                         }
                     }
                     self.mu.unlock();

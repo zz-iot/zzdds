@@ -141,6 +141,15 @@ pub const ProtocolWriter = struct {
         /// Used to enforce RESOURCE_LIMITS.max_samples before writing.
         cache_len: *const fn (ctx: *anyopaque) usize,
 
+        /// Begin a coherent set: subsequent write() calls are deferred until
+        /// end_coherent_set().
+        begin_coherent_set: *const fn (ctx: *anyopaque) void,
+
+        /// Flush a coherent set.  When `emit_pid` is true the deferred changes
+        /// are sent with PID_COHERENT_SET inline QoS.  When false (e.g. for
+        /// resume_publications) they are sent as ordinary data.
+        end_coherent_set: *const fn (ctx: *anyopaque, emit_pid: bool) void,
+
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
     };
@@ -203,6 +212,14 @@ pub const ProtocolWriter = struct {
 
     pub fn cacheLen(self: ProtocolWriter) usize {
         return self.vtable.cache_len(self.ctx);
+    }
+
+    pub fn beginCoherentSet(self: ProtocolWriter) void {
+        self.vtable.begin_coherent_set(self.ctx);
+    }
+
+    pub fn endCoherentSet(self: ProtocolWriter, emit_pid: bool) void {
+        self.vtable.end_coherent_set(self.ctx, emit_pid);
     }
 
     pub fn deinit(self: ProtocolWriter) void {
@@ -268,6 +285,7 @@ pub const ProtocolReader = struct {
             key_hash: [16]u8,
             serialized_payload: []const u8,
             kind: ChangeKind,
+            coherent_set_sn: ?SequenceNumber,
         ) void,
 
         /// Called by the participant's RTPS message dispatcher when a HEARTBEAT
@@ -355,6 +373,7 @@ pub const ProtocolReader = struct {
         key_hash: [16]u8,
         serialized_payload: []const u8,
         kind: ChangeKind,
+        coherent_set_sn: ?SequenceNumber,
     ) void {
         self.vtable.handle_incoming_change(
             self.ctx,
@@ -364,6 +383,7 @@ pub const ProtocolReader = struct {
             key_hash,
             serialized_payload,
             kind,
+            coherent_set_sn,
         );
     }
 
