@@ -75,6 +75,9 @@ pub const PendingChange = struct {
     alloc: std.mem.Allocator,
     /// DDS sample metadata stamped at enqueue time.
     info: DDS.SampleInfo,
+    /// Per-publisher group sequence number from PID_GROUP_SEQ_NUM inline QoS.
+    /// Used to sort samples in ordered GROUP_PRESENTATION access windows.
+    group_seq_num: ?i64 = null,
 
     pub fn deinit(self: PendingChange) void {
         self.alloc.free(self.data);
@@ -489,6 +492,7 @@ pub const DataReaderImpl = struct {
                     .publication_handle = writer_mod.guidToHandle(change.writer_guid),
                     .valid_data = change.kind == .alive,
                 },
+                .group_seq_num = change.group_seq_num,
             };
             if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
             if (change.kind != .alive) {
@@ -640,6 +644,7 @@ pub const DataReaderImpl = struct {
                 .publication_handle = writer_mod.guidToHandle(change.writer_guid),
                 .valid_data = change.kind == .alive,
             },
+            .group_seq_num = change.group_seq_num,
         };
 
         self.pending.append(self.alloc, pc) catch {

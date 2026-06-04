@@ -1242,7 +1242,7 @@ test "coherent_set: writes deferred until endCoherentSet" {
     // A RELIABLE reader proxy is matched before the coherent window opens.
     // During the window: addMatchedReader sends an initial HB (no DATA).
     // Each writer.write() call accumulates the SN without calling sendChangeToAllLocked.
-    // After endCoherentSet(true): all 3 DATAs are flushed with coherent_set_sn=3.
+    // After endCoherentSet(.full): all 3 DATAs are flushed with coherent_set_sn=3.
     const alloc = testing.allocator;
 
     const net = try MockNetwork.init(alloc);
@@ -1308,8 +1308,8 @@ test "coherent_set: writes deferred until endCoherentSet" {
     }
     writer.mu.unlock();
 
-    // End coherent set with emit_pid=true: patch all 3 changes and flush DATA.
-    writer.endCoherentSet(true);
+    // End coherent set with .full: patch all 3 changes and flush DATA.
+    writer.endCoherentSet(.full);
 
     // Verify coherent_set_sn is patched to last SN (3) on all 3 changes.
     writer.mu.lock();
@@ -1327,8 +1327,8 @@ test "coherent_set: writes deferred until endCoherentSet" {
     try testing.expectEqualSlices(u8, "gamma", col.samples.items[2]);
 }
 
-test "coherent_set: emit_pid=false sends without PID_COHERENT_SET" {
-    // Verifies that endCoherentSet(false) flushes pending writes but does NOT
+test "coherent_set: mode=none sends without PID_COHERENT_SET" {
+    // Verifies that endCoherentSet(.none) flushes pending writes but does NOT
     // patch coherent_set_sn on the CacheChanges (used for suspend_publications).
     const alloc = testing.allocator;
 
@@ -1375,12 +1375,76 @@ test "coherent_set: emit_pid=false sends without PID_COHERENT_SET" {
     try write(writer, "x");
     try write(writer, "y");
 
-    // End with emit_pid=false: changes sent but coherent_set_sn stays null.
-    writer.endCoherentSet(false);
+    // End with .none: changes sent but coherent_set_sn stays null.
+    writer.endCoherentSet(.none);
 
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
         try testing.expectEqual(@as(?SequenceNumber, null), ch.coherent_set_sn);
+    }
+    writer.mu.unlock();
+
+    net.deliverAll();
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 2), col.samples.items.len);
+}
+
+test "coherent_set: mode=group_seq_only emits group_seq_num but not coherent_set_sn" {
+    // Verifies that endCoherentSet(.group_seq_only) assigns group_seq_num but
+    // NOT coherent_set_sn or group_coherent_sn (ordered_access without coherent_access).
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
+    defer mt_w.deinit();
+    const mt_r = try MockTransport.init(alloc, net, &.{R1_LOC});
+    defer mt_r.deinit();
+
+    const writer = try StatefulWriter.init(
+        alloc,
+        W1_GUID,
+        mt_w.transport(),
+        .keep_all,
+        0,
+        EntityIds.unknown,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer writer.deinit();
+
+    const reader = try StatefulReader.init(alloc, R1_GUID, mt_r.transport(), .keep_all, 0, true);
+    defer reader.deinit();
+
+    var col = Collector.init(alloc);
+    defer col.deinit();
+    reader.setCallback(col.callback());
+
+    var wd = WriterDispatch{ .writer = writer };
+    var rd = ReaderDispatch{ .reader = reader };
+    try mt_w.transport().listen(&W1_LOC, wd.makeHandler());
+    try mt_r.transport().listen(&R1_LOC, rd.makeHandler());
+
+    const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
+    try writer.addMatchedReader(rp);
+    const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
+    try reader.addMatchedWriter(wp);
+    net.deliverAll();
+    net.deliverAll();
+
+    writer.beginCoherentSet();
+    try write(writer, "x");
+    try write(writer, "y");
+
+    // .group_seq_only: group_seq_num is assigned, coherent_set_sn stays null.
+    writer.endCoherentSet(.group_seq_only);
+
+    writer.mu.lock();
+    for (writer.cache.changes.items) |*ch| {
+        try testing.expectEqual(@as(?SequenceNumber, null), ch.coherent_set_sn);
+        try testing.expect(ch.group_seq_num != null);
+        try testing.expectEqual(@as(?SequenceNumber, null), ch.group_coherent_sn);
     }
     writer.mu.unlock();
 

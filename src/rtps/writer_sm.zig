@@ -1013,20 +1013,18 @@ pub const StatefulWriter = struct {
         self.coherent_active = true;
     }
 
-    /// Flush a coherent set.  When `emit_pid` is true (begin/end_coherent_changes),
-    /// each pending CacheChange is patched with inline QoS:
-    ///   PID_COHERENT_SET      = last writer SN in this coherent set
-    ///   PID_GROUP_SEQ_NUM     = per-publisher group counter (starts at 1, never reuses writer SN)
-    ///   PID_GROUP_COHERENT_SET = last group SN in this group coherent set
-    /// When false (resume_publications), the changes are sent without PIDs.
-    pub fn endCoherentSet(self: *Self, emit_pid: bool) void {
+    /// Flush a deferred coherent/ordered batch.
+    ///   .full        — PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET
+    ///   .group_seq_only — PID_GROUP_SEQ_NUM only (ordered_access without coherent_access)
+    ///   .none        — no inline QoS (resume_publications)
+    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.coherent_active = false;
         if (self.coherent_pending_sns.items.len == 0) return;
         const last_sn = self.coherent_pending_sns.items[self.coherent_pending_sns.items.len - 1];
         const n: i64 = @intCast(self.coherent_pending_sns.items.len);
-        if (emit_pid) {
+        if (mode != .none) {
             // Only assign group sequence numbers when there are readers — the GSN
             // counter must start at 1 for the FIRST sample a reader sees, not at
             // whatever the writer's write count was before the reader matched.
@@ -1040,15 +1038,17 @@ pub const StatefulWriter = struct {
                     const gsn: i64 = base_gsn + @as(i64, @intCast(i));
                     for (self.cache.changes.items) |*ch| {
                         if (ch.sequence_number == sn) {
-                            ch.coherent_set_sn = last_sn;
+                            if (mode == .full) {
+                                ch.coherent_set_sn = last_sn;
+                                ch.group_coherent_sn = last_gsn;
+                            }
                             ch.group_seq_num = gsn;
-                            ch.group_coherent_sn = last_gsn;
                             break;
                         }
                     }
                 }
                 self.group_seq_num_counter += n;
-            } else {
+            } else if (mode == .full) {
                 // No readers yet — still mark coherent_set_sn for retransmit consistency.
                 for (self.coherent_pending_sns.items) |sn| {
                     for (self.cache.changes.items) |*ch| {

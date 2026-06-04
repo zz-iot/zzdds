@@ -63,6 +63,17 @@ pub const CacheChange = struct {
 
 pub const HistoryKind = enum { keep_last, keep_all };
 
+/// Controls which inline QoS PIDs are emitted when a deferred coherent/ordered
+/// batch is flushed.
+pub const CoherentFlushMode = enum(u2) {
+    /// resume_publications: flush as ordinary data, no inline QoS.
+    none,
+    /// ordered_access without coherent_access: emit PID_GROUP_SEQ_NUM only.
+    group_seq_only,
+    /// coherent_access: emit PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET.
+    full,
+};
+
 pub const HistoryCache = struct {
     alloc: std.mem.Allocator,
     kind: HistoryKind,

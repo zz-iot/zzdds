@@ -353,8 +353,8 @@ pub const PublisherImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        // emit_pid=false: suspended publications are just delayed, not grouped.
-        for (self.writers.items) |w| w.proto_writer.endCoherentSet(false);
+        // .none: suspended publications are just delayed, not grouped.
+        for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none);
         return DDS.RETCODE_OK;
     }
 
@@ -376,7 +376,11 @@ pub const PublisherImpl = struct {
         if (self.coherent_depth == 0) return DDS.RETCODE_PRECONDITION_NOT_MET;
         self.coherent_depth -= 1;
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(true);
+            const mode: proto.CoherentFlushMode = if (self.qos.presentation.coherent_access)
+                .full
+            else
+                .group_seq_only;
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode);
         }
         return DDS.RETCODE_OK;
     }

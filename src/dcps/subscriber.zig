@@ -415,8 +415,27 @@ pub const SubscriberImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtEndAccess(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtEndAccess(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        if (self.qos.presentation.access_scope != .GROUP_PRESENTATION_QOS) return DDS.RETCODE_OK;
+        if (!self.qos.presentation.ordered_access) return DDS.RETCODE_OK;
+
+        // Sort each reader's pending queue by group_seq_num so that subsequent
+        // take() calls return samples in GROUP_PRESENTATION write order.
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.readers.items) |r| {
+            r.mu.lock();
+            std.mem.sort(reader_mod.PendingChange, r.pending.items, {}, pendingLessThan);
+            r.mu.unlock();
+        }
         return DDS.RETCODE_OK;
+    }
+
+    fn pendingLessThan(_: void, a: reader_mod.PendingChange, b: reader_mod.PendingChange) bool {
+        const a_gsn = a.group_seq_num orelse std.math.maxInt(i64);
+        const b_gsn = b.group_seq_num orelse std.math.maxInt(i64);
+        return a_gsn < b_gsn;
     }
 
     fn vtGetParticipant(ctx: *anyopaque) DDS.DomainParticipant {

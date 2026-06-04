@@ -176,9 +176,9 @@ pub const RtpsProtocolWriter = struct {
         self.writer.beginCoherentSet();
     }
 
-    fn vtEndCoherentSet(ctx: *anyopaque, emit_pid: bool) void {
+    fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.endCoherentSet(emit_pid);
+        self.writer.endCoherentSet(mode);
     }
 
     fn vtDeinit(ctx: *anyopaque) void {
@@ -308,6 +308,7 @@ pub const RtpsProtocolReader = struct {
         serialized_payload: []const u8,
         kind: history_mod.ChangeKind,
         coherent_set_sn: ?history_mod.SequenceNumber,
+        group_seq_num: ?history_mod.SequenceNumber,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.reader.isWriterMatched(writer_guid)) return;
@@ -320,6 +321,7 @@ pub const RtpsProtocolReader = struct {
             .key_hash = key_hash,
             .data = serialized_payload,
             .coherent_set_sn = coherent_set_sn,
+            .group_seq_num = group_seq_num,
         };
         // Signal liveliness: this writer is alive.
         if (self.writer_match_cb) |cb| {

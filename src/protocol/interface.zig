@@ -26,6 +26,7 @@ pub const InstanceHandle = history_mod.InstanceHandle;
 pub const RtpsTimestamp = history_mod.RtpsTimestamp;
 pub const SequenceNumber = history_mod.SequenceNumber;
 pub const CacheChange = history_mod.CacheChange;
+pub const CoherentFlushMode = history_mod.CoherentFlushMode;
 pub const Locator = iface.Locator;
 pub const SequenceNumberSet = submsg_mod.SequenceNumberSet;
 pub const FragmentNumberSet = submsg_mod.FragmentNumberSet;
@@ -145,10 +146,9 @@ pub const ProtocolWriter = struct {
         /// end_coherent_set().
         begin_coherent_set: *const fn (ctx: *anyopaque) void,
 
-        /// Flush a coherent set.  When `emit_pid` is true the deferred changes
-        /// are sent with PID_COHERENT_SET inline QoS.  When false (e.g. for
-        /// resume_publications) they are sent as ordinary data.
-        end_coherent_set: *const fn (ctx: *anyopaque, emit_pid: bool) void,
+        /// Flush a deferred coherent/ordered batch.  `mode` controls which
+        /// inline QoS PIDs are emitted (see CoherentFlushMode).
+        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode) void,
 
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
@@ -218,8 +218,8 @@ pub const ProtocolWriter = struct {
         self.vtable.begin_coherent_set(self.ctx);
     }
 
-    pub fn endCoherentSet(self: ProtocolWriter, emit_pid: bool) void {
-        self.vtable.end_coherent_set(self.ctx, emit_pid);
+    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode) void {
+        self.vtable.end_coherent_set(self.ctx, mode);
     }
 
     pub fn deinit(self: ProtocolWriter) void {
@@ -286,6 +286,7 @@ pub const ProtocolReader = struct {
             serialized_payload: []const u8,
             kind: ChangeKind,
             coherent_set_sn: ?SequenceNumber,
+            group_seq_num: ?SequenceNumber,
         ) void,
 
         /// Called by the participant's RTPS message dispatcher when a HEARTBEAT
@@ -374,6 +375,7 @@ pub const ProtocolReader = struct {
         serialized_payload: []const u8,
         kind: ChangeKind,
         coherent_set_sn: ?SequenceNumber,
+        group_seq_num: ?SequenceNumber,
     ) void {
         self.vtable.handle_incoming_change(
             self.ctx,
@@ -384,6 +386,7 @@ pub const ProtocolReader = struct {
             serialized_payload,
             kind,
             coherent_set_sn,
+            group_seq_num,
         );
     }
 
