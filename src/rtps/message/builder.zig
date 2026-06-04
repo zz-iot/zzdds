@@ -241,9 +241,10 @@ pub const MessageBuilder = struct {
         payload: []const u8,
     ) void {
         const has_iqos = params.key_hash != null or params.status_info != null;
-        var flags: u8 = sub.FLAG_ENDIANNESS | sub.DataFlags.data_present;
+        // D and K are mutually exclusive (RTPS §9.4.5.3): set D for data, K for key-only.
+        var flags: u8 = sub.FLAG_ENDIANNESS |
+            if (params.is_key) sub.DataFlags.key_flag else sub.DataFlags.data_present;
         if (has_iqos) flags |= sub.DataFlags.inline_qos;
-        if (params.is_key) flags |= sub.DataFlags.key_flag;
 
         // Calculate content length (everything except the payload).
         // Fixed fields: extraFlags(2) + octetsToInlineQos(2) + readerEntityId(4)
@@ -275,7 +276,12 @@ pub const MessageBuilder = struct {
         if (params.status_info) |si| {
             self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.status_info));
             self.scratch.writeU16Le(4);
-            self.scratch.writeU32Le(si);
+            // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11).
+            // The status byte is always at offset 3 — write as an octet array.
+            self.scratch.writeU8(0);
+            self.scratch.writeU8(0);
+            self.scratch.writeU8(0);
+            self.scratch.writeU8(@truncate(si));
         }
         if (has_iqos) {
             self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.sentinel));

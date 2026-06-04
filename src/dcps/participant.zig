@@ -1155,7 +1155,9 @@ pub const DomainParticipantImpl = struct {
         if (iq) |q| {
             if (q.get(.status_info)) |si| {
                 if (si.len >= 4) {
-                    const v = std.mem.readInt(u32, si[0..4], .little);
+                    // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11),
+                    // always big-endian regardless of message endianness.
+                    const v = std.mem.readInt(u32, si[0..4], .big);
                     if (v & 0x1 != 0) return .not_alive_disposed;
                     if (v & 0x2 != 0) return .not_alive_unregistered;
                 }

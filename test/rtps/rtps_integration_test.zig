@@ -1027,10 +1027,9 @@ test "dispose_survives_nack_replay: not_alive_disposed replayed with correct STA
                     const kind: ChangeKind = if (d.inline_qos) |iq|
                         if (iq.get(.status_info)) |si| blk: {
                             if (si.len >= 4) {
-                                const v = if (d.isLittleEndian())
-                                    std.mem.readInt(u32, si[0..4], .little)
-                                else
-                                    std.mem.readInt(u32, si[0..4], .big);
+                                // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11):
+                                // an octet array, always big-endian regardless of message endianness.
+                                const v = std.mem.readInt(u32, si[0..4], .big);
                                 if (v & 0x1 != 0) break :blk ChangeKind.not_alive_disposed;
                                 if (v & 0x2 != 0) break :blk ChangeKind.not_alive_unregistered;
                             }

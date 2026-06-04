@@ -186,6 +186,7 @@ pub const StatelessWriter = struct {
                         ch.key_hash
                     else
                         null,
+                    .is_key = ch.kind != .alive,
                     .status_info = statusInfoFromKind(ch.kind),
                 }, ch.data);
                 self.tracer.submit(.{ .send_data = .{
@@ -490,6 +491,7 @@ pub const StatefulWriter = struct {
                         ch.key_hash
                     else
                         null,
+                    .is_key = ch.kind != .alive,
                     .status_info = statusInfoFromKind(ch.kind),
                 }, ch.data);
                 for (locs) |loc| {
@@ -719,6 +721,7 @@ pub const StatefulWriter = struct {
                             .reader_entity_id = proxy.guid.entity_id,
                             .writer_entity_id = w.guid.entity_id,
                             .writer_sn = ch.sequence_number,
+                            .is_key = ch.kind != .alive,
                             .status_info = statusInfoFromKind(ch.kind),
                         }, ch.data);
                         for (proxy.effectiveLocators()) |loc| sendIovecs(w.transport, &loc, b.iovecs()) catch {};
@@ -832,6 +835,7 @@ pub const StatefulWriter = struct {
                         ch.key_hash
                     else
                         null,
+                    .is_key = ch.kind != .alive,
                     .status_info = statusInfoFromKind(ch.kind),
                 }, ch.data);
                 for (locs) |loc| {
