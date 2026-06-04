@@ -120,15 +120,10 @@ existing suite should be extended to cover the condvar path.
 - **DDS-XRCE** — embedded profile; separate project or downstream fork.
 - **TRANSIENT / PERSISTENT durability** — requires a persistence service; deferred.
 - **MultiTopic** — complex; deferred.
-- **Coherent changes and publication suspension** — `Publisher.begin_coherent_changes()`,
-  `end_coherent_changes()`, `suspend_publications()`, and `resume_publications()` all return
-  `RETCODE_UNSUPPORTED`. Full implementation requires GROUP-scope coherent delivery tracking;
-  deferred alongside GroupPresentation.
 - **Retroactive unmatching for ignored publications/subscriptions** — the ignore APIs filter
   future discovery callbacks today. Ignoring an already-discovered publication or
   subscription is treated as a permitted no-op; actively removing existing RTPS proxies is
   deferred unless a use case needs stricter behavior.
-- **GroupPresentation** (PRESENTATION QoS `access_scope = GROUP`) — deferred.
 - **Platform-specific InterfaceMonitors** — `monitor/netlink.zig` (Linux) and
   `monitor/pf_route.zig` (macOS) deferred; polling monitor is sufficient.
 - **SHMEM transport** — deferred; UDP covers current use cases.

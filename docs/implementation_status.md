@@ -14,7 +14,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | `MemoryTransport` (synchronous in-process) | Complete | `src/transport/memory.zig` |
 | `LossyTransport` (wraps any transport, fault injection) | Complete | `src/transport/lossy.zig` |
 | `InterfaceMonitor` (polling) | Complete | `src/transport/monitor/polling.zig` |
-| TCP transport | Not planned for v1 | — |
+| `TcpTransport` (IPv4 + IPv6, length-prefix framing) | Complete | `src/transport/tcp.zig` |
 | SHMEM transport | Not planned for v1 | — |
 
 ## Discovery
@@ -38,6 +38,9 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 | HEARTBEAT / ACKNACK / GAP | Complete | |
 | DATA_FRAG fragmentation + reassembly | Complete | `StatefulWriter` splits, `StatefulReader` reassembles |
 | HEARTBEAT_FRAG / NACK_FRAG | Complete | Fragment ACK/retransmit; per-proxy stale-count suppression (§8.3.8.12–13) |
+| `PID_COHERENT_SET` (0x0056) inline QoS | Complete | Emitted on coherent-set members; parsed on receive for buffering |
+| `PID_GROUP_SEQ_NUM` (0x0064) inline QoS | Complete | Emitted by Publisher on every write under ordered/coherent access; used to sort on `begin_access` |
+| `PID_GROUP_COHERENT_SET` (0x0063) inline QoS | Complete | Emitted on GROUP_PRESENTATION coherent sets; parsed on receive |
 | Writer Liveliness Protocol (P2P endpoints) | Entity IDs defined; endpoint not instantiated | `src/rtps/guid.zig:82-83` |
 
 ## DCPS
@@ -46,7 +49,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 |---|---|---|
 | `DomainParticipantFactory` | Complete | Not a singleton |
 | `DomainParticipant` | Complete | |
-| `Publisher` / `Subscriber` | Partial | `begin_coherent_changes`, `end_coherent_changes`, `suspend_publications`, `resume_publications` return `RETCODE_UNSUPPORTED` |
+| `Publisher` / `Subscriber` | Complete | `begin_coherent_changes`, `end_coherent_changes`, `suspend_publications`, `resume_publications` all implemented; `begin_access` / `end_access` implement ordered INSTANCE/TOPIC/GROUP sort |
 | `DataWriter` / `DataReader` | Complete | |
 | `Topic` | Complete | |
 | `ContentFilteredTopic` lifecycle + parser/evaluator | Complete | API, parser, evaluator, and delivery-time filtering all wired; types must register `TypeSupport.get_field` for field-level filtering |

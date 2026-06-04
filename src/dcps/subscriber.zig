@@ -372,37 +372,66 @@ pub const SubscriberImpl = struct {
 
     fn vtBeginAccess(ctx: *anyopaque) DDS.ReturnCode_t {
         const self = cast(ctx);
-        // For GROUP_PRESENTATION coherent subscribers, commit all complete coherent
-        // sets from all readers atomically so the application sees a consistent view.
-        // Lock order: subscriber.mu → reader.mu (safe: receive thread never holds
-        // subscriber.mu when acquiring reader.mu).
-        if (!self.qos.presentation.coherent_access) return DDS.RETCODE_OK;
+        const pres = self.qos.presentation;
+        if (!pres.coherent_access and !pres.ordered_access) return DDS.RETCODE_OK;
 
         // Collect readers that need notification (fire callbacks outside the lock).
         var notify_buf: [64]*reader_mod.DataReaderImpl = undefined;
         var n_notify: usize = 0;
 
         self.mu.lock();
-        // Only commit if ALL readers have a complete coherent set ready.
-        // Partial commits (some readers ready, others not) would deliver an
-        // incomplete group to the application.
-        var all_ready = true;
-        for (self.readers.items) |r| {
-            r.mu.lock();
-            if (!r.coherent_committed_ready) all_ready = false;
-            r.mu.unlock();
-        }
-        if (all_ready and self.readers.items.len > 0) {
+
+        // COHERENT ACCESS: commit all complete coherent sets atomically so the
+        // application sees a consistent view across all readers.
+        // Only commit when ALL readers have a complete set ready — partial commits
+        // would deliver an incomplete group.
+        if (pres.coherent_access) {
+            var all_ready = true;
             for (self.readers.items) |r| {
                 r.mu.lock();
-                r.commitCoherentPendingLocked();
-                if (n_notify < notify_buf.len) {
-                    notify_buf[n_notify] = r;
-                    n_notify += 1;
+                if (!r.coherent_committed_ready) all_ready = false;
+                r.mu.unlock();
+            }
+            if (all_ready and self.readers.items.len > 0) {
+                for (self.readers.items) |r| {
+                    r.mu.lock();
+                    r.commitCoherentPendingLocked();
+                    if (n_notify < notify_buf.len) {
+                        notify_buf[n_notify] = r;
+                        n_notify += 1;
+                    }
+                    r.mu.unlock();
+                }
+            }
+        }
+
+        // ORDERED ACCESS: sort each reader's pending queue so that take() returns
+        // samples in presentation order.  Must happen after coherent commit so
+        // newly committed samples are included.
+        if (pres.ordered_access) {
+            for (self.readers.items) |r| {
+                r.mu.lock();
+                switch (pres.access_scope) {
+                    // INSTANCE: group samples by instance handle so all samples of
+                    // instance X are consecutive; break ties with group_seq_num.
+                    .INSTANCE_PRESENTATION_QOS => std.mem.sort(
+                        reader_mod.PendingChange,
+                        r.pending.items,
+                        {},
+                        pendingInstanceLessThan,
+                    ),
+                    // TOPIC / GROUP: preserve publisher write order across instances.
+                    else => std.mem.sort(
+                        reader_mod.PendingChange,
+                        r.pending.items,
+                        {},
+                        pendingLessThan,
+                    ),
                 }
                 r.mu.unlock();
             }
         }
+
         self.mu.unlock();
 
         for (notify_buf[0..n_notify]) |r| {
@@ -416,23 +445,19 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtEndAccess(ctx: *anyopaque) DDS.ReturnCode_t {
-        const self = cast(ctx);
-        if (self.qos.presentation.access_scope != .GROUP_PRESENTATION_QOS) return DDS.RETCODE_OK;
-        if (!self.qos.presentation.ordered_access) return DDS.RETCODE_OK;
-
-        // Sort each reader's pending queue by group_seq_num so that subsequent
-        // take() calls return samples in GROUP_PRESENTATION write order.
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.readers.items) |r| {
-            r.mu.lock();
-            std.mem.sort(reader_mod.PendingChange, r.pending.items, {}, pendingLessThan);
-            r.mu.unlock();
-        }
+        _ = ctx;
         return DDS.RETCODE_OK;
     }
 
     fn pendingLessThan(_: void, a: reader_mod.PendingChange, b: reader_mod.PendingChange) bool {
+        const a_gsn = a.group_seq_num orelse std.math.maxInt(i64);
+        const b_gsn = b.group_seq_num orelse std.math.maxInt(i64);
+        return a_gsn < b_gsn;
+    }
+
+    fn pendingInstanceLessThan(_: void, a: reader_mod.PendingChange, b: reader_mod.PendingChange) bool {
+        if (a.info.instance_handle != b.info.instance_handle)
+            return a.info.instance_handle < b.info.instance_handle;
         const a_gsn = a.group_seq_num orelse std.math.maxInt(i64);
         const b_gsn = b.group_seq_num orelse std.math.maxInt(i64);
         return a_gsn < b_gsn;
