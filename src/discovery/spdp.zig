@@ -553,12 +553,11 @@ pub const SpdpEndpoints = struct {
         // catching peers whose interval is unknown or very long (cap at 5 s).
         const max_probe_trigger_ns: i64 = 5_000_000_000; // 5 seconds
 
+        const ProbeEntry = struct { prefix: GuidPrefix, deadline_ns: i64 };
         var to_remove: std.ArrayListUnmanaged(GuidPrefix) = .empty;
         defer to_remove.deinit(self.alloc);
-        var to_probe_prefixes: std.ArrayListUnmanaged(GuidPrefix) = .empty;
-        defer to_probe_prefixes.deinit(self.alloc);
-        var to_probe_deadlines: std.ArrayListUnmanaged(i64) = .empty;
-        defer to_probe_deadlines.deinit(self.alloc);
+        var to_probe: std.ArrayListUnmanaged(ProbeEntry) = .empty;
+        defer to_probe.deinit(self.alloc);
         var evict_guids: std.ArrayListUnmanaged(Guid) = .empty;
         defer evict_guids.deinit(self.alloc);
 
@@ -577,10 +576,12 @@ pub const SpdpEndpoints = struct {
                     max_probe_trigger_ns;
                 if (silence >= trigger) {
                     kp.probe_active = true;
-                    to_probe_prefixes.append(self.alloc, entry.key_ptr.*) catch {
+                    to_probe.append(self.alloc, .{
+                        .prefix = entry.key_ptr.*,
+                        .deadline_ns = now_ns + 1_000_000_000,
+                    }) catch {
                         kp.probe_active = false; // undo on OOM so we retry next cycle
                     };
-                    to_probe_deadlines.append(self.alloc, now_ns + 1_000_000_000) catch {};
                 }
             }
         }
@@ -604,8 +605,8 @@ pub const SpdpEndpoints = struct {
         // Start probes outside the lock: beginProbe acquires SEDP writer locks,
         // and the probe result callback acquires spdp.mu — holding it here would
         // create a potential cycle.
-        for (0..to_probe_prefixes.items.len) |i| {
-            if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, to_probe_prefixes.items[i], to_probe_deadlines.items[i]);
+        for (to_probe.items) |pe| {
+            if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, pe.prefix, pe.deadline_ns);
         }
     }
 
