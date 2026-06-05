@@ -222,6 +222,11 @@ pub const DataReaderImpl = struct {
     /// instance, even if one has lower strength than the other.
     owner_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, OwnerEntry) = .empty,
 
+    /// Per-writer set of instance handles written to via alive changes.
+    /// Guarded by `mu`. Used in onWriterUnmatchedCb to synthesize NOT_ALIVE_NO_WRITERS
+    /// when a writer disappears without an explicit unregister.
+    writer_instances: std.AutoHashMapUnmanaged(Guid, std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void)) = .empty,
+
     // ── TIME_BASED_FILTER tracking ────────────────────────────────────────────
     // Guarded by `mu`. Per-instance: each instance independently tracks the
     // source timestamp of its last delivered sample.
@@ -313,6 +318,11 @@ pub const DataReaderImpl = struct {
         self.writer_strengths.deinit(self.alloc);
         self.writer_liveliness.deinit(self.alloc);
         self.owner_map.deinit(self.alloc);
+        {
+            var wi_it = self.writer_instances.valueIterator();
+            while (wi_it.next()) |inner| inner.deinit(self.alloc);
+        }
+        self.writer_instances.deinit(self.alloc);
         self.seen_instances.deinit(self.alloc);
         // NOTE: proto_reader lifecycle is owned by the participant (via
         // subDestroyProtoReader callback), not by DataReaderImpl.
@@ -385,6 +395,14 @@ pub const DataReaderImpl = struct {
 
     // ── Data delivery ─────────────────────────────────────────────────────────
 
+    /// Record that `guid` has published an alive sample for instance `ih`.
+    /// Must be called with `mu` held.  Used by onWriterUnmatchedCb.
+    fn trackWriterInstanceLocked(self: *Self, guid: Guid, ih: DDS.InstanceHandle_t) void {
+        const gop = self.writer_instances.getOrPut(self.alloc, guid) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.put(self.alloc, ih, {}) catch {};
+    }
+
     /// Called from the RTPS receive thread when a new sample arrives.
     /// Matches the DataCallback.on_data function pointer signature.
     /// Must not block; must not call back into the ProtocolReader.
@@ -395,6 +413,11 @@ pub const DataReaderImpl = struct {
 
         // Compute instance handle first — needed by both ownership and resource-limit checks.
         const ih = writer_mod.keyHashToHandle(change.key_hash);
+
+        // Track writer→instance before any filter so that ownership-dropped writes
+        // still mark the instance as covered (prevents spurious NOT_ALIVE_NO_WRITERS
+        // when the owner leaves but another writer is still publishing to the instance).
+        if (change.kind == .alive) trackWriterInstanceLocked(self, change.writer_guid, ih);
 
         // OWNERSHIP: per-instance exclusive ownership check.
         // A writer owns an instance if it is the highest-strength writer that has
@@ -732,7 +755,6 @@ pub const DataReaderImpl = struct {
     fn onWriterUnmatchedCb(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
-        defer self.mu.unlock();
         _ = self.writer_strengths.remove(guid);
         // Clean up liveliness tracking for this writer.
         if (self.writer_liveliness.fetchRemove(guid)) |kv| {
@@ -751,14 +773,73 @@ pub const DataReaderImpl = struct {
         // from any remaining writer for those instances will re-claim them.
         var to_remove: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
         defer to_remove.deinit(self.alloc);
-        var it = self.owner_map.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.guid.eql(guid)) {
-                to_remove.append(self.alloc, entry.key_ptr.*) catch {};
+        {
+            var it = self.owner_map.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.guid.eql(guid)) {
+                    to_remove.append(self.alloc, entry.key_ptr.*) catch {};
+                }
             }
         }
-        for (to_remove.items) |ih| {
-            _ = self.owner_map.remove(ih);
+        for (to_remove.items) |ih| _ = self.owner_map.remove(ih);
+
+        // Synthesize NOT_ALIVE_NO_WRITERS for each instance this writer had
+        // published to that no longer has any other live writer.
+        var had_synthetic = false;
+        if (self.writer_instances.fetchRemove(guid)) |kv| {
+            var inner = kv.value;
+            defer inner.deinit(self.alloc);
+            var ih_it = inner.keyIterator();
+            while (ih_it.next()) |ih_ptr| {
+                const ih = ih_ptr.*;
+                // Another remaining writer covers this instance — no orphan.
+                var covered = false;
+                var wi_it = self.writer_instances.valueIterator();
+                while (wi_it.next()) |other| {
+                    if (other.contains(ih)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (covered) continue;
+                // Instance already non-alive (disposed/unregistered) — skip.
+                const si = self.seen_instances.get(ih) orelse continue;
+                if (si.instance_state != DDS.ALIVE_INSTANCE_STATE) continue;
+                // Build synthetic change.
+                const empty = self.alloc.dupe(u8, &.{}) catch continue;
+                const states = self.determineStatesLocked(ih, .not_alive_unregistered);
+                const now = time_mod.Time.now();
+                const pc = PendingChange{
+                    .data = empty,
+                    .alloc = self.alloc,
+                    .info = .{
+                        .sample_state = DDS.NOT_READ_SAMPLE_STATE,
+                        .view_state = states.view,
+                        .instance_state = states.instance_state,
+                        .instance_handle = ih,
+                        .source_timestamp = .{ .sec = now.sec, .nanosec = now.nanosec },
+                        .publication_handle = writer_mod.guidToHandle(guid),
+                        .valid_data = false,
+                    },
+                };
+                self.pending.append(self.alloc, pc) catch {
+                    self.alloc.free(empty);
+                    continue;
+                };
+                had_synthetic = true;
+            }
+        }
+        if (had_synthetic) {
+            self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+            for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+        }
+        self.mu.unlock();
+        if (had_synthetic) {
+            self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
+            if (self.status_cond) |sc| sc.notifyWakeup();
+            if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                self.listener.vtable.on_data_available(self.listener.ptr, self.toDDSDataReader());
+            }
         }
     }
 

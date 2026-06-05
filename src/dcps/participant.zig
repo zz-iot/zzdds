@@ -1453,7 +1453,27 @@ pub const DomainParticipantImpl = struct {
         for (self.discovered_participants.items, 0..) |e, i| {
             if (e.guid.eql(guid)) {
                 _ = self.discovered_participants.swapRemove(i);
-                return;
+                break;
+            }
+        }
+        // Remove matched writers/readers belonging to this participant from all
+        // local DataReaders so they can generate NOT_ALIVE_NO_WRITERS.
+        // Uses the GUID prefix as the membership key (all endpoints of a
+        // participant share its prefix).
+        const prefix = guid.prefix;
+        var ar_it = self.active_readers.valueIterator();
+        while (ar_it.next()) |ar| {
+            var guids: std.ArrayListUnmanaged(Guid) = .empty;
+            ar.proto.listMatchedWriters(self.alloc, &guids) catch continue;
+            defer guids.deinit(self.alloc);
+            for (guids.items) |w_guid| {
+                if (!w_guid.prefix.eql(prefix)) continue;
+                const before = ar.proto.matchedWriterCount();
+                ar.proto.removeMatchedWriter(w_guid);
+                if (ar.proto.matchedWriterCount() < before) {
+                    if (ar.matched_notify) |cb|
+                        cb.notify(cb.ctx, writer_mod.guidToHandle(w_guid), false);
+                }
             }
         }
     }

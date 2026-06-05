@@ -58,6 +58,12 @@ pub const KnownParticipant = struct {
     /// Monotonic expiry timestamp in ns (from timer_clock.nowNs()).
     expires_ns: i64,
     alloc: std.mem.Allocator,
+    /// Monotonic timestamp (ns) of the most recently received SPDP announcement.
+    last_seen_ns: i64,
+    /// Smoothed (EMA) inter-announcement interval in ns; 0 until two announcements observed.
+    observed_interval_ns: i64,
+    /// True while a liveness probe is outstanding for this participant.
+    probe_active: bool,
 
     pub fn deinit(self: *KnownParticipant) void {
         self.alloc.free(self.data.name);
@@ -121,6 +127,12 @@ pub const SpdpEndpoints = struct {
     // read by the timer thread — accessed via atomic to avoid needing the mutex.
     fast_announce_until_ns: std.atomic.Value(i64),
 
+    // Liveness probe: when SPDP silence exceeds the probe trigger threshold,
+    // SPDP calls begin_probe_fn to start a directed non-final HB probe via the
+    // SEDP reliable writers.  The probe result fires back via onProbeResult.
+    begin_probe_fn: ?*const fn (*anyopaque, GuidPrefix, i64) void,
+    begin_probe_ctx: ?*anyopaque,
+
     const Self = @This();
 
     pub fn init(
@@ -154,6 +166,8 @@ pub const SpdpEndpoints = struct {
             .on_participant_discovered_sedp = null,
             .sedp_ctx = null,
             .fast_announce_until_ns = std.atomic.Value(i64).init(0),
+            .begin_probe_fn = null,
+            .begin_probe_ctx = null,
         };
         return self;
     }
@@ -189,6 +203,49 @@ pub const SpdpEndpoints = struct {
     ) void {
         self.on_participant_discovered_sedp = cb;
         self.sedp_ctx = ctx;
+    }
+
+    /// Wire the SEDP liveness-probe initiator.  When SPDP detects announcement
+    /// silence, it calls fn_ptr(ctx, prefix, deadline_ns) to kick off a directed
+    /// non-final HB probe on the SEDP reliable writers.
+    pub fn setBeginProbeFn(
+        self: *Self,
+        ctx: *anyopaque,
+        fn_ptr: *const fn (*anyopaque, GuidPrefix, i64) void,
+    ) void {
+        self.begin_probe_fn = fn_ptr;
+        self.begin_probe_ctx = ctx;
+    }
+
+    /// Called by SEDP when a liveness probe resolves.
+    ///   alive=true  → reset the participant's expiry/last-seen; clear probe flag.
+    ///   alive=false → evict the participant and fire on_participant_lost.
+    pub fn onProbeResult(ctx: *anyopaque, prefix: GuidPrefix, alive: bool) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        const kp_ptr = self.known.getPtr(prefix) orelse {
+            self.mu.unlock();
+            return;
+        };
+        // Guard against a stale probe result arriving after re-announcement or
+        // a second probe fired by a different SEDP writer.
+        if (!kp_ptr.probe_active) {
+            self.mu.unlock();
+            return;
+        }
+        kp_ptr.probe_active = false;
+        if (alive) {
+            const now_ns = self.clock.nowNs();
+            kp_ptr.expires_ns = now_ns + @as(i64, @intCast(kp_ptr.data.lease_duration_ms)) * std.time.ns_per_ms;
+            kp_ptr.last_seen_ns = now_ns;
+            self.mu.unlock();
+        } else {
+            var kp = self.known.fetchRemove(prefix).?;
+            self.mu.unlock();
+            const guid = kp.value.data.guid;
+            kp.value.deinit();
+            if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, guid);
+        }
     }
 
     pub fn start(
@@ -304,9 +361,32 @@ pub const SpdpEndpoints = struct {
                 .data => |d| {
                     if (!d.writer_entity_id.eql(EntityIds.spdp_builtin_participant_writer))
                         continue;
+                    const src_prefix = it.header.guid_prefix;
+                    // BYE detection: STATUS_INFO with DISPOSED (0x1) or UNREGISTERED (0x2).
+                    // Per RTPS §9.4.5.11 the status bytes are always big-endian.
+                    const is_bye = blk: {
+                        if (d.inline_qos) |iq| {
+                            if (iq.get(.status_info)) |si| {
+                                if (si.len >= 4) break :blk std.mem.readInt(u32, si[0..4], .big) & 0x3 != 0;
+                            }
+                        }
+                        break :blk false;
+                    };
+                    if (is_bye) {
+                        // Participant is leaving — remove and notify.
+                        self.mu.lock();
+                        const kp_opt = self.known.fetchRemove(src_prefix);
+                        self.mu.unlock();
+                        if (kp_opt) |kp| {
+                            var kp2 = kp;
+                            if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, kp2.value.data.guid);
+                            kp2.value.deinit();
+                        }
+                        continue;
+                    }
                     const payload = d.serialized_payload;
                     if (payload.len == 0) continue;
-                    self.processSpdpPayload(it.header.guid_prefix, payload);
+                    self.processSpdpPayload(src_prefix, payload);
                 },
                 else => {},
             }
@@ -318,6 +398,20 @@ pub const SpdpEndpoints = struct {
     pub fn handleRelayedData(ctx: *anyopaque, prefix: GuidPrefix, payload: []const u8) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.processSpdpPayload(prefix, payload);
+    }
+
+    /// Called when a peer participant's SPDP BYE (dispose/unregister) is received.
+    /// Removes the participant from the known map and fires on_participant_lost.
+    pub fn removePeer(ctx: *anyopaque, prefix: GuidPrefix) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        const kp_opt = self.known.fetchRemove(prefix);
+        self.mu.unlock();
+        if (kp_opt) |kp| {
+            var kp2 = kp;
+            if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, kp2.value.data.guid);
+            kp2.value.deinit();
+        }
     }
 
     pub fn processSpdpPayload(
@@ -337,8 +431,11 @@ pub const SpdpEndpoints = struct {
             return;
         };
         self.filterKnownParticipantLocators(&kp);
-        kp.expires_ns = self.clock.nowNs() +
-            @as(i64, @intCast(kp.data.lease_duration_ms)) * std.time.ns_per_ms;
+        const now_ns = self.clock.nowNs();
+        kp.expires_ns = now_ns + @as(i64, @intCast(kp.data.lease_duration_ms)) * std.time.ns_per_ms;
+        kp.last_seen_ns = now_ns;
+        kp.observed_interval_ns = 0; // updated below for re-announcements
+        kp.probe_active = false; // receiving an announcement resolves any probe
 
         self.mu.lock();
         defer self.mu.unlock();
@@ -346,7 +443,18 @@ pub const SpdpEndpoints = struct {
         const gop = self.known.getOrPut(guid_prefix) catch return;
         const is_new = !gop.found_existing;
         if (gop.found_existing) {
-            // Update expiry; replace data only when locators changed (full replace is simpler).
+            // Update the smoothed announcement interval from the previous observation.
+            const prev_last_seen = gop.value_ptr.last_seen_ns;
+            const prev_interval = gop.value_ptr.observed_interval_ns;
+            if (prev_last_seen > 0 and now_ns > prev_last_seen) {
+                const interval = now_ns - prev_last_seen;
+                kp.observed_interval_ns = if (prev_interval == 0)
+                    interval
+                else
+                    @divTrunc(prev_interval + interval, 2); // EMA α=0.5
+            } else {
+                kp.observed_interval_ns = prev_interval;
+            }
             gop.value_ptr.deinit();
         }
         gop.value_ptr.* = kp;
@@ -439,24 +547,69 @@ pub const SpdpEndpoints = struct {
 
     pub fn checkLeases(self: *Self) void {
         const now_ns = self.clock.nowNs();
+        // Probe trigger: start a liveness probe when silence exceeds this threshold.
+        // Use min(3× observed interval, 5 s) so we respond quickly for peers that
+        // announce frequently (e.g. every 100 ms → threshold 300 ms) while still
+        // catching peers whose interval is unknown or very long (cap at 5 s).
+        const max_probe_trigger_ns: i64 = 5_000_000_000; // 5 seconds
+
         self.mu.lock();
-        defer self.mu.unlock();
 
         var to_remove: [64]GuidPrefix = undefined;
         var to_remove_count: usize = 0;
+        var to_probe_prefixes: [16]GuidPrefix = undefined;
+        var to_probe_deadlines: [16]i64 = undefined;
+        var to_probe_count: usize = 0;
+
         var it = self.known.iterator();
         while (it.next()) |entry| {
-            if (now_ns >= entry.value_ptr.expires_ns and to_remove_count < 64) {
-                to_remove[to_remove_count] = entry.key_ptr.*;
-                to_remove_count += 1;
+            const kp = entry.value_ptr;
+            if (now_ns >= kp.expires_ns) {
+                if (to_remove_count < to_remove.len) {
+                    to_remove[to_remove_count] = entry.key_ptr.*;
+                    to_remove_count += 1;
+                }
+            } else if (!kp.probe_active and kp.last_seen_ns > 0) {
+                const silence = now_ns - kp.last_seen_ns;
+                const trigger = if (kp.observed_interval_ns > 0)
+                    @min(3 * kp.observed_interval_ns, max_probe_trigger_ns)
+                else
+                    max_probe_trigger_ns;
+                if (silence >= trigger and to_probe_count < to_probe_prefixes.len) {
+                    kp.probe_active = true;
+                    to_probe_prefixes[to_probe_count] = entry.key_ptr.*;
+                    to_probe_deadlines[to_probe_count] = now_ns + 1_000_000_000; // 1 s deadline
+                    to_probe_count += 1;
+                }
             }
         }
+
+        var evict_guids: [64]Guid = undefined;
+        var evict_count: usize = 0;
         for (to_remove[0..to_remove_count]) |prefix| {
-            var kp = self.known.fetchRemove(prefix) orelse continue;
-            if (self.callbacks) |cbs| {
-                cbs.on_participant_lost(cbs.ctx, kp.value.data.guid);
+            if (self.known.fetchRemove(prefix)) |kp| {
+                var kp2 = kp;
+                if (evict_count < evict_guids.len) {
+                    evict_guids[evict_count] = kp2.value.data.guid;
+                    evict_count += 1;
+                }
+                kp2.value.deinit();
             }
-            kp.value.deinit();
+        }
+
+        self.mu.unlock();
+
+        // Fire eviction callbacks outside the lock to avoid spdp.mu → participant.mu
+        // → writer.mu → spdp.mu inversion with the probe result path.
+        for (evict_guids[0..evict_count]) |guid| {
+            if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, guid);
+        }
+
+        // Start probes outside the lock: beginProbe acquires SEDP writer locks,
+        // and the probe result callback acquires spdp.mu — holding it here would
+        // create a potential cycle.
+        for (0..to_probe_count) |i| {
+            if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, to_probe_prefixes[i], to_probe_deadlines[i]);
         }
     }
 
@@ -668,6 +821,9 @@ pub fn decodeSpdpParticipant(
     return KnownParticipant{
         .alloc = alloc,
         .expires_ns = 0, // caller sets this
+        .last_seen_ns = 0, // caller sets this
+        .observed_interval_ns = 0,
+        .probe_active = false,
         .data = ParticipantData{
             .guid = .{
                 .prefix = decoded_prefix,

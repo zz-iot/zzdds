@@ -244,6 +244,11 @@ pub const ReaderProxy = struct {
     /// Threshold for clearing suppress_live_data: the reader's cumulative ack
     /// must reach this SN on a non-final NACK before live data is unblocked.
     history_floor_sn: SequenceNumber,
+    /// Non-zero while a liveness probe is active for this reader proxy.
+    /// Monotonic deadline (ns): if no ACKNACK arrives before this time, the
+    /// heartbeat thread evicts the proxy and fires the probe-result callback.
+    /// Cleared immediately on any incoming ACKNACK (reader is alive).
+    probe_deadline_ns: i64,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -265,6 +270,7 @@ pub const ReaderProxy = struct {
             .last_nack_frag_count = null,
             .suppress_live_data = false,
             .history_floor_sn = 0,
+            .probe_deadline_ns = 0,
         };
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
@@ -331,6 +337,11 @@ pub const StatefulWriter = struct {
     /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
     /// Incremented by N after each group coherent set of N samples is flushed.
     group_seq_num_counter: i64,
+    /// Optional callback fired when a liveness probe resolves.
+    /// Called with (ctx, prefix, alive): alive=true means an ACKNACK was received;
+    /// alive=false means the probe deadline expired and the proxy was removed.
+    probe_result_fn: ?*const fn (*anyopaque, GuidPrefix, bool) void,
+    probe_result_ctx: ?*anyopaque,
 
     const Self = @This();
 
@@ -365,12 +376,38 @@ pub const StatefulWriter = struct {
             .coherent_active = false,
             .coherent_pending_sns = .empty,
             .group_seq_num_counter = 0,
+            .probe_result_fn = null,
+            .probe_result_ctx = null,
         };
         return self;
     }
 
     pub fn setTracer(self: *Self, t: trace.Tracer) void {
         self.tracer = t;
+    }
+
+    /// Register a callback that fires when a liveness probe resolves.
+    /// Must be called before any reader proxies are added (before the HB thread starts).
+    pub fn setProbeResult(
+        self: *Self,
+        ctx: *anyopaque,
+        fn_ptr: *const fn (*anyopaque, GuidPrefix, bool) void,
+    ) void {
+        self.probe_result_fn = fn_ptr;
+        self.probe_result_ctx = ctx;
+    }
+
+    /// Start a liveness probe for all reader proxies matching `prefix`.
+    /// The heartbeat thread will send periodic non-final HBs (as it already does)
+    /// and evict the proxy if no ACKNACK arrives before `deadline_ns` (monotonic ns).
+    pub fn beginProbe(self: *Self, prefix: GuidPrefix, deadline_ns: i64) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.reader_proxies.items) |*rp| {
+            if (rp.guid.prefix.eql(prefix) and rp.reliable) {
+                rp.probe_deadline_ns = deadline_ns;
+            }
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -667,10 +704,17 @@ pub const StatefulWriter = struct {
         if (nack_set.num_bits > 256) return; // spec maximum bitmap size
 
         self.mu.lock();
-        defer self.mu.unlock();
+
+        var probe_cleared: ?GuidPrefix = null;
 
         for (self.reader_proxies.items) |*rp| {
             if (!rp.guid.eql(reader_guid)) continue;
+            // Any ACKNACK confirms the reader is alive — clear the probe immediately
+            // regardless of whether this ACKNACK is stale or duplicate.
+            if (rp.probe_deadline_ns > 0) {
+                probe_cleared = rp.guid.prefix;
+                rp.probe_deadline_ns = 0;
+            }
             // Stale / duplicate suppression — only while suppress_live_data is
             // inactive.  While suppress is set, allowing duplicate NACKs to trigger
             // retransmits gives the remote DataReader more time to flush history
@@ -711,7 +755,7 @@ pub const StatefulWriter = struct {
 
             var scratch: [SCRATCH_SIZE]u8 = undefined;
             const locs = rp.effectiveLocators();
-            if (locs.len == 0) return;
+            if (locs.len == 0) break; // probe already cleared above; no locators to retransmit to
 
             var retransmit_count: usize = 0;
 
@@ -813,6 +857,13 @@ pub const StatefulWriter = struct {
                     self.sendHeartbeatToProxyLocked(rp, false);
                 }
             }
+            break; // GUIDs are unique; no need to scan further
+        }
+
+        self.mu.unlock();
+
+        if (probe_cleared) |prefix| {
+            if (self.probe_result_fn) |f| f(self.probe_result_ctx.?, prefix, true);
         }
     }
 
@@ -1070,6 +1121,7 @@ pub const StatefulWriter = struct {
 
     /// Background thread: sends a non-final HEARTBEAT every HB_INTERVAL_MS ms.
     /// Readers reply with ACKNACK; writer retransmits any missing data.
+    /// Also checks probe deadlines: evicts proxies that haven't ACK'd in time.
     /// Stopped by setting hb_stopping before calling hb_thread.join().
     fn heartbeatThread(self: *Self) void {
         while (!self.hb_stopping.load(.acquire)) {
@@ -1080,6 +1132,37 @@ pub const StatefulWriter = struct {
             }
             if (self.hb_stopping.load(.acquire)) break;
             self.sendHeartbeat(false);
+            self.checkProbeDeadlines();
+        }
+    }
+
+    /// Evict any reader proxies whose liveness-probe deadline has passed.
+    /// Fires the probe_result_fn callback (alive=false) for each evicted proxy.
+    /// Called under no lock; acquires and releases self.mu internally.
+    fn checkProbeDeadlines(self: *Self) void {
+        const now_ns = time_mod.monotonicClock().nowNs();
+
+        var evicted: [8]GuidPrefix = undefined;
+        var evicted_count: usize = 0;
+
+        self.mu.lock();
+        var i: usize = self.reader_proxies.items.len;
+        while (i > 0) {
+            i -= 1;
+            const rp = &self.reader_proxies.items[i];
+            if (rp.probe_deadline_ns > 0 and now_ns >= rp.probe_deadline_ns) {
+                if (evicted_count < evicted.len) {
+                    evicted[evicted_count] = rp.guid.prefix;
+                    evicted_count += 1;
+                }
+                rp.deinit(self.alloc);
+                _ = self.reader_proxies.swapRemove(i);
+            }
+        }
+        self.mu.unlock();
+
+        for (evicted[0..evicted_count]) |prefix| {
+            if (self.probe_result_fn) |f| f(self.probe_result_ctx.?, prefix, false);
         }
     }
 };
