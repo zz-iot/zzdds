@@ -375,9 +375,14 @@ pub const SubscriberImpl = struct {
         const pres = self.qos.presentation;
         if (!pres.coherent_access and !pres.ordered_access) return DDS.RETCODE_OK;
 
-        // Collect readers that need notification (fire callbacks outside the lock).
-        var notify_list: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl) = .empty;
-        defer notify_list.deinit(self.alloc);
+        // Snapshot of listener state for readers that received a coherent commit.
+        // Captured under subscriber.mu so we can fire callbacks safely after the
+        // lock is released.  Avoids use-after-free from a concurrent delete_datareader:
+        // delete_datareader must acquire subscriber.mu, so it cannot free a reader
+        // while we are still accessing its fields inside the lock.
+        const ListenerSnap = struct { listener: DDS.DataReaderListener, dr: DDS.DataReader };
+        var listener_snaps: std.ArrayListUnmanaged(ListenerSnap) = .empty;
+        defer listener_snaps.deinit(self.alloc);
 
         self.mu.lock();
 
@@ -396,8 +401,19 @@ pub const SubscriberImpl = struct {
                 for (self.readers.items) |r| {
                     r.mu.lock();
                     r.commitCoherentPendingLocked();
+                    // Fire WaitSet wakeups while subscriber.mu is held to prevent
+                    // use-after-free.  WaitSet callbacks only acquire their own cv_mu;
+                    // holding subscriber.mu and reader.mu here creates no inversion.
+                    for (r.data_notifiers.items) |n| n.on_data(n.ctx);
                     r.mu.unlock();
-                    notify_list.append(self.alloc, r) catch {};
+                    r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
+                    if (r.status_cond) |sc| sc.notifyWakeup();
+                    if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                        listener_snaps.append(self.alloc, .{
+                            .listener = r.listener,
+                            .dr = r.toDDSDataReader(),
+                        }) catch {};
+                    }
                 }
             }
         }
@@ -431,15 +447,11 @@ pub const SubscriberImpl = struct {
 
         self.mu.unlock();
 
-        for (notify_list.items) |r| {
-            r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
-            if (r.status_cond) |sc| sc.notifyWakeup();
-            r.mu.lock();
-            for (r.data_notifiers.items) |n| n.on_data(n.ctx);
-            r.mu.unlock();
-            if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                r.listener.vtable.on_data_available(r.listener.ptr, r.toDDSDataReader());
-            }
+        // Fire listener callbacks without any lock held, using pre-captured snapshots.
+        // Listener context validity is the application's responsibility (standard DDS
+        // contract: don't delete a reader while its callbacks may be in-flight).
+        for (listener_snaps.items) |snap| {
+            snap.listener.vtable.on_data_available(snap.listener.ptr, snap.dr);
         }
         return DDS.RETCODE_OK;
     }
