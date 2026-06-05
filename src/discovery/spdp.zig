@@ -437,10 +437,20 @@ pub const SpdpEndpoints = struct {
         kp.observed_interval_ns = 0; // updated below for re-announcements
         kp.probe_active = false; // receiving an announcement resolves any probe
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        // was_probing: true when a re-announcement arrives while a liveness probe is
+        // in flight for this participant.  We must cancel the SEDP probe deadline
+        // after releasing spdp.mu so that checkProbeDeadlines does not evict the
+        // SEDP reader proxy for a participant that is demonstrably alive.
+        // (Calling begin_probe_fn acquires writer.mu; spdp.mu must not be held.)
+        var was_probing = false;
+        var is_new_participant = false;
+        var new_participant_data: ?*const iface.ParticipantData = null;
 
-        const gop = self.known.getOrPut(guid_prefix) catch return;
+        self.mu.lock();
+        const gop = self.known.getOrPut(guid_prefix) catch {
+            self.mu.unlock();
+            return;
+        };
         const is_new = !gop.found_existing;
         if (gop.found_existing) {
             // Update the smoothed announcement interval from the previous observation.
@@ -455,19 +465,31 @@ pub const SpdpEndpoints = struct {
             } else {
                 kp.observed_interval_ns = prev_interval;
             }
+            // Capture whether a probe was active before we overwrite the entry.
+            was_probing = gop.value_ptr.probe_active;
             gop.value_ptr.deinit();
         }
         gop.value_ptr.* = kp;
+        is_new_participant = is_new;
+        if (is_new) new_participant_data = &gop.value_ptr.data;
+        self.mu.unlock();
+
+        // Cancel the SEDP probe deadline now that the participant has re-announced.
+        // Must happen outside spdp.mu because begin_probe_fn acquires writer.mu.
+        if (was_probing) {
+            if (self.begin_probe_fn) |f| f(self.sedp_ctx.?, guid_prefix, 0);
+        }
 
         // Fire callbacks and unicast reply only for genuinely new participants.
         // Re-announcements from known participants refresh expires_ns and locator
         // data silently; no DCPS notification or SEDP proxy establishment is needed.
-        if (is_new) {
+        if (is_new_participant) {
+            const data = new_participant_data.?;
             if (self.callbacks) |cbs| {
-                cbs.on_participant_discovered(cbs.ctx, &kp.data);
+                cbs.on_participant_discovered(cbs.ctx, data);
             }
             if (self.on_participant_discovered_sedp) |cb| {
-                cb(self.sedp_ctx.?, &kp.data);
+                cb(self.sedp_ctx.?, data);
             }
             // Register unicast locators for this peer so future sendAll() calls reach
             // it directly, then trigger fast-announce mode instead of calling sendAll()
@@ -475,7 +497,7 @@ pub const SpdpEndpoints = struct {
             // N participants start simultaneously; fast-announce fires once per half-period
             // and reaches everyone via the accumulated locator list.
             if (self.writer) |w| {
-                for (kp.data.metatraffic_unicast_locators) |loc| {
+                for (data.metatraffic_unicast_locators) |loc| {
                     w.addReaderLocator(.{ .locator = loc }) catch {};
                 }
             }

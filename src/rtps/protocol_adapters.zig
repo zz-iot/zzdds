@@ -82,6 +82,7 @@ pub const RtpsProtocolWriter = struct {
         .all_acked = vtAllAcked,
         .cache_len = vtCacheLen,
         .begin_coherent_set = vtBeginCoherentSet,
+        .coherent_window_count = vtCoherentWindowCount,
         .end_coherent_set = vtEndCoherentSet,
         .deinit = vtDeinit,
     };
@@ -176,9 +177,14 @@ pub const RtpsProtocolWriter = struct {
         self.writer.beginCoherentSet(is_coherent_window);
     }
 
-    fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64) void {
+    fn vtCoherentWindowCount(ctx: *anyopaque) usize {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.endCoherentSet(mode, resuspend, publisher_gsn);
+        return self.writer.coherentWindowPendingCount();
+    }
+
+    fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.endCoherentSet(mode, resuspend, publisher_gsn, global_last_gsn);
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

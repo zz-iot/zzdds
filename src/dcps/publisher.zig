@@ -370,7 +370,7 @@ pub const PublisherImpl = struct {
         // writes — don't flush them here; end_coherent_changes will do it correctly.
         // Only flush with .none when there is no open coherent window.
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null);
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null, 0);
         }
         return DDS.RETCODE_OK;
     }
@@ -397,11 +397,17 @@ pub const PublisherImpl = struct {
                 .full
             else
                 .group_seq_only;
+            // Pre-count total coherent-window samples across all writers to compute
+            // the group-wide last GSN for PID_GROUP_COHERENT_SET.  This lets each
+            // writer's last sample carry the correct group end marker.
+            var total_n: i64 = 0;
+            for (self.writers.items) |w| total_n += @intCast(w.proto_writer.coherentWindowCount());
+            const global_last_gsn = self.group_seq_num_counter + total_n;
             // Pass suspend_active as `resuspend` so the flush and re-arm happen
             // atomically inside writer.mu — no window where coherent_active=false.
             // Pass &group_seq_num_counter so all writers in the same publisher's
             // GROUP coherent set get globally unique, write-ordered GSNs.
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter);
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn);
         }
         return DDS.RETCODE_OK;
     }

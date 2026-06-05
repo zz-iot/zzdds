@@ -1079,6 +1079,16 @@ pub const StatefulWriter = struct {
         }
     }
 
+    /// Returns the number of samples buffered in the coherent window (i.e. those that
+    /// will be tagged with coherent-set inline QoS on the next endCoherentSet).
+    /// Used by the publisher to pre-compute the group-wide last GSN before flushing.
+    pub fn coherentWindowPendingCount(self: *Self) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.coherent_pending_sns.items.len < self.coherent_window_start) return 0;
+        return self.coherent_pending_sns.items.len - self.coherent_window_start;
+    }
+
     /// Flush a deferred coherent/ordered batch.
     ///   .full        — PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET
     ///   .group_seq_only — PID_GROUP_SEQ_NUM only (ordered_access without coherent_access)
@@ -1094,7 +1104,11 @@ pub const StatefulWriter = struct {
     /// from this shared counter, ensuring global write-order across writers in a
     /// GROUP_PRESENTATION coherent set.  When null, the writer uses its own per-writer
     /// counter (standalone writer usage — single-writer publishers or direct tests).
-    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64) void {
+    /// `global_last_gsn`: the group-wide last GSN across ALL writers in the publisher's
+    /// coherent set.  Written into PID_GROUP_COHERENT_SET on the last sample from this
+    /// writer so the receiver knows when the full group set has arrived.  0 = use the
+    /// per-writer last GSN (standalone/single-writer path where they are equal).
+    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.coherent_active = false;
@@ -1136,13 +1150,17 @@ pub const StatefulWriter = struct {
                 // standalone usage (single-writer publishers or direct test calls).
                 const base_gsn = if (publisher_gsn) |pg| pg.* else self.group_seq_num_counter;
                 const last_gsn = base_gsn + n;
+                // group_coherent_sn = last GSN in the entire publisher's coherent set
+                // (provided by the publisher as global_last_gsn).  Falls back to the
+                // per-writer last_gsn for single-writer publishers (where they are equal).
+                const group_end_gsn = if (global_last_gsn != 0) global_last_gsn else last_gsn;
                 for (coherent_sns, 1..) |sn, i| {
                     const gsn: i64 = base_gsn + @as(i64, @intCast(i));
                     for (self.cache.changes.items) |*ch| {
                         if (ch.sequence_number == sn) {
                             if (mode == .full) {
                                 ch.coherent_set_sn = last_sn;
-                                if (sn == last_sn) ch.group_coherent_sn = last_gsn;
+                                if (sn == last_sn) ch.group_coherent_sn = group_end_gsn;
                             }
                             ch.group_seq_num = gsn;
                             break;

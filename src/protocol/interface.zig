@@ -149,9 +149,14 @@ pub const ProtocolWriter = struct {
         /// only, without marking a coherent window boundary).
         begin_coherent_set: *const fn (ctx: *anyopaque, is_coherent_window: bool) void,
 
+        /// Returns the number of samples in the coherent window (used by the publisher
+        /// to pre-compute the group-wide last GSN before flushing).
+        coherent_window_count: *const fn (ctx: *anyopaque) usize,
+
         /// Flush a deferred coherent/ordered batch.  `mode` controls which
         /// inline QoS PIDs are emitted (see CoherentFlushMode).
-        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64) void,
+        /// `global_last_gsn`: group-wide last GSN across all writers; 0 = per-writer.
+        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void,
 
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
@@ -221,8 +226,12 @@ pub const ProtocolWriter = struct {
         self.vtable.begin_coherent_set(self.ctx, is_coherent_window);
     }
 
-    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64) void {
-        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn);
+    pub fn coherentWindowCount(self: ProtocolWriter) usize {
+        return self.vtable.coherent_window_count(self.ctx);
+    }
+
+    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
+        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn);
     }
 
     pub fn deinit(self: ProtocolWriter) void {
