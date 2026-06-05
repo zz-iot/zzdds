@@ -104,6 +104,14 @@ sweep of all `orderedRemove` call sites should replace them with `swapRemove` wh
 not semantically required, or with an indexed/hash structure where it is.  Existing tests
 should catch any ordering dependency that is accidentally removed.
 
+A specific instance worth addressing: `commitCoherentPendingLocked` in `reader.zig` uses
+`coherent_committed.orderedRemove(0)` to pop the oldest committed set from the front of the
+queue.  In the common late-join history-replay case where multiple coherent sets accumulate
+before the first `begin_access`, each pop is O(N) in the remaining queue depth.  The fix is
+to replace `ArrayListUnmanaged` with a head-index (`head: usize`) that advances instead of
+shifting, or to use a ring-buffer structure.  Queue depths in practice are small (1–3 sets),
+so this is a polish item rather than an urgent fix.
+
 **Condvar-based blocking in setup paths** — `wait_for_historical_data` and any other
 setup-time spin-poll (`std.time.sleep` in a retry loop) should be converted to condvar-based
 blocking.  The pattern to look for: a loop that sleeps a fixed interval then re-checks a

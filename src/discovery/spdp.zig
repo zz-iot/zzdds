@@ -553,46 +553,42 @@ pub const SpdpEndpoints = struct {
         // catching peers whose interval is unknown or very long (cap at 5 s).
         const max_probe_trigger_ns: i64 = 5_000_000_000; // 5 seconds
 
-        self.mu.lock();
+        var to_remove: std.ArrayListUnmanaged(GuidPrefix) = .empty;
+        defer to_remove.deinit(self.alloc);
+        var to_probe_prefixes: std.ArrayListUnmanaged(GuidPrefix) = .empty;
+        defer to_probe_prefixes.deinit(self.alloc);
+        var to_probe_deadlines: std.ArrayListUnmanaged(i64) = .empty;
+        defer to_probe_deadlines.deinit(self.alloc);
+        var evict_guids: std.ArrayListUnmanaged(Guid) = .empty;
+        defer evict_guids.deinit(self.alloc);
 
-        var to_remove: [64]GuidPrefix = undefined;
-        var to_remove_count: usize = 0;
-        var to_probe_prefixes: [16]GuidPrefix = undefined;
-        var to_probe_deadlines: [16]i64 = undefined;
-        var to_probe_count: usize = 0;
+        self.mu.lock();
 
         var it = self.known.iterator();
         while (it.next()) |entry| {
             const kp = entry.value_ptr;
             if (now_ns >= kp.expires_ns) {
-                if (to_remove_count < to_remove.len) {
-                    to_remove[to_remove_count] = entry.key_ptr.*;
-                    to_remove_count += 1;
-                }
+                to_remove.append(self.alloc, entry.key_ptr.*) catch {};
             } else if (!kp.probe_active and kp.last_seen_ns > 0) {
                 const silence = now_ns - kp.last_seen_ns;
                 const trigger = if (kp.observed_interval_ns > 0)
                     @min(3 * kp.observed_interval_ns, max_probe_trigger_ns)
                 else
                     max_probe_trigger_ns;
-                if (silence >= trigger and to_probe_count < to_probe_prefixes.len) {
+                if (silence >= trigger) {
                     kp.probe_active = true;
-                    to_probe_prefixes[to_probe_count] = entry.key_ptr.*;
-                    to_probe_deadlines[to_probe_count] = now_ns + 1_000_000_000; // 1 s deadline
-                    to_probe_count += 1;
+                    to_probe_prefixes.append(self.alloc, entry.key_ptr.*) catch {
+                        kp.probe_active = false; // undo on OOM so we retry next cycle
+                    };
+                    to_probe_deadlines.append(self.alloc, now_ns + 1_000_000_000) catch {};
                 }
             }
         }
 
-        var evict_guids: [64]Guid = undefined;
-        var evict_count: usize = 0;
-        for (to_remove[0..to_remove_count]) |prefix| {
+        for (to_remove.items) |prefix| {
             if (self.known.fetchRemove(prefix)) |kp| {
                 var kp2 = kp;
-                if (evict_count < evict_guids.len) {
-                    evict_guids[evict_count] = kp2.value.data.guid;
-                    evict_count += 1;
-                }
+                evict_guids.append(self.alloc, kp2.value.data.guid) catch {};
                 kp2.value.deinit();
             }
         }
@@ -601,15 +597,15 @@ pub const SpdpEndpoints = struct {
 
         // Fire eviction callbacks outside the lock to avoid spdp.mu → participant.mu
         // → writer.mu → spdp.mu inversion with the probe result path.
-        for (evict_guids[0..evict_count]) |guid| {
+        for (evict_guids.items) |guid| {
             if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, guid);
         }
 
         // Start probes outside the lock: beginProbe acquires SEDP writer locks,
         // and the probe result callback acquires spdp.mu — holding it here would
         // create a potential cycle.
-        for (0..to_probe_count) |i| {
-            if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, to_probe_prefixes[i], to_probe_deadlines[i]);
+        for (0..to_probe_prefixes.items.len) |i| {
+            if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, to_probe_prefixes.items[i], to_probe_deadlines.items[i]);
         }
     }
 
