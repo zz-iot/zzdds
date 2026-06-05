@@ -110,6 +110,11 @@ pub const PublisherImpl = struct {
     /// coherent_active on the writers so that end_coherent_changes can re-open
     /// the suspension window after flushing the coherent set.
     suspend_active: bool,
+    /// Shared group sequence number counter advanced across all writers during
+    /// begin/end_coherent_changes.  Passed by pointer to each writer's endCoherentSet
+    /// so that multiple writers in the same GROUP_PRESENTATION coherent set receive
+    /// globally unique, write-ordered GSNs rather than independent per-writer sequences.
+    group_seq_num_counter: i64,
 
     const Self = @This();
 
@@ -138,6 +143,7 @@ pub const PublisherImpl = struct {
             .mu = .{},
             .coherent_depth = 0,
             .suspend_active = false,
+            .group_seq_num_counter = 0,
         };
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
@@ -364,7 +370,7 @@ pub const PublisherImpl = struct {
         // writes — don't flush them here; end_coherent_changes will do it correctly.
         // Only flush with .none when there is no open coherent window.
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false);
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null);
         }
         return DDS.RETCODE_OK;
     }
@@ -393,7 +399,9 @@ pub const PublisherImpl = struct {
                 .group_seq_only;
             // Pass suspend_active as `resuspend` so the flush and re-arm happen
             // atomically inside writer.mu — no window where coherent_active=false.
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active);
+            // Pass &group_seq_num_counter so all writers in the same publisher's
+            // GROUP coherent set get globally unique, write-ordered GSNs.
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter);
         }
         return DDS.RETCODE_OK;
     }

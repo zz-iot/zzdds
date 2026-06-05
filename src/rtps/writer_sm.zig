@@ -1089,7 +1089,12 @@ pub const StatefulWriter = struct {
     /// When coherent_window_start > 0, items [0..coherent_window_start) were written
     /// during suspension before begin_coherent_changes and are flushed without coherent
     /// QoS; only items [coherent_window_start..) belong to the coherent set.
-    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool) void {
+    /// `publisher_gsn`: when non-null, points to the publisher's shared GSN counter.
+    /// All writers in the same publisher flush with sequentially assigned GSNs drawn
+    /// from this shared counter, ensuring global write-order across writers in a
+    /// GROUP_PRESENTATION coherent set.  When null, the writer uses its own per-writer
+    /// counter (standalone writer usage — single-writer publishers or direct tests).
+    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.coherent_active = false;
@@ -1125,7 +1130,11 @@ pub const StatefulWriter = struct {
             // so holding the counter at 0 until the first reader joins is correct.
             const has_readers = self.reader_proxies.items.len > 0;
             if (has_readers) {
-                const base_gsn = self.group_seq_num_counter;
+                // Use the publisher's shared counter when available so that samples
+                // from multiple writers in the same GROUP coherent set get globally
+                // unique, ordered GSNs.  Fall back to the per-writer counter for
+                // standalone usage (single-writer publishers or direct test calls).
+                const base_gsn = if (publisher_gsn) |pg| pg.* else self.group_seq_num_counter;
                 const last_gsn = base_gsn + n;
                 for (coherent_sns, 1..) |sn, i| {
                     const gsn: i64 = base_gsn + @as(i64, @intCast(i));
@@ -1140,7 +1149,11 @@ pub const StatefulWriter = struct {
                         }
                     }
                 }
-                self.group_seq_num_counter += n;
+                if (publisher_gsn) |pg| {
+                    pg.* += n;
+                } else {
+                    self.group_seq_num_counter += n;
+                }
             } else if (mode == .full) {
                 // No readers yet — still mark coherent_set_sn for retransmit consistency.
                 for (coherent_sns) |sn| {

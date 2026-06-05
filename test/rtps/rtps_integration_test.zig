@@ -1309,7 +1309,7 @@ test "coherent_set: writes deferred until endCoherentSet" {
     writer.mu.unlock();
 
     // End coherent set with .full: patch all 3 changes and flush DATA.
-    writer.endCoherentSet(.full, false);
+    writer.endCoherentSet(.full, false, null);
 
     // Verify coherent_set_sn is patched to last SN (3) on all 3 changes.
     writer.mu.lock();
@@ -1376,7 +1376,7 @@ test "coherent_set: mode=none sends without PID_COHERENT_SET" {
     try write(writer, "y");
 
     // End with .none: changes sent but coherent_set_sn stays null.
-    writer.endCoherentSet(.none, false);
+    writer.endCoherentSet(.none, false, null);
 
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
@@ -1438,7 +1438,7 @@ test "coherent_set: mode=group_seq_only emits group_seq_num but not coherent_set
     try write(writer, "y");
 
     // .group_seq_only: group_seq_num is assigned, coherent_set_sn stays null.
-    writer.endCoherentSet(.group_seq_only, false);
+    writer.endCoherentSet(.group_seq_only, false, null);
 
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
@@ -1451,4 +1451,66 @@ test "coherent_set: mode=group_seq_only emits group_seq_num but not coherent_set
     net.deliverAll();
     net.deliverAll();
     try testing.expectEqual(@as(usize, 2), col.samples.items.len);
+}
+
+test "coherent_set: multi-writer publisher shares GSN counter for global ordering" {
+    // Regression for per-writer group_seq_num_counter bug.  Without the fix,
+    // two writers in the same publisher both start from their own counter (both
+    // assign GSN=1 to their first sample), making group order undefined.
+    // With the fix, the publisher passes a shared counter pointer to each writer's
+    // endCoherentSet so GSNs are globally unique across the coherent set.
+    //
+    // Writer 1 has samples A(SN=1) and C(SN=2); writer 2 has sample B(SN=1).
+    // Simulated publisher flushes W1 first, then W2.
+    // Expected GSNs: A=1, C=2 (W1), B=3 (W2).
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mt_w1 = try MockTransport.init(alloc, net, &.{W1_LOC});
+    defer mt_w1.deinit();
+    const mt_w2 = try MockTransport.init(alloc, net, &.{W2_LOC});
+    defer mt_w2.deinit();
+
+    const w1 = try StatefulWriter.init(alloc, W1_GUID, mt_w1.transport(), .keep_all, 0, EntityIds.unknown, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w1.deinit();
+    const w2 = try StatefulWriter.init(alloc, W2_GUID, mt_w2.transport(), .keep_all, 0, EntityIds.unknown, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w2.deinit();
+
+    // Add a reader proxy to each writer so GSNs are actually assigned.
+    const rp1 = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
+    try w1.addMatchedReader(rp1);
+    const rp2 = try ReaderProxy.init(alloc, R2_GUID, &.{R2_LOC}, &.{}, false, true);
+    try w2.addMatchedReader(rp2);
+
+    // Open coherent windows on both writers (simulating publisher beginCoherentSet).
+    w1.beginCoherentSet(true);
+    w2.beginCoherentSet(true);
+
+    // W1 writes A and C; W2 writes B (interleaved to reflect real multi-writer usage).
+    _ = try w1.write(.alive, NIL_TS, NIL_IH, NIL_KH, "A");
+    _ = try w2.write(.alive, NIL_TS, NIL_IH, NIL_KH, "B");
+    _ = try w1.write(.alive, NIL_TS, NIL_IH, NIL_KH, "C");
+
+    // Flush both writers with a shared publisher counter (simulating vtEndCoherent).
+    var shared_gsn: i64 = 0;
+    w1.endCoherentSet(.full, false, &shared_gsn); // W1: A=GSN1, C=GSN2; shared_gsn=2
+    w2.endCoherentSet(.full, false, &shared_gsn); // W2: B=GSN3; shared_gsn=3
+
+    // Verify W1's samples got globally-unique GSNs 1 and 2.
+    w1.mu.lock();
+    var gsns_w1: [2]?i64 = .{ null, null };
+    for (w1.cache.changes.items, 0..) |*ch, i| {
+        if (i < 2) gsns_w1[i] = ch.group_seq_num;
+    }
+    w1.mu.unlock();
+    try testing.expectEqual(@as(?i64, 1), gsns_w1[0]);
+    try testing.expectEqual(@as(?i64, 2), gsns_w1[1]);
+
+    // Verify W2's sample got GSN 3 (continuing from W1's range, not restarting at 1).
+    w2.mu.lock();
+    const gsn_w2 = w2.cache.changes.items[0].group_seq_num;
+    w2.mu.unlock();
+    try testing.expectEqual(@as(?i64, 3), gsn_w2);
 }

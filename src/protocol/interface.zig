@@ -151,7 +151,7 @@ pub const ProtocolWriter = struct {
 
         /// Flush a deferred coherent/ordered batch.  `mode` controls which
         /// inline QoS PIDs are emitted (see CoherentFlushMode).
-        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool) void,
+        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64) void,
 
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
@@ -221,8 +221,8 @@ pub const ProtocolWriter = struct {
         self.vtable.begin_coherent_set(self.ctx, is_coherent_window);
     }
 
-    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool) void {
-        self.vtable.end_coherent_set(self.ctx, mode, resuspend);
+    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64) void {
+        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn);
     }
 
     pub fn deinit(self: ProtocolWriter) void {
