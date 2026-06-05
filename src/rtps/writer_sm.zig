@@ -334,6 +334,11 @@ pub const StatefulWriter = struct {
     coherent_active: bool,
     /// SNs written since the last beginCoherentSet() call; flushed in endCoherentSet().
     coherent_pending_sns: std.ArrayListUnmanaged(SequenceNumber),
+    /// Index into coherent_pending_sns where the actual coherent window begins.
+    /// Non-zero only when suspend_publications was active before begin_coherent_changes:
+    /// items [0..coherent_window_start) were written during suspension and are flushed
+    /// without coherent QoS; items [coherent_window_start..) are the true coherent set.
+    coherent_window_start: usize,
     /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
     /// Incremented by N after each group coherent set of N samples is flushed.
     group_seq_num_counter: i64,
@@ -375,6 +380,7 @@ pub const StatefulWriter = struct {
             .hb_stopping = std.atomic.Value(bool).init(false),
             .coherent_active = false,
             .coherent_pending_sns = .empty,
+            .coherent_window_start = 0,
             .group_seq_num_counter = 0,
             .probe_result_fn = null,
             .probe_result_ctx = null,
@@ -1056,12 +1062,21 @@ pub const StatefulWriter = struct {
         return false;
     }
 
-    /// Start a coherent set.  Subsequent write() calls accumulate changes in
-    /// coherent_pending_sns without sending DATA immediately.
-    pub fn beginCoherentSet(self: *Self) void {
+    /// Start a coherent set window.
+    /// `is_coherent_window`: true when called from begin_coherent_changes (marks the
+    /// current buffer depth as the coherent window start so that pre-suspension writes
+    /// are not incorrectly tagged as part of the coherent set on endCoherentSet).
+    /// false when called from suspend_publications (activates buffering only).
+    pub fn beginCoherentSet(self: *Self, is_coherent_window: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
-        self.coherent_active = true;
+        if (is_coherent_window and self.coherent_active) {
+            // Already buffering from suspend_publications — record where the actual
+            // coherent window begins so pre-window writes flush without coherent QoS.
+            self.coherent_window_start = self.coherent_pending_sns.items.len;
+        } else {
+            self.coherent_active = true;
+        }
     }
 
     /// Flush a deferred coherent/ordered batch.
@@ -1070,6 +1085,10 @@ pub const StatefulWriter = struct {
     ///   .none        — no inline QoS (resume_publications)
     /// `resuspend`: if true, re-arms coherent_active=true before releasing the lock so
     /// that concurrent write() calls never observe a window where suspension is inactive.
+    ///
+    /// When coherent_window_start > 0, items [0..coherent_window_start) were written
+    /// during suspension before begin_coherent_changes and are flushed without coherent
+    /// QoS; only items [coherent_window_start..) belong to the coherent set.
     pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -1077,9 +1096,27 @@ pub const StatefulWriter = struct {
         defer if (resuspend) {
             self.coherent_active = true;
         };
-        if (self.coherent_pending_sns.items.len == 0) return;
-        const last_sn = self.coherent_pending_sns.items[self.coherent_pending_sns.items.len - 1];
-        const n: i64 = @intCast(self.coherent_pending_sns.items.len);
+
+        const window_start = self.coherent_window_start;
+        self.coherent_window_start = 0;
+
+        const all_sns = self.coherent_pending_sns.items;
+        if (all_sns.len == 0) return;
+
+        // Flush pre-window writes (from suspension before begin_coherent_changes)
+        // without coherent QoS — they are not part of the coherent set.
+        for (all_sns[0..window_start]) |sn| {
+            if (self.cache.getChange(sn)) |ch| self.sendChangeToAllLocked(ch);
+        }
+
+        const coherent_sns = all_sns[window_start..];
+        if (coherent_sns.len == 0) {
+            self.coherent_pending_sns.clearRetainingCapacity();
+            return;
+        }
+
+        const last_sn = coherent_sns[coherent_sns.len - 1];
+        const n: i64 = @intCast(coherent_sns.len);
         if (mode != .none) {
             // Only assign group sequence numbers when there are readers — the GSN
             // counter must start at 1 for the FIRST sample a reader sees, not at
@@ -1090,7 +1127,7 @@ pub const StatefulWriter = struct {
             if (has_readers) {
                 const base_gsn = self.group_seq_num_counter;
                 const last_gsn = base_gsn + n;
-                for (self.coherent_pending_sns.items, 1..) |sn, i| {
+                for (coherent_sns, 1..) |sn, i| {
                     const gsn: i64 = base_gsn + @as(i64, @intCast(i));
                     for (self.cache.changes.items) |*ch| {
                         if (ch.sequence_number == sn) {
@@ -1106,7 +1143,7 @@ pub const StatefulWriter = struct {
                 self.group_seq_num_counter += n;
             } else if (mode == .full) {
                 // No readers yet — still mark coherent_set_sn for retransmit consistency.
-                for (self.coherent_pending_sns.items) |sn| {
+                for (coherent_sns) |sn| {
                     for (self.cache.changes.items) |*ch| {
                         if (ch.sequence_number == sn) {
                             ch.coherent_set_sn = last_sn;
@@ -1116,7 +1153,7 @@ pub const StatefulWriter = struct {
                 }
             }
         }
-        for (self.coherent_pending_sns.items) |sn| {
+        for (coherent_sns) |sn| {
             if (self.cache.getChange(sn)) |ch| {
                 self.sendChangeToAllLocked(ch);
             }

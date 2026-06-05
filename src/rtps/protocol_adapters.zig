@@ -171,9 +171,9 @@ pub const RtpsProtocolWriter = struct {
         return self.writer.cache.len();
     }
 
-    fn vtBeginCoherentSet(ctx: *anyopaque) void {
+    fn vtBeginCoherentSet(ctx: *anyopaque, is_coherent_window: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.beginCoherentSet();
+        self.writer.beginCoherentSet(is_coherent_window);
     }
 
     fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool) void {

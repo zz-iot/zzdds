@@ -143,8 +143,11 @@ pub const ProtocolWriter = struct {
         cache_len: *const fn (ctx: *anyopaque) usize,
 
         /// Begin a coherent set: subsequent write() calls are deferred until
-        /// end_coherent_set().
-        begin_coherent_set: *const fn (ctx: *anyopaque) void,
+        /// end_coherent_set().  `is_coherent_window` must be true when called from
+        /// begin_coherent_changes (records the buffer depth as the coherent window
+        /// start) and false when called from suspend_publications (activates buffering
+        /// only, without marking a coherent window boundary).
+        begin_coherent_set: *const fn (ctx: *anyopaque, is_coherent_window: bool) void,
 
         /// Flush a deferred coherent/ordered batch.  `mode` controls which
         /// inline QoS PIDs are emitted (see CoherentFlushMode).
@@ -214,8 +217,8 @@ pub const ProtocolWriter = struct {
         return self.vtable.cache_len(self.ctx);
     }
 
-    pub fn beginCoherentSet(self: ProtocolWriter) void {
-        self.vtable.begin_coherent_set(self.ctx);
+    pub fn beginCoherentSet(self: ProtocolWriter, is_coherent_window: bool) void {
+        self.vtable.begin_coherent_set(self.ctx, is_coherent_window);
     }
 
     pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool) void {

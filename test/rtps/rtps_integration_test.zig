@@ -1290,7 +1290,7 @@ test "coherent_set: writes deferred until endCoherentSet" {
     net.deliverAll(); // second round for the reader's ACKNACK response
 
     // Begin coherent set: writes are now deferred.
-    writer.beginCoherentSet();
+    writer.beginCoherentSet(true);
     try write(writer, "alpha");
     try write(writer, "beta");
     try write(writer, "gamma");
@@ -1371,7 +1371,7 @@ test "coherent_set: mode=none sends without PID_COHERENT_SET" {
     net.deliverAll();
     net.deliverAll();
 
-    writer.beginCoherentSet();
+    writer.beginCoherentSet(true);
     try write(writer, "x");
     try write(writer, "y");
 
@@ -1433,7 +1433,7 @@ test "coherent_set: mode=group_seq_only emits group_seq_num but not coherent_set
     net.deliverAll();
     net.deliverAll();
 
-    writer.beginCoherentSet();
+    writer.beginCoherentSet(true);
     try write(writer, "x");
     try write(writer, "y");
 

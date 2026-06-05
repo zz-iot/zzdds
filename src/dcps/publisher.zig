@@ -351,7 +351,7 @@ pub const PublisherImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.suspend_active = true;
-        for (self.writers.items) |w| w.proto_writer.beginCoherentSet();
+        for (self.writers.items) |w| w.proto_writer.beginCoherentSet(false);
         return DDS.RETCODE_OK;
     }
 
@@ -374,7 +374,7 @@ pub const PublisherImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.beginCoherentSet();
+            for (self.writers.items) |w| w.proto_writer.beginCoherentSet(true);
         }
         self.coherent_depth += 1;
         return DDS.RETCODE_OK;

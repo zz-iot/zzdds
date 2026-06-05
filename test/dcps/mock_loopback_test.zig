@@ -798,3 +798,122 @@ test "mock_loopback: ordered access sorts pending queue via begin_access" {
     try std.testing.expectEqualSlices(u8, &PAYLOAD_A, samples.items[0]);
     try std.testing.expectEqualSlices(u8, &PAYLOAD_B, samples.items[1]);
 }
+
+test "mock_loopback: pre-coherent-window writes not tagged as part of coherent set" {
+    // Regression for the coherent_window_start fix.  Without it, a write made
+    // during suspend_publications *before* begin_coherent_changes shared the same
+    // coherent_pending_sns buffer as the coherent-window write, so end_coherent_changes
+    // incorrectly tagged both with PID_COHERENT_SET and delivered them as one set.
+    //
+    // With the fix, endCoherentSet splits the flush at coherent_window_start:
+    //   - items before the window are sent as plain DATAs (no PID_COHERENT_SET)
+    //   - items inside the window form the actual coherent set
+    //
+    // After end_coherent_changes + delivery the reader must see:
+    //   - PAYLOAD_A in pending (plain write, not coherent-buffered)
+    //   - PAYLOAD_B in coherent_committed (1-sample coherent set)
+    const alloc = std.testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    // ── Reader side ───────────────────────────────────────────────────────────
+    const mock_r = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_R, PORT_META_R)});
+    defer mock_r.deinit();
+    const disc_r = try SpdpSedpDiscovery.init(alloc, mock_r.transport(), 0, 100);
+    var factory_r = try DomainParticipantFactoryImpl.init(alloc, mock_r.transport(), disc_r.toDiscovery(), noop_security, .spec_random, .{});
+    defer {
+        factory_r.deinit();
+        disc_r.deinit();
+    }
+    const dpf_r = factory_r.toDDSFactory();
+    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf_r.delete_participant(dp_r);
+
+    var sub_qos = DDS.SubscriberQos{};
+    sub_qos.presentation.coherent_access = true;
+    sub_qos.presentation.access_scope = .TOPIC_PRESENTATION_QOS;
+    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, sub_qos, nil.nil_sub_listener, 0);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "PreCoherentTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    const dr = sub_r.vtable.create_datareader(sub_r.ptr, topic_desc_r, dr_qos, nil.nil_dr_listener, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    // ── Writer side ───────────────────────────────────────────────────────────
+    const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
+    defer mock_w.deinit();
+    const disc_w = try SpdpSedpDiscovery.init(alloc, mock_w.transport(), 0, 100);
+    var factory_w = try DomainParticipantFactoryImpl.init(alloc, mock_w.transport(), disc_w.toDiscovery(), noop_security, .spec_random, .{});
+    defer {
+        factory_w.deinit();
+        disc_w.deinit();
+    }
+    const dpf_w = factory_w.toDDSFactory();
+    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf_w.delete_participant(dp_w);
+
+    var pub_qos = DDS.PublisherQos{};
+    pub_qos.presentation.coherent_access = true;
+    pub_qos.presentation.access_scope = .TOPIC_PRESENTATION_QOS;
+    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, pub_qos, nil.nil_pub_listener, 0);
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "PreCoherentTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    // ── Drive discovery ───────────────────────────────────────────────────────
+    const disc_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < disc_deadline) {
+        net.deliverAll();
+        if (dw_impl.matchedReaderCount() > 0) break;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(dw_impl.matchedReaderCount() > 0);
+
+    // suspend → write A (pre-window) → begin_coherent → write B (in window) → end_coherent
+    _ = pub_w.vtable.suspend_publications(pub_w.ptr);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_A);
+    _ = pub_w.vtable.begin_coherent_changes(pub_w.ptr);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_B);
+    _ = pub_w.vtable.end_coherent_changes(pub_w.ptr);
+    _ = pub_w.vtable.resume_publications(pub_w.ptr);
+
+    // Deliver until both arrive.
+    const deliver_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < deliver_deadline) {
+        net.deliverAll();
+        dr_impl.mu.lock();
+        const pending_n = dr_impl.pending.items.len;
+        const committed = dr_impl.coherent_committed_ready;
+        dr_impl.mu.unlock();
+        if (pending_n >= 1 and committed) break;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+
+    // PAYLOAD_A must be in pending as a plain write (not part of any coherent set).
+    dr_impl.mu.lock();
+    try std.testing.expectEqual(@as(usize, 1), dr_impl.pending.items.len);
+    try std.testing.expect(dr_impl.coherent_committed_ready);
+    dr_impl.mu.unlock();
+
+    const sample_a = dr_impl.takeRaw().?;
+    defer alloc.free(sample_a.data);
+    try std.testing.expectEqualSlices(u8, &PAYLOAD_A, sample_a.data);
+
+    // PAYLOAD_B must be in the coherent set, accessible only via begin_access.
+    try std.testing.expect(dr_impl.takeRaw() == null);
+    _ = sub_r.vtable.begin_access(sub_r.ptr);
+    _ = sub_r.vtable.end_access(sub_r.ptr);
+    const sample_b = dr_impl.takeRaw().?;
+    defer alloc.free(sample_b.data);
+    try std.testing.expectEqualSlices(u8, &PAYLOAD_B, sample_b.data);
+}
