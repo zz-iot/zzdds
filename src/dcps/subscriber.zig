@@ -376,8 +376,8 @@ pub const SubscriberImpl = struct {
         if (!pres.coherent_access and !pres.ordered_access) return DDS.RETCODE_OK;
 
         // Collect readers that need notification (fire callbacks outside the lock).
-        var notify_buf: [64]*reader_mod.DataReaderImpl = undefined;
-        var n_notify: usize = 0;
+        var notify_list: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl) = .empty;
+        defer notify_list.deinit(self.alloc);
 
         self.mu.lock();
 
@@ -396,11 +396,8 @@ pub const SubscriberImpl = struct {
                 for (self.readers.items) |r| {
                     r.mu.lock();
                     r.commitCoherentPendingLocked();
-                    if (n_notify < notify_buf.len) {
-                        notify_buf[n_notify] = r;
-                        n_notify += 1;
-                    }
                     r.mu.unlock();
+                    notify_list.append(self.alloc, r) catch {};
                 }
             }
         }
@@ -434,9 +431,12 @@ pub const SubscriberImpl = struct {
 
         self.mu.unlock();
 
-        for (notify_buf[0..n_notify]) |r| {
+        for (notify_list.items) |r| {
             r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
             if (r.status_cond) |sc| sc.notifyWakeup();
+            r.mu.lock();
+            for (r.data_notifiers.items) |n| n.on_data(n.ctx);
+            r.mu.unlock();
             if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
                 r.listener.vtable.on_data_available(r.listener.ptr, r.toDDSDataReader());
             }

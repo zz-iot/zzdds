@@ -749,16 +749,15 @@ pub const DataReaderImpl = struct {
         // Release ownership of any instances this writer held.  Collect keys
         // first (can't remove while iterating), then remove.  The next sample
         // from any remaining writer for those instances will re-claim them.
-        var to_remove: [64]DDS.InstanceHandle_t = undefined;
-        var n_remove: usize = 0;
+        var to_remove: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
+        defer to_remove.deinit(self.alloc);
         var it = self.owner_map.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.guid.eql(guid) and n_remove < to_remove.len) {
-                to_remove[n_remove] = entry.key_ptr.*;
-                n_remove += 1;
+            if (entry.value_ptr.guid.eql(guid)) {
+                to_remove.append(self.alloc, entry.key_ptr.*) catch {};
             }
         }
-        for (to_remove[0..n_remove]) |ih| {
+        for (to_remove.items) |ih| {
             _ = self.owner_map.remove(ih);
         }
     }
@@ -779,7 +778,7 @@ pub const DataReaderImpl = struct {
         first_set.deinit(self.alloc);
         self.coherent_committed_ready = self.coherent_committed.items.len > 0;
         self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
-        for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+        // data_notifiers are fired by the subscriber after releasing all locks.
     }
 
     /// Returns true if there is at least one pending sample.

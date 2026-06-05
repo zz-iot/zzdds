@@ -353,8 +353,12 @@ pub const PublisherImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        // .none: suspended publications are just delayed, not grouped.
-        for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none);
+        // If begin_coherent_changes is active, the coherent window owns the deferred
+        // writes — don't flush them here; end_coherent_changes will do it correctly.
+        // Only flush with .none when there is no open coherent window.
+        if (self.coherent_depth == 0) {
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none);
+        }
         return DDS.RETCODE_OK;
     }
 

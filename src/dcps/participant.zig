@@ -1179,12 +1179,13 @@ pub const DomainParticipantImpl = struct {
         return std.mem.zeroes([16]u8);
     }
 
-    fn decodeCoherentSetSn(iq: ?submsg_mod.InlineQos) ?history_mod.SequenceNumber {
+    fn decodeCoherentSetSn(iq: ?submsg_mod.InlineQos, little_endian: bool) ?history_mod.SequenceNumber {
         if (iq) |q| {
             if (q.get(.coherent_set)) |cs| {
                 if (cs.len >= 8) {
-                    const high = std.mem.readInt(i32, cs[0..4], .little);
-                    const low = std.mem.readInt(u32, cs[4..8], .little);
+                    const order: std.builtin.Endian = if (little_endian) .little else .big;
+                    const high = std.mem.readInt(i32, cs[0..4], order);
+                    const low = std.mem.readInt(u32, cs[4..8], order);
                     const h: i64 = @as(i64, high) << 32;
                     const l: i64 = @as(i64, low);
                     return h | l;
@@ -1194,12 +1195,13 @@ pub const DomainParticipantImpl = struct {
         return null;
     }
 
-    fn decodeGroupSeqNum(iq: ?submsg_mod.InlineQos) ?history_mod.SequenceNumber {
+    fn decodeGroupSeqNum(iq: ?submsg_mod.InlineQos, little_endian: bool) ?history_mod.SequenceNumber {
         if (iq) |q| {
             if (q.get(.group_seq_num)) |gs| {
                 if (gs.len >= 8) {
-                    const high = std.mem.readInt(i32, gs[0..4], .little);
-                    const low = std.mem.readInt(u32, gs[4..8], .little);
+                    const order: std.builtin.Endian = if (little_endian) .little else .big;
+                    const high = std.mem.readInt(i32, gs[0..4], order);
+                    const low = std.mem.readInt(u32, gs[4..8], order);
                     const h: i64 = @as(i64, high) << 32;
                     const l: i64 = @as(i64, low);
                     return h | l;
@@ -1290,8 +1292,8 @@ pub const DomainParticipantImpl = struct {
                     const kind = decodeChangeKind(d.inline_qos);
                     if (kind == .alive and d.serialized_payload.len == 0) continue;
                     const key_hash = decodeKeyHash(d.inline_qos);
-                    const coherent_set_sn = decodeCoherentSetSn(d.inline_qos);
-                    const group_seq_num = decodeGroupSeqNum(d.inline_qos);
+                    const coherent_set_sn = decodeCoherentSetSn(d.inline_qos, d.isLittleEndian());
+                    const group_seq_num = decodeGroupSeqNum(d.inline_qos, d.isLittleEndian());
 
                     if (d.inline_qos) |iq| {
                         if (iq.get(.directed_write)) |dw_bytes| {
