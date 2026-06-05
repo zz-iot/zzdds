@@ -873,10 +873,15 @@ pub const DataReaderImpl = struct {
     pub fn commitCoherentPendingLocked(self: *Self) void {
         if (self.coherent_committed.items.len == 0) return;
         var first_set = self.coherent_committed.orderedRemove(0);
+        // Pre-allocate so the append loop is all-or-nothing.  On OOM the entire
+        // set is discarded rather than partially committed.
+        self.pending.ensureUnusedCapacity(self.alloc, first_set.items.len) catch {
+            for (first_set.items) |cppc| cppc.deinit();
+            first_set.deinit(self.alloc);
+            return;
+        };
         for (first_set.items) |cppc| {
-            self.pending.append(self.alloc, cppc) catch {
-                cppc.deinit(); // OOM: pending full; free the payload rather than leak it
-            };
+            self.pending.appendAssumeCapacity(cppc);
         }
         first_set.deinit(self.alloc);
         self.coherent_committed_ready = self.coherent_committed.items.len > 0;
