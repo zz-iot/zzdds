@@ -1142,8 +1142,8 @@ pub const StatefulWriter = struct {
     pub fn checkProbeDeadlines(self: *Self) void {
         const now_ns = time_mod.monotonicClock().nowNs();
 
-        var evicted: [8]GuidPrefix = undefined;
-        var evicted_count: usize = 0;
+        var evicted: std.ArrayListUnmanaged(GuidPrefix) = .empty;
+        defer evicted.deinit(self.alloc);
 
         self.mu.lock();
         var i: usize = self.reader_proxies.items.len;
@@ -1151,17 +1151,14 @@ pub const StatefulWriter = struct {
             i -= 1;
             const rp = &self.reader_proxies.items[i];
             if (rp.probe_deadline_ns > 0 and now_ns >= rp.probe_deadline_ns) {
-                if (evicted_count < evicted.len) {
-                    evicted[evicted_count] = rp.guid.prefix;
-                    evicted_count += 1;
-                }
+                evicted.append(self.alloc, rp.guid.prefix) catch {};
                 rp.deinit(self.alloc);
                 _ = self.reader_proxies.swapRemove(i);
             }
         }
         self.mu.unlock();
 
-        for (evicted[0..evicted_count]) |prefix| {
+        for (evicted.items) |prefix| {
             if (self.probe_result_fn) |f| f(self.probe_result_ctx.?, prefix, false);
         }
     }
