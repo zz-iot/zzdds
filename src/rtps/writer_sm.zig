@@ -1091,7 +1091,7 @@ pub const StatefulWriter = struct {
                         if (ch.sequence_number == sn) {
                             if (mode == .full) {
                                 ch.coherent_set_sn = last_sn;
-                                ch.group_coherent_sn = last_gsn;
+                                if (sn == last_sn) ch.group_coherent_sn = last_gsn;
                             }
                             ch.group_seq_num = gsn;
                             break;
@@ -1139,7 +1139,7 @@ pub const StatefulWriter = struct {
     /// Evict any reader proxies whose liveness-probe deadline has passed.
     /// Fires the probe_result_fn callback (alive=false) for each evicted proxy.
     /// Called under no lock; acquires and releases self.mu internally.
-    fn checkProbeDeadlines(self: *Self) void {
+    pub fn checkProbeDeadlines(self: *Self) void {
         const now_ns = time_mod.monotonicClock().nowNs();
 
         var evicted: [8]GuidPrefix = undefined;
