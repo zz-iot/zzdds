@@ -550,9 +550,19 @@ pub const DataReaderImpl = struct {
                     completed_set.deinit(self.alloc);
                 };
                 self.coherent_committed_ready = true;
+                // Signal that a complete set is ready for begin_access().  Mirrors
+                // the notification pattern on the normal (non-coherent) data path.
+                self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+                for (self.data_notifiers.items) |n| n.on_data(n.ctx);
             }
             self.mu.unlock();
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
+            if (is_set_end) {
+                if (self.status_cond) |sc| sc.notifyWakeup();
+                if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                    self.listener.vtable.on_data_available(self.listener.ptr, self.toDDSDataReader());
+                }
+            }
             return;
         }
 
