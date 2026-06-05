@@ -510,6 +510,56 @@ test "checkProbeDeadlines: evicts expired proxy and fires dead callback" {
     try testing.expectEqual(@as(usize, 0), proxy_count);
 }
 
+test "checkProbeDeadlines: all proxies beyond original 8-slot cap fire dead callback" {
+    // Regression for the fixed-size [8]GuidPrefix evicted array.  With the old
+    // code, proxies beyond index 8 were removed but probe_result_fn was never
+    // called for them — their KnownParticipant.probe_active stayed true forever.
+    const alloc = testing.allocator;
+    const writer_guid = makeGuid(0x30, WRITER_EID);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        alloc,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    const N = 9;
+    for (0..N) |i| {
+        const rg = makeGuid(@intCast(0x40 + i), READER_EID);
+        const loc = Locator.udp4(.{ 127, 0, 0, 1 }, @intCast(7200 + i));
+        const rp = try ReaderProxy.init(alloc, rg, &.{loc}, &.{}, false, true);
+        try w.addMatchedReader(rp);
+    }
+
+    const CallState = struct {
+        count: usize = 0,
+        fn cb(ctx: *anyopaque, _: GuidPrefix, alive: bool) void {
+            if (!alive) @as(*@This(), @ptrCast(@alignCast(ctx))).count += 1;
+        }
+    };
+    var cs = CallState{};
+    w.setProbeResult(&cs, CallState.cb);
+
+    for (0..N) |i| {
+        const rg = makeGuid(@intCast(0x40 + i), READER_EID);
+        w.beginProbe(rg.prefix, 1); // expired deadline
+    }
+    w.checkProbeDeadlines();
+
+    try testing.expectEqual(@as(usize, N), cs.count);
+    w.mu.lock();
+    const remaining = w.reader_proxies.items.len;
+    w.mu.unlock();
+    try testing.expectEqual(@as(usize, 0), remaining);
+}
+
 test "handleAckNack: ACKNACK clears probe and fires alive callback" {
     const writer_guid = makeGuid(0x24, WRITER_EID);
     const reader_guid = makeGuid(0x25, READER_EID);
