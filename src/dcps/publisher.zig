@@ -106,6 +106,10 @@ pub const PublisherImpl = struct {
     /// Nesting counter for begin/end_coherent_changes.  The coherent set on the
     /// underlying writers is opened at depth 0→1 and closed at depth 1→0.
     coherent_depth: u32,
+    /// True while suspend_publications is in effect.  Tracked separately from
+    /// coherent_active on the writers so that end_coherent_changes can re-open
+    /// the suspension window after flushing the coherent set.
+    suspend_active: bool,
 
     const Self = @This();
 
@@ -133,6 +137,7 @@ pub const PublisherImpl = struct {
             .writers = .empty,
             .mu = .{},
             .coherent_depth = 0,
+            .suspend_active = false,
         };
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
@@ -345,6 +350,7 @@ pub const PublisherImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
+        self.suspend_active = true;
         for (self.writers.items) |w| w.proto_writer.beginCoherentSet();
         return DDS.RETCODE_OK;
     }
@@ -353,6 +359,7 @@ pub const PublisherImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
+        self.suspend_active = false;
         // If begin_coherent_changes is active, the coherent window owns the deferred
         // writes — don't flush them here; end_coherent_changes will do it correctly.
         // Only flush with .none when there is no open coherent window.
@@ -385,6 +392,11 @@ pub const PublisherImpl = struct {
             else
                 .group_seq_only;
             for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode);
+            // If suspend_publications is still in effect, re-open the deferred
+            // window so writes after this end_coherent_changes remain suspended.
+            if (self.suspend_active) {
+                for (self.writers.items) |w| w.proto_writer.beginCoherentSet();
+            }
         }
         return DDS.RETCODE_OK;
     }
