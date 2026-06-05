@@ -412,8 +412,8 @@ pub const SubscriberImpl = struct {
                         for (r.data_notifiers.items) |n| n.on_data(n.ctx);
                     }
                     r.mu.unlock();
-                    r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
                     if (has_data) {
+                        r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
                         if (r.status_cond) |sc| sc.notifyWakeup();
                         if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
                             listener_snaps.append(self.alloc, .{

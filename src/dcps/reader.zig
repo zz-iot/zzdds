@@ -776,6 +776,14 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         _ = self.writer_strengths.remove(guid);
+        // Discard any in-progress coherent set from this writer.  If the writer
+        // crashed or was deleted mid-set, the partial wip would otherwise stay
+        // in the map indefinitely — one leaked entry per connect/disconnect cycle.
+        if (self.coherent_wip.fetchRemove(guid)) |kv| {
+            var wip = kv.value;
+            for (wip.items) |pc| pc.deinit();
+            wip.deinit(self.alloc);
+        }
         // Clean up liveliness tracking for this writer.
         if (self.writer_liveliness.fetchRemove(guid)) |kv| {
             if (kv.value.is_alive) {
