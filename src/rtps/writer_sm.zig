@@ -636,7 +636,13 @@ pub const StatefulWriter = struct {
         defer self.mu.unlock();
         const sn = try self.cache.addWriterChange(kind, self.guid, source_timestamp, instance_handle, key_hash, data);
         if (self.coherent_active) {
-            try self.coherent_pending_sns.append(self.alloc, sn);
+            self.coherent_pending_sns.append(self.alloc, sn) catch |err| {
+                // Roll back the cache entry so the orphaned SN is never advertised
+                // in heartbeats and cannot be retransmitted as plain DATA outside
+                // the coherent window.
+                self.cache.removeChange(sn);
+                return err;
+            };
         } else if (self.cache.getChange(sn)) |ch| {
             self.sendChangeToAllLocked(ch);
         }

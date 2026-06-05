@@ -413,8 +413,11 @@ pub const SubscriberImpl = struct {
                     // but must not generate a spurious on_data_available or WaitSet wakeup.
                     const has_data = r.pending.items.len > 0;
                     // Fire WaitSet wakeups while subscriber.mu is held to prevent
-                    // use-after-free.  WaitSet callbacks only acquire their own cv_mu;
-                    // holding subscriber.mu and reader.mu here creates no inversion.
+                    // use-after-free from a concurrent delete_datareader.
+                    // data_notifiers are exclusively WaitSet-internal wakeup callbacks
+                    // (registered only by ReadConditionImpl/QueryConditionImpl via
+                    // addDataNotifier).  They acquire only WaitSet.cv_mu — never
+                    // subscriber.mu or reader.mu — so holding both locks here is safe.
                     if (has_data) {
                         for (r.data_notifiers.items) |n| n.on_data(n.ctx);
                     }
