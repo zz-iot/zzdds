@@ -394,7 +394,7 @@ pub const SubscriberImpl = struct {
             var all_ready = true;
             for (self.readers.items) |r| {
                 r.mu.lock();
-                if (!r.coherent_committed_ready and r.coherent_wip.items.len > 0) all_ready = false;
+                if (!r.coherent_committed_ready and r.coherent_wip.count() > 0) all_ready = false;
                 r.mu.unlock();
             }
             if (all_ready and self.readers.items.len > 0) {

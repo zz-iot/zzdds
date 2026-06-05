@@ -171,8 +171,9 @@ pub const DataReaderImpl = struct {
     pending: std.ArrayListUnmanaged(PendingChange),
     /// Working buffer for the currently-receiving coherent set.
     /// Samples are appended here as they arrive. When the end marker is received
-    /// the entire list is moved (zero-copy) into `coherent_committed` as one entry.
-    coherent_wip: std.ArrayListUnmanaged(PendingChange),
+    /// Keyed by writer GUID so that concurrent coherent sets from different writers
+    /// accumulate independently and commit only when each writer's own set is complete.
+    coherent_wip: std.AutoHashMapUnmanaged(Guid, std.ArrayListUnmanaged(PendingChange)),
     /// Queue of complete coherent sets awaiting delivery via begin_access().
     /// Each element is one complete set (filled when its end marker arrives).
     /// commitCoherentPendingLocked() pops ONLY the first entry per call so that
@@ -270,7 +271,7 @@ pub const DataReaderImpl = struct {
             .status_cond = null,
             .data_notifiers = .empty,
             .pending = .empty,
-            .coherent_wip = .empty,
+            .coherent_wip = .{},
             .coherent_committed = .empty,
             .coherent_committed_ready = false,
             .mu = .{},
@@ -307,7 +308,11 @@ pub const DataReaderImpl = struct {
         // Drain pending queues (including coherent buffers).
         for (self.pending.items) |p| p.deinit();
         self.pending.deinit(self.alloc);
-        for (self.coherent_wip.items) |p| p.deinit();
+        var wip_it = self.coherent_wip.valueIterator();
+        while (wip_it.next()) |v| {
+            for (v.items) |p| p.deinit();
+            v.deinit(self.alloc);
+        }
         self.coherent_wip.deinit(self.alloc);
         for (self.coherent_committed.items) |*s| {
             for (s.items) |p| p.deinit();
@@ -522,19 +527,24 @@ pub const DataReaderImpl = struct {
                 _ = self.tbf_map.remove(ih);
                 _ = self.owner_map.remove(ih);
             }
-            self.coherent_wip.append(self.alloc, pc) catch {
+            const wip_entry = self.coherent_wip.getOrPut(self.alloc, change.writer_guid) catch {
+                self.mu.unlock();
+                self.alloc.free(copy);
+                return;
+            };
+            if (!wip_entry.found_existing) wip_entry.value_ptr.* = .empty;
+            wip_entry.value_ptr.append(self.alloc, pc) catch {
                 self.mu.unlock();
                 self.alloc.free(copy);
                 return;
             };
             const is_set_end = (change.sequence_number == change.coherent_set_sn.?);
             if (is_set_end) {
-                // Zero-copy: take ownership of wip and enqueue it as one complete
-                // set in coherent_committed.  Subscriber.begin_access() pops one
-                // set at a time so consecutive sets are never merged into a single
-                // delivery window (important for late-join history replay).
-                var completed_set = self.coherent_wip;
-                self.coherent_wip = .empty;
+                // Zero-copy: take ownership of this writer's wip list and enqueue
+                // it as one complete set.  Other writers' in-progress sets are
+                // unaffected.  Subscriber.begin_access() pops one set at a time.
+                var completed_set = wip_entry.value_ptr.*;
+                _ = self.coherent_wip.remove(change.writer_guid);
                 self.coherent_committed.append(self.alloc, completed_set) catch {
                     for (completed_set.items) |cppc| cppc.deinit();
                     completed_set.deinit(self.alloc);
