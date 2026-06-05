@@ -506,7 +506,7 @@ pub const SpdpEndpoints = struct {
         // Must happen outside spdp.mu because begin_probe_fn acquires writer.mu
         // (lock order: spdp.mu → writer.mu, never nested).
         if (was_probing) {
-            if (self.begin_probe_fn) |f| f(self.sedp_ctx.?, guid_prefix, 0);
+            if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, guid_prefix, 0);
         }
     }
 
