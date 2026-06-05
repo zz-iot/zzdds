@@ -442,67 +442,71 @@ pub const SpdpEndpoints = struct {
         // after releasing spdp.mu so that checkProbeDeadlines does not evict the
         // SEDP reader proxy for a participant that is demonstrably alive.
         // (Calling begin_probe_fn acquires writer.mu; spdp.mu must not be held.)
+        //
+        // Implementation note: discovery callbacks (on_participant_discovered, SEDP
+        // wiring, addReaderLocator) must run INSIDE the block-scoped lock using
+        // &kp.data (the stack-local copy).  They must NOT be called after the lock
+        // is released with a pointer into gop.value_ptr, because a concurrent
+        // hashmap mutation (re-announcement or eviction) could rehash and free the
+        // pointed-to memory, causing use-after-free / "switch on corrupt value" panics.
         var was_probing = false;
-        var is_new_participant = false;
-        var new_participant_data: ?*const iface.ParticipantData = null;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
 
-        self.mu.lock();
-        const gop = self.known.getOrPut(guid_prefix) catch {
-            self.mu.unlock();
-            return;
-        };
-        const is_new = !gop.found_existing;
-        if (gop.found_existing) {
-            // Update the smoothed announcement interval from the previous observation.
-            const prev_last_seen = gop.value_ptr.last_seen_ns;
-            const prev_interval = gop.value_ptr.observed_interval_ns;
-            if (prev_last_seen > 0 and now_ns > prev_last_seen) {
-                const interval = now_ns - prev_last_seen;
-                kp.observed_interval_ns = if (prev_interval == 0)
-                    interval
-                else
-                    @divTrunc(prev_interval + interval, 2); // EMA α=0.5
-            } else {
-                kp.observed_interval_ns = prev_interval;
+            const gop = self.known.getOrPut(guid_prefix) catch return;
+            const is_new = !gop.found_existing;
+            if (gop.found_existing) {
+                // Update the smoothed announcement interval from the previous observation.
+                const prev_last_seen = gop.value_ptr.last_seen_ns;
+                const prev_interval = gop.value_ptr.observed_interval_ns;
+                if (prev_last_seen > 0 and now_ns > prev_last_seen) {
+                    const interval = now_ns - prev_last_seen;
+                    kp.observed_interval_ns = if (prev_interval == 0)
+                        interval
+                    else
+                        @divTrunc(prev_interval + interval, 2); // EMA α=0.5
+                } else {
+                    kp.observed_interval_ns = prev_interval;
+                }
+                // Capture whether a probe was active before we overwrite the entry.
+                was_probing = gop.value_ptr.probe_active;
+                gop.value_ptr.deinit();
             }
-            // Capture whether a probe was active before we overwrite the entry.
-            was_probing = gop.value_ptr.probe_active;
-            gop.value_ptr.deinit();
-        }
-        gop.value_ptr.* = kp;
-        is_new_participant = is_new;
-        if (is_new) new_participant_data = &gop.value_ptr.data;
-        self.mu.unlock();
+            gop.value_ptr.* = kp;
+
+            // Fire callbacks and unicast reply only for genuinely new participants.
+            // Re-announcements from known participants refresh expires_ns and locator
+            // data silently; no DCPS notification or SEDP proxy establishment is needed.
+            // Use &kp.data (stack-local) not &gop.value_ptr.data (heap) so the pointer
+            // stays valid even if the hashmap rehashes inside a nested callback.
+            if (is_new) {
+                if (self.callbacks) |cbs| {
+                    cbs.on_participant_discovered(cbs.ctx, &kp.data);
+                }
+                if (self.on_participant_discovered_sedp) |cb| {
+                    cb(self.sedp_ctx.?, &kp.data);
+                }
+                // Register unicast locators for this peer so future sendAll() calls reach
+                // it directly, then trigger fast-announce mode instead of calling sendAll()
+                // here. An immediate sendAll() per discovery event causes an N² burst when
+                // N participants start simultaneously; fast-announce fires once per half-period
+                // and reaches everyone via the accumulated locator list.
+                if (self.writer) |w| {
+                    for (kp.data.metatraffic_unicast_locators) |loc| {
+                        w.addReaderLocator(.{ .locator = loc }) catch {};
+                    }
+                }
+                const until_ns = self.clock.nowNs() + 2 * @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
+                self.fast_announce_until_ns.store(until_ns, .release);
+            }
+        } // spdp.mu released here by defer
 
         // Cancel the SEDP probe deadline now that the participant has re-announced.
-        // Must happen outside spdp.mu because begin_probe_fn acquires writer.mu.
+        // Must happen outside spdp.mu because begin_probe_fn acquires writer.mu
+        // (lock order: spdp.mu → writer.mu, never nested).
         if (was_probing) {
             if (self.begin_probe_fn) |f| f(self.sedp_ctx.?, guid_prefix, 0);
-        }
-
-        // Fire callbacks and unicast reply only for genuinely new participants.
-        // Re-announcements from known participants refresh expires_ns and locator
-        // data silently; no DCPS notification or SEDP proxy establishment is needed.
-        if (is_new_participant) {
-            const data = new_participant_data.?;
-            if (self.callbacks) |cbs| {
-                cbs.on_participant_discovered(cbs.ctx, data);
-            }
-            if (self.on_participant_discovered_sedp) |cb| {
-                cb(self.sedp_ctx.?, data);
-            }
-            // Register unicast locators for this peer so future sendAll() calls reach
-            // it directly, then trigger fast-announce mode instead of calling sendAll()
-            // here. An immediate sendAll() per discovery event causes an N² burst when
-            // N participants start simultaneously; fast-announce fires once per half-period
-            // and reaches everyone via the accumulated locator list.
-            if (self.writer) |w| {
-                for (data.metatraffic_unicast_locators) |loc| {
-                    w.addReaderLocator(.{ .locator = loc }) catch {};
-                }
-            }
-            const until_ns = self.clock.nowNs() + 2 * @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
-            self.fast_announce_until_ns.store(until_ns, .release);
         }
     }
 
