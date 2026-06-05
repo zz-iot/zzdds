@@ -1068,10 +1068,15 @@ pub const StatefulWriter = struct {
     ///   .full        — PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET
     ///   .group_seq_only — PID_GROUP_SEQ_NUM only (ordered_access without coherent_access)
     ///   .none        — no inline QoS (resume_publications)
-    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode) void {
+    /// `resuspend`: if true, re-arms coherent_active=true before releasing the lock so
+    /// that concurrent write() calls never observe a window where suspension is inactive.
+    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.coherent_active = false;
+        defer if (resuspend) {
+            self.coherent_active = true;
+        };
         if (self.coherent_pending_sns.items.len == 0) return;
         const last_sn = self.coherent_pending_sns.items[self.coherent_pending_sns.items.len - 1];
         const n: i64 = @intCast(self.coherent_pending_sns.items.len);

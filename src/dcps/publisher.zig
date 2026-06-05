@@ -364,7 +364,7 @@ pub const PublisherImpl = struct {
         // writes — don't flush them here; end_coherent_changes will do it correctly.
         // Only flush with .none when there is no open coherent window.
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none);
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false);
         }
         return DDS.RETCODE_OK;
     }
@@ -391,12 +391,9 @@ pub const PublisherImpl = struct {
                 .full
             else
                 .group_seq_only;
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode);
-            // If suspend_publications is still in effect, re-open the deferred
-            // window so writes after this end_coherent_changes remain suspended.
-            if (self.suspend_active) {
-                for (self.writers.items) |w| w.proto_writer.beginCoherentSet();
-            }
+            // Pass suspend_active as `resuspend` so the flush and re-arm happen
+            // atomically inside writer.mu — no window where coherent_active=false.
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active);
         }
         return DDS.RETCODE_OK;
     }

@@ -864,7 +864,9 @@ pub const DataReaderImpl = struct {
         if (self.coherent_committed.items.len == 0) return;
         var first_set = self.coherent_committed.orderedRemove(0);
         for (first_set.items) |cppc| {
-            self.pending.append(self.alloc, cppc) catch {};
+            self.pending.append(self.alloc, cppc) catch {
+                cppc.deinit(); // OOM: pending full; free the payload rather than leak it
+            };
         }
         first_set.deinit(self.alloc);
         self.coherent_committed_ready = self.coherent_committed.items.len > 0;

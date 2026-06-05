@@ -104,6 +104,25 @@ clones. The zero-copy loan upgrade path is preserved — no API changes needed w
 Per DDS spec §2.2.4. `on_offered_incompatible_qos` / `on_requested_incompatible_qos`
 listeners are called; the corresponding `StatusCondition` is also set.
 
+**GROUP_PRESENTATION coherent sets: implement to spec.**
+The zzdds implementation emits `PID_COHERENT_SET` (0x0056), `PID_GROUP_SEQ_NUM` (0x0064),
+and `PID_GROUP_COHERENT_SET` (0x0063) inline QoS per RTPS 2.5 §9.6.3.7. Five test cases
+currently fail in the zzdds→Connext direction (`CoherentSets_8/10/11/12`,
+`OrderedAccess_8`); the Connext→zzdds direction is 89/89. The interop gap is under
+investigation — vendor binaries in CI may not reflect the latest implementation. No
+wire-format changes are planned until the root cause is confirmed; deviating from the
+spec to chase a binary snapshot would risk breaking other vendor interop.
+
+**SPDP liveness probe: EMA interval + 3× silence threshold, directed SEDP HBs.**
+When `FinalInstanceState_2` requires detecting participant exit without a BYE (e.g.,
+RTI Connext announces `lease_duration=100s` and exits silently), a poll-based lease
+timeout is too slow. The probe design: SPDP tracks inter-announcement intervals via an
+EMA (`observed_interval_ns`); silence ≥ `min(3 × observed_interval, 5s)` triggers a
+directed non-final HEARTBEAT to the peer's SEDP reader proxies via the SEDP reliable
+channel. An ACKNACK within the probe deadline (~1s) confirms liveness; no response
+triggers eviction and `on_participant_lost`. Lock ordering: `spdp.mu` → `writer.mu`
+(sequentially, never nested); probe callbacks are fired after releasing `writer.mu`.
+
 ---
 
 ## Logging and Tracing

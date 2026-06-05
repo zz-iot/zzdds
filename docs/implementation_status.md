@@ -49,7 +49,7 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 |---|---|---|
 | `DomainParticipantFactory` | Complete | Not a singleton |
 | `DomainParticipant` | Complete | |
-| `Publisher` / `Subscriber` | Complete | `begin_coherent_changes`, `end_coherent_changes`, `suspend_publications`, `resume_publications` all implemented; `begin_access` / `end_access` implement ordered INSTANCE/TOPIC/GROUP sort |
+| `Publisher` / `Subscriber` | Complete | `begin_coherent_changes`, `end_coherent_changes`, `suspend_publications`, `resume_publications` all implemented; `begin_access` / `end_access` implement ordered INSTANCE/TOPIC/GROUP sort; `suspend_publications` + `begin/end_coherent_changes` interplay is correct (suspension window re-armed atomically after each coherent flush) |
 | `DataWriter` / `DataReader` | Complete | |
 | `Topic` | Complete | |
 | `ContentFilteredTopic` lifecycle + parser/evaluator | Complete | API, parser, evaluator, and delivery-time filtering all wired; types must register `TypeSupport.get_field` for field-level filtering |
@@ -94,14 +94,14 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 
 | Peer | Status | Scenarios |
 |---|---|---|
-| Cyclone DDS | Verified | pub/sub, fragmented (DATA_FRAG), all RELIABLE/BEST_EFFORT combos |
+| Cyclone DDS | Verified | bidirectional; 48/48 dds-rtps test suite (extended suite testing planned for next PR) |
 | OpenDDS | Verified | pub/sub, fragmented |
-| FastDDS | Verified | bidirectional; all 48 dds-rtps test cases pass in both directions |
-| RTI Connext | Verified in CI | bidirectional dds-rtps matrix; requires licensed binary outside CI |
+| FastDDS | Verified | bidirectional; 48/48 dds-rtps test suite (extended suite testing planned for next PR) |
+| RTI Connext | 89/89 (Connext→zzdds); 84/89 (zzdds→Connext) | 5 open interop gaps in the zzdds→Connext direction for GROUP_PRESENTATION scenarios |
 
 ## Test Coverage
 
-`zig build test` runs 600+ unit/integration tests, including Tier 1 unit tests,
+`zig build test` runs 650+ unit/integration tests, including Tier 1 unit tests,
 Tier 2 mock/intraprocess DCPS tests, and fuzz corpus regression tests.
 See `docs/testing.md` for how to run the full suite.
 
@@ -153,3 +153,17 @@ the two-byte constant.
 The constant is present but not yet serialized in SEDP announcements; when GROUP_DATA serialization
 is added, confirm that peers expect `0x002D` (not the historical `0x0056` used by some older
 implementations).
+
+**RTI Connext GROUP_PRESENTATION interop gaps (zzdds→Connext).** Five test cases fail in
+the zzdds→Connext direction: `CoherentSets_8`, `OrderedAccess_8`, `CoherentSets_10/11/12`.
+These scenarios involve GROUP_PRESENTATION coherent sets. The root cause is under
+investigation — the vendor binary in CI may predate any relevant updates to their shape_main
+implementation. The Connext→zzdds direction passes 89/89.
+
+**SPDP liveness probe fires directed HBs on SEDP reliable channels.** When SPDP silence
+exceeds `min(3 × observed_interval, 5 s)`, the SPDP layer triggers a directed non-final
+HEARTBEAT to the peer's SEDP reader proxies. If no ACKNACK arrives before the probe deadline
+(~1 s), the participant is evicted and `on_participant_lost` fires. This path is tested and
+works correctly, but sets `probe_active` on the `KnownParticipant` record, which prevents a
+second probe from firing before the first resolves. A participant that goes silent while a
+probe is in flight will be evicted on the first probe deadline — there is no probe retry.
