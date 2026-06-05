@@ -422,3 +422,137 @@ test "mock_loopback: coherent set delivered atomically via begin_access" {
     try std.testing.expectEqualSlices(u8, &PAYLOAD_A, samples.items[0]);
     try std.testing.expectEqualSlices(u8, &PAYLOAD_B, samples.items[1]);
 }
+
+test "mock_loopback: ordered access sorts pending queue via begin_access" {
+    // Covers vtBeginAccess ordered_access block (lines 424-446) and both
+    // comparators (pendingLessThan 464-468, pendingInstanceLessThan 470-475).
+    //
+    // Strategy: subscriber with INSTANCE ordered_access and no coherent_access.
+    // Writer sends two samples in separate ordered groups (each via its own
+    // begin/end_coherent_changes call) so they get distinct group_seq_nums.
+    // Both samples go directly to pending (no coherent buffering since
+    // coherent_access=false).  begin_access sorts by instance then group_seq_num,
+    // which exercises pendingInstanceLessThan on equal instance handles.
+    const alloc = std.testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    // ── Reader side ───────────────────────────────────────────────────────────
+    const mock_r = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_R, PORT_META_R)});
+    defer mock_r.deinit();
+    const disc_r = try SpdpSedpDiscovery.init(alloc, mock_r.transport(), 0, 100);
+    var factory_r = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_r.transport(),
+        disc_r.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_r.deinit();
+        disc_r.deinit();
+    }
+    const dpf_r = factory_r.toDDSFactory();
+    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf_r.delete_participant(dp_r);
+
+    var sub_qos = DDS.SubscriberQos{};
+    sub_qos.presentation.ordered_access = true;
+    sub_qos.presentation.access_scope = .INSTANCE_PRESENTATION_QOS;
+    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, sub_qos, nil.nil_sub_listener, 0);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+
+    const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "OrderedTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    const dr = sub_r.vtable.create_datareader(sub_r.ptr, topic_desc_r, dr_qos, nil.nil_dr_listener, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    // ── Writer side ───────────────────────────────────────────────────────────
+    const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
+    defer mock_w.deinit();
+    const disc_w = try SpdpSedpDiscovery.init(alloc, mock_w.transport(), 0, 100);
+    var factory_w = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_w.transport(),
+        disc_w.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_w.deinit();
+        disc_w.deinit();
+    }
+    const dpf_w = factory_w.toDDSFactory();
+    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    defer _ = dpf_w.delete_participant(dp_w);
+
+    var pub_qos = DDS.PublisherQos{};
+    pub_qos.presentation.ordered_access = true;
+    pub_qos.presentation.access_scope = .INSTANCE_PRESENTATION_QOS;
+    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, pub_qos, nil.nil_pub_listener, 0);
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+
+    const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "OrderedTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    // ── Drive discovery ───────────────────────────────────────────────────────
+    const deadline_ns = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < deadline_ns) {
+        net.deliverAll();
+        if (dw_impl.matchedReaderCount() > 0) break;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(dw_impl.matchedReaderCount() > 0);
+
+    // ── Write two samples in separate ordered groups ──────────────────────────
+    // Each begin/end_coherent_changes call flushes with mode=.group_seq_only
+    // (ordered_access=true, coherent_access=false), assigning distinct group_seq_nums.
+    // Samples arrive at the reader as plain pending changes, not coherent-buffered.
+    _ = pub_w.vtable.begin_coherent_changes(pub_w.ptr);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_A);
+    _ = pub_w.vtable.end_coherent_changes(pub_w.ptr); // GSN=1 for PAYLOAD_A
+
+    _ = pub_w.vtable.begin_coherent_changes(pub_w.ptr);
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), &PAYLOAD_B);
+    _ = pub_w.vtable.end_coherent_changes(pub_w.ptr); // GSN=2 for PAYLOAD_B
+
+    // Wait until both samples land in the reader's pending queue.
+    const deliver_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < deliver_deadline) {
+        net.deliverAll();
+        dr_impl.mu.lock();
+        const n = dr_impl.pending.items.len;
+        dr_impl.mu.unlock();
+        if (n >= 2) break;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+
+    // begin_access with INSTANCE scope: sorts pending by (instance_handle, group_seq_num).
+    // Both samples share the same instance handle (NIL), so the comparator falls
+    // through to group_seq_num — exercising pendingInstanceLessThan lines 473-475.
+    _ = sub_r.vtable.begin_access(sub_r.ptr);
+    _ = sub_r.vtable.end_access(sub_r.ptr);
+
+    var samples: std.ArrayList([]u8) = .empty;
+    defer {
+        for (samples.items) |s| alloc.free(s);
+        samples.deinit(alloc);
+    }
+    while (dr_impl.takeRaw()) |s| try samples.append(alloc, s.data);
+    try std.testing.expectEqual(@as(usize, 2), samples.items.len);
+    // GSN order: PAYLOAD_A (1) before PAYLOAD_B (2).
+    try std.testing.expectEqualSlices(u8, &PAYLOAD_A, samples.items[0]);
+    try std.testing.expectEqualSlices(u8, &PAYLOAD_B, samples.items[1]);
+}
