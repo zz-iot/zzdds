@@ -392,11 +392,18 @@ pub const SubscriberImpl = struct {
         // would deliver an incomplete group.
         if (pres.coherent_access) {
             var all_ready = true;
+            var any_committed = false;
             for (self.readers.items) |r| {
                 r.mu.lock();
-                if (!r.coherent_committed_ready and r.coherent_wip.count() > 0) all_ready = false;
+                // Block if any reader has incomplete WIP from any writer — delivering
+                // a committed set while another writer's contribution is still in
+                // transit would violate GROUP atomicity.
+                if (r.coherent_wip.count() > 0) all_ready = false;
+                if (r.coherent_committed_ready) any_committed = true;
                 r.mu.unlock();
             }
+            // Nothing to commit if no reader has a complete set ready.
+            if (!any_committed) all_ready = false;
             if (all_ready and self.readers.items.len > 0) {
                 for (self.readers.items) |r| {
                     r.mu.lock();
