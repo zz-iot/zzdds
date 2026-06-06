@@ -24,8 +24,9 @@ what broke when they fail.
 
 ### Tier 1 — In-process, deterministic (fast unit tests)
 
-Run by `zig build test`. Must stay under 30 seconds. No external dependencies, no sockets,
-no threads (where possible), no sleeping.
+Run by `zig build test`. Keep this fast enough for routine local and CI use, with no
+external dependencies, no sockets in new narrow tests, no threads where possible, and no
+sleeping.
 
 **What lives here:**
 - RTPS message parser and builder: all submessage types, endianness, edge cases in length fields
@@ -35,6 +36,8 @@ no threads (where possible), no sleeping.
 - StatefulReader state machine: Heartbeat handling (non-final+missing SNs, final+complete,
   stale count suppression, unknown writer), out-of-order DATA buffering, GAP handling,
   duplicate SN discard
+- Reference-model tests: independent compact models for presentation/coherent write-side
+  behavior, StatefulReader receive windows, and StatefulWriter ACKNACK retransmission decisions
 - SequenceNumber arithmetic: high/low word boundary rollover, SEQUENCENUMBER_UNKNOWN sentinel
 - QoS matching: all 22 policies, compatible and incompatible combinations
 - Config resolver: env var overrides, TOML file parsing, precedence order
@@ -43,6 +46,14 @@ no threads (where possible), no sleeping.
 
 **What does NOT live here:**
 Anything that requires real sockets, real wall-clock timing, or external processes.
+Any residual wall-clock sleeps in tests are audited by
+`scripts/check_test_sleeps.py`: adding or removing one requires updating the
+expected count and rationale in that script.
+
+**Reference model scope.** Model tests intentionally model a smaller contract than the
+implementation: visible samples, sequence-number windows, coherent-set markers, GSNs, and
+outgoing DATA/ACKNACK decisions. They are not alternate implementations of discovery,
+transport, or serialization.
 
 ---
 
@@ -88,21 +99,21 @@ port allocation, no bind, no threads, no timing sensitivity.
 
 ### Tier 3 — Live interop (cross-process, external vendor)
 
-The local developer targets are `zig build interop-test-cyclone` and
-`zig build interop-test-opendds`; they require the corresponding vendor implementation.
-CI also runs the dds-rtps `shape_main` matrix against pinned Cyclone DDS, FastDDS,
+CI runs the dds-rtps `shape_main` matrix against pinned Cyclone DDS, FastDDS,
 OpenDDS, and RTI Connext binaries in both publish and subscribe directions.
 
 **What lives here:**
-- Cyclone DDS: Zenzen DDS writer → Cyclone reader; Cyclone writer → Zenzen DDS reader
+- Cyclone DDS: bidirectional dds-rtps matrix in CI
 - FastDDS: bidirectional dds-rtps matrix in CI
-- OpenDDS: local Makefile scenarios plus bidirectional dds-rtps matrix in CI
+- OpenDDS: bidirectional dds-rtps matrix in CI
 - RTI Connext: bidirectional dds-rtps matrix in CI; external use requires a license
 - Security handshake (planned, when DDS Security plugin is implemented)
 
-**Execution model:** `test/interop/Makefile` launches peer processes, runs scenarios,
-asserts outcomes. Each scenario is a self-contained process pair with a timeout. The
-Makefile is the only place with real `sleep` calls (startup ordering).
+The old local `zig build interop-test-*` targets were removed because they duplicated a
+small subset of the CI matrix while requiring local vendor installs. Interop findings
+should be minimized into vendor-free regressions under `test/fuzz/corpus/`,
+`test/rtps/*_model_test.zig`, `test/dcps/*_model_test.zig`, or
+`test/interop_regressions/README.md`.
 
 ---
 
@@ -128,7 +139,10 @@ memory read.
 Implementation: each fuzz target exposes `pub fn fuzzOne(data: []const u8) void`.
 `zig build test-fuzz` compile-checks those targets; runnable libFuzzer executables are
 built manually by compiling the Zig source to an object and linking with LLVM's libFuzzer.
-Corpus lives in `test/fuzz/corpus/`.
+Corpus lives in `test/fuzz/corpus/`: `rtps_parser/` for RTPS packets and `plcdr/` for
+SPDP/SEDP ParameterList payloads. Review-found or fuzz-found counterexamples should be
+minimized and kept there when they are better represented as byte inputs than handwritten
+Zig test cases.
 
 As DDS Security is implemented, add fuzz targets for the authentication and crypto layers;
 a security-capable implementation must be robust against junk data from unauthenticated peers.
@@ -239,7 +253,7 @@ for tests that don't need the full DCPS stack.
 | ThreadSanitizer | `root_module.sanitize_thread = true` | `zig build test-tsan` (PRs, nightly) |
 | kcov coverage | `zig build emit-tests` + kcov (built against patched elfutils for DWARF 5); report uploaded to Codecov | CI on every push |
 | libFuzzer | Source entry points in `test/fuzz/`; runnable executables are built manually with LLVM's libFuzzer | Nightly; manual on parser changes |
-| Live interop | local `zig build interop-test-cyclone` / `interop-test-opendds`; CI dds-rtps vendor matrix | PRs, nightly, or on-demand |
+| Live interop | CI dds-rtps vendor matrix | PRs, nightly, or on-demand |
 
 **On static analysis:** Zig's compiler eliminates many C-style static analysis targets
 (buffer overruns caught by bounds checks, no silent integer promotions, no implicit casts
@@ -274,10 +288,8 @@ Physical-layer behavior (MTU, congestion, asymmetric latency) is out of scope.
 ## CI Structure (Target)
 
 ```
-zig build test                  ← Tier 1 + Tier 2; always runs; < 30s
+zig build test                  ← Tier 1 + Tier 2; always runs as the routine deterministic gate
 zig build test-tsan             ← Tier 1 + Tier 2 under TSan; PRs and nightly
-zig build interop-test-cyclone  ← Tier 3; requires Cyclone DDS at CYCLONE_ROOT
-zig build interop-test-opendds  ← Tier 3; requires OpenDDS at OPENDDS_ROOT
 zig build test-fuzz             ← Tier 4 fuzz harness compile-check
 ```
 

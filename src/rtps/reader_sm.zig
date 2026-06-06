@@ -681,11 +681,18 @@ pub const StatefulReader = struct {
             // as a virtual GAP so buffered out-of-order changes can be delivered.
             if (self.reliable and first_sn > wp.received.cumulativeAck() + 1) {
                 const prev_highest = wp.received.cumulativeAck();
+                var lost_count: i32 = 0;
                 var sn = prev_highest + 1;
                 while (sn < first_sn) : (sn += 1) {
+                    if (!wp.received.contains(sn)) lost_count += 1;
                     _ = wp.received.insert(self.alloc, sn) catch {};
                 }
                 self.deliverPendingLocked(wp, prev_highest);
+                if (lost_count > 0) {
+                    if (self.callback) |cb| {
+                        if (cb.on_sample_lost) |f| f(cb.ctx, lost_count);
+                    }
+                }
             }
 
             // Only RELIABLE readers send ACKNACK; BEST_EFFORT readers ignore HEARTBEATs.

@@ -18,7 +18,7 @@ Requires Zig 0.16.0.
 
 ```sh
 zig build       # generate DCPS interfaces + compile
-zig build test  # 600+ unit and integration tests
+zig build test  # unit and integration tests
 ```
 
 ## Documentation

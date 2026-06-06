@@ -245,7 +245,9 @@ pub fn build(b: *std.Build) void {
     // Per-subsystem test runners.
     const rtps_test_files = [_][]const u8{
         "test/rtps/writer_sm_test.zig",
+        "test/rtps/writer_model_test.zig",
         "test/rtps/reader_sm_test.zig",
+        "test/rtps/reader_model_test.zig",
         "test/rtps/sequence_number_test.zig",
         "test/rtps/mock_transport_test.zig",
         "test/rtps/frag_roundtrip_test.zig",
@@ -274,6 +276,8 @@ pub fn build(b: *std.Build) void {
         "test/dcps/loopback_test.zig",
         "test/dcps/api_test.zig",
         "test/dcps/mock_loopback_test.zig",
+        "test/dcps/presentation_model_test.zig",
+        "test/dcps/subscriber_model_test.zig",
         "test/dcps/ignore_test.zig",
         "test/dcps/intraprocess_test.zig",
         "test/dcps/qos_runtime_test.zig",
@@ -362,81 +366,5 @@ pub fn build(b: *std.Build) void {
         }) });
         t.root_module.link_libc = true;
         tsan_step.dependOn(&b.addRunArtifact(t).step);
-    }
-
-    // ── Interop test executables ──────────────────────────────────────────────
-
-    const zzdds_interop_pub = b.addExecutable(.{
-        .name = "zzdds_interop_pub",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/interop/zzdds_pub.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zzdds", .module = zzdds_mod },
-                .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-            },
-        }),
-    });
-    b.installArtifact(zzdds_interop_pub);
-
-    const zzdds_interop_sub = b.addExecutable(.{
-        .name = "zzdds_interop_sub",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/interop/zzdds_sub.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zzdds", .module = zzdds_mod },
-                .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-            },
-        }),
-    });
-    b.installArtifact(zzdds_interop_sub);
-
-    // DATA_FRAG interop publisher: fragment_size=512, ~2 KB payload.
-    const zzdds_interop_pub_frag = b.addExecutable(.{
-        .name = "zzdds_interop_pub_frag",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/interop/zzdds_pub_frag.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zzdds", .module = zzdds_mod },
-                .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-            },
-        }),
-    });
-    b.installArtifact(zzdds_interop_pub_frag);
-
-    // ── Interop tests (require external Cyclone DDS install) ──────────────────
-    // Run with: zig build interop-test-cyclone
-    // Builds Zenzen DDS interop executables and then invokes test/interop/Makefile.
-    const interop_step = b.step("interop-test-cyclone", "Run wire interop tests vs Cyclone DDS");
-    interop_step.dependOn(&zzdds_interop_pub.step);
-    interop_step.dependOn(&zzdds_interop_sub.step);
-    interop_step.dependOn(&zzdds_interop_pub_frag.step);
-    const maybe_interop_make = b.findProgram(&.{"make"}, &.{}) catch null;
-    if (maybe_interop_make) |make_bin| {
-        const make = b.addSystemCommand(&.{ make_bin, "-C", "test/interop", "interop-test-cyclone" });
-        make.step.dependOn(&zzdds_interop_pub.step);
-        make.step.dependOn(&zzdds_interop_sub.step);
-        make.step.dependOn(&zzdds_interop_pub_frag.step);
-        interop_step.dependOn(&make.step);
-    }
-
-    // ── OpenDDS interop tests (require OpenDDS at OPENDDS_ROOT) ───────────────
-    // Run with: zig build interop-test-opendds
-    // Builds OpenDDS C++ pub/sub via make, then runs scenarios 3–6.
-    const opendds_interop_step = b.step("interop-test-opendds", "Run wire interop tests vs OpenDDS 3.33");
-    opendds_interop_step.dependOn(&zzdds_interop_pub.step);
-    opendds_interop_step.dependOn(&zzdds_interop_sub.step);
-    opendds_interop_step.dependOn(&zzdds_interop_pub_frag.step);
-    if (maybe_interop_make) |make_bin| {
-        const make_opendds = b.addSystemCommand(&.{ make_bin, "-C", "test/interop", "interop-test-opendds" });
-        make_opendds.step.dependOn(&zzdds_interop_pub.step);
-        make_opendds.step.dependOn(&zzdds_interop_sub.step);
-        make_opendds.step.dependOn(&zzdds_interop_pub_frag.step);
-        opendds_interop_step.dependOn(&make_opendds.step);
     }
 }
