@@ -35,6 +35,8 @@ no threads (where possible), no sleeping.
 - StatefulReader state machine: Heartbeat handling (non-final+missing SNs, final+complete,
   stale count suppression, unknown writer), out-of-order DATA buffering, GAP handling,
   duplicate SN discard
+- Reference-model tests: independent compact models for presentation/coherent write-side
+  behavior, StatefulReader receive windows, and StatefulWriter ACKNACK retransmission decisions
 - SequenceNumber arithmetic: high/low word boundary rollover, SEQUENCENUMBER_UNKNOWN sentinel
 - QoS matching: all 22 policies, compatible and incompatible combinations
 - Config resolver: env var overrides, TOML file parsing, precedence order
@@ -43,6 +45,11 @@ no threads (where possible), no sleeping.
 
 **What does NOT live here:**
 Anything that requires real sockets, real wall-clock timing, or external processes.
+
+**Reference model scope.** Model tests intentionally model a smaller contract than the
+implementation: visible samples, sequence-number windows, coherent-set markers, GSNs, and
+outgoing DATA/ACKNACK decisions. They are not alternate implementations of discovery,
+transport, or serialization.
 
 ---
 
@@ -128,7 +135,10 @@ memory read.
 Implementation: each fuzz target exposes `pub fn fuzzOne(data: []const u8) void`.
 `zig build test-fuzz` compile-checks those targets; runnable libFuzzer executables are
 built manually by compiling the Zig source to an object and linking with LLVM's libFuzzer.
-Corpus lives in `test/fuzz/corpus/`.
+Corpus lives in `test/fuzz/corpus/`: `rtps_parser/` for RTPS packets and `plcdr/` for
+SPDP/SEDP ParameterList payloads. Review-found or fuzz-found counterexamples should be
+minimized and kept there when they are better represented as byte inputs than handwritten
+Zig test cases.
 
 As DDS Security is implemented, add fuzz targets for the authentication and crypto layers;
 a security-capable implementation must be robust against junk data from unauthenticated peers.

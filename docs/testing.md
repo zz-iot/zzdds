@@ -6,6 +6,7 @@
 zig build test           # all tests (600+); < 30s on a modern machine
 zig build test-tsan      # same tests under ThreadSanitizer
 zig build test-fuzz      # compile-check fuzz targets; corpus regression runs in zig build test
+python3 scripts/check_test_sleeps.py
 ```
 
 ## What `zig build test` covers
@@ -15,6 +16,7 @@ zig build test-fuzz      # compile-check fuzz targets; corpus regression runs in
 - History cache (KEEP_LAST eviction, KEEP_ALL growth, depth boundary cases)
 - `StatefulWriter` state machine (AckNack cases, Heartbeat emission)
 - `StatefulReader` state machine (Heartbeat handling, out-of-order DATA, GAP, duplicate SN)
+- Model tests for presentation/coherent writer behavior, `StatefulReader`, and `StatefulWriter`
 - DATA_FRAG fragmentation + reassembly
 - SequenceNumber arithmetic (high/low word boundary rollover)
 - QoS matching (all 22 policies, compatible + incompatible combinations)
@@ -59,12 +61,29 @@ Fuzz targets are in `test/fuzz/`:
 - `fuzz_rtps_parser.zig` — arbitrary bytes to RTPS message parser; assert no crash/UB/overrun
 - `fuzz_plcdr.zig` — arbitrary bytes to PL-CDR/PID deserializer (SPDP/SEDP)
 
+Corpus directories live under `test/fuzz/corpus/`. Add minimized RTPS packets to
+`rtps_parser/` and minimized SPDP/SEDP ParameterList payloads to `plcdr/` when fuzzing,
+interop debugging, or code review finds an input that should become a permanent regression.
+
 To run the fuzzer directly (requires LLVM's libFuzzer), build the fuzz source as an object
 and link it with `clang -fsanitize=fuzzer,address`. The exact commands are documented in
 the comments at the top of each fuzz source file.
 
 There is intentionally no `zig build test-fuzz-bin` step today; `zig build test-fuzz`
 compile-checks the fuzz targets but does not install runnable fuzz executables.
+
+## Deterministic test guardrails
+
+Model/unit tests should not add wall-clock sleeps. `scripts/check_test_sleeps.py` rejects
+new sleep calls in deterministic test areas and leaves a narrow allowlist for existing
+socket/full-stack tests that still depend on receive threads or SPDP timer ticks.
+
+CI also runs these Linux variants:
+
+```sh
+zig build test -Dipv6=false -Dinterface-monitor=false
+zig build test -Doptimize=ReleaseSafe
+```
 
 ## Live interop tests
 

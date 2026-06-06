@@ -245,7 +245,9 @@ pub fn build(b: *std.Build) void {
     // Per-subsystem test runners.
     const rtps_test_files = [_][]const u8{
         "test/rtps/writer_sm_test.zig",
+        "test/rtps/writer_model_test.zig",
         "test/rtps/reader_sm_test.zig",
+        "test/rtps/reader_model_test.zig",
         "test/rtps/sequence_number_test.zig",
         "test/rtps/mock_transport_test.zig",
         "test/rtps/frag_roundtrip_test.zig",
@@ -274,6 +276,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/loopback_test.zig",
         "test/dcps/api_test.zig",
         "test/dcps/mock_loopback_test.zig",
+        "test/dcps/presentation_model_test.zig",
         "test/dcps/ignore_test.zig",
         "test/dcps/intraprocess_test.zig",
         "test/dcps/qos_runtime_test.zig",

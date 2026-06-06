@@ -45,8 +45,17 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src/ test/
 
+      - name: Check deterministic tests avoid sleeps
+        run: python3 scripts/check_test_sleeps.py
+
       - name: Test
         run: zig build test
+
+      - name: Test (feature-minimal)
+        run: zig build test -Dipv6=false -Dinterface-monitor=false
+
+      - name: Test (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe
 
       - name: Test (TSan)
         run: zig build test-tsan
