@@ -28,6 +28,24 @@ pub fn fuzzOne(data: []const u8) void {
     while (it.next(&params) catch return) |_| {}
 }
 
+fn replayCorpusDir() !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.Io.Dir.cwd().openDir(io, "test/fuzz/corpus/rtps_parser", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.eql(u8, entry.name, "README.md")) continue;
+        const data = try dir.readFileAlloc(io, entry.name, std.testing.allocator, std.Io.Limit.limited(1024 * 1024));
+        defer std.testing.allocator.free(data);
+        fuzzOne(data);
+    }
+}
+
 /// libFuzzer entry point. Only called when this file is linked with libFuzzer.
 /// In test binaries, this symbol is exported but never called.
 export fn LLVMFuzzerTestOneInput(data: [*]const u8, size: usize) i32 {
@@ -110,6 +128,10 @@ test "valid header, no submessages: next returns null" {
     var params: [32]InlineQosParam = undefined;
     const sm = try it.next(&params);
     try std.testing.expectEqual(@as(?msg.SubMessage, null), sm);
+}
+
+test "corpus files replay without crash" {
+    try replayCorpusDir();
 }
 
 test "valid header + DATA: parses correctly" {

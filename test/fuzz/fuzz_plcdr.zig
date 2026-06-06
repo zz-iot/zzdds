@@ -28,6 +28,24 @@ pub fn fuzzOne(data: []const u8) void {
     kp.deinit();
 }
 
+fn replayCorpusDir() !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.Io.Dir.cwd().openDir(io, "test/fuzz/corpus/plcdr", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.eql(u8, entry.name, "README.md")) continue;
+        const data = try dir.readFileAlloc(io, entry.name, std.testing.allocator, std.Io.Limit.limited(1024 * 1024));
+        defer std.testing.allocator.free(data);
+        fuzzOne(data);
+    }
+}
+
 export fn LLVMFuzzerTestOneInput(data: [*]const u8, size: usize) i32 {
     fuzzOne(data[0..size]);
     return 0;
@@ -86,6 +104,10 @@ test "minimal valid SPDP payload: GUID + lease + sentinel" {
     var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload);
     kp.deinit();
     try std.testing.expectEqual(@as(u32, 10_000), kp.data.lease_duration_ms);
+}
+
+test "corpus files replay without crash" {
+    try replayCorpusDir();
 }
 
 test "full SPDP payload: GUID + lease + BES + sentinel" {

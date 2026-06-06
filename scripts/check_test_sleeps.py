@@ -34,7 +34,7 @@ def main() -> int:
     offenders: list[str] = []
     for path in sorted((ROOT / "test").rglob("*.zig")):
         rel = path.relative_to(ROOT).as_posix()
-        if rel.startswith("test/interop/") or rel in ALLOWLIST:
+        if rel in ALLOWLIST:
             continue
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
             if any(pattern in line for pattern in PATTERNS):

@@ -95,21 +95,21 @@ port allocation, no bind, no threads, no timing sensitivity.
 
 ### Tier 3 — Live interop (cross-process, external vendor)
 
-The local developer targets are `zig build interop-test-cyclone` and
-`zig build interop-test-opendds`; they require the corresponding vendor implementation.
-CI also runs the dds-rtps `shape_main` matrix against pinned Cyclone DDS, FastDDS,
+CI runs the dds-rtps `shape_main` matrix against pinned Cyclone DDS, FastDDS,
 OpenDDS, and RTI Connext binaries in both publish and subscribe directions.
 
 **What lives here:**
-- Cyclone DDS: Zenzen DDS writer → Cyclone reader; Cyclone writer → Zenzen DDS reader
+- Cyclone DDS: bidirectional dds-rtps matrix in CI
 - FastDDS: bidirectional dds-rtps matrix in CI
-- OpenDDS: local Makefile scenarios plus bidirectional dds-rtps matrix in CI
+- OpenDDS: bidirectional dds-rtps matrix in CI
 - RTI Connext: bidirectional dds-rtps matrix in CI; external use requires a license
 - Security handshake (planned, when DDS Security plugin is implemented)
 
-**Execution model:** `test/interop/Makefile` launches peer processes, runs scenarios,
-asserts outcomes. Each scenario is a self-contained process pair with a timeout. The
-Makefile is the only place with real `sleep` calls (startup ordering).
+The old local `zig build interop-test-*` targets were removed because they duplicated a
+small subset of the CI matrix while requiring local vendor installs. Interop findings
+should be minimized into vendor-free regressions under `test/fuzz/corpus/`,
+`test/rtps/*_model_test.zig`, `test/dcps/*_model_test.zig`, or
+`test/interop_regressions/README.md`.
 
 ---
 
@@ -249,7 +249,7 @@ for tests that don't need the full DCPS stack.
 | ThreadSanitizer | `root_module.sanitize_thread = true` | `zig build test-tsan` (PRs, nightly) |
 | kcov coverage | `zig build emit-tests` + kcov (built against patched elfutils for DWARF 5); report uploaded to Codecov | CI on every push |
 | libFuzzer | Source entry points in `test/fuzz/`; runnable executables are built manually with LLVM's libFuzzer | Nightly; manual on parser changes |
-| Live interop | local `zig build interop-test-cyclone` / `interop-test-opendds`; CI dds-rtps vendor matrix | PRs, nightly, or on-demand |
+| Live interop | CI dds-rtps vendor matrix | PRs, nightly, or on-demand |
 
 **On static analysis:** Zig's compiler eliminates many C-style static analysis targets
 (buffer overruns caught by bounds checks, no silent integer promotions, no implicit casts
@@ -286,8 +286,6 @@ Physical-layer behavior (MTU, congestion, asymmetric latency) is out of scope.
 ```
 zig build test                  ← Tier 1 + Tier 2; always runs; < 30s
 zig build test-tsan             ← Tier 1 + Tier 2 under TSan; PRs and nightly
-zig build interop-test-cyclone  ← Tier 3; requires Cyclone DDS at CYCLONE_ROOT
-zig build interop-test-opendds  ← Tier 3; requires OpenDDS at OPENDDS_ROOT
 zig build test-fuzz             ← Tier 4 fuzz harness compile-check
 ```
 

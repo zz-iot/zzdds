@@ -60,7 +60,7 @@ test/
   rtps/                   # RTPS message-layer tests
   discovery/              # SPDP/SEDP tests
   fuzz/                   # Corpus regression (RTPS parser, PL_CDR deserializer)
-  interop/                # Local wire interop harness vs Cyclone DDS / OpenDDS
+  interop_regressions/    # Vendor-free homes for minimized interop findings
 docs/
   overview.md             # This file — documentation index
   architecture.md         # Layer model, plugin interfaces, config, logging, wire trace

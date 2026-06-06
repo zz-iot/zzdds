@@ -100,21 +100,15 @@ zig build test-tsan
 
 ## Live interop tests
 
-The local developer targets require an installed peer implementation and are not part of
-`zig build test`.
+CI gates the dds-rtps `shape_main` matrix against pinned Cyclone DDS, FastDDS,
+OpenDDS, and RTI Connext binaries in both publish and subscribe directions, including
+ThreadSanitizer runs for the Zenzen DDS side.
 
-```sh
-zig build interop-test-cyclone   # requires Cyclone DDS; set CYCLONE_ROOT or see test/interop/Makefile
-zig build interop-test-opendds   # requires OpenDDS at OPENDDS_ROOT
-```
-
-Each scenario is a self-contained process pair run by `test/interop/Makefile`:
-- Basic pub/sub (Zenzen writer → peer reader; peer writer → Zenzen reader)
-- Fragmented data (DATA_FRAG, large payload exceeding `fragment_size`)
-
-CI also gates the dds-rtps `shape_main` matrix against the pinned release binaries for
-Cyclone DDS, FastDDS, OpenDDS, and RTI Connext in both publish and subscribe directions,
-including ThreadSanitizer runs for the Zenzen DDS side.
+The old local `zig build interop-test-*` targets were removed because the CI matrix
+has broader vendor and scenario coverage. When CI or code review finds an interop
+edge case, minimize it into a vendor-free regression under `test/fuzz/corpus/`,
+`test/rtps/*_model_test.zig`, `test/dcps/*_model_test.zig`, or
+`test/interop_regressions/README.md` as appropriate.
 
 ## Test design philosophy
 
