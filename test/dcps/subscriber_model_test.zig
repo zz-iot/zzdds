@@ -56,12 +56,14 @@ const ModelReader = struct {
 
 const Harness = struct {
     alloc: std.mem.Allocator,
-    clock: time_mod.ManualClock,
+    clock: *time_mod.ManualClock,
     sub: *SubscriberImpl,
     next_handle: DDS.InstanceHandle_t = 1,
 
     fn init(alloc: std.mem.Allocator, presentation: DDS.PresentationQosPolicy) !Harness {
-        var clock = time_mod.ManualClock.init(0);
+        const clock = try alloc.create(time_mod.ManualClock);
+        errdefer alloc.destroy(clock);
+        clock.* = time_mod.ManualClock.init(0);
         var qos = DDS.SubscriberQos{};
         qos.presentation = presentation;
         const cbs = dcps.SubscriberParticipantCbs{
@@ -90,6 +92,7 @@ const Harness = struct {
 
     fn deinit(self: *@This()) void {
         self.sub.deinit();
+        self.alloc.destroy(self.clock);
     }
 
     fn makeReader(self: *@This()) !*DataReaderImpl {
