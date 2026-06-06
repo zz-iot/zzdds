@@ -30,8 +30,12 @@ pub fn fuzzOne(data: []const u8) void {
 
 fn replayCorpusDir() !void {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var dir = std.Io.Dir.cwd().openDir(io, "test/fuzz/corpus/plcdr", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
+    const corpus_path = "test/fuzz/corpus/plcdr";
+    var dir = std.Io.Dir.cwd().openDir(io, corpus_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("missing PL-CDR fuzz corpus directory: {s}\n", .{corpus_path});
+            return error.MissingCorpusDir;
+        },
         else => return err,
     };
     defer dir.close(io);

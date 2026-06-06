@@ -34,13 +34,18 @@ PATTERNS = (
 )
 
 
+def code_before_line_comment(line: str) -> str:
+    return line.split("//", 1)[0]
+
+
 def main() -> int:
     offenders: list[str] = []
     allowed_counts = {rel: 0 for rel in ALLOWLIST}
     for path in sorted((ROOT / "test").rglob("*.zig")):
         rel = path.relative_to(ROOT).as_posix()
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            if any(pattern in line for pattern in PATTERNS):
+            code = code_before_line_comment(line)
+            if any(pattern in code for pattern in PATTERNS):
                 if rel in ALLOWLIST:
                     allowed_counts[rel] += 1
                 else:

@@ -42,23 +42,8 @@ jobs:
         with:
           version: "0.16.0"
 
-      - name: Check formatting
-        run: zig fmt --check src/ test/
-
-      - name: Check deterministic tests avoid sleeps
-        run: python3 scripts/check_test_sleeps.py
-
-      - name: Test
-        run: zig build test
-
-      - name: Test (feature-minimal)
-        run: zig build test -Dipv6=false -Dinterface-monitor=false
-
-      - name: Test (ReleaseSafe)
-        run: zig build test -Doptimize=ReleaseSafe
-
-      - name: Test (TSan)
-        run: zig build test-tsan
+      - name: Run deterministic matrix
+        run: python3 scripts/run_deterministic_matrix.py --include-tsan
 
   # ── Unit tests: remaining platforms (independent of interop) ──────────────
   test-other:

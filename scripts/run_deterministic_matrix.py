@@ -82,8 +82,13 @@ def main() -> int:
         selected = [step for step in selected if step.name in wanted]
         missing = wanted - {step.name for step in selected}
         if missing:
+            hint = ""
+            if missing == {"tsan"}:
+                hint = " (pass --include-tsan to enable the tsan step)"
             print(
-                "Requested step(s) require additional flags: " + ", ".join(sorted(missing)),
+                "Requested step(s) require additional flags: "
+                + ", ".join(sorted(missing))
+                + hint,
                 file=sys.stderr,
             )
             return 2
