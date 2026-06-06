@@ -26,6 +26,7 @@ pub const InstanceHandle = history_mod.InstanceHandle;
 pub const RtpsTimestamp = history_mod.RtpsTimestamp;
 pub const SequenceNumber = history_mod.SequenceNumber;
 pub const CacheChange = history_mod.CacheChange;
+pub const CoherentFlushMode = history_mod.CoherentFlushMode;
 pub const Locator = iface.Locator;
 pub const SequenceNumberSet = submsg_mod.SequenceNumberSet;
 pub const FragmentNumberSet = submsg_mod.FragmentNumberSet;
@@ -141,6 +142,22 @@ pub const ProtocolWriter = struct {
         /// Used to enforce RESOURCE_LIMITS.max_samples before writing.
         cache_len: *const fn (ctx: *anyopaque) usize,
 
+        /// Begin a coherent set: subsequent write() calls are deferred until
+        /// end_coherent_set().  `is_coherent_window` must be true when called from
+        /// begin_coherent_changes (records the buffer depth as the coherent window
+        /// start) and false when called from suspend_publications (activates buffering
+        /// only, without marking a coherent window boundary).
+        begin_coherent_set: *const fn (ctx: *anyopaque, is_coherent_window: bool) void,
+
+        /// Returns the number of samples in the coherent window (used by the publisher
+        /// to pre-compute the group-wide last GSN before flushing).
+        coherent_window_count: *const fn (ctx: *anyopaque) usize,
+
+        /// Flush a deferred coherent/ordered batch.  `mode` controls which
+        /// inline QoS PIDs are emitted (see CoherentFlushMode).
+        /// `global_last_gsn`: group-wide last GSN across all writers; 0 = per-writer.
+        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void,
+
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
     };
@@ -203,6 +220,18 @@ pub const ProtocolWriter = struct {
 
     pub fn cacheLen(self: ProtocolWriter) usize {
         return self.vtable.cache_len(self.ctx);
+    }
+
+    pub fn beginCoherentSet(self: ProtocolWriter, is_coherent_window: bool) void {
+        self.vtable.begin_coherent_set(self.ctx, is_coherent_window);
+    }
+
+    pub fn coherentWindowCount(self: ProtocolWriter) usize {
+        return self.vtable.coherent_window_count(self.ctx);
+    }
+
+    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
+        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn);
     }
 
     pub fn deinit(self: ProtocolWriter) void {
@@ -268,6 +297,8 @@ pub const ProtocolReader = struct {
             key_hash: [16]u8,
             serialized_payload: []const u8,
             kind: ChangeKind,
+            coherent_set_sn: ?SequenceNumber,
+            group_seq_num: ?SequenceNumber,
         ) void,
 
         /// Called by the participant's RTPS message dispatcher when a HEARTBEAT
@@ -355,6 +386,8 @@ pub const ProtocolReader = struct {
         key_hash: [16]u8,
         serialized_payload: []const u8,
         kind: ChangeKind,
+        coherent_set_sn: ?SequenceNumber,
+        group_seq_num: ?SequenceNumber,
     ) void {
         self.vtable.handle_incoming_change(
             self.ctx,
@@ -364,6 +397,8 @@ pub const ProtocolReader = struct {
             key_hash,
             serialized_payload,
             kind,
+            coherent_set_sn,
+            group_seq_num,
         );
     }
 

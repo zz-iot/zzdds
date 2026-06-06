@@ -206,3 +206,243 @@ test "SPDP: re-announcement before expiry refreshes lease" {
     spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), tr.lost);
 }
+
+test "SPDP: removePeer fires on_participant_lost" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var clock = ManualClock.init(0);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+
+    const peer = prefix(0xAA);
+    const payload = try buildPayload(alloc, peer, 1000);
+    defer alloc.free(payload);
+
+    spdp.processSpdpPayload(peer, payload);
+    try testing.expectEqual(@as(u32, 1), tr.discovered);
+
+    spdp_mod.SpdpEndpoints.removePeer(spdp, peer);
+    try testing.expectEqual(@as(u32, 1), tr.lost);
+    try testing.expect(tr.lost_guid.?.prefix.eql(peer));
+
+    // Removing again (not found) is a no-op.
+    spdp_mod.SpdpEndpoints.removePeer(spdp, peer);
+    try testing.expectEqual(@as(u32, 1), tr.lost);
+}
+
+test "SPDP: checkLeases triggers probe when silence exceeds threshold" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    // Start at 1ms so last_seen_ns is positive (avoids the guard in checkLeases).
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+
+    const ProbeTracker = struct {
+        count: u32 = 0,
+        last_prefix: ?GuidPrefix = null,
+        fn start(ctx: *anyopaque, pfx: GuidPrefix, _: i64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.last_prefix = pfx;
+        }
+    };
+    var pt = ProbeTracker{};
+    spdp.setBeginProbeFn(&pt, ProbeTracker.start);
+
+    // Peer announces at T=1ms with 60-second lease.
+    const peer = prefix(0xBB);
+    const payload = try buildPayload(alloc, peer, 60_000);
+    defer alloc.free(payload);
+    spdp.processSpdpPayload(peer, payload);
+    try testing.expectEqual(@as(u32, 1), tr.discovered);
+
+    // Re-announce at T=1001ms: interval=1000ms → observed_interval_ns=1000ms.
+    clock.set(1001 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, payload);
+
+    // T=4001ms: silence = 4001-1001 = 3000ms = 3×1s → probe fires.
+    clock.set(4001 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 1), pt.count);
+    try testing.expect(pt.last_prefix.?.eql(peer));
+    // Peer is NOT evicted (lease is 60s, only ~4s elapsed).
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+}
+
+test "SPDP: checkLeases uses 5s fallback when no interval observed" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    // Start at 1ms so last_seen_ns is positive.
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+
+    const ProbeTracker = struct {
+        count: u32 = 0,
+        fn start(ctx: *anyopaque, _: GuidPrefix, _: i64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+    var pt = ProbeTracker{};
+    spdp.setBeginProbeFn(&pt, ProbeTracker.start);
+
+    // Single announcement at T=1ms with 60s lease (no re-announce → observed_interval_ns stays 0).
+    const peer = prefix(0xCC);
+    const payload = try buildPayload(alloc, peer, 60_000);
+    defer alloc.free(payload);
+    spdp.processSpdpPayload(peer, payload);
+
+    // T=4900ms: silence = 4899ms < 5000ms → no probe yet.
+    clock.set(4_900 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 0), pt.count);
+
+    // T=5001ms: silence = 5000ms >= 5s → probe fires.
+    clock.set(5_001 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 1), pt.count);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+}
+
+test "SPDP: onProbeResult alive refreshes expiry and clears probe" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+
+    const ProbeTracker = struct {
+        count: u32 = 0,
+        fn start(ctx: *anyopaque, _: GuidPrefix, _: i64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+    var pt = ProbeTracker{};
+    spdp.setBeginProbeFn(&pt, ProbeTracker.start);
+
+    const peer = prefix(0xDD);
+    const payload = try buildPayload(alloc, peer, 600_000);
+    defer alloc.free(payload);
+
+    // Announce at T=1ms, re-announce at T=1001ms → interval = 1000ms.
+    spdp.processSpdpPayload(peer, payload);
+    clock.set(1001 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, payload);
+
+    // T=4001ms: silence = 3000ms = 3×1s → probe fires.
+    clock.set(4001 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 1), pt.count);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+
+    // Probe result: alive=true → peer stays, probe_active cleared.
+    spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, true);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+
+    // Another checkLeases at T=4001ms: last_seen_ns updated to T=4001ms,
+    // silence resets to 0 → no new probe.
+    spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 1), pt.count);
+
+    // Stale result (probe_active is false) → silently ignored.
+    spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+}
+
+test "SPDP: onProbeResult dead evicts participant" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+
+    const ProbeTracker = struct {
+        count: u32 = 0,
+        fn start(ctx: *anyopaque, _: GuidPrefix, _: i64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+    var pt = ProbeTracker{};
+    spdp.setBeginProbeFn(&pt, ProbeTracker.start);
+
+    const peer = prefix(0xFF);
+    const payload = try buildPayload(alloc, peer, 600_000);
+    defer alloc.free(payload);
+
+    spdp.processSpdpPayload(peer, payload);
+    clock.set(1001 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, payload);
+
+    // T=4001ms: probe fires (silence=3000ms=3×1s).
+    clock.set(4001 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 1), pt.count);
+
+    // Probe result: alive=false → participant evicted.
+    spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqual(@as(u32, 1), tr.lost);
+    try testing.expect(tr.lost_guid.?.prefix.eql(peer));
+
+    // Stale dead result for unknown prefix → no-op.
+    spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqual(@as(u32, 1), tr.lost);
+}

@@ -103,6 +103,19 @@ pub const PublisherImpl = struct {
     writers: std.ArrayListUnmanaged(*writer_mod.DataWriterImpl),
     mu: Mutex,
 
+    /// Nesting counter for begin/end_coherent_changes.  The coherent set on the
+    /// underlying writers is opened at depth 0→1 and closed at depth 1→0.
+    coherent_depth: u32,
+    /// True while suspend_publications is in effect.  Tracked separately from
+    /// coherent_active on the writers so that end_coherent_changes can re-open
+    /// the suspension window after flushing the coherent set.
+    suspend_active: bool,
+    /// Shared group sequence number counter advanced across all writers during
+    /// begin/end_coherent_changes.  Passed by pointer to each writer's endCoherentSet
+    /// so that multiple writers in the same GROUP_PRESENTATION coherent set receive
+    /// globally unique, write-ordered GSNs rather than independent per-writer sequences.
+    group_seq_num_counter: i64,
+
     const Self = @This();
 
     pub fn init(
@@ -128,6 +141,9 @@ pub const PublisherImpl = struct {
             .default_dw_qos = .{},
             .writers = .empty,
             .mu = .{},
+            .coherent_depth = 0,
+            .suspend_active = false,
+            .group_seq_num_counter = 0,
         };
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
@@ -336,17 +352,66 @@ pub const PublisherImpl = struct {
         return cast(ctx).listener;
     }
 
-    fn vtSuspendPublications(_: *anyopaque) DDS.ReturnCode_t {
-        return DDS.RETCODE_UNSUPPORTED;
+    fn vtSuspendPublications(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.suspend_active = true;
+        for (self.writers.items) |w| w.proto_writer.beginCoherentSet(false);
+        return DDS.RETCODE_OK;
     }
-    fn vtResumePublications(_: *anyopaque) DDS.ReturnCode_t {
-        return DDS.RETCODE_UNSUPPORTED;
+
+    fn vtResumePublications(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.suspend_active = false;
+        // If begin_coherent_changes is active, the coherent window owns the deferred
+        // writes — don't flush them here; end_coherent_changes will do it correctly.
+        // Only flush with .none when there is no open coherent window.
+        if (self.coherent_depth == 0) {
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null, 0);
+        }
+        return DDS.RETCODE_OK;
     }
-    fn vtBeginCoherent(_: *anyopaque) DDS.ReturnCode_t {
-        return DDS.RETCODE_UNSUPPORTED;
+
+    fn vtBeginCoherent(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.coherent_depth == 0) {
+            for (self.writers.items) |w| w.proto_writer.beginCoherentSet(true);
+        }
+        self.coherent_depth += 1;
+        return DDS.RETCODE_OK;
     }
-    fn vtEndCoherent(_: *anyopaque) DDS.ReturnCode_t {
-        return DDS.RETCODE_UNSUPPORTED;
+
+    fn vtEndCoherent(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.coherent_depth == 0) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        self.coherent_depth -= 1;
+        if (self.coherent_depth == 0) {
+            const mode: proto.CoherentFlushMode = if (self.qos.presentation.coherent_access)
+                .full
+            else
+                .group_seq_only;
+            // Pre-count total coherent-window samples across all writers to compute
+            // the group-wide last GSN for PID_GROUP_COHERENT_SET.  This lets the
+            // initial DATA send (and retransmits) carry the correct group end marker.
+            // The TOCTOU window between count and flush is negligible in practice:
+            // concurrent writes during end_coherent_changes are application-level
+            // misuse that the DDS spec does not require implementations to handle.
+            var total_n: i64 = 0;
+            for (self.writers.items) |w| total_n += @intCast(w.proto_writer.coherentWindowCount());
+            const global_last_gsn = self.group_seq_num_counter + total_n;
+            // Pass suspend_active as `resuspend` so the flush and re-arm happen
+            // atomically inside writer.mu — no window where coherent_active=false.
+            // Pass &group_seq_num_counter so all writers share a monotone GSN space.
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn);
+        }
+        return DDS.RETCODE_OK;
     }
 
     fn vtWaitForAck(ctx: *anyopaque, timeout: DDS.Duration_t) DDS.ReturnCode_t {

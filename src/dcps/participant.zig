@@ -87,7 +87,7 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: std.mem.Allocator, _: *std.ArrayListUnmanaged(proto.Guid)) anyerror!void {}
     }.f,
     .handle_incoming_change = struct {
-        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind) void {}
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber) void {}
     }.f,
     .handle_heartbeat = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool) void {}
@@ -1155,7 +1155,9 @@ pub const DomainParticipantImpl = struct {
         if (iq) |q| {
             if (q.get(.status_info)) |si| {
                 if (si.len >= 4) {
-                    const v = std.mem.readInt(u32, si[0..4], .little);
+                    // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11),
+                    // always big-endian regardless of message endianness.
+                    const v = std.mem.readInt(u32, si[0..4], .big);
                     if (v & 0x1 != 0) return .not_alive_disposed;
                     if (v & 0x2 != 0) return .not_alive_unregistered;
                 }
@@ -1177,6 +1179,38 @@ pub const DomainParticipantImpl = struct {
         return std.mem.zeroes([16]u8);
     }
 
+    fn decodeCoherentSetSn(iq: ?submsg_mod.InlineQos, little_endian: bool) ?history_mod.SequenceNumber {
+        if (iq) |q| {
+            if (q.get(.coherent_set)) |cs| {
+                if (cs.len >= 8) {
+                    const order: std.builtin.Endian = if (little_endian) .little else .big;
+                    const high = std.mem.readInt(i32, cs[0..4], order);
+                    const low = std.mem.readInt(u32, cs[4..8], order);
+                    const h: i64 = @as(i64, high) << 32;
+                    const l: i64 = @as(i64, low);
+                    return h | l;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn decodeGroupSeqNum(iq: ?submsg_mod.InlineQos, little_endian: bool) ?history_mod.SequenceNumber {
+        if (iq) |q| {
+            if (q.get(.group_seq_num)) |gs| {
+                if (gs.len >= 8) {
+                    const order: std.builtin.Endian = if (little_endian) .little else .big;
+                    const high = std.mem.readInt(i32, gs[0..4], order);
+                    const low = std.mem.readInt(u32, gs[4..8], order);
+                    const h: i64 = @as(i64, high) << 32;
+                    const l: i64 = @as(i64, low);
+                    return h | l;
+                }
+            }
+        }
+        return null;
+    }
+
     fn resolveKeyHash(kh: [16]u8, ar: *ActiveReader, payload: []const u8) [16]u8 {
         if (!std.mem.eql(u8, &kh, &std.mem.zeroes([16]u8))) return kh;
         if (ar.key_hash_fn) |f| return f(payload);
@@ -1193,6 +1227,8 @@ pub const DomainParticipantImpl = struct {
         key_hash: [16]u8,
         payload: []const u8,
         kind: history_mod.ChangeKind,
+        coherent_set_sn: ?history_mod.SequenceNumber,
+        group_seq_num: ?history_mod.SequenceNumber,
     ) void {
         if (dw_bytes.len < 4) return;
         const endian: std.builtin.Endian = if (little_endian) .little else .big;
@@ -1213,7 +1249,7 @@ pub const DomainParticipantImpl = struct {
             const rkey = entityIdKey(eid);
             if (self.active_readers.getPtr(rkey)) |ar| {
                 const kh = resolveKeyHash(key_hash, ar, payload);
-                ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind);
+                ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind, coherent_set_sn, group_seq_num);
             }
         }
     }
@@ -1256,10 +1292,12 @@ pub const DomainParticipantImpl = struct {
                     const kind = decodeChangeKind(d.inline_qos);
                     if (kind == .alive and d.serialized_payload.len == 0) continue;
                     const key_hash = decodeKeyHash(d.inline_qos);
+                    const coherent_set_sn = decodeCoherentSetSn(d.inline_qos, d.isLittleEndian());
+                    const group_seq_num = decodeGroupSeqNum(d.inline_qos, d.isLittleEndian());
 
                     if (d.inline_qos) |iq| {
                         if (iq.get(.directed_write)) |dw_bytes| {
-                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind);
+                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind, coherent_set_sn, group_seq_num);
                             continue;
                         }
                     }
@@ -1269,13 +1307,13 @@ pub const DomainParticipantImpl = struct {
                         var fan_it = self.active_readers.valueIterator();
                         while (fan_it.next()) |ar| {
                             const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
-                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind);
+                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num);
                         }
                     } else {
                         const rkey = entityIdKey(d.reader_entity_id);
                         if (self.active_readers.getPtr(rkey)) |ar| {
                             const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
-                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind);
+                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num);
                         }
                     }
                     self.mu.unlock();
@@ -1415,7 +1453,27 @@ pub const DomainParticipantImpl = struct {
         for (self.discovered_participants.items, 0..) |e, i| {
             if (e.guid.eql(guid)) {
                 _ = self.discovered_participants.swapRemove(i);
-                return;
+                break;
+            }
+        }
+        // Remove matched writers/readers belonging to this participant from all
+        // local DataReaders so they can generate NOT_ALIVE_NO_WRITERS.
+        // Uses the GUID prefix as the membership key (all endpoints of a
+        // participant share its prefix).
+        const prefix = guid.prefix;
+        var ar_it = self.active_readers.valueIterator();
+        while (ar_it.next()) |ar| {
+            var guids: std.ArrayListUnmanaged(Guid) = .empty;
+            ar.proto.listMatchedWriters(self.alloc, &guids) catch continue;
+            defer guids.deinit(self.alloc);
+            for (guids.items) |w_guid| {
+                if (!w_guid.prefix.eql(prefix)) continue;
+                const before = ar.proto.matchedWriterCount();
+                ar.proto.removeMatchedWriter(w_guid);
+                if (ar.proto.matchedWriterCount() < before) {
+                    if (ar.matched_notify) |cb|
+                        cb.notify(cb.ctx, writer_mod.guidToHandle(w_guid), false);
+                }
             }
         }
     }

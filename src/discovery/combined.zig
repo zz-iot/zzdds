@@ -59,6 +59,13 @@ pub const SpdpSedpDiscovery = struct {
         // Wire SEDP → SPDP relay: unicast SPDP responses arrive on the metatraffic
         // unicast port (RTPS §9.6.1.1), which SEDP owns.  Forward them to SPDP.
         se.setSpdpRelay(sp, spdp.SpdpEndpoints.handleRelayedData);
+        // Wire SEDP → SPDP BYE: SPDP participant BYE messages arriving on the
+        // metatraffic unicast port are forwarded to the SPDP handler.
+        se.setSpdpByeFn(sp, spdp.SpdpEndpoints.removePeer);
+        // Wire SPDP silence detection → SEDP liveness probe.
+        sp.setBeginProbeFn(se, sedp.SedpEndpoints.beginProbe);
+        // Wire SEDP probe result → SPDP participant eviction/renewal.
+        se.setProbeResultFn(sp, spdp.SpdpEndpoints.onProbeResult);
 
         const self = try alloc.create(Self);
         self.* = .{ .alloc = alloc, .spdp = sp, .sedp = se };

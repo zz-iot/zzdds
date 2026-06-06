@@ -48,11 +48,31 @@ pub const CacheChange = struct {
     key_hash: [16]u8,
     /// Serialized payload (encap header + CDR). Empty for NOT_ALIVE_* changes.
     data: []const u8,
+    /// When non-null, this change is part of a coherent set.
+    /// Value = last writer SN in the coherent set; emitted as PID_COHERENT_SET.
+    coherent_set_sn: ?SequenceNumber = null,
+    /// Per-publisher monotonically-increasing group sequence number for this
+    /// sample; emitted as PID_GROUP_SEQ_NUM.  null = not part of a group coherent set.
+    group_seq_num: ?SequenceNumber = null,
+    /// Last group sequence number in this group coherent set; emitted as
+    /// PID_GROUP_COHERENT_SET.  Equals group_seq_num for the last sample in the set.
+    group_coherent_sn: ?SequenceNumber = null,
 };
 
 // ── HistoryCache ──────────────────────────────────────────────────────────────
 
 pub const HistoryKind = enum { keep_last, keep_all };
+
+/// Controls which inline QoS PIDs are emitted when a deferred coherent/ordered
+/// batch is flushed.
+pub const CoherentFlushMode = enum(u2) {
+    /// resume_publications: flush as ordinary data, no inline QoS.
+    none,
+    /// ordered_access without coherent_access: emit PID_GROUP_SEQ_NUM only.
+    group_seq_only,
+    /// coherent_access: emit PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET.
+    full,
+};
 
 pub const HistoryCache = struct {
     alloc: std.mem.Allocator,

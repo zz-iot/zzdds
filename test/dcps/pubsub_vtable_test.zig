@@ -200,17 +200,17 @@ test "Publisher: set_listener / get_listener round-trip" {
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }
 
-test "Publisher: suspend/resume/begin/end return UNSUPPORTED" {
+test "Publisher: suspend/resume/begin/end return OK" {
     var h = try Harness.init(0x27);
     defer h.deinit();
     const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    try testing.expectEqual(DDS.RETCODE_UNSUPPORTED, pub_.vtable.suspend_publications(pub_.ptr));
-    try testing.expectEqual(DDS.RETCODE_UNSUPPORTED, pub_.vtable.resume_publications(pub_.ptr));
-    try testing.expectEqual(DDS.RETCODE_UNSUPPORTED, pub_.vtable.begin_coherent_changes(pub_.ptr));
-    try testing.expectEqual(DDS.RETCODE_UNSUPPORTED, pub_.vtable.end_coherent_changes(pub_.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.suspend_publications(pub_.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.resume_publications(pub_.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.begin_coherent_changes(pub_.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.end_coherent_changes(pub_.ptr));
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }

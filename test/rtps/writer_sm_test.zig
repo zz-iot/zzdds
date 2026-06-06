@@ -445,3 +445,148 @@ test "sendHeartbeat: count increments monotonically" {
     w.sendHeartbeat(true);
     try testing.expectEqual(hb_base + 3, w.hb_count);
 }
+
+// ── Liveness probe ────────────────────────────────────────────────────────────
+
+const GuidPrefix = rtps.GuidPrefix;
+
+const ProbeResult = struct {
+    prefix: ?GuidPrefix = null,
+    alive: ?bool = null,
+    fn callback(ctx: *anyopaque, pfx: GuidPrefix, a: bool) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.prefix = pfx;
+        self.alive = a;
+    }
+};
+
+test "beginProbe: sets deadline on matching reliable proxy" {
+    const writer_guid = makeGuid(0x20, WRITER_EID);
+    const reader_guid = makeGuid(0x21, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    // beginProbe with a far-future deadline so checkProbeDeadlines won't fire now.
+    const far_future: i64 = std.math.maxInt(i64);
+    w.beginProbe(reader_guid.prefix, far_future);
+
+    // Verify the deadline is set (proxy still present, no eviction yet).
+    w.mu.lock();
+    const found = for (w.reader_proxies.items) |rp| {
+        if (rp.guid.eql(reader_guid)) break rp.probe_deadline_ns == far_future;
+    } else false;
+    w.mu.unlock();
+    try testing.expect(found);
+}
+
+test "checkProbeDeadlines: evicts expired proxy and fires dead callback" {
+    const writer_guid = makeGuid(0x22, WRITER_EID);
+    const reader_guid = makeGuid(0x23, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    var pr = ProbeResult{};
+    w.setProbeResult(&pr, ProbeResult.callback);
+
+    // Set probe deadline to 1ns (past) so checkProbeDeadlines fires immediately.
+    w.beginProbe(reader_guid.prefix, 1);
+    w.checkProbeDeadlines();
+
+    // Proxy should be evicted and callback fired with alive=false.
+    try testing.expect(pr.prefix != null);
+    try testing.expect(pr.prefix.?.eql(reader_guid.prefix));
+    try testing.expect(pr.alive == false);
+
+    // Proxy is gone: no more reader proxies.
+    w.mu.lock();
+    const proxy_count = w.reader_proxies.items.len;
+    w.mu.unlock();
+    try testing.expectEqual(@as(usize, 0), proxy_count);
+}
+
+test "checkProbeDeadlines: all proxies beyond original 8-slot cap fire dead callback" {
+    // Regression for the fixed-size [8]GuidPrefix evicted array.  With the old
+    // code, proxies beyond index 8 were removed but probe_result_fn was never
+    // called for them — their KnownParticipant.probe_active stayed true forever.
+    const alloc = testing.allocator;
+    const writer_guid = makeGuid(0x30, WRITER_EID);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        alloc,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    const N = 9;
+    for (0..N) |i| {
+        const rg = makeGuid(@intCast(0x40 + i), READER_EID);
+        const loc = Locator.udp4(.{ 127, 0, 0, 1 }, @intCast(7200 + i));
+        const rp = try ReaderProxy.init(alloc, rg, &.{loc}, &.{}, false, true);
+        try w.addMatchedReader(rp);
+    }
+
+    const CallState = struct {
+        count: usize = 0,
+        fn cb(ctx: *anyopaque, _: GuidPrefix, alive: bool) void {
+            if (!alive) @as(*@This(), @ptrCast(@alignCast(ctx))).count += 1;
+        }
+    };
+    var cs = CallState{};
+    w.setProbeResult(&cs, CallState.cb);
+
+    for (0..N) |i| {
+        const rg = makeGuid(@intCast(0x40 + i), READER_EID);
+        w.beginProbe(rg.prefix, 1); // expired deadline
+    }
+    w.checkProbeDeadlines();
+
+    try testing.expectEqual(@as(usize, N), cs.count);
+    w.mu.lock();
+    const remaining = w.reader_proxies.items.len;
+    w.mu.unlock();
+    try testing.expectEqual(@as(usize, 0), remaining);
+}
+
+test "handleAckNack: ACKNACK clears probe and fires alive callback" {
+    const writer_guid = makeGuid(0x24, WRITER_EID);
+    const reader_guid = makeGuid(0x25, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    var pr = ProbeResult{};
+    w.setProbeResult(&pr, ProbeResult.callback);
+
+    // Set a far-future probe so the proxy is not evicted by checkProbeDeadlines.
+    w.beginProbe(reader_guid.prefix, std.math.maxInt(i64));
+
+    // ACKNACK from the reader should clear the probe and fire alive=true.
+    const nack_set = SequenceNumberSet{ .base = 4, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_guid, 3, nack_set, 1, true);
+
+    try testing.expect(pr.alive == true);
+    try testing.expect(pr.prefix.?.eql(reader_guid.prefix));
+
+    // Probe deadline should be cleared (proxy still alive).
+    w.mu.lock();
+    const deadline = for (w.reader_proxies.items) |rp| {
+        if (rp.guid.eql(reader_guid)) break rp.probe_deadline_ns;
+    } else -1;
+    w.mu.unlock();
+    try testing.expectEqual(@as(i64, 0), deadline);
+}

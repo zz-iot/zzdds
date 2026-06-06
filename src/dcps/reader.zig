@@ -75,6 +75,9 @@ pub const PendingChange = struct {
     alloc: std.mem.Allocator,
     /// DDS sample metadata stamped at enqueue time.
     info: DDS.SampleInfo,
+    /// Per-publisher group sequence number from PID_GROUP_SEQ_NUM inline QoS.
+    /// Used to sort samples in ordered GROUP_PRESENTATION access windows.
+    group_seq_num: ?i64 = null,
 
     pub fn deinit(self: PendingChange) void {
         self.alloc.free(self.data);
@@ -166,7 +169,23 @@ pub const DataReaderImpl = struct {
 
     /// Pending incoming samples; guarded by `mu`.
     pending: std.ArrayListUnmanaged(PendingChange),
+    /// Working buffer for the currently-receiving coherent set.
+    /// Samples are appended here as they arrive. When the end marker is received
+    /// Keyed by writer GUID so that concurrent coherent sets from different writers
+    /// accumulate independently and commit only when each writer's own set is complete.
+    coherent_wip: std.AutoHashMapUnmanaged(Guid, std.ArrayListUnmanaged(PendingChange)),
+    /// Queue of complete coherent sets awaiting delivery via begin_access().
+    /// Each element is one complete set (filled when its end marker arrives).
+    /// commitCoherentPendingLocked() pops ONLY the first entry per call so that
+    /// each begin_access/end_access cycle exposes exactly one coherent set,
+    /// even when multiple sets accumulated during a late-join history replay.
+    coherent_committed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(PendingChange)),
+    /// True when `coherent_committed` contains at least one complete set.
+    coherent_committed_ready: bool,
     mu: Mutex,
+
+    /// Presentation QoS from the owning Subscriber; set once after init.
+    subscriber_presentation: DDS.PresentationQosPolicy = .{},
 
     /// ContentFilteredTopic filter; null when no CFT or no get_field fn registered.
     /// Set once after init by the subscriber; read-only thereafter.
@@ -203,6 +222,11 @@ pub const DataReaderImpl = struct {
     /// key values (different instances) are each the sole owner of their own
     /// instance, even if one has lower strength than the other.
     owner_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, OwnerEntry) = .empty,
+
+    /// Per-writer set of instance handles written to via alive changes.
+    /// Guarded by `mu`. Used in onWriterUnmatchedCb to synthesize NOT_ALIVE_NO_WRITERS
+    /// when a writer disappears without an explicit unregister.
+    writer_instances: std.AutoHashMapUnmanaged(Guid, std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void)) = .empty,
 
     // ── TIME_BASED_FILTER tracking ────────────────────────────────────────────
     // Guarded by `mu`. Per-instance: each instance independently tracks the
@@ -247,6 +271,9 @@ pub const DataReaderImpl = struct {
             .status_cond = null,
             .data_notifiers = .empty,
             .pending = .empty,
+            .coherent_wip = .{},
+            .coherent_committed = .empty,
+            .coherent_committed_ready = false,
             .mu = .{},
             .timer_clock = timer_clock,
             .last_received_ns = .init(timer_clock.nowNs()),
@@ -278,13 +305,29 @@ pub const DataReaderImpl = struct {
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
         self.data_notifiers.deinit(self.alloc);
-        // Drain pending queue.
+        // Drain pending queues (including coherent buffers).
         for (self.pending.items) |p| p.deinit();
         self.pending.deinit(self.alloc);
+        var wip_it = self.coherent_wip.valueIterator();
+        while (wip_it.next()) |v| {
+            for (v.items) |p| p.deinit();
+            v.deinit(self.alloc);
+        }
+        self.coherent_wip.deinit(self.alloc);
+        for (self.coherent_committed.items) |*s| {
+            for (s.items) |p| p.deinit();
+            s.deinit(self.alloc);
+        }
+        self.coherent_committed.deinit(self.alloc);
         self.tbf_map.deinit(self.alloc);
         self.writer_strengths.deinit(self.alloc);
         self.writer_liveliness.deinit(self.alloc);
         self.owner_map.deinit(self.alloc);
+        {
+            var wi_it = self.writer_instances.valueIterator();
+            while (wi_it.next()) |inner| inner.deinit(self.alloc);
+        }
+        self.writer_instances.deinit(self.alloc);
         self.seen_instances.deinit(self.alloc);
         // NOTE: proto_reader lifecycle is owned by the participant (via
         // subDestroyProtoReader callback), not by DataReaderImpl.
@@ -357,6 +400,14 @@ pub const DataReaderImpl = struct {
 
     // ── Data delivery ─────────────────────────────────────────────────────────
 
+    /// Record that `guid` has published an alive sample for instance `ih`.
+    /// Must be called with `mu` held.  Used by onWriterUnmatchedCb.
+    fn trackWriterInstanceLocked(self: *Self, guid: Guid, ih: DDS.InstanceHandle_t) void {
+        const gop = self.writer_instances.getOrPut(self.alloc, guid) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.put(self.alloc, ih, {}) catch {};
+    }
+
     /// Called from the RTPS receive thread when a new sample arrives.
     /// Matches the DataCallback.on_data function pointer signature.
     /// Must not block; must not call back into the ProtocolReader.
@@ -367,6 +418,11 @@ pub const DataReaderImpl = struct {
 
         // Compute instance handle first — needed by both ownership and resource-limit checks.
         const ih = writer_mod.keyHashToHandle(change.key_hash);
+
+        // Track writer→instance before any filter so that ownership-dropped writes
+        // still mark the instance as covered (prevents spurious NOT_ALIVE_NO_WRITERS
+        // when the owner leaves but another writer is still publishing to the instance).
+        if (change.kind == .alive) trackWriterInstanceLocked(self, change.writer_guid, ih);
 
         // OWNERSHIP: per-instance exclusive ownership check.
         // A writer owns an instance if it is the highest-strength writer that has
@@ -435,6 +491,89 @@ pub const DataReaderImpl = struct {
                 self.alloc.free(copy);
                 return;
             }
+        }
+
+        // COHERENT SET BUFFERING: when the subscriber has coherent_access and the
+        // change carries PID_COHERENT_SET, buffer until the end marker arrives.
+        // "End marker" = the sample whose own SN equals the set's declared last SN.
+        //
+        // GROUP_PRESENTATION: do NOT auto-commit; mark the set complete and let
+        // Subscriber.begin_access() commit all readers atomically (cross-reader
+        // coordination avoids a race where the subscriber reads between individual
+        // reader commits).
+        // INSTANCE/TOPIC: auto-commit when the end marker arrives (per-reader
+        // coordination is sufficient).
+        if (self.subscriber_presentation.coherent_access and
+            change.coherent_set_sn != null)
+        {
+            const states = self.determineStatesLocked(ih, change.kind);
+            const src_time = change.source_timestamp.toTime();
+            const pc = PendingChange{
+                .data = copy,
+                .alloc = self.alloc,
+                .info = .{
+                    .sample_state = DDS.NOT_READ_SAMPLE_STATE,
+                    .view_state = states.view,
+                    .instance_state = states.instance_state,
+                    .source_timestamp = .{ .sec = src_time.sec, .nanosec = src_time.nanosec },
+                    .instance_handle = ih,
+                    .publication_handle = writer_mod.guidToHandle(change.writer_guid),
+                    .valid_data = change.kind == .alive,
+                },
+                .group_seq_num = change.group_seq_num,
+            };
+            if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
+            if (change.kind != .alive) {
+                _ = self.tbf_map.remove(ih);
+                _ = self.owner_map.remove(ih);
+            }
+            const wip_entry = self.coherent_wip.getOrPut(self.alloc, change.writer_guid) catch {
+                self.mu.unlock();
+                self.alloc.free(copy);
+                return;
+            };
+            if (!wip_entry.found_existing) wip_entry.value_ptr.* = .empty;
+            wip_entry.value_ptr.append(self.alloc, pc) catch {
+                self.mu.unlock();
+                self.alloc.free(copy);
+                return;
+            };
+            const is_set_end = (change.sequence_number == change.coherent_set_sn.?);
+            // commit_succeeded: true only when the completed set was successfully
+            // enqueued in coherent_committed.  Used to gate both the in-lock flag
+            // update and the post-lock notifications — if OOM discards the set we
+            // must not set coherent_committed_ready or fire spurious notifications,
+            // because there is nothing for begin_access() to deliver.
+            var commit_succeeded = false;
+            if (is_set_end) {
+                // Zero-copy: take ownership of this writer's wip list and enqueue
+                // it as one complete set.  Other writers' in-progress sets are
+                // unaffected.  Subscriber.begin_access() pops one set at a time.
+                var completed_set = wip_entry.value_ptr.*;
+                _ = self.coherent_wip.remove(change.writer_guid);
+                if (self.coherent_committed.append(self.alloc, completed_set)) {
+                    commit_succeeded = true;
+                } else |_| {
+                    for (completed_set.items) |cppc| cppc.deinit();
+                    completed_set.deinit(self.alloc);
+                }
+                if (commit_succeeded) {
+                    self.coherent_committed_ready = true;
+                    // Signal that a complete set is ready for begin_access().  Mirrors
+                    // the notification pattern on the normal (non-coherent) data path.
+                    self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+                    for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+                }
+            }
+            self.mu.unlock();
+            self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
+            if (is_set_end and commit_succeeded) {
+                if (self.status_cond) |sc| sc.notifyWakeup();
+                if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                    self.listener.vtable.on_data_available(self.listener.ptr, self.toDDSDataReader());
+                }
+            }
+            return;
         }
 
         // KEEP_LAST: if history depth is limited, evict the oldest pending sample
@@ -558,6 +697,7 @@ pub const DataReaderImpl = struct {
                 .publication_handle = writer_mod.guidToHandle(change.writer_guid),
                 .valid_data = change.kind == .alive,
             },
+            .group_seq_num = change.group_seq_num,
         };
 
         self.pending.append(self.alloc, pc) catch {
@@ -645,8 +785,15 @@ pub const DataReaderImpl = struct {
     fn onWriterUnmatchedCb(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
-        defer self.mu.unlock();
         _ = self.writer_strengths.remove(guid);
+        // Discard any in-progress coherent set from this writer.  If the writer
+        // crashed or was deleted mid-set, the partial wip would otherwise stay
+        // in the map indefinitely — one leaked entry per connect/disconnect cycle.
+        if (self.coherent_wip.fetchRemove(guid)) |kv| {
+            var wip = kv.value;
+            for (wip.items) |pc| pc.deinit();
+            wip.deinit(self.alloc);
+        }
         // Clean up liveliness tracking for this writer.
         if (self.writer_liveliness.fetchRemove(guid)) |kv| {
             if (kv.value.is_alive) {
@@ -662,18 +809,102 @@ pub const DataReaderImpl = struct {
         // Release ownership of any instances this writer held.  Collect keys
         // first (can't remove while iterating), then remove.  The next sample
         // from any remaining writer for those instances will re-claim them.
-        var to_remove: [64]DDS.InstanceHandle_t = undefined;
-        var n_remove: usize = 0;
-        var it = self.owner_map.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.guid.eql(guid) and n_remove < to_remove.len) {
-                to_remove[n_remove] = entry.key_ptr.*;
-                n_remove += 1;
+        var to_remove: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty;
+        defer to_remove.deinit(self.alloc);
+        {
+            var it = self.owner_map.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.guid.eql(guid)) {
+                    to_remove.append(self.alloc, entry.key_ptr.*) catch {};
+                }
             }
         }
-        for (to_remove[0..n_remove]) |ih| {
-            _ = self.owner_map.remove(ih);
+        for (to_remove.items) |ih| _ = self.owner_map.remove(ih);
+
+        // Synthesize NOT_ALIVE_NO_WRITERS for each instance this writer had
+        // published to that no longer has any other live writer.
+        var had_synthetic = false;
+        if (self.writer_instances.fetchRemove(guid)) |kv| {
+            var inner = kv.value;
+            defer inner.deinit(self.alloc);
+            var ih_it = inner.keyIterator();
+            while (ih_it.next()) |ih_ptr| {
+                const ih = ih_ptr.*;
+                // Another remaining writer covers this instance — no orphan.
+                var covered = false;
+                var wi_it = self.writer_instances.valueIterator();
+                while (wi_it.next()) |other| {
+                    if (other.contains(ih)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (covered) continue;
+                // Instance already non-alive (disposed/unregistered) — skip.
+                const si = self.seen_instances.get(ih) orelse continue;
+                if (si.instance_state != DDS.ALIVE_INSTANCE_STATE) continue;
+                // Build synthetic change.
+                const empty = self.alloc.dupe(u8, &.{}) catch continue;
+                const states = self.determineStatesLocked(ih, .not_alive_unregistered);
+                const now = time_mod.Time.now();
+                const pc = PendingChange{
+                    .data = empty,
+                    .alloc = self.alloc,
+                    .info = .{
+                        .sample_state = DDS.NOT_READ_SAMPLE_STATE,
+                        .view_state = states.view,
+                        .instance_state = states.instance_state,
+                        .instance_handle = ih,
+                        .source_timestamp = .{ .sec = now.sec, .nanosec = now.nanosec },
+                        .publication_handle = writer_mod.guidToHandle(guid),
+                        .valid_data = false,
+                    },
+                };
+                self.pending.append(self.alloc, pc) catch {
+                    self.alloc.free(empty);
+                    continue;
+                };
+                had_synthetic = true;
+            }
         }
+        if (had_synthetic) {
+            self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+            for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+        }
+        self.mu.unlock();
+        if (had_synthetic) {
+            self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
+            if (self.status_cond) |sc| sc.notifyWakeup();
+            if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                self.listener.vtable.on_data_available(self.listener.ptr, self.toDDSDataReader());
+            }
+        }
+    }
+
+    /// Expose the OLDEST committed coherent set to `pending`.
+    /// Called by Subscriber.vtBeginAccess() while self.mu is held.
+    /// Pops exactly one complete set from the front of the queue; if more sets
+    /// remain, coherent_committed_ready stays true so the next begin_access call
+    /// can deliver the next set.  This ensures each begin_access/end_access cycle
+    /// delivers exactly one coherent set regardless of how many accumulated.
+    /// Caller fires data-available callbacks AFTER releasing mu.
+    pub fn commitCoherentPendingLocked(self: *Self) void {
+        if (self.coherent_committed.items.len == 0) return;
+        var first_set = self.coherent_committed.orderedRemove(0);
+        // Pre-allocate so the append loop is all-or-nothing.  On OOM the entire
+        // set is discarded rather than partially committed.
+        self.pending.ensureUnusedCapacity(self.alloc, first_set.items.len) catch {
+            for (first_set.items) |cppc| cppc.deinit();
+            first_set.deinit(self.alloc);
+            return;
+        };
+        for (first_set.items) |cppc| {
+            self.pending.appendAssumeCapacity(cppc);
+        }
+        first_set.deinit(self.alloc);
+        self.coherent_committed_ready = self.coherent_committed.items.len > 0;
+        self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        // data_notifiers are fired by the subscriber after releasing all locks.
     }
 
     /// Returns true if there is at least one pending sample.

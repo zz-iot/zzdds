@@ -104,6 +104,14 @@ sweep of all `orderedRemove` call sites should replace them with `swapRemove` wh
 not semantically required, or with an indexed/hash structure where it is.  Existing tests
 should catch any ordering dependency that is accidentally removed.
 
+A specific instance worth addressing: `commitCoherentPendingLocked` in `reader.zig` uses
+`coherent_committed.orderedRemove(0)` to pop the oldest committed set from the front of the
+queue.  In the common late-join history-replay case where multiple coherent sets accumulate
+before the first `begin_access`, each pop is O(N) in the remaining queue depth.  The fix is
+to replace `ArrayListUnmanaged` with a head-index (`head: usize`) that advances instead of
+shifting, or to use a ring-buffer structure.  Queue depths in practice are small (1–3 sets),
+so this is a polish item rather than an urgent fix.
+
 **Condvar-based blocking in setup paths** — `wait_for_historical_data` and any other
 setup-time spin-poll (`std.time.sleep` in a retry loop) should be converted to condvar-based
 blocking.  The pattern to look for: a loop that sleeps a fixed interval then re-checks a
@@ -120,15 +128,10 @@ existing suite should be extended to cover the condvar path.
 - **DDS-XRCE** — embedded profile; separate project or downstream fork.
 - **TRANSIENT / PERSISTENT durability** — requires a persistence service; deferred.
 - **MultiTopic** — complex; deferred.
-- **Coherent changes and publication suspension** — `Publisher.begin_coherent_changes()`,
-  `end_coherent_changes()`, `suspend_publications()`, and `resume_publications()` all return
-  `RETCODE_UNSUPPORTED`. Full implementation requires GROUP-scope coherent delivery tracking;
-  deferred alongside GroupPresentation.
 - **Retroactive unmatching for ignored publications/subscriptions** — the ignore APIs filter
   future discovery callbacks today. Ignoring an already-discovered publication or
   subscription is treated as a permitted no-op; actively removing existing RTPS proxies is
   deferred unless a use case needs stricter behavior.
-- **GroupPresentation** (PRESENTATION QoS `access_scope = GROUP`) — deferred.
 - **Platform-specific InterfaceMonitors** — `monitor/netlink.zig` (Linux) and
   `monitor/pf_route.zig` (macOS) deferred; polling monitor is sufficient.
 - **SHMEM transport** — deferred; UDP covers current use cases.

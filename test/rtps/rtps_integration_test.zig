@@ -1027,10 +1027,9 @@ test "dispose_survives_nack_replay: not_alive_disposed replayed with correct STA
                     const kind: ChangeKind = if (d.inline_qos) |iq|
                         if (iq.get(.status_info)) |si| blk: {
                             if (si.len >= 4) {
-                                const v = if (d.isLittleEndian())
-                                    std.mem.readInt(u32, si[0..4], .little)
-                                else
-                                    std.mem.readInt(u32, si[0..4], .big);
+                                // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11):
+                                // an octet array, always big-endian regardless of message endianness.
+                                const v = std.mem.readInt(u32, si[0..4], .big);
                                 if (v & 0x1 != 0) break :blk ChangeKind.not_alive_disposed;
                                 if (v & 0x2 != 0) break :blk ChangeKind.not_alive_unregistered;
                             }
@@ -1233,4 +1232,297 @@ test "acknack_dedup: same count after retransmit is suppressed; new count is pro
     net.deliverAll();
     try testing.expectEqual(@as(usize, 2), col.samples.items.len);
     try testing.expectEqualSlices(u8, "two", col.samples.items[1]);
+}
+
+test "coherent_set: writes deferred until endCoherentSet" {
+    // Verifies that writes during a coherent set are not sent until
+    // endCoherentSet() is called, and that coherent_set_sn is patched
+    // on each CacheChange to the last SN in the set.
+    //
+    // A RELIABLE reader proxy is matched before the coherent window opens.
+    // During the window: addMatchedReader sends an initial HB (no DATA).
+    // Each writer.write() call accumulates the SN without calling sendChangeToAllLocked.
+    // After endCoherentSet(.full): all 3 DATAs are flushed with coherent_set_sn=3.
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
+    defer mt_w.deinit();
+    const mt_r = try MockTransport.init(alloc, net, &.{R1_LOC});
+    defer mt_r.deinit();
+
+    // replay_on_match=false (VOLATILE): no history replay; start_sn = next_sn at match.
+    // This avoids the suppress_live_data machinery which complicates the test.
+    const writer = try StatefulWriter.init(
+        alloc,
+        W1_GUID,
+        mt_w.transport(),
+        .keep_all,
+        0,
+        EntityIds.unknown,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer writer.deinit();
+
+    const reader = try StatefulReader.init(alloc, R1_GUID, mt_r.transport(), .keep_all, 0, true);
+    defer reader.deinit();
+
+    var col = Collector.init(alloc);
+    defer col.deinit();
+    reader.setCallback(col.callback());
+
+    var wd = WriterDispatch{ .writer = writer };
+    var rd = ReaderDispatch{ .reader = reader };
+    try mt_w.transport().listen(&W1_LOC, wd.makeHandler());
+    try mt_r.transport().listen(&R1_LOC, rd.makeHandler());
+
+    // Match reader and writer.
+    const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
+    try writer.addMatchedReader(rp);
+    const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
+    try reader.addMatchedWriter(wp);
+
+    // Drain the initial HB (from VOLATILE addMatchedReader sending an empty range HB).
+    net.deliverAll();
+    net.deliverAll(); // second round for the reader's ACKNACK response
+
+    // Begin coherent set: writes are now deferred.
+    writer.beginCoherentSet(true);
+    try write(writer, "alpha");
+    try write(writer, "beta");
+    try write(writer, "gamma");
+
+    // No DATA should have been sent yet — all are pending in coherent_pending_sns.
+    // Any packets in the queue are at most HBs from the RELIABLE send path
+    // (sendChangeToAllLocked is not called during coherent mode).
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 0), col.samples.items.len);
+
+    // Verify coherent_set_sn is null before end (changes are still deferred).
+    writer.mu.lock();
+    for (writer.cache.changes.items) |*ch| {
+        try testing.expectEqual(@as(?SequenceNumber, null), ch.coherent_set_sn);
+    }
+    writer.mu.unlock();
+
+    // End coherent set with .full: patch all 3 changes and flush DATA.
+    writer.endCoherentSet(.full, false, null, 0);
+
+    // Verify coherent_set_sn is patched to last SN (3) on all 3 changes.
+    writer.mu.lock();
+    for (writer.cache.changes.items) |*ch| {
+        try testing.expectEqual(@as(?SequenceNumber, 3), ch.coherent_set_sn);
+    }
+    writer.mu.unlock();
+
+    // Deliver the 3 DATA packets (plus HBs); reader should receive all 3 samples.
+    net.deliverAll();
+    net.deliverAll(); // second round for HB/NACK/retransmit exchange
+    try testing.expectEqual(@as(usize, 3), col.samples.items.len);
+    try testing.expectEqualSlices(u8, "alpha", col.samples.items[0]);
+    try testing.expectEqualSlices(u8, "beta", col.samples.items[1]);
+    try testing.expectEqualSlices(u8, "gamma", col.samples.items[2]);
+}
+
+test "coherent_set: mode=none sends without PID_COHERENT_SET" {
+    // Verifies that endCoherentSet(.none) flushes pending writes but does NOT
+    // patch coherent_set_sn on the CacheChanges (used for suspend_publications).
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
+    defer mt_w.deinit();
+    const mt_r = try MockTransport.init(alloc, net, &.{R1_LOC});
+    defer mt_r.deinit();
+
+    const writer = try StatefulWriter.init(
+        alloc,
+        W1_GUID,
+        mt_w.transport(),
+        .keep_all,
+        0,
+        EntityIds.unknown,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer writer.deinit();
+
+    const reader = try StatefulReader.init(alloc, R1_GUID, mt_r.transport(), .keep_all, 0, true);
+    defer reader.deinit();
+
+    var col = Collector.init(alloc);
+    defer col.deinit();
+    reader.setCallback(col.callback());
+
+    var wd = WriterDispatch{ .writer = writer };
+    var rd = ReaderDispatch{ .reader = reader };
+    try mt_w.transport().listen(&W1_LOC, wd.makeHandler());
+    try mt_r.transport().listen(&R1_LOC, rd.makeHandler());
+
+    const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
+    try writer.addMatchedReader(rp);
+    const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
+    try reader.addMatchedWriter(wp);
+    net.deliverAll();
+    net.deliverAll();
+
+    writer.beginCoherentSet(true);
+    try write(writer, "x");
+    try write(writer, "y");
+
+    // End with .none: changes sent but coherent_set_sn stays null.
+    writer.endCoherentSet(.none, false, null, 0);
+
+    writer.mu.lock();
+    for (writer.cache.changes.items) |*ch| {
+        try testing.expectEqual(@as(?SequenceNumber, null), ch.coherent_set_sn);
+    }
+    writer.mu.unlock();
+
+    net.deliverAll();
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 2), col.samples.items.len);
+}
+
+test "coherent_set: mode=group_seq_only emits group_seq_num but not coherent_set_sn" {
+    // Verifies that endCoherentSet(.group_seq_only) assigns group_seq_num but
+    // NOT coherent_set_sn or group_coherent_sn (ordered_access without coherent_access).
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mt_w = try MockTransport.init(alloc, net, &.{W1_LOC});
+    defer mt_w.deinit();
+    const mt_r = try MockTransport.init(alloc, net, &.{R1_LOC});
+    defer mt_r.deinit();
+
+    const writer = try StatefulWriter.init(
+        alloc,
+        W1_GUID,
+        mt_w.transport(),
+        .keep_all,
+        0,
+        EntityIds.unknown,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer writer.deinit();
+
+    const reader = try StatefulReader.init(alloc, R1_GUID, mt_r.transport(), .keep_all, 0, true);
+    defer reader.deinit();
+
+    var col = Collector.init(alloc);
+    defer col.deinit();
+    reader.setCallback(col.callback());
+
+    var wd = WriterDispatch{ .writer = writer };
+    var rd = ReaderDispatch{ .reader = reader };
+    try mt_w.transport().listen(&W1_LOC, wd.makeHandler());
+    try mt_r.transport().listen(&R1_LOC, rd.makeHandler());
+
+    const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
+    try writer.addMatchedReader(rp);
+    const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
+    try reader.addMatchedWriter(wp);
+    net.deliverAll();
+    net.deliverAll();
+
+    writer.beginCoherentSet(true);
+    try write(writer, "x");
+    try write(writer, "y");
+
+    // .group_seq_only: group_seq_num is assigned, coherent_set_sn stays null.
+    writer.endCoherentSet(.group_seq_only, false, null, 0);
+
+    writer.mu.lock();
+    for (writer.cache.changes.items) |*ch| {
+        try testing.expectEqual(@as(?SequenceNumber, null), ch.coherent_set_sn);
+        try testing.expect(ch.group_seq_num != null);
+        try testing.expectEqual(@as(?SequenceNumber, null), ch.group_coherent_sn);
+    }
+    writer.mu.unlock();
+
+    net.deliverAll();
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 2), col.samples.items.len);
+}
+
+test "coherent_set: multi-writer publisher shares GSN counter for global ordering" {
+    // Regression for per-writer group_seq_num_counter bug.  Without the fix,
+    // two writers in the same publisher both start from their own counter (both
+    // assign GSN=1 to their first sample), making group order undefined.
+    // With the fix, the publisher passes a shared counter pointer to each writer's
+    // endCoherentSet so GSNs are globally unique across the coherent set.
+    //
+    // Writer 1 has samples A(SN=1) and C(SN=2); writer 2 has sample B(SN=1).
+    // Simulated publisher flushes W1 first, then W2.
+    // Expected GSNs: A=1, C=2 (W1), B=3 (W2).
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mt_w1 = try MockTransport.init(alloc, net, &.{W1_LOC});
+    defer mt_w1.deinit();
+    const mt_w2 = try MockTransport.init(alloc, net, &.{W2_LOC});
+    defer mt_w2.deinit();
+
+    const w1 = try StatefulWriter.init(alloc, W1_GUID, mt_w1.transport(), .keep_all, 0, EntityIds.unknown, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w1.deinit();
+    const w2 = try StatefulWriter.init(alloc, W2_GUID, mt_w2.transport(), .keep_all, 0, EntityIds.unknown, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w2.deinit();
+
+    // Add a reader proxy to each writer so GSNs are actually assigned.
+    const rp1 = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
+    try w1.addMatchedReader(rp1);
+    const rp2 = try ReaderProxy.init(alloc, R2_GUID, &.{R2_LOC}, &.{}, false, true);
+    try w2.addMatchedReader(rp2);
+
+    // Open coherent windows on both writers (simulating publisher beginCoherentSet).
+    w1.beginCoherentSet(true);
+    w2.beginCoherentSet(true);
+
+    // W1 writes A and C; W2 writes B (interleaved to reflect real multi-writer usage).
+    _ = try w1.write(.alive, NIL_TS, NIL_IH, NIL_KH, "A");
+    _ = try w2.write(.alive, NIL_TS, NIL_IH, NIL_KH, "B");
+    _ = try w1.write(.alive, NIL_TS, NIL_IH, NIL_KH, "C");
+
+    // Pre-count total pending samples across both writers to compute global_last_gsn,
+    // mirroring what the publisher's vtEndCoherent does.
+    const total_n: i64 = @intCast(w1.coherentWindowPendingCount() + w2.coherentWindowPendingCount());
+    const global_last_gsn: i64 = 0 + total_n; // shared_gsn starts at 0
+
+    // Flush both writers with a shared publisher counter (simulating vtEndCoherent).
+    var shared_gsn: i64 = 0;
+    w1.endCoherentSet(.full, false, &shared_gsn, global_last_gsn); // W1: A=GSN1, C=GSN2; shared_gsn=2
+    w2.endCoherentSet(.full, false, &shared_gsn, global_last_gsn); // W2: B=GSN3; shared_gsn=3
+
+    // Verify W1's samples got globally-unique GSNs 1 and 2.
+    w1.mu.lock();
+    var gsns_w1: [2]?i64 = .{ null, null };
+    var group_coherent_w1: ?i64 = null;
+    for (w1.cache.changes.items, 0..) |*ch, i| {
+        if (i < 2) gsns_w1[i] = ch.group_seq_num;
+        if (ch.group_coherent_sn != null) group_coherent_w1 = ch.group_coherent_sn;
+    }
+    w1.mu.unlock();
+    try testing.expectEqual(@as(?i64, 1), gsns_w1[0]);
+    try testing.expectEqual(@as(?i64, 2), gsns_w1[1]);
+    // W1's last sample must carry the GROUP-WIDE last GSN (3), not just its own (2).
+    try testing.expectEqual(@as(?i64, 3), group_coherent_w1);
+
+    // Verify W2's sample got GSN 3 (continuing from W1's range, not restarting at 1).
+    w2.mu.lock();
+    const gsn_w2 = w2.cache.changes.items[0].group_seq_num;
+    const group_coherent_w2 = w2.cache.changes.items[0].group_coherent_sn;
+    w2.mu.unlock();
+    try testing.expectEqual(@as(?i64, 3), gsn_w2);
+    // W2's last sample also carries the group-wide last GSN.
+    try testing.expectEqual(@as(?i64, 3), group_coherent_w2);
 }

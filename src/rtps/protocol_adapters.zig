@@ -81,6 +81,9 @@ pub const RtpsProtocolWriter = struct {
         .handle_nack_frag = vtHandleNackFrag,
         .all_acked = vtAllAcked,
         .cache_len = vtCacheLen,
+        .begin_coherent_set = vtBeginCoherentSet,
+        .coherent_window_count = vtCoherentWindowCount,
+        .end_coherent_set = vtEndCoherentSet,
         .deinit = vtDeinit,
     };
 
@@ -167,6 +170,21 @@ pub const RtpsProtocolWriter = struct {
         self.writer.mu.lock();
         defer self.writer.mu.unlock();
         return self.writer.cache.len();
+    }
+
+    fn vtBeginCoherentSet(ctx: *anyopaque, is_coherent_window: bool) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.beginCoherentSet(is_coherent_window);
+    }
+
+    fn vtCoherentWindowCount(ctx: *anyopaque) usize {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.writer.coherentWindowPendingCount();
+    }
+
+    fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.endCoherentSet(mode, resuspend, publisher_gsn, global_last_gsn);
     }
 
     fn vtDeinit(ctx: *anyopaque) void {
@@ -295,6 +313,8 @@ pub const RtpsProtocolReader = struct {
         key_hash: [16]u8,
         serialized_payload: []const u8,
         kind: history_mod.ChangeKind,
+        coherent_set_sn: ?history_mod.SequenceNumber,
+        group_seq_num: ?history_mod.SequenceNumber,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.reader.isWriterMatched(writer_guid)) return;
@@ -306,6 +326,8 @@ pub const RtpsProtocolReader = struct {
             .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
             .key_hash = key_hash,
             .data = serialized_payload,
+            .coherent_set_sn = coherent_set_sn,
+            .group_seq_num = group_seq_num,
         };
         // Signal liveliness: this writer is alive.
         if (self.writer_match_cb) |cb| {

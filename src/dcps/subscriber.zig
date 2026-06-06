@@ -253,6 +253,8 @@ pub const SubscriberImpl = struct {
         );
         // Wire up get_field_fn for QueryCondition evaluation (always, when available).
         dr.get_field_fn = self.cbs.get_field_fn(self.cbs.ctx, type_name);
+        // Store subscriber's presentation QoS for coherent-set buffering decisions.
+        dr.subscriber_presentation = self.qos.presentation;
         // Wire up ContentFilteredTopic if the topic description is a CFT.
         if (topic_mod.asCft(a_topic)) |cft| {
             if (dr.get_field_fn) |get_field| {
@@ -368,11 +370,127 @@ pub const SubscriberImpl = struct {
         return cast(ctx).listener;
     }
 
-    fn vtBeginAccess(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtBeginAccess(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const pres = self.qos.presentation;
+        if (!pres.coherent_access and !pres.ordered_access) return DDS.RETCODE_OK;
+
+        // Snapshot of listener state for readers that received a coherent commit.
+        // Captured under subscriber.mu so we can fire callbacks safely after the
+        // lock is released.  Avoids use-after-free from a concurrent delete_datareader:
+        // delete_datareader must acquire subscriber.mu, so it cannot free a reader
+        // while we are still accessing its fields inside the lock.
+        const ListenerSnap = struct { listener: DDS.DataReaderListener, dr: DDS.DataReader };
+        var listener_snaps: std.ArrayListUnmanaged(ListenerSnap) = .empty;
+        defer listener_snaps.deinit(self.alloc);
+
+        self.mu.lock();
+
+        // COHERENT ACCESS: commit all complete coherent sets atomically so the
+        // application sees a consistent view across all readers.
+        // Only commit when ALL readers have a complete set ready — partial commits
+        // would deliver an incomplete group.
+        if (pres.coherent_access) {
+            var all_ready = true;
+            var any_committed = false;
+            for (self.readers.items) |r| {
+                r.mu.lock();
+                // Block if any reader has incomplete WIP from any writer — delivering
+                // a committed set while another writer's contribution is still in
+                // transit would violate GROUP atomicity.
+                if (r.coherent_wip.count() > 0) all_ready = false;
+                if (r.coherent_committed_ready) any_committed = true;
+                r.mu.unlock();
+            }
+            // Nothing to commit if no reader has a complete set ready.
+            if (!any_committed) all_ready = false;
+            if (all_ready and self.readers.items.len > 0) {
+                for (self.readers.items) |r| {
+                    r.mu.lock();
+                    r.commitCoherentPendingLocked();
+                    // Only notify if this reader actually has samples after commit — a
+                    // reader with no WIP and no committed data passes the all_ready check
+                    // but must not generate a spurious on_data_available or WaitSet wakeup.
+                    const has_data = r.pending.items.len > 0;
+                    // Fire WaitSet wakeups while subscriber.mu is held to prevent
+                    // use-after-free from a concurrent delete_datareader.
+                    // data_notifiers are exclusively WaitSet-internal wakeup callbacks
+                    // (registered only by ReadConditionImpl/QueryConditionImpl via
+                    // addDataNotifier).  They acquire only WaitSet.cv_mu — never
+                    // subscriber.mu or reader.mu — so holding both locks here is safe.
+                    if (has_data) {
+                        for (r.data_notifiers.items) |n| n.on_data(n.ctx);
+                    }
+                    r.mu.unlock();
+                    if (has_data) {
+                        r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
+                        if (r.status_cond) |sc| sc.notifyWakeup();
+                        if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                            listener_snaps.append(self.alloc, .{
+                                .listener = r.listener,
+                                .dr = r.toDDSDataReader(),
+                            }) catch {};
+                        }
+                    }
+                }
+            }
+        }
+
+        // ORDERED ACCESS: sort each reader's pending queue so that take() returns
+        // samples in presentation order.  Must happen after coherent commit so
+        // newly committed samples are included.
+        if (pres.ordered_access) {
+            for (self.readers.items) |r| {
+                r.mu.lock();
+                switch (pres.access_scope) {
+                    // INSTANCE: group samples by instance handle so all samples of
+                    // instance X are consecutive; break ties with group_seq_num.
+                    .INSTANCE_PRESENTATION_QOS => std.mem.sort(
+                        reader_mod.PendingChange,
+                        r.pending.items,
+                        {},
+                        pendingInstanceLessThan,
+                    ),
+                    // TOPIC / GROUP: preserve publisher write order across instances.
+                    else => std.mem.sort(
+                        reader_mod.PendingChange,
+                        r.pending.items,
+                        {},
+                        pendingLessThan,
+                    ),
+                }
+                r.mu.unlock();
+            }
+        }
+
+        self.mu.unlock();
+
+        // Fire listener callbacks without any lock held, using pre-captured snapshots.
+        // Listener context validity is the application's responsibility (standard DDS
+        // contract: don't delete a reader while its callbacks may be in-flight).
+        for (listener_snaps.items) |snap| {
+            snap.listener.vtable.on_data_available(snap.listener.ptr, snap.dr);
+        }
         return DDS.RETCODE_OK;
     }
-    fn vtEndAccess(_: *anyopaque) DDS.ReturnCode_t {
+
+    fn vtEndAccess(ctx: *anyopaque) DDS.ReturnCode_t {
+        _ = ctx;
         return DDS.RETCODE_OK;
+    }
+
+    fn pendingLessThan(_: void, a: reader_mod.PendingChange, b: reader_mod.PendingChange) bool {
+        const a_gsn = a.group_seq_num orelse std.math.maxInt(i64);
+        const b_gsn = b.group_seq_num orelse std.math.maxInt(i64);
+        return a_gsn < b_gsn;
+    }
+
+    fn pendingInstanceLessThan(_: void, a: reader_mod.PendingChange, b: reader_mod.PendingChange) bool {
+        if (a.info.instance_handle != b.info.instance_handle)
+            return a.info.instance_handle < b.info.instance_handle;
+        const a_gsn = a.group_seq_num orelse std.math.maxInt(i64);
+        const b_gsn = b.group_seq_num orelse std.math.maxInt(i64);
+        return a_gsn < b_gsn;
     }
 
     fn vtGetParticipant(ctx: *anyopaque) DDS.DomainParticipant {

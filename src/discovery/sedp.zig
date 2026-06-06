@@ -568,6 +568,13 @@ pub const SedpEndpoints = struct {
     // Optional relay for SPDP packets that arrive on the metatraffic unicast port.
     spdp_relay_ctx: ?*anyopaque,
     spdp_relay_fn: ?*const fn (*anyopaque, GuidPrefix, []const u8) void,
+    // Optional handler for SPDP BYE (participant dispose/unregister).
+    spdp_bye_ctx: ?*anyopaque,
+    spdp_bye_fn: ?*const fn (*anyopaque, GuidPrefix) void,
+    // Optional callback fired by SEDP reliable writers when a liveness probe resolves.
+    // Forwarded to pub_writer and sub_writer during start().
+    probe_result_ctx: ?*anyopaque,
+    probe_result_fn: ?*const fn (*anyopaque, GuidPrefix, bool) void,
 
     // Cached default locators per participant (RTPS: endpoints inherit these
     // when DiscoveredWriter/ReaderData omits explicit locator PIDs).
@@ -597,6 +604,10 @@ pub const SedpEndpoints = struct {
             .unsupported_locator_kinds = std.AutoHashMap(i32, void).init(alloc),
             .spdp_relay_ctx = null,
             .spdp_relay_fn = null,
+            .spdp_bye_ctx = null,
+            .spdp_bye_fn = null,
+            .probe_result_ctx = null,
+            .probe_result_fn = null,
         };
         return self;
     }
@@ -627,6 +638,38 @@ pub const SedpEndpoints = struct {
     ) void {
         self.spdp_relay_ctx = ctx;
         self.spdp_relay_fn = fn_ptr;
+    }
+
+    pub fn setSpdpByeFn(
+        self: *Self,
+        ctx: *anyopaque,
+        fn_ptr: *const fn (*anyopaque, GuidPrefix) void,
+    ) void {
+        self.spdp_bye_ctx = ctx;
+        self.spdp_bye_fn = fn_ptr;
+    }
+
+    /// Register a callback to receive liveness-probe results from the SEDP reliable
+    /// writers.  If the writers are already created (post-start), applies immediately.
+    pub fn setProbeResultFn(
+        self: *Self,
+        ctx: *anyopaque,
+        fn_ptr: *const fn (*anyopaque, GuidPrefix, bool) void,
+    ) void {
+        self.probe_result_ctx = ctx;
+        self.probe_result_fn = fn_ptr;
+        if (self.pub_writer) |pw| pw.setProbeResult(ctx, fn_ptr);
+        if (self.sub_writer) |sw| sw.setProbeResult(ctx, fn_ptr);
+    }
+
+    /// Initiate a liveness probe for the participant identified by `prefix`.
+    /// Sets `probe_deadline_ns` on matching reader proxies in pub_writer and
+    /// sub_writer; the periodic heartbeat thread handles the actual probe HBs.
+    /// Called by SPDP when announcement silence exceeds the trigger threshold.
+    pub fn beginProbe(ctx: *anyopaque, prefix: GuidPrefix, deadline_ns: i64) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.pub_writer) |pw| pw.beginProbe(prefix, deadline_ns);
+        if (self.sub_writer) |sw| sw.beginProbe(prefix, deadline_ns);
     }
 
     /// Must be called before `start()` to take effect.
@@ -663,6 +706,7 @@ pub const SedpEndpoints = struct {
             true, // SEDP always replays to late-joining participants
         );
         self.pub_writer.?.setTracer(self.tracer);
+        if (self.probe_result_fn) |f| self.pub_writer.?.setProbeResult(self.probe_result_ctx.?, f);
         self.pub_reader = try StatefulReader.init(
             self.alloc,
             Guid{ .prefix = local.guid.prefix, .entity_id = EntityIds.sedp_builtin_publications_reader },
@@ -686,6 +730,7 @@ pub const SedpEndpoints = struct {
             true, // SEDP always replays to late-joining participants
         );
         self.sub_writer.?.setTracer(self.tracer);
+        if (self.probe_result_fn) |f| self.sub_writer.?.setProbeResult(self.probe_result_ctx.?, f);
         self.sub_reader = try StatefulReader.init(
             self.alloc,
             Guid{ .prefix = local.guid.prefix, .entity_id = EntityIds.sedp_builtin_subscriptions_reader },
@@ -808,8 +853,11 @@ pub const SedpEndpoints = struct {
     pub fn announceWriter(self: *Self, ann: *const WriterAnnouncement) !void {
         const payload = try encodeWriterData(self.alloc, ann);
         defer self.alloc.free(payload);
+        // Each endpoint is a separate SEDP instance keyed by GUID so KEEP_LAST 1
+        // retains all endpoints rather than overwriting with the most recent.
+        const kh = guidToKeyHash(ann.guid);
         if (self.pub_writer) |pw| {
-            _ = try pw.write(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), payload);
+            _ = try pw.write(.alive, RtpsTimestamp.now(), kh, kh, payload);
         }
     }
 
@@ -818,15 +866,16 @@ pub const SedpEndpoints = struct {
         const payload = encodeEndpointDisposalPayload(self.alloc, guid) catch return;
         defer self.alloc.free(payload);
         if (self.pub_writer) |pw| {
-            _ = pw.write(.not_alive_disposed, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, kh, payload) catch {};
+            _ = pw.write(.not_alive_disposed, RtpsTimestamp.now(), kh, kh, payload) catch {};
         }
     }
 
     pub fn announceReader(self: *Self, ann: *const ReaderAnnouncement) !void {
         const payload = try encodeReaderData(self.alloc, ann);
         defer self.alloc.free(payload);
+        const kh = guidToKeyHash(ann.guid);
         if (self.sub_writer) |sw| {
-            _ = try sw.write(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), payload);
+            _ = try sw.write(.alive, RtpsTimestamp.now(), kh, kh, payload);
         }
     }
 
@@ -835,7 +884,7 @@ pub const SedpEndpoints = struct {
         const payload = encodeEndpointDisposalPayload(self.alloc, guid) catch return;
         defer self.alloc.free(payload);
         if (self.sub_writer) |sw| {
-            _ = sw.write(.not_alive_disposed, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, kh, payload) catch {};
+            _ = sw.write(.not_alive_disposed, RtpsTimestamp.now(), kh, kh, payload) catch {};
         }
     }
 
@@ -858,9 +907,14 @@ pub const SedpEndpoints = struct {
                     if (d.inline_qos) |iqos| {
                         if (iqos.get(.status_info)) |si_bytes| {
                             if (si_bytes.len >= 4) {
-                                const si = std.mem.readInt(u32, si_bytes[0..4], .little);
+                                // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11):
+                                // an octet array, always big-endian regardless of message endianness.
+                                const si = std.mem.readInt(u32, si_bytes[0..4], .big);
                                 if (si & 0x00000003 != 0) { // DISPOSED or UNREGISTERED
-                                    if (iqos.get(.key_hash)) |kh_bytes| {
+                                    if (wid.eql(EntityIds.spdp_builtin_participant_writer)) {
+                                        // SPDP BYE arriving on the metatraffic unicast port.
+                                        if (self.spdp_bye_fn) |f| f(self.spdp_bye_ctx.?, src_prefix);
+                                    } else if (iqos.get(.key_hash)) |kh_bytes| {
                                         if (kh_bytes.len >= 16) {
                                             const ep_guid = keyHashToGuid(kh_bytes[0..16].*);
                                             if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
