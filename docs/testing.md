@@ -75,9 +75,10 @@ compile-checks the fuzz targets but does not install runnable fuzz executables.
 
 ## Deterministic test guardrails
 
-Model/unit tests should not add wall-clock sleeps. `scripts/check_test_sleeps.py` rejects
-new sleep calls in deterministic test areas and leaves a narrow allowlist for existing
-socket/full-stack tests that still depend on receive threads or SPDP timer ticks.
+Model/unit tests should not add wall-clock sleeps. `scripts/check_test_sleeps.py`
+rejects new sleep calls in deterministic test areas and enforces exact audited
+counts for the remaining socket/full-stack tests that still depend on receive
+threads, SPDP timer ticks, or cross-thread WaitSet wakeups.
 
 For a local pre-push pass, run:
 

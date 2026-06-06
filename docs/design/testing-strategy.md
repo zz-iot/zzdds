@@ -45,6 +45,9 @@ no threads (where possible), no sleeping.
 
 **What does NOT live here:**
 Anything that requires real sockets, real wall-clock timing, or external processes.
+Any residual wall-clock sleeps in tests are audited by
+`scripts/check_test_sleeps.py`: adding or removing one requires updating the
+expected count and rationale in that script.
 
 **Reference model scope.** Model tests intentionally model a smaller contract than the
 implementation: visible samples, sequence-number windows, coherent-set markers, GSNs, and
