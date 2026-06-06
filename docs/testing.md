@@ -3,7 +3,7 @@
 ## Quick start
 
 ```sh
-zig build test           # all tests (600+); < 30s on a modern machine
+zig build test           # deterministic unit and integration tests
 zig build test-tsan      # same tests under ThreadSanitizer
 zig build test-fuzz      # compile-check fuzz targets; corpus regression runs in zig build test
 python3 scripts/check_test_sleeps.py

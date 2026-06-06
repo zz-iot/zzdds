@@ -24,8 +24,9 @@ what broke when they fail.
 
 ### Tier 1 — In-process, deterministic (fast unit tests)
 
-Run by `zig build test`. Must stay under 30 seconds. No external dependencies, no sockets,
-no threads (where possible), no sleeping.
+Run by `zig build test`. Keep this fast enough for routine local and CI use, with no
+external dependencies, no sockets in new narrow tests, no threads where possible, and no
+sleeping.
 
 **What lives here:**
 - RTPS message parser and builder: all submessage types, endianness, edge cases in length fields
@@ -287,7 +288,7 @@ Physical-layer behavior (MTU, congestion, asymmetric latency) is out of scope.
 ## CI Structure (Target)
 
 ```
-zig build test                  ← Tier 1 + Tier 2; always runs; < 30s
+zig build test                  ← Tier 1 + Tier 2; always runs as the routine deterministic gate
 zig build test-tsan             ← Tier 1 + Tier 2 under TSan; PRs and nightly
 zig build test-fuzz             ← Tier 4 fuzz harness compile-check
 ```

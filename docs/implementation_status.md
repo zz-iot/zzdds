@@ -94,15 +94,15 @@ planned work. See `docs/decisions.md` for stable design decisions with rationale
 
 | Peer | Status | Scenarios |
 |---|---|---|
-| Cyclone DDS | Verified | bidirectional; 48/48 dds-rtps test suite (extended suite testing planned for next PR) |
+| Cyclone DDS | Verified | bidirectional; 48/48 dds-rtps test suite |
 | OpenDDS | Verified | pub/sub, fragmented |
-| FastDDS | Verified | bidirectional; 48/48 dds-rtps test suite (extended suite testing planned for next PR) |
+| FastDDS | Verified | bidirectional; 48/48 dds-rtps test suite |
 | RTI Connext | 89/89 (Connext→zzdds); 84/89 (zzdds→Connext) | 5 open interop gaps in the zzdds→Connext direction for GROUP_PRESENTATION scenarios |
 
 ## Test Coverage
 
-`zig build test` runs 650+ unit/integration tests, including Tier 1 unit tests,
-Tier 2 mock/intraprocess DCPS tests, and fuzz corpus regression tests.
+`zig build test` runs the deterministic unit/integration suite, including Tier 1
+unit tests, Tier 2 mock/intraprocess DCPS tests, and fuzz corpus regression tests.
 See `docs/testing.md` for how to run the full suite.
 
 ---
