@@ -7,9 +7,11 @@ pub const DomainParticipantImpl = @import("participant.zig").DomainParticipantIm
 pub const TypeSupport = @import("participant.zig").TypeSupport;
 pub const PublisherImpl = @import("publisher.zig").PublisherImpl;
 pub const SubscriberImpl = @import("subscriber.zig").SubscriberImpl;
+pub const SubscriberParticipantCbs = @import("subscriber.zig").ParticipantCbs;
 pub const DataWriterImpl = @import("writer.zig").DataWriterImpl;
 pub const guidToHandle = @import("writer.zig").guidToHandle;
 pub const DataReaderImpl = @import("reader.zig").DataReaderImpl;
+pub const PendingChange = @import("reader.zig").PendingChange;
 pub const TakenSample = @import("reader.zig").TakenSample;
 pub const TopicImpl = @import("topic.zig").TopicImpl;
 pub const ContentFilteredTopicImpl = @import("topic.zig").ContentFilteredTopicImpl;
@@ -30,6 +32,8 @@ pub const nil_sub_listener = @import("nil.zig").nil_sub_listener;
 pub const nil_topic_listener = @import("nil.zig").nil_topic_listener;
 pub const nil_dw_listener = @import("nil.zig").nil_dw_listener;
 pub const nil_dr_listener = @import("nil.zig").nil_dr_listener;
+pub const nil_topic_description = @import("nil.zig").nil_topic_description;
+pub const nil_participant = @import("nil.zig").nil_participant;
 
 // Nil entity singletons and pointer sentinel.
 pub const NIL_PTR = @import("nil.zig").NIL_PTR;

@@ -37,6 +37,7 @@ pub const spdp_discovery = @import("discovery/spdp.zig");
 pub const sedp_discovery = @import("discovery/sedp.zig");
 pub const combined_discovery = @import("discovery/combined.zig");
 pub const direct_discovery = @import("discovery/direct.zig");
+pub const protocol = @import("protocol/interface.zig");
 pub const security = @import("security/interface.zig");
 pub const noop_security = @import("security/noop.zig");
 pub const intraprocess = @import("delivery/intraprocess.zig");

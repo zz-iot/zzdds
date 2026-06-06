@@ -277,6 +277,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/api_test.zig",
         "test/dcps/mock_loopback_test.zig",
         "test/dcps/presentation_model_test.zig",
+        "test/dcps/subscriber_model_test.zig",
         "test/dcps/ignore_test.zig",
         "test/dcps/intraprocess_test.zig",
         "test/dcps/qos_runtime_test.zig",
