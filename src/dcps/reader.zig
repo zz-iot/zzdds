@@ -539,25 +539,35 @@ pub const DataReaderImpl = struct {
                 return;
             };
             const is_set_end = (change.sequence_number == change.coherent_set_sn.?);
+            // commit_succeeded: true only when the completed set was successfully
+            // enqueued in coherent_committed.  Used to gate both the in-lock flag
+            // update and the post-lock notifications — if OOM discards the set we
+            // must not set coherent_committed_ready or fire spurious notifications,
+            // because there is nothing for begin_access() to deliver.
+            var commit_succeeded = false;
             if (is_set_end) {
                 // Zero-copy: take ownership of this writer's wip list and enqueue
                 // it as one complete set.  Other writers' in-progress sets are
                 // unaffected.  Subscriber.begin_access() pops one set at a time.
                 var completed_set = wip_entry.value_ptr.*;
                 _ = self.coherent_wip.remove(change.writer_guid);
-                self.coherent_committed.append(self.alloc, completed_set) catch {
+                if (self.coherent_committed.append(self.alloc, completed_set)) {
+                    commit_succeeded = true;
+                } else |_| {
                     for (completed_set.items) |cppc| cppc.deinit();
                     completed_set.deinit(self.alloc);
-                };
-                self.coherent_committed_ready = true;
-                // Signal that a complete set is ready for begin_access().  Mirrors
-                // the notification pattern on the normal (non-coherent) data path.
-                self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
-                for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+                }
+                if (commit_succeeded) {
+                    self.coherent_committed_ready = true;
+                    // Signal that a complete set is ready for begin_access().  Mirrors
+                    // the notification pattern on the normal (non-coherent) data path.
+                    self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+                    for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+                }
             }
             self.mu.unlock();
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
-            if (is_set_end) {
+            if (is_set_end and commit_succeeded) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
                 if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
                     self.listener.vtable.on_data_available(self.listener.ptr, self.toDDSDataReader());
