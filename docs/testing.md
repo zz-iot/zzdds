@@ -7,6 +7,7 @@ zig build test           # all tests (600+); < 30s on a modern machine
 zig build test-tsan      # same tests under ThreadSanitizer
 zig build test-fuzz      # compile-check fuzz targets; corpus regression runs in zig build test
 python3 scripts/check_test_sleeps.py
+python3 scripts/run_deterministic_matrix.py
 ```
 
 ## What `zig build test` covers
@@ -78,11 +79,23 @@ Model/unit tests should not add wall-clock sleeps. `scripts/check_test_sleeps.py
 new sleep calls in deterministic test areas and leaves a narrow allowlist for existing
 socket/full-stack tests that still depend on receive threads or SPDP timer ticks.
 
-CI also runs these Linux variants:
+For a local pre-push pass, run:
+
+```sh
+python3 scripts/run_deterministic_matrix.py
+```
+
+That wrapper runs formatting, sleep guardrails, Debug tests, the feature-minimal
+configuration, ReleaseSafe tests, and fuzz harness compile-checks. Use
+`--include-tsan` to add ThreadSanitizer locally. If Zig is not on `PATH`, set
+`ZIG=/path/to/zig`.
+
+CI runs the same deterministic Linux variants, plus ThreadSanitizer:
 
 ```sh
 zig build test -Dipv6=false -Dinterface-monitor=false
 zig build test -Doptimize=ReleaseSafe
+zig build test-tsan
 ```
 
 ## Live interop tests
