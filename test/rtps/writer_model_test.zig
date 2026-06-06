@@ -303,6 +303,24 @@ test "writer model: final AckNack sends only explicitly NACKed changes" {
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 1, true);
 }
 
+test "writer model: non-final sparse AckNack sends NACKed and implicit >= base changes" {
+    const alloc = testing.allocator;
+    var rec: Recording = .{};
+    const writer = try makeWriter(alloc, &rec);
+    defer writer.deinit();
+    var model = WriterModel{};
+
+    try writeBoth(writer, &model, "one");
+    try writeBoth(writer, &model, "two");
+    try writeBoth(writer, &model, "three");
+    try writeBoth(writer, &model, "four");
+
+    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 3, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(2);
+    try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 1, false);
+    try expectDataSns(&rec, &.{ 1, 2, 3, 4 });
+}
+
 test "writer model: duplicate AckNack count is suppressed after a retransmit" {
     const alloc = testing.allocator;
     var rec: Recording = .{};

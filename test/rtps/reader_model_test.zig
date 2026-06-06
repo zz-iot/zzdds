@@ -163,7 +163,10 @@ const ReaderModel = struct {
         self.last_hb_count = count;
         if (first_sn > self.cumulativeAck() + 1) {
             var sn = self.cumulativeAck() + 1;
-            while (sn < first_sn) : (sn += 1) self.setReceived(sn);
+            while (sn < first_sn) : (sn += 1) {
+                if (!self.isReceived(sn)) self.lost_count += 1;
+                self.setReceived(sn);
+            }
             try self.deliverContiguousPending(alloc);
         }
         return true;
@@ -374,6 +377,26 @@ test "reader model: explicit gap reports sample lost and unblocks pending data" 
     reader.handleGap(WRITER_GUID, 2, gap_list);
     try model.gap(alloc, 2, gap_list);
     try expectDelivered(&model, &col);
+}
+
+test "reader model: heartbeat virtual gap reports sample lost and unblocks pending data" {
+    const alloc = testing.allocator;
+    var rec: Recording = .{};
+    var col = Collector{};
+    defer col.deinit(alloc);
+    const reader = try makeReader(alloc, &rec, &col);
+    defer reader.deinit();
+    var model = ReaderModel{};
+    defer model.deinit(alloc);
+
+    try reader.handleData(WRITER_GUID, change(3));
+    try model.data(alloc, 3);
+    try expectDelivered(&model, &col);
+
+    reader.handleHeartbeat(WRITER_GUID, 3, 3, 1, true);
+    try testing.expect(try model.heartbeat(alloc, 3, 1));
+    try expectDelivered(&model, &col);
+    try testing.expectEqual(@as(i32, 2), col.lost_count);
 }
 
 test "reader model: duplicate and stale heartbeats do not send new AckNacks" {
