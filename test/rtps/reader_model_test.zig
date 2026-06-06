@@ -259,6 +259,72 @@ fn countAckNacks(rec: *const Recording) usize {
     return n;
 }
 
+const ReaderScriptOp = enum {
+    data1,
+    data2,
+    data3,
+    gap1,
+    gap2,
+    heartbeat3,
+};
+
+fn gapRange(base: SequenceNumber) SequenceNumberSet {
+    return .{ .base = base, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+}
+
+fn runReaderScript(alloc: std.mem.Allocator, ops: []const ReaderScriptOp) !void {
+    errdefer std.debug.print("reader script failed: {any}\n", .{ops});
+
+    var rec: Recording = .{};
+    var col = Collector{};
+    defer col.deinit(alloc);
+    const reader = try makeReader(alloc, &rec, &col);
+    defer reader.deinit();
+    var model = ReaderModel{};
+    defer model.deinit(alloc);
+    var hb_count: i32 = 1;
+
+    for (ops) |op| {
+        switch (op) {
+            .data1 => {
+                try reader.handleData(WRITER_GUID, change(1));
+                try model.data(alloc, 1);
+                try expectDelivered(&model, &col);
+            },
+            .data2 => {
+                try reader.handleData(WRITER_GUID, change(2));
+                try model.data(alloc, 2);
+                try expectDelivered(&model, &col);
+            },
+            .data3 => {
+                try reader.handleData(WRITER_GUID, change(3));
+                try model.data(alloc, 3);
+                try expectDelivered(&model, &col);
+            },
+            .gap1 => {
+                const gaps = gapRange(2);
+                reader.handleGap(WRITER_GUID, 1, gaps);
+                try model.gap(alloc, 1, gaps);
+                try expectDelivered(&model, &col);
+            },
+            .gap2 => {
+                const gaps = gapRange(3);
+                reader.handleGap(WRITER_GUID, 2, gaps);
+                try model.gap(alloc, 2, gaps);
+                try expectDelivered(&model, &col);
+            },
+            .heartbeat3 => {
+                rec.reset();
+                reader.handleHeartbeat(WRITER_GUID, 1, 3, hb_count, false);
+                const accepted = try model.heartbeat(alloc, 1, hb_count);
+                try testing.expectEqual(@as(usize, if (accepted) 1 else 0), countAckNacks(&rec));
+                try expectDelivered(&model, &col);
+                hb_count += 1;
+            },
+        }
+    }
+}
+
 test "reader model: out-of-order data then virtual gap delivers contiguous pending samples" {
     const alloc = testing.allocator;
     var rec: Recording = .{};
@@ -332,4 +398,50 @@ test "reader model: duplicate and stale heartbeats do not send new AckNacks" {
     reader.handleHeartbeat(WRITER_GUID, 1, 3, 4, false);
     try testing.expect(!(try model.heartbeat(alloc, 1, 4)));
     try testing.expectEqual(@as(usize, 0), countAckNacks(&rec));
+}
+
+test "reader model: heartbeat count rollover is accepted once" {
+    const alloc = testing.allocator;
+    var rec: Recording = .{};
+    var col = Collector{};
+    defer col.deinit(alloc);
+    const reader = try makeReader(alloc, &rec, &col);
+    defer reader.deinit();
+    var model = ReaderModel{};
+    defer model.deinit(alloc);
+
+    reader.writer_proxies.items[0].last_hb_count = std.math.maxInt(i32);
+    model.last_hb_count = std.math.maxInt(i32);
+
+    reader.handleHeartbeat(WRITER_GUID, 1, 3, std.math.minInt(i32), false);
+    try testing.expect(try model.heartbeat(alloc, 1, std.math.minInt(i32)));
+    try testing.expectEqual(@as(usize, 1), countAckNacks(&rec));
+
+    rec.reset();
+    reader.handleHeartbeat(WRITER_GUID, 1, 3, std.math.minInt(i32), false);
+    try testing.expect(!(try model.heartbeat(alloc, 1, std.math.minInt(i32))));
+    try testing.expectEqual(@as(usize, 0), countAckNacks(&rec));
+}
+
+test "reader model: bounded data/GAP/Heartbeat scripts match implementation" {
+    const alloc = testing.allocator;
+    const alphabet = [_]ReaderScriptOp{
+        .data1,
+        .data2,
+        .data3,
+        .gap1,
+        .gap2,
+        .heartbeat3,
+    };
+
+    for (alphabet) |a| {
+        for (alphabet) |b| {
+            for (alphabet) |c| {
+                for (alphabet) |d| {
+                    const script = [_]ReaderScriptOp{ a, b, c, d };
+                    try runReaderScript(alloc, &script);
+                }
+            }
+        }
+    }
 }

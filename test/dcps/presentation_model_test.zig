@@ -218,6 +218,21 @@ fn makeWriter(
     return writer;
 }
 
+fn makeUnmatchedWriter(alloc: std.mem.Allocator, rec: *Recording, writer_guid: Guid) !*StatefulWriter {
+    const writer = try StatefulWriter.init(
+        alloc,
+        writer_guid,
+        rec.transport(),
+        .keep_all,
+        0,
+        rtps.EntityIds.unknown,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    rec.reset();
+    return writer;
+}
+
 fn writeImpl(writer: *StatefulWriter, payload: []const u8) !SequenceNumber {
     return writer.write(.alive, ZERO_TS, NIL_IH, NIL_KH, payload);
 }
@@ -308,6 +323,56 @@ test "presentation model: ordered-only flush assigns GSN without coherent marker
     model.end(.group_seq_only, false, null, 0);
     try expectModelMatchesImpl(&model, writer);
     try expectDataSns(&rec, &.{ 1, 2 });
+}
+
+test "presentation model: empty coherent window flushes pre-window samples only" {
+    const alloc = testing.allocator;
+    var rec: Recording = .{};
+    const writer = try makeWriter(alloc, &rec, W1_GUID, R1_GUID, R1_LOC);
+    defer writer.deinit();
+    var model = ModelWriter{};
+    defer model.deinit(alloc);
+
+    writer.beginCoherentSet(false);
+    model.begin(false);
+    _ = try writeImpl(writer, "A");
+    _ = try model.write(alloc);
+
+    writer.beginCoherentSet(true);
+    model.begin(true);
+    try testing.expectEqual(@as(usize, 0), writer.coherentWindowPendingCount());
+    try testing.expectEqual(@as(usize, 0), model.coherentWindowCount());
+    try expectDataSns(&rec, &.{});
+
+    writer.endCoherentSet(.full, false, null, 0);
+    model.end(.full, false, null, 0);
+    try expectModelMatchesImpl(&model, writer);
+    try expectDataSns(&rec, &.{1});
+}
+
+test "presentation model: readerless coherent set records metadata without DATA sends" {
+    const alloc = testing.allocator;
+    var rec: Recording = .{};
+    const writer = try makeUnmatchedWriter(alloc, &rec, W1_GUID);
+    defer writer.deinit();
+
+    writer.beginCoherentSet(true);
+    _ = try writeImpl(writer, "A");
+    _ = try writeImpl(writer, "B");
+    try expectDataSns(&rec, &.{});
+
+    writer.endCoherentSet(.full, false, null, 0);
+    try expectDataSns(&rec, &.{});
+
+    writer.mu.lock();
+    defer writer.mu.unlock();
+    try testing.expectEqual(@as(usize, 2), writer.cache.changes.items.len);
+    try testing.expectEqual(@as(?SequenceNumber, 2), writer.cache.changes.items[0].coherent_set_sn);
+    try testing.expectEqual(@as(?SequenceNumber, 2), writer.cache.changes.items[1].coherent_set_sn);
+    try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[0].group_seq_num);
+    try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[1].group_seq_num);
+    try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[0].group_coherent_sn);
+    try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[1].group_coherent_sn);
 }
 
 test "presentation model: shared publisher GSN gives group-wide coherent end marker" {
