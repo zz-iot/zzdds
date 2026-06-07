@@ -14,6 +14,11 @@ on:
         options:
           - default
           - all
+      dds_rtps_ref:
+        description: 'zz-iot/dds-rtps branch or tag to check out (default: pinned release tag)'
+        required: false
+        default: ''
+        type: string
   schedule:
     # Weekly full-vendor interop sweep — Mondays 06:00 UTC
     - cron: '0 6 * * 1'
@@ -25,8 +30,13 @@ concurrency:
 
 # Pinned omg-dds/dds-rtps release used for vendor interop binaries.
 # Bump this tag when you want to pick up a new release (may change the vendor list).
+#
+# INTEROP_RTPS_REF: zz-iot/dds-rtps branch/tag checked out for the test harness.
+# Defaults to the zenzen branch pinned to INTEROP_RELEASE_TAG; override via the
+# dds_rtps_ref workflow_dispatch input to test against a dev branch (e.g. "zenzen").
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-v2.1.2026' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -246,7 +256,7 @@ jobs:
   #
   # Checkout layout (relative to $GITHUB_WORKSPACE):
   #   zzdds/      — this repo
-  #   dds-rtps/   — zz-iot/dds-rtps fork, zenzen branch based on latest omg-dds/dds-rtps release
+  #   dds-rtps/   — zz-iot/dds-rtps fork at INTEROP_RTPS_REF
   #
   # The packages/zzdds symlink inside zzdds points four levels up:
   #   dds-rtps/srcZig/zzdds/packages/zzdds -> ../../../../zzdds
@@ -266,11 +276,11 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
+      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen-v2.1.2026
+          ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
       - name: Wire packages/zzdds symlink
@@ -326,11 +336,11 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
+      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen-v2.1.2026
+          ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
       - name: Wire packages/zzdds symlink
@@ -409,11 +419,11 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
+      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen-v2.1.2026
+          ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
       - name: Install Python dependencies
@@ -488,11 +498,11 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
+      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen-v2.1.2026
+          ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
       - name: Install Python dependencies
