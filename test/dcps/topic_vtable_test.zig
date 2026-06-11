@@ -198,3 +198,66 @@ test "CFT: get_related_topic returns the base topic" {
     // The related topic name should match the base topic name.
     try testing.expectEqualStrings("CftRelBase", related.get_name());
 }
+
+test "CFT: toTopicDescription get_name returns related topic name (wire name)" {
+    // The td_vtable.get_name intentionally returns the *related* topic name so
+    // that create_datareader can use the TopicDescription directly for RTPS matching.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("TdBase", "T", .{}, null, 0);
+    defer _ = fx.dp.vtable.delete_topic(fx.dp.ptr, topic);
+
+    const cft = fx.dp.create_contentfilteredtopic("TdAlias", topic, "x = 1", &DDS.StringSeq{});
+    defer _ = fx.dp.vtable.delete_contentfilteredtopic(fx.dp.ptr, cft);
+
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const td = cft_impl.toTopicDescription();
+    try testing.expectEqualStrings("TdBase", std.mem.span(td.vtable.get_name(td.ptr)));
+}
+
+test "CFT: toTopicDescription get_participant returns the owning participant" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("TdPartBase", "T", .{}, null, 0);
+    defer _ = fx.dp.vtable.delete_topic(fx.dp.ptr, topic);
+
+    const cft = fx.dp.create_contentfilteredtopic("TdPartAlias", topic, "x = 1", &DDS.StringSeq{});
+    defer _ = fx.dp.vtable.delete_contentfilteredtopic(fx.dp.ptr, cft);
+
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const td = cft_impl.toTopicDescription();
+    const dp2 = td.vtable.get_participant(td.ptr);
+    try testing.expect(dp2.ptr == fx.dp.ptr);
+}
+
+test "CFT: set_expression_parameters replaces pre-existing params" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("TdSetBase", "T", .{}, null, 0);
+    defer _ = fx.dp.vtable.delete_topic(fx.dp.ptr, topic);
+
+    var init_strs: [1][*:0]const u8 = .{"old"};
+    const init_params = DDS.StringSeq{ ._buffer = @ptrCast(&init_strs), ._length = 1, ._maximum = 1, ._release = false };
+    const cft = fx.dp.create_contentfilteredtopic("TdSetCft", topic, "x = %0", &init_params);
+    defer _ = fx.dp.vtable.delete_contentfilteredtopic(fx.dp.ptr, cft);
+
+    // Replace with new params — exercises the free loop over expr_params.items.
+    var new_strs: [1][*:0]const u8 = .{"new"};
+    const new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 1, ._maximum = 1, ._release = false };
+    const rc = cft.vtable.set_expression_parameters(cft.ptr, &new_params);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+
+    var out = DDS.StringSeq{};
+    defer if (out._release) {
+        if (out._buffer) |b| {
+            for (b[0..out._length]) |p| alloc.free(std.mem.span(p).ptr[0 .. std.mem.span(p).len + 1]);
+            alloc.free(b[0..out._maximum]);
+        }
+    };
+    _ = cft.vtable.get_expression_parameters(cft.ptr, &out);
+    try testing.expectEqual(@as(u32, 1), out._length);
+    try testing.expectEqualStrings("new", std.mem.span(out._buffer.?[0]));
+}

@@ -8,6 +8,11 @@ coverage:
       default:
         informational: true
 
+ignore:
+  # Pure sentinel/noop vtable stubs — correct by construction, never called in tests
+  # by design (nil entities are never dispatched through).
+  - "src/dcps/nil.zig"
+
 comment:
   layout: "reach,diff,flags,files"
   behavior: default

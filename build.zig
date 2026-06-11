@@ -401,6 +401,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/sample_rejected_test.zig",
         "test/dcps/type_support_test.zig",
         "test/c_abi/typesupport_test.zig",
+        "test/c_abi/bootstrap_test.zig",
         "test/dcps/entity_routing_test.zig",
         "test/dcps/wait_for_historical_test.zig",
         "test/dcps/waitset_test.zig",
