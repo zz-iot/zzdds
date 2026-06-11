@@ -524,7 +524,7 @@ const ActiveWriter = struct {
     topic_name: []const u8, // borrowed from topic_name slice in active list
     type_name: []const u8,
     qos: DDS.DataWriterQos,
-    partition_names: []const []const u8 = &.{}, // publisher's partition names (borrowed)
+    partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
     incompat_qos: ?IncompatQosNotify = null,
     matched_notify: ?MatchedNotify = null,
@@ -539,7 +539,7 @@ const ActiveReader = struct {
     topic_name: []const u8,
     type_name: []const u8,
     qos: DDS.DataReaderQos,
-    partition_names: []const []const u8 = &.{}, // subscriber's partition names (borrowed)
+    partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
     incompat_qos: ?IncompatQosNotify = null,
     matched_notify: ?MatchedNotify = null,

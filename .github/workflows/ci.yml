@@ -292,6 +292,10 @@ jobs:
           # Clone zidl at the same tag declared by the local zzdds checkout.
           ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
             dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
+          if [[ -z "$ZIDL_TAG" ]]; then
+            echo "::error::Could not extract zidl tag from packages/zzdds/build.zig.zon"
+            exit 1
+          fi
           git clone --depth=1 --branch "$ZIDL_TAG" \
             https://github.com/zz-iot/zidl.git zidl
           ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
@@ -376,6 +380,10 @@ jobs:
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
           ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
             dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
+          if [[ -z "$ZIDL_TAG" ]]; then
+            echo "::error::Could not extract zidl tag from packages/zzdds/build.zig.zon"
+            exit 1
+          fi
           git clone --depth=1 --branch "$ZIDL_TAG" \
             https://github.com/zz-iot/zidl.git zidl
           ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
