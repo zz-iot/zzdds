@@ -125,7 +125,10 @@ pub const TopicImpl = struct {
     }
 
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.TopicQos) DDS.ReturnCode_t {
-        cast(ctx).qos = qos.*;
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.qos.deinit(self.alloc);
+        self.qos = new_qos;
         return DDS.RETCODE_OK;
     }
 

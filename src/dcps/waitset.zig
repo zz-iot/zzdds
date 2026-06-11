@@ -127,6 +127,11 @@ pub const WaitSetImpl = struct {
     fn vtWait(ctx: *anyopaque, active: ?*DDS.ConditionSeq, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         const seq = active orelse return DDS.RETCODE_BAD_PARAMETER;
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // Reset the output sequence so stale entries from a prior call don't accumulate.
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
+        }
+        seq.* = .{};
         const deadline_ns: ?i64 = blk: {
             if (timeout.sec == DDS.DURATION_INFINITE_SEC and
                 timeout.nanosec == DDS.DURATION_INFINITE_NSEC)
