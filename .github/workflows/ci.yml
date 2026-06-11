@@ -295,6 +295,10 @@ jobs:
           git clone --depth=1 --branch "$ZIDL_TAG" \
             https://github.com/zz-iot/zidl.git zidl
           ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
+          # zig-pkg/ is gitignored so actions/checkout (git clean -ffd) does not
+          # remove it between runs.  Stale URL-fetched packages in zig-pkg/ can
+          # shadow the path deps above via Zig fingerprint deduplication.
+          rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -360,6 +364,7 @@ jobs:
           git clone --depth=1 --branch "$ZIDL_TAG" \
             https://github.com/zz-iot/zidl.git zidl
           ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
+          rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
