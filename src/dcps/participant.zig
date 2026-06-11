@@ -882,7 +882,9 @@ pub const DomainParticipantImpl = struct {
         if (self.type_support_registry.get(type_name)) |old| {
             if (old.deinit) |f| f(old.ctx);
         }
-        self.type_support_registry.put(self.alloc, type_name, ts) catch {};
+        self.type_support_registry.put(self.alloc, type_name, ts) catch {
+            if (ts.deinit) |f| f(ts.ctx);
+        };
     }
 
     pub fn registerTypeInfo(self: *Self, type_name: []const u8, cdr: []const u8) void {

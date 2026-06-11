@@ -51,7 +51,7 @@ pub const TopicImpl = struct {
             .type_name = try alloc.dupeZ(u8, type_name),
             .participant_ptr = participant_ptr,
             .get_participant_fn = get_participant_fn,
-            .qos = qos,
+            .qos = try qos.clone(alloc),
             .listener = listener,
             .listener_mask = mask,
             .instance_handle = instance_handle,
@@ -66,6 +66,7 @@ pub const TopicImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
+        self.qos.deinit(self.alloc);
         self.alloc.free(self.topic_name);
         self.alloc.free(self.type_name);
         self.alloc.destroy(self);
