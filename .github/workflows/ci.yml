@@ -295,10 +295,25 @@ jobs:
           git clone --depth=1 --branch "$ZIDL_TAG" \
             https://github.com/zz-iot/zidl.git zidl
           ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
-          # zig-pkg/ is gitignored so actions/checkout (git clean -ffd) does not
-          # remove it between runs.  Stale URL-fetched packages in zig-pkg/ can
-          # shadow the path deps above via Zig fingerprint deduplication.
+          # zig-pkg/ is gitignored so actions/checkout does not clean it between
+          # runs on the same runner.  Stale URL-fetched packages shadow the path
+          # deps above via fingerprint deduplication — wipe them first.
           rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
+          # Rewrite build.zig.zon to use the local path symlinks regardless of
+          # what the branch has committed (URL or path).
+          python3 - <<'PYEOF'
+          import re
+          path = 'dds-rtps/srcZig/zzdds/build.zig.zon'
+          with open(path) as f:
+              c = f.read()
+          c = re.sub(r'\.zzdds\s*=\s*\.\{[^}]+\}',
+                     '.zzdds = .{\n            .path = "packages/zzdds",\n        }', c)
+          c = re.sub(r'\.zidl\s*=\s*\.\{[^}]+\}',
+                     '.zidl = .{\n            .path = "packages/zidl",\n        }', c)
+          with open(path, 'w') as f:
+              f.write(c)
+          print('build.zig.zon: zzdds and zidl rewritten to use local path symlinks')
+          PYEOF
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -365,6 +380,19 @@ jobs:
             https://github.com/zz-iot/zidl.git zidl
           ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
           rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
+          python3 - <<'PYEOF'
+          import re
+          path = 'dds-rtps/srcZig/zzdds/build.zig.zon'
+          with open(path) as f:
+              c = f.read()
+          c = re.sub(r'\.zzdds\s*=\s*\.\{[^}]+\}',
+                     '.zzdds = .{\n            .path = "packages/zzdds",\n        }', c)
+          c = re.sub(r'\.zidl\s*=\s*\.\{[^}]+\}',
+                     '.zidl = .{\n            .path = "packages/zidl",\n        }', c)
+          with open(path, 'w') as f:
+              f.write(c)
+          print('build.zig.zon: zzdds and zidl rewritten to use local path symlinks')
+          PYEOF
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
