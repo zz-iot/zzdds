@@ -1221,7 +1221,7 @@ test "query_condition: readRaw with SQL filter returns only matching samples" {
 
     // Register TypeSupport with get_field BEFORE creating the reader.
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
-    dp_impl.registerTypeSupport("QosType", .{
+    _ = dp_impl.registerTypeSupport("QosType", .{
         .ctx = undefined,
         .compute_key_hash = qcNilKeyHash,
         .get_field = qcCdrGetField,
@@ -1266,7 +1266,7 @@ test "query_condition: takeFiltered with SQL filter removes only matching sample
     defer fx.deinit();
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
-    dp_impl.registerTypeSupport("QosType", .{
+    _ = dp_impl.registerTypeSupport("QosType", .{
         .ctx = undefined,
         .compute_key_hash = qcNilKeyHash,
         .get_field = qcCdrGetField,
@@ -1310,7 +1310,7 @@ test "query_condition: parameter substitution with %0" {
     defer fx.deinit();
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
-    dp_impl.registerTypeSupport("QosType", .{
+    _ = dp_impl.registerTypeSupport("QosType", .{
         .ctx = undefined,
         .compute_key_hash = qcNilKeyHash,
         .get_field = qcCdrGetField,

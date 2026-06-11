@@ -32,11 +32,11 @@ concurrency:
 # Bump this tag when you want to pick up a new release (may change the vendor list).
 #
 # INTEROP_RTPS_REF: zz-iot/dds-rtps branch/tag checked out for the test harness.
-# Defaults to the zenzen branch pinned to INTEROP_RELEASE_TAG; override via the
-# dds_rtps_ref workflow_dispatch input to test against a dev branch (e.g. "zenzen").
+# Points to the zenzen branch that tracks zzdds C-ABI work.
+# Override via the dds_rtps_ref workflow_dispatch input to test a different branch or tag.
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
-  # NOTE: When bumping INTEROP_RELEASE_TAG, also update the fallback below to match (zenzen-<new-tag>).
+  # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
   INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-f88c8a4' }}
 
 jobs:

@@ -226,7 +226,7 @@ test "TypeSupport: registerTypeSupport stores callback" {
     const dp_impl = fx.dpImpl(fx.dp_r);
     try testing.expect(dp_impl.type_support_registry.get("TSType") == null);
 
-    dp_impl.registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
+    _ = dp_impl.registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
     try testing.expect(dp_impl.type_support_registry.get("TSType") != null);
 }
 
@@ -235,7 +235,7 @@ test "TypeSupport: key_hash_fn set on reader when registered before reader creat
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
+    _ = fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
     _ = fx.makeReader(.{});
 
     const dp_impl = fx.dpImpl(fx.dp_r);
@@ -256,7 +256,7 @@ test "TypeSupport: reader created before registration has no key_hash_fn" {
 
     _ = fx.makeReader(.{});
     // Register after reader creation — should not retroactively set key_hash_fn.
-    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
+    _ = fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
 
     const dp_impl = fx.dpImpl(fx.dp_r);
     dp_impl.mu.lock();
@@ -298,7 +298,7 @@ test "TypeSupport: with TypeSupport, EXCLUSIVE ownership is per-instance (Owners
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
+    _ = fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
 
     const dw_a = fx.makeWriterA(exclusiveDwQos(10));
     const dw_b = fx.makeWriterB(exclusiveDwQos(5));
@@ -320,7 +320,7 @@ test "TypeSupport: non-nil inline key_hash takes precedence over TypeSupport" {
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = constKeyHash });
+    _ = fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = constKeyHash });
 
     const dw_a = fx.makeWriterA(exclusiveDwQos(10));
     const dw_b = fx.makeWriterB(exclusiveDwQos(5));

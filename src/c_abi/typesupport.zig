@@ -69,20 +69,20 @@ pub export fn zzdds_register_type_support_c(
     if (compute_key_hash_fn) |c_fn| {
         const adapter = std.heap.c_allocator.create(CKeyHashAdapter) catch return -1;
         adapter.* = .{ .c_fn = c_fn };
-        impl.registerTypeSupport(name, TypeSupport{
+        if (!impl.registerTypeSupport(name, TypeSupport{
             .ctx = adapter,
             .compute_key_hash = CKeyHashAdapter.computeKeyHash,
             .deinit = CKeyHashAdapter.deinitAdapter,
-        });
+        })) return -1;
     } else {
-        impl.registerTypeSupport(name, TypeSupport{
+        if (!impl.registerTypeSupport(name, TypeSupport{
             .ctx = undefined,
             .compute_key_hash = struct {
                 fn f(_: *anyopaque, _: []const u8) [16]u8 {
                     return std.mem.zeroes([16]u8);
                 }
             }.f,
-        });
+        })) return -1;
     }
 
     return 0;

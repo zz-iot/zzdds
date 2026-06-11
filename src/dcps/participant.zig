@@ -878,13 +878,15 @@ pub const DomainParticipantImpl = struct {
     /// Register TypeSupport callbacks for a type name.
     /// Call before creating DataReaders for the type.  The caller must ensure
     /// `type_name` remains valid for the lifetime of the participant.
-    pub fn registerTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) void {
+    pub fn registerTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) bool {
         if (self.type_support_registry.get(type_name)) |old| {
             if (old.deinit) |f| f(old.ctx);
         }
         self.type_support_registry.put(self.alloc, type_name, ts) catch {
             if (ts.deinit) |f| f(ts.ctx);
+            return false;
         };
+        return true;
     }
 
     pub fn registerTypeInfo(self: *Self, type_name: []const u8, cdr: []const u8) void {

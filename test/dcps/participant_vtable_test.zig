@@ -105,7 +105,7 @@ test "registerTypeSupport: single registration is retrievable" {
     var fx = try Fixture.init(1);
     defer fx.deinit();
 
-    fx.impl().registerTypeSupport("MyType", .{
+    _ = fx.impl().registerTypeSupport("MyType", .{
         .ctx = undefined,
         .compute_key_hash = zeroed_key_hash,
     });
@@ -126,7 +126,7 @@ test "registerTypeSupport: double-registration calls deinit on the old entry" {
     };
     var ctx = Ctx{ .called = &deinit_called };
 
-    fx.impl().registerTypeSupport("MyType", .{
+    _ = fx.impl().registerTypeSupport("MyType", .{
         .ctx = &ctx,
         .compute_key_hash = zeroed_key_hash,
         .deinit = Ctx.deinitFn,
@@ -134,7 +134,7 @@ test "registerTypeSupport: double-registration calls deinit on the old entry" {
     try testing.expect(!deinit_called);
 
     // Re-register same type name → old entry's deinit must be called.
-    fx.impl().registerTypeSupport("MyType", .{
+    _ = fx.impl().registerTypeSupport("MyType", .{
         .ctx = undefined,
         .compute_key_hash = zeroed_key_hash,
     });
@@ -170,7 +170,7 @@ test "registerTypeSupport: deinit on participant teardown calls entry deinit" {
         }
     };
     var ctx = Ctx{ .called = &deinit_called };
-    dp_impl.registerTypeSupport("T", .{
+    _ = dp_impl.registerTypeSupport("T", .{
         .ctx = &ctx,
         .compute_key_hash = zeroed_key_hash,
         .deinit = Ctx.deinitFn,
