@@ -285,51 +285,16 @@ jobs:
           ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
-      - name: Wire packages/zzdds symlink
+      - name: Wire packages/zzdds and packages/zidl symlinks
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-
-      - name: Patch build.zig.zon to use local zzdds checkout
-        working-directory: dds-rtps
-        run: |
-          python3 - <<'PYEOF'
-          import re
-
-          zon_path = 'srcZig/zzdds/build.zig.zon'
-          with open(zon_path) as f:
-              content = f.read()
-
-          # Switch zzdds from the pinned URL release to the local checkout.
-          found = [False]
-          def use_local(m):
-              found[0] = True
-              return '.zzdds = .{\n            .path = "packages/zzdds",\n        }'
-          content = re.sub(r'\.zzdds\s*=\s*\.\{[^}]+\}', use_local, content)
-          if not found[0]:
-              raise SystemExit('zzdds dependency not found in build.zig.zon')
-
-          # Re-pin zidl to the URL+hash declared by the local zzdds checkout
-          # so it stays in sync without a separate zidl checkout step.
-          with open('srcZig/zzdds/packages/zzdds/build.zig.zon') as f:
-              zzdds_zon = f.read()
-          m = re.search(r'\.zidl\s*=\s*\.\{([^}]+)\}', zzdds_zon)
-          if m:
-              url = re.search(r'\.url\s*=\s*"([^"]+)"', m.group(1))
-              hash_ = re.search(r'\.hash\s*=\s*"([^"]+)"', m.group(1))
-              if url and hash_:
-                  content = re.sub(
-                      r'\.zidl\s*=\s*\.\{[^}]+\}',
-                      '.zidl = .{{\n            .url = "{}",\n            .hash = "{}",\n        }}'.format(
-                          url.group(1), hash_.group(1)),
-                      content,
-                  )
-                  print('zidl pinned to', url.group(1))
-
-          with open(zon_path, 'w') as f:
-              f.write(content)
-          print('build.zig.zon patched: zzdds -> packages/zzdds (local checkout)')
-          PYEOF
+          # Clone zidl at the same tag declared by the local zzdds checkout.
+          ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
+            dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
+          git clone --depth=1 --branch "$ZIDL_TAG" \
+            https://github.com/zz-iot/zidl.git zidl
+          ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -386,48 +351,15 @@ jobs:
           ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
-      - name: Wire packages/zzdds symlink
+      - name: Wire packages/zzdds and packages/zidl symlinks
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-
-      - name: Patch build.zig.zon to use local zzdds checkout
-        working-directory: dds-rtps
-        run: |
-          python3 - <<'PYEOF'
-          import re
-
-          zon_path = 'srcZig/zzdds/build.zig.zon'
-          with open(zon_path) as f:
-              content = f.read()
-
-          found = [False]
-          def use_local(m):
-              found[0] = True
-              return '.zzdds = .{\n            .path = "packages/zzdds",\n        }'
-          content = re.sub(r'\.zzdds\s*=\s*\.\{[^}]+\}', use_local, content)
-          if not found[0]:
-              raise SystemExit('zzdds dependency not found in build.zig.zon')
-
-          with open('srcZig/zzdds/packages/zzdds/build.zig.zon') as f:
-              zzdds_zon = f.read()
-          m = re.search(r'\.zidl\s*=\s*\.\{([^}]+)\}', zzdds_zon)
-          if m:
-              url = re.search(r'\.url\s*=\s*"([^"]+)"', m.group(1))
-              hash_ = re.search(r'\.hash\s*=\s*"([^"]+)"', m.group(1))
-              if url and hash_:
-                  content = re.sub(
-                      r'\.zidl\s*=\s*\.\{[^}]+\}',
-                      '.zidl = .{{\n            .url = "{}",\n            .hash = "{}",\n        }}'.format(
-                          url.group(1), hash_.group(1)),
-                      content,
-                  )
-                  print('zidl pinned to', url.group(1))
-
-          with open(zon_path, 'w') as f:
-              f.write(content)
-          print('build.zig.zon patched: zzdds -> packages/zzdds (local checkout)')
-          PYEOF
+          ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
+            dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
+          git clone --depth=1 --branch "$ZIDL_TAG" \
+            https://github.com/zz-iot/zidl.git zidl
+          ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
