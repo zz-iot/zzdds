@@ -358,6 +358,7 @@ pub const ContentFilteredTopicImpl = struct {
         const buf = self.alloc.alloc([*:0]const u8, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         for (self.expr_params.items, 0..) |p, i| {
             buf[i] = (self.alloc.dupeZ(u8, p) catch {
+                for (buf[0..i]) |s| self.alloc.free(std.mem.span(s));
                 self.alloc.free(buf);
                 return DDS.RETCODE_OUT_OF_RESOURCES;
             }).ptr;

@@ -198,6 +198,10 @@ pub export fn zzdds_write_raw(
 /// Take the next available sample regardless of instance.
 /// Copies the CDR payload into `cdr_buf[0..buf_size]`; sets `*cdr_len_out` to actual length.
 /// Returns 1 on success, 0 if queue empty, -1 on buffer-too-small error.
+///
+/// NOTE: the sample is dequeued before the size check.  On -1, the sample is
+/// discarded; `cdr_len_out` reports the required size for diagnostic purposes.
+/// Pass a buffer of at least 65536 bytes to avoid data loss.
 pub export fn zzdds_take_one_raw(
     reader: DDS.DataReader,
     cdr_buf: [*]u8,
@@ -222,7 +226,11 @@ pub export fn zzdds_take_one_raw(
 
 /// take_next_instance semantics: take one sample from the "next" instance after
 /// `prev_instance_handle` (0 means any instance).
-/// Returns 1 on success, 0 if no qualifying sample, -1 on error.
+/// Returns 1 on success, 0 if no qualifying sample, -1 on buffer-too-small error.
+///
+/// NOTE: the sample is dequeued before the size check.  On -1, the sample is
+/// discarded; `cdr_len_out` reports the required size for diagnostic purposes.
+/// Pass a buffer of at least 65536 bytes to avoid data loss.
 pub export fn zzdds_take_one_raw_instance(
     reader: DDS.DataReader,
     prev_instance_handle: DDS.InstanceHandle_t,
