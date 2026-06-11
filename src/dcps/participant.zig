@@ -1783,7 +1783,10 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
-        const ann = ann_opt orelse return;
+        const ann = ann_opt orelse {
+            freePartitionNames(self.alloc, owned_names);
+            return;
+        };
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
         var snap = writerQosSnapshot(ann.qos, ann.presentation);
         snap.partition_names = owned_names;
@@ -1828,7 +1831,10 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
-        const ann = ann_opt orelse return;
+        const ann = ann_opt orelse {
+            freePartitionNames(self.alloc, owned_names);
+            return;
+        };
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
         var snap = readerQosSnapshot(ann.qos, ann.presentation);
         snap.partition_names = owned_names;
