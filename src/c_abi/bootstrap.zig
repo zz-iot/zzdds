@@ -137,6 +137,7 @@ fn zzdds_create_participant_udp_impl(
     const default_qos = DDS.DomainParticipantQos{};
     const dp = dpf.vtable.create_participant(dpf.ptr, domain_id, &default_qos, c_listener, 0);
     if (nil.isNil(dp)) return error.ParticipantFailed;
+    errdefer _ = dpf.delete_participant(dp);
 
     if (!register(.{
         .dp_ptr = @ptrCast(dp.ptr),

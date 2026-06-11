@@ -842,10 +842,16 @@ pub const DomainParticipantImpl = struct {
 
         // Any remaining active writers/readers (normally all removed by pub/sub deinit).
         var wit = self.active_writers.valueIterator();
-        while (wit.next()) |aw| aw.proto.deinit();
+        while (wit.next()) |aw| {
+            aw.proto.deinit();
+            freePartitionNames(self.alloc, aw.partition_names);
+        }
         self.active_writers.deinit(self.alloc);
         var rit = self.active_readers.valueIterator();
-        while (rit.next()) |ar| ar.proto.deinit();
+        while (rit.next()) |ar| {
+            ar.proto.deinit();
+            freePartitionNames(self.alloc, ar.partition_names);
+        }
         self.active_readers.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
         self.ignored_prefixes.deinit(self.alloc);
