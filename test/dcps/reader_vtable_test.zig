@@ -18,29 +18,9 @@ const noop_security = zzdds.noop_security.noop_security_plugins;
 
 const testing = std.testing;
 
-// ── Listener helpers ──────────────────────────────────────────────────────────
+// ── Listener helpers (C callback struct form) ─────────────────────────────────
 
-fn drNoopDeadline(_: *anyopaque, _: DDS.DataReader, _: DDS.RequestedDeadlineMissedStatus) void {}
-fn drNoopIncompat(_: *anyopaque, _: DDS.DataReader, _: DDS.RequestedIncompatibleQosStatus) void {}
-fn drNoopSampleRejected(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleRejectedStatus) void {}
-fn drNoopLiveliness(_: *anyopaque, _: DDS.DataReader, _: DDS.LivelinessChangedStatus) void {}
-fn drNoopDataAvail(_: *anyopaque, _: DDS.DataReader) void {}
-fn drNoopSubMatched(_: *anyopaque, _: DDS.DataReader, _: DDS.SubscriptionMatchedStatus) void {}
-fn drNoopSampleLost(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleLostStatus) void {}
-fn drNoopDeinit(_: *anyopaque) void {}
-
-const noop_dr_vtable = DDS.DataReaderListener.Vtable{
-    .on_requested_deadline_missed = drNoopDeadline,
-    .on_requested_incompatible_qos = drNoopIncompat,
-    .on_sample_rejected = drNoopSampleRejected,
-    .on_liveliness_changed = drNoopLiveliness,
-    .on_data_available = drNoopDataAvail,
-    .on_subscription_matched = drNoopSubMatched,
-    .on_sample_lost = drNoopSampleLost,
-    .deinit = drNoopDeinit,
-};
-
-// Recording listener: ctx is *Counts; each callback increments its counter.
+// Recording listener: listener_data is *Counts; each callback increments its counter.
 const Counts = struct {
     incompat: i32 = 0,
     sub_matched: i32 = 0,
@@ -48,29 +28,28 @@ const Counts = struct {
     deadline: i32 = 0,
 };
 
-fn drCountIncompat(ctx: *anyopaque, _: DDS.DataReader, _: DDS.RequestedIncompatibleQosStatus) void {
-    @as(*Counts, @ptrCast(@alignCast(ctx))).incompat += 1;
+fn drCountIncompat(_: DDS.DataReader, _: *const DDS.RequestedIncompatibleQosStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*Counts, @ptrCast(@alignCast(ld))).incompat += 1;
 }
-fn drCountSubMatched(ctx: *anyopaque, _: DDS.DataReader, _: DDS.SubscriptionMatchedStatus) void {
-    @as(*Counts, @ptrCast(@alignCast(ctx))).sub_matched += 1;
+fn drCountSubMatched(_: DDS.DataReader, _: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*Counts, @ptrCast(@alignCast(ld))).sub_matched += 1;
 }
-fn drCountSampleLost(ctx: *anyopaque, _: DDS.DataReader, _: DDS.SampleLostStatus) void {
-    @as(*Counts, @ptrCast(@alignCast(ctx))).sample_lost += 1;
+fn drCountSampleLost(_: DDS.DataReader, _: *const DDS.SampleLostStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*Counts, @ptrCast(@alignCast(ld))).sample_lost += 1;
 }
-fn drCountDeadline(ctx: *anyopaque, _: DDS.DataReader, _: DDS.RequestedDeadlineMissedStatus) void {
-    @as(*Counts, @ptrCast(@alignCast(ctx))).deadline += 1;
+fn drCountDeadline(_: DDS.DataReader, _: *const DDS.RequestedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*Counts, @ptrCast(@alignCast(ld))).deadline += 1;
 }
 
-const counting_dr_vtable = DDS.DataReaderListener.Vtable{
-    .on_requested_deadline_missed = drCountDeadline,
-    .on_requested_incompatible_qos = drCountIncompat,
-    .on_sample_rejected = drNoopSampleRejected,
-    .on_liveliness_changed = drNoopLiveliness,
-    .on_data_available = drNoopDataAvail,
-    .on_subscription_matched = drCountSubMatched,
-    .on_sample_lost = drCountSampleLost,
-    .deinit = drNoopDeinit,
-};
+fn countingListener(counts: *Counts) DDS.DataReaderListener {
+    return .{
+        .listener_data = counts,
+        .on_requested_incompatible_qos = drCountIncompat,
+        .on_subscription_matched = drCountSubMatched,
+        .on_sample_lost = drCountSampleLost,
+        .on_requested_deadline_missed = drCountDeadline,
+    };
+}
 
 // ── Single-participant fixture ─────────────────────────────────────────────────
 
@@ -93,9 +72,9 @@ const SingleFixture = struct {
         errdefer d.deinit();
         const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), d.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic = dp.vtable.create_topic(dp.ptr, "RdrVtTopic", "RdrVtType", .{}, nil.nil_topic_listener, 0);
+        const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+        const sub = dp.create_subscriber(.{}, null, 0);
+        const topic = dp.create_topic("RdrVtTopic", "RdrVtType", .{}, null, 0);
         return .{ .alloc = alloc, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .sub = sub, .topic = topic };
     }
 
@@ -107,14 +86,14 @@ const SingleFixture = struct {
         self.delivery.deinit();
     }
 
-    fn makeReader(self: *SingleFixture, listener: DDS.DataReaderListener, mask: DDS.StatusMask) DDS.DataReader {
+    fn makeReader(self: *SingleFixture, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) DDS.DataReader {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic.ptr))).toTopicDescription();
-        return self.sub.vtable.create_datareader(self.sub.ptr, td, .{}, listener, mask);
+        return self.sub.create_datareader(td, .{}, listener, mask);
     }
 
-    fn makeReaderQos(self: *SingleFixture, qos: DDS.DataReaderQos, listener: DDS.DataReaderListener, mask: DDS.StatusMask) DDS.DataReader {
+    fn makeReaderQos(self: *SingleFixture, qos: DDS.DataReaderQos, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) DDS.DataReader {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic.ptr))).toTopicDescription();
-        return self.sub.vtable.create_datareader(self.sub.ptr, td, qos, listener, mask);
+        return self.sub.create_datareader(td, qos, listener, mask);
     }
 };
 
@@ -147,9 +126,9 @@ const TwoPartyFixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "RdrPubTopic", "RdrPubType", .{}, nil.nil_topic_listener, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_w = dp_w.create_publisher(.{}, null, 0);
+        const topic_w = dp_w.create_topic("RdrPubTopic", "RdrPubType", .{}, null, 0);
 
         const t_r = try delivery.newTransport();
         errdefer t_r.deinit();
@@ -157,9 +136,9 @@ const TwoPartyFixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "RdrPubTopic", "RdrPubType", .{}, nil.nil_topic_listener, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const sub_r = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("RdrPubTopic", "RdrPubType", .{}, null, 0);
         return .{
             .alloc = alloc,
             .delivery = delivery,
@@ -237,7 +216,7 @@ test "DataReader: create_readcondition and delete_readcondition" {
     defer fx.deinit();
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
-    const rc = dr.vtable.create_readcondition(dr.ptr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    const rc = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
     try testing.expect(rc.ptr != nil.NIL_PTR);
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.delete_readcondition(dr.ptr, rc));
 }
@@ -251,7 +230,8 @@ test "DataReader: create_querycondition with no TypeSupport and non-empty expres
     defer fx.deinit();
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
-    const qc = dr.vtable.create_querycondition(dr.ptr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "x = 1", DDS.StringSeq.empty);
+    var _empty_params = DDS.StringSeq{};
+    const qc = dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "x = 1", &_empty_params);
     try testing.expect(qc.ptr == nil.NIL_PTR);
 }
 
@@ -263,7 +243,8 @@ test "DataReader: create_querycondition with empty expression succeeds without T
     defer fx.deinit();
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
-    const qc = dr.vtable.create_querycondition(dr.ptr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", DDS.StringSeq.empty);
+    var _empty_params2 = DDS.StringSeq{};
+    const qc = dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", &_empty_params2);
     try testing.expect(qc.ptr != nil.NIL_PTR);
     qc.deinit();
 }
@@ -286,7 +267,7 @@ test "DataReader: set_qos / get_qos round-trip" {
 
     var qos = DDS.DataReaderQos{};
     qos.history.depth = 17;
-    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, qos));
+    try testing.expectEqual(DDS.RETCODE_OK, dr.set_qos(qos));
     var got: DDS.DataReaderQos = undefined;
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_qos(dr.ptr, &got));
     try testing.expectEqual(@as(i32, 17), got.history.depth);
@@ -299,8 +280,7 @@ test "DataReader: set_listener / get_listener round-trip" {
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
 
-    const noopL = DDS.DataReaderListener{ .ptr = nil.NIL_PTR, .vtable = &noop_dr_vtable };
-    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_listener(dr.ptr, noopL, 0));
+    try testing.expectEqual(DDS.RETCODE_OK, dr.set_listener(null, 0));
     _ = dr.vtable.get_listener(dr.ptr);
 }
 
@@ -399,7 +379,8 @@ test "DataReader: wait_for_historical_data with VOLATILE QoS returns OK immediat
     // Default QoS is VOLATILE_DURABILITY_QOS — returns OK without waiting.
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
-    const rc = dr.vtable.wait_for_historical_data(dr.ptr, .{ .sec = 0, .nanosec = 1_000_000 });
+    const _timeout = DDS.Duration_t{ .sec = 0, .nanosec = 1_000_000 };
+    const rc = dr.vtable.wait_for_historical_data(dr.ptr, &_timeout);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
@@ -409,10 +390,12 @@ test "DataReader: get_matched_publications empty when no writer" {
     defer fx.deinit();
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_matched_publications(dr.ptr, &handles));
-    try testing.expectEqual(@as(usize, 0), handles.items.len);
+    try testing.expectEqual(@as(u32, 0), handles._length);
 }
 
 test "DataReader: get_matched_publication_data with unknown handle returns BAD_PARAMETER" {
@@ -458,7 +441,7 @@ test "DataReader: pushCdr drops sample when max_samples=1 queue full" {
     defer fx.deinit();
     var qos = DDS.DataReaderQos{};
     qos.resource_limits.max_samples = 1;
-    const dr_dds = fx.makeReaderQos(qos, nil.nil_dr_listener, 0);
+    const dr_dds = fx.makeReaderQos(qos, null, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
 
@@ -477,7 +460,7 @@ test "DataReader: notifyIncompatibleQos fires listener when mask set" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
-    const listener = DDS.DataReaderListener{ .ptr = &counts, .vtable = &counting_dr_vtable };
+    const listener = countingListener(&counts);
     const dr_dds = fx.makeReader(listener, DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
@@ -491,7 +474,7 @@ test "DataReader: notifySubscriptionMatched fires listener when mask set" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
-    const listener = DDS.DataReaderListener{ .ptr = &counts, .vtable = &counting_dr_vtable };
+    const listener = countingListener(&counts);
     const dr_dds = fx.makeReader(listener, DDS.SUBSCRIPTION_MATCHED_STATUS);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
@@ -505,7 +488,7 @@ test "DataReader: notifySampleLost fires listener when mask set" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
-    const listener = DDS.DataReaderListener{ .ptr = &counts, .vtable = &counting_dr_vtable };
+    const listener = countingListener(&counts);
     const dr_dds = fx.makeReader(listener, DDS.SAMPLE_LOST_STATUS);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
@@ -519,7 +502,7 @@ test "DataReader: notifyDeadlineMissed fires listener when mask set" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
-    const listener = DDS.DataReaderListener{ .ptr = &counts, .vtable = &counting_dr_vtable };
+    const listener = countingListener(&counts);
     const dr_dds = fx.makeReader(listener, DDS.REQUESTED_DEADLINE_MISSED_STATUS);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
@@ -588,17 +571,19 @@ test "DataReader: get_matched_publications returns writer handle after match" {
     defer fx.deinit();
 
     const td_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
-    const dr_dds = fx.sub_r.vtable.create_datareader(fx.sub_r.ptr, td_r, .{}, nil.nil_dr_listener, 0);
+    const dr_dds = fx.sub_r.create_datareader(td_r, .{}, null, 0);
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_dds);
 
-    const dw_dds = fx.pub_w.vtable.create_datawriter(fx.pub_w.ptr, fx.topic_w, .{}, nil.nil_dw_listener, 0);
+    const dw_dds = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_dds);
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.get_matched_publications(dr_dds.ptr, &handles));
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
-    try testing.expect(handles.items[0] != 0);
+    try testing.expectEqual(@as(u32, 1), handles._length);
+    try testing.expect(handles._buffer.?[0] != 0);
 }
 
 test "DataReader: get_matched_publication_data returns data for matched writer" {
@@ -607,19 +592,21 @@ test "DataReader: get_matched_publication_data returns data for matched writer" 
     defer fx.deinit();
 
     const td_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
-    const dr_dds = fx.sub_r.vtable.create_datareader(fx.sub_r.ptr, td_r, .{}, nil.nil_dr_listener, 0);
+    const dr_dds = fx.sub_r.create_datareader(td_r, .{}, null, 0);
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr_dds);
 
-    const dw_dds = fx.pub_w.vtable.create_datawriter(fx.pub_w.ptr, fx.topic_w, .{}, nil.nil_dw_listener, 0);
+    const dw_dds = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_dds);
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     _ = dr_dds.vtable.get_matched_publications(dr_dds.ptr, &handles);
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
+    try testing.expectEqual(@as(u32, 1), handles._length);
 
     var data: DDS.PublicationBuiltinTopicData = undefined;
-    const rc = dr_dds.vtable.get_matched_publication_data(dr_dds.ptr, &data, handles.items[0]);
+    const rc = dr_dds.vtable.get_matched_publication_data(dr_dds.ptr, &data, handles._buffer.?[0]);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqualStrings("RdrPubTopic", data.topic_name);
     try testing.expectEqualStrings("RdrPubType", data.type_name);

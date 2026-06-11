@@ -124,7 +124,8 @@ pub const WaitSetImpl = struct {
     /// triggered or the timeout elapses.  Triggered conditions are appended
     /// to `active_conditions`.  Uses a `notified` flag to prevent missed
     /// wakeups in the window between the condition check and the condvar wait.
-    fn vtWait(ctx: *anyopaque, active: *DDS.ConditionSeq, timeout: DDS.Duration_t) DDS.ReturnCode_t {
+    fn vtWait(ctx: *anyopaque, active: ?*DDS.ConditionSeq, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
+        const seq = active orelse return DDS.RETCODE_BAD_PARAMETER;
         const self: *Self = @ptrCast(@alignCast(ctx));
         const deadline_ns: ?i64 = blk: {
             if (timeout.sec == DDS.DURATION_INFINITE_SEC and
@@ -144,10 +145,21 @@ pub const WaitSetImpl = struct {
             var any = false;
             for (self.conditions.items) |cond| {
                 if (cond.get_trigger_value()) {
-                    active.append(self.alloc, cond) catch {
+                    // Grow sequence by one.
+                    const old_n = seq._length;
+                    const new_buf = self.alloc.alloc(DDS.Condition, old_n + 1) catch {
                         self.mu.unlock();
                         return DDS.RETCODE_OUT_OF_RESOURCES;
                     };
+                    if (seq._buffer) |ob| @memcpy(new_buf[0..old_n], ob[0..old_n]);
+                    if (seq._release) {
+                        if (seq._buffer) |ob| self.alloc.free(ob[0..old_n]);
+                    }
+                    new_buf[old_n] = cond;
+                    seq._buffer = new_buf.ptr;
+                    seq._length = old_n + 1;
+                    seq._maximum = old_n + 1;
+                    seq._release = true;
                     any = true;
                 }
             }
@@ -230,12 +242,19 @@ pub const WaitSetImpl = struct {
         return DDS.RETCODE_PRECONDITION_NOT_MET;
     }
 
-    fn vtGetConditions(ctx: *anyopaque, out: *DDS.ConditionSeq) DDS.ReturnCode_t {
+    fn vtGetConditions(ctx: *anyopaque, out: ?*DDS.ConditionSeq) DDS.ReturnCode_t {
+        const seq = out orelse return DDS.RETCODE_BAD_PARAMETER;
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
-        out.clearRetainingCapacity();
-        out.appendSlice(self.alloc, self.conditions.items) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        seq.* = .{};
+        const n = self.conditions.items.len;
+        if (n == 0) return DDS.RETCODE_OK;
+        const buf = self.alloc.dupe(DDS.Condition, self.conditions.items) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        seq._buffer = buf.ptr;
+        seq._length = @intCast(n);
+        seq._maximum = @intCast(n);
+        seq._release = true;
         return DDS.RETCODE_OK;
     }
 
@@ -522,7 +541,7 @@ const DDS_STATUS_MASK_ANY: DDS.StatusMask = 0x7FFF;
 pub const QueryConditionImpl = struct {
     alloc: std.mem.Allocator,
     rc: ReadConditionImpl,
-    query_expression: []u8,
+    query_expression: [:0]u8, // null-terminated for C API
     query_parameters: std.ArrayListUnmanaged([]u8),
     /// Parsed AST of `query_expression`.  Null when the expression is empty
     /// or the content_subscription_profile is disabled.  A malformed expression
@@ -548,7 +567,7 @@ pub const QueryConditionImpl = struct {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
 
-        const expr_copy = try alloc.dupe(u8, query_expression);
+        const expr_copy = try alloc.dupeZ(u8, query_expression);
         errdefer alloc.free(expr_copy);
 
         var params: std.ArrayListUnmanaged([]u8) = .empty;
@@ -556,10 +575,12 @@ pub const QueryConditionImpl = struct {
             for (params.items) |p| alloc.free(p);
             params.deinit(alloc);
         }
-        for (query_parameters.items) |p| {
-            const copy = try alloc.dupe(u8, p);
-            errdefer alloc.free(copy);
-            try params.append(alloc, copy);
+        if (query_parameters._buffer) |b| {
+            for (b[0..query_parameters._length]) |p| {
+                const copy = try alloc.dupe(u8, std.mem.span(p));
+                errdefer alloc.free(copy);
+                try params.append(alloc, copy);
+            }
         }
 
         const parsed = try filter_mod.parse(alloc, expr_copy);
@@ -654,39 +675,43 @@ pub const QueryConditionImpl = struct {
     fn vtGetReader(ctx: *anyopaque) DDS.DataReader {
         return cast(ctx).rc.reader;
     }
-    fn vtGetExpression(ctx: *anyopaque) []const u8 {
-        return cast(ctx).query_expression;
+    fn vtGetExpression(ctx: *anyopaque) [*:0]const u8 {
+        return cast(ctx).query_expression.ptr;
     }
 
-    fn vtGetParams(ctx: *anyopaque, out: *DDS.StringSeq) DDS.ReturnCode_t {
+    fn vtGetParams(ctx: *anyopaque, out: ?*DDS.StringSeq) DDS.ReturnCode_t {
+        const seq = out orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
-        out.clearRetainingCapacity();
-        for (self.query_parameters.items) |p| {
-            const copy = self.alloc.dupe(u8, p) catch {
-                for (out.items) |c| self.alloc.free(c);
-                out.clearRetainingCapacity();
+        seq.* = .{};
+        const n = self.query_parameters.items.len;
+        if (n == 0) return DDS.RETCODE_OK;
+        const buf = self.alloc.alloc([*:0]const u8, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        for (self.query_parameters.items, 0..) |p, i| {
+            buf[i] = (self.alloc.dupeZ(u8, p) catch {
+                self.alloc.free(buf);
                 return DDS.RETCODE_OUT_OF_RESOURCES;
-            };
-            out.append(self.alloc, copy) catch {
-                self.alloc.free(copy);
-                for (out.items) |c| self.alloc.free(c);
-                out.clearRetainingCapacity();
-                return DDS.RETCODE_OUT_OF_RESOURCES;
-            };
+            }).ptr;
         }
+        seq._buffer = buf.ptr;
+        seq._length = @intCast(n);
+        seq._maximum = @intCast(n);
+        seq._release = true;
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetParams(ctx: *anyopaque, params: DDS.StringSeq) DDS.ReturnCode_t {
+    fn vtSetParams(ctx: *anyopaque, params: ?*const DDS.StringSeq) DDS.ReturnCode_t {
         const self = cast(ctx);
         for (self.query_parameters.items) |p| self.alloc.free(p);
         self.query_parameters.clearRetainingCapacity();
-        for (params.items) |p| {
-            const copy = self.alloc.dupe(u8, p) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-            self.query_parameters.append(self.alloc, copy) catch {
-                self.alloc.free(copy);
-                return DDS.RETCODE_OUT_OF_RESOURCES;
-            };
+        const seq = params orelse return DDS.RETCODE_OK;
+        if (seq._buffer) |b| {
+            for (b[0..seq._length]) |p| {
+                const copy = self.alloc.dupe(u8, std.mem.span(p)) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+                self.query_parameters.append(self.alloc, copy) catch {
+                    self.alloc.free(copy);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+            }
         }
         return DDS.RETCODE_OK;
     }

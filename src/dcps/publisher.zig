@@ -132,7 +132,7 @@ pub const PublisherImpl = struct {
             .alloc = alloc,
             .participant = participant,
             .cbs = cbs,
-            .qos = qos,
+            .qos = .{},
             .listener = listener,
             .listener_mask = mask,
             .instance_handle = handle,
@@ -145,6 +145,7 @@ pub const PublisherImpl = struct {
             .suspend_active = false,
             .group_seq_num_counter = 0,
         };
+        self.qos = try qos.clone(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;
@@ -158,6 +159,8 @@ pub const PublisherImpl = struct {
             w.deinit();
         }
         self.writers.deinit(self.alloc);
+        self.qos.deinit(self.alloc);
+        self.default_dw_qos.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -227,8 +230,8 @@ pub const PublisherImpl = struct {
     fn vtCreateDataWriter(
         ctx: *anyopaque,
         a_topic: DDS.Topic,
-        qos: DDS.DataWriterQos,
-        a_listener: DDS.DataWriterListener,
+        qos: *const DDS.DataWriterQos,
+        a_listener: ?*const DDS.DataWriterListener,
         mask: DDS.StatusMask,
     ) DDS.DataWriter {
         const self = cast(ctx);
@@ -239,7 +242,7 @@ pub const PublisherImpl = struct {
             self.cbs.ctx,
             topic_name,
             type_name,
-            qos,
+            qos.*,
             pub_handle,
         ) catch return nil.nil_datawriter;
         const dw = writer_mod.DataWriterImpl.init(
@@ -247,8 +250,8 @@ pub const PublisherImpl = struct {
             a_topic,
             self.toDDSPublisher(),
             pw,
-            qos,
-            a_listener,
+            qos.*,
+            if (a_listener) |l| l.* else DDS.noop_DataWriterListener,
             mask,
             pub_handle,
             self.cbs.timer_clock,
@@ -280,7 +283,14 @@ pub const PublisherImpl = struct {
             dw,
             writer_mod.DataWriterImpl.assertLivelinessFn,
         );
-        self.cbs.announce_writer(self.cbs.ctx, pub_handle, self.qos.partition.name.items, self.qos.presentation);
+        const pname_seq = &self.qos.partition.name;
+        const pname_count = pname_seq._length;
+        var pname_buf: [64][]const u8 = undefined;
+        const pname_slice = pname_buf[0..@min(pname_count, pname_buf.len)];
+        if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
+            s.* = std.mem.span(b[i]);
+        };
+        self.cbs.announce_writer(self.cbs.ctx, pub_handle, pname_slice, self.qos.presentation);
         self.mu.lock();
         self.writers.append(self.alloc, dw) catch {
             self.mu.unlock();
@@ -307,12 +317,13 @@ pub const PublisherImpl = struct {
         return DDS.RETCODE_BAD_PARAMETER;
     }
 
-    fn vtLookupDataWriter(ctx: *anyopaque, topic_name: []const u8) DDS.DataWriter {
+    fn vtLookupDataWriter(ctx: *anyopaque, topic_name: [*:0]const u8) DDS.DataWriter {
         const self = cast(ctx);
+        const tn_s = std.mem.span(topic_name);
         self.mu.lock();
         defer self.mu.unlock();
         for (self.writers.items) |w| {
-            if (std.mem.eql(u8, w.topic_name, topic_name)) {
+            if (std.mem.eql(u8, w.topic_name, tn_s)) {
                 return w.toDDSDataWriter();
             }
         }
@@ -331,8 +342,11 @@ pub const PublisherImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetQos(ctx: *anyopaque, qos: DDS.PublisherQos) DDS.ReturnCode_t {
-        cast(ctx).qos = qos;
+    fn vtSetQos(ctx: *anyopaque, qos: *const DDS.PublisherQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.qos.deinit(self.alloc);
+        self.qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
@@ -341,9 +355,9 @@ pub const PublisherImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetListener(ctx: *anyopaque, a_listener: DDS.PublisherListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
+    fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.PublisherListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.listener = a_listener;
+        self.listener = if (a_listener) |l| l.* else DDS.noop_PublisherListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
@@ -414,7 +428,7 @@ pub const PublisherImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtWaitForAck(ctx: *anyopaque, timeout: DDS.Duration_t) DDS.ReturnCode_t {
+    fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         const self = cast(ctx);
         const POLL_NS: u64 = 1_000_000; // 1 ms
         const deadline_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
@@ -449,8 +463,11 @@ pub const PublisherImpl = struct {
         return cast(ctx).participant;
     }
 
-    fn vtSetDefaultDwQos(ctx: *anyopaque, qos: DDS.DataWriterQos) DDS.ReturnCode_t {
-        cast(ctx).default_dw_qos = qos;
+    fn vtSetDefaultDwQos(ctx: *anyopaque, qos: *const DDS.DataWriterQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.default_dw_qos.deinit(self.alloc);
+        self.default_dw_qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
@@ -459,7 +476,7 @@ pub const PublisherImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtCopyFromTopicQos(_: *anyopaque, dw_qos: *DDS.DataWriterQos, topic_qos: DDS.TopicQos) DDS.ReturnCode_t {
+    fn vtCopyFromTopicQos(_: *anyopaque, dw_qos: *DDS.DataWriterQos, topic_qos: *const DDS.TopicQos) DDS.ReturnCode_t {
         // Copy the subset of Topic QoS fields that apply to DataWriter.
         dw_qos.durability = topic_qos.durability;
         dw_qos.deadline = topic_qos.deadline;

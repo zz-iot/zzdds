@@ -109,8 +109,8 @@ pub const DomainParticipantFactoryImpl = struct {
     fn vtCreateParticipant(
         ctx: *anyopaque,
         domain_id: DDS.DomainId_t,
-        qos: DDS.DomainParticipantQos,
-        a_listener: DDS.DomainParticipantListener,
+        qos: *const DDS.DomainParticipantQos,
+        a_listener: ?*const DDS.DomainParticipantListener,
         mask: DDS.StatusMask,
     ) DDS.DomainParticipant {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -138,8 +138,8 @@ pub const DomainParticipantFactoryImpl = struct {
             self.discovery,
             self.security,
             self.config,
-            qos,
-            a_listener,
+            qos.*,
+            if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener,
             mask,
             handle,
             self.trace_config.tracer(),
@@ -202,9 +202,9 @@ pub const DomainParticipantFactoryImpl = struct {
         return nil.nil_participant;
     }
 
-    fn vtSetDefaultDpQos(ctx: *anyopaque, qos: DDS.DomainParticipantQos) DDS.ReturnCode_t {
+    fn vtSetDefaultDpQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.default_dp_qos = qos;
+        self.default_dp_qos = qos.*;
         return DDS.RETCODE_OK;
     }
 
@@ -214,9 +214,9 @@ pub const DomainParticipantFactoryImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetQos(ctx: *anyopaque, qos: DDS.DomainParticipantFactoryQos) DDS.ReturnCode_t {
+    fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantFactoryQos) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.factory_qos = qos;
+        self.factory_qos = qos.*;
         return DDS.RETCODE_OK;
     }
 

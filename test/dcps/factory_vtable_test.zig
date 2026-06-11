@@ -90,7 +90,7 @@ test "lookup_participant: returns participant for matching domain_id" {
     var h = try Harness.init(1);
     defer h.deinit();
     const f = h.factory.toDDSFactory();
-    const dp = f.vtable.create_participant(f.ptr, 7, .{}, nil.nil_dp_listener, 0);
+    const dp = f.create_participant(7, .{}, null, 0);
     defer _ = f.vtable.delete_participant(f.ptr, dp);
 
     const found = f.vtable.lookup_participant(f.ptr, 7);
@@ -101,7 +101,7 @@ test "lookup_participant: returns nil for unknown domain_id" {
     var h = try Harness.init(2);
     defer h.deinit();
     const f = h.factory.toDDSFactory();
-    const dp = f.vtable.create_participant(f.ptr, 7, .{}, nil.nil_dp_listener, 0);
+    const dp = f.create_participant(7, .{}, null, 0);
     defer _ = f.vtable.delete_participant(f.ptr, dp);
 
     const found = f.vtable.lookup_participant(f.ptr, 99);
@@ -115,7 +115,7 @@ test "set_default_participant_qos / get_default_participant_qos: round-trips" {
 
     var qos = DDS.DomainParticipantQos{};
     qos.entity_factory.autoenable_created_entities = false;
-    _ = f.vtable.set_default_participant_qos(f.ptr, qos);
+    _ = f.set_default_participant_qos(qos);
 
     var out: DDS.DomainParticipantQos = .{};
     _ = f.vtable.get_default_participant_qos(f.ptr, &out);
@@ -129,7 +129,7 @@ test "set_qos / get_qos: round-trips" {
 
     var qos = DDS.DomainParticipantFactoryQos{};
     qos.entity_factory.autoenable_created_entities = false;
-    _ = f.vtable.set_qos(f.ptr, qos);
+    _ = f.set_qos(qos);
 
     var out: DDS.DomainParticipantFactoryQos = .{};
     _ = f.vtable.get_qos(f.ptr, &out);

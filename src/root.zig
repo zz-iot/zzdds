@@ -45,6 +45,16 @@ pub const config = @import("config/schema.zig");
 pub const rtps = @import("rtps/root.zig");
 pub const qos = @import("qos/policy.zig");
 pub const dcps = @import("dcps/root.zig");
+pub const c_abi = @import("c_abi/root.zig");
+
+// Force c_abi files to be compiled into the binary so their pub export
+// functions appear in libzzdds.  A pub const alias is not enough — Zig only
+// emits code for an imported file if it is reachable from a comptime block
+// or a runtime code path.
+comptime {
+    _ = c_abi.typesupport;
+    _ = c_abi.bootstrap;
+}
 pub const util = struct {
     pub const time = @import("util/time.zig");
     pub const clock_registry = @import("util/clock_registry.zig");

@@ -71,24 +71,22 @@ fn runMockLoopback(
     }
 
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic_r = dp_r.vtable.create_topic(
-        dp_r.ptr,
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic(
         "MockTopic",
         "MockType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
-    const dr = sub_r.vtable.create_datareader(
-        sub_r.ptr,
+    const dr = sub_r.create_datareader(
         topic_desc_r,
         dr_qos,
-        nil.nil_dr_listener,
+        null,
         0,
     );
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
@@ -111,19 +109,18 @@ fn runMockLoopback(
     }
 
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
-    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic_w = dp_w.vtable.create_topic(
-        dp_w.ptr,
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic(
         "MockTopic",
         "MockType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
-    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     // Write payloads before discovery.  The writer history cache holds them and
@@ -228,23 +225,21 @@ test "mock_loopback: incompatible QoS — best_effort writer vs reliable reader"
         disc_r.deinit();
     }
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic_r = dp_r.vtable.create_topic(
-        dp_r.ptr,
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic(
         "IncompatTopic",
         "IncompatType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
-    const dr = sub_r.vtable.create_datareader(
-        sub_r.ptr,
+    const dr = sub_r.create_datareader(
         topic_desc_r,
         dr_qos,
-        nil.nil_dr_listener,
+        null,
         0,
     );
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
@@ -265,18 +260,17 @@ test "mock_loopback: incompatible QoS — best_effort writer vs reliable reader"
         disc_w.deinit();
     }
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
-    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic_w = dp_w.vtable.create_topic(
-        dp_w.ptr,
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic(
         "IncompatTopic",
         "IncompatType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
-    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     _ = try dw_impl.writeRaw(
@@ -320,16 +314,16 @@ test "mock_loopback: suspend_publications holds writes across end_coherent_chang
         disc_r.deinit();
     }
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "SuspendTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic("SuspendTopic", "MockType", .{}, null, 0);
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const dr = sub_r.vtable.create_datareader(sub_r.ptr, topic_desc_r, dr_qos, nil.nil_dr_listener, 0);
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
     const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
@@ -341,15 +335,15 @@ test "mock_loopback: suspend_publications holds writes across end_coherent_chang
         disc_w.deinit();
     }
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
-    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "SuspendTopic", "MockType", .{}, nil.nil_topic_listener, 0);
-    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const topic_w = dp_w.create_topic("SuspendTopic", "MockType", .{}, null, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     // Drive discovery.
@@ -430,20 +424,20 @@ test "mock_loopback: coherent sets from two writers are buffered independently" 
         disc_r.deinit();
     }
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
     var sub_qos = DDS.SubscriberQos{};
     sub_qos.presentation.coherent_access = true;
     sub_qos.presentation.access_scope = .TOPIC_PRESENTATION_QOS;
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, sub_qos, nil.nil_sub_listener, 0);
-    const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "TwoWriterTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const sub_r = dp_r.create_subscriber(sub_qos, null, 0);
+    const topic_r = dp_r.create_topic("TwoWriterTopic", "MockType", .{}, null, 0);
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const dr = sub_r.vtable.create_datareader(sub_r.ptr, topic_desc_r, dr_qos, nil.nil_dr_listener, 0);
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
     const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
@@ -455,22 +449,22 @@ test "mock_loopback: coherent sets from two writers are buffered independently" 
         disc_w.deinit();
     }
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
     var pub_qos = DDS.PublisherQos{};
     pub_qos.presentation.coherent_access = true;
     pub_qos.presentation.access_scope = .TOPIC_PRESENTATION_QOS;
-    const pub_a = dp_w.vtable.create_publisher(dp_w.ptr, pub_qos, nil.nil_pub_listener, 0);
-    const pub_b = dp_w.vtable.create_publisher(dp_w.ptr, pub_qos, nil.nil_pub_listener, 0);
+    const pub_a = dp_w.create_publisher(pub_qos, null, 0);
+    const pub_b = dp_w.create_publisher(pub_qos, null, 0);
 
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "TwoWriterTopic", "MockType", .{}, nil.nil_topic_listener, 0);
-    const dw_a = pub_a.vtable.create_datawriter(pub_a.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
-    const dw_b = pub_b.vtable.create_datawriter(pub_b.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const topic_w = dp_w.create_topic("TwoWriterTopic", "MockType", .{}, null, 0);
+    const dw_a = pub_a.create_datawriter(topic_w, dw_qos, null, 0);
+    const dw_b = pub_b.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_a_impl: *DataWriterImpl = @ptrCast(@alignCast(dw_a.ptr));
     const dw_b_impl: *DataWriterImpl = @ptrCast(@alignCast(dw_b.ptr));
 
@@ -567,22 +561,22 @@ test "mock_loopback: coherent set delivered atomically via begin_access" {
         disc_r.deinit();
     }
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
     var sub_qos = DDS.SubscriberQos{};
     sub_qos.presentation.coherent_access = true;
     sub_qos.presentation.access_scope = .TOPIC_PRESENTATION_QOS;
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, sub_qos, nil.nil_sub_listener, 0);
+    const sub_r = dp_r.create_subscriber(sub_qos, null, 0);
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
 
-    const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "CoherentTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const topic_r = dp_r.create_topic("CoherentTopic", "MockType", .{}, null, 0);
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
-    const dr = sub_r.vtable.create_datareader(sub_r.ptr, topic_desc_r, dr_qos, nil.nil_dr_listener, 0);
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
     // ── Writer side ───────────────────────────────────────────────────────────
@@ -602,21 +596,21 @@ test "mock_loopback: coherent set delivered atomically via begin_access" {
         disc_w.deinit();
     }
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
     var pub_qos = DDS.PublisherQos{};
     pub_qos.presentation.coherent_access = true;
     pub_qos.presentation.access_scope = .TOPIC_PRESENTATION_QOS;
-    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, pub_qos, nil.nil_pub_listener, 0);
+    const pub_w = dp_w.create_publisher(pub_qos, null, 0);
 
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
 
-    const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "CoherentTopic", "MockType", .{}, nil.nil_topic_listener, 0);
-    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const topic_w = dp_w.create_topic("CoherentTopic", "MockType", .{}, null, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     // ── Drive discovery ───────────────────────────────────────────────────────
@@ -697,22 +691,22 @@ test "mock_loopback: ordered access sorts pending queue via begin_access" {
         disc_r.deinit();
     }
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
     var sub_qos = DDS.SubscriberQos{};
     sub_qos.presentation.ordered_access = true;
     sub_qos.presentation.access_scope = .INSTANCE_PRESENTATION_QOS;
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, sub_qos, nil.nil_sub_listener, 0);
+    const sub_r = dp_r.create_subscriber(sub_qos, null, 0);
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
 
-    const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "OrderedTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const topic_r = dp_r.create_topic("OrderedTopic", "MockType", .{}, null, 0);
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
-    const dr = sub_r.vtable.create_datareader(sub_r.ptr, topic_desc_r, dr_qos, nil.nil_dr_listener, 0);
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
     // ── Writer side ───────────────────────────────────────────────────────────
@@ -732,21 +726,21 @@ test "mock_loopback: ordered access sorts pending queue via begin_access" {
         disc_w.deinit();
     }
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
     var pub_qos = DDS.PublisherQos{};
     pub_qos.presentation.ordered_access = true;
     pub_qos.presentation.access_scope = .INSTANCE_PRESENTATION_QOS;
-    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, pub_qos, nil.nil_pub_listener, 0);
+    const pub_w = dp_w.create_publisher(pub_qos, null, 0);
 
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
 
-    const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "OrderedTopic", "MockType", .{}, nil.nil_topic_listener, 0);
-    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const topic_w = dp_w.create_topic("OrderedTopic", "MockType", .{}, null, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     // ── Drive discovery ───────────────────────────────────────────────────────
@@ -827,21 +821,21 @@ test "mock_loopback: pre-coherent-window writes not tagged as part of coherent s
         disc_r.deinit();
     }
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
     var sub_qos = DDS.SubscriberQos{};
     sub_qos.presentation.coherent_access = true;
     sub_qos.presentation.access_scope = .TOPIC_PRESENTATION_QOS;
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, sub_qos, nil.nil_sub_listener, 0);
+    const sub_r = dp_r.create_subscriber(sub_qos, null, 0);
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "PreCoherentTopic", "MockType", .{}, nil.nil_topic_listener, 0);
+    const topic_r = dp_r.create_topic("PreCoherentTopic", "MockType", .{}, null, 0);
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
-    const dr = sub_r.vtable.create_datareader(sub_r.ptr, topic_desc_r, dr_qos, nil.nil_dr_listener, 0);
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
     // ── Writer side ───────────────────────────────────────────────────────────
@@ -854,20 +848,20 @@ test "mock_loopback: pre-coherent-window writes not tagged as part of coherent s
         disc_w.deinit();
     }
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
     var pub_qos = DDS.PublisherQos{};
     pub_qos.presentation.coherent_access = true;
     pub_qos.presentation.access_scope = .TOPIC_PRESENTATION_QOS;
-    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, pub_qos, nil.nil_pub_listener, 0);
+    const pub_w = dp_w.create_publisher(pub_qos, null, 0);
 
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "PreCoherentTopic", "MockType", .{}, nil.nil_topic_listener, 0);
-    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const topic_w = dp_w.create_topic("PreCoherentTopic", "MockType", .{}, null, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     // ── Drive discovery ───────────────────────────────────────────────────────

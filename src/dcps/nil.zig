@@ -65,51 +65,10 @@ fn nilGetHandle(_: *anyopaque) DDS.InstanceHandle_t {
 }
 fn nilDeinit(_: *anyopaque) void {}
 
-// ── Nil Listener no-op callbacks ──────────────────────────────────────────────
-
-fn topicListenerDeinit(_: *anyopaque) void {}
-fn dwListenerDeadlineMissed(_: *anyopaque, _: DDS.DataWriter, _: DDS.OfferedDeadlineMissedStatus) void {}
-fn dwListenerIncompatQos(_: *anyopaque, _: DDS.DataWriter, _: DDS.OfferedIncompatibleQosStatus) void {}
-fn dwListenerLivelinesLost(_: *anyopaque, _: DDS.DataWriter, _: DDS.LivelinessLostStatus) void {}
-fn dwListenerPubMatched(_: *anyopaque, _: DDS.DataWriter, _: DDS.PublicationMatchedStatus) void {}
-fn dwListenerDeinit(_: *anyopaque) void {}
-fn drListenerDeadlineMissed(_: *anyopaque, _: DDS.DataReader, _: DDS.RequestedDeadlineMissedStatus) void {}
-fn drListenerIncompatQos(_: *anyopaque, _: DDS.DataReader, _: DDS.RequestedIncompatibleQosStatus) void {}
-fn drListenerSampleRejected(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleRejectedStatus) void {}
-fn drListenerLivelinessChanged(_: *anyopaque, _: DDS.DataReader, _: DDS.LivelinessChangedStatus) void {}
-fn drListenerDataAvail(_: *anyopaque, _: DDS.DataReader) void {}
-fn drListenerSubMatched(_: *anyopaque, _: DDS.DataReader, _: DDS.SubscriptionMatchedStatus) void {}
-fn drListenerSampleLost(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleLostStatus) void {}
-fn drListenerDeinit(_: *anyopaque) void {}
-
-var nil_topic_listener_vtable = DDS.TopicListener.Vtable{
-    .on_inconsistent_topic = struct {
-        fn f(_: *anyopaque, _: DDS.Topic, _: DDS.InconsistentTopicStatus) void {}
-    }.f,
-    .deinit = topicListenerDeinit,
-};
-pub const nil_topic_listener = DDS.TopicListener{ .ptr = NIL_PTR, .vtable = &nil_topic_listener_vtable };
-
-var nil_dw_listener_vtable = DDS.DataWriterListener.Vtable{
-    .on_offered_deadline_missed = dwListenerDeadlineMissed,
-    .on_offered_incompatible_qos = dwListenerIncompatQos,
-    .on_liveliness_lost = dwListenerLivelinesLost,
-    .on_publication_matched = dwListenerPubMatched,
-    .deinit = dwListenerDeinit,
-};
-pub const nil_dw_listener = DDS.DataWriterListener{ .ptr = NIL_PTR, .vtable = &nil_dw_listener_vtable };
-
-var nil_dr_listener_vtable = DDS.DataReaderListener.Vtable{
-    .on_requested_deadline_missed = drListenerDeadlineMissed,
-    .on_requested_incompatible_qos = drListenerIncompatQos,
-    .on_sample_rejected = drListenerSampleRejected,
-    .on_liveliness_changed = drListenerLivelinessChanged,
-    .on_data_available = drListenerDataAvail,
-    .on_subscription_matched = drListenerSubMatched,
-    .on_sample_lost = drListenerSampleLost,
-    .deinit = drListenerDeinit,
-};
-pub const nil_dr_listener = DDS.DataReaderListener{ .ptr = NIL_PTR, .vtable = &nil_dr_listener_vtable };
+// Nil listener constants: all function pointers null (zero-init).
+pub const nil_topic_listener = DDS.noop_TopicListener;
+pub const nil_dw_listener = DDS.noop_DataWriterListener;
+pub const nil_dr_listener = DDS.noop_DataReaderListener;
 
 // ── Nil DomainParticipant ─────────────────────────────────────────────────────
 
@@ -119,7 +78,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .create_publisher = struct {
-        fn f(_: *anyopaque, _: DDS.PublisherQos, _: DDS.PublisherListener, _: DDS.StatusMask) DDS.Publisher {
+        fn f(_: *anyopaque, _: *const DDS.PublisherQos, _: ?*const DDS.PublisherListener, _: DDS.StatusMask) DDS.Publisher {
             return nil_publisher;
         }
     }.f,
@@ -129,7 +88,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .create_subscriber = struct {
-        fn f(_: *anyopaque, _: DDS.SubscriberQos, _: DDS.SubscriberListener, _: DDS.StatusMask) DDS.Subscriber {
+        fn f(_: *anyopaque, _: *const DDS.SubscriberQos, _: ?*const DDS.SubscriberListener, _: DDS.StatusMask) DDS.Subscriber {
             return nil_subscriber;
         }
     }.f,
@@ -144,7 +103,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .create_topic = struct {
-        fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.TopicQos, _: DDS.TopicListener, _: DDS.StatusMask) DDS.Topic {
+        fn f(_: *anyopaque, _: [*:0]const u8, _: [*:0]const u8, _: *const DDS.TopicQos, _: ?*const DDS.TopicListener, _: DDS.StatusMask) DDS.Topic {
             return nil_topic;
         }
     }.f,
@@ -154,17 +113,17 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .find_topic = struct {
-        fn f(_: *anyopaque, _: []const u8, _: DDS.Duration_t) DDS.Topic {
+        fn f(_: *anyopaque, _: [*:0]const u8, _: *const DDS.Duration_t) DDS.Topic {
             return nil_topic;
         }
     }.f,
     .lookup_topicdescription = struct {
-        fn f(_: *anyopaque, _: []const u8) DDS.TopicDescription {
+        fn f(_: *anyopaque, _: [*:0]const u8) DDS.TopicDescription {
             return nil_topic_description;
         }
     }.f,
     .create_contentfilteredtopic = struct {
-        fn f(_: *anyopaque, _: []const u8, _: DDS.Topic, _: []const u8, _: DDS.StringSeq) DDS.ContentFilteredTopic {
+        fn f(_: *anyopaque, _: [*:0]const u8, _: DDS.Topic, _: [*:0]const u8, _: ?*const DDS.StringSeq) DDS.ContentFilteredTopic {
             return nil_cft;
         }
     }.f,
@@ -174,7 +133,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .create_multitopic = struct {
-        fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: DDS.StringSeq) DDS.MultiTopic {
+        fn f(_: *anyopaque, _: [*:0]const u8, _: [*:0]const u8, _: [*:0]const u8, _: ?*const DDS.StringSeq) DDS.MultiTopic {
             return nil_multitopic;
         }
     }.f,
@@ -189,7 +148,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .set_qos = struct {
-        fn f(_: *anyopaque, _: DDS.DomainParticipantQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -199,7 +158,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .set_listener = struct {
-        fn f(_: *anyopaque, _: DDS.DomainParticipantListener, _: DDS.StatusMask) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.DomainParticipantListener, _: DDS.StatusMask) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -239,7 +198,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .set_default_publisher_qos = struct {
-        fn f(_: *anyopaque, _: DDS.PublisherQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.PublisherQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -249,7 +208,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .set_default_subscriber_qos = struct {
-        fn f(_: *anyopaque, _: DDS.SubscriberQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.SubscriberQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -259,7 +218,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .set_default_topic_qos = struct {
-        fn f(_: *anyopaque, _: DDS.TopicQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.TopicQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -269,7 +228,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .get_discovered_participants = struct {
-        fn f(_: *anyopaque, _: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_UNSUPPORTED;
         }
     }.f,
@@ -279,7 +238,7 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .get_discovered_topics = struct {
-        fn f(_: *anyopaque, _: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_UNSUPPORTED;
         }
     }.f,
@@ -304,14 +263,7 @@ pub const nil_participant = DDS.DomainParticipant{ .ptr = NIL_PTR, .vtable = &ni
 
 // ── Nil Publisher ─────────────────────────────────────────────────────────────
 
-var nil_pub_listener_vtable = DDS.PublisherListener.Vtable{
-    .on_offered_deadline_missed = dwListenerDeadlineMissed,
-    .on_offered_incompatible_qos = dwListenerIncompatQos,
-    .on_liveliness_lost = dwListenerLivelinesLost,
-    .on_publication_matched = dwListenerPubMatched,
-    .deinit = nilDeinit,
-};
-pub const nil_pub_listener = DDS.PublisherListener{ .ptr = NIL_PTR, .vtable = &nil_pub_listener_vtable };
+pub const nil_pub_listener = DDS.noop_PublisherListener;
 
 var nil_publisher_vtable = DDS.Publisher.Vtable{
     .enable = nilEnable,
@@ -319,7 +271,7 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .create_datawriter = struct {
-        fn f(_: *anyopaque, _: DDS.Topic, _: DDS.DataWriterQos, _: DDS.DataWriterListener, _: DDS.StatusMask) DDS.DataWriter {
+        fn f(_: *anyopaque, _: DDS.Topic, _: *const DDS.DataWriterQos, _: ?*const DDS.DataWriterListener, _: DDS.StatusMask) DDS.DataWriter {
             return nil_datawriter;
         }
     }.f,
@@ -329,7 +281,7 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
         }
     }.f,
     .lookup_datawriter = struct {
-        fn f(_: *anyopaque, _: []const u8) DDS.DataWriter {
+        fn f(_: *anyopaque, _: [*:0]const u8) DDS.DataWriter {
             return nil_datawriter;
         }
     }.f,
@@ -339,7 +291,7 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
         }
     }.f,
     .set_qos = struct {
-        fn f(_: *anyopaque, _: DDS.PublisherQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.PublisherQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -349,7 +301,7 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
         }
     }.f,
     .set_listener = struct {
-        fn f(_: *anyopaque, _: DDS.PublisherListener, _: DDS.StatusMask) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.PublisherListener, _: DDS.StatusMask) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -379,7 +331,7 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
         }
     }.f,
     .wait_for_acknowledgments = struct {
-        fn f(_: *anyopaque, _: DDS.Duration_t) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.Duration_t) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -389,7 +341,7 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
         }
     }.f,
     .set_default_datawriter_qos = struct {
-        fn f(_: *anyopaque, _: DDS.DataWriterQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.DataWriterQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -399,7 +351,7 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
         }
     }.f,
     .copy_from_topic_qos = struct {
-        fn f(_: *anyopaque, _: *DDS.DataWriterQos, _: DDS.TopicQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *DDS.DataWriterQos, _: *const DDS.TopicQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -409,20 +361,7 @@ pub const nil_publisher = DDS.Publisher{ .ptr = NIL_PTR, .vtable = &nil_publishe
 
 // ── Nil Subscriber ────────────────────────────────────────────────────────────
 
-var nil_sub_listener_vtable = DDS.SubscriberListener.Vtable{
-    .on_requested_deadline_missed = drListenerDeadlineMissed,
-    .on_requested_incompatible_qos = drListenerIncompatQos,
-    .on_sample_rejected = drListenerSampleRejected,
-    .on_liveliness_changed = drListenerLivelinessChanged,
-    .on_data_available = drListenerDataAvail,
-    .on_subscription_matched = drListenerSubMatched,
-    .on_sample_lost = drListenerSampleLost,
-    .on_data_on_readers = struct {
-        fn f(_: *anyopaque, _: DDS.Subscriber) void {}
-    }.f,
-    .deinit = nilDeinit,
-};
-pub const nil_sub_listener = DDS.SubscriberListener{ .ptr = NIL_PTR, .vtable = &nil_sub_listener_vtable };
+pub const nil_sub_listener = DDS.noop_SubscriberListener;
 
 var nil_subscriber_vtable = DDS.Subscriber.Vtable{
     .enable = nilEnable,
@@ -430,7 +369,7 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .create_datareader = struct {
-        fn f(_: *anyopaque, _: DDS.TopicDescription, _: DDS.DataReaderQos, _: DDS.DataReaderListener, _: DDS.StatusMask) DDS.DataReader {
+        fn f(_: *anyopaque, _: DDS.TopicDescription, _: *const DDS.DataReaderQos, _: ?*const DDS.DataReaderListener, _: DDS.StatusMask) DDS.DataReader {
             return nil_datareader;
         }
     }.f,
@@ -445,12 +384,12 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
         }
     }.f,
     .lookup_datareader = struct {
-        fn f(_: *anyopaque, _: []const u8) DDS.DataReader {
+        fn f(_: *anyopaque, _: [*:0]const u8) DDS.DataReader {
             return nil_datareader;
         }
     }.f,
     .get_datareaders = struct {
-        fn f(_: *anyopaque, _: *DDS.DataReaderSeq, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.DataReaderSeq, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -460,7 +399,7 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
         }
     }.f,
     .set_qos = struct {
-        fn f(_: *anyopaque, _: DDS.SubscriberQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.SubscriberQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -470,7 +409,7 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
         }
     }.f,
     .set_listener = struct {
-        fn f(_: *anyopaque, _: DDS.SubscriberListener, _: DDS.StatusMask) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.SubscriberListener, _: DDS.StatusMask) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -495,7 +434,7 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
         }
     }.f,
     .set_default_datareader_qos = struct {
-        fn f(_: *anyopaque, _: DDS.DataReaderQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.DataReaderQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -505,7 +444,7 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
         }
     }.f,
     .copy_from_topic_qos = struct {
-        fn f(_: *anyopaque, _: *DDS.DataReaderQos, _: DDS.TopicQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *DDS.DataReaderQos, _: *const DDS.TopicQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -521,7 +460,7 @@ var nil_datawriter_vtable = DDS.DataWriter.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .set_qos = struct {
-        fn f(_: *anyopaque, _: DDS.DataWriterQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.DataWriterQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -531,7 +470,7 @@ var nil_datawriter_vtable = DDS.DataWriter.Vtable{
         }
     }.f,
     .set_listener = struct {
-        fn f(_: *anyopaque, _: DDS.DataWriterListener, _: DDS.StatusMask) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.DataWriterListener, _: DDS.StatusMask) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -551,7 +490,7 @@ var nil_datawriter_vtable = DDS.DataWriter.Vtable{
         }
     }.f,
     .wait_for_acknowledgments = struct {
-        fn f(_: *anyopaque, _: DDS.Duration_t) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.Duration_t) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -581,7 +520,7 @@ var nil_datawriter_vtable = DDS.DataWriter.Vtable{
         }
     }.f,
     .get_matched_subscriptions = struct {
-        fn f(_: *anyopaque, _: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -607,7 +546,7 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
         }
     }.f,
     .create_querycondition = struct {
-        fn f(_: *anyopaque, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: []const u8, _: DDS.StringSeq) DDS.QueryCondition {
+        fn f(_: *anyopaque, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: [*:0]const u8, _: ?*const DDS.StringSeq) DDS.QueryCondition {
             return nil_querycondition;
         }
     }.f,
@@ -622,7 +561,7 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
         }
     }.f,
     .set_qos = struct {
-        fn f(_: *anyopaque, _: DDS.DataReaderQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.DataReaderQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -632,7 +571,7 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
         }
     }.f,
     .set_listener = struct {
-        fn f(_: *anyopaque, _: DDS.DataReaderListener, _: DDS.StatusMask) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.DataReaderListener, _: DDS.StatusMask) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -682,12 +621,12 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
         }
     }.f,
     .wait_for_historical_data = struct {
-        fn f(_: *anyopaque, _: DDS.Duration_t) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.Duration_t) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
     .get_matched_publications = struct {
-        fn f(_: *anyopaque, _: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -704,12 +643,12 @@ pub const nil_datareader = DDS.DataReader{ .ptr = NIL_PTR, .vtable = &nil_datare
 
 var nil_topic_description_vtable = DDS.TopicDescription.Vtable{
     .get_type_name = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
     .get_name = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
@@ -728,12 +667,12 @@ var nil_topic_vtable = DDS.Topic.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .get_type_name = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
     .get_name = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
@@ -743,7 +682,7 @@ var nil_topic_vtable = DDS.Topic.Vtable{
         }
     }.f,
     .set_qos = struct {
-        fn f(_: *anyopaque, _: DDS.TopicQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.TopicQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -753,7 +692,7 @@ var nil_topic_vtable = DDS.Topic.Vtable{
         }
     }.f,
     .set_listener = struct {
-        fn f(_: *anyopaque, _: DDS.TopicListener, _: DDS.StatusMask) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.TopicListener, _: DDS.StatusMask) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -775,12 +714,12 @@ pub const nil_topic = DDS.Topic{ .ptr = NIL_PTR, .vtable = &nil_topic_vtable };
 
 var nil_cft_vtable = DDS.ContentFilteredTopic.Vtable{
     .get_type_name = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
     .get_name = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
@@ -790,17 +729,17 @@ var nil_cft_vtable = DDS.ContentFilteredTopic.Vtable{
         }
     }.f,
     .get_filter_expression = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
     .get_expression_parameters = struct {
-        fn f(_: *anyopaque, _: *DDS.StringSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.StringSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
     .set_expression_parameters = struct {
-        fn f(_: *anyopaque, _: DDS.StringSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.StringSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -817,12 +756,12 @@ pub const nil_cft = DDS.ContentFilteredTopic{ .ptr = NIL_PTR, .vtable = &nil_cft
 
 var nil_multitopic_vtable = DDS.MultiTopic.Vtable{
     .get_type_name = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
     .get_name = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
@@ -832,17 +771,17 @@ var nil_multitopic_vtable = DDS.MultiTopic.Vtable{
         }
     }.f,
     .get_subscription_expression = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
     .get_expression_parameters = struct {
-        fn f(_: *anyopaque, _: *DDS.StringSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.StringSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
     .set_expression_parameters = struct {
-        fn f(_: *anyopaque, _: DDS.StringSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.StringSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -919,17 +858,17 @@ var nil_querycondition_vtable = DDS.QueryCondition.Vtable{
         }
     }.f,
     .get_query_expression = struct {
-        fn f(_: *anyopaque) []const u8 {
+        fn f(_: *anyopaque) [*:0]const u8 {
             return "";
         }
     }.f,
     .get_query_parameters = struct {
-        fn f(_: *anyopaque, _: *DDS.StringSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.StringSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
     .set_query_parameters = struct {
-        fn f(_: *anyopaque, _: DDS.StringSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*const DDS.StringSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -939,31 +878,11 @@ pub const nil_querycondition = DDS.QueryCondition{ .ptr = NIL_PTR, .vtable = &ni
 
 // ── Nil DomainParticipantFactory ──────────────────────────────────────────────
 
-var nil_dp_listener_vtable = DDS.DomainParticipantListener.Vtable{
-    .on_inconsistent_topic = struct {
-        fn f(_: *anyopaque, _: DDS.Topic, _: DDS.InconsistentTopicStatus) void {}
-    }.f,
-    .on_offered_deadline_missed = dwListenerDeadlineMissed,
-    .on_offered_incompatible_qos = dwListenerIncompatQos,
-    .on_liveliness_lost = dwListenerLivelinesLost,
-    .on_publication_matched = dwListenerPubMatched,
-    .on_requested_deadline_missed = drListenerDeadlineMissed,
-    .on_requested_incompatible_qos = drListenerIncompatQos,
-    .on_sample_rejected = drListenerSampleRejected,
-    .on_liveliness_changed = drListenerLivelinessChanged,
-    .on_data_available = drListenerDataAvail,
-    .on_subscription_matched = drListenerSubMatched,
-    .on_sample_lost = drListenerSampleLost,
-    .on_data_on_readers = struct {
-        fn f(_: *anyopaque, _: DDS.Subscriber) void {}
-    }.f,
-    .deinit = nilDeinit,
-};
-pub const nil_dp_listener = DDS.DomainParticipantListener{ .ptr = NIL_PTR, .vtable = &nil_dp_listener_vtable };
+pub const nil_dp_listener = DDS.noop_DomainParticipantListener;
 
 var nil_factory_vtable = DDS.DomainParticipantFactory.Vtable{
     .create_participant = struct {
-        fn f(_: *anyopaque, _: DDS.DomainId_t, _: DDS.DomainParticipantQos, _: DDS.DomainParticipantListener, _: DDS.StatusMask) DDS.DomainParticipant {
+        fn f(_: *anyopaque, _: DDS.DomainId_t, _: *const DDS.DomainParticipantQos, _: ?*const DDS.DomainParticipantListener, _: DDS.StatusMask) DDS.DomainParticipant {
             return nil_participant;
         }
     }.f,
@@ -978,7 +897,7 @@ var nil_factory_vtable = DDS.DomainParticipantFactory.Vtable{
         }
     }.f,
     .set_default_participant_qos = struct {
-        fn f(_: *anyopaque, _: DDS.DomainParticipantQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,
@@ -988,7 +907,7 @@ var nil_factory_vtable = DDS.DomainParticipantFactory.Vtable{
         }
     }.f,
     .set_qos = struct {
-        fn f(_: *anyopaque, _: DDS.DomainParticipantFactoryQos) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: *const DDS.DomainParticipantFactoryQos) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,

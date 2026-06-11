@@ -10,6 +10,24 @@ pub fn build(b: *std.Build) void {
     const zidl_exe = zidl_dep.artifact("zidl");
     const zidl_rt_mod = zidl_dep.module("zidl_rt");
 
+    // ── Language binding flags ────────────────────────────────────────────────
+    //
+    // Declared early because they affect what gets generated for dcps.idl.
+    // Zig is always generated (it is the native runtime, not a binding).
+    // Other bindings are opt-in.  Python, .NET, and Rust zig-ffi are not yet
+    // implemented; their flags are noted here for when they arrive — each will
+    // also set need_c_abi since they call into the C ABI layer.
+
+    const c_binding = b.option(bool, "c-binding", "Generate C language binding (dcps.h + libzzdds)") orelse false;
+    const cpp_binding = b.option(bool, "cpp-binding", "Generate C++ language binding (implies -Dc-binding)") orelse false;
+    const java_binding = b.option(bool, "java-binding", "Generate Java language binding") orelse false;
+    // const python_binding = b.option(bool, "python-binding", ...) orelse false;  // TODO
+    // const dotnet_binding = b.option(bool, "dotnet-binding", ...) orelse false;  // TODO
+    // const rust_binding   = b.option(bool, "rust-binding",   ...) orelse false;  // TODO
+
+    // C ABI layer is a shared prerequisite for C, C++, Python, .NET, Rust zig-ffi.
+    const need_c_abi = c_binding or cpp_binding;
+
     // ── Code generation: idl/dcps.idl → generated/dcps.zig ───────────────────
 
     const gen_dir = "zzdds-generated";
@@ -22,8 +40,11 @@ pub fn build(b: *std.Build) void {
     gen_dcps.addArgs(&.{
         "-b",                    "zig",
         "--generate-interfaces", "--split-files",
-        "-o",
     });
+    // pub export fn callconv(.c) wrappers are only needed when building a C-ABI
+    // binding; skip them for pure-Zig builds to avoid unused symbol overhead.
+    if (need_c_abi) gen_dcps.addArg("--generate-c-api");
+    gen_dcps.addArg("-o");
     // addOutputDirectoryArg injects the cache-managed output path as the next arg.
     const gen_output_dir = gen_dcps.addOutputDirectoryArg(gen_dir);
     gen_dcps.addFileArg(dcps_idl);
@@ -129,6 +150,98 @@ pub fn build(b: *std.Build) void {
     const gen_only_step = b.step("gen-only", "Run zidl code generation only");
     gen_only_step.dependOn(&gen_dcps.step);
     gen_only_step.dependOn(&gen_rtps_disc.step);
+
+    // ── C language binding ────────────────────────────────────────────────────
+
+    if (need_c_abi) {
+        // Generate dcps.h and dcps_cdr.c from dcps.idl.
+        // (dcps_iface.c no longer generated; free function impls come from
+        // --generate-c-api in Phase 3)
+        const gen_dcps_c = b.addRunArtifact(zidl_exe);
+        gen_dcps_c.addArgs(&.{ "-b", "c", "--generate-interfaces", "-o" });
+        const gen_c_dir = gen_dcps_c.addOutputDirectoryArg("zzdds-c-binding");
+        if (xtypes) gen_dcps_c.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
+        gen_dcps_c.addFileArg(dcps_idl);
+
+        gen_only_step.dependOn(&gen_dcps_c.step);
+
+        // Install dcps.h → zig-out/include/
+        const install_dcps_h = b.addInstallFileWithDir(
+            gen_c_dir.path(b, "dcps.h"),
+            .header,
+            "dcps.h",
+        );
+        b.getInstallStep().dependOn(&install_dcps_h.step);
+
+        // Install zidl_cdr.h → zig-out/include/  (C users need it; dcps.h includes it)
+        const install_zidl_cdr_h = b.addInstallFileWithDir(
+            zidl_dep.path("packages/zidl-cdr/include/zidl_cdr.h"),
+            .header,
+            "zidl_cdr.h",
+        );
+        b.getInstallStep().dependOn(&install_zidl_cdr_h.step);
+
+        // Build libzzdds as a shared library exposing the C ABI surface.
+        const zzdds_lib = b.addLibrary(.{
+            .name = "zzdds",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "zidl_rt", .module = zidl_rt_mod },
+                    .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                    .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
+                },
+            }),
+        });
+        zzdds_lib.root_module.addOptions("build_options", build_options);
+        zzdds_lib.root_module.link_libc = true;
+        if (target.result.os.tag == .windows) {
+            zzdds_lib.root_module.linkSystemLibrary("ws2_32", .{});
+        }
+        b.installArtifact(zzdds_lib);
+    }
+
+    // ── C++ language binding ──────────────────────────────────────────────────
+
+    if (cpp_binding) {
+        const gen_dcps_cpp = b.addRunArtifact(zidl_exe);
+        gen_dcps_cpp.addArgs(&.{ "-b", "cpp", "--generate-interfaces", "-o" });
+        const gen_cpp_dir = gen_dcps_cpp.addOutputDirectoryArg("zzdds-cpp-binding");
+        if (xtypes) gen_dcps_cpp.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
+        gen_dcps_cpp.addFileArg(dcps_idl);
+
+        gen_only_step.dependOn(&gen_dcps_cpp.step);
+
+        const install_dcps_hpp = b.addInstallFileWithDir(
+            gen_cpp_dir.path(b, "dcps.hpp"),
+            .header,
+            "dcps.hpp",
+        );
+        b.getInstallStep().dependOn(&install_dcps_hpp.step);
+    }
+
+    // ── Java language binding ─────────────────────────────────────────────────
+
+    if (java_binding) {
+        const gen_dcps_java = b.addRunArtifact(zidl_exe);
+        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "-o" });
+        const gen_java_dir = gen_dcps_java.addOutputDirectoryArg("zzdds-java-binding");
+        if (xtypes) gen_dcps_java.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
+        gen_dcps_java.addFileArg(dcps_idl);
+
+        gen_only_step.dependOn(&gen_dcps_java.step);
+
+        // Install generated Java sources → zig-out/java/
+        const install_java = b.addInstallDirectory(.{
+            .source_dir = gen_java_dir,
+            .install_dir = .{ .custom = "java" },
+            .install_subdir = "",
+        });
+        b.getInstallStep().dependOn(&install_java.step);
+    }
 
     // ── Unit tests ────────────────────────────────────────────────────────────
 
@@ -287,6 +400,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/matched_status_test.zig",
         "test/dcps/sample_rejected_test.zig",
         "test/dcps/type_support_test.zig",
+        "test/c_abi/typesupport_test.zig",
         "test/dcps/entity_routing_test.zig",
         "test/dcps/wait_for_historical_test.zig",
         "test/dcps/waitset_test.zig",

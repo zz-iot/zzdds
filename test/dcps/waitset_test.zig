@@ -100,7 +100,7 @@ fn drNoop4(_: *anyopaque) DDS.InstanceHandle_t {
 fn drNoop5(_: *anyopaque, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask) DDS.ReadCondition {
     unreachable;
 }
-fn drNoop6(_: *anyopaque, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: []const u8, _: DDS.StringSeq) DDS.QueryCondition {
+fn drNoop6(_: *anyopaque, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: [*:0]const u8, _: ?*const DDS.StringSeq) DDS.QueryCondition {
     unreachable;
 }
 fn drNoop7(_: *anyopaque, _: DDS.ReadCondition) DDS.ReturnCode_t {
@@ -109,13 +109,13 @@ fn drNoop7(_: *anyopaque, _: DDS.ReadCondition) DDS.ReturnCode_t {
 fn drNoop8(_: *anyopaque) DDS.ReturnCode_t {
     unreachable;
 }
-fn drNoop9(_: *anyopaque, _: DDS.DataReaderQos) DDS.ReturnCode_t {
+fn drNoop9(_: *anyopaque, _: *const DDS.DataReaderQos) DDS.ReturnCode_t {
     unreachable;
 }
 fn drNoop10(_: *anyopaque, _: *DDS.DataReaderQos) DDS.ReturnCode_t {
     unreachable;
 }
-fn drNoop11(_: *anyopaque, _: DDS.DataReaderListener, _: DDS.StatusMask) DDS.ReturnCode_t {
+fn drNoop11(_: *anyopaque, _: ?*const DDS.DataReaderListener, _: DDS.StatusMask) DDS.ReturnCode_t {
     unreachable;
 }
 fn drNoop12(_: *anyopaque) DDS.DataReaderListener {
@@ -145,10 +145,10 @@ fn drNoop19(_: *anyopaque, _: *DDS.SubscriptionMatchedStatus) DDS.ReturnCode_t {
 fn drNoop20(_: *anyopaque, _: *DDS.SampleLostStatus) DDS.ReturnCode_t {
     unreachable;
 }
-fn drNoop21(_: *anyopaque, _: DDS.Duration_t) DDS.ReturnCode_t {
+fn drNoop21(_: *anyopaque, _: *const DDS.Duration_t) DDS.ReturnCode_t {
     unreachable;
 }
-fn drNoop22(_: *anyopaque, _: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+fn drNoop22(_: *anyopaque, _: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
     unreachable;
 }
 fn drNoop23(_: *anyopaque, _: *DDS.PublicationBuiltinTopicData, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
@@ -227,11 +227,13 @@ test "WakeupList: unregister removes the handler" {
     // Only ws2 should receive the notification; ws1 must not see it.
     _ = gc.toDDSGuardCondition().set_trigger_value(true);
 
-    var active: DDS.ConditionSeq = .empty;
-    defer active.deinit(a);
+    var active: DDS.ConditionSeq = .{};
+    defer if (active._release) {
+        if (active._buffer) |_b| a.free(_b[0..active._length]);
+    };
     const rc = dws2.wait(&active, DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 1), active.items.len);
+    try testing.expectEqual(@as(usize, 1), active._length);
 }
 
 test "WakeupList: register returns false when all slots are full" {
@@ -277,11 +279,13 @@ test "WaitSet: infinite-timeout wait woken by GuardCondition from thread" {
     const thr = try std.Thread.spawn(.{}, Trigger.run, .{dds_gc});
     defer thr.join();
 
-    var active: DDS.ConditionSeq = .empty;
-    defer active.deinit(a);
+    var active: DDS.ConditionSeq = .{};
+    defer if (active._release) {
+        if (active._buffer) |_b| a.free(_b[0..active._length]);
+    };
     const rc = dws.wait(&active, DURATION_INFINITE);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 1), active.items.len);
+    try testing.expectEqual(@as(usize, 1), active._length);
 }
 
 // ── WaitSet: condvar timedWaitNs timeout path (lines 174-176) ────────────────
@@ -296,13 +300,15 @@ test "WaitSet: timedWait expires inside condvar (not before entering it)" {
 
     _ = ws.toDDSWaitSet().attach_condition(gc.toCondition());
 
-    var active: DDS.ConditionSeq = .empty;
-    defer active.deinit(a);
+    var active: DDS.ConditionSeq = .{};
+    defer if (active._release) {
+        if (active._buffer) |_b| a.free(_b[0..active._length]);
+    };
     // 10ms timeout: condition never triggered, so condvar sleeps through the
     // deadline, exercising the timedWaitNs error-catch block.
     const rc = ws.toDDSWaitSet().wait(&active, DURATION_10MS);
     try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc);
-    try testing.expectEqual(@as(usize, 0), active.items.len);
+    try testing.expectEqual(@as(usize, 0), active._length);
 }
 
 // ── WaitSet: notified fast-path (lines 161-163) ──────────────────────────────
@@ -320,8 +326,10 @@ test "WaitSet: pre-set notified flag is consumed without sleeping" {
     // Force notified=true so the first cv_mu check hits the fast path.
     ws.notified = true;
 
-    var active: DDS.ConditionSeq = .empty;
-    defer active.deinit(a);
+    var active: DDS.ConditionSeq = .{};
+    defer if (active._release) {
+        if (active._buffer) |_b| a.free(_b[0..active._length]);
+    };
     // GC trigger is false; after the fast path reloops, the deadline (=now) is
     // reached and TIMEOUT is returned.
     const rc = ws.toDDSWaitSet().wait(&active, DURATION_ZERO);
@@ -343,11 +351,13 @@ test "WaitSet: attaching the same condition twice is idempotent" {
     _ = dws.attach_condition(cond);
     _ = dws.attach_condition(cond); // duplicate
 
-    var conditions: DDS.ConditionSeq = .empty;
-    defer conditions.deinit(a);
+    var conditions: DDS.ConditionSeq = .{};
+    defer if (conditions._release) {
+        if (conditions._buffer) |_b| a.free(_b[0..conditions._length]);
+    };
     _ = dws.get_conditions(&conditions);
     // Only one entry despite two attach calls.
-    try testing.expectEqual(@as(usize, 1), conditions.items.len);
+    try testing.expectEqual(@as(usize, 1), conditions._length);
 }
 
 // ── WaitSet: get_conditions ───────────────────────────────────────────────────
@@ -366,11 +376,13 @@ test "WaitSet: get_conditions returns all attached conditions" {
     _ = dws.attach_condition(gc1.toCondition());
     _ = dws.attach_condition(gc2.toCondition());
 
-    var conditions: DDS.ConditionSeq = .empty;
-    defer conditions.deinit(a);
+    var conditions: DDS.ConditionSeq = .{};
+    defer if (conditions._release) {
+        if (conditions._buffer) |_b| a.free(_b[0..conditions._length]);
+    };
     const rc = dws.get_conditions(&conditions);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 2), conditions.items.len);
+    try testing.expectEqual(@as(usize, 2), conditions._length);
 }
 
 // ── WaitSet: attach / detach for ReadCondition ────────────────────────────────
@@ -409,11 +421,13 @@ test "WaitSet: ReadCondition triggers when has_data returns true" {
 
     _ = ws.toDDSWaitSet().attach_condition(rc_impl.toCondition());
 
-    var active: DDS.ConditionSeq = .empty;
-    defer active.deinit(a);
+    var active: DDS.ConditionSeq = .{};
+    defer if (active._release) {
+        if (active._buffer) |_b| a.free(_b[0..active._length]);
+    };
     const rc = ws.toDDSWaitSet().wait(&active, DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 1), active.items.len);
+    try testing.expectEqual(@as(usize, 1), active._length);
 }
 
 // ── WaitSet: attach / detach for StatusCondition ──────────────────────────────
@@ -433,10 +447,12 @@ test "WaitSet: attach and detach StatusCondition" {
     _ = dws.detach_condition(cond);
 
     // After detach, get_conditions should be empty.
-    var conditions: DDS.ConditionSeq = .empty;
-    defer conditions.deinit(a);
+    var conditions: DDS.ConditionSeq = .{};
+    defer if (conditions._release) {
+        if (conditions._buffer) |_b| a.free(_b[0..conditions._length]);
+    };
     _ = dws.get_conditions(&conditions);
-    try testing.expectEqual(@as(usize, 0), conditions.items.len);
+    try testing.expectEqual(@as(usize, 0), conditions._length);
 }
 
 // ── WaitSet: detach not-found returns PRECONDITION_NOT_MET ───────────────────
@@ -563,7 +579,7 @@ test "QueryConditionImpl: empty expression init and deinit" {
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "",
-        DDS.StringSeq.empty,
+        DDS.StringSeq{},
         readerHasData,
         &g_reader_sentinel,
         readerAddNotify,
@@ -583,7 +599,7 @@ test "QueryConditionImpl: vtable accessors return constructed values" {
         DDS.NEW_VIEW_STATE,
         DDS.ALIVE_INSTANCE_STATE,
         "x = 1",
-        DDS.StringSeq.empty,
+        DDS.StringSeq{},
         readerHasData,
         &g_reader_sentinel,
         readerAddNotify,
@@ -615,7 +631,7 @@ test "QueryConditionImpl: get_trigger_value reflects has_data_fn" {
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "",
-        DDS.StringSeq.empty,
+        DDS.StringSeq{},
         readerHasData,
         &g_reader_sentinel,
         readerAddNotify,
@@ -636,10 +652,8 @@ test "QueryConditionImpl: get_query_parameters and set_query_parameters" {
     const a = testing.allocator;
     g_has_data = false;
 
-    var initial_params: DDS.StringSeq = .empty;
-    defer initial_params.deinit(a);
-    try initial_params.append(a, "hello");
-    try initial_params.append(a, "world");
+    var init_strs: [2][*:0]const u8 = .{ "hello", "world" };
+    const initial_params = DDS.StringSeq{ ._buffer = @ptrCast(&init_strs), ._length = 2, ._maximum = 2, ._release = false };
 
     const qc = try QueryConditionImpl.init(
         a,
@@ -658,32 +672,39 @@ test "QueryConditionImpl: get_query_parameters and set_query_parameters" {
 
     const dds_qc = qc.toDDSQueryCondition();
 
-    // Read back the initial parameters.  get_query_parameters returns owned
-    // copies; the caller must free each string before deinit-ing the seq.
-    var out_params: DDS.StringSeq = .empty;
-    defer {
-        for (out_params.items) |p| a.free(p);
-        out_params.deinit(a);
-    }
-    const rc_get = dds_qc.get_query_parameters(&out_params);
+    const freeStringSeq = struct {
+        fn f(seq: DDS.StringSeq, alloc: std.mem.Allocator) void {
+            if (!seq._release) return;
+            if (seq._buffer) |b| {
+                for (b[0..seq._length]) |p| {
+                    const s = std.mem.span(p);
+                    alloc.free(s.ptr[0 .. s.len + 1]);
+                }
+                alloc.free(b[0..seq._length]);
+            }
+        }
+    }.f;
+
+    // get_query_parameters returns owned duped strings (dupeZ: len+1 bytes each).
+    var out1 = DDS.StringSeq{};
+    const rc_get = dds_qc.get_query_parameters(&out1);
+    defer freeStringSeq(out1, a);
     try testing.expectEqual(DDS.RETCODE_OK, rc_get);
-    try testing.expectEqual(@as(usize, 2), out_params.items.len);
-    try testing.expectEqualStrings("hello", out_params.items[0]);
-    try testing.expectEqualStrings("world", out_params.items[1]);
+    try testing.expectEqual(@as(u32, 2), out1._length);
+    try testing.expectEqualStrings("hello", std.mem.span(out1._buffer.?[0]));
+    try testing.expectEqualStrings("world", std.mem.span(out1._buffer.?[1]));
 
     // Replace parameters.
-    var new_params: DDS.StringSeq = .empty;
-    defer new_params.deinit(a);
-    try new_params.append(a, "foo");
-    const rc_set = dds_qc.set_query_parameters(new_params);
+    var new_strs: [1][*:0]const u8 = .{"foo"};
+    const new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 1, ._maximum = 1, ._release = false };
+    const rc_set = dds_qc.set_query_parameters(&new_params);
     try testing.expectEqual(DDS.RETCODE_OK, rc_set);
 
-    // Free owned copies from the first get before re-using out_params.
-    for (out_params.items) |p| a.free(p);
-    out_params.clearRetainingCapacity();
-    _ = dds_qc.get_query_parameters(&out_params);
-    try testing.expectEqual(@as(usize, 1), out_params.items.len);
-    try testing.expectEqualStrings("foo", out_params.items[0]);
+    var out2 = DDS.StringSeq{};
+    _ = dds_qc.get_query_parameters(&out2);
+    defer freeStringSeq(out2, a);
+    try testing.expectEqual(@as(u32, 1), out2._length);
+    try testing.expectEqualStrings("foo", std.mem.span(out2._buffer.?[0]));
 }
 
 test "QueryConditionImpl: toCondition delegates to embedded ReadConditionImpl" {
@@ -697,7 +718,7 @@ test "QueryConditionImpl: toCondition delegates to embedded ReadConditionImpl" {
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "",
-        DDS.StringSeq.empty,
+        DDS.StringSeq{},
         readerHasData,
         &g_reader_sentinel,
         readerAddNotify,
@@ -721,7 +742,7 @@ test "QueryConditionImpl: deinit via DDS.QueryCondition vtable" {
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "y > 0",
-        DDS.StringSeq.empty,
+        DDS.StringSeq{},
         readerHasData,
         &g_reader_sentinel,
         readerAddNotify,
@@ -741,7 +762,7 @@ test "QueryConditionImpl: matchSample with simple field expression" {
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "x = 'hello'",
-        DDS.StringSeq.empty,
+        DDS.StringSeq{},
         readerHasData,
         &g_reader_sentinel,
         readerAddNotify,

@@ -84,19 +84,18 @@ fn runLoopback(
     }
 
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
-    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic_w = dp_w.vtable.create_topic(
-        dp_w.ptr,
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic(
         "LoopbackTopic",
         "LoopbackType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
-    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     // ── Reader participant ────────────────────────────────────────────────────
@@ -117,24 +116,22 @@ fn runLoopback(
     }
 
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic_r = dp_r.vtable.create_topic(
-        dp_r.ptr,
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic(
         "LoopbackTopic",
         "LoopbackType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
-    const dr = sub_r.vtable.create_datareader(
-        sub_r.ptr,
+    const dr = sub_r.create_datareader(
         topic_desc_r,
         dr_qos,
-        nil.nil_dr_listener,
+        null,
         0,
     );
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
@@ -256,19 +253,18 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     }
 
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
-    const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic_w = dp_w.vtable.create_topic(
-        dp_w.ptr,
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic(
         "IncompatTopic",
         "IncompatType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
-    const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, dw_qos, nil.nil_dw_listener, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
     const udp_r = try UdpTransport.init(alloc, .{ .participant_id = 9 }, 0, null);
@@ -288,24 +284,22 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     }
 
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
-    const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic_r = dp_r.vtable.create_topic(
-        dp_r.ptr,
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic(
         "IncompatTopic",
         "IncompatType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
-    const dr = sub_r.vtable.create_datareader(
-        sub_r.ptr,
+    const dr = sub_r.create_datareader(
         topic_desc_r,
         dr_qos,
-        nil.nil_dr_listener,
+        null,
         0,
     );
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));

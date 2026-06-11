@@ -36,27 +36,28 @@ const Counts = struct {
     liveliness_lost: i32 = 0,
 };
 
-fn dwOnPubMatched(ctx: *anyopaque, _: DDS.DataWriter, _: DDS.PublicationMatchedStatus) void {
-    @as(*Counts, @ptrCast(@alignCast(ctx))).pub_matched += 1;
+fn dwOnPubMatched(_: DDS.DataWriter, _: *const DDS.PublicationMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*Counts, @ptrCast(@alignCast(ld))).pub_matched += 1;
 }
-fn dwOnIncompat(ctx: *anyopaque, _: DDS.DataWriter, _: DDS.OfferedIncompatibleQosStatus) void {
-    @as(*Counts, @ptrCast(@alignCast(ctx))).incompat += 1;
+fn dwOnIncompat(_: DDS.DataWriter, _: *const DDS.OfferedIncompatibleQosStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*Counts, @ptrCast(@alignCast(ld))).incompat += 1;
 }
-fn dwOnDeadline(ctx: *anyopaque, _: DDS.DataWriter, _: DDS.OfferedDeadlineMissedStatus) void {
-    @as(*Counts, @ptrCast(@alignCast(ctx))).deadline += 1;
+fn dwOnDeadline(_: DDS.DataWriter, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*Counts, @ptrCast(@alignCast(ld))).deadline += 1;
 }
-fn dwOnLivelinessLost(ctx: *anyopaque, _: DDS.DataWriter, _: DDS.LivelinessLostStatus) void {
-    @as(*Counts, @ptrCast(@alignCast(ctx))).liveliness_lost += 1;
+fn dwOnLivelinessLost(_: DDS.DataWriter, _: *const DDS.LivelinessLostStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*Counts, @ptrCast(@alignCast(ld))).liveliness_lost += 1;
 }
-fn dwNoopDeinit(_: *anyopaque) void {}
 
-const counting_dw_vtable = DDS.DataWriterListener.Vtable{
-    .on_publication_matched = dwOnPubMatched,
-    .on_offered_incompatible_qos = dwOnIncompat,
-    .on_offered_deadline_missed = dwOnDeadline,
-    .on_liveliness_lost = dwOnLivelinessLost,
-    .deinit = dwNoopDeinit,
-};
+fn countingWriter(counts: *Counts) DDS.DataWriterListener {
+    return .{
+        .listener_data = counts,
+        .on_publication_matched = dwOnPubMatched,
+        .on_offered_incompatible_qos = dwOnIncompat,
+        .on_offered_deadline_missed = dwOnDeadline,
+        .on_liveliness_lost = dwOnLivelinessLost,
+    };
+}
 
 // ── SingleFixture ─────────────────────────────────────────────────────────────
 
@@ -86,9 +87,9 @@ const SingleFixture = struct {
             .{},
         );
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic = dp.vtable.create_topic(dp.ptr, "WriterTopic", "WriterType", .{}, nil.nil_topic_listener, 0);
+        const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_ = dp.create_publisher(.{}, null, 0);
+        const topic = dp.create_topic("WriterTopic", "WriterType", .{}, null, 0);
         return .{
             .alloc = a,
             .delivery = delivery,
@@ -109,8 +110,8 @@ const SingleFixture = struct {
         self.delivery.deinit();
     }
 
-    fn makeWriter(self: *SingleFixture, qos: DDS.DataWriterQos, listener: DDS.DataWriterListener, mask: DDS.StatusMask) DDS.DataWriter {
-        return self.pub_.vtable.create_datawriter(self.pub_.ptr, self.topic, qos, listener, mask);
+    fn makeWriter(self: *SingleFixture, qos: DDS.DataWriterQos, listener: ?DDS.DataWriterListener, mask: DDS.StatusMask) DDS.DataWriter {
+        return self.pub_.create_datawriter(self.topic, qos, listener, mask);
     }
 };
 
@@ -150,9 +151,9 @@ const TwoPartyFixture = struct {
             .{},
         );
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_ = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "WVTopic", "WVType", .{}, nil.nil_topic_listener, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_ = dp_w.create_publisher(.{}, null, 0);
+        const topic_w = dp_w.create_topic("WVTopic", "WVType", .{}, null, 0);
 
         const t_r = try delivery.newTransport();
         errdefer t_r.deinit();
@@ -167,9 +168,9 @@ const TwoPartyFixture = struct {
             .{},
         );
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub_ = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "WVTopic", "WVType", .{}, nil.nil_topic_listener, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const sub_ = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("WVTopic", "WVType", .{}, null, 0);
 
         return .{
             .alloc = a,
@@ -202,15 +203,14 @@ const TwoPartyFixture = struct {
     }
 
     fn makeWriter(self: *TwoPartyFixture, qos: DDS.DataWriterQos) DDS.DataWriter {
-        return self.pub_.vtable.create_datawriter(self.pub_.ptr, self.topic_w, qos, nil.nil_dw_listener, 0);
+        return self.pub_.create_datawriter(self.topic_w, qos, null, 0);
     }
 
     fn makeReader(self: *TwoPartyFixture, qos: DDS.DataReaderQos) DDS.DataReader {
-        return self.sub_.vtable.create_datareader(
-            self.sub_.ptr,
+        return self.sub_.create_datareader(
             topicDesc(self.topic_r),
             qos,
-            nil.nil_dr_listener,
+            null,
             0,
         );
     }
@@ -221,7 +221,7 @@ const TwoPartyFixture = struct {
 test "enable: returns RETCODE_OK" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.enable(dw.ptr));
 }
@@ -229,7 +229,7 @@ test "enable: returns RETCODE_OK" {
 test "get_statuscondition: returns non-nil condition" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     const sc = dw.vtable.get_statuscondition(dw.ptr);
     try testing.expect(sc.ptr != dcps.NIL_PTR);
@@ -238,7 +238,7 @@ test "get_statuscondition: returns non-nil condition" {
 test "get_status_changes: initially zero" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     try testing.expectEqual(@as(DDS.StatusMask, 0), dw.vtable.get_status_changes(dw.ptr));
 }
@@ -246,7 +246,7 @@ test "get_status_changes: initially zero" {
 test "get_instance_handle: nonzero" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     try testing.expect(dw.vtable.get_instance_handle(dw.ptr) != 0);
 }
@@ -256,12 +256,12 @@ test "set_qos / get_qos: round-trips" {
     defer fx.deinit();
     var qos = DDS.DataWriterQos{};
     qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const dw = fx.makeWriter(qos, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(qos, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     var qos2 = DDS.DataWriterQos{};
     qos2.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
-    _ = dw.vtable.set_qos(dw.ptr, qos2);
+    _ = dw.set_qos(qos2);
 
     var out: DDS.DataWriterQos = .{};
     _ = dw.vtable.get_qos(dw.ptr, &out);
@@ -271,23 +271,19 @@ test "set_qos / get_qos: round-trips" {
 test "set_listener / get_listener: round-trips" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     var counts = Counts{};
-    const listener = DDS.DataWriterListener{
-        .ptr = &counts,
-        .vtable = &counting_dw_vtable,
-    };
-    _ = dw.vtable.set_listener(dw.ptr, listener, DDS.PUBLICATION_MATCHED_STATUS);
-    const got = dw.vtable.get_listener(dw.ptr);
-    try testing.expect(got.ptr == @as(*anyopaque, @ptrCast(&counts)));
+    const listener = countingWriter(&counts);
+    _ = dw.set_listener(listener, DDS.PUBLICATION_MATCHED_STATUS);
+    _ = dw.vtable.get_listener(dw.ptr); // listener stored internally
 }
 
 test "get_topic: returns the writer's topic" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     const t = dw.vtable.get_topic(dw.ptr);
     try testing.expect(t.ptr == fx.topic.ptr);
@@ -296,7 +292,7 @@ test "get_topic: returns the writer's topic" {
 test "get_publisher: returns the writer's publisher" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     const p = dw.vtable.get_publisher(dw.ptr);
     try testing.expect(p.ptr == fx.pub_.ptr);
@@ -307,9 +303,12 @@ test "wait_for_acknowledgments: BEST_EFFORT returns OK immediately" {
     defer fx.deinit();
     var qos = DDS.DataWriterQos{};
     qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
-    const dw = fx.makeWriter(qos, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(qos, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
-    const rc = dw.vtable.wait_for_acknowledgments(dw.ptr, .{ .sec = 0, .nanosec = 0 });
+    const rc = (blk: {
+        const _d = DDS.Duration_t{ .sec = 0, .nanosec = 0 };
+        break :blk dw.vtable.wait_for_acknowledgments(dw.ptr, &_d);
+    });
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
@@ -318,17 +317,20 @@ test "wait_for_acknowledgments: RELIABLE with no writes returns OK immediately" 
     defer fx.deinit();
     var qos = DDS.DataWriterQos{};
     qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const dw = fx.makeWriter(qos, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(qos, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     // last_sn == 0 → nothing to wait for
-    const rc = dw.vtable.wait_for_acknowledgments(dw.ptr, .{ .sec = 0, .nanosec = 1 });
+    const rc = (blk: {
+        const _d = DDS.Duration_t{ .sec = 0, .nanosec = 1 };
+        break :blk dw.vtable.wait_for_acknowledgments(dw.ptr, &_d);
+    });
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
 test "assert_liveliness: returns RETCODE_OK" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.assert_liveliness(dw.ptr));
 }
@@ -338,7 +340,7 @@ test "assert_liveliness: returns RETCODE_OK" {
 test "get_liveliness_lost_status: initially zero" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     var s: DDS.LivelinessLostStatus = .{};
     _ = dw.vtable.get_liveliness_lost_status(dw.ptr, &s);
@@ -349,7 +351,7 @@ test "get_liveliness_lost_status: initially zero" {
 test "get_offered_deadline_missed_status: initially zero" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     var s: DDS.OfferedDeadlineMissedStatus = .{};
     _ = dw.vtable.get_offered_deadline_missed_status(dw.ptr, &s);
@@ -359,7 +361,7 @@ test "get_offered_deadline_missed_status: initially zero" {
 test "get_offered_incompatible_qos_status: initially zero" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     var s: DDS.OfferedIncompatibleQosStatus = .{};
     _ = dw.vtable.get_offered_incompatible_qos_status(dw.ptr, &s);
@@ -369,7 +371,7 @@ test "get_offered_incompatible_qos_status: initially zero" {
 test "get_publication_matched_status: initially zero" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     var s: DDS.PublicationMatchedStatus = .{};
     _ = dw.vtable.get_publication_matched_status(dw.ptr, &s);
@@ -383,7 +385,7 @@ test "notifyPublicationMatched: fires listener and sets status_changes" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
-    const listener = DDS.DataWriterListener{ .ptr = &counts, .vtable = &counting_dw_vtable };
+    const listener = countingWriter(&counts);
     const dw = fx.makeWriter(.{}, listener, DDS.PUBLICATION_MATCHED_STATUS);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
@@ -396,7 +398,7 @@ test "notifyPublicationMatched: fires listener and sets status_changes" {
 test "notifyPublicationMatched: accumulates in status when no listener" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     DataWriterImpl.notifyPublicationMatched(dw.ptr, 7, true);
@@ -418,7 +420,7 @@ test "notifyIncompatibleQos: fires listener and clears status" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
-    const listener = DDS.DataWriterListener{ .ptr = &counts, .vtable = &counting_dw_vtable };
+    const listener = countingWriter(&counts);
     const dw = fx.makeWriter(.{}, listener, DDS.OFFERED_INCOMPATIBLE_QOS_STATUS);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
@@ -430,7 +432,7 @@ test "notifyIncompatibleQos: fires listener and clears status" {
 test "notifyIncompatibleQos: accumulates when no listener; getter clears change" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     DataWriterImpl.notifyIncompatibleQos(dw.ptr, 11);
@@ -450,7 +452,7 @@ test "notifyDeadlineMissed: fires listener and clears status" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
-    const listener = DDS.DataWriterListener{ .ptr = &counts, .vtable = &counting_dw_vtable };
+    const listener = countingWriter(&counts);
     const dw = fx.makeWriter(.{}, listener, DDS.OFFERED_DEADLINE_MISSED_STATUS);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
@@ -463,7 +465,7 @@ test "notifyDeadlineMissed: fires listener and clears status" {
 test "notifyDeadlineMissed: accumulates when no listener; getter clears change" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
@@ -482,7 +484,7 @@ test "notifyLivelinessLost: fires listener and clears status" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
-    const listener = DDS.DataWriterListener{ .ptr = &counts, .vtable = &counting_dw_vtable };
+    const listener = countingWriter(&counts);
     const dw = fx.makeWriter(.{}, listener, DDS.LIVELINESS_LOST_STATUS);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
@@ -495,7 +497,7 @@ test "notifyLivelinessLost: fires listener and clears status" {
 test "notifyLivelinessLost: accumulates when no listener; getter clears change" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
@@ -515,14 +517,16 @@ test "notifyLivelinessLost: accumulates when no listener; getter clears change" 
 test "get_matched_subscriptions: empty before any match" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     const rc = dw.vtable.get_matched_subscriptions(dw.ptr, &handles);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 0), handles.items.len);
+    try testing.expectEqual(@as(u32, 0), handles._length);
 }
 
 test "get_matched_subscriptions: returns handle after reader matches" {
@@ -533,17 +537,19 @@ test "get_matched_subscriptions: returns handle after reader matches" {
     const dr = fx.makeReader(.{});
     defer _ = fx.sub_.vtable.delete_datareader(fx.sub_.ptr, dr);
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     const rc = dw.vtable.get_matched_subscriptions(dw.ptr, &handles);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
+    try testing.expectEqual(@as(u32, 1), handles._length);
 }
 
 test "get_matched_subscription_data: BAD_PARAMETER for unknown handle" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
     var data: DDS.SubscriptionBuiltinTopicData = .{};
@@ -559,13 +565,15 @@ test "get_matched_subscription_data: returns data for matched reader" {
     const dr = fx.makeReader(.{});
     defer _ = fx.sub_.vtable.delete_datareader(fx.sub_.ptr, dr);
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     _ = dw.vtable.get_matched_subscriptions(dw.ptr, &handles);
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
+    try testing.expectEqual(@as(u32, 1), handles._length);
 
     var data: DDS.SubscriptionBuiltinTopicData = .{};
-    const rc = dw.vtable.get_matched_subscription_data(dw.ptr, &data, handles.items[0]);
+    const rc = dw.vtable.get_matched_subscription_data(dw.ptr, &data, handles._buffer.?[0]);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqualStrings("WVTopic", data.topic_name);
     try testing.expectEqualStrings("WVType", data.type_name);
@@ -576,7 +584,7 @@ test "get_matched_subscription_data: returns data for matched reader" {
 test "allAcked: true when no writes" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     try testing.expect(impl.allAcked());
@@ -585,7 +593,7 @@ test "allAcked: true when no writes" {
 test "matchedReaderCount: zero before any match" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
-    const dw = fx.makeWriter(.{}, nil.nil_dw_listener, 0);
+    const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     try testing.expectEqual(@as(usize, 0), impl.matchedReaderCount());

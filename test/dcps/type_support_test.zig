@@ -43,14 +43,14 @@ fn pendingCount(dr: *DataReaderImpl) usize {
 }
 
 /// TypeSupport that uses payload byte [4] as the entire key discriminator.
-fn testKeyHash(payload: []const u8) [16]u8 {
+fn testKeyHash(_: *anyopaque, payload: []const u8) [16]u8 {
     var h = std.mem.zeroes([16]u8);
     if (payload.len > 4) h[0] = payload[4];
     return h;
 }
 
 /// TypeSupport that always returns the same hash regardless of payload.
-fn constKeyHash(_: []const u8) [16]u8 {
+fn constKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
     var h = std.mem.zeroes([16]u8);
     h[0] = 0xAA;
     return h;
@@ -103,9 +103,9 @@ const Fixture = struct {
             .{},
         );
         errdefer factory_a.deinit();
-        const dp_a = factory_a.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_a = dp_a.vtable.create_publisher(dp_a.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_a = dp_a.vtable.create_topic(dp_a.ptr, "TSTopic", "TSType", .{}, nil.nil_topic_listener, 0);
+        const dp_a = factory_a.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_a = dp_a.create_publisher(.{}, null, 0);
+        const topic_a = dp_a.create_topic("TSTopic", "TSType", .{}, null, 0);
 
         const t_b = try delivery.newTransport();
         errdefer t_b.deinit();
@@ -120,9 +120,9 @@ const Fixture = struct {
             .{},
         );
         errdefer factory_b.deinit();
-        const dp_b = factory_b.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_b = dp_b.vtable.create_publisher(dp_b.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_b = dp_b.vtable.create_topic(dp_b.ptr, "TSTopic", "TSType", .{}, nil.nil_topic_listener, 0);
+        const dp_b = factory_b.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_b = dp_b.create_publisher(.{}, null, 0);
+        const topic_b = dp_b.create_topic("TSTopic", "TSType", .{}, null, 0);
 
         const t_r = try delivery.newTransport();
         errdefer t_r.deinit();
@@ -137,9 +137,9 @@ const Fixture = struct {
             .{},
         );
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "TSTopic", "TSType", .{}, nil.nil_topic_listener, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const sub_r = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("TSTopic", "TSType", .{}, null, 0);
 
         return .{
             .alloc = alloc,
@@ -187,18 +187,18 @@ const Fixture = struct {
     }
 
     fn makeWriterA(self: *Fixture, qos: DDS.DataWriterQos) *DataWriterImpl {
-        const dw = self.pub_a.vtable.create_datawriter(self.pub_a.ptr, self.topic_a, qos, nil.nil_dw_listener, 0);
+        const dw = self.pub_a.create_datawriter(self.topic_a, qos, null, 0);
         return @ptrCast(@alignCast(dw.ptr));
     }
 
     fn makeWriterB(self: *Fixture, qos: DDS.DataWriterQos) *DataWriterImpl {
-        const dw = self.pub_b.vtable.create_datawriter(self.pub_b.ptr, self.topic_b, qos, nil.nil_dw_listener, 0);
+        const dw = self.pub_b.create_datawriter(self.topic_b, qos, null, 0);
         return @ptrCast(@alignCast(dw.ptr));
     }
 
     fn makeReader(self: *Fixture, qos: DDS.DataReaderQos) *DataReaderImpl {
         const td = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
-        const dr = self.sub_r.vtable.create_datareader(self.sub_r.ptr, td, qos, nil.nil_dr_listener, 0);
+        const dr = self.sub_r.create_datareader(td, qos, null, 0);
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
@@ -226,7 +226,7 @@ test "TypeSupport: registerTypeSupport stores callback" {
     const dp_impl = fx.dpImpl(fx.dp_r);
     try testing.expect(dp_impl.type_support_registry.get("TSType") == null);
 
-    dp_impl.registerTypeSupport("TSType", .{ .compute_key_hash = testKeyHash });
+    dp_impl.registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
     try testing.expect(dp_impl.type_support_registry.get("TSType") != null);
 }
 
@@ -235,7 +235,7 @@ test "TypeSupport: key_hash_fn set on reader when registered before reader creat
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .compute_key_hash = testKeyHash });
+    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
     _ = fx.makeReader(.{});
 
     const dp_impl = fx.dpImpl(fx.dp_r);
@@ -256,7 +256,7 @@ test "TypeSupport: reader created before registration has no key_hash_fn" {
 
     _ = fx.makeReader(.{});
     // Register after reader creation — should not retroactively set key_hash_fn.
-    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .compute_key_hash = testKeyHash });
+    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
 
     const dp_impl = fx.dpImpl(fx.dp_r);
     dp_impl.mu.lock();
@@ -298,7 +298,7 @@ test "TypeSupport: with TypeSupport, EXCLUSIVE ownership is per-instance (Owners
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .compute_key_hash = testKeyHash });
+    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
 
     const dw_a = fx.makeWriterA(exclusiveDwQos(10));
     const dw_b = fx.makeWriterB(exclusiveDwQos(5));
@@ -320,7 +320,7 @@ test "TypeSupport: non-nil inline key_hash takes precedence over TypeSupport" {
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .compute_key_hash = constKeyHash });
+    fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = constKeyHash });
 
     const dw_a = fx.makeWriterA(exclusiveDwQos(10));
     const dw_b = fx.makeWriterB(exclusiveDwQos(5));

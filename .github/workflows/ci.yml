@@ -122,6 +122,7 @@ jobs:
       - name: Install kcov build and runtime dependencies
         if: steps.cache-kcov.outputs.cache-hit != 'true'
         run: |
+          sudo apt-get update -qq
           sudo apt-get install -y \
             binutils-dev libdw-dev libcurl4-openssl-dev \
             zlib1g-dev libiberty-dev cmake libcurl4

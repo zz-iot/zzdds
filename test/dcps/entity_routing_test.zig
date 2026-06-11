@@ -287,7 +287,7 @@ const Fixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
         const dp_w_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_w.ptr));
 
         const t_r = try delivery.newTransport();
@@ -296,11 +296,11 @@ const Fixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
         const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
 
-        const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "RouteTopic", "RouteType", .{}, nil.nil_topic_listener, 0);
+        const sub_r = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("RouteTopic", "RouteType", .{}, null, 0);
 
         const injector = try delivery.newTransport();
         errdefer injector.deinit();
@@ -340,9 +340,9 @@ const Fixture = struct {
     /// Create a DataWriter on the writer side for a given topic (used only to trigger
     /// onWriterDiscovered on the reader side so the reader has a matched writer).
     fn makeWriter(self: *Fixture) *DataWriterImpl {
-        const pub_w = self.dp_w.vtable.create_publisher(self.dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_w = self.dp_w.vtable.create_topic(self.dp_w.ptr, "RouteTopic", "RouteType", .{}, nil.nil_topic_listener, 0);
-        const dw = pub_w.vtable.create_datawriter(pub_w.ptr, topic_w, .{}, nil.nil_dw_listener, 0);
+        const pub_w = self.dp_w.create_publisher(.{}, null, 0);
+        const topic_w = self.dp_w.create_topic("RouteTopic", "RouteType", .{}, null, 0);
+        const dw = pub_w.create_datawriter(topic_w, .{}, null, 0);
         return @as(*DataWriterImpl, @ptrCast(@alignCast(dw.ptr)));
     }
 
@@ -351,7 +351,7 @@ const Fixture = struct {
         const td = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         var qos = DDS.DataReaderQos{};
         qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
-        const dr = self.sub_r.vtable.create_datareader(self.sub_r.ptr, td, qos, nil.nil_dr_listener, 0);
+        const dr = self.sub_r.create_datareader(td, qos, null, 0);
         return @as(*DataReaderImpl, @ptrCast(@alignCast(dr.ptr)));
     }
 
