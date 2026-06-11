@@ -214,7 +214,6 @@ pub export fn zzdds_take_one_raw(
     defer impl.alloc.free(s.data);
     cdr_len_out.* = s.data.len;
     if (s.data.len > buf_size) return -1;
-    cdr_len_out.* = s.data.len;
     @memcpy(cdr_buf[0..s.data.len], s.data);
     info_out.* = .{
         .valid_data = s.info.valid_data,
@@ -244,7 +243,6 @@ pub export fn zzdds_take_one_raw_instance(
     defer impl.alloc.free(s.data);
     cdr_len_out.* = s.data.len;
     if (s.data.len > buf_size) return -1;
-    cdr_len_out.* = s.data.len;
     @memcpy(cdr_buf[0..s.data.len], s.data);
     info_out.* = .{
         .valid_data = s.info.valid_data,
