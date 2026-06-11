@@ -1737,7 +1737,13 @@ pub const DomainParticipantImpl = struct {
     fn dupePartitionNames(alloc: std.mem.Allocator, names: []const []const u8) []const []const u8 {
         if (names.len == 0) return &.{};
         const copy = alloc.alloc([]const u8, names.len) catch return &.{};
-        for (copy, names) |*dst, src| dst.* = alloc.dupe(u8, src) catch src;
+        for (copy, names, 0..) |*dst, src, i| {
+            dst.* = alloc.dupe(u8, src) catch {
+                for (copy[0..i]) |s| alloc.free(s);
+                alloc.free(copy);
+                return &.{};
+            };
+        }
         return copy;
     }
 
@@ -1780,7 +1786,7 @@ pub const DomainParticipantImpl = struct {
         const ann = ann_opt orelse return;
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
         var snap = writerQosSnapshot(ann.qos, ann.presentation);
-        snap.partition_names = partition_names;
+        snap.partition_names = owned_names;
         self.discovery.announceWriter(&disc.WriterAnnouncement{
             .guid = ann.guid,
             .participant_guid = self.guid,
@@ -1825,7 +1831,7 @@ pub const DomainParticipantImpl = struct {
         const ann = ann_opt orelse return;
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
         var snap = readerQosSnapshot(ann.qos, ann.presentation);
-        snap.partition_names = partition_names;
+        snap.partition_names = owned_names;
         self.discovery.announceReader(&disc.ReaderAnnouncement{
             .guid = ann.guid,
             .participant_guid = self.guid,
