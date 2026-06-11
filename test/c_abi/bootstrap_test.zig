@@ -176,6 +176,8 @@ test "bootstrap: take_one_raw returns -1 when buffer too small" {
     var info: bootstrap.CSampleInfo = undefined;
     const n = bootstrap.zzdds_take_one_raw(pair.dr, &tiny, tiny.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, -1), n);
+    // cdr_len_out must be set even on failure so the caller can retry with a larger buffer.
+    try testing.expectEqual(PAYLOAD.len, cdr_len);
 }
 
 // ── take_one_raw_instance ─────────────────────────────────────────────────────

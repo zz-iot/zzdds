@@ -266,7 +266,7 @@ pub const SubscriberImpl = struct {
         }
         // Convert partition name StringSeq (C extern struct) to []const []const u8 for announce_reader.
         const pname_seq = &self.qos.partition.name;
-        const pname_count = pname_seq._length;
+        const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
         var pname_buf: [64][]const u8 = undefined;
         const pname_slice = pname_buf[0..@min(pname_count, pname_buf.len)];
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {

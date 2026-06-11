@@ -208,6 +208,7 @@ pub export fn zzdds_take_one_raw(
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const s = impl.takeRaw() orelse return 0;
     defer impl.alloc.free(s.data);
+    cdr_len_out.* = s.data.len;
     if (s.data.len > buf_size) return -1;
     cdr_len_out.* = s.data.len;
     @memcpy(cdr_buf[0..s.data.len], s.data);
@@ -233,6 +234,7 @@ pub export fn zzdds_take_one_raw_instance(
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const s = impl.takeNextInstanceRaw(prev_instance_handle) orelse return 0;
     defer impl.alloc.free(s.data);
+    cdr_len_out.* = s.data.len;
     if (s.data.len > buf_size) return -1;
     cdr_len_out.* = s.data.len;
     @memcpy(cdr_buf[0..s.data.len], s.data);
