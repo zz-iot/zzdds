@@ -45,13 +45,19 @@ pub const TopicImpl = struct {
     ) !*Self {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
+        const tn = try alloc.dupeZ(u8, topic_name);
+        errdefer alloc.free(tn);
+        const tt = try alloc.dupeZ(u8, type_name);
+        errdefer alloc.free(tt);
+        var qos_clone = try qos.clone(alloc);
+        errdefer qos_clone.deinit(alloc);
         self.* = .{
             .alloc = alloc,
-            .topic_name = try alloc.dupeZ(u8, topic_name),
-            .type_name = try alloc.dupeZ(u8, type_name),
+            .topic_name = tn,
+            .type_name = tt,
             .participant_ptr = participant_ptr,
             .get_participant_fn = get_participant_fn,
-            .qos = try qos.clone(alloc),
+            .qos = qos_clone,
             .listener = listener,
             .listener_mask = mask,
             .instance_handle = instance_handle,
