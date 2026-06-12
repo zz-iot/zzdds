@@ -169,6 +169,7 @@ pub export fn zzdds_destroy_participant(dp: DDS.DomainParticipant) callconv(.c) 
 /// Topic's impl pointer to the TopicDescription interface using the dedicated
 /// TopicImpl.toTopicDescription() method.
 pub export fn zzdds_topic_as_description(topic: DDS.Topic) callconv(.c) DDS.TopicDescription {
+    if (nil.isNil(topic)) return std.mem.zeroes(DDS.TopicDescription);
     const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
     return impl.toTopicDescription();
 }
@@ -183,6 +184,7 @@ pub export fn zzdds_write_raw(
     data: [*]const u8,
     data_len: usize,
 ) callconv(.c) DDS.ReturnCode_t {
+    if (nil.isNil(writer)) return 1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
     _ = impl.writeRaw(
         .alive,
@@ -210,6 +212,7 @@ pub export fn zzdds_take_one_raw(
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
+    if (nil.isNil(reader)) return -2;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const s = impl.takeRaw() orelse return 0;
     defer impl.alloc.free(s.data);
@@ -239,6 +242,7 @@ pub export fn zzdds_take_one_raw_instance(
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
+    if (nil.isNil(reader)) return -2;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const s = impl.takeNextInstanceRaw(prev_instance_handle) orelse return 0;
     defer impl.alloc.free(s.data);

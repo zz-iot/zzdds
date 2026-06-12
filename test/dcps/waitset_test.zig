@@ -781,3 +781,106 @@ test "QueryConditionImpl: matchSample with simple field expression" {
 
     try testing.expect(qc.matchSample("ignored", GetField.get));
 }
+
+// ── Prior-buffer-free paths ───────────────────────────────────────────────────
+
+test "WaitSet: get_conditions frees prior _release buffer on second call" {
+    // Exercises the if (seq._release) free block in vtGetConditions.
+    const a = testing.allocator;
+
+    const gc1 = try GuardConditionImpl.init(a);
+    defer gc1.deinit();
+    const gc2 = try GuardConditionImpl.init(a);
+    defer gc2.deinit();
+    const ws = try WaitSetImpl.init(a);
+    defer ws.deinit();
+    const dws = ws.toDDSWaitSet();
+    _ = dws.attach_condition(gc1.toCondition());
+    _ = dws.attach_condition(gc2.toCondition());
+
+    // First call — allocates a buffer and sets _release=true.
+    var seq: DDS.ConditionSeq = .{};
+    _ = dws.get_conditions(&seq);
+    try testing.expect(seq._release);
+    try testing.expectEqual(@as(u32, 2), seq._length);
+
+    // Second call with the same output var — vtGetConditions must free the
+    // first buffer before allocating a new one (leak detector catches if not).
+    _ = dws.get_conditions(&seq);
+    try testing.expectEqual(@as(u32, 2), seq._length);
+
+    // Clean up the second buffer.
+    if (seq._buffer) |b| a.free(b[0..seq._maximum]);
+}
+
+test "WaitSet: vtWait with two pre-triggered conditions returns both" {
+    // Exercises the grow-by-one loop in vtWait for n > 1.
+    const a = testing.allocator;
+
+    const gc1 = try GuardConditionImpl.init(a);
+    defer gc1.deinit();
+    const gc2 = try GuardConditionImpl.init(a);
+    defer gc2.deinit();
+    _ = gc1.toDDSGuardCondition().set_trigger_value(true);
+    _ = gc2.toDDSGuardCondition().set_trigger_value(true);
+
+    const ws = try WaitSetImpl.init(a);
+    defer ws.deinit();
+    _ = ws.toDDSWaitSet().attach_condition(gc1.toCondition());
+    _ = ws.toDDSWaitSet().attach_condition(gc2.toCondition());
+
+    var active: DDS.ConditionSeq = .{};
+    defer if (active._release) {
+        if (active._buffer) |b| a.free(b[0..active._maximum]);
+    };
+    const rc = ws.toDDSWaitSet().wait(&active, DURATION_ZERO);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(@as(u32, 2), active._length);
+}
+
+test "QueryConditionImpl: get_query_parameters frees prior _release buffer on second call" {
+    // Exercises the if (seq._release) free block in vtGetParams.
+    const a = testing.allocator;
+    g_has_data = false;
+
+    var init_strs: [1][*:0]const u8 = .{"alpha"};
+    const init_seq = DDS.StringSeq{ ._buffer = @ptrCast(&init_strs), ._length = 1, ._maximum = 1, ._release = false };
+
+    const qc = try QueryConditionImpl.init(
+        a,
+        stubDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "",
+        init_seq,
+        readerHasData,
+        &g_reader_sentinel,
+        readerAddNotify,
+        readerRemoveNotify,
+    );
+    defer qc.deinit();
+    const dds_qc = qc.toDDSQueryCondition();
+
+    const freeStringSeq = struct {
+        fn f(seq: DDS.StringSeq, alloc: std.mem.Allocator) void {
+            if (!seq._release) return;
+            if (seq._buffer) |b| {
+                for (b[0..seq._length]) |p| alloc.free(std.mem.span(p).ptr[0 .. std.mem.span(p).len + 1]);
+                alloc.free(b[0..seq._maximum]);
+            }
+        }
+    }.f;
+
+    // First call — allocates owned strings, sets _release=true.
+    var out: DDS.StringSeq = .{};
+    _ = dds_qc.get_query_parameters(&out);
+    try testing.expect(out._release);
+
+    // Second call with the same output var — vtGetParams must free the first
+    // buffer before allocating the second (leak detector catches if not).
+    _ = dds_qc.get_query_parameters(&out);
+    try testing.expectEqual(@as(u32, 1), out._length);
+
+    defer freeStringSeq(out, a);
+}
