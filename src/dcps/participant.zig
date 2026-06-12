@@ -879,13 +879,15 @@ pub const DomainParticipantImpl = struct {
     /// Call before creating DataReaders for the type.  The caller must ensure
     /// `type_name` remains valid for the lifetime of the participant.
     pub fn registerTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) bool {
-        if (self.type_support_registry.get(type_name)) |old| {
-            if (old.deinit) |f| f(old.ctx);
-        }
+        // Snapshot the old entry BEFORE put so we only free it after the map
+        // update succeeds.  Freeing before put would leave a dangling pointer in
+        // the map if put fails (OOM on a new key).
+        const old = self.type_support_registry.get(type_name);
         self.type_support_registry.put(self.alloc, type_name, ts) catch {
             if (ts.deinit) |f| f(ts.ctx);
             return false;
         };
+        if (old) |o| if (o.deinit) |f| f(o.ctx);
         return true;
     }
 
