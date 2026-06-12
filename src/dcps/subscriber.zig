@@ -429,7 +429,16 @@ pub const SubscriberImpl = struct {
                 // Block if any reader has incomplete WIP from any writer — delivering
                 // a committed set while another writer's contribution is still in
                 // transit would violate GROUP atomicity.
-                if (r.coherent_wip.count() > 0) all_ready = false;
+                if (r.coherent_wip.count() > 0) {
+                    all_ready = false;
+                } else if (!r.coherent_committed_ready and r.sub_matched_current > 0) {
+                    // Reader has matched writer(s) but no committed set yet — first
+                    // samples of this coherent set haven't arrived yet (wip is empty
+                    // because no sample with coherent_set_sn has been received).
+                    // For multi-topic coherent sets this prevents committing 2-of-3
+                    // topics when the third topic's data is still in transit.
+                    all_ready = false;
+                }
                 if (r.coherent_committed_ready) any_committed = true;
                 r.mu.unlock();
             }
