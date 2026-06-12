@@ -598,3 +598,45 @@ test "matchedReaderCount: zero before any match" {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
     try testing.expectEqual(@as(usize, 0), impl.matchedReaderCount());
 }
+
+test "DataWriter: set_qos with user_data — clone survives replacement" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+
+    var d1 = [_]u8{0xAA};
+    var q1 = DDS.DataWriterQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &q1));
+
+    var d2 = [_]u8{0xBB};
+    var q2 = DDS.DataWriterQos{};
+    q2.user_data.value = .{ ._buffer = &d2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.set_qos(dw.ptr, &q2));
+
+    var got = DDS.DataWriterQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.get_qos(dw.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(alloc);
+}
+
+test "DataWriter: get_qos returns independent clone — replacement does not dangle" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+
+    var d1 = [_]u8{0xCC};
+    var q1 = DDS.DataWriterQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    _ = dw.vtable.set_qos(dw.ptr, &q1);
+
+    var got = DDS.DataWriterQos{};
+    _ = dw.vtable.get_qos(dw.ptr, &got);
+
+    _ = dw.vtable.set_qos(dw.ptr, &DDS.DataWriterQos{});
+
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(alloc);
+}

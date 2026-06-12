@@ -543,3 +543,78 @@ test "cft: set_expression_parameters updates params" {
     try testing.expectEqual(@as(usize, 1), cft.expr_params.items.len);
     try testing.expectEqualStrings("99", cft.expr_params.items[0]);
 }
+
+test "cft: set_expression_parameters OOM mid-loop preserves old params" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const cft_dds = fx.dp_r.create_contentfilteredtopic(
+        "CftOomParams",
+        fx.topic_r,
+        "value = %0 AND value = %1",
+        &DDS.StringSeq{},
+    );
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
+
+    // Establish initial params so there's something to preserve.
+    var p0_strs = [1][*:0]const u8{"42"};
+    var p0 = DDS.StringSeq{ ._buffer = @ptrCast(&p0_strs), ._length = 1, ._maximum = 1, ._release = false };
+    _ = cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &p0);
+
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
+    try testing.expectEqual(@as(usize, 1), cft_impl.expr_params.items.len);
+
+    // Inject a FailingAllocator: fail_index=0 fails the very first dupe in the loop,
+    // exercising the path where no tmp allocations succeeded yet.
+    var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const saved_alloc = cft_impl.alloc;
+    cft_impl.alloc = fa.allocator();
+
+    var new_strs = [2][*:0]const u8{ "new_x", "new_y" };
+    var new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 2, ._maximum = 2, ._release = false };
+    const rc = cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &new_params);
+
+    cft_impl.alloc = saved_alloc; // restore before deinit
+
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
+    // Old params must be intact.
+    try testing.expectEqual(@as(usize, 1), cft_impl.expr_params.items.len);
+    try testing.expectEqualStrings("42", cft_impl.expr_params.items[0]);
+}
+
+test "cft: set_expression_parameters OOM after first string duped preserves old params" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const cft_dds = fx.dp_r.create_contentfilteredtopic(
+        "CftOomMid",
+        fx.topic_r,
+        "value = %0 AND value = %1",
+        &DDS.StringSeq{},
+    );
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
+
+    var p0_strs = [1][*:0]const u8{"99"};
+    var p0 = DDS.StringSeq{ ._buffer = @ptrCast(&p0_strs), ._length = 1, ._maximum = 1, ._release = false };
+    _ = cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &p0);
+
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
+
+    // fail_index=2: first dupe (alloc 0) and first append's capacity alloc (alloc 1) succeed,
+    // second dupe (alloc 2) fails — exercises mid-loop cleanup of the partial tmp list.
+    var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
+    const saved_alloc = cft_impl.alloc;
+    cft_impl.alloc = fa.allocator();
+
+    var new_strs = [2][*:0]const u8{ "new_a", "new_b" };
+    var new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 2, ._maximum = 2, ._release = false };
+    const rc = cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &new_params);
+
+    cft_impl.alloc = saved_alloc;
+
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
+    try testing.expectEqual(@as(usize, 1), cft_impl.expr_params.items.len);
+    try testing.expectEqualStrings("99", cft_impl.expr_params.items[0]);
+}

@@ -884,3 +884,81 @@ test "QueryConditionImpl: get_query_parameters frees prior _release buffer on se
 
     defer freeStringSeq(out, a);
 }
+
+test "QueryConditionImpl: set_query_parameters OOM at first alloc preserves old params" {
+    const a = testing.allocator;
+    const qc = try QueryConditionImpl.init(
+        a,
+        stubDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "x = %0",
+        DDS.StringSeq{},
+        readerHasData,
+        &g_reader_sentinel,
+        readerAddNotify,
+        readerRemoveNotify,
+    );
+    defer qc.deinit();
+    const dds_qc = qc.toDDSQueryCondition();
+
+    // Establish initial params.
+    var p0_strs = [1][*:0]const u8{"7"};
+    var p0 = DDS.StringSeq{ ._buffer = @ptrCast(&p0_strs), ._length = 1, ._maximum = 1, ._release = false };
+    _ = dds_qc.vtable.set_query_parameters(dds_qc.ptr, &p0);
+    try testing.expectEqual(@as(usize, 1), qc.query_parameters.items.len);
+
+    // Fail on alloc 0 (first dupe) — tmp stays empty, OOM returned immediately.
+    var fa = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const saved = qc.alloc;
+    qc.alloc = fa.allocator();
+
+    var new_strs = [2][*:0]const u8{ "p1", "p2" };
+    var new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 2, ._maximum = 2, ._release = false };
+    const rc = dds_qc.vtable.set_query_parameters(dds_qc.ptr, &new_params);
+
+    qc.alloc = saved;
+
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
+    try testing.expectEqual(@as(usize, 1), qc.query_parameters.items.len);
+    try testing.expectEqualStrings("7", qc.query_parameters.items[0]);
+}
+
+test "QueryConditionImpl: set_query_parameters OOM mid-loop preserves old params" {
+    const a = testing.allocator;
+    const qc = try QueryConditionImpl.init(
+        a,
+        stubDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        "x = %0",
+        DDS.StringSeq{},
+        readerHasData,
+        &g_reader_sentinel,
+        readerAddNotify,
+        readerRemoveNotify,
+    );
+    defer qc.deinit();
+    const dds_qc = qc.toDDSQueryCondition();
+
+    var p0_strs = [1][*:0]const u8{"5"};
+    var p0 = DDS.StringSeq{ ._buffer = @ptrCast(&p0_strs), ._length = 1, ._maximum = 1, ._release = false };
+    _ = dds_qc.vtable.set_query_parameters(dds_qc.ptr, &p0);
+
+    // fail_index=2: first dupe+append succeed, second dupe fails.
+    var fa = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
+    const saved = qc.alloc;
+    qc.alloc = fa.allocator();
+
+    var new_strs = [2][*:0]const u8{ "q1", "q2" };
+    var new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 2, ._maximum = 2, ._release = false };
+    const rc = dds_qc.vtable.set_query_parameters(dds_qc.ptr, &new_params);
+
+    qc.alloc = saved;
+
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
+    try testing.expectEqual(@as(usize, 1), qc.query_parameters.items.len);
+    try testing.expectEqualStrings("5", qc.query_parameters.items[0]);
+}

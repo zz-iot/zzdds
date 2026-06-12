@@ -505,3 +505,124 @@ test "Subscriber: copy_from_topic_qos copies relevant fields" {
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }
+
+// ── Heap-QoS round-trip tests ─────────────────────────────────────────────────
+
+test "Publisher: set_qos with partition names — clone survives replacement" {
+    var h = try Harness.init(0xB0);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var n1 = [1][*:0]const u8{"pub_part_x"};
+    var q1 = DDS.PublisherQos{};
+    q1.partition.name = .{ ._buffer = &n1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.set_qos(pub_.ptr, &q1));
+
+    var n2 = [1][*:0]const u8{"pub_part_y"};
+    var q2 = DDS.PublisherQos{};
+    q2.partition.name = .{ ._buffer = &n2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.set_qos(pub_.ptr, &q2));
+
+    var got = DDS.PublisherQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.get_qos(pub_.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.partition.name._length);
+    got.deinit(alloc);
+}
+
+test "Publisher: get_qos returns independent clone — replacement does not dangle" {
+    var h = try Harness.init(0xB1);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var n1 = [1][*:0]const u8{"clone_test"};
+    var q1 = DDS.PublisherQos{};
+    q1.partition.name = .{ ._buffer = &n1, ._length = 1, ._maximum = 1, ._release = false };
+    _ = pub_.vtable.set_qos(pub_.ptr, &q1);
+
+    var got = DDS.PublisherQos{};
+    _ = pub_.vtable.get_qos(pub_.ptr, &got);
+
+    // Replace internal copy; a shallow get_qos would leave `got.partition.name` dangling.
+    _ = pub_.vtable.set_qos(pub_.ptr, &DDS.PublisherQos{});
+
+    try testing.expectEqual(@as(u32, 1), got.partition.name._length);
+    got.deinit(alloc);
+}
+
+test "Publisher: set_default_datawriter_qos with user_data — clone survives replacement" {
+    var h = try Harness.init(0xB2);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var d1 = [_]u8{0x11};
+    var q1 = DDS.DataWriterQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.set_default_datawriter_qos(pub_.ptr, &q1));
+
+    var d2 = [_]u8{0x22};
+    var q2 = DDS.DataWriterQos{};
+    q2.user_data.value = .{ ._buffer = &d2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.set_default_datawriter_qos(pub_.ptr, &q2));
+
+    var got = DDS.DataWriterQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.get_default_datawriter_qos(pub_.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(alloc);
+}
+
+test "Subscriber: set_qos with partition names — clone survives replacement" {
+    var h = try Harness.init(0xB3);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var n1 = [1][*:0]const u8{"sub_px"};
+    var q1 = DDS.SubscriberQos{};
+    q1.partition.name = .{ ._buffer = &n1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.set_qos(sub.ptr, &q1));
+
+    var n2 = [1][*:0]const u8{"sub_py"};
+    var q2 = DDS.SubscriberQos{};
+    q2.partition.name = .{ ._buffer = &n2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.set_qos(sub.ptr, &q2));
+
+    var got = DDS.SubscriberQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.get_qos(sub.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.partition.name._length);
+    got.deinit(alloc);
+}
+
+test "Subscriber: set_default_datareader_qos with user_data — clone survives replacement" {
+    var h = try Harness.init(0xB4);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var d1 = [_]u8{0x33};
+    var q1 = DDS.DataReaderQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.set_default_datareader_qos(sub.ptr, &q1));
+
+    var d2 = [_]u8{0x44};
+    var q2 = DDS.DataReaderQos{};
+    q2.user_data.value = .{ ._buffer = &d2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.set_default_datareader_qos(sub.ptr, &q2));
+
+    var got = DDS.DataReaderQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.get_default_datareader_qos(sub.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(alloc);
+}

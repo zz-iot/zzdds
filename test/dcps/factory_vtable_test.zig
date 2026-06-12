@@ -155,3 +155,29 @@ test "deinit via vtable: does not double-free" {
     f.vtable.deinit(f.ptr);
     // Transport and network are still alive; test just verifies no crash.
 }
+
+test "DomainParticipantFactory: set_default_participant_qos with user_data — clone survives replacement" {
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const loc = Locator.udp4(.{ 127, 0, 0, 0xC0 }, 7900 + 0xC0);
+    const t = try MockTransport.init(alloc, net, &.{loc});
+    defer t.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), noopDisc(), noop_security, .spec_random, .{});
+    defer factory.deinit();
+    const f = factory.toDDSFactory();
+
+    var d1 = [_]u8{0x11};
+    var q1 = DDS.DomainParticipantQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, f.vtable.set_default_participant_qos(f.ptr, &q1));
+
+    var d2 = [_]u8{0x22};
+    var q2 = DDS.DomainParticipantQos{};
+    q2.user_data.value = .{ ._buffer = &d2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, f.vtable.set_default_participant_qos(f.ptr, &q2));
+
+    var got = DDS.DomainParticipantQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, f.vtable.get_default_participant_qos(f.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(alloc);
+}

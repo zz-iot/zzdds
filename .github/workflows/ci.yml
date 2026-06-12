@@ -96,6 +96,46 @@ jobs:
   # Runs on the same trigger as the test jobs; gated on test-linux so coverage
   # only uploads when the suite is green.
 
+  valgrind:
+    name: Valgrind (memcheck)
+    needs: test-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Install Valgrind
+        run: sudo apt-get install -y --no-install-recommends valgrind
+
+      - name: Build test binaries
+        run: zig build emit-tests -Doptimize=Debug
+
+      - name: Run tests under Valgrind
+        run: |
+          set -e
+          ERRORS=0
+          for bin in zig-out/tests/*; do
+            [ -x "$bin" ] || continue
+            echo "=== valgrind: $(basename $bin) ==="
+            if ! valgrind \
+                --error-exitcode=1 \
+                --leak-check=full \
+                --show-leak-kinds=definite,indirect \
+                --errors-for-leak-kinds=definite,indirect \
+                --track-origins=yes \
+                --quiet \
+                "$bin" --test-filter ""; then
+              echo "::error::Valgrind reported errors in $(basename $bin)"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          [ $ERRORS -eq 0 ]
+
   coverage:
     name: Coverage
     needs: test-linux

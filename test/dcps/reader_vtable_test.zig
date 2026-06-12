@@ -611,3 +611,45 @@ test "DataReader: get_matched_publication_data returns data for matched writer" 
     try testing.expectEqualStrings("RdrPubTopic", data.topic_name);
     try testing.expectEqualStrings("RdrPubType", data.type_name);
 }
+
+test "DataReader: set_qos with user_data — clone survives replacement" {
+    var fx = try SingleFixture.init(testing.allocator);
+    defer fx.deinit();
+    const dr = fx.makeReaderQos(.{}, null, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
+
+    var d1 = [_]u8{0xDD};
+    var q1 = DDS.DataReaderQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &q1));
+
+    var d2 = [_]u8{0xEE};
+    var q2 = DDS.DataReaderQos{};
+    q2.user_data.value = .{ ._buffer = &d2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.set_qos(dr.ptr, &q2));
+
+    var got = DDS.DataReaderQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.get_qos(dr.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(testing.allocator);
+}
+
+test "DataReader: get_qos returns independent clone — replacement does not dangle" {
+    var fx = try SingleFixture.init(testing.allocator);
+    defer fx.deinit();
+    const dr = fx.makeReaderQos(.{}, null, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
+
+    var d1 = [_]u8{0xFF};
+    var q1 = DDS.DataReaderQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    _ = dr.vtable.set_qos(dr.ptr, &q1);
+
+    var got = DDS.DataReaderQos{};
+    _ = dr.vtable.get_qos(dr.ptr, &got);
+
+    _ = dr.vtable.set_qos(dr.ptr, &DDS.DataReaderQos{});
+
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(testing.allocator);
+}
