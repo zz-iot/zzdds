@@ -16,6 +16,18 @@ fn sleepMs(ms: u64) void {
     time_mod.sleepNs(ms * std.time.ns_per_ms);
 }
 
+/// Poll until `ptr.*` reaches `expected` or 10 seconds elapse.
+/// Use instead of a fixed sleepMs when waiting for a receive-thread counter:
+/// returns immediately once the value arrives (fast natively), and tolerates
+/// the 100× Valgrind slowdown without a 10-second fixed sleep.
+fn waitCount(ptr: *const usize, expected: usize) void {
+    var elapsed_ms: u64 = 0;
+    while (elapsed_ms < 10_000) : (elapsed_ms += 1) {
+        if (ptr.* >= expected) return;
+        time_mod.sleepNs(std.time.ns_per_ms);
+    }
+}
+
 /// Listen on port 0 (IPv4 loopback), return the OS-assigned port.
 fn listenAndGetPort(t: iface.Transport, h: ReceiveHandler, alloc: std.mem.Allocator) !u16 {
     const loc = Locator.tcp4(.{ 127, 0, 0, 1 }, 0);
@@ -123,7 +135,7 @@ test "tcp transport: loopback send and receive" {
     const payload = "Hello RTPS-TCP";
     try ct.send(&dest, payload);
 
-    sleepMs(100);
+    waitCount(&recv_count, 1);
 
     try testing.expectEqual(@as(usize, 1), recv_count);
     try testing.expectEqualSlices(u8, payload, received);
@@ -172,7 +184,8 @@ test "tcp transport: fan-out to two handlers" {
 
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
     try ct.send(&dest, "ping");
-    sleepMs(100);
+    waitCount(&count_a, 1);
+    waitCount(&count_b, 1);
 
     try testing.expectEqual(@as(usize, 1), count_a);
     try testing.expectEqual(@as(usize, 1), count_b);
@@ -180,7 +193,7 @@ test "tcp transport: fan-out to two handlers" {
     // Unlisten A; only B receives subsequent messages.
     st.unlisten(&listen_loc, ca.handler());
     try ct.send(&dest, "pong");
-    sleepMs(100);
+    waitCount(&count_b, 2);
     try testing.expectEqual(@as(usize, 1), count_a);
     try testing.expectEqual(@as(usize, 2), count_b);
 }
@@ -227,7 +240,8 @@ test "tcp transport: default does not reuse by host" {
 
     try ct.send(&loc_a, "a");
     try ct.send(&loc_b, "b");
-    sleepMs(100);
+    waitCount(&count_a, 1);
+    waitCount(&count_b, 1);
 
     try testing.expectEqual(@as(usize, 1), count_a);
     try testing.expectEqual(@as(usize, 1), count_b);
@@ -278,7 +292,7 @@ test "tcp transport: connection reuse by host is opt-in" {
 
     try ct.send(&loc_a, "discovery");
     try ct.send(&loc_b, "data");
-    sleepMs(100);
+    waitCount(&count_a, 2);
 
     try testing.expectEqual(@as(usize, 2), count_a);
     try testing.expectEqual(@as(usize, 0), count_b);
