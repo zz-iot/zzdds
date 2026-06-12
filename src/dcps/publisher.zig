@@ -473,7 +473,8 @@ pub const PublisherImpl = struct {
     }
 
     fn vtGetDefaultDwQos(ctx: *anyopaque, qos: *DDS.DataWriterQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).default_dw_qos;
+        const self = cast(ctx);
+        qos.* = self.default_dw_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 

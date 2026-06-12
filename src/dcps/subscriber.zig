@@ -535,7 +535,8 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtGetDefaultDrQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).default_dr_qos;
+        const self = cast(ctx);
+        qos.* = self.default_dr_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
