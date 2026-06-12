@@ -92,7 +92,7 @@ fn unregister(dp_ptr: *anyopaque) ?Entry {
 pub const CSampleInfo = extern struct {
     valid_data: bool,
     instance_state: u32,
-    instance_handle: i32,
+    instance_handle: DDS.InstanceHandle_t,
 };
 
 // ── Participant lifecycle ─────────────────────────────────────────────────────

@@ -383,7 +383,8 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.SubscriberQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).qos;
+        const self = cast(ctx);
+        qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
