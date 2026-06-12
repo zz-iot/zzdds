@@ -335,7 +335,9 @@ pub const SubscriberImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        // Reset the sequence output.
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
+        }
         seq.* = .{};
         // Pending samples are always NOT_READ / NEW / ALIVE.
         const want_not_read = (sample_states & DDS.NOT_READ_SAMPLE_STATE) != 0;

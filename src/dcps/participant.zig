@@ -2579,6 +2579,9 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
+        }
         seq.* = .{};
         const n = self.discovered_participants.items.len;
         if (n == 0) return DDS.RETCODE_OK;
@@ -2617,6 +2620,9 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
+        }
         seq.* = .{};
         const n = self.discovered_topics.items.len;
         if (n == 0) return DDS.RETCODE_OK;

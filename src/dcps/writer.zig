@@ -520,6 +520,9 @@ pub const DataWriterImpl = struct {
         defer guids.deinit(self.alloc);
         self.proto_writer.listMatchedReaders(self.alloc, &guids) catch
             return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
+        }
         seq.* = .{};
         const n = guids.items.len;
         if (n == 0) return DDS.RETCODE_OK;

@@ -252,6 +252,9 @@ pub const WaitSetImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
+        }
         seq.* = .{};
         const n = self.conditions.items.len;
         if (n == 0) return DDS.RETCODE_OK;
@@ -687,6 +690,12 @@ pub const QueryConditionImpl = struct {
     fn vtGetParams(ctx: *anyopaque, out: ?*DDS.StringSeq) DDS.ReturnCode_t {
         const seq = out orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
+        if (seq._release) {
+            if (seq._buffer) |b| {
+                for (b[0..seq._length]) |s| self.alloc.free(std.mem.span(s));
+                self.alloc.free(b[0..seq._maximum]);
+            }
+        }
         seq.* = .{};
         const n = self.query_parameters.items.len;
         if (n == 0) return DDS.RETCODE_OK;

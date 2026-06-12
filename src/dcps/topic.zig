@@ -352,7 +352,12 @@ pub const ContentFilteredTopicImpl = struct {
     fn cftGetParams(ctx: *anyopaque, out: ?*DDS.StringSeq) DDS.ReturnCode_t {
         const seq = out orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
-        // Reset output sequence and fill with owned C-string pointers.
+        if (seq._release) {
+            if (seq._buffer) |b| {
+                for (b[0..seq._length]) |s| self.alloc.free(std.mem.span(s));
+                self.alloc.free(b[0..seq._maximum]);
+            }
+        }
         seq.* = .{};
         const n = self.expr_params.items.len;
         if (n == 0) return DDS.RETCODE_OK;
