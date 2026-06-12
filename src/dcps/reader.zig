@@ -981,8 +981,7 @@ pub const DataReaderImpl = struct {
         for (self.pending.items) |pc| {
             const ih = pc.info.instance_handle;
             if (prev_instance_handle == 0) {
-                target_ih = ih; // take from whichever instance appears first
-                break;
+                if (target_ih == null or ih < target_ih.?) target_ih = ih;
             } else if (ih > prev_instance_handle) {
                 if (target_ih == null or ih < target_ih.?) target_ih = ih;
             }
