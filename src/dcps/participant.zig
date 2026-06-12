@@ -836,8 +836,11 @@ pub const DomainParticipantImpl = struct {
         cfts.deinit(self.alloc);
 
         self.type_info_registry.deinit(self.alloc);
-        var ts_it = self.type_support_registry.valueIterator();
-        while (ts_it.next()) |ts| if (ts.deinit) |f| f(ts.ctx);
+        var ts_it = self.type_support_registry.iterator();
+        while (ts_it.next()) |entry| {
+            if (entry.value_ptr.deinit) |f| f(entry.value_ptr.ctx);
+            self.alloc.free(entry.key_ptr.*);
+        }
         self.type_support_registry.deinit(self.alloc);
 
         // Any remaining active writers/readers (normally all removed by pub/sub deinit).
@@ -884,15 +887,23 @@ pub const DomainParticipantImpl = struct {
     /// Call before creating DataReaders for the type.  The caller must ensure
     /// `type_name` remains valid for the lifetime of the participant.
     pub fn registerTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) bool {
-        // Snapshot the old entry BEFORE put so we only free it after the map
-        // update succeeds.  Freeing before put would leave a dangling pointer in
-        // the map if put fails (OOM on a new key).
-        const old = self.type_support_registry.get(type_name);
-        self.type_support_registry.put(self.alloc, type_name, ts) catch {
+        // Heap-copy the key so the map owns it regardless of caller lifetime.
+        const owned_key = self.alloc.dupe(u8, type_name) catch {
             if (ts.deinit) |f| f(ts.ctx);
             return false;
         };
-        if (old) |o| if (o.deinit) |f| f(o.ctx);
+        const gop = self.type_support_registry.getOrPut(self.alloc, owned_key) catch {
+            self.alloc.free(owned_key);
+            if (ts.deinit) |f| f(ts.ctx);
+            return false;
+        };
+        if (gop.found_existing) {
+            // Replacing: deinit old value, swap in new owned key (free the old one).
+            if (gop.value_ptr.deinit) |f| f(gop.value_ptr.ctx);
+            self.alloc.free(gop.key_ptr.*);
+            gop.key_ptr.* = owned_key;
+        }
+        gop.value_ptr.* = ts;
         return true;
     }
 
