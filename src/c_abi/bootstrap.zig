@@ -155,6 +155,9 @@ pub export fn zzdds_destroy_participant(dp: DDS.DomainParticipant) callconv(.c) 
     if (nil.isNil(dp)) return;
     const e = unregister(@ptrCast(dp.ptr)) orelse return;
     const dpf = e.factory.toDDSFactory();
+    // delete_participant may return PRECONDITION_NOT_MET if the caller left child
+    // entities alive; factory.deinit() calls p.deinit() on any survivors, so
+    // teardown is unconditional regardless of the return code.
     _ = dpf.delete_participant(dp);
     e.factory.deinit();
     e.disc.deinit();
@@ -227,8 +230,9 @@ pub export fn zzdds_take_one_raw(
     return 1;
 }
 
-/// take_next_instance semantics: take one sample from the "next" instance after
-/// `prev_instance_handle` (0 means any instance).
+/// take_next_instance semantics: take one sample from the instance with the
+/// smallest handle strictly greater than `prev_instance_handle`.
+/// Pass 0 (HANDLE_NIL) to start iteration from the minimum-handle instance.
 /// Returns 1 on success, 0 if no qualifying sample, -1 on buffer-too-small error.
 ///
 /// NOTE: the sample is dequeued before the size check.  On -1, the sample is

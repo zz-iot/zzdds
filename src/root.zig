@@ -60,6 +60,7 @@ pub const util = struct {
     pub const clock_registry = @import("util/clock_registry.zig");
     pub const guid_gen = @import("util/guid_gen.zig");
     pub const mutex = @import("util/mutex.zig");
+    pub const condvar = @import("util/condvar.zig");
 };
 
 test {
