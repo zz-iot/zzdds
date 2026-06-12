@@ -147,33 +147,30 @@ pub const WaitSetImpl = struct {
         while (true) {
             // Collect triggered conditions under the conditions lock.
             self.mu.lock();
-            var any = false;
+            // Count first so we can do a single allocation.
+            var count: u32 = 0;
             for (self.conditions.items) |cond| {
-                if (cond.get_trigger_value()) {
-                    // Grow sequence by one.
-                    const old_n = seq._length;
-                    const new_buf = self.alloc.alloc(DDS.Condition, old_n + 1) catch {
-                        if (seq._release) {
-                            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
-                        }
-                        seq.* = .{};
-                        self.mu.unlock();
-                        return DDS.RETCODE_OUT_OF_RESOURCES;
-                    };
-                    if (seq._buffer) |ob| @memcpy(new_buf[0..old_n], ob[0..old_n]);
-                    if (seq._release) {
-                        if (seq._buffer) |ob| self.alloc.free(ob[0..old_n]);
+                if (cond.get_trigger_value()) count += 1;
+            }
+            if (count > 0) {
+                const buf = self.alloc.alloc(DDS.Condition, count) catch {
+                    self.mu.unlock();
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+                var i: u32 = 0;
+                for (self.conditions.items) |cond| {
+                    if (cond.get_trigger_value()) {
+                        buf[i] = cond;
+                        i += 1;
                     }
-                    new_buf[old_n] = cond;
-                    seq._buffer = new_buf.ptr;
-                    seq._length = old_n + 1;
-                    seq._maximum = old_n + 1;
-                    seq._release = true;
-                    any = true;
                 }
+                seq._buffer = buf.ptr;
+                seq._length = count;
+                seq._maximum = count;
+                seq._release = true;
             }
             self.mu.unlock();
-            if (any) return DDS.RETCODE_OK;
+            if (count > 0) return DDS.RETCODE_OK;
 
             // Block until notification or deadline.
             self.cv_mu.lock();
