@@ -720,18 +720,32 @@ pub const QueryConditionImpl = struct {
 
     fn vtSetParams(ctx: *anyopaque, params: ?*const DDS.StringSeq) DDS.ReturnCode_t {
         const self = cast(ctx);
-        for (self.query_parameters.items) |p| self.alloc.free(p);
-        self.query_parameters.clearRetainingCapacity();
-        const seq = params orelse return DDS.RETCODE_OK;
+        // Build into a temporary list first so the old params survive any OOM.
+        var tmp: std.ArrayListUnmanaged([]u8) = .empty;
+        const seq = params orelse {
+            for (self.query_parameters.items) |p| self.alloc.free(p);
+            self.query_parameters.clearRetainingCapacity();
+            return DDS.RETCODE_OK;
+        };
         if (seq._buffer) |b| {
             for (b[0..seq._length]) |p| {
-                const copy = self.alloc.dupe(u8, std.mem.span(p)) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-                self.query_parameters.append(self.alloc, copy) catch {
+                const copy = self.alloc.dupe(u8, std.mem.span(p)) catch {
+                    for (tmp.items) |s| self.alloc.free(s);
+                    tmp.deinit(self.alloc);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+                tmp.append(self.alloc, copy) catch {
                     self.alloc.free(copy);
+                    for (tmp.items) |s| self.alloc.free(s);
+                    tmp.deinit(self.alloc);
                     return DDS.RETCODE_OUT_OF_RESOURCES;
                 };
             }
         }
+        // All copies succeeded — swap in and free old.
+        for (self.query_parameters.items) |p| self.alloc.free(p);
+        self.query_parameters.deinit(self.alloc);
+        self.query_parameters = tmp;
         return DDS.RETCODE_OK;
     }
 
