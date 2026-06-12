@@ -865,6 +865,11 @@ pub const DomainParticipantImpl = struct {
         }
         self.discovered_topics.deinit(self.alloc);
 
+        self.qos.deinit(self.alloc);
+        self.default_pub_qos.deinit(self.alloc);
+        self.default_sub_qos.deinit(self.alloc);
+        self.default_topic_qos.deinit(self.alloc);
+
         self.alloc.destroy(self);
     }
 
@@ -2421,12 +2426,16 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
-        cast(ctx).qos = qos.*;
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.qos.deinit(self.alloc);
+        self.qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).qos;
+        const self = cast(ctx);
+        qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
@@ -2542,32 +2551,44 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtSetDefaultPubQos(ctx: *anyopaque, qos: *const DDS.PublisherQos) DDS.ReturnCode_t {
-        cast(ctx).default_pub_qos = qos.*;
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.default_pub_qos.deinit(self.alloc);
+        self.default_pub_qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultPubQos(ctx: *anyopaque, qos: *DDS.PublisherQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).default_pub_qos;
+        const self = cast(ctx);
+        qos.* = self.default_pub_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtSetDefaultSubQos(ctx: *anyopaque, qos: *const DDS.SubscriberQos) DDS.ReturnCode_t {
-        cast(ctx).default_sub_qos = qos.*;
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.default_sub_qos.deinit(self.alloc);
+        self.default_sub_qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultSubQos(ctx: *anyopaque, qos: *DDS.SubscriberQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).default_sub_qos;
+        const self = cast(ctx);
+        qos.* = self.default_sub_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtSetDefaultTopicQos(ctx: *anyopaque, qos: *const DDS.TopicQos) DDS.ReturnCode_t {
-        cast(ctx).default_topic_qos = qos.*;
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.default_topic_qos.deinit(self.alloc);
+        self.default_topic_qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultTopicQos(ctx: *anyopaque, qos: *DDS.TopicQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).default_topic_qos;
+        const self = cast(ctx);
+        qos.* = self.default_topic_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 

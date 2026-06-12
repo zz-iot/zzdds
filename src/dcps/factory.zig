@@ -80,6 +80,7 @@ pub const DomainParticipantFactoryImpl = struct {
         for (self.participants.items) |p| p.deinit();
         self.participants.deinit(self.alloc);
         self.clock_registry.deinit();
+        self.default_dp_qos.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -204,13 +205,15 @@ pub const DomainParticipantFactoryImpl = struct {
 
     fn vtSetDefaultDpQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.default_dp_qos = qos.*;
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.default_dp_qos.deinit(self.alloc);
+        self.default_dp_qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultDpQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        qos.* = self.default_dp_qos;
+        qos.* = self.default_dp_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
