@@ -153,6 +153,10 @@ pub const WaitSetImpl = struct {
                     // Grow sequence by one.
                     const old_n = seq._length;
                     const new_buf = self.alloc.alloc(DDS.Condition, old_n + 1) catch {
+                        if (seq._release) {
+                            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
+                        }
+                        seq.* = .{};
                         self.mu.unlock();
                         return DDS.RETCODE_OUT_OF_RESOURCES;
                     };
