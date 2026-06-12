@@ -279,7 +279,9 @@ pub const DataReaderImpl = struct {
             .last_received_ns = .init(timer_clock.nowNs()),
             .seen_instances = .empty,
         };
+        errdefer alloc.destroy(self);
         self.qos = try qos.clone(alloc);
+        errdefer self.qos.deinit(alloc);
         // Register delivery callback with the RTPS layer.
         proto_reader.setDataCallback(.{
             .ctx = self,

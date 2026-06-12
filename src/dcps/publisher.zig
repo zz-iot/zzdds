@@ -145,7 +145,9 @@ pub const PublisherImpl = struct {
             .suspend_active = false,
             .group_seq_num_counter = 0,
         };
+        errdefer alloc.destroy(self);
         self.qos = try qos.clone(alloc);
+        errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;

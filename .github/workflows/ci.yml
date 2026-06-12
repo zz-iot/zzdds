@@ -129,7 +129,7 @@ jobs:
                 --errors-for-leak-kinds=definite,indirect \
                 --track-origins=yes \
                 --quiet \
-                "$bin" --test-filter ""; then
+                "$bin"; then
               echo "::error::Valgrind reported errors in $(basename $bin)"
               ERRORS=$((ERRORS + 1))
             fi

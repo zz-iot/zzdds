@@ -109,7 +109,9 @@ pub const DataWriterImpl = struct {
             .last_write_ns = .init(now),
             .liveliness_last_ns = .init(now),
         };
+        errdefer alloc.destroy(self);
         self.qos = try qos.clone(alloc);
+        errdefer self.qos.deinit(alloc);
         // Wire up the StatusCondition.
         const sc = try waitset.StatusConditionImpl.init(
             alloc,

@@ -124,7 +124,9 @@ pub const SubscriberImpl = struct {
             .readers = .empty,
             .mu = .{},
         };
+        errdefer alloc.destroy(self);
         self.qos = try qos.clone(alloc);
+        errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;
