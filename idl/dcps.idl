@@ -189,15 +189,15 @@ module DDS {
     // -----------------------------------------------------------------------
     // Listener interfaces
 
-    interface Listener {};
+    @callback interface Listener {};
 
-    interface TopicListener : Listener {
+    @callback interface TopicListener : Listener {
         void on_inconsistent_topic(
             in Topic                    the_topic,
             in InconsistentTopicStatus  status);
     };
 
-    interface DataWriterListener : Listener {
+    @callback interface DataWriterListener : Listener {
         void on_offered_deadline_missed(
             in DataWriter                   writer,
             in OfferedDeadlineMissedStatus  status);
@@ -212,9 +212,9 @@ module DDS {
             in PublicationMatchedStatus status);
     };
 
-    interface PublisherListener : DataWriterListener {};
+    @callback interface PublisherListener : DataWriterListener {};
 
-    interface DataReaderListener : Listener {
+    @callback interface DataReaderListener : Listener {
         void on_requested_deadline_missed(
             in DataReader                       the_reader,
             in RequestedDeadlineMissedStatus    status);
@@ -237,14 +237,14 @@ module DDS {
             in SampleLostStatus status);
     };
 
-    interface SubscriberListener : DataReaderListener {
+    @callback interface SubscriberListener : DataReaderListener {
         void on_data_on_readers(
             in Subscriber the_subscriber);
     };
 
-    interface DomainParticipantListener : TopicListener,
-                                          PublisherListener,
-                                          SubscriberListener {};
+    @callback interface DomainParticipantListener : TopicListener,
+                                                   PublisherListener,
+                                                   SubscriberListener {};
 
     // -----------------------------------------------------------------------
     // Conditions

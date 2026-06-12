@@ -65,8 +65,8 @@ const Fixture = struct {
 
     fn init(
         alloc: std.mem.Allocator,
-        topic_name: []const u8,
-        type_name: []const u8,
+        topic_name: [:0]const u8,
+        type_name: [:0]const u8,
     ) !Fixture {
         var delivery = try IntraProcessDelivery.init(alloc);
         errdefer delivery.deinit();
@@ -86,14 +86,13 @@ const Fixture = struct {
         );
         errdefer factory_w.deinit();
         const dpf_w = factory_w.toDDSFactory();
-        const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_w = dp_w.vtable.create_topic(
-            dp_w.ptr,
+        const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+        const pub_w = dp_w.create_publisher(.{}, null, 0);
+        const topic_w = dp_w.create_topic(
             topic_name,
             type_name,
             .{},
-            nil.nil_topic_listener,
+            null,
             0,
         );
 
@@ -112,14 +111,13 @@ const Fixture = struct {
         );
         errdefer factory_r.deinit();
         const dpf_r = factory_r.toDDSFactory();
-        const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(
-            dp_r.ptr,
+        const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+        const sub_r = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic(
             topic_name,
             type_name,
             .{},
-            nil.nil_topic_listener,
+            null,
             0,
         );
 
@@ -162,18 +160,16 @@ const Fixture = struct {
         dr_qos: DDS.DataReaderQos,
     ) struct { dw: *DataWriterImpl, dr: *DataReaderImpl } {
         const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
-        const dr = self.sub_r.vtable.create_datareader(
-            self.sub_r.ptr,
+        const dr = self.sub_r.create_datareader(
             topic_desc_r,
             dr_qos,
-            nil.nil_dr_listener,
+            null,
             0,
         );
-        const dw = self.pub_w.vtable.create_datawriter(
-            self.pub_w.ptr,
+        const dw = self.pub_w.create_datawriter(
             self.topic_w,
             dw_qos,
-            nil.nil_dw_listener,
+            null,
             0,
         );
         return .{
@@ -305,11 +301,10 @@ test "intraprocess: writer created before reader — reader gets history via TRA
 
     // Write BEFORE creating the reader.
     const topic_w = fx.topic_w;
-    const dw_raw = fx.pub_w.vtable.create_datawriter(
-        fx.pub_w.ptr,
+    const dw_raw = fx.pub_w.create_datawriter(
         topic_w,
         dw_qos,
-        nil.nil_dw_listener,
+        null,
         0,
     );
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
@@ -319,11 +314,10 @@ test "intraprocess: writer created before reader — reader gets history via TRA
     // Now create the reader — DirectDiscovery fires on_reader_discovered
     // synchronously, which triggers history replay via addMatchedReader.
     const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
-    const dr_raw = fx.sub_r.vtable.create_datareader(
-        fx.sub_r.ptr,
+    const dr_raw = fx.sub_r.create_datareader(
         topic_desc_r,
         dr_qos,
-        nil.nil_dr_listener,
+        null,
         0,
     );
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
@@ -359,17 +353,16 @@ test "intraprocess: same-participant writer and reader — no self-delivery" {
     );
     defer factory.deinit();
     const dpf = factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const publisher = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const subscriber = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic = dp.vtable.create_topic(
-        dp.ptr,
+    const publisher = dp.create_publisher(.{}, null, 0);
+    const subscriber = dp.create_subscriber(.{}, null, 0);
+    const topic = dp.create_topic(
         "SelfTopic",
         "SelfType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
     const topic_desc = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
@@ -379,8 +372,8 @@ test "intraprocess: same-participant writer and reader — no self-delivery" {
     dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
 
-    const dr_raw = subscriber.vtable.create_datareader(subscriber.ptr, topic_desc, dr_qos, nil.nil_dr_listener, 0);
-    const dw_raw = publisher.vtable.create_datawriter(publisher.ptr, topic, dw_qos, nil.nil_dw_listener, 0);
+    const dr_raw = subscriber.create_datareader(topic_desc, dr_qos, null, 0);
+    const dw_raw = publisher.create_datawriter(topic, dw_qos, null, 0);
 
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));

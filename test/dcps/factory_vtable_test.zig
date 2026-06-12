@@ -90,7 +90,7 @@ test "lookup_participant: returns participant for matching domain_id" {
     var h = try Harness.init(1);
     defer h.deinit();
     const f = h.factory.toDDSFactory();
-    const dp = f.vtable.create_participant(f.ptr, 7, .{}, nil.nil_dp_listener, 0);
+    const dp = f.create_participant(7, .{}, null, 0);
     defer _ = f.vtable.delete_participant(f.ptr, dp);
 
     const found = f.vtable.lookup_participant(f.ptr, 7);
@@ -101,7 +101,7 @@ test "lookup_participant: returns nil for unknown domain_id" {
     var h = try Harness.init(2);
     defer h.deinit();
     const f = h.factory.toDDSFactory();
-    const dp = f.vtable.create_participant(f.ptr, 7, .{}, nil.nil_dp_listener, 0);
+    const dp = f.create_participant(7, .{}, null, 0);
     defer _ = f.vtable.delete_participant(f.ptr, dp);
 
     const found = f.vtable.lookup_participant(f.ptr, 99);
@@ -115,7 +115,7 @@ test "set_default_participant_qos / get_default_participant_qos: round-trips" {
 
     var qos = DDS.DomainParticipantQos{};
     qos.entity_factory.autoenable_created_entities = false;
-    _ = f.vtable.set_default_participant_qos(f.ptr, qos);
+    _ = f.set_default_participant_qos(qos);
 
     var out: DDS.DomainParticipantQos = .{};
     _ = f.vtable.get_default_participant_qos(f.ptr, &out);
@@ -129,7 +129,7 @@ test "set_qos / get_qos: round-trips" {
 
     var qos = DDS.DomainParticipantFactoryQos{};
     qos.entity_factory.autoenable_created_entities = false;
-    _ = f.vtable.set_qos(f.ptr, qos);
+    _ = f.set_qos(qos);
 
     var out: DDS.DomainParticipantFactoryQos = .{};
     _ = f.vtable.get_qos(f.ptr, &out);
@@ -154,4 +154,30 @@ test "deinit via vtable: does not double-free" {
     const f = factory.toDDSFactory();
     f.vtable.deinit(f.ptr);
     // Transport and network are still alive; test just verifies no crash.
+}
+
+test "DomainParticipantFactory: set_default_participant_qos with user_data — clone survives replacement" {
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const loc = Locator.udp4(.{ 127, 0, 0, 0xC0 }, 7900 + 0xC0);
+    const t = try MockTransport.init(alloc, net, &.{loc});
+    defer t.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), noopDisc(), noop_security, .spec_random, .{});
+    defer factory.deinit();
+    const f = factory.toDDSFactory();
+
+    var d1 = [_]u8{0x11};
+    var q1 = DDS.DomainParticipantQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, f.vtable.set_default_participant_qos(f.ptr, &q1));
+
+    var d2 = [_]u8{0x22};
+    var q2 = DDS.DomainParticipantQos{};
+    q2.user_data.value = .{ ._buffer = &d2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, f.vtable.set_default_participant_qos(f.ptr, &q2));
+
+    var got = DDS.DomainParticipantQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, f.vtable.get_default_participant_qos(f.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(alloc);
 }

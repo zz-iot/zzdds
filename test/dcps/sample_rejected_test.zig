@@ -57,18 +57,18 @@ const Fixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "RejTopic", "RejType", .{}, nil.nil_topic_listener, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_w = dp_w.create_publisher(.{}, null, 0);
+        const topic_w = dp_w.create_topic("RejTopic", "RejType", .{}, null, 0);
         const t_r = try delivery.newTransport();
         errdefer t_r.deinit();
         const d_r = try delivery.newDiscovery();
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "RejTopic", "RejType", .{}, nil.nil_topic_listener, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const sub_r = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("RejTopic", "RejType", .{}, null, 0);
         return .{
             .alloc = alloc,
             .delivery = delivery,
@@ -104,12 +104,12 @@ const Fixture = struct {
     }
 
     fn makeWriter(self: *Fixture) *DataWriterImpl {
-        const dw = self.pub_w.vtable.create_datawriter(self.pub_w.ptr, self.topic_w, .{}, nil.nil_dw_listener, 0);
+        const dw = self.pub_w.create_datawriter(self.topic_w, .{}, null, 0);
         return @ptrCast(@alignCast(dw.ptr));
     }
 
-    fn makeReader(self: *Fixture, dr_qos: DDS.DataReaderQos, listener: DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
-        const dr = self.sub_r.vtable.create_datareader(self.sub_r.ptr, self.topicDesc(), dr_qos, listener, mask);
+    fn makeReader(self: *Fixture, dr_qos: DDS.DataReaderQos, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
+        const dr = self.sub_r.create_datareader(self.topicDesc(), dr_qos, listener, mask);
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
@@ -118,31 +118,15 @@ fn write(dw: *DataWriterImpl, key: [16]u8) !void {
     _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, key, &PAYLOAD);
 }
 
-// ── Listener helpers ──────────────────────────────────────────────────────────
+// ── Listener helpers (C callback struct form) ─────────────────────────────────
 
-fn drOnSampleRejected(ctx: *anyopaque, _: DDS.DataReader, s: DDS.SampleRejectedStatus) void {
-    @as(*DDS.SampleRejectedStatus, @ptrCast(@alignCast(ctx))).* = s;
+fn drOnSampleRejected(_: DDS.DataReader, s: *const DDS.SampleRejectedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*DDS.SampleRejectedStatus, @ptrCast(@alignCast(ld))).* = s.*;
 }
-fn drNoop(_: *anyopaque) void {}
-fn drNoopDR(_: *anyopaque, _: DDS.DataReader) void {}
-fn drNoopIncompat(_: *anyopaque, _: DDS.DataReader, _: DDS.RequestedIncompatibleQosStatus) void {}
-fn drNoopDeadline(_: *anyopaque, _: DDS.DataReader, _: DDS.RequestedDeadlineMissedStatus) void {}
-fn drNoopLiveliness(_: *anyopaque, _: DDS.DataReader, _: DDS.LivelinessChangedStatus) void {}
-fn drNoopSubMatched(_: *anyopaque, _: DDS.DataReader, _: DDS.SubscriptionMatchedStatus) void {}
-fn drNoopSampleLost(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleLostStatus) void {}
 
-const dr_rejected_vtable = DDS.DataReaderListener.Vtable{
-    .on_requested_deadline_missed = drNoopDeadline,
-    .on_requested_incompatible_qos = drNoopIncompat,
-    .on_sample_rejected = drOnSampleRejected,
-    .on_liveliness_changed = drNoopLiveliness,
-    .on_data_available = drNoopDR,
-    .on_subscription_matched = drNoopSubMatched,
-    .on_sample_lost = drNoopSampleLost,
-    .deinit = struct {
-        fn f(_: *anyopaque) void {}
-    }.f,
-};
+fn rejectedListener(ctx: *DDS.SampleRejectedStatus) DDS.DataReaderListener {
+    return .{ .listener_data = ctx, .on_sample_rejected = drOnSampleRejected };
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -156,7 +140,7 @@ test "sample_rejected: max_samples poll path" {
     dr_qos.resource_limits.max_samples = 1;
 
     const dw = fx.makeWriter();
-    const dr = fx.makeReader(dr_qos, nil.nil_dr_listener, 0);
+    const dr = fx.makeReader(dr_qos, null, 0);
 
     try write(dw, NIL_KEY); // accepted
     try write(dw, NIL_KEY); // rejected — pending full
@@ -178,7 +162,7 @@ test "sample_rejected: change resets after poll" {
     dr_qos.resource_limits.max_samples = 1;
 
     const dw = fx.makeWriter();
-    const dr = fx.makeReader(dr_qos, nil.nil_dr_listener, 0);
+    const dr = fx.makeReader(dr_qos, null, 0);
 
     try write(dw, NIL_KEY);
     try write(dw, NIL_KEY); // rejected
@@ -203,7 +187,7 @@ test "sample_rejected: total_count accumulates across multiple rejections" {
     dr_qos.resource_limits.max_samples = 1;
 
     const dw = fx.makeWriter();
-    const dr = fx.makeReader(dr_qos, nil.nil_dr_listener, 0);
+    const dr = fx.makeReader(dr_qos, null, 0);
 
     try write(dw, NIL_KEY); // accepted
     try write(dw, NIL_KEY); // rejected #1
@@ -226,7 +210,7 @@ test "sample_rejected: listener fires on rejection" {
     dr_qos.resource_limits.max_samples = 1;
 
     var captured = DDS.SampleRejectedStatus{};
-    const listener = DDS.DataReaderListener{ .ptr = &captured, .vtable = &dr_rejected_vtable };
+    const listener = rejectedListener(&captured);
 
     const dw = fx.makeWriter();
     _ = fx.makeReader(dr_qos, listener, DDS.SAMPLE_REJECTED_STATUS);
@@ -250,7 +234,7 @@ test "sample_rejected: listener change is 1 per event even when poll change woul
     dr_qos.resource_limits.max_samples = 1;
 
     var captured = DDS.SampleRejectedStatus{};
-    const listener = DDS.DataReaderListener{ .ptr = &captured, .vtable = &dr_rejected_vtable };
+    const listener = rejectedListener(&captured);
 
     const dw = fx.makeWriter();
     _ = fx.makeReader(dr_qos, listener, DDS.SAMPLE_REJECTED_STATUS);
@@ -273,7 +257,7 @@ test "sample_rejected: max_samples_per_instance limit" {
     dr_qos.resource_limits.max_samples_per_instance = 1;
 
     const dw = fx.makeWriter();
-    const dr = fx.makeReader(dr_qos, nil.nil_dr_listener, 0);
+    const dr = fx.makeReader(dr_qos, null, 0);
 
     // Two writes for the same instance (NIL_KEY → same instance handle).
     try write(dw, NIL_KEY); // accepted
@@ -294,7 +278,7 @@ test "sample_rejected: max_instances limit" {
     dr_qos.resource_limits.max_instances = 1;
 
     const dw = fx.makeWriter();
-    const dr = fx.makeReader(dr_qos, nil.nil_dr_listener, 0);
+    const dr = fx.makeReader(dr_qos, null, 0);
 
     // First instance (key=0x01): accepted.
     try write(dw, makeKey(0x01));
@@ -314,7 +298,7 @@ test "sample_rejected: no rejection when limits are zero (unlimited)" {
 
     // Default QoS: all resource_limits are 0 = unlimited.
     const dw = fx.makeWriter();
-    const dr = fx.makeReader(.{}, nil.nil_dr_listener, 0);
+    const dr = fx.makeReader(.{}, null, 0);
 
     try write(dw, NIL_KEY);
     try write(dw, NIL_KEY);

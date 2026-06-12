@@ -471,6 +471,7 @@ pub const AsyncRingSink = struct {
         format: Format,
     ) !*Self {
         const self = try alloc.create(Self);
+        errdefer alloc.destroy(self);
         const slots = try alloc.alloc(TraceEvent, capacity);
         self.* = .{
             .alloc = alloc,

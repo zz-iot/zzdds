@@ -173,7 +173,7 @@ test "ignore_participant: removes from discovered cache" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -183,20 +183,25 @@ test "ignore_participant: removes from discovered cache" {
     h.fireParticipantDiscovered(dp_impl, prefix);
 
     // Should appear in the cache.
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(testing.allocator);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| testing.allocator.free(b[0..handles._length]);
+    };
     _ = dp.vtable.get_discovered_participants(dp.ptr, &handles);
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
-    const handle = handles.items[0];
+    try testing.expectEqual(@as(u32, 1), handles._length);
+    const handle = handles._buffer.?[0];
 
     // Ignoring it must remove it and return OK.
     const rc = dp.vtable.ignore_participant(dp.ptr, handle);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 
     // Cache should be empty now.
-    handles.clearRetainingCapacity();
+    if (handles._release) {
+        if (handles._buffer) |b| testing.allocator.free(b[0..handles._length]);
+    }
+    handles = .{};
     _ = dp.vtable.get_discovered_participants(dp.ptr, &handles);
-    try testing.expectEqual(@as(usize, 0), handles.items.len);
+    try testing.expectEqual(@as(u32, 0), handles._length);
 }
 
 test "ignore_participant: blocks future announcements from same prefix" {
@@ -204,7 +209,7 @@ test "ignore_participant: blocks future announcements from same prefix" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -212,16 +217,21 @@ test "ignore_participant: blocks future announcements from same prefix" {
 
     // Discover, ignore.
     h.fireParticipantDiscovered(dp_impl, prefix);
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(testing.allocator);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| testing.allocator.free(b[0..handles._length]);
+    };
     _ = dp.vtable.get_discovered_participants(dp.ptr, &handles);
-    _ = dp.vtable.ignore_participant(dp.ptr, handles.items[0]);
+    _ = dp.vtable.ignore_participant(dp.ptr, handles._buffer.?[0]);
 
     // Re-announce from the same prefix — must stay out of the cache.
     h.fireParticipantDiscovered(dp_impl, prefix);
-    handles.clearRetainingCapacity();
+    if (handles._release) {
+        if (handles._buffer) |b| testing.allocator.free(b[0..handles._length]);
+    }
+    handles = .{};
     _ = dp.vtable.get_discovered_participants(dp.ptr, &handles);
-    try testing.expectEqual(@as(usize, 0), handles.items.len);
+    try testing.expectEqual(@as(u32, 0), handles._length);
 }
 
 test "ignore_participant: bad handle returns RETCODE_BAD_PARAMETER" {
@@ -229,7 +239,7 @@ test "ignore_participant: bad handle returns RETCODE_BAD_PARAMETER" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const rc = dp.vtable.ignore_participant(dp.ptr, 0x7FFF_FFFF);
@@ -241,18 +251,18 @@ test "ignore_participant: writer from ignored prefix not matched" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
     // Create a DataReader for "TestTopic".
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "TestTopic", "TestType", .{}, nil.nil_topic_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
     const topic_desc = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const dr = sub.vtable.create_datareader(sub.ptr, topic_desc, dr_qos, nil.nil_dr_listener, 0);
+    const dr = sub.create_datareader(topic_desc, dr_qos, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
@@ -260,10 +270,12 @@ test "ignore_participant: writer from ignored prefix not matched" {
 
     // Discover and ignore the participant.
     h.fireParticipantDiscovered(dp_impl, prefix);
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(testing.allocator);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| testing.allocator.free(b[0..handles._length]);
+    };
     _ = dp.vtable.get_discovered_participants(dp.ptr, &handles);
-    _ = dp.vtable.ignore_participant(dp.ptr, handles.items[0]);
+    _ = dp.vtable.ignore_participant(dp.ptr, handles._buffer.?[0]);
 
     // Fire on_writer_discovered for an endpoint from the ignored prefix.
     h.fireWriterDiscovered(dp_impl, prefix, "TestTopic", "TestType");
@@ -277,17 +289,17 @@ test "ignore_participant: reader from ignored prefix not matched to writer" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
     // Create a DataWriter for "TestTopic".
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "TestTopic", "TestType", .{}, nil.nil_topic_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, dw_qos, nil.nil_dw_listener, 0);
+    const dw = pub_.create_datawriter(topic, dw_qos, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
     const dw_impl: *dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
@@ -295,10 +307,12 @@ test "ignore_participant: reader from ignored prefix not matched to writer" {
 
     // Discover and ignore the participant.
     h.fireParticipantDiscovered(dp_impl, prefix);
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(testing.allocator);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| testing.allocator.free(b[0..handles._length]);
+    };
     _ = dp.vtable.get_discovered_participants(dp.ptr, &handles);
-    _ = dp.vtable.ignore_participant(dp.ptr, handles.items[0]);
+    _ = dp.vtable.ignore_participant(dp.ptr, handles._buffer.?[0]);
 
     // Fire on_reader_discovered for an endpoint from the ignored prefix.
     h.fireReaderDiscovered(dp_impl, prefix, "TestTopic", "TestType");
@@ -312,7 +326,7 @@ test "ignore_topic: bad handle returns BAD_PARAMETER" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dp.vtable.ignore_topic(dp.ptr, 0x7FFF_FFFF));
@@ -323,21 +337,20 @@ test "ignore_topic: writer for ignored topic not matched to reader" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "IgnoredTopic", "T", .{}, nil.nil_topic_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    const topic = dp.create_topic("IgnoredTopic", "T", .{}, null, 0);
     const topic_handle = topic.vtable.get_instance_handle(topic.ptr);
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const dr = sub.vtable.create_datareader(
-        sub.ptr,
+    const dr = sub.create_datareader(
         @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription(),
         dr_qos,
-        nil.nil_dr_listener,
+        null,
         0,
     );
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -353,17 +366,17 @@ test "ignore_topic: reader for ignored topic not matched to writer" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "IgnoredTopic", "T", .{}, nil.nil_topic_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("IgnoredTopic", "T", .{}, null, 0);
     const topic_handle = topic.vtable.get_instance_handle(topic.ptr);
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, dw_qos, nil.nil_dw_listener, 0);
+    const dw = pub_.create_datawriter(topic, dw_qos, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
     const dw_impl: *dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
@@ -377,20 +390,19 @@ test "ignore_publication: ignored writer not matched to reader" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "PubTopic", "T", .{}, nil.nil_topic_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    const topic = dp.create_topic("PubTopic", "T", .{}, null, 0);
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const dr = sub.vtable.create_datareader(
-        sub.ptr,
+    const dr = sub.create_datareader(
         @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription(),
         dr_qos,
-        nil.nil_dr_listener,
+        null,
         0,
     );
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -414,16 +426,16 @@ test "ignore_subscription: ignored reader not matched to writer" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "SubTopic", "T", .{}, nil.nil_topic_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("SubTopic", "T", .{}, null, 0);
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, dw_qos, nil.nil_dw_listener, 0);
+    const dw = pub_.create_datawriter(topic, dw_qos, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
     const dw_impl: *dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
@@ -445,7 +457,7 @@ test "ignore_publication/subscription: duplicate call is idempotent" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, 42));

@@ -96,9 +96,9 @@ const Fixture = struct {
         );
         errdefer factory_w.deinit();
         const dpf_w = factory_w.toDDSFactory();
-        const dp_w = dpf_w.create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "QosTopic", "QosType", .{}, nil.nil_topic_listener, 0);
+        const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+        const pub_w = dp_w.create_publisher(.{}, null, 0);
+        const topic_w = dp_w.create_topic("QosTopic", "QosType", .{}, null, 0);
 
         const t_r = try delivery.newTransport();
         errdefer t_r.deinit();
@@ -114,9 +114,9 @@ const Fixture = struct {
         );
         errdefer factory_r.deinit();
         const dpf_r = factory_r.toDDSFactory();
-        const dp_r = dpf_r.create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "QosTopic", "QosType", .{}, nil.nil_topic_listener, 0);
+        const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+        const sub_r = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("QosTopic", "QosType", .{}, null, 0);
 
         return .{
             .alloc = alloc,
@@ -154,8 +154,8 @@ const Fixture = struct {
         dr_qos: DDS.DataReaderQos,
     ) struct { dw: *DataWriterImpl, dr: *DataReaderImpl } {
         const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
-        const dr_raw = self.sub_r.vtable.create_datareader(self.sub_r.ptr, topic_desc_r, dr_qos, nil.nil_dr_listener, 0);
-        const dw_raw = self.pub_w.vtable.create_datawriter(self.pub_w.ptr, self.topic_w, dw_qos, nil.nil_dw_listener, 0);
+        const dr_raw = self.sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+        const dw_raw = self.pub_w.create_datawriter(self.topic_w, dw_qos, null, 0);
         return .{
             .dw = @ptrCast(@alignCast(dw_raw.ptr)),
             .dr = @ptrCast(@alignCast(dr_raw.ptr)),
@@ -328,9 +328,9 @@ const OwnershipFixture = struct {
             .{},
         );
         errdefer factory_a.deinit();
-        const dp_a = factory_a.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_a = dp_a.vtable.create_publisher(dp_a.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_a = dp_a.vtable.create_topic(dp_a.ptr, "OwnTopic", "OwnType", .{}, nil.nil_topic_listener, 0);
+        const dp_a = factory_a.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_a = dp_a.create_publisher(.{}, null, 0);
+        const topic_a = dp_a.create_topic("OwnTopic", "OwnType", .{}, null, 0);
 
         const t_b = try delivery.newTransport();
         errdefer t_b.deinit();
@@ -345,9 +345,9 @@ const OwnershipFixture = struct {
             .{},
         );
         errdefer factory_b.deinit();
-        const dp_b = factory_b.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_b = dp_b.vtable.create_publisher(dp_b.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_b = dp_b.vtable.create_topic(dp_b.ptr, "OwnTopic", "OwnType", .{}, nil.nil_topic_listener, 0);
+        const dp_b = factory_b.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_b = dp_b.create_publisher(.{}, null, 0);
+        const topic_b = dp_b.create_topic("OwnTopic", "OwnType", .{}, null, 0);
 
         const t_r = try delivery.newTransport();
         errdefer t_r.deinit();
@@ -362,9 +362,9 @@ const OwnershipFixture = struct {
             .{},
         );
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "OwnTopic", "OwnType", .{}, nil.nil_topic_listener, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const sub_r = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("OwnTopic", "OwnType", .{}, null, 0);
 
         return .{
             .alloc = alloc,
@@ -408,17 +408,17 @@ const OwnershipFixture = struct {
 
     fn makeReader(self: *OwnershipFixture, dr_qos: DDS.DataReaderQos) *DataReaderImpl {
         const topic_desc = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
-        const dr_raw = self.sub_r.vtable.create_datareader(self.sub_r.ptr, topic_desc, dr_qos, nil.nil_dr_listener, 0);
+        const dr_raw = self.sub_r.create_datareader(topic_desc, dr_qos, null, 0);
         return @ptrCast(@alignCast(dr_raw.ptr));
     }
 
     fn makeWriterA(self: *OwnershipFixture, dw_qos: DDS.DataWriterQos) *DataWriterImpl {
-        const dw_raw = self.pub_a.vtable.create_datawriter(self.pub_a.ptr, self.topic_a, dw_qos, nil.nil_dw_listener, 0);
+        const dw_raw = self.pub_a.create_datawriter(self.topic_a, dw_qos, null, 0);
         return @ptrCast(@alignCast(dw_raw.ptr));
     }
 
     fn makeWriterB(self: *OwnershipFixture, dw_qos: DDS.DataWriterQos) *DataWriterImpl {
-        const dw_raw = self.pub_b.vtable.create_datawriter(self.pub_b.ptr, self.topic_b, dw_qos, nil.nil_dw_listener, 0);
+        const dw_raw = self.pub_b.create_datawriter(self.topic_b, dw_qos, null, 0);
         return @ptrCast(@alignCast(dw_raw.ptr));
     }
 };
@@ -548,7 +548,7 @@ test "ownership: EXCLUSIVE — owner transfer when current owner is removed" {
     dw_qos_b.history.kind = .KEEP_ALL_HISTORY_QOS;
 
     const dr = fx.makeReader(dr_qos);
-    const dw_a_raw = fx.pub_a.vtable.create_datawriter(fx.pub_a.ptr, fx.topic_a, dw_qos_a, nil.nil_dw_listener, 0);
+    const dw_a_raw = fx.pub_a.create_datawriter(fx.topic_a, dw_qos_a, null, 0);
     const dw_b = fx.makeWriterB(dw_qos_b);
 
     // A is owner (strength 10).  B is not.
@@ -827,53 +827,25 @@ test "time_based_filter: per-instance — instances have independent TBF windows
 // ── Timer listener helpers ────────────────────────────────────────────────────
 // ctx is *i32; callback stores status.total_count there.
 
-fn dwOnDeadlineMissed(ctx: *anyopaque, _: DDS.DataWriter, s: DDS.OfferedDeadlineMissedStatus) void {
-    @as(*i32, @ptrCast(@alignCast(ctx))).* = s.total_count;
+fn dwOnDeadlineMissed(_: DDS.DataWriter, s: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*i32, @ptrCast(@alignCast(ld))).* = s.total_count;
 }
-fn dwOnLivelinessLost(ctx: *anyopaque, _: DDS.DataWriter, s: DDS.LivelinessLostStatus) void {
-    @as(*i32, @ptrCast(@alignCast(ctx))).* = s.total_count;
+fn dwOnLivelinessLost(_: DDS.DataWriter, s: *const DDS.LivelinessLostStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*i32, @ptrCast(@alignCast(ld))).* = s.total_count;
 }
-fn drOnDeadlineMissed(ctx: *anyopaque, _: DDS.DataReader, s: DDS.RequestedDeadlineMissedStatus) void {
-    @as(*i32, @ptrCast(@alignCast(ctx))).* = s.total_count;
+fn drOnDeadlineMissed(_: DDS.DataReader, s: *const DDS.RequestedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*i32, @ptrCast(@alignCast(ld))).* = s.total_count;
 }
-fn dwNoopDeadline(_: *anyopaque, _: DDS.DataWriter, _: DDS.OfferedDeadlineMissedStatus) void {}
-fn dwNoopIncompat(_: *anyopaque, _: DDS.DataWriter, _: DDS.OfferedIncompatibleQosStatus) void {}
-fn dwNoopLiveliness(_: *anyopaque, _: DDS.DataWriter, _: DDS.LivelinessLostStatus) void {}
-fn dwNoopPubMatched(_: *anyopaque, _: DDS.DataWriter, _: DDS.PublicationMatchedStatus) void {}
-fn dwNoopDeinit(_: *anyopaque) void {}
-fn drNoopDeadline(_: *anyopaque, _: DDS.DataReader, _: DDS.RequestedDeadlineMissedStatus) void {}
-fn drNoopIncompat(_: *anyopaque, _: DDS.DataReader, _: DDS.RequestedIncompatibleQosStatus) void {}
-fn drNoopSampleRejected(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleRejectedStatus) void {}
-fn drNoopLivelinessChanged(_: *anyopaque, _: DDS.DataReader, _: DDS.LivelinessChangedStatus) void {}
-fn drNoopDataAvail(_: *anyopaque, _: DDS.DataReader) void {}
-fn drNoopSubMatched(_: *anyopaque, _: DDS.DataReader, _: DDS.SubscriptionMatchedStatus) void {}
-fn drNoopSampleLost(_: *anyopaque, _: DDS.DataReader, _: DDS.SampleLostStatus) void {}
-fn drNoopDeinit(_: *anyopaque) void {}
 
-const dw_vtable_deadline = DDS.DataWriterListener.Vtable{
-    .on_offered_deadline_missed = dwOnDeadlineMissed,
-    .on_offered_incompatible_qos = dwNoopIncompat,
-    .on_liveliness_lost = dwNoopLiveliness,
-    .on_publication_matched = dwNoopPubMatched,
-    .deinit = dwNoopDeinit,
-};
-const dw_vtable_liveliness = DDS.DataWriterListener.Vtable{
-    .on_offered_deadline_missed = dwNoopDeadline,
-    .on_offered_incompatible_qos = dwNoopIncompat,
-    .on_liveliness_lost = dwOnLivelinessLost,
-    .on_publication_matched = dwNoopPubMatched,
-    .deinit = dwNoopDeinit,
-};
-const dr_vtable_deadline = DDS.DataReaderListener.Vtable{
-    .on_requested_deadline_missed = drOnDeadlineMissed,
-    .on_requested_incompatible_qos = drNoopIncompat,
-    .on_sample_rejected = drNoopSampleRejected,
-    .on_liveliness_changed = drNoopLivelinessChanged,
-    .on_data_available = drNoopDataAvail,
-    .on_subscription_matched = drNoopSubMatched,
-    .on_sample_lost = drNoopSampleLost,
-    .deinit = drNoopDeinit,
-};
+fn dwListenerDeadline(ctx: *i32) DDS.DataWriterListener {
+    return .{ .listener_data = ctx, .on_offered_deadline_missed = dwOnDeadlineMissed };
+}
+fn dwListenerLiveliness(ctx: *i32) DDS.DataWriterListener {
+    return .{ .listener_data = ctx, .on_liveliness_lost = dwOnLivelinessLost };
+}
+fn drListenerDeadline(ctx: *i32) DDS.DataReaderListener {
+    return .{ .listener_data = ctx, .on_requested_deadline_missed = drOnDeadlineMissed };
+}
 
 // ── TimerFixture ──────────────────────────────────────────────────────────────
 
@@ -909,11 +881,11 @@ const TimerFixture = struct {
         errdefer factory.deinit();
         try factory.clock_registry.register("manual", clock);
         const dpf = factory.toDDSFactory();
-        const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+        const dp = dpf.create_participant(0, .{}, null, 0);
         const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
-        const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-        const sub_ = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic = dp.vtable.create_topic(dp.ptr, "TimerTopic", "TimerType", .{}, nil.nil_topic_listener, 0);
+        const pub_ = dp.create_publisher(.{}, null, 0);
+        const sub_ = dp.create_subscriber(.{}, null, 0);
+        const topic = dp.create_topic("TimerTopic", "TimerType", .{}, null, 0);
         return .{
             .alloc = alloc,
             .delivery = delivery,
@@ -939,21 +911,21 @@ const TimerFixture = struct {
     fn makeWriter(
         self: *TimerFixture,
         qos: DDS.DataWriterQos,
-        listener: DDS.DataWriterListener,
+        listener: ?DDS.DataWriterListener,
         mask: DDS.StatusMask,
     ) *DataWriterImpl {
-        const dw = self.pub_.vtable.create_datawriter(self.pub_.ptr, self.topic, qos, listener, mask);
+        const dw = self.pub_.create_datawriter(self.topic, qos, listener, mask);
         return @ptrCast(@alignCast(dw.ptr));
     }
 
     fn makeReader(
         self: *TimerFixture,
         qos: DDS.DataReaderQos,
-        listener: DDS.DataReaderListener,
+        listener: ?DDS.DataReaderListener,
         mask: DDS.StatusMask,
     ) *DataReaderImpl {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic.ptr))).toTopicDescription();
-        const dr = self.sub_.vtable.create_datareader(self.sub_.ptr, td, qos, listener, mask);
+        const dr = self.sub_.create_datareader(td, qos, listener, mask);
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
@@ -969,7 +941,7 @@ test "deadline: writer — fires on_offered_deadline_missed when period elapses"
     var count: i32 = 0;
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
-    _ = fx.makeWriter(dw_qos, .{ .ptr = &count, .vtable = &dw_vtable_deadline }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
+    _ = fx.makeWriter(dw_qos, dwListenerDeadline(&count), DDS.OFFERED_DEADLINE_MISSED_STATUS);
 
     // Period not yet elapsed — no notification.
     mc.advance(999_999_999); // 1 ns short of 1 s
@@ -996,7 +968,7 @@ test "deadline: writer — write() resets the deadline window" {
     var count: i32 = 0;
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
-    const dw = fx.makeWriter(dw_qos, .{ .ptr = &count, .vtable = &dw_vtable_deadline }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
+    const dw = fx.makeWriter(dw_qos, dwListenerDeadline(&count), DDS.OFFERED_DEADLINE_MISSED_STATUS);
 
     // Write at T=0.5 s — resets last_write_ns to 500 ms.
     mc.advance(std.time.ns_per_s / 2);
@@ -1022,7 +994,7 @@ test "deadline: reader — fires on_requested_deadline_missed when period elapse
     var count: i32 = 0;
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
-    _ = fx.makeReader(dr_qos, .{ .ptr = &count, .vtable = &dr_vtable_deadline }, DDS.REQUESTED_DEADLINE_MISSED_STATUS);
+    _ = fx.makeReader(dr_qos, drListenerDeadline(&count), DDS.REQUESTED_DEADLINE_MISSED_STATUS);
 
     // Period not yet elapsed.
     mc.advance(999_999_999);
@@ -1044,7 +1016,7 @@ test "deadline: reader — receiving data resets the deadline window" {
     var count: i32 = 0;
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.deadline.period = .{ .sec = 1, .nanosec = 0 };
-    const dr = fx.makeReader(dr_qos, .{ .ptr = &count, .vtable = &dr_vtable_deadline }, DDS.REQUESTED_DEADLINE_MISSED_STATUS);
+    const dr = fx.makeReader(dr_qos, drListenerDeadline(&count), DDS.REQUESTED_DEADLINE_MISSED_STATUS);
 
     // Receive a sample at T=0.5 s — resets last_received_ns.
     mc.advance(std.time.ns_per_s / 2);
@@ -1069,7 +1041,7 @@ test "deadline: inactive (period = 0) — never fires" {
 
     var count: i32 = 0;
     // Default DataWriterQos has deadline.period = {0, 0} = infinite/inactive.
-    _ = fx.makeWriter(.{}, .{ .ptr = &count, .vtable = &dw_vtable_deadline }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
+    _ = fx.makeWriter(.{}, dwListenerDeadline(&count), DDS.OFFERED_DEADLINE_MISSED_STATUS);
 
     mc.advance(100 * std.time.ns_per_s); // advance 100 seconds
     fx.dp_impl.checkTimers();
@@ -1088,7 +1060,7 @@ test "liveliness: AUTOMATIC — fires on_liveliness_lost after lease elapses wit
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
     dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
-    _ = fx.makeWriter(dw_qos, .{ .ptr = &count, .vtable = &dw_vtable_liveliness }, DDS.LIVELINESS_LOST_STATUS);
+    _ = fx.makeWriter(dw_qos, dwListenerLiveliness(&count), DDS.LIVELINESS_LOST_STATUS);
 
     // Lease not yet expired.
     mc.advance(999_999_999);
@@ -1111,7 +1083,7 @@ test "liveliness: AUTOMATIC — write() resets the liveliness lease" {
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
     dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
-    const dw = fx.makeWriter(dw_qos, .{ .ptr = &count, .vtable = &dw_vtable_liveliness }, DDS.LIVELINESS_LOST_STATUS);
+    const dw = fx.makeWriter(dw_qos, dwListenerLiveliness(&count), DDS.LIVELINESS_LOST_STATUS);
 
     // Write at T=0.5 s — resets liveliness_last_ns.
     mc.advance(std.time.ns_per_s / 2);
@@ -1138,7 +1110,7 @@ test "liveliness: MANUAL_BY_TOPIC — fires when assert_liveliness() not called 
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.liveliness.kind = .MANUAL_BY_TOPIC_LIVELINESS_QOS;
     dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
-    const dw = fx.makeWriter(dw_qos, .{ .ptr = &count, .vtable = &dw_vtable_liveliness }, DDS.LIVELINESS_LOST_STATUS);
+    const dw = fx.makeWriter(dw_qos, dwListenerLiveliness(&count), DDS.LIVELINESS_LOST_STATUS);
 
     // write() does NOT reset liveliness for MANUAL_BY_TOPIC.
     mc.advance(std.time.ns_per_s / 2);
@@ -1160,7 +1132,7 @@ test "liveliness: MANUAL_BY_TOPIC — assert_liveliness() on writer resets the l
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.liveliness.kind = .MANUAL_BY_TOPIC_LIVELINESS_QOS;
     dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
-    const dw = fx.makeWriter(dw_qos, .{ .ptr = &count, .vtable = &dw_vtable_liveliness }, DDS.LIVELINESS_LOST_STATUS);
+    const dw = fx.makeWriter(dw_qos, dwListenerLiveliness(&count), DDS.LIVELINESS_LOST_STATUS);
     const dw_dds = dw.toDDSDataWriter();
 
     // Assert liveliness at T=0.5 s.
@@ -1188,7 +1160,7 @@ test "liveliness: MANUAL_BY_PARTICIPANT — participant.assert_liveliness() rese
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.liveliness.kind = .MANUAL_BY_PARTICIPANT_LIVELINESS_QOS;
     dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
-    _ = fx.makeWriter(dw_qos, .{ .ptr = &count, .vtable = &dw_vtable_liveliness }, DDS.LIVELINESS_LOST_STATUS);
+    _ = fx.makeWriter(dw_qos, dwListenerLiveliness(&count), DDS.LIVELINESS_LOST_STATUS);
 
     // Call participant.assert_liveliness() at T=0.5 s.
     mc.advance(std.time.ns_per_s / 2);
@@ -1215,7 +1187,7 @@ test "liveliness: MANUAL_BY_PARTICIPANT — write() does not reset the lease" {
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.liveliness.kind = .MANUAL_BY_PARTICIPANT_LIVELINESS_QOS;
     dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
-    const dw = fx.makeWriter(dw_qos, .{ .ptr = &count, .vtable = &dw_vtable_liveliness }, DDS.LIVELINESS_LOST_STATUS);
+    const dw = fx.makeWriter(dw_qos, dwListenerLiveliness(&count), DDS.LIVELINESS_LOST_STATUS);
 
     // write() must NOT reset liveliness for MANUAL_BY_PARTICIPANT.
     mc.advance(std.time.ns_per_s / 2);
@@ -1229,7 +1201,7 @@ test "liveliness: MANUAL_BY_PARTICIPANT — write() does not reset the lease" {
 
 // ── QueryCondition tests ──────────────────────────────────────────────────────
 
-fn qcNilKeyHash(_: []const u8) [16]u8 {
+fn qcNilKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
     return std.mem.zeroes([16]u8);
 }
 
@@ -1249,7 +1221,8 @@ test "query_condition: readRaw with SQL filter returns only matching samples" {
 
     // Register TypeSupport with get_field BEFORE creating the reader.
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
-    dp_impl.registerTypeSupport("QosType", .{
+    _ = dp_impl.registerTypeSupport("QosType", .{
+        .ctx = undefined,
         .compute_key_hash = qcNilKeyHash,
         .get_field = qcCdrGetField,
     });
@@ -1264,13 +1237,12 @@ test "query_condition: readRaw with SQL filter returns only matching samples" {
 
     // QueryCondition: only value = 170 (0xAA).
     const dr_dds = pair.dr.toDDSDataReader();
-    const qc = dr_dds.vtable.create_querycondition(
-        dr_dds.ptr,
+    const qc = dr_dds.create_querycondition(
         DDS.ANY_SAMPLE_STATE,
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "value = 170",
-        DDS.StringSeq.empty,
+        &DDS.StringSeq{},
     );
     defer qc.deinit();
     const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
@@ -1294,7 +1266,8 @@ test "query_condition: takeFiltered with SQL filter removes only matching sample
     defer fx.deinit();
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
-    dp_impl.registerTypeSupport("QosType", .{
+    _ = dp_impl.registerTypeSupport("QosType", .{
+        .ctx = undefined,
         .compute_key_hash = qcNilKeyHash,
         .get_field = qcCdrGetField,
     });
@@ -1309,13 +1282,12 @@ test "query_condition: takeFiltered with SQL filter removes only matching sample
 
     // Take only samples where value <> 187 (excludes PAYLOAD_B).
     const dr_dds = pair.dr.toDDSDataReader();
-    const qc = dr_dds.vtable.create_querycondition(
-        dr_dds.ptr,
+    const qc = dr_dds.create_querycondition(
         DDS.ANY_SAMPLE_STATE,
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "value <> 187",
-        DDS.StringSeq.empty,
+        &DDS.StringSeq{},
     );
     defer qc.deinit();
     const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
@@ -1338,7 +1310,8 @@ test "query_condition: parameter substitution with %0" {
     defer fx.deinit();
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
-    dp_impl.registerTypeSupport("QosType", .{
+    _ = dp_impl.registerTypeSupport("QosType", .{
+        .ctx = undefined,
         .compute_key_hash = qcNilKeyHash,
         .get_field = qcCdrGetField,
     });
@@ -1351,18 +1324,16 @@ test "query_condition: parameter substitution with %0" {
     try writeRaw(pair.dw, &PAYLOAD_B); // value = 187
 
     // Create QC with parameterised expression, bound to "170".
-    var params = DDS.StringSeq.empty;
-    try params.append(alloc, "170");
-    defer params.deinit(alloc);
+    var param_strs: [1][*:0]const u8 = .{"170"};
+    var params = DDS.StringSeq{ ._buffer = @ptrCast(&param_strs), ._length = 1, ._maximum = 1, ._release = false };
 
     const dr_dds = pair.dr.toDDSDataReader();
-    const qc = dr_dds.vtable.create_querycondition(
-        dr_dds.ptr,
+    const qc = dr_dds.create_querycondition(
         DDS.ANY_SAMPLE_STATE,
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "value = %0",
-        params,
+        &params,
     );
     defer qc.deinit();
     const qc_impl: *const QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
@@ -1389,13 +1360,12 @@ test "query_condition: no TypeSupport registered — create_querycondition retur
     const pair = fx.makeWriterReader(.{}, dr_qos);
 
     const dr_dds = pair.dr.toDDSDataReader();
-    const qc = dr_dds.vtable.create_querycondition(
-        dr_dds.ptr,
+    const qc = dr_dds.create_querycondition(
         DDS.ANY_SAMPLE_STATE,
         DDS.ANY_VIEW_STATE,
         DDS.ANY_INSTANCE_STATE,
         "value = 170",
-        DDS.StringSeq.empty,
+        &DDS.StringSeq{},
     );
     // Without TypeSupport the expression cannot be evaluated: NIL is returned
     // rather than a condition that silently passes every sample.
@@ -1411,20 +1381,13 @@ test "query_condition: no TypeSupport registered — create_querycondition retur
 // Uses a two-participant fixture: DirectDiscovery only cross-notifies between
 // separate participants, not same-participant endpoints.
 
-fn drOnLivelinessChanged(ctx: *anyopaque, _: DDS.DataReader, s: DDS.LivelinessChangedStatus) void {
-    @as(*DDS.LivelinessChangedStatus, @ptrCast(@alignCast(ctx))).* = s;
+fn drOnLivelinessChanged(_: DDS.DataReader, s: *const DDS.LivelinessChangedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*DDS.LivelinessChangedStatus, @ptrCast(@alignCast(ld))).* = s.*;
 }
 
-const dr_vtable_liveliness = DDS.DataReaderListener.Vtable{
-    .on_requested_deadline_missed = drNoopDeadline,
-    .on_requested_incompatible_qos = drNoopIncompat,
-    .on_sample_rejected = drNoopSampleRejected,
-    .on_liveliness_changed = drOnLivelinessChanged,
-    .on_data_available = drNoopDataAvail,
-    .on_subscription_matched = drNoopSubMatched,
-    .on_sample_lost = drNoopSampleLost,
-    .deinit = drNoopDeinit,
-};
+fn drListenerLiveliness(ctx: *DDS.LivelinessChangedStatus) DDS.DataReaderListener {
+    return .{ .listener_data = ctx, .on_liveliness_changed = drOnLivelinessChanged };
+}
 
 // Two-participant fixture sharing a ManualClock — both factories register the
 // same manual clock so reader timer_clock and writer timer_clock advance in sync.
@@ -1461,9 +1424,9 @@ const TwoPartyTimerFixture = struct {
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_w.deinit();
         try factory_w.clock_registry.register("manual", clock);
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_ = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "LiveTopic", "LiveType", .{}, nil.nil_topic_listener, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_ = dp_w.create_publisher(.{}, null, 0);
+        const topic_w = dp_w.create_topic("LiveTopic", "LiveType", .{}, null, 0);
 
         const t_r = try delivery.newTransport();
         errdefer t_r.deinit();
@@ -1472,10 +1435,10 @@ const TwoPartyTimerFixture = struct {
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_r.deinit();
         try factory_r.clock_registry.register("manual", clock);
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
         const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
-        const sub_ = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "LiveTopic", "LiveType", .{}, nil.nil_topic_listener, 0);
+        const sub_ = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("LiveTopic", "LiveType", .{}, null, 0);
 
         return .{
             .alloc = alloc,
@@ -1509,13 +1472,13 @@ const TwoPartyTimerFixture = struct {
     }
 
     fn makeWriter(self: *TwoPartyTimerFixture, qos: DDS.DataWriterQos) *DataWriterImpl {
-        const dw = self.pub_.vtable.create_datawriter(self.pub_.ptr, self.topic_w, qos, nil.nil_dw_listener, 0);
+        const dw = self.pub_.create_datawriter(self.topic_w, qos, null, 0);
         return @ptrCast(@alignCast(dw.ptr));
     }
 
-    fn makeReader(self: *TwoPartyTimerFixture, listener: DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
+    fn makeReader(self: *TwoPartyTimerFixture, listener: ?DDS.DataReaderListener, mask: DDS.StatusMask) *DataReaderImpl {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
-        const dr = self.sub_.vtable.create_datareader(self.sub_.ptr, td, .{}, listener, mask);
+        const dr = self.sub_.create_datareader(td, .{}, listener, mask);
         return @ptrCast(@alignCast(dr.ptr));
     }
 };
@@ -1531,10 +1494,7 @@ test "liveliness: reader — on_liveliness_changed fires when writer lease expir
     dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
     dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
     _ = fx.makeWriter(dw_qos);
-    _ = fx.makeReader(
-        .{ .ptr = &captured, .vtable = &dr_vtable_liveliness },
-        DDS.LIVELINESS_CHANGED_STATUS,
-    );
+    _ = fx.makeReader(drListenerLiveliness(&captured), DDS.LIVELINESS_CHANGED_STATUS);
 
     // Lease not yet expired.
     mc.advance(999_999_999);

@@ -99,7 +99,7 @@ pub const DataWriterImpl = struct {
             .topic = topic,
             .publisher = publisher,
             .proto_writer = proto_writer,
-            .qos = qos,
+            .qos = .{},
             .listener = listener,
             .listener_mask = mask,
             .instance_handle = instance_handle,
@@ -109,6 +109,9 @@ pub const DataWriterImpl = struct {
             .last_write_ns = .init(now),
             .liveliness_last_ns = .init(now),
         };
+        errdefer alloc.destroy(self);
+        self.qos = try qos.clone(alloc);
+        errdefer self.qos.deinit(alloc);
         // Wire up the StatusCondition.
         const sc = try waitset.StatusConditionImpl.init(
             alloc,
@@ -121,6 +124,7 @@ pub const DataWriterImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
+        self.qos.deinit(self.alloc);
         // NOTE: proto_writer lifecycle is owned by the participant (via
         // pubDestroyProtoWriter callback), not by DataWriterImpl.
         self.alloc.destroy(self);
@@ -251,11 +255,7 @@ pub const DataWriterImpl = struct {
             self.status_changes &= ~DDS.PUBLICATION_MATCHED_STATUS;
             self.pub_matched_total_change = 0;
             self.pub_matched_current_change = 0;
-            self.listener.vtable.on_publication_matched(
-                self.listener.ptr,
-                self.toDDSDataWriter(),
-                status,
-            );
+            if (self.listener.on_publication_matched) |cb| cb(self.toDDSDataWriter(), &status, self.listener.listener_data);
         }
     }
 
@@ -278,11 +278,7 @@ pub const DataWriterImpl = struct {
             status.last_policy_id = policy_id;
             self.incompat_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
-            self.listener.vtable.on_offered_incompatible_qos(
-                self.listener.ptr,
-                self.toDDSDataWriter(),
-                status,
-            );
+            if (self.listener.on_offered_incompatible_qos) |cb| cb(self.toDDSDataWriter(), &status, self.listener.listener_data);
         }
     }
 
@@ -299,11 +295,7 @@ pub const DataWriterImpl = struct {
             status.total_count_change = 1;
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_DEADLINE_MISSED_STATUS;
-            self.listener.vtable.on_offered_deadline_missed(
-                self.listener.ptr,
-                self.toDDSDataWriter(),
-                status,
-            );
+            if (self.listener.on_offered_deadline_missed) |cb| cb(self.toDDSDataWriter(), &status, self.listener.listener_data);
         }
     }
 
@@ -320,11 +312,7 @@ pub const DataWriterImpl = struct {
             status.total_count_change = 1;
             self.liveliness_lost_total_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_LOST_STATUS;
-            self.listener.vtable.on_liveliness_lost(
-                self.listener.ptr,
-                self.toDDSDataWriter(),
-                status,
-            );
+            if (self.listener.on_liveliness_lost) |cb| cb(self.toDDSDataWriter(), &status, self.listener.listener_data);
         }
     }
 
@@ -415,19 +403,23 @@ pub const DataWriterImpl = struct {
         return cast(ctx).instance_handle;
     }
 
-    fn vtSetQos(ctx: *anyopaque, qos: DDS.DataWriterQos) DDS.ReturnCode_t {
-        cast(ctx).qos = qos;
+    fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DataWriterQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.qos.deinit(self.alloc);
+        self.qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataWriterQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).qos;
+        const self = cast(ctx);
+        qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetListener(ctx: *anyopaque, a_listener: DDS.DataWriterListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
+    fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataWriterListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.listener = a_listener;
+        self.listener = if (a_listener) |l| l.* else DDS.noop_DataWriterListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
@@ -444,7 +436,7 @@ pub const DataWriterImpl = struct {
         return cast(ctx).publisher;
     }
 
-    fn vtWaitForAck(ctx: *anyopaque, timeout: DDS.Duration_t) DDS.ReturnCode_t {
+    fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return DDS.RETCODE_OK;
         if (self.last_sn == 0) return DDS.RETCODE_OK;
@@ -524,17 +516,25 @@ pub const DataWriterImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtGetMatchedSubs(ctx: *anyopaque, handles: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+    fn vtGetMatchedSubs(ctx: *anyopaque, handles: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+        const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
         defer guids.deinit(self.alloc);
         self.proto_writer.listMatchedReaders(self.alloc, &guids) catch
             return DDS.RETCODE_OUT_OF_RESOURCES;
-        handles.clearRetainingCapacity();
-        for (guids.items) |guid| {
-            handles.append(self.alloc, guidToHandle(guid)) catch
-                return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
+        seq.* = .{};
+        const n = guids.items.len;
+        if (n == 0) return DDS.RETCODE_OK;
+        const buf = self.alloc.alloc(DDS.InstanceHandle_t, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        for (guids.items, 0..) |guid, i| buf[i] = guidToHandle(guid);
+        seq._buffer = buf.ptr;
+        seq._length = @intCast(n);
+        seq._maximum = @intCast(n);
+        seq._release = true;
         return DDS.RETCODE_OK;
     }
 

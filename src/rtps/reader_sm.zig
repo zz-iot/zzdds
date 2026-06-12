@@ -188,6 +188,7 @@ pub const WriterProxy = struct {
             .history_established = true,
         };
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
+        errdefer self.unicast_locators.deinit(alloc);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
         return self;
     }

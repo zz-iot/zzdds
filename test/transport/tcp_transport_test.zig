@@ -16,6 +16,44 @@ fn sleepMs(ms: u64) void {
     time_mod.sleepNs(ms * std.time.ns_per_ms);
 }
 
+const Mutex = zzdds.util.mutex.Mutex;
+const Condvar = zzdds.util.condvar.Condvar;
+
+/// Thread-safe event counter backed by a mutex + condition variable.
+/// The receive-thread callback calls post(); the test thread calls waitFor(n)
+/// which blocks until the count reaches n.  No polling, no fixed sleeps.
+const Latch = struct {
+    mu: Mutex = .{},
+    cond: Condvar = .{},
+    n: usize = 0,
+
+    fn post(self: *Latch) void {
+        self.mu.lock();
+        self.n += 1;
+        self.mu.unlock();
+        self.cond.signal();
+    }
+
+    fn waitFor(self: *Latch, expected: usize) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (self.n < expected) self.cond.wait(&self.mu);
+    }
+};
+
+/// Receive handler that posts to a Latch on every message.  Used by tests that
+/// only care about delivery count, not payload.
+const LatchCounter = struct {
+    latch: *Latch,
+    fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.latch.post();
+    }
+    fn handler(self: *@This()) ReceiveHandler {
+        return .{ .ctx = self, .on_receive = f };
+    }
+};
+
 /// Listen on port 0 (IPv4 loopback), return the OS-assigned port.
 fn listenAndGetPort(t: iface.Transport, h: ReceiveHandler, alloc: std.mem.Allocator) !u16 {
     const loc = Locator.tcp4(.{ 127, 0, 0, 1 }, 0);
@@ -93,22 +131,25 @@ test "tcp transport: loopback send and receive" {
     var received: []u8 = &.{};
     var recv_count: usize = 0;
 
+    var recv_latch = Latch{};
     const Ctx = struct {
         buf: *[]u8,
         count: *usize,
         alloc: std.mem.Allocator,
+        latch: *Latch,
 
         fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.alloc.free(self.buf.*);
             self.buf.* = self.alloc.dupe(u8, data) catch &.{};
             self.count.* += 1;
+            self.latch.post();
         }
         fn handler(self: *@This()) ReceiveHandler {
             return .{ .ctx = self, .on_receive = onRecv };
         }
     };
-    var ctx = Ctx{ .buf = &received, .count = &recv_count, .alloc = alloc };
+    var ctx = Ctx{ .buf = &received, .count = &recv_count, .alloc = alloc, .latch = &recv_latch };
 
     const port = try listenAndGetPort(st, ctx.handler(), alloc);
     defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), ctx.handler());
@@ -123,7 +164,7 @@ test "tcp transport: loopback send and receive" {
     const payload = "Hello RTPS-TCP";
     try ct.send(&dest, payload);
 
-    sleepMs(100);
+    recv_latch.waitFor(1);
 
     try testing.expectEqual(@as(usize, 1), recv_count);
     try testing.expectEqualSlices(u8, payload, received);
@@ -140,21 +181,10 @@ test "tcp transport: fan-out to two handlers" {
     defer server.deinit();
     const st = server.transport();
 
-    var count_a: usize = 0;
-    var count_b: usize = 0;
-
-    const Counter = struct {
-        n: *usize,
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.n.* += 1;
-        }
-        fn handler(self: *@This()) ReceiveHandler {
-            return .{ .ctx = self, .on_receive = f };
-        }
-    };
-    var ca = Counter{ .n = &count_a };
-    var cb = Counter{ .n = &count_b };
+    var latch_a = Latch{};
+    var latch_b = Latch{};
+    var ca = LatchCounter{ .latch = &latch_a };
+    var cb = LatchCounter{ .latch = &latch_b };
 
     const port = try listenAndGetPort(st, ca.handler(), alloc);
     const listen_loc = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
@@ -172,17 +202,18 @@ test "tcp transport: fan-out to two handlers" {
 
     const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
     try ct.send(&dest, "ping");
-    sleepMs(100);
+    latch_a.waitFor(1);
+    latch_b.waitFor(1);
 
-    try testing.expectEqual(@as(usize, 1), count_a);
-    try testing.expectEqual(@as(usize, 1), count_b);
+    try testing.expectEqual(@as(usize, 1), latch_a.n);
+    try testing.expectEqual(@as(usize, 1), latch_b.n);
 
     // Unlisten A; only B receives subsequent messages.
     st.unlisten(&listen_loc, ca.handler());
     try ct.send(&dest, "pong");
-    sleepMs(100);
-    try testing.expectEqual(@as(usize, 1), count_a);
-    try testing.expectEqual(@as(usize, 2), count_b);
+    latch_b.waitFor(2);
+    try testing.expectEqual(@as(usize, 1), latch_a.n);
+    try testing.expectEqual(@as(usize, 2), latch_b.n);
 }
 
 // ── Connection reuse by host ──────────────────────────────────────────────────
@@ -190,20 +221,10 @@ test "tcp transport: fan-out to two handlers" {
 test "tcp transport: default does not reuse by host" {
     const alloc = testing.allocator;
 
-    var count_a: usize = 0;
-    var count_b: usize = 0;
-    const Counter = struct {
-        n: *usize,
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.n.* += 1;
-        }
-        fn handler(self: *@This()) ReceiveHandler {
-            return .{ .ctx = self, .on_receive = f };
-        }
-    };
-    var ca = Counter{ .n = &count_a };
-    var cb = Counter{ .n = &count_b };
+    var latch_a = Latch{};
+    var latch_b = Latch{};
+    var ca = LatchCounter{ .latch = &latch_a };
+    var cb = LatchCounter{ .latch = &latch_b };
 
     const server_a = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server_a.deinit();
@@ -227,10 +248,11 @@ test "tcp transport: default does not reuse by host" {
 
     try ct.send(&loc_a, "a");
     try ct.send(&loc_b, "b");
-    sleepMs(100);
+    latch_a.waitFor(1);
+    latch_b.waitFor(1);
 
-    try testing.expectEqual(@as(usize, 1), count_a);
-    try testing.expectEqual(@as(usize, 1), count_b);
+    try testing.expectEqual(@as(usize, 1), latch_a.n);
+    try testing.expectEqual(@as(usize, 1), latch_b.n);
     {
         client.conn_mu.lock();
         defer client.conn_mu.unlock();
@@ -241,20 +263,10 @@ test "tcp transport: default does not reuse by host" {
 test "tcp transport: connection reuse by host is opt-in" {
     const alloc = testing.allocator;
 
-    var count_a: usize = 0;
-    var count_b: usize = 0;
-    const Counter = struct {
-        n: *usize,
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.n.* += 1;
-        }
-        fn handler(self: *@This()) ReceiveHandler {
-            return .{ .ctx = self, .on_receive = f };
-        }
-    };
-    var ca = Counter{ .n = &count_a };
-    var cb = Counter{ .n = &count_b };
+    var latch_a = Latch{};
+    var latch_b = Latch{};
+    var ca = LatchCounter{ .latch = &latch_a };
+    var cb = LatchCounter{ .latch = &latch_b };
 
     const server_a = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
     defer server_a.deinit();
@@ -278,10 +290,10 @@ test "tcp transport: connection reuse by host is opt-in" {
 
     try ct.send(&loc_a, "discovery");
     try ct.send(&loc_b, "data");
-    sleepMs(100);
+    latch_a.waitFor(2);
 
-    try testing.expectEqual(@as(usize, 2), count_a);
-    try testing.expectEqual(@as(usize, 0), count_b);
+    try testing.expectEqual(@as(usize, 2), latch_a.n);
+    try testing.expectEqual(@as(usize, 0), latch_b.n);
     {
         client.conn_mu.lock();
         defer client.conn_mu.unlock();
@@ -669,18 +681,8 @@ test "tcp transport: connection recovery after fd close" {
     defer server.deinit();
     const st = server.transport();
 
-    var count: usize = 0;
-    const Counter = struct {
-        n: *usize,
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.n.* += 1;
-        }
-        fn handler(self: *@This()) ReceiveHandler {
-            return .{ .ctx = self, .on_receive = f };
-        }
-    };
-    var ctr = Counter{ .n = &count };
+    var latch = Latch{};
+    var ctr = LatchCounter{ .latch = &latch };
 
     const port = try listenAndGetPort(st, ctr.handler(), alloc);
     defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), ctr.handler());
@@ -695,8 +697,8 @@ test "tcp transport: connection recovery after fd close" {
 
     // Initial send establishes a connection.
     try ct.send(&dest, "first");
-    sleepMs(100);
-    try testing.expectEqual(@as(usize, 1), count);
+    latch.waitFor(1);
+    try testing.expectEqual(@as(usize, 1), latch.n);
 
     // Close the client-side connection fd to simulate network failure.
     // vtSend will detect the write failure on next send and re-dial.
@@ -712,8 +714,8 @@ test "tcp transport: connection recovery after fd close" {
     // Send again — vtSend detects the dead connection, re-dials, and succeeds.
     // (No sleep needed: vtSend retries on write failure.)
     try ct.send(&dest, "second");
-    sleepMs(100);
-    try testing.expectEqual(@as(usize, 2), count);
+    latch.waitFor(2);
+    try testing.expectEqual(@as(usize, 2), latch.n);
 }
 
 // ── IPv6 loopback send + receive ──────────────────────────────────────────────
@@ -730,23 +732,26 @@ test "tcp transport: IPv6 loopback send and receive" {
 
     var received: []u8 = &.{};
     var recv_count: usize = 0;
+    var recv_latch = Latch{};
 
     const Ctx = struct {
         buf: *[]u8,
         count: *usize,
         alloc: std.mem.Allocator,
+        latch: *Latch,
 
         fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.alloc.free(self.buf.*);
             self.buf.* = self.alloc.dupe(u8, data) catch &.{};
             self.count.* += 1;
+            self.latch.post();
         }
         fn handler(self: *@This()) ReceiveHandler {
             return .{ .ctx = self, .on_receive = onRecv };
         }
     };
-    var ctx = Ctx{ .buf = &received, .count = &recv_count, .alloc = alloc };
+    var ctx = Ctx{ .buf = &received, .count = &recv_count, .alloc = alloc, .latch = &recv_latch };
 
     const port = listenAndGetPortV6(st, ctx.handler(), alloc) catch |err| switch (err) {
         error.BindFailed => return, // IPv6 loopback not available on this system
@@ -774,7 +779,7 @@ test "tcp transport: IPv6 loopback send and receive" {
     const dest = Locator.tcp6(lo6, port);
     try ct.send(&dest, "Hello IPv6 TCP");
 
-    sleepMs(100);
+    recv_latch.waitFor(1);
 
     try testing.expectEqual(@as(usize, 1), recv_count);
     try testing.expectEqualSlices(u8, "Hello IPv6 TCP", received);

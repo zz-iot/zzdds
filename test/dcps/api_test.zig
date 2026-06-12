@@ -108,7 +108,7 @@ test "DCPS: create_participant / delete_participant" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     // ptr is *anyopaque; verify it's not the null address
     try testing.expect(@intFromPtr(dp.ptr) != 0);
 
@@ -121,9 +121,9 @@ test "DCPS: delete_participant with outstanding children fails" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     // Create a publisher without deleting it.
-    _ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    _ = dp.create_publisher(.{}, null, 0);
 
     // delete_participant without deleting children should fail.
     const rc = dpf.delete_participant(dp);
@@ -141,13 +141,13 @@ test "DCPS: create/delete Publisher and Subscriber" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     try testing.expect(@intFromPtr(pub_.ptr) != 0);
 
-    const sub_ = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub_ = dp.create_subscriber(.{}, null, 0);
     try testing.expect(@intFromPtr(sub_.ptr) != 0);
 
     try testing.expectEqual(RETCODE_OK, dp.vtable.delete_publisher(dp.ptr, pub_));
@@ -159,15 +159,14 @@ test "DCPS: create/delete Topic" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const topic = dp.vtable.create_topic(
-        dp.ptr,
+    const topic = dp.create_topic(
         "MyTopic",
         "MyType",
         .{},
-        nil.nil_topic_listener,
+        null,
         0,
     );
     try testing.expect(@intFromPtr(topic.ptr) != 0);
@@ -183,24 +182,23 @@ test "DCPS: create/delete DataWriter and DataReader" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const sub_ = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    _ = dp.vtable.create_topic(dp.ptr, "T", "TT", .{}, nil.nil_topic_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const sub_ = dp.create_subscriber(.{}, null, 0);
+    _ = dp.create_topic("T", "TT", .{}, null, 0);
     const td = dp.vtable.lookup_topicdescription(dp.ptr, "T");
 
-    const dw = pub_.vtable.create_datawriter(
-        pub_.ptr,
-        dp.vtable.create_topic(dp.ptr, "T2", "TT", .{}, nil.nil_topic_listener, 0),
+    const dw = pub_.create_datawriter(
+        dp.create_topic("T2", "TT", .{}, null, 0),
         .{},
-        nil.nil_dw_listener,
+        null,
         0,
     );
     try testing.expect(@intFromPtr(dw.ptr) != 0);
 
-    const dr = sub_.vtable.create_datareader(sub_.ptr, td, .{}, nil.nil_dr_listener, 0);
+    const dr = sub_.create_datareader(td, .{}, null, 0);
     try testing.expect(@intFromPtr(dr.ptr) != 0);
 
     try testing.expectEqual(RETCODE_OK, dp.vtable.delete_contained_entities(dp.ptr));
@@ -211,20 +209,19 @@ test "DCPS: delete_contained_entities removes all children" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const sub_ = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    _ = dp.vtable.create_topic(dp.ptr, "T", "TT", .{}, nil.nil_topic_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const sub_ = dp.create_subscriber(.{}, null, 0);
+    _ = dp.create_topic("T", "TT", .{}, null, 0);
     const td = dp.vtable.lookup_topicdescription(dp.ptr, "T");
-    _ = pub_.vtable.create_datawriter(
-        pub_.ptr,
-        dp.vtable.create_topic(dp.ptr, "T2", "TT", .{}, nil.nil_topic_listener, 0),
+    _ = pub_.create_datawriter(
+        dp.create_topic("T2", "TT", .{}, null, 0),
         .{},
-        nil.nil_dw_listener,
+        null,
         0,
     );
-    _ = sub_.vtable.create_datareader(sub_.ptr, td, .{}, nil.nil_dr_listener, 0);
+    _ = sub_.create_datareader(td, .{}, null, 0);
 
     try testing.expectEqual(RETCODE_OK, dp.vtable.delete_contained_entities(dp.ptr));
     try testing.expectEqual(RETCODE_OK, dpf.delete_participant(dp));
@@ -258,12 +255,14 @@ test "DCPS: WaitSet.wait returns already-triggered GuardCondition immediately" {
     _ = dds_gc.vtable.set_trigger_value(dds_gc.ptr, true);
     _ = dds_ws.vtable.attach_condition(dds_ws.ptr, gc.toCondition());
 
-    var triggered: DDS.ConditionSeq = .empty;
-    defer triggered.deinit(testing.allocator);
-    const rc = dds_ws.vtable.wait(dds_ws.ptr, &triggered, DURATION_ZERO);
+    var triggered: DDS.ConditionSeq = .{};
+    defer if (triggered._release) {
+        if (triggered._buffer) |_b| testing.allocator.free(_b[0..triggered._length]);
+    };
+    const rc = dds_ws.vtable.wait(dds_ws.ptr, &triggered, &DURATION_ZERO);
     try testing.expectEqual(RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 1), triggered.items.len);
-    try testing.expect(triggered.items[0].ptr == dds_gc.ptr);
+    try testing.expectEqual(@as(usize, 1), triggered._length);
+    try testing.expect(triggered._buffer.?[0].ptr == dds_gc.ptr);
 }
 
 test "DCPS: WaitSet.wait times out when no condition is triggered" {
@@ -275,11 +274,13 @@ test "DCPS: WaitSet.wait times out when no condition is triggered" {
     const dds_ws = ws.toDDSWaitSet();
     _ = dds_ws.vtable.attach_condition(dds_ws.ptr, gc.toCondition());
 
-    var triggered: DDS.ConditionSeq = .empty;
-    defer triggered.deinit(testing.allocator);
-    const rc = dds_ws.vtable.wait(dds_ws.ptr, &triggered, DURATION_ZERO);
+    var triggered: DDS.ConditionSeq = .{};
+    defer if (triggered._release) {
+        if (triggered._buffer) |_b| testing.allocator.free(_b[0..triggered._length]);
+    };
+    const rc = dds_ws.vtable.wait(dds_ws.ptr, &triggered, &DURATION_ZERO);
     try testing.expectEqual(RETCODE_TIMEOUT, rc);
-    try testing.expectEqual(@as(usize, 0), triggered.items.len);
+    try testing.expectEqual(@as(usize, 0), triggered._length);
 }
 
 test "DCPS: WaitSet.wait woken by GuardCondition triggered from another thread" {
@@ -301,12 +302,14 @@ test "DCPS: WaitSet.wait woken by GuardCondition triggered from another thread" 
     const thr = try std.Thread.spawn(.{}, Trigger.run, .{dds_gc});
     defer thr.join();
 
-    var triggered: DDS.ConditionSeq = .empty;
-    defer triggered.deinit(testing.allocator);
+    var triggered: DDS.ConditionSeq = .{};
+    defer if (triggered._release) {
+        if (triggered._buffer) |_b| testing.allocator.free(_b[0..triggered._length]);
+    };
     const timeout = DDS.Duration_t{ .sec = 2, .nanosec = 0 };
-    const rc = dds_ws.vtable.wait(dds_ws.ptr, &triggered, timeout);
+    const rc = dds_ws.vtable.wait(dds_ws.ptr, &triggered, &timeout);
     try testing.expectEqual(RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 1), triggered.items.len);
+    try testing.expectEqual(@as(usize, 1), triggered._length);
 }
 
 // ── StatusCondition ───────────────────────────────────────────────────────────
@@ -316,7 +319,7 @@ test "DCPS: get_statuscondition on participant returns bound condition" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const sc = dp.vtable.get_statuscondition(dp.ptr);
@@ -330,12 +333,12 @@ test "DCPS: get_statuscondition on DataWriter returns non-null condition" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "T", "TT", .{}, nil.nil_topic_listener, 0);
-    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, .{}, nil.nil_dw_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("T", "TT", .{}, null, 0);
+    const dw = pub_.create_datawriter(topic, .{}, null, 0);
 
     const sc = dw.vtable.get_statuscondition(dw.ptr);
     try testing.expect(@intFromPtr(sc.ptr) != 0);
@@ -369,13 +372,13 @@ test "DCPS: DCPSTopic reader receives a sample when a topic is created" {
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const bs_sub = dp.vtable.get_builtin_subscriber(dp.ptr);
     try testing.expect(@intFromPtr(bs_sub.ptr) != 0);
 
-    _ = dp.vtable.create_topic(dp.ptr, "MyTopic", "MyType", .{}, nil.nil_topic_listener, 0);
+    _ = dp.create_topic("MyTopic", "MyType", .{}, null, 0);
 
     // The builtin DCPSTopic DataReader should now have one pending sample.
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -391,17 +394,19 @@ test "DCPS: get_discovered_topics returns handle for a SEDP-discovered writer's 
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
     fireRemoteWriter(dp_impl, "RemoteTopic", "RemoteType");
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topics(dp.ptr, &handles));
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
-    try testing.expect(handles.items[0] != 0);
+    try testing.expectEqual(@as(u32, 1), handles._length);
+    try testing.expect(handles._buffer.?[0] != 0);
 }
 
 test "DCPS: get_discovered_topic_data returns name and type_name for discovered topic" {
@@ -410,19 +415,21 @@ test "DCPS: get_discovered_topic_data returns name and type_name for discovered 
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
     fireRemoteWriter(dp_impl, "DiscTopic", "DiscType");
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     _ = dp.vtable.get_discovered_topics(dp.ptr, &handles);
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
+    try testing.expectEqual(@as(u32, 1), handles._length);
 
     var data = DDS.TopicBuiltinTopicData{};
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles.items[0]));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles._buffer.?[0]));
     try testing.expectEqualStrings("DiscTopic", data.name);
     try testing.expectEqualStrings("DiscType", data.type_name);
 
@@ -436,7 +443,7 @@ test "DCPS: get_discovered_topics deduplicates same topic from multiple writers"
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -444,10 +451,12 @@ test "DCPS: get_discovered_topics deduplicates same topic from multiple writers"
     fireRemoteWriter(dp_impl, "SharedTopic", "SharedType");
     fireRemoteWriter(dp_impl, "SharedTopic", "SharedType");
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     _ = dp.vtable.get_discovered_topics(dp.ptr, &handles);
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
+    try testing.expectEqual(@as(u32, 1), handles._length);
 }
 
 test "DCPS: contains_entity returns true for participant, topic, publisher, writer" {
@@ -455,21 +464,21 @@ test "DCPS: contains_entity returns true for participant, topic, publisher, writ
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_handle = dp.vtable.get_instance_handle(dp.ptr);
     try testing.expect(dp.vtable.contains_entity(dp.ptr, dp_handle));
 
-    const topic = dp.vtable.create_topic(dp.ptr, "T", "TT", .{}, nil.nil_topic_listener, 0);
+    const topic = dp.create_topic("T", "TT", .{}, null, 0);
     const topic_handle = topic.vtable.get_instance_handle(topic.ptr);
     try testing.expect(dp.vtable.contains_entity(dp.ptr, topic_handle));
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     const pub_handle = pub_.vtable.get_instance_handle(pub_.ptr);
     try testing.expect(dp.vtable.contains_entity(dp.ptr, pub_handle));
 
-    const dw = pub_.vtable.create_datawriter(pub_.ptr, topic, .{}, nil.nil_dw_listener, 0);
+    const dw = pub_.create_datawriter(topic, .{}, null, 0);
     const dw_handle = dw.vtable.get_instance_handle(dw.ptr);
     try testing.expect(dp.vtable.contains_entity(dp.ptr, dw_handle));
 
@@ -485,19 +494,21 @@ test "DCPS: get_discovered_topics and get_discovered_topic_data work for locally
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    _ = dp.vtable.create_topic(dp.ptr, "LocalTopic", "LocalType", .{}, nil.nil_topic_listener, 0);
+    _ = dp.create_topic("LocalTopic", "LocalType", .{}, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topics(dp.ptr, &handles));
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
+    try testing.expectEqual(@as(u32, 1), handles._length);
 
     var data = DDS.TopicBuiltinTopicData{};
-    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles.items[0]));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles._buffer.?[0]));
     try testing.expectEqualStrings("LocalTopic", data.name);
     try testing.expectEqualStrings("LocalType", data.type_name);
 }
@@ -508,20 +519,22 @@ test "DCPS: SEDP announcement for a locally-created topic does not produce a dup
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    _ = dp.vtable.create_topic(dp.ptr, "DupTopic", "DupType", .{}, nil.nil_topic_listener, 0);
+    _ = dp.create_topic("DupTopic", "DupType", .{}, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
 
     // Simulate SEDP discovering a writer on the same topic.
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
     fireRemoteWriter(dp_impl, "DupTopic", "DupType");
 
-    var handles = DDS.InstanceHandleSeq.empty;
-    defer handles.deinit(alloc);
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
     _ = dp.vtable.get_discovered_topics(dp.ptr, &handles);
 
     // Should still be exactly one entry, not two.
-    try testing.expectEqual(@as(usize, 1), handles.items.len);
+    try testing.expectEqual(@as(u32, 1), handles._length);
 }

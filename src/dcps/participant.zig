@@ -118,18 +118,18 @@ fn noopProtocolReader() proto.ProtocolReader {
 // ── BuiltinTopicDescImpl — minimal TopicDescription for built-in topics ───────
 
 const BuiltinTopicDescImpl = struct {
-    name: []const u8,
-    type_name: []const u8,
+    name: [*:0]const u8,
+    type_name: [*:0]const u8,
     participant: DDS.DomainParticipant,
 
     const vtbl = DDS.TopicDescription.Vtable{
         .get_type_name = struct {
-            fn f(ctx: *anyopaque) []const u8 {
+            fn f(ctx: *anyopaque) [*:0]const u8 {
                 return cast(ctx).type_name;
             }
         }.f,
         .get_name = struct {
-            fn f(ctx: *anyopaque) []const u8 {
+            fn f(ctx: *anyopaque) [*:0]const u8 {
                 return cast(ctx).name;
             }
         }.f,
@@ -498,14 +498,23 @@ const DiscoveredTopic = struct {
 /// carries no inline-QoS key_hash.  Keyed types should register this to
 /// enable per-instance OWNERSHIP, TIME_BASED_FILTER, and SampleInfo tracking.
 pub const TypeSupport = struct {
+    /// Opaque context passed as the first argument to all function pointers.
+    /// Follows the same convention as Transport and Security plugin vtables.
+    /// Zig-native implementations that need no state may pass `undefined`.
+    ctx: *anyopaque,
     /// Compute the 16-byte DDS key hash from a CDR-encoded payload.
     /// `payload` includes the 4-byte encapsulation header (as received from
     /// the wire).  Return `zeroes([16]u8)` for keyless types.
-    compute_key_hash: *const fn (payload: []const u8) [16]u8,
+    compute_key_hash: *const fn (ctx: *anyopaque, payload: []const u8) [16]u8,
     /// Optional: extract a named field value from a raw CDR payload.
     /// Used to evaluate ContentFilteredTopic expressions at delivery time.
     /// null = CFT evaluation deferred to the typed DataReader layer.
+    /// NOTE: get_field does not yet receive ctx — it will be threaded through
+    /// when the ContentFilteredTopic C-ABI binding is designed.
     get_field: ?*const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue = null,
+    /// Optional cleanup called when the participant deinits this TypeSupport entry.
+    /// Use to free any ctx allocation.  null = no cleanup needed (e.g. ctx = undefined).
+    deinit: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 const ActiveWriter = struct {
@@ -515,7 +524,7 @@ const ActiveWriter = struct {
     topic_name: []const u8, // borrowed from topic_name slice in active list
     type_name: []const u8,
     qos: DDS.DataWriterQos,
-    partition_names: []const []const u8 = &.{}, // publisher's partition names (borrowed)
+    partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
     incompat_qos: ?IncompatQosNotify = null,
     matched_notify: ?MatchedNotify = null,
@@ -530,12 +539,13 @@ const ActiveReader = struct {
     topic_name: []const u8,
     type_name: []const u8,
     qos: DDS.DataReaderQos,
-    partition_names: []const []const u8 = &.{}, // subscriber's partition names (borrowed)
+    partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
     incompat_qos: ?IncompatQosNotify = null,
     matched_notify: ?MatchedNotify = null,
     timer_check: ?TimerNotify = null,
-    key_hash_fn: ?*const fn ([]const u8) [16]u8 = null,
+    key_hash_ctx: *anyopaque = undefined,
+    key_hash_fn: ?*const fn (*anyopaque, []const u8) [16]u8 = null,
 };
 
 // ── DomainParticipantImpl ────────────────────────────────────────────────────
@@ -645,7 +655,7 @@ pub const DomainParticipantImpl = struct {
             .alloc = alloc,
             .domain_id = domain_id,
             .guid = guid,
-            .qos = qos,
+            .qos = .{},
             .listener = listener,
             .listener_mask = mask,
             .instance_handle = handle,
@@ -690,6 +700,8 @@ pub const DomainParticipantImpl = struct {
             .mu = .{},
         };
         errdefer alloc.destroy(self);
+        self.qos = try qos.clone(alloc);
+        errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         self.builtin_sub = BuiltinSubscriberState.init(alloc, self) catch null;
@@ -826,14 +838,25 @@ pub const DomainParticipantImpl = struct {
         cfts.deinit(self.alloc);
 
         self.type_info_registry.deinit(self.alloc);
+        var ts_it = self.type_support_registry.iterator();
+        while (ts_it.next()) |entry| {
+            if (entry.value_ptr.deinit) |f| f(entry.value_ptr.ctx);
+            self.alloc.free(entry.key_ptr.*);
+        }
         self.type_support_registry.deinit(self.alloc);
 
         // Any remaining active writers/readers (normally all removed by pub/sub deinit).
         var wit = self.active_writers.valueIterator();
-        while (wit.next()) |aw| aw.proto.deinit();
+        while (wit.next()) |aw| {
+            aw.proto.deinit();
+            freePartitionNames(self.alloc, aw.partition_names);
+        }
         self.active_writers.deinit(self.alloc);
         var rit = self.active_readers.valueIterator();
-        while (rit.next()) |ar| ar.proto.deinit();
+        while (rit.next()) |ar| {
+            ar.proto.deinit();
+            freePartitionNames(self.alloc, ar.partition_names);
+        }
         self.active_readers.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
         self.ignored_prefixes.deinit(self.alloc);
@@ -846,6 +869,11 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(dt.type_name);
         }
         self.discovered_topics.deinit(self.alloc);
+
+        self.qos.deinit(self.alloc);
+        self.default_pub_qos.deinit(self.alloc);
+        self.default_sub_qos.deinit(self.alloc);
+        self.default_topic_qos.deinit(self.alloc);
 
         self.alloc.destroy(self);
     }
@@ -860,8 +888,35 @@ pub const DomainParticipantImpl = struct {
     /// Register TypeSupport callbacks for a type name.
     /// Call before creating DataReaders for the type.  The caller must ensure
     /// `type_name` remains valid for the lifetime of the participant.
-    pub fn registerTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) void {
-        self.type_support_registry.put(self.alloc, type_name, ts) catch {};
+    pub fn registerTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) bool {
+        // Heap-copy the key so the map owns it regardless of caller lifetime.
+        const owned_key = self.alloc.dupe(u8, type_name) catch {
+            if (ts.deinit) |f| f(ts.ctx);
+            return false;
+        };
+        self.mu.lock();
+        defer self.mu.unlock();
+        const gop = self.type_support_registry.getOrPut(self.alloc, owned_key) catch {
+            self.alloc.free(owned_key);
+            if (ts.deinit) |f| f(ts.ctx);
+            return false;
+        };
+        if (gop.found_existing) {
+            // Replacing: deinit old value, swap in new owned key (free the old one).
+            if (gop.value_ptr.deinit) |f| f(gop.value_ptr.ctx);
+            self.alloc.free(gop.key_ptr.*);
+            gop.key_ptr.* = owned_key;
+            // Propagate new ctx/fn to active readers that cached the old (now freed) pointers.
+            var ar_it = self.active_readers.valueIterator();
+            while (ar_it.next()) |ar| {
+                if (std.mem.eql(u8, ar.type_name, type_name)) {
+                    ar.key_hash_ctx = ts.ctx;
+                    ar.key_hash_fn = ts.compute_key_hash;
+                }
+            }
+        }
+        gop.value_ptr.* = ts;
+        return true;
     }
 
     pub fn registerTypeInfo(self: *Self, type_name: []const u8, cdr: []const u8) void {
@@ -968,6 +1023,7 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         var found_guid: ?Guid = null;
         var found_proto: ?proto.ProtocolWriter = null;
+        var found_parts: []const []const u8 = &.{};
 
         self.mu.lock();
         var writ = self.active_writers.valueIterator();
@@ -975,12 +1031,14 @@ pub const DomainParticipantImpl = struct {
             if (aw.handle == handle) {
                 found_guid = aw.guid;
                 found_proto = aw.proto;
+                found_parts = aw.partition_names;
                 break;
             }
         }
         if (found_guid) |g| _ = self.active_writers.remove(entityIdKey(g.entity_id));
         self.mu.unlock();
 
+        freePartitionNames(self.alloc, found_parts);
         if (found_guid) |g| self.discovery.retractWriter(g);
         if (found_proto) |p| p.deinit();
     }
@@ -1040,6 +1098,7 @@ pub const DomainParticipantImpl = struct {
                 .topic_name = topic_name,
                 .type_name = type_name,
                 .qos = qos,
+                .key_hash_ctx = if (self.type_support_registry.get(type_name)) |ts| ts.ctx else undefined,
                 .key_hash_fn = if (self.type_support_registry.get(type_name)) |ts|
                     ts.compute_key_hash
                 else
@@ -1054,6 +1113,7 @@ pub const DomainParticipantImpl = struct {
         const self = cast(ctx);
         var found_guid: ?Guid = null;
         var found_proto: ?proto.ProtocolReader = null;
+        var found_parts: []const []const u8 = &.{};
 
         self.mu.lock();
         var rrit = self.active_readers.valueIterator();
@@ -1061,12 +1121,14 @@ pub const DomainParticipantImpl = struct {
             if (ar.handle == handle) {
                 found_guid = ar.guid;
                 found_proto = ar.proto;
+                found_parts = ar.partition_names;
                 break;
             }
         }
         if (found_guid) |g| _ = self.active_readers.remove(entityIdKey(g.entity_id));
         self.mu.unlock();
 
+        freePartitionNames(self.alloc, found_parts);
         if (found_guid) |g| self.discovery.retractReader(g);
         if (found_proto) |p| p.deinit();
     }
@@ -1092,7 +1154,7 @@ pub const DomainParticipantImpl = struct {
             .ownership_strength = qos.ownership_strength.value,
             .destination_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
             .data_representation = if (comptime build_opts.xtypes)
-                reprFromQos(qos.data_representation.value.items)
+                reprFromQos(if (qos.data_representation.value._buffer) |b| b[0..qos.data_representation.value._length] else &.{})
             else
                 1,
             .deadline_sec = if (dl_zero_w) 0x7fff_ffff else qos.deadline.period.sec,
@@ -1117,7 +1179,7 @@ pub const DomainParticipantImpl = struct {
             .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
             .destination_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
             .data_representation = if (comptime build_opts.xtypes)
-                reprFromQos(qos.data_representation.value.items)
+                reprFromQos(if (qos.data_representation.value._buffer) |b| b[0..qos.data_representation.value._length] else &.{})
             else
                 2, // Advertise XCDR2 acceptance so XCDR2-capable writers (OpenDDS) match.
             // zzdds stores raw CDR bytes and interop programs parse both XCDR1/2.
@@ -1213,7 +1275,7 @@ pub const DomainParticipantImpl = struct {
 
     fn resolveKeyHash(kh: [16]u8, ar: *ActiveReader, payload: []const u8) [16]u8 {
         if (!std.mem.eql(u8, &kh, &std.mem.zeroes([16]u8))) return kh;
-        if (ar.key_hash_fn) |f| return f(payload);
+        if (ar.key_hash_fn) |f| return f(ar.key_hash_ctx, payload);
         return kh;
     }
 
@@ -1712,6 +1774,24 @@ pub const DomainParticipantImpl = struct {
 
     // ── ParticipantCbs factory helpers ────────────────────────────────────────
 
+    fn dupePartitionNames(alloc: std.mem.Allocator, names: []const []const u8) []const []const u8 {
+        if (names.len == 0) return &.{};
+        const copy = alloc.alloc([]const u8, names.len) catch return &.{};
+        for (copy, names, 0..) |*dst, src, i| {
+            dst.* = alloc.dupe(u8, src) catch {
+                for (copy[0..i]) |s| alloc.free(s);
+                alloc.free(copy);
+                return &.{};
+            };
+        }
+        return copy;
+    }
+
+    fn freePartitionNames(alloc: std.mem.Allocator, names: []const []const u8) void {
+        for (names) |s| alloc.free(s);
+        if (names.len > 0) alloc.free(names);
+    }
+
     fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
         // Find the writer and snapshot its announcement fields outside the lock.
@@ -1722,13 +1802,15 @@ pub const DomainParticipantImpl = struct {
             qos: DDS.DataWriterQos,
             presentation: DDS.PresentationQosPolicy,
         } = null;
+        const owned_names = dupePartitionNames(self.alloc, partition_names);
         {
             self.mu.lock();
             defer self.mu.unlock();
             var aw_it3 = self.active_writers.valueIterator();
             while (aw_it3.next()) |aw| {
                 if (aw.handle == handle) {
-                    aw.partition_names = partition_names;
+                    freePartitionNames(self.alloc, aw.partition_names);
+                    aw.partition_names = owned_names;
                     aw.presentation = presentation;
                     ann_opt = .{
                         .guid = aw.guid,
@@ -1741,10 +1823,13 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
-        const ann = ann_opt orelse return;
+        const ann = ann_opt orelse {
+            freePartitionNames(self.alloc, owned_names);
+            return;
+        };
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
         var snap = writerQosSnapshot(ann.qos, ann.presentation);
-        snap.partition_names = partition_names;
+        snap.partition_names = owned_names;
         self.discovery.announceWriter(&disc.WriterAnnouncement{
             .guid = ann.guid,
             .participant_guid = self.guid,
@@ -1765,13 +1850,15 @@ pub const DomainParticipantImpl = struct {
             qos: DDS.DataReaderQos,
             presentation: DDS.PresentationQosPolicy,
         } = null;
+        const owned_names = dupePartitionNames(self.alloc, partition_names);
         {
             self.mu.lock();
             defer self.mu.unlock();
             var ar_it3 = self.active_readers.valueIterator();
             while (ar_it3.next()) |ar| {
                 if (ar.handle == handle) {
-                    ar.partition_names = partition_names;
+                    freePartitionNames(self.alloc, ar.partition_names);
+                    ar.partition_names = owned_names;
                     ar.presentation = presentation;
                     ann_opt = .{
                         .guid = ar.guid,
@@ -1784,10 +1871,13 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
-        const ann = ann_opt orelse return;
+        const ann = ann_opt orelse {
+            freePartitionNames(self.alloc, owned_names);
+            return;
+        };
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
         var snap = readerQosSnapshot(ann.qos, ann.presentation);
-        snap.partition_names = partition_names;
+        snap.partition_names = owned_names;
         self.discovery.announceReader(&disc.ReaderAnnouncement{
             .guid = ann.guid,
             .participant_guid = self.guid,
@@ -2058,8 +2148,8 @@ pub const DomainParticipantImpl = struct {
 
     fn vtCreatePublisher(
         ctx: *anyopaque,
-        qos: DDS.PublisherQos,
-        a_listener: DDS.PublisherListener,
+        qos: *const DDS.PublisherQos,
+        a_listener: ?*const DDS.PublisherListener,
         mask: DDS.StatusMask,
     ) DDS.Publisher {
         const self = cast(ctx);
@@ -2068,8 +2158,8 @@ pub const DomainParticipantImpl = struct {
             self.alloc,
             self.toDDSParticipant(),
             self.makePubCbs(),
-            qos,
-            a_listener,
+            qos.*,
+            if (a_listener) |l| l.* else DDS.noop_PublisherListener,
             mask,
             handle,
         ) catch return nil.nil_publisher;
@@ -2105,8 +2195,8 @@ pub const DomainParticipantImpl = struct {
 
     fn vtCreateSubscriber(
         ctx: *anyopaque,
-        qos: DDS.SubscriberQos,
-        a_listener: DDS.SubscriberListener,
+        qos: *const DDS.SubscriberQos,
+        a_listener: ?*const DDS.SubscriberListener,
         mask: DDS.StatusMask,
     ) DDS.Subscriber {
         const self = cast(ctx);
@@ -2115,8 +2205,8 @@ pub const DomainParticipantImpl = struct {
             self.alloc,
             self.toDDSParticipant(),
             self.makeSubCbs(),
-            qos,
-            a_listener,
+            qos.*,
+            if (a_listener) |l| l.* else DDS.noop_SubscriberListener,
             mask,
             handle,
         ) catch return nil.nil_subscriber;
@@ -2157,22 +2247,24 @@ pub const DomainParticipantImpl = struct {
 
     fn vtCreateTopic(
         ctx: *anyopaque,
-        topic_name: []const u8,
-        type_name: []const u8,
-        qos: DDS.TopicQos,
-        a_listener: DDS.TopicListener,
+        topic_name: [*:0]const u8,
+        type_name: [*:0]const u8,
+        qos: *const DDS.TopicQos,
+        a_listener: ?*const DDS.TopicListener,
         mask: DDS.StatusMask,
     ) DDS.Topic {
         const self = cast(ctx);
         const handle = nextHandle(ctx);
+        const tn_s = std.mem.span(topic_name);
+        const tt_s = std.mem.span(type_name);
         const t = topic_mod.TopicImpl.init(
             self.alloc,
-            topic_name,
-            type_name,
+            tn_s,
+            tt_s,
             self,
             getDDSParticipant,
-            qos,
-            a_listener,
+            qos.*,
+            if (a_listener) |l| l.* else DDS.noop_TopicListener,
             mask,
             handle,
         ) catch return nil.nil_topic;
@@ -2187,18 +2279,18 @@ pub const DomainParticipantImpl = struct {
         // by the SEDP callbacks prevents a duplicate entry when the topic later appears on wire.
         new_dt: {
             for (self.discovered_topics.items) |dt| {
-                if (std.mem.eql(u8, dt.topic_name, topic_name) and
-                    std.mem.eql(u8, dt.type_name, type_name)) break :new_dt;
+                if (std.mem.eql(u8, dt.topic_name, tn_s) and
+                    std.mem.eql(u8, dt.type_name, tt_s)) break :new_dt;
             }
-            const tn = self.alloc.dupe(u8, topic_name) catch break :new_dt;
-            const tt = self.alloc.dupe(u8, type_name) catch {
+            const tn = self.alloc.dupe(u8, tn_s) catch break :new_dt;
+            const tt = self.alloc.dupe(u8, tt_s) catch {
                 self.alloc.free(tn);
                 break :new_dt;
             };
             const dt = DiscoveredTopic{
                 .topic_name = tn,
                 .type_name = tt,
-                .handle = topicToHandle(topic_name, type_name),
+                .handle = topicToHandle(tn_s, tt_s),
                 .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
                 .durability_kind = @as(u8, @intCast(@intFromEnum(qos.durability.kind))),
                 .liveliness_kind = @as(u8, @intCast(@intFromEnum(qos.liveliness.kind))),
@@ -2215,9 +2307,9 @@ pub const DomainParticipantImpl = struct {
             if (self.builtin_sub) |bs| bs.topic_dr else null;
         self.mu.unlock();
         if (maybe_topic_dr) |dr| pushBuiltinTopicCdr(self.alloc, dr, .{
-            .key = topicNameToKey(topic_name),
-            .name = topic_name,
-            .type_name = type_name,
+            .key = topicNameToKey(tn_s),
+            .name = tn_s,
+            .type_name = tt_s,
             .durability = qos.durability,
             .durability_service = qos.durability_service,
             .deadline = qos.deadline,
@@ -2253,40 +2345,45 @@ pub const DomainParticipantImpl = struct {
         return DDS.RETCODE_BAD_PARAMETER;
     }
 
-    fn vtFindTopic(ctx: *anyopaque, topic_name: []const u8, _: DDS.Duration_t) DDS.Topic {
+    fn vtFindTopic(ctx: *anyopaque, topic_name: [*:0]const u8, _: *const DDS.Duration_t) DDS.Topic {
         const self = cast(ctx);
+        const tn_s = std.mem.span(topic_name);
         self.mu.lock();
         defer self.mu.unlock();
         for (self.topics.items) |t| {
-            if (std.mem.eql(u8, t.topic_name, topic_name)) return t.toDDSTopic();
+            if (std.mem.eql(u8, t.topic_name, tn_s)) return t.toDDSTopic();
         }
         return nil.nil_topic;
     }
 
-    fn vtLookupTopicDesc(ctx: *anyopaque, name: []const u8) DDS.TopicDescription {
+    fn vtLookupTopicDesc(ctx: *anyopaque, name: [*:0]const u8) DDS.TopicDescription {
         const self = cast(ctx);
+        const name_s = std.mem.span(name);
         self.mu.lock();
         defer self.mu.unlock();
         for (self.topics.items) |t| {
-            if (std.mem.eql(u8, t.topic_name, name)) return t.toTopicDescription();
+            if (std.mem.eql(u8, t.topic_name, name_s)) return t.toTopicDescription();
         }
         return nil.nil_topic_description;
     }
 
     fn vtCreateCFTopic(
         ctx: *anyopaque,
-        name: []const u8,
+        name: [*:0]const u8,
         related_topic: DDS.Topic,
-        filter_expression: []const u8,
-        expression_parameters: DDS.StringSeq,
+        filter_expression: [*:0]const u8,
+        expression_parameters: ?*const DDS.StringSeq,
     ) DDS.ContentFilteredTopic {
         const self = cast(ctx);
+        const name_s = std.mem.span(name);
+        const filter_s = std.mem.span(filter_expression);
+        const empty_seq = DDS.StringSeq{};
         const cft = topic_mod.ContentFilteredTopicImpl.init(
             self.alloc,
-            name,
+            name_s,
             related_topic,
-            filter_expression,
-            expression_parameters,
+            filter_s,
+            if (expression_parameters) |p| p.* else empty_seq,
             self.toDDSParticipant(),
         ) catch return nil.nil_cft;
         self.mu.lock();
@@ -2315,10 +2412,10 @@ pub const DomainParticipantImpl = struct {
 
     fn vtCreateMultiTopic(
         _: *anyopaque,
-        _: []const u8,
-        _: []const u8,
-        _: []const u8,
-        _: DDS.StringSeq,
+        _: [*:0]const u8,
+        _: [*:0]const u8,
+        _: [*:0]const u8,
+        _: ?*const DDS.StringSeq,
     ) DDS.MultiTopic {
         return nil.nil_multitopic;
     }
@@ -2351,23 +2448,27 @@ pub const DomainParticipantImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetQos(ctx: *anyopaque, qos: DDS.DomainParticipantQos) DDS.ReturnCode_t {
-        cast(ctx).qos = qos;
+    fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.qos.deinit(self.alloc);
+        self.qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).qos;
+        const self = cast(ctx);
+        qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtSetListener(
         ctx: *anyopaque,
-        a_listener: DDS.DomainParticipantListener,
+        a_listener: ?*const DDS.DomainParticipantListener,
         mask: DDS.StatusMask,
     ) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.listener = a_listener;
+        self.listener = if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
@@ -2472,47 +2573,68 @@ pub const DomainParticipantImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetDefaultPubQos(ctx: *anyopaque, qos: DDS.PublisherQos) DDS.ReturnCode_t {
-        cast(ctx).default_pub_qos = qos;
+    fn vtSetDefaultPubQos(ctx: *anyopaque, qos: *const DDS.PublisherQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.default_pub_qos.deinit(self.alloc);
+        self.default_pub_qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultPubQos(ctx: *anyopaque, qos: *DDS.PublisherQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).default_pub_qos;
+        const self = cast(ctx);
+        qos.* = self.default_pub_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetDefaultSubQos(ctx: *anyopaque, qos: DDS.SubscriberQos) DDS.ReturnCode_t {
-        cast(ctx).default_sub_qos = qos;
+    fn vtSetDefaultSubQos(ctx: *anyopaque, qos: *const DDS.SubscriberQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.default_sub_qos.deinit(self.alloc);
+        self.default_sub_qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultSubQos(ctx: *anyopaque, qos: *DDS.SubscriberQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).default_sub_qos;
+        const self = cast(ctx);
+        qos.* = self.default_sub_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetDefaultTopicQos(ctx: *anyopaque, qos: DDS.TopicQos) DDS.ReturnCode_t {
-        cast(ctx).default_topic_qos = qos;
+    fn vtSetDefaultTopicQos(ctx: *anyopaque, qos: *const DDS.TopicQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.default_topic_qos.deinit(self.alloc);
+        self.default_topic_qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDefaultTopicQos(ctx: *anyopaque, qos: *DDS.TopicQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).default_topic_qos;
+        const self = cast(ctx);
+        qos.* = self.default_topic_qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetDiscoveredParticipants(
         ctx: *anyopaque,
-        handles: *DDS.InstanceHandleSeq,
+        handles: ?*DDS.InstanceHandleSeq,
     ) DDS.ReturnCode_t {
+        const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        handles.clearRetainingCapacity();
-        for (self.discovered_participants.items) |e| {
-            handles.append(self.alloc, e.handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
+        seq.* = .{};
+        const n = self.discovered_participants.items.len;
+        if (n == 0) return DDS.RETCODE_OK;
+        const buf = self.alloc.alloc(DDS.InstanceHandle_t, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        for (self.discovered_participants.items, 0..) |e, i| buf[i] = e.handle;
+        seq._buffer = buf.ptr;
+        seq._length = @intCast(n);
+        seq._maximum = @intCast(n);
+        seq._release = true;
         return DDS.RETCODE_OK;
     }
 
@@ -2536,15 +2658,24 @@ pub const DomainParticipantImpl = struct {
 
     fn vtGetDiscoveredTopics(
         ctx: *anyopaque,
-        handles: *DDS.InstanceHandleSeq,
+        handles: ?*DDS.InstanceHandleSeq,
     ) DDS.ReturnCode_t {
+        const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        handles.clearRetainingCapacity();
-        for (self.discovered_topics.items) |dt| {
-            handles.append(self.alloc, dt.handle) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
+        seq.* = .{};
+        const n = self.discovered_topics.items.len;
+        if (n == 0) return DDS.RETCODE_OK;
+        const buf = self.alloc.alloc(DDS.InstanceHandle_t, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        for (self.discovered_topics.items, 0..) |dt, i| buf[i] = dt.handle;
+        seq._buffer = buf.ptr;
+        seq._length = @intCast(n);
+        seq._maximum = @intCast(n);
+        seq._release = true;
         return DDS.RETCODE_OK;
     }
 

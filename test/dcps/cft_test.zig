@@ -363,9 +363,9 @@ const Fixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const pub_w = dp_w.vtable.create_publisher(dp_w.ptr, .{}, nil.nil_pub_listener, 0);
-        const topic_w = dp_w.vtable.create_topic(dp_w.ptr, "CftTopic", "CftType", .{}, nil.nil_topic_listener, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const pub_w = dp_w.create_publisher(.{}, null, 0);
+        const topic_w = dp_w.create_topic("CftTopic", "CftType", .{}, null, 0);
 
         const t_r = try delivery.newTransport();
         errdefer t_r.deinit();
@@ -373,9 +373,9 @@ const Fixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
-        const sub_r = dp_r.vtable.create_subscriber(dp_r.ptr, .{}, nil.nil_sub_listener, 0);
-        const topic_r = dp_r.vtable.create_topic(dp_r.ptr, "CftTopic", "CftType", .{}, nil.nil_topic_listener, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const sub_r = dp_r.create_subscriber(.{}, null, 0);
+        const topic_r = dp_r.create_topic("CftTopic", "CftType", .{}, null, 0);
 
         return .{
             .alloc = alloc,
@@ -430,17 +430,16 @@ test "cft: ContentFilteredTopicImpl lifecycle and expression parsing" {
     defer fx.deinit();
 
     // Create a ContentFilteredTopic with a filter expression.
-    const cft_dds = fx.dp_r.vtable.create_contentfilteredtopic(
-        fx.dp_r.ptr,
+    const cft_dds = fx.dp_r.create_contentfilteredtopic(
         "CftFiltered",
         fx.topic_r,
         "value = 66",
-        DDS.StringSeq.empty,
+        &DDS.StringSeq{},
     );
     defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
 
     // Retrieve the impl and verify the expression was stored.
-    try testing.expectEqualStrings("value = 66", cft_dds.vtable.get_filter_expression(cft_dds.ptr));
+    try testing.expectEqualStrings("value = 66", cft_dds.get_filter_expression());
 
     // The parsed_expr should be non-null (content_subscription_profile = true by default).
     const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
@@ -453,12 +452,11 @@ test "cft: matchSample evaluates filter against field accessor" {
     defer fx.deinit();
 
     // Filter: value = 66 (0x42).
-    const cft_dds = fx.dp_r.vtable.create_contentfilteredtopic(
-        fx.dp_r.ptr,
+    const cft_dds = fx.dp_r.create_contentfilteredtopic(
         "CftFiltered2",
         fx.topic_r,
         "value = 66",
-        DDS.StringSeq.empty,
+        &DDS.StringSeq{},
     );
     defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
     const cft: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
@@ -480,21 +478,20 @@ test "cft: end-to-end sample delivery with post-take filtering" {
     defer fx.deinit();
 
     // Create CFT DataReader subscribed to topic_r via a ContentFilteredTopic.
-    const cft_dds = fx.dp_r.vtable.create_contentfilteredtopic(
-        fx.dp_r.ptr,
+    const cft_dds = fx.dp_r.create_contentfilteredtopic(
         "CftE2E",
         fx.topic_r,
         "value > 70",
-        DDS.StringSeq.empty,
+        &DDS.StringSeq{},
     );
     defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
     const cft: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
 
     const cft_td = cft.toTopicDescription();
-    const dr_raw = fx.sub_r.vtable.create_datareader(fx.sub_r.ptr, cft_td, .{}, nil.nil_dr_listener, 0);
+    const dr_raw = fx.sub_r.create_datareader(cft_td, .{}, null, 0);
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
 
-    const dw_raw = fx.pub_w.vtable.create_datawriter(fx.pub_w.ptr, fx.topic_w, .{}, nil.nil_dw_listener, 0);
+    const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
     const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
 
     // Write payload with value = 0x42 = 66 (should NOT pass "value > 70").
@@ -529,22 +526,95 @@ test "cft: set_expression_parameters updates params" {
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    const cft_dds = fx.dp_r.vtable.create_contentfilteredtopic(
-        fx.dp_r.ptr,
+    const cft_dds = fx.dp_r.create_contentfilteredtopic(
         "CftParams",
         fx.topic_r,
         "value = %0",
-        DDS.StringSeq.empty,
+        &DDS.StringSeq{},
     );
     defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
 
     // Update the parameter.
-    var new_params = DDS.StringSeq.empty;
-    defer new_params.deinit(alloc);
-    try new_params.append(alloc, "99");
-    try testing.expectEqual(DDS.RETCODE_OK, cft_dds.vtable.set_expression_parameters(cft_dds.ptr, new_params));
+    var new_param_strs: [1][*:0]const u8 = .{"99"};
+    var new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_param_strs), ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &new_params));
 
     const cft: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
     try testing.expectEqual(@as(usize, 1), cft.expr_params.items.len);
     try testing.expectEqualStrings("99", cft.expr_params.items[0]);
+}
+
+test "cft: set_expression_parameters OOM mid-loop preserves old params" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const cft_dds = fx.dp_r.create_contentfilteredtopic(
+        "CftOomParams",
+        fx.topic_r,
+        "value = %0 AND value = %1",
+        &DDS.StringSeq{},
+    );
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
+
+    // Establish initial params so there's something to preserve.
+    var p0_strs = [1][*:0]const u8{"42"};
+    var p0 = DDS.StringSeq{ ._buffer = @ptrCast(&p0_strs), ._length = 1, ._maximum = 1, ._release = false };
+    _ = cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &p0);
+
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
+    try testing.expectEqual(@as(usize, 1), cft_impl.expr_params.items.len);
+
+    // Inject a FailingAllocator: fail_index=0 fails the very first dupe in the loop,
+    // exercising the path where no tmp allocations succeeded yet.
+    var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const saved_alloc = cft_impl.alloc;
+    cft_impl.alloc = fa.allocator();
+
+    var new_strs = [2][*:0]const u8{ "new_x", "new_y" };
+    var new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 2, ._maximum = 2, ._release = false };
+    const rc = cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &new_params);
+
+    cft_impl.alloc = saved_alloc; // restore before deinit
+
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
+    // Old params must be intact.
+    try testing.expectEqual(@as(usize, 1), cft_impl.expr_params.items.len);
+    try testing.expectEqualStrings("42", cft_impl.expr_params.items[0]);
+}
+
+test "cft: set_expression_parameters OOM after first string duped preserves old params" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const cft_dds = fx.dp_r.create_contentfilteredtopic(
+        "CftOomMid",
+        fx.topic_r,
+        "value = %0 AND value = %1",
+        &DDS.StringSeq{},
+    );
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
+
+    var p0_strs = [1][*:0]const u8{"99"};
+    var p0 = DDS.StringSeq{ ._buffer = @ptrCast(&p0_strs), ._length = 1, ._maximum = 1, ._release = false };
+    _ = cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &p0);
+
+    const cft_impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
+
+    // fail_index=2: first dupe (alloc 0) and first append's capacity alloc (alloc 1) succeed,
+    // second dupe (alloc 2) fails — exercises mid-loop cleanup of the partial tmp list.
+    var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
+    const saved_alloc = cft_impl.alloc;
+    cft_impl.alloc = fa.allocator();
+
+    var new_strs = [2][*:0]const u8{ "new_a", "new_b" };
+    var new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 2, ._maximum = 2, ._release = false };
+    const rc = cft_dds.vtable.set_expression_parameters(cft_dds.ptr, &new_params);
+
+    cft_impl.alloc = saved_alloc;
+
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
+    try testing.expectEqual(@as(usize, 1), cft_impl.expr_params.items.len);
+    try testing.expectEqualStrings("99", cft_impl.expr_params.items[0]);
 }

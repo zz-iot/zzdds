@@ -32,12 +32,12 @@ concurrency:
 # Bump this tag when you want to pick up a new release (may change the vendor list).
 #
 # INTEROP_RTPS_REF: zz-iot/dds-rtps branch/tag checked out for the test harness.
-# Defaults to the zenzen branch pinned to INTEROP_RELEASE_TAG; override via the
-# dds_rtps_ref workflow_dispatch input to test against a dev branch (e.g. "zenzen").
+# Points to the zenzen branch that tracks zzdds C-ABI work.
+# Override via the dds_rtps_ref workflow_dispatch input to test a different branch or tag.
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
-  # NOTE: When bumping INTEROP_RELEASE_TAG, also update the fallback below to match (zenzen-<new-tag>).
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-v2.1.2026' }}
+  # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-f88c8a4' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -96,6 +96,46 @@ jobs:
   # Runs on the same trigger as the test jobs; gated on test-linux so coverage
   # only uploads when the suite is green.
 
+  valgrind:
+    name: Valgrind (memcheck)
+    needs: test-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Install Valgrind
+        run: sudo apt-get install -y --no-install-recommends valgrind
+
+      - name: Build test binaries
+        run: zig build emit-tests -Doptimize=Debug
+
+      - name: Run tests under Valgrind
+        run: |
+          set -e
+          ERRORS=0
+          for bin in zig-out/tests/*; do
+            [ -x "$bin" ] || continue
+            echo "=== valgrind: $(basename $bin) ==="
+            if ! valgrind \
+                --error-exitcode=1 \
+                --leak-check=full \
+                --show-leak-kinds=definite,indirect \
+                --errors-for-leak-kinds=definite,indirect \
+                --track-origins=yes \
+                --quiet \
+                "$bin"; then
+              echo "::error::Valgrind reported errors in $(basename $bin)"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          [ $ERRORS -eq 0 ]
+
   coverage:
     name: Coverage
     needs: test-linux
@@ -122,6 +162,7 @@ jobs:
       - name: Install kcov build and runtime dependencies
         if: steps.cache-kcov.outputs.cache-hit != 'true'
         run: |
+          sudo apt-get update -qq
           sudo apt-get install -y \
             binutils-dev libdw-dev libcurl4-openssl-dev \
             zlib1g-dev libiberty-dev cmake libcurl4
@@ -284,10 +325,25 @@ jobs:
           ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
-      - name: Wire packages/zzdds symlink
+      - name: Wire packages/zzdds and packages/zidl symlinks
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
+          # Clone zidl at the same tag declared by the local zzdds checkout.
+          ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
+            dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
+          if [[ -z "$ZIDL_TAG" ]]; then
+            echo "::error::Could not extract zidl tag from packages/zzdds/build.zig.zon"
+            exit 1
+          fi
+          git clone --depth=1 --branch "$ZIDL_TAG" \
+            https://github.com/zz-iot/zidl.git zidl
+          ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
+          # zig-pkg/ is gitignored so actions/checkout does not clean it between
+          # runs on the same runner.  Stale URL-fetched packages shadow the path
+          # deps above via fingerprint deduplication — wipe them first.
+          rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
+          (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -344,10 +400,21 @@ jobs:
           ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
-      - name: Wire packages/zzdds symlink
+      - name: Wire packages/zzdds and packages/zidl symlinks
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
+          ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
+            dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
+          if [[ -z "$ZIDL_TAG" ]]; then
+            echo "::error::Could not extract zidl tag from packages/zzdds/build.zig.zon"
+            exit 1
+          fi
+          git clone --depth=1 --branch "$ZIDL_TAG" \
+            https://github.com/zz-iot/zidl.git zidl
+          ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
+          rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
+          (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2

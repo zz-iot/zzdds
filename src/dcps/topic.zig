@@ -18,8 +18,8 @@ const filter_mod = @import("filter.zig");
 
 pub const TopicImpl = struct {
     alloc: std.mem.Allocator,
-    topic_name: []u8, // owned
-    type_name: []u8, // owned
+    topic_name: [:0]u8, // owned, null-terminated for C API compatibility
+    type_name: [:0]u8, // owned, null-terminated for C API compatibility
     participant_ptr: *anyopaque, // borrowed — points to ParticipantImpl
     get_participant_fn: *const fn (*anyopaque) DDS.DomainParticipant,
     qos: DDS.TopicQos,
@@ -45,13 +45,19 @@ pub const TopicImpl = struct {
     ) !*Self {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
+        const tn = try alloc.dupeZ(u8, topic_name);
+        errdefer alloc.free(tn);
+        const tt = try alloc.dupeZ(u8, type_name);
+        errdefer alloc.free(tt);
+        var qos_clone = try qos.clone(alloc);
+        errdefer qos_clone.deinit(alloc);
         self.* = .{
             .alloc = alloc,
-            .topic_name = try alloc.dupe(u8, topic_name),
-            .type_name = try alloc.dupe(u8, type_name),
+            .topic_name = tn,
+            .type_name = tt,
             .participant_ptr = participant_ptr,
             .get_participant_fn = get_participant_fn,
-            .qos = qos,
+            .qos = qos_clone,
             .listener = listener,
             .listener_mask = mask,
             .instance_handle = instance_handle,
@@ -66,6 +72,7 @@ pub const TopicImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
+        self.qos.deinit(self.alloc);
         self.alloc.free(self.topic_name);
         self.alloc.free(self.type_name);
         self.alloc.destroy(self);
@@ -111,12 +118,12 @@ pub const TopicImpl = struct {
         return cast(ctx).instance_handle;
     }
 
-    fn vtGetTypeName(ctx: *anyopaque) []const u8 {
-        return cast(ctx).type_name;
+    fn vtGetTypeName(ctx: *anyopaque) [*:0]const u8 {
+        return cast(ctx).type_name.ptr;
     }
 
-    fn vtGetName(ctx: *anyopaque) []const u8 {
-        return cast(ctx).topic_name;
+    fn vtGetName(ctx: *anyopaque) [*:0]const u8 {
+        return cast(ctx).topic_name.ptr;
     }
 
     fn vtGetParticipant(ctx: *anyopaque) DDS.DomainParticipant {
@@ -124,19 +131,23 @@ pub const TopicImpl = struct {
         return self.get_participant_fn(self.participant_ptr);
     }
 
-    fn vtSetQos(ctx: *anyopaque, qos: DDS.TopicQos) DDS.ReturnCode_t {
-        cast(ctx).qos = qos;
+    fn vtSetQos(ctx: *anyopaque, qos: *const DDS.TopicQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.qos.deinit(self.alloc);
+        self.qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.TopicQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).qos;
+        const self = cast(ctx);
+        qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetListener(ctx: *anyopaque, a_listener: DDS.TopicListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
+    fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.TopicListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.listener = a_listener;
+        self.listener = if (a_listener) |l| l.* else DDS.noop_TopicListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
@@ -209,8 +220,8 @@ pub fn asCft(td: DDS.TopicDescription) ?*ContentFilteredTopicImpl {
 /// to those that match a filter expression (SQL-subset on topic fields).
 pub const ContentFilteredTopicImpl = struct {
     alloc: std.mem.Allocator,
-    name: []u8, // owned
-    filter_expr: []u8, // owned
+    name: [:0]u8, // owned, null-terminated for C API
+    filter_expr: [:0]u8, // owned, null-terminated for C API
     expr_params: std.ArrayListUnmanaged([]u8), // owned copies
     related: DDS.Topic,
     participant: DDS.DomainParticipant,
@@ -232,9 +243,9 @@ pub const ContentFilteredTopicImpl = struct {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
 
-        const name_copy = try alloc.dupe(u8, name);
+        const name_copy = try alloc.dupeZ(u8, name);
         errdefer alloc.free(name_copy);
-        const expr_copy = try alloc.dupe(u8, filter_expr);
+        const expr_copy = try alloc.dupeZ(u8, filter_expr);
         errdefer alloc.free(expr_copy);
 
         var params: std.ArrayListUnmanaged([]u8) = .empty;
@@ -242,10 +253,13 @@ pub const ContentFilteredTopicImpl = struct {
             for (params.items) |p| alloc.free(p);
             params.deinit(alloc);
         }
-        for (expr_params.items) |p| {
-            const copy = try alloc.dupe(u8, p);
-            errdefer alloc.free(copy);
-            try params.append(alloc, copy);
+        // Convert StringSeq (C extern struct) to owned []u8 slices.
+        if (expr_params._buffer) |b| {
+            for (b[0..expr_params._length]) |p| {
+                const copy = try alloc.dupe(u8, std.mem.span(p));
+                errdefer alloc.free(copy);
+                try params.append(alloc, copy);
+            }
         }
 
         // Parse the filter expression (borrows slices from expr_copy).
@@ -309,14 +323,16 @@ pub const ContentFilteredTopicImpl = struct {
         .deinit = tdDeinit,
     };
 
-    fn tdGetTypeName(ctx: *anyopaque) []const u8 {
-        return cast(ctx).related.get_type_name();
+    fn tdGetTypeName(ctx: *anyopaque) [*:0]const u8 {
+        const r = cast(ctx).related;
+        return r.vtable.get_type_name(r.ptr);
     }
-    fn tdGetName(ctx: *anyopaque) []const u8 {
-        return cast(ctx).name;
+    fn tdGetName(ctx: *anyopaque) [*:0]const u8 {
+        return cast(ctx).name.ptr;
     }
-    fn tdGetRelatedName(ctx: *anyopaque) []const u8 {
-        return cast(ctx).related.get_name();
+    fn tdGetRelatedName(ctx: *anyopaque) [*:0]const u8 {
+        const r = cast(ctx).related;
+        return r.vtable.get_name(r.ptr);
     }
     fn tdGetParticipant(ctx: *anyopaque) DDS.DomainParticipant {
         return cast(ctx).participant;
@@ -336,30 +352,65 @@ pub const ContentFilteredTopicImpl = struct {
         .deinit = cftDeinit,
     };
 
-    fn cftGetExpr(ctx: *anyopaque) []const u8 {
-        return cast(ctx).filter_expr;
+    fn cftGetExpr(ctx: *anyopaque) [*:0]const u8 {
+        return cast(ctx).filter_expr.ptr;
     }
 
-    fn cftGetParams(ctx: *anyopaque, out: *DDS.StringSeq) DDS.ReturnCode_t {
+    fn cftGetParams(ctx: *anyopaque, out: ?*DDS.StringSeq) DDS.ReturnCode_t {
+        const seq = out orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
-        out.clearRetainingCapacity();
-        for (self.expr_params.items) |p| {
-            out.append(self.alloc, p) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (seq._release) {
+            if (seq._buffer) |b| {
+                for (b[0..seq._length]) |s| self.alloc.free(std.mem.span(s));
+                self.alloc.free(b[0..seq._maximum]);
+            }
         }
+        seq.* = .{};
+        const n = self.expr_params.items.len;
+        if (n == 0) return DDS.RETCODE_OK;
+        const buf = self.alloc.alloc([*:0]const u8, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        for (self.expr_params.items, 0..) |p, i| {
+            buf[i] = (self.alloc.dupeZ(u8, p) catch {
+                for (buf[0..i]) |s| self.alloc.free(std.mem.span(s));
+                self.alloc.free(buf);
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            }).ptr;
+        }
+        seq._buffer = buf.ptr;
+        seq._length = @intCast(n);
+        seq._maximum = @intCast(n);
+        seq._release = true;
         return DDS.RETCODE_OK;
     }
 
-    fn cftSetParams(ctx: *anyopaque, params: DDS.StringSeq) DDS.ReturnCode_t {
+    fn cftSetParams(ctx: *anyopaque, params: ?*const DDS.StringSeq) DDS.ReturnCode_t {
         const self = cast(ctx);
-        for (self.expr_params.items) |p| self.alloc.free(p);
-        self.expr_params.clearRetainingCapacity();
-        for (params.items) |p| {
-            const copy = self.alloc.dupe(u8, p) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-            self.expr_params.append(self.alloc, copy) catch {
-                self.alloc.free(copy);
-                return DDS.RETCODE_OUT_OF_RESOURCES;
-            };
+        // Build into a temporary list first so the old params survive any OOM.
+        var tmp: std.ArrayListUnmanaged([]u8) = .empty;
+        const seq = params orelse {
+            for (self.expr_params.items) |p| self.alloc.free(p);
+            self.expr_params.clearRetainingCapacity();
+            return DDS.RETCODE_OK;
+        };
+        if (seq._buffer) |b| {
+            for (b[0..seq._length]) |p| {
+                const copy = self.alloc.dupe(u8, std.mem.span(p)) catch {
+                    for (tmp.items) |s| self.alloc.free(s);
+                    tmp.deinit(self.alloc);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+                tmp.append(self.alloc, copy) catch {
+                    self.alloc.free(copy);
+                    for (tmp.items) |s| self.alloc.free(s);
+                    tmp.deinit(self.alloc);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+            }
         }
+        // All copies succeeded — swap in and free old.
+        for (self.expr_params.items) |p| self.alloc.free(p);
+        self.expr_params.deinit(self.alloc);
+        self.expr_params = tmp;
         return DDS.RETCODE_OK;
     }
 

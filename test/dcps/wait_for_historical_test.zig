@@ -145,21 +145,21 @@ test "wait_for_historical_data: VOLATILE returns OK immediately" {
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const topic = dp.vtable.create_topic(dp.ptr, "TestTopic", "TestType", .{}, nil.nil_topic_listener, 0);
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
     const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
     const td = tp_impl.toTopicDescription();
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
 
     // Default QoS: VOLATILE durability.
-    const dr_raw = sub.vtable.create_datareader(sub.ptr, td, .{}, nil.nil_dr_listener, 0);
+    const dr_raw = sub.create_datareader(td, .{}, null, 0);
     _ = alloc;
 
-    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
@@ -168,23 +168,23 @@ test "wait_for_historical_data: TRANSIENT_LOCAL with no matched writers returns 
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const topic = dp.vtable.create_topic(dp.ptr, "TestTopic", "TestType", .{}, nil.nil_topic_listener, 0);
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
     const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
     const td = tp_impl.toTopicDescription();
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const dr_raw = sub.vtable.create_datareader(sub.ptr, td, dr_qos, nil.nil_dr_listener, 0);
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
 
     // No writers matched → nothing to wait for.
-    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
@@ -193,29 +193,29 @@ test "wait_for_historical_data: times out before first HEARTBEAT from transient-
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
-    const topic = dp.vtable.create_topic(dp.ptr, "TestTopic", "TestType", .{}, nil.nil_topic_listener, 0);
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
     const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
     const td = tp_impl.toTopicDescription();
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const dr_raw = sub.vtable.create_datareader(sub.ptr, td, dr_qos, nil.nil_dr_listener, 0);
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
 
     // Match a TRANSIENT_LOCAL RELIABLE remote writer.
     const prefix = makePrefix(0x10);
     _ = h.fireWriter(dp_impl, prefix, "TestTopic", 1, 1);
 
     // No HEARTBEAT received yet → history_established=false → must timeout.
-    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc);
 }
 
@@ -224,22 +224,22 @@ test "wait_for_historical_data: returns OK after first HB with empty history (la
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
-    const topic = dp.vtable.create_topic(dp.ptr, "TestTopic", "TestType", .{}, nil.nil_topic_listener, 0);
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
     const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
     const td = tp_impl.toTopicDescription();
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const dr_raw = sub.vtable.create_datareader(sub.ptr, td, dr_qos, nil.nil_dr_listener, 0);
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
 
     const prefix = makePrefix(0x20);
@@ -249,7 +249,7 @@ test "wait_for_historical_data: returns OK after first HB with empty history (la
     // Per RTPS §8.3.7.5.1 this signals an empty cache; floor_sn=0 → immediately satisfied.
     dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 0, 1, true);
 
-    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
 
@@ -258,23 +258,23 @@ test "wait_for_historical_data: returns OK after history fully delivered (data b
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
-    const topic = dp.vtable.create_topic(dp.ptr, "TestTopic", "TestType", .{}, nil.nil_topic_listener, 0);
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
     const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
     const td = tp_impl.toTopicDescription();
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
-    const dr_raw = sub.vtable.create_datareader(sub.ptr, td, dr_qos, nil.nil_dr_listener, 0);
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
 
     const prefix = makePrefix(0x30);
@@ -290,13 +290,13 @@ test "wait_for_historical_data: returns OK after history fully delivered (data b
     dr_impl.proto_reader.handleIncomingChange(writer_guid, 3, ts, kh, &payload, .alive, null, null);
 
     // Before HB: history_established=false → timeout.
-    const rc1 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc1 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc1);
 
     // First HEARTBEAT: sets floor=3; cumulativeAck=3 already satisfies the floor.
     dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 3, 1, true);
 
-    const rc2 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc2 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc2);
 }
 
@@ -305,23 +305,23 @@ test "wait_for_historical_data: returns OK once pending data fills history floor
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
-    const topic = dp.vtable.create_topic(dp.ptr, "TestTopic", "TestType", .{}, nil.nil_topic_listener, 0);
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
     const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
     const td = tp_impl.toTopicDescription();
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
 
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
-    const dr_raw = sub.vtable.create_datareader(sub.ptr, td, dr_qos, nil.nil_dr_listener, 0);
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
 
     const prefix = makePrefix(0x40);
@@ -335,16 +335,16 @@ test "wait_for_historical_data: returns OK once pending data fills history floor
     dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 2, 1, false);
 
     // History floor is established but no data yet → timeout.
-    const rc1 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc1 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc1);
 
     // Deliver SN=1 only — still short of floor (2).
     dr_impl.proto_reader.handleIncomingChange(writer_guid, 1, ts, kh, &payload, .alive, null, null);
-    const rc2 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc2 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc2);
 
     // Deliver SN=2 — cumulativeAck=2 >= floor=2 → OK.
     dr_impl.proto_reader.handleIncomingChange(writer_guid, 2, ts, kh, &payload, .alive, null, null);
-    const rc3 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, DURATION_ZERO);
+    const rc3 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc3);
 }

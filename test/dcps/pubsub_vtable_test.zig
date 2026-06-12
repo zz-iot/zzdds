@@ -91,20 +91,20 @@ const Harness = struct {
 test "Publisher: enable returns RETCODE_OK" {
     var h = try Harness.init(0x20);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.enable(pub_.ptr));
 }
 
 test "Publisher: get_statuscondition and get_status_changes" {
     var h = try Harness.init(0x21);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
 
     const sc = pub_.vtable.get_statuscondition(pub_.ptr);
     try testing.expect(@intFromPtr(sc.ptr) != 0);
@@ -121,12 +121,12 @@ test "Publisher: lookup_datawriter found and not-found" {
     var h = try Harness.init(0x22);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "LookupTopic", "LT", .{}, nil.nil_topic_listener, 0);
-    _ = pub_.vtable.create_datawriter(pub_.ptr, topic, .{}, nil.nil_dw_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("LookupTopic", "LT", .{}, null, 0);
+    _ = pub_.create_datawriter(topic, .{}, null, 0);
 
     // Found.
     const found = pub_.vtable.lookup_datawriter(pub_.ptr, "LookupTopic");
@@ -143,12 +143,12 @@ test "Publisher: delete_contained_entities clears all writers" {
     var h = try Harness.init(0x23);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "T1", "TT", .{}, nil.nil_topic_listener, 0);
-    _ = pub_.vtable.create_datawriter(pub_.ptr, topic, .{}, nil.nil_dw_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("T1", "TT", .{}, null, 0);
+    _ = pub_.create_datawriter(topic, .{}, null, 0);
 
     const rc = pub_.vtable.delete_contained_entities(pub_.ptr);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
@@ -158,10 +158,10 @@ test "Publisher: delete_datawriter returns BAD_PARAMETER for unknown writer" {
     var h = try Harness.init(0x24);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     const rc = pub_.vtable.delete_datawriter(pub_.ptr, nil.nil_datawriter);
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
 }
@@ -169,15 +169,15 @@ test "Publisher: delete_datawriter returns BAD_PARAMETER for unknown writer" {
 test "Publisher: set_qos / get_qos round-trip" {
     var h = try Harness.init(0x25);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     var qos = DDS.PublisherQos{};
     // Default Partition has no names — set a marker via the presentation field.
     qos.presentation.coherent_access = true;
 
-    _ = pub_.vtable.set_qos(pub_.ptr, qos);
+    _ = pub_.set_qos(qos);
 
     var got: DDS.PublisherQos = .{};
     _ = pub_.vtable.get_qos(pub_.ptr, &got);
@@ -189,13 +189,12 @@ test "Publisher: set_qos / get_qos round-trip" {
 test "Publisher: set_listener / get_listener round-trip" {
     var h = try Harness.init(0x26);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    _ = pub_.vtable.set_listener(pub_.ptr, nil.nil_pub_listener, 0xFFFF);
-    const l = pub_.vtable.get_listener(pub_.ptr);
-    try testing.expectEqual(@intFromPtr(nil.nil_pub_listener.ptr), @intFromPtr(l.ptr));
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    _ = pub_.set_listener(null, 0xFFFF);
+    _ = pub_.vtable.get_listener(pub_.ptr); // returns noop listener after null set
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }
@@ -203,10 +202,10 @@ test "Publisher: set_listener / get_listener round-trip" {
 test "Publisher: suspend/resume/begin/end return OK" {
     var h = try Harness.init(0x27);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.suspend_publications(pub_.ptr));
     try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.resume_publications(pub_.ptr));
     try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.begin_coherent_changes(pub_.ptr));
@@ -219,16 +218,16 @@ test "Publisher: wait_for_acknowledgments with BEST_EFFORT writer returns OK" {
     var h = try Harness.init(0x28);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
-    const topic = dp.vtable.create_topic(dp.ptr, "AckTopic", "AT", .{}, nil.nil_topic_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("AckTopic", "AT", .{}, null, 0);
     // Default QoS is BEST_EFFORT; no acks needed → wait returns OK immediately.
-    _ = pub_.vtable.create_datawriter(pub_.ptr, topic, .{}, nil.nil_dw_listener, 0);
+    _ = pub_.create_datawriter(topic, .{}, null, 0);
 
     const timeout: DDS.Duration_t = .{ .sec = 0, .nanosec = 1_000_000 };
-    const rc = pub_.vtable.wait_for_acknowledgments(pub_.ptr, timeout);
+    const rc = pub_.vtable.wait_for_acknowledgments(pub_.ptr, &timeout);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -238,15 +237,13 @@ test "Publisher: wait_for_acknowledgments with infinite timeout and no writers" 
     var h = try Harness.init(0x29);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     // No writers → all_done is immediately true for any timeout including infinite.
-    const rc = pub_.vtable.wait_for_acknowledgments(pub_.ptr, .{
-        .sec = DDS.DURATION_INFINITE_SEC,
-        .nanosec = DDS.DURATION_INFINITE_NSEC,
-    });
+    const _inf = DDS.Duration_t{ .sec = DDS.DURATION_INFINITE_SEC, .nanosec = DDS.DURATION_INFINITE_NSEC };
+    const rc = pub_.vtable.wait_for_acknowledgments(pub_.ptr, &_inf);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -255,10 +252,10 @@ test "Publisher: wait_for_acknowledgments with infinite timeout and no writers" 
 test "Publisher: get_participant returns the owning DomainParticipant" {
     var h = try Harness.init(0x2A);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     const got_dp = pub_.vtable.get_participant(pub_.ptr);
     try testing.expectEqual(@intFromPtr(dp.ptr), @intFromPtr(got_dp.ptr));
 
@@ -268,13 +265,13 @@ test "Publisher: get_participant returns the owning DomainParticipant" {
 test "Publisher: set/get_default_datawriter_qos round-trip" {
     var h = try Harness.init(0x2B);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     var qos = DDS.DataWriterQos{};
     qos.history.depth = 42;
-    _ = pub_.vtable.set_default_datawriter_qos(pub_.ptr, qos);
+    _ = pub_.set_default_datawriter_qos(qos);
 
     var got: DDS.DataWriterQos = .{};
     _ = pub_.vtable.get_default_datawriter_qos(pub_.ptr, &got);
@@ -286,14 +283,14 @@ test "Publisher: set/get_default_datawriter_qos round-trip" {
 test "Publisher: copy_from_topic_qos copies relevant fields" {
     var h = try Harness.init(0x2C);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const pub_ = dp.vtable.create_publisher(dp.ptr, .{}, nil.nil_pub_listener, 0);
+    const pub_ = dp.create_publisher(.{}, null, 0);
     var topic_qos = DDS.TopicQos{};
     topic_qos.history.depth = 7;
     var dw_qos = DDS.DataWriterQos{};
-    const rc = pub_.vtable.copy_from_topic_qos(pub_.ptr, &dw_qos, topic_qos);
+    const rc = pub_.copy_from_topic_qos(&dw_qos, topic_qos);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqual(@as(i32, 7), dw_qos.history.depth);
 
@@ -305,10 +302,10 @@ test "Publisher: copy_from_topic_qos copies relevant fields" {
 test "Subscriber: enable, get_statuscondition, get_status_changes, get_instance_handle" {
     var h = try Harness.init(0x30);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
 
     try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.enable(sub.ptr));
 
@@ -328,13 +325,13 @@ test "Subscriber: lookup_datareader found and not-found" {
     var h = try Harness.init(0x31);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    _ = dp.vtable.create_topic(dp.ptr, "SubLookup", "SLT", .{}, nil.nil_topic_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    _ = dp.create_topic("SubLookup", "SLT", .{}, null, 0);
     const topic_desc = dp.vtable.lookup_topicdescription(dp.ptr, "SubLookup");
-    _ = sub.vtable.create_datareader(sub.ptr, topic_desc, .{}, nil.nil_dr_listener, 0);
+    _ = sub.create_datareader(topic_desc, .{}, null, 0);
 
     const found = sub.vtable.lookup_datareader(sub.ptr, "SubLookup");
     try testing.expect(@intFromPtr(found.ptr) != @intFromPtr(nil.NIL_PTR));
@@ -349,12 +346,12 @@ test "Subscriber: delete_contained_entities" {
     var h = try Harness.init(0x32);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    _ = dp.vtable.create_topic(dp.ptr, "SubDel", "SDT", .{}, nil.nil_topic_listener, 0);
-    _ = sub.vtable.create_datareader(sub.ptr, dp.vtable.lookup_topicdescription(dp.ptr, "SubDel"), .{}, nil.nil_dr_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    _ = dp.create_topic("SubDel", "SDT", .{}, null, 0);
+    _ = sub.create_datareader(dp.vtable.lookup_topicdescription(dp.ptr, "SubDel"), .{}, null, 0);
 
     const rc = sub.vtable.delete_contained_entities(sub.ptr);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
@@ -363,10 +360,10 @@ test "Subscriber: delete_contained_entities" {
 test "Subscriber: delete_datareader returns BAD_PARAMETER for unknown reader" {
     var h = try Harness.init(0x33);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     const rc = sub.vtable.delete_datareader(sub.ptr, nil.nil_datareader);
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
 }
@@ -374,15 +371,17 @@ test "Subscriber: delete_datareader returns BAD_PARAMETER for unknown reader" {
 test "Subscriber: get_datareaders with empty subscriber returns empty list" {
     var h = try Harness.init(0x34);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    var out: DDS.DataReaderSeq = .empty;
-    defer out.deinit(alloc);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    var out: DDS.DataReaderSeq = .{};
+    defer if (out._release) {
+        if (out._buffer) |_b| alloc.free(_b[0..out._length]);
+    };
     const rc = sub.vtable.get_datareaders(sub.ptr, &out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
-    try testing.expectEqual(@as(usize, 0), out.items.len);
+    try testing.expectEqual(@as(u32, 0), out._length);
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }
@@ -391,13 +390,13 @@ test "Subscriber: notify_datareaders fires listener for readers with DATA_AVAILA
     var h = try Harness.init(0x35);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = dpf.create_participant(0, .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    _ = dp.vtable.create_topic(dp.ptr, "NotifyDR", "NDT", .{}, nil.nil_topic_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    _ = dp.create_topic("NotifyDR", "NDT", .{}, null, 0);
     // Create a reader with DATA_AVAILABLE_STATUS in its listener mask.
-    _ = sub.vtable.create_datareader(sub.ptr, dp.vtable.lookup_topicdescription(dp.ptr, "NotifyDR"), .{}, nil.nil_dr_listener, DDS.DATA_AVAILABLE_STATUS);
+    _ = sub.create_datareader(dp.vtable.lookup_topicdescription(dp.ptr, "NotifyDR"), .{}, null, DDS.DATA_AVAILABLE_STATUS);
 
     const rc = sub.vtable.notify_datareaders(sub.ptr);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
@@ -408,10 +407,10 @@ test "Subscriber: notify_datareaders fires listener for readers with DATA_AVAILA
 test "Subscriber: notify_datareaders with no readers returns OK" {
     var h = try Harness.init(0x36);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.notify_datareaders(sub.ptr));
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -420,13 +419,13 @@ test "Subscriber: notify_datareaders with no readers returns OK" {
 test "Subscriber: set_qos / get_qos round-trip" {
     var h = try Harness.init(0x37);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     var qos = DDS.SubscriberQos{};
     qos.presentation.ordered_access = true;
-    _ = sub.vtable.set_qos(sub.ptr, qos);
+    _ = sub.set_qos(qos);
     var got: DDS.SubscriberQos = .{};
     _ = sub.vtable.get_qos(sub.ptr, &got);
     try testing.expectEqual(true, got.presentation.ordered_access);
@@ -437,13 +436,12 @@ test "Subscriber: set_qos / get_qos round-trip" {
 test "Subscriber: set_listener / get_listener round-trip" {
     var h = try Harness.init(0x38);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
-    _ = sub.vtable.set_listener(sub.ptr, nil.nil_sub_listener, 0xABCD);
-    const l = sub.vtable.get_listener(sub.ptr);
-    try testing.expectEqual(@intFromPtr(nil.nil_sub_listener.ptr), @intFromPtr(l.ptr));
+    const sub = dp.create_subscriber(.{}, null, 0);
+    _ = sub.set_listener(null, 0xABCD);
+    _ = sub.vtable.get_listener(sub.ptr); // returns noop listener after null set
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
 }
@@ -451,10 +449,10 @@ test "Subscriber: set_listener / get_listener round-trip" {
 test "Subscriber: begin_access / end_access return RETCODE_OK" {
     var h = try Harness.init(0x39);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.begin_access(sub.ptr));
     try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.end_access(sub.ptr));
 
@@ -464,10 +462,10 @@ test "Subscriber: begin_access / end_access return RETCODE_OK" {
 test "Subscriber: get_participant returns the owning DomainParticipant" {
     var h = try Harness.init(0x3A);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     const got_dp = sub.vtable.get_participant(sub.ptr);
     try testing.expectEqual(@intFromPtr(dp.ptr), @intFromPtr(got_dp.ptr));
 
@@ -477,13 +475,13 @@ test "Subscriber: get_participant returns the owning DomainParticipant" {
 test "Subscriber: set/get_default_datareader_qos round-trip" {
     var h = try Harness.init(0x3B);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     var qos = DDS.DataReaderQos{};
     qos.history.depth = 99;
-    _ = sub.vtable.set_default_datareader_qos(sub.ptr, qos);
+    _ = sub.set_default_datareader_qos(qos);
     var got: DDS.DataReaderQos = .{};
     _ = sub.vtable.get_default_datareader_qos(sub.ptr, &got);
     try testing.expectEqual(@as(i32, 99), got.history.depth);
@@ -494,16 +492,137 @@ test "Subscriber: set/get_default_datareader_qos round-trip" {
 test "Subscriber: copy_from_topic_qos copies relevant fields" {
     var h = try Harness.init(0x3C);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, nil.nil_dp_listener, 0);
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
-    const sub = dp.vtable.create_subscriber(dp.ptr, .{}, nil.nil_sub_listener, 0);
+    const sub = dp.create_subscriber(.{}, null, 0);
     var topic_qos = DDS.TopicQos{};
     topic_qos.history.depth = 5;
     var dr_qos = DDS.DataReaderQos{};
-    const rc = sub.vtable.copy_from_topic_qos(sub.ptr, &dr_qos, topic_qos);
+    const rc = sub.copy_from_topic_qos(&dr_qos, topic_qos);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqual(@as(i32, 5), dr_qos.history.depth);
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
+}
+
+// ── Heap-QoS round-trip tests ─────────────────────────────────────────────────
+
+test "Publisher: set_qos with partition names — clone survives replacement" {
+    var h = try Harness.init(0xB0);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var n1 = [1][*:0]const u8{"pub_part_x"};
+    var q1 = DDS.PublisherQos{};
+    q1.partition.name = .{ ._buffer = &n1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.set_qos(pub_.ptr, &q1));
+
+    var n2 = [1][*:0]const u8{"pub_part_y"};
+    var q2 = DDS.PublisherQos{};
+    q2.partition.name = .{ ._buffer = &n2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.set_qos(pub_.ptr, &q2));
+
+    var got = DDS.PublisherQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.get_qos(pub_.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.partition.name._length);
+    got.deinit(alloc);
+}
+
+test "Publisher: get_qos returns independent clone — replacement does not dangle" {
+    var h = try Harness.init(0xB1);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var n1 = [1][*:0]const u8{"clone_test"};
+    var q1 = DDS.PublisherQos{};
+    q1.partition.name = .{ ._buffer = &n1, ._length = 1, ._maximum = 1, ._release = false };
+    _ = pub_.vtable.set_qos(pub_.ptr, &q1);
+
+    var got = DDS.PublisherQos{};
+    _ = pub_.vtable.get_qos(pub_.ptr, &got);
+
+    // Replace internal copy; a shallow get_qos would leave `got.partition.name` dangling.
+    _ = pub_.vtable.set_qos(pub_.ptr, &DDS.PublisherQos{});
+
+    try testing.expectEqual(@as(u32, 1), got.partition.name._length);
+    got.deinit(alloc);
+}
+
+test "Publisher: set_default_datawriter_qos with user_data — clone survives replacement" {
+    var h = try Harness.init(0xB2);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var d1 = [_]u8{0x11};
+    var q1 = DDS.DataWriterQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.set_default_datawriter_qos(pub_.ptr, &q1));
+
+    var d2 = [_]u8{0x22};
+    var q2 = DDS.DataWriterQos{};
+    q2.user_data.value = .{ ._buffer = &d2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.set_default_datawriter_qos(pub_.ptr, &q2));
+
+    var got = DDS.DataWriterQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.get_default_datawriter_qos(pub_.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(alloc);
+}
+
+test "Subscriber: set_qos with partition names — clone survives replacement" {
+    var h = try Harness.init(0xB3);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var n1 = [1][*:0]const u8{"sub_px"};
+    var q1 = DDS.SubscriberQos{};
+    q1.partition.name = .{ ._buffer = &n1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.set_qos(sub.ptr, &q1));
+
+    var n2 = [1][*:0]const u8{"sub_py"};
+    var q2 = DDS.SubscriberQos{};
+    q2.partition.name = .{ ._buffer = &n2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.set_qos(sub.ptr, &q2));
+
+    var got = DDS.SubscriberQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.get_qos(sub.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.partition.name._length);
+    got.deinit(alloc);
+}
+
+test "Subscriber: set_default_datareader_qos with user_data — clone survives replacement" {
+    var h = try Harness.init(0xB4);
+    defer h.deinit();
+    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+
+    var d1 = [_]u8{0x33};
+    var q1 = DDS.DataReaderQos{};
+    q1.user_data.value = .{ ._buffer = &d1, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.set_default_datareader_qos(sub.ptr, &q1));
+
+    var d2 = [_]u8{0x44};
+    var q2 = DDS.DataReaderQos{};
+    q2.user_data.value = .{ ._buffer = &d2, ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.set_default_datareader_qos(sub.ptr, &q2));
+
+    var got = DDS.DataReaderQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.get_default_datareader_qos(sub.ptr, &got));
+    try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
+    got.deinit(alloc);
 }

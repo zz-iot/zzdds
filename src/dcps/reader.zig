@@ -263,7 +263,7 @@ pub const DataReaderImpl = struct {
             .topic_desc = topic_desc,
             .subscriber = subscriber,
             .proto_reader = proto_reader,
-            .qos = qos,
+            .qos = .{},
             .listener = listener,
             .listener_mask = mask,
             .instance_handle = instance_handle,
@@ -279,6 +279,9 @@ pub const DataReaderImpl = struct {
             .last_received_ns = .init(timer_clock.nowNs()),
             .seen_instances = .empty,
         };
+        errdefer alloc.destroy(self);
+        self.qos = try qos.clone(alloc);
+        errdefer self.qos.deinit(alloc);
         // Register delivery callback with the RTPS layer.
         proto_reader.setDataCallback(.{
             .ctx = self,
@@ -329,6 +332,7 @@ pub const DataReaderImpl = struct {
         }
         self.writer_instances.deinit(self.alloc);
         self.seen_instances.deinit(self.alloc);
+        self.qos.deinit(self.alloc);
         // NOTE: proto_reader lifecycle is owned by the participant (via
         // subDestroyProtoReader callback), not by DataReaderImpl.
         // The participant's destroy_proto_reader callback frees it.
@@ -394,7 +398,7 @@ pub const DataReaderImpl = struct {
         self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
         if (self.status_cond) |sc| sc.notifyWakeup();
         if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-            self.listener.vtable.on_data_available(self.listener.ptr, self.toDDSDataReader());
+            if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
         }
     }
 
@@ -570,7 +574,7 @@ pub const DataReaderImpl = struct {
             if (is_set_end and commit_succeeded) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
                 if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                    self.listener.vtable.on_data_available(self.listener.ptr, self.toDDSDataReader());
+                    if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
                 }
             }
             return;
@@ -668,16 +672,12 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (fire) {
-                self.listener.vtable.on_sample_rejected(
-                    self.listener.ptr,
-                    self.toDDSDataReader(),
-                    .{
-                        .total_count = self.sample_rejected_total,
-                        .total_count_change = 1,
-                        .last_reason = reason,
-                        .last_instance_handle = ih,
-                    },
-                );
+                if (self.listener.on_sample_rejected) |cb| cb(self.toDDSDataReader(), &.{
+                    .total_count = self.sample_rejected_total,
+                    .total_count_change = 1,
+                    .last_reason = reason,
+                    .last_instance_handle = ih,
+                }, self.listener.listener_data);
             }
             return;
         }
@@ -726,7 +726,7 @@ pub const DataReaderImpl = struct {
         // Fire listener if registered for DATA_AVAILABLE.
         if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
             const dr = self.toDDSDataReader();
-            self.listener.vtable.on_data_available(self.listener.ptr, dr);
+            if (self.listener.on_data_available) |cb| cb(dr, self.listener.listener_data);
         }
     }
 
@@ -876,7 +876,7 @@ pub const DataReaderImpl = struct {
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                self.listener.vtable.on_data_available(self.listener.ptr, self.toDDSDataReader());
+                if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
             }
         }
     }
@@ -965,6 +965,40 @@ pub const DataReaderImpl = struct {
             self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
         return .{ .data = pc.data, .info = pc.info };
+    }
+
+    /// DDS take_next_instance semantics: dequeue one sample belonging to the
+    /// "next" instance in handle order after `prev_instance_handle`.
+    /// If prev == 0 (HANDLE_NIL), dequeue from whatever instance appears first.
+    /// Returns null when the queue has no qualifying sample.
+    /// The caller owns TakenSample.data and must free with the reader's allocator.
+    pub fn takeNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        // Find the target instance handle.
+        var target_ih: ?DDS.InstanceHandle_t = null;
+        for (self.pending.items) |pc| {
+            const ih = pc.info.instance_handle;
+            if (prev_instance_handle == 0) {
+                if (target_ih == null or ih < target_ih.?) target_ih = ih;
+            } else if (ih > prev_instance_handle) {
+                if (target_ih == null or ih < target_ih.?) target_ih = ih;
+            }
+        }
+        const tgt = target_ih orelse return null;
+
+        for (self.pending.items, 0..) |pc, i| {
+            if (pc.info.instance_handle == tgt) {
+                const s = TakenSample{ .data = pc.data, .info = pc.info };
+                _ = self.pending.orderedRemove(i);
+                if (self.pending.items.len == 0) {
+                    self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+                }
+                return s;
+            }
+        }
+        return null;
     }
 
     /// Non-destructively read samples matching the given state masks.
@@ -1084,11 +1118,7 @@ pub const DataReaderImpl = struct {
             status.total_count = self.incompat_total;
             status.total_count_change = 1;
             status.last_policy_id = policy_id;
-            self.listener.vtable.on_requested_incompatible_qos(
-                self.listener.ptr,
-                self.toDDSDataReader(),
-                status,
-            );
+            if (self.listener.on_requested_incompatible_qos) |cb| cb(self.toDDSDataReader(), &status, self.listener.listener_data);
         }
     }
 
@@ -1123,11 +1153,7 @@ pub const DataReaderImpl = struct {
             self.sub_matched_total_change = 0;
             self.sub_matched_current_change = 0;
             self.mu.unlock();
-            self.listener.vtable.on_subscription_matched(
-                self.listener.ptr,
-                self.toDDSDataReader(),
-                status,
-            );
+            if (self.listener.on_subscription_matched) |cb| cb(self.toDDSDataReader(), &status, self.listener.listener_data);
         }
     }
 
@@ -1150,14 +1176,10 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         if (self.status_cond) |sc| sc.notifyWakeup();
         if (fire) {
-            self.listener.vtable.on_sample_lost(
-                self.listener.ptr,
-                self.toDDSDataReader(),
-                .{
-                    .total_count = self.sample_lost_total,
-                    .total_count_change = count,
-                },
-            );
+            if (self.listener.on_sample_lost) |cb| cb(self.toDDSDataReader(), &.{
+                .total_count = self.sample_lost_total,
+                .total_count_change = count,
+            }, self.listener.listener_data);
         }
     }
 
@@ -1175,11 +1197,7 @@ pub const DataReaderImpl = struct {
             self.liveliness_alive_count_change = 0;
             self.liveliness_not_alive_count_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
-            self.listener.vtable.on_liveliness_changed(
-                self.listener.ptr,
-                self.toDDSDataReader(),
-                status,
-            );
+            if (self.listener.on_liveliness_changed) |cb| cb(self.toDDSDataReader(), &status, self.listener.listener_data);
         }
     }
 
@@ -1196,11 +1214,7 @@ pub const DataReaderImpl = struct {
             status.total_count_change = 1;
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.REQUESTED_DEADLINE_MISSED_STATUS;
-            self.listener.vtable.on_requested_deadline_missed(
-                self.listener.ptr,
-                self.toDDSDataReader(),
-                status,
-            );
+            if (self.listener.on_requested_deadline_missed) |cb| cb(self.toDDSDataReader(), &status, self.listener.listener_data);
         }
     }
 
@@ -1326,24 +1340,26 @@ pub const DataReaderImpl = struct {
         sample_states: DDS.SampleStateMask,
         view_states: DDS.ViewStateMask,
         instance_states: DDS.InstanceStateMask,
-        query_expression: []const u8,
-        query_parameters: DDS.StringSeq,
+        query_expression: [*:0]const u8,
+        query_parameters: ?*const DDS.StringSeq,
     ) DDS.QueryCondition {
         const self = cast(ctx);
+        const qe_s = std.mem.span(query_expression);
         // A non-empty expression requires field-level access to evaluate.
         // If no TypeSupport is registered for this reader's type, the filter
         // cannot be evaluated and would silently pass every sample.  Return NIL
         // rather than creating a condition that does nothing.
-        if (query_expression.len > 0 and self.get_field_fn == null)
+        if (qe_s.len > 0 and self.get_field_fn == null)
             return nil.nil_querycondition;
+        const empty_seq = DDS.StringSeq{};
         const qc = waitset.QueryConditionImpl.init(
             self.alloc,
             self.toDDSDataReader(),
             sample_states,
             view_states,
             instance_states,
-            query_expression,
-            query_parameters,
+            qe_s,
+            if (query_parameters) |p| p.* else empty_seq,
             hasPendingDataFn,
             self,
             addDataNotifier,
@@ -1362,19 +1378,23 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetQos(ctx: *anyopaque, qos: DDS.DataReaderQos) DDS.ReturnCode_t {
-        cast(ctx).qos = qos;
+    fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DataReaderQos) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        self.qos.deinit(self.alloc);
+        self.qos = new_qos;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetQos(ctx: *anyopaque, qos: *DDS.DataReaderQos) DDS.ReturnCode_t {
-        qos.* = cast(ctx).qos;
+        const self = cast(ctx);
+        qos.* = self.qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         return DDS.RETCODE_OK;
     }
 
-    fn vtSetListener(ctx: *anyopaque, a_listener: DDS.DataReaderListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
+    fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataReaderListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.listener = a_listener;
+        self.listener = if (a_listener) |l| l.* else DDS.noop_DataReaderListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
@@ -1478,7 +1498,7 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtWaitForHistorical(ctx: *anyopaque, max_wait: DDS.Duration_t) DDS.ReturnCode_t {
+    fn vtWaitForHistorical(ctx: *anyopaque, max_wait: *const DDS.Duration_t) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (self.qos.durability.kind == .VOLATILE_DURABILITY_QOS) return DDS.RETCODE_OK;
 
@@ -1501,17 +1521,25 @@ pub const DataReaderImpl = struct {
         }
     }
 
-    fn vtGetMatchedPubs(ctx: *anyopaque, handles: *DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+    fn vtGetMatchedPubs(ctx: *anyopaque, handles: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+        const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
         defer guids.deinit(self.alloc);
         self.proto_reader.listMatchedWriters(self.alloc, &guids) catch
             return DDS.RETCODE_OUT_OF_RESOURCES;
-        handles.clearRetainingCapacity();
-        for (guids.items) |guid| {
-            handles.append(self.alloc, writer_mod.guidToHandle(guid)) catch
-                return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (seq._release) {
+            if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
+        seq.* = .{};
+        const n = guids.items.len;
+        if (n == 0) return DDS.RETCODE_OK;
+        const buf = self.alloc.alloc(DDS.InstanceHandle_t, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        for (guids.items, 0..) |guid, i| buf[i] = writer_mod.guidToHandle(guid);
+        seq._buffer = buf.ptr;
+        seq._length = @intCast(n);
+        seq._maximum = @intCast(n);
+        seq._release = true;
         return DDS.RETCODE_OK;
     }
 

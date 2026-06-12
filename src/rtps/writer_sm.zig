@@ -273,6 +273,7 @@ pub const ReaderProxy = struct {
             .probe_deadline_ns = 0,
         };
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
+        errdefer self.unicast_locators.deinit(alloc);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
         return self;
     }
