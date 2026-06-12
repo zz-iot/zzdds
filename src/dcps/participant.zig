@@ -655,7 +655,7 @@ pub const DomainParticipantImpl = struct {
             .alloc = alloc,
             .domain_id = domain_id,
             .guid = guid,
-            .qos = qos,
+            .qos = .{},
             .listener = listener,
             .listener_mask = mask,
             .instance_handle = handle,
@@ -700,6 +700,8 @@ pub const DomainParticipantImpl = struct {
             .mu = .{},
         };
         errdefer alloc.destroy(self);
+        self.qos = try qos.clone(alloc);
+        errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         self.builtin_sub = BuiltinSubscriberState.init(alloc, self) catch null;
@@ -892,6 +894,8 @@ pub const DomainParticipantImpl = struct {
             if (ts.deinit) |f| f(ts.ctx);
             return false;
         };
+        self.mu.lock();
+        defer self.mu.unlock();
         const gop = self.type_support_registry.getOrPut(self.alloc, owned_key) catch {
             self.alloc.free(owned_key);
             if (ts.deinit) |f| f(ts.ctx);
@@ -902,6 +906,14 @@ pub const DomainParticipantImpl = struct {
             if (gop.value_ptr.deinit) |f| f(gop.value_ptr.ctx);
             self.alloc.free(gop.key_ptr.*);
             gop.key_ptr.* = owned_key;
+            // Propagate new ctx/fn to active readers that cached the old (now freed) pointers.
+            var ar_it = self.active_readers.valueIterator();
+            while (ar_it.next()) |ar| {
+                if (std.mem.eql(u8, ar.type_name, type_name)) {
+                    ar.key_hash_ctx = ts.ctx;
+                    ar.key_hash_fn = ts.compute_key_hash;
+                }
+            }
         }
         gop.value_ptr.* = ts;
         return true;
