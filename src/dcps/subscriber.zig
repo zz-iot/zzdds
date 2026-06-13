@@ -426,18 +426,17 @@ pub const SubscriberImpl = struct {
             var any_committed = false;
             for (self.readers.items) |r| {
                 r.mu.lock();
-                if (r.coherent_wip.count() > 0 and !r.coherent_committed_ready) {
-                    // Writer is mid-coherent-set (WIP has samples but end-marker hasn't
-                    // arrived yet). Block until this set is complete.
-                    // We do NOT block when committed_ready=true even if WIP is non-empty —
+                if (!r.coherent_committed_ready and r.sub_matched_current > 0) {
+                    // Reader has matched writers but no complete set ready yet — stall.
+                    // This covers two cases: (a) WIP is accumulating (end-marker hasn't
+                    // arrived), and (b) first sample of the new set hasn't arrived yet
+                    // (wip is transiently 0 between delivery and the next write burst).
+                    // We do NOT additionally block on coherent_wip.count() > 0 —
                     // a non-empty WIP with committed_ready=true means set N is done and
-                    // set N+1 has started. Blocking on that WIP would livelock against
-                    // continuous writers (Connext) where set N+1 starts immediately after
-                    // set N's end-marker, so WIP is never 0 when begin_access fires.
-                    // We also do NOT block on matched_current > 0 alone: a reader whose
-                    // writer omits coherent markers sends samples straight to pending,
-                    // leaving committed_ready permanently false, which would stall the
-                    // whole group indefinitely.
+                    // set N+1 has started. Blocking on that WIP alone would livelock
+                    // against continuous writers (Connext) where set N+1 starts
+                    // immediately after set N's end-marker, so WIP is never 0 when
+                    // begin_access fires.
                     all_ready = false;
                 }
                 if (r.coherent_committed_ready) any_committed = true;
