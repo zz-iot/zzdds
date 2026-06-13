@@ -34,7 +34,6 @@ const ModelChange = struct {
 const ModelReader = struct {
     pending: std.ArrayListUnmanaged(ModelChange) = .empty,
     committed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(ModelChange)) = .empty,
-    wip_count: usize = 0,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.pending.deinit(alloc);
@@ -162,7 +161,6 @@ fn modelBeginAccess(
         var all_ready = true;
         var any_committed = false;
         for (readers) |r| {
-            if (r.wip_count > 0) all_ready = false;
             if (r.committed.items.len > 0) any_committed = true;
         }
         if (!any_committed) all_ready = false;
@@ -289,7 +287,7 @@ test "subscriber model: begin_access exposes one committed coherent set per call
     try expectReaderMatchesModel(dr, &model);
 }
 
-test "subscriber model: incomplete coherent WIP blocks committed sets across readers" {
+test "subscriber model: WIP for next set does not block committed set delivery" {
     const alloc = testing.allocator;
     var presentation = DDS.PresentationQosPolicy{};
     presentation.coherent_access = true;
@@ -306,16 +304,17 @@ test "subscriber model: incomplete coherent WIP blocks committed sets across rea
     try m1.addCommitted(alloc, &.{.{ .id = 'A', .instance = 1 }});
     try addCommitted(alloc, dr2, &.{.{ .id = 'B', .instance = 2 }});
     try m2.addCommitted(alloc, &.{.{ .id = 'B', .instance = 2 }});
+    // dr2 also has WIP for the *next* coherent set — this must not block
+    // delivery of the already-committed set on dr2 or dr1.
     try addWip(alloc, dr2, GUID_A, &.{.{ .id = 'C', .instance = 2 }});
-    m2.wip_count = 1;
 
     try h.beginAccess();
     try modelBeginAccess(alloc, presentation, &.{ &m1, &m2 });
     try expectReaderMatchesModel(dr1, &m1);
     try expectReaderMatchesModel(dr2, &m2);
 
+    // Clearing the WIP changes nothing for the already-consumed committed sets.
     clearWip(alloc, dr2, GUID_A);
-    m2.wip_count = 0;
     try h.beginAccess();
     try modelBeginAccess(alloc, presentation, &.{ &m1, &m2 });
     try expectReaderMatchesModel(dr1, &m1);
