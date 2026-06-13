@@ -426,15 +426,18 @@ pub const SubscriberImpl = struct {
             var any_committed = false;
             for (self.readers.items) |r| {
                 r.mu.lock();
-                if (!r.coherent_committed_ready and r.sub_matched_current > 0) {
-                    // Reader has matched writers but no complete set ready yet.
-                    // Covers two cases: (a) WIP is still accumulating (set end-marker
-                    // hasn't arrived), and (b) first sample hasn't arrived yet.
-                    // We do NOT additionally block on coherent_wip.count() > 0 —
-                    // a non-empty WIP means the NEXT set is in progress, which is fine.
-                    // Blocking on it would livelock against continuous writers (Connext)
-                    // where set N+1 starts immediately after set N's end-marker arrives,
-                    // so wip is never 0 when begin_access fires.
+                if (r.coherent_wip.count() > 0 and !r.coherent_committed_ready) {
+                    // Writer is mid-coherent-set (WIP has samples but end-marker hasn't
+                    // arrived yet). Block until this set is complete.
+                    // We do NOT block when committed_ready=true even if WIP is non-empty —
+                    // a non-empty WIP with committed_ready=true means set N is done and
+                    // set N+1 has started. Blocking on that WIP would livelock against
+                    // continuous writers (Connext) where set N+1 starts immediately after
+                    // set N's end-marker, so WIP is never 0 when begin_access fires.
+                    // We also do NOT block on matched_current > 0 alone: a reader whose
+                    // writer omits coherent markers sends samples straight to pending,
+                    // leaving committed_ready permanently false, which would stall the
+                    // whole group indefinitely.
                     all_ready = false;
                 }
                 if (r.coherent_committed_ready) any_committed = true;
