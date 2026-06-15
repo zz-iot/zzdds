@@ -519,9 +519,38 @@ pub const StatefulWriter = struct {
         if (rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
         // Reliable readers use NACK-driven history delivery: the HB above
         // announces the range; the reader's NACK drives actual DATA sends.
-        // Eager DATA without the reader's writer-proxy context can cause
-        // out-of-order delivery on the remote side before gap detection fires.
-        if (rp.reliable) return;
+        // Exception: for fragmented history, prime the reader with fragment 1
+        // of the first fragmented change so it learns frag_size/data_size and
+        // can immediately issue NACK_FRAG (~12ms) instead of waiting ~1.5s for
+        // nackResponseDelay to fire a NON-FINAL ACKNACK with zero fragments.
+        if (rp.reliable) {
+            var scratch: [SCRATCH_SIZE]u8 = undefined;
+            for (self.cache.changes.items) |*ch| {
+                if (ch.data.len <= self.frag_size) continue;
+                const frag_size: usize = self.frag_size;
+                const num_frags: u32 = @intCast((ch.data.len + frag_size - 1) / frag_size);
+                var b = MessageBuilder.init(&scratch, self.guid.prefix);
+                b.addInfoDst(rp.guid.prefix);
+                b.addInfoTs(ch.source_timestamp);
+                b.addDataFrag(.{
+                    .reader_entity_id = rp.guid.entity_id,
+                    .writer_entity_id = self.guid.entity_id,
+                    .writer_sn = ch.sequence_number,
+                    .fragment_starting_num = 1,
+                    .fragments_in_submessage = 1,
+                    .fragment_size = @intCast(frag_size),
+                    .data_size = @intCast(ch.data.len),
+                }, ch.data[0..@min(frag_size, ch.data.len)]);
+                for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
+                self.hb_count += 1;
+                var hb = MessageBuilder.init(&scratch, self.guid.prefix);
+                hb.addInfoDst(rp.guid.prefix);
+                hb.addHeartbeatFrag(rp.guid.entity_id, self.guid.entity_id, ch.sequence_number, num_frags, self.hb_count);
+                for (locs) |loc| sendIovecs(self.transport, &loc, hb.iovecs()) catch {};
+                break; // only the first fragmented change needs priming
+            }
+            return;
+        }
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.cache.changes.items) |*ch| {
             self.tracer.submit(.{ .send_data = .{
@@ -773,8 +802,22 @@ pub const StatefulWriter = struct {
             var retransmit_count: usize = 0;
 
             // Helper: retransmit one change to this proxy (fragmented or not).
+            //
+            // `frag_budget` controls fragmented-sample retransmit behaviour:
+            //   > 0 → send all DATA_FRAGs + HEARTBEAT_FRAG (full retransmit),
+            //         then decrement budget.
+            //   = 0 → send HEARTBEAT_FRAG only.
+            //
+            // Sending all DATA_FRAGs for every missing fragmented SN in one
+            // ACKNACK response floods the reader's UDP receive buffer (default
+            // ~208 KB; 500 × 7 × 16 KB = ~56 MB in one burst).  Limiting full
+            // retransmits to one sample per ACKNACK cycle paces delivery:
+            // each DATA_FRAG burst primes the reader with fragment layout so it
+            // can NACK_FRAG the specific missing pieces, and the base advances
+            // by one SN per cycle.  HEARTBEAT_FRAG for the rest lets the reader
+            // request fragments it already has partial info for via NACK_FRAG.
             const retransmitChange = struct {
-                fn call(w: *Self, proxy: *const ReaderProxy, ch: *const CacheChange, s: *[SCRATCH_SIZE]u8) void {
+                fn call(w: *Self, proxy: *const ReaderProxy, ch: *const CacheChange, s: *[SCRATCH_SIZE]u8, frag_budget: *usize) void {
                     w.tracer.submit(.{ .send_data = .{
                         .src_prefix = w.guid.prefix,
                         .writer_eid = w.guid.entity_id,
@@ -784,8 +827,20 @@ pub const StatefulWriter = struct {
                         .data_len = @intCast(ch.data.len),
                     } });
                     if (ch.data.len > w.frag_size) {
-                        w.hb_count += 1;
-                        w.sendFragsToProxyLocked(proxy, ch, w.hb_count, s);
+                        const num_frags: u32 = @intCast(
+                            (ch.data.len + @as(usize, w.frag_size) - 1) / @as(usize, w.frag_size),
+                        );
+                        if (frag_budget.* > 0) {
+                            frag_budget.* -= 1;
+                            w.hb_count += 1;
+                            w.sendFrag1ToProxyLocked(proxy, ch, w.hb_count, s);
+                        } else {
+                            w.hb_count += 1;
+                            var b = MessageBuilder.init(s, w.guid.prefix);
+                            b.addInfoDst(proxy.guid.prefix);
+                            b.addHeartbeatFrag(proxy.guid.entity_id, w.guid.entity_id, ch.sequence_number, num_frags, w.hb_count);
+                            for (proxy.effectiveLocators()) |loc| sendIovecs(w.transport, &loc, b.iovecs()) catch {};
+                        }
                     } else {
                         var b = MessageBuilder.init(s, w.guid.prefix);
                         b.addInfoDst(proxy.guid.prefix);
@@ -807,7 +862,11 @@ pub const StatefulWriter = struct {
 
             // Retransmit explicitly NACKed changes (bitmap bits set to 1).
             // rp.start_sn guards against replaying pre-match data to VOLATILE readers.
+            // Allow one full DATA_FRAG burst for the first fragmented SN the reader
+            // has explicitly NACKed; this primes the reader with the fragment layout
+            // it needs to construct NACK_FRAGs for any missing pieces.
             {
+                var bitmap_frag_budget: usize = 1;
                 var sn: SequenceNumber = nack_set.base;
                 var bit: u32 = 0;
                 while (bit < nack_set.num_bits) : ({
@@ -819,7 +878,7 @@ pub const StatefulWriter = struct {
                     // Don't retransmit changes that are still inside a coherent window.
                     if (self.isCoherentPendingSn(sn)) continue;
                     const ch = self.cache.getChange(sn) orelse continue;
-                    retransmitChange(self, rp, ch, &scratch);
+                    retransmitChange(self, rp, ch, &scratch, &bitmap_frag_budget);
                     retransmit_count += 1;
                 }
             }
@@ -838,6 +897,12 @@ pub const StatefulWriter = struct {
                     if (self.cache.maxSn() >= effective_base and rp.reliable)
                         self.sendHeartbeatToProxyLocked(rp, false);
                 }
+                // For fragmented samples outside the explicit NACK bitmap, send
+                // HEARTBEAT_FRAG only (budget=0): the reader either has partial
+                // fragments (and will NACK_FRAG the missing ones after the
+                // HEARTBEAT_FRAG) or will get a full retransmit on the next
+                // ACKNACK cycle once its base advances to that SN.
+                var nonfinal_frag_budget: usize = 0;
                 for (self.cache.changes.items) |*ch| {
                     if (ch.sequence_number < nack_set.base) continue;
                     if (ch.sequence_number < rp.start_sn) continue;
@@ -849,7 +914,7 @@ pub const StatefulWriter = struct {
                     // Skip if already covered by the NACK bitmap above.
                     const offset = ch.sequence_number - nack_set.base;
                     if (offset < nack_set.num_bits and nack_set.contains(ch.sequence_number)) continue;
-                    retransmitChange(self, rp, ch, &scratch);
+                    retransmitChange(self, rp, ch, &scratch, &nonfinal_frag_budget);
                     retransmit_count += 1;
                 }
             }
@@ -909,7 +974,15 @@ pub const StatefulWriter = struct {
                 .data_len = @intCast(ch.data.len),
             } });
             if (fragmented) {
-                self.sendFragsToProxyLocked(rp, ch, hb_count_snap, &scratch);
+                // Reliable readers: send only frag 1 + HEARTBEAT_FRAG.  The reader
+                // NACK_FRAGs the remaining fragments on demand.  Sending all N frags
+                // in the live path would saturate the reader's UDP recv buffer when
+                // a NACK_FRAG recovery burst (N-1 frags) is still in flight.
+                if (rp.reliable) {
+                    self.sendFrag1ToProxyLocked(rp, ch, hb_count_snap, &scratch);
+                } else {
+                    self.sendFragsToProxyLocked(rp, ch, hb_count_snap, &scratch);
+                }
             } else {
                 var b = MessageBuilder.init(&scratch, self.guid.prefix);
                 b.addInfoDst(rp.guid.prefix);
@@ -993,6 +1066,49 @@ pub const StatefulWriter = struct {
         b.addInfoDst(rp.guid.prefix);
         b.addHeartbeatFrag(rp.guid.entity_id, self.guid.entity_id, ch.sequence_number, num_frags, hb_count);
         for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
+    }
+
+    /// Send only fragment 1 of a fragmented change followed by a HEARTBEAT_FRAG.
+    /// Used for reliable readers in the live write path so that a NACK_FRAG
+    /// recovery burst (frags 2..N) already in flight cannot overlap with a fresh
+    /// full-fragment burst and overflow the reader's UDP recv buffer.
+    fn sendFrag1ToProxyLocked(
+        self: *Self,
+        rp: *const ReaderProxy,
+        ch: *const CacheChange,
+        hb_count: i32,
+        scratch: *[SCRATCH_SIZE]u8,
+    ) void {
+        const locs = rp.effectiveLocators();
+        if (locs.len == 0) return;
+
+        const frag_size: usize = self.frag_size;
+        const num_frags: u32 = @intCast((ch.data.len + frag_size - 1) / frag_size);
+
+        {
+            var b = MessageBuilder.init(scratch, self.guid.prefix);
+            b.addInfoDst(rp.guid.prefix);
+            b.addInfoTs(ch.source_timestamp);
+            b.addDataFrag(.{
+                .reader_entity_id = rp.guid.entity_id,
+                .writer_entity_id = self.guid.entity_id,
+                .writer_sn = ch.sequence_number,
+                .fragment_starting_num = 1,
+                .fragments_in_submessage = 1,
+                .fragment_size = @intCast(frag_size),
+                .data_size = @intCast(ch.data.len),
+            }, ch.data[0..@min(frag_size, ch.data.len)]);
+            for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                error.UnsupportedLocatorKind => {},
+                else => log.rtps.warn("StatefulWriter: DATA_FRAG 1/{} send error: {}", .{ num_frags, err }),
+            };
+        }
+        {
+            var hb = MessageBuilder.init(scratch, self.guid.prefix);
+            hb.addInfoDst(rp.guid.prefix);
+            hb.addHeartbeatFrag(rp.guid.entity_id, self.guid.entity_id, ch.sequence_number, num_frags, hb_count);
+            for (locs) |loc| sendIovecs(self.transport, &loc, hb.iovecs()) catch {};
+        }
     }
 
     /// Handle an incoming NACK_FRAG from a matched reader.
