@@ -233,10 +233,10 @@ fn makeReader(alloc: std.mem.Allocator, transport: Transport, reliable: bool) !*
     return StatefulReader.init(alloc, READER_GUID, transport, .keep_all, 0, reliable);
 }
 
-fn addProxies(alloc: std.mem.Allocator, writer: *StatefulWriter, reader: *StatefulReader) !void {
-    const rp = try ReaderProxy.init(alloc, READER_GUID, &.{READER_LOC}, &.{}, false, true);
+fn addProxies(alloc: std.mem.Allocator, writer: *StatefulWriter, reader: *StatefulReader, reliable: bool) !void {
+    const rp = try ReaderProxy.init(alloc, READER_GUID, &.{READER_LOC}, &.{}, false, reliable);
     try writer.addMatchedReader(rp);
-    const wp = try WriterProxy.init(alloc, WRITER_GUID, &.{WRITER_LOC}, &.{}, true);
+    const wp = try WriterProxy.init(alloc, WRITER_GUID, &.{WRITER_LOC}, &.{}, reliable);
     try reader.addMatchedWriter(wp);
 }
 
@@ -270,7 +270,7 @@ test "DATA_FRAG: large payload assembles correctly (BEST_EFFORT)" {
     try mt_w.transport().listen(&WRITER_LOC, wd.makeHandler());
     try mt_r.transport().listen(&READER_LOC, rd.makeHandler());
 
-    try addProxies(alloc, writer, reader);
+    try addProxies(alloc, writer, reader, false);
     _ = try writer.write(.alive, NIL_TS, NIL_IH, NIL_KH, &payload);
 
     // All DATA_FRAG packets + HEARTBEAT_FRAG travel in one deliverAll.
@@ -310,11 +310,11 @@ test "DATA_FRAG: large payload assembles correctly (RELIABLE)" {
     try mt_w.transport().listen(&WRITER_LOC, wd.makeHandler());
     try mt_r.transport().listen(&READER_LOC, rd.makeHandler());
 
-    try addProxies(alloc, writer, reader);
+    try addProxies(alloc, writer, reader, true);
     _ = try writer.write(.alive, NIL_TS, NIL_IH, NIL_KH, &payload);
 
-    net.deliverAll(); // DATA_FRAG + HEARTBEAT_FRAG → reader; NACK_FRAG if any missing
-    net.deliverAll(); // any retransmits settle
+    net.deliverAll(); // frag1 + HEARTBEAT_FRAG → reader; NACK_FRAG for frags 2..N
+    net.deliverAll(); // retransmit frags settle
 
     try testing.expectEqual(@as(usize, 1), col.samples.items.len);
     try testing.expectEqualSlices(u8, &payload, col.samples.items[0]);
@@ -350,7 +350,7 @@ test "DATA_FRAG: payload exactly one fragment delivered as single DATA_FRAG" {
     try mt_w.transport().listen(&WRITER_LOC, wd.makeHandler());
     try mt_r.transport().listen(&READER_LOC, rd.makeHandler());
 
-    try addProxies(alloc, writer, reader);
+    try addProxies(alloc, writer, reader, false);
     _ = try writer.write(.alive, NIL_TS, NIL_IH, NIL_KH, &payload);
 
     net.deliverAll();
@@ -385,7 +385,7 @@ test "DATA_FRAG: multiple large samples each reassemble correctly" {
     try mt_w.transport().listen(&WRITER_LOC, wd.makeHandler());
     try mt_r.transport().listen(&READER_LOC, rd.makeHandler());
 
-    try addProxies(alloc, writer, reader);
+    try addProxies(alloc, writer, reader, false);
 
     var payloads: [3][PAYLOAD_LEN]u8 = undefined;
     for (&payloads, 0..) |*p, pi| {
