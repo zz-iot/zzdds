@@ -57,6 +57,8 @@ pub const MatchedWriterInfo = struct {
     ownership_strength: i32 = 0,
     /// Liveliness lease duration in nanoseconds; 0 = infinite (no expiry tracking).
     liveliness_lease_ns: i64 = 0,
+    /// Lifespan duration in nanoseconds; 0 = infinite (no expiry).
+    lifespan_ns: i64 = 0,
     /// True when the writer offers TRANSIENT_LOCAL (or stronger) durability with RELIABLE
     /// reliability.  The reader must wait for history delivery before signalling completion
     /// of wait_for_historical_data.

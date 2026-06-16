@@ -51,6 +51,9 @@ pub const QosSnapshot = struct {
     presentation_access_scope: u8 = 0,
     coherent_access: bool = false,
     ordered_access: bool = false,
+    // LIFESPAN QoS (DataWriter only). DDS INFINITE = {0x7fffffff, 0x7fffffff}.
+    lifespan_sec: i32 = 0x7fff_ffff,
+    lifespan_nanosec: u32 = 0x7fff_ffff,
 };
 
 /// Information about the local participant broadcast to remote peers.

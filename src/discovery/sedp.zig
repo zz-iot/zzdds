@@ -229,6 +229,11 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     try writePidHdr(alloc, &buf, PidTable.HISTORY, 8);
     try writeU32Le(alloc, &buf, ann.qos.history_kind);
     try writeI32Le(alloc, &buf, ann.qos.history_depth);
+    // PID_LIFESPAN: only emitted when not INFINITE (same pattern as DEADLINE).
+    if (ann.qos.lifespan_sec != 0x7fff_ffff or ann.qos.lifespan_nanosec != 0x7fff_ffff) {
+        try writePidHdr(alloc, &buf, PidTable.LIFESPAN, 8);
+        try writeRtpsDuration(alloc, &buf, .{ .sec = ann.qos.lifespan_sec, .nanosec = ann.qos.lifespan_nanosec });
+    }
 
     // PID_DATA_REPRESENTATION: seq_len(4) + value(2) + pad(2) = 8 bytes.
     // Advertise a single representation matching the writer's QoS so that
@@ -486,6 +491,13 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
                         // Map wire value: 0=XCDR1, 2=XCDR2. Store as 1/2.
                         qos.data_representation = if (id == 2) 2 else 1;
                     }
+                }
+            },
+            PidTable.LIFESPAN => {
+                if (v.len >= 8) {
+                    const dur = readDeadlineDuration(v, le);
+                    qos.lifespan_sec = dur.sec;
+                    qos.lifespan_nanosec = dur.nanosec;
                 }
             },
             PidTable.PARTITION, PidTable.PARTITION_LEGACY => {

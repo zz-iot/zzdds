@@ -1141,6 +1141,8 @@ pub const DomainParticipantImpl = struct {
         const dl_zero_w = qos.deadline.period.sec == 0 and qos.deadline.period.nanosec == 0;
         // Liveliness lease: {0,0} from codegen means unset → treat as infinite.
         const ll_zero_w = qos.liveliness.lease_duration.sec == 0 and qos.liveliness.lease_duration.nanosec == 0;
+        // Lifespan: {0,0} from codegen means unset → treat as infinite.
+        const ls_zero_w = qos.lifespan.duration.sec == 0 and qos.lifespan.duration.nanosec == 0;
         return .{
             .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
             .durability_kind = @as(u8, @truncate(@intFromEnum(qos.durability.kind))),
@@ -1162,6 +1164,8 @@ pub const DomainParticipantImpl = struct {
             .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
             .coherent_access = presentation.coherent_access,
             .ordered_access = presentation.ordered_access,
+            .lifespan_sec = if (ls_zero_w) 0x7fff_ffff else qos.lifespan.duration.sec,
+            .lifespan_nanosec = if (ls_zero_w) 0x7fff_ffff else qos.lifespan.duration.nanosec,
         };
     }
 
@@ -1585,6 +1589,12 @@ pub const DomainParticipantImpl = struct {
                 0 // infinite — no expiry tracking
             else
                 @as(i64, ll_sec) * std.time.ns_per_s + @as(i64, ll_ns);
+            const ls_sec = data.qos.lifespan_sec;
+            const ls_ns = data.qos.lifespan_nanosec;
+            const lifespan_ns: i64 = if (ls_sec == 0x7fff_ffff)
+                0 // infinite — no expiry
+            else
+                @as(i64, ls_sec) * std.time.ns_per_s + @as(i64, ls_ns);
             const info = proto.MatchedWriterInfo{
                 .guid = data.guid,
                 .unicast_locators = data.unicast_locators,
@@ -1592,6 +1602,7 @@ pub const DomainParticipantImpl = struct {
                 .reliability = if (data.qos.reliability_kind == 1) .reliable else .best_effort,
                 .ownership_strength = data.qos.ownership_strength,
                 .liveliness_lease_ns = lease_ns,
+                .lifespan_ns = lifespan_ns,
                 .history_expected = data.qos.durability_kind > 0 and data.qos.reliability_kind == 1,
             };
             ar.proto.addMatchedWriter(&info) catch {};

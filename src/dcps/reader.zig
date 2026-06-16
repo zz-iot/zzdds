@@ -78,6 +78,9 @@ pub const PendingChange = struct {
     /// Per-publisher group sequence number from PID_GROUP_SEQ_NUM inline QoS.
     /// Used to sort samples in ordered GROUP_PRESENTATION access windows.
     group_seq_num: ?i64 = null,
+    /// Wall-clock nanosecond timestamp after which this sample is expired (LIFESPAN QoS).
+    /// Null means no expiry (infinite lifespan or NOT_ALIVE change).
+    expiry_ns: ?i64 = null,
 
     pub fn deinit(self: PendingChange) void {
         self.alloc.free(self.data);
@@ -211,6 +214,9 @@ pub const DataReaderImpl = struct {
     /// Guarded by `mu`.
     writer_liveliness: std.AutoHashMapUnmanaged(Guid, WriterLivelinessEntry) = .empty,
 
+    /// Per-writer lifespan in nanoseconds (0 = infinite). Guarded by `mu`.
+    writer_lifespans: std.AutoHashMapUnmanaged(Guid, i64) = .empty,
+
     // ── OWNERSHIP tracking ────────────────────────────────────────────────────
     // Only used when qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS.
     // Guarded by `mu`.
@@ -325,6 +331,7 @@ pub const DataReaderImpl = struct {
         self.tbf_map.deinit(self.alloc);
         self.writer_strengths.deinit(self.alloc);
         self.writer_liveliness.deinit(self.alloc);
+        self.writer_lifespans.deinit(self.alloc);
         self.owner_map.deinit(self.alloc);
         {
             var wi_it = self.writer_instances.valueIterator();
@@ -512,6 +519,13 @@ pub const DataReaderImpl = struct {
         {
             const states = self.determineStatesLocked(ih, change.kind);
             const src_time = change.source_timestamp.toTime();
+            const coh_expiry: ?i64 = if (change.kind == .alive)
+                if (self.writer_lifespans.get(change.writer_guid)) |ls_ns|
+                    src_time.toNs() + ls_ns
+                else
+                    null
+            else
+                null;
             const pc = PendingChange{
                 .data = copy,
                 .alloc = self.alloc,
@@ -525,6 +539,7 @@ pub const DataReaderImpl = struct {
                     .valid_data = change.kind == .alive,
                 },
                 .group_seq_num = change.group_seq_num,
+                .expiry_ns = coh_expiry,
             };
             if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
             if (change.kind != .alive) {
@@ -685,6 +700,13 @@ pub const DataReaderImpl = struct {
         // Build SampleInfo from the CacheChange.
         const states = self.determineStatesLocked(ih, change.kind);
         const src_time = change.source_timestamp.toTime();
+        const expiry: ?i64 = if (change.kind == .alive)
+            if (self.writer_lifespans.get(change.writer_guid)) |ls_ns|
+                src_time.toNs() + ls_ns
+            else
+                null
+        else
+            null;
         const pc = PendingChange{
             .data = copy,
             .alloc = self.alloc,
@@ -698,6 +720,7 @@ pub const DataReaderImpl = struct {
                 .valid_data = change.kind == .alive,
             },
             .group_seq_num = change.group_seq_num,
+            .expiry_ns = expiry,
         };
 
         self.pending.append(self.alloc, pc) catch {
@@ -737,6 +760,10 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
+        if (info.lifespan_ns > 0)
+            self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
+        else
+            _ = self.writer_lifespans.remove(info.guid);
         // Track liveliness for writers with a finite lease.
         if (info.liveliness_lease_ns > 0) {
             const prev = self.writer_liveliness.get(info.guid);
@@ -786,6 +813,7 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         _ = self.writer_strengths.remove(guid);
+        _ = self.writer_lifespans.remove(guid);
         // Discard any in-progress coherent set from this writer.  If the writer
         // crashed or was deleted mid-set, the partial wip would otherwise stay
         // in the map indefinitely — one leaked entry per connect/disconnect cycle.
@@ -955,26 +983,54 @@ pub const DataReaderImpl = struct {
     }
 
     /// Dequeue one sample.  Returns null if the queue is empty.
+    /// Expired samples (LIFESPAN QoS) are silently discarded.
     /// The caller owns TakenSample.data and must free it with the reader's allocator.
     pub fn takeRaw(self: *Self) ?TakenSample {
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.pending.items.len == 0) return null;
-        const pc = self.pending.orderedRemove(0);
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        const now_ns = time_mod.nanoTimestamp();
+        while (self.pending.items.len > 0) {
+            const pc = self.pending.orderedRemove(0);
+            if (pc.expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    pc.deinit();
+                    continue;
+                }
+            }
+            if (self.pending.items.len == 0) {
+                self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+            }
+            return .{ .data = pc.data, .info = pc.info };
         }
-        return .{ .data = pc.data, .info = pc.info };
+        self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        return null;
     }
 
     /// DDS take_next_instance semantics: dequeue one sample belonging to the
     /// "next" instance in handle order after `prev_instance_handle`.
     /// If prev == 0 (HANDLE_NIL), dequeue from whatever instance appears first.
+    /// Expired samples (LIFESPAN QoS) are silently purged during the scan.
     /// Returns null when the queue has no qualifying sample.
     /// The caller owns TakenSample.data and must free with the reader's allocator.
     pub fn takeNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
         self.mu.lock();
         defer self.mu.unlock();
+
+        const now_ns = time_mod.nanoTimestamp();
+
+        // Purge expired samples before scanning for the target instance.
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            const pc = &self.pending.items[i];
+            if (pc.expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    const expired = self.pending.orderedRemove(i);
+                    expired.deinit();
+                    continue;
+                }
+            }
+            i += 1;
+        }
 
         // Find the target instance handle.
         var target_ih: ?DDS.InstanceHandle_t = null;
@@ -988,10 +1044,10 @@ pub const DataReaderImpl = struct {
         }
         const tgt = target_ih orelse return null;
 
-        for (self.pending.items, 0..) |pc, i| {
+        for (self.pending.items, 0..) |pc, idx| {
             if (pc.info.instance_handle == tgt) {
                 const s = TakenSample{ .data = pc.data, .info = pc.info };
-                _ = self.pending.orderedRemove(i);
+                _ = self.pending.orderedRemove(idx);
                 if (self.pending.items.len == 0) {
                     self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
                 }
