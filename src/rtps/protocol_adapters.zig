@@ -80,6 +80,7 @@ pub const RtpsProtocolWriter = struct {
         .handle_ack_nack = vtHandleAckNack,
         .handle_nack_frag = vtHandleNackFrag,
         .all_acked = vtAllAcked,
+        .wait_all_acked = vtWaitAllAcked,
         .cache_len = vtCacheLen,
         .begin_coherent_set = vtBeginCoherentSet,
         .coherent_window_count = vtCoherentWindowCount,
@@ -115,6 +116,11 @@ pub const RtpsProtocolWriter = struct {
     fn vtAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         return self.writer.allProxiesAcked(target_sn);
+    }
+
+    fn vtWaitAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber, deadline_ns: ?i64) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.writer.waitAllAcked(target_sn, deadline_ns);
     }
 
     fn vtRemoveMatchedReader(ctx: *anyopaque, guid: Guid) void {

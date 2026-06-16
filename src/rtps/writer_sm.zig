@@ -12,6 +12,7 @@ const std = @import("std");
 const log = @import("../log.zig");
 const trace = @import("../trace.zig");
 const mutex_mod = @import("../util/mutex.zig");
+const condvar_mod = @import("../util/condvar.zig");
 const history_mod = @import("history.zig");
 const guid_mod = @import("guid.zig");
 const sn_mod = @import("sequence_number.zig");
@@ -315,6 +316,7 @@ pub const StatefulWriter = struct {
     /// Entity ID used in DATA/HEARTBEAT submessages as reader entity ID.
     reader_entity_id: EntityId,
     mu: mutex_mod.Mutex,
+    ack_cond: condvar_mod.Condvar,
     /// Monotonically increasing count for HEARTBEAT / HEARTBEAT_FRAG submessages.
     hb_count: i32,
     tracer: trace.Tracer,
@@ -373,6 +375,7 @@ pub const StatefulWriter = struct {
             .reader_proxies = .empty,
             .reader_entity_id = reader_entity_id,
             .mu = .{},
+            .ack_cond = .{},
             .hb_count = 0,
             .tracer = trace.Tracer.noop(),
             .frag_size = frag_size,
@@ -434,14 +437,39 @@ pub const StatefulWriter = struct {
     /// all changes up to and including `target_sn`.  BEST_EFFORT proxies are
     /// excluded since they never send AckNack.  Returns true immediately when
     /// there are no RELIABLE proxies or `target_sn` is 0.
-    pub fn allProxiesAcked(self: *Self, target_sn: SequenceNumber) bool {
+    /// Caller must hold `mu`.
+    fn allProxiesAckedLocked(self: *Self, target_sn: SequenceNumber) bool {
         if (target_sn == 0) return true;
-        self.mu.lock();
-        defer self.mu.unlock();
         for (self.reader_proxies.items) |rp| {
             if (rp.reliable and rp.highest_acked_sn < target_sn) return false;
         }
         return true;
+    }
+
+    pub fn allProxiesAcked(self: *Self, target_sn: SequenceNumber) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.allProxiesAckedLocked(target_sn);
+    }
+
+    /// Block until every RELIABLE matched reader has cumulatively acked all
+    /// changes up to and including `target_sn`, or until `deadline_ns`
+    /// (monotonic ns) is reached.  Null means wait indefinitely.
+    /// Returns true on success, false on timeout.
+    pub fn waitAllAcked(self: *Self, target_sn: SequenceNumber, deadline_ns: ?i64) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (true) {
+            if (self.allProxiesAckedLocked(target_sn)) return true;
+            if (deadline_ns) |dl| {
+                const now = time_mod.nanoTimestamp();
+                if (now >= dl) return false;
+                const remaining: u64 = @intCast(dl - now);
+                self.ack_cond.timedWaitNs(&self.mu, remaining) catch return false;
+            } else {
+                self.ack_cond.wait(&self.mu);
+            }
+        }
     }
 
     /// Add a matched reader. When a proxy with the same GUID already exists,
@@ -527,26 +555,8 @@ pub const StatefulWriter = struct {
             var scratch: [SCRATCH_SIZE]u8 = undefined;
             for (self.cache.changes.items) |*ch| {
                 if (ch.data.len <= self.frag_size) continue;
-                const frag_size: usize = self.frag_size;
-                const num_frags: u32 = @intCast((ch.data.len + frag_size - 1) / frag_size);
-                var b = MessageBuilder.init(&scratch, self.guid.prefix);
-                b.addInfoDst(rp.guid.prefix);
-                b.addInfoTs(ch.source_timestamp);
-                b.addDataFrag(.{
-                    .reader_entity_id = rp.guid.entity_id,
-                    .writer_entity_id = self.guid.entity_id,
-                    .writer_sn = ch.sequence_number,
-                    .fragment_starting_num = 1,
-                    .fragments_in_submessage = 1,
-                    .fragment_size = @intCast(frag_size),
-                    .data_size = @intCast(ch.data.len),
-                }, ch.data[0..@min(frag_size, ch.data.len)]);
-                for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
                 self.hb_count += 1;
-                var hb = MessageBuilder.init(&scratch, self.guid.prefix);
-                hb.addInfoDst(rp.guid.prefix);
-                hb.addHeartbeatFrag(rp.guid.entity_id, self.guid.entity_id, ch.sequence_number, num_frags, self.hb_count);
-                for (locs) |loc| sendIovecs(self.transport, &loc, hb.iovecs()) catch {};
+                self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
                 break; // only the first fragmented change needs priming
             }
             return;
@@ -622,6 +632,16 @@ pub const StatefulWriter = struct {
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
+        // Send an explicit GAP for KEEP_LAST-evicted SNs alongside the HB so
+        // readers permanently retire missing SNs and avoid accumulating state.
+        if (cache_first > 0 and rp.start_sn > 0 and cache_first > rp.start_sn) {
+            const gap_list = msg.submessage.SequenceNumberSet{
+                .base = cache_first,
+                .num_bits = 0,
+                .bitmap = std.mem.zeroes([8]u32),
+            };
+            b.addGap(rp.guid.entity_id, self.guid.entity_id, rp.start_sn, gap_list);
+        }
         b.addHeartbeat(
             rp.guid.entity_id,
             self.guid.entity_id,
@@ -699,6 +719,18 @@ pub const StatefulWriter = struct {
             const last_sn = if (cache_last == 0) 0 else cache_last;
             var b = MessageBuilder.init(&scratch, self.guid.prefix);
             b.addInfoDst(rp.guid.prefix);
+            // When KEEP_LAST eviction has moved the cache floor above the reader's
+            // start_sn, send an explicit GAP so the reader permanently retires the
+            // missing SNs instead of accumulating unbounded pending-SN state that
+            // can corrupt OpenDDS's reliability internals (SIGSEGV observed).
+            if (cache_first > 0 and rp.start_sn > 0 and cache_first > rp.start_sn) {
+                const gap_list = msg.submessage.SequenceNumberSet{
+                    .base = cache_first,
+                    .num_bits = 0,
+                    .bitmap = std.mem.zeroes([8]u32),
+                };
+                b.addGap(rp.guid.entity_id, self.guid.entity_id, rp.start_sn, gap_list);
+            }
             b.addHeartbeat(
                 rp.guid.entity_id,
                 self.guid.entity_id,
@@ -770,6 +802,7 @@ pub const StatefulWriter = struct {
                 }
             }
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
+            self.ack_cond.broadcast();
             // Clear suppress_live_data when either:
             // (a) The reader sends a NON-FINAL NACK with cumAck >= history floor:
             //     RTI is actively requesting live samples, meaning its DataReader
@@ -804,7 +837,8 @@ pub const StatefulWriter = struct {
             // Helper: retransmit one change to this proxy (fragmented or not).
             //
             // `frag_budget` controls fragmented-sample retransmit behaviour:
-            //   > 0 → send all DATA_FRAGs + HEARTBEAT_FRAG (full retransmit),
+            //   > 0 → send frag 1 + HEARTBEAT_FRAG (primes the reader's
+            //         frag layout so it can issue NACK_FRAG immediately),
             //         then decrement budget.
             //   = 0 → send HEARTBEAT_FRAG only.
             //
