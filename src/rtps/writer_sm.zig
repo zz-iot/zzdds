@@ -669,6 +669,9 @@ pub const StatefulWriter = struct {
                 _ = self.reader_proxies.swapRemove(i);
             }
         }
+        // Wake any thread blocked in waitAllAcked: removing a reliable reader
+        // may satisfy the all-acked condition even without an explicit ACKNACK.
+        self.ack_cond.broadcast();
     }
 
     /// Store a new change and send it immediately to all matched readers.
