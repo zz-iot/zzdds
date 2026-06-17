@@ -1093,7 +1093,10 @@ pub const DataReaderImpl = struct {
                 if (target_ih == null or ih < target_ih.?) target_ih = ih;
             }
         }
-        const tgt = target_ih orelse return null;
+        const tgt = target_ih orelse {
+            if (self.pending.items.len == 0) self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+            return null;
+        };
 
         for (self.pending.items, 0..) |pc, idx| {
             if (pc.info.instance_handle == tgt) {
