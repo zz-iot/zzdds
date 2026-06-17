@@ -94,6 +94,10 @@ pub const CoherentWipEntry = struct {
     /// coherent_set_sn of the samples currently buffered (CS = first SN of the set,
     /// per RTI Connext convention).
     cs: history_mod.SequenceNumber,
+    /// Highest RTPS sequence number received into this WIP so far.
+    /// Used in onHeartbeatCb to guard against flushing when the HEARTBEAT arrived
+    /// before all DATA datagrams of the set (possible on real UDP networks).
+    highest_sn: history_mod.SequenceNumber = 0,
     samples: std.ArrayListUnmanaged(PendingChange) = .empty,
 };
 
@@ -570,6 +574,7 @@ pub const DataReaderImpl = struct {
                 const prev = gop.value_ptr.samples;
                 gop.value_ptr.samples = .empty;
                 gop.value_ptr.cs = new_cs;
+                gop.value_ptr.highest_sn = 0;
                 transition_committed = self.commitCoherentWipSamplesLocked(prev);
             } else if (!gop.found_existing) {
                 gop.value_ptr.* = .{ .cs = new_cs };
@@ -579,6 +584,8 @@ pub const DataReaderImpl = struct {
                 self.alloc.free(copy);
                 return;
             };
+            if (change.sequence_number > gop.value_ptr.highest_sn)
+                gop.value_ptr.highest_sn = change.sequence_number;
             self.mu.unlock();
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             if (transition_committed) {
@@ -771,17 +778,23 @@ pub const DataReaderImpl = struct {
     }
 
     /// Called when a valid HEARTBEAT arrives from a matched writer.
-    /// Flushes any in-progress coherent WIP for that writer: the HB means the
-    /// writer has sent all data for the current set, so the set is complete.
+    /// Flushes the coherent WIP for that writer only when we have received every
+    /// sample the writer has declared (highest_sn >= last_sn).  Guarding on
+    /// last_sn prevents committing a partial set when the HEARTBEAT arrives before
+    /// all DATA datagrams on a real UDP network where datagrams may reorder.
     fn onHeartbeatCb(ctx: *anyopaque, writer_guid: Guid, last_sn: history_mod.SequenceNumber) void {
-        _ = last_sn;
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.subscriber_presentation.coherent_access) return;
         self.mu.lock();
-        const committed = if (self.coherent_wip.fetchRemove(writer_guid)) |kv|
-            self.commitCoherentWipSamplesLocked(kv.value.samples)
-        else
-            false;
+        const committed = if (self.coherent_wip.getPtr(writer_guid)) |entry| blk: {
+            // Only flush once we hold all samples up to the writer's declared last_sn.
+            if (entry.highest_sn < last_sn) {
+                self.mu.unlock();
+                return;
+            }
+            const kv = self.coherent_wip.fetchRemove(writer_guid).?;
+            break :blk self.commitCoherentWipSamplesLocked(kv.value.samples);
+        } else false;
         self.mu.unlock();
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
