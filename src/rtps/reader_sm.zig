@@ -45,6 +45,9 @@ pub const DataCallback = struct {
     ctx: *anyopaque,
     on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
+    /// Called when a valid (non-duplicate) HEARTBEAT is received from a writer.
+    /// Invoked under the state machine's lock; must NOT call back into the SM.
+    on_heartbeat: ?*const fn (ctx: *anyopaque, writer_guid: Guid, last_sn: SequenceNumber) void = null,
 };
 
 // ── StatelessReader ───────────────────────────────────────────────────────────
@@ -694,6 +697,12 @@ pub const StatefulReader = struct {
                         if (cb.on_sample_lost) |f| f(cb.ctx, lost_count);
                     }
                 }
+            }
+
+            // Notify the DDS layer that a valid HB arrived.  Used to flush
+            // coherent WIP when no subsequent set will trigger a CS transition.
+            if (self.callback) |cb| {
+                if (cb.on_heartbeat) |f| f(cb.ctx, writer_guid, last_sn);
             }
 
             // Only RELIABLE readers send ACKNACK; BEST_EFFORT readers ignore HEARTBEATs.

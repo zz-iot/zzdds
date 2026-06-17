@@ -166,6 +166,20 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
         ann.guid.entity_id.entity_kind,
     });
 
+    // PID_GROUP_GUID (0x0052): 16 bytes — publisher group GUID for GROUP coherent sets.
+    // Required so that Connext GROUP subscribers can associate writers into the same
+    // coherent group (publisherKey in PublicationBuiltinTopicData).
+    if (ann.group_guid) |gg| {
+        try writePidHdr(alloc, &buf, PidTable.GROUP_GUID, 16);
+        try buf.appendSlice(alloc, &gg.prefix.bytes);
+        try buf.appendSlice(alloc, &[_]u8{
+            gg.entity_id.entity_key[0],
+            gg.entity_id.entity_key[1],
+            gg.entity_id.entity_key[2],
+            gg.entity_id.entity_kind,
+        });
+    }
+
     // PID_TOPIC_NAME (0x0005)
     {
         const slen: u32 = @intCast(ann.topic_name.len + 1);

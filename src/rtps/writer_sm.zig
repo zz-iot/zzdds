@@ -465,7 +465,9 @@ pub const StatefulWriter = struct {
                 const now = time_mod.nanoTimestamp();
                 if (now >= dl) return false;
                 const remaining: u64 = @intCast(dl - now);
-                self.ack_cond.timedWaitNs(&self.mu, remaining) catch return false;
+                self.ack_cond.timedWaitNs(&self.mu, remaining) catch {};
+                // Re-check after timeout: an ACK may have arrived just as the
+                // condvar re-acquired mu, satisfying the condition already.
             } else {
                 self.ack_cond.wait(&self.mu);
             }
@@ -697,7 +699,7 @@ pub const StatefulWriter = struct {
                 return err;
             };
         } else if (self.cache.getChange(sn)) |ch| {
-            self.sendChangeToAllLocked(ch);
+            self.sendChangeToAllLocked(ch, true);
         }
         return sn;
     }
@@ -982,7 +984,7 @@ pub const StatefulWriter = struct {
         }
     }
 
-    fn sendChangeToAllLocked(self: *Self, ch: *const CacheChange) void {
+    fn sendChangeToAllLocked(self: *Self, ch: *const CacheChange, send_trailing_hb: bool) void {
         log.rtps.debug("StatefulWriter({x}): sendChangeToAll sn={} to {} readers", .{
             self.guid.entity_id.entity_key, ch.sequence_number, self.reader_proxies.items.len,
         });
@@ -1052,7 +1054,11 @@ pub const StatefulWriter = struct {
                 // Skip for BEST_EFFORT proxies: they never send AckNack, and sending
                 // a Heartbeat would trigger a synchronous AckNack round-trip when
                 // using MemoryTransport, re-entering the writer's mutex.
-                if (rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
+                // Callers that flush a whole coherent set at once pass false here and
+                // send ONE heartbeat after all samples instead; this prevents the
+                // per-DATA heartbeat from triggering a premature coherent WIP flush
+                // on the subscriber side before all set samples have arrived.
+                if (rp.reliable and send_trailing_hb) self.sendHeartbeatToProxyLocked(rp, false);
             }
         }
     }
@@ -1250,9 +1256,10 @@ pub const StatefulWriter = struct {
     }
 
     /// Flush a deferred coherent/ordered batch.
-    ///   .full        — PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET
+    ///   .full           — PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET (GROUP scope)
+    ///   .coherent_only  — PID_COHERENT_SET only (INSTANCE/TOPIC scope coherent_access)
     ///   .group_seq_only — PID_GROUP_SEQ_NUM only (ordered_access without coherent_access)
-    ///   .none        — no inline QoS (resume_publications)
+    ///   .none           — no inline QoS (resume_publications)
     /// `resuspend`: if true, re-arms coherent_active=true before releasing the lock so
     /// that concurrent write() calls never observe a window where suspension is inactive.
     ///
@@ -1285,7 +1292,7 @@ pub const StatefulWriter = struct {
         // Flush pre-window writes (from suspension before begin_coherent_changes)
         // without coherent QoS — they are not part of the coherent set.
         for (all_sns[0..window_start]) |sn| {
-            if (self.cache.getChange(sn)) |ch| self.sendChangeToAllLocked(ch);
+            if (self.cache.getChange(sn)) |ch| self.sendChangeToAllLocked(ch, true);
         }
 
         const coherent_sns = all_sns[window_start..];
@@ -1295,34 +1302,35 @@ pub const StatefulWriter = struct {
         }
 
         const last_sn = coherent_sns[coherent_sns.len - 1];
+        const first_sn = coherent_sns[0];
         const n: i64 = @intCast(coherent_sns.len);
         if (mode != .none) {
-            // Only assign group sequence numbers when there are readers — the GSN
-            // counter must start at 1 for the FIRST sample a reader sees, not at
-            // whatever the writer's write count was before the reader matched.
-            // With VOLATILE durability, new readers never see pre-match samples,
-            // so holding the counter at 0 until the first reader joins is correct.
-            const has_readers = self.reader_proxies.items.len > 0;
-            if (has_readers) {
-                // Use the publisher's shared counter when available so that samples
-                // from multiple writers in the same GROUP coherent set get globally
-                // unique, ordered GSNs.  Fall back to the per-writer counter for
-                // standalone usage (single-writer publishers or direct test calls).
+            // PID_COHERENT_SET: stamp the first SN of the coherent window on all
+            // samples.  RTI Connext groups samples by this value and treats a
+            // CS transition (new value arriving) as the end-of-set signal.
+            if (mode == .full or mode == .coherent_only) {
+                for (coherent_sns) |sn| {
+                    for (self.cache.changes.items) |*ch| {
+                        if (ch.sequence_number == sn) {
+                            ch.coherent_set_sn = first_sn;
+                            break;
+                        }
+                    }
+                }
+            }
+            // PID_GROUP_SEQ_NUM / PID_GROUP_COHERENT_SET: GROUP-scope and ordered-access
+            // only.  Always assign even when no readers are matched — late-joining
+            // KEEP_ALL readers will receive history with correct inline QoS via NACK repair.
+            if (mode == .full or mode == .group_seq_only) {
                 const base_gsn = if (publisher_gsn) |pg| pg.* else self.group_seq_num_counter;
                 const last_gsn = base_gsn + n;
-                // group_coherent_sn = last GSN in the entire publisher's coherent set
-                // (provided by the publisher as global_last_gsn).  Falls back to the
-                // per-writer last_gsn for single-writer publishers (where they are equal).
                 const group_end_gsn = if (global_last_gsn != 0) global_last_gsn else last_gsn;
                 for (coherent_sns, 1..) |sn, i| {
                     const gsn: i64 = base_gsn + @as(i64, @intCast(i));
                     for (self.cache.changes.items) |*ch| {
                         if (ch.sequence_number == sn) {
-                            if (mode == .full) {
-                                ch.coherent_set_sn = last_sn;
-                                if (sn == last_sn) ch.group_coherent_sn = group_end_gsn;
-                            }
                             ch.group_seq_num = gsn;
+                            if (mode == .full and sn == last_sn) ch.group_coherent_sn = group_end_gsn;
                             break;
                         }
                     }
@@ -1332,22 +1340,19 @@ pub const StatefulWriter = struct {
                 } else {
                     self.group_seq_num_counter += n;
                 }
-            } else if (mode == .full) {
-                // No readers yet — still mark coherent_set_sn for retransmit consistency.
-                for (coherent_sns) |sn| {
-                    for (self.cache.changes.items) |*ch| {
-                        if (ch.sequence_number == sn) {
-                            ch.coherent_set_sn = last_sn;
-                            break;
-                        }
-                    }
-                }
             }
         }
         for (coherent_sns) |sn| {
             if (self.cache.getChange(sn)) |ch| {
-                self.sendChangeToAllLocked(ch);
+                // No per-DATA heartbeat: send one HB after all coherent samples so the
+                // subscriber's coherent WIP is not flushed prematurely on the first sample.
+                self.sendChangeToAllLocked(ch, false);
             }
+        }
+        // One heartbeat after all coherent-set samples so reliable readers learn the
+        // full [first_sn, last_sn] range and the subscriber can commit the complete WIP.
+        for (self.reader_proxies.items) |*rp| {
+            if (rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
         }
         self.coherent_pending_sns.clearRetainingCapacity();
     }

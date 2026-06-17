@@ -1803,7 +1803,7 @@ pub const DomainParticipantImpl = struct {
         if (names.len > 0) alloc.free(names);
     }
 
-    fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
+    fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
         // Find the writer and snapshot its announcement fields outside the lock.
         var ann_opt: ?struct {
@@ -1838,12 +1838,32 @@ pub const DomainParticipantImpl = struct {
             freePartitionNames(self.alloc, owned_names);
             return;
         };
+        // Derive group GUID for GROUP-scope coherent publishers (PID_GROUP_GUID).
+        // All writers in the same publisher share this GUID so that remote GROUP
+        // subscribers can associate them into the same coherent group.
+        const group_guid: ?Guid = if (presentation.coherent_access and
+            presentation.access_scope == .GROUP_PRESENTATION_QOS)
+        blk: {
+            const h: u32 = @bitCast(publisher_handle);
+            break :blk Guid{
+                .prefix = self.guid.prefix,
+                .entity_id = .{
+                    .entity_key = .{
+                        @truncate(h >> 16),
+                        @truncate(h >> 8),
+                        @truncate(h),
+                    },
+                    .entity_kind = guid_mod.EntityKind.writer_group,
+                },
+            };
+        } else null;
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
         var snap = writerQosSnapshot(ann.qos, ann.presentation);
         snap.partition_names = owned_names;
         self.discovery.announceWriter(&disc.WriterAnnouncement{
             .guid = ann.guid,
             .participant_guid = self.guid,
+            .group_guid = group_guid,
             .topic_name = ann.topic_name,
             .type_name = ann.type_name,
             .qos = snap,

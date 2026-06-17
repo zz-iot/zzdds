@@ -12,6 +12,7 @@ pub const DataWriterImpl = @import("writer.zig").DataWriterImpl;
 pub const guidToHandle = @import("writer.zig").guidToHandle;
 pub const DataReaderImpl = @import("reader.zig").DataReaderImpl;
 pub const PendingChange = @import("reader.zig").PendingChange;
+pub const CoherentWipEntry = @import("reader.zig").CoherentWipEntry;
 pub const TakenSample = @import("reader.zig").TakenSample;
 pub const TopicImpl = @import("topic.zig").TopicImpl;
 pub const ContentFilteredTopicImpl = @import("topic.zig").ContentFilteredTopicImpl;

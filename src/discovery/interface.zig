@@ -83,6 +83,9 @@ pub const ParticipantAnnouncement = struct {
 pub const WriterAnnouncement = struct {
     guid: Guid,
     participant_guid: Guid,
+    /// Publisher group GUID for GROUP-scope coherent sets (PID_GROUP_GUID = 0x0052).
+    /// Null for writers not in a GROUP presentation publisher.
+    group_guid: ?Guid = null,
     topic_name: []const u8,
     type_name: []const u8,
     qos: QosSnapshot,

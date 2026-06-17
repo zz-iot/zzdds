@@ -87,6 +87,16 @@ pub const PendingChange = struct {
     }
 };
 
+/// In-progress coherent set accumulator for one writer (keyed by writer GUID in
+/// `coherent_wip`).  Tracks the coherent_set_sn that all buffered samples share
+/// so that a CS-value transition can be detected and the previous set committed.
+pub const CoherentWipEntry = struct {
+    /// coherent_set_sn of the samples currently buffered (CS = first SN of the set,
+    /// per RTI Connext convention).
+    cs: history_mod.SequenceNumber,
+    samples: std.ArrayListUnmanaged(PendingChange) = .empty,
+};
+
 /// Ownership by the caller of data returned from takeRaw().
 pub const TakenSample = struct {
     /// Serialized CDR payload; caller must free with the reader's allocator.
@@ -176,7 +186,7 @@ pub const DataReaderImpl = struct {
     /// Samples are appended here as they arrive. When the end marker is received
     /// Keyed by writer GUID so that concurrent coherent sets from different writers
     /// accumulate independently and commit only when each writer's own set is complete.
-    coherent_wip: std.AutoHashMapUnmanaged(Guid, std.ArrayListUnmanaged(PendingChange)),
+    coherent_wip: std.AutoHashMapUnmanaged(Guid, CoherentWipEntry),
     /// Queue of complete coherent sets awaiting delivery via begin_access().
     /// Each element is one complete set (filled when its end marker arrives).
     /// commitCoherentPendingLocked() pops ONLY the first entry per call so that
@@ -293,6 +303,7 @@ pub const DataReaderImpl = struct {
             .ctx = self,
             .on_data = onDataCb,
             .on_sample_lost = onSampleLostCb,
+            .on_heartbeat = onHeartbeatCb,
         });
         // Register writer-match callback for OWNERSHIP and LIVELINESS tracking.
         proto_reader.setWriterMatchCallback(.{
@@ -319,8 +330,8 @@ pub const DataReaderImpl = struct {
         self.pending.deinit(self.alloc);
         var wip_it = self.coherent_wip.valueIterator();
         while (wip_it.next()) |v| {
-            for (v.items) |p| p.deinit();
-            v.deinit(self.alloc);
+            for (v.samples.items) |p| p.deinit();
+            v.samples.deinit(self.alloc);
         }
         self.coherent_wip.deinit(self.alloc);
         for (self.coherent_committed.items) |*s| {
@@ -546,47 +557,31 @@ pub const DataReaderImpl = struct {
                 _ = self.tbf_map.remove(ih);
                 _ = self.owner_map.remove(ih);
             }
-            const wip_entry = self.coherent_wip.getOrPut(self.alloc, change.writer_guid) catch {
+            const new_cs = change.coherent_set_sn.?;
+            const gop = self.coherent_wip.getOrPut(self.alloc, change.writer_guid) catch {
                 self.mu.unlock();
                 self.alloc.free(copy);
                 return;
             };
-            if (!wip_entry.found_existing) wip_entry.value_ptr.* = .empty;
-            wip_entry.value_ptr.append(self.alloc, pc) catch {
-                self.mu.unlock();
-                self.alloc.free(copy);
-                return;
-            };
-            const is_set_end = (change.sequence_number == change.coherent_set_sn.?);
-            // commit_succeeded: true only when the completed set was successfully
-            // enqueued in coherent_committed.  Used to gate both the in-lock flag
-            // update and the post-lock notifications — if OOM discards the set we
-            // must not set coherent_committed_ready or fire spurious notifications,
-            // because there is nothing for begin_access() to deliver.
-            var commit_succeeded = false;
-            if (is_set_end) {
-                // Zero-copy: take ownership of this writer's wip list and enqueue
-                // it as one complete set.  Other writers' in-progress sets are
-                // unaffected.  Subscriber.begin_access() pops one set at a time.
-                var completed_set = wip_entry.value_ptr.*;
-                _ = self.coherent_wip.remove(change.writer_guid);
-                if (self.coherent_committed.append(self.alloc, completed_set)) {
-                    commit_succeeded = true;
-                } else |_| {
-                    for (completed_set.items) |cppc| cppc.deinit();
-                    completed_set.deinit(self.alloc);
-                }
-                if (commit_succeeded) {
-                    self.coherent_committed_ready = true;
-                    // Signal that a complete set is ready for begin_access().  Mirrors
-                    // the notification pattern on the normal (non-coherent) data path.
-                    self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
-                    for (self.data_notifiers.items) |n| n.on_data(n.ctx);
-                }
+            // CS transition: the incoming sample belongs to a new coherent set.
+            // Commit the previous WIP before starting the new one.
+            var transition_committed = false;
+            if (gop.found_existing and gop.value_ptr.cs != new_cs) {
+                const prev = gop.value_ptr.samples;
+                gop.value_ptr.samples = .empty;
+                gop.value_ptr.cs = new_cs;
+                transition_committed = self.commitCoherentWipSamplesLocked(prev);
+            } else if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .cs = new_cs };
             }
+            gop.value_ptr.samples.append(self.alloc, pc) catch {
+                self.mu.unlock();
+                self.alloc.free(copy);
+                return;
+            };
             self.mu.unlock();
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
-            if (is_set_end and commit_succeeded) {
+            if (transition_committed) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
                 if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
                     if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
@@ -753,6 +748,49 @@ pub const DataReaderImpl = struct {
         }
     }
 
+    // ── Coherent set helpers ───────────────────────────────────────────────────
+
+    /// Enqueue a completed coherent WIP samples list into coherent_committed.
+    /// Must be called with self.mu held.  Takes ownership of `samples`; frees it
+    /// on OOM.  Returns true if the commit succeeded.
+    fn commitCoherentWipSamplesLocked(
+        self: *Self,
+        samples: std.ArrayListUnmanaged(PendingChange),
+    ) bool {
+        if (self.coherent_committed.append(self.alloc, samples)) {
+            self.coherent_committed_ready = true;
+            self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+            for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+            return true;
+        } else |_| {
+            for (samples.items) |pc| pc.deinit();
+            var s = samples;
+            s.deinit(self.alloc);
+            return false;
+        }
+    }
+
+    /// Called when a valid HEARTBEAT arrives from a matched writer.
+    /// Flushes any in-progress coherent WIP for that writer: the HB means the
+    /// writer has sent all data for the current set, so the set is complete.
+    fn onHeartbeatCb(ctx: *anyopaque, writer_guid: Guid, last_sn: history_mod.SequenceNumber) void {
+        _ = last_sn;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.subscriber_presentation.coherent_access) return;
+        self.mu.lock();
+        const committed = if (self.coherent_wip.fetchRemove(writer_guid)) |kv|
+            self.commitCoherentWipSamplesLocked(kv.value.samples)
+        else
+            false;
+        self.mu.unlock();
+        if (committed) {
+            if (self.status_cond) |sc| sc.notifyWakeup();
+            if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
+            }
+        }
+    }
+
     // ── Ownership tracking ─────────────────────────────────────────────────────
 
     fn onWriterMatchedCb(ctx: *anyopaque, info: *const proto.MatchedWriterInfo) void {
@@ -819,8 +857,8 @@ pub const DataReaderImpl = struct {
         // in the map indefinitely — one leaked entry per connect/disconnect cycle.
         if (self.coherent_wip.fetchRemove(guid)) |kv| {
             var wip = kv.value;
-            for (wip.items) |pc| pc.deinit();
-            wip.deinit(self.alloc);
+            for (wip.samples.items) |pc| pc.deinit();
+            wip.samples.deinit(self.alloc);
         }
         // Clean up liveliness tracking for this writer.
         if (self.writer_liveliness.fetchRemove(guid)) |kv| {

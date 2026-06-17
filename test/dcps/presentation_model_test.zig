@@ -167,11 +167,12 @@ const ModelWriter = struct {
             const last_gsn = base_gsn + @as(i64, @intCast(coherent_sns.len));
             const group_end_gsn = if (global_last_gsn != 0) global_last_gsn else last_gsn;
             const last_sn = coherent_sns[coherent_sns.len - 1];
+            const first_sn = coherent_sns[0];
             for (coherent_sns, 1..) |sn, i| {
                 const gsn = base_gsn + @as(i64, @intCast(i));
                 if (self.changePtr(sn)) |ch| {
                     if (mode == .full) {
-                        ch.coherent_set_sn = last_sn;
+                        ch.coherent_set_sn = first_sn;
                         if (sn == last_sn) ch.group_coherent_sn = group_end_gsn;
                     }
                     ch.group_seq_num = gsn;
@@ -367,12 +368,12 @@ test "presentation model: readerless coherent set records metadata without DATA 
     writer.mu.lock();
     defer writer.mu.unlock();
     try testing.expectEqual(@as(usize, 2), writer.cache.changes.items.len);
-    try testing.expectEqual(@as(?SequenceNumber, 2), writer.cache.changes.items[0].coherent_set_sn);
-    try testing.expectEqual(@as(?SequenceNumber, 2), writer.cache.changes.items[1].coherent_set_sn);
-    try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[0].group_seq_num);
-    try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[1].group_seq_num);
+    try testing.expectEqual(@as(?SequenceNumber, 1), writer.cache.changes.items[0].coherent_set_sn);
+    try testing.expectEqual(@as(?SequenceNumber, 1), writer.cache.changes.items[1].coherent_set_sn);
+    try testing.expectEqual(@as(?i64, 1), writer.cache.changes.items[0].group_seq_num);
+    try testing.expectEqual(@as(?i64, 2), writer.cache.changes.items[1].group_seq_num);
     try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[0].group_coherent_sn);
-    try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[1].group_coherent_sn);
+    try testing.expectEqual(@as(?i64, 2), writer.cache.changes.items[1].group_coherent_sn);
 }
 
 test "presentation model: shared publisher GSN gives group-wide coherent end marker" {

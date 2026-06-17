@@ -70,7 +70,9 @@ pub const CoherentFlushMode = enum(u2) {
     none,
     /// ordered_access without coherent_access: emit PID_GROUP_SEQ_NUM only.
     group_seq_only,
-    /// coherent_access: emit PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET.
+    /// coherent_access with INSTANCE/TOPIC scope: emit PID_COHERENT_SET only.
+    coherent_only,
+    /// coherent_access with GROUP scope: emit PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET.
     full,
 };
 

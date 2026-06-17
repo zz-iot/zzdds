@@ -76,6 +76,9 @@ pub const DataCallback = struct {
     /// Optional: called when gap processing marks `count` sequence numbers as
     /// irreversibly lost (never delivered). Called under the same lock as on_data.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
+    /// Optional: called when a valid (non-duplicate) HEARTBEAT arrives from a
+    /// writer.  Used to flush coherent WIP when no CS transition follows the set.
+    on_heartbeat: ?*const fn (ctx: *anyopaque, writer_guid: Guid, last_sn: SequenceNumber) void = null,
 };
 
 // ── ProtocolWriter ────────────────────────────────────────────────────────────

@@ -18,6 +18,7 @@ const testing = std.testing;
 
 const DataReaderImpl = dcps.DataReaderImpl;
 const PendingChange = dcps.PendingChange;
+const CoherentWipEntry = dcps.CoherentWipEntry;
 const SubscriberImpl = dcps.SubscriberImpl;
 
 const GUID_A = proto.Guid{
@@ -233,20 +234,20 @@ fn addCommitted(alloc: std.mem.Allocator, dr: *DataReaderImpl, changes: []const 
 }
 
 fn addWip(alloc: std.mem.Allocator, dr: *DataReaderImpl, writer_guid: proto.Guid, changes: []const ModelChange) !void {
-    var set: std.ArrayListUnmanaged(PendingChange) = .empty;
+    var entry: CoherentWipEntry = .{ .cs = 1 };
     errdefer {
-        for (set.items) |pc| pc.deinit();
-        set.deinit(alloc);
+        for (entry.samples.items) |pc| pc.deinit();
+        entry.samples.deinit(alloc);
     }
-    for (changes) |ch| try set.append(alloc, try makePending(alloc, ch));
-    try dr.coherent_wip.put(alloc, writer_guid, set);
+    for (changes) |ch| try entry.samples.append(alloc, try makePending(alloc, ch));
+    try dr.coherent_wip.put(alloc, writer_guid, entry);
 }
 
 fn clearWip(alloc: std.mem.Allocator, dr: *DataReaderImpl, writer_guid: proto.Guid) void {
     if (dr.coherent_wip.fetchRemove(writer_guid)) |kv| {
-        var set = kv.value;
-        for (set.items) |pc| pc.deinit();
-        set.deinit(alloc);
+        var entry = kv.value;
+        for (entry.samples.items) |pc| pc.deinit();
+        entry.samples.deinit(alloc);
     }
 }
 

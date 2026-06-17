@@ -1311,10 +1311,10 @@ test "coherent_set: writes deferred until endCoherentSet" {
     // End coherent set with .full: patch all 3 changes and flush DATA.
     writer.endCoherentSet(.full, false, null, 0);
 
-    // Verify coherent_set_sn is patched to last SN (3) on all 3 changes.
+    // Verify coherent_set_sn is patched to first SN (1) on all 3 changes.
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
-        try testing.expectEqual(@as(?SequenceNumber, 3), ch.coherent_set_sn);
+        try testing.expectEqual(@as(?SequenceNumber, 1), ch.coherent_set_sn);
     }
     writer.mu.unlock();
 
