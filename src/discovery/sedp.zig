@@ -948,15 +948,20 @@ pub const SedpEndpoints = struct {
                                     if (wid.eql(EntityIds.spdp_builtin_participant_writer)) {
                                         // SPDP BYE arriving on the metatraffic unicast port.
                                         if (self.spdp_bye_fn) |f| f(self.spdp_bye_ctx.?, src_prefix);
-                                    } else if (iqos.get(.key_hash)) |kh_bytes| {
-                                        if (kh_bytes.len >= 16) {
-                                            const ep_guid = keyHashToGuid(kh_bytes[0..16].*);
+                                    } else {
+                                        // Extract endpoint GUID: prefer PID_KEY_HASH in inline_qos
+                                        // (RTPS §9.6.3.6 MAY), fall back to PID_ENDPOINT_GUID in payload.
+                                        const ep_guid: ?Guid = if (iqos.get(.key_hash)) |kh_bytes|
+                                            if (kh_bytes.len >= 16) keyHashToGuid(kh_bytes[0..16].*) else null
+                                        else
+                                            guidFromDisposalPayload(d.serialized_payload);
+                                        if (ep_guid) |g| {
                                             if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
                                                 if (self.callbacks) |cbs|
-                                                    cbs.on_writer_lost(cbs.ctx, ep_guid);
+                                                    cbs.on_writer_lost(cbs.ctx, g);
                                             } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
                                                 if (self.callbacks) |cbs|
-                                                    cbs.on_reader_lost(cbs.ctx, ep_guid);
+                                                    cbs.on_reader_lost(cbs.ctx, g);
                                             }
                                         }
                                     }
@@ -1138,6 +1143,30 @@ fn guidToKeyHash(guid: Guid) [16]u8 {
     kh[14] = guid.entity_id.entity_key[2];
     kh[15] = guid.entity_id.entity_kind;
     return kh;
+}
+
+/// Scan a PL-CDR disposal payload for PID_ENDPOINT_GUID and return the GUID.
+/// Called when PID_KEY_HASH is absent from inline_qos (RTPS §9.6.3.6: MAY).
+fn guidFromDisposalPayload(payload: []const u8) ?Guid {
+    if (payload.len < 4) return null;
+    const le = (payload[1] & 0x01) != 0;
+    var pos: usize = 4;
+    while (pos + 4 <= payload.len) {
+        const pid = readU16LE(payload[pos..], le);
+        const len = readU16LE(payload[pos + 2 ..], le);
+        pos += 4;
+        if (pid == PidTable.SENTINEL) break;
+        if (pos + len > payload.len) break;
+        const v = payload[pos .. pos + len];
+        pos += len;
+        if (pid == PidTable.ENDPOINT_GUID and v.len >= 16) {
+            return .{
+                .prefix = .{ .bytes = v[0..12].* },
+                .entity_id = .{ .entity_key = v[12..15].*, .entity_kind = v[15] },
+            };
+        }
+    }
+    return null;
 }
 
 /// Unpack a 16-byte key hash back into a GUID.
