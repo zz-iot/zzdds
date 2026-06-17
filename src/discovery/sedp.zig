@@ -135,14 +135,22 @@ fn readString(b: []const u8, le: bool) []const u8 {
     const end = 4 + slen - 1; // strip null
     return b[4..end];
 }
+// DDS QoS parameters in SEDP ParameterLists encode Duration_t as CDR {sec: i32,
+// nanosec: u32} — direct nanoseconds, NOT RTPS 1/2^32 fraction.
 fn readDeadlineDuration(b: []const u8, le: bool) time_mod.Duration {
     if (b.len < 8) return time_mod.Duration.infinite;
-    const wire = time_mod.RtpsDuration{ .seconds = readI32LE(b[0..], le), .fraction = readU32LE(b[4..], le) };
-    return wire.toDuration();
+    const d = time_mod.Duration{ .sec = readI32LE(b[0..], le), .nanosec = readU32LE(b[4..], le) };
+    if (d.isInfinite()) return time_mod.Duration.infinite;
+    return d;
 }
 
 fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
     try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
+}
+
+fn writeDdsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
+    try writeI32Le(alloc, buf, duration.sec);
+    try writeU32Le(alloc, buf, duration.nanosec);
 }
 
 fn snapshotDeadlineDuration(qos: QosSnapshot) time_mod.Duration {
@@ -227,7 +235,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
+        try writeDdsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
     // Cyclone and OpenDDS use different on-wire representations for Duration_t
@@ -246,7 +254,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     // PID_LIFESPAN: only emitted when not INFINITE (same pattern as DEADLINE).
     if (ann.qos.lifespan_sec != 0x7fff_ffff or ann.qos.lifespan_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.LIFESPAN, 8);
-        try writeRtpsDuration(alloc, &buf, .{ .sec = ann.qos.lifespan_sec, .nanosec = ann.qos.lifespan_nanosec });
+        try writeDdsDuration(alloc, &buf, .{ .sec = ann.qos.lifespan_sec, .nanosec = ann.qos.lifespan_nanosec });
     }
 
     // PID_DATA_REPRESENTATION: seq_len(4) + value(2) + pad(2) = 8 bytes.
@@ -354,7 +362,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
+        try writeDdsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
 
@@ -1180,18 +1188,18 @@ test "readDeadlineDuration preserves explicit zero QoS duration" {
     try std.testing.expectEqual(time_mod.Duration.zero, readDeadlineDuration(&bytes, true));
 }
 
-test "readDeadlineDuration normalizes max-fraction QoS duration to DDS infinite" {
-    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff };
+test "readDeadlineDuration recognizes DDS infinite sentinel" {
+    // DDS Duration_t INFINITE = {sec=0x7fffffff, nanosec=0x7fffffff}
+    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0x7f };
     try std.testing.expect(readDeadlineDuration(&bytes, true).isInfinite());
 }
 
-test "readDeadlineDuration preserves finite QoS duration" {
-    const wire = time_mod.RtpsDuration.fromDuration(.{ .sec = 3, .nanosec = 1_000_000 });
+test "readDeadlineDuration reads sub-second DDS Duration_t" {
+    // OpenDDS encodes 250ms as {sec=0, nanosec=250000000} — direct nanoseconds.
     var bytes: [8]u8 = undefined;
-    std.mem.writeInt(i32, bytes[0..4], wire.seconds, .little);
-    std.mem.writeInt(u32, bytes[4..8], wire.fraction, .little);
+    std.mem.writeInt(i32, bytes[0..4], 0, .little);
+    std.mem.writeInt(u32, bytes[4..8], 250_000_000, .little);
     const dur = readDeadlineDuration(&bytes, true);
-    try std.testing.expectEqual(@as(i32, 3), dur.sec);
-    // 2^32-fraction can't represent 1ms exactly; round-trip is within 1 ns.
-    try std.testing.expect(dur.nanosec >= 999_999 and dur.nanosec <= 1_000_000);
+    try std.testing.expectEqual(@as(i32, 0), dur.sec);
+    try std.testing.expectEqual(@as(u32, 250_000_000), dur.nanosec);
 }
