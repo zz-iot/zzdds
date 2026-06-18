@@ -427,17 +427,18 @@ pub const SubscriberImpl = struct {
             for (self.readers.items) |r| {
                 r.mu.lock();
                 if (!r.coherent_committed_ready and r.sub_matched_current > 0 and
-                    (r.coherent_wip.count() > 0 or (r.coherent_writer_seen and r.pending.items.len == 0)))
+                    (r.coherent_wip.count() > 0 or (r.coherent_writer_guids.count() > 0 and r.pending.items.len == 0)))
                 {
                     // Block when a coherent set is in-flight for this reader.
                     // coherent_wip.count() > 0: end-marker hasn't arrived yet.
-                    // coherent_writer_seen and pending empty: writer is known-coherent
-                    //   but its next set DATA hasn't arrived yet (sequential vtEndCoherent
-                    //   means a later writer may lag behind earlier ones that committed).
-                    //   Requiring pending to be empty ensures a reader matched by BOTH a
-                    //   coherent writer and a non-coherent writer does not stall between
-                    //   coherent sets — non-coherent samples land in pending directly, and
-                    //   a non-empty pending means there is no in-flight coherent set to wait for.
+                    // coherent_writer_guids non-empty and pending empty: at least one
+                    //   currently-matched writer is coherent but its next set DATA hasn't
+                    //   arrived yet (sequential vtEndCoherent means a later writer may lag
+                    //   behind earlier ones that committed).  coherent_writer_guids is
+                    //   cleared on writer departure so a stale flag never permanently blocks
+                    //   begin_access after all coherent writers have left.  Requiring pending
+                    //   to be empty avoids stalling when a non-coherent writer has buffered
+                    //   data — non-coherent samples land in pending directly.
                     all_ready = false;
                 }
                 if (r.coherent_committed_ready) any_committed = true;

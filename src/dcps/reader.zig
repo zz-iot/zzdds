@@ -203,12 +203,14 @@ pub const DataReaderImpl = struct {
     coherent_committed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(PendingChange)),
     /// True when `coherent_committed` contains at least one complete set.
     coherent_committed_ready: bool,
-    /// True once this reader has received at least one DATA sample that carried a
-    /// PID_COHERENT_SET inline QoS (i.e. its matched writer participates in coherent
-    /// sets).  Used by Subscriber.begin_access to distinguish a lagging-but-coherent
-    /// writer (whose WIP has not started yet) from a non-coherent writer (which never
-    /// commits a coherent set and must not stall delivery indefinitely).
-    coherent_writer_seen: bool = false,
+    /// Set of writer GUIDs that have sent at least one DATA sample with PID_COHERENT_SET
+    /// and are still matched.  Entries are added on first coherent sample from a writer
+    /// and removed in onWriterUnmatchedCb.  Non-empty means "at least one currently-matched
+    /// writer participates in coherent sets," used by Subscriber.begin_access to gate
+    /// commits: when this set is non-empty and pending is empty, a coherent set may be
+    /// about to arrive (sequential vtEndCoherent timing).  Cleared on writer departure so
+    /// a stale flag never permanently blocks begin_access.  Guarded by `mu`.
+    coherent_writer_guids: std.AutoHashMapUnmanaged(Guid, void) = .empty,
     mu: Mutex,
 
     /// Presentation QoS from the owning Subscriber; set once after init.
@@ -348,6 +350,7 @@ pub const DataReaderImpl = struct {
             v.samples.deinit(self.alloc);
         }
         self.coherent_wip.deinit(self.alloc);
+        self.coherent_writer_guids.deinit(self.alloc);
         for (self.coherent_committed.items) |*s| {
             for (s.items) |p| p.deinit();
             s.deinit(self.alloc);
@@ -542,7 +545,7 @@ pub const DataReaderImpl = struct {
         if (self.subscriber_presentation.coherent_access and
             change.coherent_set_sn != null)
         {
-            self.coherent_writer_seen = true;
+            self.coherent_writer_guids.put(self.alloc, change.writer_guid, {}) catch {};
             const states = self.determineStatesLocked(ih, change.kind);
             const src_time = change.source_timestamp.toTime();
             const coh_expiry: ?i64 = if (change.kind == .alive)
@@ -903,6 +906,7 @@ pub const DataReaderImpl = struct {
         // Discard any in-progress coherent set from this writer.  If the writer
         // crashed or was deleted mid-set, the partial wip would otherwise stay
         // in the map indefinitely — one leaked entry per connect/disconnect cycle.
+        _ = self.coherent_writer_guids.remove(guid);
         if (self.coherent_wip.fetchRemove(guid)) |kv| {
             var wip = kv.value;
             for (wip.samples.items) |pc| pc.deinit();
