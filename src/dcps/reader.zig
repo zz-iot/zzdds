@@ -211,6 +211,10 @@ pub const DataReaderImpl = struct {
     /// about to arrive (sequential vtEndCoherent timing).  Cleared on writer departure so
     /// a stale flag never permanently blocks begin_access.  Guarded by `mu`.
     coherent_writer_guids: std.AutoHashMapUnmanaged(Guid, void) = .empty,
+    /// Timestamp (ns) when the most recent coherent WIP entry was created for any writer.
+    /// Reset when a new entry is added; used by Subscriber.begin_access to detect idle
+    /// coherent writers that never send a new set (preventing a permanent gate stall).
+    last_coherent_wip_start_ns: i64 = 0,
     mu: Mutex,
 
     /// Presentation QoS from the owning Subscriber; set once after init.
@@ -604,6 +608,7 @@ pub const DataReaderImpl = struct {
                 }
             } else if (!gop.found_existing) {
                 gop.value_ptr.* = .{ .cs = new_cs };
+                self.last_coherent_wip_start_ns = time_mod.nanoTimestamp();
             }
             gop.value_ptr.samples.append(self.alloc, pc) catch {
                 self.mu.unlock();
@@ -822,6 +827,11 @@ pub const DataReaderImpl = struct {
         if (!self.subscriber_presentation.coherent_access) return;
         self.mu.lock();
         const committed = if (self.coherent_wip.getPtr(writer_guid)) |entry| blk: {
+            // Stale HB guard: a HEARTBEAT from the previous coherent set can arrive
+            // after a CS transition has already started the next set.  Such a HB has
+            // last_sn < entry.cs (the first SN of the current set), and committing it
+            // would prematurely flush an in-progress set.  Drop it.
+            if (last_sn < entry.cs) break :blk false;
             if (entry.highest_sn < last_sn) {
                 // Missing DATA packets — can't flush yet.  Record the minimum last_sn
                 // we've seen so onDataCb can trigger the flush when the missing packets arrive.

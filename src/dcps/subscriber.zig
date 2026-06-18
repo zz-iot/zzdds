@@ -426,19 +426,22 @@ pub const SubscriberImpl = struct {
             var any_committed = false;
             for (self.readers.items) |r| {
                 r.mu.lock();
+                const coherent_guids_pending = r.coherent_writer_guids.count() > 0 and
+                    r.pending.items.len == 0 and
+                    (time_mod.nanoTimestamp() - r.last_coherent_wip_start_ns < 5_000_000_000);
                 if (!r.coherent_committed_ready and r.sub_matched_current > 0 and
-                    (r.coherent_wip.count() > 0 or (r.coherent_writer_guids.count() > 0 and r.pending.items.len == 0)))
+                    (r.coherent_wip.count() > 0 or coherent_guids_pending))
                 {
                     // Block when a coherent set is in-flight for this reader.
                     // coherent_wip.count() > 0: end-marker hasn't arrived yet.
-                    // coherent_writer_guids non-empty and pending empty: at least one
-                    //   currently-matched writer is coherent but its next set DATA hasn't
-                    //   arrived yet (sequential vtEndCoherent means a later writer may lag
-                    //   behind earlier ones that committed).  coherent_writer_guids is
-                    //   cleared on writer departure so a stale flag never permanently blocks
-                    //   begin_access after all coherent writers have left.  Requiring pending
-                    //   to be empty avoids stalling when a non-coherent writer has buffered
-                    //   data — non-coherent samples land in pending directly.
+                    // coherent_guids_pending: at least one currently-matched writer is
+                    //   coherent but its next set DATA hasn't arrived yet (sequential
+                    //   vtEndCoherent timing).  The 5 s window on last_coherent_wip_start_ns
+                    //   ensures an idle writer that stops sending never permanently stalls
+                    //   begin_access — after 5 s without a new WIP entry the gate opens.
+                    //   coherent_writer_guids is also cleared on writer departure for the
+                    //   same reason.  Requiring pending to be empty avoids stalling when a
+                    //   non-coherent writer has buffered data.
                     all_ready = false;
                 }
                 if (r.coherent_committed_ready) any_committed = true;
