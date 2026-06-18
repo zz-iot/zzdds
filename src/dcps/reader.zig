@@ -582,12 +582,23 @@ pub const DataReaderImpl = struct {
             // Commit the previous WIP before starting the new one.
             var transition_committed = false;
             if (gop.found_existing and gop.value_ptr.cs != new_cs) {
-                const prev = gop.value_ptr.samples;
+                var prev = gop.value_ptr.samples;
+                // If a prior HB told us the set had more samples than we received
+                // (flush_target_sn set but not yet reached), the previous set is
+                // incomplete.  Delivering a partial coherent set violates the coherency
+                // contract, so discard it rather than commit.
+                const prev_complete = gop.value_ptr.flush_target_sn == null or
+                    gop.value_ptr.highest_sn >= gop.value_ptr.flush_target_sn.?;
                 gop.value_ptr.samples = .empty;
                 gop.value_ptr.cs = new_cs;
                 gop.value_ptr.highest_sn = 0;
                 gop.value_ptr.flush_target_sn = null;
-                transition_committed = self.commitCoherentWipSamplesLocked(prev);
+                if (prev_complete) {
+                    transition_committed = self.commitCoherentWipSamplesLocked(prev);
+                } else {
+                    for (prev.items) |stale| stale.deinit();
+                    prev.deinit(self.alloc);
+                }
             } else if (!gop.found_existing) {
                 gop.value_ptr.* = .{ .cs = new_cs };
             }
