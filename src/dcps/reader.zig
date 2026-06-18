@@ -1180,6 +1180,18 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        const now_ns = time_mod.nanoTimestamp();
+        var ei: usize = 0;
+        while (ei < self.pending.items.len) {
+            if (self.pending.items[ei].expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    const expired = self.pending.orderedRemove(ei);
+                    expired.deinit();
+                    continue;
+                }
+            }
+            ei += 1;
+        }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
         var count: usize = 0;
         for (self.pending.items) |*pc| {
@@ -1212,6 +1224,18 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        const now_ns = time_mod.nanoTimestamp();
+        var ei: usize = 0;
+        while (ei < self.pending.items.len) {
+            if (self.pending.items[ei].expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    const expired = self.pending.orderedRemove(ei);
+                    expired.deinit();
+                    continue;
+                }
+            }
+            ei += 1;
+        }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
 
         // Count matches first so we can reserve out capacity before mutating pending.
