@@ -342,6 +342,11 @@ pub const StatefulWriter = struct {
     /// items [0..coherent_window_start) were written during suspension and are flushed
     /// without coherent QoS; items [coherent_window_start..) are the true coherent set.
     coherent_window_start: usize,
+    /// Highest SN actually delivered to readers via sendChangeToAllLocked (i.e. sent
+    /// on the wire, not merely buffered in coherent_pending_sns).  Used to cap the
+    /// background heartbeat's last_sn during coherent-set buffering so that the HB
+    /// does not advertise unsent SNs that would poison subscriber WIP flush_target_sn.
+    last_flushed_sn: SequenceNumber,
     /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
     /// Incremented by N after each group coherent set of N samples is flushed.
     group_seq_num_counter: i64,
@@ -385,6 +390,7 @@ pub const StatefulWriter = struct {
             .coherent_active = false,
             .coherent_pending_sns = .empty,
             .coherent_window_start = 0,
+            .last_flushed_sn = 0,
             .group_seq_num_counter = 0,
             .probe_result_fn = null,
             .probe_result_ctx = null,
@@ -622,10 +628,11 @@ pub const StatefulWriter = struct {
 
     fn sendHeartbeatToProxyLockedWithLastSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber, extra_gap_sn: ?SequenceNumber) void {
         const locs = rp.effectiveLocators();
+        const cache_first = self.cache.minSn();
+        const hb_first_sn = @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
         if (locs.len == 0) return;
         self.hb_count += 1;
-        const cache_first = self.cache.minSn();
-        const first_sn = @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
+        const first_sn = hb_first_sn;
         // Guard: RTPS requires first_sn <= last_sn (except the empty-cache
         // convention first=1, last=0).  A capped last_sn combined with
         // KEEP_LAST eviction can push cache_first past last_sn — skip the HB
@@ -728,12 +735,30 @@ pub const StatefulWriter = struct {
         const cache_last = self.cache.maxSn();
         var scratch: [SCRATCH_SIZE]u8 = undefined;
 
+        // When a coherent set is in progress, coherent_pending_sns holds SNs that
+        // have been allocated and added to the cache but NOT yet sent to readers
+        // (held until endCoherentSet).  Advertising those SNs in a background HB
+        // causes subscriber WIPs to record a flush_target_sn that exceeds the
+        // current CS's data range, permanently stalling the commit.
+        //
+        // Cap last_sn to last_flushed_sn — the highest SN actually delivered to
+        // readers so far.  This ensures the background HB only describes data the
+        // subscriber can achieve as WIP highest_sn (EOC SNs are gapped, not data).
+        const adj_last: SequenceNumber = if (self.coherent_active)
+            self.last_flushed_sn
+        else
+            cache_last;
+
         for (self.reader_proxies.items) |*rp| {
             if (!rp.reliable) continue; // BEST_EFFORT readers do not use HEARTBEAT/ACKNACK
             const locs = rp.effectiveLocators();
             if (locs.len == 0) continue;
             const first_sn = @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
-            const last_sn = if (cache_last == 0) 0 else cache_last;
+            const last_sn = adj_last;
+            // RTPS requires first_sn <= last_sn (except the empty-cache first=1,last=0
+            // convention).  The coherent cap can push last_sn below the proxy's start_sn
+            // — skip rather than send a malformed submessage.
+            if (last_sn > 0 and first_sn > last_sn) continue;
             var b = MessageBuilder.init(&scratch, self.guid.prefix);
             b.addInfoDst(rp.guid.prefix);
             // When KEEP_LAST eviction has moved the cache floor above the reader's
@@ -1073,6 +1098,8 @@ pub const StatefulWriter = struct {
                 if (rp.reliable and send_trailing_hb) self.sendHeartbeatToProxyLocked(rp, false);
             }
         }
+        if (ch.sequence_number > self.last_flushed_sn)
+            self.last_flushed_sn = ch.sequence_number;
     }
 
     /// Send a fragmented change to a single reader proxy as N DATA_FRAG datagrams
