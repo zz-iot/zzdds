@@ -608,7 +608,7 @@ pub const StatefulWriter = struct {
     /// history-delivery completion before live data begins flowing).
     fn sendHeartbeatToProxyLocked(self: *Self, rp: *const ReaderProxy, final: bool) void {
         const cache_last = self.cache.maxSn();
-        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, cache_last);
+        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, cache_last, null);
     }
 
     /// Like sendHeartbeatToProxyLocked but caps last_sn at `last_sn_cap`.
@@ -617,10 +617,10 @@ pub const StatefulWriter = struct {
     fn sendHeartbeatToProxyLockedCapped(self: *Self, rp: *const ReaderProxy, final: bool, last_sn_cap: SequenceNumber) void {
         const cache_last = self.cache.maxSn();
         const capped = if (cache_last > 0) @min(cache_last, last_sn_cap) else cache_last;
-        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, capped);
+        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, capped, null);
     }
 
-    fn sendHeartbeatToProxyLockedWithLastSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber) void {
+    fn sendHeartbeatToProxyLockedWithLastSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber, extra_gap_sn: ?SequenceNumber) void {
         const locs = rp.effectiveLocators();
         if (locs.len == 0) return;
         self.hb_count += 1;
@@ -643,6 +643,18 @@ pub const StatefulWriter = struct {
                 .bitmap = std.mem.zeroes([8]u32),
             };
             b.addGap(rp.guid.entity_id, self.guid.entity_id, rp.start_sn, gap_list);
+        }
+        // Optional point GAP for the EOC SN (allocated via allocSn but never in
+        // cache).  Reliable readers that miss the EOC DATA packet would otherwise
+        // NACK this SN forever; the GAP lets them retire it and unblock delivery
+        // of all subsequent non-coherent samples buffered in pending_changes.
+        if (extra_gap_sn) |eoc_sn| {
+            const eoc_gap_list = msg.submessage.SequenceNumberSet{
+                .base = eoc_sn + 1,
+                .num_bits = 0,
+                .bitmap = std.mem.zeroes([8]u32),
+            };
+            b.addGap(rp.guid.entity_id, self.guid.entity_id, eoc_sn, eoc_gap_list);
         }
         b.addHeartbeat(
             rp.guid.entity_id,
@@ -1356,8 +1368,9 @@ pub const StatefulWriter = struct {
         // the per-proxy HEARTBEATs so best-effort readers also get it.
         // Only meaningful for coherent-access modes; .none and .group_seq_only
         // do not use PID_COHERENT_SET so there is no coherent set to terminate.
+        var eoc_sn: ?SequenceNumber = null;
         if (mode == .coherent_only or mode == .full) {
-            const eoc_sn = self.cache.allocSn();
+            eoc_sn = self.cache.allocSn();
             var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
             for (self.reader_proxies.items) |*rp| {
                 if (rp.suppress_live_data) continue;
@@ -1368,7 +1381,7 @@ pub const StatefulWriter = struct {
                 b.addData(.{
                     .reader_entity_id = rp.guid.entity_id,
                     .writer_entity_id = self.guid.entity_id,
-                    .writer_sn = eoc_sn,
+                    .writer_sn = eoc_sn.?,
                     .no_payload = true,
                 }, &.{});
                 for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
@@ -1376,8 +1389,14 @@ pub const StatefulWriter = struct {
         }
         // One heartbeat after all coherent-set samples so reliable readers learn the
         // full [first_sn, last_sn] range and the subscriber can commit the complete WIP.
+        // For non-suppressed proxies in coherent modes, also include a GAP for eoc_sn
+        // so that readers that missed the EOC DATA can retire it and unblock delivery
+        // of all subsequent non-coherent samples buffered in pending_changes.
+        const cache_last = self.cache.maxSn();
         for (self.reader_proxies.items) |*rp| {
-            if (rp.reliable) self.sendHeartbeatToProxyLocked(rp, false);
+            if (!rp.reliable) continue;
+            const proxy_eoc_sn = if (!rp.suppress_live_data) eoc_sn else null;
+            self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, proxy_eoc_sn);
         }
         self.coherent_pending_sns.clearRetainingCapacity();
     }
