@@ -773,6 +773,17 @@ pub const StatefulWriter = struct {
                 };
                 b.addGap(rp.guid.entity_id, self.guid.entity_id, rp.start_sn, gap_list);
             }
+            // Include a GAP for allocated-but-uncached SNs above cache_last (EOC markers).
+            // Reliable readers that missed the endCoherentSet HB+GAP can retire the EOC
+            // SN here instead of perpetually NACKing it and blocking pending_changes.
+            if (!self.coherent_active and self.cache.next_sn > cache_last + 1) {
+                const eoc_gap = msg.submessage.SequenceNumberSet{
+                    .base = self.cache.next_sn,
+                    .num_bits = 0,
+                    .bitmap = std.mem.zeroes([8]u32),
+                };
+                b.addGap(rp.guid.entity_id, self.guid.entity_id, cache_last + 1, eoc_gap);
+            }
             b.addHeartbeat(
                 rp.guid.entity_id,
                 self.guid.entity_id,
@@ -953,7 +964,25 @@ pub const StatefulWriter = struct {
                     if (sn < rp.start_sn) continue;
                     // Don't retransmit changes that are still inside a coherent window.
                     if (self.isCoherentPendingSn(sn)) continue;
-                    const ch = self.cache.getChange(sn) orelse continue;
+                    const ch = self.cache.getChange(sn) orelse {
+                        // SN is allocated but absent from the history cache — it was
+                        // reserved via allocSn() for a wire-only EOC marker.  Reply with
+                        // a GAP so the reader can retire the SN and unblock pending_changes.
+                        if (sn < self.cache.next_sn) {
+                            const eoc_gap = msg.submessage.SequenceNumberSet{
+                                .base = sn + 1,
+                                .num_bits = 0,
+                                .bitmap = std.mem.zeroes([8]u32),
+                            };
+                            var eg = MessageBuilder.init(&scratch, self.guid.prefix);
+                            eg.addInfoDst(rp.guid.prefix);
+                            eg.addGap(rp.guid.entity_id, self.guid.entity_id, sn, eoc_gap);
+                            for (locs) |loc|
+                                sendIovecs(self.transport, &loc, eg.iovecs()) catch {};
+                            retransmit_count += 1;
+                        }
+                        continue;
+                    };
                     retransmitChange(self, rp, ch, &scratch, &bitmap_frag_budget);
                     retransmit_count += 1;
                 }
