@@ -567,13 +567,21 @@ pub const StatefulReader = struct {
             .data_len = @intCast(change.data.len),
         } });
 
+        // EOC marker (§9.6.4.2 Table 9.22 Example 3): alive change with empty
+        // data and no PID_COHERENT_SET.  Track the SN in received (to avoid
+        // perpetual NACKs) but never add to the application-visible cache or
+        // fire the data callback — the DCPS layer handles EOC in onDataCb.
+        const is_eoc = change.kind == .alive and change.data.len == 0 and change.coherent_set_sn == null;
+
         if (self.reliable) {
             const prev_highest = wp.received.cumulativeAck();
             if (sn == prev_highest + 1) {
                 _ = wp.received.insert(self.alloc, sn) catch {};
-                try self.cache.addReaderChange(change);
-                if (self.callback) |cb| {
-                    if (self.cache.getChangeForWriter(change.writer_guid, sn)) |cached| cb.on_data(cb.ctx, cached);
+                if (!is_eoc) {
+                    try self.cache.addReaderChange(change);
+                    if (self.callback) |cb| {
+                        if (self.cache.getChangeForWriter(change.writer_guid, sn)) |cached| cb.on_data(cb.ctx, cached);
+                    }
                 }
                 self.deliverPendingLocked(wp, sn);
             } else {
@@ -581,20 +589,24 @@ pub const StatefulReader = struct {
                 for (wp.pending_changes.items) |pc| {
                     if (pc.sequence_number == sn) return;
                 }
-                const data_copy = try self.alloc.dupe(u8, change.data);
-                var owned = change;
-                owned.data = data_copy;
-                wp.pending_changes.append(self.alloc, owned) catch {
-                    self.alloc.free(data_copy);
-                    return;
-                };
+                if (!is_eoc) {
+                    const data_copy = try self.alloc.dupe(u8, change.data);
+                    var owned = change;
+                    owned.data = data_copy;
+                    wp.pending_changes.append(self.alloc, owned) catch {
+                        self.alloc.free(data_copy);
+                        return;
+                    };
+                }
                 _ = wp.received.insert(self.alloc, sn) catch {};
             }
         } else {
             _ = wp.received.insert(self.alloc, sn) catch {};
-            try self.cache.addReaderChange(change);
-            if (self.callback) |cb| {
-                if (self.cache.getChangeForWriter(change.writer_guid, sn)) |ch| cb.on_data(cb.ctx, ch);
+            if (!is_eoc) {
+                try self.cache.addReaderChange(change);
+                if (self.callback) |cb| {
+                    if (self.cache.getChangeForWriter(change.writer_guid, sn)) |ch| cb.on_data(cb.ctx, ch);
+                }
             }
         }
     }

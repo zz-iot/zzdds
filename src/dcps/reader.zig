@@ -456,6 +456,28 @@ pub const DataReaderImpl = struct {
     /// Must not block; must not call back into the ProtocolReader.
     fn onDataCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+
+        // End-of-coherent-set marker: alive DATA with no serialized payload and no
+        // PID_COHERENT_SET (RTPS §9.6.4.2 Table 9.22 Examples 2 and 3).
+        // Bypass all sample filters — it is a protocol signal, not application data.
+        if (change.kind == .alive and change.data.len == 0 and change.coherent_set_sn == null) {
+            if (self.subscriber_presentation.coherent_access) {
+                self.mu.lock();
+                const committed = if (self.coherent_wip.fetchRemove(change.writer_guid)) |kv|
+                    self.commitCoherentWipSamplesLocked(kv.value.samples)
+                else
+                    false;
+                self.mu.unlock();
+                if (committed) {
+                    if (self.status_cond) |sc| sc.notifyWakeup();
+                    if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                        if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
+                    }
+                }
+            }
+            return;
+        }
+
         const copy = self.alloc.dupe(u8, change.data) catch return;
         self.mu.lock();
 
@@ -635,6 +657,15 @@ pub const DataReaderImpl = struct {
                 }
             }
             return;
+        }
+
+        // Non-coherent DATA with a pending coherent WIP for this writer: any DATA
+        // without PID_COHERENT_SET signals end-of-coherent-set (RTPS §9.6.4.2).
+        // Flush the WIP now; the notification fires at the end of this path.
+        if (self.subscriber_presentation.coherent_access) {
+            if (self.coherent_wip.fetchRemove(change.writer_guid)) |kv| {
+                _ = self.commitCoherentWipSamplesLocked(kv.value.samples);
+            }
         }
 
         // KEEP_LAST: if history depth is limited, evict the oldest pending sample

@@ -1258,7 +1258,12 @@ pub const DomainParticipantImpl = struct {
                     const low = std.mem.readInt(u32, cs[4..8], order);
                     const h: i64 = @as(i64, high) << 32;
                     const l: i64 = @as(i64, low);
-                    return h | l;
+                    const sn = h | l;
+                    // Valid RTPS SNs start at 1.  SEQUENCENUMBER_UNKNOWN ({high=-1,low=MAX})
+                    // and any other non-positive value are end-of-coherent-set signals
+                    // (RTPS §9.6.4.2 Table 9.22 Example 2) — treat as non-coherent DATA.
+                    if (sn < 1) return null;
+                    return sn;
                 }
             }
         }

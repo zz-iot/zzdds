@@ -1349,6 +1349,31 @@ pub const StatefulWriter = struct {
                 self.sendChangeToAllLocked(ch, false);
             }
         }
+        // End-of-coherent-set marker: a DATA with DataFlag=0 and no inline QoS.
+        // Per RTPS §9.6.4.2 Table 9.22 (Example 3), this is the minimal explicit
+        // end-of-set signal — any DATA from this writer without PID_COHERENT_SET
+        // tells the receiver the previous coherent set is complete.  Sent before
+        // the per-proxy HEARTBEATs so best-effort readers also get it.
+        // Only meaningful for coherent-access modes; .none and .group_seq_only
+        // do not use PID_COHERENT_SET so there is no coherent set to terminate.
+        if (mode == .coherent_only or mode == .full) {
+            const eoc_sn = self.cache.allocSn();
+            var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
+            for (self.reader_proxies.items) |*rp| {
+                if (rp.suppress_live_data) continue;
+                const locs = rp.effectiveLocators();
+                if (locs.len == 0) continue;
+                var b = MessageBuilder.init(&eoc_scratch, self.guid.prefix);
+                b.addInfoDst(rp.guid.prefix);
+                b.addData(.{
+                    .reader_entity_id = rp.guid.entity_id,
+                    .writer_entity_id = self.guid.entity_id,
+                    .writer_sn = eoc_sn,
+                    .no_payload = true,
+                }, &.{});
+                for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
+            }
+        }
         // One heartbeat after all coherent-set samples so reliable readers learn the
         // full [first_sn, last_sn] range and the subscriber can commit the complete WIP.
         for (self.reader_proxies.items) |*rp| {

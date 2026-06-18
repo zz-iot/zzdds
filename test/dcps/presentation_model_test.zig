@@ -181,6 +181,8 @@ const ModelWriter = struct {
             if (shared_gsn) |g| g.* += @intCast(coherent_sns.len);
         }
         for (coherent_sns) |sn| self.markSent(sn);
+        // Mirror allocSn() for the EOC marker sent by the real writer.
+        if (mode == .coherent_only or mode == .full) self.next_sn += 1;
         self.pending_sns.clearRetainingCapacity();
     }
 
@@ -291,7 +293,8 @@ test "presentation model: suspend before coherent keeps pre-window write out of 
     writer.endCoherentSet(.full, true, null, 0);
     model.end(.full, true, null, 0);
     try expectModelMatchesImpl(&model, writer);
-    try expectDataSns(&rec, &.{ 1, 2 });
+    // SN 1 ("A", pre-window), SN 2 ("B", coherent), SN 3 (EOC marker).
+    try expectDataSns(&rec, &.{ 1, 2, 3 });
 
     rec.reset();
     _ = try writeImpl(writer, "C");
@@ -301,7 +304,8 @@ test "presentation model: suspend before coherent keeps pre-window write out of 
     writer.endCoherentSet(.none, false, null, 0);
     model.end(.none, false, null, 0);
     try expectModelMatchesImpl(&model, writer);
-    try expectDataSns(&rec, &.{3});
+    // "C" is SN 4: EOC for the previous set consumed SN 3 via allocSn().
+    try expectDataSns(&rec, &.{4});
 }
 
 test "presentation model: ordered-only flush assigns GSN without coherent markers" {
@@ -415,6 +419,8 @@ test "presentation model: shared publisher GSN gives group-wide coherent end mar
     try testing.expectEqual(model_shared_gsn, impl_shared_gsn);
     try expectModelMatchesImpl(&m1, w1);
     try expectModelMatchesImpl(&m2, w2);
-    try expectDataSns(&rec1, &.{ 1, 2 });
-    try expectDataSns(&rec2, &.{1});
+    // w1: SN 1 ("A"), SN 2 ("C"), SN 3 (EOC marker).
+    try expectDataSns(&rec1, &.{ 1, 2, 3 });
+    // w2: SN 1 ("B"), SN 2 (EOC marker).
+    try expectDataSns(&rec2, &.{ 1, 2 });
 }

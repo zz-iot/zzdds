@@ -139,6 +139,15 @@ pub const HistoryCache = struct {
         return sn;
     }
 
+    /// Advance next_sn without creating a cache entry.
+    /// Used to allocate a sequence number for a transient wire-only message
+    /// (e.g. the EOC marker) that must not appear in the history cache.
+    pub fn allocSn(self: *Self) SequenceNumber {
+        const sn = self.next_sn;
+        self.next_sn += 1;
+        return sn;
+    }
+
     // ── Reader-side ───────────────────────────────────────────────────────────
 
     /// Add a change received from the wire. `ch.data` is copied into the cache.

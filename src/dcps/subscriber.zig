@@ -426,9 +426,12 @@ pub const SubscriberImpl = struct {
             var any_committed = false;
             for (self.readers.items) |r| {
                 r.mu.lock();
+                // Maximum time to wait for the first DATA of a new coherent set before
+                // assuming the writer is idle and releasing the begin_access gate.
+                const coherent_idle_gate_ns: i64 = 5 * std.time.ns_per_s;
                 const coherent_guids_pending = r.coherent_writer_guids.count() > 0 and
                     r.pending.items.len == 0 and
-                    (time_mod.nanoTimestamp() - r.last_coherent_wip_start_ns < 5_000_000_000);
+                    (time_mod.nanoTimestamp() - r.last_coherent_wip_start_ns < coherent_idle_gate_ns);
                 if (!r.coherent_committed_ready and r.sub_matched_current > 0 and
                     (r.coherent_wip.count() > 0 or coherent_guids_pending))
                 {

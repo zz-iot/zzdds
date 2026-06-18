@@ -227,6 +227,11 @@ pub const MessageBuilder = struct {
         key_hash: ?[16]u8 = null,
         /// True if `payload` contains a serialized key rather than data.
         is_key: bool = false,
+        /// If true, set neither DataFlag nor KeyFlag (DataFlag=0, KeyFlag=0).
+        /// Used for end-of-coherent-set markers per RTPS §9.6.4.2 Table 9.22 (Example 3).
+        /// The receiver sees a DATA with no serialized payload and no inline QoS, which
+        /// it interprets as end-of-coherent-set without consuming application queue space.
+        no_payload: bool = false,
         /// PID_STATUS_INFO inline QoS (RTPS §9.6.3.6).
         /// 0x00000001 = NOT_ALIVE_DISPOSED, 0x00000002 = NOT_ALIVE_UNREGISTERED.
         /// null = omit (normal alive DATA).
@@ -253,8 +258,11 @@ pub const MessageBuilder = struct {
             params.coherent_set_sn != null or params.group_seq_num != null or
             params.group_coherent_sn != null;
         // D and K are mutually exclusive (RTPS §9.4.5.3): set D for data, K for key-only.
-        var flags: u8 = sub.FLAG_ENDIANNESS |
-            if (params.is_key) sub.DataFlags.key_flag else sub.DataFlags.data_present;
+        // no_payload leaves both clear (end-of-coherent-set marker, RTPS §9.6.4.2).
+        var flags: u8 = sub.FLAG_ENDIANNESS;
+        if (!params.no_payload) {
+            flags |= if (params.is_key) sub.DataFlags.key_flag else sub.DataFlags.data_present;
+        }
         if (has_iqos) flags |= sub.DataFlags.inline_qos;
 
         // Calculate content length (everything except the payload).
