@@ -1224,8 +1224,12 @@ pub const DomainParticipantImpl = struct {
                     // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11),
                     // always big-endian regardless of message endianness.
                     const v = std.mem.readInt(u32, si[0..4], .big);
-                    if (v & 0x1 != 0) return .not_alive_disposed;
+                    // RTPS §8.6.3.5: NOT_ALIVE_DISPOSED_UNREGISTERED (0x3, both bits) is
+                    // treated as NOT_ALIVE_UNREGISTERED on the subscriber side — the writer
+                    // has departed, so instance_state = NOT_ALIVE_NO_WRITERS_INSTANCE_STATE.
+                    // Check UNREGISTERED first so that 0x3 maps to not_alive_unregistered.
                     if (v & 0x2 != 0) return .not_alive_unregistered;
+                    if (v & 0x1 != 0) return .not_alive_disposed;
                 }
             }
         }

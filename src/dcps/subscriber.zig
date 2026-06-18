@@ -426,13 +426,18 @@ pub const SubscriberImpl = struct {
             var any_committed = false;
             for (self.readers.items) |r| {
                 r.mu.lock();
-                if (!r.coherent_committed_ready and r.sub_matched_current > 0 and r.coherent_wip.count() > 0) {
-                    // A coherent set is actively accumulating (WIP > 0) but the
-                    // end-marker hasn't arrived yet — stall until the set closes.
-                    // We require WIP > 0 so that a writer sending non-coherent samples
-                    // (coherent_set_sn == null, which go straight to pending and never
-                    // advance coherent_committed_ready) does not cause an indefinite stall
-                    // that blocks delivery of other readers' committed coherent sets.
+                if (!r.coherent_committed_ready and r.sub_matched_current > 0 and
+                    (r.coherent_wip.count() > 0 or r.coherent_writer_seen))
+                {
+                    // Block when a coherent set is in-flight for this reader.
+                    // coherent_wip.count() > 0: end-marker hasn't arrived yet.
+                    // coherent_writer_seen: writer is coherent but its DATA hasn't
+                    //   started arriving yet (sequential vtEndCoherent means a later
+                    //   writer may lag behind earlier ones that already committed).
+                    // We gate on coherent_writer_seen (not just sub_matched_current)
+                    // so that a non-coherent writer (coherent_set_sn == null, data
+                    // goes straight to pending, never sets coherent_writer_seen) does
+                    // not cause an indefinite stall for other readers' committed sets.
                     all_ready = false;
                 }
                 if (r.coherent_committed_ready) any_committed = true;

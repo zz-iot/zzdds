@@ -203,6 +203,12 @@ pub const DataReaderImpl = struct {
     coherent_committed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(PendingChange)),
     /// True when `coherent_committed` contains at least one complete set.
     coherent_committed_ready: bool,
+    /// True once this reader has received at least one DATA sample that carried a
+    /// PID_COHERENT_SET inline QoS (i.e. its matched writer participates in coherent
+    /// sets).  Used by Subscriber.begin_access to distinguish a lagging-but-coherent
+    /// writer (whose WIP has not started yet) from a non-coherent writer (which never
+    /// commits a coherent set and must not stall delivery indefinitely).
+    coherent_writer_seen: bool = false,
     mu: Mutex,
 
     /// Presentation QoS from the owning Subscriber; set once after init.
@@ -536,6 +542,7 @@ pub const DataReaderImpl = struct {
         if (self.subscriber_presentation.coherent_access and
             change.coherent_set_sn != null)
         {
+            self.coherent_writer_seen = true;
             const states = self.determineStatesLocked(ih, change.kind);
             const src_time = change.source_timestamp.toTime();
             const coh_expiry: ?i64 = if (change.kind == .alive)
