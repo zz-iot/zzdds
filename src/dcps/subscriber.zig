@@ -539,6 +539,13 @@ pub const SubscriberImpl = struct {
             for (self.readers.items) |r| {
                 r.mu.lock();
                 r.ordered_access_watermark = null;
+                // Items that arrived after begin_access() are now available.
+                // Re-arm DATA_AVAILABLE_STATUS so StatusCondition users wake
+                // on the next wait rather than missing the deferred samples.
+                if (r.pending.items.len > 0) {
+                    r.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+                    if (r.status_cond) |sc| sc.notifyWakeup();
+                }
                 r.mu.unlock();
             }
         }

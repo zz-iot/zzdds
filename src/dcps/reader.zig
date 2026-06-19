@@ -1152,7 +1152,12 @@ pub const DataReaderImpl = struct {
             // Honour the ordered-access window set by Subscriber.begin_access().
             // Samples appended after the sort (new network arrivals during the window
             // between begin_access and end_access) must not leak into the sorted batch.
-            if (self.ordered_access_watermark) |wm| if (wm == 0) return null;
+            // Clear DATA_AVAILABLE_STATUS so StatusCondition users don't busy-spin
+            // while waiting for end_access() to open the next window.
+            if (self.ordered_access_watermark) |wm| if (wm == 0) {
+                self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+                return null;
+            };
             const pc = self.pending.orderedRemove(0);
             if (self.ordered_access_watermark) |*wm| wm.* -= 1;
             if (pc.expiry_ns) |exp| {
@@ -1302,6 +1307,9 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
+        }
+        if (self.pending.items.len == 0) {
+            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
 
