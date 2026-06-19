@@ -512,6 +512,11 @@ pub const SubscriberImpl = struct {
                         pendingLessThan,
                     ),
                 }
+                // Watermark: only serve samples present at begin_access time.
+                // New samples appended by the inbound path after this sort are
+                // withheld until end_access() clears the watermark, preventing
+                // unsorted arrivals from breaking the presentation-order guarantee.
+                r.ordered_access_watermark = r.pending.items.len;
                 r.mu.unlock();
             }
         }
@@ -528,7 +533,15 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtEndAccess(ctx: *anyopaque) DDS.ReturnCode_t {
-        _ = ctx;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const pres: DDS.PresentationQosPolicy = self.qos.presentation;
+        if (pres.ordered_access) {
+            for (self.readers.items) |r| {
+                r.mu.lock();
+                r.ordered_access_watermark = null;
+                r.mu.unlock();
+            }
+        }
         return DDS.RETCODE_OK;
     }
 

@@ -253,6 +253,12 @@ pub const DataReaderImpl = struct {
     /// Per-writer lifespan in nanoseconds (0 = infinite). Guarded by `mu`.
     writer_lifespans: std.AutoHashMapUnmanaged(Guid, i64) = .empty,
 
+    /// Set by Subscriber.begin_access() after sorting pending for ordered access.
+    /// takeRaw() returns null once this many items have been consumed, so that
+    /// samples appended by the inbound network path after the sort are not served
+    /// until end_access() clears this field (null = no limit).  Guarded by `mu`.
+    ordered_access_watermark: ?usize = null,
+
     // ── OWNERSHIP tracking ────────────────────────────────────────────────────
     // Only used when qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS.
     // Guarded by `mu`.
@@ -1143,7 +1149,12 @@ pub const DataReaderImpl = struct {
         defer self.mu.unlock();
         const now_ns = time_mod.nanoTimestamp();
         while (self.pending.items.len > 0) {
+            // Honour the ordered-access window set by Subscriber.begin_access().
+            // Samples appended after the sort (new network arrivals during the window
+            // between begin_access and end_access) must not leak into the sorted batch.
+            if (self.ordered_access_watermark) |wm| if (wm == 0) return null;
             const pc = self.pending.orderedRemove(0);
+            if (self.ordered_access_watermark) |*wm| wm.* -= 1;
             if (pc.expiry_ns) |exp| {
                 if (now_ns >= exp) {
                     pc.deinit();
