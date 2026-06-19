@@ -1245,6 +1245,9 @@ pub const DataReaderImpl = struct {
             }
             ei += 1;
         }
+        if (self.pending.items.len == 0) {
+            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
         var count: usize = 0;
         for (self.pending.items) |*pc| {
