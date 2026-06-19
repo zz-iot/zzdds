@@ -597,15 +597,17 @@ pub const StatefulReader = struct {
                 for (wp.pending_changes.items) |pc| {
                     if (pc.sequence_number == sn) return;
                 }
-                if (!is_eoc) {
-                    const data_copy = try self.alloc.dupe(u8, change.data);
-                    var owned = change;
-                    owned.data = data_copy;
-                    wp.pending_changes.append(self.alloc, owned) catch {
-                        self.alloc.free(data_copy);
-                        return;
-                    };
-                }
+                // Buffer the change (including EOC markers, which have data.len == 0)
+                // so deliverPendingLocked can fire on_eoc when the gap fills.  Without
+                // buffering the EOC, a writer that already appears in coherent_eoc_writers
+                // (HB flushing suppressed) would leave its WIP permanently stuck.
+                const data_copy = try self.alloc.dupe(u8, change.data);
+                var owned = change;
+                owned.data = data_copy;
+                wp.pending_changes.append(self.alloc, owned) catch {
+                    self.alloc.free(data_copy);
+                    return;
+                };
                 _ = wp.received.insert(self.alloc, sn) catch {};
             }
         } else {
@@ -629,11 +631,18 @@ pub const StatefulReader = struct {
                 if (wp.pending_changes.items[i].sequence_number == next_sn) {
                     const pending_ch = wp.pending_changes.orderedRemove(i);
                     defer self.alloc.free(pending_ch.data);
-                    self.cache.addReaderChange(pending_ch) catch {};
-                    if (self.callback) |cb| {
-                        if (self.cache.getChangeForWriter(pending_ch.writer_guid, next_sn)) |cached| {
-                            cb.on_data(cb.ctx, cached);
+                    const is_eoc = pending_ch.kind == .alive and
+                        pending_ch.data.len == 0 and
+                        pending_ch.coherent_set_sn == null;
+                    if (!is_eoc) {
+                        self.cache.addReaderChange(pending_ch) catch {};
+                        if (self.callback) |cb| {
+                            if (self.cache.getChangeForWriter(pending_ch.writer_guid, next_sn)) |cached| {
+                                cb.on_data(cb.ctx, cached);
+                            }
                         }
+                    } else {
+                        if (self.callback) |cb| if (cb.on_eoc) |f| f(cb.ctx, &pending_ch);
                     }
                     break;
                 }
