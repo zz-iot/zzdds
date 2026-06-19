@@ -780,7 +780,9 @@ pub const StatefulWriter = struct {
             // Include a GAP for allocated-but-uncached SNs above cache_last (EOC markers).
             // Reliable readers that missed the endCoherentSet HB+GAP can retire the EOC
             // SN here instead of perpetually NACKing it and blocking pending_changes.
-            if (!self.coherent_active and self.cache.next_sn > cache_last + 1) {
+            // Skip when pending_eoc_sn is set: the EOC hasn't been sent yet (two-phase
+            // GROUP flush), so GAPping it now would cause Connext to discard the EOC.
+            if (!self.coherent_active and self.pending_eoc_sn == null and self.cache.next_sn > cache_last + 1) {
                 const eoc_gap = msg.submessage.SequenceNumberSet{
                     .base = self.cache.next_sn,
                     .num_bits = 0,
@@ -972,7 +974,10 @@ pub const StatefulWriter = struct {
                         // SN is allocated but absent from the history cache — it was
                         // reserved via allocSn() for a wire-only EOC marker.  Reply with
                         // a GAP so the reader can retire the SN and unblock pending_changes.
-                        if (sn < self.cache.next_sn) {
+                        // Skip if this is the pending two-phase EOC: flushGroupEOC() will
+                        // send the EOC DATA + GAP shortly; a premature GAP here would cause
+                        // Connext to discard the EOC and never close the coherent set.
+                        if (sn < self.cache.next_sn and sn != (self.pending_eoc_sn orelse 0)) {
                             const eoc_gap = msg.submessage.SequenceNumberSet{
                                 .base = sn + 1,
                                 .num_bits = 0,
