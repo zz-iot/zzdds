@@ -607,6 +607,7 @@ pub const DataReaderImpl = struct {
                     for (prev.items) |stale| stale.deinit();
                     prev.deinit(self.alloc);
                 }
+                self.last_coherent_wip_start_ns = time_mod.nanoTimestamp();
             } else if (!gop.found_existing) {
                 gop.value_ptr.* = .{ .cs = new_cs };
                 self.last_coherent_wip_start_ns = time_mod.nanoTimestamp();
