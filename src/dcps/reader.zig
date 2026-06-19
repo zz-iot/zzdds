@@ -1871,3 +1871,211 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
     try testing.expectEqual(@as(usize, 0), dr.coherent_wip.count());
     try testing.expect(dr.coherent_committed_ready);
 }
+
+test "coherent WIP: CS transition discards incomplete previous WIP" {
+    // Covers the discard branch (lines 606-610): when a new coherent set arrives
+    // while the previous WIP has flush_target_sn set (incomplete), the previous
+    // set is discarded rather than committed to preserve the coherency guarantee.
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    const pres = DDS.PresentationQosPolicy{ .coherent_access = true };
+    var dr = DataReaderImpl{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener = nil.nil_dr_listener,
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .subscriber_presentation = pres,
+        .seen_instances = .empty,
+    };
+    defer {
+        var it = dr.coherent_wip.valueIterator();
+        while (it.next()) |e| {
+            for (e.samples.items) |pc| pc.deinit();
+            e.samples.deinit(alloc);
+        }
+        dr.coherent_wip.deinit(alloc);
+        for (dr.coherent_committed.items) |*set| {
+            for (set.items) |pc| pc.deinit();
+            set.deinit(alloc);
+        }
+        dr.coherent_committed.deinit(alloc);
+        dr.seen_instances.deinit(alloc);
+        dr.coherent_writer_guids.deinit(alloc);
+        var wit = dr.writer_instances.valueIterator();
+        while (wit.next()) |v| v.deinit(alloc);
+        dr.writer_instances.deinit(alloc);
+    }
+
+    const guid_mod = @import("../rtps/guid.zig");
+    const writer_guid = guid_mod.Guid{
+        .prefix = .{ .bytes = [_]u8{0xCC} ** 12 },
+        .entity_id = guid_mod.EntityIds.sedp_builtin_publications_writer,
+    };
+
+    // Seed a WIP entry with CS=1, one sample, flush_target_sn=5 (highest_sn=1 < 5 → incomplete).
+    var entry = CoherentWipEntry{ .cs = 1, .highest_sn = 1, .flush_target_sn = 5 };
+    const d1 = try alloc.dupe(u8, &.{0x01});
+    try entry.samples.append(alloc, PendingChange{
+        .data = d1,
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
+    });
+    try dr.coherent_wip.put(alloc, writer_guid, entry);
+
+    // CS=10 DATA arrives — triggers CS transition; prev (CS=1) is incomplete → discard.
+    const change = history_mod.CacheChange{
+        .kind = .alive,
+        .writer_guid = writer_guid,
+        .sequence_number = 10,
+        .source_timestamp = .{ .seconds = 0, .fraction = 0 },
+        .instance_handle = std.mem.zeroes(history_mod.InstanceHandle),
+        .key_hash = std.mem.zeroes([16]u8),
+        .data = &.{0x02},
+        .coherent_set_sn = 10,
+    };
+    DataReaderImpl.onDataCb(@ptrCast(&dr), &change);
+
+    try testing.expectEqual(@as(usize, 0), dr.coherent_committed.items.len);
+    const e = dr.coherent_wip.get(writer_guid).?;
+    try testing.expectEqual(@as(history_mod.SequenceNumber, 10), e.cs);
+}
+
+test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" {
+    // Covers lines 624-626: onDataCb advances highest_sn and flushes when it
+    // reaches flush_target_sn that was previously set by a HEARTBEAT.
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    const pres = DDS.PresentationQosPolicy{ .coherent_access = true };
+    var dr = DataReaderImpl{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener = nil.nil_dr_listener,
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .subscriber_presentation = pres,
+        .seen_instances = .empty,
+    };
+    defer {
+        var it = dr.coherent_wip.valueIterator();
+        while (it.next()) |e| {
+            for (e.samples.items) |pc| pc.deinit();
+            e.samples.deinit(alloc);
+        }
+        dr.coherent_wip.deinit(alloc);
+        for (dr.coherent_committed.items) |*set| {
+            for (set.items) |pc| pc.deinit();
+            set.deinit(alloc);
+        }
+        dr.coherent_committed.deinit(alloc);
+        dr.seen_instances.deinit(alloc);
+        dr.coherent_writer_guids.deinit(alloc);
+        var wit = dr.writer_instances.valueIterator();
+        while (wit.next()) |v| v.deinit(alloc);
+        dr.writer_instances.deinit(alloc);
+    }
+
+    const guid_mod = @import("../rtps/guid.zig");
+    const writer_guid = guid_mod.Guid{
+        .prefix = .{ .bytes = [_]u8{0xDD} ** 12 },
+        .entity_id = guid_mod.EntityIds.sedp_builtin_publications_writer,
+    };
+
+    // Seed WIP: CS=5, one sample (SN=1) already received, flush_target_sn=2.
+    var entry = CoherentWipEntry{ .cs = 5, .highest_sn = 1, .flush_target_sn = 2 };
+    const d1 = try alloc.dupe(u8, &.{0x01});
+    try entry.samples.append(alloc, PendingChange{
+        .data = d1,
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
+    });
+    try dr.coherent_wip.put(alloc, writer_guid, entry);
+
+    // DATA SN=2 (same CS=5) arrives — highest_sn reaches flush_target_sn → flush.
+    const change = history_mod.CacheChange{
+        .kind = .alive,
+        .writer_guid = writer_guid,
+        .sequence_number = 2,
+        .source_timestamp = .{ .seconds = 0, .fraction = 0 },
+        .instance_handle = std.mem.zeroes(history_mod.InstanceHandle),
+        .key_hash = std.mem.zeroes([16]u8),
+        .data = &.{0x02},
+        .coherent_set_sn = 5,
+    };
+    DataReaderImpl.onDataCb(@ptrCast(&dr), &change);
+
+    try testing.expectEqual(@as(usize, 0), dr.coherent_wip.count());
+    try testing.expectEqual(@as(usize, 1), dr.coherent_committed.items.len);
+}
+
+test "takeRaw: expired LIFESPAN sample is silently discarded" {
+    // Covers lines 1105-1107: a sample whose expiry_ns has passed is removed
+    // from pending and takeRaw returns null rather than a stale sample.
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    var dr = DataReaderImpl{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener = nil.nil_dr_listener,
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .seen_instances = .empty,
+    };
+    defer {
+        for (dr.pending.items) |pc| pc.deinit();
+        dr.pending.deinit(alloc);
+        dr.coherent_wip.deinit(alloc);
+        dr.coherent_committed.deinit(alloc);
+        dr.seen_instances.deinit(alloc);
+    }
+
+    const d = try alloc.dupe(u8, &.{0xAA});
+    try dr.pending.append(alloc, PendingChange{
+        .data = d,
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
+        .expiry_ns = 1, // nanosecond 1 — far in the past
+    });
+
+    try testing.expect(dr.takeRaw() == null);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}

@@ -518,3 +518,72 @@ test "SEDP: second onParticipantDiscovered replaces proxy without adding a dupli
     const count_after = local.sedp.pub_writer.?.reader_proxies.items.len;
     try testing.expectEqual(@as(usize, 1), count_after);
 }
+
+test "SEDP: WriterAnnouncement with group_guid encodes and delivers without error" {
+    // Covers sedp.zig lines 180-188: the PID_GROUP_GUID block that encodes the
+    // publisher-group GUID into the DiscoveredWriterData inline QoS parameters.
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x15);
+    var remote = try Participant.init(net, 0x16);
+    defer local.deinit();
+    defer remote.deinit();
+
+    local.discoverPeer(0x16);
+    remote.discoverPeer(0x15);
+
+    const writer_guid = makeGuid(0x15, 0x10);
+    try local.sedp.announceWriter(&.{
+        .guid = writer_guid,
+        .participant_guid = makeGuid(0x15, 0x01),
+        .group_guid = makeGuid(0x15, 0x01), // publisher participant GUID as group GUID
+        .topic_name = "GroupTopic",
+        .type_name = "GroupType",
+        .qos = .{ .coherent_access = true, .presentation_access_scope = 2 },
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+    try testing.expect(remote.rec.writers_found.items[0].guid.eql(writer_guid));
+}
+
+test "SEDP: WriterAnnouncement with lifespan and deadline QoS round-trips correctly" {
+    // Covers sedp.zig lines 151-153 (writeDdsDuration for lifespan) and 519-522
+    // (lifespan decode), and 236/363 + 477-482 (deadline encode/decode).
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x17);
+    var remote = try Participant.init(net, 0x18);
+    defer local.deinit();
+    defer remote.deinit();
+
+    local.discoverPeer(0x18);
+    remote.discoverPeer(0x17);
+
+    try local.sedp.announceWriter(&.{
+        .guid = makeGuid(0x17, 0x10),
+        .participant_guid = makeGuid(0x17, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{
+            .lifespan_sec = 10,
+            .lifespan_nanosec = 500_000_000,
+            .deadline_sec = 5,
+            .deadline_nanosec = 0,
+        },
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+    const found = &remote.rec.writers_found.items[0];
+    try testing.expectEqual(@as(i32, 10), found.qos.lifespan_sec);
+    try testing.expectEqual(@as(u32, 500_000_000), found.qos.lifespan_nanosec);
+    try testing.expectEqual(@as(i32, 5), found.qos.deadline_sec);
+    try testing.expectEqual(@as(u32, 0), found.qos.deadline_nanosec);
+}
