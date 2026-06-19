@@ -211,6 +211,12 @@ pub const DataReaderImpl = struct {
     /// about to arrive (sequential vtEndCoherent timing).  Cleared on writer departure so
     /// a stale flag never permanently blocks begin_access.  Guarded by `mu`.
     coherent_writer_guids: std.AutoHashMapUnmanaged(Guid, void) = .empty,
+    /// Writers known to use a Connext-style zero-payload alive DATA as end-of-set marker
+    /// (§9.6.4.2 Table 9.22 Example 3).  Once a writer sends its first EOC packet, it is
+    /// added here and HB-based WIP commits are suppressed for that writer — EOC is the
+    /// authoritative flush trigger, and intermediate HBs would otherwise cause premature
+    /// partial commits.  Entries removed on writer departure.  Guarded by `mu`.
+    coherent_eoc_writers: std.AutoHashMapUnmanaged(Guid, void) = .empty,
     /// Timestamp (ns) when the most recent coherent WIP entry was created for any writer.
     /// Reset when a new entry is added; used by Subscriber.begin_access to detect idle
     /// coherent writers that never send a new set (preventing a permanent gate stall).
@@ -324,6 +330,7 @@ pub const DataReaderImpl = struct {
             .on_data = onDataCb,
             .on_sample_lost = onSampleLostCb,
             .on_heartbeat = onHeartbeatCb,
+            .on_eoc = onEocCb,
         });
         // Register writer-match callback for OWNERSHIP and LIVELINESS tracking.
         proto_reader.setWriterMatchCallback(.{
@@ -355,6 +362,7 @@ pub const DataReaderImpl = struct {
         }
         self.coherent_wip.deinit(self.alloc);
         self.coherent_writer_guids.deinit(self.alloc);
+        self.coherent_eoc_writers.deinit(self.alloc);
         for (self.coherent_committed.items) |*s| {
             for (s.items) |p| p.deinit();
             s.deinit(self.alloc);
@@ -452,6 +460,29 @@ pub const DataReaderImpl = struct {
     }
 
     /// Called from the RTPS receive thread when a new sample arrives.
+    /// Matches the DataCallback.on_eoc function pointer signature.
+    /// Called by reader_sm when a Connext-style zero-payload alive DATA arrives (no
+    /// PID_COHERENT_SET) — the end-of-coherent-set signal.  Flushes the coherent WIP
+    /// for this writer without adding a sample to the pending queue.
+    fn onEocCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.subscriber_presentation.coherent_access) return;
+        self.mu.lock();
+        // Remember this writer uses EOC so onHeartbeatCb stops issuing premature commits.
+        self.coherent_eoc_writers.put(self.alloc, change.writer_guid, {}) catch {};
+        const committed = if (self.coherent_wip.fetchRemove(change.writer_guid)) |kv|
+            self.commitCoherentWipSamplesLocked(kv.value.samples)
+        else
+            false;
+        self.mu.unlock();
+        if (committed) {
+            if (self.status_cond) |sc| sc.notifyWakeup();
+            if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
+            }
+        }
+    }
+
     /// Matches the DataCallback.on_data function pointer signature.
     /// Must not block; must not call back into the ProtocolReader.
     fn onDataCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
@@ -621,8 +652,11 @@ pub const DataReaderImpl = struct {
                 gop.value_ptr.highest_sn = change.sequence_number;
             // If a prior HB deferred the flush (highest_sn was < last_sn at HB time),
             // check whether this DATA packet completes the set.
+            // Skip for EOC writers: their set ends only when the EOC packet arrives.
             const data_committed = if (gop.value_ptr.flush_target_sn) |target|
-                if (gop.value_ptr.highest_sn >= target) blk2: {
+                if (self.coherent_eoc_writers.get(change.writer_guid) == null and
+                    gop.value_ptr.highest_sn >= target)
+                blk2: {
                     const kv2 = self.coherent_wip.fetchRemove(change.writer_guid).?;
                     break :blk2 self.commitCoherentWipSamplesLocked(kv2.value.samples);
                 } else false
@@ -843,6 +877,13 @@ pub const DataReaderImpl = struct {
             // last_sn < entry.cs (the first SN of the current set), and committing it
             // would prematurely flush an in-progress set.  Drop it.
             if (last_sn < entry.cs) break :blk false;
+            // EOC writers use a zero-payload DATA as the definitive end-of-set signal.
+            // Intermediate HBs from these writers carry a partial last_sn that would
+            // commit the WIP too early.  Skip HB-based flush entirely for them.
+            if (self.coherent_eoc_writers.get(writer_guid) != null) {
+                self.mu.unlock();
+                return;
+            }
             if (entry.highest_sn < last_sn) {
                 // Missing DATA packets — can't flush yet.  Record the minimum last_sn
                 // we've seen so onDataCb can trigger the flush when the missing packets arrive.
@@ -928,6 +969,7 @@ pub const DataReaderImpl = struct {
         // crashed or was deleted mid-set, the partial wip would otherwise stay
         // in the map indefinitely — one leaked entry per connect/disconnect cycle.
         _ = self.coherent_writer_guids.remove(guid);
+        _ = self.coherent_eoc_writers.remove(guid);
         if (self.coherent_wip.fetchRemove(guid)) |kv| {
             var wip = kv.value;
             for (wip.samples.items) |pc| pc.deinit();

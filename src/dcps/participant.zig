@@ -1365,7 +1365,6 @@ pub const DomainParticipantImpl = struct {
 
                     const writer_guid = Guid{ .prefix = src_prefix, .entity_id = d.writer_entity_id };
                     const kind = decodeChangeKind(d.inline_qos);
-                    if (kind == .alive and d.serialized_payload.len == 0) continue;
                     const key_hash = decodeKeyHash(d.inline_qos);
                     const coherent_set_sn = decodeCoherentSetSn(d.inline_qos, d.isLittleEndian());
                     const group_seq_num = decodeGroupSeqNum(d.inline_qos, d.isLittleEndian());

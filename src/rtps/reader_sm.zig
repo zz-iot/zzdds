@@ -48,6 +48,10 @@ pub const DataCallback = struct {
     /// Called when a valid (non-duplicate) HEARTBEAT is received from a writer.
     /// Invoked under the state machine's lock; must NOT call back into the SM.
     on_heartbeat: ?*const fn (ctx: *anyopaque, writer_guid: Guid, last_sn: SequenceNumber) void = null,
+    /// Called when an end-of-coherent-set marker arrives (zero-payload alive DATA,
+    /// no PID_COHERENT_SET).  The DCPS layer registers this to flush the coherent WIP.
+    /// If null, EOC packets are silently dropped — correct for RTPS-level consumers.
+    on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
 };
 
 // ── StatelessReader ───────────────────────────────────────────────────────────
@@ -582,6 +586,10 @@ pub const StatefulReader = struct {
                     if (self.callback) |cb| {
                         if (self.cache.getChangeForWriter(change.writer_guid, sn)) |cached| cb.on_data(cb.ctx, cached);
                     }
+                } else {
+                    // EOC marker: not cached, but notify the DCPS layer so it can
+                    // flush the coherent WIP without adding a data sample to pending.
+                    if (self.callback) |cb| if (cb.on_eoc) |f| f(cb.ctx, &change);
                 }
                 self.deliverPendingLocked(wp, sn);
             } else {
