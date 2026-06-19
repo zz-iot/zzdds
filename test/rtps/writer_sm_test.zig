@@ -670,7 +670,7 @@ test "sendHeartbeat: EOC GAP included for allocated-but-uncached SNs" {
     w.beginCoherentSet(true);
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
-    w.endCoherentSet(.coherent_only, false, null, 0);
+    w.endCoherentSet(.coherent_only, false, null, 0, false);
     rec.reset();
 
     // Periodic HB must include a GAP for the EOC SN range [3, 4).

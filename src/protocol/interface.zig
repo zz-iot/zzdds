@@ -171,7 +171,13 @@ pub const ProtocolWriter = struct {
         /// Flush a deferred coherent/ordered batch.  `mode` controls which
         /// inline QoS PIDs are emitted (see CoherentFlushMode).
         /// `global_last_gsn`: group-wide last GSN across all writers; 0 = per-writer.
-        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void,
+        /// When `defer_eoc` is true, the EOC DATA and HB are stashed (not sent) so the
+        /// caller can follow with flush_group_eoc() across all writers atomically.
+        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void,
+
+        /// Send the deferred EOC DATA and HB+GAP stashed by end_coherent_set(defer_eoc=true).
+        /// No-op if no EOC is pending.  Used as phase 2 of a GROUP coherent flush.
+        flush_group_eoc: *const fn (ctx: *anyopaque) void,
 
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
@@ -249,8 +255,12 @@ pub const ProtocolWriter = struct {
         return self.vtable.coherent_window_count(self.ctx);
     }
 
-    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
-        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn);
+    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
+        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
+    }
+
+    pub fn flushGroupEOC(self: ProtocolWriter) void {
+        self.vtable.flush_group_eoc(self.ctx);
     }
 
     pub fn deinit(self: ProtocolWriter) void {

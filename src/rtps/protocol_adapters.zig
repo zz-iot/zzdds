@@ -85,6 +85,7 @@ pub const RtpsProtocolWriter = struct {
         .begin_coherent_set = vtBeginCoherentSet,
         .coherent_window_count = vtCoherentWindowCount,
         .end_coherent_set = vtEndCoherentSet,
+        .flush_group_eoc = vtFlushGroupEOC,
         .deinit = vtDeinit,
     };
 
@@ -188,9 +189,14 @@ pub const RtpsProtocolWriter = struct {
         return self.writer.coherentWindowPendingCount();
     }
 
-    fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
+    fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.endCoherentSet(mode, resuspend, publisher_gsn, global_last_gsn);
+        self.writer.endCoherentSet(mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
+    }
+
+    fn vtFlushGroupEOC(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.flushGroupEOC();
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

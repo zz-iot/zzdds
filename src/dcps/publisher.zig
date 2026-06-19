@@ -387,7 +387,7 @@ pub const PublisherImpl = struct {
         // writes — don't flush them here; end_coherent_changes will do it correctly.
         // Only flush with .none when there is no open coherent window.
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null, 0);
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null, 0, false);
         }
         return DDS.RETCODE_OK;
     }
@@ -426,7 +426,16 @@ pub const PublisherImpl = struct {
             // Pass suspend_active as `resuspend` so the flush and re-arm happen
             // atomically inside writer.mu — no window where coherent_active=false.
             // Pass &group_seq_num_counter so all writers share a monotone GSN space.
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn);
+            //
+            // For GROUP presentation, use a two-phase flush: send DATA for all writers
+            // first (defer_eoc=true), then send EOC+HB for all writers together.  This
+            // keeps per-writer EOC packets close together on the wire even when the
+            // sequential endCoherentSet calls are spread out in time (e.g. under TSAN).
+            const defer_eoc = mode == .full;
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn, defer_eoc);
+            if (defer_eoc) {
+                for (self.writers.items) |w| w.proto_writer.flushGroupEOC();
+            }
         }
         return DDS.RETCODE_OK;
     }

@@ -290,7 +290,7 @@ test "presentation model: suspend before coherent keeps pre-window write out of 
     try testing.expectEqual(@as(usize, 1), model.coherentWindowCount());
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.full, true, null, 0);
+    writer.endCoherentSet(.full, true, null, 0, false);
     model.end(.full, true, null, 0);
     try expectModelMatchesImpl(&model, writer);
     // SN 1 ("A", pre-window), SN 2 ("B", coherent), SN 3 (EOC marker).
@@ -301,7 +301,7 @@ test "presentation model: suspend before coherent keeps pre-window write out of 
     _ = try model.write(alloc);
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.none, false, null, 0);
+    writer.endCoherentSet(.none, false, null, 0, false);
     model.end(.none, false, null, 0);
     try expectModelMatchesImpl(&model, writer);
     // "C" is SN 4: EOC for the previous set consumed SN 3 via allocSn().
@@ -324,7 +324,7 @@ test "presentation model: ordered-only flush assigns GSN without coherent marker
     _ = try model.write(alloc);
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.group_seq_only, false, null, 0);
+    writer.endCoherentSet(.group_seq_only, false, null, 0, false);
     model.end(.group_seq_only, false, null, 0);
     try expectModelMatchesImpl(&model, writer);
     try expectDataSns(&rec, &.{ 1, 2 });
@@ -349,7 +349,7 @@ test "presentation model: empty coherent window flushes pre-window samples only"
     try testing.expectEqual(@as(usize, 0), model.coherentWindowCount());
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.full, false, null, 0);
+    writer.endCoherentSet(.full, false, null, 0, false);
     model.end(.full, false, null, 0);
     try expectModelMatchesImpl(&model, writer);
     try expectDataSns(&rec, &.{1});
@@ -366,7 +366,7 @@ test "presentation model: readerless coherent set records metadata without DATA 
     _ = try writeImpl(writer, "B");
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.full, false, null, 0);
+    writer.endCoherentSet(.full, false, null, 0, false);
     try expectDataSns(&rec, &.{});
 
     writer.mu.lock();
@@ -411,9 +411,9 @@ test "presentation model: shared publisher GSN gives group-wide coherent end mar
 
     var impl_shared_gsn: i64 = 0;
     var model_shared_gsn: i64 = 0;
-    w1.endCoherentSet(.full, false, &impl_shared_gsn, total_n);
+    w1.endCoherentSet(.full, false, &impl_shared_gsn, total_n, false);
     m1.end(.full, false, &model_shared_gsn, model_total_n);
-    w2.endCoherentSet(.full, false, &impl_shared_gsn, total_n);
+    w2.endCoherentSet(.full, false, &impl_shared_gsn, total_n, false);
     m2.end(.full, false, &model_shared_gsn, model_total_n);
 
     try testing.expectEqual(model_shared_gsn, impl_shared_gsn);

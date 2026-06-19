@@ -350,6 +350,9 @@ pub const StatefulWriter = struct {
     /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
     /// Incremented by N after each group coherent set of N samples is flushed.
     group_seq_num_counter: i64,
+    /// EOC SN allocated by endCoherentSet(defer_eoc=true) but not yet sent.
+    /// Consumed and cleared by flushGroupEOC().
+    pending_eoc_sn: ?SequenceNumber,
     /// Optional callback fired when a liveness probe resolves.
     /// Called with (ctx, prefix, alive): alive=true means an ACKNACK was received;
     /// alive=false means the probe deadline expired and the proxy was removed.
@@ -392,6 +395,7 @@ pub const StatefulWriter = struct {
             .coherent_window_start = 0,
             .last_flushed_sn = 0,
             .group_seq_num_counter = 0,
+            .pending_eoc_sn = null,
             .probe_result_fn = null,
             .probe_result_ctx = null,
         };
@@ -1343,7 +1347,7 @@ pub const StatefulWriter = struct {
     /// coherent set.  Written into PID_GROUP_COHERENT_SET on the last sample from this
     /// writer so the receiver knows when the full group set has arrived.  0 = use the
     /// per-writer last GSN (standalone/single-writer path where they are equal).
-    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
+    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.coherent_active = false;
@@ -1424,9 +1428,16 @@ pub const StatefulWriter = struct {
         // the per-proxy HEARTBEATs so best-effort readers also get it.
         // Only meaningful for coherent-access modes; .none and .group_seq_only
         // do not use PID_COHERENT_SET so there is no coherent set to terminate.
-        var eoc_sn: ?SequenceNumber = null;
         if (mode == .coherent_only or mode == .full) {
-            eoc_sn = self.cache.allocSn();
+            const eoc_sn = self.cache.allocSn();
+            if (defer_eoc) {
+                // Phase 1 of a two-phase GROUP flush: stash the EOC SN and return.
+                // flushGroupEOC() will send EOC DATA + HB+GAP for all writers together,
+                // ensuring Connext receives per-writer EOCs without large timing gaps.
+                self.pending_eoc_sn = eoc_sn;
+                self.coherent_pending_sns.clearRetainingCapacity();
+                return;
+            }
             var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
             for (self.reader_proxies.items) |*rp| {
                 if (rp.suppress_live_data) continue;
@@ -1437,24 +1448,63 @@ pub const StatefulWriter = struct {
                 b.addData(.{
                     .reader_entity_id = rp.guid.entity_id,
                     .writer_entity_id = self.guid.entity_id,
-                    .writer_sn = eoc_sn.?,
+                    .writer_sn = eoc_sn,
                     .no_payload = true,
                 }, &.{});
                 for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
             }
+            // One heartbeat after all coherent-set samples so reliable readers learn the
+            // full [first_sn, last_sn] range and the subscriber can commit the complete WIP.
+            // Also include a GAP for eoc_sn so readers that missed the EOC DATA can retire
+            // it and unblock delivery of subsequent non-coherent samples.
+            const cache_last = self.cache.maxSn();
+            for (self.reader_proxies.items) |*rp| {
+                if (!rp.reliable) continue;
+                const proxy_eoc_sn = if (!rp.suppress_live_data) eoc_sn else null;
+                self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, proxy_eoc_sn);
+            }
+        } else {
+            // Non-coherent modes (.none, .group_seq_only): no EOC, but still send HB.
+            const cache_last = self.cache.maxSn();
+            for (self.reader_proxies.items) |*rp| {
+                if (!rp.reliable) continue;
+                self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, null);
+            }
         }
-        // One heartbeat after all coherent-set samples so reliable readers learn the
-        // full [first_sn, last_sn] range and the subscriber can commit the complete WIP.
-        // For non-suppressed proxies in coherent modes, also include a GAP for eoc_sn
-        // so that readers that missed the EOC DATA can retire it and unblock delivery
-        // of all subsequent non-coherent samples buffered in pending_changes.
+        self.coherent_pending_sns.clearRetainingCapacity();
+    }
+
+    /// Phase 2 of a two-phase GROUP coherent flush (called after endCoherentSet with
+    /// defer_eoc=true has been called for all writers in the publisher).  Sends the
+    /// EOC DATA and per-proxy HB+GAP that were held back in phase 1, so that all
+    /// writers' EOCs arrive at the subscriber in rapid succession regardless of TSAN
+    /// or other timing effects from sequential per-writer endCoherentSet calls.
+    pub fn flushGroupEOC(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const eoc_sn = self.pending_eoc_sn orelse return;
+        self.pending_eoc_sn = null;
+        var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
+        for (self.reader_proxies.items) |*rp| {
+            if (rp.suppress_live_data) continue;
+            const locs = rp.effectiveLocators();
+            if (locs.len == 0) continue;
+            var b = MessageBuilder.init(&eoc_scratch, self.guid.prefix);
+            b.addInfoDst(rp.guid.prefix);
+            b.addData(.{
+                .reader_entity_id = rp.guid.entity_id,
+                .writer_entity_id = self.guid.entity_id,
+                .writer_sn = eoc_sn,
+                .no_payload = true,
+            }, &.{});
+            for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
+        }
         const cache_last = self.cache.maxSn();
         for (self.reader_proxies.items) |*rp| {
             if (!rp.reliable) continue;
             const proxy_eoc_sn = if (!rp.suppress_live_data) eoc_sn else null;
             self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, proxy_eoc_sn);
         }
-        self.coherent_pending_sns.clearRetainingCapacity();
     }
 
     /// Background thread: sends a non-final HEARTBEAT every HB_INTERVAL_MS ms.
