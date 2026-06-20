@@ -1001,9 +1001,10 @@ pub const StatefulWriter = struct {
                         // SN is allocated but absent from the history cache — it was
                         // reserved via allocSn() for a wire-only EOC marker.  Reply with
                         // a GAP so the reader can retire the SN and unblock pending_changes.
-                        // Skip if this is the pending two-phase EOC: flushGroupEOC() will
-                        // send the EOC DATA + GAP shortly; a premature GAP here would cause
-                        // Connext to discard the EOC and never close the coherent set.
+                        // Skip if this is the pending two-phase EOC: sendCombinedEOCData() +
+                        // flushGroupEOCHBOnly() will send the EOC DATA + HB shortly; a premature
+                        // GAP here would cause Connext to discard the EOC and never close the
+                        // coherent set.
                         if (sn < self.cache.next_sn and sn != (self.pending_eoc_sn orelse 0)) {
                             const eoc_gap = msg.submessage.SequenceNumberSet{
                                 .base = sn + 1,
@@ -1464,10 +1465,10 @@ pub const StatefulWriter = struct {
             const eoc_sn = self.cache.allocSn();
             if (defer_eoc) {
                 // Phase 1 of a two-phase flush (all coherent-access scopes): stash the
-                // EOC SN and return.  flushGroupEOC() sends EOC DATA + HB+GAP for all
-                // writers together so Connext completes all per-reader coherent sets at
-                // roughly the same time, preventing a subscriber poll from splitting a
-                // multi-topic coherent window.
+                // EOC SN and return.  sendCombinedEOCData() + flushGroupEOCHBOnly() send
+                // EOC DATA + HBs for all writers together so Connext completes all per-reader
+                // coherent sets at roughly the same time, preventing a subscriber poll from
+                // splitting a multi-topic coherent window.
                 self.pending_eoc_sn = eoc_sn;
                 self.coherent_pending_sns.clearRetainingCapacity();
                 return;
@@ -1541,7 +1542,7 @@ pub const StatefulWriter = struct {
         }
     }
 
-    /// Phase 3 of a publisher-level combined EOC flush (INSTANCE/TOPIC scopes).
+    /// Phase 3 of a publisher-level combined EOC flush (all coherent-access scopes).
     /// Called after the publisher has sent the combined EOC DATA via sendCombinedEOCData().
     /// Sends per-proxy HBs using the EOC SN stashed by takeEOCProxyInfos(), then clears it.
     /// No-op if no committed EOC is pending.

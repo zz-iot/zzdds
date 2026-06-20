@@ -184,7 +184,8 @@ pub const ProtocolWriter = struct {
         /// inline QoS PIDs are emitted (see CoherentFlushMode).
         /// `global_last_gsn`: group-wide last GSN across all writers; 0 = per-writer.
         /// When `defer_eoc` is true, the EOC DATA and HB are stashed (not sent) so the
-        /// caller can follow with flush_group_eoc() across all writers atomically.
+        /// caller can follow with sendCombinedEOCData() + flush_group_eoc_hb_only() across
+        /// all writers atomically.
         end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void,
 
         /// Send the deferred EOC DATA and HB+GAP stashed by end_coherent_set(defer_eoc=true).
