@@ -192,8 +192,9 @@ pub const ProtocolWriter = struct {
         flush_group_eoc: *const fn (ctx: *anyopaque) void,
 
         /// Collect EOC proxy infos for a publisher-level combined EOC send.
-        /// Moves pending_eoc_sn to committed_eoc_sn so flush_group_eoc_hb_only can
-        /// send HBs after the caller sends the combined UDP datagram.
+        /// Leaves pending_eoc_sn set so the background HB thread cannot send a
+        /// premature GAP before the caller delivers the combined EOC DATA.
+        /// flush_group_eoc_hb_only() will clear it after the combined send.
         /// Appends one EOCProxyInfo per (reader proxy, effective locator) pair.
         /// No-op if no EOC is pending.
         take_eoc_proxy_infos: *const fn (
@@ -212,8 +213,8 @@ pub const ProtocolWriter = struct {
             count: usize,
         ) void,
 
-        /// Send per-proxy HBs using the EOC SN stashed by take_eoc_proxy_infos.
-        /// Clears committed_eoc_sn.  No-op if no committed EOC is pending.
+        /// Send per-proxy HBs using the EOC SN held in pending_eoc_sn, then clears it.
+        /// No-op if no EOC is pending.
         flush_group_eoc_hb_only: *const fn (ctx: *anyopaque) void,
 
         /// Destroy this writer and release its resources.

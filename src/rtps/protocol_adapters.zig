@@ -212,8 +212,9 @@ pub const RtpsProtocolWriter = struct {
         self.writer.mu.lock();
         defer self.writer.mu.unlock();
         const eoc_sn = self.writer.pending_eoc_sn orelse return;
-        self.writer.committed_eoc_sn = eoc_sn;
-        self.writer.pending_eoc_sn = null;
+        // Do NOT clear pending_eoc_sn here — keep it set so the background HB
+        // thread cannot send a premature GAP before the EOC DATA is delivered.
+        // flushGroupEOCHBOnly() will read and clear it after the combined send.
         for (self.writer.reader_proxies.items) |*rp| {
             if (rp.suppress_live_data) continue;
             for (rp.effectiveLocators()) |loc| {
@@ -243,15 +244,23 @@ pub const RtpsProtocolWriter = struct {
 
         // Group by (locator, destination participant prefix). O(n²) is fine for
         // small n (typically writer_count × reader_proxy_count ≤ ~10).
-        const safe_len = @min(infos_slice.len, 64);
-        var sent = std.StaticBitSet(64).initEmpty();
-
-        for (infos_slice[0..safe_len], 0..) |entry0, i| {
-            if (sent.isSet(i)) continue;
+        // No cap: check whether this (locator, prefix) pair was already sent
+        // in a prior iteration rather than tracking via a fixed-size bitset.
+        for (infos_slice, 0..) |entry0, i| {
+            // Skip if a previous group already covered this (locator, prefix).
+            var handled = false;
+            for (infos_slice[0..i]) |prev| {
+                if (prev.locator.eql(entry0.locator) and
+                    prev.reader_guid.prefix.eql(entry0.reader_guid.prefix))
+                {
+                    handled = true;
+                    break;
+                }
+            }
+            if (handled) continue;
             var b = msg_builder.MessageBuilder.init(&scratch, self.writer.guid.prefix);
             b.addInfoDst(entry0.reader_guid.prefix);
-            for (infos_slice[0..safe_len], 0..) |entry, j| {
-                if (sent.isSet(j)) continue;
+            for (infos_slice) |entry| {
                 if (!entry.locator.eql(entry0.locator)) continue;
                 if (!entry.reader_guid.prefix.eql(entry0.reader_guid.prefix)) continue;
                 b.addData(.{
@@ -260,7 +269,6 @@ pub const RtpsProtocolWriter = struct {
                     .writer_sn = entry.eoc_sn,
                     .no_payload = true,
                 }, &.{});
-                sent.set(j);
             }
             writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};
         }

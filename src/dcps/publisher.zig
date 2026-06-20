@@ -435,22 +435,19 @@ pub const PublisherImpl = struct {
             const defer_eoc = mode == .full or mode == .coherent_only;
             for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn, defer_eoc);
             if (defer_eoc) {
-                if (mode == .coherent_only) {
-                    // INSTANCE/TOPIC scope: send all writers' EOC DATAs in a single UDP
-                    // datagram per destination so Connext's subscriber poll cannot split
-                    // a multi-topic coherent window across delivery iterations.
-                    var eoc_infos: std.ArrayListUnmanaged(proto.EOCProxyInfo) = .empty;
-                    defer eoc_infos.deinit(self.alloc);
-                    for (self.writers.items) |w| w.proto_writer.takeEOCProxyInfos(self.alloc, &eoc_infos) catch {};
-                    if (eoc_infos.items.len > 0) {
-                        self.writers.items[0].proto_writer.sendCombinedEOCData(eoc_infos.items);
-                    }
-                    for (self.writers.items) |w| w.proto_writer.flushGroupEOCHBOnly();
-                } else {
-                    // GROUP scope: sequential per-writer flush is fine; GROUP markers
-                    // provide atomicity at the subscriber independently of EOC timing.
-                    for (self.writers.items) |w| w.proto_writer.flushGroupEOC();
+                // Send all writers' EOC DATAs in a single UDP datagram per destination
+                // so Connext's subscriber poll cannot split a multi-topic coherent window
+                // across delivery iterations.  Applies to all coherent-access scopes:
+                // INSTANCE and TOPIC (coherent_only) as well as GROUP (full) — in both
+                // cases Connext triggers per-reader delivery when it sees the EOC DATA,
+                // so all EOCs must land in the same recvmsg() call to be atomic.
+                var eoc_infos: std.ArrayListUnmanaged(proto.EOCProxyInfo) = .empty;
+                defer eoc_infos.deinit(self.alloc);
+                for (self.writers.items) |w| w.proto_writer.takeEOCProxyInfos(self.alloc, &eoc_infos) catch {};
+                if (eoc_infos.items.len > 0) {
+                    self.writers.items[0].proto_writer.sendCombinedEOCData(eoc_infos.items);
                 }
+                for (self.writers.items) |w| w.proto_writer.flushGroupEOCHBOnly();
             }
         }
         return DDS.RETCODE_OK;
