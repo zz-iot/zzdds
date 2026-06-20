@@ -188,10 +188,6 @@ pub const ProtocolWriter = struct {
         /// all writers atomically.
         end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void,
 
-        /// Send the deferred EOC DATA and HB+GAP stashed by end_coherent_set(defer_eoc=true).
-        /// No-op if no EOC is pending.  Used as phase 2 of a GROUP coherent flush.
-        flush_group_eoc: *const fn (ctx: *anyopaque) void,
-
         /// Collect EOC proxy infos for a publisher-level combined EOC send.
         /// Leaves pending_eoc_sn set so the background HB thread cannot send a
         /// premature GAP before the caller delivers the combined EOC DATA.
@@ -296,10 +292,6 @@ pub const ProtocolWriter = struct {
 
     pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
         self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
-    }
-
-    pub fn flushGroupEOC(self: ProtocolWriter) void {
-        self.vtable.flush_group_eoc(self.ctx);
     }
 
     pub fn takeEOCProxyInfos(

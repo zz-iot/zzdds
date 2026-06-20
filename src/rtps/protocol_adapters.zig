@@ -86,7 +86,6 @@ pub const RtpsProtocolWriter = struct {
         .begin_coherent_set = vtBeginCoherentSet,
         .coherent_window_count = vtCoherentWindowCount,
         .end_coherent_set = vtEndCoherentSet,
-        .flush_group_eoc = vtFlushGroupEOC,
         .take_eoc_proxy_infos = vtTakeEOCProxyInfos,
         .send_combined_eoc_data = vtSendCombinedEOCData,
         .flush_group_eoc_hb_only = vtFlushGroupEOCHBOnly,
@@ -196,11 +195,6 @@ pub const RtpsProtocolWriter = struct {
     fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.writer.endCoherentSet(mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
-    }
-
-    fn vtFlushGroupEOC(ctx: *anyopaque) void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.flushGroupEOC();
     }
 
     fn vtTakeEOCProxyInfos(
