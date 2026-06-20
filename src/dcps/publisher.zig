@@ -427,14 +427,30 @@ pub const PublisherImpl = struct {
             // atomically inside writer.mu — no window where coherent_active=false.
             // Pass &group_seq_num_counter so all writers share a monotone GSN space.
             //
-            // For GROUP presentation, use a two-phase flush: send DATA for all writers
-            // first (defer_eoc=true), then send EOC+HB for all writers together.  This
-            // keeps per-writer EOC packets close together on the wire even when the
-            // sequential endCoherentSet calls are spread out in time (e.g. under TSAN).
-            const defer_eoc = mode == .full;
+            // Two-phase flush for any coherent-access mode (INSTANCE, TOPIC, GROUP):
+            // send DATA for all writers first (defer_eoc=true), then send EOC+HB for
+            // all writers together.  This keeps per-writer EOC packets close together
+            // on the wire so Connext completes all per-reader coherent sets at the same
+            // time, preventing a subscriber poll from splitting a multi-topic set.
+            const defer_eoc = mode == .full or mode == .coherent_only;
             for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn, defer_eoc);
             if (defer_eoc) {
-                for (self.writers.items) |w| w.proto_writer.flushGroupEOC();
+                if (mode == .coherent_only) {
+                    // INSTANCE/TOPIC scope: send all writers' EOC DATAs in a single UDP
+                    // datagram per destination so Connext's subscriber poll cannot split
+                    // a multi-topic coherent window across delivery iterations.
+                    var eoc_infos: std.ArrayListUnmanaged(proto.EOCProxyInfo) = .empty;
+                    defer eoc_infos.deinit(self.alloc);
+                    for (self.writers.items) |w| w.proto_writer.takeEOCProxyInfos(self.alloc, &eoc_infos) catch {};
+                    if (eoc_infos.items.len > 0) {
+                        self.writers.items[0].proto_writer.sendCombinedEOCData(eoc_infos.items);
+                    }
+                    for (self.writers.items) |w| w.proto_writer.flushGroupEOCHBOnly();
+                } else {
+                    // GROUP scope: sequential per-writer flush is fine; GROUP markers
+                    // provide atomicity at the subscriber independently of EOC timing.
+                    for (self.writers.items) |w| w.proto_writer.flushGroupEOC();
+                }
             }
         }
         return DDS.RETCODE_OK;

@@ -32,6 +32,18 @@ pub const SequenceNumberSet = submsg_mod.SequenceNumberSet;
 pub const FragmentNumberSet = submsg_mod.FragmentNumberSet;
 pub const DataFragSubmessage = submsg_mod.DataFragSubmessage;
 
+// ── Combined EOC types ────────────────────────────────────────────────────────
+
+/// One entry for a publisher-level combined EOC send.
+/// Collected per (reader proxy, locator) by take_eoc_proxy_infos() before the
+/// publisher sends all writers' EOC DATAs in a single UDP datagram per group.
+pub const EOCProxyInfo = struct {
+    locator: Locator,
+    reader_guid: Guid,
+    writer_guid: Guid,
+    eoc_sn: SequenceNumber,
+};
+
 // ── Matched endpoint information ──────────────────────────────────────────────
 
 /// Reliability class for a matched endpoint.  Mirrors the DDS QoS value but
@@ -179,6 +191,31 @@ pub const ProtocolWriter = struct {
         /// No-op if no EOC is pending.  Used as phase 2 of a GROUP coherent flush.
         flush_group_eoc: *const fn (ctx: *anyopaque) void,
 
+        /// Collect EOC proxy infos for a publisher-level combined EOC send.
+        /// Moves pending_eoc_sn to committed_eoc_sn so flush_group_eoc_hb_only can
+        /// send HBs after the caller sends the combined UDP datagram.
+        /// Appends one EOCProxyInfo per (reader proxy, effective locator) pair.
+        /// No-op if no EOC is pending.
+        take_eoc_proxy_infos: *const fn (
+            ctx: *anyopaque,
+            alloc: std.mem.Allocator,
+            out: *std.ArrayListUnmanaged(EOCProxyInfo),
+        ) anyerror!void,
+
+        /// Send EOC DATAs for all entries in `infos[0..count]` grouped by
+        /// (locator, destination participant prefix) as single UDP datagrams.
+        /// Uses this writer's transport.  Called once on the "leader" writer after
+        /// all writers have called take_eoc_proxy_infos.
+        send_combined_eoc_data: *const fn (
+            ctx: *anyopaque,
+            infos: [*]const EOCProxyInfo,
+            count: usize,
+        ) void,
+
+        /// Send per-proxy HBs using the EOC SN stashed by take_eoc_proxy_infos.
+        /// Clears committed_eoc_sn.  No-op if no committed EOC is pending.
+        flush_group_eoc_hb_only: *const fn (ctx: *anyopaque) void,
+
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
     };
@@ -261,6 +298,22 @@ pub const ProtocolWriter = struct {
 
     pub fn flushGroupEOC(self: ProtocolWriter) void {
         self.vtable.flush_group_eoc(self.ctx);
+    }
+
+    pub fn takeEOCProxyInfos(
+        self: ProtocolWriter,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(EOCProxyInfo),
+    ) anyerror!void {
+        return self.vtable.take_eoc_proxy_infos(self.ctx, alloc, out);
+    }
+
+    pub fn sendCombinedEOCData(self: ProtocolWriter, infos: []const EOCProxyInfo) void {
+        self.vtable.send_combined_eoc_data(self.ctx, infos.ptr, infos.len);
+    }
+
+    pub fn flushGroupEOCHBOnly(self: ProtocolWriter) void {
+        self.vtable.flush_group_eoc_hb_only(self.ctx);
     }
 
     pub fn deinit(self: ProtocolWriter) void {

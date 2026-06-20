@@ -353,6 +353,10 @@ pub const StatefulWriter = struct {
     /// EOC SN allocated by endCoherentSet(defer_eoc=true) but not yet sent.
     /// Consumed and cleared by flushGroupEOC().
     pending_eoc_sn: ?SequenceNumber,
+    /// EOC SN handed off to a publisher-level combined send via takeEOCProxyInfos().
+    /// Cleared and used by flushGroupEOCHBOnly() to send HBs after the combined
+    /// UDP datagram has been sent externally.
+    committed_eoc_sn: ?SequenceNumber,
     /// Optional callback fired when a liveness probe resolves.
     /// Called with (ctx, prefix, alive): alive=true means an ACKNACK was received;
     /// alive=false means the probe deadline expired and the proxy was removed.
@@ -396,6 +400,7 @@ pub const StatefulWriter = struct {
             .last_flushed_sn = 0,
             .group_seq_num_counter = 0,
             .pending_eoc_sn = null,
+            .committed_eoc_sn = null,
             .probe_result_fn = null,
             .probe_result_ctx = null,
         };
@@ -1436,9 +1441,11 @@ pub const StatefulWriter = struct {
         if (mode == .coherent_only or mode == .full) {
             const eoc_sn = self.cache.allocSn();
             if (defer_eoc) {
-                // Phase 1 of a two-phase GROUP flush: stash the EOC SN and return.
-                // flushGroupEOC() will send EOC DATA + HB+GAP for all writers together,
-                // ensuring Connext receives per-writer EOCs without large timing gaps.
+                // Phase 1 of a two-phase flush (all coherent-access scopes): stash the
+                // EOC SN and return.  flushGroupEOC() sends EOC DATA + HB+GAP for all
+                // writers together so Connext completes all per-reader coherent sets at
+                // roughly the same time, preventing a subscriber poll from splitting a
+                // multi-topic coherent window.
                 self.pending_eoc_sn = eoc_sn;
                 self.coherent_pending_sns.clearRetainingCapacity();
                 return;
@@ -1479,11 +1486,11 @@ pub const StatefulWriter = struct {
         self.coherent_pending_sns.clearRetainingCapacity();
     }
 
-    /// Phase 2 of a two-phase GROUP coherent flush (called after endCoherentSet with
-    /// defer_eoc=true has been called for all writers in the publisher).  Sends the
-    /// EOC DATA and per-proxy HB+GAP that were held back in phase 1, so that all
-    /// writers' EOCs arrive at the subscriber in rapid succession regardless of TSAN
-    /// or other timing effects from sequential per-writer endCoherentSet calls.
+    /// Phase 2 of a two-phase coherent flush (INSTANCE, TOPIC, and GROUP scopes).
+    /// Called after endCoherentSet(defer_eoc=true) for all writers in the publisher.
+    /// Sends the EOC DATA and per-proxy HB+GAP held back in phase 1 so all writers'
+    /// EOCs arrive at the subscriber in rapid succession regardless of TSAN or other
+    /// timing effects from sequential per-writer endCoherentSet calls.
     pub fn flushGroupEOC(self: *Self) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -1504,6 +1511,23 @@ pub const StatefulWriter = struct {
             }, &.{});
             for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
         }
+        const cache_last = self.cache.maxSn();
+        for (self.reader_proxies.items) |*rp| {
+            if (!rp.reliable) continue;
+            const proxy_eoc_sn = if (!rp.suppress_live_data) eoc_sn else null;
+            self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, proxy_eoc_sn);
+        }
+    }
+
+    /// Phase 3 of a publisher-level combined EOC flush (INSTANCE/TOPIC scopes).
+    /// Called after the publisher has sent the combined EOC DATA via sendCombinedEOCData().
+    /// Sends per-proxy HBs using the EOC SN stashed by takeEOCProxyInfos(), then clears it.
+    /// No-op if no committed EOC is pending.
+    pub fn flushGroupEOCHBOnly(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const eoc_sn = self.committed_eoc_sn orelse return;
+        self.committed_eoc_sn = null;
         const cache_last = self.cache.maxSn();
         for (self.reader_proxies.items) |*rp| {
             if (!rp.reliable) continue;

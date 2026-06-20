@@ -19,6 +19,7 @@ const history_mod = @import("history.zig");
 const guid_mod = @import("guid.zig");
 const trace_mod = @import("../trace.zig");
 const submsg_mod = @import("message/submessage.zig");
+const msg_builder = @import("message/builder.zig");
 
 pub const StatefulWriter = writer_sm.StatefulWriter;
 pub const StatefulReader = reader_sm.StatefulReader;
@@ -86,6 +87,9 @@ pub const RtpsProtocolWriter = struct {
         .coherent_window_count = vtCoherentWindowCount,
         .end_coherent_set = vtEndCoherentSet,
         .flush_group_eoc = vtFlushGroupEOC,
+        .take_eoc_proxy_infos = vtTakeEOCProxyInfos,
+        .send_combined_eoc_data = vtSendCombinedEOCData,
+        .flush_group_eoc_hb_only = vtFlushGroupEOCHBOnly,
         .deinit = vtDeinit,
     };
 
@@ -197,6 +201,74 @@ pub const RtpsProtocolWriter = struct {
     fn vtFlushGroupEOC(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.writer.flushGroupEOC();
+    }
+
+    fn vtTakeEOCProxyInfos(
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(protocol.EOCProxyInfo),
+    ) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.mu.lock();
+        defer self.writer.mu.unlock();
+        const eoc_sn = self.writer.pending_eoc_sn orelse return;
+        self.writer.committed_eoc_sn = eoc_sn;
+        self.writer.pending_eoc_sn = null;
+        for (self.writer.reader_proxies.items) |*rp| {
+            if (rp.suppress_live_data) continue;
+            for (rp.effectiveLocators()) |loc| {
+                try out.append(alloc, .{
+                    .locator = loc,
+                    .reader_guid = rp.guid,
+                    .writer_guid = self.writer.guid,
+                    .eoc_sn = eoc_sn,
+                });
+            }
+        }
+    }
+
+    fn vtSendCombinedEOCData(
+        ctx: *anyopaque,
+        infos: [*]const protocol.EOCProxyInfo,
+        count: usize,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const infos_slice = infos[0..count];
+        if (infos_slice.len == 0) return;
+
+        self.writer.mu.lock();
+        defer self.writer.mu.unlock();
+
+        var scratch: [msg_builder.SCRATCH_SIZE]u8 = undefined;
+
+        // Group by (locator, destination participant prefix). O(n²) is fine for
+        // small n (typically writer_count × reader_proxy_count ≤ ~10).
+        const safe_len = @min(infos_slice.len, 64);
+        var sent = std.StaticBitSet(64).initEmpty();
+
+        for (infos_slice[0..safe_len], 0..) |entry0, i| {
+            if (sent.isSet(i)) continue;
+            var b = msg_builder.MessageBuilder.init(&scratch, self.writer.guid.prefix);
+            b.addInfoDst(entry0.reader_guid.prefix);
+            for (infos_slice[0..safe_len], 0..) |entry, j| {
+                if (sent.isSet(j)) continue;
+                if (!entry.locator.eql(entry0.locator)) continue;
+                if (!entry.reader_guid.prefix.eql(entry0.reader_guid.prefix)) continue;
+                b.addData(.{
+                    .reader_entity_id = entry.reader_guid.entity_id,
+                    .writer_entity_id = entry.writer_guid.entity_id,
+                    .writer_sn = entry.eoc_sn,
+                    .no_payload = true,
+                }, &.{});
+                sent.set(j);
+            }
+            writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};
+        }
+    }
+
+    fn vtFlushGroupEOCHBOnly(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.flushGroupEOCHBOnly();
     }
 
     fn vtDeinit(ctx: *anyopaque) void {
