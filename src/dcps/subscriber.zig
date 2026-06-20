@@ -415,6 +415,14 @@ pub const SubscriberImpl = struct {
         var listener_snaps: std.ArrayListUnmanaged(ListenerSnap) = .empty;
         defer listener_snaps.deinit(self.alloc);
 
+        // Snapshot time before acquiring any lock — nanoTimestamp() is a vDSO call
+        // but still avoids holding the lock longer than necessary.  All readers in
+        // the loop are evaluated against the same instant, which is more consistent.
+        const now_ns = time_mod.nanoTimestamp();
+        // Maximum time to wait for the first DATA of a new coherent set before
+        // assuming the writer is idle and releasing the begin_access gate.
+        const coherent_idle_gate_ns: i64 = 5 * std.time.ns_per_s;
+
         self.mu.lock();
 
         // COHERENT ACCESS: commit all complete coherent sets atomically so the
@@ -426,10 +434,24 @@ pub const SubscriberImpl = struct {
             var any_committed = false;
             for (self.readers.items) |r| {
                 r.mu.lock();
-                // Block if any reader has incomplete WIP from any writer — delivering
-                // a committed set while another writer's contribution is still in
-                // transit would violate GROUP atomicity.
-                if (r.coherent_wip.count() > 0) all_ready = false;
+                const coherent_guids_pending = r.coherent_writer_guids.count() > 0 and
+                    r.pending.items.len == 0 and
+                    (now_ns - r.last_coherent_wip_start_ns < coherent_idle_gate_ns);
+                if (!r.coherent_committed_ready and r.sub_matched_current > 0 and
+                    (r.coherent_wip.count() > 0 or coherent_guids_pending))
+                {
+                    // Block when a coherent set is in-flight for this reader.
+                    // coherent_wip.count() > 0: end-marker hasn't arrived yet.
+                    // coherent_guids_pending: at least one currently-matched writer is
+                    //   coherent but its next set DATA hasn't arrived yet (sequential
+                    //   vtEndCoherent timing).  The 5 s window on last_coherent_wip_start_ns
+                    //   ensures an idle writer that stops sending never permanently stalls
+                    //   begin_access — after 5 s without a new WIP entry the gate opens.
+                    //   coherent_writer_guids is also cleared on writer departure for the
+                    //   same reason.  Requiring pending to be empty avoids stalling when a
+                    //   non-coherent writer has buffered data.
+                    all_ready = false;
+                }
                 if (r.coherent_committed_ready) any_committed = true;
                 r.mu.unlock();
             }
@@ -490,6 +512,11 @@ pub const SubscriberImpl = struct {
                         pendingLessThan,
                     ),
                 }
+                // Watermark: only serve samples present at begin_access time.
+                // New samples appended by the inbound path after this sort are
+                // withheld until end_access() clears the watermark, preventing
+                // unsorted arrivals from breaking the presentation-order guarantee.
+                r.ordered_access_watermark = r.pending.items.len;
                 r.mu.unlock();
             }
         }
@@ -506,7 +533,22 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtEndAccess(ctx: *anyopaque) DDS.ReturnCode_t {
-        _ = ctx;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const pres: DDS.PresentationQosPolicy = self.qos.presentation;
+        if (pres.ordered_access) {
+            for (self.readers.items) |r| {
+                r.mu.lock();
+                r.ordered_access_watermark = null;
+                // Items that arrived after begin_access() are now available.
+                // Re-arm DATA_AVAILABLE_STATUS so StatusCondition users wake
+                // on the next wait rather than missing the deferred samples.
+                if (r.pending.items.len > 0) {
+                    r.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+                    if (r.status_cond) |sc| sc.notifyWakeup();
+                }
+                r.mu.unlock();
+            }
+        }
         return DDS.RETCODE_OK;
     }
 

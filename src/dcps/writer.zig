@@ -440,8 +440,6 @@ pub const DataWriterImpl = struct {
         const self = cast(ctx);
         if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return DDS.RETCODE_OK;
         if (self.last_sn == 0) return DDS.RETCODE_OK;
-
-        const POLL_NS: u64 = 1_000_000; // 1 ms
         const deadline_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
             timeout.nanosec == DDS.DURATION_INFINITE_NSEC)
             null
@@ -449,16 +447,12 @@ pub const DataWriterImpl = struct {
             const now = time_mod.nanoTimestamp();
             break :blk now +
                 @as(i64, timeout.sec) * std.time.ns_per_s +
-                @as(i64, timeout.nanosec);
+                @as(i64, @intCast(timeout.nanosec));
         };
-
-        while (true) {
-            if (self.proto_writer.allAcked(self.last_sn)) return DDS.RETCODE_OK;
-            if (deadline_ns) |dl| {
-                if (time_mod.nanoTimestamp() >= dl) return DDS.RETCODE_TIMEOUT;
-            }
-            time_mod.sleepNs(POLL_NS);
-        }
+        return if (self.proto_writer.waitAllAcked(self.last_sn, deadline_ns))
+            DDS.RETCODE_OK
+        else
+            DDS.RETCODE_TIMEOUT;
     }
 
     fn vtGetLivelinessLost(ctx: *anyopaque, status: *DDS.LivelinessLostStatus) DDS.ReturnCode_t {

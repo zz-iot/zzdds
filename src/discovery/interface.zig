@@ -51,6 +51,9 @@ pub const QosSnapshot = struct {
     presentation_access_scope: u8 = 0,
     coherent_access: bool = false,
     ordered_access: bool = false,
+    // LIFESPAN QoS (DataWriter only). DDS INFINITE = {0x7fffffff, 0x7fffffff}.
+    lifespan_sec: i32 = 0x7fff_ffff,
+    lifespan_nanosec: u32 = 0x7fff_ffff,
 };
 
 /// Information about the local participant broadcast to remote peers.
@@ -80,6 +83,9 @@ pub const ParticipantAnnouncement = struct {
 pub const WriterAnnouncement = struct {
     guid: Guid,
     participant_guid: Guid,
+    /// Publisher group GUID for GROUP-scope coherent sets (PID_GROUP_GUID = 0x0052).
+    /// Null for writers not in a GROUP presentation publisher.
+    group_guid: ?Guid = null,
     topic_name: []const u8,
     type_name: []const u8,
     qos: QosSnapshot,

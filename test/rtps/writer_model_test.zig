@@ -252,7 +252,7 @@ fn runWriterScript(alloc: std.mem.Allocator, ops: []const WriterScriptOp) !void 
             },
             .end_coherent => {
                 if (model.coherent_active) {
-                    writer.endCoherentSet(.full, false, null, 0);
+                    writer.endCoherentSet(.full, false, null, 0, false);
                     model.endCoherent();
                 }
                 rec.reset();
@@ -391,7 +391,7 @@ test "writer model: AckNack does not retransmit samples still inside coherent wi
     const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 1, false);
 
-    writer.endCoherentSet(.full, false, null, 0);
+    writer.endCoherentSet(.full, false, null, 0, false);
     model.endCoherent();
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 2, false);
 }

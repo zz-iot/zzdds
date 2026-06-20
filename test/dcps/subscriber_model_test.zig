@@ -18,6 +18,7 @@ const testing = std.testing;
 
 const DataReaderImpl = dcps.DataReaderImpl;
 const PendingChange = dcps.PendingChange;
+const CoherentWipEntry = dcps.CoherentWipEntry;
 const SubscriberImpl = dcps.SubscriberImpl;
 
 const GUID_A = proto.Guid{
@@ -34,7 +35,6 @@ const ModelChange = struct {
 const ModelReader = struct {
     pending: std.ArrayListUnmanaged(ModelChange) = .empty,
     committed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(ModelChange)) = .empty,
-    wip_count: usize = 0,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.pending.deinit(alloc);
@@ -162,7 +162,6 @@ fn modelBeginAccess(
         var all_ready = true;
         var any_committed = false;
         for (readers) |r| {
-            if (r.wip_count > 0) all_ready = false;
             if (r.committed.items.len > 0) any_committed = true;
         }
         if (!any_committed) all_ready = false;
@@ -235,20 +234,20 @@ fn addCommitted(alloc: std.mem.Allocator, dr: *DataReaderImpl, changes: []const 
 }
 
 fn addWip(alloc: std.mem.Allocator, dr: *DataReaderImpl, writer_guid: proto.Guid, changes: []const ModelChange) !void {
-    var set: std.ArrayListUnmanaged(PendingChange) = .empty;
+    var entry: CoherentWipEntry = .{ .cs = 1 };
     errdefer {
-        for (set.items) |pc| pc.deinit();
-        set.deinit(alloc);
+        for (entry.samples.items) |pc| pc.deinit();
+        entry.samples.deinit(alloc);
     }
-    for (changes) |ch| try set.append(alloc, try makePending(alloc, ch));
-    try dr.coherent_wip.put(alloc, writer_guid, set);
+    for (changes) |ch| try entry.samples.append(alloc, try makePending(alloc, ch));
+    try dr.coherent_wip.put(alloc, writer_guid, entry);
 }
 
 fn clearWip(alloc: std.mem.Allocator, dr: *DataReaderImpl, writer_guid: proto.Guid) void {
     if (dr.coherent_wip.fetchRemove(writer_guid)) |kv| {
-        var set = kv.value;
-        for (set.items) |pc| pc.deinit();
-        set.deinit(alloc);
+        var entry = kv.value;
+        for (entry.samples.items) |pc| pc.deinit();
+        entry.samples.deinit(alloc);
     }
 }
 
@@ -289,7 +288,7 @@ test "subscriber model: begin_access exposes one committed coherent set per call
     try expectReaderMatchesModel(dr, &model);
 }
 
-test "subscriber model: incomplete coherent WIP blocks committed sets across readers" {
+test "subscriber model: WIP for next set does not block committed set delivery" {
     const alloc = testing.allocator;
     var presentation = DDS.PresentationQosPolicy{};
     presentation.coherent_access = true;
@@ -306,16 +305,17 @@ test "subscriber model: incomplete coherent WIP blocks committed sets across rea
     try m1.addCommitted(alloc, &.{.{ .id = 'A', .instance = 1 }});
     try addCommitted(alloc, dr2, &.{.{ .id = 'B', .instance = 2 }});
     try m2.addCommitted(alloc, &.{.{ .id = 'B', .instance = 2 }});
+    // dr2 also has WIP for the *next* coherent set — this must not block
+    // delivery of the already-committed set on dr2 or dr1.
     try addWip(alloc, dr2, GUID_A, &.{.{ .id = 'C', .instance = 2 }});
-    m2.wip_count = 1;
 
     try h.beginAccess();
     try modelBeginAccess(alloc, presentation, &.{ &m1, &m2 });
     try expectReaderMatchesModel(dr1, &m1);
     try expectReaderMatchesModel(dr2, &m2);
 
+    // Clearing the WIP changes nothing for the already-consumed committed sets.
     clearWip(alloc, dr2, GUID_A);
-    m2.wip_count = 0;
     try h.beginAccess();
     try modelBeginAccess(alloc, presentation, &.{ &m1, &m2 });
     try expectReaderMatchesModel(dr1, &m1);

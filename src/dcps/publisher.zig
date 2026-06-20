@@ -62,7 +62,7 @@ pub const ParticipantCbs = struct {
     /// Announce the writer identified by handle to the discovery layer.
     /// Called after register_incompat_qos so that synchronous discovery
     /// callbacks (e.g. DirectDiscovery) fire with the incompat callback already set.
-    announce_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void,
+    announce_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void,
 
     /// Clock passed to DataWriterImpl for DEADLINE and LIVELINESS interval timers.
     timer_clock: time_mod.Clock,
@@ -292,7 +292,7 @@ pub const PublisherImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        self.cbs.announce_writer(self.cbs.ctx, pub_handle, pname_slice, self.qos.presentation);
+        self.cbs.announce_writer(self.cbs.ctx, pub_handle, self.instance_handle, pname_slice, self.qos.presentation);
         self.mu.lock();
         self.writers.append(self.alloc, dw) catch {
             self.mu.unlock();
@@ -387,7 +387,7 @@ pub const PublisherImpl = struct {
         // writes — don't flush them here; end_coherent_changes will do it correctly.
         // Only flush with .none when there is no open coherent window.
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null, 0);
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null, 0, false);
         }
         return DDS.RETCODE_OK;
     }
@@ -411,7 +411,7 @@ pub const PublisherImpl = struct {
         self.coherent_depth -= 1;
         if (self.coherent_depth == 0) {
             const mode: proto.CoherentFlushMode = if (self.qos.presentation.coherent_access)
-                .full
+                if (self.qos.presentation.access_scope == .GROUP_PRESENTATION_QOS) .full else .coherent_only
             else
                 .group_seq_only;
             // Pre-count total coherent-window samples across all writers to compute
@@ -426,7 +426,32 @@ pub const PublisherImpl = struct {
             // Pass suspend_active as `resuspend` so the flush and re-arm happen
             // atomically inside writer.mu — no window where coherent_active=false.
             // Pass &group_seq_num_counter so all writers share a monotone GSN space.
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn);
+            //
+            // Two-phase flush for any coherent-access mode (INSTANCE, TOPIC, GROUP):
+            // send DATA for all writers first (defer_eoc=true), then send EOC+HB for
+            // all writers together.  This keeps per-writer EOC packets close together
+            // on the wire so Connext completes all per-reader coherent sets at the same
+            // time, preventing a subscriber poll from splitting a multi-topic set.
+            const defer_eoc = mode == .full or mode == .coherent_only;
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn, defer_eoc);
+            if (defer_eoc) {
+                if (mode == .coherent_only) {
+                    // INSTANCE/TOPIC scope: send all writers' EOC DATAs in a single UDP
+                    // datagram per destination so Connext's subscriber poll cannot split
+                    // a multi-topic coherent window across delivery iterations.
+                    var eoc_infos: std.ArrayListUnmanaged(proto.EOCProxyInfo) = .empty;
+                    defer eoc_infos.deinit(self.alloc);
+                    for (self.writers.items) |w| w.proto_writer.takeEOCProxyInfos(self.alloc, &eoc_infos) catch {};
+                    if (eoc_infos.items.len > 0) {
+                        self.writers.items[0].proto_writer.sendCombinedEOCData(eoc_infos.items);
+                    }
+                    for (self.writers.items) |w| w.proto_writer.flushGroupEOCHBOnly();
+                } else {
+                    // GROUP scope: sequential per-writer flush is fine; GROUP markers
+                    // provide atomicity at the subscriber independently of EOC timing.
+                    for (self.writers.items) |w| w.proto_writer.flushGroupEOC();
+                }
+            }
         }
         return DDS.RETCODE_OK;
     }

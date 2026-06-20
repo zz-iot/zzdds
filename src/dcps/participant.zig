@@ -1141,6 +1141,8 @@ pub const DomainParticipantImpl = struct {
         const dl_zero_w = qos.deadline.period.sec == 0 and qos.deadline.period.nanosec == 0;
         // Liveliness lease: {0,0} from codegen means unset → treat as infinite.
         const ll_zero_w = qos.liveliness.lease_duration.sec == 0 and qos.liveliness.lease_duration.nanosec == 0;
+        // Lifespan: {0,0} from codegen means unset → treat as infinite.
+        const ls_zero_w = qos.lifespan.duration.sec == 0 and qos.lifespan.duration.nanosec == 0;
         return .{
             .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
             .durability_kind = @as(u8, @truncate(@intFromEnum(qos.durability.kind))),
@@ -1162,6 +1164,8 @@ pub const DomainParticipantImpl = struct {
             .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
             .coherent_access = presentation.coherent_access,
             .ordered_access = presentation.ordered_access,
+            .lifespan_sec = if (ls_zero_w) 0x7fff_ffff else qos.lifespan.duration.sec,
+            .lifespan_nanosec = if (ls_zero_w) 0x7fff_ffff else qos.lifespan.duration.nanosec,
         };
     }
 
@@ -1220,8 +1224,12 @@ pub const DomainParticipantImpl = struct {
                     // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11),
                     // always big-endian regardless of message endianness.
                     const v = std.mem.readInt(u32, si[0..4], .big);
-                    if (v & 0x1 != 0) return .not_alive_disposed;
+                    // RTPS §8.6.3.5: NOT_ALIVE_DISPOSED_UNREGISTERED (0x3, both bits) is
+                    // treated as NOT_ALIVE_UNREGISTERED on the subscriber side — the writer
+                    // has departed, so instance_state = NOT_ALIVE_NO_WRITERS_INSTANCE_STATE.
+                    // Check UNREGISTERED first so that 0x3 maps to not_alive_unregistered.
                     if (v & 0x2 != 0) return .not_alive_unregistered;
+                    if (v & 0x1 != 0) return .not_alive_disposed;
                 }
             }
         }
@@ -1250,7 +1258,12 @@ pub const DomainParticipantImpl = struct {
                     const low = std.mem.readInt(u32, cs[4..8], order);
                     const h: i64 = @as(i64, high) << 32;
                     const l: i64 = @as(i64, low);
-                    return h | l;
+                    const sn = h | l;
+                    // Valid RTPS SNs start at 1.  SEQUENCENUMBER_UNKNOWN ({high=-1,low=MAX})
+                    // and any other non-positive value are end-of-coherent-set signals
+                    // (RTPS §9.6.4.2 Table 9.22 Example 2) — treat as non-coherent DATA.
+                    if (sn < 1) return null;
+                    return sn;
                 }
             }
         }
@@ -1352,7 +1365,6 @@ pub const DomainParticipantImpl = struct {
 
                     const writer_guid = Guid{ .prefix = src_prefix, .entity_id = d.writer_entity_id };
                     const kind = decodeChangeKind(d.inline_qos);
-                    if (kind == .alive and d.serialized_payload.len == 0) continue;
                     const key_hash = decodeKeyHash(d.inline_qos);
                     const coherent_set_sn = decodeCoherentSetSn(d.inline_qos, d.isLittleEndian());
                     const group_seq_num = decodeGroupSeqNum(d.inline_qos, d.isLittleEndian());
@@ -1585,6 +1597,12 @@ pub const DomainParticipantImpl = struct {
                 0 // infinite — no expiry tracking
             else
                 @as(i64, ll_sec) * std.time.ns_per_s + @as(i64, ll_ns);
+            const ls_sec = data.qos.lifespan_sec;
+            const ls_ns = data.qos.lifespan_nanosec;
+            const lifespan_ns: i64 = if (ls_sec == 0x7fff_ffff)
+                0 // infinite — no expiry
+            else
+                @as(i64, ls_sec) * std.time.ns_per_s + @as(i64, ls_ns);
             const info = proto.MatchedWriterInfo{
                 .guid = data.guid,
                 .unicast_locators = data.unicast_locators,
@@ -1592,6 +1610,7 @@ pub const DomainParticipantImpl = struct {
                 .reliability = if (data.qos.reliability_kind == 1) .reliable else .best_effort,
                 .ownership_strength = data.qos.ownership_strength,
                 .liveliness_lease_ns = lease_ns,
+                .lifespan_ns = lifespan_ns,
                 .history_expected = data.qos.durability_kind > 0 and data.qos.reliability_kind == 1,
             };
             ar.proto.addMatchedWriter(&info) catch {};
@@ -1792,7 +1811,7 @@ pub const DomainParticipantImpl = struct {
         if (names.len > 0) alloc.free(names);
     }
 
-    fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
+    fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
         // Find the writer and snapshot its announcement fields outside the lock.
         var ann_opt: ?struct {
@@ -1827,12 +1846,32 @@ pub const DomainParticipantImpl = struct {
             freePartitionNames(self.alloc, owned_names);
             return;
         };
+        // Derive group GUID for GROUP-scope coherent publishers (PID_GROUP_GUID).
+        // All writers in the same publisher share this GUID so that remote GROUP
+        // subscribers can associate them into the same coherent group.
+        const group_guid: ?Guid = if (presentation.coherent_access and
+            presentation.access_scope == .GROUP_PRESENTATION_QOS)
+        blk: {
+            const h: u32 = @bitCast(publisher_handle);
+            break :blk Guid{
+                .prefix = self.guid.prefix,
+                .entity_id = .{
+                    .entity_key = .{
+                        @truncate(h >> 16),
+                        @truncate(h >> 8),
+                        @truncate(h),
+                    },
+                    .entity_kind = guid_mod.EntityKind.writer_group,
+                },
+            };
+        } else null;
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
         var snap = writerQosSnapshot(ann.qos, ann.presentation);
         snap.partition_names = owned_names;
         self.discovery.announceWriter(&disc.WriterAnnouncement{
             .guid = ann.guid,
             .participant_guid = self.guid,
+            .group_guid = group_guid,
             .topic_name = ann.topic_name,
             .type_name = ann.type_name,
             .qos = snap,

@@ -146,6 +146,21 @@ fn countAllData(rec: *const Recording) usize {
     return n;
 }
 
+/// Find the first GAP submessage in captures.
+fn findGap(rec: *const Recording) ?msg.submessage.GapSubmessage {
+    for (rec.caps[0..rec.n]) |*cap| {
+        var it = MessageIterator.init(cap.buf[0..cap.len]) catch continue;
+        var params: [32]InlineQosParam = undefined;
+        while (it.next(&params) catch null) |sm| {
+            switch (sm) {
+                .gap => |g| return g,
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
 /// Find the first HEARTBEAT submessage in captures.
 fn findHeartbeat(rec: *const Recording) ?msg.submessage.HeartbeatSubmessage {
     for (rec.caps[0..rec.n]) |*cap| {
@@ -589,4 +604,78 @@ test "handleAckNack: ACKNACK clears probe and fires alive callback" {
     } else -1;
     w.mu.unlock();
     try testing.expectEqual(@as(i64, 0), deadline);
+}
+
+// ── Coherent HB cap ───────────────────────────────────────────────────────────
+
+test "sendHeartbeat: coherent_active caps last_sn to last_flushed_sn" {
+    // During an active coherent set, write() buffers SNs in coherent_pending_sns
+    // without sending them.  The background HB must not advertise these unsent SNs
+    // or subscriber WIPs will record an unachievable flush_target_sn.
+    // Covers writer_sm.zig lines 747-750.
+    const writer_guid = makeGuid(0x50, WRITER_EID);
+    const reader_guid = makeGuid(0x51, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    // makeWriterWithReader writes SNs 1-3 (all flushed → last_flushed_sn=3).
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    // Begin coherent set; write SN 4 — buffered, not sent, last_flushed_sn stays 3.
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "coherent");
+    rec.reset();
+
+    // Periodic HB must cap last_sn to last_flushed_sn (3), not cache max (4).
+    w.sendHeartbeat(true);
+
+    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
+}
+
+// ── EOC GAP in periodic HB ────────────────────────────────────────────────────
+
+test "sendHeartbeat: EOC GAP included for allocated-but-uncached SNs" {
+    // After endCoherentSet, the EOC SN is allocated (cache.next_sn advances) but
+    // not stored in the cache.  The next HB must include a GAP for that SN so
+    // reliable readers can retire it without perpetually NACKing it.
+    // Covers writer_sm.zig lines 779-785.
+    const writer_guid = makeGuid(0x52, WRITER_EID);
+    const reader_guid = makeGuid(0x53, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const t = rec.makeTransport();
+
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        t,
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+    rec.reset();
+
+    // Write 2 coherent samples then end the set.
+    // endCoherentSet allocates EOC SN=3 (via allocSn) — not stored in cache.
+    // After: cache_last=2, cache.next_sn=4, coherent_active=false.
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    w.endCoherentSet(.coherent_only, false, null, 0, false);
+    rec.reset();
+
+    // Periodic HB must include a GAP for the EOC SN range [3, 4).
+    w.sendHeartbeat(true);
+
+    const gap = findGap(&rec) orelse return error.NoGapFound;
+    try testing.expectEqual(@as(SequenceNumber, 3), gap.gap_start);
 }

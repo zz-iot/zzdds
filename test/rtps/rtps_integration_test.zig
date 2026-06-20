@@ -1309,12 +1309,12 @@ test "coherent_set: writes deferred until endCoherentSet" {
     writer.mu.unlock();
 
     // End coherent set with .full: patch all 3 changes and flush DATA.
-    writer.endCoherentSet(.full, false, null, 0);
+    writer.endCoherentSet(.full, false, null, 0, false);
 
-    // Verify coherent_set_sn is patched to last SN (3) on all 3 changes.
+    // Verify coherent_set_sn is patched to first SN (1) on all 3 changes.
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
-        try testing.expectEqual(@as(?SequenceNumber, 3), ch.coherent_set_sn);
+        try testing.expectEqual(@as(?SequenceNumber, 1), ch.coherent_set_sn);
     }
     writer.mu.unlock();
 
@@ -1376,7 +1376,7 @@ test "coherent_set: mode=none sends without PID_COHERENT_SET" {
     try write(writer, "y");
 
     // End with .none: changes sent but coherent_set_sn stays null.
-    writer.endCoherentSet(.none, false, null, 0);
+    writer.endCoherentSet(.none, false, null, 0, false);
 
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
@@ -1438,7 +1438,7 @@ test "coherent_set: mode=group_seq_only emits group_seq_num but not coherent_set
     try write(writer, "y");
 
     // .group_seq_only: group_seq_num is assigned, coherent_set_sn stays null.
-    writer.endCoherentSet(.group_seq_only, false, null, 0);
+    writer.endCoherentSet(.group_seq_only, false, null, 0, false);
 
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
@@ -1500,8 +1500,8 @@ test "coherent_set: multi-writer publisher shares GSN counter for global orderin
 
     // Flush both writers with a shared publisher counter (simulating vtEndCoherent).
     var shared_gsn: i64 = 0;
-    w1.endCoherentSet(.full, false, &shared_gsn, global_last_gsn); // W1: A=GSN1, C=GSN2; shared_gsn=2
-    w2.endCoherentSet(.full, false, &shared_gsn, global_last_gsn); // W2: B=GSN3; shared_gsn=3
+    w1.endCoherentSet(.full, false, &shared_gsn, global_last_gsn, false); // W1: A=GSN1, C=GSN2; shared_gsn=2
+    w2.endCoherentSet(.full, false, &shared_gsn, global_last_gsn, false); // W2: B=GSN3; shared_gsn=3
 
     // Verify W1's samples got globally-unique GSNs 1 and 2.
     w1.mu.lock();

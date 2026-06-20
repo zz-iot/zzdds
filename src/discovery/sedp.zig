@@ -135,14 +135,22 @@ fn readString(b: []const u8, le: bool) []const u8 {
     const end = 4 + slen - 1; // strip null
     return b[4..end];
 }
+// DDS QoS parameters in SEDP ParameterLists encode Duration_t as CDR {sec: i32,
+// nanosec: u32} — direct nanoseconds, NOT RTPS 1/2^32 fraction.
 fn readDeadlineDuration(b: []const u8, le: bool) time_mod.Duration {
     if (b.len < 8) return time_mod.Duration.infinite;
-    const wire = time_mod.RtpsDuration{ .seconds = readI32LE(b[0..], le), .fraction = readU32LE(b[4..], le) };
-    return wire.toDuration();
+    const d = time_mod.Duration{ .sec = readI32LE(b[0..], le), .nanosec = readU32LE(b[4..], le) };
+    if (d.isInfinite()) return time_mod.Duration.infinite;
+    return d;
 }
 
 fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
     try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
+}
+
+fn writeDdsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
+    try writeI32Le(alloc, buf, duration.sec);
+    try writeU32Le(alloc, buf, duration.nanosec);
 }
 
 fn snapshotDeadlineDuration(qos: QosSnapshot) time_mod.Duration {
@@ -165,6 +173,20 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
         ann.guid.entity_id.entity_key[2],
         ann.guid.entity_id.entity_kind,
     });
+
+    // PID_GROUP_GUID (0x0052): 16 bytes — publisher group GUID for GROUP coherent sets.
+    // Required so that Connext GROUP subscribers can associate writers into the same
+    // coherent group (publisherKey in PublicationBuiltinTopicData).
+    if (ann.group_guid) |gg| {
+        try writePidHdr(alloc, &buf, PidTable.GROUP_GUID, 16);
+        try buf.appendSlice(alloc, &gg.prefix.bytes);
+        try buf.appendSlice(alloc, &[_]u8{
+            gg.entity_id.entity_key[0],
+            gg.entity_id.entity_key[1],
+            gg.entity_id.entity_key[2],
+            gg.entity_id.entity_kind,
+        });
+    }
 
     // PID_TOPIC_NAME (0x0005)
     {
@@ -213,7 +235,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
+        try writeDdsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
     // Cyclone and OpenDDS use different on-wire representations for Duration_t
@@ -229,6 +251,11 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     try writePidHdr(alloc, &buf, PidTable.HISTORY, 8);
     try writeU32Le(alloc, &buf, ann.qos.history_kind);
     try writeI32Le(alloc, &buf, ann.qos.history_depth);
+    // PID_LIFESPAN: only emitted when not INFINITE (same pattern as DEADLINE).
+    if (ann.qos.lifespan_sec != 0x7fff_ffff or ann.qos.lifespan_nanosec != 0x7fff_ffff) {
+        try writePidHdr(alloc, &buf, PidTable.LIFESPAN, 8);
+        try writeDdsDuration(alloc, &buf, .{ .sec = ann.qos.lifespan_sec, .nanosec = ann.qos.lifespan_nanosec });
+    }
 
     // PID_DATA_REPRESENTATION: seq_len(4) + value(2) + pad(2) = 8 bytes.
     // Advertise a single representation matching the writer's QoS so that
@@ -335,7 +362,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
+        try writeDdsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
 
@@ -486,6 +513,13 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
                         // Map wire value: 0=XCDR1, 2=XCDR2. Store as 1/2.
                         qos.data_representation = if (id == 2) 2 else 1;
                     }
+                }
+            },
+            PidTable.LIFESPAN => {
+                if (v.len >= 8) {
+                    const dur = readDeadlineDuration(v, le);
+                    qos.lifespan_sec = dur.sec;
+                    qos.lifespan_nanosec = dur.nanosec;
                 }
             },
             PidTable.PARTITION, PidTable.PARTITION_LEGACY => {
@@ -914,15 +948,20 @@ pub const SedpEndpoints = struct {
                                     if (wid.eql(EntityIds.spdp_builtin_participant_writer)) {
                                         // SPDP BYE arriving on the metatraffic unicast port.
                                         if (self.spdp_bye_fn) |f| f(self.spdp_bye_ctx.?, src_prefix);
-                                    } else if (iqos.get(.key_hash)) |kh_bytes| {
-                                        if (kh_bytes.len >= 16) {
-                                            const ep_guid = keyHashToGuid(kh_bytes[0..16].*);
+                                    } else {
+                                        // Extract endpoint GUID: prefer PID_KEY_HASH in inline_qos
+                                        // (RTPS §9.6.3.6 MAY), fall back to PID_ENDPOINT_GUID in payload.
+                                        const ep_guid: ?Guid = if (iqos.get(.key_hash)) |kh_bytes|
+                                            if (kh_bytes.len >= 16) keyHashToGuid(kh_bytes[0..16].*) else null
+                                        else
+                                            guidFromDisposalPayload(d.serialized_payload);
+                                        if (ep_guid) |g| {
                                             if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
                                                 if (self.callbacks) |cbs|
-                                                    cbs.on_writer_lost(cbs.ctx, ep_guid);
+                                                    cbs.on_writer_lost(cbs.ctx, g);
                                             } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
                                                 if (self.callbacks) |cbs|
-                                                    cbs.on_reader_lost(cbs.ctx, ep_guid);
+                                                    cbs.on_reader_lost(cbs.ctx, g);
                                             }
                                         }
                                     }
@@ -1106,6 +1145,30 @@ fn guidToKeyHash(guid: Guid) [16]u8 {
     return kh;
 }
 
+/// Scan a PL-CDR disposal payload for PID_ENDPOINT_GUID and return the GUID.
+/// Called when PID_KEY_HASH is absent from inline_qos (RTPS §9.6.3.6: MAY).
+fn guidFromDisposalPayload(payload: []const u8) ?Guid {
+    if (payload.len < 4) return null;
+    const le = (payload[1] & 0x01) != 0;
+    var pos: usize = 4;
+    while (pos + 4 <= payload.len) {
+        const pid = readU16LE(payload[pos..], le);
+        const len = readU16LE(payload[pos + 2 ..], le);
+        pos += 4;
+        if (pid == PidTable.SENTINEL) break;
+        if (pos + len > payload.len) break;
+        const v = payload[pos .. pos + len];
+        pos += len;
+        if (pid == PidTable.ENDPOINT_GUID and v.len >= 16) {
+            return .{
+                .prefix = .{ .bytes = v[0..12].* },
+                .entity_id = .{ .entity_key = v[12..15].*, .entity_kind = v[15] },
+            };
+        }
+    }
+    return null;
+}
+
 /// Unpack a 16-byte key hash back into a GUID.
 fn keyHashToGuid(kh: [16]u8) Guid {
     return .{
@@ -1154,18 +1217,18 @@ test "readDeadlineDuration preserves explicit zero QoS duration" {
     try std.testing.expectEqual(time_mod.Duration.zero, readDeadlineDuration(&bytes, true));
 }
 
-test "readDeadlineDuration normalizes max-fraction QoS duration to DDS infinite" {
-    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff };
+test "readDeadlineDuration recognizes DDS infinite sentinel" {
+    // DDS Duration_t INFINITE = {sec=0x7fffffff, nanosec=0x7fffffff}
+    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0x7f };
     try std.testing.expect(readDeadlineDuration(&bytes, true).isInfinite());
 }
 
-test "readDeadlineDuration preserves finite QoS duration" {
-    const wire = time_mod.RtpsDuration.fromDuration(.{ .sec = 3, .nanosec = 1_000_000 });
+test "readDeadlineDuration reads sub-second DDS Duration_t" {
+    // OpenDDS encodes 250ms as {sec=0, nanosec=250000000} — direct nanoseconds.
     var bytes: [8]u8 = undefined;
-    std.mem.writeInt(i32, bytes[0..4], wire.seconds, .little);
-    std.mem.writeInt(u32, bytes[4..8], wire.fraction, .little);
+    std.mem.writeInt(i32, bytes[0..4], 0, .little);
+    std.mem.writeInt(u32, bytes[4..8], 250_000_000, .little);
     const dur = readDeadlineDuration(&bytes, true);
-    try std.testing.expectEqual(@as(i32, 3), dur.sec);
-    // 2^32-fraction can't represent 1ms exactly; round-trip is within 1 ns.
-    try std.testing.expect(dur.nanosec >= 999_999 and dur.nanosec <= 1_000_000);
+    try std.testing.expectEqual(@as(i32, 0), dur.sec);
+    try std.testing.expectEqual(@as(u32, 250_000_000), dur.nanosec);
 }

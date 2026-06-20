@@ -32,6 +32,18 @@ pub const SequenceNumberSet = submsg_mod.SequenceNumberSet;
 pub const FragmentNumberSet = submsg_mod.FragmentNumberSet;
 pub const DataFragSubmessage = submsg_mod.DataFragSubmessage;
 
+// ── Combined EOC types ────────────────────────────────────────────────────────
+
+/// One entry for a publisher-level combined EOC send.
+/// Collected per (reader proxy, locator) by take_eoc_proxy_infos() before the
+/// publisher sends all writers' EOC DATAs in a single UDP datagram per group.
+pub const EOCProxyInfo = struct {
+    locator: Locator,
+    reader_guid: Guid,
+    writer_guid: Guid,
+    eoc_sn: SequenceNumber,
+};
+
 // ── Matched endpoint information ──────────────────────────────────────────────
 
 /// Reliability class for a matched endpoint.  Mirrors the DDS QoS value but
@@ -57,6 +69,8 @@ pub const MatchedWriterInfo = struct {
     ownership_strength: i32 = 0,
     /// Liveliness lease duration in nanoseconds; 0 = infinite (no expiry tracking).
     liveliness_lease_ns: i64 = 0,
+    /// Lifespan duration in nanoseconds; 0 = infinite (no expiry).
+    lifespan_ns: i64 = 0,
     /// True when the writer offers TRANSIENT_LOCAL (or stronger) durability with RELIABLE
     /// reliability.  The reader must wait for history delivery before signalling completion
     /// of wait_for_historical_data.
@@ -74,6 +88,13 @@ pub const DataCallback = struct {
     /// Optional: called when gap processing marks `count` sequence numbers as
     /// irreversibly lost (never delivered). Called under the same lock as on_data.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
+    /// Optional: called when a valid (non-duplicate) HEARTBEAT arrives from a
+    /// writer.  Used to flush coherent WIP when no CS transition follows the set.
+    on_heartbeat: ?*const fn (ctx: *anyopaque, writer_guid: Guid, last_sn: SequenceNumber) void = null,
+    /// Optional: called when a Connext-style zero-payload alive DATA arrives with
+    /// no PID_COHERENT_SET — the end-of-coherent-set signal.  RTPS-level consumers
+    /// leave this null; the DCPS layer registers it to flush the coherent WIP.
+    on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
 };
 
 // ── ProtocolWriter ────────────────────────────────────────────────────────────
@@ -138,6 +159,12 @@ pub const ProtocolWriter = struct {
         /// excluded.  Returns true immediately when `target_sn` is 0.
         all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber) bool,
 
+        /// Block until every RELIABLE matched reader has acknowledged all changes
+        /// up to and including `target_sn`, or until `deadline_ns` (monotonic ns)
+        /// is reached.  Null `deadline_ns` waits indefinitely.
+        /// Returns true on success, false on timeout.
+        wait_all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber, deadline_ns: ?i64) bool,
+
         /// Return the current number of samples in the writer's history cache.
         /// Used to enforce RESOURCE_LIMITS.max_samples before writing.
         cache_len: *const fn (ctx: *anyopaque) usize,
@@ -156,7 +183,38 @@ pub const ProtocolWriter = struct {
         /// Flush a deferred coherent/ordered batch.  `mode` controls which
         /// inline QoS PIDs are emitted (see CoherentFlushMode).
         /// `global_last_gsn`: group-wide last GSN across all writers; 0 = per-writer.
-        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void,
+        /// When `defer_eoc` is true, the EOC DATA and HB are stashed (not sent) so the
+        /// caller can follow with flush_group_eoc() across all writers atomically.
+        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void,
+
+        /// Send the deferred EOC DATA and HB+GAP stashed by end_coherent_set(defer_eoc=true).
+        /// No-op if no EOC is pending.  Used as phase 2 of a GROUP coherent flush.
+        flush_group_eoc: *const fn (ctx: *anyopaque) void,
+
+        /// Collect EOC proxy infos for a publisher-level combined EOC send.
+        /// Moves pending_eoc_sn to committed_eoc_sn so flush_group_eoc_hb_only can
+        /// send HBs after the caller sends the combined UDP datagram.
+        /// Appends one EOCProxyInfo per (reader proxy, effective locator) pair.
+        /// No-op if no EOC is pending.
+        take_eoc_proxy_infos: *const fn (
+            ctx: *anyopaque,
+            alloc: std.mem.Allocator,
+            out: *std.ArrayListUnmanaged(EOCProxyInfo),
+        ) anyerror!void,
+
+        /// Send EOC DATAs for all entries in `infos[0..count]` grouped by
+        /// (locator, destination participant prefix) as single UDP datagrams.
+        /// Uses this writer's transport.  Called once on the "leader" writer after
+        /// all writers have called take_eoc_proxy_infos.
+        send_combined_eoc_data: *const fn (
+            ctx: *anyopaque,
+            infos: [*]const EOCProxyInfo,
+            count: usize,
+        ) void,
+
+        /// Send per-proxy HBs using the EOC SN stashed by take_eoc_proxy_infos.
+        /// Clears committed_eoc_sn.  No-op if no committed EOC is pending.
+        flush_group_eoc_hb_only: *const fn (ctx: *anyopaque) void,
 
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
@@ -218,6 +276,10 @@ pub const ProtocolWriter = struct {
         return self.vtable.all_acked(self.ctx, target_sn);
     }
 
+    pub fn waitAllAcked(self: ProtocolWriter, target_sn: SequenceNumber, deadline_ns: ?i64) bool {
+        return self.vtable.wait_all_acked(self.ctx, target_sn, deadline_ns);
+    }
+
     pub fn cacheLen(self: ProtocolWriter) usize {
         return self.vtable.cache_len(self.ctx);
     }
@@ -230,8 +292,28 @@ pub const ProtocolWriter = struct {
         return self.vtable.coherent_window_count(self.ctx);
     }
 
-    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64) void {
-        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn);
+    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
+        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
+    }
+
+    pub fn flushGroupEOC(self: ProtocolWriter) void {
+        self.vtable.flush_group_eoc(self.ctx);
+    }
+
+    pub fn takeEOCProxyInfos(
+        self: ProtocolWriter,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(EOCProxyInfo),
+    ) anyerror!void {
+        return self.vtable.take_eoc_proxy_infos(self.ctx, alloc, out);
+    }
+
+    pub fn sendCombinedEOCData(self: ProtocolWriter, infos: []const EOCProxyInfo) void {
+        self.vtable.send_combined_eoc_data(self.ctx, infos.ptr, infos.len);
+    }
+
+    pub fn flushGroupEOCHBOnly(self: ProtocolWriter) void {
+        self.vtable.flush_group_eoc_hb_only(self.ctx);
     }
 
     pub fn deinit(self: ProtocolWriter) void {
