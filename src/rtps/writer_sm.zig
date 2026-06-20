@@ -1565,6 +1565,11 @@ pub const StatefulWriter = struct {
         const first_sn_override: ?SequenceNumber = if (cache_first > 0) cache_first else 1;
         for (self.reader_proxies.items) |*rp| {
             if (!rp.reliable) continue;
+            // Skip history-replaying proxies: they never received the coherent DATA or EOC
+            // (sendChangeToAllLocked and takeEOCProxyInfos both skip suppress_live_data).
+            // Advertising eoc_sn to them would trigger an unnecessary NACK round-trip for an
+            // SN they can never receive.  The background HB handles their history range.
+            if (rp.suppress_live_data) continue;
             self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, false, cache_last, null, first_sn_override);
         }
     }
