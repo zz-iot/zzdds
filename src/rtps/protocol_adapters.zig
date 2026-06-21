@@ -405,7 +405,6 @@ pub const RtpsProtocolReader = struct {
         group_seq_num: ?history_mod.SequenceNumber,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (!self.reader.isWriterMatched(writer_guid)) return;
         const change = history_mod.CacheChange{
             .kind = kind,
             .writer_guid = writer_guid,
@@ -417,11 +416,15 @@ pub const RtpsProtocolReader = struct {
             .coherent_set_sn = coherent_set_sn,
             .group_seq_num = group_seq_num,
         };
-        // Signal liveliness: this writer is alive.
-        if (self.writer_match_cb) |cb| {
-            if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+        // Signal liveliness only for writers already matched; unmatched writers are
+        // handled by StatefulReader.handleData (buffered for reliable readers so the
+        // SEDP race — data arriving before the writer proxy is established — is recovered).
+        if (self.reader.isWriterMatched(writer_guid)) {
+            if (self.writer_match_cb) |cb| {
+                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+            }
         }
-        // handleData stores a copy in the cache; on error just drop.
+        // handleData stores a copy; unmatched reliable-reader data is buffered for replay.
         self.reader.handleData(writer_guid, change) catch {};
     }
 

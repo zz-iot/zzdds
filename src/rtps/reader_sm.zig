@@ -272,8 +272,13 @@ pub const StatefulReader = struct {
     /// delivered only when the sequence is contiguous (RTPS §8.4.8 RELIABLE semantics).
     /// When false, changes are delivered immediately on arrival (BEST_EFFORT).
     reliable: bool,
+    /// DATA received before the sending writer's proxy was established.
+    /// Keyed by writer GUID; drained and replayed in addMatchedWriter.
+    /// Bounded at MAX_UNMATCHED_BUFFER entries per writer to limit memory use.
+    pending_unmatched: std.AutoHashMapUnmanaged(Guid, std.ArrayListUnmanaged(CacheChange)),
 
     const Self = @This();
+    const MAX_UNMATCHED_BUFFER: usize = 64;
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -294,6 +299,7 @@ pub const StatefulReader = struct {
             .mu = .{},
             .tracer = trace.Tracer.noop(),
             .reliable = reliable,
+            .pending_unmatched = .empty,
         };
         return self;
     }
@@ -306,6 +312,12 @@ pub const StatefulReader = struct {
         for (self.writer_proxies.items) |*wp| wp.deinit(self.alloc);
         self.writer_proxies.deinit(self.alloc);
         self.cache.deinit();
+        var pu_it = self.pending_unmatched.valueIterator();
+        while (pu_it.next()) |list| {
+            for (list.items) |ch| self.alloc.free(ch.data);
+            list.deinit(self.alloc);
+        }
+        self.pending_unmatched.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -346,6 +358,18 @@ pub const StatefulReader = struct {
         }
         try self.writer_proxies.append(self.alloc, proxy);
         const new_wp = &self.writer_proxies.items[self.writer_proxies.items.len - 1];
+        // Replay any DATA that arrived in the window between first receiving data
+        // from this writer and the writer proxy being established (SEDP race).
+        // deliverChangeLocked makes its own copy, so we free our buffered copy afterward.
+        if (self.pending_unmatched.fetchRemove(new_wp.guid)) |kv| {
+            var pending = kv.value;
+            defer pending.deinit(self.alloc);
+            for (pending.items) |pending_change| {
+                defer self.alloc.free(pending_change.data);
+                if (new_wp.received.contains(pending_change.sequence_number)) continue;
+                self.deliverChangeLocked(new_wp, pending_change) catch {};
+            }
+        }
         // AckNack triggers TRANSIENT_LOCAL replay from both RELIABLE and BEST_EFFORT
         // writers.  For RELIABLE writers the heartbeat cycle also covers this; for
         // BEST_EFFORT writers (no periodic heartbeats per §8.4.15) this is the only
@@ -395,7 +419,13 @@ pub const StatefulReader = struct {
                 break;
             }
         }
-        if (wp == null) return;
+        if (wp == null) {
+            // For reliable readers, buffer the change so it can be replayed once the
+            // writer proxy is established (SEDP race: data arrives before discovery
+            // completes and addMatchedWriter is called).
+            if (self.reliable) self.bufferUnmatchedLocked(writer_guid, change) catch {};
+            return;
+        }
 
         const sn = change.sequence_number;
         if (wp.?.received.contains(sn)) {
@@ -407,6 +437,28 @@ pub const StatefulReader = struct {
             return;
         }
         try self.deliverChangeLocked(wp.?, change);
+    }
+
+    /// Buffer a change whose writer proxy has not yet been established.
+    /// Called under self.mu. Evicts the oldest entry when the per-writer cap is hit.
+    fn bufferUnmatchedLocked(self: *Self, writer_guid: Guid, change: CacheChange) !void {
+        const entry = try self.pending_unmatched.getOrPut(self.alloc, writer_guid);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        const list = entry.value_ptr;
+        for (list.items) |existing| {
+            if (existing.sequence_number == change.sequence_number) return;
+        }
+        if (list.items.len >= MAX_UNMATCHED_BUFFER) {
+            const evicted = list.orderedRemove(0);
+            self.alloc.free(evicted.data);
+        }
+        const data_copy = try self.alloc.dupe(u8, change.data);
+        var owned = change;
+        owned.data = data_copy;
+        list.append(self.alloc, owned) catch {
+            self.alloc.free(data_copy);
+            return error.OutOfMemory;
+        };
     }
 
     /// Handle a received DATA_FRAG submessage.  Accumulates fragments into a
@@ -853,6 +905,35 @@ const ZERO_TS: RtpsTimestamp = .{ .seconds = 0, .fraction = 0 };
 const NIL_IH = history_mod.INSTANCE_HANDLE_NIL;
 const NIL_KH = std.mem.zeroes([16]u8);
 
+// Stateless null transport for unit tests that don't exercise network I/O.
+const TestNullCtx = struct {
+    fn canReach(_: *anyopaque, _: *const Locator) bool {
+        return false;
+    }
+    fn send(_: *anyopaque, _: *const Locator, _: []const u8) anyerror!void {}
+    fn listen(_: *anyopaque, _: *const Locator, _: iface.ReceiveHandler) anyerror!void {}
+    fn joinMulticast(_: *anyopaque, _: *const Locator) anyerror!void {}
+    fn leaveMulticast(_: *anyopaque, _: *const Locator) void {}
+    fn unlisten(_: *anyopaque, _: *const Locator, _: iface.ReceiveHandler) void {}
+    fn unicastLocators(_: *anyopaque, out: *std.ArrayListUnmanaged(Locator), _: std.mem.Allocator) anyerror!void {
+        out.clearRetainingCapacity();
+    }
+    fn setLocatorChangeHandler(_: *anyopaque, _: ?iface.LocatorChangeHandler) void {}
+    fn close(_: *anyopaque) void {}
+};
+const test_null_vtable = Transport.Vtable{
+    .capabilities = .{},
+    .can_reach = TestNullCtx.canReach,
+    .send = TestNullCtx.send,
+    .listen = TestNullCtx.listen,
+    .join_multicast = TestNullCtx.joinMulticast,
+    .leave_multicast = TestNullCtx.leaveMulticast,
+    .unlisten = TestNullCtx.unlisten,
+    .unicast_locators = TestNullCtx.unicastLocators,
+    .set_locator_change_handler = TestNullCtx.setLocatorChangeHandler,
+    .close = TestNullCtx.close,
+};
+
 test "StatelessReader init and callback delivery" {
     var delivered: bool = false;
 
@@ -1163,4 +1244,95 @@ test "addMatchedWriter re-match preserves received set" {
     const proxy_count = reader.writer_proxies.items.len;
     reader.mu.unlock();
     try testing.expectEqual(@as(usize, 1), proxy_count);
+}
+
+test "StatefulReader buffers data from unmatched writer and replays on addMatchedWriter" {
+    // Regression: DATA arriving before addMatchedWriter was silently dropped.
+    // The fix buffers the change in pending_unmatched and drains it when the
+    // writer proxy is established.  For in-order SN=1 the replay delivers immediately.
+    var null_ctx: TestNullCtx = .{};
+    const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
+
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(10, 0xC7), null_transport, .keep_all, 0, true);
+    defer reader.deinit();
+
+    var delivered: usize = 0;
+    const Cb = struct {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+            const n: *usize = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+        }
+    };
+    reader.setCallback(.{ .ctx = &delivered, .on_data = Cb.onData });
+
+    const writer_guid = makeGuid(10, 0xC2);
+    var payload = [_]u8{ 0x00, 0x00, 0x00, 0x00 };
+    const change = CacheChange{
+        .kind = .alive,
+        .writer_guid = writer_guid,
+        .sequence_number = 1,
+        .source_timestamp = ZERO_TS,
+        .instance_handle = NIL_IH,
+        .key_hash = NIL_KH,
+        .data = &payload,
+    };
+
+    // DATA arrives before writer proxy exists — must be buffered, not dropped.
+    try reader.handleData(writer_guid, change);
+    try testing.expectEqual(@as(usize, 0), delivered);
+
+    // addMatchedWriter drains the buffer and replays SN=1 in-order → delivered.
+    const proxy = try WriterProxy.init(testing.allocator, writer_guid, &.{}, &.{}, true);
+    try reader.addMatchedWriter(proxy);
+    try testing.expectEqual(@as(usize, 1), delivered);
+}
+
+test "StatefulReader pending_unmatched: out-of-order replay delivered by heartbeat GAP fill" {
+    // Reproduces the CS_7 TSAN failure: DATA SN=30 arrives ~27ms before the
+    // writer proxy is established (SEDP processing delayed by TSAN overhead and
+    // participant.mu contention).  The change is buffered, then replayed as
+    // out-of-order when addMatchedWriter is called.  A subsequent empty HEARTBEAT
+    // (first_sn=30, last_sn=29) fills SNs 1-29 as virtual GAPs → cumulativeAck=29
+    // → deliverPendingLocked fires and delivers the buffered SN=30.
+    var null_ctx: TestNullCtx = .{};
+    const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
+
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(11, 0xC7), null_transport, .keep_all, 0, true);
+    defer reader.deinit();
+
+    var delivered: usize = 0;
+    const Cb = struct {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+            const n: *usize = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+        }
+    };
+    reader.setCallback(.{ .ctx = &delivered, .on_data = Cb.onData });
+
+    const writer_guid = makeGuid(11, 0xC2);
+    var payload = [_]u8{ 0x00, 0x00, 0x00, 0x00 };
+    const change = CacheChange{
+        .kind = .alive,
+        .writer_guid = writer_guid,
+        .sequence_number = 30,
+        .source_timestamp = ZERO_TS,
+        .instance_handle = NIL_IH,
+        .key_hash = NIL_KH,
+        .data = &payload,
+    };
+
+    // SN=30 arrives before writer proxy — buffered in pending_unmatched.
+    try reader.handleData(writer_guid, change);
+    try testing.expectEqual(@as(usize, 0), delivered);
+
+    // addMatchedWriter: SN=30 replayed as out-of-order (cumAck=0, need SN=1 first).
+    const proxy = try WriterProxy.init(testing.allocator, writer_guid, &.{}, &.{}, true);
+    try reader.addMatchedWriter(proxy);
+    try testing.expectEqual(@as(usize, 0), delivered); // still waiting for gap fill
+
+    // Empty HEARTBEAT (first_sn=30, last_sn=29): writer history starts at SN=30,
+    // so SNs 1-29 never existed.  Virtual GAP fill advances cumAck to 29 →
+    // deliverPendingLocked delivers the buffered SN=30.
+    reader.handleHeartbeat(writer_guid, 30, 29, 1, true);
+    try testing.expectEqual(@as(usize, 1), delivered);
 }
