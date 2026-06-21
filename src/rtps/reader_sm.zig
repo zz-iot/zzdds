@@ -276,6 +276,10 @@ pub const StatefulReader = struct {
     /// Keyed by writer GUID; drained and replayed in addMatchedWriter.
     /// Bounded at MAX_UNMATCHED_BUFFER entries per writer to limit memory use.
     pending_unmatched: std.AutoHashMapUnmanaged(Guid, std.ArrayListUnmanaged(CacheChange)),
+    /// In-progress DATA_FRAG reassembly for unmatched writers.
+    /// Keyed by writer GUID then SN. Completed assemblies move to pending_unmatched;
+    /// in-progress entries are migrated into the new WriterProxy in addMatchedWriter.
+    pending_unmatched_reassembly: std.AutoHashMapUnmanaged(Guid, std.AutoHashMapUnmanaged(SequenceNumber, ReassemblyEntry)),
 
     const Self = @This();
     const MAX_UNMATCHED_BUFFER: usize = 64;
@@ -300,6 +304,7 @@ pub const StatefulReader = struct {
             .tracer = trace.Tracer.noop(),
             .reliable = reliable,
             .pending_unmatched = .empty,
+            .pending_unmatched_reassembly = .empty,
         };
         return self;
     }
@@ -318,6 +323,13 @@ pub const StatefulReader = struct {
             list.deinit(self.alloc);
         }
         self.pending_unmatched.deinit(self.alloc);
+        var pur_it = self.pending_unmatched_reassembly.iterator();
+        while (pur_it.next()) |outer| {
+            var inner_it = outer.value_ptr.valueIterator();
+            while (inner_it.next()) |entry| entry.deinit(self.alloc);
+            outer.value_ptr.deinit(self.alloc);
+        }
+        self.pending_unmatched_reassembly.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -370,6 +382,17 @@ pub const StatefulReader = struct {
                 self.deliverChangeLocked(new_wp, pending_change) catch {};
             }
         }
+        // Migrate any in-progress DATA_FRAG reassembly that arrived before the proxy.
+        if (self.pending_unmatched_reassembly.fetchRemove(new_wp.guid)) |kv| {
+            var frag_map = kv.value;
+            var frag_it = frag_map.iterator();
+            while (frag_it.next()) |frag_entry| {
+                new_wp.reassembly.put(self.alloc, frag_entry.key_ptr.*, frag_entry.value_ptr.*) catch {
+                    frag_entry.value_ptr.deinit(self.alloc);
+                };
+            }
+            frag_map.deinit(self.alloc);
+        }
         // AckNack triggers TRANSIENT_LOCAL replay from both RELIABLE and BEST_EFFORT
         // writers.  For RELIABLE writers the heartbeat cycle also covers this; for
         // BEST_EFFORT writers (no periodic heartbeats per §8.4.15) this is the only
@@ -389,6 +412,14 @@ pub const StatefulReader = struct {
                 _ = self.writer_proxies.swapRemove(i);
             }
         }
+    }
+
+    /// Returns true if buffered-but-undelivered changes exist for the given writer.
+    /// Used by vtAddMatchedWriter to decide whether to fire on_writer_alive before replay.
+    pub fn hasPendingUnmatched(self: *Self, guid: Guid) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.pending_unmatched.contains(guid);
     }
 
     /// Returns true if the given GUID is currently in the writer proxy list.
@@ -461,9 +492,58 @@ pub const StatefulReader = struct {
         };
     }
 
+    /// Buffer a DATA_FRAG from an unmatched writer into pending_unmatched_reassembly.
+    /// Called under self.mu. When all fragments arrive the assembled change is moved
+    /// to pending_unmatched for replay in addMatchedWriter; otherwise the in-progress
+    /// ReassemblyEntry is migrated directly into the new WriterProxy.
+    fn bufferUnmatchedFragLocked(self: *Self, writer_guid: Guid, df: msg.submessage.DataFragSubmessage) !void {
+        if (df.fragment_size == 0 or df.data_size == 0) return;
+        const sn = df.writer_sn;
+        const total_frags: u32 = (df.data_size + df.fragment_size - 1) / df.fragment_size;
+
+        const outer = try self.pending_unmatched_reassembly.getOrPut(self.alloc, writer_guid);
+        if (!outer.found_existing) outer.value_ptr.* = .empty;
+
+        if (outer.value_ptr.getPtr(sn) == null) {
+            const data = try self.alloc.alloc(u8, df.data_size);
+            errdefer self.alloc.free(data);
+            var received = try std.DynamicBitSet.initEmpty(self.alloc, total_frags);
+            errdefer received.deinit();
+            try outer.value_ptr.put(self.alloc, sn, .{
+                .data = data,
+                .data_size = df.data_size,
+                .fragment_size = df.fragment_size,
+                .total_frags = total_frags,
+                .received = received,
+            });
+        }
+
+        const entry = outer.value_ptr.getPtr(sn).?;
+        entry.receiveFrag(df.fragment_starting_num, df.fragments_in_submessage, df.serialized_payload);
+
+        if (!entry.isComplete()) return;
+
+        // Assembled — promote to pending_unmatched so addMatchedWriter replays it.
+        // bufferUnmatchedLocked dupes entry.data, so we free the original afterward.
+        const change = CacheChange{
+            .kind = .alive,
+            .writer_guid = writer_guid,
+            .sequence_number = sn,
+            .source_timestamp = time_mod.RtpsTimestamp.now(),
+            .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
+            .key_hash = std.mem.zeroes([16]u8),
+            .data = entry.data,
+        };
+        try self.bufferUnmatchedLocked(writer_guid, change);
+        var removed = outer.value_ptr.fetchRemove(sn).?;
+        removed.value.received.deinit();
+        self.alloc.free(removed.value.data);
+    }
+
     /// Handle a received DATA_FRAG submessage.  Accumulates fragments into a
     /// reassembly buffer; delivers the complete change once all fragments arrive.
-    /// Silently ignores data from unmatched writers or already-delivered SNs.
+    /// For reliable readers, fragments from unmatched writers are buffered in
+    /// pending_unmatched_reassembly and migrated to the WriterProxy in addMatchedWriter.
     pub fn handleDataFrag(self: *Self, writer_guid: Guid, df: msg.submessage.DataFragSubmessage) !void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -475,7 +555,10 @@ pub const StatefulReader = struct {
                 break;
             }
         }
-        if (wp == null) return;
+        if (wp == null) {
+            if (self.reliable) self.bufferUnmatchedFragLocked(writer_guid, df) catch {};
+            return;
+        }
 
         const sn = df.writer_sn;
         if (wp.?.received.contains(sn)) return; // already delivered
