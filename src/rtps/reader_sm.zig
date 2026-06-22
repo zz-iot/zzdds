@@ -473,7 +473,10 @@ pub const StatefulReader = struct {
         if (!self.pending_unmatched.contains(writer_guid) and
             self.pending_unmatched.count() >= MAX_UNMATCHED_WRITERS) return;
         const entry = try self.pending_unmatched.getOrPut(self.alloc, writer_guid);
-        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+            errdefer _ = self.pending_unmatched.remove(writer_guid);
+        }
         const list = entry.value_ptr;
         for (list.items) |existing| {
             if (existing.sequence_number == change.sequence_number) return;
@@ -503,7 +506,10 @@ pub const StatefulReader = struct {
         if (!self.pending_unmatched_reassembly.contains(writer_guid) and
             self.pending_unmatched_reassembly.count() >= MAX_UNMATCHED_WRITERS) return;
         const outer = try self.pending_unmatched_reassembly.getOrPut(self.alloc, writer_guid);
-        if (!outer.found_existing) outer.value_ptr.* = .empty;
+        if (!outer.found_existing) {
+            outer.value_ptr.* = .empty;
+            errdefer _ = self.pending_unmatched_reassembly.remove(writer_guid);
+        }
 
         if (outer.value_ptr.getPtr(sn) == null) {
             const data = try self.alloc.alloc(u8, df.data_size);
@@ -535,7 +541,7 @@ pub const StatefulReader = struct {
             .key_hash = std.mem.zeroes([16]u8),
             .data = entry.data,
         };
-        try self.bufferUnmatchedLocked(writer_guid, change);
+        self.bufferUnmatchedLocked(writer_guid, change) catch {};
         var removed = outer.value_ptr.fetchRemove(sn).?;
         removed.value.received.deinit();
         self.alloc.free(removed.value.data);
