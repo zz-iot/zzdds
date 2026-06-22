@@ -361,14 +361,14 @@ pub const RtpsProtocolReader = struct {
         // Mark the proxy as awaiting history delivery when the remote writer offers
         // TRANSIENT_LOCAL (or stronger) history with RELIABLE reliability.
         proxy.history_established = !info.history_expected;
+        try self.reader.addMatchedWriter(proxy);
+        // Fire on_writer_alive after addMatchedWriter succeeds so DCPS never sees
+        // a liveliness signal for a GUID that failed to be inserted as a proxy.
         // A matched writer is alive by definition (it just sent SEDP announcements).
-        // Fire before addMatchedWriter so DCPS sees the liveliness signal before
-        // any data replayed from pending_unmatched is delivered under addMatchedWriter's lock.
         if (self.writer_match_cb) |cb| {
             if (cb.on_writer_alive) |f| f(cb.ctx, info.guid);
+            cb.on_writer_matched(cb.ctx, info);
         }
-        try self.reader.addMatchedWriter(proxy);
-        if (self.writer_match_cb) |cb| cb.on_writer_matched(cb.ctx, info);
     }
 
     fn vtRemoveMatchedWriter(ctx: *anyopaque, guid: Guid) void {
@@ -443,9 +443,12 @@ pub const RtpsProtocolReader = struct {
         final: bool,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // A heartbeat also proves the writer is alive.
-        if (self.writer_match_cb) |cb| {
-            if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+        // A heartbeat proves the writer is alive, but only signal DCPS if the
+        // writer is already matched — unmatched senders should not inject liveliness.
+        if (self.reader.isWriterMatched(writer_guid)) {
+            if (self.writer_match_cb) |cb| {
+                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+            }
         }
         self.reader.handleHeartbeat(writer_guid, first_sn, last_sn, count, final);
     }
