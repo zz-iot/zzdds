@@ -1512,7 +1512,7 @@ pub const StatefulWriter = struct {
     /// Phase 3 of a publisher-level combined EOC flush (all coherent-access scopes).
     /// Called after the publisher has sent the combined EOC DATA via sendCombinedEOCData().
     /// Sends per-proxy HBs using the EOC SN stashed by takeEOCProxyInfos(), then clears it.
-    /// No-op if no committed EOC is pending.
+    /// No-op if no pending EOC is set.
     pub fn flushGroupEOCHBOnly(self: *Self) void {
         self.mu.lock();
         defer self.mu.unlock();

@@ -283,6 +283,10 @@ pub const StatefulReader = struct {
 
     const Self = @This();
     const MAX_UNMATCHED_BUFFER: usize = 64;
+    /// Maximum number of distinct writer GUIDs buffered across pending_unmatched
+    /// and pending_unmatched_reassembly. Prevents unbounded map growth from
+    /// spoofed or misbehaving senders flooding with synthetic GUIDs.
+    const MAX_UNMATCHED_WRITERS: usize = 32;
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -414,14 +418,6 @@ pub const StatefulReader = struct {
         }
     }
 
-    /// Returns true if buffered-but-undelivered changes exist for the given writer.
-    /// Used by vtAddMatchedWriter to decide whether to fire on_writer_alive before replay.
-    pub fn hasPendingUnmatched(self: *Self, guid: Guid) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        return self.pending_unmatched.contains(guid);
-    }
-
     /// Returns true if the given GUID is currently in the writer proxy list.
     /// Used by the RTPS message dispatcher to skip allocation for unmatched data.
     pub fn isWriterMatched(self: *Self, guid: Guid) bool {
@@ -472,7 +468,10 @@ pub const StatefulReader = struct {
 
     /// Buffer a change whose writer proxy has not yet been established.
     /// Called under self.mu. Evicts the oldest entry when the per-writer cap is hit.
+    /// Drops the change if the total unmatched-writer GUID count is at capacity.
     fn bufferUnmatchedLocked(self: *Self, writer_guid: Guid, change: CacheChange) !void {
+        if (!self.pending_unmatched.contains(writer_guid) and
+            self.pending_unmatched.count() >= MAX_UNMATCHED_WRITERS) return;
         const entry = try self.pending_unmatched.getOrPut(self.alloc, writer_guid);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         const list = entry.value_ptr;
@@ -501,6 +500,8 @@ pub const StatefulReader = struct {
         const sn = df.writer_sn;
         const total_frags: u32 = (df.data_size + df.fragment_size - 1) / df.fragment_size;
 
+        if (!self.pending_unmatched_reassembly.contains(writer_guid) and
+            self.pending_unmatched_reassembly.count() >= MAX_UNMATCHED_WRITERS) return;
         const outer = try self.pending_unmatched_reassembly.getOrPut(self.alloc, writer_guid);
         if (!outer.found_existing) outer.value_ptr.* = .empty;
 

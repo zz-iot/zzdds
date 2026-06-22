@@ -361,12 +361,11 @@ pub const RtpsProtocolReader = struct {
         // Mark the proxy as awaiting history delivery when the remote writer offers
         // TRANSIENT_LOCAL (or stronger) history with RELIABLE reliability.
         proxy.history_established = !info.history_expected;
-        // Fire on_writer_alive before addMatchedWriter so DCPS sees the liveliness
-        // signal before any data replayed from pending_unmatched is delivered.
-        if (self.reader.hasPendingUnmatched(info.guid)) {
-            if (self.writer_match_cb) |cb| {
-                if (cb.on_writer_alive) |f| f(cb.ctx, info.guid);
-            }
+        // A matched writer is alive by definition (it just sent SEDP announcements).
+        // Fire before addMatchedWriter so DCPS sees the liveliness signal before
+        // any data replayed from pending_unmatched is delivered under addMatchedWriter's lock.
+        if (self.writer_match_cb) |cb| {
+            if (cb.on_writer_alive) |f| f(cb.ctx, info.guid);
         }
         try self.reader.addMatchedWriter(proxy);
         if (self.writer_match_cb) |cb| cb.on_writer_matched(cb.ctx, info);
