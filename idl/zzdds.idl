@@ -1,0 +1,153 @@
+// zzdds-specific DCPS extensions.
+//
+// This file is the source-of-truth sketch for APIs that are intentionally
+// outside the OMG DDS DCPS IDL. Keep idl/dcps.idl normative and put vendor
+// extensions here.
+
+import DDS;
+
+module zzdds {
+
+    typedef sequence<string> StringSeq;
+    typedef sequence<octet>  OctetSeq;
+
+    enum GuidStrategy {
+        GUID_SPEC_RANDOM,
+        GUID_HOST_BASED,
+        GUID_FULLY_RANDOM
+    };
+
+    enum DiscoveryKind {
+        DISCOVERY_SPDP,
+        DISCOVERY_STATIC,
+        DISCOVERY_BROKER
+    };
+
+    enum ReliabilityKind {
+        RELIABILITY_BEST_EFFORT,
+        RELIABILITY_RELIABLE
+    };
+
+    enum DurabilityKind {
+        DURABILITY_VOLATILE,
+        DURABILITY_TRANSIENT_LOCAL
+    };
+
+    enum HistoryKind {
+        HISTORY_KEEP_LAST,
+        HISTORY_KEEP_ALL
+    };
+
+    enum WriteKind {
+        WRITE_ALIVE,
+        WRITE_DISPOSE,
+        WRITE_UNREGISTER
+    };
+
+    struct DomainConfig {
+        unsigned long id;
+    };
+
+    struct ParticipantConfig {
+        string       name;
+        unsigned long lease_duration_ms;
+        unsigned long announcement_period_ms;
+        GuidStrategy guid_strategy;
+        string       timer_clock_name;
+    };
+
+    struct UdpConfig {
+        boolean enabled;
+        boolean ipv4_enabled;
+        boolean ipv6_enabled;
+        unsigned short port_base;
+        unsigned short domain_gain;
+        unsigned short participant_gain;
+        unsigned long  participant_id;
+        boolean        has_participant_id;
+        StringSeq      interfaces;
+        string         multicast_group_v4;
+        string         multicast_group_v6;
+        octet          multicast_ttl;
+        StringSeq      initial_peers;
+        boolean        bind_wildcard;
+        unsigned long  recv_buffer_size;
+        unsigned long  interface_poll_interval_ms;
+    };
+
+    struct TcpConfig {
+        string  bind_address;
+        boolean reuse_connection_by_host;
+    };
+
+    struct TransportConfig {
+        UdpConfig udp;
+        TcpConfig tcp;
+    };
+
+    struct RtpsConfig {
+        unsigned short fragment_size;
+    };
+
+    struct DiscoveryConfig {
+        DiscoveryKind kind;
+        StringSeq     initial_peers;
+        string        static_config_file;
+    };
+
+    struct QosDefaults {
+        ReliabilityKind reliability_kind;
+        DurabilityKind  durability_kind;
+        HistoryKind     history_kind;
+        long            history_depth;
+    };
+
+    struct DomainParticipantConfig {
+        DomainConfig      domain;
+        ParticipantConfig participant;
+        TransportConfig   transport;
+        RtpsConfig        rtps;
+        DiscoveryConfig   discovery;
+        QosDefaults       qos;
+    };
+
+    struct SerializedSample {
+        OctetSeq             cdr;
+        DDS::InstanceHandle_t instance_handle;
+        boolean              valid_data;
+        unsigned long        instance_state;
+    };
+
+    interface DomainParticipantFactory : DDS::DomainParticipantFactory {
+        DDS::DomainParticipant create_participant_ex(
+            in DDS::DomainId_t                   domain_id,
+            in DDS::DomainParticipantQos         qos,
+            in DDS::DomainParticipantListener    a_listener,
+            in DDS::StatusMask                   mask,
+            in DomainParticipantConfig           config);
+    };
+
+    interface DomainParticipant : DDS::DomainParticipant {
+        DDS::ReturnCode_t register_type_support(
+            in string type_name);
+    };
+
+    interface Topic : DDS::Topic {
+        DDS::TopicDescription as_topic_description();
+    };
+
+    interface DataWriter : DDS::DataWriter {
+        DDS::ReturnCode_t write_serialized(
+            in WriteKind kind,
+            in OctetSeq key_hash,
+            in OctetSeq cdr);
+    };
+
+    interface DataReader : DDS::DataReader {
+        DDS::ReturnCode_t take_serialized(
+            inout SerializedSample sample);
+        DDS::ReturnCode_t take_next_instance_serialized(
+            in DDS::InstanceHandle_t previous_instance,
+            inout SerializedSample sample);
+    };
+};

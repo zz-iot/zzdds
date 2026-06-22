@@ -38,6 +38,12 @@ with `zidl -b <lang>`. Lives in the user's project. Imports from the installed
 DDS API package (e.g. `from zzdds import DomainParticipant`) and calls into
 the CDR companion library (or uses inline CDR for managed-runtime languages).
 
+`zzdds_c.h` is a support ABI for generated wrappers, not the preferred
+application-facing API. User code should normally use generated DDS bindings and
+the zzdds extension IDL surface from `idl/zzdds.idl`; generated topic wrappers
+call the small byte-oriented support functions when they need raw writes, raw
+takes, loan return, or C callback-backed TypeSupport registration.
+
 ---
 
 ## C binding API design
@@ -116,6 +122,8 @@ zig build -Dc-binding=true      # dcps.h + zidl_cdr.h → zig-out/include/
                                  # libzzdds.so         → zig-out/lib/
 zig build -Dcpp-binding=true    # implies -Dc-binding; also dcps.hpp
 zig build -Djava-binding=true   # Java sources         → zig-out/java/
+zig build test-bindings -Dc-binding=true -Dcpp-binding=true
+                                # compile/run Zig, C, and C++ generated wrapper smoke tests
 ```
 
 Zig is always built (it is the runtime, not a binding). Python, .NET, and Rust

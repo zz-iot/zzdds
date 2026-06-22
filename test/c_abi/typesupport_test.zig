@@ -86,7 +86,7 @@ test "c_abi TypeSupport: zzdds_register_type_support_c wires compute_key_hash" {
     defer fx.deinit();
 
     const rc = c_abi_ts.zzdds_register_type_support_c(
-        fx.impl(),
+        fx.dp,
         "TestType",
         stubComputeKeyHashFromCdr,
     );
@@ -114,7 +114,7 @@ test "c_abi TypeSupport: NULL compute_key_hash registers zeroed-hash fallback" {
     defer fx.deinit();
 
     const rc = c_abi_ts.zzdds_register_type_support_c(
-        fx.impl(),
+        fx.dp,
         "KeylessType",
         null,
     );

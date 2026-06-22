@@ -150,6 +150,46 @@ test "bootstrap: write_raw and take_one_raw round-trip" {
     try testing.expect(info.valid_data);
 }
 
+test "bootstrap: write_raw_kind dispose produces not-alive sample" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const rc = bootstrap.zzdds_write_raw_kind(pair.dw, .dispose, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    try testing.expectEqual(@as(DDS.ReturnCode_t, 0), rc);
+
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    const n = bootstrap.zzdds_take_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    try testing.expectEqual(@as(c_int, 1), n);
+    try testing.expect(!info.valid_data);
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, info.instance_state);
+}
+
+test "bootstrap: take_loaned_raw and return_loaned_raw" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+
+    var loan: bootstrap.CLoanedSample = undefined;
+    var info: bootstrap.CSampleInfo = undefined;
+    const n = bootstrap.zzdds_take_loaned_raw(pair.dr, &loan, &info);
+    try testing.expectEqual(@as(c_int, 1), n);
+    try testing.expect(info.valid_data);
+    try testing.expectEqual(PAYLOAD.len, loan.data_len);
+    try testing.expectEqualSlices(u8, &PAYLOAD, loan.data[0..loan.data_len]);
+    try testing.expect(loan.owner != null);
+
+    bootstrap.zzdds_return_loaned_raw(pair.dr, &loan);
+    try testing.expectEqual(@as(usize, 0), loan.data_len);
+    try testing.expect(loan.owner == null);
+}
+
 test "bootstrap: take_one_raw returns 0 when queue is empty" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
