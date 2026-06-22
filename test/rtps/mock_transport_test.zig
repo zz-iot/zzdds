@@ -91,7 +91,7 @@ const ReaderDispatch = struct {
             },
             .data_frag => |df| {
                 const wguid = Guid{ .prefix = src, .entity_id = df.writer_entity_id };
-                self.reader.handleDataFrag(wguid, df) catch {};
+                self.reader.handleDataFrag(wguid, RtpsTimestamp.invalid, df) catch {};
             },
             .heartbeat => |hb| {
                 const wguid = Guid{ .prefix = src, .entity_id = hb.writer_entity_id };

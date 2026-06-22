@@ -184,16 +184,14 @@ pub const ProtocolWriter = struct {
         /// inline QoS PIDs are emitted (see CoherentFlushMode).
         /// `global_last_gsn`: group-wide last GSN across all writers; 0 = per-writer.
         /// When `defer_eoc` is true, the EOC DATA and HB are stashed (not sent) so the
-        /// caller can follow with flush_group_eoc() across all writers atomically.
+        /// caller can follow with sendCombinedEOCData() + flush_group_eoc_hb_only() across
+        /// all writers atomically.
         end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void,
 
-        /// Send the deferred EOC DATA and HB+GAP stashed by end_coherent_set(defer_eoc=true).
-        /// No-op if no EOC is pending.  Used as phase 2 of a GROUP coherent flush.
-        flush_group_eoc: *const fn (ctx: *anyopaque) void,
-
         /// Collect EOC proxy infos for a publisher-level combined EOC send.
-        /// Moves pending_eoc_sn to committed_eoc_sn so flush_group_eoc_hb_only can
-        /// send HBs after the caller sends the combined UDP datagram.
+        /// Leaves pending_eoc_sn set so the background HB thread cannot send a
+        /// premature GAP before the caller delivers the combined EOC DATA.
+        /// flush_group_eoc_hb_only() will clear it after the combined send.
         /// Appends one EOCProxyInfo per (reader proxy, effective locator) pair.
         /// No-op if no EOC is pending.
         take_eoc_proxy_infos: *const fn (
@@ -212,8 +210,8 @@ pub const ProtocolWriter = struct {
             count: usize,
         ) void,
 
-        /// Send per-proxy HBs using the EOC SN stashed by take_eoc_proxy_infos.
-        /// Clears committed_eoc_sn.  No-op if no committed EOC is pending.
+        /// Send per-proxy HBs using the EOC SN held in pending_eoc_sn, then clears it.
+        /// No-op if no EOC is pending.
         flush_group_eoc_hb_only: *const fn (ctx: *anyopaque) void,
 
         /// Destroy this writer and release its resources.
@@ -294,10 +292,6 @@ pub const ProtocolWriter = struct {
 
     pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
         self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
-    }
-
-    pub fn flushGroupEOC(self: ProtocolWriter) void {
-        self.vtable.flush_group_eoc(self.ctx);
     }
 
     pub fn takeEOCProxyInfos(
@@ -400,6 +394,7 @@ pub const ProtocolReader = struct {
         handle_data_frag: *const fn (
             ctx: *anyopaque,
             writer_guid: Guid,
+            source_timestamp: RtpsTimestamp,
             df: DataFragSubmessage,
         ) void,
 
@@ -498,9 +493,10 @@ pub const ProtocolReader = struct {
     pub fn handleDataFrag(
         self: ProtocolReader,
         writer_guid: Guid,
+        source_timestamp: RtpsTimestamp,
         df: DataFragSubmessage,
     ) void {
-        self.vtable.handle_data_frag(self.ctx, writer_guid, df);
+        self.vtable.handle_data_frag(self.ctx, writer_guid, source_timestamp, df);
     }
 
     pub fn handleHeartbeatFrag(

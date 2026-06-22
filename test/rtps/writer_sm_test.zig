@@ -634,13 +634,14 @@ test "sendHeartbeat: coherent_active caps last_sn to last_flushed_sn" {
     try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
 }
 
-// ── EOC GAP in periodic HB ────────────────────────────────────────────────────
+// ── EOC SN in periodic HB ─────────────────────────────────────────────────────
 
-test "sendHeartbeat: EOC GAP included for allocated-but-uncached SNs" {
+test "sendHeartbeat: EOC SN advertised in HB lastSN for pull-based recovery" {
     // After endCoherentSet, the EOC SN is allocated (cache.next_sn advances) but
-    // not stored in the cache.  The next HB must include a GAP for that SN so
-    // reliable readers can retire it without perpetually NACKing it.
-    // Covers writer_sm.zig lines 779-785.
+    // not stored in the cache.  The background HB must advertise lastSN=eoc_sn so
+    // readers can NACK it if missed; the NACK handler then responds with GAP(eoc_sn).
+    // Sending an inline GAP here would race with Connext processing the EOC DATA.
+    // Covers writer_sm.zig lines 778-789.
     const writer_guid = makeGuid(0x52, WRITER_EID);
     const reader_guid = makeGuid(0x53, READER_EID);
     const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
@@ -673,9 +674,11 @@ test "sendHeartbeat: EOC GAP included for allocated-but-uncached SNs" {
     w.endCoherentSet(.coherent_only, false, null, 0, false);
     rec.reset();
 
-    // Periodic HB must include a GAP for the EOC SN range [3, 4).
+    // Periodic HB must advertise lastSN=3 (the EOC SN), not just lastSN=2 (cache max).
+    // No inline GAP should be emitted — recovery is NACK-driven via the NACK handler.
     w.sendHeartbeat(true);
 
-    const gap = findGap(&rec) orelse return error.NoGapFound;
-    try testing.expectEqual(@as(SequenceNumber, 3), gap.gap_start);
+    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
+    try testing.expectEqual(null, findGap(&rec));
 }

@@ -351,12 +351,10 @@ pub const StatefulWriter = struct {
     /// Incremented by N after each group coherent set of N samples is flushed.
     group_seq_num_counter: i64,
     /// EOC SN allocated by endCoherentSet(defer_eoc=true) but not yet sent.
-    /// Consumed and cleared by flushGroupEOC().
+    /// Consumed and cleared by flushGroupEOCHBOnly().
+    /// Kept non-null from endCoherentSet() through to flushGroupEOCHBOnly() so
+    /// the background HB thread never sends a premature GAP for the EOC SN.
     pending_eoc_sn: ?SequenceNumber,
-    /// EOC SN handed off to a publisher-level combined send via takeEOCProxyInfos().
-    /// Cleared and used by flushGroupEOCHBOnly() to send HBs after the combined
-    /// UDP datagram has been sent externally.
-    committed_eoc_sn: ?SequenceNumber,
     /// Optional callback fired when a liveness probe resolves.
     /// Called with (ctx, prefix, alive): alive=true means an ACKNACK was received;
     /// alive=false means the probe deadline expired and the proxy was removed.
@@ -400,7 +398,6 @@ pub const StatefulWriter = struct {
             .last_flushed_sn = 0,
             .group_seq_num_counter = 0,
             .pending_eoc_sn = null,
-            .committed_eoc_sn = null,
             .probe_result_fn = null,
             .probe_result_ctx = null,
         };
@@ -636,9 +633,18 @@ pub const StatefulWriter = struct {
     }
 
     fn sendHeartbeatToProxyLockedWithLastSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber, extra_gap_sn: ?SequenceNumber) void {
+        self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, final, last_sn, extra_gap_sn, null);
+    }
+
+    fn sendHeartbeatToProxyLockedWithLastSnAndFirstSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber, extra_gap_sn: ?SequenceNumber, first_sn_override: ?SequenceNumber) void {
         const locs = rp.effectiveLocators();
         const cache_first = self.cache.minSn();
-        const hb_first_sn = @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
+        // When last_sn=0 (empty-cache / coherent-write-in-progress convention), force
+        // firstSN=1 regardless of rp.start_sn.  An empty HB announces writer presence;
+        // using start_sn here poisons Connext's GROUP coherent set floor before any data
+        // arrives, causing it to reject GROUP deliveries whose coherent_set_sn < start_sn.
+        const hb_first_sn = first_sn_override orelse
+            if (last_sn == 0) @as(SequenceNumber, 1) else @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
         if (locs.len == 0) return;
         self.hb_count += 1;
         const first_sn = hb_first_sn;
@@ -650,6 +656,21 @@ pub const StatefulWriter = struct {
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
+        // When first_sn is overridden below rp.start_sn (GROUP EOC flush with a
+        // late-matching VOLATILE reader), send a GAP for the pre-match range
+        // [first_sn_override, rp.start_sn) so the reader retires those SNs
+        // rather than NACKing them indefinitely.  The writer cannot retransmit
+        // them (start_sn guard), so the GAP is the only way to unblock delivery.
+        if (first_sn_override) |fsn| {
+            if (rp.start_sn > 0 and fsn < rp.start_sn) {
+                const pre_start_gap = msg.submessage.SequenceNumberSet{
+                    .base = rp.start_sn,
+                    .num_bits = 0,
+                    .bitmap = std.mem.zeroes([8]u32),
+                };
+                b.addGap(rp.guid.entity_id, self.guid.entity_id, fsn, pre_start_gap);
+            }
+        }
         // Send an explicit GAP for KEEP_LAST-evicted SNs alongside the HB so
         // readers permanently retire missing SNs and avoid accumulating state.
         if (cache_first > 0 and rp.start_sn > 0 and cache_first > rp.start_sn) {
@@ -753,8 +774,17 @@ pub const StatefulWriter = struct {
         // Cap last_sn to last_flushed_sn — the highest SN actually delivered to
         // readers so far.  This ensures the background HB only describes data the
         // subscriber can achieve as WIP highest_sn (EOC SNs are gapped, not data).
+        //
+        // After a two-phase GROUP EOC flush (pending_eoc_sn cleared by flushGroupEOCHBOnly),
+        // include the sent EOC SN in the advertised range: cache.next_sn - 1 is the EOC
+        // marker that was sent via sendCombinedEOCData.  This lets readers NACK the EOC SN
+        // if they missed it; the NACK handler then responds with GAP(eoc_sn) — the only
+        // race-free way to retire an uncached EOC SN.
+        const allocated_last = self.cache.next_sn -% 1;
         const adj_last: SequenceNumber = if (self.coherent_active)
             self.last_flushed_sn
+        else if (self.pending_eoc_sn == null and allocated_last > cache_last)
+            allocated_last
         else
             cache_last;
 
@@ -762,8 +792,13 @@ pub const StatefulWriter = struct {
             if (!rp.reliable) continue; // BEST_EFFORT readers do not use HEARTBEAT/ACKNACK
             const locs = rp.effectiveLocators();
             if (locs.len == 0) continue;
-            const first_sn = @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
             const last_sn = adj_last;
+            // When last_sn=0 (empty or coherent-write-in-progress), force firstSN=1
+            // to avoid poisoning Connext's GROUP coherent set floor with rp.start_sn.
+            const first_sn = if (last_sn == 0)
+                @as(SequenceNumber, 1)
+            else
+                @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
             // RTPS requires first_sn <= last_sn (except the empty-cache first=1,last=0
             // convention).  The coherent cap can push last_sn below the proxy's start_sn
             // — skip rather than send a malformed submessage.
@@ -781,19 +816,6 @@ pub const StatefulWriter = struct {
                     .bitmap = std.mem.zeroes([8]u32),
                 };
                 b.addGap(rp.guid.entity_id, self.guid.entity_id, rp.start_sn, gap_list);
-            }
-            // Include a GAP for allocated-but-uncached SNs above cache_last (EOC markers).
-            // Reliable readers that missed the endCoherentSet HB+GAP can retire the EOC
-            // SN here instead of perpetually NACKing it and blocking pending_changes.
-            // Skip when pending_eoc_sn is set: the EOC hasn't been sent yet (two-phase
-            // GROUP flush), so GAPping it now would cause Connext to discard the EOC.
-            if (!self.coherent_active and self.pending_eoc_sn == null and self.cache.next_sn > cache_last + 1) {
-                const eoc_gap = msg.submessage.SequenceNumberSet{
-                    .base = self.cache.next_sn,
-                    .num_bits = 0,
-                    .bitmap = std.mem.zeroes([8]u32),
-                };
-                b.addGap(rp.guid.entity_id, self.guid.entity_id, cache_last + 1, eoc_gap);
             }
             b.addHeartbeat(
                 rp.guid.entity_id,
@@ -979,9 +1001,10 @@ pub const StatefulWriter = struct {
                         // SN is allocated but absent from the history cache — it was
                         // reserved via allocSn() for a wire-only EOC marker.  Reply with
                         // a GAP so the reader can retire the SN and unblock pending_changes.
-                        // Skip if this is the pending two-phase EOC: flushGroupEOC() will
-                        // send the EOC DATA + GAP shortly; a premature GAP here would cause
-                        // Connext to discard the EOC and never close the coherent set.
+                        // Skip if this is the pending two-phase EOC: sendCombinedEOCData() +
+                        // flushGroupEOCHBOnly() will send the EOC DATA + HB shortly; a premature
+                        // GAP here would cause Connext to discard the EOC and never close the
+                        // coherent set.
                         if (sn < self.cache.next_sn and sn != (self.pending_eoc_sn orelse 0)) {
                             const eoc_gap = msg.submessage.SequenceNumberSet{
                                 .base = sn + 1,
@@ -1442,10 +1465,10 @@ pub const StatefulWriter = struct {
             const eoc_sn = self.cache.allocSn();
             if (defer_eoc) {
                 // Phase 1 of a two-phase flush (all coherent-access scopes): stash the
-                // EOC SN and return.  flushGroupEOC() sends EOC DATA + HB+GAP for all
-                // writers together so Connext completes all per-reader coherent sets at
-                // roughly the same time, preventing a subscriber poll from splitting a
-                // multi-topic coherent window.
+                // EOC SN and return.  sendCombinedEOCData() + flushGroupEOCHBOnly() send
+                // EOC DATA + HBs for all writers together so Connext completes all per-reader
+                // coherent sets at roughly the same time, preventing a subscriber poll from
+                // splitting a multi-topic coherent window.
                 self.pending_eoc_sn = eoc_sn;
                 self.coherent_pending_sns.clearRetainingCapacity();
                 return;
@@ -1486,53 +1509,35 @@ pub const StatefulWriter = struct {
         self.coherent_pending_sns.clearRetainingCapacity();
     }
 
-    /// Phase 2 of a two-phase coherent flush (INSTANCE, TOPIC, and GROUP scopes).
-    /// Called after endCoherentSet(defer_eoc=true) for all writers in the publisher.
-    /// Sends the EOC DATA and per-proxy HB+GAP held back in phase 1 so all writers'
-    /// EOCs arrive at the subscriber in rapid succession regardless of TSAN or other
-    /// timing effects from sequential per-writer endCoherentSet calls.
-    pub fn flushGroupEOC(self: *Self) void {
+    /// Phase 3 of a publisher-level combined EOC flush (all coherent-access scopes).
+    /// Called after the publisher has sent the combined EOC DATA via sendCombinedEOCData().
+    /// Sends per-proxy HBs using the EOC SN stashed by takeEOCProxyInfos(), then clears it.
+    /// No-op if no pending EOC is set.
+    pub fn flushGroupEOCHBOnly(self: *Self) void {
         self.mu.lock();
         defer self.mu.unlock();
         const eoc_sn = self.pending_eoc_sn orelse return;
         self.pending_eoc_sn = null;
-        var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
+        // Advertise lastSN=eoc_sn (not just cache.maxSn()) so Connext learns the full
+        // committed range including the EOC marker.  If Connext missed the EOC DATA
+        // packet it will NACK eoc_sn; the NACK handler responds with GAP(eoc_sn) which
+        // is the only safe time to retire it — after the DATA has been in flight long
+        // enough for Connext to have received it (pull-based recovery, no race).
+        const cache_last = eoc_sn;
+        const cache_first = self.cache.minSn();
+        // Override first_sn to cache.minSn() rather than max(cache.minSn(), rp.start_sn):
+        // all coherent SNs are sent to readers regardless of start_sn (sendChangeToAllLocked
+        // has no start_sn guard), so advertising firstSN=start_sn would make Connext think
+        // the coherent set started after the coherent_set_sn, causing it to reject GROUP delivery.
+        const first_sn_override: ?SequenceNumber = if (cache_first > 0) cache_first else 1;
         for (self.reader_proxies.items) |*rp| {
+            if (!rp.reliable) continue;
+            // Skip history-replaying proxies: they never received the coherent DATA or EOC
+            // (sendChangeToAllLocked and takeEOCProxyInfos both skip suppress_live_data).
+            // Advertising eoc_sn to them would trigger an unnecessary NACK round-trip for an
+            // SN they can never receive.  The background HB handles their history range.
             if (rp.suppress_live_data) continue;
-            const locs = rp.effectiveLocators();
-            if (locs.len == 0) continue;
-            var b = MessageBuilder.init(&eoc_scratch, self.guid.prefix);
-            b.addInfoDst(rp.guid.prefix);
-            b.addData(.{
-                .reader_entity_id = rp.guid.entity_id,
-                .writer_entity_id = self.guid.entity_id,
-                .writer_sn = eoc_sn,
-                .no_payload = true,
-            }, &.{});
-            for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
-        }
-        const cache_last = self.cache.maxSn();
-        for (self.reader_proxies.items) |*rp| {
-            if (!rp.reliable) continue;
-            const proxy_eoc_sn = if (!rp.suppress_live_data) eoc_sn else null;
-            self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, proxy_eoc_sn);
-        }
-    }
-
-    /// Phase 3 of a publisher-level combined EOC flush (INSTANCE/TOPIC scopes).
-    /// Called after the publisher has sent the combined EOC DATA via sendCombinedEOCData().
-    /// Sends per-proxy HBs using the EOC SN stashed by takeEOCProxyInfos(), then clears it.
-    /// No-op if no committed EOC is pending.
-    pub fn flushGroupEOCHBOnly(self: *Self) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        const eoc_sn = self.committed_eoc_sn orelse return;
-        self.committed_eoc_sn = null;
-        const cache_last = self.cache.maxSn();
-        for (self.reader_proxies.items) |*rp| {
-            if (!rp.reliable) continue;
-            const proxy_eoc_sn = if (!rp.suppress_live_data) eoc_sn else null;
-            self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, proxy_eoc_sn);
+            self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, false, cache_last, null, first_sn_override);
         }
     }
 

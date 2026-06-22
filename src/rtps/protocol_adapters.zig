@@ -86,7 +86,6 @@ pub const RtpsProtocolWriter = struct {
         .begin_coherent_set = vtBeginCoherentSet,
         .coherent_window_count = vtCoherentWindowCount,
         .end_coherent_set = vtEndCoherentSet,
-        .flush_group_eoc = vtFlushGroupEOC,
         .take_eoc_proxy_infos = vtTakeEOCProxyInfos,
         .send_combined_eoc_data = vtSendCombinedEOCData,
         .flush_group_eoc_hb_only = vtFlushGroupEOCHBOnly,
@@ -198,11 +197,6 @@ pub const RtpsProtocolWriter = struct {
         self.writer.endCoherentSet(mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
     }
 
-    fn vtFlushGroupEOC(ctx: *anyopaque) void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.flushGroupEOC();
-    }
-
     fn vtTakeEOCProxyInfos(
         ctx: *anyopaque,
         alloc: std.mem.Allocator,
@@ -212,8 +206,9 @@ pub const RtpsProtocolWriter = struct {
         self.writer.mu.lock();
         defer self.writer.mu.unlock();
         const eoc_sn = self.writer.pending_eoc_sn orelse return;
-        self.writer.committed_eoc_sn = eoc_sn;
-        self.writer.pending_eoc_sn = null;
+        // Do NOT clear pending_eoc_sn here — keep it set so the background HB
+        // thread cannot send a premature GAP before the EOC DATA is delivered.
+        // flushGroupEOCHBOnly() will read and clear it after the combined send.
         for (self.writer.reader_proxies.items) |*rp| {
             if (rp.suppress_live_data) continue;
             for (rp.effectiveLocators()) |loc| {
@@ -243,15 +238,23 @@ pub const RtpsProtocolWriter = struct {
 
         // Group by (locator, destination participant prefix). O(n²) is fine for
         // small n (typically writer_count × reader_proxy_count ≤ ~10).
-        const safe_len = @min(infos_slice.len, 64);
-        var sent = std.StaticBitSet(64).initEmpty();
-
-        for (infos_slice[0..safe_len], 0..) |entry0, i| {
-            if (sent.isSet(i)) continue;
+        // No cap: check whether this (locator, prefix) pair was already sent
+        // in a prior iteration rather than tracking via a fixed-size bitset.
+        for (infos_slice, 0..) |entry0, i| {
+            // Skip if a previous group already covered this (locator, prefix).
+            var handled = false;
+            for (infos_slice[0..i]) |prev| {
+                if (prev.locator.eql(entry0.locator) and
+                    prev.reader_guid.prefix.eql(entry0.reader_guid.prefix))
+                {
+                    handled = true;
+                    break;
+                }
+            }
+            if (handled) continue;
             var b = msg_builder.MessageBuilder.init(&scratch, self.writer.guid.prefix);
             b.addInfoDst(entry0.reader_guid.prefix);
-            for (infos_slice[0..safe_len], 0..) |entry, j| {
-                if (sent.isSet(j)) continue;
+            for (infos_slice) |entry| {
                 if (!entry.locator.eql(entry0.locator)) continue;
                 if (!entry.reader_guid.prefix.eql(entry0.reader_guid.prefix)) continue;
                 b.addData(.{
@@ -260,7 +263,6 @@ pub const RtpsProtocolWriter = struct {
                     .writer_sn = entry.eoc_sn,
                     .no_payload = true,
                 }, &.{});
-                sent.set(j);
             }
             writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};
         }
@@ -360,7 +362,13 @@ pub const RtpsProtocolReader = struct {
         // TRANSIENT_LOCAL (or stronger) history with RELIABLE reliability.
         proxy.history_established = !info.history_expected;
         try self.reader.addMatchedWriter(proxy);
-        if (self.writer_match_cb) |cb| cb.on_writer_matched(cb.ctx, info);
+        // on_writer_matched first (DDS spec: subscription_matched precedes liveliness_changed),
+        // then on_writer_alive — a newly matched writer is alive by definition.
+        // Both fire only after addMatchedWriter succeeds so no callback leaks on OOM.
+        if (self.writer_match_cb) |cb| {
+            cb.on_writer_matched(cb.ctx, info);
+            if (cb.on_writer_alive) |f| f(cb.ctx, info.guid);
+        }
     }
 
     fn vtRemoveMatchedWriter(ctx: *anyopaque, guid: Guid) void {
@@ -403,7 +411,6 @@ pub const RtpsProtocolReader = struct {
         group_seq_num: ?history_mod.SequenceNumber,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (!self.reader.isWriterMatched(writer_guid)) return;
         const change = history_mod.CacheChange{
             .kind = kind,
             .writer_guid = writer_guid,
@@ -415,11 +422,15 @@ pub const RtpsProtocolReader = struct {
             .coherent_set_sn = coherent_set_sn,
             .group_seq_num = group_seq_num,
         };
-        // Signal liveliness: this writer is alive.
-        if (self.writer_match_cb) |cb| {
-            if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+        // Signal liveliness only for writers already matched; unmatched writers are
+        // handled by StatefulReader.handleData (buffered for reliable readers so the
+        // SEDP race — data arriving before the writer proxy is established — is recovered).
+        if (self.reader.isWriterMatched(writer_guid)) {
+            if (self.writer_match_cb) |cb| {
+                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+            }
         }
-        // handleData stores a copy in the cache; on error just drop.
+        // handleData stores a copy; unmatched reliable-reader data is buffered for replay.
         self.reader.handleData(writer_guid, change) catch {};
     }
 
@@ -432,9 +443,12 @@ pub const RtpsProtocolReader = struct {
         final: bool,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // A heartbeat also proves the writer is alive.
-        if (self.writer_match_cb) |cb| {
-            if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+        // A heartbeat proves the writer is alive, but only signal DCPS if the
+        // writer is already matched — unmatched senders should not inject liveliness.
+        if (self.reader.isWriterMatched(writer_guid)) {
+            if (self.writer_match_cb) |cb| {
+                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+            }
         }
         self.reader.handleHeartbeat(writer_guid, first_sn, last_sn, count, final);
     }
@@ -442,10 +456,11 @@ pub const RtpsProtocolReader = struct {
     fn vtHandleDataFrag(
         ctx: *anyopaque,
         writer_guid: Guid,
+        source_timestamp: protocol.RtpsTimestamp,
         df: submsg_mod.DataFragSubmessage,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.reader.handleDataFrag(writer_guid, df) catch {};
+        self.reader.handleDataFrag(writer_guid, source_timestamp, df) catch {};
     }
 
     fn vtHandleHeartbeatFrag(
