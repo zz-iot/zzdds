@@ -93,7 +93,7 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool) void {}
     }.f,
     .handle_data_frag = struct {
-        fn f(_: *anyopaque, _: proto.Guid, _: proto.DataFragSubmessage) void {}
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.RtpsTimestamp, _: proto.DataFragSubmessage) void {}
     }.f,
     .handle_heartbeat_frag = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: u32, _: i32) void {}
@@ -1428,10 +1428,10 @@ pub const DomainParticipantImpl = struct {
                     self.mu.lock();
                     if (df.reader_entity_id.eql(EntityIds.unknown)) {
                         var fan_it = self.active_readers.valueIterator();
-                        while (fan_it.next()) |ar| ar.proto.handleDataFrag(writer_guid, df);
+                        while (fan_it.next()) |ar| ar.proto.handleDataFrag(writer_guid, current_ts, df);
                     } else {
                         const rkey = entityIdKey(df.reader_entity_id);
-                        if (self.active_readers.getPtr(rkey)) |ar| ar.proto.handleDataFrag(writer_guid, df);
+                        if (self.active_readers.getPtr(rkey)) |ar| ar.proto.handleDataFrag(writer_guid, current_ts, df);
                     }
                     self.mu.unlock();
                 },

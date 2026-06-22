@@ -456,10 +456,11 @@ pub const RtpsProtocolReader = struct {
     fn vtHandleDataFrag(
         ctx: *anyopaque,
         writer_guid: Guid,
+        source_timestamp: protocol.RtpsTimestamp,
         df: submsg_mod.DataFragSubmessage,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.reader.handleDataFrag(writer_guid, df) catch {};
+        self.reader.handleDataFrag(writer_guid, source_timestamp, df) catch {};
     }
 
     fn vtHandleHeartbeatFrag(

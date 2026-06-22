@@ -89,6 +89,15 @@ pub const StatelessReader = struct {
     }
 };
 
+fn keyHashFromInlineQos(inline_qos: ?msg.submessage.InlineQos) [16]u8 {
+    if (inline_qos) |iq| {
+        if (iq.get(.key_hash)) |bytes| {
+            if (bytes.len == 16) return bytes[0..16].*;
+        }
+    }
+    return std.mem.zeroes([16]u8);
+}
+
 // ── ReassemblyEntry ───────────────────────────────────────────────────────────
 
 /// In-progress fragment reassembly for one (writer, sequence_number) pair.
@@ -100,6 +109,12 @@ pub const ReassemblyEntry = struct {
     fragment_size: u16,
     total_frags: u32,
     received: std.DynamicBitSet,
+    /// Source timestamp from the INFO_TS submessage preceding the first DATA_FRAG
+    /// fragment. Carried forward to the assembled CacheChange for BY_SOURCE_TIMESTAMP
+    /// destination-order QoS and history-cache ordering.
+    source_timestamp: time_mod.RtpsTimestamp,
+    /// MD5 key hash from PID_KEY_HASH inline QoS, if present in the first fragment.
+    key_hash: [16]u8,
 
     pub fn deinit(self: *ReassemblyEntry, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
@@ -468,10 +483,14 @@ pub const StatefulReader = struct {
 
     /// Buffer a change whose writer proxy has not yet been established.
     /// Called under self.mu. Evicts the oldest entry when the per-writer cap is hit.
-    /// Drops the change if the total unmatched-writer GUID count is at capacity.
+    /// Drops the change if the combined unmatched-writer GUID count is at capacity.
+    /// A GUID already present in either map is not considered "new" — only GUIDs
+    /// absent from both maps are counted against MAX_UNMATCHED_WRITERS, preventing
+    /// a spoofed sender from exploiting two separate maps to double the limit.
     fn bufferUnmatchedLocked(self: *Self, writer_guid: Guid, change: CacheChange) !void {
         if (!self.pending_unmatched.contains(writer_guid) and
-            self.pending_unmatched.count() >= MAX_UNMATCHED_WRITERS) return;
+            !self.pending_unmatched_reassembly.contains(writer_guid) and
+            self.pending_unmatched.count() + self.pending_unmatched_reassembly.count() >= MAX_UNMATCHED_WRITERS) return;
         const entry = try self.pending_unmatched.getOrPut(self.alloc, writer_guid);
         const pu_inserted = !entry.found_existing;
         if (pu_inserted) entry.value_ptr.* = .empty;
@@ -501,13 +520,14 @@ pub const StatefulReader = struct {
     /// Called under self.mu. When all fragments arrive the assembled change is moved
     /// to pending_unmatched for replay in addMatchedWriter; otherwise the in-progress
     /// ReassemblyEntry is migrated directly into the new WriterProxy.
-    fn bufferUnmatchedFragLocked(self: *Self, writer_guid: Guid, df: msg.submessage.DataFragSubmessage) !void {
+    fn bufferUnmatchedFragLocked(self: *Self, writer_guid: Guid, source_timestamp: time_mod.RtpsTimestamp, df: msg.submessage.DataFragSubmessage) !void {
         if (df.fragment_size == 0 or df.data_size == 0) return;
         const sn = df.writer_sn;
         const total_frags: u32 = (df.data_size + df.fragment_size - 1) / df.fragment_size;
 
         if (!self.pending_unmatched_reassembly.contains(writer_guid) and
-            self.pending_unmatched_reassembly.count() >= MAX_UNMATCHED_WRITERS) return;
+            !self.pending_unmatched.contains(writer_guid) and
+            self.pending_unmatched.count() + self.pending_unmatched_reassembly.count() >= MAX_UNMATCHED_WRITERS) return;
         const outer = try self.pending_unmatched_reassembly.getOrPut(self.alloc, writer_guid);
         const pur_inserted = !outer.found_existing;
         if (pur_inserted) outer.value_ptr.* = .empty;
@@ -520,12 +540,15 @@ pub const StatefulReader = struct {
             errdefer self.alloc.free(data);
             var received = try std.DynamicBitSet.initEmpty(self.alloc, total_frags);
             errdefer received.deinit();
+            const key_hash = keyHashFromInlineQos(df.inline_qos);
             try outer.value_ptr.put(self.alloc, sn, .{
                 .data = data,
                 .data_size = df.data_size,
                 .fragment_size = df.fragment_size,
                 .total_frags = total_frags,
                 .received = received,
+                .source_timestamp = source_timestamp,
+                .key_hash = key_hash,
             });
         }
 
@@ -540,9 +563,9 @@ pub const StatefulReader = struct {
             .kind = .alive,
             .writer_guid = writer_guid,
             .sequence_number = sn,
-            .source_timestamp = time_mod.RtpsTimestamp.now(),
+            .source_timestamp = entry.source_timestamp,
             .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
-            .key_hash = std.mem.zeroes([16]u8),
+            .key_hash = entry.key_hash,
             .data = entry.data,
         };
         self.bufferUnmatchedLocked(writer_guid, change) catch {};
@@ -561,7 +584,7 @@ pub const StatefulReader = struct {
     /// reassembly buffer; delivers the complete change once all fragments arrive.
     /// For reliable readers, fragments from unmatched writers are buffered in
     /// pending_unmatched_reassembly and migrated to the WriterProxy in addMatchedWriter.
-    pub fn handleDataFrag(self: *Self, writer_guid: Guid, df: msg.submessage.DataFragSubmessage) !void {
+    pub fn handleDataFrag(self: *Self, writer_guid: Guid, source_timestamp: time_mod.RtpsTimestamp, df: msg.submessage.DataFragSubmessage) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -573,7 +596,7 @@ pub const StatefulReader = struct {
             }
         }
         if (wp == null) {
-            if (self.reliable) self.bufferUnmatchedFragLocked(writer_guid, df) catch {};
+            if (self.reliable) self.bufferUnmatchedFragLocked(writer_guid, source_timestamp, df) catch {};
             return;
         }
 
@@ -590,12 +613,15 @@ pub const StatefulReader = struct {
             errdefer self.alloc.free(data);
             var received = try std.DynamicBitSet.initEmpty(self.alloc, total_frags);
             errdefer received.deinit();
+            const key_hash = keyHashFromInlineQos(df.inline_qos);
             try wp.?.reassembly.put(self.alloc, sn, .{
                 .data = data,
                 .data_size = df.data_size,
                 .fragment_size = df.fragment_size,
                 .total_frags = total_frags,
                 .received = received,
+                .source_timestamp = source_timestamp,
+                .key_hash = key_hash,
             });
         }
 
@@ -611,9 +637,9 @@ pub const StatefulReader = struct {
             .kind = .alive,
             .writer_guid = writer_guid,
             .sequence_number = sn,
-            .source_timestamp = time_mod.RtpsTimestamp.now(),
+            .source_timestamp = entry.source_timestamp,
             .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
-            .key_hash = std.mem.zeroes([16]u8),
+            .key_hash = entry.key_hash,
             .data = assembled_data,
         };
         try self.deliverChangeLocked(wp.?, change);
@@ -1484,14 +1510,17 @@ test "StatefulReader pending_unmatched: GUID cap drops 33rd unmatched writer" {
 }
 
 test "StatefulReader pending_unmatched_reassembly: outer entry removed after assembly completes" {
-    // After a DATA_FRAG from an unmatched writer completes reassembly, the outer
-    // GUID entry in pending_unmatched_reassembly must be removed so the slot is not
-    // permanently counted against MAX_UNMATCHED_WRITERS.
+    // When a DATA_FRAG from an unmatched writer completes reassembly, the outer
+    // GUID entry in pending_unmatched_reassembly must be removed.  If it is left
+    // as a ghost, the combined GUID cap counts it twice (once in
+    // pending_unmatched_reassembly, once in pending_unmatched after promotion),
+    // prematurely exhausting the 32-slot budget.
     //
-    // Strategy: fill all 32 slots with *incomplete* (2-fragment) reassemblies so
-    // pending_unmatched stays empty.  Complete slot 0 (outer entry removed).
-    // Then send a single-fragment DATA_FRAG for the 33rd writer — it must be
-    // accepted (slot was reclaimed) and deliver on match.
+    // Strategy: fill 31 slots with incomplete (2-fragment) reassemblies.  Complete
+    // slot 0 — promotes writer 0 to pending_unmatched and removes its outer entry,
+    // keeping combined = 31.  A 32nd unique GUID must then be accepted.
+    // Without the outer-entry cleanup, combined = 32 after completion and the 32nd
+    // GUID is incorrectly dropped.
     var null_ctx: TestNullCtx = .{};
     const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
 
@@ -1513,24 +1542,223 @@ test "StatefulReader pending_unmatched_reassembly: outer entry removed after ass
     const frag1 = msg.submessage.DataFragSubmessage{ .flags = 0, .reader_entity_id = std.mem.zeroes(EntityId), .writer_entity_id = std.mem.zeroes(EntityId), .writer_sn = 1, .fragment_starting_num = 1, .fragments_in_submessage = 1, .fragment_size = 4, .data_size = 8, .inline_qos = null, .serialized_payload = &frag1_bytes };
     const frag2 = msg.submessage.DataFragSubmessage{ .flags = 0, .reader_entity_id = std.mem.zeroes(EntityId), .writer_entity_id = std.mem.zeroes(EntityId), .writer_sn = 1, .fragment_starting_num = 2, .fragments_in_submessage = 1, .fragment_size = 4, .data_size = 8, .inline_qos = null, .serialized_payload = &frag2_bytes };
 
-    // Fill all 32 slots with incomplete reassemblies (only frag 1 sent).
+    // Fill 31 slots with incomplete reassemblies (only frag 1 sent).
     var i: u8 = 0;
-    while (i < 32) : (i += 1) {
-        try reader.handleDataFrag(makeGuid(i, 0xC3), frag1);
+    while (i < 31) : (i += 1) {
+        try reader.handleDataFrag(makeGuid(i, 0xC3), ZERO_TS, frag1);
     }
 
-    // Complete slot 0: send frag 2 → assembly finishes → outer entry removed.
-    try reader.handleDataFrag(makeGuid(0, 0xC3), frag2);
+    // Complete slot 0: frag 2 → assembly finishes → promoted to pending_unmatched,
+    // outer entry removed.  combined = pending_unmatched(1) + pending_unmatched_reassembly(30) = 31.
+    // Without the fix: ghost persists → 1 + 31 = 32, blocking the 32nd GUID.
+    try reader.handleDataFrag(makeGuid(0, 0xC3), ZERO_TS, frag2);
 
-    // 33rd writer: single-fragment message. Must be accepted now that slot 0 was freed.
+    // 32nd unique GUID — must be accepted (slot correctly reclaimed).
     var single_payload = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     const single_frag = msg.submessage.DataFragSubmessage{ .flags = 0, .reader_entity_id = std.mem.zeroes(EntityId), .writer_entity_id = std.mem.zeroes(EntityId), .writer_sn = 1, .fragment_starting_num = 1, .fragments_in_submessage = 1, .fragment_size = 4, .data_size = 4, .inline_qos = null, .serialized_payload = &single_payload };
     const extra_guid = makeGuid(201, 0xC3);
-    try reader.handleDataFrag(extra_guid, single_frag);
+    try reader.handleDataFrag(extra_guid, ZERO_TS, single_frag);
 
-    // Match the 33rd writer and confirm its change is delivered.
-    const proxy33 = try WriterProxy.init(testing.allocator, extra_guid, &.{}, &.{}, true);
-    try reader.addMatchedWriter(proxy33);
+    // Match the 32nd writer and confirm its change is delivered.
+    const proxy32 = try WriterProxy.init(testing.allocator, extra_guid, &.{}, &.{}, true);
+    try reader.addMatchedWriter(proxy32);
     reader.handleHeartbeat(extra_guid, 1, 1, 1, true);
     try testing.expectEqual(@as(usize, 1), delivered);
+}
+
+test "StatefulReader pending_unmatched: GUID cap is shared across DATA and DATA_FRAG maps" {
+    // MAX_UNMATCHED_WRITERS applies to the combined GUID count across
+    // pending_unmatched and pending_unmatched_reassembly. A spoofed sender must
+    // not be able to occupy 32 slots in each map for a total of 64 GUIDs.
+    var null_ctx: TestNullCtx = .{};
+    const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
+
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(22, 0xC7), null_transport, .keep_all, 0, true);
+    defer reader.deinit();
+
+    var delivered: usize = 0;
+    const Cb = struct {
+        fn onData(ctx: *anyopaque, _: *const CacheChange) void {
+            const n: *usize = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+        }
+    };
+    reader.setCallback(.{ .ctx = &delivered, .on_data = Cb.onData });
+
+    var payload = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+
+    // Fill 16 slots via DATA (pending_unmatched).
+    var i: u8 = 0;
+    while (i < 16) : (i += 1) {
+        const wguid = makeGuid(i, 0xC4);
+        const ch = CacheChange{ .kind = .alive, .writer_guid = wguid, .sequence_number = 1, .source_timestamp = ZERO_TS, .instance_handle = NIL_IH, .key_hash = NIL_KH, .data = &payload };
+        try reader.handleData(wguid, ch);
+    }
+
+    // Fill 16 more slots via incomplete DATA_FRAG (pending_unmatched_reassembly).
+    // Combined total is now 32 — at the cap.
+    var frag1_bytes = [_]u8{ 0x0A, 0x0B, 0x0C, 0x0D };
+    const frag1 = msg.submessage.DataFragSubmessage{ .flags = 0, .reader_entity_id = std.mem.zeroes(EntityId), .writer_entity_id = std.mem.zeroes(EntityId), .writer_sn = 1, .fragment_starting_num = 1, .fragments_in_submessage = 1, .fragment_size = 4, .data_size = 8, .inline_qos = null, .serialized_payload = &frag1_bytes };
+    while (i < 32) : (i += 1) {
+        const wguid = makeGuid(i, 0xC4);
+        try reader.handleDataFrag(wguid, ZERO_TS, frag1);
+    }
+
+    // 33rd unique GUID must be dropped — both DATA and DATA_FRAG paths.
+    const extra_data_guid = makeGuid(200, 0xC4);
+    const ch33 = CacheChange{ .kind = .alive, .writer_guid = extra_data_guid, .sequence_number = 1, .source_timestamp = ZERO_TS, .instance_handle = NIL_IH, .key_hash = NIL_KH, .data = &payload };
+    try reader.handleData(extra_data_guid, ch33);
+
+    const extra_frag_guid = makeGuid(201, 0xC4);
+    try reader.handleDataFrag(extra_frag_guid, ZERO_TS, frag1);
+
+    // Neither extra GUID delivered after matching.
+    const proxy_data = try WriterProxy.init(testing.allocator, extra_data_guid, &.{}, &.{}, true);
+    try reader.addMatchedWriter(proxy_data);
+    reader.handleHeartbeat(extra_data_guid, 1, 1, 1, true);
+    try testing.expectEqual(@as(usize, 0), delivered);
+
+    const proxy_frag = try WriterProxy.init(testing.allocator, extra_frag_guid, &.{}, &.{}, true);
+    try reader.addMatchedWriter(proxy_frag);
+    reader.handleHeartbeat(extra_frag_guid, 1, 1, 1, true);
+    try testing.expectEqual(@as(usize, 0), delivered);
+}
+
+test "StatefulReader DATA_FRAG: source_timestamp and key_hash preserved through matched reassembly" {
+    // Verifies that the assembled CacheChange carries the source_timestamp from
+    // the first fragment's INFO_TS and the key_hash from PID_KEY_HASH inline QoS,
+    // not RtpsTimestamp.now() / zeroes as before this fix.
+    var null_ctx: TestNullCtx = .{};
+    const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
+
+    // best-effort: deliverChangeLocked fires immediately without a heartbeat.
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(30, 0xC7), null_transport, .keep_all, 0, false);
+    defer reader.deinit();
+
+    const Ctx = struct {
+        ts: time_mod.RtpsTimestamp = ZERO_TS,
+        kh: [16]u8 = NIL_KH,
+        fn onData(ctx: *anyopaque, change: *const CacheChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ts = change.source_timestamp;
+            self.kh = change.key_hash;
+        }
+    };
+    var ctx = Ctx{};
+    reader.setCallback(.{ .ctx = &ctx, .on_data = Ctx.onData });
+
+    const wguid = makeGuid(30, 0xC2);
+    const proxy = try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, false);
+    try reader.addMatchedWriter(proxy);
+
+    const expected_ts = time_mod.RtpsTimestamp{ .seconds = 12345, .fraction = 67890 };
+    const expected_kh = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
+
+    var kh_bytes = expected_kh;
+    const iq_params = [_]msg.submessage.InlineQosParam{.{ .pid = .key_hash, .value = &kh_bytes }};
+    const iq = msg.submessage.InlineQos{ .params = @constCast(&iq_params) };
+
+    var frag1_bytes = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    var frag2_bytes = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    // Inline QoS only on first fragment — key_hash from first frag must survive.
+    const frag1 = msg.submessage.DataFragSubmessage{
+        .flags = msg.submessage.DataFragFlags.inline_qos,
+        .reader_entity_id = std.mem.zeroes(EntityId),
+        .writer_entity_id = std.mem.zeroes(EntityId),
+        .writer_sn = 1,
+        .fragment_starting_num = 1,
+        .fragments_in_submessage = 1,
+        .fragment_size = 4,
+        .data_size = 8,
+        .inline_qos = iq,
+        .serialized_payload = &frag1_bytes,
+    };
+    const frag2 = msg.submessage.DataFragSubmessage{
+        .flags = 0,
+        .reader_entity_id = std.mem.zeroes(EntityId),
+        .writer_entity_id = std.mem.zeroes(EntityId),
+        .writer_sn = 1,
+        .fragment_starting_num = 2,
+        .fragments_in_submessage = 1,
+        .fragment_size = 4,
+        .data_size = 8,
+        .inline_qos = null,
+        .serialized_payload = &frag2_bytes,
+    };
+
+    try reader.handleDataFrag(wguid, expected_ts, frag1);
+    try reader.handleDataFrag(wguid, ZERO_TS, frag2); // second frag has no INFO_TS
+
+    try testing.expectEqual(expected_ts, ctx.ts);
+    try testing.expectEqual(expected_kh, ctx.kh);
+}
+
+test "StatefulReader DATA_FRAG: source_timestamp and key_hash preserved through unmatched-buffer reassembly" {
+    // Same as above but the writer is not yet matched when fragments arrive.
+    // Assembly completes in bufferUnmatchedFragLocked → promoted to pending_unmatched
+    // → replayed in addMatchedWriter.  The assembled CacheChange must carry the
+    // original timestamp and key_hash, not defaults.
+    var null_ctx: TestNullCtx = .{};
+    const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
+
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(31, 0xC7), null_transport, .keep_all, 0, true);
+    defer reader.deinit();
+
+    const Ctx = struct {
+        ts: time_mod.RtpsTimestamp = ZERO_TS,
+        kh: [16]u8 = NIL_KH,
+        fn onData(ctx: *anyopaque, change: *const CacheChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ts = change.source_timestamp;
+            self.kh = change.key_hash;
+        }
+    };
+    var ctx = Ctx{};
+    reader.setCallback(.{ .ctx = &ctx, .on_data = Ctx.onData });
+
+    const wguid = makeGuid(31, 0xC2);
+    const expected_ts = time_mod.RtpsTimestamp{ .seconds = 99999, .fraction = 11111 };
+    const expected_kh = [16]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+
+    var kh_bytes = expected_kh;
+    const iq_params = [_]msg.submessage.InlineQosParam{.{ .pid = .key_hash, .value = &kh_bytes }};
+    const iq = msg.submessage.InlineQos{ .params = @constCast(&iq_params) };
+
+    var frag1_bytes = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var frag2_bytes = [_]u8{ 0x55, 0x66, 0x77, 0x88 };
+    const frag1 = msg.submessage.DataFragSubmessage{
+        .flags = msg.submessage.DataFragFlags.inline_qos,
+        .reader_entity_id = std.mem.zeroes(EntityId),
+        .writer_entity_id = std.mem.zeroes(EntityId),
+        .writer_sn = 1,
+        .fragment_starting_num = 1,
+        .fragments_in_submessage = 1,
+        .fragment_size = 4,
+        .data_size = 8,
+        .inline_qos = iq,
+        .serialized_payload = &frag1_bytes,
+    };
+    const frag2 = msg.submessage.DataFragSubmessage{
+        .flags = 0,
+        .reader_entity_id = std.mem.zeroes(EntityId),
+        .writer_entity_id = std.mem.zeroes(EntityId),
+        .writer_sn = 1,
+        .fragment_starting_num = 2,
+        .fragments_in_submessage = 1,
+        .fragment_size = 4,
+        .data_size = 8,
+        .inline_qos = null,
+        .serialized_payload = &frag2_bytes,
+    };
+
+    // Both fragments arrive before the writer is matched.
+    try reader.handleDataFrag(wguid, expected_ts, frag1);
+    try reader.handleDataFrag(wguid, ZERO_TS, frag2);
+
+    // addMatchedWriter drains pending_unmatched; SN=1 is in-order → delivered immediately.
+    const proxy = try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, true);
+    try reader.addMatchedWriter(proxy);
+
+    try testing.expectEqual(expected_ts, ctx.ts);
+    try testing.expectEqual(expected_kh, ctx.kh);
 }

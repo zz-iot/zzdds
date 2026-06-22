@@ -394,6 +394,7 @@ pub const ProtocolReader = struct {
         handle_data_frag: *const fn (
             ctx: *anyopaque,
             writer_guid: Guid,
+            source_timestamp: RtpsTimestamp,
             df: DataFragSubmessage,
         ) void,
 
@@ -492,9 +493,10 @@ pub const ProtocolReader = struct {
     pub fn handleDataFrag(
         self: ProtocolReader,
         writer_guid: Guid,
+        source_timestamp: RtpsTimestamp,
         df: DataFragSubmessage,
     ) void {
-        self.vtable.handle_data_frag(self.ctx, writer_guid, df);
+        self.vtable.handle_data_frag(self.ctx, writer_guid, source_timestamp, df);
     }
 
     pub fn handleHeartbeatFrag(
