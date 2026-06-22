@@ -362,12 +362,12 @@ pub const RtpsProtocolReader = struct {
         // TRANSIENT_LOCAL (or stronger) history with RELIABLE reliability.
         proxy.history_established = !info.history_expected;
         try self.reader.addMatchedWriter(proxy);
-        // Fire on_writer_alive after addMatchedWriter succeeds so DCPS never sees
-        // a liveliness signal for a GUID that failed to be inserted as a proxy.
-        // A matched writer is alive by definition (it just sent SEDP announcements).
+        // on_writer_matched first (DDS spec: subscription_matched precedes liveliness_changed),
+        // then on_writer_alive — a newly matched writer is alive by definition.
+        // Both fire only after addMatchedWriter succeeds so no callback leaks on OOM.
         if (self.writer_match_cb) |cb| {
-            if (cb.on_writer_alive) |f| f(cb.ctx, info.guid);
             cb.on_writer_matched(cb.ctx, info);
+            if (cb.on_writer_alive) |f| f(cb.ctx, info.guid);
         }
     }
 

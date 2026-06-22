@@ -473,10 +473,13 @@ pub const StatefulReader = struct {
         if (!self.pending_unmatched.contains(writer_guid) and
             self.pending_unmatched.count() >= MAX_UNMATCHED_WRITERS) return;
         const entry = try self.pending_unmatched.getOrPut(self.alloc, writer_guid);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .empty;
-            errdefer _ = self.pending_unmatched.remove(writer_guid);
-        }
+        const pu_inserted = !entry.found_existing;
+        if (pu_inserted) entry.value_ptr.* = .empty;
+        // errdefer at function scope so it fires for any error below (dupe, append),
+        // not just errors inside the if block (which has none).
+        errdefer if (pu_inserted) {
+            _ = self.pending_unmatched.remove(writer_guid);
+        };
         const list = entry.value_ptr;
         for (list.items) |existing| {
             if (existing.sequence_number == change.sequence_number) return;
@@ -506,10 +509,11 @@ pub const StatefulReader = struct {
         if (!self.pending_unmatched_reassembly.contains(writer_guid) and
             self.pending_unmatched_reassembly.count() >= MAX_UNMATCHED_WRITERS) return;
         const outer = try self.pending_unmatched_reassembly.getOrPut(self.alloc, writer_guid);
-        if (!outer.found_existing) {
-            outer.value_ptr.* = .empty;
-            errdefer _ = self.pending_unmatched_reassembly.remove(writer_guid);
-        }
+        const pur_inserted = !outer.found_existing;
+        if (pur_inserted) outer.value_ptr.* = .empty;
+        errdefer if (pur_inserted) {
+            _ = self.pending_unmatched_reassembly.remove(writer_guid);
+        };
 
         if (outer.value_ptr.getPtr(sn) == null) {
             const data = try self.alloc.alloc(u8, df.data_size);
