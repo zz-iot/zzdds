@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
     });
     // pub export fn callconv(.c) wrappers are only needed when building a C-ABI
     // binding; skip them for pure-Zig builds to avoid unused symbol overhead.
-    if (need_c_abi) gen_dcps.addArg("--generate-c-api");
+    if (need_c_abi) gen_dcps.addArg("--zig-generate-c-api");
     gen_dcps.addArg("-o");
     // addOutputDirectoryArg injects the cache-managed output path as the next arg.
     const gen_output_dir = gen_dcps.addOutputDirectoryArg(gen_dir);
@@ -59,6 +59,23 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
         },
     });
+
+    // ── Code generation: idl/zzdds.idl → generated/zzdds.zig ─────────────────
+    //
+    // Generates vendor-extension types (DomainParticipantConfig, etc.).
+    // --single-file: avoids root/module filename collision (stem == module == "zzdds")
+    // --no-typesupport/--no-typeobject-support: vendor structs need no DDS scaffolding
+    // Output goes into the same directory as dcps so that @import("DDS.zig") resolves.
+
+    const gen_zzdds_vendor = b.addRunArtifact(zidl_exe);
+    gen_zzdds_vendor.addArgs(&.{
+        "-b",               "zig",
+        "--single-file",    "--zig-idiomatic-enums",
+        "--no-typesupport", "--no-typeobject-support",
+        "-o",
+    });
+    gen_zzdds_vendor.addDirectoryArg(gen_output_dir);
+    gen_zzdds_vendor.addFileArg(b.path("idl/zzdds.idl"));
 
     // ── Code generation: idl/rtps_discovery.idl → generated/rtps_discovery.zig ─
     //
@@ -149,9 +166,47 @@ pub fn build(b: *std.Build) void {
 
     const gen_only_step = b.step("gen-only", "Run zidl code generation only");
     gen_only_step.dependOn(&gen_dcps.step);
+    gen_only_step.dependOn(&gen_zzdds_vendor.step);
     gen_only_step.dependOn(&gen_rtps_disc.step);
 
     // ── C language binding ────────────────────────────────────────────────────
+
+    const binding_smoke_step = b.step("test-bindings", "Compile and run Zig/C/C++ binding smoke tests");
+    const smoke_idl = b.path("test/bindings/smoke/binding_smoke.idl");
+
+    const dds_adapter_mod = b.createModule(.{
+        .root_source_file = b.path("test/bindings/smoke/zig_dds_adapter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const gen_smoke_zig = b.addRunArtifact(zidl_exe);
+    gen_smoke_zig.addArgs(&.{ "-b", "zig", "--generate-zzdds-wrappers", "-o" });
+    const gen_smoke_zig_dir = gen_smoke_zig.addOutputDirectoryArg("zzdds-binding-smoke-zig");
+    gen_smoke_zig.addFileArg(smoke_idl);
+
+    const generated_smoke_mod = b.createModule(.{
+        .root_source_file = gen_smoke_zig_dir.path(b, "binding_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "dds", .module = dds_adapter_mod },
+        },
+    });
+
+    const zig_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("test/bindings/smoke/zig_smoke.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "dds", .module = dds_adapter_mod },
+            .{ .name = "binding_smoke", .module = generated_smoke_mod },
+        },
+    });
+    const zig_smoke = b.addExecutable(.{ .name = "zzdds_zig_binding_smoke", .root_module = zig_smoke_mod });
+    binding_smoke_step.dependOn(&b.addRunArtifact(zig_smoke).step);
 
     if (need_c_abi) {
         // Generate dcps.h and dcps_cdr.c from dcps.idl.
@@ -181,6 +236,13 @@ pub fn build(b: *std.Build) void {
         );
         b.getInstallStep().dependOn(&install_zidl_cdr_h.step);
 
+        const install_zzdds_c_h = b.addInstallFileWithDir(
+            b.path("include/zzdds_c.h"),
+            .header,
+            "zzdds_c.h",
+        );
+        b.getInstallStep().dependOn(&install_zzdds_c_h.step);
+
         // Build libzzdds as a shared library exposing the C ABI surface.
         const zzdds_lib = b.addLibrary(.{
             .name = "zzdds",
@@ -202,6 +264,71 @@ pub fn build(b: *std.Build) void {
             zzdds_lib.root_module.linkSystemLibrary("ws2_32", .{});
         }
         b.installArtifact(zzdds_lib);
+
+        const gen_smoke_c = b.addRunArtifact(zidl_exe);
+        gen_smoke_c.addArgs(&.{ "-b", "c", "--generate-zzdds-wrappers", "-o" });
+        const gen_smoke_c_dir = gen_smoke_c.addOutputDirectoryArg("zzdds-binding-smoke-c");
+        gen_smoke_c.addFileArg(smoke_idl);
+
+        const c_smoke_mod = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        c_smoke_mod.addCSourceFiles(.{
+            .files = &.{"test/bindings/smoke/c_smoke.c"},
+            .flags = &.{ "-std=c99", "-Wall" },
+        });
+        c_smoke_mod.addCSourceFile(.{
+            .file = gen_smoke_c_dir.path(b, "binding_smoke_cdr.c"),
+            .flags = &.{ "-std=c99", "-Wall" },
+        });
+        c_smoke_mod.addCSourceFile(.{
+            .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
+            .flags = &.{ "-std=c99", "-Wall" },
+        });
+        c_smoke_mod.addIncludePath(gen_smoke_c_dir);
+        c_smoke_mod.addIncludePath(gen_c_dir);
+        c_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+        c_smoke_mod.addIncludePath(b.path("include"));
+        c_smoke_mod.linkLibrary(zzdds_lib);
+        const c_smoke = b.addExecutable(.{ .name = "zzdds_c_binding_smoke", .root_module = c_smoke_mod });
+        binding_smoke_step.dependOn(&b.addRunArtifact(c_smoke).step);
+
+        if (cpp_binding) {
+            const gen_smoke_cpp = b.addRunArtifact(zidl_exe);
+            gen_smoke_cpp.addArgs(&.{ "-b", "cpp", "--generate-zzdds-wrappers", "-o" });
+            const gen_smoke_cpp_dir = gen_smoke_cpp.addOutputDirectoryArg("zzdds-binding-smoke-cpp");
+            gen_smoke_cpp.addFileArg(smoke_idl);
+
+            const cpp_smoke_mod = b.createModule(.{
+                .root_source_file = null,
+                .target = target,
+                .optimize = .Debug,
+                .link_libc = true,
+                .link_libcpp = true,
+            });
+            cpp_smoke_mod.addCSourceFiles(.{
+                .files = &.{"test/bindings/smoke/cpp_smoke.cpp"},
+                .flags = &.{ "-std=c++17", "-Wall" },
+            });
+            cpp_smoke_mod.addCSourceFile(.{
+                .file = gen_smoke_cpp_dir.path(b, "binding_smoke_cdr.cpp"),
+                .flags = &.{ "-std=c++17", "-Wall" },
+            });
+            cpp_smoke_mod.addCSourceFile(.{
+                .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
+                .flags = &.{ "-std=c99", "-Wall" },
+            });
+            cpp_smoke_mod.addIncludePath(gen_smoke_cpp_dir);
+            cpp_smoke_mod.addIncludePath(gen_c_dir);
+            cpp_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            cpp_smoke_mod.addIncludePath(b.path("include"));
+            cpp_smoke_mod.linkLibrary(zzdds_lib);
+            const cpp_smoke = b.addExecutable(.{ .name = "zzdds_cpp_binding_smoke", .root_module = cpp_smoke_mod });
+            binding_smoke_step.dependOn(&b.addRunArtifact(cpp_smoke).step);
+        }
     }
 
     // ── C++ language binding ──────────────────────────────────────────────────

@@ -95,6 +95,23 @@ pub const CSampleInfo = extern struct {
     instance_handle: DDS.InstanceHandle_t,
 };
 
+pub const CWriteKind = enum(c_int) {
+    alive = 0,
+    dispose = 1,
+    unregister = 2,
+};
+
+pub const CLoanedSample = extern struct {
+    data: ?[*]const u8,
+    data_len: usize,
+    owner: ?*anyopaque,
+};
+
+const LoanedRawSample = struct {
+    data: []u8,
+    alloc: std.mem.Allocator,
+};
+
 // ── Participant lifecycle ─────────────────────────────────────────────────────
 
 /// Create a DomainParticipant backed by UDP transport + SPDP/SEDP discovery.
@@ -187,10 +204,28 @@ pub export fn zzdds_write_raw(
     data: [*]const u8,
     data_len: usize,
 ) callconv(.c) DDS.ReturnCode_t {
+    return zzdds_write_raw_kind(writer, .alive, key_hash, data, data_len);
+}
+
+pub export fn zzdds_write_raw_kind(
+    writer: DDS.DataWriter,
+    kind: CWriteKind,
+    key_hash: *const [16]u8,
+    data: [*]const u8,
+    data_len: usize,
+) callconv(.c) DDS.ReturnCode_t {
     if (nil.isNil(writer)) return 1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    const change_kind: history_mod.ChangeKind = switch (kind) {
+        .alive => .alive,
+        .dispose => .not_alive_disposed,
+        .unregister => if (impl.qos.writer_data_lifecycle.autodispose_unregistered_instances)
+            .not_alive_disposed
+        else
+            .not_alive_unregistered,
+    };
     _ = impl.writeRaw(
-        .alive,
+        change_kind,
         time_mod.RtpsTimestamp.now(),
         history_mod.INSTANCE_HANDLE_NIL,
         key_hash.*,
@@ -228,6 +263,48 @@ pub export fn zzdds_take_one_raw(
         .instance_handle = s.info.instance_handle,
     };
     return 1;
+}
+
+pub export fn zzdds_take_loaned_raw(
+    reader: DDS.DataReader,
+    loan_out: *CLoanedSample,
+    info_out: *CSampleInfo,
+) callconv(.c) c_int {
+    if (nil.isNil(reader)) return -2;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const s = impl.takeRaw() orelse return 0;
+    const owner = std.heap.c_allocator.create(LoanedRawSample) catch {
+        impl.alloc.free(s.data);
+        return -1;
+    };
+    owner.* = .{ .data = s.data, .alloc = impl.alloc };
+    loan_out.* = .{
+        .data = s.data.ptr,
+        .data_len = s.data.len,
+        .owner = owner,
+    };
+    info_out.* = .{
+        .valid_data = s.info.valid_data,
+        .instance_state = s.info.instance_state,
+        .instance_handle = s.info.instance_handle,
+    };
+    return 1;
+}
+
+pub export fn zzdds_return_loaned_raw(
+    reader: DDS.DataReader,
+    loan: *CLoanedSample,
+) callconv(.c) void {
+    _ = reader;
+    const opaque_owner = loan.owner orelse return;
+    const owner: *LoanedRawSample = @ptrCast(@alignCast(opaque_owner));
+    owner.alloc.free(owner.data);
+    std.heap.c_allocator.destroy(owner);
+    loan.* = .{
+        .data = null,
+        .data_len = 0,
+        .owner = null,
+    };
 }
 
 /// take_next_instance semantics: take one sample from the instance with the

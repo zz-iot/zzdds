@@ -1,0 +1,5 @@
+@appendable struct BindingSmokeStatus {
+    @key unsigned long id;
+    unsigned long count;
+    string<32> label;
+};
