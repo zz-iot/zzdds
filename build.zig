@@ -60,6 +60,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ── Code generation: idl/zzdds.idl → generated/zzdds.zig ─────────────────
+    //
+    // Generates vendor-extension types (DomainParticipantConfig, etc.).
+    // --single-file: avoids root/module filename collision (stem == module == "zzdds")
+    // --no-typesupport/--no-typeobject-support: vendor structs need no DDS scaffolding
+    // Output goes into the same directory as dcps so that @import("DDS.zig") resolves.
+
+    const gen_zzdds_vendor = b.addRunArtifact(zidl_exe);
+    gen_zzdds_vendor.addArgs(&.{
+        "-b",               "zig",
+        "--single-file",    "--zig-idiomatic-enums",
+        "--no-typesupport", "--no-typeobject-support",
+        "-o",
+    });
+    gen_zzdds_vendor.addDirectoryArg(gen_output_dir);
+    gen_zzdds_vendor.addFileArg(b.path("idl/zzdds.idl"));
+
     // ── Code generation: idl/rtps_discovery.idl → generated/rtps_discovery.zig ─
     //
     // Generates PL_CDR serialize/deserialize for SPDP/SEDP discovery types.
@@ -149,6 +166,7 @@ pub fn build(b: *std.Build) void {
 
     const gen_only_step = b.step("gen-only", "Run zidl code generation only");
     gen_only_step.dependOn(&gen_dcps.step);
+    gen_only_step.dependOn(&gen_zzdds_vendor.step);
     gen_only_step.dependOn(&gen_rtps_disc.step);
 
     // ── C language binding ────────────────────────────────────────────────────

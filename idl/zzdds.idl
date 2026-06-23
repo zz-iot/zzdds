@@ -4,7 +4,7 @@
 // outside the OMG DDS DCPS IDL. Keep idl/dcps.idl normative and put vendor
 // extensions here.
 
-import DDS;
+import "dcps.idl";
 
 module zzdds {
 
@@ -21,21 +21,6 @@ module zzdds {
         DISCOVERY_SPDP,
         DISCOVERY_STATIC,
         DISCOVERY_BROKER
-    };
-
-    enum ReliabilityKind {
-        RELIABILITY_BEST_EFFORT,
-        RELIABILITY_RELIABLE
-    };
-
-    enum DurabilityKind {
-        DURABILITY_VOLATILE,
-        DURABILITY_TRANSIENT_LOCAL
-    };
-
-    enum HistoryKind {
-        HISTORY_KEEP_LAST,
-        HISTORY_KEEP_ALL
     };
 
     enum WriteKind {
@@ -56,23 +41,30 @@ module zzdds {
         string       timer_clock_name;
     };
 
-    struct UdpConfig {
-        boolean enabled;
-        boolean ipv4_enabled;
-        boolean ipv6_enabled;
-        unsigned short port_base;
-        unsigned short domain_gain;
-        unsigned short participant_gain;
-        unsigned long  participant_id;
-        boolean        has_participant_id;
-        StringSeq      interfaces;
-        string         multicast_group_v4;
-        string         multicast_group_v6;
-        octet          multicast_ttl;
-        StringSeq      initial_peers;
-        boolean        bind_wildcard;
-        unsigned long  recv_buffer_size;
-        unsigned long  interface_poll_interval_ms;
+    @mutable struct UdpConfig {
+        @default(TRUE)  boolean        enabled;
+        @default(TRUE)  boolean        ipv4_enabled;
+        @default(TRUE)  boolean        ipv6_enabled;
+        @default(7400)  unsigned short port_base;
+        @default(250)   unsigned short domain_gain;
+        @default(2)     unsigned short participant_gain;
+        @default(0)     unsigned short meta_multicast_offset;
+        @default(10)    unsigned short meta_unicast_offset;
+        @default(1)     unsigned short data_multicast_offset;
+        @default(11)    unsigned short data_unicast_offset;
+        @optional       unsigned long  participant_id;
+                        StringSeq      interfaces;
+        @default("239.255.0.1") string multicast_group_v4;
+        @default("ff02::1")     string multicast_group_v6;
+        @default(1)     octet          multicast_ttl;
+        @optional       unsigned short meta_unicast_port;
+        @optional       unsigned short data_unicast_port;
+        @optional       unsigned short meta_multicast_port;
+        @optional       unsigned short data_multicast_port;
+        @default(FALSE) boolean        bind_wildcard;
+                        StringSeq      initial_peers;
+                        unsigned long  recv_buffer_size;
+        @default(5000)  unsigned long  interface_poll_interval_ms;
     };
 
     struct TcpConfig {
@@ -96,10 +88,10 @@ module zzdds {
     };
 
     struct QosDefaults {
-        ReliabilityKind reliability_kind;
-        DurabilityKind  durability_kind;
-        HistoryKind     history_kind;
-        long            history_depth;
+        DDS::ReliabilityQosPolicyKind reliability_kind;
+        DDS::DurabilityQosPolicyKind  durability_kind;
+        DDS::HistoryQosPolicyKind     history_kind;
+        long                          history_depth;
     };
 
     struct DomainParticipantConfig {
