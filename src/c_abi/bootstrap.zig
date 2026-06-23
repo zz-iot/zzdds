@@ -102,7 +102,7 @@ pub const CWriteKind = enum(c_int) {
 };
 
 pub const CLoanedSample = extern struct {
-    data: [*]const u8,
+    data: ?[*]const u8,
     data_len: usize,
     owner: ?*anyopaque,
 };
@@ -301,7 +301,7 @@ pub export fn zzdds_return_loaned_raw(
     owner.alloc.free(owner.data);
     std.heap.c_allocator.destroy(owner);
     loan.* = .{
-        .data = undefined,
+        .data = null,
         .data_len = 0,
         .owner = null,
     };

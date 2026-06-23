@@ -182,11 +182,12 @@ test "bootstrap: take_loaned_raw and return_loaned_raw" {
     try testing.expectEqual(@as(c_int, 1), n);
     try testing.expect(info.valid_data);
     try testing.expectEqual(PAYLOAD.len, loan.data_len);
-    try testing.expectEqualSlices(u8, &PAYLOAD, loan.data[0..loan.data_len]);
+    try testing.expectEqualSlices(u8, &PAYLOAD, loan.data.?[0..loan.data_len]);
     try testing.expect(loan.owner != null);
 
     bootstrap.zzdds_return_loaned_raw(pair.dr, &loan);
     try testing.expectEqual(@as(usize, 0), loan.data_len);
+    try testing.expect(loan.data == null);
     try testing.expect(loan.owner == null);
 }
 
