@@ -337,3 +337,269 @@ pub export fn zzdds_take_one_raw_instance(
     };
     return 1;
 }
+
+// ── New writer operations ────────────────────────────────────────────────────
+
+/// Return the DDS instance handle for a key hash without writing.
+/// Always succeeds (deterministic hash mapping).
+pub export fn zzdds_register_instance_raw(
+    writer: DDS.DataWriter,
+    key_hash: *const [16]u8,
+) callconv(.c) DDS.InstanceHandle_t {
+    _ = writer;
+    return DataWriterImpl.registerInstanceRaw(key_hash.*);
+}
+
+/// Write with an explicit source timestamp.
+pub export fn zzdds_write_raw_w_timestamp(
+    writer: DDS.DataWriter,
+    kind: CWriteKind,
+    key_hash: *const [16]u8,
+    data: [*]const u8,
+    data_len: usize,
+    ts: DDS.Time_t,
+) callconv(.c) DDS.ReturnCode_t {
+    if (nil.isNil(writer)) return 1;
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    const change_kind: history_mod.ChangeKind = switch (kind) {
+        .alive => .alive,
+        .dispose => .not_alive_disposed,
+        .unregister => if (impl.qos.writer_data_lifecycle.autodispose_unregistered_instances)
+            .not_alive_disposed
+        else
+            .not_alive_unregistered,
+    };
+    const t = time_mod.Time{ .sec = ts.sec, .nanosec = ts.nanosec };
+    const rtps_ts = time_mod.RtpsTimestamp.fromTime(t);
+    _ = impl.writeRaw(change_kind, rtps_ts, history_mod.INSTANCE_HANDLE_NIL, key_hash.*, data[0..data_len]) catch return 1;
+    return 0;
+}
+
+/// Copy the stored CDR payload for `handle` into `buf[0..buf_size]`.
+/// Sets `*len_out` to the actual payload size.
+/// Returns 0 on success, -1 if handle unknown, -2 if buffer too small.
+pub export fn zzdds_get_key_value_writer(
+    writer: DDS.DataWriter,
+    handle: DDS.InstanceHandle_t,
+    buf: [*]u8,
+    buf_size: usize,
+    len_out: *usize,
+) callconv(.c) c_int {
+    if (nil.isNil(writer)) return -1;
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    const kv = impl.getKeyValueRaw(handle) orelse return -1;
+    len_out.* = kv.len;
+    if (kv.len > buf_size) return -2;
+    @memcpy(buf[0..kv.len], kv);
+    return 0;
+}
+
+/// Look up the instance handle for a key hash (always deterministic).
+pub export fn zzdds_lookup_instance_writer(
+    writer: DDS.DataWriter,
+    key_hash: *const [16]u8,
+) callconv(.c) DDS.InstanceHandle_t {
+    _ = writer;
+    return DataWriterImpl.registerInstanceRaw(key_hash.*);
+}
+
+// ── New reader operations ─────────────────────────────────────────────────────
+
+/// read_next_sample: non-destructively return one sample (marks it READ).
+/// Returns 1 on success, 0 if queue empty, -1 on buffer-too-small.
+pub export fn zzdds_read_one_raw(
+    reader: DDS.DataReader,
+    cdr_buf: [*]u8,
+    buf_size: usize,
+    cdr_len_out: *usize,
+    info_out: *CSampleInfo,
+) callconv(.c) c_int {
+    if (nil.isNil(reader)) return -2;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    var tmp: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    impl.readRaw(
+        &tmp,
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        1,
+        null,
+        null,
+    ) catch return -2;
+    if (tmp.items.len == 0) return 0;
+    const s = tmp.items[0];
+    cdr_len_out.* = s.data.len;
+    if (s.data.len > buf_size) return -1;
+    @memcpy(cdr_buf[0..s.data.len], s.data);
+    info_out.* = .{
+        .valid_data = s.info.valid_data,
+        .instance_state = s.info.instance_state,
+        .instance_handle = s.info.instance_handle,
+    };
+    return 1;
+}
+
+/// read_next_instance: non-destructively return one sample for the next instance.
+/// Returns 1 on success, 0 if no qualifying sample, -1 on buffer-too-small.
+pub export fn zzdds_read_one_raw_instance(
+    reader: DDS.DataReader,
+    prev_instance_handle: DDS.InstanceHandle_t,
+    cdr_buf: [*]u8,
+    buf_size: usize,
+    cdr_len_out: *usize,
+    info_out: *CSampleInfo,
+) callconv(.c) c_int {
+    if (nil.isNil(reader)) return -2;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const s = impl.readNextInstanceRaw(prev_instance_handle) orelse return 0;
+    defer impl.alloc.free(s.data);
+    cdr_len_out.* = s.data.len;
+    if (s.data.len > buf_size) return -1;
+    @memcpy(cdr_buf[0..s.data.len], s.data);
+    info_out.* = .{
+        .valid_data = s.info.valid_data,
+        .instance_state = s.info.instance_state,
+        .instance_handle = s.info.instance_handle,
+    };
+    return 1;
+}
+
+/// C representation of a batch of raw samples.
+/// Allocated by zzdds_take_n_raw / zzdds_read_n_raw; freed by zzdds_return_raw_samples.
+pub const CRawSample = extern struct {
+    data: ?[*]u8,
+    data_len: usize,
+    info: CSampleInfo,
+};
+
+pub const CRawSampleArray = extern struct {
+    samples: ?[*]CRawSample,
+    count: usize,
+    _alloc_capacity: usize, // internal; do not modify
+};
+
+fn nRawImpl(
+    reader: DDS.DataReader,
+    ss: DDS.SampleStateMask,
+    vs: DDS.ViewStateMask,
+    is: DDS.InstanceStateMask,
+    max: c_int,
+    out: *CRawSampleArray,
+    destructive: bool,
+) c_int {
+    if (nil.isNil(reader)) return -1;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const alloc = std.heap.c_allocator;
+    var tmp: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    if (destructive) {
+        impl.takeFiltered(&tmp, ss, vs, is, max, null, null) catch return -1;
+    } else {
+        impl.readRaw(&tmp, ss, vs, is, max, null, null) catch return -1;
+    }
+    if (tmp.items.len == 0) {
+        out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+        return 0;
+    }
+    const arr = alloc.alloc(CRawSample, tmp.items.len) catch return -1;
+    for (tmp.items, 0..) |s, i| {
+        const copy = alloc.dupe(u8, s.data) catch {
+            for (arr[0..i]) |prev| alloc.free(prev.data.?[0..prev.data_len]);
+            alloc.free(arr);
+            return -1;
+        };
+        arr[i] = .{
+            .data = copy.ptr,
+            .data_len = copy.len,
+            .info = .{
+                .valid_data = s.info.valid_data,
+                .instance_state = s.info.instance_state,
+                .instance_handle = s.info.instance_handle,
+            },
+        };
+    }
+    out.* = .{ .samples = arr.ptr, .count = arr.len, ._alloc_capacity = arr.len };
+    return @intCast(arr.len);
+}
+
+/// Batch take: remove up to `max` samples matching the given state masks.
+/// Populates `out`; caller must call zzdds_return_raw_samples when done.
+/// Returns sample count on success, 0 if empty, -1 on error.
+pub export fn zzdds_take_n_raw(
+    reader: DDS.DataReader,
+    ss: DDS.SampleStateMask,
+    vs: DDS.ViewStateMask,
+    is: DDS.InstanceStateMask,
+    max: c_int,
+    out: *CRawSampleArray,
+) callconv(.c) c_int {
+    return nRawImpl(reader, ss, vs, is, max, out, true);
+}
+
+/// Batch read: non-destructively return up to `max` samples matching the masks.
+/// Populates `out`; caller must call zzdds_return_raw_samples when done.
+/// Returns sample count on success, 0 if empty, -1 on error.
+pub export fn zzdds_read_n_raw(
+    reader: DDS.DataReader,
+    ss: DDS.SampleStateMask,
+    vs: DDS.ViewStateMask,
+    is: DDS.InstanceStateMask,
+    max: c_int,
+    out: *CRawSampleArray,
+) callconv(.c) c_int {
+    return nRawImpl(reader, ss, vs, is, max, out, false);
+}
+
+/// Free a CRawSampleArray returned by zzdds_take_n_raw or zzdds_read_n_raw.
+pub export fn zzdds_return_raw_samples(
+    reader: DDS.DataReader,
+    arr: *CRawSampleArray,
+) callconv(.c) void {
+    _ = reader;
+    if (arr.samples) |samples| {
+        const alloc = std.heap.c_allocator;
+        for (samples[0..arr.count]) |s| {
+            if (s.data) |d| alloc.free(d[0..s.data_len]);
+        }
+        alloc.free(samples[0..arr._alloc_capacity]);
+    }
+    arr.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+}
+
+/// Copy the stored CDR payload for `handle` into `buf[0..buf_size]`.
+/// Returns 0 on success, -1 if handle unknown, -2 if buffer too small.
+pub export fn zzdds_get_key_value_reader(
+    reader: DDS.DataReader,
+    handle: DDS.InstanceHandle_t,
+    buf: [*]u8,
+    buf_size: usize,
+    len_out: *usize,
+) callconv(.c) c_int {
+    if (nil.isNil(reader)) return -1;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const kv = impl.getKeyValueRaw(handle) orelse return -1;
+    len_out.* = kv.len;
+    if (kv.len > buf_size) return -2;
+    @memcpy(buf[0..kv.len], kv);
+    return 0;
+}
+
+/// Return the instance handle for a key hash if the instance is known to this reader.
+/// Returns the handle if ALIVE, 0 (HANDLE_NIL) if unknown or not alive.
+pub export fn zzdds_lookup_instance_reader(
+    reader: DDS.DataReader,
+    key_hash: *const [16]u8,
+) callconv(.c) DDS.InstanceHandle_t {
+    if (nil.isNil(reader)) return 0;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    // Compute handle from key hash and check if it's known alive.
+    const handle = DataWriterImpl.registerInstanceRaw(key_hash.*);
+    return if (impl.lookupInstance(handle)) handle else 0;
+}

@@ -77,6 +77,10 @@ pub const DataWriterImpl = struct {
     /// AUTOMATIC kind and by assert_liveliness() for MANUAL kinds.
     liveliness_last_ns: std.atomic.Value(i64),
 
+    /// Maps instance_handle → last alive CDR payload for get_key_value support.
+    /// Populated on the first alive write per instance; never overwritten.
+    key_registry: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, []u8) = .empty,
+
     const Self = @This();
 
     pub fn init(
@@ -125,6 +129,11 @@ pub const DataWriterImpl = struct {
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
         self.qos.deinit(self.alloc);
+        {
+            var it = self.key_registry.valueIterator();
+            while (it.next()) |v| self.alloc.free(v.*);
+        }
+        self.key_registry.deinit(self.alloc);
         // NOTE: proto_writer lifecycle is owned by the participant (via
         // pubDestroyProtoWriter callback), not by DataWriterImpl.
         self.alloc.destroy(self);
@@ -164,6 +173,17 @@ pub const DataWriterImpl = struct {
 
         const sn = try self.proto_writer.write(kind, source_timestamp, instance_handle, key_hash, data);
         self.last_sn = sn;
+        if (kind == .alive) {
+            const ih = keyHashToHandle(key_hash);
+            if (!self.key_registry.contains(ih)) {
+                const stored = self.alloc.dupe(u8, data) catch null;
+                if (stored) |s| {
+                    self.key_registry.put(self.alloc, ih, s) catch {
+                        self.alloc.free(s);
+                    };
+                }
+            }
+        }
         const now_ns = self.timer_clock.nowNs();
         self.last_write_ns.store(now_ns, .monotonic);
         // AUTOMATIC: any write() counts as a liveliness assertion.
@@ -187,6 +207,19 @@ pub const DataWriterImpl = struct {
     /// Compute a stable DDS instance handle from a 16-byte key hash.
     /// For keyless types the key hash is all zeros; all calls return the same handle.
     pub fn registerInstanceRaw(key_hash: [16]u8) DDS.InstanceHandle_t {
+        return keyHashToHandle(key_hash);
+    }
+
+    /// Return the stored CDR payload for the given instance handle, or null if
+    /// no alive write has been made for this instance.
+    /// The returned slice is valid until the next write to this writer.
+    pub fn getKeyValueRaw(self: *Self, handle: DDS.InstanceHandle_t) ?[]u8 {
+        return self.key_registry.get(handle);
+    }
+
+    /// Look up the instance handle for a given key hash. Returns HANDLE_NIL if
+    /// no alive write has been made for this key.
+    pub fn lookupInstanceRaw(key_hash: [16]u8) DDS.InstanceHandle_t {
         return keyHashToHandle(key_hash);
     }
 
