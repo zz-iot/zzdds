@@ -81,6 +81,10 @@ module DDS {
     const StatusKind PUBLICATION_MATCHED_STATUS         = 0x0001 << 13;
     const StatusKind SUBSCRIPTION_MATCHED_STATUS        = 0x0001 << 14;
 
+    const StatusMask STATUS_MASK_ALL                    = 0xffffffff; // Non-Spec
+    const StatusMask STATUS_MASK_NONE                   = 0x00000000; // Non-Spec
+    const StatusMask STATUS_MASK_DEFAULT                = 0xffffffff; // Non-Spec
+
     // -----------------------------------------------------------------------
     // Status structs
 
