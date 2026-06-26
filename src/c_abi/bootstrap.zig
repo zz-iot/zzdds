@@ -494,21 +494,42 @@ fn nRawImpl(
     if (nil.isNil(reader)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const alloc = std.heap.c_allocator;
+
+    // For bounded destructive takes, pre-allocate the output struct array BEFORE
+    // removing samples from the queue.  Without this, an OOM at the alloc step
+    // would silently discard already-taken data with no way to recover it.
+    // _alloc_capacity may exceed count; zzdds_return_raw_samples uses it for the
+    // free, so over-allocating is safe.
+    const pre_capacity: usize = if (destructive and max > 0) @intCast(max) else 0;
+    const pre_arr: []CRawSample = if (pre_capacity > 0)
+        alloc.alloc(CRawSample, pre_capacity) catch return -1
+    else
+        &.{};
+
     var tmp: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
     defer {
         for (tmp.items) |s| impl.alloc.free(s.data);
         tmp.deinit(impl.alloc);
     }
     if (destructive) {
-        impl.takeFiltered(&tmp, ss, vs, is, max, null, null) catch return -1;
+        impl.takeFiltered(&tmp, ss, vs, is, max, null, null) catch {
+            if (pre_arr.len > 0) alloc.free(pre_arr);
+            return -1;
+        };
     } else {
         impl.readRaw(&tmp, ss, vs, is, max, null, null) catch return -1;
     }
     if (tmp.items.len == 0) {
+        if (pre_arr.len > 0) alloc.free(pre_arr);
         out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
         return 0;
     }
-    const arr = alloc.alloc(CRawSample, tmp.items.len) catch return -1;
+    // Use the pre-allocated array for destructive bounded takes; otherwise alloc now
+    // (samples remain in queue on non-destructive failure, so this is safe).
+    const arr: []CRawSample = if (pre_arr.len > 0)
+        pre_arr
+    else
+        alloc.alloc(CRawSample, tmp.items.len) catch return -1;
     for (tmp.items, 0..) |s, i| {
         const copy = alloc.dupe(u8, s.data) catch {
             for (arr[0..i]) |prev| alloc.free(prev.data.?[0..prev.data_len]);
@@ -525,8 +546,8 @@ fn nRawImpl(
             },
         };
     }
-    out.* = .{ .samples = arr.ptr, .count = arr.len, ._alloc_capacity = arr.len };
-    return @intCast(arr.len);
+    out.* = .{ .samples = arr.ptr, .count = tmp.items.len, ._alloc_capacity = arr.len };
+    return @intCast(tmp.items.len);
 }
 
 /// Batch take: remove up to `max` samples matching the given state masks.
