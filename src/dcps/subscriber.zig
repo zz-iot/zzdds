@@ -28,6 +28,7 @@ pub const ParticipantCbs = struct {
         type_name: []const u8,
         qos: DDS.DataReaderQos,
         handle: DDS.InstanceHandle_t,
+        presentation: DDS.PresentationQosPolicy,
     ) anyerror!proto.ProtocolReader,
 
     /// Tear down the ProtocolReader identified by handle.
@@ -217,12 +218,14 @@ pub const SubscriberImpl = struct {
         const sub_handle = self.cbs.next_handle(self.cbs.ctx);
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
+        const presentation = self.qos.presentation;
         const pr = self.cbs.create_proto_reader(
             self.cbs.ctx,
             topic_name,
             type_name,
             qos.*,
             sub_handle,
+            presentation,
         ) catch return nil.nil_datareader;
         const dr = reader_mod.DataReaderImpl.init(
             self.alloc,
@@ -259,7 +262,7 @@ pub const SubscriberImpl = struct {
         // Wire up get_field_fn for QueryCondition evaluation (always, when available).
         dr.get_field_fn = self.cbs.get_field_fn(self.cbs.ctx, type_name);
         // Store subscriber's presentation QoS for coherent-set buffering decisions.
-        dr.subscriber_presentation = self.qos.presentation;
+        dr.subscriber_presentation = presentation;
         // Wire up ContentFilteredTopic if the topic description is a CFT.
         if (topic_mod.asCft(a_topic)) |cft| {
             if (dr.get_field_fn) |get_field| {
@@ -274,7 +277,7 @@ pub const SubscriberImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        self.cbs.announce_reader(self.cbs.ctx, sub_handle, pname_slice, self.qos.presentation);
+        self.cbs.announce_reader(self.cbs.ctx, sub_handle, pname_slice, presentation);
         self.mu.lock();
         self.readers.append(self.alloc, dr) catch {
             self.mu.unlock();

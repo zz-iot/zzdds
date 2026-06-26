@@ -136,6 +136,7 @@ const Harness = struct {
         _: []const u8,
         _: DDS.DataReaderQos,
         _: DDS.InstanceHandle_t,
+        _: DDS.PresentationQosPolicy,
     ) anyerror!proto.ProtocolReader {
         return error.Unused;
     }

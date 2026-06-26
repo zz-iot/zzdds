@@ -184,7 +184,7 @@ const BuiltinSubscriberState = struct {
         const noop_cbs = subscriber_mod.ParticipantCbs{
             .ctx = @ptrCast(participant),
             .create_proto_reader = struct {
-                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.InstanceHandle_t) anyerror!proto.ProtocolReader {
+                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.InstanceHandle_t, _: DDS.PresentationQosPolicy) anyerror!proto.ProtocolReader {
                     return noopProtocolReader();
                 }
             }.f,
@@ -964,6 +964,7 @@ pub const DomainParticipantImpl = struct {
         type_name: []const u8,
         qos: DDS.DataWriterQos,
         handle: DDS.InstanceHandle_t,
+        presentation: DDS.PresentationQosPolicy,
     ) anyerror!proto.ProtocolWriter {
         const self = cast(ctx);
 
@@ -1013,6 +1014,7 @@ pub const DomainParticipantImpl = struct {
                 .topic_name = topic_name,
                 .type_name = type_name,
                 .qos = qos,
+                .presentation = presentation,
             });
         }
 
@@ -1051,6 +1053,7 @@ pub const DomainParticipantImpl = struct {
         type_name: []const u8,
         qos: DDS.DataReaderQos,
         handle: DDS.InstanceHandle_t,
+        presentation: DDS.PresentationQosPolicy,
     ) anyerror!proto.ProtocolReader {
         const self = cast(ctx);
 
@@ -1098,6 +1101,7 @@ pub const DomainParticipantImpl = struct {
                 .topic_name = topic_name,
                 .type_name = type_name,
                 .qos = qos,
+                .presentation = presentation,
                 .key_hash_ctx = if (self.type_support_registry.get(type_name)) |ts| ts.ctx else undefined,
                 .key_hash_fn = if (self.type_support_registry.get(type_name)) |ts|
                     ts.compute_key_hash
