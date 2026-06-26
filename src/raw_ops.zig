@@ -31,11 +31,14 @@ pub const OwnedRawSample = struct {
     }
 };
 
-fn toChangeKind(kind: WriteKind) history_mod.ChangeKind {
+fn toChangeKind(kind: WriteKind, impl: *DataWriterImpl) history_mod.ChangeKind {
     return switch (kind) {
         .alive => .alive,
         .dispose => .not_alive_disposed,
-        .unregister => .not_alive_unregistered,
+        .unregister => if (impl.qos.writer_data_lifecycle.autodispose_unregistered_instances)
+            .not_alive_disposed
+        else
+            .not_alive_unregistered,
     };
 }
 
@@ -61,7 +64,7 @@ pub fn writeRaw(
     data: []const u8,
 ) !void {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
-    const ck = toChangeKind(kind);
+    const ck = toChangeKind(kind, impl);
     _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
 }
 
@@ -74,7 +77,7 @@ pub fn writeRawWithTimestamp(
     ts: DDS.Time_t,
 ) !void {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
-    const ck = toChangeKind(kind);
+    const ck = toChangeKind(kind, impl);
     const t = time_mod.Time{ .sec = ts.sec, .nanosec = ts.nanosec };
     const rtps_ts = time_mod.RtpsTimestamp.fromTime(t);
     _ = try impl.writeRaw(ck, rtps_ts, history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
