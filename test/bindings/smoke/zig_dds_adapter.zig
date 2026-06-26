@@ -71,7 +71,7 @@ pub fn registerInstanceRaw(_: [16]u8) DDS.InstanceHandle_t {
     return 0;
 }
 
-pub fn getKeyValueRawWriter(_: DDS.DataWriter, _: DDS.InstanceHandle_t) ?[]const u8 {
+pub fn getKeyValueRawWriter(_: DDS.DataWriter, _: DDS.InstanceHandle_t) ?[]u8 {
     return null;
 }
 
@@ -117,7 +117,7 @@ pub fn readFilteredRaw(
     _: ?DDS.InstanceHandle_t,
 ) !void {}
 
-pub fn getKeyValueRawReader(_: DDS.DataReader, _: DDS.InstanceHandle_t) ?[]const u8 {
+pub fn getKeyValueRawReader(_: DDS.DataReader, _: DDS.InstanceHandle_t) ?[]u8 {
     return null;
 }
 

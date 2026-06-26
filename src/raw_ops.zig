@@ -126,8 +126,7 @@ pub fn readNextSampleRaw(reader: DDS.DataReader) ?OwnedRawSample {
     // readRaw with ANY masks, limit 1, and no instance filter.
     var out: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
-        // If we got a sample, we own it — do NOT free here; wrap and return it.
-        // If we error out, free accumulated items.
+        for (out.items) |s| impl.alloc.free(s.data);
         out.deinit(impl.alloc);
     }
     impl.readRaw(
