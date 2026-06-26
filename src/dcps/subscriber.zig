@@ -28,6 +28,7 @@ pub const ParticipantCbs = struct {
         type_name: []const u8,
         qos: DDS.DataReaderQos,
         handle: DDS.InstanceHandle_t,
+        presentation: DDS.PresentationQosPolicy,
     ) anyerror!proto.ProtocolReader,
 
     /// Tear down the ProtocolReader identified by handle.
@@ -223,6 +224,7 @@ pub const SubscriberImpl = struct {
             type_name,
             qos.*,
             sub_handle,
+            self.qos.presentation,
         ) catch return nil.nil_datareader;
         const dr = reader_mod.DataReaderImpl.init(
             self.alloc,

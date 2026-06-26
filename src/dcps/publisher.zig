@@ -30,6 +30,7 @@ pub const ParticipantCbs = struct {
         type_name: []const u8,
         qos: DDS.DataWriterQos,
         handle: DDS.InstanceHandle_t,
+        presentation: DDS.PresentationQosPolicy,
     ) anyerror!proto.ProtocolWriter,
 
     /// Tear down the ProtocolWriter identified by handle.
@@ -246,6 +247,7 @@ pub const PublisherImpl = struct {
             type_name,
             qos.*,
             pub_handle,
+            self.qos.presentation,
         ) catch return nil.nil_datawriter;
         const dw = writer_mod.DataWriterImpl.init(
             self.alloc,
