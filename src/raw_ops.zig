@@ -205,7 +205,10 @@ pub fn readFilteredRaw(
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
-    defer tmp.deinit(impl.alloc);
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
     try impl.readRaw(&tmp, ss, vs, is, max, maybe_ih, null);
     try out.ensureUnusedCapacity(impl.alloc, tmp.items.len);
     for (tmp.items) |s| {
