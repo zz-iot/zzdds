@@ -251,3 +251,281 @@ test "bootstrap: take_one_raw_instance returns 0 when queue is empty" {
     const n = bootstrap.zzdds_take_one_raw_instance(pair.dr, 0, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 0), n);
 }
+
+// ── register_instance_raw ─────────────────────────────────────────────────────
+
+test "bootstrap: register_instance_raw returns deterministic handle" {
+    const h1 = bootstrap.zzdds_register_instance_raw(undefined, &KEY_HASH);
+    const h2 = bootstrap.zzdds_register_instance_raw(undefined, &KEY_HASH);
+    try testing.expectEqual(h1, h2);
+    // Distinct key should produce distinct handle.
+    var other_key: [16]u8 = undefined;
+    @memset(&other_key, 0x01);
+    const h3 = bootstrap.zzdds_register_instance_raw(undefined, &other_key);
+    try testing.expect(h1 != h3);
+}
+
+// ── write_raw_w_timestamp ─────────────────────────────────────────────────────
+
+test "bootstrap: write_raw_w_timestamp round-trip" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const ts = DDS.Time_t{ .sec = 42, .nanosec = 0 };
+    const rc = bootstrap.zzdds_write_raw_w_timestamp(pair.dw, .alive, &KEY_HASH, &PAYLOAD, PAYLOAD.len, ts);
+    try testing.expectEqual(@as(DDS.ReturnCode_t, 0), rc);
+
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    const n = bootstrap.zzdds_take_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    try testing.expectEqual(@as(c_int, 1), n);
+    try testing.expectEqual(PAYLOAD.len, cdr_len);
+    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..cdr_len]);
+}
+
+// ── read_one_raw ──────────────────────────────────────────────────────────────
+
+test "bootstrap: read_one_raw non-destructive — sample stays in queue" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    const n1 = bootstrap.zzdds_read_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    try testing.expectEqual(@as(c_int, 1), n1);
+    try testing.expectEqual(PAYLOAD.len, cdr_len);
+    // Second read still returns the same sample.
+    const n2 = bootstrap.zzdds_read_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    try testing.expectEqual(@as(c_int, 1), n2);
+}
+
+test "bootstrap: read_one_raw returns 0 when queue is empty" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    const n = bootstrap.zzdds_read_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    try testing.expectEqual(@as(c_int, 0), n);
+}
+
+// ── read_one_raw_instance ─────────────────────────────────────────────────────
+
+test "bootstrap: read_one_raw_instance round-trip" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    const n = bootstrap.zzdds_read_one_raw_instance(pair.dr, 0, &buf, buf.len, &cdr_len, &info);
+    try testing.expectEqual(@as(c_int, 1), n);
+    try testing.expectEqual(PAYLOAD.len, cdr_len);
+    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..cdr_len]);
+}
+
+test "bootstrap: read_one_raw_instance returns 0 when queue is empty" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    const n = bootstrap.zzdds_read_one_raw_instance(pair.dr, 0, &buf, buf.len, &cdr_len, &info);
+    try testing.expectEqual(@as(c_int, 0), n);
+}
+
+// ── take_n_raw / read_n_raw / return_raw_samples ──────────────────────────────
+
+test "bootstrap: take_n_raw returns all samples and return_raw_samples frees" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    // Use three different key hashes to get three distinct instances
+    // (default KEEP_LAST=1 QoS keeps one sample per instance).
+    var k1: [16]u8 = std.mem.zeroes([16]u8);
+    k1[0] = 1;
+    var k2: [16]u8 = std.mem.zeroes([16]u8);
+    k2[0] = 2;
+    var k3: [16]u8 = std.mem.zeroes([16]u8);
+    k3[0] = 3;
+    _ = bootstrap.zzdds_write_raw(pair.dw, &k1, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw, &k2, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw, &k3, &PAYLOAD, PAYLOAD.len);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr);
+    try testing.expectEqual(@as(c_int, 3), n);
+    try testing.expectEqual(@as(usize, 3), arr.count);
+    try testing.expect(arr.samples != null);
+    // Verify first sample payload.
+    const s0 = arr.samples.?[0];
+    try testing.expectEqual(PAYLOAD.len, s0.data_len);
+    try testing.expectEqualSlices(u8, &PAYLOAD, s0.data.?[0..s0.data_len]);
+
+    bootstrap.zzdds_return_raw_samples(pair.dr, &arr);
+    try testing.expectEqual(@as(usize, 0), arr.count);
+    try testing.expect(arr.samples == null);
+
+    // Queue is now empty.
+    var arr2: bootstrap.CRawSampleArray = undefined;
+    const n2 = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr2);
+    try testing.expectEqual(@as(c_int, 0), n2);
+    try testing.expect(arr2.samples == null);
+}
+
+test "bootstrap: take_n_raw returns 0 when queue is empty" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 10, &arr);
+    try testing.expectEqual(@as(c_int, 0), n);
+    try testing.expect(arr.samples == null);
+}
+
+test "bootstrap: read_n_raw is non-destructive" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var k1: [16]u8 = std.mem.zeroes([16]u8);
+    k1[0] = 1;
+    var k2: [16]u8 = std.mem.zeroes([16]u8);
+    k2[0] = 2;
+    _ = bootstrap.zzdds_write_raw(pair.dw, &k1, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw, &k2, &PAYLOAD, PAYLOAD.len);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_read_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 10, &arr);
+    try testing.expectEqual(@as(c_int, 2), n);
+    bootstrap.zzdds_return_raw_samples(pair.dr, &arr);
+
+    // Samples still in queue — take should succeed.
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    const m = bootstrap.zzdds_take_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    try testing.expectEqual(@as(c_int, 1), m);
+}
+
+// ── get_key_value_writer / lookup_instance_writer ─────────────────────────────
+
+test "bootstrap: get_key_value_writer returns CDR payload after alive write" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw, &KEY_HASH);
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw, ih, &buf, buf.len, &len);
+    try testing.expectEqual(@as(c_int, 0), rc);
+    try testing.expectEqual(PAYLOAD.len, len);
+    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..len]);
+}
+
+test "bootstrap: get_key_value_writer returns -1 for unknown handle" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var dummy_key: [16]u8 = undefined;
+    @memset(&dummy_key, 0xFF);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw, &dummy_key);
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw, ih, &buf, buf.len, &len);
+    try testing.expectEqual(@as(c_int, -1), rc);
+}
+
+test "bootstrap: lookup_instance_writer matches register_instance_raw" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const h1 = bootstrap.zzdds_register_instance_raw(pair.dw, &KEY_HASH);
+    const h2 = bootstrap.zzdds_lookup_instance_writer(pair.dw, &KEY_HASH);
+    try testing.expectEqual(h1, h2);
+}
+
+// ── get_key_value_reader / lookup_instance_reader ─────────────────────────────
+
+test "bootstrap: get_key_value_reader returns CDR payload after receive" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw, &KEY_HASH);
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr, ih, &buf, buf.len, &len);
+    try testing.expectEqual(@as(c_int, 0), rc);
+    try testing.expectEqual(PAYLOAD.len, len);
+    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..len]);
+}
+
+test "bootstrap: get_key_value_reader returns -1 for unknown handle" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var dummy_key: [16]u8 = undefined;
+    @memset(&dummy_key, 0xFF);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw, &dummy_key);
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr, ih, &buf, buf.len, &len);
+    try testing.expectEqual(@as(c_int, -1), rc);
+}
+
+test "bootstrap: lookup_instance_reader returns handle for alive instance, 0 when not found" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+
+    // Known alive instance returns its handle.
+    const ih = bootstrap.zzdds_lookup_instance_reader(pair.dr, &KEY_HASH);
+    try testing.expect(ih != 0);
+    try testing.expectEqual(bootstrap.zzdds_register_instance_raw(pair.dw, &KEY_HASH), ih);
+
+    // Unknown key returns 0 (HANDLE_NIL).
+    var unknown_key: [16]u8 = undefined;
+    @memset(&unknown_key, 0xFF);
+    const ih2 = bootstrap.zzdds_lookup_instance_reader(pair.dr, &unknown_key);
+    try testing.expectEqual(@as(DDS.InstanceHandle_t, 0), ih2);
+}

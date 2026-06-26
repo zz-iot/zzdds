@@ -133,6 +133,20 @@ overflows (similar to a small-vector), or a two-phase dispatch that re-acquires 
 lock between calls with a generation counter to detect concurrent mutations. The goal
 is to remove the hard cap without introducing a heap allocation on the common path.
 
+**`register_instance` side-effect optimization** — `zzdds_register_instance_raw`
+is currently a pure function (FNV1a of the 16-byte MD5 key hash → `int32_t` handle;
+no state stored, no side effects).  A complete implementation would pre-allocate the
+instance's history cache entry, pre-warm SEDP discovery state, and enable a
+`zzdds_write_raw_kind_w_handle` C ABI variant that accepts a pre-registered
+`DDS_InstanceHandle_t` instead of a 16-byte key hash, skipping MD5 key hash
+recomputation on the hot write path.  Meaningful for high-frequency writes (100k+/s)
+on topics with non-trivial keys (string keys, multi-field keys); negligible for simple
+scalar keys at typical sensor/video rates.  The C++ typed wrapper layer (see
+`cpp_binding_improvements.md` B2) is already structured for this: it stores the key
+hash at `register_instance` time and passes it through to the existing C ABI; when
+the C ABI gains a handle-based write path, the wrapper can switch without any
+user-visible API change.
+
 **`swapRemove` / `orderedRemove` audit** — several hot paths use `orderedRemove` on
 `ArrayListUnmanaged` to delete a single element from the middle of a list, which is O(N) per
 call and O(N²) in loops.  The pattern is pre-existing and fine for the small lists seen

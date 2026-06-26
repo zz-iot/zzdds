@@ -55,6 +55,32 @@ comptime {
     _ = c_abi.typesupport;
     _ = c_abi.bootstrap;
 }
+/// Re-export the generated DDS type definitions so generated code can do
+///   const _zzdds = @import("zzdds");
+///   const DDS = _zzdds.DDS;
+pub const DDS = @import("zzdds_generated").DDS;
+
+/// Module-level raw operations called by zidl-generated typed wrappers.
+pub const raw_ops = @import("raw_ops.zig");
+
+// Flat re-exports from raw_ops so callers can write _zzdds.writeRaw(...) directly.
+pub const writerUsesXcdr2 = raw_ops.writerUsesXcdr2;
+pub const WriteKind = raw_ops.WriteKind;
+pub const OwnedRawSample = raw_ops.OwnedRawSample;
+pub const writeRaw = raw_ops.writeRaw;
+pub const writeRawWithTimestamp = raw_ops.writeRawWithTimestamp;
+pub const registerInstanceRaw = raw_ops.registerInstanceRaw;
+pub const getKeyValueRawWriter = raw_ops.getKeyValueRawWriter;
+pub const lookupInstanceWriter = raw_ops.lookupInstanceWriter;
+pub const takeRaw = raw_ops.takeRaw;
+pub const readNextSampleRaw = raw_ops.readNextSampleRaw;
+pub const takeNextInstanceRaw = raw_ops.takeNextInstanceRaw;
+pub const readNextInstanceRaw = raw_ops.readNextInstanceRaw;
+pub const takeFilteredRaw = raw_ops.takeFilteredRaw;
+pub const readFilteredRaw = raw_ops.readFilteredRaw;
+pub const getKeyValueRawReader = raw_ops.getKeyValueRawReader;
+pub const lookupInstanceReader = raw_ops.lookupInstanceReader;
+
 pub const util = struct {
     pub const time = @import("util/time.zig");
     pub const clock_registry = @import("util/clock_registry.zig");
@@ -111,5 +137,6 @@ test {
     _ = @import("discovery/direct.zig");
     _ = @import("delivery/intraprocess.zig");
     _ = @import("dcps/root.zig");
+    _ = @import("raw_ops.zig");
     _ = @import("trace.zig");
 }

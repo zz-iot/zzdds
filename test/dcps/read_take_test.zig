@@ -323,3 +323,125 @@ test "takeFiltered: empty queue returns zero results" {
     try pair.dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }
+
+// ── readNextInstanceRaw ───────────────────────────────────────────────────────
+
+const KEY_A: [16]u8 = .{1} ++ .{0} ** 15;
+const KEY_B: [16]u8 = .{2} ++ .{0} ** 15;
+
+test "readNextInstanceRaw: returns one sample from the first instance" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+
+    const s = pair.dr.readNextInstanceRaw(0);
+    try testing.expect(s != null);
+    defer alloc.free(s.?.data);
+    try testing.expectEqualSlices(u8, &PAYLOAD, s.?.data);
+}
+
+test "readNextInstanceRaw: returns null when queue is empty" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    try testing.expect(pair.dr.readNextInstanceRaw(0) == null);
+}
+
+test "readNextInstanceRaw: iterates instances in handle order" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_B, &PAYLOAD);
+
+    const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
+    const ih_b = DataWriterImpl.registerInstanceRaw(KEY_B);
+    const first_ih = @min(ih_a, ih_b);
+    const second_ih = @max(ih_a, ih_b);
+
+    const s1 = pair.dr.readNextInstanceRaw(0);
+    try testing.expect(s1 != null);
+    defer alloc.free(s1.?.data);
+    try testing.expectEqual(first_ih, s1.?.info.instance_handle);
+
+    const s2 = pair.dr.readNextInstanceRaw(first_ih);
+    try testing.expect(s2 != null);
+    defer alloc.free(s2.?.data);
+    try testing.expectEqual(second_ih, s2.?.info.instance_handle);
+
+    try testing.expect(pair.dr.readNextInstanceRaw(second_ih) == null);
+}
+
+// ── getKeyValueRaw (reader) ───────────────────────────────────────────────────
+
+test "getKeyValueRaw (reader): returns CDR payload for known alive instance" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+
+    const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
+    const kv = pair.dr.getKeyValueRaw(ih);
+    try testing.expect(kv != null);
+    try testing.expectEqualSlices(u8, &PAYLOAD, kv.?);
+}
+
+test "getKeyValueRaw (reader): returns null for unknown handle" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    const unknown_ih: DDS.InstanceHandle_t = @bitCast(@as(u32, 0x7FFF_FFFE));
+    try testing.expect(pair.dr.getKeyValueRaw(unknown_ih) == null);
+}
+
+// ── lookupInstance ────────────────────────────────────────────────────────────
+
+test "lookupInstance: true for alive instance, false for unknown" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+
+    const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
+    try testing.expect(pair.dr.lookupInstance(ih_a));
+    try testing.expect(!pair.dr.lookupInstance(0x7FFF_FFFE));
+}
+
+// ── getKeyValueRaw (writer) ───────────────────────────────────────────────────
+
+test "getKeyValueRaw (writer): returns CDR payload after alive write" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+
+    const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
+    const kv = pair.dw.getKeyValueRaw(ih);
+    try testing.expect(kv != null);
+    try testing.expectEqualSlices(u8, &PAYLOAD, kv.?);
+}
+
+test "getKeyValueRaw (writer): returns null for handle with no prior write" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
+    try testing.expect(pair.dw.getKeyValueRaw(ih) == null);
+}

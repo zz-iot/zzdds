@@ -113,9 +113,12 @@ pub const TakenSample = struct {
     info: DDS.SampleInfo,
 };
 
-/// Per-instance tracking used to compute view_state.
+/// Per-instance tracking used to compute view_state and get_key_value.
 const InstanceEntry = struct {
     instance_state: DDS.InstanceStateKind,
+    /// Full CDR payload of the first alive sample for this instance.
+    /// Used by getKeyValueRaw. Null until the first alive sample arrives.
+    key_cdr: ?[]u8 = null,
 };
 
 fn matchesSample(
@@ -384,6 +387,12 @@ pub const DataReaderImpl = struct {
             while (wi_it.next()) |inner| inner.deinit(self.alloc);
         }
         self.writer_instances.deinit(self.alloc);
+        {
+            var si_it = self.seen_instances.valueIterator();
+            while (si_it.next()) |entry| {
+                if (entry.key_cdr) |kc| self.alloc.free(kc);
+            }
+        }
         self.seen_instances.deinit(self.alloc);
         self.qos.deinit(self.alloc);
         // NOTE: proto_reader lifecycle is owned by the participant (via
@@ -415,6 +424,16 @@ pub const DataReaderImpl = struct {
         } else {
             self.seen_instances.put(self.alloc, ih, .{ .instance_state = new_state }) catch {};
             return .{ .view = DDS.NEW_VIEW_STATE, .instance_state = new_state };
+        }
+    }
+
+    /// Store `data` as the key CDR for `ih` if not already set.
+    /// Must be called with `mu` held.
+    fn storeKeyIfNeededLocked(self: *Self, ih: DDS.InstanceHandle_t, data: []const u8) void {
+        if (self.seen_instances.getPtr(ih)) |entry| {
+            if (entry.key_cdr == null) {
+                entry.key_cdr = self.alloc.dupe(u8, data) catch null;
+            }
         }
     }
 
@@ -589,6 +608,7 @@ pub const DataReaderImpl = struct {
         {
             self.coherent_writer_guids.put(self.alloc, change.writer_guid, {}) catch {};
             const states = self.determineStatesLocked(ih, change.kind);
+            if (change.kind == .alive) self.storeKeyIfNeededLocked(ih, copy);
             const src_time = change.source_timestamp.toTime();
             const coh_expiry: ?i64 = if (change.kind == .alive)
                 if (self.writer_lifespans.get(change.writer_guid)) |ls_ns|
@@ -792,6 +812,7 @@ pub const DataReaderImpl = struct {
 
         // Build SampleInfo from the CacheChange.
         const states = self.determineStatesLocked(ih, change.kind);
+        if (change.kind == .alive) self.storeKeyIfNeededLocked(ih, copy);
         const src_time = change.source_timestamp.toTime();
         const expiry: ?i64 = if (change.kind == .alive)
             if (self.writer_lifespans.get(change.writer_guid)) |ls_ns|
@@ -1227,6 +1248,75 @@ pub const DataReaderImpl = struct {
             }
         }
         return null;
+    }
+
+    /// Non-destructive analog to takeNextInstanceRaw: return (without removing) one
+    /// sample from the "next" instance in handle order after `prev_instance_handle`.
+    /// The sample's sample_state is updated to READ_SAMPLE_STATE in-place.
+    /// Returns null when no qualifying sample exists.
+    /// The caller owns TakenSample.data and must free with the reader's allocator.
+    pub fn readNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const now_ns = time_mod.nanoTimestamp();
+
+        // Purge expired samples before scanning.
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            const pc = &self.pending.items[i];
+            if (pc.expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    const expired = self.pending.orderedRemove(i);
+                    expired.deinit();
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        // Find the target instance handle (smallest ih > prev, or smallest overall if prev == 0).
+        var target_ih: ?DDS.InstanceHandle_t = null;
+        for (self.pending.items) |pc| {
+            const ih = pc.info.instance_handle;
+            if (prev_instance_handle == 0) {
+                if (target_ih == null or ih < target_ih.?) target_ih = ih;
+            } else if (ih > prev_instance_handle) {
+                if (target_ih == null or ih < target_ih.?) target_ih = ih;
+            }
+        }
+        const tgt = target_ih orelse return null;
+
+        for (self.pending.items) |*pc| {
+            if (pc.info.instance_handle == tgt) {
+                const clone = self.alloc.dupe(u8, pc.data) catch return null;
+                pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+                return TakenSample{ .data = clone, .info = pc.info };
+            }
+        }
+        return null;
+    }
+
+    /// Return the stored CDR payload for the given instance handle, or null if
+    /// no alive sample has arrived for this instance.
+    /// The returned slice is valid until the next write to this reader or deinit.
+    pub fn getKeyValueRaw(self: *Self, handle: DDS.InstanceHandle_t) ?[]u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.seen_instances.get(handle)) |entry| {
+            return entry.key_cdr;
+        }
+        return null;
+    }
+
+    /// Return true if `handle` refers to a known ALIVE instance.
+    pub fn lookupInstance(self: *Self, handle: DDS.InstanceHandle_t) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.seen_instances.get(handle)) |entry| {
+            return entry.instance_state == DDS.ALIVE_INSTANCE_STATE;
+        }
+        return false;
     }
 
     /// Non-destructively read samples matching the given state masks.
@@ -1883,6 +1973,10 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
             set.deinit(alloc);
         }
         dr.coherent_committed.deinit(alloc);
+        {
+            var _si = dr.seen_instances.valueIterator();
+            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
+        }
         dr.seen_instances.deinit(alloc);
     }
 
@@ -1977,6 +2071,10 @@ test "coherent WIP: CS transition discards incomplete previous WIP" {
             set.deinit(alloc);
         }
         dr.coherent_committed.deinit(alloc);
+        {
+            var _si = dr.seen_instances.valueIterator();
+            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
+        }
         dr.seen_instances.deinit(alloc);
         dr.coherent_writer_guids.deinit(alloc);
         var wit = dr.writer_instances.valueIterator();
@@ -2058,6 +2156,10 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
             set.deinit(alloc);
         }
         dr.coherent_committed.deinit(alloc);
+        {
+            var _si = dr.seen_instances.valueIterator();
+            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
+        }
         dr.seen_instances.deinit(alloc);
         dr.coherent_writer_guids.deinit(alloc);
         var wit = dr.writer_instances.valueIterator();
@@ -2129,6 +2231,10 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
         dr.pending.deinit(alloc);
         dr.coherent_wip.deinit(alloc);
         dr.coherent_committed.deinit(alloc);
+        {
+            var _si = dr.seen_instances.valueIterator();
+            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
+        }
         dr.seen_instances.deinit(alloc);
     }
 
