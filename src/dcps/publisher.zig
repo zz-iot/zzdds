@@ -241,13 +241,14 @@ pub const PublisherImpl = struct {
         const pub_handle = self.cbs.next_handle(self.cbs.ctx);
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
+        const presentation = self.qos.presentation;
         const pw = self.cbs.create_proto_writer(
             self.cbs.ctx,
             topic_name,
             type_name,
             qos.*,
             pub_handle,
-            self.qos.presentation,
+            presentation,
         ) catch return nil.nil_datawriter;
         const dw = writer_mod.DataWriterImpl.init(
             self.alloc,
@@ -294,7 +295,7 @@ pub const PublisherImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        self.cbs.announce_writer(self.cbs.ctx, pub_handle, self.instance_handle, pname_slice, self.qos.presentation);
+        self.cbs.announce_writer(self.cbs.ctx, pub_handle, self.instance_handle, pname_slice, presentation);
         self.mu.lock();
         self.writers.append(self.alloc, dw) catch {
             self.mu.unlock();
