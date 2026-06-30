@@ -127,7 +127,9 @@ pub const DomainParticipantFactoryImpl = struct {
         mask: DDS.StatusMask,
         config: config_mod.Config,
     ) DDS.DomainParticipant {
-        return self.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, null);
+        const p = self.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, null) orelse
+            return nil.nil_participant;
+        return p.toDDSParticipant();
     }
 
     pub fn createParticipantWithConfigOwned(
@@ -138,7 +140,7 @@ pub const DomainParticipantFactoryImpl = struct {
         mask: DDS.StatusMask,
         config: config_mod.Config,
         config_deinit_allocator: ?std.mem.Allocator,
-    ) DDS.DomainParticipant {
+    ) ?*participant_mod.DomainParticipantImpl {
         // Allocate a handle for this participant.
         self.mu.lock();
         const handle = self.next_handle;
@@ -168,7 +170,7 @@ pub const DomainParticipantFactoryImpl = struct {
             handle,
             self.trace_config.tracer(),
             timer_clock,
-        ) catch return nil.nil_participant;
+        ) catch return null;
         // config_deinit_allocator is set AFTER participants.append so that p.deinit()
         // on any failure path below doesn't free config — the caller retains ownership
         // and handles cleanup on error.
@@ -176,19 +178,19 @@ pub const DomainParticipantFactoryImpl = struct {
         // Start discovery; if it fails we still own the participant and must clean up.
         p.start() catch {
             p.deinit();
-            return nil.nil_participant;
+            return null;
         };
 
         self.mu.lock();
         self.participants.append(self.alloc, p) catch {
             self.mu.unlock();
             p.deinit();
-            return nil.nil_participant;
+            return null;
         };
         self.mu.unlock();
 
         p.config_deinit_allocator = config_deinit_allocator;
-        return p.toDDSParticipant();
+        return p;
     }
 
     fn vtDeleteParticipant(ctx: *anyopaque, a_participant: DDS.DomainParticipant) DDS.ReturnCode_t {

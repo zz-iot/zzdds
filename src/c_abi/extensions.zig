@@ -64,15 +64,12 @@ const FactoryOwner = struct {
         // so that p.deinit() on any failure path doesn't free the config (the
         // caller's catch block in factoryCreateParticipantEx is the sole cleanup
         // site).
-        const dp = stack.factory.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, null);
-        if (nil.isNil(dp)) return error.ParticipantFailed;
+        const p = stack.factory.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, null) orelse
+            return error.ParticipantFailed;
 
         try self.stacks.append(self.alloc, stack);
-        if (config_deinit_allocator) |cfg_alloc| {
-            const impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
-            impl.config_deinit_allocator = cfg_alloc;
-        }
-        return dp;
+        if (config_deinit_allocator) |cfg_alloc| p.config_deinit_allocator = cfg_alloc;
+        return p.toDDSParticipant();
     }
 
     fn deleteParticipant(self: *@This(), participant: DDS.DomainParticipant) DDS.ReturnCode_t {
@@ -472,8 +469,7 @@ fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.Re
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
     const taken = impl.takeRaw() orelse return DDS.RETCODE_NO_DATA;
-    defer impl.alloc.free(taken.data);
-    fillSerializedSample(sample, taken) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    fillSerializedSample(sample, taken);
     return DDS.RETCODE_OK;
 }
 
@@ -485,12 +481,11 @@ fn readerTakeNextInstanceSerialized(
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
     const taken = impl.takeNextInstanceRaw(previous_instance) orelse return DDS.RETCODE_NO_DATA;
-    defer impl.alloc.free(taken.data);
-    fillSerializedSample(sample, taken) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    fillSerializedSample(sample, taken);
     return DDS.RETCODE_OK;
 }
 
-fn borrowedDeinit(_: *anyopaque) void {}
+const borrowedDeinit = nil.nilDeinit;
 
 fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
     const s = seq orelse return null;
@@ -498,14 +493,14 @@ fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
     return buf[0..s._length];
 }
 
-fn fillSerializedSample(sample: *ZZDDS.SerializedSample, taken: reader_mod.TakenSample) !void {
-    const copy = try std.heap.c_allocator.alloc(u8, taken.data.len);
-    @memcpy(copy, taken.data);
+fn fillSerializedSample(sample: *ZZDDS.SerializedSample, taken: reader_mod.TakenSample) void {
+    // taken.data is a c_allocator buffer; transfer ownership directly to the
+    // caller's OctetSeq so they can free() it via _release = true.
     sample.* = .{
         .cdr = .{
-            ._maximum = @intCast(copy.len),
-            ._length = @intCast(copy.len),
-            ._buffer = copy.ptr,
+            ._maximum = @intCast(taken.data.len),
+            ._length = @intCast(taken.data.len),
+            ._buffer = taken.data.ptr,
             ._release = true,
         },
         .instance_handle = taken.info.instance_handle,
