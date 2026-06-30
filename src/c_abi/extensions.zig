@@ -232,6 +232,10 @@ pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(fac
     return .{ .ptr = factory.ptr, .vtable = &factory_vtable };
 }
 
+/// Only valid for participants created through a FactoryOwner factory (i.e., via
+/// zzdds_create_factory → create_participant_ex). Passing a participant from any
+/// other implementation will produce a type-confused pointer and corrupt memory
+/// on the next vtable dispatch.
 pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: DDS.DomainParticipant) callconv(.c) ZZDDS.DomainParticipant {
     return .{ .ptr = participant.ptr, .vtable = &participant_vtable };
 }
@@ -242,10 +246,14 @@ pub export fn zzdds_DomainParticipant_as_DDS_DomainParticipant(participant: ZZDD
     return impl.toDDSParticipant();
 }
 
+/// Only valid for topics created through a FactoryOwner-owned participant.
+/// See DDS_DomainParticipant_as_zzdds_DomainParticipant for the same caveat.
 pub export fn DDS_Topic_as_zzdds_Topic(topic: DDS.Topic) callconv(.c) ZZDDS.Topic {
     return .{ .ptr = topic.ptr, .vtable = &topic_vtable };
 }
 
+/// Only valid for writers created through a FactoryOwner-owned participant.
+/// See DDS_DomainParticipant_as_zzdds_DomainParticipant for the same caveat.
 pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: DDS.DataWriter) callconv(.c) ZZDDS.DataWriter {
     return .{ .ptr = writer.ptr, .vtable = &writer_vtable };
 }
@@ -256,6 +264,8 @@ pub export fn zzdds_DataWriter_as_DDS_DataWriter(writer: ZZDDS.DataWriter) callc
     return impl.toDDSDataWriter();
 }
 
+/// Only valid for readers created through a FactoryOwner-owned participant.
+/// See DDS_DomainParticipant_as_zzdds_DomainParticipant for the same caveat.
 pub export fn DDS_DataReader_as_zzdds_DataReader(reader: DDS.DataReader) callconv(.c) ZZDDS.DataReader {
     return .{ .ptr = reader.ptr, .vtable = &reader_vtable };
 }
@@ -379,7 +389,10 @@ fn factoryCreateParticipantEx(
 ) DDS.DomainParticipant {
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
-    const runtime_config = config_generated.toRuntimeConfig(owner.alloc, config) catch return nil.nil_participant;
+    const runtime_config = config_generated.toRuntimeConfig(owner.alloc, config) catch |err| {
+        std.log.err("create_participant_ex: config conversion failed: {}", .{err});
+        return nil.nil_participant;
+    };
     return owner.createParticipant(domain_id, qos, a_listener, mask, runtime_config, owner.alloc) catch |err| {
         var cfg = runtime_config;
         config_generated.deinitRuntimeConfig(owner.alloc, &cfg);
