@@ -1141,7 +1141,8 @@ fn createUnicastSocket(addr_kind: i32, ip: [16]u8, port: u16, recv_buf: u32) !po
     } else {
         // Keep IPv6 sockets out of the IPv4-mapped address space so UDPv4 and
         // UDPv6 sockets can coexist on the same RTPS well-known port.
-        sockOptInt(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1) catch {};
+        sockOptInt(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1) catch |err|
+            log.transport.warn("udp: IPV6_V6ONLY on unicast socket: {}", .{err});
         const addr = posix.sockaddr.in6{
             .family = posix.AF.INET6,
             .port = std.mem.nativeToBig(u16, port),
@@ -1174,7 +1175,8 @@ fn createMulticastSocket(addr_kind: i32, port: u16, recv_buf: u32) !posix.socket
         };
         try socketBind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
     } else {
-        sockOptInt(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1) catch {};
+        sockOptInt(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1) catch |err|
+            log.transport.warn("udp: IPV6_V6ONLY on multicast socket: {}", .{err});
         const addr = posix.sockaddr.in6{
             .family = posix.AF.INET6,
             .port = std.mem.nativeToBig(u16, port),

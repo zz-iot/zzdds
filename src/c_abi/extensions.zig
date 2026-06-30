@@ -453,6 +453,7 @@ fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQ
     owner.mu.lock();
     defer owner.mu.unlock();
     qos.deinit(owner.alloc);
+    qos.* = .{}; // zero before clone so caller gets an empty struct on OOM, not stale pointers
     qos.* = owner.default_dp_qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
     return DDS.RETCODE_OK;
 }
