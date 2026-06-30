@@ -416,12 +416,21 @@ pub const UdpTransport = struct {
             errdefer {
                 for (owned[0..n_duped]) |s| alloc.free(s);
                 alloc.free(owned);
+                // Zero the field so the function-scope errdefer below skips it.
+                self.config.interfaces = &.{};
             }
             for (config.interfaces, 0..) |src, i| {
                 owned[i] = try alloc.dupe(u8, src);
                 n_duped += 1;
             }
         }
+        // If any subsequent init step fails, free the owned interface strings.
+        // The inner errdefer above zeros self.config.interfaces on mid-copy failure
+        // so this guard never double-frees.
+        errdefer if (self.config.interfaces.len > 0) {
+            for (self.config.interfaces) |s| alloc.free(s);
+            alloc.free(self.config.interfaces);
+        };
 
         var owned_pm: ?*polling.PollingMonitor = null;
         errdefer if (owned_pm) |pm| {
