@@ -376,7 +376,10 @@ fn factoryCreateParticipant(
 ) DDS.DomainParticipant {
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
-    return owner.createParticipant(domain_id, qos, a_listener, mask, .{}, null) catch return nil.nil_participant;
+    return owner.createParticipant(domain_id, qos, a_listener, mask, .{}, null) catch |err| {
+        std.log.err("create_participant: {}", .{err});
+        return nil.nil_participant;
+    };
 }
 
 fn factoryCreateParticipantEx(

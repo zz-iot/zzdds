@@ -11,7 +11,7 @@ namespace detail {
 
 class DomainParticipantFactorySupport final : public DomainParticipantFactoryImpl {
 public:
-    explicit DomainParticipantFactorySupport(zzdds_DomainParticipantFactory handle) noexcept
+    explicit DomainParticipantFactorySupport(zzdds_DomainParticipantFactory handle)
         : DomainParticipantFactoryImpl(handle),
           dds_(zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(handle))
     {}
