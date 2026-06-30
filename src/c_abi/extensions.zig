@@ -432,6 +432,7 @@ fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQ
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     owner.mu.lock();
     defer owner.mu.unlock();
+    qos.deinit(owner.alloc);
     qos.* = owner.default_dp_qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
     return DDS.RETCODE_OK;
 }
@@ -545,6 +546,7 @@ fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
 fn fillSerializedSample(sample: *ZZDDS.SerializedSample, taken: reader_mod.TakenSample) !void {
     // Copy into a c_allocator buffer so the C caller can safely free() it via
     // _release = true, regardless of which allocator backed the reader.
+    if (taken.data.len > std.math.maxInt(u32)) return error.OutOfMemory;
     const copy = try std.heap.c_allocator.alloc(u8, taken.data.len);
     @memcpy(copy, taken.data);
     sample.* = .{
