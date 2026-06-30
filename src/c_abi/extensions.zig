@@ -23,6 +23,7 @@ const GuardConditionImpl = waitset_mod.GuardConditionImpl;
 const StatusConditionImpl = waitset_mod.StatusConditionImpl;
 const ReadConditionImpl = waitset_mod.ReadConditionImpl;
 const QueryConditionImpl = waitset_mod.QueryConditionImpl;
+const Mutex = @import("../util/mutex.zig").Mutex;
 const UdpTransport = @import("../transport/udp.zig").UdpTransport;
 const SpdpSedpDiscovery = @import("../discovery/combined.zig").SpdpSedpDiscovery;
 const noop_security = @import("../security/noop.zig").noop_security_plugins;
@@ -32,6 +33,7 @@ const nil = @import("../dcps/nil.zig");
 
 const FactoryOwner = struct {
     alloc: std.mem.Allocator,
+    mu: Mutex = .{},
     stacks: std.ArrayListUnmanaged(*ParticipantStack) = .empty,
     default_dp_qos: DDS.DomainParticipantQos = .{},
     factory_qos: DDS.DomainParticipantFactoryQos = .{},
@@ -55,8 +57,15 @@ const FactoryOwner = struct {
         const stack = try ParticipantStack.init(self.alloc, domain_id, config);
         errdefer stack.deinit();
 
-        _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &self.default_dp_qos);
-        _ = stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, &self.factory_qos);
+        // Snapshot QoS under the lock before releasing it for the (slow)
+        // participant construction below.
+        self.mu.lock();
+        const dp_qos_snap = self.default_dp_qos;
+        const fac_qos_snap = self.factory_qos;
+        self.mu.unlock();
+
+        _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &dp_qos_snap);
+        _ = stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, &fac_qos_snap);
 
         // Always use createParticipantWithConfigOwned so the `config` param is
         // honoured regardless of whether ownership is being transferred.  Pass
@@ -67,6 +76,8 @@ const FactoryOwner = struct {
         const p = stack.factory.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, null) orelse
             return error.ParticipantFailed;
 
+        self.mu.lock();
+        defer self.mu.unlock();
         try self.stacks.append(self.alloc, stack);
         if (config_deinit_allocator) |cfg_alloc| p.config_deinit_allocator = cfg_alloc;
         return p.toDDSParticipant();
@@ -74,6 +85,8 @@ const FactoryOwner = struct {
 
     fn deleteParticipant(self: *@This(), participant: DDS.DomainParticipant) DDS.ReturnCode_t {
         if (nil.isNil(participant)) return DDS.RETCODE_BAD_PARAMETER;
+        self.mu.lock();
+        defer self.mu.unlock();
         for (self.stacks.items, 0..) |stack, i| {
             const rc = stack.factory_handle.vtable.delete_participant(stack.factory_handle.ptr, participant);
             if (rc == DDS.RETCODE_BAD_PARAMETER) continue;
@@ -87,6 +100,8 @@ const FactoryOwner = struct {
     }
 
     fn lookupParticipant(self: *@This(), domain_id: DDS.DomainId_t) DDS.DomainParticipant {
+        self.mu.lock();
+        defer self.mu.unlock();
         for (self.stacks.items) |stack| {
             const dp = stack.factory_handle.vtable.lookup_participant(stack.factory_handle.ptr, domain_id);
             if (!nil.isNil(dp)) return dp;
@@ -378,17 +393,21 @@ fn factorySetDefaultParticipantQos(ctx: *anyopaque, qos: *const DDS.DomainPartic
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     const new_qos = qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    owner.mu.lock();
     owner.default_dp_qos.deinit(owner.alloc);
     owner.default_dp_qos = new_qos;
     for (owner.stacks.items) |stack| {
         _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &owner.default_dp_qos);
     }
+    owner.mu.unlock();
     return DDS.RETCODE_OK;
 }
 
 fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    owner.mu.lock();
+    defer owner.mu.unlock();
     qos.* = owner.default_dp_qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
     return DDS.RETCODE_OK;
 }
@@ -396,6 +415,8 @@ fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQ
 fn factorySetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantFactoryQos) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    owner.mu.lock();
+    defer owner.mu.unlock();
     owner.factory_qos = qos.*;
     for (owner.stacks.items) |stack| {
         _ = stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, qos);
@@ -406,6 +427,8 @@ fn factorySetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantFactoryQos) D
 fn factoryGetQos(ctx: *anyopaque, qos: *DDS.DomainParticipantFactoryQos) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    owner.mu.lock();
+    defer owner.mu.unlock();
     qos.* = owner.factory_qos;
     return DDS.RETCODE_OK;
 }
@@ -469,7 +492,8 @@ fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.Re
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
     const taken = impl.takeRaw() orelse return DDS.RETCODE_NO_DATA;
-    fillSerializedSample(sample, taken);
+    defer impl.alloc.free(taken.data);
+    fillSerializedSample(sample, taken) catch return DDS.RETCODE_OUT_OF_RESOURCES;
     return DDS.RETCODE_OK;
 }
 
@@ -481,7 +505,8 @@ fn readerTakeNextInstanceSerialized(
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
     const taken = impl.takeNextInstanceRaw(previous_instance) orelse return DDS.RETCODE_NO_DATA;
-    fillSerializedSample(sample, taken);
+    defer impl.alloc.free(taken.data);
+    fillSerializedSample(sample, taken) catch return DDS.RETCODE_OUT_OF_RESOURCES;
     return DDS.RETCODE_OK;
 }
 
@@ -493,14 +518,16 @@ fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
     return buf[0..s._length];
 }
 
-fn fillSerializedSample(sample: *ZZDDS.SerializedSample, taken: reader_mod.TakenSample) void {
-    // taken.data is a c_allocator buffer; transfer ownership directly to the
-    // caller's OctetSeq so they can free() it via _release = true.
+fn fillSerializedSample(sample: *ZZDDS.SerializedSample, taken: reader_mod.TakenSample) !void {
+    // Copy into a c_allocator buffer so the C caller can safely free() it via
+    // _release = true, regardless of which allocator backed the reader.
+    const copy = try std.heap.c_allocator.alloc(u8, taken.data.len);
+    @memcpy(copy, taken.data);
     sample.* = .{
         .cdr = .{
-            ._maximum = @intCast(taken.data.len),
-            ._length = @intCast(taken.data.len),
-            ._buffer = taken.data.ptr,
+            ._maximum = @intCast(copy.len),
+            ._length = @intCast(copy.len),
+            ._buffer = copy.ptr,
             ._release = true,
         },
         .instance_handle = taken.info.instance_handle,
