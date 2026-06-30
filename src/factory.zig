@@ -19,8 +19,7 @@ pub const DomainParticipantFactory = struct {
     const Self = @This();
 
     pub fn deinit(self: *Self) void {
-        if (!self.active) return;
-        self.active = false;
+        if (!@atomicRmw(bool, &self.active, .Xchg, false, .acq_rel)) return;
         extensions.zzdds_destroy_factory(self.handle);
     }
 

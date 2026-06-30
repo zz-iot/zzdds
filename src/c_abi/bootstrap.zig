@@ -381,6 +381,7 @@ fn nRawImpl(
             out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
             return 0;
         }
+        if (peek.items.len > std.math.maxInt(c_int)) return -1;
         unbounded_take_max = @intCast(peek.items.len);
     }
 
