@@ -363,9 +363,29 @@ fn nRawImpl(
     // For bounded destructive takes, pre-allocate the output struct array BEFORE
     // removing samples from the queue.  Without this, an OOM at the alloc step
     // would silently discard already-taken data with no way to recover it.
+    // For unbounded destructive takes, peek the count via readRaw first so we
+    // can apply the same guarantee (data stays in queue if alloc fails).
     // _alloc_capacity may exceed count; zzdds_return_raw_samples uses it for the
     // free, so over-allocating is safe.
-    const pre_capacity: usize = if (destructive and max > 0) @intCast(max) else 0;
+    var unbounded_take_max: c_int = 0;
+    if (destructive and max <= 0) {
+        var peek: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
+        defer {
+            for (peek.items) |s| impl.alloc.free(s.data);
+            peek.deinit(impl.alloc);
+        }
+        impl.readRaw(&peek, ss, vs, is, 0, null, null) catch return -1;
+        if (peek.items.len == 0) {
+            out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+            return 0;
+        }
+        unbounded_take_max = @intCast(peek.items.len);
+    }
+
+    const pre_capacity: usize =
+        if (destructive and max > 0) @intCast(max)
+        else if (destructive) @intCast(unbounded_take_max)
+        else 0;
     const pre_arr: []CRawSample = if (pre_capacity > 0)
         alloc.alloc(CRawSample, pre_capacity) catch return -1
     else
@@ -377,7 +397,8 @@ fn nRawImpl(
         tmp.deinit(impl.alloc);
     }
     if (destructive) {
-        impl.takeFiltered(&tmp, ss, vs, is, max, null, null) catch {
+        const take_max = if (max <= 0) unbounded_take_max else max;
+        impl.takeFiltered(&tmp, ss, vs, is, take_max, null, null) catch {
             if (pre_arr.len > 0) alloc.free(pre_arr);
             return -1;
         };
@@ -389,7 +410,7 @@ fn nRawImpl(
         out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
         return 0;
     }
-    // Use the pre-allocated array for destructive bounded takes; otherwise alloc now
+    // Use the pre-allocated array for all destructive takes; otherwise alloc now
     // (samples remain in queue on non-destructive failure, so this is safe).
     const arr: []CRawSample = if (pre_arr.len > 0)
         pre_arr

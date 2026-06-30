@@ -82,6 +82,7 @@ const FactoryOwner = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
+        stack.participant_ptr = p;
         try self.stacks.append(self.alloc, stack);
         if (config_deinit_allocator) |cfg_alloc| p.config_deinit_allocator = cfg_alloc;
         return p.toDDSParticipant();
@@ -89,20 +90,23 @@ const FactoryOwner = struct {
 
     fn deleteParticipant(self: *@This(), participant: DDS.DomainParticipant) DDS.ReturnCode_t {
         if (nil.isNil(participant)) return DDS.RETCODE_BAD_PARAMETER;
-        // Remove the stack from the list under the lock, then deinit outside it
-        // to avoid a deadlock if teardown callbacks re-enter any FactoryOwner method.
+        // Identify and remove the stack by participant_ptr under the lock.
+        // Calling the inner factory vtable inside the lock would invert the
+        // lock order (FactoryOwner.mu → inner factory mu), risking deadlock
+        // if a listener callback re-enters any factory function while the
+        // inner factory holds its own lock.
         self.mu.lock();
         var found: ?*ParticipantStack = null;
-        var rc: DDS.ReturnCode_t = DDS.RETCODE_BAD_PARAMETER;
         for (self.stacks.items, 0..) |stack, i| {
-            const r = stack.factory_handle.vtable.delete_participant(stack.factory_handle.ptr, participant);
-            if (r == DDS.RETCODE_BAD_PARAMETER) continue;
-            rc = r;
-            if (r == DDS.RETCODE_OK) found = self.stacks.swapRemove(i);
-            break;
+            if (stack.participant_ptr == participant.ptr) {
+                found = self.stacks.swapRemove(i);
+                break;
+            }
         }
         self.mu.unlock();
-        if (found) |stack| stack.deinit();
+        const stack = found orelse return DDS.RETCODE_BAD_PARAMETER;
+        const rc = stack.factory_handle.vtable.delete_participant(stack.factory_handle.ptr, participant);
+        stack.deinit();
         return rc;
     }
 
@@ -123,6 +127,10 @@ const ParticipantStack = struct {
     discovery: *SpdpSedpDiscovery,
     udp: *UdpTransport,
     factory_handle: DDS.DomainParticipantFactory,
+    // Ptr of the single participant created through this stack; used to identify
+    // the owning stack in deleteParticipant without calling the inner factory vtable
+    // while holding FactoryOwner.mu (which would invert lock order).
+    participant_ptr: *anyopaque = undefined,
 
     fn deinit(self: *@This()) void {
         self.factory.deinit();
@@ -424,9 +432,11 @@ fn factorySetDefaultParticipantQos(ctx: *anyopaque, qos: *const DDS.DomainPartic
     defer owner.mu.unlock();
     owner.default_dp_qos.deinit(owner.alloc);
     owner.default_dp_qos = new_qos;
-    for (owner.stacks.items) |stack| {
-        _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &owner.default_dp_qos);
-    }
+    // Do NOT propagate to existing inner factories here: calling inner vtables
+    // while holding owner.mu inverts the lock order (FactoryOwner.mu → inner
+    // factory mu).  Each ParticipantStack's inner factory already received the
+    // default QoS snapshot at createParticipant time; newly created participants
+    // always snapshot the then-current default, so no propagation is needed.
     return DDS.RETCODE_OK;
 }
 
