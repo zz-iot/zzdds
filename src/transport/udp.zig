@@ -61,7 +61,8 @@ const IPV6_MULTICAST_IF: i32 = switch (builtin.os.tag) {
 };
 const IPV6_V6ONLY: i32 = switch (builtin.os.tag) {
     .linux => 26,
-    else => 27,
+    .openbsd => 23,
+    else => 27, // macOS, FreeBSD, NetBSD, DragonFly, Windows
 };
 // IPPROTO_IPV6 = 41 on all platforms (ws2_32.IPPROTO has no IPV6 member in Zig 0.16.0).
 const IPPROTO_IPV6: i32 = 41;

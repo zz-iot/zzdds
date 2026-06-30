@@ -137,9 +137,11 @@ const ParticipantStack = struct {
     participant: DDS.DomainParticipant = nil.nil_participant,
 
     fn deinit(self: *@This()) void {
+        // Stop the UDP transport (and its interface-monitor thread) FIRST so no
+        // background thread can access config strings after factory.deinit() frees them.
+        self.udp.deinit();
         self.factory.deinit();
         self.discovery.deinit();
-        self.udp.deinit();
         self.alloc.destroy(self);
     }
 
@@ -567,6 +569,10 @@ fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.Re
     return DDS.RETCODE_OK;
 }
 
+/// NOTE: concurrent readers on the same DataReader must be externally
+/// synchronized. If two threads call this concurrently, the peek and take may
+/// see different instances; the smaller peek buffer is used for the copy,
+/// silently truncating if the taken sample is larger.
 fn readerTakeNextInstanceSerialized(
     ctx: *anyopaque,
     previous_instance: DDS.InstanceHandle_t,
@@ -604,7 +610,6 @@ fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
     const buf = s._buffer orelse return if (s._length == 0) &.{} else null;
     return buf[0..s._length];
 }
-
 
 test "zzdds extension factory creates participant with generated default config" {
     const factory = try createFactory();
