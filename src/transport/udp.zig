@@ -406,6 +406,23 @@ pub const UdpTransport = struct {
             .closing = std.atomic.Value(bool).init(false),
         };
 
+        // Deep-copy config.interfaces so the transport owns the filter strings.
+        // The interface-monitor thread reads self.config.interfaces after init returns;
+        // without a private copy, the caller freeing their config causes a UAF.
+        if (config.interfaces.len > 0) {
+            const owned = try alloc.alloc([]const u8, config.interfaces.len);
+            self.config.interfaces = owned;
+            var n_duped: usize = 0;
+            errdefer {
+                for (owned[0..n_duped]) |s| alloc.free(s);
+                alloc.free(owned);
+            }
+            for (config.interfaces, 0..) |src, i| {
+                owned[i] = try alloc.dupe(u8, src);
+                n_duped += 1;
+            }
+        }
+
         var owned_pm: ?*polling.PollingMonitor = null;
         errdefer if (owned_pm) |pm| {
             pm.deinit();
@@ -469,6 +486,11 @@ pub const UdpTransport = struct {
         self.port_entries.deinit(self.alloc);
         self.locators_cache.deinit(self.alloc);
         self.active_ifaces.deinit(self.alloc);
+        // Free the owned copy of the interfaces filter (deep-copied in init).
+        if (self.config.interfaces.len > 0) {
+            for (self.config.interfaces) |s| self.alloc.free(s);
+            self.alloc.free(self.config.interfaces);
+        }
         self.alloc.destroy(self);
     }
 

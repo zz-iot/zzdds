@@ -42,6 +42,7 @@ const FactoryOwner = struct {
         for (self.stacks.items) |stack| stack.deinit();
         self.stacks.deinit(self.alloc);
         self.default_dp_qos.deinit(self.alloc);
+        self.factory_qos.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -137,11 +138,13 @@ const ParticipantStack = struct {
     participant: DDS.DomainParticipant = nil.nil_participant,
 
     fn deinit(self: *@This()) void {
-        // Stop the UDP transport (and its interface-monitor thread) FIRST so no
-        // background thread can access config strings after factory.deinit() frees them.
-        self.udp.deinit();
+        // factory.deinit() sends RTPS BYE announcements via the UDP transport,
+        // so it must run BEFORE udp.deinit() closes the sockets.
+        // UdpTransport owns a deep copy of its config.interfaces strings, so
+        // factory.deinit() freeing the participant config is safe.
         self.factory.deinit();
         self.discovery.deinit();
+        self.udp.deinit();
         self.alloc.destroy(self);
     }
 
@@ -390,6 +393,9 @@ fn factoryCreateParticipant(
 ) DDS.DomainParticipant {
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    // config = .{} uses schema default literals (no heap allocation); config_deinit_allocator
+    // = null tells DomainParticipantImpl.deinit not to call deinitRuntimeConfig.
+    // factoryCreateParticipantEx uses runtime-converted config with config_deinit_allocator set.
     return owner.createParticipant(domain_id, qos, a_listener, mask, .{}, null) catch |err| {
         std.log.err("create_participant: {}", .{err});
         return nil.nil_participant;
