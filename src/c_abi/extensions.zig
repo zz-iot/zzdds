@@ -66,7 +66,7 @@ const FactoryOwner = struct {
         };
         const fac_qos_snap = self.factory_qos;
         self.mu.unlock();
-        errdefer dp_qos_snap.deinit(self.alloc);
+        defer dp_qos_snap.deinit(self.alloc);
 
         _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &dp_qos_snap);
         _ = stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, &fac_qos_snap);
