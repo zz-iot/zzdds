@@ -10,6 +10,11 @@ pub const DomainParticipantConfig = ext.DomainParticipantConfig;
 
 pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParticipantConfig) !schema.Config {
     var runtime = schema.Config{};
+    // Zero non-empty string defaults BEFORE errdefer so deinitRuntimeConfig
+    // won't call free() on read-only literals if we fail early.
+    runtime.participant.timer_clock_name = "";
+    runtime.transport.udp.multicast_group_v4 = "";
+    runtime.transport.udp.multicast_group_v6 = "";
     errdefer deinitRuntimeConfig(allocator, &runtime);
 
     runtime.domain.id = cfg.domain.id;
@@ -54,7 +59,9 @@ fn freeStringSlice(allocator: std.mem.Allocator, slice: []const []const u8) void
 }
 
 fn toUdpConfig(allocator: std.mem.Allocator, udp: *const ext.UdpConfig) !schema.UdpConfig {
-    return .{
+    // Non-allocating fields in a struct literal; allocating fields start empty
+    // so the errdefer below won't free literals on early failure.
+    var result = schema.UdpConfig{
         .enabled = udp.enabled,
         .ipv4_enabled = udp.ipv4_enabled,
         .ipv6_enabled = udp.ipv6_enabled,
@@ -66,19 +73,30 @@ fn toUdpConfig(allocator: std.mem.Allocator, udp: *const ext.UdpConfig) !schema.
         .data_multicast_offset = udp.data_multicast_offset,
         .data_unicast_offset = udp.data_unicast_offset,
         .participant_id = udp.participant_id,
-        .interfaces = try stringSeqSlice(allocator, &udp.interfaces),
-        .multicast_group_v4 = try dupeString(allocator, udp.multicast_group_v4),
-        .multicast_group_v6 = try dupeString(allocator, udp.multicast_group_v6),
         .multicast_ttl = udp.multicast_ttl,
         .meta_unicast_port = udp.meta_unicast_port,
         .data_unicast_port = udp.data_unicast_port,
         .meta_multicast_port = udp.meta_multicast_port,
         .data_multicast_port = udp.data_multicast_port,
         .bind_wildcard = udp.bind_wildcard,
-        .initial_peers = try stringSeqSlice(allocator, &udp.initial_peers),
         .recv_buffer_size = udp.recv_buffer_size,
         .interface_poll_interval_ms = udp.interface_poll_interval_ms,
+        .interfaces = &.{},
+        .multicast_group_v4 = "",
+        .multicast_group_v6 = "",
+        .initial_peers = &.{},
     };
+    errdefer {
+        if (result.interfaces.len != 0) freeStringSlice(allocator, result.interfaces);
+        if (result.multicast_group_v4.len != 0) allocator.free(result.multicast_group_v4);
+        if (result.multicast_group_v6.len != 0) allocator.free(result.multicast_group_v6);
+        if (result.initial_peers.len != 0) freeStringSlice(allocator, result.initial_peers);
+    }
+    result.interfaces = try stringSeqSlice(allocator, &udp.interfaces);
+    result.multicast_group_v4 = try dupeString(allocator, udp.multicast_group_v4);
+    result.multicast_group_v6 = try dupeString(allocator, udp.multicast_group_v6);
+    result.initial_peers = try stringSeqSlice(allocator, &udp.initial_peers);
+    return result;
 }
 
 fn dupeString(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {

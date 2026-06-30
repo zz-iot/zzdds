@@ -89,18 +89,21 @@ const FactoryOwner = struct {
 
     fn deleteParticipant(self: *@This(), participant: DDS.DomainParticipant) DDS.ReturnCode_t {
         if (nil.isNil(participant)) return DDS.RETCODE_BAD_PARAMETER;
+        // Remove the stack from the list under the lock, then deinit outside it
+        // to avoid a deadlock if teardown callbacks re-enter any FactoryOwner method.
         self.mu.lock();
-        defer self.mu.unlock();
+        var found: ?*ParticipantStack = null;
+        var rc: DDS.ReturnCode_t = DDS.RETCODE_BAD_PARAMETER;
         for (self.stacks.items, 0..) |stack, i| {
-            const rc = stack.factory_handle.vtable.delete_participant(stack.factory_handle.ptr, participant);
-            if (rc == DDS.RETCODE_BAD_PARAMETER) continue;
-            if (rc == DDS.RETCODE_OK) {
-                _ = self.stacks.swapRemove(i);
-                stack.deinit();
-            }
-            return rc;
+            const r = stack.factory_handle.vtable.delete_participant(stack.factory_handle.ptr, participant);
+            if (r == DDS.RETCODE_BAD_PARAMETER) continue;
+            rc = r;
+            if (r == DDS.RETCODE_OK) found = self.stacks.swapRemove(i);
+            break;
         }
-        return DDS.RETCODE_BAD_PARAMETER;
+        self.mu.unlock();
+        if (found) |stack| stack.deinit();
+        return rc;
     }
 
     fn lookupParticipant(self: *@This(), domain_id: DDS.DomainId_t) DDS.DomainParticipant {
@@ -402,12 +405,12 @@ fn factorySetDefaultParticipantQos(ctx: *anyopaque, qos: *const DDS.DomainPartic
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     const new_qos = qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
     owner.mu.lock();
+    defer owner.mu.unlock();
     owner.default_dp_qos.deinit(owner.alloc);
     owner.default_dp_qos = new_qos;
     for (owner.stacks.items) |stack| {
         _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &owner.default_dp_qos);
     }
-    owner.mu.unlock();
     return DDS.RETCODE_OK;
 }
 
