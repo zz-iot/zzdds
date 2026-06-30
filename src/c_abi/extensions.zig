@@ -542,6 +542,10 @@ fn writerWriteSerialized(
     return DDS.RETCODE_OK;
 }
 
+/// NOTE: concurrent readers on the same DataReader must be externally
+/// synchronized. Between readRaw (peek) and takeRaw, a concurrent consumer
+/// could remove the front sample; takeRaw would then return a different,
+/// potentially larger sample silently truncated to peek_len bytes.
 fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
