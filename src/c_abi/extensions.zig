@@ -42,7 +42,6 @@ const FactoryOwner = struct {
         for (self.stacks.items) |stack| stack.deinit();
         self.stacks.deinit(self.alloc);
         self.default_dp_qos.deinit(self.alloc);
-        self.factory_qos.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
