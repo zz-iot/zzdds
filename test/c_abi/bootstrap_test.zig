@@ -1,6 +1,6 @@
 //! Tests for the C-ABI bootstrap shim (src/c_abi/bootstrap.zig).
 //!
-//! - UDP lifecycle test: zzdds_create_participant_udp + zzdds_destroy_participant
+//! - Factory lifecycle test: zzdds_create_factory + generated create/delete
 //! - Write/take tests: use IntraProcessDelivery for synchronous delivery so
 //!   no timing sensitivity; the write/take functions work on any DDS entity handle.
 //! - topic_as_description: verified against the CFT TopicDescription vtable.
@@ -9,8 +9,10 @@ const std = @import("std");
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = zzdds.ZZDDS;
 
 const bootstrap = zzdds.c_abi.bootstrap;
+const extensions = zzdds.c_abi.extensions;
 const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const MemoryTransport = zzdds.intraprocess.MemoryTransport;
 const DirectDiscovery = zzdds.intraprocess.DirectDiscovery;
@@ -106,16 +108,38 @@ const Fixture = struct {
     }
 };
 
-// ── UDP lifecycle ─────────────────────────────────────────────────────────────
+// ── Factory lifecycle ─────────────────────────────────────────────────────────
 
-test "bootstrap: create_participant_udp returns non-nil participant" {
-    const dp = bootstrap.zzdds_create_participant_udp(0, null);
-    defer bootstrap.zzdds_destroy_participant(dp);
+test "support factory: generated create_participant and delete_participant" {
+    const ext_factory = extensions.zzdds_create_factory();
+    defer extensions.zzdds_destroy_factory(ext_factory);
+
+    const factory = extensions.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(ext_factory);
+    const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, 0, null);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
+    try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
 }
 
-test "bootstrap: destroy_participant is safe on nil participant" {
-    bootstrap.zzdds_destroy_participant(std.mem.zeroes(DDS.DomainParticipant));
+test "support factory: generated create_participant_ex uses config defaults" {
+    const ext_factory = extensions.zzdds_create_factory();
+    defer extensions.zzdds_destroy_factory(ext_factory);
+
+    const cfg = ZZDDS.DomainParticipantConfig.default();
+    const qos = DDS.DomainParticipantQos{};
+    const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
+    try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
+
+    const factory = extensions.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(ext_factory);
+    try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
+}
+
+fn DDS_DomainParticipantFactory_create_participant_for_test(
+    factory: DDS.DomainParticipantFactory,
+    domain_id: DDS.DomainId_t,
+    listener: ?*const DDS.DomainParticipantListener,
+) DDS.DomainParticipant {
+    const qos = DDS.DomainParticipantQos{};
+    return factory.vtable.create_participant(factory.ptr, domain_id, &qos, listener, 0);
 }
 
 // ── topic_as_description ──────────────────────────────────────────────────────

@@ -184,7 +184,7 @@ pub const TopicImpl = struct {
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    fn toEntity(self: *Self) DDS.Entity {
+    pub fn toEntity(self: *Self) DDS.Entity {
         return .{ .ptr = self, .vtable = &entity_vtable };
     }
 

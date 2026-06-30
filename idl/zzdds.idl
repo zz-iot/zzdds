@@ -30,15 +30,15 @@ module zzdds {
     };
 
     struct DomainConfig {
-        unsigned long id;
+        @default(0) unsigned long id;
     };
 
     struct ParticipantConfig {
-        string       name;
-        unsigned long lease_duration_ms;
-        unsigned long announcement_period_ms;
-        GuidStrategy guid_strategy;
-        string       timer_clock_name;
+        @default("") string       name;
+        @default(10000) unsigned long lease_duration_ms;
+        @default(3000)  unsigned long announcement_period_ms;
+        @default(GUID_SPEC_RANDOM) GuidStrategy guid_strategy;
+        @default("default") string timer_clock_name;
     };
 
     @mutable struct UdpConfig {
@@ -68,8 +68,8 @@ module zzdds {
     };
 
     struct TcpConfig {
-        string  bind_address;
-        boolean reuse_connection_by_host;
+        @default("")    string  bind_address;
+        @default(FALSE) boolean reuse_connection_by_host;
     };
 
     struct TransportConfig {
@@ -78,20 +78,20 @@ module zzdds {
     };
 
     struct RtpsConfig {
-        unsigned short fragment_size;
+        @default(16384) unsigned short fragment_size;
     };
 
     struct DiscoveryConfig {
-        DiscoveryKind kind;
-        StringSeq     initial_peers;
-        string        static_config_file;
+        @default(DISCOVERY_SPDP) DiscoveryKind kind;
+                              StringSeq     initial_peers;
+        @default("")             string        static_config_file;
     };
 
     struct QosDefaults {
-        DDS::ReliabilityQosPolicyKind reliability_kind;
-        DDS::DurabilityQosPolicyKind  durability_kind;
-        DDS::HistoryQosPolicyKind     history_kind;
-        long                          history_depth;
+        @default(BEST_EFFORT_RELIABILITY_QOS) DDS::ReliabilityQosPolicyKind reliability_kind;
+        @default(VOLATILE_DURABILITY_QOS)     DDS::DurabilityQosPolicyKind  durability_kind;
+        @default(KEEP_LAST_HISTORY_QOS)       DDS::HistoryQosPolicyKind     history_kind;
+        @default(1)                           long                          history_depth;
     };
 
     struct DomainParticipantConfig {

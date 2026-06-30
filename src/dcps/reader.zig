@@ -1437,7 +1437,7 @@ pub const DataReaderImpl = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn toEntity(self: *Self) DDS.Entity {
+    pub fn toEntity(self: *Self) DDS.Entity {
         return .{ .ptr = self, .vtable = &entity_vtable };
     }
 

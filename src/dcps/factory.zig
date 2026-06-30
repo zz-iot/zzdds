@@ -16,6 +16,7 @@ const participant_mod = @import("participant.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const guid_gen = @import("../util/guid_gen.zig");
 const config_mod = @import("../config/schema.zig");
+const generated_config_mod = @import("../config/generated.zig");
 const trace_mod = @import("../trace.zig");
 const clock_registry_mod = @import("../util/clock_registry.zig");
 
@@ -115,7 +116,29 @@ pub const DomainParticipantFactoryImpl = struct {
         mask: DDS.StatusMask,
     ) DDS.DomainParticipant {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.createParticipantWithConfig(domain_id, qos, a_listener, mask, self.config);
+    }
 
+    pub fn createParticipantWithConfig(
+        self: *Self,
+        domain_id: DDS.DomainId_t,
+        qos: *const DDS.DomainParticipantQos,
+        a_listener: ?*const DDS.DomainParticipantListener,
+        mask: DDS.StatusMask,
+        config: config_mod.Config,
+    ) DDS.DomainParticipant {
+        return self.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, null);
+    }
+
+    pub fn createParticipantWithConfigOwned(
+        self: *Self,
+        domain_id: DDS.DomainId_t,
+        qos: *const DDS.DomainParticipantQos,
+        a_listener: ?*const DDS.DomainParticipantListener,
+        mask: DDS.StatusMask,
+        config: config_mod.Config,
+        config_deinit_allocator: ?std.mem.Allocator,
+    ) DDS.DomainParticipant {
         // Allocate a handle for this participant.
         self.mu.lock();
         const handle = self.next_handle;
@@ -129,7 +152,7 @@ pub const DomainParticipantFactoryImpl = struct {
             .entity_id = participant_mod.EntityIds.participant,
         };
 
-        const timer_clock = self.clock_registry.get(self.config.participant.timer_clock_name);
+        const timer_clock = self.clock_registry.get(config.participant.timer_clock_name);
 
         const p = participant_mod.DomainParticipantImpl.init(
             self.alloc,
@@ -138,14 +161,21 @@ pub const DomainParticipantFactoryImpl = struct {
             self.transport,
             self.discovery,
             self.security,
-            self.config,
+            config,
             qos.*,
             if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener,
             mask,
             handle,
             self.trace_config.tracer(),
             timer_clock,
-        ) catch return nil.nil_participant;
+        ) catch {
+            if (config_deinit_allocator) |cfg_alloc| {
+                var cfg = config;
+                generated_config_mod.deinitRuntimeConfig(cfg_alloc, &cfg);
+            }
+            return nil.nil_participant;
+        };
+        p.config_deinit_allocator = config_deinit_allocator;
 
         // Start discovery; if it fails we still own the participant and must clean up.
         p.start() catch {

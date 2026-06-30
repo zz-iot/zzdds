@@ -51,6 +51,7 @@ var nil_entity_vtable = DDS.Entity.Vtable{
     .get_instance_handle = nilGetHandle,
     .deinit = nilDeinit,
 };
+pub const nil_entity = DDS.Entity{ .ptr = NIL_PTR, .vtable = &nil_entity_vtable };
 fn nilEnable(_: *anyopaque) DDS.ReturnCode_t {
     return DDS.RETCODE_ERROR;
 }

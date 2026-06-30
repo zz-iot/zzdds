@@ -8,3 +8,4 @@
 
 pub const typesupport = @import("typesupport.zig");
 pub const bootstrap = @import("bootstrap.zig");
+pub const extensions = @import("extensions.zig");

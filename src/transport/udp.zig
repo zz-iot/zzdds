@@ -59,6 +59,10 @@ const IPV6_MULTICAST_IF: i32 = switch (builtin.os.tag) {
     .linux => 17,
     else => 9,
 };
+const IPV6_V6ONLY: i32 = switch (builtin.os.tag) {
+    .linux => 26,
+    else => 27,
+};
 // IPPROTO_IPV6 = 41 on all platforms (ws2_32.IPPROTO has no IPV6 member in Zig 0.16.0).
 const IPPROTO_IPV6: i32 = 41;
 
@@ -544,19 +548,28 @@ pub const UdpTransport = struct {
 
     fn addUnicastSocket(self: *Self, if_addr: IfAddr, port: u32, handler: ReceiveHandler) !void {
         const fd = try createUnicastSocket(if_addr.kind, if_addr.ip, @intCast(port), self.config.recv_buffer_size);
+        try self.addUnicastSocketFromFd(fd, if_addr.kind, if_addr.ip, port, handler);
+    }
+
+    fn addUnicastSocketFromFd(self: *Self, fd: posix.socket_t, addr_kind: i32, bound_ip: [16]u8, port: u32, handler: ReceiveHandler) !void {
+        var fd_needs_close = true;
+        errdefer if (fd_needs_close) socketClose(fd);
         const entry = try self.alloc.create(SocketEntry);
+        errdefer self.alloc.destroy(entry);
         entry.* = .{
             .fd = fd,
             .port = port,
             .kind = .unicast,
-            .addr_kind = if_addr.kind,
-            .bound_ip = if_addr.ip,
+            .addr_kind = addr_kind,
+            .bound_ip = bound_ip,
             .stopping = std.atomic.Value(bool).init(false),
             .thread = undefined,
             .transport = self,
             .handler = handler,
         };
         entry.thread = try std.Thread.spawn(.{}, recvThread, .{entry});
+        fd_needs_close = false;
+        errdefer entry.stop();
         try self.sockets.append(self.alloc, entry);
     }
 
@@ -617,9 +630,15 @@ pub const UdpTransport = struct {
         // Skip wildcard sockets (bound_ip = zeroes) — they hold the port but don't
         // know the real interface IP; fall through to active_ifaces for locators.
         const zero_ip = std.mem.zeroes([16]u8);
+        var wildcard_v4 = false;
+        var wildcard_v6 = false;
         for (self.sockets.items) |s| {
             if (s.kind != .unicast or s.port != meta_port) continue;
-            if (std.mem.eql(u8, &s.bound_ip, &zero_ip)) continue;
+            if (std.mem.eql(u8, &s.bound_ip, &zero_ip)) {
+                if (s.addr_kind == LocatorKind.udp_v4) wildcard_v4 = true;
+                if (s.addr_kind == LocatorKind.udp_v6) wildcard_v6 = true;
+                continue;
+            }
             const loc: Locator = switch (s.addr_kind) {
                 LocatorKind.udp_v4 => .{ .udp_v4 = .{ .addr = s.bound_ip[12..16].*, .port = meta_port } },
                 LocatorKind.udp_v6 => .{ .udp_v6 = .{ .addr = s.bound_ip, .port = meta_port } },
@@ -627,11 +646,18 @@ pub const UdpTransport = struct {
             };
             try self.locators_cache.append(self.alloc, loc);
         }
-        // If no sockets yet (before listen()), derive locators from active interfaces.
-        if (self.locators_cache.items.len == 0) {
+        // If no sockets exist yet, derive locators from active interfaces. If a
+        // wildcard socket serves a family, advertise the interface addresses for
+        // that family because the wildcard socket can receive for all of them.
+        const derive_all_from_ifaces = self.locators_cache.items.len == 0;
+        if (derive_all_from_ifaces or wildcard_v4 or wildcard_v6) {
             for (self.active_ifaces.items) |ia| {
                 if (ia.kind == LocatorKind.udp_v4 and !self.config.ipv4_enabled) continue;
                 if (ia.kind == LocatorKind.udp_v6 and !self.config.ipv6_enabled) continue;
+                if (!derive_all_from_ifaces) {
+                    if (ia.kind == LocatorKind.udp_v4 and !wildcard_v4) continue;
+                    if (ia.kind == LocatorKind.udp_v6 and !wildcard_v6) continue;
+                }
                 const loc: Locator = switch (ia.kind) {
                     LocatorKind.udp_v4 => .{ .udp_v4 = .{ .addr = ia.ip[12..16].*, .port = meta_port } },
                     LocatorKind.udp_v6 => .{ .udp_v6 = .{ .addr = ia.ip, .port = meta_port } },
@@ -819,21 +845,21 @@ pub const UdpTransport = struct {
         // for this port (hasWildcardSocket guard), and rebuildLocatorsLocked skips
         // wildcard entries and derives locators from active_ifaces instead.
         if (self.takeReservedFd(port)) |fd| {
-            const entry = try self.alloc.create(SocketEntry);
-            errdefer self.alloc.destroy(entry);
-            entry.* = .{
-                .fd = fd,
-                .port = port,
-                .kind = .unicast,
-                .addr_kind = LocatorKind.udp_v4,
-                .bound_ip = std.mem.zeroes([16]u8),
-                .stopping = std.atomic.Value(bool).init(false),
-                .thread = undefined,
-                .transport = self,
-                .handler = pe.asHandler(),
-            };
-            entry.thread = try std.Thread.spawn(.{}, recvThread, .{entry});
-            try self.sockets.append(self.alloc, entry);
+            const wildcard = std.mem.zeroes([16]u8);
+            try self.addUnicastSocketFromFd(fd, LocatorKind.udp_v4, wildcard, port, pe.asHandler());
+            if (self.config.ipv6_enabled) {
+                if (self.config.bind_wildcard) {
+                    const ia = IfAddr{ .kind = LocatorKind.udp_v6, .ip = wildcard, .name = std.mem.zeroes([16]u8), .flags = 0 };
+                    self.addUnicastSocket(ia, port, pe.asHandler()) catch |err|
+                        log.transport.warn("udp: reserved-port wildcard v6 socket port {}: {}", .{ port, err });
+                } else {
+                    for (self.active_ifaces.items) |ia| {
+                        if (ia.kind != LocatorKind.udp_v6) continue;
+                        self.addUnicastSocket(ia, port, pe.asHandler()) catch |err|
+                            log.transport.warn("udp: reserved-port unicast v6 socket port {}: {}", .{ port, err });
+                    }
+                }
+            }
             try self.rebuildLocatorsLocked();
             return;
         }
@@ -1113,6 +1139,9 @@ fn createUnicastSocket(addr_kind: i32, ip: [16]u8, port: u16, recv_buf: u32) !po
         };
         try socketBind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
     } else {
+        // Keep IPv6 sockets out of the IPv4-mapped address space so UDPv4 and
+        // UDPv6 sockets can coexist on the same RTPS well-known port.
+        sockOptInt(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1) catch {};
         const addr = posix.sockaddr.in6{
             .family = posix.AF.INET6,
             .port = std.mem.nativeToBig(u16, port),
@@ -1145,6 +1174,7 @@ fn createMulticastSocket(addr_kind: i32, port: u16, recv_buf: u32) !posix.socket
         };
         try socketBind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
     } else {
+        sockOptInt(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1) catch {};
         const addr = posix.sockaddr.in6{
             .family = posix.AF.INET6,
             .port = std.mem.nativeToBig(u16, port),
@@ -1500,6 +1530,87 @@ test "vtListen promotes reserved meta fd on first listen" {
     defer t.unlisten(&loc, h);
 
     try std.testing.expectEqual(@as(?posix.socket_t, null), udp.reserved_meta_fd);
+}
+
+test "vtListen reserved meta fd also serves advertised IPv6 locators" {
+    const alloc = std.testing.allocator;
+
+    const zero_ip = std.mem.zeroes([16]u8);
+    const probe = createUnicastSocket(LocatorKind.udp_v6, zero_ip, 0, 0) catch return;
+    socketClose(probe);
+
+    var mon_sentinel: u8 = 0;
+    const dual_stack_mon_vtable = InterfaceMonitor.Vtable{
+        .start = struct {
+            fn f(_: *anyopaque, _: iface.IfChangeCallback) anyerror!void {}
+        }.f,
+        .stop = struct {
+            fn f(_: *anyopaque) void {}
+        }.f,
+        .enumerate = struct {
+            fn f(_: *anyopaque, out: *std.ArrayListUnmanaged(IfAddr), alloc_: std.mem.Allocator) anyerror!void {
+                out.clearRetainingCapacity();
+                try out.append(alloc_, .{
+                    .name = std.mem.zeroes([16]u8),
+                    .kind = LocatorKind.udp_v4,
+                    .ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 },
+                    .flags = 0,
+                });
+                try out.append(alloc_, .{
+                    .name = std.mem.zeroes([16]u8),
+                    .kind = LocatorKind.udp_v6,
+                    .ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+                    .flags = 0,
+                });
+            }
+        }.f,
+        .deinit = struct {
+            fn f(_: *anyopaque) void {}
+        }.f,
+    };
+    const mon = InterfaceMonitor{ .ctx = &mon_sentinel, .vtable = &dual_stack_mon_vtable };
+
+    const udp = try UdpTransport.init(alloc, .{
+        .bind_wildcard = true,
+        .ipv6_enabled = true,
+    }, 0, mon);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const meta_port = schema.metatrafficUnicastPort(&udp.config, udp.domain_id, udp.participant_id);
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, meta_port);
+    var sentinel: u8 = 0;
+    const h = ReceiveHandler{
+        .ctx = &sentinel,
+        .on_receive = struct {
+            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        }.f,
+    };
+    try t.listen(&loc, h);
+    defer t.unlisten(&loc, h);
+
+    var has_v4_socket = false;
+    var has_v6_socket = false;
+    for (udp.sockets.items) |s| {
+        if (s.kind != .unicast or s.port != meta_port) continue;
+        if (s.addr_kind == LocatorKind.udp_v4) has_v4_socket = true;
+        if (s.addr_kind == LocatorKind.udp_v6) has_v6_socket = true;
+    }
+    try std.testing.expect(has_v4_socket);
+    try std.testing.expect(has_v6_socket);
+
+    var locs: std.ArrayListUnmanaged(Locator) = .empty;
+    defer locs.deinit(alloc);
+    try t.unicastLocators(&locs, alloc);
+    var has_v4_locator = false;
+    var has_v6_locator = false;
+    for (locs.items) |announced| switch (announced) {
+        .udp_v4 => has_v4_locator = true,
+        .udp_v6 => has_v6_locator = true,
+        else => {},
+    };
+    try std.testing.expect(has_v4_locator);
+    try std.testing.expect(has_v6_locator);
 }
 
 // ── init with external InterfaceMonitor ──────────────────────────────────────

@@ -21,6 +21,7 @@ const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const trace_mod = @import("../trace.zig");
 const config_mod = @import("../config/schema.zig");
+const generated_config_mod = @import("../config/generated.zig");
 const log_mod = @import("../log.zig");
 const publisher_mod = @import("publisher.zig");
 const subscriber_mod = @import("subscriber.zig");
@@ -564,6 +565,7 @@ pub const DomainParticipantImpl = struct {
     discovery: Discovery,
     security: SecurityPlugins,
     config: config_mod.Config,
+    config_deinit_allocator: ?std.mem.Allocator,
 
     publishers: std.ArrayListUnmanaged(*publisher_mod.PublisherImpl),
     subscribers: std.ArrayListUnmanaged(*subscriber_mod.SubscriberImpl),
@@ -665,6 +667,7 @@ pub const DomainParticipantImpl = struct {
             .discovery = discovery,
             .security = security,
             .config = config,
+            .config_deinit_allocator = null,
             .publishers = .empty,
             .subscribers = .empty,
             .topics = .empty,
@@ -874,6 +877,9 @@ pub const DomainParticipantImpl = struct {
         self.default_pub_qos.deinit(self.alloc);
         self.default_sub_qos.deinit(self.alloc);
         self.default_topic_qos.deinit(self.alloc);
+        if (self.config_deinit_allocator) |cfg_alloc| {
+            generated_config_mod.deinitRuntimeConfig(cfg_alloc, &self.config);
+        }
 
         self.alloc.destroy(self);
     }
@@ -924,7 +930,7 @@ pub const DomainParticipantImpl = struct {
         self.type_info_registry.put(self.alloc, type_name, cdr) catch {};
     }
 
-    fn toEntity(self: *Self) DDS.Entity {
+    pub fn toEntity(self: *Self) DDS.Entity {
         return .{ .ptr = self, .vtable = &entity_vtable };
     }
 
