@@ -385,9 +385,7 @@ fn nRawImpl(
     }
 
     const pre_capacity: usize =
-        if (destructive and max > 0) @intCast(max)
-        else if (destructive) @intCast(unbounded_take_max)
-        else 0;
+        if (destructive and max > 0) @intCast(max) else if (destructive) @intCast(unbounded_take_max) else 0;
     const pre_arr: []CRawSample = if (pre_capacity > 0)
         alloc.alloc(CRawSample, pre_capacity) catch return -1
     else
