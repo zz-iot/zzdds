@@ -57,12 +57,16 @@ const FactoryOwner = struct {
         const stack = try ParticipantStack.init(self.alloc, domain_id, config);
         errdefer stack.deinit();
 
-        // Snapshot QoS under the lock before releasing it for the (slow)
-        // participant construction below.
+        // Clone QoS under the lock so the snapshot owns its heap memory and
+        // is safe to use after the lock is released.
         self.mu.lock();
-        const dp_qos_snap = self.default_dp_qos;
+        var dp_qos_snap = self.default_dp_qos.clone(self.alloc) catch |e| {
+            self.mu.unlock();
+            return e;
+        };
         const fac_qos_snap = self.factory_qos;
         self.mu.unlock();
+        errdefer dp_qos_snap.deinit(self.alloc);
 
         _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &dp_qos_snap);
         _ = stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, &fac_qos_snap);
@@ -218,6 +222,10 @@ pub export fn zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(fac
 }
 
 pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(factory: DDS.DomainParticipantFactory) callconv(.c) ZZDDS.DomainParticipantFactory {
+    // factory_vtable methods cast ctx to *FactoryOwner, so this conversion is
+    // only valid for handles that were originally issued by zzdds_create_factory
+    // (which sets vtable = &dds_factory_vtable via the sibling export above).
+    if (factory.vtable != &dds_factory_vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &factory_vtable };
     return .{ .ptr = factory.ptr, .vtable = &factory_vtable };
 }
 
