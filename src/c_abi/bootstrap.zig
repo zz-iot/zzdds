@@ -363,8 +363,10 @@ fn nRawImpl(
     // For bounded destructive takes, pre-allocate the output struct array BEFORE
     // removing samples from the queue.  Without this, an OOM at the alloc step
     // would silently discard already-taken data with no way to recover it.
-    // For unbounded destructive takes, peek the count via readRaw first so we
-    // can apply the same guarantee (data stays in queue if alloc fails).
+    // For unbounded destructive takes (max <= 0), peek the count via readRaw
+    // first to enable the same pre-allocation guarantee.  As a consequence,
+    // samples that arrive between the peek and the take are NOT included in
+    // this call; they remain in the queue and will be returned by the next call.
     // _alloc_capacity may exceed count; zzdds_return_raw_samples uses it for the
     // free, so over-allocating is safe.
     var unbounded_take_max: c_int = 0;

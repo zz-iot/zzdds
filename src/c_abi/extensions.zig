@@ -82,10 +82,11 @@ const FactoryOwner = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
-        stack.participant_ptr = p;
+        stack.domain_id = domain_id;
+        stack.participant = p.toDDSParticipant();
         try self.stacks.append(self.alloc, stack);
         if (config_deinit_allocator) |cfg_alloc| p.config_deinit_allocator = cfg_alloc;
-        return p.toDDSParticipant();
+        return stack.participant;
     }
 
     fn deleteParticipant(self: *@This(), participant: DDS.DomainParticipant) DDS.ReturnCode_t {
@@ -98,7 +99,7 @@ const FactoryOwner = struct {
         self.mu.lock();
         var found: ?*ParticipantStack = null;
         for (self.stacks.items, 0..) |stack, i| {
-            if (stack.participant_ptr == participant.ptr) {
+            if (stack.participant.ptr == participant.ptr) {
                 found = self.stacks.swapRemove(i);
                 break;
             }
@@ -111,11 +112,12 @@ const FactoryOwner = struct {
     }
 
     fn lookupParticipant(self: *@This(), domain_id: DDS.DomainId_t) DDS.DomainParticipant {
+        // Use the stored domain_id and participant handle to avoid calling the
+        // inner factory vtable under self.mu (which would invert lock order).
         self.mu.lock();
         defer self.mu.unlock();
         for (self.stacks.items) |stack| {
-            const dp = stack.factory_handle.vtable.lookup_participant(stack.factory_handle.ptr, domain_id);
-            if (!nil.isNil(dp)) return dp;
+            if (stack.domain_id == domain_id) return stack.participant;
         }
         return nil.nil_participant;
     }
@@ -127,10 +129,12 @@ const ParticipantStack = struct {
     discovery: *SpdpSedpDiscovery,
     udp: *UdpTransport,
     factory_handle: DDS.DomainParticipantFactory,
-    // Ptr of the single participant created through this stack; used to identify
-    // the owning stack in deleteParticipant without calling the inner factory vtable
-    // while holding FactoryOwner.mu (which would invert lock order).
-    participant_ptr: *anyopaque = undefined,
+    // The single participant created through this stack, and its domain id.
+    // Stored so deleteParticipant and lookupParticipant can identify the stack
+    // without calling the inner factory vtable while holding FactoryOwner.mu
+    // (which would invert lock order: FactoryOwner.mu → inner factory mu).
+    domain_id: DDS.DomainId_t = 0,
+    participant: DDS.DomainParticipant = nil.nil_participant,
 
     fn deinit(self: *@This()) void {
         self.factory.deinit();
@@ -440,6 +444,9 @@ fn factorySetDefaultParticipantQos(ctx: *anyopaque, qos: *const DDS.DomainPartic
     return DDS.RETCODE_OK;
 }
 
+/// Caller contract: any heap-allocated fields in *qos must have been allocated
+/// with c_allocator (or *qos must be zero-initialised). The function frees
+/// existing content with c_allocator before writing the cloned default.
 fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
@@ -456,9 +463,10 @@ fn factorySetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantFactoryQos) D
     owner.mu.lock();
     defer owner.mu.unlock();
     owner.factory_qos = qos.*;
-    for (owner.stacks.items) |stack| {
-        _ = stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, qos);
-    }
+    // Do NOT propagate to existing inner factories: calling inner vtables under
+    // owner.mu inverts the lock order (FactoryOwner.mu → inner factory mu).
+    // New participants snapshot factory_qos at createParticipant time, so no
+    // propagation is needed for correctness.
     return DDS.RETCODE_OK;
 }
 
