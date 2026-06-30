@@ -538,9 +538,32 @@ fn writerWriteSerialized(
 fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
-    const taken = impl.takeRaw() orelse return DDS.RETCODE_NO_DATA;
+    // Peek the first sample non-destructively to pre-allocate the c_allocator
+    // buffer before taking.  Without this, an OOM after takeRaw would permanently
+    // discard the sample with no recovery path.
+    var peek: std.ArrayListUnmanaged(reader_mod.TakenSample) = .empty;
+    defer {
+        for (peek.items) |s| impl.alloc.free(s.data);
+        peek.deinit(impl.alloc);
+    }
+    impl.readRaw(&peek, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 1, null, null) catch return DDS.RETCODE_ERROR;
+    if (peek.items.len == 0) return DDS.RETCODE_NO_DATA;
+    const peek_len = peek.items[0].data.len;
+    if (peek_len > std.math.maxInt(u32)) return DDS.RETCODE_OUT_OF_RESOURCES;
+    const copy = std.heap.c_allocator.alloc(u8, peek_len) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    const taken = impl.takeRaw() orelse {
+        std.heap.c_allocator.free(copy);
+        return DDS.RETCODE_NO_DATA;
+    };
     defer impl.alloc.free(taken.data);
-    fillSerializedSample(sample, taken) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    const n = @min(taken.data.len, copy.len);
+    @memcpy(copy[0..n], taken.data[0..n]);
+    sample.* = .{
+        .cdr = .{ ._maximum = @intCast(copy.len), ._length = @intCast(n), ._buffer = copy.ptr, ._release = true },
+        .instance_handle = taken.info.instance_handle,
+        .valid_data = taken.info.valid_data,
+        .instance_state = taken.info.instance_state,
+    };
     return DDS.RETCODE_OK;
 }
 
@@ -551,9 +574,26 @@ fn readerTakeNextInstanceSerialized(
 ) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
-    const taken = impl.takeNextInstanceRaw(previous_instance) orelse return DDS.RETCODE_NO_DATA;
+    // Peek (non-destructive) to pre-allocate the copy buffer before removing
+    // the sample — same guarantee as readerTakeSerialized.
+    const peeked = impl.readNextInstanceRaw(previous_instance) orelse return DDS.RETCODE_NO_DATA;
+    defer impl.alloc.free(peeked.data);
+    const peek_len = peeked.data.len;
+    if (peek_len > std.math.maxInt(u32)) return DDS.RETCODE_OUT_OF_RESOURCES;
+    const copy = std.heap.c_allocator.alloc(u8, peek_len) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    const taken = impl.takeNextInstanceRaw(previous_instance) orelse {
+        std.heap.c_allocator.free(copy);
+        return DDS.RETCODE_NO_DATA;
+    };
     defer impl.alloc.free(taken.data);
-    fillSerializedSample(sample, taken) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    const n = @min(taken.data.len, copy.len);
+    @memcpy(copy[0..n], taken.data[0..n]);
+    sample.* = .{
+        .cdr = .{ ._maximum = @intCast(copy.len), ._length = @intCast(n), ._buffer = copy.ptr, ._release = true },
+        .instance_handle = taken.info.instance_handle,
+        .valid_data = taken.info.valid_data,
+        .instance_state = taken.info.instance_state,
+    };
     return DDS.RETCODE_OK;
 }
 
@@ -565,24 +605,6 @@ fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
     return buf[0..s._length];
 }
 
-fn fillSerializedSample(sample: *ZZDDS.SerializedSample, taken: reader_mod.TakenSample) !void {
-    // Copy into a c_allocator buffer so the C caller can safely free() it via
-    // _release = true, regardless of which allocator backed the reader.
-    if (taken.data.len > std.math.maxInt(u32)) return error.OutOfMemory;
-    const copy = try std.heap.c_allocator.alloc(u8, taken.data.len);
-    @memcpy(copy, taken.data);
-    sample.* = .{
-        .cdr = .{
-            ._maximum = @intCast(copy.len),
-            ._length = @intCast(copy.len),
-            ._buffer = copy.ptr,
-            ._release = true,
-        },
-        .instance_handle = taken.info.instance_handle,
-        .valid_data = taken.info.valid_data,
-        .instance_state = taken.info.instance_state,
-    };
-}
 
 test "zzdds extension factory creates participant with generated default config" {
     const factory = try createFactory();
