@@ -41,11 +41,16 @@ pub fn deinitRuntimeConfig(allocator: std.mem.Allocator, cfg: *schema.Config) vo
     if (cfg.transport.tcp.bind_address.len != 0) allocator.free(cfg.transport.tcp.bind_address);
     if (cfg.transport.udp.multicast_group_v4.len != 0) allocator.free(cfg.transport.udp.multicast_group_v4);
     if (cfg.transport.udp.multicast_group_v6.len != 0) allocator.free(cfg.transport.udp.multicast_group_v6);
-    if (cfg.transport.udp.interfaces.len != 0) allocator.free(cfg.transport.udp.interfaces);
-    if (cfg.transport.udp.initial_peers.len != 0) allocator.free(cfg.transport.udp.initial_peers);
-    if (cfg.discovery.initial_peers.len != 0) allocator.free(cfg.discovery.initial_peers);
+    if (cfg.transport.udp.interfaces.len != 0) freeStringSlice(allocator, cfg.transport.udp.interfaces);
+    if (cfg.transport.udp.initial_peers.len != 0) freeStringSlice(allocator, cfg.transport.udp.initial_peers);
+    if (cfg.discovery.initial_peers.len != 0) freeStringSlice(allocator, cfg.discovery.initial_peers);
     if (cfg.discovery.static_config_file.len != 0) allocator.free(cfg.discovery.static_config_file);
     cfg.* = .{};
+}
+
+fn freeStringSlice(allocator: std.mem.Allocator, slice: []const []const u8) void {
+    for (slice) |s| allocator.free(s);
+    allocator.free(slice);
 }
 
 fn toUdpConfig(allocator: std.mem.Allocator, udp: *const ext.UdpConfig) !schema.UdpConfig {
@@ -85,8 +90,14 @@ fn stringSeqSlice(allocator: std.mem.Allocator, seq: *const ext.StringSeq) ![]co
     if (seq._length == 0) return &.{};
     const buf = seq._buffer orelse return &.{};
     const out = try allocator.alloc([]const u8, seq._length);
+    var n: usize = 0;
+    errdefer {
+        for (out[0..n]) |s| allocator.free(s);
+        allocator.free(out);
+    }
     for (buf[0..seq._length], out) |item, *slot| {
-        slot.* = std.mem.span(item);
+        slot.* = try allocator.dupe(u8, std.mem.span(item));
+        n += 1;
     }
     return out;
 }
