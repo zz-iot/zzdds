@@ -73,7 +73,7 @@ private:
 inline std::shared_ptr<DomainParticipantFactory> create_factory()
 {
     const zzdds_DomainParticipantFactory handle = zzdds_create_factory();
-    if (!handle.ptr) return {};
+    if (zzdds_factory_is_nil(handle)) return {};
 
     struct FactoryHandleGuard {
         zzdds_DomainParticipantFactory handle;

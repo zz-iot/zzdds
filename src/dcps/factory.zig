@@ -168,14 +168,10 @@ pub const DomainParticipantFactoryImpl = struct {
             handle,
             self.trace_config.tracer(),
             timer_clock,
-        ) catch {
-            if (config_deinit_allocator) |cfg_alloc| {
-                var cfg = config;
-                generated_config_mod.deinitRuntimeConfig(cfg_alloc, &cfg);
-            }
-            return nil.nil_participant;
-        };
-        p.config_deinit_allocator = config_deinit_allocator;
+        ) catch return nil.nil_participant;
+        // config_deinit_allocator is set AFTER participants.append so that p.deinit()
+        // on any failure path below doesn't free config — the caller retains ownership
+        // and handles cleanup on error.
 
         // Start discovery; if it fails we still own the participant and must clean up.
         p.start() catch {
@@ -191,6 +187,7 @@ pub const DomainParticipantFactoryImpl = struct {
         };
         self.mu.unlock();
 
+        p.config_deinit_allocator = config_deinit_allocator;
         return p.toDDSParticipant();
     }
 

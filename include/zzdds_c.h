@@ -52,6 +52,7 @@ typedef struct zzdds_raw_sample_array {
 typedef int (*zzdds_compute_key_hash_fn)(const uint8_t *payload, size_t len, uint8_t hash_out[16]);
 
 zzdds_DomainParticipantFactory zzdds_create_factory(void);
+bool zzdds_factory_is_nil(zzdds_DomainParticipantFactory factory);
 void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
 DDS_DomainParticipantFactory zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zzdds_DomainParticipantFactory factory);
 zzdds_DomainParticipantFactory DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(DDS_DomainParticipantFactory factory);

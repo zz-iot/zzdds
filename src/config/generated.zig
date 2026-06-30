@@ -13,26 +13,19 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
     errdefer deinitRuntimeConfig(allocator, &runtime);
 
     runtime.domain.id = cfg.domain.id;
-    runtime.participant = .{
-        .name = cfg.participant.name,
-        .lease_duration_ms = cfg.participant.lease_duration_ms,
-        .announcement_period_ms = cfg.participant.announcement_period_ms,
-        .guid_strategy = toGuidStrategy(cfg.participant.guid_strategy),
-        .timer_clock_name = cfg.participant.timer_clock_name,
-    };
-    runtime.transport = .{
-        .udp = try toUdpConfig(allocator, &cfg.transport.udp),
-        .tcp = .{
-            .bind_address = cfg.transport.tcp.bind_address,
-            .reuse_connection_by_host = cfg.transport.tcp.reuse_connection_by_host,
-        },
-    };
+    // Assign sequentially so that errdefer sees each duped string as it lands.
+    runtime.participant.name = try dupeString(allocator, cfg.participant.name);
+    runtime.participant.lease_duration_ms = cfg.participant.lease_duration_ms;
+    runtime.participant.announcement_period_ms = cfg.participant.announcement_period_ms;
+    runtime.participant.guid_strategy = toGuidStrategy(cfg.participant.guid_strategy);
+    runtime.participant.timer_clock_name = try dupeString(allocator, cfg.participant.timer_clock_name);
+    runtime.transport.udp = try toUdpConfig(allocator, &cfg.transport.udp);
+    runtime.transport.tcp.bind_address = try dupeString(allocator, cfg.transport.tcp.bind_address);
+    runtime.transport.tcp.reuse_connection_by_host = cfg.transport.tcp.reuse_connection_by_host;
     runtime.rtps.fragment_size = cfg.rtps.fragment_size;
-    runtime.discovery = .{
-        .kind = toDiscoveryKind(cfg.discovery.kind),
-        .initial_peers = try stringSeqSlice(allocator, &cfg.discovery.initial_peers),
-        .static_config_file = cfg.discovery.static_config_file,
-    };
+    runtime.discovery.kind = toDiscoveryKind(cfg.discovery.kind);
+    runtime.discovery.initial_peers = try stringSeqSlice(allocator, &cfg.discovery.initial_peers);
+    runtime.discovery.static_config_file = try dupeString(allocator, cfg.discovery.static_config_file);
     runtime.qos = .{
         .reliability_kind = toReliabilityKind(cfg.qos.reliability_kind),
         .durability_kind = toDurabilityKind(cfg.qos.durability_kind),
@@ -43,9 +36,15 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
 }
 
 pub fn deinitRuntimeConfig(allocator: std.mem.Allocator, cfg: *schema.Config) void {
+    if (cfg.participant.name.len != 0) allocator.free(cfg.participant.name);
+    if (cfg.participant.timer_clock_name.len != 0) allocator.free(cfg.participant.timer_clock_name);
+    if (cfg.transport.tcp.bind_address.len != 0) allocator.free(cfg.transport.tcp.bind_address);
+    if (cfg.transport.udp.multicast_group_v4.len != 0) allocator.free(cfg.transport.udp.multicast_group_v4);
+    if (cfg.transport.udp.multicast_group_v6.len != 0) allocator.free(cfg.transport.udp.multicast_group_v6);
     if (cfg.transport.udp.interfaces.len != 0) allocator.free(cfg.transport.udp.interfaces);
     if (cfg.transport.udp.initial_peers.len != 0) allocator.free(cfg.transport.udp.initial_peers);
     if (cfg.discovery.initial_peers.len != 0) allocator.free(cfg.discovery.initial_peers);
+    if (cfg.discovery.static_config_file.len != 0) allocator.free(cfg.discovery.static_config_file);
     cfg.* = .{};
 }
 
@@ -63,8 +62,8 @@ fn toUdpConfig(allocator: std.mem.Allocator, udp: *const ext.UdpConfig) !schema.
         .data_unicast_offset = udp.data_unicast_offset,
         .participant_id = udp.participant_id,
         .interfaces = try stringSeqSlice(allocator, &udp.interfaces),
-        .multicast_group_v4 = udp.multicast_group_v4,
-        .multicast_group_v6 = udp.multicast_group_v6,
+        .multicast_group_v4 = try dupeString(allocator, udp.multicast_group_v4),
+        .multicast_group_v6 = try dupeString(allocator, udp.multicast_group_v6),
         .multicast_ttl = udp.multicast_ttl,
         .meta_unicast_port = udp.meta_unicast_port,
         .data_unicast_port = udp.data_unicast_port,
@@ -75,6 +74,11 @@ fn toUdpConfig(allocator: std.mem.Allocator, udp: *const ext.UdpConfig) !schema.
         .recv_buffer_size = udp.recv_buffer_size,
         .interface_poll_interval_ms = udp.interface_poll_interval_ms,
     };
+}
+
+fn dupeString(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (s.len == 0) return "";
+    return allocator.dupe(u8, s);
 }
 
 fn stringSeqSlice(allocator: std.mem.Allocator, seq: *const ext.StringSeq) ![]const []const u8 {

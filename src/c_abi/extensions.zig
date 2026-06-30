@@ -58,13 +58,20 @@ const FactoryOwner = struct {
         _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &self.default_dp_qos);
         _ = stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, &self.factory_qos);
 
-        const dp = if (config_deinit_allocator) |cfg_alloc|
-            stack.factory.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, cfg_alloc)
-        else
-            stack.factory_handle.vtable.create_participant(stack.factory_handle.ptr, domain_id, qos, a_listener, mask);
+        // Always use createParticipantWithConfigOwned so the `config` param is
+        // honoured regardless of whether ownership is being transferred.  Pass
+        // null for the allocator here; ownership is assigned after stacks.append
+        // so that p.deinit() on any failure path doesn't free the config (the
+        // caller's catch block in factoryCreateParticipantEx is the sole cleanup
+        // site).
+        const dp = stack.factory.createParticipantWithConfigOwned(domain_id, qos, a_listener, mask, config, null);
         if (nil.isNil(dp)) return error.ParticipantFailed;
 
         try self.stacks.append(self.alloc, stack);
+        if (config_deinit_allocator) |cfg_alloc| {
+            const impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+            impl.config_deinit_allocator = cfg_alloc;
+        }
         return dp;
     }
 
@@ -183,6 +190,10 @@ pub export fn zzdds_create_factory() callconv(.c) ZZDDS.DomainParticipantFactory
         std.log.err("zzdds_create_factory: {}", .{err});
         return .{ .ptr = nil.NIL_PTR, .vtable = &factory_vtable };
     };
+}
+
+pub export fn zzdds_factory_is_nil(factory: ZZDDS.DomainParticipantFactory) callconv(.c) bool {
+    return factory.ptr == nil.NIL_PTR;
 }
 
 pub export fn zzdds_destroy_factory(factory: ZZDDS.DomainParticipantFactory) callconv(.c) void {
@@ -413,11 +424,13 @@ fn participantRegisterTypeSupport(ctx: *anyopaque, type_name: [*:0]const u8) DDS
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(ctx));
     const name = std.mem.span(type_name);
     if (!impl.registerTypeSupport(name, .{
-        .ctx = undefined,
+        .ctx = &keyless_type_support_ctx,
         .compute_key_hash = keylessComputeKeyHash,
     })) return DDS.RETCODE_OUT_OF_RESOURCES;
     return DDS.RETCODE_OK;
 }
+
+var keyless_type_support_ctx: u8 = 0;
 
 fn keylessComputeKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
     return [_]u8{0} ** 16;
