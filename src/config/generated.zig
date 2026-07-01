@@ -50,7 +50,7 @@ pub fn deinitRuntimeConfig(allocator: std.mem.Allocator, cfg: *schema.Config) vo
     if (cfg.transport.udp.initial_peers.len != 0) freeStringSlice(allocator, cfg.transport.udp.initial_peers);
     if (cfg.discovery.initial_peers.len != 0) freeStringSlice(allocator, cfg.discovery.initial_peers);
     if (cfg.discovery.static_config_file.len != 0) allocator.free(cfg.discovery.static_config_file);
-    cfg.* = .{};
+    cfg.* = std.mem.zeroes(schema.Config);
 }
 
 fn freeStringSlice(allocator: std.mem.Allocator, slice: []const []const u8) void {

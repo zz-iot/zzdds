@@ -258,6 +258,7 @@ pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: DDS.
 
 pub export fn zzdds_DomainParticipant_as_DDS_DomainParticipant(participant: ZZDDS.DomainParticipant) callconv(.c) DDS.DomainParticipant {
     if (participant.ptr == nil.NIL_PTR) return nil.nil_participant;
+    if (participant.vtable != &participant_vtable) return nil.nil_participant;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(participant.ptr));
     return impl.toDDSParticipant();
 }
@@ -276,6 +277,7 @@ pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: DDS.DataWriter) callcon
 
 pub export fn zzdds_DataWriter_as_DDS_DataWriter(writer: ZZDDS.DataWriter) callconv(.c) DDS.DataWriter {
     if (writer.ptr == nil.NIL_PTR) return nil.nil_datawriter;
+    if (writer.vtable != &writer_vtable) return nil.nil_datawriter;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
     return impl.toDDSDataWriter();
 }
@@ -288,12 +290,14 @@ pub export fn DDS_DataReader_as_zzdds_DataReader(reader: DDS.DataReader) callcon
 
 pub export fn zzdds_DataReader_as_DDS_DataReader(reader: ZZDDS.DataReader) callconv(.c) DDS.DataReader {
     if (reader.ptr == nil.NIL_PTR) return nil.nil_datareader;
+    if (reader.vtable != &reader_vtable) return nil.nil_datareader;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     return impl.toDDSDataReader();
 }
 
 pub export fn zzdds_Topic_as_DDS_Topic(topic: ZZDDS.Topic) callconv(.c) DDS.Topic {
     if (topic.ptr == nil.NIL_PTR) return nil.nil_topic;
+    if (topic.vtable != &topic_vtable) return nil.nil_topic;
     const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
     return impl.toDDSTopic();
 }
