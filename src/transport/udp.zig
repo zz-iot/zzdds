@@ -408,6 +408,9 @@ pub const UdpTransport = struct {
         // Deep-copy config.interfaces so the transport owns the filter strings.
         // The interface-monitor thread reads self.config.interfaces after init returns;
         // without a private copy, the caller freeing their config causes a UAF.
+        // Other config strings (multicast_group_v4, multicast_group_v6, initial_peers)
+        // are NOT deep-copied because they are only read synchronously during
+        // DomainParticipantImpl.init, which completes before any teardown can begin.
         if (config.interfaces.len > 0) {
             const owned = try alloc.alloc([]const u8, config.interfaces.len);
             self.config.interfaces = owned;

@@ -385,6 +385,11 @@ fn nRawImpl(
         unbounded_take_max = @intCast(peek.items.len);
     }
 
+    // pre_capacity may exceed the number of samples actually taken: concurrent
+    // removal between the readRaw peek and takeFiltered can reduce the result
+    // below unbounded_take_max.  Entries pre_arr[count.._alloc_capacity-1] are
+    // uninitialized; callers must iterate `count` for individual frees and use
+    // `_alloc_capacity` only for the array-level free.
     const pre_capacity: usize =
         if (destructive and max > 0) @intCast(max) else if (destructive) @intCast(unbounded_take_max) else 0;
     const pre_arr: []CRawSample = if (pre_capacity > 0)
