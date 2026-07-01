@@ -425,7 +425,10 @@ fn nRawImpl(
         alloc.alloc(CRawSample, tmp.items.len) catch return -1;
     for (tmp.items, 0..) |s, i| {
         const copy = alloc.dupe(u8, s.data) catch {
-            std.log.err("zzdds_read_raw: OOM copying sample {d}/{d} — all {d} taken samples permanently lost", .{ i, tmp.items.len, tmp.items.len });
+            if (destructive)
+                std.log.err("zzdds_take_n_raw: OOM copying sample {d}/{d} — all {d} taken samples permanently lost", .{ i, tmp.items.len, tmp.items.len })
+            else
+                std.log.err("zzdds_read_n_raw: OOM copying sample {d}/{d} — samples remain in queue, caller may retry", .{ i, tmp.items.len });
             for (arr[0..i]) |prev| alloc.free(prev.data.?[0..prev.data_len]);
             alloc.free(arr);
             return -1;
