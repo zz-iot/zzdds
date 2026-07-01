@@ -2133,7 +2133,7 @@ pub const DomainParticipantImpl = struct {
 
     // ── DomainParticipant vtable ──────────────────────────────────────────────
 
-    const vtable = DDS.DomainParticipant.Vtable{
+    pub const vtable = DDS.DomainParticipant.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,

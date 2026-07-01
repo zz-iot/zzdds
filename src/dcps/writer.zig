@@ -396,7 +396,7 @@ pub const DataWriterImpl = struct {
 
     // ── DDS.DataWriter vtable ─────────────────────────────────────────────────
 
-    const vtable = DDS.DataWriter.Vtable{
+    pub const vtable = DDS.DataWriter.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,

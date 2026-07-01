@@ -590,10 +590,17 @@ fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.Re
         return DDS.RETCODE_NO_DATA;
     };
     defer impl.alloc.free(taken.data);
-    const n = @min(taken.data.len, copy.len);
-    @memcpy(copy[0..n], taken.data[0..n]);
+    // A KEEP_LAST-1 writer may have replaced the queued sample between peek and
+    // take, making taken.data larger than copy.  Reallocate to avoid truncated CDR.
+    var buf = copy;
+    if (taken.data.len > copy.len) {
+        std.heap.c_allocator.free(copy);
+        if (taken.data.len > std.math.maxInt(u32)) return DDS.RETCODE_OUT_OF_RESOURCES;
+        buf = std.heap.c_allocator.alloc(u8, taken.data.len) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    }
+    @memcpy(buf[0..taken.data.len], taken.data);
     sample.* = .{
-        .cdr = .{ ._maximum = @intCast(copy.len), ._length = @intCast(n), ._buffer = copy.ptr, ._release = true },
+        .cdr = .{ ._maximum = @intCast(buf.len), ._length = @intCast(taken.data.len), ._buffer = buf.ptr, ._release = true },
         .instance_handle = taken.info.instance_handle,
         .valid_data = taken.info.valid_data,
         .instance_state = taken.info.instance_state,
@@ -624,10 +631,16 @@ fn readerTakeNextInstanceSerialized(
         return DDS.RETCODE_NO_DATA;
     };
     defer impl.alloc.free(taken.data);
-    const n = @min(taken.data.len, copy.len);
-    @memcpy(copy[0..n], taken.data[0..n]);
+    // Same KEEP_LAST-1 realloc guard as readerTakeSerialized.
+    var buf = copy;
+    if (taken.data.len > copy.len) {
+        std.heap.c_allocator.free(copy);
+        if (taken.data.len > std.math.maxInt(u32)) return DDS.RETCODE_OUT_OF_RESOURCES;
+        buf = std.heap.c_allocator.alloc(u8, taken.data.len) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    }
+    @memcpy(buf[0..taken.data.len], taken.data);
     sample.* = .{
-        .cdr = .{ ._maximum = @intCast(copy.len), ._length = @intCast(n), ._buffer = copy.ptr, ._release = true },
+        .cdr = .{ ._maximum = @intCast(buf.len), ._length = @intCast(taken.data.len), ._buffer = buf.ptr, ._release = true },
         .instance_handle = taken.info.instance_handle,
         .valid_data = taken.info.valid_data,
         .instance_state = taken.info.instance_state,

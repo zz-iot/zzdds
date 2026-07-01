@@ -84,7 +84,7 @@ pub const TopicImpl = struct {
         return .{ .ptr = self, .vtable = &topic_vtable };
     }
 
-    const topic_vtable = DDS.Topic.Vtable{
+    pub const topic_vtable = DDS.Topic.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,

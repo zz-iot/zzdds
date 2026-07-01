@@ -1617,7 +1617,7 @@ pub const DataReaderImpl = struct {
 
     // ── DDS.DataReader vtable ─────────────────────────────────────────────────
 
-    const vtable = DDS.DataReader.Vtable{
+    pub const vtable = DDS.DataReader.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,

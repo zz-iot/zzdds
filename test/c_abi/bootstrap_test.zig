@@ -110,6 +110,11 @@ const Fixture = struct {
 
 // ── Factory lifecycle ─────────────────────────────────────────────────────────
 
+test "support factory: destroy_factory is safe on nil handle" {
+    const nil_factory = ZZDDS.DomainParticipantFactory{ .ptr = zzdds.dcps.NIL_PTR, .vtable = undefined };
+    extensions.zzdds_destroy_factory(nil_factory); // must not crash or call deinit
+}
+
 test "support factory: generated create_participant and delete_participant" {
     const ext_factory = extensions.zzdds_create_factory();
     defer extensions.zzdds_destroy_factory(ext_factory);
