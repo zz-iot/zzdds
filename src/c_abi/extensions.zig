@@ -407,6 +407,10 @@ fn createFactory() !ZZDDS.DomainParticipantFactory {
     return .{ .ptr = owner, .vtable = &factory_vtable };
 }
 
+/// Each create_participant call allocates an independent ParticipantStack with its
+/// own UdpTransport.  UdpTransport.init auto-assigns a participant_id that maps to
+/// a unique RTPS port (PB + DG*domain + PG*participant_id + offset), so multiple
+/// participants within the same domain on the same host do not collide on port binding.
 fn factoryCreateParticipant(
     ctx: *anyopaque,
     domain_id: DDS.DomainId_t,
@@ -594,11 +598,18 @@ fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.Re
     defer impl.alloc.free(taken.data);
     // A KEEP_LAST-1 writer may have replaced the queued sample between peek and
     // take, making taken.data larger than copy.  Reallocate to avoid truncated CDR.
+    // If realloc fails the sample is already consumed — log so the loss is visible.
     var buf = copy;
     if (taken.data.len > copy.len) {
         std.heap.c_allocator.free(copy);
-        if (taken.data.len > std.math.maxInt(u32)) return DDS.RETCODE_OUT_OF_RESOURCES;
-        buf = std.heap.c_allocator.alloc(u8, taken.data.len) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (taken.data.len > std.math.maxInt(u32)) {
+            std.log.err("readerTakeSerialized: sample permanently lost — payload {d} bytes exceeds u32", .{taken.data.len});
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        }
+        buf = std.heap.c_allocator.alloc(u8, taken.data.len) catch {
+            std.log.err("readerTakeSerialized: sample permanently lost — OOM reallocating {d}-byte buffer after KEEP_LAST-1 replacement", .{taken.data.len});
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        };
     }
     @memcpy(buf[0..taken.data.len], taken.data);
     sample.* = .{
@@ -634,11 +645,18 @@ fn readerTakeNextInstanceSerialized(
     };
     defer impl.alloc.free(taken.data);
     // Same KEEP_LAST-1 realloc guard as readerTakeSerialized.
+    // If realloc fails the sample is already consumed — log so the loss is visible.
     var buf = copy;
     if (taken.data.len > copy.len) {
         std.heap.c_allocator.free(copy);
-        if (taken.data.len > std.math.maxInt(u32)) return DDS.RETCODE_OUT_OF_RESOURCES;
-        buf = std.heap.c_allocator.alloc(u8, taken.data.len) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (taken.data.len > std.math.maxInt(u32)) {
+            std.log.err("readerTakeNextInstanceSerialized: sample permanently lost — payload {d} bytes exceeds u32", .{taken.data.len});
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        }
+        buf = std.heap.c_allocator.alloc(u8, taken.data.len) catch {
+            std.log.err("readerTakeNextInstanceSerialized: sample permanently lost — OOM reallocating {d}-byte buffer after KEEP_LAST-1 replacement", .{taken.data.len});
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        };
     }
     @memcpy(buf[0..taken.data.len], taken.data);
     sample.* = .{
