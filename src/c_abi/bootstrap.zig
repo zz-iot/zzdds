@@ -378,7 +378,7 @@ fn nRawImpl(
             for (peek.items) |s| impl.alloc.free(s.data);
             peek.deinit(impl.alloc);
         }
-        impl.readRaw(&peek, ss, vs, is, 0, null, null) catch return -1;
+        impl.readRaw(&peek, ss, vs, is, -1, null, null) catch return -1;
         if (peek.items.len == 0) {
             out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
             return 0;

@@ -20,7 +20,11 @@ const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
+const GuardConditionImpl = zzdds.dcps.GuardConditionImpl;
+const StatusConditionImpl = zzdds.dcps.StatusConditionImpl;
+const ReadConditionImpl = zzdds.dcps.ReadConditionImpl;
 const noop_security = zzdds.noop_security.noop_security_plugins;
+const generated_config = zzdds.generated_config;
 const RtpsTimestamp = zzdds.util.time.RtpsTimestamp;
 const history = zzdds.rtps.history;
 
@@ -557,4 +561,193 @@ test "bootstrap: lookup_instance_reader returns handle for alive instance, 0 whe
     @memset(&unknown_key, 0xFF);
     const ih2 = bootstrap.zzdds_lookup_instance_reader(pair.dr, &unknown_key);
     try testing.expectEqual(@as(DDS.InstanceHandle_t, 0), ih2);
+}
+
+// ── Conversion nil-guard tests ────────────────────────────────────────────────
+//
+// Every DDS_X_as_DDS_Y and zzdds_X_as_DDS_X function must return a nil handle
+// when passed a nil input. These tests exercise the nil-guard branch at the top
+// of each conversion function so it shows up as covered in kcov.
+
+test "extensions: condition conversion functions return nil for nil handles" {
+    const np = zzdds.dcps.NIL_PTR;
+
+    const c1 = extensions.DDS_GuardCondition_as_DDS_Condition(.{ .ptr = np, .vtable = undefined });
+    try testing.expectEqual(np, c1.ptr);
+
+    const c2 = extensions.DDS_StatusCondition_as_DDS_Condition(.{ .ptr = np, .vtable = undefined });
+    try testing.expectEqual(np, c2.ptr);
+
+    const c3 = extensions.DDS_ReadCondition_as_DDS_Condition(.{ .ptr = np, .vtable = undefined });
+    try testing.expectEqual(np, c3.ptr);
+
+    const rc = extensions.DDS_QueryCondition_as_DDS_ReadCondition(.{ .ptr = np, .vtable = undefined });
+    try testing.expectEqual(np, rc.ptr);
+}
+
+test "extensions: entity and topic-description conversion functions return nil for nil handles" {
+    const np = zzdds.dcps.NIL_PTR;
+    const nil_topic: DDS.Topic = .{ .ptr = np, .vtable = undefined };
+
+    try testing.expectEqual(np, extensions.DDS_DomainParticipant_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
+    try testing.expectEqual(np, extensions.DDS_Topic_as_DDS_Entity(nil_topic).ptr);
+    try testing.expectEqual(np, extensions.DDS_Publisher_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
+    try testing.expectEqual(np, extensions.DDS_DataWriter_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
+    try testing.expectEqual(np, extensions.DDS_Subscriber_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
+    try testing.expectEqual(np, extensions.DDS_DataReader_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
+    try testing.expectEqual(np, extensions.DDS_Topic_as_DDS_TopicDescription(nil_topic).ptr);
+    try testing.expectEqual(np, extensions.DDS_ContentFilteredTopic_as_DDS_TopicDescription(.{ .ptr = np, .vtable = undefined }).ptr);
+}
+
+// ── Conversion valid-handle tests (using IntraProcess fixture) ────────────────
+
+test "extensions: entity conversion functions return valid handles for real entities" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const np = zzdds.dcps.NIL_PTR;
+
+    try testing.expect(extensions.DDS_DomainParticipant_as_DDS_Entity(fx.dp_w).ptr != np);
+    try testing.expect(extensions.DDS_Topic_as_DDS_Entity(fx.topic_w).ptr != np);
+    try testing.expect(extensions.DDS_Publisher_as_DDS_Entity(fx.pub_w).ptr != np);
+    try testing.expect(extensions.DDS_Subscriber_as_DDS_Entity(fx.sub_r).ptr != np);
+    try testing.expect(extensions.DDS_DataWriter_as_DDS_Entity(pair.dw).ptr != np);
+    try testing.expect(extensions.DDS_DataReader_as_DDS_Entity(pair.dr).ptr != np);
+
+    const td = extensions.DDS_Topic_as_DDS_TopicDescription(fx.topic_w);
+    try testing.expect(td.ptr != np);
+    try testing.expectEqualStrings("BootTopic", std.mem.span(td.vtable.get_name(td.ptr)));
+}
+
+test "extensions: DDS_DataReader_as_zzdds and back round-trip" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const np = zzdds.dcps.NIL_PTR;
+
+    // DDS → ZZDDS
+    const zdr = extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr);
+    try testing.expect(zdr.ptr != np);
+
+    // ZZDDS → DDS round-trip
+    const ddr = extensions.zzdds_DataReader_as_DDS_DataReader(zdr);
+    try testing.expect(ddr.ptr != np);
+    try testing.expectEqual(pair.dr.ptr, ddr.ptr);
+
+    // Same for DataWriter
+    const zdw = extensions.DDS_DataWriter_as_zzdds_DataWriter(pair.dw);
+    try testing.expect(zdw.ptr != np);
+    const ddw = extensions.zzdds_DataWriter_as_DDS_DataWriter(zdw);
+    try testing.expectEqual(pair.dw.ptr, ddw.ptr);
+}
+
+// ── Condition conversion valid-handle tests ───────────────────────────────────
+
+test "extensions: DDS_GuardCondition_as_DDS_Condition with real GuardCondition" {
+    const gc_impl = try GuardConditionImpl.init(testing.allocator);
+    defer gc_impl.deinit();
+
+    const gc = gc_impl.toDDSGuardCondition();
+    const c = extensions.DDS_GuardCondition_as_DDS_Condition(gc);
+    try testing.expect(c.ptr != zzdds.dcps.NIL_PTR);
+    try testing.expect(!c.vtable.get_trigger_value(c.ptr));
+
+    _ = gc.set_trigger_value(true);
+    try testing.expect(c.vtable.get_trigger_value(c.ptr));
+}
+
+test "extensions: DDS_StatusCondition_as_DDS_Condition with participant status condition" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const sc = fx.dp_w.get_statuscondition();
+    const c = extensions.DDS_StatusCondition_as_DDS_Condition(sc);
+    try testing.expect(c.ptr != zzdds.dcps.NIL_PTR);
+}
+
+test "extensions: DDS_ReadCondition_as_DDS_Condition with real ReadCondition" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const rc = pair.dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = pair.dr.delete_readcondition(rc);
+
+    const c = extensions.DDS_ReadCondition_as_DDS_Condition(rc);
+    try testing.expect(c.ptr != zzdds.dcps.NIL_PTR);
+}
+
+// ── Extension serialized take via ZZDDS DataReader vtable ─────────────────────
+
+test "extensions: take_serialized via ZZDDS DataReader vtable" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+
+    const zdr = extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr);
+    var sample: ZZDDS.SerializedSample = std.mem.zeroes(ZZDDS.SerializedSample);
+    const rc = zdr.vtable.take_serialized(zdr.ptr, &sample);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(@as(u32, @intCast(PAYLOAD.len)), sample.cdr._length);
+    try testing.expect(sample.cdr._release);
+    try testing.expectEqualSlices(u8, &PAYLOAD, sample.cdr._buffer.?[0..sample.cdr._length]);
+    std.heap.c_allocator.free(sample.cdr._buffer.?[0..sample.cdr._maximum]);
+
+    // Queue is now empty.
+    var sample2: ZZDDS.SerializedSample = std.mem.zeroes(ZZDDS.SerializedSample);
+    try testing.expectEqual(DDS.RETCODE_NO_DATA, zdr.vtable.take_serialized(zdr.ptr, &sample2));
+}
+
+// ── nRawImpl max≤0: unbounded take ───────────────────────────────────────────
+//
+// max=0 and max=-1 both mean "take all available samples" (unlimited).
+// The implementation peeks with readRaw(-1) first to size the pre-allocation,
+// then calls takeFiltered with the peeked count.
+
+test "bootstrap: take_n_raw with max=0 takes all available samples" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var k1 = std.mem.zeroes([16]u8);
+    k1[0] = 0xC1;
+    var k2 = std.mem.zeroes([16]u8);
+    k2[0] = 0xC2;
+    _ = bootstrap.zzdds_write_raw(pair.dw, &k1, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw, &k2, &PAYLOAD, PAYLOAD.len);
+
+    // max=0 means "unlimited" — takes all samples and returns their count.
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 0, &arr);
+    try testing.expectEqual(@as(c_int, 2), n);
+    try testing.expectEqual(@as(usize, 2), arr.count);
+    try testing.expect(arr.samples != null);
+    bootstrap.zzdds_return_raw_samples(pair.dr, &arr);
+
+    // Queue is now empty.
+    var arr2: bootstrap.CRawSampleArray = undefined;
+    const n2 = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 0, &arr2);
+    try testing.expectEqual(@as(c_int, 0), n2);
+    try testing.expect(arr2.samples == null);
+}
+
+// ── Config: stringSeqSlice null-buffer and null-element guards ────────────────
+
+test "generated: toRuntimeConfig returns NullBuffer when StringSeq has length>0 but null buffer" {
+    const alloc = testing.allocator;
+    var cfg = ZZDDS.DomainParticipantConfig.default();
+    // interfaces has length=0 by default; set length=1 with null buffer.
+    cfg.transport.udp.interfaces._length = 1;
+    cfg.transport.udp.interfaces._buffer = null;
+    try testing.expectError(error.NullBuffer, generated_config.toRuntimeConfig(alloc, &cfg));
 }
