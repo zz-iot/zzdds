@@ -346,36 +346,42 @@ pub export fn DDS_QueryCondition_as_DDS_ReadCondition(condition: DDS.QueryCondit
 
 pub export fn DDS_DomainParticipant_as_DDS_Entity(participant: DDS.DomainParticipant) callconv(.c) DDS.Entity {
     if (participant.ptr == nil.NIL_PTR) return nil.nil_entity;
+    if (participant.vtable != &DomainParticipantImpl.vtable) return nil.nil_entity;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(participant.ptr));
     return impl.toEntity();
 }
 
 pub export fn DDS_Topic_as_DDS_Entity(topic: DDS.Topic) callconv(.c) DDS.Entity {
     if (topic.ptr == nil.NIL_PTR) return nil.nil_entity;
+    if (topic.vtable != &TopicImpl.topic_vtable) return nil.nil_entity;
     const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
     return impl.toEntity();
 }
 
 pub export fn DDS_Publisher_as_DDS_Entity(publisher: DDS.Publisher) callconv(.c) DDS.Entity {
     if (publisher.ptr == nil.NIL_PTR) return nil.nil_entity;
+    if (publisher.vtable != &PublisherImpl.vtable) return nil.nil_entity;
     const impl: *PublisherImpl = @ptrCast(@alignCast(publisher.ptr));
     return impl.toEntity();
 }
 
 pub export fn DDS_DataWriter_as_DDS_Entity(writer: DDS.DataWriter) callconv(.c) DDS.Entity {
     if (writer.ptr == nil.NIL_PTR) return nil.nil_entity;
+    if (writer.vtable != &DataWriterImpl.vtable) return nil.nil_entity;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
     return impl.toEntity();
 }
 
 pub export fn DDS_Subscriber_as_DDS_Entity(subscriber: DDS.Subscriber) callconv(.c) DDS.Entity {
     if (subscriber.ptr == nil.NIL_PTR) return nil.nil_entity;
+    if (subscriber.vtable != &SubscriberImpl.vtable) return nil.nil_entity;
     const impl: *SubscriberImpl = @ptrCast(@alignCast(subscriber.ptr));
     return impl.toEntity();
 }
 
 pub export fn DDS_DataReader_as_DDS_Entity(reader: DDS.DataReader) callconv(.c) DDS.Entity {
     if (reader.ptr == nil.NIL_PTR) return nil.nil_entity;
+    if (reader.vtable != &DataReaderImpl.vtable) return nil.nil_entity;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     return impl.toEntity();
 }

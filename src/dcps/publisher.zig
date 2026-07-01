@@ -187,7 +187,7 @@ pub const PublisherImpl = struct {
 
     // ── DDS.Publisher vtable ──────────────────────────────────────────────────
 
-    const vtable = DDS.Publisher.Vtable{
+    pub const vtable = DDS.Publisher.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,

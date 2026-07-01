@@ -165,7 +165,7 @@ pub const SubscriberImpl = struct {
 
     // ── DDS.Subscriber vtable ─────────────────────────────────────────────────
 
-    const vtable = DDS.Subscriber.Vtable{
+    pub const vtable = DDS.Subscriber.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,
