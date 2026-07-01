@@ -341,7 +341,7 @@ pub const ContentFilteredTopicImpl = struct {
 
     // ── DDS.ContentFilteredTopic vtable ──────────────────────────────────────
 
-    const cft_vtable = DDS.ContentFilteredTopic.Vtable{
+    pub const cft_vtable = DDS.ContentFilteredTopic.Vtable{
         .get_type_name = tdGetTypeName,
         .get_name = tdGetName,
         .get_participant = tdGetParticipant,

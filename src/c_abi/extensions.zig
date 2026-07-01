@@ -316,6 +316,7 @@ pub export fn zzdds_Topic_as_DDS_Topic(topic: ZZDDS.Topic) callconv(.c) DDS.Topi
 /// Passing a handle from any other DDS implementation causes memory corruption.
 pub export fn DDS_GuardCondition_as_DDS_Condition(condition: DDS.GuardCondition) callconv(.c) DDS.Condition {
     if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
+    if (condition.vtable != &GuardConditionImpl.vtable) return nil.nil_condition;
     const impl: *GuardConditionImpl = @ptrCast(@alignCast(condition.ptr));
     return impl.toCondition();
 }
@@ -324,6 +325,7 @@ pub export fn DDS_GuardCondition_as_DDS_Condition(condition: DDS.GuardCondition)
 /// Passing a handle from any other DDS implementation causes memory corruption.
 pub export fn DDS_StatusCondition_as_DDS_Condition(condition: DDS.StatusCondition) callconv(.c) DDS.Condition {
     if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
+    if (condition.vtable != &StatusConditionImpl.vtable) return nil.nil_condition;
     const impl: *StatusConditionImpl = @ptrCast(@alignCast(condition.ptr));
     return impl.toCondition();
 }
@@ -332,6 +334,7 @@ pub export fn DDS_StatusCondition_as_DDS_Condition(condition: DDS.StatusConditio
 /// Passing a handle from any other DDS implementation causes memory corruption.
 pub export fn DDS_ReadCondition_as_DDS_Condition(condition: DDS.ReadCondition) callconv(.c) DDS.Condition {
     if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
+    if (condition.vtable != &ReadConditionImpl.vtable) return nil.nil_condition;
     const impl: *ReadConditionImpl = @ptrCast(@alignCast(condition.ptr));
     return impl.toCondition();
 }
@@ -340,6 +343,7 @@ pub export fn DDS_ReadCondition_as_DDS_Condition(condition: DDS.ReadCondition) c
 /// Passing a handle from any other DDS implementation causes memory corruption.
 pub export fn DDS_QueryCondition_as_DDS_ReadCondition(condition: DDS.QueryCondition) callconv(.c) DDS.ReadCondition {
     if (condition.ptr == nil.NIL_PTR) return nil.nil_readcondition;
+    if (condition.vtable != &QueryConditionImpl.vtable) return nil.nil_readcondition;
     const impl: *QueryConditionImpl = @ptrCast(@alignCast(condition.ptr));
     return impl.rc.toDDSReadCondition();
 }
@@ -388,12 +392,14 @@ pub export fn DDS_DataReader_as_DDS_Entity(reader: DDS.DataReader) callconv(.c) 
 
 pub export fn DDS_Topic_as_DDS_TopicDescription(topic: DDS.Topic) callconv(.c) DDS.TopicDescription {
     if (topic.ptr == nil.NIL_PTR) return nil.nil_topic_description;
+    if (topic.vtable != &TopicImpl.topic_vtable) return nil.nil_topic_description;
     const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
     return impl.toTopicDescription();
 }
 
 pub export fn DDS_ContentFilteredTopic_as_DDS_TopicDescription(topic: DDS.ContentFilteredTopic) callconv(.c) DDS.TopicDescription {
     if (topic.ptr == nil.NIL_PTR) return nil.nil_topic_description;
+    if (topic.vtable != &ContentFilteredTopicImpl.cft_vtable) return nil.nil_topic_description;
     const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(topic.ptr));
     return impl.toTopicDescription();
 }

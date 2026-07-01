@@ -309,7 +309,7 @@ pub const GuardConditionImpl = struct {
         return .{ .ptr = self, .vtable = &cond_vtable };
     }
 
-    const vtable = DDS.GuardCondition.Vtable{
+    pub const vtable = DDS.GuardCondition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .set_trigger_value = vtSetTrigger,
         .deinit = vtDeinit,
@@ -404,7 +404,7 @@ pub const ReadConditionImpl = struct {
         return .{ .ptr = self, .vtable = &cond_vtable };
     }
 
-    const vtable = DDS.ReadCondition.Vtable{
+    pub const vtable = DDS.ReadCondition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .get_sample_state_mask = vtGetSampleMask,
         .get_view_state_mask = vtGetViewMask,
@@ -494,7 +494,7 @@ pub const StatusConditionImpl = struct {
         return .{ .ptr = self, .vtable = &cond_vtable };
     }
 
-    const vtable = DDS.StatusCondition.Vtable{
+    pub const vtable = DDS.StatusCondition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .get_enabled_statuses = vtGetEnabled,
         .set_enabled_statuses = vtSetEnabled,
@@ -655,7 +655,7 @@ pub const QueryConditionImpl = struct {
         return self.rc.toCondition();
     }
 
-    const vtable = DDS.QueryCondition.Vtable{
+    pub const vtable = DDS.QueryCondition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .get_sample_state_mask = vtGetSampleMask,
         .get_view_state_mask = vtGetViewMask,
