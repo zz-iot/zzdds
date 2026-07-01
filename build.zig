@@ -86,6 +86,8 @@ pub fn build(b: *std.Build) void {
         gen_zzdds_output_dir.path(b, "zzdds.zig"),
         "zzdds.zig",
     );
+    // DDS.zig shim: re-exports the subset of DDS types referenced by idl/zzdds.idl.
+    // When a new DDS type is added to the extension IDL, add it here too.
     _ = gen_zzdds_module_files.add("DDS.zig",
         \\const Generated = @import("zzdds_generated").DDS;
         \\
