@@ -42,6 +42,8 @@ pub const security = @import("security/interface.zig");
 pub const noop_security = @import("security/noop.zig");
 pub const intraprocess = @import("delivery/intraprocess.zig");
 pub const config = @import("config/schema.zig");
+pub const generated_config = @import("config/generated.zig");
+pub const factory = @import("factory.zig");
 pub const rtps = @import("rtps/root.zig");
 pub const qos = @import("qos/policy.zig");
 pub const dcps = @import("dcps/root.zig");
@@ -54,11 +56,15 @@ pub const c_abi = @import("c_abi/root.zig");
 comptime {
     _ = c_abi.typesupport;
     _ = c_abi.bootstrap;
+    _ = c_abi.extensions;
 }
 /// Re-export the generated DDS type definitions so generated code can do
 ///   const _zzdds = @import("zzdds");
 ///   const DDS = _zzdds.DDS;
 pub const DDS = @import("zzdds_generated").DDS;
+pub const ZZDDS = @import("zzdds_ext_generated").zzdds;
+pub const DomainParticipantFactory = factory.DomainParticipantFactory;
+pub const createFactory = factory.createFactory;
 
 /// Module-level raw operations called by zidl-generated typed wrappers.
 pub const raw_ops = @import("raw_ops.zig");
@@ -93,8 +99,10 @@ test {
     std.testing.log_level = .err;
 
     _ = @import("config/schema.zig");
+    _ = @import("config/generated.zig");
     _ = @import("config/file.zig");
     _ = @import("config/resolve.zig");
+    _ = @import("factory.zig");
     _ = @import("transport/interface.zig");
     _ = @import("transport/udp.zig");
     _ = @import("transport/tcp.zig");

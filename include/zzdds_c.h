@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "dcps.h"
+#include "zzdds.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,8 +51,24 @@ typedef struct zzdds_raw_sample_array {
 
 typedef int (*zzdds_compute_key_hash_fn)(const uint8_t *payload, size_t len, uint8_t hash_out[16]);
 
-DDS_DomainParticipant zzdds_create_participant_udp(uint32_t domain_id, const DDS_DomainParticipantListener *listener);
-void zzdds_destroy_participant(DDS_DomainParticipant participant);
+zzdds_DomainParticipantFactory zzdds_create_factory(void);
+bool zzdds_factory_is_nil(zzdds_DomainParticipantFactory factory);
+void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
+DDS_DomainParticipantFactory zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zzdds_DomainParticipantFactory factory);
+zzdds_DomainParticipantFactory DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(DDS_DomainParticipantFactory factory);
+DDS_DomainParticipant zzdds_DomainParticipant_as_DDS_DomainParticipant(zzdds_DomainParticipant participant);
+/** NOTE: only valid for handles created by a zzdds FactoryOwner (zzdds_create_factory).
+ *  Passing a handle from any other DDS implementation causes memory corruption. */
+zzdds_DomainParticipant DDS_DomainParticipant_as_zzdds_DomainParticipant(DDS_DomainParticipant participant);
+/** NOTE: only valid for topics owned by a zzdds FactoryOwner participant. */
+zzdds_Topic DDS_Topic_as_zzdds_Topic(DDS_Topic topic);
+DDS_Topic zzdds_Topic_as_DDS_Topic(zzdds_Topic topic);
+DDS_DataWriter zzdds_DataWriter_as_DDS_DataWriter(zzdds_DataWriter writer);
+/** NOTE: only valid for writers owned by a zzdds FactoryOwner participant. */
+zzdds_DataWriter DDS_DataWriter_as_zzdds_DataWriter(DDS_DataWriter writer);
+DDS_DataReader zzdds_DataReader_as_DDS_DataReader(zzdds_DataReader reader);
+/** NOTE: only valid for readers owned by a zzdds FactoryOwner participant. */
+zzdds_DataReader DDS_DataReader_as_zzdds_DataReader(DDS_DataReader reader);
 DDS_TopicDescription zzdds_topic_as_description(DDS_Topic topic);
 
 int zzdds_register_type_support_c(

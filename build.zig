@@ -67,17 +67,55 @@ pub fn build(b: *std.Build) void {
     // Generates vendor-extension types (DomainParticipantConfig, etc.).
     // --single-file: avoids root/module filename collision (stem == module == "zzdds")
     // --no-typesupport/--no-typeobject-support: vendor structs need no DDS scaffolding
-    // Output goes into the same directory as dcps so that @import("DDS.zig") resolves.
+    // Output goes into its own directory; a build-generated DDS.zig shim below
+    // resolves @import("DDS.zig") back to the generated DCPS module.
 
     const gen_zzdds_vendor = b.addRunArtifact(zidl_exe);
     gen_zzdds_vendor.addArgs(&.{
-        "-b",               "zig",
-        "--single-file",    "--zig-idiomatic-enums",
-        "--no-typesupport", "--no-typeobject-support",
-        "-o",
+        "-b",                    "zig",
+        "--generate-interfaces", "--single-file",
+        "--no-typesupport",      "--no-typeobject-support",
     });
-    gen_zzdds_vendor.addDirectoryArg(gen_output_dir);
+    if (need_c_abi) gen_zzdds_vendor.addArg("--zig-generate-c-api");
+    gen_zzdds_vendor.addArg("-o");
+    const gen_zzdds_output_dir = gen_zzdds_vendor.addOutputDirectoryArg("zzdds-generated-ext");
     gen_zzdds_vendor.addFileArg(b.path("idl/zzdds.idl"));
+
+    const gen_zzdds_module_files = b.addWriteFiles();
+    const generated_zzdds_root = gen_zzdds_module_files.addCopyFile(
+        gen_zzdds_output_dir.path(b, "zzdds.zig"),
+        "zzdds.zig",
+    );
+    // DDS.zig shim: re-exports the subset of DDS types referenced by idl/zzdds.idl.
+    // When a new DDS type is added to the extension IDL, add it here too or the
+    // generated zzdds.zig will fail to compile with an opaque "unknown identifier"
+    // error rather than a diagnostic pointing to this file.
+    _ = gen_zzdds_module_files.add("DDS.zig",
+        \\const Generated = @import("zzdds_generated").DDS;
+        \\
+        \\pub const DataReader = Generated.DataReader;
+        \\pub const DataWriter = Generated.DataWriter;
+        \\pub const DomainId_t = Generated.DomainId_t;
+        \\pub const DomainParticipant = Generated.DomainParticipant;
+        \\pub const DomainParticipantListener = Generated.DomainParticipantListener;
+        \\pub const DomainParticipantQos = Generated.DomainParticipantQos;
+        \\pub const DurabilityQosPolicyKind = Generated.DurabilityQosPolicyKind;
+        \\pub const HistoryQosPolicyKind = Generated.HistoryQosPolicyKind;
+        \\pub const InstanceHandle_t = Generated.InstanceHandle_t;
+        \\pub const ReliabilityQosPolicyKind = Generated.ReliabilityQosPolicyKind;
+        \\pub const ReturnCode_t = Generated.ReturnCode_t;
+        \\pub const StatusMask = Generated.StatusMask;
+        \\pub const TopicDescription = Generated.TopicDescription;
+        \\
+    );
+    const generated_zzdds_mod = b.addModule("zzdds_ext_generated", .{
+        .root_source_file = generated_zzdds_root,
+        .target = target,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+        },
+    });
 
     // ── Code generation: idl/rtps_discovery.idl → generated/rtps_discovery.zig ─
     //
@@ -155,6 +193,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
             .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
         },
     });
@@ -222,6 +261,12 @@ pub fn build(b: *std.Build) void {
 
         gen_only_step.dependOn(&gen_dcps_c.step);
 
+        const gen_zzdds_c = b.addRunArtifact(zidl_exe);
+        gen_zzdds_c.addArgs(&.{ "-b", "c", "--generate-interfaces", "-o" });
+        const gen_zzdds_c_dir = gen_zzdds_c.addOutputDirectoryArg("zzdds-c-ext-binding");
+        gen_zzdds_c.addFileArg(b.path("idl/zzdds.idl"));
+        gen_only_step.dependOn(&gen_zzdds_c.step);
+
         // Install dcps.h → zig-out/include/
         const install_dcps_h = b.addInstallFileWithDir(
             gen_c_dir.path(b, "dcps.h"),
@@ -229,6 +274,13 @@ pub fn build(b: *std.Build) void {
             "dcps.h",
         );
         b.getInstallStep().dependOn(&install_dcps_h.step);
+
+        const install_zzdds_h = b.addInstallFileWithDir(
+            gen_zzdds_c_dir.path(b, "zzdds.h"),
+            .header,
+            "zzdds.h",
+        );
+        b.getInstallStep().dependOn(&install_zzdds_h.step);
 
         // Install zidl_cdr.h → zig-out/include/  (C users need it; dcps.h includes it)
         const install_zidl_cdr_h = b.addInstallFileWithDir(
@@ -281,6 +333,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zidl_rt", .module = zidl_rt_mod },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                    .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
                     .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
                 },
             }),
@@ -317,6 +370,7 @@ pub fn build(b: *std.Build) void {
         });
         c_smoke_mod.addIncludePath(gen_smoke_c_dir);
         c_smoke_mod.addIncludePath(gen_c_dir);
+        c_smoke_mod.addIncludePath(gen_zzdds_c_dir);
         c_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
         c_smoke_mod.addIncludePath(b.path("include"));
         c_smoke_mod.linkLibrary(zzdds_lib);
@@ -350,6 +404,7 @@ pub fn build(b: *std.Build) void {
             });
             cpp_smoke_mod.addIncludePath(gen_smoke_cpp_dir);
             cpp_smoke_mod.addIncludePath(gen_c_dir);
+            cpp_smoke_mod.addIncludePath(gen_zzdds_c_dir);
             cpp_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
             cpp_smoke_mod.addIncludePath(b.path("include"));
             cpp_smoke_mod.linkLibrary(zzdds_lib);
@@ -422,6 +477,7 @@ pub fn build(b: *std.Build) void {
             \\
             \\set(ZZDDS_ZIDL_EXECUTABLE "${{_ZZDDS_PREFIX}}/bin/zidl")
             \\set(ZZDDS_DCPS_IMPL_CPP   "${{_ZZDDS_PREFIX}}/src/dcps_impl.cpp")
+            \\set(ZZDDS_ZZDDS_IMPL_CPP  "${{_ZZDDS_PREFIX}}/src/zzdds_impl.cpp")
             \\set(ZZDDS_VERSION         "{s}")
             \\set(ZZDDS_FOUND           TRUE)
             \\
@@ -446,12 +502,25 @@ pub fn build(b: *std.Build) void {
 
         gen_only_step.dependOn(&gen_dcps_cpp.step);
 
+        const gen_zzdds_cpp = b.addRunArtifact(zidl_exe);
+        gen_zzdds_cpp.addArgs(&.{ "-b", "cpp", "--generate-interfaces", "-o" });
+        const gen_zzdds_cpp_dir = gen_zzdds_cpp.addOutputDirectoryArg("zzdds-cpp-ext-binding");
+        gen_zzdds_cpp.addFileArg(b.path("idl/zzdds.idl"));
+        gen_only_step.dependOn(&gen_zzdds_cpp.step);
+
         const install_dcps_hpp = b.addInstallFileWithDir(
             gen_cpp_dir.path(b, "dcps.hpp"),
             .header,
             "dcps.hpp",
         );
         b.getInstallStep().dependOn(&install_dcps_hpp.step);
+
+        const install_zzdds_hpp = b.addInstallFileWithDir(
+            gen_zzdds_cpp_dir.path(b, "zzdds.hpp"),
+            .header,
+            "zzdds.hpp",
+        );
+        b.getInstallStep().dependOn(&install_zzdds_hpp.step);
 
         // Generate dcps_impl.hpp + dcps_impl.cpp (B1+B3 concrete Impl + listener bridges).
         const gen_dcps_cpp_impl = b.addRunArtifact(zidl_exe);
@@ -462,6 +531,12 @@ pub fn build(b: *std.Build) void {
 
         gen_only_step.dependOn(&gen_dcps_cpp_impl.step);
 
+        const gen_zzdds_cpp_impl = b.addRunArtifact(zidl_exe);
+        gen_zzdds_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl", "-o" });
+        const gen_zzdds_cpp_impl_dir = gen_zzdds_cpp_impl.addOutputDirectoryArg("zzdds-cpp-ext-impl");
+        gen_zzdds_cpp_impl.addFileArg(b.path("idl/zzdds.idl"));
+        gen_only_step.dependOn(&gen_zzdds_cpp_impl.step);
+
         // Install dcps_impl.hpp → include/dcps_impl.hpp
         const install_dcps_impl_hpp = b.addInstallFileWithDir(
             gen_cpp_impl_dir.path(b, "dcps_impl.hpp"),
@@ -469,6 +544,20 @@ pub fn build(b: *std.Build) void {
             "dcps_impl.hpp",
         );
         b.getInstallStep().dependOn(&install_dcps_impl_hpp.step);
+
+        const install_zzdds_impl_hpp = b.addInstallFileWithDir(
+            gen_zzdds_cpp_impl_dir.path(b, "zzdds_impl.hpp"),
+            .header,
+            "zzdds_impl.hpp",
+        );
+        b.getInstallStep().dependOn(&install_zzdds_impl_hpp.step);
+
+        const install_zzdds_cpp_hpp = b.addInstallFileWithDir(
+            b.path("include/zzdds_cpp.hpp"),
+            .header,
+            "zzdds_cpp.hpp",
+        );
+        b.getInstallStep().dependOn(&install_zzdds_cpp_hpp.step);
 
         // Install dcps_impl.cpp → src/dcps_impl.cpp (source file for user compilation).
         // Users add this to their C++ build; it depends on dcps.hpp, dcps.h, zzdds_c.h.
@@ -478,6 +567,13 @@ pub fn build(b: *std.Build) void {
             "dcps_impl.cpp",
         );
         b.getInstallStep().dependOn(&install_dcps_impl_cpp.step);
+
+        const install_zzdds_impl_cpp = b.addInstallFileWithDir(
+            gen_zzdds_cpp_impl_dir.path(b, "zzdds_impl.cpp"),
+            .{ .custom = "src" },
+            "zzdds_impl.cpp",
+        );
+        b.getInstallStep().dependOn(&install_zzdds_impl_cpp.step);
     }
 
     // ── Java language binding ─────────────────────────────────────────────────
@@ -491,6 +587,12 @@ pub fn build(b: *std.Build) void {
 
         gen_only_step.dependOn(&gen_dcps_java.step);
 
+        const gen_zzdds_java = b.addRunArtifact(zidl_exe);
+        gen_zzdds_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "-o" });
+        const gen_zzdds_java_dir = gen_zzdds_java.addOutputDirectoryArg("zzdds-java-ext-binding");
+        gen_zzdds_java.addFileArg(b.path("idl/zzdds.idl"));
+        gen_only_step.dependOn(&gen_zzdds_java.step);
+
         // Install generated Java sources → zig-out/java/
         const install_java = b.addInstallDirectory(.{
             .source_dir = gen_java_dir,
@@ -498,6 +600,13 @@ pub fn build(b: *std.Build) void {
             .install_subdir = "",
         });
         b.getInstallStep().dependOn(&install_java.step);
+
+        const install_zzdds_java = b.addInstallDirectory(.{
+            .source_dir = gen_zzdds_java_dir,
+            .install_dir = .{ .custom = "java" },
+            .install_subdir = "",
+        });
+        b.getInstallStep().dependOn(&install_zzdds_java.step);
     }
 
     // ── Unit tests ────────────────────────────────────────────────────────────
@@ -702,6 +811,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
             .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
         },
     });

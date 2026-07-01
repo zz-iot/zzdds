@@ -1,90 +1,24 @@
 //! Hand-written C ABI bootstrap for zzdds.
 //!
-//! Provides three groups of C-callable exports:
+//! Provides C-callable raw sample exports:
 //!
-//!   1. Participant lifecycle (UDP transport + SPDP/SEDP discovery):
-//!        zzdds_create_participant_udp  — create factory + participant in one call
-//!        zzdds_destroy_participant     — tear down participant + factory + transport
-//!
-//!   2. Generic raw write/take:
-//!        zzdds_write_raw               — CDR bytes → RTPS wire
-//!        zzdds_take_one_raw            — RTPS wire → CDR bytes (any sample)
-//!        zzdds_take_one_raw_instance   — RTPS wire → CDR bytes (take_next_instance)
+//!   zzdds_write_raw               — CDR bytes → RTPS wire
+//!   zzdds_take_one_raw            — RTPS wire → CDR bytes (any sample)
+//!   zzdds_take_one_raw_instance   — RTPS wire → CDR bytes (take_next_instance)
 //!
 //! These exports are intentionally type-agnostic.  The caller is responsible for
 //! CDR serialization/deserialization (use the zidl-generated shape.h helpers).
 //!
-//! Usage from C (shape_configurator_zzdds.h wires these up):
-//!
-//!   DDS_DomainParticipant dp = zzdds_create_participant_udp(0, &listener);
-//!   zzdds_write_raw(writer, key_hash, cdr_buf, cdr_len);
-//!   int n = zzdds_take_one_raw_instance(reader, prev_ih, buf, sizeof(buf), &len, &info);
-//!   zzdds_destroy_participant(dp);
-
 const std = @import("std");
 
 const DDS = @import("zzdds_generated").DDS;
 
-const UdpTransport = @import("../transport/udp.zig").UdpTransport;
-const SpdpSedpDiscovery = @import("../discovery/combined.zig").SpdpSedpDiscovery;
-const DomainParticipantFactoryImpl = @import("../dcps/factory.zig").DomainParticipantFactoryImpl;
 const DataWriterImpl = @import("../dcps/writer.zig").DataWriterImpl;
 const DataReaderImpl = @import("../dcps/reader.zig").DataReaderImpl;
 const TopicImpl = @import("../dcps/topic.zig").TopicImpl;
-const noop_security = @import("../security/noop.zig").noop_security_plugins;
 const time_mod = @import("../util/time.zig");
 const history_mod = @import("../rtps/history.zig");
 const nil = @import("../dcps/nil.zig");
-const Mutex = @import("../util/mutex.zig").Mutex;
-
-// `DDS.DomainParticipantListener` IS the C callback struct (generated from dcps.idl).
-// The C header `DDS_DomainParticipantListener` must match its layout exactly.
-
-// ── Dead code removed: CDPListener, CDPAdapter ───────────────────────────────
-// Previously, a CDPAdapter translated a C callback struct into a fat-pointer
-// DomainParticipantListener.  With C-ABI primary, DDS.DomainParticipantListener
-// IS the C callback struct — no adapter needed.
-
-// ── Participant registry ─────────────────────────────────────────────────────
-// Maps DomainParticipantImpl* → the factory/transport/discovery that owns it.
-
-const Entry = struct {
-    dp_ptr: *anyopaque,
-    factory: *DomainParticipantFactoryImpl,
-    disc: *SpdpSedpDiscovery,
-    udp: *UdpTransport,
-    alloc: std.mem.Allocator,
-};
-
-const MAX_ENTRIES = 16;
-var g_entries: [MAX_ENTRIES]?Entry = [_]?Entry{null} ** MAX_ENTRIES;
-var g_mu: Mutex = .{};
-
-fn register(e: Entry) bool {
-    g_mu.lock();
-    defer g_mu.unlock();
-    for (&g_entries) |*slot| {
-        if (slot.* == null) {
-            slot.* = e;
-            return true;
-        }
-    }
-    return false;
-}
-
-fn unregister(dp_ptr: *anyopaque) ?Entry {
-    g_mu.lock();
-    defer g_mu.unlock();
-    for (&g_entries) |*slot| {
-        if (slot.*) |e| {
-            if (e.dp_ptr == dp_ptr) {
-                slot.* = null;
-                return e;
-            }
-        }
-    }
-    return null;
-}
 
 // ── SampleInfo for C ─────────────────────────────────────────────────────────
 // Minimal extern struct matching SH_SampleInfo in shape_configurator_zzdds.h.
@@ -111,75 +45,6 @@ const LoanedRawSample = struct {
     data: []u8,
     alloc: std.mem.Allocator,
 };
-
-// ── Participant lifecycle ─────────────────────────────────────────────────────
-
-/// Create a DomainParticipant backed by UDP transport + SPDP/SEDP discovery.
-/// `c_listener` may be null (noop listener is used).
-/// Returns a null fat-pointer participant on failure.
-pub export fn zzdds_create_participant_udp(
-    domain_id: u32,
-    c_listener: ?*const DDS.DomainParticipantListener,
-) callconv(.c) DDS.DomainParticipant {
-    return zzdds_create_participant_udp_impl(domain_id, c_listener) catch |err| {
-        std.log.err("zzdds_create_participant_udp: {}", .{err});
-        return std.mem.zeroes(DDS.DomainParticipant);
-    };
-}
-
-fn zzdds_create_participant_udp_impl(
-    domain_id: u32,
-    c_listener: ?*const DDS.DomainParticipantListener,
-) !DDS.DomainParticipant {
-    const alloc = std.heap.c_allocator;
-
-    const udp = try UdpTransport.init(alloc, .{}, domain_id, null);
-    errdefer udp.deinit();
-
-    const disc = try SpdpSedpDiscovery.init(alloc, udp.transport(), domain_id, 3_000);
-    errdefer disc.deinit();
-
-    const factory = try DomainParticipantFactoryImpl.init(
-        alloc,
-        udp.transport(),
-        disc.toDiscovery(),
-        noop_security,
-        .spec_random,
-        .{},
-    );
-    errdefer factory.deinit();
-
-    const dpf = factory.toDDSFactory();
-    // Call vtable slot directly: bootstrap deals with C-ABI types (?*const T).
-    const default_qos = DDS.DomainParticipantQos{};
-    const dp = dpf.vtable.create_participant(dpf.ptr, domain_id, &default_qos, c_listener, 0);
-    if (nil.isNil(dp)) return error.ParticipantFailed;
-    errdefer _ = dpf.delete_participant(dp);
-
-    if (!register(.{
-        .dp_ptr = @ptrCast(dp.ptr),
-        .factory = factory,
-        .disc = disc,
-        .udp = udp,
-        .alloc = alloc,
-    })) return error.RegistryFull;
-
-    return dp;
-}
-
-/// Tear down a participant created by zzdds_create_participant_udp.
-pub export fn zzdds_destroy_participant(dp: DDS.DomainParticipant) callconv(.c) void {
-    if (nil.isNil(dp)) return;
-    const e = unregister(@ptrCast(dp.ptr)) orelse return;
-    const dpf = e.factory.toDDSFactory();
-    // delete_participant may return PRECONDITION_NOT_MET if the caller left child
-    // entities alive; factory.deinit() calls p.deinit() on any survivors, so
-    // teardown is unconditional regardless of the return code.
-    _ = dpf.delete_participant(dp);
-    e.factory.deinit();
-    e.disc.deinit();
-    e.udp.deinit();
-}
 
 // ── Topic → TopicDescription conversion ──────────────────────────────────────
 
@@ -274,6 +139,7 @@ pub export fn zzdds_take_loaned_raw(
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const s = impl.takeRaw() orelse return 0;
     const owner = std.heap.c_allocator.create(LoanedRawSample) catch {
+        std.log.err("zzdds_take_loaned_raw: sample permanently lost — OOM allocating loan handle", .{});
         impl.alloc.free(s.data);
         return -1;
     };
@@ -491,6 +357,7 @@ fn nRawImpl(
     out: *CRawSampleArray,
     destructive: bool,
 ) c_int {
+    out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
     if (nil.isNil(reader)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const alloc = std.heap.c_allocator;
@@ -498,9 +365,35 @@ fn nRawImpl(
     // For bounded destructive takes, pre-allocate the output struct array BEFORE
     // removing samples from the queue.  Without this, an OOM at the alloc step
     // would silently discard already-taken data with no way to recover it.
+    // For unbounded destructive takes (max <= 0), peek the count via readRaw
+    // first to enable the same pre-allocation guarantee.  As a consequence,
+    // samples that arrive between the peek and the take are NOT included in
+    // this call; they remain in the queue and will be returned by the next call.
     // _alloc_capacity may exceed count; zzdds_return_raw_samples uses it for the
     // free, so over-allocating is safe.
-    const pre_capacity: usize = if (destructive and max > 0) @intCast(max) else 0;
+    var unbounded_take_max: c_int = 0;
+    if (destructive and max <= 0) {
+        var peek: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
+        defer {
+            for (peek.items) |s| impl.alloc.free(s.data);
+            peek.deinit(impl.alloc);
+        }
+        impl.readRaw(&peek, ss, vs, is, -1, null, null) catch return -1;
+        if (peek.items.len == 0) {
+            out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+            return 0;
+        }
+        if (peek.items.len > std.math.maxInt(c_int)) return -1;
+        unbounded_take_max = @intCast(peek.items.len);
+    }
+
+    // pre_capacity may exceed the number of samples actually taken: concurrent
+    // removal between the readRaw peek and takeFiltered can reduce the result
+    // below unbounded_take_max.  Entries pre_arr[count.._alloc_capacity-1] are
+    // uninitialized; callers must iterate `count` for individual frees and use
+    // `_alloc_capacity` only for the array-level free.
+    const pre_capacity: usize =
+        if (destructive and max > 0) @intCast(max) else if (destructive) @intCast(unbounded_take_max) else 0;
     const pre_arr: []CRawSample = if (pre_capacity > 0)
         alloc.alloc(CRawSample, pre_capacity) catch return -1
     else
@@ -512,7 +405,8 @@ fn nRawImpl(
         tmp.deinit(impl.alloc);
     }
     if (destructive) {
-        impl.takeFiltered(&tmp, ss, vs, is, max, null, null) catch {
+        const take_max = if (max <= 0) unbounded_take_max else max;
+        impl.takeFiltered(&tmp, ss, vs, is, take_max, null, null) catch {
             if (pre_arr.len > 0) alloc.free(pre_arr);
             return -1;
         };
@@ -524,7 +418,7 @@ fn nRawImpl(
         out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
         return 0;
     }
-    // Use the pre-allocated array for destructive bounded takes; otherwise alloc now
+    // Use the pre-allocated array for all destructive takes; otherwise alloc now
     // (samples remain in queue on non-destructive failure, so this is safe).
     const arr: []CRawSample = if (pre_arr.len > 0)
         pre_arr
@@ -532,6 +426,10 @@ fn nRawImpl(
         alloc.alloc(CRawSample, tmp.items.len) catch return -1;
     for (tmp.items, 0..) |s, i| {
         const copy = alloc.dupe(u8, s.data) catch {
+            if (destructive)
+                std.log.err("zzdds_take_n_raw: OOM copying sample {d}/{d} — all {d} taken samples permanently lost", .{ i, tmp.items.len, tmp.items.len })
+            else
+                std.log.err("zzdds_read_n_raw: OOM copying sample {d}/{d} — samples remain in queue, caller may retry", .{ i, tmp.items.len });
             for (arr[0..i]) |prev| alloc.free(prev.data.?[0..prev.data_len]);
             alloc.free(arr);
             return -1;

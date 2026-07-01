@@ -51,6 +51,7 @@ var nil_entity_vtable = DDS.Entity.Vtable{
     .get_instance_handle = nilGetHandle,
     .deinit = nilDeinit,
 };
+pub const nil_entity = DDS.Entity{ .ptr = NIL_PTR, .vtable = &nil_entity_vtable };
 fn nilEnable(_: *anyopaque) DDS.ReturnCode_t {
     return DDS.RETCODE_ERROR;
 }
@@ -63,7 +64,7 @@ fn nilGetStatusChanges(_: *anyopaque) DDS.StatusMask {
 fn nilGetHandle(_: *anyopaque) DDS.InstanceHandle_t {
     return DDS.HANDLE_NIL;
 }
-fn nilDeinit(_: *anyopaque) void {}
+pub fn nilDeinit(_: *anyopaque) void {}
 
 // Nil listener constants: all function pointers null (zero-init).
 pub const nil_topic_listener = DDS.noop_TopicListener;

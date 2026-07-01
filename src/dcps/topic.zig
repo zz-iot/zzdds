@@ -84,7 +84,7 @@ pub const TopicImpl = struct {
         return .{ .ptr = self, .vtable = &topic_vtable };
     }
 
-    const topic_vtable = DDS.Topic.Vtable{
+    pub const topic_vtable = DDS.Topic.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,
@@ -184,7 +184,7 @@ pub const TopicImpl = struct {
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    fn toEntity(self: *Self) DDS.Entity {
+    pub fn toEntity(self: *Self) DDS.Entity {
         return .{ .ptr = self, .vtable = &entity_vtable };
     }
 
@@ -341,7 +341,7 @@ pub const ContentFilteredTopicImpl = struct {
 
     // ── DDS.ContentFilteredTopic vtable ──────────────────────────────────────
 
-    const cft_vtable = DDS.ContentFilteredTopic.Vtable{
+    pub const cft_vtable = DDS.ContentFilteredTopic.Vtable{
         .get_type_name = tdGetTypeName,
         .get_name = tdGetName,
         .get_participant = tdGetParticipant,
