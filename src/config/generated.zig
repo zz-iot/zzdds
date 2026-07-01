@@ -50,7 +50,18 @@ pub fn deinitRuntimeConfig(allocator: std.mem.Allocator, cfg: *schema.Config) vo
     if (cfg.transport.udp.initial_peers.len != 0) freeStringSlice(allocator, cfg.transport.udp.initial_peers);
     if (cfg.discovery.initial_peers.len != 0) freeStringSlice(allocator, cfg.discovery.initial_peers);
     if (cfg.discovery.static_config_file.len != 0) allocator.free(cfg.discovery.static_config_file);
-    cfg.* = std.mem.zeroes(schema.Config);
+    // Zero only the heap-owning fields so a second deinit call is safe (len == 0
+    // means the guards above skip the free).  Cannot use std.mem.zeroes(schema.Config)
+    // because ReliabilityKind has no tag with value 0.
+    cfg.participant.name = "";
+    cfg.participant.timer_clock_name = "";
+    cfg.transport.tcp.bind_address = "";
+    cfg.transport.udp.multicast_group_v4 = "";
+    cfg.transport.udp.multicast_group_v6 = "";
+    cfg.transport.udp.interfaces = &.{};
+    cfg.transport.udp.initial_peers = &.{};
+    cfg.discovery.initial_peers = &.{};
+    cfg.discovery.static_config_file = "";
 }
 
 fn freeStringSlice(allocator: std.mem.Allocator, slice: []const []const u8) void {
