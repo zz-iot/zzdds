@@ -12,6 +12,9 @@ pub const CreateFactoryError = error{
     FactoryCreateFailed,
 };
 
+/// Single-owner factory wrapper. Must not be copied by value while active —
+/// each copy holds an independent `active` field, so both copies would call
+/// zzdds_destroy_factory on the same underlying FactoryOwner on deinit.
 pub const DomainParticipantFactory = struct {
     handle: ZZDDS.DomainParticipantFactory,
     active: bool = true,

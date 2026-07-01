@@ -68,8 +68,10 @@ const FactoryOwner = struct {
         self.mu.unlock();
         defer dp_qos_snap.deinit(self.alloc);
 
-        _ = stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &dp_qos_snap);
-        _ = stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, &fac_qos_snap);
+        if (stack.factory_handle.vtable.set_default_participant_qos(stack.factory_handle.ptr, &dp_qos_snap) != DDS.RETCODE_OK)
+            std.log.warn("createParticipant: failed to propagate default_dp_qos to inner factory; PARTICIPANT_QOS_DEFAULT will use defaults", .{});
+        if (stack.factory_handle.vtable.set_qos(stack.factory_handle.ptr, &fac_qos_snap) != DDS.RETCODE_OK)
+            std.log.warn("createParticipant: failed to propagate factory_qos to inner factory", .{});
 
         // Always use createParticipantWithConfigOwned so the `config` param is
         // honoured regardless of whether ownership is being transferred.  Pass
