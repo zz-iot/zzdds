@@ -117,7 +117,7 @@ fn dupeString(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
 
 fn stringSeqSlice(allocator: std.mem.Allocator, seq: *const ext.StringSeq) ![]const []const u8 {
     if (seq._length == 0) return &.{};
-    const buf = seq._buffer orelse return &.{};
+    const buf = seq._buffer orelse return error.NullBuffer;
     const out = try allocator.alloc([]const u8, seq._length);
     var n: usize = 0;
     errdefer {
