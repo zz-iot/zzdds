@@ -569,6 +569,8 @@ fn writerWriteSerialized(
     if (octets(key_hash)) |bytes| {
         const n = @min(bytes.len, hash.len);
         @memcpy(hash[0..n], bytes[0..n]);
+    } else if (key_hash != null) {
+        return DDS.RETCODE_BAD_PARAMETER;
     }
     const change_kind: history_mod.ChangeKind = switch (kind) {
         .WRITE_ALIVE => .alive,

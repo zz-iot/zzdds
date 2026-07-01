@@ -139,6 +139,7 @@ pub export fn zzdds_take_loaned_raw(
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const s = impl.takeRaw() orelse return 0;
     const owner = std.heap.c_allocator.create(LoanedRawSample) catch {
+        std.log.err("zzdds_take_loaned_raw: sample permanently lost — OOM allocating loan handle", .{});
         impl.alloc.free(s.data);
         return -1;
     };
