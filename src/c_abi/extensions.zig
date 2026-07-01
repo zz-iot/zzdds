@@ -96,24 +96,34 @@ const FactoryOwner = struct {
 
     fn deleteParticipant(self: *@This(), participant: DDS.DomainParticipant) DDS.ReturnCode_t {
         if (nil.isNil(participant)) return DDS.RETCODE_BAD_PARAMETER;
-        // Identify and remove the stack by participant_ptr under the lock.
-        // Calling the inner factory vtable inside the lock would invert the
-        // lock order (FactoryOwner.mu → inner factory mu), risking deadlock
-        // if a listener callback re-enters any factory function while the
-        // inner factory holds its own lock.
+        // Find the stack without removing it yet. Calling the inner factory
+        // vtable inside FactoryOwner.mu would invert lock order (FactoryOwner.mu
+        // → inner factory mu), risking deadlock if a listener re-enters here.
         self.mu.lock();
         var found: ?*ParticipantStack = null;
-        for (self.stacks.items, 0..) |stack, i| {
+        for (self.stacks.items) |stack| {
             if (stack.participant.ptr == participant.ptr) {
-                found = self.stacks.swapRemove(i);
+                found = stack;
                 break;
             }
         }
         self.mu.unlock();
         const stack = found orelse return DDS.RETCODE_BAD_PARAMETER;
+        // Call into the inner factory outside any lock. PRECONDITION_NOT_MET
+        // means the participant still has live entities — do NOT destroy the stack.
         const rc = stack.factory_handle.vtable.delete_participant(stack.factory_handle.ptr, participant);
+        if (rc != DDS.RETCODE_OK) return rc;
+        // Inner factory accepted the deletion; now remove and destroy the stack.
+        self.mu.lock();
+        for (self.stacks.items, 0..) |s, i| {
+            if (s.participant.ptr == participant.ptr) {
+                _ = self.stacks.swapRemove(i);
+                break;
+            }
+        }
+        self.mu.unlock();
         stack.deinit();
-        return rc;
+        return DDS.RETCODE_OK;
     }
 
     fn lookupParticipant(self: *@This(), domain_id: DDS.DomainId_t) DDS.DomainParticipant {
@@ -499,9 +509,10 @@ fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQ
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     owner.mu.lock();
     defer owner.mu.unlock();
+    // Clone first so caller's existing QoS is untouched if OOM occurs.
+    const cloned = owner.default_dp_qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
     qos.deinit(owner.alloc);
-    qos.* = .{}; // zero before clone so caller gets an empty struct on OOM, not stale pointers
-    qos.* = owner.default_dp_qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    qos.* = cloned;
     return DDS.RETCODE_OK;
 }
 

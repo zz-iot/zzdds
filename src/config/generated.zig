@@ -125,6 +125,7 @@ fn stringSeqSlice(allocator: std.mem.Allocator, seq: *const ext.StringSeq) ![]co
         allocator.free(out);
     }
     for (buf[0..seq._length], out) |item, *slot| {
+        if (@intFromPtr(item) == 0) return error.NullBuffer;
         slot.* = try allocator.dupe(u8, std.mem.span(item));
         n += 1;
     }
