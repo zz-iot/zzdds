@@ -306,24 +306,32 @@ pub export fn zzdds_Topic_as_DDS_Topic(topic: ZZDDS.Topic) callconv(.c) DDS.Topi
     return impl.toDDSTopic();
 }
 
+/// Only valid for GuardConditions created through a FactoryOwner-owned participant.
+/// Passing a handle from any other DDS implementation causes memory corruption.
 pub export fn DDS_GuardCondition_as_DDS_Condition(condition: DDS.GuardCondition) callconv(.c) DDS.Condition {
     if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
     const impl: *GuardConditionImpl = @ptrCast(@alignCast(condition.ptr));
     return impl.toCondition();
 }
 
+/// Only valid for StatusConditions created through a FactoryOwner-owned participant.
+/// Passing a handle from any other DDS implementation causes memory corruption.
 pub export fn DDS_StatusCondition_as_DDS_Condition(condition: DDS.StatusCondition) callconv(.c) DDS.Condition {
     if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
     const impl: *StatusConditionImpl = @ptrCast(@alignCast(condition.ptr));
     return impl.toCondition();
 }
 
+/// Only valid for ReadConditions created through a FactoryOwner-owned participant.
+/// Passing a handle from any other DDS implementation causes memory corruption.
 pub export fn DDS_ReadCondition_as_DDS_Condition(condition: DDS.ReadCondition) callconv(.c) DDS.Condition {
     if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
     const impl: *ReadConditionImpl = @ptrCast(@alignCast(condition.ptr));
     return impl.toCondition();
 }
 
+/// Only valid for QueryConditions created through a FactoryOwner-owned participant.
+/// Passing a handle from any other DDS implementation causes memory corruption.
 pub export fn DDS_QueryCondition_as_DDS_ReadCondition(condition: DDS.QueryCondition) callconv(.c) DDS.ReadCondition {
     if (condition.ptr == nil.NIL_PTR) return nil.nil_readcondition;
     const impl: *QueryConditionImpl = @ptrCast(@alignCast(condition.ptr));
