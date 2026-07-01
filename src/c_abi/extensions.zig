@@ -253,10 +253,10 @@ pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(fac
 }
 
 /// Only valid for participants created through a FactoryOwner factory (i.e., via
-/// zzdds_create_factory → create_participant_ex). Passing a participant from any
-/// other implementation will produce a type-confused pointer and corrupt memory
-/// on the next vtable dispatch.
+/// zzdds_create_factory → create_participant_ex). Returns a nil handle for any
+/// handle not issued by this implementation.
 pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: DDS.DomainParticipant) callconv(.c) ZZDDS.DomainParticipant {
+    if (participant.vtable != &DomainParticipantImpl.vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &participant_vtable };
     return .{ .ptr = participant.ptr, .vtable = &participant_vtable };
 }
 
@@ -268,14 +268,16 @@ pub export fn zzdds_DomainParticipant_as_DDS_DomainParticipant(participant: ZZDD
 }
 
 /// Only valid for topics created through a FactoryOwner-owned participant.
-/// See DDS_DomainParticipant_as_zzdds_DomainParticipant for the same caveat.
+/// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_Topic_as_zzdds_Topic(topic: DDS.Topic) callconv(.c) ZZDDS.Topic {
+    if (topic.vtable != &TopicImpl.topic_vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &topic_vtable };
     return .{ .ptr = topic.ptr, .vtable = &topic_vtable };
 }
 
 /// Only valid for writers created through a FactoryOwner-owned participant.
-/// See DDS_DomainParticipant_as_zzdds_DomainParticipant for the same caveat.
+/// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: DDS.DataWriter) callconv(.c) ZZDDS.DataWriter {
+    if (writer.vtable != &DataWriterImpl.vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &writer_vtable };
     return .{ .ptr = writer.ptr, .vtable = &writer_vtable };
 }
 
@@ -287,8 +289,9 @@ pub export fn zzdds_DataWriter_as_DDS_DataWriter(writer: ZZDDS.DataWriter) callc
 }
 
 /// Only valid for readers created through a FactoryOwner-owned participant.
-/// See DDS_DomainParticipant_as_zzdds_DomainParticipant for the same caveat.
+/// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_DataReader_as_zzdds_DataReader(reader: DDS.DataReader) callconv(.c) ZZDDS.DataReader {
+    if (reader.vtable != &DataReaderImpl.vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &reader_vtable };
     return .{ .ptr = reader.ptr, .vtable = &reader_vtable };
 }
 

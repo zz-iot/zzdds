@@ -88,6 +88,9 @@ inline std::shared_ptr<DomainParticipantFactory> create_factory()
     } guard{handle};
 
     auto deleter = [handle](detail::DomainParticipantFactorySupport* factory) {
+        // ~DomainParticipantFactoryImpl() is `= default` and does NOT call
+        // vtable->deinit, so `delete factory` does not tear down the underlying
+        // FactoryOwner.  zzdds_destroy_factory is the sole teardown path.
         delete factory;
         zzdds_destroy_factory(handle);
     };
