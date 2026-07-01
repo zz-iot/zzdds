@@ -237,6 +237,8 @@ pub export fn zzdds_destroy_factory(factory: ZZDDS.DomainParticipantFactory) cal
 }
 
 pub export fn zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory: ZZDDS.DomainParticipantFactory) callconv(.c) DDS.DomainParticipantFactory {
+    if (factory.ptr == nil.NIL_PTR) return nil.nil_factory;
+    if (factory.vtable != &factory_vtable) return nil.nil_factory;
     return .{ .ptr = factory.ptr, .vtable = &dds_factory_vtable };
 }
 
