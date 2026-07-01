@@ -392,6 +392,8 @@ pub export fn DDS_ContentFilteredTopic_as_DDS_TopicDescription(topic: DDS.Conten
     return impl.toTopicDescription();
 }
 
+/// MultiTopic is not implemented by this stack. Always returns a nil
+/// TopicDescription regardless of the input handle.
 pub export fn DDS_MultiTopic_as_DDS_TopicDescription(topic: DDS.MultiTopic) callconv(.c) DDS.TopicDescription {
     _ = topic;
     return nil.nil_topic_description;

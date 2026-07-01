@@ -685,10 +685,15 @@ pub const UdpTransport = struct {
         // that family because the wildcard socket can receive for all of them.
         const derive_all_from_ifaces = self.locators_cache.items.len == 0;
         if (derive_all_from_ifaces or wildcard_v4 or wildcard_v6) {
+            // When at least one wildcard socket exists, only advertise interfaces for the
+            // families that have a wildcard socket.  A silent socket-creation failure on
+            // one family must not cause unreachable locators to be advertised for it.
+            // When no sockets exist yet (bootstrap), advertise all families.
+            const has_any_wildcard = wildcard_v4 or wildcard_v6;
             for (self.active_ifaces.items) |ia| {
                 if (ia.kind == LocatorKind.udp_v4 and !self.config.ipv4_enabled) continue;
                 if (ia.kind == LocatorKind.udp_v6 and !self.config.ipv6_enabled) continue;
-                if (!derive_all_from_ifaces) {
+                if (has_any_wildcard) {
                     if (ia.kind == LocatorKind.udp_v4 and !wildcard_v4) continue;
                     if (ia.kind == LocatorKind.udp_v6 and !wildcard_v6) continue;
                 }
