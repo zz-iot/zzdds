@@ -87,6 +87,9 @@ const FactoryOwner = struct {
         stack.domain_id = domain_id;
         stack.participant = p.toDDSParticipant();
         try self.stacks.append(self.alloc, stack);
+        // config_deinit_allocator is written here under FactoryOwner.mu.
+        // DomainParticipantImpl.deinit reads it without holding FactoryOwner.mu,
+        // so this field must never be mutated outside a FactoryOwner.mu critical section.
         if (config_deinit_allocator) |cfg_alloc| p.config_deinit_allocator = cfg_alloc;
         return stack.participant;
     }
@@ -546,7 +549,8 @@ fn writerWriteSerialized(
     const payload = octets(cdr) orelse return DDS.RETCODE_BAD_PARAMETER;
     var hash = [_]u8{0} ** 16;
     if (octets(key_hash)) |bytes| {
-        if (bytes.len >= hash.len) @memcpy(&hash, bytes[0..hash.len]);
+        const n = @min(bytes.len, hash.len);
+        @memcpy(hash[0..n], bytes[0..n]);
     }
     const change_kind: history_mod.ChangeKind = switch (kind) {
         .WRITE_ALIVE => .alive,
