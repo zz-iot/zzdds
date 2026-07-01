@@ -637,6 +637,10 @@ fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.Re
         };
     }
     @memcpy(buf[0..taken.data.len], taken.data);
+    if (taken.data.len < buf.len) {
+        // Sample shrank between peek and take; resize down so _maximum == _length.
+        buf = std.heap.c_allocator.realloc(buf, taken.data.len) catch buf;
+    }
     sample.* = .{
         .cdr = .{ ._maximum = @intCast(buf.len), ._length = @intCast(taken.data.len), ._buffer = buf.ptr, ._release = true },
         .instance_handle = taken.info.instance_handle,
@@ -684,6 +688,9 @@ fn readerTakeNextInstanceSerialized(
         };
     }
     @memcpy(buf[0..taken.data.len], taken.data);
+    if (taken.data.len < buf.len) {
+        buf = std.heap.c_allocator.realloc(buf, taken.data.len) catch buf;
+    }
     sample.* = .{
         .cdr = .{ ._maximum = @intCast(buf.len), ._length = @intCast(taken.data.len), ._buffer = buf.ptr, ._release = true },
         .instance_handle = taken.info.instance_handle,

@@ -357,6 +357,7 @@ fn nRawImpl(
     out: *CRawSampleArray,
     destructive: bool,
 ) c_int {
+    out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
     if (nil.isNil(reader)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     const alloc = std.heap.c_allocator;
