@@ -787,6 +787,15 @@ pub const SedpEndpoints = struct {
     }
 
     pub fn stop(self: *Self) void {
+        // Stop and join both writers' heartbeat threads before unlistening —
+        // they hold probe_result_ctx/probe_result_fn pointing back at
+        // whatever registered them (typically a DomainParticipantImpl), and
+        // that object's own teardown sequence (e.g. a factory.deinit() that
+        // runs before this discovery object's own deinit()) may free it
+        // shortly after this call returns. Without this, the heartbeat
+        // thread can fire onProbeResult -> onParticipantLost on freed memory.
+        if (self.pub_writer) |w| w.stopHeartbeat();
+        if (self.sub_writer) |w| w.stopHeartbeat();
         if (self.meta_unicast_port != 0) {
             const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.meta_unicast_port);
             self.transport.unlisten(&loc, ReceiveHandler{

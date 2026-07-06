@@ -432,12 +432,26 @@ pub const StatefulWriter = struct {
         }
     }
 
-    pub fn deinit(self: *Self) void {
+    /// Signal and join the heartbeat thread, without freeing anything else.
+    /// Idempotent — safe to call more than once (e.g. once from a graceful
+    /// `stop()` and again from `deinit()`): after the first join, `hb_thread`
+    /// is null and subsequent calls are a no-op.
+    ///
+    /// Callers that register `probe_result_fn`/`probe_result_ctx` pointing at
+    /// an object they're about to tear down (e.g. a DomainParticipantImpl)
+    /// MUST call this — or `deinit()` — before freeing that object: the
+    /// heartbeat thread fires that callback on its own schedule and doesn't
+    /// otherwise know the target is gone.
+    pub fn stopHeartbeat(self: *Self) void {
         self.hb_stopping.store(true, .release);
         if (self.hb_thread) |t| {
             t.join();
             self.hb_thread = null;
         }
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.stopHeartbeat();
         for (self.reader_proxies.items) |*rp| rp.deinit(self.alloc);
         self.reader_proxies.deinit(self.alloc);
         self.coherent_pending_sns.deinit(self.alloc);

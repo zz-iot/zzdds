@@ -70,6 +70,19 @@ sent Heartbeat's firstSN). Per-proxy state: `first_sent_hb_first_sn: ?SequenceNu
 For BEST_EFFORT: fire immediately on discovery (no handshake). See `docs/decisions.md`
 for the full analysis.
 
+**Participant teardown can take several seconds under live reliability timers** — found
+while fixing a real use-after-free (`SedpEndpoints.stop()` wasn't stopping/joining
+`pub_writer`/`sub_writer`'s heartbeat threads before `discovery.stop()` returned, so
+`DomainParticipantImpl.deinit()` could free participant memory while a heartbeat thread
+was still scheduled to fire `onProbeResult` → `onParticipantLost` on it — fixed via a new
+`StatefulWriter.stopHeartbeat()`, called from `SedpEndpoints.stop()`). Fixing that
+crash exposed a separate, previously-masked issue: teardown can now take on the order of
+`beginProbe`'s hardcoded 1-second probe deadline (`spdp.zig`'s `.deadline_ns = now_ns +
+1_000_000_000`) per in-flight probe rather than exiting promptly — observed as an
+occasional multi-second (not unbounded) delay in `loopback_test`, not a hang. Root cause
+not fully chased down (which timer(s) specifically, why shutdown doesn't short-circuit
+them) — worth a dedicated look so teardown is fast in all cases, not just crash-free.
+
 **Language bindings** — see `docs/language-bindings.md` for the distribution model
 (three-artifact structure, build flags, version coupling). Current status:
 
