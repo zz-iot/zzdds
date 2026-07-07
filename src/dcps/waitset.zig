@@ -690,6 +690,11 @@ pub const QueryConditionImpl = struct {
     pub fn deinit(self: *Self) void {
         if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
         self.qc_c_abi.free(self.alloc);
+        // self.rc is embedded by value, not a separately-owned ReadConditionImpl,
+        // so ReadConditionImpl.deinit() (which would also alloc.destroy(&self.rc))
+        // can't be called here — free its cache fields directly instead.
+        self.rc.rc_c_abi.free(self.alloc);
+        self.rc.cond_c_abi.free(self.alloc);
         for (self.query_parameters.items) |p| self.alloc.free(p);
         self.query_parameters.deinit(self.alloc);
         self.alloc.free(self.query_expression);
