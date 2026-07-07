@@ -117,7 +117,11 @@ const Fixture = struct {
 
 test "support factory: destroy_factory is safe on nil handle" {
     const alloc = testing.allocator;
-    const boxed = try zidl_rt.boxEntity(alloc, zzdds.dcps.NIL_PTR, &GuardConditionImpl.vtable);
+    // Must use the real ZZDDS.DomainParticipantFactory.Vtable here, not some
+    // other interface's vtable — zzdds_destroy_factory checks ptr == NIL_PTR
+    // before touching .vtable today, but boxing with a mismatched vtable type
+    // would be unsound if that guard ever moved.
+    const boxed = try zidl_rt.boxEntity(alloc, zzdds.dcps.NIL_PTR, &extensions.factory_vtable);
     defer zidl_rt.freeEntityBox(alloc, boxed);
     extensions.zzdds_destroy_factory(boxed); // must not crash or call deinit
 }

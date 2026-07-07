@@ -207,7 +207,7 @@ const ParticipantStack = struct {
     }
 };
 
-const factory_vtable = ZZDDS.DomainParticipantFactory.Vtable{
+pub const factory_vtable = ZZDDS.DomainParticipantFactory.Vtable{
     .create_participant_ex = factoryCreateParticipantEx,
     .deinit = factoryDeinit,
     .get_c_abi_handle = factoryGetCAbiHandleZzdds,
@@ -242,8 +242,11 @@ const dds_factory_vtable = DDS.DomainParticipantFactory.Vtable{
     .get_c_abi_handle = factoryGetCAbiHandleDds,
 };
 
+// Same reasoning as nil_zzdds_fac_c_abi above, for the DDS.* view.
+var nil_dds_fac_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+
 fn factoryGetCAbiHandleDds(ctx: *anyopaque) *anyopaque {
-    if (ctx == nil.NIL_PTR) return ctx;
+    if (ctx == nil.NIL_PTR) return nil_dds_fac_c_abi.get(std.heap.c_allocator, ctx, &dds_factory_vtable);
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     return owner.dds_fac_c_abi.get(owner.alloc, ctx, &dds_factory_vtable);
 }

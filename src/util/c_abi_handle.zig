@@ -19,24 +19,33 @@ const std = @import("std");
 const zidl_rt = @import("zidl_rt");
 
 pub const CachedCAbiHandle = struct {
-    handle: ?*anyopaque = null,
+    handle: std.atomic.Value(?*anyopaque) = std.atomic.Value(?*anyopaque).init(null),
 
     /// Return the cached handle, boxing `(ptr, vtable)` on first call.
+    ///
+    /// Listener callbacks can fire on different threads for the same entity
+    /// (e.g. a data-available callback and a subscription-matched callback
+    /// racing after the entity mutex is released), so a plain check-then-write
+    /// here would let two threads both box and one leak. Resolved via CAS:
+    /// the loser frees its box and reuses whichever one won.
     pub fn get(self: *CachedCAbiHandle, alloc: std.mem.Allocator, ptr: *anyopaque, vtable: *const anyopaque) *anyopaque {
-        if (self.handle) |h| return h;
+        if (self.handle.load(.acquire)) |h| return h;
         // get_c_abi_handle's vtable signature can't express allocation
         // failure (no error union, no optional) — the box is two words, so
         // treat OOM here the same as any other unrecoverable allocation
         // failure in zzdds.
         const h = zidl_rt.boxEntity(alloc, ptr, vtable) catch @panic("zzdds: out of memory boxing C-ABI entity handle");
-        self.handle = h;
+        if (self.handle.cmpxchgStrong(null, h, .acq_rel, .acquire)) |existing| {
+            zidl_rt.freeEntityBox(alloc, h);
+            return existing.?;
+        }
         return h;
     }
 
     /// Free the cached handle, if one was ever created. Call from the owning
-    /// object's `deinit`.
+    /// object's `deinit`, once no concurrent `get()` calls remain.
     pub fn free(self: *CachedCAbiHandle, alloc: std.mem.Allocator) void {
-        if (self.handle) |h| zidl_rt.freeEntityBox(alloc, h);
-        self.handle = null;
+        if (self.handle.load(.acquire)) |h| zidl_rt.freeEntityBox(alloc, h);
+        self.handle.store(null, .release);
     }
 };
