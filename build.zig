@@ -98,6 +98,7 @@ pub fn build(b: *std.Build) void {
         \\pub const DomainId_t = Generated.DomainId_t;
         \\pub const DomainParticipant = Generated.DomainParticipant;
         \\pub const DomainParticipantListener = Generated.DomainParticipantListener;
+        \\pub const DomainParticipantFactory = Generated.DomainParticipantFactory;
         \\pub const DomainParticipantQos = Generated.DomainParticipantQos;
         \\pub const DurabilityQosPolicyKind = Generated.DurabilityQosPolicyKind;
         \\pub const HistoryQosPolicyKind = Generated.HistoryQosPolicyKind;
@@ -105,6 +106,7 @@ pub fn build(b: *std.Build) void {
         \\pub const ReliabilityQosPolicyKind = Generated.ReliabilityQosPolicyKind;
         \\pub const ReturnCode_t = Generated.ReturnCode_t;
         \\pub const StatusMask = Generated.StatusMask;
+        \\pub const Topic = Generated.Topic;
         \\pub const TopicDescription = Generated.TopicDescription;
         \\
     );
@@ -787,6 +789,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zzdds", .module = zzdds_mod },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                    .{ .name = "zidl_rt", .module = zidl_rt_mod },
                 },
             }),
         });

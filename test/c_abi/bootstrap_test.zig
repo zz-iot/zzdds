@@ -13,6 +13,7 @@ const ZZDDS = zzdds.ZZDDS;
 
 const bootstrap = zzdds.c_abi.bootstrap;
 const extensions = zzdds.c_abi.extensions;
+const zidl_rt = @import("zidl_rt");
 const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const MemoryTransport = zzdds.intraprocess.MemoryTransport;
 const DirectDiscovery = zzdds.intraprocess.DirectDiscovery;
@@ -115,30 +116,34 @@ const Fixture = struct {
 // ── Factory lifecycle ─────────────────────────────────────────────────────────
 
 test "support factory: destroy_factory is safe on nil handle" {
-    const nil_factory = ZZDDS.DomainParticipantFactory{ .ptr = zzdds.dcps.NIL_PTR, .vtable = undefined };
-    extensions.zzdds_destroy_factory(nil_factory); // must not crash or call deinit
+    const alloc = testing.allocator;
+    const boxed = try zidl_rt.boxEntity(alloc, zzdds.dcps.NIL_PTR, &GuardConditionImpl.vtable);
+    defer zidl_rt.freeEntityBox(alloc, boxed);
+    extensions.zzdds_destroy_factory(boxed); // must not crash or call deinit
 }
 
 test "support factory: generated create_participant and delete_participant" {
-    const ext_factory = extensions.zzdds_create_factory();
-    defer extensions.zzdds_destroy_factory(ext_factory);
+    const ext_factory_boxed = extensions.zzdds_create_factory();
+    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
-    const factory = extensions.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(ext_factory);
+    const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
     const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, 0, null);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
     try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
 }
 
 test "support factory: generated create_participant_ex uses config defaults" {
-    const ext_factory = extensions.zzdds_create_factory();
-    defer extensions.zzdds_destroy_factory(ext_factory);
+    const ext_factory_boxed = extensions.zzdds_create_factory();
+    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
     const cfg = ZZDDS.DomainParticipantConfig.default();
     const qos = DDS.DomainParticipantQos{};
     const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
 
-    const factory = extensions.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(ext_factory);
+    const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
     try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
 }
 
@@ -565,39 +570,15 @@ test "bootstrap: lookup_instance_reader returns handle for alive instance, 0 whe
 
 // ── Conversion nil-guard tests ────────────────────────────────────────────────
 //
-// Every DDS_X_as_DDS_Y and zzdds_X_as_DDS_X function must return a nil handle
-// when passed a nil input. These tests exercise the nil-guard branch at the top
-// of each conversion function so it shows up as covered in kcov.
-
-test "extensions: condition conversion functions return nil for nil handles" {
-    const np = zzdds.dcps.NIL_PTR;
-
-    const c1 = extensions.DDS_GuardCondition_as_DDS_Condition(.{ .ptr = np, .vtable = undefined });
-    try testing.expectEqual(np, c1.ptr);
-
-    const c2 = extensions.DDS_StatusCondition_as_DDS_Condition(.{ .ptr = np, .vtable = undefined });
-    try testing.expectEqual(np, c2.ptr);
-
-    const c3 = extensions.DDS_ReadCondition_as_DDS_Condition(.{ .ptr = np, .vtable = undefined });
-    try testing.expectEqual(np, c3.ptr);
-
-    const rc = extensions.DDS_QueryCondition_as_DDS_ReadCondition(.{ .ptr = np, .vtable = undefined });
-    try testing.expectEqual(np, rc.ptr);
-}
-
-test "extensions: entity and topic-description conversion functions return nil for nil handles" {
-    const np = zzdds.dcps.NIL_PTR;
-    const nil_topic: DDS.Topic = .{ .ptr = np, .vtable = undefined };
-
-    try testing.expectEqual(np, extensions.DDS_DomainParticipant_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
-    try testing.expectEqual(np, extensions.DDS_Topic_as_DDS_Entity(nil_topic).ptr);
-    try testing.expectEqual(np, extensions.DDS_Publisher_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
-    try testing.expectEqual(np, extensions.DDS_DataWriter_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
-    try testing.expectEqual(np, extensions.DDS_Subscriber_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
-    try testing.expectEqual(np, extensions.DDS_DataReader_as_DDS_Entity(.{ .ptr = np, .vtable = undefined }).ptr);
-    try testing.expectEqual(np, extensions.DDS_Topic_as_DDS_TopicDescription(nil_topic).ptr);
-    try testing.expectEqual(np, extensions.DDS_ContentFilteredTopic_as_DDS_TopicDescription(.{ .ptr = np, .vtable = undefined }).ptr);
-}
+// The DDS-internal upcasts (DDS_X_as_DDS_Y, where Y is an IDL-declared base
+// of X) are now generated via the `as_{Base}` vtable slot mechanism (see
+// zidl's docs/roadmap.md) rather than hand-written free functions with their
+// own defensive vtable-identity check. That check — "is this really the
+// vtable I expect, else return nil" — doesn't have an analogue to test
+// anymore: dispatch through the vtable is correct by construction (you can
+// only ever call `.vtable.as_X()` on a value that already has *some* real
+// vtable for the interface type it claims to be), so there's no
+// "wrong-implementation" runtime branch left to exercise here.
 
 // ── Conversion valid-handle tests (using IntraProcess fixture) ────────────────
 
@@ -609,14 +590,14 @@ test "extensions: entity conversion functions return valid handles for real enti
 
     const np = zzdds.dcps.NIL_PTR;
 
-    try testing.expect(extensions.DDS_DomainParticipant_as_DDS_Entity(fx.dp_w).ptr != np);
-    try testing.expect(extensions.DDS_Topic_as_DDS_Entity(fx.topic_w).ptr != np);
-    try testing.expect(extensions.DDS_Publisher_as_DDS_Entity(fx.pub_w).ptr != np);
-    try testing.expect(extensions.DDS_Subscriber_as_DDS_Entity(fx.sub_r).ptr != np);
-    try testing.expect(extensions.DDS_DataWriter_as_DDS_Entity(pair.dw).ptr != np);
-    try testing.expect(extensions.DDS_DataReader_as_DDS_Entity(pair.dr).ptr != np);
+    try testing.expect(fx.dp_w.vtable.as_Entity(fx.dp_w.ptr).ptr != np);
+    try testing.expect(fx.topic_w.vtable.as_Entity(fx.topic_w.ptr).ptr != np);
+    try testing.expect(fx.pub_w.vtable.as_Entity(fx.pub_w.ptr).ptr != np);
+    try testing.expect(fx.sub_r.vtable.as_Entity(fx.sub_r.ptr).ptr != np);
+    try testing.expect(pair.dw.vtable.as_Entity(pair.dw.ptr).ptr != np);
+    try testing.expect(pair.dr.vtable.as_Entity(pair.dr.ptr).ptr != np);
 
-    const td = extensions.DDS_Topic_as_DDS_TopicDescription(fx.topic_w);
+    const td = fx.topic_w.vtable.as_TopicDescription(fx.topic_w.ptr);
     try testing.expect(td.ptr != np);
     try testing.expectEqualStrings("BootTopic", std.mem.span(td.vtable.get_name(td.ptr)));
 }
@@ -629,19 +610,22 @@ test "extensions: DDS_DataReader_as_zzdds and back round-trip" {
 
     const np = zzdds.dcps.NIL_PTR;
 
-    // DDS → ZZDDS
-    const zdr = extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr);
+    // DDS → ZZDDS: still hand-written (genuine downcast, no IDL relationship
+    // zidl could derive it from).
+    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr));
+    const zdr = zidl_rt.unboxAs(ZZDDS.DataReader, zdr_boxed);
     try testing.expect(zdr.ptr != np);
 
-    // ZZDDS → DDS round-trip
-    const ddr = extensions.zzdds_DataReader_as_DDS_DataReader(zdr);
+    // ZZDDS → DDS round-trip: generated upcast (ZZDDS.DataReader : DDS::DataReader).
+    const ddr = zdr.vtable.as_DataReader(zdr.ptr);
     try testing.expect(ddr.ptr != np);
     try testing.expectEqual(pair.dr.ptr, ddr.ptr);
 
     // Same for DataWriter
-    const zdw = extensions.DDS_DataWriter_as_zzdds_DataWriter(pair.dw);
+    const zdw_boxed = extensions.DDS_DataWriter_as_zzdds_DataWriter(pair.dw.vtable.get_c_abi_handle(pair.dw.ptr));
+    const zdw = zidl_rt.unboxAs(ZZDDS.DataWriter, zdw_boxed);
     try testing.expect(zdw.ptr != np);
-    const ddw = extensions.zzdds_DataWriter_as_DDS_DataWriter(zdw);
+    const ddw = zdw.vtable.as_DataWriter(zdw.ptr);
     try testing.expectEqual(pair.dw.ptr, ddw.ptr);
 }
 
@@ -652,7 +636,7 @@ test "extensions: DDS_GuardCondition_as_DDS_Condition with real GuardCondition" 
     defer gc_impl.deinit();
 
     const gc = gc_impl.toDDSGuardCondition();
-    const c = extensions.DDS_GuardCondition_as_DDS_Condition(gc);
+    const c = gc.vtable.as_Condition(gc.ptr);
     try testing.expect(c.ptr != zzdds.dcps.NIL_PTR);
     try testing.expect(!c.vtable.get_trigger_value(c.ptr));
 
@@ -666,7 +650,7 @@ test "extensions: DDS_StatusCondition_as_DDS_Condition with participant status c
     defer fx.deinit();
 
     const sc = fx.dp_w.get_statuscondition();
-    const c = extensions.DDS_StatusCondition_as_DDS_Condition(sc);
+    const c = sc.vtable.as_Condition(sc.ptr);
     try testing.expect(c.ptr != zzdds.dcps.NIL_PTR);
 }
 
@@ -679,7 +663,7 @@ test "extensions: DDS_ReadCondition_as_DDS_Condition with real ReadCondition" {
     const rc = pair.dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
     defer _ = pair.dr.delete_readcondition(rc);
 
-    const c = extensions.DDS_ReadCondition_as_DDS_Condition(rc);
+    const c = rc.vtable.as_Condition(rc.ptr);
     try testing.expect(c.ptr != zzdds.dcps.NIL_PTR);
 }
 
@@ -693,7 +677,7 @@ test "extensions: take_serialized via ZZDDS DataReader vtable" {
 
     _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
 
-    const zdr = extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr);
+    const zdr = zidl_rt.unboxAs(ZZDDS.DataReader, extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)));
     var sample: ZZDDS.SerializedSample = std.mem.zeroes(ZZDDS.SerializedSample);
     const rc = zdr.vtable.take_serialized(zdr.ptr, &sample);
     try testing.expectEqual(DDS.RETCODE_OK, rc);

@@ -827,13 +827,13 @@ test "time_based_filter: per-instance — instances have independent TBF windows
 // ── Timer listener helpers ────────────────────────────────────────────────────
 // ctx is *i32; callback stores status.total_count there.
 
-fn dwOnDeadlineMissed(_: DDS.DataWriter, s: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn dwOnDeadlineMissed(_: *anyopaque, s: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*i32, @ptrCast(@alignCast(ld))).* = s.total_count;
 }
-fn dwOnLivelinessLost(_: DDS.DataWriter, s: *const DDS.LivelinessLostStatus, ld: ?*anyopaque) callconv(.c) void {
+fn dwOnLivelinessLost(_: *anyopaque, s: *const DDS.LivelinessLostStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*i32, @ptrCast(@alignCast(ld))).* = s.total_count;
 }
-fn drOnDeadlineMissed(_: DDS.DataReader, s: *const DDS.RequestedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn drOnDeadlineMissed(_: *anyopaque, s: *const DDS.RequestedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*i32, @ptrCast(@alignCast(ld))).* = s.total_count;
 }
 
@@ -1381,7 +1381,7 @@ test "query_condition: no TypeSupport registered — create_querycondition retur
 // Uses a two-participant fixture: DirectDiscovery only cross-notifies between
 // separate participants, not same-participant endpoints.
 
-fn drOnLivelinessChanged(_: DDS.DataReader, s: *const DDS.LivelinessChangedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn drOnLivelinessChanged(_: *anyopaque, s: *const DDS.LivelinessChangedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*DDS.LivelinessChangedStatus, @ptrCast(@alignCast(ld))).* = s.*;
 }
 

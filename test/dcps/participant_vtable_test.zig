@@ -257,7 +257,7 @@ test "participant: set_listener stores and retrieves the listener" {
     const dp = fx.dp;
 
     const L = struct {
-        fn on_data_on_readers(_: DDS.Subscriber, _: ?*anyopaque) callconv(.c) void {}
+        fn on_data_on_readers(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {}
     };
     const listener = DDS.DomainParticipantListener{
         .on_data_on_readers = L.on_data_on_readers,

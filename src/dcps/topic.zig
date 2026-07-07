@@ -10,6 +10,7 @@ const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
 const waitset = @import("waitset.zig");
 const filter_mod = @import("filter.zig");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 // Forward reference: participant is defined in participant.zig.
 // We use *anyopaque here to avoid a circular import; the vtable forwarding
@@ -29,6 +30,14 @@ pub const TopicImpl = struct {
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
     inconsistent: DDS.InconsistentTopicStatus,
+    // One cache slot per distinct (ptr, vtable) view this object presents
+    // across the C-ABI — Topic, Entity, and TopicDescription are three
+    // different boxed values even though they share the same `self` pointer.
+    topic_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    td_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    // ZZDDS.Topic borrowed view — see src/c_abi/extensions.zig.
+    zzdds_topic_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -72,6 +81,10 @@ pub const TopicImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
+        self.topic_c_abi.free(self.alloc);
+        self.entity_c_abi.free(self.alloc);
+        self.td_c_abi.free(self.alloc);
+        self.zzdds_topic_c_abi.free(self.alloc);
         self.qos.deinit(self.alloc);
         self.alloc.free(self.topic_name);
         self.alloc.free(self.type_name);
@@ -98,7 +111,23 @@ pub const TopicImpl = struct {
         .get_listener = vtGetListener,
         .get_inconsistent_topic_status = vtGetInconsistent,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleTopic,
+        .as_Entity = vtAsEntity,
+        .as_TopicDescription = vtAsTopicDescription,
     };
+
+    fn vtAsEntity(ctx: *anyopaque) DDS.Entity {
+        return .{ .ptr = ctx, .vtable = &entity_vtable };
+    }
+
+    fn vtAsTopicDescription(ctx: *anyopaque) DDS.TopicDescription {
+        return .{ .ptr = ctx, .vtable = &td_vtable };
+    }
+
+    fn vtGetCAbiHandleTopic(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.topic_c_abi.get(self.alloc, ctx, &topic_vtable);
+    }
 
     fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
         return DDS.RETCODE_OK;
@@ -180,7 +209,13 @@ pub const TopicImpl = struct {
         .get_name = vtGetName,
         .get_participant = vtGetParticipant,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleTd,
     };
+
+    fn vtGetCAbiHandleTd(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.td_c_abi.get(self.alloc, ctx, &td_vtable);
+    }
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -194,7 +229,13 @@ pub const TopicImpl = struct {
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleEntity,
     };
+
+    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
+    }
 
     fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
         return cast(entity_ptr).status_changes;
@@ -229,6 +270,8 @@ pub const ContentFilteredTopicImpl = struct {
     /// content-subscription profile is disabled.  AST node slices borrow from
     /// `filter_expr`, so this must be freed before `filter_expr`.
     parsed_expr: ?*filter_mod.AstNode,
+    td_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    cft_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -280,6 +323,8 @@ pub const ContentFilteredTopicImpl = struct {
     pub fn deinit(self: *Self) void {
         // Free the AST before the expression string (AST slices borrow from it).
         if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
+        self.td_c_abi.free(self.alloc);
+        self.cft_c_abi.free(self.alloc);
         for (self.expr_params.items) |p| self.alloc.free(p);
         self.expr_params.deinit(self.alloc);
         self.alloc.free(self.filter_expr);
@@ -321,7 +366,13 @@ pub const ContentFilteredTopicImpl = struct {
         .get_name = tdGetRelatedName,
         .get_participant = tdGetParticipant,
         .deinit = tdDeinit,
+        .get_c_abi_handle = tdGetCAbiHandle,
     };
+
+    fn tdGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.td_c_abi.get(self.alloc, ctx, &td_vtable);
+    }
 
     fn tdGetTypeName(ctx: *anyopaque) [*:0]const u8 {
         const r = cast(ctx).related;
@@ -350,7 +401,18 @@ pub const ContentFilteredTopicImpl = struct {
         .set_expression_parameters = cftSetParams,
         .get_related_topic = cftGetRelated,
         .deinit = cftDeinit,
+        .get_c_abi_handle = cftGetCAbiHandle,
+        .as_TopicDescription = cftAsTopicDescription,
     };
+
+    fn cftGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.cft_c_abi.get(self.alloc, ctx, &cft_vtable);
+    }
+
+    fn cftAsTopicDescription(ctx: *anyopaque) DDS.TopicDescription {
+        return .{ .ptr = ctx, .vtable = &td_vtable };
+    }
 
     fn cftGetExpr(ctx: *anyopaque) [*:0]const u8 {
         return cast(ctx).filter_expr.ptr;

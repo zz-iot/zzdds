@@ -28,16 +28,16 @@ const Counts = struct {
     deadline: i32 = 0,
 };
 
-fn drCountIncompat(_: DDS.DataReader, _: *const DDS.RequestedIncompatibleQosStatus, ld: ?*anyopaque) callconv(.c) void {
+fn drCountIncompat(_: *anyopaque, _: *const DDS.RequestedIncompatibleQosStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*Counts, @ptrCast(@alignCast(ld))).incompat += 1;
 }
-fn drCountSubMatched(_: DDS.DataReader, _: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn drCountSubMatched(_: *anyopaque, _: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*Counts, @ptrCast(@alignCast(ld))).sub_matched += 1;
 }
-fn drCountSampleLost(_: DDS.DataReader, _: *const DDS.SampleLostStatus, ld: ?*anyopaque) callconv(.c) void {
+fn drCountSampleLost(_: *anyopaque, _: *const DDS.SampleLostStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*Counts, @ptrCast(@alignCast(ld))).sample_lost += 1;
 }
-fn drCountDeadline(_: DDS.DataReader, _: *const DDS.RequestedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn drCountDeadline(_: *anyopaque, _: *const DDS.RequestedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*Counts, @ptrCast(@alignCast(ld))).deadline += 1;
 }
 

@@ -100,10 +100,10 @@ const Fixture = struct {
 
 // ── Listener helpers ──────────────────────────────────────────────────────────
 
-fn dwOnPubMatched(_: DDS.DataWriter, s: *const DDS.PublicationMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn dwOnPubMatched(_: *anyopaque, s: *const DDS.PublicationMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*DDS.PublicationMatchedStatus, @ptrCast(@alignCast(ld))).* = s.*;
 }
-fn drOnSubMatched(_: DDS.DataReader, s: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn drOnSubMatched(_: *anyopaque, s: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*DDS.SubscriptionMatchedStatus, @ptrCast(@alignCast(ld))).* = s.*;
 }
 

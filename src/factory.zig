@@ -7,6 +7,7 @@ const ZZDDS = @import("zzdds_ext_generated").zzdds;
 
 const extensions = @import("c_abi/extensions.zig");
 const nil = @import("dcps/nil.zig");
+const zidl_rt = @import("zidl_rt");
 
 pub const CreateFactoryError = error{
     FactoryCreateFailed,
@@ -23,7 +24,7 @@ pub const DomainParticipantFactory = struct {
 
     pub fn deinit(self: *Self) void {
         if (!@atomicRmw(bool, &self.active, .Xchg, false, .acq_rel)) return;
-        extensions.zzdds_destroy_factory(self.handle);
+        extensions.zzdds_destroy_factory(self.handle.vtable.get_c_abi_handle(self.handle.ptr));
     }
 
     pub fn toZZDDSFactory(self: *const Self) ZZDDS.DomainParticipantFactory {
@@ -31,12 +32,13 @@ pub const DomainParticipantFactory = struct {
     }
 
     pub fn toDDSFactory(self: *const Self) DDS.DomainParticipantFactory {
-        return extensions.zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(self.handle);
+        return self.handle.vtable.as_DomainParticipantFactory(self.handle.ptr);
     }
 };
 
 pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
-    const handle = extensions.zzdds_create_factory();
+    const boxed = extensions.zzdds_create_factory();
+    const handle = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, boxed);
     if (nil.isNil(handle)) return error.FactoryCreateFailed;
     return .{ .handle = handle };
 }

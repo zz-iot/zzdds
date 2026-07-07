@@ -4,6 +4,8 @@ const std = @import("std");
 
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
+const zidl_rt = @import("zidl_rt");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 const config_generated = @import("../config/generated.zig");
 const config_mod = @import("../config/schema.zig");
@@ -37,8 +39,15 @@ const FactoryOwner = struct {
     stacks: std.ArrayListUnmanaged(*ParticipantStack) = .empty,
     default_dp_qos: DDS.DomainParticipantQos = .{},
     factory_qos: DDS.DomainParticipantFactoryQos = .{},
+    // Two distinct C-ABI views of the same FactoryOwner (ZZDDS.DomainParticipantFactory
+    // via factory_vtable, DDS.DomainParticipantFactory via dds_factory_vtable) — each
+    // needs its own cache slot, same as any other multi-view concrete impl.
+    zzdds_fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    dds_fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     fn deinit(self: *@This()) void {
+        self.zzdds_fac_c_abi.free(self.alloc);
+        self.dds_fac_c_abi.free(self.alloc);
         for (self.stacks.items) |stack| stack.deinit();
         self.stacks.deinit(self.alloc);
         self.default_dp_qos.deinit(self.alloc);
@@ -201,7 +210,25 @@ const ParticipantStack = struct {
 const factory_vtable = ZZDDS.DomainParticipantFactory.Vtable{
     .create_participant_ex = factoryCreateParticipantEx,
     .deinit = factoryDeinit,
+    .get_c_abi_handle = factoryGetCAbiHandleZzdds,
+    .as_DomainParticipantFactory = factoryAsDdsFactory,
 };
+
+fn factoryAsDdsFactory(ctx: *anyopaque) DDS.DomainParticipantFactory {
+    return .{ .ptr = ctx, .vtable = &dds_factory_vtable };
+}
+
+// Nil ZZDDS.* views (ptr == nil.NIL_PTR, but still the real vtable — see
+// DDS_..._as_zzdds_... below) need their own dedicated cache, same reasoning
+// as nil.zig's own nil-entity singletons: there's no real impl object to hang
+// a cache field off of, and std.heap.c_allocator is the fixed default.
+var nil_zzdds_fac_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+
+fn factoryGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return nil_zzdds_fac_c_abi.get(std.heap.c_allocator, ctx, &factory_vtable);
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    return owner.zzdds_fac_c_abi.get(owner.alloc, ctx, &factory_vtable);
+}
 
 const dds_factory_vtable = DDS.DomainParticipantFactory.Vtable{
     .create_participant = factoryCreateParticipant,
@@ -212,213 +239,174 @@ const dds_factory_vtable = DDS.DomainParticipantFactory.Vtable{
     .set_qos = factorySetQos,
     .get_qos = factoryGetQos,
     .deinit = factoryDeinit,
+    .get_c_abi_handle = factoryGetCAbiHandleDds,
 };
+
+fn factoryGetCAbiHandleDds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return ctx;
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    return owner.dds_fac_c_abi.get(owner.alloc, ctx, &dds_factory_vtable);
+}
 
 const participant_vtable = ZZDDS.DomainParticipant.Vtable{
     .register_type_support = participantRegisterTypeSupport,
     .deinit = borrowedDeinit,
+    .get_c_abi_handle = participantGetCAbiHandleZzdds,
+    .as_DomainParticipant = participantAsDds,
 };
+
+fn participantAsDds(ctx: *anyopaque) DDS.DomainParticipant {
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(ctx));
+    return impl.toDDSParticipant();
+}
+
+var nil_zzdds_participant_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+
+fn participantGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return nil_zzdds_participant_c_abi.get(std.heap.c_allocator, ctx, &participant_vtable);
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(ctx));
+    return impl.zzdds_participant_c_abi.get(impl.alloc, ctx, &participant_vtable);
+}
 
 const topic_vtable = ZZDDS.Topic.Vtable{
     .as_topic_description = topicAsTopicDescription,
     .deinit = borrowedDeinit,
+    .get_c_abi_handle = topicGetCAbiHandleZzdds,
+    .as_Topic = topicAsDds,
 };
+
+fn topicAsDds(ctx: *anyopaque) DDS.Topic {
+    const impl: *TopicImpl = @ptrCast(@alignCast(ctx));
+    return impl.toDDSTopic();
+}
+
+var nil_zzdds_topic_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+
+fn topicGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return nil_zzdds_topic_c_abi.get(std.heap.c_allocator, ctx, &topic_vtable);
+    const impl: *TopicImpl = @ptrCast(@alignCast(ctx));
+    return impl.zzdds_topic_c_abi.get(impl.alloc, ctx, &topic_vtable);
+}
 
 const writer_vtable = ZZDDS.DataWriter.Vtable{
     .write_serialized = writerWriteSerialized,
     .deinit = borrowedDeinit,
+    .get_c_abi_handle = writerGetCAbiHandleZzdds,
+    .as_DataWriter = writerAsDds,
 };
+
+fn writerAsDds(ctx: *anyopaque) DDS.DataWriter {
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
+    return impl.toDDSDataWriter();
+}
+
+var nil_zzdds_dw_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+
+fn writerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return nil_zzdds_dw_c_abi.get(std.heap.c_allocator, ctx, &writer_vtable);
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
+    return impl.zzdds_dw_c_abi.get(impl.alloc, ctx, &writer_vtable);
+}
 
 const reader_vtable = ZZDDS.DataReader.Vtable{
     .take_serialized = readerTakeSerialized,
     .take_next_instance_serialized = readerTakeNextInstanceSerialized,
     .deinit = borrowedDeinit,
+    .get_c_abi_handle = readerGetCAbiHandleZzdds,
+    .as_DataReader = readerAsDds,
 };
 
-pub export fn zzdds_create_factory() callconv(.c) ZZDDS.DomainParticipantFactory {
-    return createFactory() catch |err| {
+fn readerAsDds(ctx: *anyopaque) DDS.DataReader {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    return impl.toDDSDataReader();
+}
+
+var nil_zzdds_dr_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+
+fn readerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return nil_zzdds_dr_c_abi.get(std.heap.c_allocator, ctx, &reader_vtable);
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    return impl.zzdds_dr_c_abi.get(impl.alloc, ctx, &reader_vtable);
+}
+
+pub export fn zzdds_create_factory() callconv(.c) *anyopaque {
+    const r: ZZDDS.DomainParticipantFactory = createFactory() catch |err| {
         std.log.err("zzdds_create_factory: {}", .{err});
-        return .{ .ptr = nil.NIL_PTR, .vtable = &factory_vtable };
+        return factoryGetCAbiHandleZzdds(nil.NIL_PTR);
     };
+    return r.vtable.get_c_abi_handle(r.ptr);
 }
 
-pub export fn zzdds_factory_is_nil(factory: ZZDDS.DomainParticipantFactory) callconv(.c) bool {
-    return factory.ptr == nil.NIL_PTR;
+pub export fn zzdds_factory_is_nil(factory: *anyopaque) callconv(.c) bool {
+    const f = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, factory);
+    return f.ptr == nil.NIL_PTR;
 }
 
-pub export fn zzdds_destroy_factory(factory: ZZDDS.DomainParticipantFactory) callconv(.c) void {
-    if (factory.ptr == nil.NIL_PTR) return;
-    factory.vtable.deinit(factory.ptr);
+pub export fn zzdds_destroy_factory(factory: *anyopaque) callconv(.c) void {
+    const f = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, factory);
+    if (f.ptr == nil.NIL_PTR) return;
+    f.vtable.deinit(f.ptr);
 }
 
-pub export fn zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory: ZZDDS.DomainParticipantFactory) callconv(.c) DDS.DomainParticipantFactory {
-    if (factory.ptr == nil.NIL_PTR) return nil.nil_factory;
-    if (factory.vtable != &factory_vtable) return nil.nil_factory;
-    return .{ .ptr = factory.ptr, .vtable = &dds_factory_vtable };
-}
+// Every ZZDDS.* → DDS.* upcast (zzdds_X_as_DDS_X) and every DDS-internal
+// upcast (DDS_X_as_DDS_Y, where Y is a declared base of X) is now generated
+// by zidl directly from the IDL-declared inheritance (`interface Topic :
+// DDS::Topic` in zzdds.idl; `interface Topic : Entity, TopicDescription` in
+// dcps.idl) via the `as_{Base}` vtable slot / export mechanism — see the
+// `.as_*` fields wired into each concrete impl's vtable literal and zidl's
+// `docs/roadmap.md`. Only genuine *downcasts* (DDS_X_as_zzdds_X, going from
+// a base handle down to a specific derived type) remain hand-written below —
+// IDL inheritance can't express "which concrete derived type is this," so
+// these still need a runtime vtable-identity check.
 
-pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(factory: DDS.DomainParticipantFactory) callconv(.c) ZZDDS.DomainParticipantFactory {
+/// Only valid for participants created through a FactoryOwner factory (i.e., via
+/// zzdds_create_factory → create_participant_ex). Returns a nil handle for any
+/// handle not issued by this implementation.
+pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(factory: *anyopaque) callconv(.c) *anyopaque {
     // factory_vtable methods cast ctx to *FactoryOwner, so this conversion is
     // only valid for handles that were originally issued by zzdds_create_factory
-    // (which sets vtable = &dds_factory_vtable via the sibling export above).
-    if (factory.vtable != &dds_factory_vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &factory_vtable };
-    return .{ .ptr = factory.ptr, .vtable = &factory_vtable };
+    // (which sets vtable = &dds_factory_vtable via the generated as_DomainParticipantFactory export).
+    const f = zidl_rt.unboxAs(DDS.DomainParticipantFactory, factory);
+    if (f.vtable != &dds_factory_vtable) return factoryGetCAbiHandleZzdds(nil.NIL_PTR);
+    const r: ZZDDS.DomainParticipantFactory = .{ .ptr = f.ptr, .vtable = &factory_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 /// Only valid for participants created through a FactoryOwner factory (i.e., via
 /// zzdds_create_factory → create_participant_ex). Returns a nil handle for any
 /// handle not issued by this implementation.
-pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: DDS.DomainParticipant) callconv(.c) ZZDDS.DomainParticipant {
-    if (participant.vtable != &DomainParticipantImpl.vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &participant_vtable };
-    return .{ .ptr = participant.ptr, .vtable = &participant_vtable };
-}
-
-pub export fn zzdds_DomainParticipant_as_DDS_DomainParticipant(participant: ZZDDS.DomainParticipant) callconv(.c) DDS.DomainParticipant {
-    if (participant.ptr == nil.NIL_PTR) return nil.nil_participant;
-    if (participant.vtable != &participant_vtable) return nil.nil_participant;
-    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(participant.ptr));
-    return impl.toDDSParticipant();
+pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: *anyopaque) callconv(.c) *anyopaque {
+    const p = zidl_rt.unboxAs(DDS.DomainParticipant, participant);
+    if (p.vtable != &DomainParticipantImpl.vtable) return participantGetCAbiHandleZzdds(nil.NIL_PTR);
+    const r: ZZDDS.DomainParticipant = .{ .ptr = p.ptr, .vtable = &participant_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 /// Only valid for topics created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
-pub export fn DDS_Topic_as_zzdds_Topic(topic: DDS.Topic) callconv(.c) ZZDDS.Topic {
-    if (topic.vtable != &TopicImpl.topic_vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &topic_vtable };
-    return .{ .ptr = topic.ptr, .vtable = &topic_vtable };
+pub export fn DDS_Topic_as_zzdds_Topic(topic: *anyopaque) callconv(.c) *anyopaque {
+    const t = zidl_rt.unboxAs(DDS.Topic, topic);
+    if (t.vtable != &TopicImpl.topic_vtable) return topicGetCAbiHandleZzdds(nil.NIL_PTR);
+    const r: ZZDDS.Topic = .{ .ptr = t.ptr, .vtable = &topic_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 /// Only valid for writers created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
-pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: DDS.DataWriter) callconv(.c) ZZDDS.DataWriter {
-    if (writer.vtable != &DataWriterImpl.vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &writer_vtable };
-    return .{ .ptr = writer.ptr, .vtable = &writer_vtable };
-}
-
-pub export fn zzdds_DataWriter_as_DDS_DataWriter(writer: ZZDDS.DataWriter) callconv(.c) DDS.DataWriter {
-    if (writer.ptr == nil.NIL_PTR) return nil.nil_datawriter;
-    if (writer.vtable != &writer_vtable) return nil.nil_datawriter;
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
-    return impl.toDDSDataWriter();
+pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: *anyopaque) callconv(.c) *anyopaque {
+    const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
+    if (w.vtable != &DataWriterImpl.vtable) return writerGetCAbiHandleZzdds(nil.NIL_PTR);
+    const r: ZZDDS.DataWriter = .{ .ptr = w.ptr, .vtable = &writer_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 /// Only valid for readers created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
-pub export fn DDS_DataReader_as_zzdds_DataReader(reader: DDS.DataReader) callconv(.c) ZZDDS.DataReader {
-    if (reader.vtable != &DataReaderImpl.vtable) return .{ .ptr = nil.NIL_PTR, .vtable = &reader_vtable };
-    return .{ .ptr = reader.ptr, .vtable = &reader_vtable };
-}
-
-pub export fn zzdds_DataReader_as_DDS_DataReader(reader: ZZDDS.DataReader) callconv(.c) DDS.DataReader {
-    if (reader.ptr == nil.NIL_PTR) return nil.nil_datareader;
-    if (reader.vtable != &reader_vtable) return nil.nil_datareader;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    return impl.toDDSDataReader();
-}
-
-pub export fn zzdds_Topic_as_DDS_Topic(topic: ZZDDS.Topic) callconv(.c) DDS.Topic {
-    if (topic.ptr == nil.NIL_PTR) return nil.nil_topic;
-    if (topic.vtable != &topic_vtable) return nil.nil_topic;
-    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
-    return impl.toDDSTopic();
-}
-
-/// Only valid for GuardConditions created through a FactoryOwner-owned participant.
-/// Passing a handle from any other DDS implementation causes memory corruption.
-pub export fn DDS_GuardCondition_as_DDS_Condition(condition: DDS.GuardCondition) callconv(.c) DDS.Condition {
-    if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
-    if (condition.vtable != &GuardConditionImpl.vtable) return nil.nil_condition;
-    const impl: *GuardConditionImpl = @ptrCast(@alignCast(condition.ptr));
-    return impl.toCondition();
-}
-
-/// Only valid for StatusConditions created through a FactoryOwner-owned participant.
-/// Passing a handle from any other DDS implementation causes memory corruption.
-pub export fn DDS_StatusCondition_as_DDS_Condition(condition: DDS.StatusCondition) callconv(.c) DDS.Condition {
-    if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
-    if (condition.vtable != &StatusConditionImpl.vtable) return nil.nil_condition;
-    const impl: *StatusConditionImpl = @ptrCast(@alignCast(condition.ptr));
-    return impl.toCondition();
-}
-
-/// Only valid for ReadConditions created through a FactoryOwner-owned participant.
-/// Passing a handle from any other DDS implementation causes memory corruption.
-pub export fn DDS_ReadCondition_as_DDS_Condition(condition: DDS.ReadCondition) callconv(.c) DDS.Condition {
-    if (condition.ptr == nil.NIL_PTR) return nil.nil_condition;
-    if (condition.vtable != &ReadConditionImpl.vtable) return nil.nil_condition;
-    const impl: *ReadConditionImpl = @ptrCast(@alignCast(condition.ptr));
-    return impl.toCondition();
-}
-
-/// Only valid for QueryConditions created through a FactoryOwner-owned participant.
-/// Passing a handle from any other DDS implementation causes memory corruption.
-pub export fn DDS_QueryCondition_as_DDS_ReadCondition(condition: DDS.QueryCondition) callconv(.c) DDS.ReadCondition {
-    if (condition.ptr == nil.NIL_PTR) return nil.nil_readcondition;
-    if (condition.vtable != &QueryConditionImpl.vtable) return nil.nil_readcondition;
-    const impl: *QueryConditionImpl = @ptrCast(@alignCast(condition.ptr));
-    return impl.rc.toDDSReadCondition();
-}
-
-pub export fn DDS_DomainParticipant_as_DDS_Entity(participant: DDS.DomainParticipant) callconv(.c) DDS.Entity {
-    if (participant.ptr == nil.NIL_PTR) return nil.nil_entity;
-    if (participant.vtable != &DomainParticipantImpl.vtable) return nil.nil_entity;
-    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(participant.ptr));
-    return impl.toEntity();
-}
-
-pub export fn DDS_Topic_as_DDS_Entity(topic: DDS.Topic) callconv(.c) DDS.Entity {
-    if (topic.ptr == nil.NIL_PTR) return nil.nil_entity;
-    if (topic.vtable != &TopicImpl.topic_vtable) return nil.nil_entity;
-    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
-    return impl.toEntity();
-}
-
-pub export fn DDS_Publisher_as_DDS_Entity(publisher: DDS.Publisher) callconv(.c) DDS.Entity {
-    if (publisher.ptr == nil.NIL_PTR) return nil.nil_entity;
-    if (publisher.vtable != &PublisherImpl.vtable) return nil.nil_entity;
-    const impl: *PublisherImpl = @ptrCast(@alignCast(publisher.ptr));
-    return impl.toEntity();
-}
-
-pub export fn DDS_DataWriter_as_DDS_Entity(writer: DDS.DataWriter) callconv(.c) DDS.Entity {
-    if (writer.ptr == nil.NIL_PTR) return nil.nil_entity;
-    if (writer.vtable != &DataWriterImpl.vtable) return nil.nil_entity;
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
-    return impl.toEntity();
-}
-
-pub export fn DDS_Subscriber_as_DDS_Entity(subscriber: DDS.Subscriber) callconv(.c) DDS.Entity {
-    if (subscriber.ptr == nil.NIL_PTR) return nil.nil_entity;
-    if (subscriber.vtable != &SubscriberImpl.vtable) return nil.nil_entity;
-    const impl: *SubscriberImpl = @ptrCast(@alignCast(subscriber.ptr));
-    return impl.toEntity();
-}
-
-pub export fn DDS_DataReader_as_DDS_Entity(reader: DDS.DataReader) callconv(.c) DDS.Entity {
-    if (reader.ptr == nil.NIL_PTR) return nil.nil_entity;
-    if (reader.vtable != &DataReaderImpl.vtable) return nil.nil_entity;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
-    return impl.toEntity();
-}
-
-pub export fn DDS_Topic_as_DDS_TopicDescription(topic: DDS.Topic) callconv(.c) DDS.TopicDescription {
-    if (topic.ptr == nil.NIL_PTR) return nil.nil_topic_description;
-    if (topic.vtable != &TopicImpl.topic_vtable) return nil.nil_topic_description;
-    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
-    return impl.toTopicDescription();
-}
-
-pub export fn DDS_ContentFilteredTopic_as_DDS_TopicDescription(topic: DDS.ContentFilteredTopic) callconv(.c) DDS.TopicDescription {
-    if (topic.ptr == nil.NIL_PTR) return nil.nil_topic_description;
-    if (topic.vtable != &ContentFilteredTopicImpl.cft_vtable) return nil.nil_topic_description;
-    const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(topic.ptr));
-    return impl.toTopicDescription();
-}
-
-/// MultiTopic is not implemented by this stack. Always returns a nil
-/// TopicDescription regardless of the input handle.
-pub export fn DDS_MultiTopic_as_DDS_TopicDescription(topic: DDS.MultiTopic) callconv(.c) DDS.TopicDescription {
-    _ = topic;
-    return nil.nil_topic_description;
+pub export fn DDS_DataReader_as_zzdds_DataReader(reader: *anyopaque) callconv(.c) *anyopaque {
+    const rd = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (rd.vtable != &DataReaderImpl.vtable) return readerGetCAbiHandleZzdds(nil.NIL_PTR);
+    const r: ZZDDS.DataReader = .{ .ptr = rd.ptr, .vtable = &reader_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 fn createFactory() !ZZDDS.DomainParticipantFactory {
@@ -717,9 +705,9 @@ test "zzdds extension factory creates participant with generated default config"
     const dp = factory.create_participant_ex(203, qos, null, 0, cfg);
     try std.testing.expect(!nil.isNil(dp));
 
-    const ext_dp = DDS_DomainParticipant_as_zzdds_DomainParticipant(dp);
+    const ext_dp = zidl_rt.unboxAs(ZZDDS.DomainParticipant, DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)));
     try std.testing.expectEqual(DDS.RETCODE_OK, ext_dp.register_type_support("KeylessSmoke"));
 
-    const dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
+    const dds_factory = factory.vtable.as_DomainParticipantFactory(factory.ptr);
     try std.testing.expectEqual(DDS.RETCODE_OK, dds_factory.delete_participant(dp));
 }

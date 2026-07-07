@@ -37,15 +37,15 @@ int main(void) {
     check(BindingSmokeStatus_compute_key_hash_from_cdr(buffer, writer.len, from_cdr));
     assert(memcmp(from_struct, from_cdr, sizeof(from_struct)) == 0);
 
-    DDS_DataWriter null_writer = {0};
+    DDS_DataWriter null_writer = NULL;
     BindingSmokeStatusDataWriter typed_writer;
     BindingSmokeStatusDataWriter_init(&typed_writer, null_writer, ZIDL_XCDR1);
     assert(typed_writer.xcdr_version == ZIDL_XCDR1);
 
-    DDS_DataReader null_reader = {0};
+    DDS_DataReader null_reader = NULL;
     BindingSmokeStatusDataReader typed_reader;
     BindingSmokeStatusDataReader_init(&typed_reader, null_reader);
-    assert(typed_reader.reader.ptr == 0);
+    assert(typed_reader.reader == NULL);
 
     return 0;
 }

@@ -36,16 +36,16 @@ const Counts = struct {
     liveliness_lost: i32 = 0,
 };
 
-fn dwOnPubMatched(_: DDS.DataWriter, _: *const DDS.PublicationMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn dwOnPubMatched(_: *anyopaque, _: *const DDS.PublicationMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*Counts, @ptrCast(@alignCast(ld))).pub_matched += 1;
 }
-fn dwOnIncompat(_: DDS.DataWriter, _: *const DDS.OfferedIncompatibleQosStatus, ld: ?*anyopaque) callconv(.c) void {
+fn dwOnIncompat(_: *anyopaque, _: *const DDS.OfferedIncompatibleQosStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*Counts, @ptrCast(@alignCast(ld))).incompat += 1;
 }
-fn dwOnDeadline(_: DDS.DataWriter, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn dwOnDeadline(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*Counts, @ptrCast(@alignCast(ld))).deadline += 1;
 }
-fn dwOnLivelinessLost(_: DDS.DataWriter, _: *const DDS.LivelinessLostStatus, ld: ?*anyopaque) callconv(.c) void {
+fn dwOnLivelinessLost(_: *anyopaque, _: *const DDS.LivelinessLostStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*Counts, @ptrCast(@alignCast(ld))).liveliness_lost += 1;
 }
 

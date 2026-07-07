@@ -120,7 +120,7 @@ fn write(dw: *DataWriterImpl, key: [16]u8) !void {
 
 // ── Listener helpers (C callback struct form) ─────────────────────────────────
 
-fn drOnSampleRejected(_: DDS.DataReader, s: *const DDS.SampleRejectedStatus, ld: ?*anyopaque) callconv(.c) void {
+fn drOnSampleRejected(_: *anyopaque, s: *const DDS.SampleRejectedStatus, ld: ?*anyopaque) callconv(.c) void {
     @as(*DDS.SampleRejectedStatus, @ptrCast(@alignCast(ld))).* = s.*;
 }
 
