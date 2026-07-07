@@ -259,6 +259,7 @@ const participant_vtable = ZZDDS.DomainParticipant.Vtable{
 };
 
 fn participantAsDds(ctx: *anyopaque) DDS.DomainParticipant {
+    if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(ctx));
     return impl.toDDSParticipant();
 }
@@ -279,6 +280,7 @@ const topic_vtable = ZZDDS.Topic.Vtable{
 };
 
 fn topicAsDds(ctx: *anyopaque) DDS.Topic {
+    if (ctx == nil.NIL_PTR) return nil.nil_topic;
     const impl: *TopicImpl = @ptrCast(@alignCast(ctx));
     return impl.toDDSTopic();
 }
@@ -299,6 +301,7 @@ const writer_vtable = ZZDDS.DataWriter.Vtable{
 };
 
 fn writerAsDds(ctx: *anyopaque) DDS.DataWriter {
+    if (ctx == nil.NIL_PTR) return nil.nil_datawriter;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
     return impl.toDDSDataWriter();
 }
@@ -320,6 +323,7 @@ const reader_vtable = ZZDDS.DataReader.Vtable{
 };
 
 fn readerAsDds(ctx: *anyopaque) DDS.DataReader {
+    if (ctx == nil.NIL_PTR) return nil.nil_datareader;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
     return impl.toDDSDataReader();
 }
