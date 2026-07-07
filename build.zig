@@ -848,6 +848,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zzdds", .module = zzdds_mod_tsan },
                 .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                .{ .name = "zidl_rt", .module = zidl_rt_mod },
             },
         }) });
         t.root_module.link_libc = true;
