@@ -120,6 +120,11 @@ const InstanceEntry = struct {
     /// Full CDR payload of the first alive sample for this instance.
     /// Used by getKeyValueRaw. Null until the first alive sample arrives.
     key_cdr: ?[]u8 = null,
+    /// Number of times this instance has become ALIVE after being disposed / after
+    /// having no writers, respectively (DDS spec §2.2.2.5.4). Stamped onto each
+    /// sample's SampleInfo at receipt time.
+    disposed_generation_count: i32 = 0,
+    no_writers_generation_count: i32 = 0,
 };
 
 fn matchesSample(
@@ -416,7 +421,12 @@ pub const DataReaderImpl = struct {
         self: *Self,
         ih: DDS.InstanceHandle_t,
         kind: history_mod.ChangeKind,
-    ) struct { view: DDS.ViewStateKind, instance_state: DDS.InstanceStateKind } {
+    ) struct {
+        view: DDS.ViewStateKind,
+        instance_state: DDS.InstanceStateKind,
+        disposed_generation_count: i32,
+        no_writers_generation_count: i32,
+    } {
         const new_state: DDS.InstanceStateKind = switch (kind) {
             .alive => DDS.ALIVE_INSTANCE_STATE,
             .not_alive_disposed => DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE,
@@ -424,15 +434,33 @@ pub const DataReaderImpl = struct {
         };
         if (self.seen_instances.getPtr(ih)) |entry| {
             // Resurrection: instance was not alive but a new alive sample arrived.
-            const view: DDS.ViewStateKind = if (entry.instance_state != DDS.ALIVE_INSTANCE_STATE and kind == .alive)
+            const was_not_alive = entry.instance_state != DDS.ALIVE_INSTANCE_STATE;
+            const view: DDS.ViewStateKind = if (was_not_alive and kind == .alive)
                 DDS.NEW_VIEW_STATE
             else
                 DDS.NOT_NEW_VIEW_STATE;
+            if (was_not_alive and kind == .alive) {
+                if (entry.instance_state == DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE) {
+                    entry.disposed_generation_count += 1;
+                } else if (entry.instance_state == DDS.NOT_ALIVE_NO_WRITERS_INSTANCE_STATE) {
+                    entry.no_writers_generation_count += 1;
+                }
+            }
             entry.instance_state = new_state;
-            return .{ .view = view, .instance_state = new_state };
+            return .{
+                .view = view,
+                .instance_state = new_state,
+                .disposed_generation_count = entry.disposed_generation_count,
+                .no_writers_generation_count = entry.no_writers_generation_count,
+            };
         } else {
             self.seen_instances.put(self.alloc, ih, .{ .instance_state = new_state }) catch {};
-            return .{ .view = DDS.NEW_VIEW_STATE, .instance_state = new_state };
+            return .{
+                .view = DDS.NEW_VIEW_STATE,
+                .instance_state = new_state,
+                .disposed_generation_count = 0,
+                .no_writers_generation_count = 0,
+            };
         }
     }
 
@@ -460,6 +488,8 @@ pub const DataReaderImpl = struct {
             .instance_state = states.instance_state,
             .instance_handle = ih,
             .valid_data = true,
+            .disposed_generation_count = states.disposed_generation_count,
+            .no_writers_generation_count = states.no_writers_generation_count,
         };
         const pc = PendingChange{ .data = copy, .alloc = self.alloc, .info = info };
         const max = self.qos.resource_limits.max_samples;
@@ -637,6 +667,8 @@ pub const DataReaderImpl = struct {
                     .instance_handle = ih,
                     .publication_handle = writer_mod.guidToHandle(change.writer_guid),
                     .valid_data = change.kind == .alive,
+                    .disposed_generation_count = states.disposed_generation_count,
+                    .no_writers_generation_count = states.no_writers_generation_count,
                 },
                 .group_seq_num = change.group_seq_num,
                 .expiry_ns = coh_expiry,
@@ -841,6 +873,8 @@ pub const DataReaderImpl = struct {
                 .instance_handle = ih,
                 .publication_handle = writer_mod.guidToHandle(change.writer_guid),
                 .valid_data = change.kind == .alive,
+                .disposed_generation_count = states.disposed_generation_count,
+                .no_writers_generation_count = states.no_writers_generation_count,
             },
             .group_seq_num = change.group_seq_num,
             .expiry_ns = expiry,
@@ -1074,6 +1108,8 @@ pub const DataReaderImpl = struct {
                         .source_timestamp = .{ .sec = now.sec, .nanosec = now.nanosec },
                         .publication_handle = writer_mod.guidToHandle(guid),
                         .valid_data = false,
+                        .disposed_generation_count = states.disposed_generation_count,
+                        .no_writers_generation_count = states.no_writers_generation_count,
                     },
                 };
                 self.pending.append(self.alloc, pc) catch {
@@ -1170,6 +1206,32 @@ pub const DataReaderImpl = struct {
         }
     }
 
+    /// Computes sample_rank/generation_rank/absolute_generation_rank for a just-collected
+    /// batch (DDS spec §2.2.2.5.4). O(n²) is fine — batch size is bounded by max_samples /
+    /// resource limits, same precedent as the KEEP_LAST/resource-limit checks in onDataCb.
+    /// Must be called with `mu` held (reads `seen_instances` for the live baseline).
+    fn finalizeGenerationRanksLocked(self: *Self, out: []TakenSample) void {
+        for (out, 0..) |*s, i| {
+            const ih = s.info.instance_handle;
+            const this_sum: i64 = @as(i64, s.info.disposed_generation_count) + s.info.no_writers_generation_count;
+            var mrsic_sum = this_sum;
+            var sample_rank: i32 = 0;
+            for (out[i + 1 ..]) |later| {
+                if (later.info.instance_handle != ih) continue;
+                sample_rank += 1;
+                const later_sum: i64 = @as(i64, later.info.disposed_generation_count) + later.info.no_writers_generation_count;
+                if (later_sum > mrsic_sum) mrsic_sum = later_sum;
+            }
+            s.info.sample_rank = sample_rank;
+            s.info.generation_rank = @intCast(mrsic_sum - this_sum);
+            const live_sum: i64 = if (self.seen_instances.get(ih)) |entry|
+                @as(i64, entry.disposed_generation_count) + entry.no_writers_generation_count
+            else
+                this_sum;
+            s.info.absolute_generation_rank = @intCast(live_sum - this_sum);
+        }
+    }
+
     /// Dequeue one sample.  Returns null if the queue is empty.
     /// Expired samples (LIFESPAN QoS) are silently discarded.
     /// The caller owns TakenSample.data and must free it with the reader's allocator.
@@ -1198,7 +1260,9 @@ pub const DataReaderImpl = struct {
             if (self.pending.items.len == 0) {
                 self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
             }
-            return .{ .data = pc.data, .info = pc.info };
+            var result = [1]TakenSample{.{ .data = pc.data, .info = pc.info }};
+            self.finalizeGenerationRanksLocked(&result);
+            return result[0];
         }
         self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         return null;
@@ -1247,12 +1311,13 @@ pub const DataReaderImpl = struct {
 
         for (self.pending.items, 0..) |pc, idx| {
             if (pc.info.instance_handle == tgt) {
-                const s = TakenSample{ .data = pc.data, .info = pc.info };
+                var result = [1]TakenSample{.{ .data = pc.data, .info = pc.info }};
                 _ = self.pending.orderedRemove(idx);
                 if (self.pending.items.len == 0) {
                     self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
                 }
-                return s;
+                self.finalizeGenerationRanksLocked(&result);
+                return result[0];
             }
         }
         return null;
@@ -1299,7 +1364,9 @@ pub const DataReaderImpl = struct {
             if (pc.info.instance_handle == tgt) {
                 const clone = self.alloc.dupe(u8, pc.data) catch return null;
                 pc.info.sample_state = DDS.READ_SAMPLE_STATE;
-                return TakenSample{ .data = clone, .info = pc.info };
+                var result = [1]TakenSample{.{ .data = clone, .info = pc.info }};
+                self.finalizeGenerationRanksLocked(&result);
+                return result[0];
             }
         }
         return null;
@@ -1374,6 +1441,7 @@ pub const DataReaderImpl = struct {
             pc.info.sample_state = DDS.READ_SAMPLE_STATE;
             count += 1;
         }
+        self.finalizeGenerationRanksLocked(out.items);
     }
 
     /// Remove and return samples matching the given state masks.
@@ -1439,6 +1507,7 @@ pub const DataReaderImpl = struct {
         if (self.pending.items.len == 0) {
             self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
+        self.finalizeGenerationRanksLocked(out.items);
     }
 
     pub fn toDDSDataReader(self: *Self) DDS.DataReader {
@@ -2273,4 +2342,158 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
 
     try testing.expect(dr.takeRaw() == null);
     try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
+
+fn mkTestReaderForGenerationTests(alloc: std.mem.Allocator, clock: *time_test.ManualClock) DataReaderImpl {
+    return DataReaderImpl{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener = nil.nil_dr_listener,
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .seen_instances = .empty,
+    };
+}
+
+fn deinitTestReader(dr: *DataReaderImpl, alloc: std.mem.Allocator) void {
+    for (dr.pending.items) |pc| pc.deinit();
+    dr.pending.deinit(alloc);
+    dr.coherent_wip.deinit(alloc);
+    dr.coherent_committed.deinit(alloc);
+    {
+        var _si = dr.seen_instances.valueIterator();
+        while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
+    }
+    dr.seen_instances.deinit(alloc);
+}
+
+test "determineStatesLocked: disposed_generation_count increments only on resurrection from DISPOSED" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    var dr = mkTestReaderForGenerationTests(alloc, &clock);
+    defer deinitTestReader(&dr, alloc);
+
+    const ih: DDS.InstanceHandle_t = 1;
+
+    const s1 = dr.determineStatesLocked(ih, .alive);
+    try testing.expectEqual(@as(i32, 0), s1.disposed_generation_count);
+    try testing.expectEqual(@as(i32, 0), s1.no_writers_generation_count);
+
+    // Disposing does not itself bump the counter — only resurrection does.
+    const s2 = dr.determineStatesLocked(ih, .not_alive_disposed);
+    try testing.expectEqual(@as(i32, 0), s2.disposed_generation_count);
+
+    const s3 = dr.determineStatesLocked(ih, .alive);
+    try testing.expectEqual(DDS.NEW_VIEW_STATE, s3.view);
+    try testing.expectEqual(@as(i32, 1), s3.disposed_generation_count);
+    try testing.expectEqual(@as(i32, 0), s3.no_writers_generation_count);
+}
+
+test "determineStatesLocked: no_writers_generation_count increments only on resurrection from NO_WRITERS" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    var dr = mkTestReaderForGenerationTests(alloc, &clock);
+    defer deinitTestReader(&dr, alloc);
+
+    const ih: DDS.InstanceHandle_t = 2;
+
+    _ = dr.determineStatesLocked(ih, .alive);
+    const s2 = dr.determineStatesLocked(ih, .not_alive_unregistered);
+    try testing.expectEqual(@as(i32, 0), s2.no_writers_generation_count);
+
+    const s3 = dr.determineStatesLocked(ih, .alive);
+    try testing.expectEqual(DDS.NEW_VIEW_STATE, s3.view);
+    try testing.expectEqual(@as(i32, 0), s3.disposed_generation_count);
+    try testing.expectEqual(@as(i32, 1), s3.no_writers_generation_count);
+}
+
+test "readRaw: sample_rank/generation_rank/absolute_generation_rank span a generation boundary in one batch" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    var dr = mkTestReaderForGenerationTests(alloc, &clock);
+    defer deinitTestReader(&dr, alloc);
+
+    const ih: DDS.InstanceHandle_t = 7;
+
+    // Three samples for the same instance, spanning one dispose/resurrect cycle:
+    // gen 0 (alive) -> gen 0 (dispose) -> gen 1 (alive again).
+    const d0 = try alloc.dupe(u8, &.{0x00});
+    try dr.pending.append(alloc, PendingChange{
+        .data = d0,
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = ih, .valid_data = true, .disposed_generation_count = 0, .no_writers_generation_count = 0 },
+    });
+    const d1 = try alloc.dupe(u8, &.{});
+    try dr.pending.append(alloc, PendingChange{
+        .data = d1,
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NOT_NEW_VIEW_STATE, .instance_state = DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, .instance_handle = ih, .valid_data = false, .disposed_generation_count = 0, .no_writers_generation_count = 0 },
+    });
+    const d2 = try alloc.dupe(u8, &.{0x02});
+    try dr.pending.append(alloc, PendingChange{
+        .data = d2,
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = ih, .valid_data = true, .disposed_generation_count = 1, .no_writers_generation_count = 0 },
+    });
+
+    // Live instance state matches the most recent (highest-generation) sample.
+    try dr.seen_instances.put(alloc, ih, .{ .instance_state = DDS.ALIVE_INSTANCE_STATE, .disposed_generation_count = 1, .no_writers_generation_count = 0 });
+
+    var out: std.ArrayListUnmanaged(TakenSample) = .empty;
+    defer {
+        for (out.items) |s| alloc.free(s.data);
+        out.deinit(alloc);
+    }
+    try dr.readRaw(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+
+    try testing.expectEqual(@as(i32, 2), out.items[0].info.sample_rank);
+    try testing.expectEqual(@as(i32, 1), out.items[0].info.generation_rank);
+    try testing.expectEqual(@as(i32, 1), out.items[0].info.absolute_generation_rank);
+
+    try testing.expectEqual(@as(i32, 1), out.items[1].info.sample_rank);
+    try testing.expectEqual(@as(i32, 1), out.items[1].info.generation_rank);
+    try testing.expectEqual(@as(i32, 1), out.items[1].info.absolute_generation_rank);
+
+    try testing.expectEqual(@as(i32, 0), out.items[2].info.sample_rank);
+    try testing.expectEqual(@as(i32, 0), out.items[2].info.generation_rank);
+    try testing.expectEqual(@as(i32, 0), out.items[2].info.absolute_generation_rank);
+}
+
+test "takeRaw: absolute_generation_rank reflects live generation ahead of a stale queued sample" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    var dr = mkTestReaderForGenerationTests(alloc, &clock);
+    defer deinitTestReader(&dr, alloc);
+
+    const ih: DDS.InstanceHandle_t = 9;
+    const d = try alloc.dupe(u8, &.{0xAA});
+    try dr.pending.append(alloc, PendingChange{
+        .data = d,
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = ih, .valid_data = true, .disposed_generation_count = 0, .no_writers_generation_count = 0 },
+    });
+    // Instance has since disposed and resurrected once more, advancing the live count
+    // past what this still-queued sample was stamped with at receipt time.
+    try dr.seen_instances.put(alloc, ih, .{ .instance_state = DDS.ALIVE_INSTANCE_STATE, .disposed_generation_count = 1, .no_writers_generation_count = 0 });
+
+    const taken = dr.takeRaw() orelse return error.TestExpectedNonNull;
+    defer alloc.free(taken.data);
+    try testing.expectEqual(@as(i32, 0), taken.info.sample_rank);
+    try testing.expectEqual(@as(i32, 0), taken.info.generation_rank);
+    try testing.expectEqual(@as(i32, 1), taken.info.absolute_generation_rank);
 }
