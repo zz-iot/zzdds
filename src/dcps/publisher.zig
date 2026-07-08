@@ -15,6 +15,7 @@ const writer_mod = @import("writer.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 /// All function pointers must remain valid for the lifetime of the PublisherImpl.
@@ -117,6 +118,9 @@ pub const PublisherImpl = struct {
     /// globally unique, write-ordered GSNs rather than independent per-writer sequences.
     group_seq_num_counter: i64,
 
+    pub_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+
     const Self = @This();
 
     pub fn init(
@@ -156,6 +160,8 @@ pub const PublisherImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
+        self.pub_c_abi.free(self.alloc);
+        self.entity_c_abi.free(self.alloc);
         // Destroy all remaining DataWriters.
         for (self.writers.items) |w| {
             self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
@@ -183,7 +189,13 @@ pub const PublisherImpl = struct {
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleEntity,
     };
+
+    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
+    }
 
     // ── DDS.Publisher vtable ──────────────────────────────────────────────────
 
@@ -210,7 +222,18 @@ pub const PublisherImpl = struct {
         .get_default_datawriter_qos = vtGetDefaultDwQos,
         .copy_from_topic_qos = vtCopyFromTopicQos,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandlePublisher,
+        .as_Entity = vtAsEntity,
     };
+
+    fn vtGetCAbiHandlePublisher(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.pub_c_abi.get(self.alloc, ctx, &vtable);
+    }
+
+    fn vtAsEntity(ctx: *anyopaque) DDS.Entity {
+        return .{ .ptr = ctx, .vtable = &entity_vtable };
+    }
 
     fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
         return DDS.RETCODE_OK;

@@ -43,6 +43,7 @@ const qm_mod = @import("qos_match.zig");
 const reader_mod = @import("reader.zig");
 const writer_mod = @import("writer.zig");
 const zidl_rt = @import("zidl_rt");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
@@ -119,9 +120,11 @@ fn noopProtocolReader() proto.ProtocolReader {
 // ── BuiltinTopicDescImpl — minimal TopicDescription for built-in topics ───────
 
 const BuiltinTopicDescImpl = struct {
+    alloc: std.mem.Allocator,
     name: [*:0]const u8,
     type_name: [*:0]const u8,
     participant: DDS.DomainParticipant,
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const vtbl = DDS.TopicDescription.Vtable{
         .get_type_name = struct {
@@ -142,6 +145,12 @@ const BuiltinTopicDescImpl = struct {
         .deinit = struct {
             fn f(_: *anyopaque) void {}
         }.f,
+        .get_c_abi_handle = struct {
+            fn f(ctx: *anyopaque) *anyopaque {
+                const self = cast(ctx);
+                return self.c_abi.get(self.alloc, ctx, &vtbl);
+            }
+        }.f,
     };
 
     fn cast(ctx: *anyopaque) *@This() {
@@ -150,6 +159,10 @@ const BuiltinTopicDescImpl = struct {
 
     fn toTopicDescription(self: *@This()) DDS.TopicDescription {
         return .{ .ptr = self, .vtable = &vtbl };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.c_abi.free(self.alloc);
     }
 };
 
@@ -228,10 +241,10 @@ const BuiltinSubscriberState = struct {
 
         // Embedded topic descriptions — their addresses are stable because self
         // is heap-allocated; assignments here set their initial values.
-        self.part_desc = .{ .name = "DCPSParticipant", .type_name = "ParticipantBuiltinTopicData", .participant = dp };
-        self.topic_desc = .{ .name = "DCPSTopic", .type_name = "TopicBuiltinTopicData", .participant = dp };
-        self.pub_desc = .{ .name = "DCPSPublication", .type_name = "PublicationBuiltinTopicData", .participant = dp };
-        self.sub_desc = .{ .name = "DCPSSubscription", .type_name = "SubscriptionBuiltinTopicData", .participant = dp };
+        self.part_desc = .{ .alloc = alloc, .name = "DCPSParticipant", .type_name = "ParticipantBuiltinTopicData", .participant = dp };
+        self.topic_desc = .{ .alloc = alloc, .name = "DCPSTopic", .type_name = "TopicBuiltinTopicData", .participant = dp };
+        self.pub_desc = .{ .alloc = alloc, .name = "DCPSPublication", .type_name = "PublicationBuiltinTopicData", .participant = dp };
+        self.sub_desc = .{ .alloc = alloc, .name = "DCPSSubscription", .type_name = "SubscriptionBuiltinTopicData", .participant = dp };
 
         // Create all four DataReaders; track how many succeeded for errdefer.
         var readers: [4]*reader_mod.DataReaderImpl = undefined;
@@ -311,6 +324,10 @@ const BuiltinSubscriberState = struct {
         // sub.deinit() calls destroy_proto_reader (noop) + r.deinit() for each
         // reader in sub.readers, which covers our four DataReaderImpls.
         self.sub.deinit();
+        self.part_desc.deinit();
+        self.topic_desc.deinit();
+        self.pub_desc.deinit();
+        self.sub_desc.deinit();
         self.alloc.destroy(self);
     }
 };
@@ -635,6 +652,12 @@ pub const DomainParticipantImpl = struct {
 
     mu: Mutex,
 
+    participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    // ZZDDS.DomainParticipant is a separate "borrowed view" (same ptr, its own
+    // vtable) exposed by src/c_abi/extensions.zig's vendor-extension layer.
+    zzdds_participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+
     const Self = @This();
 
     pub fn init(
@@ -818,6 +841,9 @@ pub const DomainParticipantImpl = struct {
 
         if (self.status_cond) |sc| sc.deinit();
         if (self.builtin_sub) |bs| bs.deinit();
+        self.participant_c_abi.free(self.alloc);
+        self.entity_c_abi.free(self.alloc);
+        self.zzdds_participant_c_abi.free(self.alloc);
 
         // Drain publishers, subscribers, topics.
         // Do NOT hold participant.mu while calling deinit() — publisher/subscriber
@@ -2129,7 +2155,13 @@ pub const DomainParticipantImpl = struct {
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleEntity,
     };
+
+    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
+    }
 
     // ── DomainParticipant vtable ──────────────────────────────────────────────
 
@@ -2175,7 +2207,18 @@ pub const DomainParticipantImpl = struct {
         .contains_entity = vtContainsEntity,
         .get_current_time = vtGetCurrentTime,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleParticipant,
+        .as_Entity = vtAsEntity,
     };
+
+    fn vtGetCAbiHandleParticipant(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.participant_c_abi.get(self.alloc, ctx, &vtable);
+    }
+
+    fn vtAsEntity(ctx: *anyopaque) DDS.Entity {
+        return .{ .ptr = ctx, .vtable = &entity_vtable };
+    }
 
     fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
         return DDS.RETCODE_OK;

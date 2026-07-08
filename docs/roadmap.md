@@ -102,6 +102,75 @@ them) — worth a dedicated look so teardown is fast in all cases, not just cras
 - **Rust** — planned; dual-mode (`pure` via `zidl-rs`; `zig-ffi` for embedded/perf).
   See zidl roadmap for Rust backend steps.
 
+**Configurable allocation for embedded/real-time targets** — zzdds has always aimed to let
+real-time and embedded deployments supply their own allocation strategy (static pools, slab
+allocators) rather than being locked to a default heap, but this hasn't been prioritized as
+an end-user-facing configuration surface yet, in zzdds itself or in the generated bindings.
+Three separate tiers, in priority order:
+
+- **Tier 1 — structural/bookkeeping** (entity impl structs, and the entity-handle heap-boxing
+  now implemented on the zidl side — see "Entity handle ABI: heap-boxing" in the zidl
+  roadmap). Small, low-frequency, lifecycle-bound allocations. Every concrete impl already
+  stores its own `alloc: std.mem.Allocator`, inherited from whatever created it — the gap is
+  making that genuinely end-user-configurable (at `DomainParticipantFactory`/`create_participant`
+  time, the same way QoS already flows down the entity hierarchy) rather than hardcoded at
+  whatever call site currently supplies it, plus a process-wide bootstrap default for
+  constructing the factory itself before any participant exists.
+  **Required, not optional**: every concrete impl now needs a `get_c_abi_handle` vtable
+  implementation (zidl's generated vtables already declare this slot) that lazily creates and
+  *caches* its own C-ABI handle — via `zidl_rt.boxEntity`, using `self.alloc` — reused on every
+  subsequent call and freed in that same object's `deinit()`. This isn't just an allocator
+  nicety: skipping the cache-and-reuse pattern (e.g. boxing fresh on every call) breaks handle
+  identity for accessor operations and leaks a box on every call to a widened-view accessor
+  (`get_entity()`, `lookup_topicdescription()`, etc.) — objects that return a widened view of
+  themselves or another object need their own cache slot for that view too, freed the same way.
+
+  **Done**, against a local-path zidl checkout (not yet a tagged release — see below). A
+  diagnostic build first surfaced 31 compile errors (29× missing `get_c_abi_handle`, 2×
+  listener-dispatch sites in `subscriber.zig` needing to box entity args before firing a
+  callback); the real implementation found 17 listener-dispatch sites total (writer.zig had
+  4 more, reader.zig had ~10 more, matching the predicted pattern) and covers every hand-written
+  vtable literal: all ~15 nil sentinels in `nil.zig`, `topic.zig`, `participant.zig`,
+  `publisher.zig`, `subscriber.zig`, `reader.zig`, `writer.zig`, `waitset.zig`, `factory.zig`,
+  and (once found necessary) `c_abi/extensions.zig`'s own `ZZDDS.*` vtables. A shared
+  `CachedCAbiHandle` helper (`src/util/c_abi_handle.zig`) centralizes the lazy-box-and-reuse
+  pattern; objects presenting more than one distinct (ptr, vtable) view of themselves (e.g.
+  `TopicImpl` as `Topic`, `Entity`, and `TopicDescription`) got one cache field per view.
+- **Tier 2 — data-plane** (history cache sample storage; CDR serialize/deserialize scratch
+  buffers — the latter is the already-tracked `ZidlCdrAllocator` gap, see the zidl roadmap's
+  Known Gaps). Higher-frequency, latency-sensitive, size-variable — the category real-time
+  users actually care most about controlling. A separate configuration surface from Tier 1,
+  same discipline: route through a swappable interface, never hardcode an allocator choice in
+  generated per-type code.
+- **Tier 3 — per-entity-kind or per-topic overrides** (e.g. distinct pools for readers vs.
+  writers). Explicitly deferred — plausible eventually as an optional override on top of
+  Tier 1/2's default-from-parent, but not designed; don't build ahead of a real use case.
+
+**C++ generated binding allocator injection** — a fourth, orthogonal axis, not covered by the
+tiers above: `std::vector`/`std::string` inside `--cpp-generate-impl` output use the global
+allocator unless parameterized, and C++ allocator customization is a compile-time template
+concern, not a runtime value — it can't share any of the Tier 1/2 runtime machinery. Likely
+means injecting an allocator header/type into generated code via a zidl flag. Deferred; no
+design work done yet.
+
+**C++ entity wrapper identity** — a zidl backend task, not a zzdds one (see "C++ backend:
+entity wrapper identity" in the zidl roadmap). `ConcreteImplGenerator` constructs a fresh
+`std::make_shared<FooImpl>(_h)` on every entity-returning operation, so e.g. calling
+`get_topic()` twice returns non-identity-equal wrapper objects for the same entity (no leak —
+`shared_ptr` RAII still cleans up correctly — just no identity guarantee). Only became
+practically fixable once the Zig-side `get_c_abi_handle` work made the underlying C handle
+itself stable across calls; nothing to do on zzdds's side since zzdds doesn't hand-write its
+own C++ bindings.
+
+**`as_{Base}` upcast migration** — Done, against the local-path zidl checkout. zidl now
+generates the ~12 DDS-internal upcasts zzdds used to hand-write (`DDS_Topic_as_DDS_Entity`,
+`DDS_GuardCondition_as_DDS_Condition`, ...) plus, discovered mid-migration, the *upcast*
+direction of the `ZZDDS.* ↔ DDS.*` conversions too (`zzdds_Topic_as_DDS_Topic` and 4 siblings)
+— `zzdds.idl` declares real IDL bases (`interface Topic : DDS::Topic`) that were easy to miss.
+Only the downcast direction (`DDS_Topic_as_zzdds_Topic` and siblings, requiring a runtime
+vtable-identity check IDL can't express) stays hand-written in `c_abi/extensions.zig`. See
+zidl's roadmap ("Zig backend: `as_{Base}` upcast vtable slot") for the generator-side design.
+
 **DDS Security v1.2** — Authentication (PKI-DH), AccessControl, Cryptographic (AES-GCM).
 First step: fix `Cryptographic.encode_payload` to use a tagged-union return (see
 `docs/design/security-pipeline.md`).

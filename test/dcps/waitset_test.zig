@@ -51,6 +51,9 @@ fn entGetIH(_: *anyopaque) DDS.InstanceHandle_t {
     return 0;
 }
 fn entNoDeinit(_: *anyopaque) void {}
+fn entNoCAbiHandle(_: *anyopaque) *anyopaque {
+    unreachable;
+}
 
 const stub_entity_vtable = DDS.Entity.Vtable{
     .enable = entEnable,
@@ -58,6 +61,7 @@ const stub_entity_vtable = DDS.Entity.Vtable{
     .get_status_changes = entGetStatusChanges,
     .get_instance_handle = entGetIH,
     .deinit = entNoDeinit,
+    .get_c_abi_handle = entNoCAbiHandle,
 };
 
 fn stubEntity() DDS.Entity {
@@ -155,6 +159,12 @@ fn drNoop23(_: *anyopaque, _: *DDS.PublicationBuiltinTopicData, _: DDS.InstanceH
     unreachable;
 }
 fn drNoDeinit(_: *anyopaque) void {}
+fn drNoCAbiHandle(_: *anyopaque) *anyopaque {
+    unreachable;
+}
+fn drNoAsEntity(_: *anyopaque) DDS.Entity {
+    unreachable;
+}
 
 const stub_dr_vtable = DDS.DataReader.Vtable{
     .enable = drNoop1,
@@ -181,6 +191,8 @@ const stub_dr_vtable = DDS.DataReader.Vtable{
     .get_matched_publications = drNoop22,
     .get_matched_publication_data = drNoop23,
     .deinit = drNoDeinit,
+    .get_c_abi_handle = drNoCAbiHandle,
+    .as_Entity = drNoAsEntity,
 };
 
 fn stubDataReader() DDS.DataReader {

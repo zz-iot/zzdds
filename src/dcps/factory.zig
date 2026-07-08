@@ -19,6 +19,7 @@ const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
 const trace_mod = @import("../trace.zig");
 const clock_registry_mod = @import("../util/clock_registry.zig");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 pub const ClockRegistry = clock_registry_mod.ClockRegistry;
 
@@ -45,6 +46,8 @@ pub const DomainParticipantFactoryImpl = struct {
     next_handle: DDS.InstanceHandle_t,
 
     mu: Mutex,
+
+    fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -78,6 +81,7 @@ pub const DomainParticipantFactoryImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.fac_c_abi.free(self.alloc);
         for (self.participants.items) |p| p.deinit();
         self.participants.deinit(self.alloc);
         self.clock_registry.deinit();
@@ -106,7 +110,13 @@ pub const DomainParticipantFactoryImpl = struct {
         .set_qos = vtSetQos,
         .get_qos = vtGetQos,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleFactory,
     };
+
+    fn vtGetCAbiHandleFactory(ctx: *anyopaque) *anyopaque {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.fac_c_abi.get(self.alloc, ctx, &vtable);
+    }
 
     fn vtCreateParticipant(
         ctx: *anyopaque,

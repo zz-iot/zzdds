@@ -19,6 +19,7 @@ const filter_mod = @import("filter.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const Condvar = @import("../util/condvar.zig").Condvar;
 const time_mod = @import("../util/time.zig");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 // ── Push-notification types ───────────────────────────────────────────────────
 
@@ -87,6 +88,7 @@ pub const WaitSetImpl = struct {
     cv_mu: Mutex, // protects `notified`
     cv_cond: Condvar,
     notified: bool,
+    ws_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -104,6 +106,7 @@ pub const WaitSetImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.ws_c_abi.free(self.alloc);
         self.conditions.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -118,7 +121,13 @@ pub const WaitSetImpl = struct {
         .detach_condition = vtDetach,
         .get_conditions = vtGetConditions,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleWaitSet,
     };
+
+    fn vtGetCAbiHandleWaitSet(ctx: *anyopaque) *anyopaque {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.ws_c_abi.get(self.alloc, ctx, &vtable);
+    }
 
     /// Condvar-based wait: blocks until at least one attached condition is
     /// triggered or the timeout elapses.  Triggered conditions are appended
@@ -288,6 +297,8 @@ pub const GuardConditionImpl = struct {
     alloc: std.mem.Allocator,
     trigger: bool,
     wakeups: WakeupList,
+    gc_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    cond_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -298,6 +309,8 @@ pub const GuardConditionImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.gc_c_abi.free(self.alloc);
+        self.cond_c_abi.free(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -313,12 +326,29 @@ pub const GuardConditionImpl = struct {
         .get_trigger_value = vtGetTrigger,
         .set_trigger_value = vtSetTrigger,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleGuardCondition,
+        .as_Condition = vtAsConditionGuard,
     };
+
+    fn vtAsConditionGuard(ctx: *anyopaque) DDS.Condition {
+        return .{ .ptr = ctx, .vtable = &cond_vtable };
+    }
+
+    fn vtGetCAbiHandleGuardCondition(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.gc_c_abi.get(self.alloc, ctx, &vtable);
+    }
 
     pub const cond_vtable = DDS.Condition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleCondition,
     };
+
+    fn vtGetCAbiHandleCondition(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.cond_c_abi.get(self.alloc, ctx, &cond_vtable);
+    }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
         return cast(ctx).trigger;
@@ -363,6 +393,8 @@ pub const ReadConditionImpl = struct {
     add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) void,
     /// Called by vtDetach: removes the DataNotifyFn keyed by waitset_ctx pointer.
     remove_notify_fn: *const fn (reader_ctx: *anyopaque, waitset_ctx: *anyopaque) void,
+    rc_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    cond_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -393,6 +425,8 @@ pub const ReadConditionImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.rc_c_abi.free(self.alloc);
+        self.cond_c_abi.free(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -411,12 +445,29 @@ pub const ReadConditionImpl = struct {
         .get_instance_state_mask = vtGetInstMask,
         .get_datareader = vtGetReader,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleReadCondition,
+        .as_Condition = vtAsConditionRead,
     };
+
+    fn vtAsConditionRead(ctx: *anyopaque) DDS.Condition {
+        return .{ .ptr = ctx, .vtable = &cond_vtable };
+    }
+
+    fn vtGetCAbiHandleReadCondition(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.rc_c_abi.get(self.alloc, ctx, &vtable);
+    }
 
     pub const cond_vtable = DDS.Condition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleCondition,
     };
+
+    fn vtGetCAbiHandleCondition(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.cond_c_abi.get(self.alloc, ctx, &cond_vtable);
+    }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
         const self = cast(ctx);
@@ -458,6 +509,8 @@ pub const StatusConditionImpl = struct {
     enabled_statuses: DDS.StatusMask,
     get_status_fn: *const fn (entity_ptr: *anyopaque) DDS.StatusMask,
     wakeups: WakeupList,
+    sc_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    cond_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -478,6 +531,8 @@ pub const StatusConditionImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.sc_c_abi.free(self.alloc);
+        self.cond_c_abi.free(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -500,12 +555,29 @@ pub const StatusConditionImpl = struct {
         .set_enabled_statuses = vtSetEnabled,
         .get_entity = vtGetEntity,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleStatusCondition,
+        .as_Condition = vtAsConditionStatus,
     };
+
+    fn vtAsConditionStatus(ctx: *anyopaque) DDS.Condition {
+        return .{ .ptr = ctx, .vtable = &cond_vtable };
+    }
+
+    fn vtGetCAbiHandleStatusCondition(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.sc_c_abi.get(self.alloc, ctx, &vtable);
+    }
 
     pub const cond_vtable = DDS.Condition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleCondition,
     };
+
+    fn vtGetCAbiHandleCondition(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.cond_c_abi.get(self.alloc, ctx, &cond_vtable);
+    }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
         const self = cast(ctx);
@@ -557,6 +629,7 @@ pub const QueryConditionImpl = struct {
     /// returns error.ParseError from init, so the caller returns NIL.
     /// AST node slices borrow from `query_expression`; free before it.
     parsed_expr: ?*filter_mod.AstNode,
+    qc_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -616,6 +689,12 @@ pub const QueryConditionImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
+        self.qc_c_abi.free(self.alloc);
+        // self.rc is embedded by value, not a separately-owned ReadConditionImpl,
+        // so ReadConditionImpl.deinit() (which would also alloc.destroy(&self.rc))
+        // can't be called here — free its cache fields directly instead.
+        self.rc.rc_c_abi.free(self.alloc);
+        self.rc.cond_c_abi.free(self.alloc);
         for (self.query_parameters.items) |p| self.alloc.free(p);
         self.query_parameters.deinit(self.alloc);
         self.alloc.free(self.query_expression);
@@ -665,7 +744,21 @@ pub const QueryConditionImpl = struct {
         .get_query_parameters = vtGetParams,
         .set_query_parameters = vtSetParams,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleQueryCondition,
+        .as_ReadCondition = vtAsReadCondition,
     };
+
+    // The "ReadCondition view" of a QueryCondition is the embedded
+    // ReadConditionImpl's own view (a different `ptr` — `&self.rc`, not
+    // `ctx`), same as `toCondition()` above already delegates to it.
+    fn vtAsReadCondition(ctx: *anyopaque) DDS.ReadCondition {
+        return cast(ctx).rc.toDDSReadCondition();
+    }
+
+    fn vtGetCAbiHandleQueryCondition(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.qc_c_abi.get(self.alloc, ctx, &vtable);
+    }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
         const self = cast(ctx);

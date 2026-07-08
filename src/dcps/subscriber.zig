@@ -16,6 +16,7 @@ const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 pub const ParticipantCbs = struct {
@@ -99,6 +100,9 @@ pub const SubscriberImpl = struct {
     readers: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl),
     mu: Mutex,
 
+    sub_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+
     const Self = @This();
 
     pub fn init(
@@ -135,6 +139,8 @@ pub const SubscriberImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
+        self.sub_c_abi.free(self.alloc);
+        self.entity_c_abi.free(self.alloc);
         for (self.readers.items) |r| {
             self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
             r.deinit();
@@ -161,7 +167,13 @@ pub const SubscriberImpl = struct {
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleEntity,
     };
+
+    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
+    }
 
     // ── DDS.Subscriber vtable ─────────────────────────────────────────────────
 
@@ -187,7 +199,18 @@ pub const SubscriberImpl = struct {
         .get_default_datareader_qos = vtGetDefaultDrQos,
         .copy_from_topic_qos = vtCopyFromTopicQos,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleSubscriber,
+        .as_Entity = vtAsEntity,
     };
+
+    fn vtGetCAbiHandleSubscriber(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.sub_c_abi.get(self.alloc, ctx, &vtable);
+    }
+
+    fn vtAsEntity(ctx: *anyopaque) DDS.Entity {
+        return .{ .ptr = ctx, .vtable = &entity_vtable };
+    }
 
     fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
         return DDS.RETCODE_OK;
@@ -373,7 +396,7 @@ pub const SubscriberImpl = struct {
         for (self.readers.items) |r| {
             if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
                 const dr = r.toDDSDataReader();
-                if (r.listener.on_data_available) |cb| cb(dr, r.listener.listener_data);
+                if (r.listener.on_data_available) |cb| cb(dr.vtable.get_c_abi_handle(dr.ptr), r.listener.listener_data);
             }
         }
         return DDS.RETCODE_OK;
@@ -530,7 +553,7 @@ pub const SubscriberImpl = struct {
         // Listener context validity is the application's responsibility (standard DDS
         // contract: don't delete a reader while its callbacks may be in-flight).
         for (listener_snaps.items) |snap| {
-            if (snap.listener.on_data_available) |cb| cb(snap.dr, snap.listener.listener_data);
+            if (snap.listener.on_data_available) |cb| cb(snap.dr.vtable.get_c_abi_handle(snap.dr.ptr), snap.listener.listener_data);
         }
         return DDS.RETCODE_OK;
     }

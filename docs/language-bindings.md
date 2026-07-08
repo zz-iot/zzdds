@@ -71,40 +71,58 @@ DDS_DataReaderListener listener = {
 DDS_DataReader r = DDS_Subscriber_create_datareader(sub, t, NULL, &listener, 0);
 ```
 
-**Architecture: C-ABI primary**
+**Architecture: uniform heap-boxing at the C-ABI boundary**
 
-The Zig vtable methods use C-ABI types directly — sentinel strings
-(`[*:0]const u8`), struct pointers (`*const DDS.TopicQos`), and callback struct
-pointers (`?*const DDS.TopicListener`).  The C export functions are trivial
-one-line forwarders with no conversion logic:
+Every non-listener entity interface crosses the C-ABI as a single opaque
+pointer — `DDS_Topic`, `DDS_Entity`, `DDS_DataReader`, and so on are all
+`typedef struct Foo_s *Foo;`, uniformly, regardless of how many real
+implementations exist behind the interface.  The native Zig vtable methods
+never see that opaque form at all — internally they keep operating on the
+real `{ptr, vtable}` fat-pointer value; boxing/unboxing happens only inside
+the generated `pub export fn` wrapper, which unboxes `self` (and any
+entity-typed parameters) before dispatching, and boxes any entity-typed
+return value via a synthetic `get_c_abi_handle` vtable slot before handing it
+back to the C caller:
 
 ```zig
-pub export fn DDS_Topic_get_name(self: DDS.Topic) callconv(.c) [*:0]const u8 {
-    return self.vtable.get_name(self.ptr);
+pub export fn DDS_Topic_get_name(self: *anyopaque) callconv(.c) [*:0]const u8 {
+    const _self: DDS.Topic = zidl_rt.unboxAs(DDS.Topic, self);
+    return _self.vtable.get_name(_self.ptr);
 }
 ```
 
-Listener interfaces (annotated `@callback` in `dcps.idl`) are plain C callback
-structs — no heap allocation, no adapter, no fat-pointer form:
+Each concrete implementation's `get_c_abi_handle` is expected to cache and
+reuse its own boxed handle (freed in that object's own `deinit`) — this is
+what makes repeated accessor calls return an identity-stable (`==`-comparable)
+handle and keeps widened-view accessors like `get_entity()` from leaking a
+fresh box on every call.  See zidl's `docs/ecosystem.md` ("`--zig-generate-c-api`
+C-ABI export layer") for the full design and rationale.
+
+Listener interfaces (annotated `@callback` in `dcps.idl`) are still plain C
+callback structs — no heap allocation, no adapter struct — but any
+entity-typed callback parameter is boxed the same way, since the same struct
+type is shared between C-ABI registration and pure Zig-native code:
 
 ```zig
 pub const noop_TopicListener: DDS.TopicListener = .{};  // null function ptrs
 
 // Invocation in zzdds (e.g. on inconsistent topic):
 if (self.listener.on_inconsistent_topic) |cb|
-    cb(topic, &status, self.listener.listener_data);
+    cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
 ```
 
 **Generation:** two zidl steps:
 1. `zidl -b c --generate-interfaces dcps.idl` → `dcps.h` (opaque typedefs + free
    function declarations + QoS/status types; listener structs match Zig layout)
 2. `zidl -b zig --generate-c-api dcps.idl` → Zig `pub export fn callconv(.c)`
-   trivial forwarders; no `CXxxListenerAdapter` structs needed
+   wrappers (unbox `self`/entity params, box entity returns via
+   `get_c_abi_handle`); no `CXxxListenerAdapter` structs needed
 
 **Idiomatic Zig binding:** A future generated `dcps_zig.zig` will provide ergonomic
-helpers (closure-based listeners, slice-friendly QoS builders).  For now, the Zig
-vtable IS the C-ABI; Zig callers use `std.mem.span()` to convert strings and
-dereference struct pointer params.
+helpers (closure-based listeners, slice-friendly QoS builders).  For now, Zig
+callers use the native fat-pointer vtable directly (not the boxed C-ABI form —
+those are two different representations of the same value, see above); use
+`std.mem.span()` to convert strings and dereference struct pointer params.
 
 **Performance:** the hot-path typed operations (`write`, `read`, `take`) are
 generated per-type from the user's own IDL and use only C-compatible types

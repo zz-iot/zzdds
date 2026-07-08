@@ -16,6 +16,7 @@ const proto = @import("../protocol/interface.zig");
 const history_mod = @import("../rtps/history.zig");
 const waitset = @import("waitset.zig");
 const time_mod = @import("../util/time.zig");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 const Guid = proto.Guid;
 
@@ -81,6 +82,11 @@ pub const DataWriterImpl = struct {
     /// Populated on the first alive write per instance; never overwritten.
     key_registry: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, []u8) = .empty,
 
+    dw_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    // ZZDDS.DataWriter borrowed view — see src/c_abi/extensions.zig.
+    zzdds_dw_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+
     const Self = @This();
 
     pub fn init(
@@ -128,6 +134,9 @@ pub const DataWriterImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
+        self.dw_c_abi.free(self.alloc);
+        self.entity_c_abi.free(self.alloc);
+        self.zzdds_dw_c_abi.free(self.alloc);
         self.qos.deinit(self.alloc);
         {
             var it = self.key_registry.valueIterator();
@@ -288,7 +297,7 @@ pub const DataWriterImpl = struct {
             self.status_changes &= ~DDS.PUBLICATION_MATCHED_STATUS;
             self.pub_matched_total_change = 0;
             self.pub_matched_current_change = 0;
-            if (self.listener.on_publication_matched) |cb| cb(self.toDDSDataWriter(), &status, self.listener.listener_data);
+            if (self.listener.on_publication_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
         }
     }
 
@@ -311,7 +320,7 @@ pub const DataWriterImpl = struct {
             status.last_policy_id = policy_id;
             self.incompat_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
-            if (self.listener.on_offered_incompatible_qos) |cb| cb(self.toDDSDataWriter(), &status, self.listener.listener_data);
+            if (self.listener.on_offered_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
         }
     }
 
@@ -328,7 +337,7 @@ pub const DataWriterImpl = struct {
             status.total_count_change = 1;
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_DEADLINE_MISSED_STATUS;
-            if (self.listener.on_offered_deadline_missed) |cb| cb(self.toDDSDataWriter(), &status, self.listener.listener_data);
+            if (self.listener.on_offered_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
         }
     }
 
@@ -345,7 +354,7 @@ pub const DataWriterImpl = struct {
             status.total_count_change = 1;
             self.liveliness_lost_total_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_LOST_STATUS;
-            if (self.listener.on_liveliness_lost) |cb| cb(self.toDDSDataWriter(), &status, self.listener.listener_data);
+            if (self.listener.on_liveliness_lost) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
         }
     }
 
@@ -392,7 +401,13 @@ pub const DataWriterImpl = struct {
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleEntity,
     };
+
+    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
+    }
 
     // ── DDS.DataWriter vtable ─────────────────────────────────────────────────
 
@@ -416,7 +431,18 @@ pub const DataWriterImpl = struct {
         .get_matched_subscriptions = vtGetMatchedSubs,
         .get_matched_subscription_data = vtGetMatchedSubData,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleDataWriter,
+        .as_Entity = vtAsEntity,
     };
+
+    fn vtGetCAbiHandleDataWriter(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.dw_c_abi.get(self.alloc, ctx, &vtable);
+    }
+
+    fn vtAsEntity(ctx: *anyopaque) DDS.Entity {
+        return .{ .ptr = ctx, .vtable = &entity_vtable };
+    }
 
     fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
         return DDS.RETCODE_OK;

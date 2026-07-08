@@ -8,7 +8,9 @@
 //!
 //! Use `isNil(entity)` to check whether a returned entity is nil.
 
+const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 /// Single-byte storage whose address serves as the nil-entity sentinel.
 pub var nil_storage: u8 = 0;
@@ -19,6 +21,11 @@ pub fn isNil(entity: anytype) bool {
     return entity.ptr == NIL_PTR;
 }
 
+// Nil entities are process-lifetime singletons (never individually freed), so
+// each get_c_abi_handle below caches its one box with std.heap.c_allocator —
+// there is no natural per-instance allocator to draw from, unlike real impls.
+const nil_alloc = std.heap.c_allocator;
+
 // ── Nil StatusCondition (shared by all nil entities that need one) ─────────
 
 var nil_sc_vtable = DDS.StatusCondition.Vtable{
@@ -27,7 +34,13 @@ var nil_sc_vtable = DDS.StatusCondition.Vtable{
     .set_enabled_statuses = scSetEnabled,
     .get_entity = scGetEntity,
     .deinit = nilDeinit,
+    .get_c_abi_handle = scGetCAbiHandle,
+    .as_Condition = nilAsCondition,
 };
+var nil_sc_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn scGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_sc_c_abi.get(nil_alloc, ctx, &nil_sc_vtable);
+}
 fn scGetTrigger(_: *anyopaque) bool {
     return false;
 }
@@ -50,8 +63,13 @@ var nil_entity_vtable = DDS.Entity.Vtable{
     .get_status_changes = nilGetStatusChanges,
     .get_instance_handle = nilGetHandle,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilEntityGetCAbiHandle,
 };
 pub const nil_entity = DDS.Entity{ .ptr = NIL_PTR, .vtable = &nil_entity_vtable };
+var nil_entity_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilEntityGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_entity_c_abi.get(nil_alloc, ctx, &nil_entity_vtable);
+}
 fn nilEnable(_: *anyopaque) DDS.ReturnCode_t {
     return DDS.RETCODE_ERROR;
 }
@@ -65,6 +83,23 @@ fn nilGetHandle(_: *anyopaque) DDS.InstanceHandle_t {
     return DDS.HANDLE_NIL;
 }
 pub fn nilDeinit(_: *anyopaque) void {}
+
+// Shared `as_{Base}` implementations for nil vtables — every nil entity's
+// upcast just returns the corresponding shared nil singleton, regardless of
+// which nil vtable is asking, so one function per base interface is reused
+// across every nil vtable that declares it.
+fn nilAsEntity(_: *anyopaque) DDS.Entity {
+    return nil_entity;
+}
+fn nilAsCondition(_: *anyopaque) DDS.Condition {
+    return nil_condition;
+}
+fn nilAsTopicDescription(_: *anyopaque) DDS.TopicDescription {
+    return nil_topic_description;
+}
+fn nilAsReadCondition(_: *anyopaque) DDS.ReadCondition {
+    return nil_readcondition;
+}
 
 // Nil listener constants: all function pointers null (zero-init).
 pub const nil_topic_listener = DDS.noop_TopicListener;
@@ -259,8 +294,14 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilParticipantGetCAbiHandle,
+    .as_Entity = nilAsEntity,
 };
 pub const nil_participant = DDS.DomainParticipant{ .ptr = NIL_PTR, .vtable = &nil_participant_vtable };
+var nil_participant_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilParticipantGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_participant_c_abi.get(nil_alloc, ctx, &nil_participant_vtable);
+}
 
 // ── Nil Publisher ─────────────────────────────────────────────────────────────
 
@@ -357,8 +398,14 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilPublisherGetCAbiHandle,
+    .as_Entity = nilAsEntity,
 };
 pub const nil_publisher = DDS.Publisher{ .ptr = NIL_PTR, .vtable = &nil_publisher_vtable };
+var nil_publisher_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilPublisherGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_publisher_c_abi.get(nil_alloc, ctx, &nil_publisher_vtable);
+}
 
 // ── Nil Subscriber ────────────────────────────────────────────────────────────
 
@@ -450,8 +497,14 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilSubscriberGetCAbiHandle,
+    .as_Entity = nilAsEntity,
 };
 pub const nil_subscriber = DDS.Subscriber{ .ptr = NIL_PTR, .vtable = &nil_subscriber_vtable };
+var nil_subscriber_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilSubscriberGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_subscriber_c_abi.get(nil_alloc, ctx, &nil_subscriber_vtable);
+}
 
 // ── Nil DataWriter ────────────────────────────────────────────────────────────
 
@@ -531,8 +584,14 @@ var nil_datawriter_vtable = DDS.DataWriter.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilDatawriterGetCAbiHandle,
+    .as_Entity = nilAsEntity,
 };
 pub const nil_datawriter = DDS.DataWriter{ .ptr = NIL_PTR, .vtable = &nil_datawriter_vtable };
+var nil_datawriter_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilDatawriterGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_datawriter_c_abi.get(nil_alloc, ctx, &nil_datawriter_vtable);
+}
 
 // ── Nil DataReader ────────────────────────────────────────────────────────────
 
@@ -637,8 +696,14 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilDatareaderGetCAbiHandle,
+    .as_Entity = nilAsEntity,
 };
 pub const nil_datareader = DDS.DataReader{ .ptr = NIL_PTR, .vtable = &nil_datareader_vtable };
+var nil_datareader_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilDatareaderGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_datareader_c_abi.get(nil_alloc, ctx, &nil_datareader_vtable);
+}
 
 // ── Nil Topic / TopicDescription ─────────────────────────────────────────────
 
@@ -659,8 +724,13 @@ var nil_topic_description_vtable = DDS.TopicDescription.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilTopicDescriptionGetCAbiHandle,
 };
 pub const nil_topic_description = DDS.TopicDescription{ .ptr = NIL_PTR, .vtable = &nil_topic_description_vtable };
+var nil_topic_description_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilTopicDescriptionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_topic_description_c_abi.get(nil_alloc, ctx, &nil_topic_description_vtable);
+}
 
 var nil_topic_vtable = DDS.Topic.Vtable{
     .enable = nilEnable,
@@ -708,8 +778,15 @@ var nil_topic_vtable = DDS.Topic.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilTopicGetCAbiHandle,
+    .as_Entity = nilAsEntity,
+    .as_TopicDescription = nilAsTopicDescription,
 };
 pub const nil_topic = DDS.Topic{ .ptr = NIL_PTR, .vtable = &nil_topic_vtable };
+var nil_topic_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilTopicGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_topic_c_abi.get(nil_alloc, ctx, &nil_topic_vtable);
+}
 
 // ── Nil ContentFilteredTopic ──────────────────────────────────────────────────
 
@@ -750,8 +827,14 @@ var nil_cft_vtable = DDS.ContentFilteredTopic.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilCftGetCAbiHandle,
+    .as_TopicDescription = nilAsTopicDescription,
 };
 pub const nil_cft = DDS.ContentFilteredTopic{ .ptr = NIL_PTR, .vtable = &nil_cft_vtable };
+var nil_cft_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilCftGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_cft_c_abi.get(nil_alloc, ctx, &nil_cft_vtable);
+}
 
 // ── Nil MultiTopic ────────────────────────────────────────────────────────────
 
@@ -787,8 +870,14 @@ var nil_multitopic_vtable = DDS.MultiTopic.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilMultitopicGetCAbiHandle,
+    .as_TopicDescription = nilAsTopicDescription,
 };
 pub const nil_multitopic = DDS.MultiTopic{ .ptr = NIL_PTR, .vtable = &nil_multitopic_vtable };
+var nil_multitopic_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilMultitopicGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_multitopic_c_abi.get(nil_alloc, ctx, &nil_multitopic_vtable);
+}
 
 // ── Nil Conditions ────────────────────────────────────────────────────────────
 
@@ -799,8 +888,13 @@ var nil_condition_vtable = DDS.Condition.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilConditionGetCAbiHandle,
 };
 pub const nil_condition = DDS.Condition{ .ptr = NIL_PTR, .vtable = &nil_condition_vtable };
+var nil_condition_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilConditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_condition_c_abi.get(nil_alloc, ctx, &nil_condition_vtable);
+}
 
 var nil_readcondition_vtable = DDS.ReadCondition.Vtable{
     .get_trigger_value = struct {
@@ -829,8 +923,14 @@ var nil_readcondition_vtable = DDS.ReadCondition.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilReadconditionGetCAbiHandle,
+    .as_Condition = nilAsCondition,
 };
 pub const nil_readcondition = DDS.ReadCondition{ .ptr = NIL_PTR, .vtable = &nil_readcondition_vtable };
+var nil_readcondition_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilReadconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_readcondition_c_abi.get(nil_alloc, ctx, &nil_readcondition_vtable);
+}
 
 var nil_querycondition_vtable = DDS.QueryCondition.Vtable{
     .get_trigger_value = struct {
@@ -874,8 +974,14 @@ var nil_querycondition_vtable = DDS.QueryCondition.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilQueryconditionGetCAbiHandle,
+    .as_ReadCondition = nilAsReadCondition,
 };
 pub const nil_querycondition = DDS.QueryCondition{ .ptr = NIL_PTR, .vtable = &nil_querycondition_vtable };
+var nil_querycondition_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilQueryconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_querycondition_c_abi.get(nil_alloc, ctx, &nil_querycondition_vtable);
+}
 
 // ── Nil DomainParticipantFactory ──────────────────────────────────────────────
 
@@ -918,5 +1024,10 @@ var nil_factory_vtable = DDS.DomainParticipantFactory.Vtable{
         }
     }.f,
     .deinit = nilDeinit,
+    .get_c_abi_handle = nilFactoryGetCAbiHandle,
 };
 pub const nil_factory = DDS.DomainParticipantFactory{ .ptr = NIL_PTR, .vtable = &nil_factory_vtable };
+var nil_factory_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilFactoryGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_factory_c_abi.get(nil_alloc, ctx, &nil_factory_vtable);
+}

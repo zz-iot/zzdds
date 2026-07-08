@@ -23,6 +23,7 @@ const waitset = @import("waitset.zig");
 const writer_mod = @import("writer.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
+const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 const Guid = proto.Guid;
 
@@ -294,6 +295,11 @@ pub const DataReaderImpl = struct {
     /// Used to determine view_state (NEW_VIEW vs NOT_NEW_VIEW) at enqueue time.
     seen_instances: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, InstanceEntry),
 
+    dr_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    // ZZDDS.DataReader borrowed view — see src/c_abi/extensions.zig.
+    zzdds_dr_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+
     const OwnerEntry = struct { guid: Guid, strength: i32 };
     const Self = @This();
 
@@ -360,6 +366,9 @@ pub const DataReaderImpl = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.status_cond) |sc| sc.deinit();
+        self.dr_c_abi.free(self.alloc);
+        self.entity_c_abi.free(self.alloc);
+        self.zzdds_dr_c_abi.free(self.alloc);
         self.data_notifiers.deinit(self.alloc);
         // Drain pending queues (including coherent buffers).
         for (self.pending.items) |p| p.deinit();
@@ -470,7 +479,7 @@ pub const DataReaderImpl = struct {
         self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
         if (self.status_cond) |sc| sc.notifyWakeup();
         if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-            if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
+            if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
         }
     }
 
@@ -503,7 +512,7 @@ pub const DataReaderImpl = struct {
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
+                if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
             }
         }
     }
@@ -693,7 +702,7 @@ pub const DataReaderImpl = struct {
             if (transition_committed or data_committed) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
                 if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                    if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
+                    if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
                 }
             }
             return;
@@ -800,7 +809,7 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (fire) {
-                if (self.listener.on_sample_rejected) |cb| cb(self.toDDSDataReader(), &.{
+                if (self.listener.on_sample_rejected) |cb| cb(vtable.get_c_abi_handle(self), &.{
                     .total_count = self.sample_rejected_total,
                     .total_count_change = 1,
                     .last_reason = reason,
@@ -862,8 +871,7 @@ pub const DataReaderImpl = struct {
 
         // Fire listener if registered for DATA_AVAILABLE.
         if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-            const dr = self.toDDSDataReader();
-            if (self.listener.on_data_available) |cb| cb(dr, self.listener.listener_data);
+            if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
         }
     }
 
@@ -926,7 +934,7 @@ pub const DataReaderImpl = struct {
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
+                if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
             }
         }
     }
@@ -1084,7 +1092,7 @@ pub const DataReaderImpl = struct {
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                if (self.listener.on_data_available) |cb| cb(self.toDDSDataReader(), self.listener.listener_data);
+                if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
             }
         }
     }
@@ -1466,7 +1474,7 @@ pub const DataReaderImpl = struct {
             status.total_count = self.incompat_total;
             status.total_count_change = 1;
             status.last_policy_id = policy_id;
-            if (self.listener.on_requested_incompatible_qos) |cb| cb(self.toDDSDataReader(), &status, self.listener.listener_data);
+            if (self.listener.on_requested_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
         }
     }
 
@@ -1501,7 +1509,7 @@ pub const DataReaderImpl = struct {
             self.sub_matched_total_change = 0;
             self.sub_matched_current_change = 0;
             self.mu.unlock();
-            if (self.listener.on_subscription_matched) |cb| cb(self.toDDSDataReader(), &status, self.listener.listener_data);
+            if (self.listener.on_subscription_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
         }
     }
 
@@ -1524,7 +1532,7 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         if (self.status_cond) |sc| sc.notifyWakeup();
         if (fire) {
-            if (self.listener.on_sample_lost) |cb| cb(self.toDDSDataReader(), &.{
+            if (self.listener.on_sample_lost) |cb| cb(vtable.get_c_abi_handle(self), &.{
                 .total_count = self.sample_lost_total,
                 .total_count_change = count,
             }, self.listener.listener_data);
@@ -1545,7 +1553,7 @@ pub const DataReaderImpl = struct {
             self.liveliness_alive_count_change = 0;
             self.liveliness_not_alive_count_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
-            if (self.listener.on_liveliness_changed) |cb| cb(self.toDDSDataReader(), &status, self.listener.listener_data);
+            if (self.listener.on_liveliness_changed) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
         }
     }
 
@@ -1562,7 +1570,7 @@ pub const DataReaderImpl = struct {
             status.total_count_change = 1;
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.REQUESTED_DEADLINE_MISSED_STATUS;
-            if (self.listener.on_requested_deadline_missed) |cb| cb(self.toDDSDataReader(), &status, self.listener.listener_data);
+            if (self.listener.on_requested_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
         }
     }
 
@@ -1613,7 +1621,13 @@ pub const DataReaderImpl = struct {
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleEntity,
     };
+
+    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
+    }
 
     // ── DDS.DataReader vtable ─────────────────────────────────────────────────
 
@@ -1642,7 +1656,18 @@ pub const DataReaderImpl = struct {
         .get_matched_publications = vtGetMatchedPubs,
         .get_matched_publication_data = vtGetMatchedPubData,
         .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandleDataReader,
+        .as_Entity = vtAsEntity,
     };
+
+    fn vtGetCAbiHandleDataReader(ctx: *anyopaque) *anyopaque {
+        const self = cast(ctx);
+        return self.dr_c_abi.get(self.alloc, ctx, &vtable);
+    }
+
+    fn vtAsEntity(ctx: *anyopaque) DDS.Entity {
+        return .{ .ptr = ctx, .vtable = &entity_vtable };
+    }
 
     fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
         return DDS.RETCODE_OK;
