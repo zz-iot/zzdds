@@ -1223,12 +1223,12 @@ pub const DataReaderImpl = struct {
                 if (later_sum > mrsic_sum) mrsic_sum = later_sum;
             }
             s.info.sample_rank = sample_rank;
-            s.info.generation_rank = @intCast(mrsic_sum - this_sum);
+            s.info.generation_rank = std.math.lossyCast(i32, mrsic_sum - this_sum);
             const live_sum: i64 = if (self.seen_instances.get(ih)) |entry|
                 @as(i64, entry.disposed_generation_count) + entry.no_writers_generation_count
             else
                 this_sum;
-            s.info.absolute_generation_rank = @intCast(live_sum - this_sum);
+            s.info.absolute_generation_rank = std.math.lossyCast(i32, live_sum - this_sum);
         }
     }
 
@@ -1430,6 +1430,7 @@ pub const DataReaderImpl = struct {
             self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+        const start = out.items.len;
         var count: usize = 0;
         for (self.pending.items) |*pc| {
             if (count >= limit) break;
@@ -1441,7 +1442,7 @@ pub const DataReaderImpl = struct {
             pc.info.sample_state = DDS.READ_SAMPLE_STATE;
             count += 1;
         }
-        self.finalizeGenerationRanksLocked(out.items);
+        self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
     /// Remove and return samples matching the given state masks.
@@ -1487,6 +1488,7 @@ pub const DataReaderImpl = struct {
                 matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
         }
         try out.ensureUnusedCapacity(self.alloc, match_count);
+        const start = out.items.len;
 
         // In-place compaction: matching items move to out, rest stay in pending.
         var write: usize = 0;
@@ -1507,7 +1509,7 @@ pub const DataReaderImpl = struct {
         if (self.pending.items.len == 0) {
             self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
-        self.finalizeGenerationRanksLocked(out.items);
+        self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
     pub fn toDDSDataReader(self: *Self) DDS.DataReader {
