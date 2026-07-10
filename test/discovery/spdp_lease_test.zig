@@ -292,6 +292,60 @@ test "SPDP: checkLeases triggers probe when silence exceeds threshold" {
     try testing.expectEqual(@as(u32, 0), tr.lost);
 }
 
+test "SPDP: same-SN redelivery does not skew observed interval or last_seen_ns" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+
+    const ProbeTracker = struct {
+        count: u32 = 0,
+        fn start(ctx: *anyopaque, _: GuidPrefix, _: i64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+    var pt = ProbeTracker{};
+    spdp.setBeginProbeFn(&pt, ProbeTracker.start);
+
+    // Peer announces at T=1ms with 60-second lease.
+    const peer = prefix(0xEE);
+    const payload = try buildPayload(alloc, peer, 60_000);
+    defer alloc.free(payload);
+    spdp.processSpdpPayload(peer, 1, payload);
+
+    // Genuine re-announce at T=1001ms (SN=2): interval=1000ms → observed_interval_ns=1000ms.
+    clock.set(1001 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, payload);
+
+    // A redundant copy of the same sample (same SN=2) arrives late, at T=1050ms,
+    // as if via a slower secondary interface. If last_seen_ns were bumped to this
+    // duplicate's arrival time instead of staying anchored to T=1001ms, the next
+    // silence calculation below would be shifted by 49ms.
+    clock.set(1050 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, payload);
+
+    // T=4001ms: silence from the *genuine* announcement at T=1001ms is exactly
+    // 3000ms = 3×1000ms → probe fires. Under the bug (anchor shifted to 1050ms)
+    // silence would only be 2951ms and the probe would not fire yet.
+    clock.set(4001 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 1), pt.count);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+}
+
 test "SPDP: checkLeases uses 5s fallback when no interval observed" {
     const alloc = testing.allocator;
 

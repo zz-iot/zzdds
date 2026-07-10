@@ -482,8 +482,12 @@ pub const SpdpEndpoints = struct {
                 if (same_sn) {
                     // Redelivery of the same SPDP sample (e.g. a multi-homed peer sending
                     // redundantly across several local interfaces within microseconds of
-                    // each other). Not a genuine re-announcement — leave the EMA untouched.
+                    // each other). Not a genuine re-announcement — leave the EMA untouched,
+                    // and keep last_seen_ns anchored to the original arrival rather than
+                    // this duplicate's, so a slow secondary-path copy can't shift the
+                    // baseline the next genuine re-announcement's interval is measured from.
                     kp.observed_interval_ns = prev_interval;
+                    kp.last_seen_ns = prev_last_seen;
                 } else if (prev_last_seen > 0 and now_ns > prev_last_seen) {
                     const interval = now_ns - prev_last_seen;
                     if (interval < MIN_PLAUSIBLE_INTERVAL_NS) {
