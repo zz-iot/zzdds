@@ -324,12 +324,14 @@ pub const SpdpEndpoints = struct {
             };
         }
 
+        // Send an immediate announcement before spawning the timer thread, so
+        // there's no window where the timer's first cycle could race this send
+        // and both end up transmitting the same SN.
+        self.writer.?.sendAll();
+
         // Spawn the timer thread.
         self.shutdown.store(false, .release);
         self.timer_thread = try std.Thread.spawn(.{}, timerFn, .{self});
-
-        // Send an immediate announcement.
-        self.writer.?.sendAll();
     }
 
     /// Re-announce with a fresh sequence number, then transmit. Called once per
