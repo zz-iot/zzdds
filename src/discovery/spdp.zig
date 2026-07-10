@@ -493,8 +493,10 @@ pub const SpdpEndpoints = struct {
                     if (interval < MIN_PLAUSIBLE_INTERVAL_NS) {
                         // Backstop for peers that bump the SN on each redundant copy instead
                         // of reusing it: implausibly short for a real SPDP period, so treat
-                        // it the same as a same-SN duplicate rather than let it poison the EMA.
+                        // it the same as a same-SN duplicate rather than let it poison the EMA
+                        // — including keeping last_seen_ns anchored to the original arrival.
                         kp.observed_interval_ns = prev_interval;
+                        kp.last_seen_ns = prev_last_seen;
                     } else {
                         kp.observed_interval_ns = if (prev_interval == 0)
                             interval

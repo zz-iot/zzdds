@@ -346,6 +346,61 @@ test "SPDP: same-SN redelivery does not skew observed interval or last_seen_ns" 
     try testing.expectEqual(@as(u32, 0), tr.lost);
 }
 
+test "SPDP: implausibly-short interval floor does not skew last_seen_ns either" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+
+    const ProbeTracker = struct {
+        count: u32 = 0,
+        fn start(ctx: *anyopaque, _: GuidPrefix, _: i64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+    var pt = ProbeTracker{};
+    spdp.setBeginProbeFn(&pt, ProbeTracker.start);
+
+    // Peer announces at T=1ms with 60-second lease.
+    const peer = prefix(0xFF);
+    const payload = try buildPayload(alloc, peer, 60_000);
+    defer alloc.free(payload);
+    spdp.processSpdpPayload(peer, 1, payload);
+
+    // Genuine re-announce at T=1001ms (SN=2): interval=1000ms → observed_interval_ns=1000ms.
+    clock.set(1001 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, payload);
+
+    // A peer that bumps the SN on every redundant per-interface copy (rather than
+    // reusing it) resends with a NEW SN=3 at T=1011ms — only 10ms later, well under
+    // MIN_PLAUSIBLE_INTERVAL_NS (50ms). If last_seen_ns were bumped to this arrival
+    // time instead of staying anchored to T=1001ms, the silence calculation below
+    // would be shifted by 10ms.
+    clock.set(1011 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 3, payload);
+
+    // T=4001ms: silence from the *genuine* announcement at T=1001ms is exactly
+    // 3000ms = 3×1000ms → probe fires. Under the bug (anchor shifted to 1011ms)
+    // silence would only be 2990ms and the probe would not fire yet.
+    clock.set(4001 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expectEqual(@as(u32, 1), pt.count);
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+}
+
 test "SPDP: checkLeases uses 5s fallback when no interval observed" {
     const alloc = testing.allocator;
 
