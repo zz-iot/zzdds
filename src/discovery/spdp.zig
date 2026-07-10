@@ -26,6 +26,7 @@ const parser_mod = @import("../rtps/message/parser.zig");
 const history_mod = @import("../rtps/history.zig");
 const mutex_mod = @import("../util/mutex.zig");
 const time_mod = @import("../util/time.zig");
+const sn_mod = @import("../rtps/sequence_number.zig");
 
 const Transport = tr_iface.Transport;
 const Locator = tr_iface.Locator;
@@ -41,6 +42,7 @@ const CacheChange = history_mod.CacheChange;
 const ChangeKind = history_mod.ChangeKind;
 const RtpsTimestamp = time_mod.RtpsTimestamp;
 const Mutex = mutex_mod.Mutex;
+const SequenceNumber = sn_mod.SequenceNumber;
 const Callbacks = iface.Callbacks;
 const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 const ParticipantData = iface.ParticipantData;
@@ -50,6 +52,13 @@ const BuiltinEndpointSet = pid_mod.BuiltinEndpointSet;
 
 // PL_CDR_LE encapsulation identifier (RTPS §10.2, PL_CDR little-endian)
 const PLCDR_LE_ENCAP: [4]u8 = .{ 0x00, 0x03, 0x00, 0x00 };
+
+/// Floor for genuine SPDP re-announcement intervals fed into the EMA in
+/// processSpdpPayload. Real-world SPDP periods are seconds, never sub-100ms;
+/// anything faster is almost certainly duplicate delivery of the same
+/// announcement (e.g. a multi-homed peer transmitting redundantly across
+/// several local interfaces), not a legitimately fast announcer.
+const MIN_PLAUSIBLE_INTERVAL_NS: i64 = 50_000_000; // 50ms
 
 // ── State for one known remote participant ────────────────────────────────────
 
@@ -64,6 +73,12 @@ pub const KnownParticipant = struct {
     observed_interval_ns: i64,
     /// True while a liveness probe is outstanding for this participant.
     probe_active: bool,
+    /// SPDP builtin writer SN of the most recently processed announcement. Multi-homed
+    /// peers commonly resend the *same* SPDP sample redundantly across several local
+    /// interfaces within microseconds of each other; a repeated SN identifies that as
+    /// duplicate delivery rather than a genuine (fast) re-announcement, so it doesn't
+    /// poison observed_interval_ns. See processSpdpPayload.
+    last_writer_sn: SequenceNumber,
 
     pub fn deinit(self: *KnownParticipant) void {
         self.alloc.free(self.data.name);
@@ -386,7 +401,7 @@ pub const SpdpEndpoints = struct {
                     }
                     const payload = d.serialized_payload;
                     if (payload.len == 0) continue;
-                    self.processSpdpPayload(src_prefix, payload);
+                    self.processSpdpPayload(src_prefix, d.writer_sn, payload);
                 },
                 else => {},
             }
@@ -395,9 +410,9 @@ pub const SpdpEndpoints = struct {
 
     /// Relay entry point: called by SEDP when an SPDP DATA arrives on the
     /// metatraffic unicast port (Cyclone sends unicast responses there per RTPS §9.6.1.1).
-    pub fn handleRelayedData(ctx: *anyopaque, prefix: GuidPrefix, payload: []const u8) void {
+    pub fn handleRelayedData(ctx: *anyopaque, prefix: GuidPrefix, writer_sn: SequenceNumber, payload: []const u8) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.processSpdpPayload(prefix, payload);
+        self.processSpdpPayload(prefix, writer_sn, payload);
     }
 
     /// Called when a peer participant's SPDP BYE (dispose/unregister) is received.
@@ -417,6 +432,7 @@ pub const SpdpEndpoints = struct {
     pub fn processSpdpPayload(
         self: *Self,
         guid_prefix: GuidPrefix,
+        writer_sn: SequenceNumber,
         payload: []const u8,
     ) void {
         // Ignore our own announcements.
@@ -436,6 +452,7 @@ pub const SpdpEndpoints = struct {
         kp.last_seen_ns = now_ns;
         kp.observed_interval_ns = 0; // updated below for re-announcements
         kp.probe_active = false; // receiving an announcement resolves any probe
+        kp.last_writer_sn = writer_sn;
 
         // was_probing: true when a re-announcement arrives while a liveness probe is
         // in flight for this participant.  We must cancel the SEDP probe deadline
@@ -460,12 +477,26 @@ pub const SpdpEndpoints = struct {
                 // Update the smoothed announcement interval from the previous observation.
                 const prev_last_seen = gop.value_ptr.last_seen_ns;
                 const prev_interval = gop.value_ptr.observed_interval_ns;
-                if (prev_last_seen > 0 and now_ns > prev_last_seen) {
+                const same_sn = writer_sn != sn_mod.SEQUENCENUMBER_UNKNOWN and
+                    writer_sn == gop.value_ptr.last_writer_sn;
+                if (same_sn) {
+                    // Redelivery of the same SPDP sample (e.g. a multi-homed peer sending
+                    // redundantly across several local interfaces within microseconds of
+                    // each other). Not a genuine re-announcement — leave the EMA untouched.
+                    kp.observed_interval_ns = prev_interval;
+                } else if (prev_last_seen > 0 and now_ns > prev_last_seen) {
                     const interval = now_ns - prev_last_seen;
-                    kp.observed_interval_ns = if (prev_interval == 0)
-                        interval
-                    else
-                        @divTrunc(prev_interval + interval, 2); // EMA α=0.5
+                    if (interval < MIN_PLAUSIBLE_INTERVAL_NS) {
+                        // Backstop for peers that bump the SN on each redundant copy instead
+                        // of reusing it: implausibly short for a real SPDP period, so treat
+                        // it the same as a same-SN duplicate rather than let it poison the EMA.
+                        kp.observed_interval_ns = prev_interval;
+                    } else {
+                        kp.observed_interval_ns = if (prev_interval == 0)
+                            interval
+                        else
+                            @divTrunc(prev_interval + interval, 2); // EMA α=0.5
+                    }
                 } else {
                     kp.observed_interval_ns = prev_interval;
                 }
@@ -847,6 +878,7 @@ pub fn decodeSpdpParticipant(
         .last_seen_ns = 0, // caller sets this
         .observed_interval_ns = 0,
         .probe_active = false,
+        .last_writer_sn = sn_mod.SEQUENCENUMBER_UNKNOWN, // caller sets this
         .data = ParticipantData{
             .guid = .{
                 .prefix = decoded_prefix,
