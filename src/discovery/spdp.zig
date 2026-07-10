@@ -332,6 +332,27 @@ pub const SpdpEndpoints = struct {
         self.writer.?.sendAll();
     }
 
+    /// Re-announce with a fresh sequence number, then transmit. Called once per
+    /// periodic announcement cycle (never per-interface — the transport layer
+    /// fans a single logical send out to every joined interface using the same
+    /// cached change/SN, so redundant per-interface copies stay deduplicable by
+    /// receivers). Without this, every re-announcement for the life of the
+    /// process would carry the same SN the participant was created with, which
+    /// a peer's own SPDP dedup logic could (reasonably) mistake for redundant
+    /// delivery of one announcement rather than a genuine new one.
+    fn reannounce(self: *Self) void {
+        const w = self.writer orelse return;
+        const payload = self.local_payload orelse return;
+        _ = w.write(
+            .alive,
+            RtpsTimestamp.now(),
+            history_mod.INSTANCE_HANDLE_NIL,
+            std.mem.zeroes([16]u8),
+            payload,
+        ) catch return;
+        w.sendAll();
+    }
+
     pub fn stop(self: *Self) void {
         self.shutdown.store(true, .release);
         if (self.timer_thread) |t| {
@@ -564,7 +585,7 @@ pub const SpdpEndpoints = struct {
 
             if (now_ns - last_announce_ns >= period_ns) {
                 last_announce_ns = now_ns;
-                if (self.writer) |w| w.sendAll();
+                self.reannounce();
             }
 
             self.checkLeases();
