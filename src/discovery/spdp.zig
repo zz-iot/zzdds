@@ -9,7 +9,8 @@
 //!      the StatelessWriter cache.
 //!   2. Register the SPDP multicast locator as the writer's reader-locator.
 //!   3. Call transport.listen + joinMulticast on the SPDP multicast port.
-//!   4. Spawn a timer thread that periodically calls sendAll() and checks leases.
+//!   4. Spawn a timer thread that periodically calls reannounce() (bumping the SN
+//!      before resending) and checks leases.
 //!
 //! PL-CDR encoding is hand-written (no dependency on zidl-generated code here).
 
