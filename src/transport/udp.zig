@@ -378,6 +378,13 @@ pub const UdpTransport = struct {
     /// Snapshots replaced by publishMcSendIfacesLocked, freed in deinit(). See
     /// mc_send_ifaces doc comment.
     retired_mc_send_ifaces: std.ArrayListUnmanaged(*McSendIfaces),
+    /// Serializes the per-interface setsockopt(IP_MULTICAST_IF)+sendto sequence in
+    /// vtSend's multicast fan-out loop: both calls share one socket fd, so two
+    /// concurrent multicast sends could otherwise interleave and each packet could
+    /// go out whichever interface the *other* call's setsockopt last selected.
+    /// Deliberately NOT `mu` — vtSend must never acquire that (see the SocketEntry
+    /// comment about deadlock); this lock is never held across a thread.join().
+    mc_send_mu: mutex_mod.Mutex,
 
     locator_change_handler: ?LocatorChangeHandler,
     monitor: InterfaceMonitor,
@@ -424,6 +431,7 @@ pub const UdpTransport = struct {
             .send_fd_v6 = std.atomic.Value(posix.socket_t).init(sv6),
             .mc_send_ifaces = std.atomic.Value(?*const McSendIfaces).init(null),
             .retired_mc_send_ifaces = .empty,
+            .mc_send_mu = .{},
             .locator_change_handler = null,
             .monitor = undefined,
             .monitor_owned = mon == null,
@@ -887,6 +895,10 @@ pub const UdpTransport = struct {
                 if (is_multicast and fd != INVALID_SOCKET) {
                     if (self.mc_send_ifaces.load(.acquire)) |snap| {
                         if (snap.ifaces.len > 1) {
+                            // Serialize the setsockopt+sendto pair against other concurrent
+                            // multicast sends on this shared fd — see mc_send_mu doc comment.
+                            self.mc_send_mu.lock();
+                            defer self.mc_send_mu.unlock();
                             for (snap.ifaces) |iface_ip| {
                                 sockOpt(fd, posix.IPPROTO.IP, @as(u32, @bitCast(IP_MULTICAST_IF)), &iface_ip) catch continue;
                                 socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch {};
@@ -1164,6 +1176,7 @@ pub const UdpTransport = struct {
         pe.deinit();
         _ = self.port_entries.remove(port);
         self.rebuildLocatorsLocked() catch {};
+        self.publishMcSendIfacesLocked();
     }
 
     fn vtUnicastLocators(ctx: *anyopaque, out: *std.ArrayListUnmanaged(Locator), alloc: std.mem.Allocator) anyerror!void {
