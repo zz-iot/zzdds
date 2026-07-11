@@ -1082,6 +1082,7 @@ pub const UdpTransport = struct {
     /// vtSend reads mc_send_ifaces lock-free and may still hold the old pointer.
     fn publishMcSendIfacesLocked(self: *Self) void {
         var ifaces: std.ArrayListUnmanaged([4]u8) = .empty;
+        defer ifaces.deinit(self.alloc);
         var has_v4_group = false;
         for (self.mc_states.items) |*ms| {
             if (ms.group == .udp_v4) has_v4_group = true;
