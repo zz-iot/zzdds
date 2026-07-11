@@ -894,7 +894,7 @@ pub const UdpTransport = struct {
                 const is_multicast = (u.addr[0] & 0xf0) == 0xe0;
                 if (is_multicast and fd != INVALID_SOCKET) {
                     if (self.mc_send_ifaces.load(.acquire)) |snap| {
-                        if (snap.ifaces.len > 1) {
+                        if (snap.ifaces.len >= 1) {
                             // Serialize the setsockopt+sendto pair against other concurrent
                             // multicast sends on this shared fd — see mc_send_mu doc comment.
                             self.mc_send_mu.lock();
