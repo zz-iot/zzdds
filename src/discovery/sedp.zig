@@ -601,7 +601,7 @@ pub const SedpEndpoints = struct {
 
     // Optional relay for SPDP packets that arrive on the metatraffic unicast port.
     spdp_relay_ctx: ?*anyopaque,
-    spdp_relay_fn: ?*const fn (*anyopaque, GuidPrefix, []const u8) void,
+    spdp_relay_fn: ?*const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8) void,
     // Optional handler for SPDP BYE (participant dispose/unregister).
     spdp_bye_ctx: ?*anyopaque,
     spdp_bye_fn: ?*const fn (*anyopaque, GuidPrefix) void,
@@ -668,7 +668,7 @@ pub const SedpEndpoints = struct {
     pub fn setSpdpRelay(
         self: *Self,
         ctx: *anyopaque,
-        fn_ptr: *const fn (*anyopaque, GuidPrefix, []const u8) void,
+        fn_ptr: *const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8) void,
     ) void {
         self.spdp_relay_ctx = ctx;
         self.spdp_relay_fn = fn_ptr;
@@ -985,7 +985,7 @@ pub const SedpEndpoints = struct {
 
                     if (wid.eql(EntityIds.spdp_builtin_participant_writer)) {
                         if (self.spdp_relay_fn) |relay|
-                            relay(self.spdp_relay_ctx.?, src_prefix, payload);
+                            relay(self.spdp_relay_ctx.?, src_prefix, d.writer_sn, payload);
                         continue;
                     } else if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
                         if (self.pub_reader) |pr| {
