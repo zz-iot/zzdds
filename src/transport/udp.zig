@@ -895,14 +895,23 @@ pub const UdpTransport = struct {
                 if (is_multicast and fd != INVALID_SOCKET) {
                     if (self.mc_send_ifaces.load(.acquire)) |snap| {
                         if (snap.ifaces.len >= 1) {
-                            // Serialize the setsockopt+sendto pair against other concurrent
-                            // multicast sends on this shared fd — see mc_send_mu doc comment.
-                            self.mc_send_mu.lock();
-                            defer self.mc_send_mu.unlock();
-                            for (snap.ifaces) |iface_ip| {
-                                sockOpt(fd, posix.IPPROTO.IP, @as(u32, @bitCast(IP_MULTICAST_IF)), &iface_ip) catch continue;
-                                socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch {};
+                            var any_sent = false;
+                            {
+                                // Serialize the setsockopt+sendto pair against other concurrent
+                                // multicast sends on this shared fd — see mc_send_mu doc comment.
+                                self.mc_send_mu.lock();
+                                defer self.mc_send_mu.unlock();
+                                for (snap.ifaces) |iface_ip| {
+                                    sockOpt(fd, posix.IPPROTO.IP, @as(u32, @bitCast(IP_MULTICAST_IF)), &iface_ip) catch continue;
+                                    socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch continue;
+                                    any_sent = true;
+                                }
                             }
+                            // Every interface in the snapshot failed (e.g. all went down
+                            // between snapshot and send) — fall back the same way the
+                            // single-interface path below does, instead of silently
+                            // reporting success for a datagram nothing actually carried.
+                            if (!any_sent) try sendUdp4(u.addr, u.port, data);
                             return;
                         }
                     }
