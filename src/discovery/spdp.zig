@@ -9,7 +9,8 @@
 //!      the StatelessWriter cache.
 //!   2. Register the SPDP multicast locator as the writer's reader-locator.
 //!   3. Call transport.listen + joinMulticast on the SPDP multicast port.
-//!   4. Spawn a timer thread that periodically calls sendAll() and checks leases.
+//!   4. Spawn a timer thread that periodically calls reannounce() (bumping the SN
+//!      before resending) and checks leases.
 //!
 //! PL-CDR encoding is hand-written (no dependency on zidl-generated code here).
 
@@ -339,12 +340,35 @@ pub const SpdpEndpoints = struct {
             };
         }
 
+        // Send an immediate announcement before spawning the timer thread, so
+        // there's no window where the timer's first cycle could race this send
+        // and both end up transmitting the same SN.
+        self.writer.?.sendAll();
+
         // Spawn the timer thread.
         self.shutdown.store(false, .release);
         self.timer_thread = try std.Thread.spawn(.{}, timerFn, .{self});
+    }
 
-        // Send an immediate announcement.
-        self.writer.?.sendAll();
+    /// Re-announce with a fresh sequence number, then transmit. Called once per
+    /// periodic announcement cycle (never per-interface — the transport layer
+    /// fans a single logical send out to every joined interface using the same
+    /// cached change/SN, so redundant per-interface copies stay deduplicable by
+    /// receivers). Without this, every re-announcement for the life of the
+    /// process would carry the same SN the participant was created with, which
+    /// a peer's own SPDP dedup logic could (reasonably) mistake for redundant
+    /// delivery of one announcement rather than a genuine new one.
+    fn reannounce(self: *Self) void {
+        const w = self.writer orelse return;
+        const payload = self.local_payload orelse return;
+        _ = w.write(
+            .alive,
+            RtpsTimestamp.now(),
+            history_mod.INSTANCE_HANDLE_NIL,
+            std.mem.zeroes([16]u8),
+            payload,
+        ) catch return;
+        w.sendAll();
     }
 
     pub fn stop(self: *Self) void {
@@ -601,7 +625,7 @@ pub const SpdpEndpoints = struct {
 
             if (now_ns - last_announce_ns >= period_ns) {
                 last_announce_ns = now_ns;
-                if (self.writer) |w| w.sendAll();
+                self.reannounce();
             }
 
             self.checkLeases();
