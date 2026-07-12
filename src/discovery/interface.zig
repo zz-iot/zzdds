@@ -36,14 +36,14 @@ pub const QosSnapshot = struct {
     history_depth: i32 = 1,
     liveliness_kind: u8 = 0, // 0=automatic, 1=manual_by_participant, 2=manual_by_topic
     liveliness_lease_sec: i32 = 0x7fff_ffff, // default = infinite
-    liveliness_lease_nanosec: u32 = 0x7fff_ffff,
+    liveliness_lease_nanosec: u32 = 0xffff_ffff,
     ownership_kind: u8 = 0, // 0=shared, 1=exclusive
     ownership_strength: i32 = 0, // only meaningful when ownership_kind=exclusive
     destination_order_kind: u8 = 0, // 0=by_reception_timestamp, 1=by_source_timestamp
     data_representation: u16 = 1, // 1=XCDR1, 2=XCDR2
-    // DDS INFINITE = {sec=0x7fffffff, nanosec=0x7fffffff}; default means "no deadline constraint".
+    // DDS INFINITE = {sec=0x7fffffff, nanosec=0xffffffff}; default means "no deadline constraint".
     deadline_sec: i32 = 0x7fff_ffff,
-    deadline_nanosec: u32 = 0x7fff_ffff,
+    deadline_nanosec: u32 = 0xffff_ffff,
     // Publisher/Subscriber partition names. Empty = default partition ("").
     // Points into memory owned by the source (DecodedEndpoint or ActiveWriter/Reader).
     partition_names: []const []const u8 = &.{},
@@ -51,9 +51,9 @@ pub const QosSnapshot = struct {
     presentation_access_scope: u8 = 0,
     coherent_access: bool = false,
     ordered_access: bool = false,
-    // LIFESPAN QoS (DataWriter only). DDS INFINITE = {0x7fffffff, 0x7fffffff}.
+    // LIFESPAN QoS (DataWriter only). DDS INFINITE = {0x7fffffff, 0xffffffff}.
     lifespan_sec: i32 = 0x7fff_ffff,
-    lifespan_nanosec: u32 = 0x7fff_ffff,
+    lifespan_nanosec: u32 = 0xffff_ffff,
 };
 
 /// Information about the local participant broadcast to remote peers.
