@@ -36,7 +36,7 @@ module DDS {
     const long              LENGTH_UNLIMITED         = -1;
 
     const long              DURATION_INFINITE_SEC   = 0x7fffffff;
-    const unsigned long     DURATION_INFINITE_NSEC  = 0x7fffffff;
+    const unsigned long     DURATION_INFINITE_NSEC  = 0xffffffff;
     const long              DURATION_ZERO_SEC        = 0;
     const unsigned long     DURATION_ZERO_NSEC       = 0;
 

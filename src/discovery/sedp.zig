@@ -233,7 +233,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     }
     // PID_DEADLINE: only emitted when not INFINITE; omitting INFINITE avoids
     // encoding differences between implementations.
-    if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
+    if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0xffff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
         try writeDdsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
@@ -252,7 +252,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     try writeU32Le(alloc, &buf, ann.qos.history_kind);
     try writeI32Le(alloc, &buf, ann.qos.history_depth);
     // PID_LIFESPAN: only emitted when not INFINITE (same pattern as DEADLINE).
-    if (ann.qos.lifespan_sec != 0x7fff_ffff or ann.qos.lifespan_nanosec != 0x7fff_ffff) {
+    if (ann.qos.lifespan_sec != 0x7fff_ffff or ann.qos.lifespan_nanosec != 0xffff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.LIFESPAN, 8);
         try writeDdsDuration(alloc, &buf, .{ .sec = ann.qos.lifespan_sec, .nanosec = ann.qos.lifespan_nanosec });
     }
@@ -360,7 +360,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
 
     // PID_DEADLINE: only emitted when not INFINITE; omitting INFINITE avoids
     // encoding differences between implementations.
-    if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0x7fff_ffff) {
+    if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0xffff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
         try writeDdsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
@@ -1227,8 +1227,8 @@ test "readDeadlineDuration preserves explicit zero QoS duration" {
 }
 
 test "readDeadlineDuration recognizes DDS infinite sentinel" {
-    // DDS Duration_t INFINITE = {sec=0x7fffffff, nanosec=0x7fffffff}
-    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0x7f };
+    // DDS Duration_t INFINITE = {sec=0x7fffffff, nanosec=0xffffffff}
+    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff };
     try std.testing.expect(readDeadlineDuration(&bytes, true).isInfinite());
 }
 

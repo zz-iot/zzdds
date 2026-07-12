@@ -1187,7 +1187,7 @@ pub const DomainParticipantImpl = struct {
             .history_depth = if (keep_last and qos.history.depth < 1) 1 else qos.history.depth,
             .liveliness_kind = @as(u8, @truncate(@intFromEnum(qos.liveliness.kind))),
             .liveliness_lease_sec = if (ll_zero_w) 0x7fff_ffff else qos.liveliness.lease_duration.sec,
-            .liveliness_lease_nanosec = if (ll_zero_w) 0x7fff_ffff else qos.liveliness.lease_duration.nanosec,
+            .liveliness_lease_nanosec = if (ll_zero_w) 0xffff_ffff else qos.liveliness.lease_duration.nanosec,
             .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
             .ownership_strength = qos.ownership_strength.value,
             .destination_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
@@ -1196,12 +1196,12 @@ pub const DomainParticipantImpl = struct {
             else
                 1,
             .deadline_sec = if (dl_zero_w) 0x7fff_ffff else qos.deadline.period.sec,
-            .deadline_nanosec = if (dl_zero_w) 0x7fff_ffff else qos.deadline.period.nanosec,
+            .deadline_nanosec = if (dl_zero_w) 0xffff_ffff else qos.deadline.period.nanosec,
             .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
             .coherent_access = presentation.coherent_access,
             .ordered_access = presentation.ordered_access,
             .lifespan_sec = if (ls_zero_w) 0x7fff_ffff else qos.lifespan.duration.sec,
-            .lifespan_nanosec = if (ls_zero_w) 0x7fff_ffff else qos.lifespan.duration.nanosec,
+            .lifespan_nanosec = if (ls_zero_w) 0xffff_ffff else qos.lifespan.duration.nanosec,
         };
     }
 
@@ -1224,7 +1224,7 @@ pub const DomainParticipantImpl = struct {
                 2, // Advertise XCDR2 acceptance so XCDR2-capable writers (OpenDDS) match.
             // zzdds stores raw CDR bytes and interop programs parse both XCDR1/2.
             .deadline_sec = if (dl_zero_r) 0x7fff_ffff else qos.deadline.period.sec,
-            .deadline_nanosec = if (dl_zero_r) 0x7fff_ffff else qos.deadline.period.nanosec,
+            .deadline_nanosec = if (dl_zero_r) 0xffff_ffff else qos.deadline.period.nanosec,
             .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
             .coherent_access = presentation.coherent_access,
             .ordered_access = presentation.ordered_access,

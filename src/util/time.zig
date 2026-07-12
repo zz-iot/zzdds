@@ -24,7 +24,7 @@ pub const Duration = extern struct {
     sec: i32,
     nanosec: u32,
 
-    pub const infinite: Duration = .{ .sec = 0x7fff_ffff, .nanosec = 0x7fff_ffff };
+    pub const infinite: Duration = .{ .sec = 0x7fff_ffff, .nanosec = 0xffff_ffff };
     pub const zero: Duration = .{ .sec = 0, .nanosec = 0 };
 
     /// True if this duration represents DDS "infinity".

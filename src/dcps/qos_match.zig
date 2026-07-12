@@ -155,8 +155,8 @@ pub fn checkSnapshots(offered: disc.QosSnapshot, requested: disc.QosSnapshot) Ma
 
     // DEADLINE: offered.period <= requested.period (infinite = largest possible value)
     {
-        const off_inf = offered.deadline_sec == 0x7fff_ffff and offered.deadline_nanosec == 0x7fff_ffff;
-        const req_inf = requested.deadline_sec == 0x7fff_ffff and requested.deadline_nanosec == 0x7fff_ffff;
+        const off_inf = offered.deadline_sec == 0x7fff_ffff and offered.deadline_nanosec == 0xffff_ffff;
+        const req_inf = requested.deadline_sec == 0x7fff_ffff and requested.deadline_nanosec == 0xffff_ffff;
         if (!req_inf) { // finite reader deadline — writer must also be finite and <=
             if (off_inf) return .{ .incompatible = .deadline };
             const off_ns: i64 = @as(i64, offered.deadline_sec) * std.time.ns_per_s + @as(i64, offered.deadline_nanosec);
