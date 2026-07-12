@@ -249,6 +249,12 @@ const MulticastState = struct {
     }
 };
 
+/// Immutable snapshot of the IPv4 interfaces joined for outgoing multicast, published
+/// by publishMcSendIfacesLocked and read lock-free by vtSend. See mc_send_ifaces.
+const McSendIfaces = struct {
+    ifaces: [][4]u8,
+};
+
 // ── Port entry (fan-out dispatch) ─────────────────────────────────────────────
 
 /// One PortEntry exists per listened port. Multiple ReceiveHandlers can register
@@ -356,6 +362,30 @@ pub const UdpTransport = struct {
     send_fd_v4: std.atomic.Value(posix.socket_t),
     send_fd_v6: std.atomic.Value(posix.socket_t),
 
+    /// Snapshot of the IPv4 interfaces currently joined for outgoing multicast.
+    /// vtSend uses this to transmit multicast datagrams (e.g. SPDP announcements)
+    /// out every joined interface instead of a single arbitrarily-chosen one — a
+    /// multi-homed peer may only be listening on some of them. Rebuilt (new
+    /// allocation) whenever the joined-interface set changes; the replaced
+    /// snapshot is parked in retired_mc_send_ifaces rather than freed immediately,
+    /// since a concurrent vtSend call may still be dereferencing it — actually
+    /// freeing happens in deinit(), by which point no sends are in flight.
+    ///
+    /// Written under `mu` (store .release); read in vtSend WITHOUT `mu` (load
+    /// .acquire) — same constraint as send_fd_v4/v6 above: vtSend MUST NOT acquire
+    /// `mu` (see the SocketEntry comment about deadlock).
+    mc_send_ifaces: std.atomic.Value(?*const McSendIfaces),
+    /// Snapshots replaced by publishMcSendIfacesLocked, freed in deinit(). See
+    /// mc_send_ifaces doc comment.
+    retired_mc_send_ifaces: std.ArrayListUnmanaged(*McSendIfaces),
+    /// Serializes the per-interface setsockopt(IP_MULTICAST_IF)+sendto sequence in
+    /// vtSend's multicast fan-out loop: both calls share one socket fd, so two
+    /// concurrent multicast sends could otherwise interleave and each packet could
+    /// go out whichever interface the *other* call's setsockopt last selected.
+    /// Deliberately NOT `mu` — vtSend must never acquire that (see the SocketEntry
+    /// comment about deadlock); this lock is never held across a thread.join().
+    mc_send_mu: mutex_mod.Mutex,
+
     locator_change_handler: ?LocatorChangeHandler,
     monitor: InterfaceMonitor,
     monitor_owned: bool,
@@ -399,6 +429,9 @@ pub const UdpTransport = struct {
             .owned_send_fd_v6 = sv6,
             .send_fd_v4 = std.atomic.Value(posix.socket_t).init(sv4),
             .send_fd_v6 = std.atomic.Value(posix.socket_t).init(sv6),
+            .mc_send_ifaces = std.atomic.Value(?*const McSendIfaces).init(null),
+            .retired_mc_send_ifaces = .empty,
+            .mc_send_mu = .{},
             .locator_change_handler = null,
             .monitor = undefined,
             .monitor_owned = mon == null,
@@ -491,6 +524,16 @@ pub const UdpTransport = struct {
 
         for (self.mc_states.items) |*ms| ms.deinit(self.alloc);
         self.mc_states.deinit(self.alloc);
+
+        if (self.mc_send_ifaces.load(.acquire)) |snap| {
+            self.alloc.free(snap.ifaces);
+            self.alloc.destroy(@constCast(snap));
+        }
+        for (self.retired_mc_send_ifaces.items) |snap| {
+            self.alloc.free(snap.ifaces);
+            self.alloc.destroy(snap);
+        }
+        self.retired_mc_send_ifaces.deinit(self.alloc);
 
         var pe_it = self.port_entries.valueIterator();
         while (pe_it.next()) |pe_ptr| pe_ptr.*.deinit();
@@ -711,6 +754,22 @@ pub const UdpTransport = struct {
                 log.transport.warn("transport: no usable interfaces found; advertising no unicast locators", .{});
             }
         }
+        // Always additionally advertise loopback (127.0.0.1), regardless of which
+        // branch above ran. Real interfaces are excluded from active_ifaces (see
+        // IFF_LOOPBACK filtering in monitor/polling.zig) since they're not routable
+        // from other hosts, but a peer running on this same machine can always reach
+        // us via loopback — including cases where routing over "real" interfaces is
+        // flaky in a sandboxed/VM environment (the existing multicast-join-on-loopback
+        // comment above already documents this same class of problem).
+        if (self.config.ipv4_enabled) {
+            const already_present = for (self.locators_cache.items) |loc| {
+                if (loc == .udp_v4 and loc.udp_v4.port == meta_port and
+                    std.mem.eql(u8, &loc.udp_v4.addr, &.{ 127, 0, 0, 1 })) break true;
+            } else false;
+            if (!already_present) {
+                self.locators_cache.append(self.alloc, .{ .udp_v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = meta_port } }) catch {};
+            }
+        }
     }
 
     // ── Interface change callback ─────────────────────────────────────────────
@@ -765,6 +824,7 @@ pub const UdpTransport = struct {
         self.active_ifaces.deinit(self.alloc);
         self.active_ifaces = new_ifaces;
         self.rebuildLocatorsLocked() catch {};
+        self.publishMcSendIfacesLocked();
 
         if (self.locator_change_handler) |h| h.on_change(h.ctx);
     }
@@ -823,6 +883,39 @@ pub const UdpTransport = struct {
                     .addr = @bitCast(u.addr),
                 };
                 const fd = self.send_fd_v4.load(.acquire);
+                // Multicast destinations (224.0.0.0/4): transmit out every joined
+                // interface, not just whichever one IP_MULTICAST_IF currently points
+                // at. A multi-homed peer's discovery socket may only be listening on
+                // some of the local interfaces we could reach it from — sending on
+                // one arbitrarily-chosen interface risks it never seeing us at all.
+                // mc_send_ifaces is read lock-free (see its doc comment); if it's
+                // unset or has only one interface, this degrades to the original
+                // single-send behavior.
+                const is_multicast = (u.addr[0] & 0xf0) == 0xe0;
+                if (is_multicast and fd != INVALID_SOCKET) {
+                    if (self.mc_send_ifaces.load(.acquire)) |snap| {
+                        if (snap.ifaces.len >= 1) {
+                            var any_sent = false;
+                            {
+                                // Serialize the setsockopt+sendto pair against other concurrent
+                                // multicast sends on this shared fd — see mc_send_mu doc comment.
+                                self.mc_send_mu.lock();
+                                defer self.mc_send_mu.unlock();
+                                for (snap.ifaces) |iface_ip| {
+                                    sockOpt(fd, posix.IPPROTO.IP, @as(u32, @bitCast(IP_MULTICAST_IF)), &iface_ip) catch continue;
+                                    socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch continue;
+                                    any_sent = true;
+                                }
+                            }
+                            // Every interface in the snapshot failed (e.g. all went down
+                            // between snapshot and send) — fall back the same way the
+                            // single-interface path below does, instead of silently
+                            // reporting success for a datagram nothing actually carried.
+                            if (!any_sent) try sendUdp4(u.addr, u.port, data);
+                            return;
+                        }
+                    }
+                }
                 if (fd != INVALID_SOCKET) {
                     socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch {
                         try sendUdp4(u.addr, u.port, data);
@@ -989,6 +1082,50 @@ pub const UdpTransport = struct {
             }
         }
         try self.mc_states.append(self.alloc, ms);
+        self.publishMcSendIfacesLocked();
+    }
+
+    /// Rebuild and publish the mc_send_ifaces snapshot from the current mc_states.
+    /// Must be called with `mu` held. The replaced snapshot is parked in
+    /// retired_mc_send_ifaces (freed in deinit()) rather than freed here, since
+    /// vtSend reads mc_send_ifaces lock-free and may still hold the old pointer.
+    fn publishMcSendIfacesLocked(self: *Self) void {
+        var ifaces: std.ArrayListUnmanaged([4]u8) = .empty;
+        defer ifaces.deinit(self.alloc);
+        var has_v4_group = false;
+        for (self.mc_states.items) |*ms| {
+            if (ms.group == .udp_v4) has_v4_group = true;
+            for (ms.v4_ifaces.items) |ip| {
+                const already_present = for (ifaces.items) |existing| {
+                    if (std.mem.eql(u8, &existing, &ip)) break true;
+                } else false;
+                if (!already_present) ifaces.append(self.alloc, ip) catch return;
+            }
+        }
+        // Also send via loopback: we already join multicast on loopback for receive
+        // (see the join call above), and a same-host peer may only reliably see us
+        // that way if routing over "real" interfaces is flaky in a sandboxed/VM
+        // environment (same rationale as that existing receive-side join).
+        if (has_v4_group) {
+            const lo: [4]u8 = .{ 127, 0, 0, 1 };
+            const already_present = for (ifaces.items) |existing| {
+                if (std.mem.eql(u8, &existing, &lo)) break true;
+            } else false;
+            if (!already_present) ifaces.append(self.alloc, lo) catch return;
+        }
+        const owned = ifaces.toOwnedSlice(self.alloc) catch return;
+        const snap = self.alloc.create(McSendIfaces) catch {
+            self.alloc.free(owned);
+            return;
+        };
+        snap.* = .{ .ifaces = owned };
+        const old = self.mc_send_ifaces.swap(snap, .acq_rel);
+        if (old) |o| {
+            self.retired_mc_send_ifaces.append(self.alloc, @constCast(o)) catch {
+                // Retirement bookkeeping failed (OOM) — leak this one instance
+                // rather than risk freeing memory a concurrent vtSend may hold.
+            };
+        }
     }
 
     fn vtLeaveMulticast(ctx: *anyopaque, group: *const Locator) void {
@@ -1021,6 +1158,7 @@ pub const UdpTransport = struct {
             if (ms.port() == grp_port) break true;
         } else false;
         if (!still_needed) self.removeSockets(grp_port);
+        self.publishMcSendIfacesLocked();
     }
 
     fn vtUnlisten(ctx: *anyopaque, locator: *const Locator, handler: ReceiveHandler) void {
@@ -1048,6 +1186,7 @@ pub const UdpTransport = struct {
         pe.deinit();
         _ = self.port_entries.remove(port);
         self.rebuildLocatorsLocked() catch {};
+        self.publishMcSendIfacesLocked();
     }
 
     fn vtUnicastLocators(ctx: *anyopaque, out: *std.ArrayListUnmanaged(Locator), alloc: std.mem.Allocator) anyerror!void {
