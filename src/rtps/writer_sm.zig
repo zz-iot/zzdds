@@ -551,6 +551,12 @@ pub const StatefulWriter = struct {
         // write() that acquires mu after we release it.  The replay sends
         // directly to the proxy (not through sendChangeToAllLocked) so it is
         // unaffected by the flag itself.
+        //
+        // BEST_EFFORT readers are excluded here even when should_replay is true:
+        // suppress_live_data exists to hold live data back until an ACKNACK proves
+        // the reader caught up, but BEST_EFFORT readers never ACKNACK, so a replayed
+        // history can race with concurrent live writes for them. That's acceptable —
+        // BEST_EFFORT already permits gaps and reordering — not a bug to fix here.
         if (new_rp.reliable and should_replay and self.cache.changes.items.len > 0) {
             new_rp.suppress_live_data = true;
             new_rp.history_floor_sn = self.cache.maxSn();
