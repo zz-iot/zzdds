@@ -168,6 +168,10 @@ test "mock_loopback: BEST_EFFORT single sample" {
     dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    // Reader must request TRANSIENT_LOCAL+ to receive the pre-match replay
+    // below; a VOLATILE-requesting reader is not entitled to historical data
+    // regardless of what durability the writer offers.
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const p: []const u8 = &PAYLOAD_A;
     try runMockLoopback(std.testing.allocator, dw_qos, dr_qos, &.{p}, &.{p});
 }
@@ -178,6 +182,10 @@ test "mock_loopback: RELIABLE single sample" {
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    // Reader must request TRANSIENT_LOCAL+ to receive the pre-match replay
+    // below; a VOLATILE-requesting reader is not entitled to historical data
+    // regardless of what durability the writer offers.
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const p: []const u8 = &PAYLOAD_A;
     try runMockLoopback(std.testing.allocator, dw_qos, dr_qos, &.{p}, &.{p});
 }
@@ -190,6 +198,10 @@ test "mock_loopback: RELIABLE KEEP_ALL three samples" {
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    // Reader must request TRANSIENT_LOCAL+ to receive the pre-match replay
+    // below; a VOLATILE-requesting reader is not entitled to historical data
+    // regardless of what durability the writer offers.
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     try runMockLoopback(
         std.testing.allocator,
         dw_qos,

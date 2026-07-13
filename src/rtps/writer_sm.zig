@@ -250,6 +250,14 @@ pub const ReaderProxy = struct {
     /// heartbeat thread evicts the proxy and fires the probe-result callback.
     /// Cleared immediately on any incoming ACKNACK (reader is alive).
     probe_deadline_ns: i64,
+    /// True when this specific reader requested TRANSIENT_LOCAL+ durability
+    /// and therefore wants historical replay. A reader requesting VOLATILE
+    /// never wants replay regardless of what durability the writer offers
+    /// (DDS DURABILITY §2.2.3.4), so it must not be held in
+    /// `suppress_live_data` waiting for an ACKNACK it has no reason to send.
+    /// Defaults to true so existing callers that don't track per-reader
+    /// durability keep today's behavior.
+    wants_replay: bool = true,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -522,6 +530,7 @@ pub const StatefulWriter = struct {
                 rp.multicast_locators = proxy.multicast_locators;
                 rp.reliable = proxy.reliable;
                 rp.expects_inline_qos = proxy.expects_inline_qos;
+                rp.wants_replay = proxy.wants_replay;
                 // Dispose the incoming proxy's empty locator lists.
                 var discarded = proxy;
                 discarded.unicast_locators = .empty;
@@ -532,16 +541,27 @@ pub const StatefulWriter = struct {
         }
         try self.reader_proxies.append(self.alloc, proxy);
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
-        if (!self.replay_on_match) new_rp.start_sn = self.cache.next_sn;
+        // Replay only applies when BOTH the writer offers TRANSIENT_LOCAL+ AND
+        // this specific reader requested it. A VOLATILE-requesting reader has
+        // no use for history and must not be held back waiting for an ACKNACK
+        // it has no spec-driven reason to send.
+        const should_replay = self.replay_on_match and new_rp.wants_replay;
+        if (!should_replay) new_rp.start_sn = self.cache.next_sn;
         // Set suppress_live_data before replay so the flag is visible to any
         // write() that acquires mu after we release it.  The replay sends
         // directly to the proxy (not through sendChangeToAllLocked) so it is
         // unaffected by the flag itself.
-        if (new_rp.reliable and self.replay_on_match and self.cache.changes.items.len > 0) {
+        //
+        // BEST_EFFORT readers are excluded here even when should_replay is true:
+        // suppress_live_data exists to hold live data back until an ACKNACK proves
+        // the reader caught up, but BEST_EFFORT readers never ACKNACK, so a replayed
+        // history can race with concurrent live writes for them. That's acceptable —
+        // BEST_EFFORT already permits gaps and reordering — not a bug to fix here.
+        if (new_rp.reliable and should_replay and self.cache.changes.items.len > 0) {
             new_rp.suppress_live_data = true;
             new_rp.history_floor_sn = self.cache.maxSn();
         }
-        if (self.replay_on_match) self.replayHistoryToProxyLocked(new_rp) else if (new_rp.reliable) self.sendHeartbeatToProxyLocked(new_rp, false);
+        if (should_replay) self.replayHistoryToProxyLocked(new_rp) else if (new_rp.reliable) self.sendHeartbeatToProxyLocked(new_rp, false);
         // Start the periodic heartbeat thread on the first matched reader so
         // that dropped DATA or HEARTBEAT packets can be recovered via NACK.
         if (self.hb_thread == null) {

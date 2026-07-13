@@ -1760,6 +1760,7 @@ pub const DomainParticipantImpl = struct {
                 .multicast_locators = data.multicast_locators,
                 .expects_inline_qos = false,
                 .reliability = if (data.qos.reliability_kind == 1) .reliable else .best_effort,
+                .durability_kind = data.qos.durability_kind,
             };
             aw.proto.addMatchedReader(&info) catch {};
             if (aw.matched_notify) |cb|
