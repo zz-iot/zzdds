@@ -530,6 +530,7 @@ pub const StatefulWriter = struct {
                 rp.multicast_locators = proxy.multicast_locators;
                 rp.reliable = proxy.reliable;
                 rp.expects_inline_qos = proxy.expects_inline_qos;
+                rp.wants_replay = proxy.wants_replay;
                 // Dispose the incoming proxy's empty locator lists.
                 var discarded = proxy;
                 discarded.unicast_locators = .empty;
