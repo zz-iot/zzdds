@@ -1242,6 +1242,8 @@ pub const StatefulWriter = struct {
             var b = MessageBuilder.init(scratch, self.guid.prefix);
             b.addInfoDst(rp.guid.prefix);
             if (frag_num == 1) b.addInfoTs(ch.source_timestamp);
+            // Inline QoS (RTPS §9.6.3) belongs only on fragment 1 — later fragments
+            // are pure data continuation; the reassembled sample carries the QoS.
             b.addDataFrag(.{
                 .reader_entity_id = rp.guid.entity_id,
                 .writer_entity_id = self.guid.entity_id,
@@ -1250,6 +1252,15 @@ pub const StatefulWriter = struct {
                 .fragments_in_submessage = 1,
                 .fragment_size = @intCast(frag_size),
                 .data_size = data_size,
+                .key_hash = if (frag_num == 1 and !std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
+                    ch.key_hash
+                else
+                    null,
+                .status_info = if (frag_num == 1) statusInfoFromKind(ch.kind) else null,
+                .coherent_set_sn = if (frag_num == 1) ch.coherent_set_sn else null,
+                .group_seq_num = if (frag_num == 1) ch.group_seq_num else null,
+                .group_coherent_sn = if (frag_num == 1) ch.group_coherent_sn else null,
+                .lifespan = if (frag_num == 1 and ch.kind == .alive) self.lifespan else null,
             }, ch.data[offset..][0..this_len]);
             for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
                 error.UnsupportedLocatorKind => {}, // same defence-in-depth as DATA path above
@@ -1293,6 +1304,15 @@ pub const StatefulWriter = struct {
                 .fragments_in_submessage = 1,
                 .fragment_size = @intCast(frag_size),
                 .data_size = @intCast(ch.data.len),
+                .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
+                    ch.key_hash
+                else
+                    null,
+                .status_info = statusInfoFromKind(ch.kind),
+                .coherent_set_sn = ch.coherent_set_sn,
+                .group_seq_num = ch.group_seq_num,
+                .group_coherent_sn = ch.group_coherent_sn,
+                .lifespan = if (ch.kind == .alive) self.lifespan else null,
             }, ch.data[0..@min(frag_size, ch.data.len)]);
             for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
                 error.UnsupportedLocatorKind => {},
@@ -1357,6 +1377,15 @@ pub const StatefulWriter = struct {
                     .fragments_in_submessage = 1,
                     .fragment_size = @intCast(frag_size),
                     .data_size = data_size,
+                    .key_hash = if (frag_num == 1 and !std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
+                        ch.key_hash
+                    else
+                        null,
+                    .status_info = if (frag_num == 1) statusInfoFromKind(ch.kind) else null,
+                    .coherent_set_sn = if (frag_num == 1) ch.coherent_set_sn else null,
+                    .group_seq_num = if (frag_num == 1) ch.group_seq_num else null,
+                    .group_coherent_sn = if (frag_num == 1) ch.group_coherent_sn else null,
+                    .lifespan = if (frag_num == 1 and ch.kind == .alive) self.lifespan else null,
                 }, ch.data[offset..][0..this_len]);
                 for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
             }

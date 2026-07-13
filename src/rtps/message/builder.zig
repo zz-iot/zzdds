@@ -429,6 +429,15 @@ pub const MessageBuilder = struct {
         fragment_size: u16,
         data_size: u32,
         is_key: bool = false,
+        /// Same inline QoS parameters as addData (RTPS §9.6.3) — see DataParams for
+        /// per-field docs. Only meaningful on the first fragment of a change; callers
+        /// typically pass these only when fragment_starting_num == 1.
+        key_hash: ?[16]u8 = null,
+        status_info: ?u32 = null,
+        coherent_set_sn: ?SequenceNumber = null,
+        group_seq_num: ?SequenceNumber = null,
+        group_coherent_sn: ?SequenceNumber = null,
+        lifespan: ?RtpsDuration = null,
     };
 
     /// Add a DATA_FRAG submessage with a fragment payload slice.
@@ -437,13 +446,28 @@ pub const MessageBuilder = struct {
         params: DataFragParams,
         payload: []const u8,
     ) void {
+        const has_iqos = params.key_hash != null or params.status_info != null or
+            params.coherent_set_sn != null or params.group_seq_num != null or
+            params.group_coherent_sn != null or params.lifespan != null;
+
         var flags: u8 = sub.FLAG_ENDIANNESS;
         if (params.is_key) flags |= sub.DataFragFlags.key_flag;
+        if (has_iqos) flags |= sub.DataFragFlags.inline_qos;
 
         // Fixed fields: extraFlags(2) + qos_offset(2) + reader(4) + writer(4) +
         //               SN(8) + fragStart(4) + fragCount(2) + fragSize(2) + dataSize(4)
         //             = 32 bytes
-        const fixed_len: usize = 32;
+        // Inline QoS parameters (each: 2-byte PID + 2-byte length + value) — see
+        // addData for the byte-size breakdown of each PID.
+        var fixed_len: usize = 32;
+        if (params.key_hash != null) fixed_len += 20;
+        if (params.status_info != null) fixed_len += 8;
+        if (params.group_seq_num != null) fixed_len += 12;
+        if (params.coherent_set_sn != null) fixed_len += 12;
+        if (params.group_coherent_sn != null) fixed_len += 12;
+        if (params.lifespan != null) fixed_len += 12;
+        if (has_iqos) fixed_len += 4; // PID_SENTINEL
+
         writeSmHeader(&self.scratch, .data_frag, flags, fixed_len + payload.len);
 
         self.scratch.writeU16Le(0); // extraFlags
@@ -455,6 +479,46 @@ pub const MessageBuilder = struct {
         self.scratch.writeU16Le(params.fragments_in_submessage);
         self.scratch.writeU16Le(params.fragment_size);
         self.scratch.writeU32Le(params.data_size);
+
+        if (params.key_hash) |kh| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.key_hash));
+            self.scratch.writeU16Le(16);
+            self.scratch.writeBytes(&kh);
+        }
+        if (params.status_info) |si| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.status_info));
+            self.scratch.writeU16Le(4);
+            self.scratch.writeU8(0);
+            self.scratch.writeU8(0);
+            self.scratch.writeU8(0);
+            self.scratch.writeU8(@truncate(si));
+        }
+        if (params.group_seq_num) |gsn| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_seq_num));
+            self.scratch.writeU16Le(8);
+            self.scratch.writeSequenceNumber(gsn);
+        }
+        if (params.coherent_set_sn) |csn| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.coherent_set));
+            self.scratch.writeU16Le(8);
+            self.scratch.writeSequenceNumber(csn);
+        }
+        if (params.group_coherent_sn) |gcs| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_coherent_set));
+            self.scratch.writeU16Le(8);
+            self.scratch.writeSequenceNumber(gcs);
+        }
+        if (params.lifespan) |ls| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.lifespan));
+            self.scratch.writeU16Le(8);
+            self.scratch.writeI32Le(ls.seconds);
+            self.scratch.writeU32Le(ls.fraction);
+        }
+        if (has_iqos) {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.sentinel));
+            self.scratch.writeU16Le(0);
+        }
+
         self.syncScratchIov();
 
         if (payload.len > 0) self.addPayloadIov(payload);
