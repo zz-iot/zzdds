@@ -18,6 +18,7 @@ const reader_sm = @import("reader_sm.zig");
 const history_mod = @import("history.zig");
 const guid_mod = @import("guid.zig");
 const trace_mod = @import("../trace.zig");
+const time_mod = @import("../util/time.zig");
 const submsg_mod = @import("message/submessage.zig");
 const msg_builder = @import("message/builder.zig");
 
@@ -66,6 +67,10 @@ pub const RtpsProtocolWriter = struct {
 
     pub fn setTracer(self: *Self, t: trace_mod.Tracer) void {
         self.writer.setTracer(t);
+    }
+
+    pub fn setLifespan(self: *Self, ls: ?time_mod.RtpsDuration) void {
+        self.writer.setLifespan(ls);
     }
 
     pub fn toProtocolWriter(self: *Self) ProtocolWriter {

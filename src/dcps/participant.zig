@@ -1033,6 +1033,13 @@ pub const DomainParticipantImpl = struct {
         );
         errdefer adapter.deinit();
         adapter.setTracer(self.tracer);
+        // {0,0} from codegen means unset → infinite (no lifespan enforcement),
+        // matching the convention used by writerQosSnapshot for SEDP announcement.
+        const ls_zero = qos.lifespan.duration.sec == 0 and qos.lifespan.duration.nanosec == 0;
+        adapter.setLifespan(if (ls_zero) null else time_mod.RtpsDuration.fromDuration(.{
+            .sec = qos.lifespan.duration.sec,
+            .nanosec = qos.lifespan.duration.nanosec,
+        }));
 
         const pw = adapter.toProtocolWriter();
 

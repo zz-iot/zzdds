@@ -368,6 +368,10 @@ pub const StatefulWriter = struct {
     /// alive=false means the probe deadline expired and the proxy was removed.
     probe_result_fn: ?*const fn (*anyopaque, GuidPrefix, bool) void,
     probe_result_ctx: ?*anyopaque,
+    /// PID_LIFESPAN QoS, sent as inline QoS on every alive DATA submessage (not just
+    /// via SEDP writer announcement) — some readers only apply lifespan-based expiry
+    /// to samples that carry it inline. null = no lifespan configured.
+    lifespan: ?time_mod.RtpsDuration,
 
     const Self = @This();
 
@@ -408,8 +412,15 @@ pub const StatefulWriter = struct {
             .pending_eoc_sn = null,
             .probe_result_fn = null,
             .probe_result_ctx = null,
+            .lifespan = null,
         };
         return self;
+    }
+
+    pub fn setLifespan(self: *Self, ls: ?time_mod.RtpsDuration) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.lifespan = ls;
     }
 
     pub fn setTracer(self: *Self, t: trace.Tracer) void {
@@ -636,6 +647,7 @@ pub const StatefulWriter = struct {
                         null,
                     .is_key = ch.kind != .alive,
                     .status_info = statusInfoFromKind(ch.kind),
+                    .lifespan = if (ch.kind == .alive) self.lifespan else null,
                 }, ch.data);
                 for (locs) |loc| {
                     sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
@@ -1008,6 +1020,7 @@ pub const StatefulWriter = struct {
                             .coherent_set_sn = ch.coherent_set_sn,
                             .group_seq_num = ch.group_seq_num,
                             .group_coherent_sn = ch.group_coherent_sn,
+                            .lifespan = if (ch.kind == .alive) w.lifespan else null,
                         }, ch.data);
                         for (proxy.effectiveLocators()) |loc| sendIovecs(w.transport, &loc, b.iovecs()) catch {};
                     }
@@ -1176,6 +1189,7 @@ pub const StatefulWriter = struct {
                     .coherent_set_sn = ch.coherent_set_sn,
                     .group_seq_num = ch.group_seq_num,
                     .group_coherent_sn = ch.group_coherent_sn,
+                    .lifespan = if (ch.kind == .alive) self.lifespan else null,
                 }, ch.data);
                 for (locs) |loc| {
                     sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
