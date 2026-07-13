@@ -57,6 +57,10 @@ pub const MatchedReaderInfo = struct {
     multicast_locators: []const Locator,
     expects_inline_qos: bool,
     reliability: ReliabilityKind,
+    /// Requested DURABILITY of the remote reader: 0=volatile, 1=transient_local,
+    /// 2=transient, 3=persistent. A reader requesting VOLATILE never wants
+    /// historical replay, regardless of what durability the local writer offers.
+    durability_kind: u8 = 0,
 };
 
 /// What SEDP tells the protocol layer about a newly-matched remote writer.

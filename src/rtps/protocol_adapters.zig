@@ -106,7 +106,7 @@ pub const RtpsProtocolWriter = struct {
 
     fn vtAddMatchedReader(ctx: *anyopaque, info: *const MatchedReaderInfo) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const proxy = try ReaderProxy.init(
+        var proxy = try ReaderProxy.init(
             self.alloc,
             info.guid,
             info.unicast_locators,
@@ -114,6 +114,7 @@ pub const RtpsProtocolWriter = struct {
             info.expects_inline_qos,
             info.reliability == .reliable,
         );
+        proxy.wants_replay = info.durability_kind != 0;
         try self.writer.addMatchedReader(proxy);
     }
 

@@ -168,6 +168,10 @@ test "loopback: BEST_EFFORT single sample" {
     dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    // Reader must request TRANSIENT_LOCAL+ to receive the pre-match replay
+    // below; a VOLATILE-requesting reader is not entitled to historical data
+    // regardless of what durability the writer offers.
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const p: []const u8 = &PAYLOAD_1;
     try runLoopback(std.testing.allocator, 0, 1, dw_qos, dr_qos, &.{p}, &.{p});
 }
@@ -178,6 +182,10 @@ test "loopback: RELIABLE single sample" {
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    // Reader must request TRANSIENT_LOCAL+ to receive the pre-match replay
+    // below; a VOLATILE-requesting reader is not entitled to historical data
+    // regardless of what durability the writer offers.
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const p: []const u8 = &PAYLOAD_1;
     try runLoopback(std.testing.allocator, 2, 3, dw_qos, dr_qos, &.{p}, &.{p});
 }
@@ -194,6 +202,10 @@ test "loopback: RELIABLE KEEP_LAST depth=1" {
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_LAST_HISTORY_QOS;
     dr_qos.history.depth = 1;
+    // Reader must request TRANSIENT_LOCAL+ to receive the pre-match replay
+    // below; a VOLATILE-requesting reader is not entitled to historical data
+    // regardless of what durability the writer offers.
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     try runLoopback(
         std.testing.allocator,
         4,
@@ -214,6 +226,10 @@ test "loopback: RELIABLE KEEP_ALL" {
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    // Reader must request TRANSIENT_LOCAL+ to receive the pre-match replay
+    // below; a VOLATILE-requesting reader is not entitled to historical data
+    // regardless of what durability the writer offers.
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     try runLoopback(
         std.testing.allocator,
         6,
