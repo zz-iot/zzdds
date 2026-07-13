@@ -451,11 +451,15 @@ pub const SubscriberImpl = struct {
 
         self.mu.lock();
 
-        // COHERENT ACCESS: commit all complete coherent sets atomically so the
-        // application sees a consistent view across all readers.
-        // Only commit when ALL readers have a complete set ready — partial commits
-        // would deliver an incomplete group.
+        // COHERENT ACCESS: commit complete coherent sets so the application sees a
+        // consistent view.  Per DDS PRESENTATION QoS (§2.2.3.6), cross-reader
+        // synchronization — waiting for every reader's set before committing any
+        // of them — is only required for GROUP_PRESENTATION.  For INSTANCE/TOPIC
+        // scope, each DataReader's coherent set is independent and must commit as
+        // soon as it is complete, without waiting on sibling readers (which may be
+        // matched to entirely different, independently-paced remote writers).
         if (pres.coherent_access) {
+            const group_scope = pres.access_scope == .GROUP_PRESENTATION_QOS;
             var all_ready = true;
             var any_committed = false;
             for (self.readers.items) |r| {
@@ -483,12 +487,25 @@ pub const SubscriberImpl = struct {
             }
             // Nothing to commit if no reader has a complete set ready.
             if (!any_committed) all_ready = false;
-            if (all_ready and self.readers.items.len > 0) {
+            if (self.readers.items.len > 0) {
                 for (self.readers.items) |r| {
                     r.mu.lock();
+                    const coherent_guids_pending = r.coherent_writer_guids.count() > 0 and
+                        r.pending.items.len == 0 and
+                        (now_ns - r.last_coherent_wip_start_ns < coherent_idle_gate_ns);
+                    const reader_ready = r.coherent_committed_ready or
+                        !(r.sub_matched_current > 0 and (r.coherent_wip.count() > 0 or coherent_guids_pending));
+                    // GROUP scope: commit only once every reader is ready (all_ready).
+                    // INSTANCE/TOPIC scope: commit this reader independently once it,
+                    // specifically, is ready.
+                    const should_commit = if (group_scope) all_ready else reader_ready;
+                    if (!should_commit) {
+                        r.mu.unlock();
+                        continue;
+                    }
                     r.commitCoherentPendingLocked();
                     // Only notify if this reader actually has samples after commit — a
-                    // reader with no WIP and no committed data passes the all_ready check
+                    // reader with no WIP and no committed data passes the ready check
                     // but must not generate a spurious on_data_available or WaitSet wakeup.
                     const has_data = r.pending.items.len > 0;
                     // Fire WaitSet wakeups while subscriber.mu is held to prevent
