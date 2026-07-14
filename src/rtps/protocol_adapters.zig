@@ -415,6 +415,7 @@ pub const RtpsProtocolReader = struct {
         kind: history_mod.ChangeKind,
         coherent_set_sn: ?history_mod.SequenceNumber,
         group_seq_num: ?history_mod.SequenceNumber,
+        lifespan_ns: ?i64,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const change = history_mod.CacheChange{
@@ -427,6 +428,7 @@ pub const RtpsProtocolReader = struct {
             .data = serialized_payload,
             .coherent_set_sn = coherent_set_sn,
             .group_seq_num = group_seq_num,
+            .inline_lifespan_ns = lifespan_ns,
         };
         // Signal liveliness only for writers already matched; unmatched writers are
         // handled by StatefulReader.handleData (buffered for reliable readers so the

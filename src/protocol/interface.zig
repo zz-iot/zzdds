@@ -379,6 +379,7 @@ pub const ProtocolReader = struct {
             kind: ChangeKind,
             coherent_set_sn: ?SequenceNumber,
             group_seq_num: ?SequenceNumber,
+            lifespan_ns: ?i64,
         ) void,
 
         /// Called by the participant's RTPS message dispatcher when a HEARTBEAT
@@ -469,6 +470,7 @@ pub const ProtocolReader = struct {
         kind: ChangeKind,
         coherent_set_sn: ?SequenceNumber,
         group_seq_num: ?SequenceNumber,
+        lifespan_ns: ?i64,
     ) void {
         self.vtable.handle_incoming_change(
             self.ctx,
@@ -480,6 +482,7 @@ pub const ProtocolReader = struct {
             kind,
             coherent_set_sn,
             group_seq_num,
+            lifespan_ns,
         );
     }
 

@@ -57,6 +57,11 @@ pub const CacheChange = struct {
     /// Last group sequence number in this group coherent set; emitted as
     /// PID_GROUP_COHERENT_SET.  Equals group_seq_num for the last sample in the set.
     group_coherent_sn: ?SequenceNumber = null,
+    /// Reader side only: this sample's PID_LIFESPAN inline QoS, if the writer sent
+    /// one (RTPS §8.7.2 Table 8.85 lists LIFESPAN as eligible for in-line QoS).
+    /// null = not present on this sample; the reader falls back to whatever
+    /// duration it learned for this writer via SEDP discovery.
+    inline_lifespan_ns: ?i64 = null,
 };
 
 // ── HistoryCache ──────────────────────────────────────────────────────────────
