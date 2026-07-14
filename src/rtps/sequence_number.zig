@@ -6,7 +6,8 @@
 //! arithmetic, converting to/from wire form at the serialization boundary.
 //!
 //! Valid range: 1 .. 2^63-1. Zero and negative values are reserved.
-//! SEQUENCENUMBER_UNKNOWN = {high=-1, low=u32::MAX} → logical value = -1 (sentinel).
+//! SEQUENCENUMBER_UNKNOWN = {high=-1, low=0} (RTPS 2.5 §9.3.2 IDL comment) →
+//! logical value = -1 (sentinel).
 
 const std = @import("std");
 
@@ -26,7 +27,7 @@ pub const SEQUENCENUMBER_ZERO: SequenceNumber = 0;
 /// Pack a logical sequence number into wire form.
 pub fn toWire(sn: SequenceNumber) SequenceNumberWire {
     if (sn == SEQUENCENUMBER_UNKNOWN) {
-        return .{ .high = -1, .low = std.math.maxInt(u32) };
+        return .{ .high = -1, .low = 0 };
     }
     return .{
         .high = @intCast(sn >> 32),
@@ -36,7 +37,7 @@ pub fn toWire(sn: SequenceNumber) SequenceNumberWire {
 
 /// Unpack wire form to logical sequence number.
 pub fn fromWire(w: SequenceNumberWire) SequenceNumber {
-    if (w.high == -1 and w.low == std.math.maxInt(u32)) {
+    if (w.high == -1 and w.low == 0) {
         return SEQUENCENUMBER_UNKNOWN;
     }
     const h: i64 = @as(i64, w.high) << 32;

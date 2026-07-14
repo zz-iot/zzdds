@@ -18,8 +18,10 @@ const reader_sm = @import("reader_sm.zig");
 const history_mod = @import("history.zig");
 const guid_mod = @import("guid.zig");
 const trace_mod = @import("../trace.zig");
+const time_mod = @import("../util/time.zig");
 const submsg_mod = @import("message/submessage.zig");
 const msg_builder = @import("message/builder.zig");
+const sn_mod = @import("sequence_number.zig");
 
 pub const StatefulWriter = writer_sm.StatefulWriter;
 pub const StatefulReader = reader_sm.StatefulReader;
@@ -66,6 +68,10 @@ pub const RtpsProtocolWriter = struct {
 
     pub fn setTracer(self: *Self, t: trace_mod.Tracer) void {
         self.writer.setTracer(t);
+    }
+
+    pub fn setLifespan(self: *Self, ls: ?time_mod.RtpsDuration) void {
+        self.writer.setLifespan(ls);
     }
 
     pub fn toProtocolWriter(self: *Self) ProtocolWriter {
@@ -115,6 +121,7 @@ pub const RtpsProtocolWriter = struct {
             info.reliability == .reliable,
         );
         proxy.wants_replay = info.durability_kind != 0;
+        proxy.needs_pid_coherent_set_marker = info.needs_pid_coherent_set_marker;
         try self.writer.addMatchedReader(proxy);
     }
 
@@ -218,6 +225,7 @@ pub const RtpsProtocolWriter = struct {
                     .reader_guid = rp.guid,
                     .writer_guid = self.writer.guid,
                     .eoc_sn = eoc_sn,
+                    .needs_pid_coherent_set_marker = rp.needs_pid_coherent_set_marker,
                 });
             }
         }
@@ -258,11 +266,22 @@ pub const RtpsProtocolWriter = struct {
             for (infos_slice) |entry| {
                 if (!entry.locator.eql(entry0.locator)) continue;
                 if (!entry.reader_guid.prefix.eql(entry0.reader_guid.prefix)) continue;
+                // RTPS 2.5 §9.6.4.2 Table 9.22 lists two equivalent spec-legal ways
+                // to signal end-of-coherent-set: "Example 3" (DataFlag=0,
+                // InlineQosFlag=0, no inline QoS at all — the smaller wire form)
+                // and "Example 2" (DataFlag=0, InlineQosFlag=1, PID_COHERENT_SET=
+                // SEQUENCENUMBER_UNKNOWN). Default to Example 3. Readers whose
+                // vendor is known (via needs_pid_coherent_set_marker, set from the
+                // remote participant's discovered VendorId — see
+                // header_mod.needsPidCoherentSetMarker) to reject a bare Example 3
+                // as malformed get Example 2 instead, still with the spec-correct
+                // SEQUENCENUMBER_UNKNOWN value — never a non-compliant one.
                 b.addData(.{
                     .reader_entity_id = entry.reader_guid.entity_id,
                     .writer_entity_id = entry.writer_guid.entity_id,
                     .writer_sn = entry.eoc_sn,
                     .no_payload = true,
+                    .coherent_set_sn = if (entry.needs_pid_coherent_set_marker) sn_mod.SEQUENCENUMBER_UNKNOWN else null,
                 }, &.{});
             }
             writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};
@@ -410,6 +429,7 @@ pub const RtpsProtocolReader = struct {
         kind: history_mod.ChangeKind,
         coherent_set_sn: ?history_mod.SequenceNumber,
         group_seq_num: ?history_mod.SequenceNumber,
+        lifespan_ns: ?i64,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const change = history_mod.CacheChange{
@@ -422,6 +442,7 @@ pub const RtpsProtocolReader = struct {
             .data = serialized_payload,
             .coherent_set_sn = coherent_set_sn,
             .group_seq_num = group_seq_num,
+            .inline_lifespan_ns = lifespan_ns,
         };
         // Signal liveliness only for writers already matched; unmatched writers are
         // handled by StatefulReader.handleData (buffered for reliable readers so the

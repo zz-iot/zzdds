@@ -650,7 +650,11 @@ pub const DataReaderImpl = struct {
             if (change.kind == .alive) self.storeKeyIfNeededLocked(ih, copy);
             const src_time = change.source_timestamp.toTime();
             const coh_expiry: ?i64 = if (change.kind == .alive)
-                if (self.writer_lifespans.get(change.writer_guid)) |ls_ns|
+                // Prefer this sample's own PID_LIFESPAN inline QoS (RTPS §8.7.2 Table
+                // 8.85) over the SEDP-discovered default — inline QoS takes effect
+                // immediately and reflects the writer's QoS at the time this sample
+                // was written, which may differ from what discovery last announced.
+                if (change.inline_lifespan_ns orelse self.writer_lifespans.get(change.writer_guid)) |ls_ns|
                     src_time.toNs() + ls_ns
                 else
                     null
@@ -856,7 +860,9 @@ pub const DataReaderImpl = struct {
         if (change.kind == .alive) self.storeKeyIfNeededLocked(ih, copy);
         const src_time = change.source_timestamp.toTime();
         const expiry: ?i64 = if (change.kind == .alive)
-            if (self.writer_lifespans.get(change.writer_guid)) |ls_ns|
+            // See the coherent-set branch above: inline PID_LIFESPAN takes
+            // precedence over the SEDP-discovered default when present.
+            if (change.inline_lifespan_ns orelse self.writer_lifespans.get(change.writer_guid)) |ls_ns|
                 src_time.toNs() + ls_ns
             else
                 null

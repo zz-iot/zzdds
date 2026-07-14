@@ -21,6 +21,7 @@
 const std = @import("std");
 const disc_iface = @import("interface.zig");
 const mutex_mod = @import("../util/mutex.zig");
+const header_mod = @import("../rtps/message/header.zig");
 
 pub const Discovery = disc_iface.Discovery;
 pub const Callbacks = disc_iface.Callbacks;
@@ -125,6 +126,7 @@ pub const DiscoveryBus = struct {
                 .default_multicast_locators = &.{},
                 .lease_duration_ms = std.math.maxInt(u32),
                 .builtin_endpoint_set = 0,
+                .vendor_id = header_mod.VENDOR_ID,
             };
             new_callbacks.on_participant_discovered(new_callbacks.ctx, &pd);
 
@@ -149,6 +151,7 @@ pub const DiscoveryBus = struct {
             .default_multicast_locators = &.{},
             .lease_duration_ms = local.lease_duration_ms,
             .builtin_endpoint_set = local.builtin_endpoint_set,
+            .vendor_id = header_mod.VENDOR_ID,
         };
         for (snapshots[0..snap_count]) |snap| {
             snap.callbacks.on_participant_discovered(snap.callbacks.ctx, &new_pd);

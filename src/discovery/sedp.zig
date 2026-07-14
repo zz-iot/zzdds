@@ -30,6 +30,7 @@ const history_mod = @import("../rtps/history.zig");
 const mutex_mod = @import("../util/mutex.zig");
 const time_mod = @import("../util/time.zig");
 const build_opts = @import("build_options");
+const header_mod = @import("../rtps/message/header.zig");
 
 const Transport = tr_iface.Transport;
 const Locator = tr_iface.Locator;
@@ -135,22 +136,20 @@ fn readString(b: []const u8, le: bool) []const u8 {
     const end = 4 + slen - 1; // strip null
     return b[4..end];
 }
-// DDS QoS parameters in SEDP ParameterLists encode Duration_t as CDR {sec: i32,
-// nanosec: u32} — direct nanoseconds, NOT RTPS 1/2^32 fraction.
+// RTPS 2.5 §9.3.2.3: Duration_t is {seconds: long, fraction: unsigned long},
+// with time = seconds + fraction/2^32, for ALL types appearing within
+// submessages or Built-in Topic Data (i.e. SEDP/SPDP ParameterLists use the
+// same wire Duration_t as inline QoS — there is no separate "direct
+// nanoseconds" encoding).
 fn readDeadlineDuration(b: []const u8, le: bool) time_mod.Duration {
     if (b.len < 8) return time_mod.Duration.infinite;
-    const d = time_mod.Duration{ .sec = readI32LE(b[0..], le), .nanosec = readU32LE(b[4..], le) };
-    if (d.isInfinite()) return time_mod.Duration.infinite;
-    return d;
+    const rd = time_mod.RtpsDuration{ .seconds = readI32LE(b[0..], le), .fraction = readU32LE(b[4..], le) };
+    if (rd.isInfinite()) return time_mod.Duration.infinite;
+    return rd.toDuration();
 }
 
 fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
     try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
-}
-
-fn writeDdsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
-    try writeI32Le(alloc, buf, duration.sec);
-    try writeU32Le(alloc, buf, duration.nanosec);
 }
 
 fn snapshotDeadlineDuration(qos: QosSnapshot) time_mod.Duration {
@@ -235,7 +234,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0xffff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeDdsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
+        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
     // Cyclone and OpenDDS use different on-wire representations for Duration_t
@@ -254,7 +253,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
     // PID_LIFESPAN: only emitted when not INFINITE (same pattern as DEADLINE).
     if (ann.qos.lifespan_sec != 0x7fff_ffff or ann.qos.lifespan_nanosec != 0xffff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.LIFESPAN, 8);
-        try writeDdsDuration(alloc, &buf, .{ .sec = ann.qos.lifespan_sec, .nanosec = ann.qos.lifespan_nanosec });
+        try writeRtpsDuration(alloc, &buf, .{ .sec = ann.qos.lifespan_sec, .nanosec = ann.qos.lifespan_nanosec });
     }
 
     // PID_DATA_REPRESENTATION: seq_len(4) + value(2) + pad(2) = 8 bytes.
@@ -362,7 +361,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
     // encoding differences between implementations.
     if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0xffff_ffff) {
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeDdsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
+        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
     // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
 
@@ -601,7 +600,7 @@ pub const SedpEndpoints = struct {
 
     // Optional relay for SPDP packets that arrive on the metatraffic unicast port.
     spdp_relay_ctx: ?*anyopaque,
-    spdp_relay_fn: ?*const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8) void,
+    spdp_relay_fn: ?*const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8, header_mod.VendorId) void,
     // Optional handler for SPDP BYE (participant dispose/unregister).
     spdp_bye_ctx: ?*anyopaque,
     spdp_bye_fn: ?*const fn (*anyopaque, GuidPrefix) void,
@@ -668,7 +667,7 @@ pub const SedpEndpoints = struct {
     pub fn setSpdpRelay(
         self: *Self,
         ctx: *anyopaque,
-        fn_ptr: *const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8) void,
+        fn_ptr: *const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8, header_mod.VendorId) void,
     ) void {
         self.spdp_relay_ctx = ctx;
         self.spdp_relay_fn = fn_ptr;
@@ -985,7 +984,7 @@ pub const SedpEndpoints = struct {
 
                     if (wid.eql(EntityIds.spdp_builtin_participant_writer)) {
                         if (self.spdp_relay_fn) |relay|
-                            relay(self.spdp_relay_ctx.?, src_prefix, d.writer_sn, payload);
+                            relay(self.spdp_relay_ctx.?, src_prefix, d.writer_sn, payload, it.header.vendor_id);
                         continue;
                     } else if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
                         if (self.pub_reader) |pr| {
@@ -1232,11 +1231,11 @@ test "readDeadlineDuration recognizes DDS infinite sentinel" {
     try std.testing.expect(readDeadlineDuration(&bytes, true).isInfinite());
 }
 
-test "readDeadlineDuration reads sub-second DDS Duration_t" {
-    // OpenDDS encodes 250ms as {sec=0, nanosec=250000000} — direct nanoseconds.
+test "readDeadlineDuration reads sub-second RTPS wire Duration_t" {
+    // RTPS 2.5 §9.3.2.3: 250ms on the wire is {seconds=0, fraction=0.25 * 2^32}.
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(i32, bytes[0..4], 0, .little);
-    std.mem.writeInt(u32, bytes[4..8], 250_000_000, .little);
+    std.mem.writeInt(u32, bytes[4..8], 0x4000_0000, .little); // 0.25 * 2^32
     const dur = readDeadlineDuration(&bytes, true);
     try std.testing.expectEqual(@as(i32, 0), dur.sec);
     try std.testing.expectEqual(@as(u32, 250_000_000), dur.nanosec);

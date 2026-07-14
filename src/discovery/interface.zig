@@ -17,6 +17,7 @@
 const std = @import("std");
 const transport = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
+const header_mod = @import("../rtps/message/header.zig");
 const Locator = transport.Locator;
 const Transport = transport.Transport;
 
@@ -24,6 +25,7 @@ pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
 pub const EntityId = guid_mod.EntityId;
 pub const EntityIds = guid_mod.EntityIds;
+pub const VendorId = header_mod.VendorId;
 
 /// QoS snapshot passed to discovery for matching and advertisement.
 /// Fields are kept as raw i32/u32 to avoid a circular dependency on qos.zig
@@ -119,6 +121,10 @@ pub const ParticipantData = struct {
     default_multicast_locators: []const Locator,
     lease_duration_ms: u32,
     builtin_endpoint_set: u32,
+    /// VendorId from the RTPS Message header (§9.4.1) that carried this
+    /// participant's SPDP announcement. Used to work around known per-vendor
+    /// RTPS wire-format quirks (see header_mod.needsPidCoherentSetMarker).
+    vendor_id: VendorId,
 };
 
 /// Data about a discovered remote DataWriter.

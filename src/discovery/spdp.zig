@@ -28,6 +28,7 @@ const history_mod = @import("../rtps/history.zig");
 const mutex_mod = @import("../util/mutex.zig");
 const time_mod = @import("../util/time.zig");
 const sn_mod = @import("../rtps/sequence_number.zig");
+const header_mod = @import("../rtps/message/header.zig");
 
 const Transport = tr_iface.Transport;
 const Locator = tr_iface.Locator;
@@ -425,7 +426,7 @@ pub const SpdpEndpoints = struct {
                     }
                     const payload = d.serialized_payload;
                     if (payload.len == 0) continue;
-                    self.processSpdpPayload(src_prefix, d.writer_sn, payload);
+                    self.processSpdpPayload(src_prefix, d.writer_sn, payload, it.header.vendor_id);
                 },
                 else => {},
             }
@@ -434,9 +435,15 @@ pub const SpdpEndpoints = struct {
 
     /// Relay entry point: called by SEDP when an SPDP DATA arrives on the
     /// metatraffic unicast port (Cyclone sends unicast responses there per RTPS §9.6.1.1).
-    pub fn handleRelayedData(ctx: *anyopaque, prefix: GuidPrefix, writer_sn: SequenceNumber, payload: []const u8) void {
+    pub fn handleRelayedData(
+        ctx: *anyopaque,
+        prefix: GuidPrefix,
+        writer_sn: SequenceNumber,
+        payload: []const u8,
+        vendor_id: header_mod.VendorId,
+    ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.processSpdpPayload(prefix, writer_sn, payload);
+        self.processSpdpPayload(prefix, writer_sn, payload, vendor_id);
     }
 
     /// Called when a peer participant's SPDP BYE (dispose/unregister) is received.
@@ -458,6 +465,7 @@ pub const SpdpEndpoints = struct {
         guid_prefix: GuidPrefix,
         writer_sn: SequenceNumber,
         payload: []const u8,
+        vendor_id: header_mod.VendorId,
     ) void {
         // Ignore our own announcements.
         if (self.writer) |w| {
@@ -466,7 +474,7 @@ pub const SpdpEndpoints = struct {
 
         log.spdp.debug("spdp: received from {x}", .{guid_prefix.bytes});
 
-        var kp = decodeSpdpParticipant(self.alloc, guid_prefix, self.domain_id, payload) catch |err| {
+        var kp = decodeSpdpParticipant(self.alloc, guid_prefix, self.domain_id, payload, vendor_id) catch |err| {
             log.spdp.warn("spdp: decode error: {}", .{err});
             return;
         };
@@ -825,6 +833,7 @@ pub fn decodeSpdpParticipant(
     guid_prefix: GuidPrefix,
     domain_id: u32,
     payload: []const u8,
+    vendor_id: header_mod.VendorId,
 ) !KnownParticipant {
     if (payload.len < 4) return error.TooShort;
     const le = (payload[1] & 0x01) != 0;
@@ -922,6 +931,7 @@ pub fn decodeSpdpParticipant(
             .default_multicast_locators = try data_mc.toOwnedSlice(alloc),
             .lease_duration_ms = lease_ms,
             .builtin_endpoint_set = builtin_eps,
+            .vendor_id = vendor_id,
         },
     };
 }

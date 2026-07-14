@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zidl = .{
-            .url = "https://github.com/zz-iot/zidl/archive/refs/tags/v0.2.7-zig.0.16.0.tar.gz",
-            .hash = "zidl-0.2.7-zig.0.16.0-H6NwLskbHwDiWUUwaw9mI6dNqgLEV-OvCDCMuoyIH1R5",
+            .url = "https://github.com/zz-iot/zidl/archive/refs/tags/v0.2.8-zig.0.16.0.tar.gz",
+            .hash = "zidl-0.2.8-zig.0.16.0-H6NwLtcbHwDe52Slriimk_zg3fhJecqNpYqMEOmOR3Wu",
         },
     },
     .paths = .{

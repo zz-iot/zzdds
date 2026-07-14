@@ -178,6 +178,7 @@ pub fn takeFilteredRaw(
     vs: DDS.ViewStateMask,
     is: DDS.InstanceStateMask,
     maybe_ih: ?DDS.InstanceHandle_t,
+    caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
@@ -186,7 +187,12 @@ pub fn takeFilteredRaw(
         tmp.deinit(impl.alloc);
     }
     try impl.takeFiltered(&tmp, ss, vs, is, max, maybe_ih, null);
-    try out.ensureUnusedCapacity(impl.alloc, tmp.items.len);
+    // `out`'s backing storage must grow with `caller_alloc` (whatever the caller
+    // will later use to deinit it) — not `impl.alloc`, which is this reader's own
+    // internal allocator and is generally a different instance from the caller's.
+    // Each item's `.data` buffer legitimately stays impl.alloc-owned via its own
+    // `._alloc` field; only the container's growth allocator needs to match here.
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
     for (tmp.items) |s| {
         out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
     }
@@ -204,6 +210,7 @@ pub fn readFilteredRaw(
     vs: DDS.ViewStateMask,
     is: DDS.InstanceStateMask,
     maybe_ih: ?DDS.InstanceHandle_t,
+    caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
@@ -212,7 +219,9 @@ pub fn readFilteredRaw(
         tmp.deinit(impl.alloc);
     }
     try impl.readRaw(&tmp, ss, vs, is, max, maybe_ih, null);
-    try out.ensureUnusedCapacity(impl.alloc, tmp.items.len);
+    // See takeFilteredRaw: `out` must grow with the caller's allocator, not
+    // impl.alloc, since the caller (not this reader) owns and will deinit `out`.
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
     for (tmp.items) |s| {
         out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
     }

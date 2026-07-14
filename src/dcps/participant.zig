@@ -38,6 +38,7 @@ const security_if = @import("../security/interface.zig");
 const parser_mod = @import("../rtps/message/parser.zig");
 const submsg_mod = @import("../rtps/message/submessage.zig");
 const time_mod = @import("../util/time.zig");
+const header_mod = @import("../rtps/message/header.zig");
 const build_opts = @import("build_options");
 const qm_mod = @import("qos_match.zig");
 const reader_mod = @import("reader.zig");
@@ -89,7 +90,7 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: std.mem.Allocator, _: *std.ArrayListUnmanaged(proto.Guid)) anyerror!void {}
     }.f,
     .handle_incoming_change = struct {
-        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber) void {}
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber, _: ?i64) void {}
     }.f,
     .handle_heartbeat = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool) void {}
@@ -498,6 +499,9 @@ const AssertNotify = struct {
 const DiscoveredParticipant = struct {
     guid: Guid,
     handle: DDS.InstanceHandle_t,
+    /// VendorId from this participant's SPDP announcement. Used to work around
+    /// known per-vendor RTPS wire-format quirks (see header_mod.needsPidCoherentSetMarker).
+    vendor_id: header_mod.VendorId,
 };
 
 const DiscoveredTopic = struct {
@@ -509,6 +513,51 @@ const DiscoveredTopic = struct {
     liveliness_kind: u8,
     ownership_kind: u8,
     dest_order_kind: u8,
+};
+
+/// Persistent record of a remote writer discovered via SEDP, kept independent
+/// of whether any local DataReader for the topic exists yet.  Lets a
+/// DataReader created *after* the writer was discovered still be matched
+/// immediately at creation time, instead of only reacting to (and possibly
+/// missing) the one-shot onWriterDiscovered callback.  All slices owned.
+///
+/// Per RTPS 2.5 Table 8.78, individual SEDP endpoints carry no lease of their
+/// own; entries are removed on individual retraction (onWriterLost) or when
+/// the owning participant's SPDP lease expires (onParticipantLost).
+const DiscoveredWriter = struct {
+    guid: Guid,
+    topic_name: []const u8, // owned
+    type_name: []const u8, // owned
+    qos: disc.QosSnapshot, // qos.partition_names owned via dupePartitionNames
+    unicast_locators: []const Locator, // owned
+    multicast_locators: []const Locator, // owned
+
+    fn deinit(self: DiscoveredWriter, alloc: std.mem.Allocator) void {
+        alloc.free(self.topic_name);
+        alloc.free(self.type_name);
+        DomainParticipantImpl.freePartitionNames(alloc, self.qos.partition_names);
+        alloc.free(self.unicast_locators);
+        alloc.free(self.multicast_locators);
+    }
+};
+
+/// Persistent record of a remote reader discovered via SEDP.  See
+/// DiscoveredWriter for rationale and lifetime semantics.
+const DiscoveredReader = struct {
+    guid: Guid,
+    topic_name: []const u8, // owned
+    type_name: []const u8, // owned
+    qos: disc.QosSnapshot, // qos.partition_names owned via dupePartitionNames
+    unicast_locators: []const Locator, // owned
+    multicast_locators: []const Locator, // owned
+
+    fn deinit(self: DiscoveredReader, alloc: std.mem.Allocator) void {
+        alloc.free(self.topic_name);
+        alloc.free(self.type_name);
+        DomainParticipantImpl.freePartitionNames(alloc, self.qos.partition_names);
+        alloc.free(self.unicast_locators);
+        alloc.free(self.multicast_locators);
+    }
 };
 
 /// Callback table registered per type name via registerTypeSupport().
@@ -615,6 +664,13 @@ pub const DomainParticipantImpl = struct {
     /// (topic_name, type_name).  Backing strings are owned.  Guarded by mu.
     discovered_topics: std.ArrayListUnmanaged(DiscoveredTopic),
 
+    /// Remote writers/readers discovered via SEDP, kept independent of
+    /// currently-active local entities so a DataReader/DataWriter created
+    /// after the remote endpoint was discovered can still be matched
+    /// immediately.  Deduped/updated by GUID.  Guarded by mu.
+    discovered_writers: std.ArrayListUnmanaged(DiscoveredWriter),
+    discovered_readers: std.ArrayListUnmanaged(DiscoveredReader),
+
     /// Built-in subscriber (DCPSParticipant / DCPSTopic / DCPSPublication /
     /// DCPSSubscription DataReaders). Created in init(); null on OOM.
     builtin_sub: ?*BuiltinSubscriberState,
@@ -703,6 +759,8 @@ pub const DomainParticipantImpl = struct {
             .ignored_publication_handles = .empty,
             .ignored_subscription_handles = .empty,
             .discovered_topics = .empty,
+            .discovered_writers = .empty,
+            .discovered_readers = .empty,
             .builtin_sub = null,
             .type_info_registry = .empty,
             .type_support_registry = .empty,
@@ -898,6 +956,10 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(dt.type_name);
         }
         self.discovered_topics.deinit(self.alloc);
+        for (self.discovered_writers.items) |dw| dw.deinit(self.alloc);
+        self.discovered_writers.deinit(self.alloc);
+        for (self.discovered_readers.items) |dr| dr.deinit(self.alloc);
+        self.discovered_readers.deinit(self.alloc);
 
         self.qos.deinit(self.alloc);
         self.default_pub_qos.deinit(self.alloc);
@@ -1033,6 +1095,13 @@ pub const DomainParticipantImpl = struct {
         );
         errdefer adapter.deinit();
         adapter.setTracer(self.tracer);
+        // {0,0} from codegen means unset → infinite (no lifespan enforcement),
+        // matching the convention used by writerQosSnapshot for SEDP announcement.
+        const ls_zero = qos.lifespan.duration.sec == 0 and qos.lifespan.duration.nanosec == 0;
+        adapter.setLifespan(if (ls_zero) null else time_mod.RtpsDuration.fromDuration(.{
+            .sec = qos.lifespan.duration.sec,
+            .nanosec = qos.lifespan.duration.nanosec,
+        }));
 
         const pw = adapter.toProtocolWriter();
 
@@ -1322,6 +1391,26 @@ pub const DomainParticipantImpl = struct {
         return null;
     }
 
+    /// Decode this sample's PID_LIFESPAN inline QoS (RTPS §8.7.2 Table 8.85), if
+    /// the writer sent one. Returns the duration in nanoseconds, or null if absent
+    /// or DURATION_INFINITE — the caller falls back to the SEDP-discovered writer
+    /// duration in that case.
+    fn decodeLifespan(iq: ?submsg_mod.InlineQos, little_endian: bool) ?i64 {
+        if (iq) |q| {
+            if (q.get(.lifespan)) |ls| {
+                if (ls.len >= 8) {
+                    const order: std.builtin.Endian = if (little_endian) .little else .big;
+                    const seconds = std.mem.readInt(i32, ls[0..4], order);
+                    const fraction = std.mem.readInt(u32, ls[4..8], order);
+                    const rd = time_mod.RtpsDuration{ .seconds = seconds, .fraction = fraction };
+                    if (rd.isInfinite()) return null;
+                    return rd.toDuration().toNs();
+                }
+            }
+        }
+        return null;
+    }
+
     fn resolveKeyHash(kh: [16]u8, ar: *ActiveReader, payload: []const u8) [16]u8 {
         if (!std.mem.eql(u8, &kh, &std.mem.zeroes([16]u8))) return kh;
         if (ar.key_hash_fn) |f| return f(ar.key_hash_ctx, payload);
@@ -1340,6 +1429,7 @@ pub const DomainParticipantImpl = struct {
         kind: history_mod.ChangeKind,
         coherent_set_sn: ?history_mod.SequenceNumber,
         group_seq_num: ?history_mod.SequenceNumber,
+        lifespan_ns: ?i64,
     ) void {
         if (dw_bytes.len < 4) return;
         const endian: std.builtin.Endian = if (little_endian) .little else .big;
@@ -1360,7 +1450,7 @@ pub const DomainParticipantImpl = struct {
             const rkey = entityIdKey(eid);
             if (self.active_readers.getPtr(rkey)) |ar| {
                 const kh = resolveKeyHash(key_hash, ar, payload);
-                ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind, coherent_set_sn, group_seq_num);
+                ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
             }
         }
     }
@@ -1404,10 +1494,11 @@ pub const DomainParticipantImpl = struct {
                     const key_hash = decodeKeyHash(d.inline_qos);
                     const coherent_set_sn = decodeCoherentSetSn(d.inline_qos, d.isLittleEndian());
                     const group_seq_num = decodeGroupSeqNum(d.inline_qos, d.isLittleEndian());
+                    const lifespan_ns = decodeLifespan(d.inline_qos, d.isLittleEndian());
 
                     if (d.inline_qos) |iq| {
                         if (iq.get(.directed_write)) |dw_bytes| {
-                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind, coherent_set_sn, group_seq_num);
+                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
                             continue;
                         }
                     }
@@ -1417,13 +1508,13 @@ pub const DomainParticipantImpl = struct {
                         var fan_it = self.active_readers.valueIterator();
                         while (fan_it.next()) |ar| {
                             const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
-                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num);
+                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
                         }
                     } else {
                         const rkey = entityIdKey(d.reader_entity_id);
                         if (self.active_readers.getPtr(rkey)) |ar| {
                             const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
-                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num);
+                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
                         }
                     }
                     self.mu.unlock();
@@ -1547,7 +1638,7 @@ pub const DomainParticipantImpl = struct {
                 const handle = writer_mod.guidToHandle(data.guid);
                 self.discovered_participants.append(
                     self.alloc,
-                    .{ .guid = data.guid, .handle = handle },
+                    .{ .guid = data.guid, .handle = handle, .vendor_id = data.vendor_id },
                 ) catch {};
                 if (self.builtin_sub) |bs| push_dr = bs.part_dr;
             }
@@ -1586,6 +1677,55 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
+        // Symmetric sweep: remove matched readers belonging to this participant
+        // from all local DataWriters so they can generate on_publication_matched
+        // (count decreasing) / update matched-subscription state.
+        var aw_it = self.active_writers.valueIterator();
+        while (aw_it.next()) |aw| {
+            var r_guids: std.ArrayListUnmanaged(Guid) = .empty;
+            aw.proto.listMatchedReaders(self.alloc, &r_guids) catch continue;
+            defer r_guids.deinit(self.alloc);
+            for (r_guids.items) |r_guid| {
+                if (!r_guid.prefix.eql(prefix)) continue;
+                const before = aw.proto.matchedReaderCount();
+                aw.proto.removeMatchedReader(r_guid);
+                if (aw.proto.matchedReaderCount() < before) {
+                    if (aw.matched_notify) |cb|
+                        cb.notify(cb.ctx, writer_mod.guidToHandle(r_guid), false);
+                }
+            }
+        }
+        removeDiscoveredEndpointsForPrefix(self, prefix);
+    }
+
+    fn buildMatchedWriterInfo(
+        guid: Guid,
+        qos: disc.QosSnapshot,
+        unicast_locators: []const Locator,
+        multicast_locators: []const Locator,
+    ) proto.MatchedWriterInfo {
+        const ll_sec = qos.liveliness_lease_sec;
+        const ll_ns = qos.liveliness_lease_nanosec;
+        const lease_ns: i64 = if (ll_sec == 0x7fff_ffff)
+            0 // infinite — no expiry tracking
+        else
+            @as(i64, ll_sec) * std.time.ns_per_s + @as(i64, ll_ns);
+        const ls_sec = qos.lifespan_sec;
+        const ls_ns = qos.lifespan_nanosec;
+        const lifespan_ns: i64 = if (ls_sec == 0x7fff_ffff)
+            0 // infinite — no expiry
+        else
+            @as(i64, ls_sec) * std.time.ns_per_s + @as(i64, ls_ns);
+        return .{
+            .guid = guid,
+            .unicast_locators = unicast_locators,
+            .multicast_locators = multicast_locators,
+            .reliability = if (qos.reliability_kind == 1) .reliable else .best_effort,
+            .ownership_strength = qos.ownership_strength,
+            .liveliness_lease_ns = lease_ns,
+            .lifespan_ns = lifespan_ns,
+            .history_expected = qos.durability_kind > 0 and qos.reliability_kind == 1,
+        };
     }
 
     fn onWriterDiscovered(ctx: *anyopaque, data: *const disc.WriterData) void {
@@ -1627,32 +1767,12 @@ pub const DomainParticipantImpl = struct {
                 .{ .name = ar.partition_names },
             );
             if (!part_result.isCompatible()) continue;
-            const ll_sec = data.qos.liveliness_lease_sec;
-            const ll_ns = data.qos.liveliness_lease_nanosec;
-            const lease_ns: i64 = if (ll_sec == 0x7fff_ffff)
-                0 // infinite — no expiry tracking
-            else
-                @as(i64, ll_sec) * std.time.ns_per_s + @as(i64, ll_ns);
-            const ls_sec = data.qos.lifespan_sec;
-            const ls_ns = data.qos.lifespan_nanosec;
-            const lifespan_ns: i64 = if (ls_sec == 0x7fff_ffff)
-                0 // infinite — no expiry
-            else
-                @as(i64, ls_sec) * std.time.ns_per_s + @as(i64, ls_ns);
-            const info = proto.MatchedWriterInfo{
-                .guid = data.guid,
-                .unicast_locators = data.unicast_locators,
-                .multicast_locators = data.multicast_locators,
-                .reliability = if (data.qos.reliability_kind == 1) .reliable else .best_effort,
-                .ownership_strength = data.qos.ownership_strength,
-                .liveliness_lease_ns = lease_ns,
-                .lifespan_ns = lifespan_ns,
-                .history_expected = data.qos.durability_kind > 0 and data.qos.reliability_kind == 1,
-            };
+            const info = buildMatchedWriterInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
             ar.proto.addMatchedWriter(&info) catch {};
             if (ar.matched_notify) |cb|
                 cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
         }
+        upsertDiscoveredWriter(self, data);
         if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
         // Register newly-seen topic in the discovered-topic registry.
         var new_topic: ?DiscoveredTopic = null;
@@ -1713,6 +1833,38 @@ pub const DomainParticipantImpl = struct {
                     cb.notify(cb.ctx, remote_handle, false);
             }
         }
+        removeDiscoveredWriter(self, guid);
+    }
+
+    /// Looks up the VendorId of a previously-discovered participant by GUID
+    /// prefix. Caller must hold self.mu (reads discovered_participants).
+    fn vendorIdForPrefixLocked(self: *Self, prefix: guid_mod.GuidPrefix) ?header_mod.VendorId {
+        for (self.discovered_participants.items) |e| {
+            if (e.guid.prefix.eql(prefix)) return e.vendor_id;
+        }
+        return null;
+    }
+
+    fn buildMatchedReaderInfo(
+        self: *Self,
+        guid: Guid,
+        qos: disc.QosSnapshot,
+        unicast_locators: []const Locator,
+        multicast_locators: []const Locator,
+    ) proto.MatchedReaderInfo {
+        const needs_marker = if (self.vendorIdForPrefixLocked(guid.prefix)) |vid|
+            header_mod.needsPidCoherentSetMarker(vid)
+        else
+            false;
+        return .{
+            .guid = guid,
+            .unicast_locators = unicast_locators,
+            .multicast_locators = multicast_locators,
+            .expects_inline_qos = false,
+            .reliability = if (qos.reliability_kind == 1) .reliable else .best_effort,
+            .durability_kind = qos.durability_kind,
+            .needs_pid_coherent_set_marker = needs_marker,
+        };
     }
 
     fn onReaderDiscovered(ctx: *anyopaque, data: *const disc.ReaderData) void {
@@ -1754,18 +1906,12 @@ pub const DomainParticipantImpl = struct {
                 .{ .name = data.qos.partition_names },
             );
             if (!part_result.isCompatible()) continue;
-            const info = proto.MatchedReaderInfo{
-                .guid = data.guid,
-                .unicast_locators = data.unicast_locators,
-                .multicast_locators = data.multicast_locators,
-                .expects_inline_qos = false,
-                .reliability = if (data.qos.reliability_kind == 1) .reliable else .best_effort,
-                .durability_kind = data.qos.durability_kind,
-            };
+            const info = self.buildMatchedReaderInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
             aw.proto.addMatchedReader(&info) catch {};
             if (aw.matched_notify) |cb|
                 cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
         }
+        upsertDiscoveredReader(self, data);
         if (self.builtin_sub) |bs| push_dr = bs.sub_dr;
         // Register newly-seen topic in the discovered-topic registry.
         var new_topic: ?DiscoveredTopic = null;
@@ -1826,6 +1972,130 @@ pub const DomainParticipantImpl = struct {
                     cb.notify(cb.ctx, remote_handle, false);
             }
         }
+        removeDiscoveredReader(self, guid);
+    }
+
+    // ── Discovered writer/reader registry (retroactive matching) ─────────────
+
+    fn dupeLocators(alloc: std.mem.Allocator, locs: []const Locator) []const Locator {
+        if (locs.len == 0) return &.{};
+        return alloc.dupe(Locator, locs) catch &.{};
+    }
+
+    fn makeDiscoveredWriter(alloc: std.mem.Allocator, data: *const disc.WriterData) ?DiscoveredWriter {
+        const tn = alloc.dupe(u8, data.topic_name) catch return null;
+        const tt = alloc.dupe(u8, data.type_name) catch {
+            alloc.free(tn);
+            return null;
+        };
+        var qos = data.qos;
+        qos.partition_names = dupePartitionNames(alloc, data.qos.partition_names);
+        return .{
+            .guid = data.guid,
+            .topic_name = tn,
+            .type_name = tt,
+            .qos = qos,
+            .unicast_locators = dupeLocators(alloc, data.unicast_locators),
+            .multicast_locators = dupeLocators(alloc, data.multicast_locators),
+        };
+    }
+
+    fn makeDiscoveredReader(alloc: std.mem.Allocator, data: *const disc.ReaderData) ?DiscoveredReader {
+        const tn = alloc.dupe(u8, data.topic_name) catch return null;
+        const tt = alloc.dupe(u8, data.type_name) catch {
+            alloc.free(tn);
+            return null;
+        };
+        var qos = data.qos;
+        qos.partition_names = dupePartitionNames(alloc, data.qos.partition_names);
+        return .{
+            .guid = data.guid,
+            .topic_name = tn,
+            .type_name = tt,
+            .qos = qos,
+            .unicast_locators = dupeLocators(alloc, data.unicast_locators),
+            .multicast_locators = dupeLocators(alloc, data.multicast_locators),
+        };
+    }
+
+    /// Insert or refresh the persistent record for a discovered remote writer.
+    /// Called unconditionally from onWriterDiscovered, regardless of whether any
+    /// currently-active local reader matched — a future DataReader created for
+    /// this topic still needs to find it.  Must be called with self.mu held.
+    fn upsertDiscoveredWriter(self: *Self, data: *const disc.WriterData) void {
+        for (self.discovered_writers.items, 0..) |*dw, i| {
+            if (dw.guid.eql(data.guid)) {
+                if (makeDiscoveredWriter(self.alloc, data)) |fresh| {
+                    dw.deinit(self.alloc);
+                    self.discovered_writers.items[i] = fresh;
+                }
+                return;
+            }
+        }
+        if (makeDiscoveredWriter(self.alloc, data)) |fresh| {
+            self.discovered_writers.append(self.alloc, fresh) catch {
+                var f = fresh;
+                f.deinit(self.alloc);
+            };
+        }
+    }
+
+    fn upsertDiscoveredReader(self: *Self, data: *const disc.ReaderData) void {
+        for (self.discovered_readers.items, 0..) |*dr, i| {
+            if (dr.guid.eql(data.guid)) {
+                if (makeDiscoveredReader(self.alloc, data)) |fresh| {
+                    dr.deinit(self.alloc);
+                    self.discovered_readers.items[i] = fresh;
+                }
+                return;
+            }
+        }
+        if (makeDiscoveredReader(self.alloc, data)) |fresh| {
+            self.discovered_readers.append(self.alloc, fresh) catch {
+                var f = fresh;
+                f.deinit(self.alloc);
+            };
+        }
+    }
+
+    /// Must be called with self.mu held.
+    fn removeDiscoveredWriter(self: *Self, guid: Guid) void {
+        for (self.discovered_writers.items, 0..) |dw, i| {
+            if (dw.guid.eql(guid)) {
+                dw.deinit(self.alloc);
+                _ = self.discovered_writers.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Must be called with self.mu held.
+    fn removeDiscoveredReader(self: *Self, guid: Guid) void {
+        for (self.discovered_readers.items, 0..) |dr, i| {
+            if (dr.guid.eql(guid)) {
+                dr.deinit(self.alloc);
+                _ = self.discovered_readers.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Must be called with self.mu held.
+    fn removeDiscoveredEndpointsForPrefix(self: *Self, prefix: GuidPrefix) void {
+        var i: usize = 0;
+        while (i < self.discovered_writers.items.len) {
+            if (self.discovered_writers.items[i].guid.prefix.eql(prefix)) {
+                self.discovered_writers.items[i].deinit(self.alloc);
+                _ = self.discovered_writers.swapRemove(i);
+            } else i += 1;
+        }
+        i = 0;
+        while (i < self.discovered_readers.items.len) {
+            if (self.discovered_readers.items[i].guid.prefix.eql(prefix)) {
+                self.discovered_readers.items[i].deinit(self.alloc);
+                _ = self.discovered_readers.swapRemove(i);
+            } else i += 1;
+        }
     }
 
     // ── ParticipantCbs factory helpers ────────────────────────────────────────
@@ -1875,6 +2145,27 @@ pub const DomainParticipantImpl = struct {
                         .qos = aw.qos,
                         .presentation = presentation,
                     };
+                    // Retroactively match against readers discovered before this
+                    // writer existed (or before it announced final partition/
+                    // presentation QoS) — onReaderDiscovered only scans writers
+                    // that already exist at the moment a reader is discovered, so
+                    // without this a reader discovered first would never be matched.
+                    const local_snap = writerQosSnapshot(aw.qos, aw.presentation);
+                    for (self.discovered_readers.items) |dr| {
+                        if (!std.mem.eql(u8, dr.topic_name, aw.topic_name)) continue;
+                        if (!std.mem.eql(u8, dr.type_name, aw.type_name)) continue;
+                        const result = qm_mod.checkSnapshots(local_snap, dr.qos);
+                        if (!result.isCompatible()) continue;
+                        const part_result = qm_mod.checkPartition(
+                            .{ .name = aw.partition_names },
+                            .{ .name = dr.qos.partition_names },
+                        );
+                        if (!part_result.isCompatible()) continue;
+                        const info = self.buildMatchedReaderInfo(dr.guid, dr.qos, dr.unicast_locators, dr.multicast_locators);
+                        aw.proto.addMatchedReader(&info) catch continue;
+                        if (aw.matched_notify) |cb|
+                            cb.notify(cb.ctx, writer_mod.guidToHandle(dr.guid), true);
+                    }
                     break;
                 }
             }
@@ -1943,6 +2234,27 @@ pub const DomainParticipantImpl = struct {
                         .qos = ar.qos,
                         .presentation = presentation,
                     };
+                    // Retroactively match against writers discovered before this
+                    // reader existed (or before it announced final partition/
+                    // presentation QoS) — onWriterDiscovered only scans readers
+                    // that already exist at the moment a writer is discovered, so
+                    // without this a writer discovered first would never be matched.
+                    const local_snap = readerQosSnapshot(ar.qos, ar.presentation);
+                    for (self.discovered_writers.items) |dw| {
+                        if (!std.mem.eql(u8, dw.topic_name, ar.topic_name)) continue;
+                        if (!std.mem.eql(u8, dw.type_name, ar.type_name)) continue;
+                        const result = qm_mod.checkSnapshots(dw.qos, local_snap);
+                        if (!result.isCompatible()) continue;
+                        const part_result = qm_mod.checkPartition(
+                            .{ .name = dw.qos.partition_names },
+                            .{ .name = ar.partition_names },
+                        );
+                        if (!part_result.isCompatible()) continue;
+                        const info = buildMatchedWriterInfo(dw.guid, dw.qos, dw.unicast_locators, dw.multicast_locators);
+                        ar.proto.addMatchedWriter(&info) catch continue;
+                        if (ar.matched_notify) |cb|
+                            cb.notify(cb.ctx, writer_mod.guidToHandle(dw.guid), true);
+                    }
                     break;
                 }
             }

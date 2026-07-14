@@ -99,23 +99,39 @@ pub fn readNextInstanceRaw(_: DDS.DataReader, _: DDS.InstanceHandle_t) ?OwnedRaw
 
 pub fn takeFilteredRaw(
     _: DDS.DataReader,
-    _: *std.ArrayListUnmanaged(OwnedRawSample),
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
     _: i32,
     _: DDS.SampleStateMask,
     _: DDS.ViewStateMask,
     _: DDS.InstanceStateMask,
     _: ?DDS.InstanceHandle_t,
-) !void {}
+    caller_alloc: std.mem.Allocator,
+) !void {
+    if (pending) |s| {
+        try out.append(caller_alloc, s);
+        pending = null;
+    }
+}
 
 pub fn readFilteredRaw(
     _: DDS.DataReader,
-    _: *std.ArrayListUnmanaged(OwnedRawSample),
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
     _: i32,
     _: DDS.SampleStateMask,
     _: DDS.ViewStateMask,
     _: DDS.InstanceStateMask,
     _: ?DDS.InstanceHandle_t,
-) !void {}
+    caller_alloc: std.mem.Allocator,
+) !void {
+    if (pending) |s| {
+        // OwnedRawSample.deinit() above always frees via page_allocator, so the
+        // payload copy must come from there too; caller_alloc only grows `out`'s
+        // own backing array, mirroring the real caller_alloc/impl.alloc split in
+        // src/raw_ops.zig.
+        const copy = try std.heap.page_allocator.dupe(u8, s.data);
+        try out.append(caller_alloc, .{ .data = copy, .info = s.info });
+    }
+}
 
 pub fn getKeyValueRawReader(_: DDS.DataReader, _: DDS.InstanceHandle_t) ?[]u8 {
     return null;

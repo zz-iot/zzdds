@@ -42,6 +42,8 @@ pub const EOCProxyInfo = struct {
     reader_guid: Guid,
     writer_guid: Guid,
     eoc_sn: SequenceNumber,
+    /// See MatchedReaderInfo.needs_pid_coherent_set_marker.
+    needs_pid_coherent_set_marker: bool = false,
 };
 
 // ── Matched endpoint information ──────────────────────────────────────────────
@@ -61,6 +63,12 @@ pub const MatchedReaderInfo = struct {
     /// 2=transient, 3=persistent. A reader requesting VOLATILE never wants
     /// historical replay, regardless of what durability the local writer offers.
     durability_kind: u8 = 0,
+    /// True when this remote reader's vendor is known to reject a fully-bare
+    /// end-of-coherent-set DATA submessage ("Example 3") as malformed, and
+    /// needs the explicit PID_COHERENT_SET=SEQUENCENUMBER_UNKNOWN form
+    /// ("Example 2") instead. Both are spec-legal; see
+    /// header_mod.needsPidCoherentSetMarker for the empirical basis.
+    needs_pid_coherent_set_marker: bool = false,
 };
 
 /// What SEDP tells the protocol layer about a newly-matched remote writer.
@@ -379,6 +387,7 @@ pub const ProtocolReader = struct {
             kind: ChangeKind,
             coherent_set_sn: ?SequenceNumber,
             group_seq_num: ?SequenceNumber,
+            lifespan_ns: ?i64,
         ) void,
 
         /// Called by the participant's RTPS message dispatcher when a HEARTBEAT
@@ -469,6 +478,7 @@ pub const ProtocolReader = struct {
         kind: ChangeKind,
         coherent_set_sn: ?SequenceNumber,
         group_seq_num: ?SequenceNumber,
+        lifespan_ns: ?i64,
     ) void {
         self.vtable.handle_incoming_change(
             self.ctx,
@@ -480,6 +490,7 @@ pub const ProtocolReader = struct {
             kind,
             coherent_set_sn,
             group_seq_num,
+            lifespan_ns,
         );
     }
 

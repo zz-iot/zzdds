@@ -48,6 +48,38 @@ pub const VendorId = extern struct {
     }
 };
 
+/// Eclipse Cyclone DDS's VendorId as observed on the wire from
+/// eclipse_cyclone-11.0.1's shape_main binary (2026-07-14, via
+/// dds-rtps/rtps_pcap.py packet capture) — {0x01, 0x10}. Note this differs
+/// from the "Eclipse CycloneDDS" entry (0x0113) some vendor-ID reference
+/// tables list; always verify against a real capture rather than a table.
+pub const VENDOR_ID_ECLIPSE_CYCLONE: VendorId = .{ .bytes = .{ 0x01, 0x10 } };
+
+/// True for remote vendors whose RTPS reader is known, by direct empirical
+/// testing, to reject a fully-bare end-of-coherent-set DATA submessage (RTPS
+/// 2.5 §9.6.4.2 Table 9.22 "Example 3": DataFlag=0, InlineQosFlag=0) as a
+/// malformed packet, and therefore need the explicit
+/// PID_COHERENT_SET=SEQUENCENUMBER_UNKNOWN form ("Example 2") instead.
+///
+/// Both forms are spec-legal and declared equivalent by RTPS 2.5 §9.6.4.2:
+/// "A Data Submessage ... that does not contain a coherent set in-line QoS
+/// parameter or alternatively, contains a coherent set in-line QoS parameter
+/// with value SEQUENCENUMBER_UNKNOWN. Both approaches are equivalent." This
+/// is a parser-strictness accommodation, not a spec deviation — the value
+/// sent is always the spec-correct SEQUENCENUMBER_UNKNOWN ({-1,0}); only the
+/// choice of which of the two equally-valid Table 9.22 forms to use varies
+/// per remote reader.
+///
+/// Verified directly against eclipse_cyclone-11.0.1's shape_main: it logs
+/// "malformed packet ... state parse:shortmsg" when sent Example 3, and logs
+/// no error when sent Example 2 with the spec-correct value. Example 3 is the
+/// default (smaller, and what every other tested vendor — RTI Connext 7.7.0 —
+/// correctly accepts); this list should only grow when a new vendor is
+/// concretely observed to have the same defect.
+pub fn needsPidCoherentSetMarker(vendor_id: VendorId) bool {
+    return vendor_id.eql(VENDOR_ID_ECLIPSE_CYCLONE);
+}
+
 /// RTPS Message Header (§9.4.1).
 /// Serialized layout: 20 bytes, no padding.
 pub const Header = extern struct {

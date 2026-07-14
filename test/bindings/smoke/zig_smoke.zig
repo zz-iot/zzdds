@@ -31,6 +31,29 @@ pub fn main() !void {
     try std.testing.expectEqual(@as(u32, 1), taken_info.instance_state);
     try std.testing.expectEqual(@as(zzdds.DDS.InstanceHandle_t, 7), taken_info.instance_handle);
 
+    // Batched take()/read() grow their `out` list with the *caller's* allocator
+    // (see src/raw_ops.zig's caller_alloc parameter) while each sample's payload
+    // is freed by the adapter's own page_allocator — using a separate
+    // DebugAllocator here for the reader means any mismatch between those two
+    // (the exact bug this parameter was added to fix) trips an immediate
+    // "Invalid free" panic on the mismatched .free() call, not just a leak.
+    var batch_gpa = std.heap.DebugAllocator(.{}){};
+    defer std.debug.assert(batch_gpa.deinit() == .ok);
+    const batch_alloc = batch_gpa.allocator();
+
+    try writer.write(sample, 0);
+    const batch_reader = smoke.BindingSmokeStatusDataReader.init(1, batch_alloc);
+
+    // BindingSmokeStatus has no heap-owning fields (label is a fixed-size
+    // BoundedArray), so the generator omits SampledValue.deinit() — only the
+    // container itself needs freeing.
+    var taken: std.ArrayListUnmanaged(smoke.BindingSmokeStatusDataReader.SampledValue) = .empty;
+    defer taken.deinit(batch_alloc);
+    const got_batch = try batch_reader.take(&taken, -1, 0xFFFF, 0xFFFF, 0xFFFF);
+    if (!got_batch or taken.items.len != 1) return error.UnexpectedBatchResult;
+    try std.testing.expectEqual(sample.id, taken.items[0].value.id);
+    try std.testing.expectEqual(sample.count, taken.items[0].value.count);
+
     sample.count += 1;
     try writer.dispose(sample, 0);
     try std.testing.expectEqual(zzdds.WriteKind.dispose, zzdds.capturedKind().?);
