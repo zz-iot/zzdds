@@ -228,6 +228,7 @@ const Participant = struct {
             .default_multicast_locators = &.{},
             .lease_duration_ms = 10_000,
             .builtin_endpoint_set = ALL_SEDP_ENDPOINTS,
+            .vendor_id = .{ .bytes = .{ 0x00, 0x00 } },
         };
         SedpEndpoints.onParticipantDiscovered(self.sedp, &data);
     }

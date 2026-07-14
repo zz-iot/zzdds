@@ -38,6 +38,7 @@ const security_if = @import("../security/interface.zig");
 const parser_mod = @import("../rtps/message/parser.zig");
 const submsg_mod = @import("../rtps/message/submessage.zig");
 const time_mod = @import("../util/time.zig");
+const header_mod = @import("../rtps/message/header.zig");
 const build_opts = @import("build_options");
 const qm_mod = @import("qos_match.zig");
 const reader_mod = @import("reader.zig");
@@ -498,6 +499,9 @@ const AssertNotify = struct {
 const DiscoveredParticipant = struct {
     guid: Guid,
     handle: DDS.InstanceHandle_t,
+    /// VendorId from this participant's SPDP announcement. Used to work around
+    /// known per-vendor RTPS wire-format quirks (see header_mod.needsPidCoherentSetMarker).
+    vendor_id: header_mod.VendorId,
 };
 
 const DiscoveredTopic = struct {
@@ -1634,7 +1638,7 @@ pub const DomainParticipantImpl = struct {
                 const handle = writer_mod.guidToHandle(data.guid);
                 self.discovered_participants.append(
                     self.alloc,
-                    .{ .guid = data.guid, .handle = handle },
+                    .{ .guid = data.guid, .handle = handle, .vendor_id = data.vendor_id },
                 ) catch {};
                 if (self.builtin_sub) |bs| push_dr = bs.part_dr;
             }
@@ -1832,12 +1836,26 @@ pub const DomainParticipantImpl = struct {
         removeDiscoveredWriter(self, guid);
     }
 
+    /// Looks up the VendorId of a previously-discovered participant by GUID
+    /// prefix. Caller must hold self.mu (reads discovered_participants).
+    fn vendorIdForPrefixLocked(self: *Self, prefix: guid_mod.GuidPrefix) ?header_mod.VendorId {
+        for (self.discovered_participants.items) |e| {
+            if (e.guid.prefix.eql(prefix)) return e.vendor_id;
+        }
+        return null;
+    }
+
     fn buildMatchedReaderInfo(
+        self: *Self,
         guid: Guid,
         qos: disc.QosSnapshot,
         unicast_locators: []const Locator,
         multicast_locators: []const Locator,
     ) proto.MatchedReaderInfo {
+        const needs_marker = if (self.vendorIdForPrefixLocked(guid.prefix)) |vid|
+            header_mod.needsPidCoherentSetMarker(vid)
+        else
+            false;
         return .{
             .guid = guid,
             .unicast_locators = unicast_locators,
@@ -1845,6 +1863,7 @@ pub const DomainParticipantImpl = struct {
             .expects_inline_qos = false,
             .reliability = if (qos.reliability_kind == 1) .reliable else .best_effort,
             .durability_kind = qos.durability_kind,
+            .needs_pid_coherent_set_marker = needs_marker,
         };
     }
 
@@ -1887,7 +1906,7 @@ pub const DomainParticipantImpl = struct {
                 .{ .name = data.qos.partition_names },
             );
             if (!part_result.isCompatible()) continue;
-            const info = buildMatchedReaderInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
+            const info = self.buildMatchedReaderInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
             aw.proto.addMatchedReader(&info) catch {};
             if (aw.matched_notify) |cb|
                 cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
@@ -2142,7 +2161,7 @@ pub const DomainParticipantImpl = struct {
                             .{ .name = dr.qos.partition_names },
                         );
                         if (!part_result.isCompatible()) continue;
-                        const info = buildMatchedReaderInfo(dr.guid, dr.qos, dr.unicast_locators, dr.multicast_locators);
+                        const info = self.buildMatchedReaderInfo(dr.guid, dr.qos, dr.unicast_locators, dr.multicast_locators);
                         aw.proto.addMatchedReader(&info) catch continue;
                         if (aw.matched_notify) |cb|
                             cb.notify(cb.ctx, writer_mod.guidToHandle(dr.guid), true);

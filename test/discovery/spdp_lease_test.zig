@@ -122,7 +122,7 @@ test "SPDP: processSpdpPayload fires on_participant_discovered" {
     const payload = try buildPayload(alloc, peer, 500);
     defer alloc.free(payload);
 
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     try testing.expectEqual(@as(u32, 1), tr.discovered);
     try testing.expectEqual(@as(u32, 0), tr.lost);
@@ -151,7 +151,7 @@ test "SPDP: lease expiry fires on_participant_lost" {
     const payload = try buildPayload(alloc, peer, 100);
     defer alloc.free(payload);
 
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
     try testing.expectEqual(@as(u32, 1), tr.discovered);
 
     // T=99ms: not yet expired
@@ -190,11 +190,11 @@ test "SPDP: re-announcement before expiry refreshes lease" {
     defer alloc.free(payload);
 
     // Initial announcement at T=0: expires at T=100.
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // At T=80ms the peer re-announces: expires_ns refreshed to 80ms+100ms=180ms.
     clock.set(80 * std.time.ns_per_ms);
-    spdp.processSpdpPayload(peer, 2, payload);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // T=110ms: would have expired under old lease but not the refreshed one.
     clock.set(110 * std.time.ns_per_ms);
@@ -229,7 +229,7 @@ test "SPDP: removePeer fires on_participant_lost" {
     const payload = try buildPayload(alloc, peer, 1000);
     defer alloc.free(payload);
 
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
     try testing.expectEqual(@as(u32, 1), tr.discovered);
 
     spdp_mod.SpdpEndpoints.removePeer(spdp, peer);
@@ -276,12 +276,12 @@ test "SPDP: checkLeases triggers probe when silence exceeds threshold" {
     const peer = prefix(0xBB);
     const payload = try buildPayload(alloc, peer, 60_000);
     defer alloc.free(payload);
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
     try testing.expectEqual(@as(u32, 1), tr.discovered);
 
     // Re-announce at T=1001ms: interval=1000ms → observed_interval_ns=1000ms.
     clock.set(1001 * std.time.ns_per_ms);
-    spdp.processSpdpPayload(peer, 2, payload);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // T=4001ms: silence = 4001-1001 = 3000ms = 3×1s → probe fires.
     clock.set(4001 * std.time.ns_per_ms);
@@ -324,18 +324,18 @@ test "SPDP: same-SN redelivery does not skew observed interval or last_seen_ns" 
     const peer = prefix(0xEE);
     const payload = try buildPayload(alloc, peer, 60_000);
     defer alloc.free(payload);
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // Genuine re-announce at T=1001ms (SN=2): interval=1000ms → observed_interval_ns=1000ms.
     clock.set(1001 * std.time.ns_per_ms);
-    spdp.processSpdpPayload(peer, 2, payload);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // A redundant copy of the same sample (same SN=2) arrives late, at T=1050ms,
     // as if via a slower secondary interface. If last_seen_ns were bumped to this
     // duplicate's arrival time instead of staying anchored to T=1001ms, the next
     // silence calculation below would be shifted by 49ms.
     clock.set(1050 * std.time.ns_per_ms);
-    spdp.processSpdpPayload(peer, 2, payload);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // T=4001ms: silence from the *genuine* announcement at T=1001ms is exactly
     // 3000ms = 3×1000ms → probe fires. Under the bug (anchor shifted to 1050ms)
@@ -378,11 +378,11 @@ test "SPDP: implausibly-short interval floor does not skew last_seen_ns either" 
     const peer = prefix(0xFF);
     const payload = try buildPayload(alloc, peer, 60_000);
     defer alloc.free(payload);
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // Genuine re-announce at T=1001ms (SN=2): interval=1000ms → observed_interval_ns=1000ms.
     clock.set(1001 * std.time.ns_per_ms);
-    spdp.processSpdpPayload(peer, 2, payload);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // A peer that bumps the SN on every redundant per-interface copy (rather than
     // reusing it) resends with a NEW SN=3 at T=1011ms — only 10ms later, well under
@@ -390,7 +390,7 @@ test "SPDP: implausibly-short interval floor does not skew last_seen_ns either" 
     // time instead of staying anchored to T=1001ms, the silence calculation below
     // would be shifted by 10ms.
     clock.set(1011 * std.time.ns_per_ms);
-    spdp.processSpdpPayload(peer, 3, payload);
+    spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // T=4001ms: silence from the *genuine* announcement at T=1001ms is exactly
     // 3000ms = 3×1000ms → probe fires. Under the bug (anchor shifted to 1011ms)
@@ -434,7 +434,7 @@ test "SPDP: checkLeases uses 5s fallback when no interval observed" {
     const peer = prefix(0xCC);
     const payload = try buildPayload(alloc, peer, 60_000);
     defer alloc.free(payload);
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // T=4900ms: silence = 4899ms < 5000ms → no probe yet.
     clock.set(4_900 * std.time.ns_per_ms);
@@ -481,9 +481,9 @@ test "SPDP: onProbeResult alive refreshes expiry and clears probe" {
     defer alloc.free(payload);
 
     // Announce at T=1ms, re-announce at T=1001ms → interval = 1000ms.
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
     clock.set(1001 * std.time.ns_per_ms);
-    spdp.processSpdpPayload(peer, 2, payload);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // T=4001ms: silence = 3000ms = 3×1s → probe fires.
     clock.set(4001 * std.time.ns_per_ms);
@@ -537,9 +537,9 @@ test "SPDP: onProbeResult dead evicts participant" {
     const payload = try buildPayload(alloc, peer, 600_000);
     defer alloc.free(payload);
 
-    spdp.processSpdpPayload(peer, 1, payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
     clock.set(1001 * std.time.ns_per_ms);
-    spdp.processSpdpPayload(peer, 2, payload);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
 
     // T=4001ms: probe fires (silence=3000ms=3×1s).
     clock.set(4001 * std.time.ns_per_ms);

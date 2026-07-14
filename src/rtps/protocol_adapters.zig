@@ -121,6 +121,7 @@ pub const RtpsProtocolWriter = struct {
             info.reliability == .reliable,
         );
         proxy.wants_replay = info.durability_kind != 0;
+        proxy.needs_pid_coherent_set_marker = info.needs_pid_coherent_set_marker;
         try self.writer.addMatchedReader(proxy);
     }
 
@@ -224,6 +225,7 @@ pub const RtpsProtocolWriter = struct {
                     .reader_guid = rp.guid,
                     .writer_guid = self.writer.guid,
                     .eoc_sn = eoc_sn,
+                    .needs_pid_coherent_set_marker = rp.needs_pid_coherent_set_marker,
                 });
             }
         }
@@ -264,19 +266,22 @@ pub const RtpsProtocolWriter = struct {
             for (infos_slice) |entry| {
                 if (!entry.locator.eql(entry0.locator)) continue;
                 if (!entry.reader_guid.prefix.eql(entry0.reader_guid.prefix)) continue;
-                // RTPS 2.5 §9.6.4.2 Table 9.22 "Example 2": end-of-coherent-set is
-                // signaled with DataFlag=0, InlineQosFlag=1, and PID_COHERENT_SET
-                // set to SEQUENCENUMBER_UNKNOWN. Table 9.22 also lists "Example 3"
-                // (no inline QoS at all), which is spec-legal but some readers
-                // (observed: Eclipse Cyclone) reject a fully bare DATA submessage
-                // as malformed. Example 2 is unambiguous and self-describing, so
-                // prefer it for broader interop.
+                // RTPS 2.5 §9.6.4.2 Table 9.22 lists two equivalent spec-legal ways
+                // to signal end-of-coherent-set: "Example 3" (DataFlag=0,
+                // InlineQosFlag=0, no inline QoS at all — the smaller wire form)
+                // and "Example 2" (DataFlag=0, InlineQosFlag=1, PID_COHERENT_SET=
+                // SEQUENCENUMBER_UNKNOWN). Default to Example 3. Readers whose
+                // vendor is known (via needs_pid_coherent_set_marker, set from the
+                // remote participant's discovered VendorId — see
+                // header_mod.needsPidCoherentSetMarker) to reject a bare Example 3
+                // as malformed get Example 2 instead, still with the spec-correct
+                // SEQUENCENUMBER_UNKNOWN value — never a non-compliant one.
                 b.addData(.{
                     .reader_entity_id = entry.reader_guid.entity_id,
                     .writer_entity_id = entry.writer_guid.entity_id,
                     .writer_sn = entry.eoc_sn,
                     .no_payload = true,
-                    .coherent_set_sn = sn_mod.SEQUENCENUMBER_UNKNOWN,
+                    .coherent_set_sn = if (entry.needs_pid_coherent_set_marker) sn_mod.SEQUENCENUMBER_UNKNOWN else null,
                 }, &.{});
             }
             writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};

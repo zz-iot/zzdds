@@ -30,6 +30,7 @@ const history_mod = @import("../rtps/history.zig");
 const mutex_mod = @import("../util/mutex.zig");
 const time_mod = @import("../util/time.zig");
 const build_opts = @import("build_options");
+const header_mod = @import("../rtps/message/header.zig");
 
 const Transport = tr_iface.Transport;
 const Locator = tr_iface.Locator;
@@ -599,7 +600,7 @@ pub const SedpEndpoints = struct {
 
     // Optional relay for SPDP packets that arrive on the metatraffic unicast port.
     spdp_relay_ctx: ?*anyopaque,
-    spdp_relay_fn: ?*const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8) void,
+    spdp_relay_fn: ?*const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8, header_mod.VendorId) void,
     // Optional handler for SPDP BYE (participant dispose/unregister).
     spdp_bye_ctx: ?*anyopaque,
     spdp_bye_fn: ?*const fn (*anyopaque, GuidPrefix) void,
@@ -666,7 +667,7 @@ pub const SedpEndpoints = struct {
     pub fn setSpdpRelay(
         self: *Self,
         ctx: *anyopaque,
-        fn_ptr: *const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8) void,
+        fn_ptr: *const fn (*anyopaque, GuidPrefix, history_mod.SequenceNumber, []const u8, header_mod.VendorId) void,
     ) void {
         self.spdp_relay_ctx = ctx;
         self.spdp_relay_fn = fn_ptr;
@@ -983,7 +984,7 @@ pub const SedpEndpoints = struct {
 
                     if (wid.eql(EntityIds.spdp_builtin_participant_writer)) {
                         if (self.spdp_relay_fn) |relay|
-                            relay(self.spdp_relay_ctx.?, src_prefix, d.writer_sn, payload);
+                            relay(self.spdp_relay_ctx.?, src_prefix, d.writer_sn, payload, it.header.vendor_id);
                         continue;
                     } else if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
                         if (self.pub_reader) |pr| {

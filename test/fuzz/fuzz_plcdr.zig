@@ -24,7 +24,7 @@ pub fn fuzzOne(data: []const u8) void {
     var buf: [8192]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const alloc = fba.allocator();
-    var kp = spdp_mod.decodeSpdpParticipant(alloc, FAKE_PREFIX, 0, data) catch return;
+    var kp = spdp_mod.decodeSpdpParticipant(alloc, FAKE_PREFIX, 0, data, .{ .bytes = .{ 0x00, 0x00 } }) catch return;
     kp.deinit();
 }
 
@@ -87,7 +87,7 @@ const PID_BES = [_]u8{
 test "empty payload returns TooShort" {
     var buf: [1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const err = spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &.{});
+    const err = spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &.{}, .{ .bytes = .{ 0x00, 0x00 } });
     try std.testing.expectError(error.TooShort, err);
 }
 
@@ -95,7 +95,7 @@ test "encap header + sentinel only: succeeds with defaults" {
     const payload = LE_ENCAP ++ SENTINEL;
     var buf: [1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload);
+    var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload, .{ .bytes = .{ 0x00, 0x00 } });
     kp.deinit();
     // Default lease = 10_000 ms
     try std.testing.expectEqual(@as(u32, 10_000), kp.data.lease_duration_ms);
@@ -105,7 +105,7 @@ test "minimal valid SPDP payload: GUID + lease + sentinel" {
     const payload = LE_ENCAP ++ PID_GUID ++ PID_LEASE_10S ++ SENTINEL;
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload);
+    var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload, .{ .bytes = .{ 0x00, 0x00 } });
     kp.deinit();
     try std.testing.expectEqual(@as(u32, 10_000), kp.data.lease_duration_ms);
 }
@@ -118,7 +118,7 @@ test "full SPDP payload: GUID + lease + BES + sentinel" {
     const payload = LE_ENCAP ++ PID_GUID ++ PID_LEASE_10S ++ PID_BES ++ SENTINEL;
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload);
+    var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload, .{ .bytes = .{ 0x00, 0x00 } });
     kp.deinit();
 }
 

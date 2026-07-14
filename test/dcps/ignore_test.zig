@@ -108,6 +108,7 @@ const Harness = struct {
             .default_multicast_locators = &.{},
             .lease_duration_ms = 10_000,
             .builtin_endpoint_set = 0,
+            .vendor_id = .{ .bytes = .{ 0x00, 0x00 } },
         };
         dp_impl.disc_callbacks.on_participant_discovered(dp_impl.disc_callbacks.ctx, &data);
     }

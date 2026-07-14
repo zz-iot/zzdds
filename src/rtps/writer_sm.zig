@@ -258,6 +258,10 @@ pub const ReaderProxy = struct {
     /// Defaults to true so existing callers that don't track per-reader
     /// durability keep today's behavior.
     wants_replay: bool = true,
+    /// See protocol.MatchedReaderInfo.needs_pid_coherent_set_marker. Set from
+    /// vtAddMatchedReader; defaults to false (Example 3, the smaller spec-legal
+    /// end-of-coherent-set form) for readers with no known quirk.
+    needs_pid_coherent_set_marker: bool = false,
 
     pub fn init(
         alloc: std.mem.Allocator,
