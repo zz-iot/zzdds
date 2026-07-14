@@ -266,11 +266,28 @@ jobs:
 
           # Asset-name prefixes included in the gated (default) CI set.
           # Extend when a new partner reaches a known-good interop state.
+          #
+          # eprosima_fastdds and opendds are temporarily demoted (2026-07-14):
+          # both have persistent, vendor-side Test_Lifespan_* failures unrelated
+          # to zzdds (FastDDS's reader never enforces Lifespan expiry at all —
+          # confirmed via FastDDS-vs-FastDDS self-interop, which also fails all
+          # 8 Lifespan tests; OpenDDS's SEDP PID_LIFESPAN/PID_DEADLINE wire
+          # encoding is non-compliant, raw nanoseconds in the RTPS fraction
+          # field — root-caused directly against OpenDDS master source, fix
+          # prepared upstream). Re-promote once fixed on their end.
+          #
+          # toc_coredx_dds is promoted (2026-07-14): full suite is clean in one
+          # direction (105/105) and 103/105 in the other. The 2 failures
+          # (Test_CoherentSets_10/19) are a rare (~1/15 runs), spec-compliant
+          # flake — CoreDX sends all topics' coherent-set-completing data
+          # within microseconds of each other (confirmed via pcap), so the
+          # occasional single-poll-cycle lag is internal zzdds reader-dispatch
+          # jitter across independent per-topic StatefulReaders, not a wire or
+          # protocol bug. Tracked as a follow-up; not blocking.
           DEFAULT_PREFIXES = [
               'connext_dds',
               'eclipse_cyclone',
-              'eprosima_fastdds',
-              'opendds',
+              'toc_coredx_dds',
           ]
 
           result = subprocess.run(
