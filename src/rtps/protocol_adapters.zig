@@ -21,6 +21,7 @@ const trace_mod = @import("../trace.zig");
 const time_mod = @import("../util/time.zig");
 const submsg_mod = @import("message/submessage.zig");
 const msg_builder = @import("message/builder.zig");
+const sn_mod = @import("sequence_number.zig");
 
 pub const StatefulWriter = writer_sm.StatefulWriter;
 pub const StatefulReader = reader_sm.StatefulReader;
@@ -263,11 +264,19 @@ pub const RtpsProtocolWriter = struct {
             for (infos_slice) |entry| {
                 if (!entry.locator.eql(entry0.locator)) continue;
                 if (!entry.reader_guid.prefix.eql(entry0.reader_guid.prefix)) continue;
+                // RTPS 2.5 §9.6.4.2 Table 9.22 "Example 2": end-of-coherent-set is
+                // signaled with DataFlag=0, InlineQosFlag=1, and PID_COHERENT_SET
+                // set to SEQUENCENUMBER_UNKNOWN. Table 9.22 also lists "Example 3"
+                // (no inline QoS at all), which is spec-legal but some readers
+                // (observed: Eclipse Cyclone) reject a fully bare DATA submessage
+                // as malformed. Example 2 is unambiguous and self-describing, so
+                // prefer it for broader interop.
                 b.addData(.{
                     .reader_entity_id = entry.reader_guid.entity_id,
                     .writer_entity_id = entry.writer_guid.entity_id,
                     .writer_sn = entry.eoc_sn,
                     .no_payload = true,
+                    .coherent_set_sn = sn_mod.SEQUENCENUMBER_UNKNOWN,
                 }, &.{});
             }
             writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};
