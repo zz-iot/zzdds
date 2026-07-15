@@ -115,10 +115,17 @@ jobs:
   # ── Self-interop gate (same as CI) ────────────────────────────────────────
   # Uses the stable binary name (no -Ddds-version) — the versioned name is for
   # official dds-rtps submission, not the CI gate.
+  #
+  # NOTE: When ci.yml's INTEROP_RTPS_REF is bumped to a new zenzen branch, bump
+  # the ref below to match — this job must stay in sync with ci.yml's
+  # self-interop job (same checkout, same symlink wiring) or it will build the
+  # current zzdds against a stale dds-rtps harness and fail with API mismatches.
   self-interop:
     name: self-interop (dds-rtps)
     needs: [prepare, test]
     runs-on: ubuntu-latest
+    env:
+      INTEROP_RTPS_REF: zenzen-38fa15e
 
     steps:
       - name: Check out zzdds
@@ -126,17 +133,32 @@ jobs:
         with:
           path: zzdds
 
-      - name: Check out dds-rtps (zenzen branch based on latest omg-dds/dds-rtps release)
+      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
         uses: actions/checkout@v4
         with:
           repository: zz-iot/dds-rtps
-          ref: zenzen-v2.1.2026
+          ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
-      - name: Wire packages/zzdds symlink
+      - name: Wire packages/zzdds and packages/zidl symlinks
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
+          # Clone zidl at the same tag declared by the local zzdds checkout.
+          ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
+            dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
+          if [[ -z "$ZIDL_TAG" ]]; then
+            echo "::error::Could not extract zidl tag from packages/zzdds/build.zig.zon"
+            exit 1
+          fi
+          git clone --depth=1 --branch "$ZIDL_TAG" \
+            https://github.com/zz-iot/zidl.git zidl
+          ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
+          # zig-pkg/ is gitignored so actions/checkout does not clean it between
+          # runs on the same runner.  Stale URL-fetched packages shadow the path
+          # deps above via fingerprint deduplication — wipe them first.
+          rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
+          (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
