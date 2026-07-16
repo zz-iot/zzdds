@@ -923,3 +923,110 @@ test "mock_loopback: pre-coherent-window writes not tagged as part of coherent s
     defer alloc.free(sample_b.data);
     try std.testing.expectEqualSlices(u8, &PAYLOAD_B, sample_b.data);
 }
+
+// ── on_reliable_reader_ready extended listener ────────────────────────────────
+
+const ReaderReadyState = struct {
+    seq: usize = 0,
+    matched_calls: usize = 0,
+    matched_seq: ?usize = null,
+    ready_calls: usize = 0,
+    ready_seq: ?usize = null,
+    last_ready: bool = false,
+};
+
+fn onPubMatchedForReadyTest(_: *anyopaque, _: *const DDS.PublicationMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+    const state: *ReaderReadyState = @ptrCast(@alignCast(ld.?));
+    state.seq += 1;
+    state.matched_calls += 1;
+    if (state.matched_seq == null) state.matched_seq = state.seq;
+}
+
+fn onReaderReadyForReadyTest(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaque) callconv(.c) void {
+    const state: *ReaderReadyState = @ptrCast(@alignCast(ld.?));
+    state.seq += 1;
+    state.ready_calls += 1;
+    state.last_ready = ready;
+    if (state.ready_seq == null) state.ready_seq = state.seq;
+}
+
+test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, strictly after on_publication_matched" {
+    const alloc = std.testing.allocator;
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mock_r = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_R, PORT_META_R)});
+    defer mock_r.deinit();
+    const disc_r = try SpdpSedpDiscovery.init(alloc, mock_r.transport(), 0, 100);
+    var factory_r = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_r.transport(),
+        disc_r.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_r.deinit();
+        disc_r.deinit();
+    }
+    const dpf_r = factory_r.toDDSFactory();
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    defer _ = dpf_r.delete_participant(dp_r);
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic("MockTopic", "MockType", .{}, null, 0);
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    _ = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+
+    const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
+    defer mock_w.deinit();
+    const disc_w = try SpdpSedpDiscovery.init(alloc, mock_w.transport(), 0, 100);
+    var factory_w = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_w.transport(),
+        disc_w.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_w.deinit();
+        disc_w.deinit();
+    }
+    const dpf_w = factory_w.toDDSFactory();
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    defer _ = dpf_w.delete_participant(dp_w);
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic("MockTopic", "MockType", .{}, null, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var state = ReaderReadyState{};
+    dw_impl.setListenerEx(.{
+        .listener_data = &state,
+        .on_publication_matched = onPubMatchedForReadyTest,
+        .on_reliable_reader_ready = onReaderReadyForReadyTest,
+    }, DDS.STATUS_MASK_ALL);
+
+    // Drive discovery + the AckNack/Heartbeat handshake until both callbacks
+    // have fired (or timeout).
+    const deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while ((state.matched_calls == 0 or state.ready_calls == 0) and time_mod.nanoTimestamp() < deadline) {
+        net.deliverAll();
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(state.matched_calls > 0);
+    try std.testing.expectEqual(@as(usize, 1), state.ready_calls);
+    try std.testing.expect(state.last_ready == true);
+    // The protocol-ready signal must never fire before (or in the same
+    // "tick" as) the discovery-time match — it requires the real AckNack
+    // round trip on top of SEDP matching, which on_publication_matched alone
+    // does not wait for.
+    try std.testing.expect(state.matched_seq.? < state.ready_seq.?);
+}

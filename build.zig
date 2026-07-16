@@ -95,16 +95,23 @@ pub fn build(b: *std.Build) void {
         \\
         \\pub const DataReader = Generated.DataReader;
         \\pub const DataWriter = Generated.DataWriter;
+        \\pub const DataWriterListener = Generated.DataWriterListener;
         \\pub const DomainId_t = Generated.DomainId_t;
         \\pub const DomainParticipant = Generated.DomainParticipant;
         \\pub const DomainParticipantListener = Generated.DomainParticipantListener;
         \\pub const DomainParticipantFactory = Generated.DomainParticipantFactory;
         \\pub const DomainParticipantQos = Generated.DomainParticipantQos;
+        \\pub const DomainParticipantFactoryQos = Generated.DomainParticipantFactoryQos;
         \\pub const DurabilityQosPolicyKind = Generated.DurabilityQosPolicyKind;
         \\pub const HistoryQosPolicyKind = Generated.HistoryQosPolicyKind;
         \\pub const InstanceHandle_t = Generated.InstanceHandle_t;
+        \\pub const LivelinessLostStatus = Generated.LivelinessLostStatus;
+        \\pub const OfferedDeadlineMissedStatus = Generated.OfferedDeadlineMissedStatus;
+        \\pub const OfferedIncompatibleQosStatus = Generated.OfferedIncompatibleQosStatus;
+        \\pub const PublicationMatchedStatus = Generated.PublicationMatchedStatus;
         \\pub const ReliabilityQosPolicyKind = Generated.ReliabilityQosPolicyKind;
         \\pub const ReturnCode_t = Generated.ReturnCode_t;
+        \\pub const StatusCondition = Generated.StatusCondition;
         \\pub const StatusMask = Generated.StatusMask;
         \\pub const Topic = Generated.Topic;
         \\pub const TopicDescription = Generated.TopicDescription;

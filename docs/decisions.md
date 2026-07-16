@@ -104,6 +104,44 @@ clones. The zero-copy loan upgrade path is preserved — no API changes needed w
 Per DDS spec §2.2.4. `on_offered_incompatible_qos` / `on_requested_incompatible_qos`
 listeners are called; the corresponding `StatusCondition` is also set.
 
+**RELIABLE readiness (`on_reliable_reader_ready`): separate listener interface,
+listener-only, no StatusCondition.**
+`on_publication_matched` fires on bare SEDP discovery per spec; users actually want "I can
+write now and expect delivery," which needs the AckNack/Heartbeat handshake. Rather than
+changing `on_publication_matched`'s spec-implied semantics (a compliance regression), the
+signal is a new, additive extended listener interface: `zzdds::DataWriterListenerEx :
+DDS::DataWriterListener`, adding `on_reliable_reader_ready(reader_handle, is_ready)`, set via
+a new `zzdds::DataWriter::set_listener_ex()` alongside the standard `set_listener()`. Both
+setters populate the same unified storage (`DataWriterImpl.listener_ex`) so the two OMG
+status callbacks and the extension callback are always dispatched from one place.
+
+Per-proxy correlation state: `ReaderProxy.first_sent_hb_first_sn` (recorded once, at match
+time, from the firstSN the initial Heartbeat to that proxy will carry) and
+`protocol_ready: bool` (sticky). A RELIABLE proxy becomes ready when an incoming AckNack's
+`nack_set.base` (next-expected SN) reaches that floor — deliberately `base`, not
+`highest_sn` (cumulative ack): for an empty-cache writer the floor is 1 (the empty-Heartbeat
+convention), which `highest_sn` can never reach since nothing was ever written, but a
+caught-up reader's AckNack still legitimately reports `base=1` ("I have nothing, next
+expect SN 1"), which correctly satisfies the handshake. BEST_EFFORT proxies never AckNack,
+so they become ready immediately at match instead. The callback fires from
+`StatefulWriter`/`handleAckNack` and `addMatchedReader` only after `mu` is released, mirroring
+the existing `probe_result_fn` liveness-probe pattern.
+
+Deliberately **not** wired into `DDS.StatusMask`/`StatusCondition`/waitset: this is a vendor
+extension signal, not an OMG-defined status kind, and inventing a vendor-reserved
+`StatusMask` bit was judged out of scope for this feature. Listener-only, matching the
+decision's own framing ("add a new listener interface/method", not "add a new status kind").
+
+Implementing this required a zidl generator fix: cross-module `@callback interface`
+inheritance (a `zzdds.idl` callback interface inheriting a `dcps.idl` one via `import`) had
+never been exercised before and silently dropped the base's methods. See the zidl repo's
+`docs/roadmap.md` for the generator-side fix; it also uncovered that entity interfaces share
+the same flattening code, which would have required unrelated new work in
+`c_abi/extensions.zig` and hit an existing C++ backend limitation
+(`error.MultipleNativeHandleBases`) — the zidl fix is deliberately scoped to only fill
+cross-module content for `@callback` interfaces, leaving entity interfaces' cross-module
+bases exactly as before (unexercised, matching today's shipped behavior).
+
 **GROUP_PRESENTATION coherent sets: implement to spec.**
 The zzdds implementation emits `PID_COHERENT_SET` (0x0056), `PID_GROUP_SEQ_NUM` (0x0064),
 and `PID_GROUP_COHERENT_SET` (0x0063) inline QoS per RTPS 2.5 §9.6.3.7. Five test cases

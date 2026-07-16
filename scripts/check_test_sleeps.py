@@ -18,7 +18,7 @@ ALLOWLIST = {
     # Full UDP loopback tests use receive threads and real sockets.
     "test/dcps/loopback_test.zig": (2, "UDP loopback receive/discovery polling"),
     # MockTransport avoids sockets, but SPDP timer threads still announce on intervals.
-    "test/dcps/mock_loopback_test.zig": (13, "SPDP timer-thread discovery polling"),
+    "test/dcps/mock_loopback_test.zig": (14, "SPDP timer-thread discovery polling"),
     # API and WaitSet tests intentionally wake waits from another thread.
     "test/dcps/api_test.zig": (1, "threaded WaitSet wakeup"),
     "test/dcps/waitset_test.zig": (1, "threaded WaitSet wakeup"),

@@ -606,6 +606,162 @@ test "handleAckNack: ACKNACK clears probe and fires alive callback" {
     try testing.expectEqual(@as(i64, 0), deadline);
 }
 
+// ── Protocol-ready readiness (RELIABLE readiness handshake) ──────────────────
+
+const ProtocolReadyResult = struct {
+    guid: ?Guid = null,
+    ready: ?bool = null,
+    calls: usize = 0,
+    fn callback(ctx: *anyopaque, g: Guid, r: bool) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.guid = g;
+        self.ready = r;
+        self.calls += 1;
+    }
+};
+
+test "protocol_ready: RELIABLE proxy is not ready at match time" {
+    const writer_guid = makeGuid(0x60, WRITER_EID);
+    const reader_guid = makeGuid(0x61, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    w.mu.lock();
+    const ready = for (w.reader_proxies.items) |rp| {
+        if (rp.guid.eql(reader_guid)) break rp.protocol_ready;
+    } else true;
+    w.mu.unlock();
+    try testing.expect(!ready);
+}
+
+test "protocol_ready: RELIABLE proxy becomes ready when AckNack reaches the HB floor, fires once" {
+    // Uses a custom setup (not makeWriterWithReader) so the floor is
+    // meaningfully non-trivial: 3 changes are written BEFORE the VOLATILE
+    // match, so the late-joining reader's start_sn (4) skips that history —
+    // hbFirstSn(cache_first=1, start_sn=4) = 4. (makeWriterWithReader matches
+    // against an empty cache, giving the empty-HB-convention floor of 1,
+    // which any valid ACKNACK base satisfies immediately — not useful for
+    // testing the "not yet at the floor" case.)
+    const alloc = testing.allocator;
+    const writer_guid = makeGuid(0x62, WRITER_EID);
+    const reader_guid = makeGuid(0x63, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        alloc,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false, // replay_on_match=false (VOLATILE)
+    );
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "three");
+
+    var pr = ProtocolReadyResult{};
+    w.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    const rp = try ReaderProxy.init(alloc, reader_guid, &.{loc_a}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+    try testing.expectEqual(@as(usize, 0), pr.calls);
+
+    // ACKNACK below the floor (start_sn=4): reader hasn't caught up yet.
+    const nack_below = SequenceNumberSet{ .base = 3, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_guid, 2, nack_below, 1, true);
+    try testing.expectEqual(@as(usize, 0), pr.calls);
+
+    // ACKNACK whose base reaches the floor fires readiness exactly once.
+    const nack_at = SequenceNumberSet{ .base = 4, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_guid, 3, nack_at, 2, true);
+    try testing.expectEqual(@as(usize, 1), pr.calls);
+    try testing.expect(pr.ready == true);
+    try testing.expect(pr.guid.?.eql(reader_guid));
+
+    // A later ACKNACK must not refire (sticky).
+    const nack_later = SequenceNumberSet{ .base = 4, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_guid, 3, nack_later, 3, true);
+    try testing.expectEqual(@as(usize, 1), pr.calls);
+}
+
+test "protocol_ready: BEST_EFFORT proxy fires ready immediately at match" {
+    const alloc = testing.allocator;
+    const writer_guid = makeGuid(0x64, WRITER_EID);
+    const reader_guid = makeGuid(0x65, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        alloc,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    var pr = ProtocolReadyResult{};
+    w.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    // reliable=false: BEST_EFFORT never AckNacks, so it must become ready
+    // immediately at match rather than waiting for a handshake that never comes.
+    const rp = try ReaderProxy.init(alloc, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+
+    try testing.expectEqual(@as(usize, 1), pr.calls);
+    try testing.expect(pr.ready == true);
+    try testing.expect(pr.guid.?.eql(reader_guid));
+}
+
+test "protocol_ready: removing a ready proxy fires ready=false" {
+    const writer_guid = makeGuid(0x66, WRITER_EID);
+    const reader_guid = makeGuid(0x67, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    var pr = ProtocolReadyResult{};
+    w.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    const nack_at = SequenceNumberSet{ .base = 2, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_guid, 1, nack_at, 2, true);
+    try testing.expect(pr.ready == true);
+
+    w.removeMatchedReader(reader_guid);
+    try testing.expectEqual(@as(usize, 2), pr.calls);
+    try testing.expect(pr.ready == false);
+    try testing.expect(pr.guid.?.eql(reader_guid));
+}
+
+test "protocol_ready: removing a never-ready proxy does not fire" {
+    const writer_guid = makeGuid(0x68, WRITER_EID);
+    const reader_guid = makeGuid(0x69, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    var pr = ProtocolReadyResult{};
+    w.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    w.removeMatchedReader(reader_guid);
+    try testing.expectEqual(@as(usize, 0), pr.calls);
+}
+
 // ── Coherent HB cap ───────────────────────────────────────────────────────────
 
 test "sendHeartbeat: coherent_active caps last_sn to last_flushed_sn" {
