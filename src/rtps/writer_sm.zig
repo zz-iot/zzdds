@@ -254,8 +254,11 @@ pub const ReaderProxy = struct {
     /// at match time, in `addMatchedReader`/`replayHistoryToProxyLocked`).
     /// Null until that first Heartbeat is sent. Used as the correlation floor
     /// for `protocol_ready`: a RELIABLE proxy is considered protocol-ready once
-    /// an AckNack's `highest_sn` reaches this floor, proving the reader has
-    /// processed the initial Heartbeat handshake (not just SEDP discovery).
+    /// an AckNack's `nack_set.base` (next-expected SN) reaches this floor,
+    /// proving the reader has processed the initial Heartbeat handshake (not
+    /// just SEDP discovery). Deliberately `base`, not `highest_sn`: for an
+    /// empty-cache writer the floor is 1 (empty-HB convention), which
+    /// `highest_sn` can never reach.
     first_sent_hb_first_sn: ?SequenceNumber = null,
     /// True once this proxy has completed the RELIABLE readiness handshake
     /// (or, for BEST_EFFORT proxies, immediately at match — no handshake
