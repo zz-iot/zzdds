@@ -37,6 +37,11 @@ pub fn selectInto(
     multicast: []const Locator,
 ) !void {
     out.clearRetainingCapacity();
+    // On OOM partway through the append loop below, leave `out` empty rather
+    // than a partial subset — callers treat "selection failed" as "send to
+    // nothing" (see effectiveLocators()), not "send to whichever locators we
+    // happened to append before running out of memory".
+    errdefer out.clearRetainingCapacity();
     const chosen: []const Locator = if (unicast.len > 0) unicast else multicast;
     if (chosen.len == 0) return;
 
@@ -132,6 +137,24 @@ test "selectInto: same-tier same-family ties are all kept" {
     try std.testing.expectEqual(@as(usize, 2), out.items.len);
     try std.testing.expect(Locator.eql(a, out.items[0]));
     try std.testing.expect(Locator.eql(b, out.items[1]));
+}
+
+test "selectInto: OOM partway through append leaves out empty, not partial" {
+    var out: std.ArrayListUnmanaged(Locator) = .empty;
+    defer out.deinit(std.testing.allocator);
+    var ties: [6]Locator = undefined;
+    for (&ties, 0..) |*loc, i| loc.* = Locator.udp4(.{ 10, 0, 0, @intCast(i + 1) }, 7400);
+
+    // Six same-tier/same-family ties so the append loop needs a second
+    // capacity-growth allocation (ArrayList's first growth from empty jumps
+    // straight to capacity 5 for this element size). fail_index=1 lets the
+    // first 5 ties land in `out` via the first growth allocation (alloc 0),
+    // then fails the 6th tie's growth allocation (alloc 1) — proves the
+    // errdefer clears entries already appended before the failure, not just
+    // a no-op on an already-empty list.
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, selectInto(&out, fa.allocator(), &ties, &.{}));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "selectInto: recomputing into the same out buffer clears stale entries" {
