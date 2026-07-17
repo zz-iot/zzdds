@@ -4,6 +4,7 @@ const iface = zzdds.transport;
 const Locator = iface.Locator;
 const LocatorKind = iface.LocatorKind;
 const LocatorWire = iface.LocatorWire;
+const LocatorTier = iface.LocatorTier;
 
 const testing = std.testing;
 
@@ -104,6 +105,73 @@ test "Locator.isMulticast: udp_v6 multicast (0xFF leading byte)" {
 test "Locator.isMulticast: udp_v6 non-multicast" {
     const uc = Locator{ .udp_v6 = .{ .addr = [16]u8{ 0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 7400 } };
     try testing.expect(!uc.isMulticast());
+}
+
+// ── Locator.tier ─────────────────────────────────────────────────────────────
+
+test "Locator.tier: udp_v4 loopback (127.0.0.0/8)" {
+    const loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7400);
+    try testing.expectEqual(LocatorTier.loopback, loc.tier());
+}
+
+test "Locator.tier: udp_v4 link-local (169.254.0.0/16)" {
+    const loc = Locator.udp4(.{ 169, 254, 1, 2 }, 7400);
+    try testing.expectEqual(LocatorTier.link_local, loc.tier());
+}
+
+test "Locator.tier: udp_v4 private (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)" {
+    try testing.expectEqual(LocatorTier.private, Locator.udp4(.{ 10, 1, 2, 3 }, 1).tier());
+    try testing.expectEqual(LocatorTier.private, Locator.udp4(.{ 172, 16, 0, 1 }, 1).tier());
+    try testing.expectEqual(LocatorTier.private, Locator.udp4(.{ 172, 31, 255, 255 }, 1).tier());
+    try testing.expectEqual(LocatorTier.private, Locator.udp4(.{ 192, 168, 0, 1 }, 1).tier());
+    // 172.15.x.x and 172.32.x.x are outside the /12 range and must not match.
+    try testing.expectEqual(LocatorTier.public, Locator.udp4(.{ 172, 15, 0, 1 }, 1).tier());
+    try testing.expectEqual(LocatorTier.public, Locator.udp4(.{ 172, 32, 0, 1 }, 1).tier());
+}
+
+test "Locator.tier: udp_v4 public" {
+    const loc = Locator.udp4(.{ 8, 8, 8, 8 }, 53);
+    try testing.expectEqual(LocatorTier.public, loc.tier());
+}
+
+test "Locator.tier: udp_v6 loopback (::1)" {
+    var addr = [_]u8{0} ** 16;
+    addr[15] = 1;
+    try testing.expectEqual(LocatorTier.loopback, Locator.udp6(addr, 7400).tier());
+}
+
+test "Locator.tier: udp_v6 link-local (fe80::/10)" {
+    var addr = [_]u8{0} ** 16;
+    addr[0] = 0xFE;
+    addr[1] = 0x80;
+    try testing.expectEqual(LocatorTier.link_local, Locator.udp6(addr, 7400).tier());
+}
+
+test "Locator.tier: udp_v6 ULA (fc00::/7)" {
+    var addr = [_]u8{0} ** 16;
+    addr[0] = 0xFD;
+    try testing.expectEqual(LocatorTier.private, Locator.udp6(addr, 7400).tier());
+}
+
+test "Locator.tier: udp_v6 public" {
+    var addr = [_]u8{0} ** 16;
+    addr[0] = 0x20;
+    addr[1] = 0x01; // 2001:: — a real public documentation prefix range
+    try testing.expectEqual(LocatorTier.public, Locator.udp6(addr, 7400).tier());
+}
+
+test "Locator.tier: shmem and shmem_zc are loopback" {
+    const s = Locator{ .shmem = .{ .host_id = 1, .channel_id = 1 } };
+    const sz = Locator{ .shmem_zc = .{ .host_id = 1, .writer_entity = .{ 0, 0, 0, 0 } } };
+    try testing.expectEqual(LocatorTier.loopback, s.tier());
+    try testing.expectEqual(LocatorTier.loopback, sz.tier());
+}
+
+test "Locator.tier: custom and invalid are public" {
+    const inv: Locator = .invalid;
+    const custom = Locator{ .custom = .{ .kind = 99, .port = 0, .address = [_]u8{0} ** 16 } };
+    try testing.expectEqual(LocatorTier.public, inv.tier());
+    try testing.expectEqual(LocatorTier.public, custom.tier());
 }
 
 // ── Locator.eql ──────────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@ const received_set_mod = @import("received_set.zig");
 const time_mod = @import("../util/time.zig");
 const msg = @import("message/root.zig");
 const iface = @import("../transport/interface.zig");
+const locator_selector = @import("../transport/locator_selector.zig");
 const writer_sm = @import("writer_sm.zig");
 
 const MessageBuilder = msg.builder.MessageBuilder;
@@ -160,6 +161,12 @@ pub const WriterProxy = struct {
     guid: Guid,
     unicast_locators: std.ArrayListUnmanaged(Locator),
     multicast_locators: std.ArrayListUnmanaged(Locator),
+    /// Ranked, cached subset of unicast_locators (or multicast_locators as
+    /// fallback) actually used for sends. See transport.locator_selector.
+    /// Recomputed only when unicast_locators/multicast_locators change (at
+    /// construction, and moved on lease refresh in addMatchedWriter) — never
+    /// per-send.
+    selected_locators: std.ArrayListUnmanaged(Locator),
     /// Disjoint set of all SNs received from this writer.
     /// cumulativeAck() gives the highest contiguous SN from SN 1.
     received: ReceivedSet,
@@ -199,6 +206,7 @@ pub const WriterProxy = struct {
             .guid = guid,
             .unicast_locators = .empty,
             .multicast_locators = .empty,
+            .selected_locators = .empty,
             .received = .empty,
             .pending_changes = .empty,
             .ack_count = 0,
@@ -212,12 +220,18 @@ pub const WriterProxy = struct {
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
         errdefer self.unicast_locators.deinit(alloc);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
+        errdefer self.multicast_locators.deinit(alloc);
+        // Selection failure must not fail proxy construction — fall back to
+        // an empty selected_locators (effectiveLocators() then returns
+        // nothing, which every call site already handles gracefully).
+        locator_selector.selectInto(&self.selected_locators, alloc, self.unicast_locators.items, self.multicast_locators.items) catch {};
         return self;
     }
 
     pub fn deinit(self: *WriterProxy, alloc: std.mem.Allocator) void {
         self.unicast_locators.deinit(alloc);
         self.multicast_locators.deinit(alloc);
+        self.selected_locators.deinit(alloc);
         self.received.deinit(alloc);
         for (self.pending_changes.items) |*ch| alloc.free(ch.data);
         self.pending_changes.deinit(alloc);
@@ -233,10 +247,10 @@ pub const WriterProxy = struct {
         return null;
     }
 
-    /// All locators to deliver to: unicast list if non-empty, else multicast list.
+    /// Ranked subset of locators to deliver to — see transport.locator_selector.
+    /// Cached at construction/lease-refresh time; O(1) per call.
     pub fn effectiveLocators(self: *const WriterProxy) []const Locator {
-        if (self.unicast_locators.items.len > 0) return self.unicast_locators.items;
-        return self.multicast_locators.items;
+        return self.selected_locators.items;
     }
 
     /// Build a SequenceNumberSet that represents the SNs this reader is missing
@@ -374,15 +388,21 @@ pub const StatefulReader = struct {
         for (self.writer_proxies.items) |*wp| {
             if (wp.guid.eql(proxy.guid)) {
                 // Lease refresh: update locators/metadata, preserve sequence state.
+                // proxy.selected_locators was already computed against
+                // proxy.unicast_locators/multicast_locators by WriterProxy.init,
+                // so it moves alongside them rather than being recomputed here.
                 wp.unicast_locators.deinit(self.alloc);
                 wp.multicast_locators.deinit(self.alloc);
+                wp.selected_locators.deinit(self.alloc);
                 wp.unicast_locators = proxy.unicast_locators;
                 wp.multicast_locators = proxy.multicast_locators;
+                wp.selected_locators = proxy.selected_locators;
                 wp.reliable = proxy.reliable;
                 // Dispose the incoming proxy's empty tracking fields cleanly.
                 var discarded = proxy;
                 discarded.unicast_locators = .empty;
                 discarded.multicast_locators = .empty;
+                discarded.selected_locators = .empty;
                 discarded.deinit(self.alloc);
                 return;
             }

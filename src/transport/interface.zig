@@ -27,6 +27,17 @@ pub const LocatorKind = struct {
     pub const tcp_v6: i32 = 0x00000011;
 };
 
+// ── LocatorTier ───────────────────────────────────────────────────────────────
+
+/// Reachability preference tier for locator selection ranking, best first.
+/// See `Locator.tier()` and `transport/locator_selector.zig`.
+pub const LocatorTier = enum(u2) {
+    loopback = 0,
+    link_local = 1,
+    private = 2,
+    public = 3,
+};
+
 // ── LocatorWire ───────────────────────────────────────────────────────────────
 
 /// RTPS on-wire Locator_t (§9.3.2 Table 9.19, CDR layout).
@@ -138,6 +149,46 @@ pub const Locator = union(enum) {
             .udp_v6 => |u| u.addr[0] == 0xFF,
             else => false,
         };
+    }
+
+    /// Reachability preference tier for locator selection ranking (best/lowest
+    /// ordinal first). Only meaningful for locators that already passed
+    /// Transport.canReach() upstream (see discovery/interface.zig's
+    /// filterReachableLocators) — this does NOT re-check address-family
+    /// enablement, only address scope/reachability-likelihood.
+    pub fn tier(self: Locator) LocatorTier {
+        return switch (self) {
+            .invalid => .public,
+            .udp_v4 => |u| tierV4(u.addr),
+            .udp_v6 => |u| tierV6(u.addr),
+            .tcp_v4 => |t| tierV4(t.addr),
+            .tcp_v6 => |t| tierV6(t.addr),
+            // Shared memory is inherently same-host: best possible tier.
+            .shmem, .shmem_zc => .loopback,
+            .custom => .public,
+        };
+    }
+
+    fn tierV4(addr: [4]u8) LocatorTier {
+        if (addr[0] == 127) return .loopback; // 127.0.0.0/8
+        if (addr[0] == 169 and addr[1] == 254) return .link_local; // 169.254.0.0/16
+        if (addr[0] == 10) return .private; // 10.0.0.0/8
+        if (addr[0] == 172 and addr[1] >= 16 and addr[1] <= 31) return .private; // 172.16.0.0/12
+        if (addr[0] == 192 and addr[1] == 168) return .private; // 192.168.0.0/16
+        return .public;
+    }
+
+    fn tierV6(addr: [16]u8) LocatorTier {
+        const is_loopback = blk: {
+            for (addr[0..15]) |b| {
+                if (b != 0) break :blk false;
+            }
+            break :blk addr[15] == 1;
+        };
+        if (is_loopback) return .loopback; // ::1
+        if (addr[0] == 0xFE and (addr[1] & 0xC0) == 0x80) return .link_local; // fe80::/10
+        if ((addr[0] & 0xFE) == 0xFC) return .private; // fc00::/7 (ULA)
+        return .public;
     }
 
     /// Structural equality (tag + all payload fields).

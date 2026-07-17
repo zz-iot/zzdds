@@ -122,6 +122,34 @@ fn findAckNack(rec: *const Recording) ?msg.submessage.AckNackSubmessage {
     return null;
 }
 
+/// Count captures sent to a udp_v4 locator with the given port.
+fn countSendsToPort(rec: *const Recording, port: u16) usize {
+    var n: usize = 0;
+    for (rec.caps[0..rec.n]) |*cap| {
+        switch (cap.locator) {
+            .udp_v4 => |u| {
+                if (u.port == port) n += 1;
+            },
+            else => {},
+        }
+    }
+    return n;
+}
+
+/// Count captures sent to a udp_v6 locator with the given port.
+fn countSendsToV6Port(rec: *const Recording, port: u16) usize {
+    var n: usize = 0;
+    for (rec.caps[0..rec.n]) |*cap| {
+        switch (cap.locator) {
+            .udp_v6 => |u| {
+                if (u.port == port) n += 1;
+            },
+            else => {},
+        }
+    }
+    return n;
+}
+
 // ── Shared reader setup ───────────────────────────────────────────────────────
 
 /// Set up a StatefulReader with one matched writer proxy (writer_loc = where
@@ -689,4 +717,99 @@ test "BEST_EFFORT: out-of-order changes delivered immediately (no reorder)" {
     try r.handleData(writer_guid, ch1);
     // BEST_EFFORT: both delivered in arrival order (2 then 1).
     try testing.expectEqualSlices(SequenceNumber, &.{ 2, 1 }, recorder.sns.items);
+}
+
+// ── LocatorSelector: effectiveLocators ranking (via WriterProxy) ──────────────
+
+fn v6Public(last: u8) [16]u8 {
+    var addr = [_]u8{0} ** 16;
+    addr[0] = 0x20;
+    addr[1] = 0x01;
+    addr[15] = last;
+    return addr;
+}
+
+test "effectiveLocators: dual-stack writer proxy collapses to a single family" {
+    const reader_guid = makeGuid(0x70, READER_EID);
+    const writer_guid = makeGuid(0x71, WRITER_EID);
+    const loc_v4 = Locator.udp4(.{ 8, 8, 8, 8 }, 7520);
+    const loc_v6 = Locator.udp6(v6Public(1), 7521);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{ loc_v4, loc_v6 }, &.{}, true);
+    try r.addMatchedWriter(wp);
+    rec.reset();
+
+    r.handleHeartbeat(writer_guid, 1, 0, 1, false);
+
+    const v4_sends = countSendsToPort(&rec, 7520);
+    const v6_sends = countSendsToV6Port(&rec, 7521);
+    try testing.expect((v4_sends > 0) != (v6_sends > 0));
+}
+
+test "effectiveLocators: loopback preferred over public at same family (reader side)" {
+    const reader_guid = makeGuid(0x72, READER_EID);
+    const writer_guid = makeGuid(0x73, WRITER_EID);
+    const loc_pub = Locator.udp4(.{ 8, 8, 8, 8 }, 7522);
+    const loc_lo = Locator.udp4(.{ 127, 0, 0, 1 }, 7523);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+    // Public listed first so a naive "first-wins" bug (ignoring tier) would fail this.
+    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{ loc_pub, loc_lo }, &.{}, true);
+    try r.addMatchedWriter(wp);
+    rec.reset();
+
+    r.handleHeartbeat(writer_guid, 1, 0, 1, false);
+
+    try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7522));
+    try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7523));
+}
+
+test "effectiveLocators: unicast-over-multicast preference unchanged when only multicast present (reader side)" {
+    const reader_guid = makeGuid(0x74, READER_EID);
+    const writer_guid = makeGuid(0x75, WRITER_EID);
+    const loc_mc = Locator.udp4(.{ 239, 255, 0, 1 }, 7524);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{}, &.{loc_mc}, true);
+    try r.addMatchedWriter(wp);
+    rec.reset();
+
+    r.handleHeartbeat(writer_guid, 1, 0, 1, false);
+
+    try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7524));
+}
+
+test "addMatchedWriter: lease refresh recomputes cached selection when locators change" {
+    const reader_guid = makeGuid(0x76, READER_EID);
+    const writer_guid = makeGuid(0x77, WRITER_EID);
+    const loc_pub = Locator.udp4(.{ 8, 8, 8, 8 }, 7525);
+    const loc_lo = Locator.udp4(.{ 127, 0, 0, 1 }, 7526);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    // First match: only the public locator is offered.
+    const wp1 = try WriterProxy.init(testing.allocator, writer_guid, &.{loc_pub}, &.{}, true);
+    try r.addMatchedWriter(wp1);
+    rec.reset();
+    r.handleHeartbeat(writer_guid, 1, 0, 1, false);
+    try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7525));
+    try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7526));
+    rec.reset();
+
+    // Lease refresh: same GUID, now also offers loopback — selection must
+    // switch to it, not keep serving the stale public-only selection.
+    const wp2 = try WriterProxy.init(testing.allocator, writer_guid, &.{ loc_pub, loc_lo }, &.{}, true);
+    try r.addMatchedWriter(wp2);
+    r.handleHeartbeat(writer_guid, 1, 0, 2, false);
+    try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7525));
+    try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7526));
 }

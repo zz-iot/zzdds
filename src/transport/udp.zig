@@ -1017,6 +1017,23 @@ pub const UdpTransport = struct {
                 self.addUnicastSocket(ia, port, pe.asHandler()) catch |err|
                     log.transport.warn("udp: unicast socket port {}: {}", .{ port, err });
             }
+            // rebuildLocatorsLocked always advertises 127.0.0.1 as reachable (see its
+            // own comment), but active_ifaces never includes loopback (filtered by
+            // IFF_LOOPBACK in the interface monitor), so without this the advertised
+            // loopback locator would have no socket actually listening on it — any
+            // peer selecting loopback (e.g. LocatorSelector preferring it as the best
+            // reachability tier) would silently fail to be received. Bind it explicitly
+            // here so the advertised locator and the actual listening sockets agree.
+            if (self.config.ipv4_enabled) {
+                const loopback = IfAddr{
+                    .kind = LocatorKind.udp_v4,
+                    .ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 },
+                    .name = std.mem.zeroes([16]u8),
+                    .flags = 0,
+                };
+                self.addUnicastSocket(loopback, port, pe.asHandler()) catch |err|
+                    log.transport.warn("udp: loopback unicast socket port {}: {}", .{ port, err });
+            }
         }
         try self.rebuildLocatorsLocked();
     }
@@ -1663,6 +1680,51 @@ test "two participants share one UdpTransport; independent teardown" {
     try std.testing.expect(udp.send_fd_v4.load(.acquire) != INVALID_SOCKET);
 
     t.unlisten(&listen_loc, ctr_b.handler());
+}
+
+test "non-wildcard bind still receives loopback traffic" {
+    // Regression test: bind_wildcard=false (the default) with an explicit
+    // participant_id bypasses autoAssignParticipantId's reservation-based
+    // wildcard-socket promotion (init.zig's `if (self.config.participant_id)
+    // |fixed| return fixed;` short-circuit never binds a reservation fd), so
+    // vtListen falls into the per-active-interface socket loop. active_ifaces
+    // never includes loopback (filtered by IFF_LOOPBACK upstream), yet
+    // rebuildLocatorsLocked unconditionally advertises 127.0.0.1 as reachable
+    // — without an explicit loopback bind alongside that advertisement, a
+    // peer selecting the advertised loopback locator (e.g. LocatorSelector
+    // preferring it as the best reachability tier) would silently receive
+    // nothing, even though the send() call itself reports success.
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 199,
+        .bind_wildcard = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 199 + 10;
+    const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+    const send_loc = Locator.udp4(.{ 127, 0, 0, 1 }, port);
+
+    var count: usize = 0;
+    const Counter = struct {
+        n: *usize,
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.n.* += 1;
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = f };
+        }
+    };
+    var ctr = Counter{ .n = &count };
+
+    try t.listen(&listen_loc, ctr.handler());
+    try t.send(&send_loc, "hello");
+    sleepMs(100);
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    t.unlisten(&listen_loc, ctr.handler());
 }
 
 // ── participantIdRange: nonzero min_pid when port base is low ─────────────────
