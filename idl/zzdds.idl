@@ -128,11 +128,26 @@ module zzdds {
         DDS::TopicDescription as_topic_description();
     };
 
+    // Protocol-ready RELIABLE readiness signal — deliberately separate from
+    // DDS::DataWriterListener::on_publication_matched, which fires on bare
+    // SEDP discovery per spec. on_reliable_reader_ready fires once a matched
+    // reader proxy has completed the AckNack/Heartbeat handshake (RELIABLE),
+    // or immediately at match (BEST_EFFORT, which has no handshake). See
+    // docs/decisions.md.
+    @callback interface DataWriterListenerEx : DDS::DataWriterListener {
+        void on_reliable_reader_ready(
+            in DDS::InstanceHandle_t reader_handle,
+            in boolean               is_ready);
+    };
+
     interface DataWriter : DDS::DataWriter {
         DDS::ReturnCode_t write_serialized(
             in WriteKind kind,
             in OctetSeq key_hash,
             in OctetSeq cdr);
+        DDS::ReturnCode_t set_listener_ex(
+            in DataWriterListenerEx a_listener,
+            in DDS::StatusMask      mask);
     };
 
     interface DataReader : DDS::DataReader {

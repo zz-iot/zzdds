@@ -250,6 +250,21 @@ pub const ReaderProxy = struct {
     /// heartbeat thread evicts the proxy and fires the probe-result callback.
     /// Cleared immediately on any incoming ACKNACK (reader is alive).
     probe_deadline_ns: i64,
+    /// firstSN of the first Heartbeat actually sent to this proxy (set once,
+    /// at match time, in `addMatchedReader`/`replayHistoryToProxyLocked`).
+    /// Null until that first Heartbeat is sent. Used as the correlation floor
+    /// for `protocol_ready`: a RELIABLE proxy is considered protocol-ready once
+    /// an AckNack's `nack_set.base` (next-expected SN) reaches this floor,
+    /// proving the reader has processed the initial Heartbeat handshake (not
+    /// just SEDP discovery). Deliberately `base`, not `highest_sn`: for an
+    /// empty-cache writer the floor is 1 (empty-HB convention), which
+    /// `highest_sn` can never reach.
+    first_sent_hb_first_sn: ?SequenceNumber = null,
+    /// True once this proxy has completed the RELIABLE readiness handshake
+    /// (or, for BEST_EFFORT proxies, immediately at match — no handshake
+    /// exists). Sticky: never cleared by a later stale/duplicate AckNack.
+    /// Drives the `on_reliable_reader_ready` extended listener callback.
+    protocol_ready: bool = false,
     /// True when this specific reader requested TRANSIENT_LOCAL+ durability
     /// and therefore wants historical replay. A reader requesting VOLATILE
     /// never wants replay regardless of what durability the writer offers
@@ -372,6 +387,12 @@ pub const StatefulWriter = struct {
     /// alive=false means the probe deadline expired and the proxy was removed.
     probe_result_fn: ?*const fn (*anyopaque, GuidPrefix, bool) void,
     probe_result_ctx: ?*anyopaque,
+    /// Optional callback fired when a reader proxy's `protocol_ready` state
+    /// transitions. Called with (ctx, guid, ready): ready=true when the
+    /// RELIABLE handshake completes (or immediately at match for BEST_EFFORT);
+    /// ready=false when the proxy is removed after having been ready.
+    protocol_ready_fn: ?*const fn (*anyopaque, Guid, bool) void,
+    protocol_ready_ctx: ?*anyopaque,
     /// PID_LIFESPAN QoS, sent as inline QoS on every alive DATA submessage (not just
     /// via SEDP writer announcement) — some readers only apply lifespan-based expiry
     /// to samples that carry it inline. null = no lifespan configured.
@@ -416,6 +437,8 @@ pub const StatefulWriter = struct {
             .pending_eoc_sn = null,
             .probe_result_fn = null,
             .probe_result_ctx = null,
+            .protocol_ready_fn = null,
+            .protocol_ready_ctx = null,
             .lifespan = null,
         };
         return self;
@@ -440,6 +463,17 @@ pub const StatefulWriter = struct {
     ) void {
         self.probe_result_fn = fn_ptr;
         self.probe_result_ctx = ctx;
+    }
+
+    /// Register a callback that fires when a reader proxy's protocol-ready
+    /// state transitions. Must be called before any reader proxies are added.
+    pub fn setProtocolReadyCallback(
+        self: *Self,
+        ctx: *anyopaque,
+        fn_ptr: *const fn (*anyopaque, Guid, bool) void,
+    ) void {
+        self.protocol_ready_fn = fn_ptr;
+        self.protocol_ready_ctx = ctx;
     }
 
     /// Start a liveness probe for all reader proxies matching `prefix`.
@@ -535,7 +569,6 @@ pub const StatefulWriter = struct {
     /// is sent to communicate this range.
     pub fn addMatchedReader(self: *Self, proxy: ReaderProxy) !void {
         self.mu.lock();
-        defer self.mu.unlock();
         for (self.reader_proxies.items) |*rp| {
             if (rp.guid.eql(proxy.guid)) {
                 // Lease refresh: update locators/metadata, preserve ack state.
@@ -551,10 +584,14 @@ pub const StatefulWriter = struct {
                 discarded.unicast_locators = .empty;
                 discarded.multicast_locators = .empty;
                 discarded.deinit(self.alloc);
+                self.mu.unlock();
                 return;
             }
         }
-        try self.reader_proxies.append(self.alloc, proxy);
+        self.reader_proxies.append(self.alloc, proxy) catch |err| {
+            self.mu.unlock();
+            return err;
+        };
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
         // Replay only applies when BOTH the writer offers TRANSIENT_LOCAL+ AND
         // this specific reader requested it. A VOLATILE-requesting reader has
@@ -562,6 +599,19 @@ pub const StatefulWriter = struct {
         // it has no spec-driven reason to send.
         const should_replay = self.replay_on_match and new_rp.wants_replay;
         if (!should_replay) new_rp.start_sn = self.cache.next_sn;
+        // Record the correlating floor for the RELIABLE readiness handshake,
+        // matching whatever firstSN the HB sent below will actually carry (see
+        // hbFirstSn). BEST_EFFORT proxies never ACKNACK, so there is no
+        // handshake to wait for — they become ready immediately instead,
+        // fired after mu is released below (never while holding it).
+        new_rp.first_sent_hb_first_sn = hbFirstSn(self.cache.minSn(), self.cache.maxSn(), new_rp.start_sn, null);
+        const newly_ready_guid: ?Guid = blk: {
+            if (!new_rp.reliable) {
+                new_rp.protocol_ready = true;
+                break :blk new_rp.guid;
+            }
+            break :blk null;
+        };
         // Set suppress_live_data before replay so the flag is visible to any
         // write() that acquires mu after we release it.  The replay sends
         // directly to the proxy (not through sendChangeToAllLocked) so it is
@@ -581,6 +631,11 @@ pub const StatefulWriter = struct {
         // that dropped DATA or HEARTBEAT packets can be recovered via NACK.
         if (self.hb_thread == null) {
             self.hb_thread = std.Thread.spawn(.{}, heartbeatThread, .{self}) catch null;
+        }
+        self.mu.unlock();
+
+        if (newly_ready_guid) |guid| {
+            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, true);
         }
     }
 
@@ -686,15 +741,23 @@ pub const StatefulWriter = struct {
         self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, final, last_sn, extra_gap_sn, null);
     }
 
+    /// firstSN a Heartbeat to `rp` would carry, given the writer's current
+    /// cache bounds. When `last_sn=0` (empty-cache / coherent-write-in-progress
+    /// convention), always 1 regardless of `start_sn` — an empty HB announces
+    /// writer presence; using start_sn here poisons Connext's GROUP coherent
+    /// set floor before any data arrives, causing it to reject GROUP
+    /// deliveries whose coherent_set_sn < start_sn. `first_sn_override`, when
+    /// set, wins unconditionally (GROUP EOC flush with a late-matching
+    /// VOLATILE reader — see the GAP-emission callers below).
+    fn hbFirstSn(cache_first: SequenceNumber, last_sn: SequenceNumber, start_sn: SequenceNumber, first_sn_override: ?SequenceNumber) SequenceNumber {
+        return first_sn_override orelse
+            if (last_sn == 0) @as(SequenceNumber, 1) else @max(if (cache_first == 0) 1 else cache_first, start_sn);
+    }
+
     fn sendHeartbeatToProxyLockedWithLastSnAndFirstSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber, extra_gap_sn: ?SequenceNumber, first_sn_override: ?SequenceNumber) void {
         const locs = rp.effectiveLocators();
         const cache_first = self.cache.minSn();
-        // When last_sn=0 (empty-cache / coherent-write-in-progress convention), force
-        // firstSN=1 regardless of rp.start_sn.  An empty HB announces writer presence;
-        // using start_sn here poisons Connext's GROUP coherent set floor before any data
-        // arrives, causing it to reject GROUP deliveries whose coherent_set_sn < start_sn.
-        const hb_first_sn = first_sn_override orelse
-            if (last_sn == 0) @as(SequenceNumber, 1) else @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
+        const hb_first_sn = hbFirstSn(cache_first, last_sn, rp.start_sn, first_sn_override);
         if (locs.len == 0) return;
         self.hb_count += 1;
         const first_sn = hb_first_sn;
@@ -761,11 +824,12 @@ pub const StatefulWriter = struct {
 
     pub fn removeMatchedReader(self: *Self, guid: Guid) void {
         self.mu.lock();
-        defer self.mu.unlock();
+        var was_ready = false;
         var i: usize = self.reader_proxies.items.len;
         while (i > 0) {
             i -= 1;
             if (self.reader_proxies.items[i].guid.eql(guid)) {
+                was_ready = was_ready or self.reader_proxies.items[i].protocol_ready;
                 self.reader_proxies.items[i].deinit(self.alloc);
                 _ = self.reader_proxies.swapRemove(i);
             }
@@ -773,6 +837,11 @@ pub const StatefulWriter = struct {
         // Wake any thread blocked in waitAllAcked: removing a reliable reader
         // may satisfy the all-acked condition even without an explicit ACKNACK.
         self.ack_cond.broadcast();
+        self.mu.unlock();
+
+        if (was_ready) {
+            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, false);
+        }
     }
 
     /// Store a new change and send it immediately to all matched readers.
@@ -916,6 +985,7 @@ pub const StatefulWriter = struct {
         self.mu.lock();
 
         var probe_cleared: ?GuidPrefix = null;
+        var newly_ready_guid: ?Guid = null;
 
         for (self.reader_proxies.items) |*rp| {
             if (!rp.guid.eql(reader_guid)) continue;
@@ -939,6 +1009,25 @@ pub const StatefulWriter = struct {
             }
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
             self.ack_cond.broadcast();
+            // RELIABLE protocol-ready handshake: the first AckNack whose base
+            // (next-expected SN) reaches the firstSN of the Heartbeat we sent
+            // this proxy at match time proves the reader processed that
+            // Heartbeat (not just SEDP discovery). Sticky — never re-checked
+            // once true. Deliberately compares against `nack_set.base`, not
+            // `highest_sn` (cumulative ack): for an empty-cache writer the
+            // floor is 1 (the empty-HB convention), which `highest_sn` can
+            // never reach since nothing was ever written — but a caught-up
+            // reader's ACKNACK still legitimately reports `base=1` ("I have
+            // nothing, next expect SN 1"), which correctly satisfies the
+            // handshake.
+            if (!rp.protocol_ready) {
+                if (rp.first_sent_hb_first_sn) |floor| {
+                    if (nack_set.base >= floor) {
+                        rp.protocol_ready = true;
+                        newly_ready_guid = rp.guid;
+                    }
+                }
+            }
             // Clear suppress_live_data when either:
             // (a) The reader sends a NON-FINAL NACK with cumAck >= history floor:
             //     RTI is actively requesting live samples, meaning its DataReader
@@ -1135,6 +1224,9 @@ pub const StatefulWriter = struct {
 
         if (probe_cleared) |prefix| {
             if (self.probe_result_fn) |f| f(self.probe_result_ctx.?, prefix, true);
+        }
+        if (newly_ready_guid) |guid| {
+            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, true);
         }
     }
 

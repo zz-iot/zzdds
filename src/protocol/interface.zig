@@ -109,6 +109,15 @@ pub const DataCallback = struct {
     on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
 };
 
+/// Invoked when a matched reader proxy's protocol-ready state transitions.
+/// `ready=true`: the RELIABLE AckNack/Heartbeat handshake completed (or, for
+/// BEST_EFFORT proxies, fired immediately at match — no handshake exists).
+/// `ready=false`: the proxy was removed after having been ready.
+pub const ProtocolReadyCallback = struct {
+    ctx: *anyopaque,
+    on_ready: *const fn (ctx: *anyopaque, guid: Guid, ready: bool) void,
+};
+
 // ── ProtocolWriter ────────────────────────────────────────────────────────────
 
 /// Write-side protocol abstraction. DCPS DataWriter holds one of these.
@@ -228,6 +237,11 @@ pub const ProtocolWriter = struct {
 
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
+
+        /// Register the callback invoked when a matched reader proxy's
+        /// protocol-ready state transitions. Must be called before any reader
+        /// proxies are added.
+        set_protocol_ready_callback: *const fn (ctx: *anyopaque, cb: ProtocolReadyCallback) void,
     };
 
     pub fn write(
@@ -324,6 +338,10 @@ pub const ProtocolWriter = struct {
 
     pub fn deinit(self: ProtocolWriter) void {
         self.vtable.deinit(self.ctx);
+    }
+
+    pub fn setProtocolReadyCallback(self: ProtocolWriter, cb: ProtocolReadyCallback) void {
+        self.vtable.set_protocol_ready_callback(self.ctx, cb);
     }
 };
 

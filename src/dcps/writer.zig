@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const history_mod = @import("../rtps/history.zig");
@@ -26,6 +27,31 @@ fn durationIsActive(d: DDS.Duration_t) bool {
     return true;
 }
 
+/// Build the unified listener representation from a plain `set_listener()`
+/// (base OMG API) call, with the extension callback unset.
+fn listenerExFromBase(l: DDS.DataWriterListener) ZZDDS.DataWriterListenerEx {
+    return .{
+        .listener_data = l.listener_data,
+        .on_offered_deadline_missed = l.on_offered_deadline_missed,
+        .on_offered_incompatible_qos = l.on_offered_incompatible_qos,
+        .on_liveliness_lost = l.on_liveliness_lost,
+        .on_publication_matched = l.on_publication_matched,
+        .on_reliable_reader_ready = null,
+    };
+}
+
+/// Narrow the unified listener representation back to the base OMG type for
+/// `get_listener()` — drops the extension callback.
+fn baseFromListenerEx(l: ZZDDS.DataWriterListenerEx) DDS.DataWriterListener {
+    return .{
+        .listener_data = l.listener_data,
+        .on_offered_deadline_missed = l.on_offered_deadline_missed,
+        .on_offered_incompatible_qos = l.on_offered_incompatible_qos,
+        .on_liveliness_lost = l.on_liveliness_lost,
+        .on_publication_matched = l.on_publication_matched,
+    };
+}
+
 pub const DataWriterImpl = struct {
     alloc: std.mem.Allocator,
     topic_name: []const u8, // borrowed from TopicImpl
@@ -34,7 +60,11 @@ pub const DataWriterImpl = struct {
     publisher: DDS.Publisher,
     proto_writer: proto.ProtocolWriter,
     qos: DDS.DataWriterQos,
-    listener: DDS.DataWriterListener,
+    // Unified listener storage: both the base OMG `set_listener()` and the
+    // zzdds `set_listener_ex()` extension populate this same representation
+    // (see listenerExFromBase/baseFromListenerEx) so on_reliable_reader_ready
+    // and the standard callbacks are always dispatched from one place.
+    listener_ex: ZZDDS.DataWriterListenerEx,
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -110,7 +140,7 @@ pub const DataWriterImpl = struct {
             .publisher = publisher,
             .proto_writer = proto_writer,
             .qos = .{},
-            .listener = listener,
+            .listener_ex = listenerExFromBase(listener),
             .listener_mask = mask,
             .instance_handle = instance_handle,
             .status_changes = 0,
@@ -297,7 +327,7 @@ pub const DataWriterImpl = struct {
             self.status_changes &= ~DDS.PUBLICATION_MATCHED_STATUS;
             self.pub_matched_total_change = 0;
             self.pub_matched_current_change = 0;
-            if (self.listener.on_publication_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
+            if (self.listener_ex.on_publication_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener_ex.listener_data);
         }
     }
 
@@ -320,7 +350,7 @@ pub const DataWriterImpl = struct {
             status.last_policy_id = policy_id;
             self.incompat_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
-            if (self.listener.on_offered_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
+            if (self.listener_ex.on_offered_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener_ex.listener_data);
         }
     }
 
@@ -337,7 +367,7 @@ pub const DataWriterImpl = struct {
             status.total_count_change = 1;
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_DEADLINE_MISSED_STATUS;
-            if (self.listener.on_offered_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
+            if (self.listener_ex.on_offered_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener_ex.listener_data);
         }
     }
 
@@ -354,8 +384,27 @@ pub const DataWriterImpl = struct {
             status.total_count_change = 1;
             self.liveliness_lost_total_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_LOST_STATUS;
-            if (self.listener.on_liveliness_lost) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
+            if (self.listener_ex.on_liveliness_lost) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener_ex.listener_data);
         }
+    }
+
+    /// Registered directly on the ProtocolWriter (see publisher.zig's
+    /// create_datawriter) — this signal is purely RTPS-internal (AckNack/
+    /// Heartbeat correlation or, for BEST_EFFORT, immediate at match) and
+    /// needs no SEDP/participant bookkeeping, unlike notifyPublicationMatched.
+    /// Not a DDS.StatusMask status: no counters, no StatusCondition wakeup —
+    /// this is a vendor extension callback only.
+    pub fn notifyReaderProtocolReady(ctx: *anyopaque, reader_guid: Guid, ready: bool) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.listener_ex.on_reliable_reader_ready) |cb| {
+            cb(guidToHandle(reader_guid), ready, self.listener_ex.listener_data);
+        }
+    }
+
+    /// Backs `zzdds::DataWriter::set_listener_ex` (see src/c_abi/extensions.zig).
+    pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) void {
+        self.listener_ex = listener_ex;
+        self.listener_mask = mask;
     }
 
     /// Called by participant.checkTimers() for each active writer.
@@ -478,13 +527,13 @@ pub const DataWriterImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataWriterListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.listener = if (a_listener) |l| l.* else DDS.noop_DataWriterListener;
+        self.listener_ex = listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener);
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.DataWriterListener {
-        return cast(ctx).listener;
+        return baseFromListenerEx(cast(ctx).listener_ex);
     }
 
     fn vtGetTopic(ctx: *anyopaque) DDS.Topic {

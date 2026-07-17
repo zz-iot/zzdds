@@ -295,6 +295,7 @@ fn topicGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
 
 const writer_vtable = ZZDDS.DataWriter.Vtable{
     .write_serialized = writerWriteSerialized,
+    .set_listener_ex = writerSetListenerEx,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = writerGetCAbiHandleZzdds,
     .as_DataWriter = writerAsDds,
@@ -588,6 +589,17 @@ fn writerWriteSerialized(
         _ => .alive,
     };
     _ = impl.writeRaw(change_kind, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, hash, payload) catch return DDS.RETCODE_ERROR;
+    return DDS.RETCODE_OK;
+}
+
+fn writerSetListenerEx(
+    ctx: *anyopaque,
+    a_listener: ?*const ZZDDS.DataWriterListenerEx,
+    mask: DDS.StatusMask,
+) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
+    impl.setListenerEx(if (a_listener) |l| l.* else ZZDDS.noop_DataWriterListenerEx, mask);
     return DDS.RETCODE_OK;
 }
 

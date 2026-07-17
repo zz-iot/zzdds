@@ -63,13 +63,6 @@ building, but they are not production target support. For each supported OS, pro
 entropy, PID, and monotonic-clock implementations; keep GUID-prefix vendor bytes aligned
 with the OMG Vendor ID registration item above.
 
-**`on_publication_matched` RELIABLE readiness contract** — current implementation fires
-on SEDP discovery. A protocol-ready contract would fire on the first AckNack from a reader
-proxy that correlates with a Heartbeat already sent to that proxy (AckNack base ≥ first
-sent Heartbeat's firstSN). Per-proxy state: `first_sent_hb_first_sn: ?SequenceNumber`.
-For BEST_EFFORT: fire immediately on discovery (no handshake). See `docs/decisions.md`
-for the full analysis.
-
 **Participant teardown can take several seconds under live reliability timers** — found
 while fixing a real use-after-free (`SedpEndpoints.stop()` wasn't stopping/joining
 `pub_writer`/`sub_writer`'s heartbeat threads before `discovery.stop()` returned, so
@@ -250,16 +243,6 @@ existing suite should be extended to cover the condvar path.
 ---
 
 ## Open Questions
-
-**`on_publication_matched` RELIABLE readiness contract.** The DDS spec fires on SEDP
-discovery, but users expect "I can write now." The protocol-ready approach described above
-is the preferred solution. Open edges:
-- Multiple concurrent readers: each `ReaderProxy` tracks readiness independently; `current_count`
-  increments per-proxy as each becomes ready.
-- Traffic minimization: initial Heartbeat to a new proxy should be sent promptly on proxy
-  creation (not waiting for the periodic HB timer).
-- No vendor detection to fast-path ZZDDS-to-ZZDDS matching — inter-version fragility
-  cost outweighs the benefit.
 
 **Key material storage.** File-based PEM certs to start when DDS Security is implemented.
 HSM abstraction deferred.

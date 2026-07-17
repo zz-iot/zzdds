@@ -311,6 +311,11 @@ pub const PublisherImpl = struct {
             dw,
             writer_mod.DataWriterImpl.assertLivelinessFn,
         );
+        // Direct ProtocolWriter registration (not routed through ParticipantCbs
+        // like the callbacks above): this signal is purely RTPS-internal
+        // (AckNack/Heartbeat correlation), unlike matched_notify which needs
+        // SEDP bookkeeping in the participant's active_writers map.
+        pw.setProtocolReadyCallback(.{ .ctx = dw, .on_ready = writer_mod.DataWriterImpl.notifyReaderProtocolReady });
         const pname_seq = &self.qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
         var pname_buf: [64][]const u8 = undefined;

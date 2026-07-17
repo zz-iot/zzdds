@@ -96,6 +96,7 @@ pub const RtpsProtocolWriter = struct {
         .send_combined_eoc_data = vtSendCombinedEOCData,
         .flush_group_eoc_hb_only = vtFlushGroupEOCHBOnly,
         .deinit = vtDeinit,
+        .set_protocol_ready_callback = vtSetProtocolReadyCallback,
     };
 
     fn vtWrite(
@@ -296,6 +297,11 @@ pub const RtpsProtocolWriter = struct {
     fn vtDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.deinit();
+    }
+
+    fn vtSetProtocolReadyCallback(ctx: *anyopaque, cb: protocol.ProtocolReadyCallback) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.setProtocolReadyCallback(cb.ctx, cb.on_ready);
     }
 };
 
