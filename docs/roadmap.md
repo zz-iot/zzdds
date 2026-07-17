@@ -42,15 +42,53 @@ re-announcements from a participant whose `sedp_seen` is still false, send a tar
 retransmit of our own SPDP announcement. Recovers from SEDP packet loss on initial exchange
 without waiting for a full announcement period.
 
-**LocatorSelector abstraction** — replace the flat per-locator blast in
-`StatelessWriter.sendAll()` (and `StatefulWriter`) with a selector that prefers loopback
-for local peers and unicast over multicast when the remote is reachable unicast. A
-GUID-to-selected-locator cache amortizes selection cost. When building the selector,
-filter out locator kinds the active transport does not support rather than attempting
-sends and swallowing the error; this eliminates the pty-buffer pressure that caused
-Durability_17 failures against Connext. Pair with a one-time debug log (per unsupported
-kind encountered) so that the locator kinds a vendor is advertising remain observable
-when debugging interop issues without flooding production output.
+**LocatorSelector abstraction — Phase 1 done** (per-proxy ranking; `StatefulWriter`'s
+`ReaderProxy` and `StatefulReader`'s `WriterProxy`). `Locator.tier()`
+(`src/transport/interface.zig`) classifies loopback/link-local/private/public reachability;
+`transport/locator_selector.zig`'s `selectInto` ranks a proxy's own locator set — unicast
+list wins over multicast list (unchanged), best reachability tier wins, address family is a
+first-in-list tiebreak at equal tier, and same-tier/same-family ties are all kept (preserves
+delivery to multi-homed peers, e.g. a reader advertising both a VPN and a LAN address). Each
+`ReaderProxy`/`WriterProxy` caches the result in a `selected_locators` field, recomputed only
+at construction and moved (not recomputed) on lease refresh — the GUID-scoped amortization
+this roadmap item asked for. `effectiveLocators()`'s signature and all 12 call sites (10 in
+`writer_sm.zig`, 2 in `reader_sm.zig`) are unchanged.
+
+Filtering out locator kinds the active transport doesn't support, plus the one-time
+per-kind debug log, turned out to already be fully implemented upstream of this work
+(`discovery/interface.zig`'s `filterReachableLocators`, applied at every SPDP/SEDP
+locator-ingestion point via `Transport.canReach()`, with `warnUnsupportedLocatorOnce` in
+`spdp.zig`/`sedp.zig`) — not new work, just confirmed and left alone. Address-family
+*enablement* (`ipv4_enabled`/`ipv6_enabled`) is enforced at that same upstream layer, not
+re-checked by the selector.
+
+Landing this surfaced a real, previously-masked transport bug: with `bind_wildcard=false`
+(the default) and an explicit `participant_id` (which bypasses the
+`autoAssignParticipantId` reservation-socket path), `UdpTransport` advertised 127.0.0.1 as
+a reachable locator (`rebuildLocatorsLocked`'s unconditional loopback-advertise) without
+ever binding a socket to it — `active_ifaces` excludes loopback interfaces, so the
+non-wildcard per-interface socket loop never created one. Blasting to every locator masked
+this (one of the other advertised addresses always had a real listening socket); ranking
+that correctly prefers loopback as the best tier exposed it as silent, total data loss.
+Fixed in `UdpTransport.vtListen`'s non-wildcard branch by explicitly binding 127.0.0.1
+alongside the per-interface sockets, with a regression test (`"non-wildcard bind still
+receives loopback traffic"` in `src/transport/udp.zig`).
+
+`StatelessWriter.sendAll()` is intentionally **not** touched in this phase — its
+`ReaderLocator` has no unicast/multicast split and is populated by SPDP's already-flattened
+locator list; out of scope for the per-proxy ranking design.
+
+Deferred, not precluded by this design:
+- **Cross-proxy multicast fan-out grouping** ("N matched readers share a multicast group,
+  send once") — needs a writer-level view across the whole matched-proxy set for a send
+  event, which a per-proxy `effectiveLocators()` call can't express. Precedent for the
+  grouping shape already exists in `src/rtps/protocol_adapters.zig` (`vtTakeEOCProxyInfos`/
+  `vtSendCombinedEOCData`, the GROUP coherent-set EOC flush) — natural migration target if
+  this is built.
+- **NACK-aggregation / delayed-response repair batching** — separate, larger feature;
+  `nack_response_delay`/`nack_suppression_duration` don't exist anywhere in the codebase yet.
+  Would feed decisions into a future writer-level delivery planner rather than needing
+  anything from the selector itself.
 
 **GUID generation platform coverage** — the current fallback paths keep unsupported targets
 building, but they are not production target support. For each supported OS, provide real

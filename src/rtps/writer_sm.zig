@@ -19,6 +19,7 @@ const sn_mod = @import("sequence_number.zig");
 const time_mod = @import("../util/time.zig");
 const msg = @import("message/root.zig");
 const iface = @import("../transport/interface.zig");
+const locator_selector = @import("../transport/locator_selector.zig");
 
 const MessageBuilder = msg.builder.MessageBuilder;
 const SCRATCH_SIZE = msg.builder.SCRATCH_SIZE;
@@ -214,6 +215,12 @@ pub const ReaderProxy = struct {
     guid: Guid,
     unicast_locators: std.ArrayListUnmanaged(Locator),
     multicast_locators: std.ArrayListUnmanaged(Locator),
+    /// Ranked, cached subset of unicast_locators (or multicast_locators as
+    /// fallback) actually used for sends. See transport.locator_selector.
+    /// Recomputed only when unicast_locators/multicast_locators change (at
+    /// construction, and moved on lease refresh in addMatchedReader) — never
+    /// per-send.
+    selected_locators: std.ArrayListUnmanaged(Locator),
     expects_inline_qos: bool,
     /// True when the matched reader is RELIABLE; false for BEST_EFFORT.
     /// BEST_EFFORT proxies never send AckNack so they are excluded from
@@ -290,6 +297,7 @@ pub const ReaderProxy = struct {
             .guid = guid,
             .unicast_locators = .empty,
             .multicast_locators = .empty,
+            .selected_locators = .empty,
             .expects_inline_qos = expects_inline_qos,
             .reliable = reliable,
             .highest_acked_sn = 0,
@@ -303,12 +311,18 @@ pub const ReaderProxy = struct {
         try self.unicast_locators.appendSlice(alloc, unicast_locators);
         errdefer self.unicast_locators.deinit(alloc);
         try self.multicast_locators.appendSlice(alloc, multicast_locators);
+        errdefer self.multicast_locators.deinit(alloc);
+        // Selection failure must not fail proxy construction — fall back to
+        // an empty selected_locators (effectiveLocators() then returns
+        // nothing, which every call site already handles gracefully).
+        locator_selector.selectInto(&self.selected_locators, alloc, self.unicast_locators.items, self.multicast_locators.items) catch {};
         return self;
     }
 
     pub fn deinit(self: *ReaderProxy, alloc: std.mem.Allocator) void {
         self.unicast_locators.deinit(alloc);
         self.multicast_locators.deinit(alloc);
+        self.selected_locators.deinit(alloc);
     }
 
     /// Primary locator for sending: first unicast, else first multicast.
@@ -318,13 +332,14 @@ pub const ReaderProxy = struct {
         return null;
     }
 
-    /// All locators to deliver to: unicast list if non-empty, else multicast list.
-    /// RTPS requires sending to every locator in the list so that peers with
-    /// multiple interfaces (e.g. OpenDDS advertising both a VPN and a LAN address)
-    /// receive the datagram on whichever interface is actually reachable.
+    /// Ranked subset of locators to deliver to — see transport.locator_selector.
+    /// Cached at construction/lease-refresh time; O(1) per call. Prefers the
+    /// best-reachability-tier, single address family among unicast_locators
+    /// (falling back to multicast_locators when unicast is empty), while still
+    /// delivering to every distinct locator tied at that best tier/family (e.g.
+    /// a peer advertising both a VPN and a LAN address on the same family).
     pub fn effectiveLocators(self: *const ReaderProxy) []const Locator {
-        if (self.unicast_locators.items.len > 0) return self.unicast_locators.items;
-        return self.multicast_locators.items;
+        return self.selected_locators.items;
     }
 };
 
@@ -572,10 +587,15 @@ pub const StatefulWriter = struct {
         for (self.reader_proxies.items) |*rp| {
             if (rp.guid.eql(proxy.guid)) {
                 // Lease refresh: update locators/metadata, preserve ack state.
+                // proxy.selected_locators was already computed against
+                // proxy.unicast_locators/multicast_locators by ReaderProxy.init,
+                // so it moves alongside them rather than being recomputed here.
                 rp.unicast_locators.deinit(self.alloc);
                 rp.multicast_locators.deinit(self.alloc);
+                rp.selected_locators.deinit(self.alloc);
                 rp.unicast_locators = proxy.unicast_locators;
                 rp.multicast_locators = proxy.multicast_locators;
+                rp.selected_locators = proxy.selected_locators;
                 rp.reliable = proxy.reliable;
                 rp.expects_inline_qos = proxy.expects_inline_qos;
                 rp.wants_replay = proxy.wants_replay;
@@ -583,6 +603,7 @@ pub const StatefulWriter = struct {
                 var discarded = proxy;
                 discarded.unicast_locators = .empty;
                 discarded.multicast_locators = .empty;
+                discarded.selected_locators = .empty;
                 discarded.deinit(self.alloc);
                 self.mu.unlock();
                 return;
