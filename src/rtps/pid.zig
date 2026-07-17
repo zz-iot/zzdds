@@ -100,4 +100,7 @@ pub const BuiltinEndpointSet = struct {
 // ── RTPS VendorId for Zenzen DDS ────────────────────────────────────────────────
 
 /// RTPS VendorId_t (§8.3.3.1) for Zenzen DDS, officially registered with OMG.
-pub const ZZDDS_VENDOR_ID: [2]u8 = .{ 0x01, 0x1B };
+/// Derived from `message/header.VENDOR_ID` so there is a single authoritative
+/// definition of the two-byte value; this is just its raw-byte form for
+/// appending directly into PL_CDR parameter buffers.
+pub const ZZDDS_VENDOR_ID: [2]u8 = @import("message/header.zig").VENDOR_ID.bytes;
