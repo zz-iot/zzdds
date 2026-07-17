@@ -99,6 +99,5 @@ pub const BuiltinEndpointSet = struct {
 
 // ── RTPS VendorId for Zenzen DDS ────────────────────────────────────────────────
 
-/// RTPS VendorId_t (§8.3.3.1) for Zenzen DDS.
-/// TODO: register with OMG before v1.0. Placeholder value used during development.
-pub const ZZDDS_VENDOR_ID: [2]u8 = .{ 0x01, 0x23 };
+/// RTPS VendorId_t (§8.3.3.1) for Zenzen DDS, officially registered with OMG.
+pub const ZZDDS_VENDOR_ID: [2]u8 = .{ 0x01, 0x1B };

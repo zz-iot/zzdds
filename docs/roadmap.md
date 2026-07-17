@@ -21,12 +21,6 @@ wire issue).
 
 ## Planned (after Phase 33)
 
-**OMG Vendor ID registration** — both `pid.zig:ZZDDS_VENDOR_ID` and
-`src/rtps/message/header.zig:VENDOR_ID` use the placeholder `{0x01, 0x23}`, and
-`src/util/guid_gen.zig` already embeds `guidPrefix[0..2]` from that constant (compliant
-with RTPS §9.3.1.5). The only remaining step is to register with OMG and update the
-two-byte constant once a real ID is assigned. No structural changes needed.
-
 **C-ABI TypeSupport** — complete. `zzdds_register_type_support_c` in
 `src/c_abi/typesupport.zig` bridges a C function pointer to the Zig `TypeSupport`
 vtable via a heap-allocated `CKeyHashAdapter`. Pass the
@@ -60,8 +54,7 @@ when debugging interop issues without flooding production output.
 
 **GUID generation platform coverage** — the current fallback paths keep unsupported targets
 building, but they are not production target support. For each supported OS, provide real
-entropy, PID, and monotonic-clock implementations; keep GUID-prefix vendor bytes aligned
-with the OMG Vendor ID registration item above.
+entropy, PID, and monotonic-clock implementations.
 
 **Participant teardown can take several seconds under live reliability timers** — found
 while fixing a real use-after-free (`SedpEndpoints.stop()` wasn't stopping/joining

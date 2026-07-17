@@ -21,11 +21,9 @@ pub const PROTOCOL_ID: [4]u8 = .{ 'R', 'T', 'P', 'S' };
 /// Protocol version supported by this implementation (RTPS 2.5).
 pub const PROTOCOL_VERSION: ProtocolVersion = .{ .major = 2, .minor = 5 };
 
-/// Zenzen DDS vendor ID.
-/// TODO: register a real vendor ID with the OMG/DDS Foundation before shipping.
-/// Using 0x0123 as a placeholder; verify it is unregistered before release at
+/// Zenzen DDS vendor ID, officially registered with the OMG/DDS Foundation.
 /// https://www.dds-foundation.org/dds-rtps-vendor-and-product-ids
-pub const VENDOR_ID: VendorId = .{ .bytes = .{ 0x01, 0x23 } };
+pub const VENDOR_ID: VendorId = .{ .bytes = .{ 0x01, 0x1B } };
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
