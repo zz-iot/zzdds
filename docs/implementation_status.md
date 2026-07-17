@@ -156,11 +156,6 @@ uses PID/time on supported OSes and PID `0` plus a constant clock seed on unsupp
 Add target-specific entropy, PID, and monotonic-clock support before claiming production
 support for those targets.
 
-**Vendor ID placeholder pending OMG registration.** Both `pid.zig` and `src/rtps/message/header.zig`
-use `{0x01, 0x23}` consistently, and `src/util/guid_gen.zig` already embeds those bytes into
-`guidPrefix[0..2]` (RTPS §9.3.1.5). The sole remaining step is registering with OMG and updating
-the two-byte constant.
-
 **`PID_GROUP_DATA` wire value.** `pid.zig` defines `GROUP_DATA = 0x002D` per RTPS 2.5 Table 9.18.
 The constant is present but not yet serialized in SEDP announcements; when GROUP_DATA serialization
 is added, confirm that peers expect `0x002D` (not the historical `0x0056` used by some older

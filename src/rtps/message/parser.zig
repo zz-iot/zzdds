@@ -448,7 +448,7 @@ test "MessageIterator parses header-only message (no submessages)" {
     buf[4] = 2;
     buf[5] = 5; // version 2.5
     buf[6] = 0x01;
-    buf[7] = 0x23; // vendor id
+    buf[7] = 0x1B; // vendor id
     // guid prefix: zeros
 
     var it = try MessageIterator.init(&buf);

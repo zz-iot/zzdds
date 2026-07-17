@@ -430,14 +430,12 @@ The RTPS spec requires the first two bytes of a GuidPrefix to equal the particip
 VendorId bytes.
 
 Current implementation status:
-- `src/rtps/message/header.zig` uses header `VENDOR_ID = {0x01, 0x23}`.
-- `src/rtps/pid.zig` uses SPDP `ZZDDS_VENDOR_ID = {0x01, 0x23}`.
+- `src/rtps/message/header.zig` uses header `VENDOR_ID = {0x01, 0x1B}`, Zenzen DDS's
+  registered OMG vendor ID.
+- `src/rtps/pid.zig` uses SPDP `ZZDDS_VENDOR_ID = {0x01, 0x1B}`.
 - `src/util/guid_gen.zig` stamps those bytes into `guidPrefix[0..2]` for `.spec_random`
   and `.host_based` GUID generation. `.fully_random` intentionally does not stamp vendor
   bytes and is not the default participant strategy.
-
-Before publishing a stable release, register a permanent vendor ID with OMG and update the
-two-byte placeholder in both header and SPDP constants.
 
 ---
 
