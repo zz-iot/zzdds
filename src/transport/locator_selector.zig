@@ -47,7 +47,8 @@ pub fn selectInto(
 
     var best_tier: LocatorTier = .public;
     for (chosen) |loc| {
-        if (@intFromEnum(loc.tier()) < @intFromEnum(best_tier)) best_tier = loc.tier();
+        const t = loc.tier();
+        if (@intFromEnum(t) < @intFromEnum(best_tier)) best_tier = t;
     }
 
     var winning_family: ?std.meta.Tag(Locator) = null;
