@@ -620,7 +620,11 @@ test "SPDP: SEDP-traffic-seen heuristic retransmits unicast on re-announcement u
     const spdp = try SpdpEndpoints.init(alloc, self_mt.transport(), 0, 3000);
     defer spdp.deinit();
 
-    var clock = ManualClock.init(0);
+    // Start at 1ms (not 0) and advance by 100ms between re-announcements so
+    // each one clears MIN_PLAUSIBLE_INTERVAL_NS (50ms) and is recognized as a
+    // genuine re-announcement, not a same-timestamp/implausible-interval
+    // duplicate — see "same-SN duplicate" test below for that path.
+    var clock = ManualClock.init(std.time.ns_per_ms);
     spdp.setClock(clock.clock());
 
     var tr = Tracker{};
@@ -639,9 +643,10 @@ test "SPDP: SEDP-traffic-seen heuristic retransmits unicast on re-announcement u
     };
     // No multicast locators and no initial_peers → the writer starts with zero
     // registered reader locators, so start()'s own initial sendAll() sends
-    // nothing. The ManualClock never advances, so the background timer thread
-    // never fires a periodic/fast-announce reannounce() during this test either
-    // — every observed send below comes from the heuristic under test.
+    // nothing. The 100ms per-step clock advances below stay far short of the
+    // 3000ms announcement period, so the background timer thread never fires a
+    // periodic/fast-announce reannounce() during this test either — every
+    // observed send below comes from the heuristic under test.
     try spdp.start(&local, &c);
     defer spdp.stop();
 
@@ -655,11 +660,14 @@ test "SPDP: SEDP-traffic-seen heuristic retransmits unicast on re-announcement u
     try testing.expectEqual(@as(u32, 1), tr.discovered);
     try testing.expectEqual(@as(usize, 0), peer_mt.queueLen());
 
-    // Re-announcement while sedp_seen is still false → targeted unicast retransmit.
+    // Genuine re-announcement (100ms later) while sedp_seen is still false →
+    // targeted unicast retransmit.
+    clock.set(101 * std.time.ns_per_ms);
     spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
     try testing.expectEqual(@as(usize, 1), peer_mt.queueLen());
 
-    // Still no SEDP traffic observed → retransmits again on the next re-announcement.
+    // Still no SEDP traffic observed → retransmits again on the next genuine re-announcement.
+    clock.set(201 * std.time.ns_per_ms);
     spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
     try testing.expectEqual(@as(usize, 2), peer_mt.queueLen());
 
@@ -667,7 +675,75 @@ test "SPDP: SEDP-traffic-seen heuristic retransmits unicast on re-announcement u
     spdp_mod.SpdpEndpoints.markSedpSeen(spdp, peer);
 
     // Further re-announcements no longer trigger a retransmit.
+    clock.set(301 * std.time.ns_per_ms);
     spdp.processSpdpPayload(peer, 4, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    clock.set(401 * std.time.ns_per_ms);
     spdp.processSpdpPayload(peer, 5, payload, .{ .bytes = .{ 0x00, 0x00 } });
     try testing.expectEqual(@as(usize, 2), peer_mt.queueLen());
+}
+
+test "SPDP: SEDP-traffic-seen heuristic does not retransmit on same-SN duplicate redelivery" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const self_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7421);
+    const self_locs = [_]Locator{self_loc};
+    const self_mt = try MockTransport.init(alloc, net, &self_locs);
+    defer self_mt.deinit();
+
+    const peer_loc = Locator.udp4(.{ 127, 0, 0, 2 }, 7422);
+    const peer_locs = [_]Locator{peer_loc};
+    const peer_mt = try MockTransport.init(alloc, net, &peer_locs);
+    defer peer_mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, self_mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+
+    const local = ParticipantAnnouncement{
+        .guid = .{ .prefix = prefix(0x02), .entity_id = iface.EntityIds.participant },
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &self_locs,
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 10_000,
+        .builtin_endpoint_set = 0,
+    };
+    try spdp.start(&local, &c);
+    defer spdp.stop();
+
+    const peer = prefix(0xDD);
+    const payload = try buildPayloadWithLocator(alloc, peer, 60_000, peer_loc);
+    defer alloc.free(payload);
+
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(usize, 0), peer_mt.queueLen());
+
+    // Genuine re-announcement (SN=2) at T=101ms → one retransmit.
+    clock.set(101 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(usize, 1), peer_mt.queueLen());
+
+    // A multi-homed peer's redundant copy of the SAME sample (same SN=2)
+    // arrives moments later via a second local interface. This must NOT be
+    // treated as a genuine re-announcement, so no second retransmit fires.
+    clock.set(105 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(usize, 1), peer_mt.queueLen());
+
+    // An implausibly-fast "new" SN (peer bumps SN per redundant copy instead of
+    // reusing it) arrives 10ms later — well under MIN_PLAUSIBLE_INTERVAL_NS
+    // (50ms). Also must not trigger a second retransmit.
+    clock.set(115 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(usize, 1), peer_mt.queueLen());
 }

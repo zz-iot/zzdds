@@ -536,6 +536,13 @@ pub const SpdpEndpoints = struct {
                 const prev_interval = gop.value_ptr.observed_interval_ns;
                 const same_sn = writer_sn != sn_mod.SEQUENCENUMBER_UNKNOWN and
                     writer_sn == gop.value_ptr.last_writer_sn;
+                // True only for a genuinely new, plausibly-spaced re-announcement —
+                // never for same-SN or implausibly-fast duplicate redelivery (see the
+                // last_writer_sn field doc and MIN_PLAUSIBLE_INTERVAL_NS above). Gates
+                // the SEDP-traffic-seen retransmit below so a multi-homed peer's
+                // redundant per-interface copies of one announcement don't each
+                // trigger their own unicast retransmit.
+                var is_genuine_reannounce = false;
                 if (same_sn) {
                     // Redelivery of the same SPDP sample (e.g. a multi-homed peer sending
                     // redundantly across several local interfaces within microseconds of
@@ -559,6 +566,7 @@ pub const SpdpEndpoints = struct {
                             interval
                         else
                             @divTrunc(prev_interval + interval, 2); // EMA α=0.5
+                        is_genuine_reannounce = true;
                     }
                 } else {
                     kp.observed_interval_ns = prev_interval;
@@ -567,7 +575,7 @@ pub const SpdpEndpoints = struct {
                 was_probing = gop.value_ptr.probe_active;
                 // Carry sedp_seen forward — a fresh decode always starts false.
                 kp.sedp_seen = gop.value_ptr.sedp_seen;
-                if (!kp.sedp_seen) {
+                if (is_genuine_reannounce and !kp.sedp_seen) {
                     retransmit_locators = self.alloc.dupe(
                         Locator,
                         kp.data.metatraffic_unicast_locators,
