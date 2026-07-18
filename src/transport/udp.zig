@@ -222,10 +222,25 @@ const SocketEntry = struct {
     // block indefinitely.
     handler: ReceiveHandler,
 
-    fn stop(self: *SocketEntry) void {
+    /// Signal the recv thread to stop, without waiting for it to exit. Safe to
+    /// call on any number of sockets before joining any of them — letting every
+    /// thread observe the flag concurrently means the subsequent joins are each
+    /// bounded by the slowest thread's remaining poll wait, not by their sum.
+    fn requestStop(self: *SocketEntry) void {
         self.stopping.store(true, .release);
+    }
+
+    /// Wait for the recv thread to exit (already signaled via `requestStop`)
+    /// and close the socket. Call `requestStop` on every socket being torn down
+    /// first; see that method's comment.
+    fn joinAndClose(self: *SocketEntry) void {
         self.thread.join();
         socketClose(self.fd);
+    }
+
+    fn stop(self: *SocketEntry) void {
+        self.requestStop();
+        self.joinAndClose();
     }
 };
 
@@ -516,8 +531,11 @@ pub const UdpTransport = struct {
         if (self.owned_send_fd_v4 != INVALID_SOCKET) socketClose(self.owned_send_fd_v4);
         if (self.owned_send_fd_v6 != INVALID_SOCKET) socketClose(self.owned_send_fd_v6);
 
+        // Signal every recv thread before joining any of them (see
+        // SocketEntry.requestStop) so N sockets cost one bounded wait, not N.
+        for (self.sockets.items) |s| s.requestStop();
         for (self.sockets.items) |s| {
-            s.stop();
+            s.joinAndClose();
             self.alloc.destroy(s);
         }
         self.sockets.deinit(self.alloc);
@@ -651,12 +669,18 @@ pub const UdpTransport = struct {
     }
 
     fn removeUnicastSockets(self: *Self, ip: [16]u8, port: u32) void {
+        // Signal before joining (see SocketEntry.requestStop) — same rationale
+        // as removeSockets, kept consistent even though this usually matches
+        // at most one socket.
+        for (self.sockets.items) |s| {
+            if (s.kind == .unicast and s.port == port and std.mem.eql(u8, &s.bound_ip, &ip)) s.requestStop();
+        }
         var i: usize = self.sockets.items.len;
         while (i > 0) {
             i -= 1;
             const s = self.sockets.items[i];
             if (s.kind == .unicast and s.port == port and std.mem.eql(u8, &s.bound_ip, &ip)) {
-                s.stop();
+                s.joinAndClose();
                 self.alloc.destroy(s);
                 _ = self.sockets.swapRemove(i);
             }
@@ -686,12 +710,20 @@ pub const UdpTransport = struct {
     }
 
     fn removeSockets(self: *Self, port: u32) void {
+        // Signal every matching socket's recv thread before joining any of
+        // them (see SocketEntry.requestStop) so tearing down a port with N
+        // bound sockets (one per active interface, plus the explicit loopback
+        // bind — see vtListen) costs one bounded poll wait, not N sequential
+        // ones. This was previously the dominant cost in participant teardown.
+        for (self.sockets.items) |s| {
+            if (s.port == port) s.requestStop();
+        }
         var i: usize = self.sockets.items.len;
         while (i > 0) {
             i -= 1;
             const s = self.sockets.items[i];
             if (s.port == port) {
-                s.stop();
+                s.joinAndClose();
                 self.alloc.destroy(s);
                 _ = self.sockets.swapRemove(i);
             }
