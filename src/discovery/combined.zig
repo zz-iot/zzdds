@@ -66,6 +66,9 @@ pub const SpdpSedpDiscovery = struct {
         sp.setBeginProbeFn(se, sedp.SedpEndpoints.beginProbe);
         // Wire SEDP probe result → SPDP participant eviction/renewal.
         se.setProbeResultFn(sp, spdp.SpdpEndpoints.onProbeResult);
+        // Wire SEDP-traffic-seen → SPDP: stop targeted-retransmit once real SEDP
+        // endpoint data has been received from a peer.
+        se.setSedpSeenFn(sp, spdp.SpdpEndpoints.markSedpSeen);
 
         const self = try alloc.create(Self);
         self.* = .{ .alloc = alloc, .spdp = sp, .sedp = se };

@@ -81,6 +81,12 @@ pub const KnownParticipant = struct {
     /// duplicate delivery rather than a genuine (fast) re-announcement, so it doesn't
     /// poison observed_interval_ns. See processSpdpPayload.
     last_writer_sn: SequenceNumber,
+    /// True once real SEDP endpoint traffic (a DiscoveredWriterData or
+    /// DiscoveredReaderData) has been received from this participant. Set by
+    /// SEDP via markSedpSeen; carried forward across re-announcements (a fresh
+    /// decode always starts false). See the SEDP-traffic-seen heuristic in
+    /// processSpdpPayload.
+    sedp_seen: bool,
 
     pub fn deinit(self: *KnownParticipant) void {
         self.alloc.free(self.data.name);
@@ -263,6 +269,17 @@ pub const SpdpEndpoints = struct {
             kp.value.deinit();
             if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, guid);
         }
+    }
+
+    /// Called by SEDP when a DiscoveredWriterData or DiscoveredReaderData is
+    /// received from `prefix`. Marks the participant so processSpdpPayload
+    /// stops retransmitting SPDP on its behalf. A no-op if the participant
+    /// isn't (or is no longer) known.
+    pub fn markSedpSeen(ctx: *anyopaque, prefix: GuidPrefix) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.known.getPtr(prefix)) |kp| kp.sedp_seen = true;
     }
 
     pub fn start(
@@ -499,6 +516,14 @@ pub const SpdpEndpoints = struct {
         // hashmap mutation (re-announcement or eviction) could rehash and free the
         // pointed-to memory, causing use-after-free / "switch on corrupt value" panics.
         var was_probing = false;
+        // SEDP-traffic-seen heuristic: if a peer keeps re-announcing itself over
+        // SPDP but we've never received real SEDP endpoint traffic from it, our
+        // own SPDP announcement may never have reached it (or was lost). Retransmit
+        // it directly to the peer's unicast locators on every such re-announcement,
+        // rather than waiting for the next periodic/fast-announce cycle. Populated
+        // under the lock below; sent after releasing it (same discipline as
+        // was_probing/begin_probe_fn — no network I/O while holding self.mu).
+        var retransmit_locators: []Locator = &.{};
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -540,6 +565,14 @@ pub const SpdpEndpoints = struct {
                 }
                 // Capture whether a probe was active before we overwrite the entry.
                 was_probing = gop.value_ptr.probe_active;
+                // Carry sedp_seen forward — a fresh decode always starts false.
+                kp.sedp_seen = gop.value_ptr.sedp_seen;
+                if (!kp.sedp_seen) {
+                    retransmit_locators = self.alloc.dupe(
+                        Locator,
+                        kp.data.metatraffic_unicast_locators,
+                    ) catch &.{};
+                }
                 gop.value_ptr.deinit();
             }
             gop.value_ptr.* = kp;
@@ -576,6 +609,12 @@ pub const SpdpEndpoints = struct {
         // (lock order: spdp.mu → writer.mu, never nested).
         if (was_probing) {
             if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, guid_prefix, 0);
+        }
+        if (retransmit_locators.len > 0) {
+            defer self.alloc.free(retransmit_locators);
+            if (self.writer) |w| {
+                for (retransmit_locators) |loc| w.sendToLocator(loc);
+            }
         }
     }
 
@@ -918,6 +957,7 @@ pub fn decodeSpdpParticipant(
         .observed_interval_ns = 0,
         .probe_active = false,
         .last_writer_sn = sn_mod.SEQUENCENUMBER_UNKNOWN, // caller sets this
+        .sedp_seen = false, // caller carries forward on re-announcement
         .data = ParticipantData{
             .guid = .{
                 .prefix = decoded_prefix,

@@ -16,9 +16,11 @@ const SpdpEndpoints = spdp_mod.SpdpEndpoints;
 const ManualClock = time_mod.ManualClock;
 const MockNetwork = mock_tr.MockNetwork;
 const MockTransport = mock_tr.MockTransport;
+const Locator = mock_tr.Locator;
 const GuidPrefix = iface.GuidPrefix;
 const Guid = iface.Guid;
 const Callbacks = iface.Callbacks;
+const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 const ParticipantData = iface.ParticipantData;
 const WriterData = iface.WriterData;
 const ReaderData = iface.ReaderData;
@@ -58,6 +60,45 @@ fn buildPayload(alloc: std.mem.Allocator, p: GuidPrefix, lease_ms: u32) ![]u8 {
     try buf.appendSlice(alloc, &tmp);
 
     // PID_SENTINEL (0x0001), length = 0
+    try buf.appendSlice(alloc, &.{ 0x01, 0x00, 0x00, 0x00 });
+
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Like buildPayload, but also encodes a single PID_METATRAFFIC_UNICAST_LOCATOR
+/// (0x0032, length 24: kind[4] + port[4] + address[16]) so the decoded
+/// KnownParticipant has a real locator to target for a unicast retransmit.
+fn buildPayloadWithLocator(alloc: std.mem.Allocator, p: GuidPrefix, lease_ms: u32, loc: Locator) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, &.{ 0x00, 0x03, 0x00, 0x00 });
+
+    try buf.appendSlice(alloc, &.{ 0x50, 0x00, 0x10, 0x00 });
+    try buf.appendSlice(alloc, &p.bytes);
+    try buf.appendSlice(alloc, &.{ 0x00, 0x00, 0x01, 0xc1 });
+
+    const lease = time_mod.RtpsDuration.fromDuration(.{
+        .sec = @intCast(lease_ms / 1000),
+        .nanosec = (lease_ms % 1000) * 1_000_000,
+    });
+    try buf.appendSlice(alloc, &.{ 0x02, 0x00, 0x08, 0x00 });
+    var tmp: [4]u8 = undefined;
+    std.mem.writeInt(i32, &tmp, lease.seconds, .little);
+    try buf.appendSlice(alloc, &tmp);
+    std.mem.writeInt(u32, &tmp, lease.fraction, .little);
+    try buf.appendSlice(alloc, &tmp);
+
+    // PID_METATRAFFIC_UNICAST_LOCATOR (0x0032), length = 24
+    try buf.appendSlice(alloc, &.{ 0x32, 0x00, 0x18, 0x00 });
+    const wire = loc.toRtpsWire();
+    var tmp4: [4]u8 = undefined;
+    std.mem.writeInt(i32, &tmp4, wire.kind, .little);
+    try buf.appendSlice(alloc, &tmp4);
+    std.mem.writeInt(u32, &tmp4, wire.port, .little);
+    try buf.appendSlice(alloc, &tmp4);
+    try buf.appendSlice(alloc, &wire.address);
+
     try buf.appendSlice(alloc, &.{ 0x01, 0x00, 0x00, 0x00 });
 
     return buf.toOwnedSlice(alloc);
@@ -554,4 +595,79 @@ test "SPDP: onProbeResult dead evicts participant" {
     // Stale dead result for unknown prefix → no-op.
     spdp_mod.SpdpEndpoints.onProbeResult(spdp, peer, false);
     try testing.expectEqual(@as(u32, 1), tr.lost);
+}
+
+test "SPDP: SEDP-traffic-seen heuristic retransmits unicast on re-announcement until SEDP is seen" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    // "self": the SpdpEndpoints under test, sending real StatelessWriter traffic.
+    const self_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7411);
+    const self_locs = [_]Locator{self_loc};
+    const self_mt = try MockTransport.init(alloc, net, &self_locs);
+    defer self_mt.deinit();
+
+    // "peer": only used to observe what self_mt sends it. IP-based routing in
+    // MockNetwork means any packet addressed to this IP lands in its queue,
+    // regardless of destination port, so no receive handler is needed.
+    const peer_loc = Locator.udp4(.{ 127, 0, 0, 2 }, 7412);
+    const peer_locs = [_]Locator{peer_loc};
+    const peer_mt = try MockTransport.init(alloc, net, &peer_locs);
+    defer peer_mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, self_mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var clock = ManualClock.init(0);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+
+    const local = ParticipantAnnouncement{
+        .guid = .{ .prefix = prefix(0x01), .entity_id = iface.EntityIds.participant },
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &self_locs,
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 10_000,
+        .builtin_endpoint_set = 0,
+    };
+    // No multicast locators and no initial_peers → the writer starts with zero
+    // registered reader locators, so start()'s own initial sendAll() sends
+    // nothing. The ManualClock never advances, so the background timer thread
+    // never fires a periodic/fast-announce reannounce() during this test either
+    // — every observed send below comes from the heuristic under test.
+    try spdp.start(&local, &c);
+    defer spdp.stop();
+
+    const peer = prefix(0xCC);
+    const payload = try buildPayloadWithLocator(alloc, peer, 60_000, peer_loc);
+    defer alloc.free(payload);
+
+    // First announcement (is_new): registers the peer's locator and arms
+    // fast-announce, but does not itself send anything.
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(u32, 1), tr.discovered);
+    try testing.expectEqual(@as(usize, 0), peer_mt.queueLen());
+
+    // Re-announcement while sedp_seen is still false → targeted unicast retransmit.
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(usize, 1), peer_mt.queueLen());
+
+    // Still no SEDP traffic observed → retransmits again on the next re-announcement.
+    spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(usize, 2), peer_mt.queueLen());
+
+    // SEDP finally observes real endpoint traffic from this peer.
+    spdp_mod.SpdpEndpoints.markSedpSeen(spdp, peer);
+
+    // Further re-announcements no longer trigger a retransmit.
+    spdp.processSpdpPayload(peer, 4, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    spdp.processSpdpPayload(peer, 5, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqual(@as(usize, 2), peer_mt.queueLen());
 }

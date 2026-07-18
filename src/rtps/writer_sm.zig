@@ -174,36 +174,50 @@ pub const StatelessWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
+        for (self.reader_locators.items) |rl| {
+            self.sendChangesToLocked(rl.locator);
+        }
+    }
+
+    /// Send all cached changes to a single locator, which need not be a
+    /// registered reader locator. Used for a targeted unicast retransmit (e.g.
+    /// SPDP's SEDP-traffic-seen heuristic) without blasting every registered
+    /// peer the way sendAll() would.
+    pub fn sendToLocator(self: *Self, locator: Locator) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.sendChangesToLocked(locator);
+    }
+
+    fn sendChangesToLocked(self: *Self, locator: Locator) void {
         var scratch: [SCRATCH_SIZE]u8 = undefined;
 
-        for (self.reader_locators.items) |rl| {
-            for (self.cache.changes.items) |*ch| {
-                var builder = MessageBuilder.init(&scratch, self.guid.prefix);
-                builder.addInfoTs(ch.source_timestamp);
-                builder.addData(.{
-                    .reader_entity_id = self.reader_entity_id,
-                    .writer_entity_id = self.guid.entity_id,
-                    .writer_sn = ch.sequence_number,
-                    .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
-                        ch.key_hash
-                    else
-                        null,
-                    .is_key = ch.kind != .alive,
-                    .status_info = statusInfoFromKind(ch.kind),
-                }, ch.data);
-                self.tracer.submit(.{ .send_data = .{
-                    .src_prefix = self.guid.prefix,
-                    .writer_eid = self.guid.entity_id,
-                    .reader_eid = self.reader_entity_id,
-                    .sn = ch.sequence_number,
-                    .key_hash = ch.key_hash,
-                    .data_len = @intCast(ch.data.len),
-                } });
-                sendIovecs(self.transport, &rl.locator, builder.iovecs()) catch |err| switch (err) {
-                    error.UnsupportedLocatorKind => {},
-                    else => log.rtps.warn("StatelessWriter.sendAll: send error: {}", .{err}),
-                };
-            }
+        for (self.cache.changes.items) |*ch| {
+            var builder = MessageBuilder.init(&scratch, self.guid.prefix);
+            builder.addInfoTs(ch.source_timestamp);
+            builder.addData(.{
+                .reader_entity_id = self.reader_entity_id,
+                .writer_entity_id = self.guid.entity_id,
+                .writer_sn = ch.sequence_number,
+                .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
+                    ch.key_hash
+                else
+                    null,
+                .is_key = ch.kind != .alive,
+                .status_info = statusInfoFromKind(ch.kind),
+            }, ch.data);
+            self.tracer.submit(.{ .send_data = .{
+                .src_prefix = self.guid.prefix,
+                .writer_eid = self.guid.entity_id,
+                .reader_eid = self.reader_entity_id,
+                .sn = ch.sequence_number,
+                .key_hash = ch.key_hash,
+                .data_len = @intCast(ch.data.len),
+            } });
+            sendIovecs(self.transport, &locator, builder.iovecs()) catch |err| switch (err) {
+                error.UnsupportedLocatorKind => {},
+                else => log.rtps.warn("StatelessWriter.sendChangesToLocked: send error: {}", .{err}),
+            };
         }
     }
 };
