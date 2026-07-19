@@ -608,6 +608,11 @@ pub const SedpEndpoints = struct {
     // Forwarded to pub_writer and sub_writer during start().
     probe_result_ctx: ?*anyopaque,
     probe_result_fn: ?*const fn (*anyopaque, GuidPrefix, bool) void,
+    // Optional callback fired when real SEDP endpoint traffic (a DiscoveredWriterData
+    // or DiscoveredReaderData) is received from a peer. Forwarded to SPDP so it can
+    // stop retransmitting on that peer's behalf. See spdp.zig's SEDP-traffic-seen heuristic.
+    sedp_seen_ctx: ?*anyopaque,
+    sedp_seen_fn: ?*const fn (*anyopaque, GuidPrefix) void,
 
     // Cached default locators per participant (RTPS: endpoints inherit these
     // when DiscoveredWriter/ReaderData omits explicit locator PIDs).
@@ -641,6 +646,8 @@ pub const SedpEndpoints = struct {
             .spdp_bye_fn = null,
             .probe_result_ctx = null,
             .probe_result_fn = null,
+            .sedp_seen_ctx = null,
+            .sedp_seen_fn = null,
         };
         return self;
     }
@@ -693,6 +700,17 @@ pub const SedpEndpoints = struct {
         self.probe_result_fn = fn_ptr;
         if (self.pub_writer) |pw| pw.setProbeResult(ctx, fn_ptr);
         if (self.sub_writer) |sw| sw.setProbeResult(ctx, fn_ptr);
+    }
+
+    /// Register a callback fired when real SEDP endpoint traffic (a
+    /// DiscoveredWriterData or DiscoveredReaderData) arrives from a peer.
+    pub fn setSedpSeenFn(
+        self: *Self,
+        ctx: *anyopaque,
+        fn_ptr: *const fn (*anyopaque, GuidPrefix) void,
+    ) void {
+        self.sedp_seen_ctx = ctx;
+        self.sedp_seen_fn = fn_ptr;
     }
 
     /// Initiate a liveness probe for the participant identified by `prefix`.
@@ -991,11 +1009,13 @@ pub const SedpEndpoints = struct {
                             const ch = makeCacheChange(src_prefix, wid, d.writer_sn, payload);
                             pr.handleData(Guid{ .prefix = src_prefix, .entity_id = wid }, ch) catch {};
                         }
+                        if (self.sedp_seen_fn) |f| f(self.sedp_seen_ctx.?, src_prefix);
                     } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
                         if (self.sub_reader) |sr| {
                             const ch = makeCacheChange(src_prefix, wid, d.writer_sn, payload);
                             sr.handleData(Guid{ .prefix = src_prefix, .entity_id = wid }, ch) catch {};
                         }
+                        if (self.sedp_seen_fn) |f| f(self.sedp_seen_ctx.?, src_prefix);
                     }
                 },
                 .heartbeat => |hb| {
