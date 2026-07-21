@@ -151,6 +151,80 @@ test "support factory: generated create_participant_ex uses config defaults" {
     try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
 }
 
+// ── zzdds_create_factory_with_allocator ────────────────────────────────────────
+//
+// Proves the C-ABI allocator injection actually reaches every downstream
+// allocation (factory bootstrap, transport, discovery, participant), not just
+// that the new export compiles. TrackingCtx forwards every call to
+// std.testing.allocator's raw vtable functions, so Zig's own leak/double-free
+// detection for `testing.allocator` continues to apply transparently across
+// the C-ABI round trip — a missing free anywhere in the injected path would
+// fail this test the same way any other testing.allocator leak would.
+
+const TrackingCtx = struct {
+    child: std.mem.Allocator,
+    alloc_calls: usize = 0,
+    resize_calls: usize = 0,
+    free_calls: usize = 0,
+};
+
+fn trackAlloc(ctx: ?*anyopaque, len: usize, alignment: usize) callconv(.c) ?[*]u8 {
+    const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
+    self.alloc_calls += 1;
+    return self.child.rawAlloc(len, std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+}
+
+fn trackResize(ctx: ?*anyopaque, ptr: ?[*]u8, old_len: usize, new_len: usize, alignment: usize) callconv(.c) bool {
+    const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
+    self.resize_calls += 1;
+    return self.child.rawResize(ptr.?[0..old_len], std.mem.Alignment.fromByteUnits(alignment), new_len, @returnAddress());
+}
+
+fn trackFree(ctx: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callconv(.c) void {
+    const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
+    self.free_calls += 1;
+    self.child.rawFree(ptr.?[0..len], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+}
+
+test "support factory: zzdds_create_factory_with_allocator(NULL) matches zzdds_create_factory" {
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(null);
+    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
+    try testing.expect(ext_factory.ptr != zzdds.dcps.NIL_PTR);
+}
+
+test "support factory: zzdds_create_factory_with_allocator routes every allocation through the caller's allocator" {
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_rt.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc);
+    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
+
+    // Bootstrapping the factory itself (FactoryOwner) already allocates.
+    try testing.expect(track.alloc_calls > 0);
+    const calls_after_bootstrap = track.alloc_calls;
+
+    // Creating a participant spins up a real UdpTransport + SpdpSedpDiscovery +
+    // DomainParticipantFactoryImpl/DomainParticipantImpl stack (ParticipantStack.init)
+    // — every one of those allocates, and every one must inherit the injected
+    // allocator, not silently fall back to std.heap.c_allocator.
+    const cfg = ZZDDS.DomainParticipantConfig.default();
+    const qos = DDS.DomainParticipantQos{};
+    const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
+    try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
+    try testing.expect(track.alloc_calls > calls_after_bootstrap);
+
+    const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
+    try testing.expect(track.free_calls > 0);
+}
+
 fn DDS_DomainParticipantFactory_create_participant_for_test(
     factory: DDS.DomainParticipantFactory,
     domain_id: DDS.DomainId_t,

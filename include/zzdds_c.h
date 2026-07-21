@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include "dcps.h"
 #include "zzdds.h"
+#include "zidl_allocator.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,6 +53,20 @@ typedef struct zzdds_raw_sample_array {
 typedef int (*zzdds_compute_key_hash_fn)(const uint8_t *payload, size_t len, uint8_t hash_out[16]);
 
 zzdds_DomainParticipantFactory zzdds_create_factory(void);
+
+/**
+ * Same as zzdds_create_factory, but every allocation the factory and
+ * everything it ever creates makes (participants, topics, writers, readers,
+ * history cache entries, ...) is routed through `allocator` instead of the
+ * default libc malloc/free. Pass NULL for the default (equivalent to
+ * zzdds_create_factory()).
+ *
+ * `allocator` must outlive the returned factory and everything created
+ * through it — zzdds never copies it. See ZidlAllocator's contract in
+ * zidl_allocator.h.
+ */
+zzdds_DomainParticipantFactory zzdds_create_factory_with_allocator(const ZidlAllocator *allocator);
+
 bool zzdds_factory_is_nil(zzdds_DomainParticipantFactory factory);
 void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
 DDS_DomainParticipantFactory zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zzdds_DomainParticipantFactory factory);

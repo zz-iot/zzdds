@@ -338,8 +338,21 @@ fn readerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
 }
 
 pub export fn zzdds_create_factory() callconv(.c) *anyopaque {
-    const r: ZZDDS.DomainParticipantFactory = createFactory() catch |err| {
-        std.log.err("zzdds_create_factory: {}", .{err});
+    return zzdds_create_factory_with_allocator(null);
+}
+
+/// Same as zzdds_create_factory, but every allocation the factory and
+/// everything it ever creates makes (participants, topics, writers, readers,
+/// history cache entries, ...) is routed through `allocator` instead of the
+/// default std.heap.c_allocator (libc malloc) — every concrete impl already
+/// stores `self.alloc`, inherited from whatever created it, so this one
+/// injection point is sufficient for the whole Zig core; nothing downstream
+/// needs its own separate configuration surface. Pass NULL for the default.
+/// `allocator` must outlive the factory returned here and everything created
+/// through it — see ZidlAllocator's contract in zidl_allocator.h.
+pub export fn zzdds_create_factory_with_allocator(allocator: ?*const zidl_rt.ZidlAllocator) callconv(.c) *anyopaque {
+    const r: ZZDDS.DomainParticipantFactory = createFactory(allocator) catch |err| {
+        std.log.err("zzdds_create_factory_with_allocator: {}", .{err});
         return factoryGetCAbiHandleZzdds(nil.NIL_PTR);
     };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -417,8 +430,8 @@ pub export fn DDS_DataReader_as_zzdds_DataReader(reader: *anyopaque) callconv(.c
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
-fn createFactory() !ZZDDS.DomainParticipantFactory {
-    const alloc = std.heap.c_allocator;
+fn createFactory(allocator: ?*const zidl_rt.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
+    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
     const owner = try alloc.create(FactoryOwner);
     errdefer alloc.destroy(owner);
     owner.* = .{ .alloc = alloc };
@@ -716,7 +729,7 @@ fn octets(seq: ?*const ZZDDS.OctetSeq) ?[]const u8 {
 }
 
 test "zzdds extension factory creates participant with generated default config" {
-    const factory = try createFactory();
+    const factory = try createFactory(null);
     defer factory.vtable.deinit(factory.ptr);
 
     const qos = DDS.DomainParticipantQos{};

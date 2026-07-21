@@ -299,6 +299,26 @@ pub fn build(b: *std.Build) void {
         );
         b.getInstallStep().dependOn(&install_zidl_cdr_h.step);
 
+        // Install zidl_allocator.h → zig-out/include/  (C/C++ users need it; zzdds_c.h includes it)
+        const install_zidl_allocator_h = b.addInstallFileWithDir(
+            zidl_dep.path("packages/zidl-cdr/include/zidl_allocator.h"),
+            .header,
+            "zidl_allocator.h",
+        );
+        b.getInstallStep().dependOn(&install_zidl_allocator_h.step);
+
+        // Install zidl_allocator_pmr.hpp → zig-out/include/  (C++ users need it;
+        // generated _getOrCreate and zzdds_cpp.hpp both include it — cpp-binding only,
+        // it's a C++ header)
+        if (cpp_binding) {
+            const install_zidl_allocator_pmr_hpp = b.addInstallFileWithDir(
+                zidl_dep.path("packages/zidl-cdr/include/zidl_allocator_pmr.hpp"),
+                .header,
+                "zidl_allocator_pmr.hpp",
+            );
+            b.getInstallStep().dependOn(&install_zidl_allocator_pmr_hpp.step);
+        }
+
         const install_zzdds_c_h = b.addInstallFileWithDir(
             b.path("include/zzdds_c.h"),
             .header,
@@ -419,6 +439,98 @@ pub fn build(b: *std.Build) void {
             cpp_smoke_mod.linkLibrary(zzdds_lib);
             const cpp_smoke = b.addExecutable(.{ .name = "zzdds_cpp_binding_smoke", .root_module = cpp_smoke_mod });
             binding_smoke_step.dependOn(&b.addRunArtifact(cpp_smoke).step);
+
+            // Binding smoke test for zzdds_cpp.hpp's allocator-injection surfaces
+            // (factory bootstrap + C++ wrapper-object PMR allocation), including
+            // the PMR-exhaustion-must-not-leak-the-factory regression. Needs real
+            // DCPS entities (DomainParticipantFactory/DomainParticipant), so it
+            // generates its own --cpp-generate-impl output from the full dcps.idl
+            // rather than reusing binding_smoke.idl's minimal CDR-only types.
+            // dcps.hpp includes the plain-C "dcps.h", so this also needs its own
+            // local -b c --generate-interfaces run -- reusing the outer gen_c_dir
+            // (a separate zidl invocation) produces two independently-generated
+            // copies of the same C-ABI declarations in one translation unit,
+            // which clang rejects as conflicting redeclarations.
+            const gen_alloc_smoke_c = b.addRunArtifact(zidl_exe);
+            gen_alloc_smoke_c.addArgs(&.{ "-b", "c", "--generate-interfaces", "-o" });
+            const gen_alloc_smoke_c_dir = gen_alloc_smoke_c.addOutputDirectoryArg("zzdds-binding-smoke-c-alloc");
+            if (xtypes) gen_alloc_smoke_c.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
+            gen_alloc_smoke_c.addFileArg(dcps_idl);
+
+            const gen_alloc_smoke_zzdds_c = b.addRunArtifact(zidl_exe);
+            gen_alloc_smoke_zzdds_c.addArgs(&.{ "-b", "c", "--generate-interfaces", "-o" });
+            const gen_alloc_smoke_zzdds_c_dir = gen_alloc_smoke_zzdds_c.addOutputDirectoryArg("zzdds-binding-smoke-c-ext-alloc");
+            gen_alloc_smoke_zzdds_c.addFileArg(b.path("idl/zzdds.idl"));
+
+            const gen_alloc_smoke_cpp = b.addRunArtifact(zidl_exe);
+            gen_alloc_smoke_cpp.addArgs(&.{ "-b", "cpp", "--generate-interfaces", "-o" });
+            const gen_alloc_smoke_cpp_dir = gen_alloc_smoke_cpp.addOutputDirectoryArg("zzdds-binding-smoke-cpp-alloc");
+            if (xtypes) gen_alloc_smoke_cpp.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
+            gen_alloc_smoke_cpp.addFileArg(dcps_idl);
+
+            const gen_alloc_smoke_cpp_impl = b.addRunArtifact(zidl_exe);
+            gen_alloc_smoke_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl", "-o" });
+            const gen_alloc_smoke_cpp_impl_dir = gen_alloc_smoke_cpp_impl.addOutputDirectoryArg("zzdds-binding-smoke-cpp-alloc-impl");
+            if (xtypes) gen_alloc_smoke_cpp_impl.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
+            gen_alloc_smoke_cpp_impl.addFileArg(dcps_idl);
+
+            const gen_alloc_smoke_zzdds_cpp = b.addRunArtifact(zidl_exe);
+            gen_alloc_smoke_zzdds_cpp.addArgs(&.{ "-b", "cpp", "--generate-interfaces", "-o" });
+            const gen_alloc_smoke_zzdds_cpp_dir = gen_alloc_smoke_zzdds_cpp.addOutputDirectoryArg("zzdds-binding-smoke-cpp-ext-alloc");
+            gen_alloc_smoke_zzdds_cpp.addFileArg(b.path("idl/zzdds.idl"));
+
+            const gen_alloc_smoke_zzdds_cpp_impl = b.addRunArtifact(zidl_exe);
+            gen_alloc_smoke_zzdds_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl", "-o" });
+            const gen_alloc_smoke_zzdds_cpp_impl_dir = gen_alloc_smoke_zzdds_cpp_impl.addOutputDirectoryArg("zzdds-binding-smoke-cpp-ext-alloc-impl");
+            gen_alloc_smoke_zzdds_cpp_impl.addFileArg(b.path("idl/zzdds.idl"));
+
+            // --cpp-generate-impl redundantly regenerates its own copy of
+            // dcps.hpp/zzdds.hpp alongside dcps_impl.hpp/zzdds_impl.hpp (a
+            // second, independent zidl invocation on the same input, not
+            // guaranteed byte-identical to --generate-interfaces's copy).
+            // dcps_impl.hpp's own `#include "dcps.hpp"` is a quoted include,
+            // which searches its own directory before any -I path, so simply
+            // adding both generated dirs to the include path picks up TWO
+            // different copies of the same declarations in one translation
+            // unit. Fixed the way the real zig-build-install step already
+            // avoids this for real consumers: copy only the needed files into
+            // one merged directory, so every quoted #include resolves to a
+            // single, deduplicated copy.
+            const alloc_smoke_merged = b.addWriteFiles();
+            _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_cpp_dir.path(b, "dcps.hpp"), "dcps.hpp");
+            _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_c_dir.path(b, "dcps.h"), "dcps.h");
+            _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_cpp_impl_dir.path(b, "dcps_impl.hpp"), "dcps_impl.hpp");
+            const alloc_smoke_dcps_impl_cpp = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_cpp_impl_dir.path(b, "dcps_impl.cpp"), "dcps_impl.cpp");
+            _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_cpp_dir.path(b, "zzdds.hpp"), "zzdds.hpp");
+            _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_c_dir.path(b, "zzdds.h"), "zzdds.h");
+            _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_cpp_impl_dir.path(b, "zzdds_impl.hpp"), "zzdds_impl.hpp");
+            const alloc_smoke_zzdds_impl_cpp = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_cpp_impl_dir.path(b, "zzdds_impl.cpp"), "zzdds_impl.cpp");
+
+            const cpp_alloc_smoke_mod = b.createModule(.{
+                .root_source_file = null,
+                .target = target,
+                .optimize = .Debug,
+                .link_libc = true,
+                .link_libcpp = true,
+            });
+            cpp_alloc_smoke_mod.addCSourceFiles(.{
+                .files = &.{"test/bindings/smoke/cpp_allocator_smoke.cpp"},
+                .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
+            });
+            cpp_alloc_smoke_mod.addCSourceFile(.{
+                .file = alloc_smoke_dcps_impl_cpp,
+                .flags = &.{ "-std=c++17", "-Wall" },
+            });
+            cpp_alloc_smoke_mod.addCSourceFile(.{
+                .file = alloc_smoke_zzdds_impl_cpp,
+                .flags = &.{ "-std=c++17", "-Wall" },
+            });
+            cpp_alloc_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+            cpp_alloc_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            cpp_alloc_smoke_mod.addIncludePath(b.path("include"));
+            cpp_alloc_smoke_mod.linkLibrary(zzdds_lib);
+            const cpp_alloc_smoke = b.addExecutable(.{ .name = "zzdds_cpp_allocator_smoke", .root_module = cpp_alloc_smoke_mod });
+            binding_smoke_step.dependOn(&b.addRunArtifact(cpp_alloc_smoke).step);
         }
 
         // Generate and install lib/pkgconfig/zzdds.pc.
