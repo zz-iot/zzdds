@@ -299,6 +299,26 @@ pub fn build(b: *std.Build) void {
         );
         b.getInstallStep().dependOn(&install_zidl_cdr_h.step);
 
+        // Install zidl_allocator.h → zig-out/include/  (C/C++ users need it; zzdds_c.h includes it)
+        const install_zidl_allocator_h = b.addInstallFileWithDir(
+            zidl_dep.path("packages/zidl-cdr/include/zidl_allocator.h"),
+            .header,
+            "zidl_allocator.h",
+        );
+        b.getInstallStep().dependOn(&install_zidl_allocator_h.step);
+
+        // Install zidl_allocator_pmr.hpp → zig-out/include/  (C++ users need it;
+        // generated _getOrCreate and zzdds_cpp.hpp both include it — cpp-binding only,
+        // it's a C++ header)
+        if (cpp_binding) {
+            const install_zidl_allocator_pmr_hpp = b.addInstallFileWithDir(
+                zidl_dep.path("packages/zidl-cdr/include/zidl_allocator_pmr.hpp"),
+                .header,
+                "zidl_allocator_pmr.hpp",
+            );
+            b.getInstallStep().dependOn(&install_zidl_allocator_pmr_hpp.step);
+        }
+
         const install_zzdds_c_h = b.addInstallFileWithDir(
             b.path("include/zzdds_c.h"),
             .header,

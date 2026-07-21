@@ -37,9 +37,12 @@ or remove the advertised config surface before v1.
 Add an interface-MTU/path-MTU aware default that accounts for IP, UDP, RTPS, and future
 security overhead, while preserving the explicit override for deterministic tests.
 
-**SEDP-traffic-seen heuristic** — add `sedp_seen: bool` to `KnownParticipant`. On SPDP
-re-announcements from a participant whose `sedp_seen` is still false, send a targeted unicast
-retransmit of our own SPDP announcement. Recovers from SEDP packet loss on initial exchange
+**SEDP-traffic-seen heuristic** — Complete (PR #49). `sedp_seen: bool` added to
+`KnownParticipant`, set via `SpdpEndpoints.markSedpSeen` when SEDP receives a
+`DiscoveredWriterData`/`DiscoveredReaderData` from a participant. On a genuine (plausibly-spaced,
+not same-SN/duplicate) SPDP re-announcement from a participant whose `sedp_seen` is still false,
+`processSpdpPayload` sends a targeted unicast retransmit of our own SPDP announcement to that
+peer's metatraffic unicast locators, recovering from SEDP packet loss on initial exchange
 without waiting for a full announcement period.
 
 **LocatorSelector abstraction — Phase 1 done** (per-proxy ranking; `StatefulWriter`'s
@@ -107,6 +110,15 @@ occasional multi-second (not unbounded) delay in `loopback_test`, not a hang. Ro
 not fully chased down (which timer(s) specifically, why shutdown doesn't short-circuit
 them) — worth a dedicated look so teardown is fast in all cases, not just crash-free.
 
+*Partially addressed in PR #48 (Parallel Thread Join):* `UdpTransport`'s socket teardown
+(`removeSockets`/`removeUnicastSockets`/`deinit`) previously called `SocketEntry.stop()`
+(signal-then-join) sequentially per socket, making N bound sockets cost N sequential poll
+waits — "previously the dominant cost in participant teardown" per the fix's own comment.
+Split into `requestStop()` (signal only) and `joinAndClose()`; every matching socket is now
+signaled before any is joined, so teardown cost is one bounded wait regardless of socket
+count. The `beginProbe` 1-second-deadline-per-in-flight-probe cause above is a separate,
+still-open root cause this PR did not touch.
+
 **Language bindings** — see `docs/language-bindings.md` for the distribution model
 (three-artifact structure, build flags, version coupling). Current status:
 
@@ -115,31 +127,58 @@ them) — worth a dedicated look so teardown is fast in all cases, not just cras
   `zidl -b zig --zig-generate-c-api`; TypeSupport via `zzdds_register_type_support_c`.
   Build artifacts (`libzidl_cdr.a`, `zzdds.pc`, `zzdds-config.cmake`) installed by
   `zig build install`. See `docs/language-bindings.md` §"C binding API design".
-- **C++ binding** — majority complete. `zidl -b cpp --generate-interfaces
-  --cpp-generate-impl` generates `dcps.hpp` + `dcps_impl.hpp/cpp`. Typed topic wrappers
-  (DataWriter/DataReader), listener base classes, CDR serialize/deserialize, and
-  out-param QoS adaptation are all generated. 11 method stubs remain in `dcps_impl.cpp`
-  (6 `get_listener`, 2 incompatible-QoS-status, 2 WaitSet, 1 `get_datareaders`); see
-  the zidl roadmap for the groups and their unblocking conditions.
+- **C++ binding** — complete. `zidl -b cpp --generate-interfaces --cpp-generate-impl`
+  generates `dcps.hpp` + `dcps_impl.hpp/cpp`. Typed topic wrappers (DataWriter/DataReader),
+  listener base classes, CDR serialize/deserialize, and out-param QoS adaptation are all
+  generated. The 11 method stubs that once remained in `dcps_impl.cpp` (6 `get_listener`,
+  2 incompatible-QoS-status, 2 WaitSet, 1 `get_datareaders`) were fixed upstream in zidl's
+  "C++ impl TODOs" (#21), which shipped in `v0.2.7-zig.0.16.0` — already included in the
+  `v0.2.10-zig.0.16.0` zidl release zzdds currently pins (`build.zig.zon`). Verified against
+  a real `zig build install`: the generated `zig-out/src/dcps_impl.cpp` has zero `TODO`
+  markers.
 - **Java binding** — planned; zidl Java backend; inline CDR; JNI bridge.
 - **Python / .NET** — planned; inline CDR; C-ABI layer via ctypes / P/Invoke.
 - **Rust** — planned; dual-mode (`pure` via `zidl-rs`; `zig-ffi` for embedded/perf).
   See zidl roadmap for Rust backend steps.
 
-**Configurable allocation for embedded/real-time targets** — zzdds has always aimed to let
-real-time and embedded deployments supply their own allocation strategy (static pools, slab
-allocators) rather than being locked to a default heap, but this hasn't been prioritized as
-an end-user-facing configuration surface yet, in zzdds itself or in the generated bindings.
-Three separate tiers, in priority order:
+**Configurable allocation for embedded/real-time targets** — full plan, inventory, and
+phase ordering now in `docs/design/allocator-strategy.md`; this entry is a summary pointer,
+not the source of truth. zzdds has always aimed to let real-time and embedded deployments
+supply their own allocation strategy (static pools, slab allocators) rather than being
+locked to a default heap, but this hasn't been prioritized as an end-user-facing
+configuration surface yet, in zzdds itself or in the generated bindings.
 
+- **Tier 0 — C-ABI bootstrap injection (the actual blocking gap; not previously tracked).
+  Done.** Verified by tracing the real allocation path: the Zig core was *already* 100%
+  allocator-agnostic (`grep -rn "std\.heap\." src/` found zero hardcoded heap use outside
+  `c_abi/` and the tiny fixed nil-singleton bookkeeping in `dcps/nil.zig`) — every object
+  inherits `self.alloc` from whatever created it, exactly as Tier 1 below assumed. The gap
+  was narrower and more concrete than "make it configurable somewhere":
+  `zzdds_create_factory()` (`src/c_abi/extensions.zig`) was the *only* C-ABI bootstrap
+  entry point, and its implementation hardcoded `const alloc = std.heap.c_allocator;`
+  with zero parameters to override it. Added `zzdds_create_factory_with_allocator(const
+  ZidlAllocator *allocator)` (`zzdds_create_factory()` is now a thin `NULL`-passing
+  wrapper, preserving compatibility) plus a `zzdds_cpp.hpp` overload; see the design doc
+  for the shared `ZidlAllocator` vtable ABI (defined zidl-side, in `zidl-cdr`, and reused
+  here — not zzdds's own type) and why the bridging adapter must not itself heap-allocate.
+  Verified two ways: a Zig-level test tracking real allocator calls through factory
+  bootstrap and participant creation (`test/c_abi/bootstrap_test.zig`), and a standalone
+  C++ program compiled/linked against the real built library and run — 83 allocations, 83
+  frees, 0 outstanding. This one change was the highest-leverage item in the whole plan:
+  because the core already did the right thing everywhere, it unlocks
+  allocator-controlled participant/topic/writer/reader lifecycle *and* history-cache
+  storage for both C and C++ callers at once, with no further zzdds-side work. Getting a
+  real (not just compiled-in-isolation) C++ verification working surfaced four pre-existing
+  bugs in zidl's C++ backend (cross-module `native_handle()` resolution, listener
+  trampoline wrapping the wrong class, an `_getOrCreate` regression from this session's
+  earlier entity-wrapper-identity work, and a scalar-typedef listener parameter
+  mismatch) — all fixed; see the design doc and zidl's roadmap for details. In a tagged zidl
+  release as of `v0.2.10-zig.0.16.0`, which zzdds now pins (`build.zig.zon`).
 - **Tier 1 — structural/bookkeeping** (entity impl structs, and the entity-handle heap-boxing
-  now implemented on the zidl side — see "Entity handle ABI: heap-boxing" in the zidl
-  roadmap). Small, low-frequency, lifecycle-bound allocations. Every concrete impl already
-  stores its own `alloc: std.mem.Allocator`, inherited from whatever created it — the gap is
-  making that genuinely end-user-configurable (at `DomainParticipantFactory`/`create_participant`
-  time, the same way QoS already flows down the entity hierarchy) rather than hardcoded at
-  whatever call site currently supplies it, plus a process-wide bootstrap default for
-  constructing the factory itself before any participant exists.
+  implemented on the zidl side — see "Entity handle ABI: heap-boxing" in the zidl roadmap).
+  **Done** — see below; the remaining gap this tier originally described (making the
+  already-correct `self.alloc` plumbing genuinely end-user-configurable from outside Zig) is
+  what Tier 0 above actually closes.
   **Required, not optional**: every concrete impl now needs a `get_c_abi_handle` vtable
   implementation (zidl's generated vtables already declare this slot) that lazily creates and
   *caches* its own C-ABI handle — via `zidl_rt.boxEntity`, using `self.alloc` — reused on every
@@ -149,8 +188,10 @@ Three separate tiers, in priority order:
   (`get_entity()`, `lookup_topicdescription()`, etc.) — objects that return a widened view of
   themselves or another object need their own cache slot for that view too, freed the same way.
 
-  **Done**, against a local-path zidl checkout (not yet a tagged release — see below). A
-  diagnostic build first surfaced 31 compile errors (29× missing `get_c_abi_handle`, 2×
+  **Done.** The `get_c_abi_handle` vtable slot shipped in zidl's C-backend opaque-handles
+  work (#22), which has been in tagged releases since `v0.2.7-zig.0.16.0` — already included
+  in the `v0.2.10-zig.0.16.0` release zzdds currently pins (`build.zig.zon`), no local-path
+  checkout needed. A diagnostic build first surfaced 31 compile errors (29× missing `get_c_abi_handle`, 2×
   listener-dispatch sites in `subscriber.zig` needing to box entity args before firing a
   callback); the real implementation found 17 listener-dispatch sites total (writer.zig had
   4 more, reader.zig had ~10 more, matching the predicted pattern) and covers every hand-written
@@ -162,32 +203,47 @@ Three separate tiers, in priority order:
   `TopicImpl` as `Topic`, `Entity`, and `TopicDescription`) got one cache field per view.
 - **Tier 2 — data-plane** (history cache sample storage; CDR serialize/deserialize scratch
   buffers — the latter is the already-tracked `ZidlCdrAllocator` gap, see the zidl roadmap's
-  Known Gaps). Higher-frequency, latency-sensitive, size-variable — the category real-time
-  users actually care most about controlling. A separate configuration surface from Tier 1,
-  same discipline: route through a swappable interface, never hardcode an allocator choice in
-  generated per-type code.
+  Known Gaps). Deferred behind Tier 0: since Tier 0 already gives every subsystem one
+  shared, caller-chosen allocator, this tier is specifically about wanting a *second,
+  separate* allocator for the data plane — a real but strictly-secondary tuning knob, not a
+  blocking gap. Don't build ahead of a real request for the split; see the design doc.
 - **Tier 3 — per-entity-kind or per-topic overrides** (e.g. distinct pools for readers vs.
   writers). Explicitly deferred — plausible eventually as an optional override on top of
   Tier 1/2's default-from-parent, but not designed; don't build ahead of a real use case.
 
-**C++ generated binding allocator injection** — a fourth, orthogonal axis, not covered by the
-tiers above: `std::vector`/`std::string` inside `--cpp-generate-impl` output use the global
-allocator unless parameterized, and C++ allocator customization is a compile-time template
-concern, not a runtime value — it can't share any of the Tier 1/2 runtime machinery. Likely
-means injecting an allocator header/type into generated code via a zidl flag. Deferred; no
-design work done yet.
+**C++ generated binding allocator injection** — a separate, harder axis from the tiers
+above; full analysis (including a second, previously-untracked allocation surface found
+while doing this session's `_getOrCreate` work — the wrapper objects themselves, not just
+struct fields) now in `docs/design/allocator-strategy.md`'s "Phase 3/4" and "the C++
+template problem" sections. Short version: `std::vector`/`std::string` inside
+`--cpp-generate-impl` output use the global allocator unless parameterized, and C++
+allocator customization is a compile-time template concern, not a runtime value — it can't
+share any of the Tier 0-2 runtime vtable machinery. Three candidate designs identified
+(template-parameterize generated types; standardize on `std::pmr::*`; or don't make
+generated types allocator-aware at all and push unbounded-field topics toward bounded
+types instead), each with different compatibility costs — needs a short design spike
+before committing, flagged as the single riskiest item in the allocator plan.
 
-**C++ entity wrapper identity** — a zidl backend task, not a zzdds one (see "C++ backend:
-entity wrapper identity" in the zidl roadmap). `ConcreteImplGenerator` constructs a fresh
-`std::make_shared<FooImpl>(_h)` on every entity-returning operation, so e.g. calling
-`get_topic()` twice returns non-identity-equal wrapper objects for the same entity (no leak —
-`shared_ptr` RAII still cleans up correctly — just no identity guarantee). Only became
-practically fixable once the Zig-side `get_c_abi_handle` work made the underlying C handle
-itself stable across calls; nothing to do on zzdds's side since zzdds doesn't hand-write its
-own C++ bindings.
+**C++ entity wrapper identity** — Done, zidl-side (see "C++ backend: entity wrapper
+identity" in the zidl roadmap for the design and verification). `ConcreteImplGenerator`
+used to construct a fresh `std::make_shared<FooImpl>(_h)` on every entity-returning
+operation, so e.g. calling `get_topic()` twice returned non-identity-equal wrapper objects
+for the same entity (no leak — `shared_ptr` RAII still cleaned up correctly — just no
+identity guarantee). Every entity `FooImpl` now has a cache-and-reuse `_getOrCreate` static
+factory (`unordered_map<C-handle, weak_ptr<FooImpl>>` + mutex), and all four generation
+sites that used to construct a wrapper directly (op return, attribute getter,
+sequence-of-entities out-adaptation, listener-trampoline argument wrapping) route through
+it. Nothing to do on zzdds's side — zzdds doesn't hand-write its own C++ bindings. In a
+tagged zidl release as of `v0.2.10-zig.0.16.0`, which zzdds now pins (`build.zig.zon`).
+Verified against zzdds's actual generated
+`dcps_impl.cpp` (95 `_getOrCreate` call sites across ~35 entity classes) compiling cleanly
+with `g++ -std=c++17 -Wall -Wextra -pthread`, plus a standalone runtime check of the exact
+cache pattern confirming identity, expiry, and handle-reuse behavior all hold.
 
-**`as_{Base}` upcast migration** — Done, against the local-path zidl checkout. zidl now
-generates the ~12 DDS-internal upcasts zzdds used to hand-write (`DDS_Topic_as_DDS_Entity`,
+**`as_{Base}` upcast migration** — Done. Also part of zidl #22, in tagged releases since
+`v0.2.7-zig.0.16.0` (currently-pinned `v0.2.10-zig.0.16.0` includes it — no local-path
+checkout needed). zidl now generates the ~12 DDS-internal upcasts zzdds used to hand-write
+(`DDS_Topic_as_DDS_Entity`,
 `DDS_GuardCondition_as_DDS_Condition`, ...) plus, discovered mid-migration, the *upcast*
 direction of the `ZZDDS.* ↔ DDS.*` conversions too (`zzdds_Topic_as_DDS_Topic` and 4 siblings)
 — `zzdds.idl` declares real IDL bases (`interface Topic : DDS::Topic`) that were easy to miss.
