@@ -107,20 +107,30 @@ namespace detail {
 // in DomainParticipantFactorySupport's own destructor rather than a separate
 // custom deleter — allocate_shared has no hook for a deleter distinct from
 // the allocator-driven one, unlike the raw new + shared_ptr(ptr, deleter)
-// construction this replaced. No exception-safety gap results: every
-// constructor DomainParticipantFactorySupport's initializer list runs
-// (DomainParticipantFactoryImpl's, ::DDS::DomainParticipantFactoryImpl's, the
-// `handle_` assignment) is a trivial, noexcept, handle-storing constructor —
-// none can throw partway through and leave `handle` stored nowhere.
+// construction this replaced. DomainParticipantFactorySupport's own
+// constructor can't throw partway through and leave `handle` stored nowhere
+// (every initializer is a trivial, noexcept, handle-storing constructor) --
+// but that's not the only way to fail here: std::allocate_shared's PMR
+// allocation itself (the control-block + object storage) can throw
+// std::bad_alloc *before* the constructor ever runs, e.g. under a bounded
+// pool allocator registered via zidl::setCppAllocator that's exhausted. In
+// that case DomainParticipantFactorySupport never exists, so its destructor
+// never runs, so nothing frees `handle` -- the try/catch below is what
+// closes that gap, not the constructor's own noexcept-ness.
 inline std::shared_ptr<DomainParticipantFactory> wrapFactoryHandle(zzdds_DomainParticipantFactory handle)
 {
     if (zzdds_factory_is_nil(handle)) return {};
 
-    return std::allocate_shared<detail::DomainParticipantFactorySupport>(
-        std::pmr::polymorphic_allocator<detail::DomainParticipantFactorySupport>(
-            std::pmr::get_default_resource()),
-        handle
-    );
+    try {
+        return std::allocate_shared<detail::DomainParticipantFactorySupport>(
+            std::pmr::polymorphic_allocator<detail::DomainParticipantFactorySupport>(
+                std::pmr::get_default_resource()),
+            handle
+        );
+    } catch (...) {
+        zzdds_destroy_factory(handle);
+        throw;
+    }
 }
 
 } // namespace detail
