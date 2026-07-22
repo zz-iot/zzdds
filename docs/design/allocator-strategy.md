@@ -323,27 +323,149 @@ the real `zig build install` step already avoids this for actual consumers (it o
 installs one file per name into a flat `zig-out/include/`).
 
 **Phase 4 — C++ STL-container-in-generated-types allocator injection (zidl repo, C++
-backend).** The pre-existing "custom STL allocators" gap: `sequence<T>` → `std::vector<T,
-Alloc>`, `string` → templated `std::basic_string`, threaded through every generated type.
-This is a compile-time template-parameterization change, categorically different from
-Phases 0-3 (which are all runtime vtable injection) — see "the C++ template problem"
-below. Needed for the C++ showcase only if its sample type carries unbounded
-fields *and* is accessed through the idiomatic typed API rather than raw CDR bytes.
+backend). Done.** Landed as a new opt-in `--cpp-pmr-containers` backend flag: when set,
+every generated `sequence<T>`/`string`/`wstring`/`map<K,V>` field (struct members, union
+case payloads, CDR-source local temporaries, everywhere `typeRefToCpp`-equivalent logic
+runs across all four C++ generator structs — `Generator`, `CdrGenerator`,
+`ConcreteImplGenerator`, `ImplGenerator`, plus the file-level `cppTypeStr` helper) emits
+`std::pmr::vector<T>`/`std::pmr::string`/`std::pmr::wstring`/`std::pmr::map<K,V>` instead
+of their plain-`std::allocator` equivalents, reusing Phase 3's already-shipped
+`zidl::setCppAllocator`/process-wide `std::pmr` default resource directly — no new
+registration API, no per-instance/scoped-allocator constructor plumbing needed, since
+`std::pmr::vector`/`string`/`map` all default-construct against
+`std::pmr::get_default_resource()` automatically, exactly matching how `_getOrCreate`'s
+`allocate_shared` already works. `#include <memory_resource>` is emitted alongside the
+existing `<vector>`/`<string>` includes when the flag is set. Default behavior (plain
+`std::vector`/`std::string`/`std::map`) is completely unchanged unless the flag is passed —
+a deliberate choice, since this changes the concrete C++ type of every
+sequence/string/wstring/map field, a real source/ABI break for any consumer code that names
+`std::vector<T>`/`std::string` directly.
 
-**Phase 5 — Implement the missing `{Type}_free()` function bodies (zidl repo, C backend).**
-Added last, as a deliberate scope extension beyond the original Phase 0-4 plan: not
+This applies uniformly to *both* bounded and unbounded fields — the flag only changes the
+container's allocator, not zidl's existing bound-enforcement logic in the CDR read/write
+bodies, which is untouched. (An earlier design pass considered giving *bounded* fields their
+own genuinely fixed-capacity, non-heap-allocating C++ type instead — mirroring
+`zidl_rt.BoundedArray` on the Zig side — but that idea was dropped: the actual ask driving
+this whole effort is *caller-controlled* allocation, not literally zero allocation, and a
+hand-rolled container satisfying the full `std::vector`/`std::string`-compatible surface the
+OMG C++11 PSM (formal-24-07-01 §6.10/§6.12) requires for a bounded type would have been a
+real from-scratch STL-container implementation, not a cheap wrapper — a materially bigger,
+riskier lift than reusing `std::pmr` for the one uniform mechanism this flag needed to
+provide. The PSM itself doesn't require fixed-capacity storage for bounded types either —
+"a distinct type... under no obligation to perform a bounds check on the type itself" — and
+separately confirms the container's allocator argument is implementation-defined ("the
+arguments for the Compare and Allocator parameters are unspecified", §6.31.1, stated for
+maps but the same principle applies), so `std::pmr::vector`/`string` is a spec-conformant
+choice, not a deviation from one.)
+
+Verified: `zig build test` (three new unit tests: flag off leaves output unchanged, flag on
+emits `std::pmr::` types + the new include for both bounded and unbounded fields, and a
+union-case-decode local-temp check) plus `zig build integration-test` (a new, real,
+CI-tracked end-to-end test: generates a fresh `types.hpp` from the shared
+`test/golden/types.idl` with `--cpp-pmr-containers` at build time, compiles it for real, and
+proves struct-field construction/assignment/destruction routes through a registered tracking
+`ZidlAllocator` — matched alloc/free counts — while defaulting to untracked `new`/libc when
+unregistered). Also manually verified (not yet a permanent test, since it hit a confirmed
+*pre-existing*, flag-unrelated gap): a real CDR serialize/deserialize roundtrip through
+`std::pmr::` struct fields compiles and round-trips correctly; a union with a
+sequence/string case payload does *not* compile, with or without this flag — zidl's C++
+union codegen has a known, already-documented limitation for non-trivially-constructible
+union members (`cpp.zig`'s own header comment: "Unions with members of
+non-trivially-constructible types (std::string, std::vector, …) produce C++ that requires
+explicit constructor/destructor; not generated here") — confirmed identical failure with
+plain `std::string`/`std::vector` too, so this is not a regression introduced by this flag
+and stays out of Phase 4's scope.
+
+**Post-merge review fix (Greptile, zidl PR #29)**: the first cut only flag-gated *type
+declarations* (struct/union fields, CDR locals, signatures), missing that the generated
+interface adapters (`ConcreteImplGenerator`'s `str_ret` op/attribute bodies,
+`emitFieldAdaptOut`'s string-field assignment, `ImplGenerator`'s equivalent) still
+hardcoded `std::string(raw_c_string)` construction. Worse than a stray extra allocation:
+`std::pmr::string` has no implicit conversion from `std::string`, so any interface with a
+string-returning operation/attribute failed to *compile at all* under the flag. Fixed by
+routing all five construction sites through the same type-name helper the declarations
+already used; verified with new unit tests plus a real generated interface that now
+compiles and runs correctly (values correct, allocation routed through a registered
+`ZidlAllocator`) where it previously failed to compile — see zidl's `docs/roadmap.md` for
+the fuller writeup.
+
+**Phase 5 — Implement the missing `{Type}_free()` function bodies (zidl repo, C backend).
+Done.** Added last, as a deliberate scope extension beyond the original Phase 0-4 plan: not
 strictly required by any of it, but discovered along the way (Phase 2's real-build
-verification) that `void {Type}_free({Type} *v);` is declared in every generated C header
+verification) that `void {Type}_free({Type} *v);` was declared for some generated C structs
 and never given a body anywhere — confirmed via golden fixtures and a real build; calling
-it today is a link error. It's allocation-related (freeing exactly the heap-owned fields
-Phase 2 taught the rest of the C backend to allocate correctly) and leaving it broken
-undercuts the rest of this plan's credibility, so it's in scope here even though it isn't
-on the critical path to either showcase. Needs a general free-function generator —
-extending the existing `emitFreeArrayElements`/`emitFreeSeqElements`-style logic (currently
-only reachable from the `@key`-only cleanup path in `compute_key_hash_from_cdr`) to run
-over *every* field, not just `@key` ones, recursing into nested structs — that frees each
-heap-owned field via the Phase 2 allocator-aware helpers (`zidl_cdr_free_str`/`_free_wstr`/
-`_free`), not raw `free()`.
+it was a link error.
+
+Investigating turned up a wider scope than originally described: the declaration itself was
+gated on `structHasSequenceFields`, which only checked for *unbounded* sequence fields. Two
+more gaps existed silently: (1) a struct with only unbounded `string`/`wstring` fields (no
+sequence at all) got no `_free()` declared at all, even though a `char*`/`uint16_t*` field is
+just as heap-owned; (2) a struct with only a *bounded* `sequence<T,N>` field also got nothing
+declared — bounded sequences in the C mapping are still `{_maximum, _length, T*_buffer,
+_release}` (only `_maximum` is capped; `_buffer` is always a heap pointer, unlike bounded
+strings which get a genuine inline `char[N+1]`), confirmed by generating one and inspecting
+the header. All three collapsed into one fix: widened the gating check (renamed in place,
+kept the name `structHasSequenceFields` for minimal churn but broadened its logic) to treat
+any unbounded string/wstring or *any* sequence (bound or not) as needing a free, matching
+`keyFieldAllocatesC`'s already-correct semantics for the pre-existing `@key`-only path.
+
+Implemented the actual body generator (new `emitStructFree` + `emitFreeTypeRefGeneral`/
+`emitFreeArrayElementsGeneral`/`emitFreeSeqElementsGeneral`, modeled on the existing
+`emitDefault`/`emitApplyDefaults` pair for structure): walks *every* member (not just `@key`
+ones, matching the original plan), correctly skips absent `@optional` fields via the same
+`_present` bitmask check `emitApplyDefaults` uses, frees a struct's base class's heap-owned
+fields too (calling the base's own `_free`), and recurses into nested structs by *calling*
+their own generated `_free()` rather than re-inlining their member walk — which, as a
+side effect, also fixed a narrower pre-existing gap in the `@key`-only helpers: nested
+sequences-of-sequences-of-strings only freed one level deep before, the new general version
+recurses fully. All frees route through the Phase 2 allocator-aware helpers
+(`zidl_cdr_free_str`/`_free_wstr`/`_free`), never raw `free()`.
+
+Verified: new/updated `zig build test` unit tests for all three previously-silent gaps
+(string-only, bounded-sequence-only, and the original unbounded-sequence case), golden
+fixtures regenerated and reviewed (`Frame`/`Beacon` now correctly gain a `_free`; `Sample`'s
+already-declared one gains its real body) — a clean, expected diff, not a surprise one. Real,
+not just unit-tested: a standalone C program registered a tracking `ZidlAllocator`, decoded a
+real CDR payload into a `Sample` (string + sequence fields), called the generated
+`Sample_free`, and confirmed alloc/free counts matched exactly (2/2) — no leaks, no
+double-frees, no under-frees.
+
+**Post-merge review fixes (Greptile, zidl PR #30)**: three real, serious bugs surfaced,
+all in the new general free-function generator (not the pre-existing `@key`-only one,
+which doesn't share these exposures since it only ever runs on values it just decoded
+itself):
+1. **Non-owning sequences were freed unconditionally.** The C sequence mapping's
+   `_release` field (present but previously unchecked anywhere) signals whether a sequence
+   owns its `_buffer` or is a non-owning view over caller/static/stack memory (the OMG C
+   mapping's zero-copy escape hatch). Fixed by wrapping every sequence's element-loop and
+   buffer-free in `if (seq._release) { ... }`. Confirmed real by constructing a
+   stack-backed, non-owning `Nested.grid` and calling `_free()`: the unguarded version
+   crashed with `free(): invalid size`; the fixed version correctly made zero free calls.
+2. **Nested sequences (`sequence<sequence<T>>`) shadowed their loop index.** Every
+   recursion level declared the same `_fsi` name; the inner declaration's own bound-check
+   expression then resolved `_fsi` to the *inner* (just-reset-to-0) variable instead of the
+   outer loop's current index, silently reading the wrong element's length. Fixed by
+   threading a `depth` counter through (shared across both array and sequence recursion, so
+   `_fai`/`_fsi` names never collide with each other either), naming each level `_fsi{depth}`
+   — mirroring the pattern the array-freeing helper already used correctly
+   (`_fai{dim_idx}`). Confirmed real: decoding a `sequence<sequence<string>>` with
+   *different* inner lengths per outer element (2 then 1) and freeing it crashed with a
+   segfault under the old shared-name code; the fixed version freed exactly the 9 real
+   allocations made.
+3. **Array typedefs of heap-owning elements were skipped entirely.** The declaration gate's
+   typedef case required `dimensions.len == 0`, so a `typedef string NameList[N];` used as a
+   struct field never got a `_free()` at all, regardless of its element type. Fixed by
+   checking the *element* type unconditionally (array-ness only changes how elements are
+   freed — via a loop — not whether they need to be), and teaching the body generator's
+   typedef case to delegate to the existing array-loop helper when the typedef has
+   dimensions. Confirmed via the same end-to-end run: a 3-element `NameList` field's strings
+   were all correctly included in the 9 freed allocations.
+
+All three were verified the same way: real generated code, real compile, and — critically —
+each one reproduced the exact reported failure (crash, segfault, or leak) by mechanically
+reverting just that fix in the generated output and re-running, before confirming the fixed
+version behaves correctly. Golden fixtures regenerated for the one fix that changed output
+shape for existing test types (the `_release` guard around `Sample.nums`'s free).
 
 **Deferred, not needed for either showcase:**
 - **Tier 2 fine-grained override** (separate allocator for history-cache/CDR-scratch vs.
@@ -355,34 +477,41 @@ heap-owned field via the Phase 2 allocator-aware helpers (`zidl_cdr_free_str`/`_
 - **Tier 3 per-entity-kind/per-topic overrides** — same reasoning, explicitly deferred
   already, unchanged by this plan.
 
-## The C++ template problem (why Phase 4 is the risk in this plan)
+## The C++ template problem (Phase 4's design spike, resolved)
 
 Phases 0-3 are all runtime, vtable-based injection — the same pattern zzdds already uses
 everywhere (`TypeSupport`, `get_c_abi_handle`, now `ZidlAllocator`): a `{ctx, fn pointers}`
 struct passed once at construction. Phase 4 is not that. C++ allocator customization for
 STL containers is a **type-level**, not value-level, concern —
 `std::vector<T, Alloc1>` and `std::vector<T, Alloc2>` are different, non-interconvertible
-types. Making generated types allocator-parameterizable means either:
-- threading a template parameter through every generated struct (invasive, changes the
-  public shape of every generated type, breaks source compatibility for existing C++
-  consumers), or
-- standardizing on `std::pmr::*` containers with a runtime `memory_resource*` (avoids the
-  template-parameter explosion, but `std::pmr::string`/`std::pmr::vector<T>` are still
-  distinct types from `std::string`/`std::vector<T>` — an ABI/source break for anyone
-  already consuming the generated headers), or
-- a narrower, lower-risk alternative worth seriously considering before committing to
-  either of the above: don't make the *generated types* allocator-aware at all; instead
-  give the C++ typed DataReader/DataWriter wrapper an option to hand back
-  borrowed/non-owning views (spans) into caller-managed storage for the hot read/write
-  path, and accept that a *type that structurally contains* an unbounded string/sequence
-  is inherently a heap-owning type in idiomatic C++ regardless of which allocator backs it
-  — the real fix for such a topic on a constrained target is to make the *type* bounded
-  (fixed-capacity), not to make `std::vector`'s allocator swappable.
+types. Three options were considered:
 
-This needs a short design spike before committing to an approach — flagging it here rather
-than picking one, since the three options have materially different compatibility and
-effort costs and this is the one place in the plan where "have zidl auto-generate it"
-might be the wrong instinct entirely.
+- **A — thread a template parameter through every generated struct.** Rejected. The
+  allocator parameter doesn't stay contained to the struct — it cascades through every
+  signature that touches the type (`DataReader<T>`, `DataWriter<T>`, `TypeSupport`, CDR
+  serialize functions, listener callbacks), forcing today's separately-compiled
+  `dcps_impl.cpp` model into header-only templates. Largest blast radius by far, ruled out.
+- **B — standardize on `std::pmr::*` containers with a runtime `memory_resource*`.**
+  **Chosen** (see Phase 4 above). Smaller blast radius than A — `std::pmr::vector<T>` is one
+  concrete type, not templated per caller, so no cascading template explosion — and reuses
+  Phase 3's already-shipped `zidl::setCppAllocator` directly. Real cost (an ABI/source
+  break) is accepted and made opt-in via `--cpp-pmr-containers`, default off.
+- **C — don't make generated types allocator-aware; give bounded fields a genuinely
+  fixed-capacity type instead** (mirroring `zidl_rt.BoundedArray`), leaving unbounded fields
+  as plain heap-owning `std::vector`/`std::string`. **Considered, then dropped.** The actual
+  goal here is *caller-controlled* allocation (no uncontrolled libc malloc/global `new`), not
+  literally zero allocation — the "zero malloc" framing earlier in this doc read more into
+  the original ask than intended, and pulled this design toward solving a problem nobody was
+  asking for. Building a real `IDL::bounded_vector<T,N>` satisfying the full
+  `std::vector`-compatible surface the OMG C++11 PSM requires for a bounded type (range-`for`,
+  iterators, algorithms, comparisons, copy/move, the works — see formal-24-07-01 §6.10/§6.12)
+  would have been a genuine from-scratch STL-container implementation, not the cheap wrapper
+  it first looked like; a smaller `std::pmr::vector` fronted by a fixed inline buffer (a
+  `monotonic_buffer_resource` with a non-heap-falling-back upstream) was floated as a
+  cheaper middle ground, but even that adds real subtlety (upstream must not silently fall
+  back to heap; must `reserve()` immediately to avoid burning the fixed buffer on
+  grow-by-doubling waste; copy/move must reseat the resource pointer at the new object's own
+  buffer) for a need nobody had actually stated. Dropped in favor of B alone.
 
 ## Definition of "zero malloc" — needs an explicit decision, not an assumption
 
@@ -468,11 +597,18 @@ paper. Concerns, as invited:
    C++ program proving both `_getOrCreate` and `wrapFactoryHandle` route through
    `zidl::setCppAllocator`). Unlocks entity-wrapper construction under a caller-controlled
    allocator. In a tagged zidl release as of `v0.2.10-zig.0.16.0`.
-5. Phase 4 — C++ STL-container-in-generated-types injection (zidl) — needs a design spike
-   first, see "the C++ template problem"; unlocks unbounded fields in idiomatic C++
-6. Phase 5 — implement the missing `{Type}_free()` bodies (zidl) — last, deliberately out
-   of the original scope but allocation-related and worth closing out; not on the critical
-   path to either showcase
+5. Phase 4 — C++ STL-container-in-generated-types injection (zidl) — **Done**, via the new
+   opt-in `--cpp-pmr-containers` backend flag (Option B; see "the C++ template problem"),
+   verified via unit tests plus a real, CI-tracked integration test proving struct-field
+   allocation routes through `zidl::setCppAllocator`. Unlocks unbounded (and bounded) fields
+   in idiomatic C++ under a caller-controlled allocator, opt-in since it's a source/ABI
+   break. Not yet in a tagged zidl release.
+6. Phase 5 — implement the missing `{Type}_free()` bodies (zidl) — **Done**, and wider in
+   scope than originally described: also fixed two silent gaps found along the way
+   (string-only structs and bounded-sequence-only structs got no `_free()` declared at all,
+   not just "declared but bodyless"). Verified via unit tests, reviewed golden-fixture
+   diffs, and a real decode-then-free run proving exact alloc/free count matches. Not yet in
+   a tagged zidl release.
 7. Tier 2 (data-plane override) / Tier 3 (per-entity-kind override) — deferred, revisit
    only once Phase 1 ships and a real need for *separate* allocators (not just one
    configurable one) shows up.

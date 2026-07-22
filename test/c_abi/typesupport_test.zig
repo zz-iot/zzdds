@@ -7,6 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
+const zidl_rt = @import("zidl_rt");
 
 const c_abi_ts = zzdds.c_abi.typesupport;
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
@@ -14,6 +15,20 @@ const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
 const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const noop_security = zzdds.noop_security.noop_security_plugins;
 const nil = zzdds.dcps;
+
+/// Constructs a genuinely NULL *anyopaque -- what a real C caller passing
+/// NULL for a handle parameter actually produces at the `.c` calling
+/// convention boundary. `@ptrFromInt(0)` alone is rejected by Zig's own
+/// pointer-safety checks (comptime and runtime) since `*anyopaque` is a
+/// non-optional, non-allowzero type; `@setRuntimeSafety(false)` opts out of
+/// that check specifically to construct the exact input the ABI boundary
+/// itself does not (and cannot) enforce against.
+fn makeNullHandle() *anyopaque {
+    @setRuntimeSafety(false);
+    var addr: usize = 0;
+    addr += 0;
+    return @ptrFromInt(addr);
+}
 
 // ── C-style compute_key_hash_from_cdr stub ───────────────────────────────────
 //
@@ -45,6 +60,16 @@ const Fixture = struct {
     d: *DirectDiscovery,
     factory: *DomainParticipantFactoryImpl,
     dp: DDS.DomainParticipant,
+    /// Boxed C-ABI handle for `dp` -- what a real C caller actually has
+    /// (zzdds_c.h's DDS_DomainParticipant is an opaque pointer, not the
+    /// native {ptr, vtable} fat pointer). zzdds_register_type_support_c must
+    /// be exercised with *this*, not `dp` directly, or the test never
+    /// catches a C-ABI signature mismatch (it previously didn't: passing
+    /// `dp` natively happened to typecheck against the function's old,
+    /// incorrect `participant: DDS.DomainParticipant` signature, masking a
+    /// real bug that crashed every actual C caller).
+    dp_boxed: *anyopaque,
+    alloc: std.mem.Allocator,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
         var delivery = try IntraProcessDelivery.init(alloc);
@@ -63,10 +88,12 @@ const Fixture = struct {
         );
         errdefer factory.deinit();
         const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
-        return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp };
+        const dp_boxed = try zidl_rt.boxEntity(alloc, dp.ptr, dp.vtable);
+        return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .dp_boxed = dp_boxed, .alloc = alloc };
     }
 
     fn deinit(self: *Fixture) void {
+        zidl_rt.freeEntityBox(self.alloc, self.dp_boxed);
         _ = self.factory.toDDSFactory().delete_participant(self.dp);
         self.factory.deinit();
         self.d.deinit();
@@ -86,7 +113,7 @@ test "c_abi TypeSupport: zzdds_register_type_support_c wires compute_key_hash" {
     defer fx.deinit();
 
     const rc = c_abi_ts.zzdds_register_type_support_c(
-        fx.dp,
+        fx.dp_boxed,
         "TestType",
         stubComputeKeyHashFromCdr,
     );
@@ -109,12 +136,26 @@ test "c_abi TypeSupport: zzdds_register_type_support_c wires compute_key_hash" {
     try testing.expectEqualSlices(u8, &std.mem.zeroes([12]u8), hash[4..]);
 }
 
+test "c_abi TypeSupport: NULL participant handle returns error instead of crashing" {
+    // Regression test: zidl_rt.unboxAs dereferences its argument
+    // unconditionally, so a literal NULL passed by a C caller (a normal,
+    // expected "no object" value in C, not UB) must be caught before
+    // unboxing, not after -- @ptrFromInt(0) constructs the same bit pattern
+    // a real C caller's NULL would produce at the ABI boundary.
+    const rc = c_abi_ts.zzdds_register_type_support_c(
+        makeNullHandle(),
+        "TestType",
+        stubComputeKeyHashFromCdr,
+    );
+    try testing.expectEqual(@as(c_int, -1), rc);
+}
+
 test "c_abi TypeSupport: NULL compute_key_hash registers zeroed-hash fallback" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     const rc = c_abi_ts.zzdds_register_type_support_c(
-        fx.dp,
+        fx.dp_boxed,
         "KeylessType",
         null,
     );

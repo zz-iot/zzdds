@@ -18,7 +18,22 @@ const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const MemoryTransport = zzdds.intraprocess.MemoryTransport;
 const DirectDiscovery = zzdds.intraprocess.DirectDiscovery;
 const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
+const nil = zzdds.dcps;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
+
+/// Constructs a genuinely NULL *anyopaque -- what a real C caller passing
+/// NULL for a handle parameter actually produces at the `.c` calling
+/// convention boundary. `@ptrFromInt(0)` alone is rejected by Zig's own
+/// pointer-safety checks (comptime and runtime) since `*anyopaque` is a
+/// non-optional, non-allowzero type; `@setRuntimeSafety(false)` opts out of
+/// that check specifically to construct the exact input the ABI boundary
+/// itself does not (and cannot) enforce against.
+fn makeNullHandle() *anyopaque {
+    @setRuntimeSafety(false);
+    var addr: usize = 0;
+    addr += 0;
+    return @ptrFromInt(addr);
+}
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const GuardConditionImpl = zzdds.dcps.GuardConditionImpl;
@@ -50,6 +65,13 @@ const Fixture = struct {
     dp_r: DDS.DomainParticipant,
     sub_r: DDS.Subscriber,
     topic_r: DDS.Topic,
+    /// Boxed C-ABI handles from the most recent makeWriterReader() call --
+    /// what a real C caller actually has (zzdds_c.h's DDS_DataWriter/
+    /// DDS_DataReader are opaque pointers, not the native {ptr, vtable} fat
+    /// pointer). Freed in deinit(); at most one pair per Fixture instance in
+    /// this test file, so tracking "the last one" is sufficient.
+    dw_box: ?*anyopaque = null,
+    dr_box: ?*anyopaque = null,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
         var delivery = try IntraProcessDelivery.init(alloc);
@@ -94,6 +116,8 @@ const Fixture = struct {
     }
 
     fn deinit(self: *Fixture) void {
+        if (self.dw_box) |b| zidl_rt.freeEntityBox(self.alloc, b);
+        if (self.dr_box) |b| zidl_rt.freeEntityBox(self.alloc, b);
         _ = self.factory_w.toDDSFactory().delete_participant(self.dp_w);
         _ = self.factory_r.toDDSFactory().delete_participant(self.dp_r);
         self.factory_w.deinit();
@@ -105,11 +129,23 @@ const Fixture = struct {
         self.delivery.deinit();
     }
 
-    fn makeWriterReader(self: *Fixture) struct { dw: DDS.DataWriter, dr: DDS.DataReader } {
+    /// Returns both the native fat-pointer structs (dw/dr -- for calling
+    /// vtable methods directly, as some tests do) and their *boxed* C-ABI
+    /// handle equivalents (dw_boxed/dr_boxed -- what a real C caller actually
+    /// has and must pass to bootstrap.zzdds_write_raw/zzdds_take_one_raw/etc;
+    /// zzdds_c.h's DDS_DataWriter/DDS_DataReader are opaque pointers, not the
+    /// native struct). Exercising the bootstrap functions with the native
+    /// structs directly previously masked a real C-ABI signature mismatch bug
+    /// (see bootstrap.zig's file-level doc comment).
+    fn makeWriterReader(self: *Fixture) struct { dw: DDS.DataWriter, dr: DDS.DataReader, dw_boxed: *anyopaque, dr_boxed: *anyopaque } {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr = self.sub_r.create_datareader(td, .{}, null, 0);
         const dw = self.pub_w.create_datawriter(self.topic_w, .{}, null, 0);
-        return .{ .dw = dw, .dr = dr };
+        const dw_box = zidl_rt.boxEntity(self.alloc, dw.ptr, dw.vtable) catch @panic("test OOM boxing DataWriter");
+        const dr_box = zidl_rt.boxEntity(self.alloc, dr.ptr, dr.vtable) catch @panic("test OOM boxing DataReader");
+        self.dw_box = dw_box;
+        self.dr_box = dr_box;
+        return .{ .dw = dw, .dr = dr, .dw_boxed = dw_box, .dr_boxed = dr_box };
     }
 };
 
@@ -241,11 +277,46 @@ test "bootstrap: topic_as_description returns TopicDescription with correct name
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
 
-    const td = bootstrap.zzdds_topic_as_description(fx.topic_w);
+    // zzdds_topic_as_description takes/returns *boxed* C-ABI handles, matching
+    // what a real C caller has (zzdds_c.h's DDS_Topic/DDS_TopicDescription are
+    // opaque pointers, not the native {ptr, vtable} fat pointer) -- box
+    // fx.topic_w the same way, then unbox the result to call its vtable.
+    const topic_w_boxed = try zidl_rt.boxEntity(alloc, fx.topic_w.ptr, fx.topic_w.vtable);
+    defer zidl_rt.freeEntityBox(alloc, topic_w_boxed);
+
+    const td_boxed = bootstrap.zzdds_topic_as_description(topic_w_boxed);
+    const td = zidl_rt.unboxAs(DDS.TopicDescription, td_boxed);
     try testing.expectEqualStrings("BootTopic", std.mem.span(td.vtable.get_name(td.ptr)));
 }
 
+test "bootstrap: topic_as_description returns nil TopicDescription for a NULL topic handle" {
+    // Regression test: zidl_rt.unboxAs dereferences its argument
+    // unconditionally, so a literal NULL passed by a C caller (a normal,
+    // expected "no object" value in C, not UB) must be caught before
+    // unboxing, not after -- @ptrFromInt(0) constructs the same bit pattern
+    // a real C caller's NULL would produce at the ABI boundary. The old
+    // (pre-boxing-fix) implementation explicitly returned a nil
+    // TopicDescription for this input; this must still hold.
+    const td_boxed = bootstrap.zzdds_topic_as_description(makeNullHandle());
+    const td = zidl_rt.unboxAs(DDS.TopicDescription, td_boxed);
+    try testing.expectEqual(nil.NIL_PTR, td.ptr);
+}
+
 // ── write_raw + take_one_raw ──────────────────────────────────────────────────
+
+test "bootstrap: write_raw and take_one_raw return an error, not a crash, for NULL handles" {
+    // Same regression as the topic_as_description NULL test above, covering
+    // the write and take sides -- every zidl_rt.unboxAs call site in this
+    // file was affected by the same ordering bug.
+    const key_hash = std.mem.zeroes([16]u8);
+    const payload = [_]u8{0xAB};
+    try testing.expectEqual(@as(DDS.ReturnCode_t, 1), bootstrap.zzdds_write_raw(makeNullHandle(), &key_hash, DDS.HANDLE_NIL, &payload, payload.len));
+
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    try testing.expectEqual(@as(c_int, -2), bootstrap.zzdds_take_one_raw(makeNullHandle(), &buf, buf.len, &cdr_len, &info));
+}
 
 test "bootstrap: write_raw and take_one_raw round-trip" {
     const alloc = testing.allocator;
@@ -253,13 +324,13 @@ test "bootstrap: write_raw and take_one_raw round-trip" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    const rc = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    const rc = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
     try testing.expectEqual(@as(DDS.ReturnCode_t, 0), rc);
 
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 1), n);
     try testing.expectEqual(PAYLOAD.len, cdr_len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..cdr_len]);
@@ -272,13 +343,13 @@ test "bootstrap: write_raw_kind dispose produces not-alive sample" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    const rc = bootstrap.zzdds_write_raw_kind(pair.dw, .dispose, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    const rc = bootstrap.zzdds_write_raw_kind(pair.dw_boxed, .dispose, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
     try testing.expectEqual(@as(DDS.ReturnCode_t, 0), rc);
 
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 1), n);
     try testing.expect(!info.valid_data);
     try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, info.instance_state);
@@ -290,18 +361,18 @@ test "bootstrap: take_loaned_raw and return_loaned_raw" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     var loan: bootstrap.CLoanedSample = undefined;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_loaned_raw(pair.dr, &loan, &info);
+    const n = bootstrap.zzdds_take_loaned_raw(pair.dr_boxed, &loan, &info);
     try testing.expectEqual(@as(c_int, 1), n);
     try testing.expect(info.valid_data);
     try testing.expectEqual(PAYLOAD.len, loan.data_len);
     try testing.expectEqualSlices(u8, &PAYLOAD, loan.data.?[0..loan.data_len]);
     try testing.expect(loan.owner != null);
 
-    bootstrap.zzdds_return_loaned_raw(pair.dr, &loan);
+    bootstrap.zzdds_return_loaned_raw(pair.dr_boxed, &loan);
     try testing.expectEqual(@as(usize, 0), loan.data_len);
     try testing.expect(loan.data == null);
     try testing.expect(loan.owner == null);
@@ -316,7 +387,7 @@ test "bootstrap: take_one_raw returns 0 when queue is empty" {
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 0), n);
 }
 
@@ -326,12 +397,12 @@ test "bootstrap: take_one_raw returns -1 when buffer too small" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     var tiny: [2]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr, &tiny, tiny.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &tiny, tiny.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, -1), n);
     // cdr_len_out must be set even on failure so the caller can retry with a larger buffer.
     try testing.expectEqual(PAYLOAD.len, cdr_len);
@@ -345,12 +416,12 @@ test "bootstrap: take_one_raw_instance round-trip" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw_instance(pair.dr, 0, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_take_one_raw_instance(pair.dr_boxed, 0, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 1), n);
     try testing.expectEqual(PAYLOAD.len, cdr_len);
 }
@@ -364,7 +435,7 @@ test "bootstrap: take_one_raw_instance returns 0 when queue is empty" {
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw_instance(pair.dr, 0, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_take_one_raw_instance(pair.dr_boxed, 0, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 0), n);
 }
 
@@ -390,13 +461,13 @@ test "bootstrap: write_raw_w_timestamp round-trip" {
     const pair = fx.makeWriterReader();
 
     const ts = DDS.Time_t{ .sec = 42, .nanosec = 0 };
-    const rc = bootstrap.zzdds_write_raw_w_timestamp(pair.dw, .alive, &KEY_HASH, &PAYLOAD, PAYLOAD.len, ts);
+    const rc = bootstrap.zzdds_write_raw_w_timestamp(pair.dw_boxed, .alive, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len, ts);
     try testing.expectEqual(@as(DDS.ReturnCode_t, 0), rc);
 
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 1), n);
     try testing.expectEqual(PAYLOAD.len, cdr_len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..cdr_len]);
@@ -410,16 +481,16 @@ test "bootstrap: read_one_raw non-destructive — sample stays in queue" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n1 = bootstrap.zzdds_read_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    const n1 = bootstrap.zzdds_read_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 1), n1);
     try testing.expectEqual(PAYLOAD.len, cdr_len);
     // Second read still returns the same sample.
-    const n2 = bootstrap.zzdds_read_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    const n2 = bootstrap.zzdds_read_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 1), n2);
 }
 
@@ -432,7 +503,7 @@ test "bootstrap: read_one_raw returns 0 when queue is empty" {
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_read_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_read_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 0), n);
 }
 
@@ -444,12 +515,12 @@ test "bootstrap: read_one_raw_instance round-trip" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_read_one_raw_instance(pair.dr, 0, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_read_one_raw_instance(pair.dr_boxed, 0, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 1), n);
     try testing.expectEqual(PAYLOAD.len, cdr_len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..cdr_len]);
@@ -464,7 +535,7 @@ test "bootstrap: read_one_raw_instance returns 0 when queue is empty" {
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_read_one_raw_instance(pair.dr, 0, &buf, buf.len, &cdr_len, &info);
+    const n = bootstrap.zzdds_read_one_raw_instance(pair.dr_boxed, 0, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 0), n);
 }
 
@@ -484,12 +555,12 @@ test "bootstrap: take_n_raw returns all samples and return_raw_samples frees" {
     k2[0] = 2;
     var k3: [16]u8 = std.mem.zeroes([16]u8);
     k3[0] = 3;
-    _ = bootstrap.zzdds_write_raw(pair.dw, &k1, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw, &k2, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw, &k3, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k3, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr);
+    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr);
     try testing.expectEqual(@as(c_int, 3), n);
     try testing.expectEqual(@as(usize, 3), arr.count);
     try testing.expect(arr.samples != null);
@@ -498,13 +569,13 @@ test "bootstrap: take_n_raw returns all samples and return_raw_samples frees" {
     try testing.expectEqual(PAYLOAD.len, s0.data_len);
     try testing.expectEqualSlices(u8, &PAYLOAD, s0.data.?[0..s0.data_len]);
 
-    bootstrap.zzdds_return_raw_samples(pair.dr, &arr);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
     try testing.expectEqual(@as(usize, 0), arr.count);
     try testing.expect(arr.samples == null);
 
     // Queue is now empty.
     var arr2: bootstrap.CRawSampleArray = undefined;
-    const n2 = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr2);
+    const n2 = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr2);
     try testing.expectEqual(@as(c_int, 0), n2);
     try testing.expect(arr2.samples == null);
 }
@@ -516,7 +587,7 @@ test "bootstrap: take_n_raw returns 0 when queue is empty" {
     const pair = fx.makeWriterReader();
 
     var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 10, &arr);
+    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 10, &arr);
     try testing.expectEqual(@as(c_int, 0), n);
     try testing.expect(arr.samples == null);
 }
@@ -531,19 +602,19 @@ test "bootstrap: read_n_raw is non-destructive" {
     k1[0] = 1;
     var k2: [16]u8 = std.mem.zeroes([16]u8);
     k2[0] = 2;
-    _ = bootstrap.zzdds_write_raw(pair.dw, &k1, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw, &k2, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_read_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 10, &arr);
+    const n = bootstrap.zzdds_read_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 10, &arr);
     try testing.expectEqual(@as(c_int, 2), n);
-    bootstrap.zzdds_return_raw_samples(pair.dr, &arr);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
 
     // Samples still in queue — take should succeed.
     var buf: [64]u8 = undefined;
     var cdr_len: usize = 0;
     var info: bootstrap.CSampleInfo = undefined;
-    const m = bootstrap.zzdds_take_one_raw(pair.dr, &buf, buf.len, &cdr_len, &info);
+    const m = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
     try testing.expectEqual(@as(c_int, 1), m);
 }
 
@@ -555,12 +626,12 @@ test "bootstrap: get_key_value_writer returns CDR payload after alive write" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw, &KEY_HASH);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw, ih, &buf, buf.len, &len);
+    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len);
     try testing.expectEqual(@as(c_int, 0), rc);
     try testing.expectEqual(PAYLOAD.len, len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..len]);
@@ -574,10 +645,10 @@ test "bootstrap: get_key_value_writer returns -1 for unknown handle" {
 
     var dummy_key: [16]u8 = undefined;
     @memset(&dummy_key, 0xFF);
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw, &dummy_key);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &dummy_key);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw, ih, &buf, buf.len, &len);
+    const rc = bootstrap.zzdds_get_key_value_writer(pair.dw_boxed, ih, &buf, buf.len, &len);
     try testing.expectEqual(@as(c_int, -1), rc);
 }
 
@@ -587,8 +658,8 @@ test "bootstrap: lookup_instance_writer matches register_instance_raw" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    const h1 = bootstrap.zzdds_register_instance_raw(pair.dw, &KEY_HASH);
-    const h2 = bootstrap.zzdds_lookup_instance_writer(pair.dw, &KEY_HASH);
+    const h1 = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
+    const h2 = bootstrap.zzdds_lookup_instance_writer(pair.dw_boxed, &KEY_HASH);
     try testing.expectEqual(h1, h2);
 }
 
@@ -600,12 +671,12 @@ test "bootstrap: get_key_value_reader returns CDR payload after receive" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw, &KEY_HASH);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr, ih, &buf, buf.len, &len);
+    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len);
     try testing.expectEqual(@as(c_int, 0), rc);
     try testing.expectEqual(PAYLOAD.len, len);
     try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..len]);
@@ -619,10 +690,10 @@ test "bootstrap: get_key_value_reader returns -1 for unknown handle" {
 
     var dummy_key: [16]u8 = undefined;
     @memset(&dummy_key, 0xFF);
-    const ih = bootstrap.zzdds_register_instance_raw(pair.dw, &dummy_key);
+    const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &dummy_key);
     var buf: [64]u8 = undefined;
     var len: usize = 0;
-    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr, ih, &buf, buf.len, &len);
+    const rc = bootstrap.zzdds_get_key_value_reader(pair.dr_boxed, ih, &buf, buf.len, &len);
     try testing.expectEqual(@as(c_int, -1), rc);
 }
 
@@ -632,17 +703,17 @@ test "bootstrap: lookup_instance_reader returns handle for alive instance, 0 whe
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     // Known alive instance returns its handle.
-    const ih = bootstrap.zzdds_lookup_instance_reader(pair.dr, &KEY_HASH);
+    const ih = bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH);
     try testing.expect(ih != 0);
-    try testing.expectEqual(bootstrap.zzdds_register_instance_raw(pair.dw, &KEY_HASH), ih);
+    try testing.expectEqual(bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH), ih);
 
     // Unknown key returns 0 (HANDLE_NIL).
     var unknown_key: [16]u8 = undefined;
     @memset(&unknown_key, 0xFF);
-    const ih2 = bootstrap.zzdds_lookup_instance_reader(pair.dr, &unknown_key);
+    const ih2 = bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &unknown_key);
     try testing.expectEqual(@as(DDS.InstanceHandle_t, 0), ih2);
 }
 
@@ -753,7 +824,7 @@ test "extensions: take_serialized via ZZDDS DataReader vtable" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw, &KEY_HASH, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     const zdr = zidl_rt.unboxAs(ZZDDS.DataReader, extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)));
     var sample: ZZDDS.SerializedSample = std.mem.zeroes(ZZDDS.SerializedSample);
@@ -785,20 +856,20 @@ test "bootstrap: take_n_raw with max=0 takes all available samples" {
     k1[0] = 0xC1;
     var k2 = std.mem.zeroes([16]u8);
     k2[0] = 0xC2;
-    _ = bootstrap.zzdds_write_raw(pair.dw, &k1, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw, &k2, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
 
     // max=0 means "unlimited" — takes all samples and returns their count.
     var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 0, &arr);
+    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 0, &arr);
     try testing.expectEqual(@as(c_int, 2), n);
     try testing.expectEqual(@as(usize, 2), arr.count);
     try testing.expect(arr.samples != null);
-    bootstrap.zzdds_return_raw_samples(pair.dr, &arr);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
 
     // Queue is now empty.
     var arr2: bootstrap.CRawSampleArray = undefined;
-    const n2 = bootstrap.zzdds_take_n_raw(pair.dr, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 0, &arr2);
+    const n2 = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 0, &arr2);
     try testing.expectEqual(@as(c_int, 0), n2);
     try testing.expect(arr2.samples == null);
 }

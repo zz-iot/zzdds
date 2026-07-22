@@ -25,6 +25,9 @@ const noop_security = zzdds.noop_security.noop_security_plugins;
 const PAYLOAD_1 = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x11 };
 const PAYLOAD_2 = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x22 };
 const PAYLOAD_3 = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x33 };
+const PAYLOAD_4 = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x44 };
+
+const ZERO_KEY: [16]u8 = std.mem.zeroes([16]u8);
 
 // Poll a DataReader until `expected_n` samples arrive or `timeout_ns` elapses.
 // Returns owned slice of received payloads (each element owned by allocator).
@@ -58,8 +61,10 @@ fn runLoopback(
     r_pid: u32,
     dw_qos: DDS.DataWriterQos,
     dr_qos: DDS.DataReaderQos,
+    key_hashes: []const [16]u8,
     payloads: []const []const u8,
     expected: []const []const u8,
+    check_order: bool,
 ) !void {
     // ── Writer participant ────────────────────────────────────────────────────
     // Explicit participant_ids prevent the TOCTOU race in autoAssignParticipantId:
@@ -139,14 +144,12 @@ fn runLoopback(
     // ── Write all payloads immediately (before discovery completes) ───────────
     // RELIABLE: samples sit in history cache and are replayed once the proxy
     // is established via SEDP.  BEST_EFFORT: same courtesy replay behaviour.
-    for (payloads) |p| {
-        _ = try dw_impl.writeRaw(
-            .alive,
-            RtpsTimestamp.now(),
-            history_mod.INSTANCE_HANDLE_NIL,
-            std.mem.zeroes([16]u8),
-            p,
-        );
+    // instance_handle and key_hash are the same value here, matching the
+    // production zzdds_write_raw* fix: the internal per-instance grouping key
+    // History's KEEP_LAST trimming uses must be the sample's real key hash,
+    // not a NIL placeholder shared by every instance.
+    for (payloads, key_hashes) |p, kh| {
+        _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), kh, kh, p);
     }
 
     // ── Collect and assert ────────────────────────────────────────────────────
@@ -157,8 +160,29 @@ fn runLoopback(
     }
 
     try std.testing.expectEqual(expected.len, received.len);
-    for (expected, received) |exp, got| {
-        try std.testing.expectEqualSlices(u8, exp, got);
+    if (check_order) {
+        for (expected, received) |exp, got| {
+            try std.testing.expectEqualSlices(u8, exp, got);
+        }
+    } else {
+        // Order across distinct instances isn't part of the contract being
+        // tested here -- only that each expected payload survived exactly
+        // once. Multiset comparison: match each expected payload against an
+        // unmatched received one.
+        const matched = try alloc.alloc(bool, received.len);
+        defer alloc.free(matched);
+        @memset(matched, false);
+        for (expected) |exp| {
+            var found = false;
+            for (received, 0..) |got, i| {
+                if (!matched[i] and std.mem.eql(u8, exp, got)) {
+                    matched[i] = true;
+                    found = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found);
+        }
     }
 }
 
@@ -173,7 +197,7 @@ test "loopback: BEST_EFFORT single sample" {
     // regardless of what durability the writer offers.
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const p: []const u8 = &PAYLOAD_1;
-    try runLoopback(std.testing.allocator, 0, 1, dw_qos, dr_qos, &.{p}, &.{p});
+    try runLoopback(std.testing.allocator, 0, 1, dw_qos, dr_qos, &.{ZERO_KEY}, &.{p}, &.{p}, true);
 }
 
 test "loopback: RELIABLE single sample" {
@@ -187,7 +211,7 @@ test "loopback: RELIABLE single sample" {
     // regardless of what durability the writer offers.
     dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     const p: []const u8 = &PAYLOAD_1;
-    try runLoopback(std.testing.allocator, 2, 3, dw_qos, dr_qos, &.{p}, &.{p});
+    try runLoopback(std.testing.allocator, 2, 3, dw_qos, dr_qos, &.{ZERO_KEY}, &.{p}, &.{p}, true);
 }
 
 test "loopback: RELIABLE KEEP_LAST depth=1" {
@@ -212,8 +236,50 @@ test "loopback: RELIABLE KEEP_LAST depth=1" {
         5,
         dw_qos,
         dr_qos,
+        &.{ ZERO_KEY, ZERO_KEY, ZERO_KEY },
         &.{ &PAYLOAD_1, &PAYLOAD_2, &PAYLOAD_3 },
         &.{&PAYLOAD_3},
+        true,
+    );
+}
+
+test "loopback: RELIABLE KEEP_LAST depth=1, two distinct instances trimmed independently" {
+    // Regression test: zzdds_write_raw* (and, before that, DataWriterImpl's
+    // own direct callers) used to pass a shared NIL placeholder instead of
+    // the sample's real key hash for HistoryCache's per-instance KEEP_LAST
+    // grouping key -- collapsing every instance into one shared bucket, so
+    // writing to two distinct instances would incorrectly evict the *other*
+    // instance's only sample instead of trimming each instance
+    // independently. Two writes each to two distinct keys before the reader
+    // matches: only the latest per instance should survive replay (2 total),
+    // not 1 (bug: both instances share one depth-1 bucket) and not 4 (no
+    // trimming at all).
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dw_qos.history.kind = .KEEP_LAST_HISTORY_QOS;
+    dw_qos.history.depth = 1;
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_LAST_HISTORY_QOS;
+    dr_qos.history.depth = 1;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+
+    var k1: [16]u8 = std.mem.zeroes([16]u8);
+    k1[0] = 1;
+    var k2: [16]u8 = std.mem.zeroes([16]u8);
+    k2[0] = 2;
+
+    try runLoopback(
+        std.testing.allocator,
+        10,
+        11,
+        dw_qos,
+        dr_qos,
+        &.{ k1, k2, k1, k2 },
+        &.{ &PAYLOAD_1, &PAYLOAD_2, &PAYLOAD_3, &PAYLOAD_4 },
+        &.{ &PAYLOAD_3, &PAYLOAD_4 },
+        false,
     );
 }
 
@@ -236,8 +302,10 @@ test "loopback: RELIABLE KEEP_ALL" {
         7,
         dw_qos,
         dr_qos,
+        &.{ ZERO_KEY, ZERO_KEY, ZERO_KEY },
         &.{ &PAYLOAD_1, &PAYLOAD_2, &PAYLOAD_3 },
         &.{ &PAYLOAD_1, &PAYLOAD_2, &PAYLOAD_3 },
+        true,
     );
 }
 
