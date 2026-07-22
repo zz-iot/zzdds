@@ -92,9 +92,14 @@ int zzdds_register_type_support_c(
     zzdds_compute_key_hash_fn compute_key_hash_fn
 );
 
+/* handle: pass DDS_HANDLE_NIL to derive the instance automatically from
+ * key_hash, or a handle previously returned by zzdds_register_instance_raw
+ * (or a prior write) for that same key. Any other value returns
+ * DDS_RETCODE_BAD_PARAMETER. */
 DDS_ReturnCode_t zzdds_write_raw(
     DDS_DataWriter writer,
     const uint8_t key_hash[16],
+    DDS_InstanceHandle_t handle,
     const uint8_t *data,
     size_t data_len
 );
@@ -103,6 +108,7 @@ DDS_ReturnCode_t zzdds_write_raw_kind(
     DDS_DataWriter writer,
     zzdds_write_kind kind,
     const uint8_t key_hash[16],
+    DDS_InstanceHandle_t handle,
     const uint8_t *data,
     size_t data_len
 );
@@ -138,6 +144,7 @@ DDS_ReturnCode_t zzdds_write_raw_w_timestamp(
     DDS_DataWriter writer,
     zzdds_write_kind kind,
     const uint8_t key_hash[16],
+    DDS_InstanceHandle_t handle,
     const uint8_t *data,
     size_t data_len,
     DDS_Time_t timestamp

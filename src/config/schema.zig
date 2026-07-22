@@ -175,8 +175,13 @@ pub const UdpConfig = struct {
     recv_buffer_size: u32 = 0,
 
     /// How often the polling InterfaceMonitor re-enumerates interfaces (ms).
-    /// Ignored when a platform event-driven monitor is compiled in, or when
-    /// interface_monitor = false (build option).
+    /// 0 disables periodic re-polling entirely (interfaces are still
+    /// enumerated once at startup to bind sockets, but no background thread
+    /// is spawned and no further getifaddrs()-driven allocation happens) --
+    /// appropriate for a static-topology embedded deployment that never
+    /// expects interface changes. Ignored (forced to 0) when the
+    /// interface-monitor build option is false, which selects the same
+    /// startup-only behavior at compile time instead.
     interface_poll_interval_ms: u32 = 5_000,
 };
 

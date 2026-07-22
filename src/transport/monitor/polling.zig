@@ -301,8 +301,15 @@ pub const PollingMonitor = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.callback = cb;
         self.stopping.store(false, .release);
-        // Populate initial snapshot before starting the thread.
+        // Populate initial snapshot regardless -- transport needs this once
+        // at startup to bind sockets to the right addresses.
         try enumerateInterfaces(self.alloc, &self.prev_addrs);
+        // interval_ms == 0 means "disabled": no periodic re-poll thread, for
+        // static-topology deployments that never expect interface changes
+        // and want no recurring getifaddrs()-driven allocation at all after
+        // startup. Without this check, interval_ms == 0 would busy-loop
+        // threadMain's sleep chunking with zero delay.
+        if (self.interval_ms == 0) return;
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
     }
 

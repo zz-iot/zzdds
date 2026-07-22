@@ -1143,6 +1143,10 @@ pub const StatefulWriter = struct {
                             .reader_entity_id = proxy.guid.entity_id,
                             .writer_entity_id = w.guid.entity_id,
                             .writer_sn = ch.sequence_number,
+                            .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
+                                ch.key_hash
+                            else
+                                null,
                             .is_key = ch.kind != .alive,
                             .status_info = statusInfoFromKind(ch.kind),
                             .coherent_set_sn = ch.coherent_set_sn,

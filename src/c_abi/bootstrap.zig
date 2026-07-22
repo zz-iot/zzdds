@@ -19,6 +19,20 @@ const TopicImpl = @import("../dcps/topic.zig").TopicImpl;
 const time_mod = @import("../util/time.zig");
 const history_mod = @import("../rtps/history.zig");
 const nil = @import("../dcps/nil.zig");
+const zidl_rt = @import("zidl_rt");
+
+// Every exported function below takes entity parameters (writer/reader/topic)
+// as `*anyopaque` -- the boxed C-ABI handle matching zzdds_c.h's opaque
+// pointer typedefs (DDS_DataWriter, DDS_DataReader, DDS_Topic) -- and unboxes
+// via zidl_rt.unboxAs to recover the native {ptr, vtable} fat pointer before
+// touching `.ptr`. Passing the native fat-pointer struct as the parameter
+// type directly (as this file previously did throughout) is a real C-ABI
+// layout mismatch: the struct is 16 bytes (two pointer fields) where the
+// actual C caller only ever has an 8-byte opaque pointer, corrupting every
+// argument after it in the call. Confirmed via a real crash from a real C
+// program (not just a hypothetical) — see zzdds_register_type_support_c's
+// fix in typesupport.zig for the first instance of this bug and the repro
+// that found it.
 
 // ── SampleInfo for C ─────────────────────────────────────────────────────────
 // Minimal extern struct matching SH_SampleInfo in shape_configurator_zzdds.h.
@@ -50,37 +64,54 @@ const LoanedRawSample = struct {
 
 /// Convert a DDS_Topic to a DDS_TopicDescription with the correct vtable.
 /// A direct memcpy of the {ptr, vtable} fields is WRONG because Topic and
-/// TopicDescription have different vtable layouts.  This function casts the
-/// Topic's impl pointer to the TopicDescription interface using the dedicated
-/// TopicImpl.toTopicDescription() method.
-pub export fn zzdds_topic_as_description(topic: DDS.Topic) callconv(.c) DDS.TopicDescription {
-    if (nil.isNil(topic)) return std.mem.zeroes(DDS.TopicDescription);
-    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
-    return impl.toTopicDescription();
+/// TopicDescription have different vtable layouts — use the Topic vtable's
+/// own as_TopicDescription slot to get the right one, then box the result via
+/// its own get_c_abi_handle (which returns the cached, identity-stable
+/// TopicDescription handle — TopicImpl.td_c_abi — not a fresh box per call).
+///
+/// This mirrors what the --zig-generate-c-api-generated
+/// DDS_Topic_as_DDS_TopicDescription does internally, rather than calling
+/// that generated function directly: this file (c_abi's hand-written
+/// bootstrap shim) is compiled unconditionally, but --zig-generate-c-api's
+/// generated exports only exist when C bindings are actually requested
+/// (need_c_abi) — depending on one from the other would make this function
+/// uncompilable in a Zig-only build.
+pub export fn zzdds_topic_as_description(topic: *anyopaque) callconv(.c) *anyopaque {
+    const t = zidl_rt.unboxAs(DDS.Topic, topic);
+    const r = t.vtable.as_TopicDescription(t.ptr);
+    return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 // ── Raw write ────────────────────────────────────────────────────────────────
 
 /// Write a pre-serialized CDR payload (including 4-byte encap header).
 /// `key_hash` is the 16-byte MD5 key hash computed by `ShapeType_compute_key_hash`.
+/// `handle`: pass DDS.HANDLE_NIL to derive the instance automatically from
+/// `key_hash`, or a handle previously returned by zzdds_register_instance_raw
+/// (or this same write function) for that key -- any other value is a caller
+/// error (DDS spec: write() with a handle that doesn't correspond to the
+/// data's key returns BAD_PARAMETER).
 pub export fn zzdds_write_raw(
-    writer: DDS.DataWriter,
+    writer: *anyopaque,
     key_hash: *const [16]u8,
+    handle: DDS.InstanceHandle_t,
     data: [*]const u8,
     data_len: usize,
 ) callconv(.c) DDS.ReturnCode_t {
-    return zzdds_write_raw_kind(writer, .alive, key_hash, data, data_len);
+    return zzdds_write_raw_kind(writer, .alive, key_hash, handle, data, data_len);
 }
 
 pub export fn zzdds_write_raw_kind(
-    writer: DDS.DataWriter,
+    writer: *anyopaque,
     kind: CWriteKind,
     key_hash: *const [16]u8,
+    handle: DDS.InstanceHandle_t,
     data: [*]const u8,
     data_len: usize,
 ) callconv(.c) DDS.ReturnCode_t {
-    if (nil.isNil(writer)) return 1;
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
+    if (nil.isNil(w)) return 1;
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
     const change_kind: history_mod.ChangeKind = switch (kind) {
         .alive => .alive,
         .dispose => .not_alive_disposed,
@@ -89,10 +120,17 @@ pub export fn zzdds_write_raw_kind(
         else
             .not_alive_unregistered,
     };
+    if (handle != DDS.HANDLE_NIL and handle != DataWriterImpl.registerInstanceRaw(key_hash.*)) {
+        return DDS.RETCODE_BAD_PARAMETER;
+    }
+    // instance_handle here is the internal per-instance grouping key used by
+    // History's KEEP_LAST trimming (trimForKeepLast) -- it must be the
+    // sample's actual key hash, not a NIL placeholder, or KEEP_LAST collapses
+    // every instance into one shared bucket instead of trimming per-instance.
     _ = impl.writeRaw(
         change_kind,
         time_mod.RtpsTimestamp.now(),
-        history_mod.INSTANCE_HANDLE_NIL,
+        key_hash.*,
         key_hash.*,
         data[0..data_len],
     ) catch return 1;
@@ -109,14 +147,15 @@ pub export fn zzdds_write_raw_kind(
 /// discarded; `cdr_len_out` reports the required size for diagnostic purposes.
 /// Pass a buffer of at least 65536 bytes to avoid data loss.
 pub export fn zzdds_take_one_raw(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     cdr_buf: [*]u8,
     buf_size: usize,
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
-    if (nil.isNil(reader)) return -2;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -2;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const s = impl.takeRaw() orelse return 0;
     defer impl.alloc.free(s.data);
     cdr_len_out.* = s.data.len;
@@ -131,12 +170,13 @@ pub export fn zzdds_take_one_raw(
 }
 
 pub export fn zzdds_take_loaned_raw(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     loan_out: *CLoanedSample,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
-    if (nil.isNil(reader)) return -2;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -2;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const s = impl.takeRaw() orelse return 0;
     const owner = std.heap.c_allocator.create(LoanedRawSample) catch {
         std.log.err("zzdds_take_loaned_raw: sample permanently lost — OOM allocating loan handle", .{});
@@ -158,7 +198,7 @@ pub export fn zzdds_take_loaned_raw(
 }
 
 pub export fn zzdds_return_loaned_raw(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     loan: *CLoanedSample,
 ) callconv(.c) void {
     _ = reader;
@@ -182,15 +222,16 @@ pub export fn zzdds_return_loaned_raw(
 /// discarded; `cdr_len_out` reports the required size for diagnostic purposes.
 /// Pass a buffer of at least 65536 bytes to avoid data loss.
 pub export fn zzdds_take_one_raw_instance(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     prev_instance_handle: DDS.InstanceHandle_t,
     cdr_buf: [*]u8,
     buf_size: usize,
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
-    if (nil.isNil(reader)) return -2;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -2;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const s = impl.takeNextInstanceRaw(prev_instance_handle) orelse return 0;
     defer impl.alloc.free(s.data);
     cdr_len_out.* = s.data.len;
@@ -209,24 +250,26 @@ pub export fn zzdds_take_one_raw_instance(
 /// Return the DDS instance handle for a key hash without writing.
 /// Always succeeds (deterministic hash mapping).
 pub export fn zzdds_register_instance_raw(
-    writer: DDS.DataWriter,
+    writer: *anyopaque,
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
     _ = writer;
     return DataWriterImpl.registerInstanceRaw(key_hash.*);
 }
 
-/// Write with an explicit source timestamp.
+/// Write with an explicit source timestamp. `handle`: see zzdds_write_raw_kind.
 pub export fn zzdds_write_raw_w_timestamp(
-    writer: DDS.DataWriter,
+    writer: *anyopaque,
     kind: CWriteKind,
     key_hash: *const [16]u8,
+    handle: DDS.InstanceHandle_t,
     data: [*]const u8,
     data_len: usize,
     ts: DDS.Time_t,
 ) callconv(.c) DDS.ReturnCode_t {
-    if (nil.isNil(writer)) return 1;
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
+    if (nil.isNil(w)) return 1;
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
     const change_kind: history_mod.ChangeKind = switch (kind) {
         .alive => .alive,
         .dispose => .not_alive_disposed,
@@ -235,9 +278,12 @@ pub export fn zzdds_write_raw_w_timestamp(
         else
             .not_alive_unregistered,
     };
+    if (handle != DDS.HANDLE_NIL and handle != DataWriterImpl.registerInstanceRaw(key_hash.*)) {
+        return DDS.RETCODE_BAD_PARAMETER;
+    }
     const t = time_mod.Time{ .sec = ts.sec, .nanosec = ts.nanosec };
     const rtps_ts = time_mod.RtpsTimestamp.fromTime(t);
-    _ = impl.writeRaw(change_kind, rtps_ts, history_mod.INSTANCE_HANDLE_NIL, key_hash.*, data[0..data_len]) catch return 1;
+    _ = impl.writeRaw(change_kind, rtps_ts, key_hash.*, key_hash.*, data[0..data_len]) catch return 1;
     return 0;
 }
 
@@ -245,14 +291,15 @@ pub export fn zzdds_write_raw_w_timestamp(
 /// Sets `*len_out` to the actual payload size.
 /// Returns 0 on success, -1 if handle unknown, -2 if buffer too small.
 pub export fn zzdds_get_key_value_writer(
-    writer: DDS.DataWriter,
+    writer: *anyopaque,
     handle: DDS.InstanceHandle_t,
     buf: [*]u8,
     buf_size: usize,
     len_out: *usize,
 ) callconv(.c) c_int {
-    if (nil.isNil(writer)) return -1;
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
+    if (nil.isNil(w)) return -1;
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
     const kv = impl.getKeyValueRaw(handle) orelse return -1;
     len_out.* = kv.len;
     if (kv.len > buf_size) return -2;
@@ -262,7 +309,7 @@ pub export fn zzdds_get_key_value_writer(
 
 /// Look up the instance handle for a key hash (always deterministic).
 pub export fn zzdds_lookup_instance_writer(
-    writer: DDS.DataWriter,
+    writer: *anyopaque,
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
     _ = writer;
@@ -274,14 +321,15 @@ pub export fn zzdds_lookup_instance_writer(
 /// read_next_sample: non-destructively return one sample (marks it READ).
 /// Returns 1 on success, 0 if queue empty, -1 on buffer-too-small.
 pub export fn zzdds_read_one_raw(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     cdr_buf: [*]u8,
     buf_size: usize,
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
-    if (nil.isNil(reader)) return -2;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -2;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     var tmp: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
     defer {
         for (tmp.items) |s| impl.alloc.free(s.data);
@@ -312,15 +360,16 @@ pub export fn zzdds_read_one_raw(
 /// read_next_instance: non-destructively return one sample for the next instance.
 /// Returns 1 on success, 0 if no qualifying sample, -1 on buffer-too-small.
 pub export fn zzdds_read_one_raw_instance(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     prev_instance_handle: DDS.InstanceHandle_t,
     cdr_buf: [*]u8,
     buf_size: usize,
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
-    if (nil.isNil(reader)) return -2;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -2;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const s = impl.readNextInstanceRaw(prev_instance_handle) orelse return 0;
     defer impl.alloc.free(s.data);
     cdr_len_out.* = s.data.len;
@@ -349,7 +398,7 @@ pub const CRawSampleArray = extern struct {
 };
 
 fn nRawImpl(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     ss: DDS.SampleStateMask,
     vs: DDS.ViewStateMask,
     is: DDS.InstanceStateMask,
@@ -358,8 +407,9 @@ fn nRawImpl(
     destructive: bool,
 ) c_int {
     out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
-    if (nil.isNil(reader)) return -1;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -1;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const alloc = std.heap.c_allocator;
 
     // For bounded destructive takes, pre-allocate the output struct array BEFORE
@@ -452,7 +502,7 @@ fn nRawImpl(
 /// Populates `out`; caller must call zzdds_return_raw_samples when done.
 /// Returns sample count on success, 0 if empty, -1 on error.
 pub export fn zzdds_take_n_raw(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     ss: DDS.SampleStateMask,
     vs: DDS.ViewStateMask,
     is: DDS.InstanceStateMask,
@@ -466,7 +516,7 @@ pub export fn zzdds_take_n_raw(
 /// Populates `out`; caller must call zzdds_return_raw_samples when done.
 /// Returns sample count on success, 0 if empty, -1 on error.
 pub export fn zzdds_read_n_raw(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     ss: DDS.SampleStateMask,
     vs: DDS.ViewStateMask,
     is: DDS.InstanceStateMask,
@@ -478,7 +528,7 @@ pub export fn zzdds_read_n_raw(
 
 /// Free a CRawSampleArray returned by zzdds_take_n_raw or zzdds_read_n_raw.
 pub export fn zzdds_return_raw_samples(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     arr: *CRawSampleArray,
 ) callconv(.c) void {
     _ = reader;
@@ -495,14 +545,15 @@ pub export fn zzdds_return_raw_samples(
 /// Copy the stored CDR payload for `handle` into `buf[0..buf_size]`.
 /// Returns 0 on success, -1 if handle unknown, -2 if buffer too small.
 pub export fn zzdds_get_key_value_reader(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     handle: DDS.InstanceHandle_t,
     buf: [*]u8,
     buf_size: usize,
     len_out: *usize,
 ) callconv(.c) c_int {
-    if (nil.isNil(reader)) return -1;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -1;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const kv = impl.getKeyValueRaw(handle) orelse return -1;
     len_out.* = kv.len;
     if (kv.len > buf_size) return -2;
@@ -513,11 +564,12 @@ pub export fn zzdds_get_key_value_reader(
 /// Return the instance handle for a key hash if the instance is known to this reader.
 /// Returns the handle if ALIVE, 0 (HANDLE_NIL) if unknown or not alive.
 pub export fn zzdds_lookup_instance_reader(
-    reader: DDS.DataReader,
+    reader: *anyopaque,
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
-    if (nil.isNil(reader)) return 0;
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return 0;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     // Compute handle from key hash and check if it's known alive.
     const handle = DataWriterImpl.registerInstanceRaw(key_hash.*);
     return if (impl.lookupInstance(handle)) handle else 0;

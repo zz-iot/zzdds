@@ -7,6 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
+const zidl_rt = @import("zidl_rt");
 
 const c_abi_ts = zzdds.c_abi.typesupport;
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
@@ -45,6 +46,16 @@ const Fixture = struct {
     d: *DirectDiscovery,
     factory: *DomainParticipantFactoryImpl,
     dp: DDS.DomainParticipant,
+    /// Boxed C-ABI handle for `dp` -- what a real C caller actually has
+    /// (zzdds_c.h's DDS_DomainParticipant is an opaque pointer, not the
+    /// native {ptr, vtable} fat pointer). zzdds_register_type_support_c must
+    /// be exercised with *this*, not `dp` directly, or the test never
+    /// catches a C-ABI signature mismatch (it previously didn't: passing
+    /// `dp` natively happened to typecheck against the function's old,
+    /// incorrect `participant: DDS.DomainParticipant` signature, masking a
+    /// real bug that crashed every actual C caller).
+    dp_boxed: *anyopaque,
+    alloc: std.mem.Allocator,
 
     fn init(alloc: std.mem.Allocator) !Fixture {
         var delivery = try IntraProcessDelivery.init(alloc);
@@ -63,10 +74,12 @@ const Fixture = struct {
         );
         errdefer factory.deinit();
         const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
-        return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp };
+        const dp_boxed = try zidl_rt.boxEntity(alloc, dp.ptr, dp.vtable);
+        return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .dp_boxed = dp_boxed, .alloc = alloc };
     }
 
     fn deinit(self: *Fixture) void {
+        zidl_rt.freeEntityBox(self.alloc, self.dp_boxed);
         _ = self.factory.toDDSFactory().delete_participant(self.dp);
         self.factory.deinit();
         self.d.deinit();
@@ -86,7 +99,7 @@ test "c_abi TypeSupport: zzdds_register_type_support_c wires compute_key_hash" {
     defer fx.deinit();
 
     const rc = c_abi_ts.zzdds_register_type_support_c(
-        fx.dp,
+        fx.dp_boxed,
         "TestType",
         stubComputeKeyHashFromCdr,
     );
@@ -114,7 +127,7 @@ test "c_abi TypeSupport: NULL compute_key_hash registers zeroed-hash fallback" {
     defer fx.deinit();
 
     const rc = c_abi_ts.zzdds_register_type_support_c(
-        fx.dp,
+        fx.dp_boxed,
         "KeylessType",
         null,
     );

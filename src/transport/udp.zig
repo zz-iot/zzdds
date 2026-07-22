@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_opts = @import("build_options");
 const posix = std.posix;
 const log = @import("../log.zig");
 const mutex_mod = @import("../util/mutex.zig");
@@ -491,8 +492,13 @@ pub const UdpTransport = struct {
         if (mon) |m| {
             self.monitor = m;
         } else {
+            // build_opts.interface_monitor == false: interfaces are
+            // enumerated once at startup only (PollingMonitor.vtStart does
+            // this unconditionally), never re-polled -- interval_ms = 0 is
+            // PollingMonitor's own sentinel for "no periodic re-poll thread".
+            const poll_interval: u32 = if (build_opts.interface_monitor) config.interface_poll_interval_ms else 0;
             const pm = try alloc.create(polling.PollingMonitor);
-            pm.* = polling.PollingMonitor.init(alloc, config.interface_poll_interval_ms);
+            pm.* = polling.PollingMonitor.init(alloc, poll_interval);
             self.monitor = pm.monitor();
             owned_pm = pm;
         }
