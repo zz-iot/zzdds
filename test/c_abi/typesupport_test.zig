@@ -16,6 +16,20 @@ const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const noop_security = zzdds.noop_security.noop_security_plugins;
 const nil = zzdds.dcps;
 
+/// Constructs a genuinely NULL *anyopaque -- what a real C caller passing
+/// NULL for a handle parameter actually produces at the `.c` calling
+/// convention boundary. `@ptrFromInt(0)` alone is rejected by Zig's own
+/// pointer-safety checks (comptime and runtime) since `*anyopaque` is a
+/// non-optional, non-allowzero type; `@setRuntimeSafety(false)` opts out of
+/// that check specifically to construct the exact input the ABI boundary
+/// itself does not (and cannot) enforce against.
+fn makeNullHandle() *anyopaque {
+    @setRuntimeSafety(false);
+    var addr: usize = 0;
+    addr += 0;
+    return @ptrFromInt(addr);
+}
+
 // ── C-style compute_key_hash_from_cdr stub ───────────────────────────────────
 //
 // Simulates what `zidl -b c` generates: copies payload bytes [4..8] (after
@@ -120,6 +134,20 @@ test "c_abi TypeSupport: zzdds_register_type_support_c wires compute_key_hash" {
     try testing.expectEqual(@as(u8, 0x02), hash[2]);
     try testing.expectEqual(@as(u8, 0x01), hash[3]);
     try testing.expectEqualSlices(u8, &std.mem.zeroes([12]u8), hash[4..]);
+}
+
+test "c_abi TypeSupport: NULL participant handle returns error instead of crashing" {
+    // Regression test: zidl_rt.unboxAs dereferences its argument
+    // unconditionally, so a literal NULL passed by a C caller (a normal,
+    // expected "no object" value in C, not UB) must be caught before
+    // unboxing, not after -- @ptrFromInt(0) constructs the same bit pattern
+    // a real C caller's NULL would produce at the ABI boundary.
+    const rc = c_abi_ts.zzdds_register_type_support_c(
+        makeNullHandle(),
+        "TestType",
+        stubComputeKeyHashFromCdr,
+    );
+    try testing.expectEqual(@as(c_int, -1), rc);
 }
 
 test "c_abi TypeSupport: NULL compute_key_hash registers zeroed-hash fallback" {

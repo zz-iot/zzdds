@@ -34,6 +34,16 @@ const zidl_rt = @import("zidl_rt");
 // fix in typesupport.zig for the first instance of this bug and the repro
 // that found it.
 
+/// True if a raw C-ABI handle is a literal NULL pointer -- distinct from
+/// `nil.isNil`, which checks an *already-unboxed* entity's `.ptr == NIL_PTR`
+/// sentinel. `zidl_rt.unboxAs` dereferences its argument unconditionally, so
+/// a literal NULL passed by a C caller (a normal, expected "no object" value
+/// in C, not UB) must be caught here, before unboxing, not after -- every
+/// call site below checks this first.
+fn isNullHandle(handle: *anyopaque) bool {
+    return @intFromPtr(handle) == 0;
+}
+
 // ── SampleInfo for C ─────────────────────────────────────────────────────────
 // Minimal extern struct matching SH_SampleInfo in shape_configurator_zzdds.h.
 
@@ -77,6 +87,7 @@ const LoanedRawSample = struct {
 /// (need_c_abi) — depending on one from the other would make this function
 /// uncompilable in a Zig-only build.
 pub export fn zzdds_topic_as_description(topic: *anyopaque) callconv(.c) *anyopaque {
+    if (isNullHandle(topic)) return nil.nil_topic_description.vtable.get_c_abi_handle(nil.nil_topic_description.ptr);
     const t = zidl_rt.unboxAs(DDS.Topic, topic);
     const r = t.vtable.as_TopicDescription(t.ptr);
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -109,6 +120,7 @@ pub export fn zzdds_write_raw_kind(
     data: [*]const u8,
     data_len: usize,
 ) callconv(.c) DDS.ReturnCode_t {
+    if (isNullHandle(writer)) return 1;
     const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
     if (nil.isNil(w)) return 1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
@@ -153,6 +165,7 @@ pub export fn zzdds_take_one_raw(
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
+    if (isNullHandle(reader)) return -2;
     const r = zidl_rt.unboxAs(DDS.DataReader, reader);
     if (nil.isNil(r)) return -2;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -174,6 +187,7 @@ pub export fn zzdds_take_loaned_raw(
     loan_out: *CLoanedSample,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
+    if (isNullHandle(reader)) return -2;
     const r = zidl_rt.unboxAs(DDS.DataReader, reader);
     if (nil.isNil(r)) return -2;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -229,6 +243,7 @@ pub export fn zzdds_take_one_raw_instance(
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
+    if (isNullHandle(reader)) return -2;
     const r = zidl_rt.unboxAs(DDS.DataReader, reader);
     if (nil.isNil(r)) return -2;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -267,6 +282,7 @@ pub export fn zzdds_write_raw_w_timestamp(
     data_len: usize,
     ts: DDS.Time_t,
 ) callconv(.c) DDS.ReturnCode_t {
+    if (isNullHandle(writer)) return 1;
     const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
     if (nil.isNil(w)) return 1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
@@ -297,6 +313,7 @@ pub export fn zzdds_get_key_value_writer(
     buf_size: usize,
     len_out: *usize,
 ) callconv(.c) c_int {
+    if (isNullHandle(writer)) return -1;
     const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
     if (nil.isNil(w)) return -1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
@@ -327,6 +344,7 @@ pub export fn zzdds_read_one_raw(
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
+    if (isNullHandle(reader)) return -2;
     const r = zidl_rt.unboxAs(DDS.DataReader, reader);
     if (nil.isNil(r)) return -2;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -367,6 +385,7 @@ pub export fn zzdds_read_one_raw_instance(
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
 ) callconv(.c) c_int {
+    if (isNullHandle(reader)) return -2;
     const r = zidl_rt.unboxAs(DDS.DataReader, reader);
     if (nil.isNil(r)) return -2;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -407,6 +426,7 @@ fn nRawImpl(
     destructive: bool,
 ) c_int {
     out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+    if (isNullHandle(reader)) return -1;
     const r = zidl_rt.unboxAs(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -551,6 +571,7 @@ pub export fn zzdds_get_key_value_reader(
     buf_size: usize,
     len_out: *usize,
 ) callconv(.c) c_int {
+    if (isNullHandle(reader)) return -1;
     const r = zidl_rt.unboxAs(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -567,6 +588,7 @@ pub export fn zzdds_lookup_instance_reader(
     reader: *anyopaque,
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
+    if (isNullHandle(reader)) return 0;
     const r = zidl_rt.unboxAs(DDS.DataReader, reader);
     if (nil.isNil(r)) return 0;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));

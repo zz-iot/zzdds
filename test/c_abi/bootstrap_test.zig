@@ -18,7 +18,22 @@ const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const MemoryTransport = zzdds.intraprocess.MemoryTransport;
 const DirectDiscovery = zzdds.intraprocess.DirectDiscovery;
 const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
+const nil = zzdds.dcps;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
+
+/// Constructs a genuinely NULL *anyopaque -- what a real C caller passing
+/// NULL for a handle parameter actually produces at the `.c` calling
+/// convention boundary. `@ptrFromInt(0)` alone is rejected by Zig's own
+/// pointer-safety checks (comptime and runtime) since `*anyopaque` is a
+/// non-optional, non-allowzero type; `@setRuntimeSafety(false)` opts out of
+/// that check specifically to construct the exact input the ABI boundary
+/// itself does not (and cannot) enforce against.
+fn makeNullHandle() *anyopaque {
+    @setRuntimeSafety(false);
+    var addr: usize = 0;
+    addr += 0;
+    return @ptrFromInt(addr);
+}
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const GuardConditionImpl = zzdds.dcps.GuardConditionImpl;
@@ -274,7 +289,34 @@ test "bootstrap: topic_as_description returns TopicDescription with correct name
     try testing.expectEqualStrings("BootTopic", std.mem.span(td.vtable.get_name(td.ptr)));
 }
 
+test "bootstrap: topic_as_description returns nil TopicDescription for a NULL topic handle" {
+    // Regression test: zidl_rt.unboxAs dereferences its argument
+    // unconditionally, so a literal NULL passed by a C caller (a normal,
+    // expected "no object" value in C, not UB) must be caught before
+    // unboxing, not after -- @ptrFromInt(0) constructs the same bit pattern
+    // a real C caller's NULL would produce at the ABI boundary. The old
+    // (pre-boxing-fix) implementation explicitly returned a nil
+    // TopicDescription for this input; this must still hold.
+    const td_boxed = bootstrap.zzdds_topic_as_description(makeNullHandle());
+    const td = zidl_rt.unboxAs(DDS.TopicDescription, td_boxed);
+    try testing.expectEqual(nil.NIL_PTR, td.ptr);
+}
+
 // ── write_raw + take_one_raw ──────────────────────────────────────────────────
+
+test "bootstrap: write_raw and take_one_raw return an error, not a crash, for NULL handles" {
+    // Same regression as the topic_as_description NULL test above, covering
+    // the write and take sides -- every zidl_rt.unboxAs call site in this
+    // file was affected by the same ordering bug.
+    const key_hash = std.mem.zeroes([16]u8);
+    const payload = [_]u8{0xAB};
+    try testing.expectEqual(@as(DDS.ReturnCode_t, 1), bootstrap.zzdds_write_raw(makeNullHandle(), &key_hash, DDS.HANDLE_NIL, &payload, payload.len));
+
+    var buf: [64]u8 = undefined;
+    var cdr_len: usize = 0;
+    var info: bootstrap.CSampleInfo = undefined;
+    try testing.expectEqual(@as(c_int, -2), bootstrap.zzdds_take_one_raw(makeNullHandle(), &buf, buf.len, &cdr_len, &info));
+}
 
 test "bootstrap: write_raw and take_one_raw round-trip" {
     const alloc = testing.allocator;

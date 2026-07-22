@@ -69,6 +69,12 @@ pub export fn zzdds_register_type_support_c(
     type_name: [*:0]const u8,
     compute_key_hash_fn: ?ZzddsComputeKeyHashFn,
 ) callconv(.c) c_int {
+    // zidl_rt.unboxAs dereferences its argument unconditionally -- a literal
+    // NULL passed by a C caller (a normal, expected "no object" value in C,
+    // not UB) must be caught before unboxing, not after; nil.isNil only
+    // catches an *already-unboxed* entity's ptr == NIL_PTR sentinel, which a
+    // raw NULL C pointer would never reach without crashing first.
+    if (@intFromPtr(participant) == 0) return -1;
     const p = zidl_rt.unboxAs(DDS.DomainParticipant, participant);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
