@@ -1,6 +1,6 @@
 .{
     .name = .zzdds,
-    .version = "0.2.1-zig.0.16.0",
+    .version = "0.2.1-zig.0.16.0-dev",
     .fingerprint = 0xf681a2529addceb1,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
