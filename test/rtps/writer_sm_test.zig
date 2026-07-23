@@ -1106,3 +1106,50 @@ test "checkConnectionGenerations: replays to a proxy whose connection generation
     w.checkConnectionGenerations();
     try testing.expectEqual(@as(usize, 0), countAllData(&rec));
 }
+
+test "addMatchedReader: lease refresh landing after a reconnect still replays (not silently absorbed)" {
+    // Regression test: a lease refresh (e.g. a repeated SEDP announcement)
+    // arriving for an already-matched proxy between two heartbeat-thread
+    // ticks must not be able to record a reconnect's new generation without
+    // the corresponding replay actually happening — that would silently and
+    // permanently lose whatever data the reconnect gap dropped.
+    const writer_guid = makeGuid(0x72, WRITER_EID);
+    const reader_guid = makeGuid(0x73, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7521);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    const rp1 = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp1);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+    rec.reset();
+
+    // Reconnect happens, but no heartbeat-thread tick has run yet.
+    rec.connection_generation = 1;
+
+    // A lease refresh for the same proxy (same locators) lands first.
+    const rp2 = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp2);
+
+    // The refresh itself must have replayed — this is the assertion that
+    // fails under the bug (old code recorded the new generation directly,
+    // without calling replayHistoryToProxyLocked, so this would see 0).
+    try testing.expectEqual(@as(usize, 2), countAllData(&rec));
+
+    // A subsequent periodic check finds nothing new to do — already resynced.
+    rec.reset();
+    w.checkConnectionGenerations();
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}

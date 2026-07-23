@@ -619,12 +619,16 @@ pub const StatefulWriter = struct {
                 rp.reliable = proxy.reliable;
                 rp.expects_inline_qos = proxy.expects_inline_qos;
                 rp.wants_replay = proxy.wants_replay;
-                // Locators may have changed on this refresh; reset the
-                // tracked generation against the (possibly new) locators so
-                // checkConnectionGenerations doesn't compare against a value
-                // that no longer corresponds to what effectiveLocators()
-                // returns now.
-                rp.last_seen_connection_generation = self.connectionGenerationSumLocked(rp);
+                // Locators may have changed on this refresh, and — separately
+                // — a reconnect may have happened since the last periodic
+                // check. Route through the shared resync helper (not a plain
+                // assignment): if the generation implied by the (possibly
+                // new) locators differs from what we last recorded, this
+                // replays before recording it, so a refresh landing between
+                // two heartbeat-thread ticks can never silently "absorb" a
+                // reconnect's generation bump without the corresponding
+                // replay actually happening.
+                self.resyncIfGenerationChangedLocked(rp);
                 // Dispose the incoming proxy's empty locator lists.
                 var discarded = proxy;
                 discarded.unicast_locators = .empty;
@@ -722,11 +726,24 @@ pub const StatefulWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
         for (self.reader_proxies.items) |*rp| {
-            const current = self.connectionGenerationSumLocked(rp);
-            if (current != rp.last_seen_connection_generation) {
-                rp.last_seen_connection_generation = current;
-                self.replayHistoryToProxyLocked(rp);
-            }
+            self.resyncIfGenerationChangedLocked(rp);
+        }
+    }
+
+    /// If rp's connection generation has changed since we last recorded it,
+    /// replay the cache to it and record the new value together, atomically
+    /// from the caller's point of view. Shared by checkConnectionGenerations
+    /// (the periodic heartbeat-thread check) and addMatchedReader's
+    /// lease-refresh path — any code that touches last_seen_connection_generation
+    /// must go through this, never assign it directly, or a refresh landing
+    /// between two periodic checks could silently record a reconnect's new
+    /// generation without ever having replayed for it (the gap this whole
+    /// mechanism exists to close).
+    fn resyncIfGenerationChangedLocked(self: *Self, rp: *ReaderProxy) void {
+        const current = self.connectionGenerationSumLocked(rp);
+        if (current != rp.last_seen_connection_generation) {
+            rp.last_seen_connection_generation = current;
+            self.replayHistoryToProxyLocked(rp);
         }
     }
 
