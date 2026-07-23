@@ -74,6 +74,11 @@ jobs:
             os: windows-latest
 
     runs-on: ${{ matrix.os }}
+    # No platform here has ever legitimately taken more than ~8 minutes; a
+    # hang defaults to GitHub's 360-minute job cap otherwise, which is what
+    # let a stuck Windows run burn ~58 minutes before it got noticed and
+    # cancelled by hand. 20 minutes is generous headroom, not a tight budget.
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4

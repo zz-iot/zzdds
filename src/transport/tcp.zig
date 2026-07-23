@@ -759,9 +759,17 @@ fn acceptLoop(self: *TcpTransport) void {
                 .events = WinPoll.POLLIN,
                 .revents = 0,
             }};
+            // WSAPoll returns SOCKET_ERROR (-1) on a real error, 0 on timeout,
+            // and a positive count when revents is non-empty — these need to
+            // be told apart the same way the POSIX branch below tells a
+            // genuine poll() error from a timeout. Treating -1 the same as 0
+            // (as `if (n <= 0) continue;` used to) meant a real poll error on
+            // Windows was silently treated as "nothing happened yet, keep
+            // polling forever" instead of breaking out of the loop.
             const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
-            if (n <= 0) continue;
-            if (pfds[0].revents & WinPoll.POLLIN == 0) break;
+            if (n < 0) break; // WSAPoll error
+            if (n == 0) continue; // timeout — re-check stopping
+            if (pfds[0].revents & WinPoll.POLLIN == 0) break; // POLLERR/POLLHUP
         } else {
             var pfds = [1]posix.pollfd{.{
                 .fd = listen_snapshot.fd,
@@ -863,9 +871,17 @@ fn recvLoop(conn: *TcpConnection) void {
                 .events = WinPoll.POLLIN,
                 .revents = 0,
             }};
+            // WSAPoll returns SOCKET_ERROR (-1) on a real error, 0 on timeout,
+            // and a positive count when revents is non-empty — these need to
+            // be told apart the same way the POSIX branch below tells a
+            // genuine poll() error from a timeout. Treating -1 the same as 0
+            // (as `if (n <= 0) continue;` used to) meant a real poll error on
+            // Windows was silently treated as "nothing happened yet, keep
+            // polling forever" instead of breaking out of the loop.
             const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
-            if (n <= 0) continue;
-            if (pfds[0].revents & WinPoll.POLLIN == 0) break;
+            if (n < 0) break; // WSAPoll error
+            if (n == 0) continue; // timeout — re-check stopping
+            if (pfds[0].revents & WinPoll.POLLIN == 0) break; // POLLERR/POLLHUP
         } else {
             var pfds = [1]posix.pollfd{.{
                 .fd = conn.fd,
