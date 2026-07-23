@@ -448,6 +448,15 @@ pub const Transport = struct {
 
         /// Release all resources. Must not be called while any listen is active.
         close: *const fn (ctx: *anyopaque) void,
+
+        /// Returns a value that changes whenever connectivity to `locator` is
+        /// freshly (re-)established after having been lost — e.g. a TCP
+        /// reconnect. Null (the default) means this transport has no
+        /// connection-lifecycle concept (UDP, and any transport that doesn't
+        /// implement this): connectionGeneration() then always returns a
+        /// constant, so RTPS code can check for a change unconditionally
+        /// without needing to know which transport kind it's talking to.
+        connection_generation: ?*const fn (ctx: *anyopaque, locator: *const Locator) u32 = null,
     };
 
     // ── Forwarding helpers ────────────────────────────────────────────────────
@@ -481,5 +490,10 @@ pub const Transport = struct {
     }
     pub fn close(self: Transport) void {
         self.vtable.close(self.ctx);
+    }
+
+    pub fn connectionGeneration(self: Transport, locator: *const Locator) u32 {
+        if (self.vtable.connection_generation) |f| return f(self.ctx, locator);
+        return 0;
     }
 };

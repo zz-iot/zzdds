@@ -94,6 +94,8 @@ pub const KnownParticipant = struct {
         self.alloc.free(self.data.metatraffic_multicast_locators);
         self.alloc.free(self.data.default_unicast_locators);
         self.alloc.free(self.data.default_multicast_locators);
+        self.alloc.free(self.data.default_unicast_locators_for_data);
+        self.alloc.free(self.data.default_multicast_locators_for_data);
     }
 };
 
@@ -156,6 +158,11 @@ pub const SpdpEndpoints = struct {
     begin_probe_fn: ?*const fn (*anyopaque, GuidPrefix, i64) void,
     begin_probe_ctx: ?*anyopaque,
 
+    // Set in start() from ParticipantAnnouncement.data_reachable. Null (the
+    // default) means the local participant's data transport is the same as
+    // this discovery transport — see filterKnownParticipantLocators.
+    data_reachable: ?iface.DataLocatorReachability,
+
     const Self = @This();
 
     pub fn init(
@@ -191,6 +198,7 @@ pub const SpdpEndpoints = struct {
             .fast_announce_until_ns = std.atomic.Value(i64).init(0),
             .begin_probe_fn = null,
             .begin_probe_ctx = null,
+            .data_reachable = null,
         };
         return self;
     }
@@ -288,6 +296,7 @@ pub const SpdpEndpoints = struct {
         callbacks: *const Callbacks,
     ) !void {
         self.callbacks = callbacks;
+        self.data_reachable = local.data_reachable;
 
         // Fix the GUID prefix now that we know it.
         self.reader.guid.prefix = local.guid.prefix;
@@ -635,12 +644,31 @@ pub const SpdpEndpoints = struct {
         kp.data.metatraffic_multicast_locators = self.filterReachableLocators(old_meta_mc, "metatraffic multicast");
         self.alloc.free(old_meta_mc);
 
+        // Capture the raw (not yet discovery-filtered) default locators before
+        // either filter pass runs. The data-transport pass needs to see locator
+        // kinds discovery itself can't reach (e.g. TCP) — the discovery filter
+        // below would otherwise strip them irrecoverably before this pass ever
+        // saw them.
         const old_data_uc = kp.data.default_unicast_locators;
-        kp.data.default_unicast_locators = self.filterReachableLocators(old_data_uc, "default unicast");
-        self.alloc.free(old_data_uc);
-
         const old_data_mc = kp.data.default_multicast_locators;
+
+        if (self.data_reachable) |dr| {
+            kp.data.default_unicast_locators_for_data = iface.filterReachableLocatorsForData(self.alloc, old_data_uc, dr);
+            kp.data.default_multicast_locators_for_data = iface.filterReachableLocatorsForData(self.alloc, old_data_mc, dr);
+        }
+
+        kp.data.default_unicast_locators = self.filterReachableLocators(old_data_uc, "default unicast");
         kp.data.default_multicast_locators = self.filterReachableLocators(old_data_mc, "default multicast");
+
+        if (self.data_reachable == null) {
+            // No separate data transport configured: the data transport IS the
+            // discovery transport, so the discovery-filtered result just
+            // computed above is already correct for data purposes too.
+            kp.data.default_unicast_locators_for_data = self.alloc.dupe(Locator, kp.data.default_unicast_locators) catch &.{};
+            kp.data.default_multicast_locators_for_data = self.alloc.dupe(Locator, kp.data.default_multicast_locators) catch &.{};
+        }
+
+        self.alloc.free(old_data_uc);
         self.alloc.free(old_data_mc);
     }
 

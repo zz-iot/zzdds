@@ -79,6 +79,26 @@ pub const ParticipantAnnouncement = struct {
     initial_peers: []const []const u8 = &.{},
     /// Bit mask of built-in endpoints this participant supports (RTPS §8.5.4.2).
     builtin_endpoint_set: u32,
+    /// Optional reachability check for this participant's user-data transport,
+    /// when it differs from the discovery transport (e.g. TCP data + UDP
+    /// discovery). Null (the default) means the data transport IS the
+    /// discovery transport — SPDP/SEDP's own discovery-filtered locators are
+    /// already correct for user-data purposes too, and no separate filtering
+    /// pass is needed. Set only by DomainParticipantImpl when it constructed
+    /// a dedicated data transport.
+    data_reachable: ?DataLocatorReachability = null,
+};
+
+/// Injected capability letting discovery (SPDP/SEDP, always UDP) ask whether a
+/// locator is reachable by the *participant's* user-data transport, without
+/// discovery ever holding a reference to that transport itself.
+pub const DataLocatorReachability = struct {
+    ctx: *anyopaque,
+    can_reach: *const fn (ctx: *anyopaque, loc: *const Locator) bool,
+
+    pub fn reaches(self: DataLocatorReachability, loc: *const Locator) bool {
+        return self.can_reach(self.ctx, loc);
+    }
 };
 
 /// Information about a local DataWriter endpoint.
@@ -119,6 +139,13 @@ pub const ParticipantData = struct {
     metatraffic_multicast_locators: []const Locator,
     default_unicast_locators: []const Locator,
     default_multicast_locators: []const Locator,
+    /// Same locators as default_unicast_locators/default_multicast_locators,
+    /// but filtered for reachability by the local participant's user-data
+    /// transport (via ParticipantAnnouncement.data_reachable) instead of the
+    /// discovery transport. Empty when no data_reachable check was configured
+    /// for the local participant (the common case — see filterKnownParticipantLocators).
+    default_unicast_locators_for_data: []const Locator = &.{},
+    default_multicast_locators_for_data: []const Locator = &.{},
     lease_duration_ms: u32,
     builtin_endpoint_set: u32,
     /// VendorId from the RTPS Message header (§9.4.1) that carried this
@@ -260,6 +287,33 @@ pub fn filterReachableLocators(
         // promoting them into participant or endpoint locator lists.
         if (loc.isOpaqueCustom()) continue;
         warn_self.warnUnsupportedLocatorOnce(loc, context);
+    }
+    return out.toOwnedSlice(alloc) catch {
+        out.deinit(alloc);
+        return &.{};
+    };
+}
+
+/// Like filterReachableLocators, but checks reachability via an injected
+/// DataLocatorReachability capability instead of a concrete discovery
+/// Transport. No unsupported-locator-kind warning is logged here — a locator
+/// unreachable by the data transport but reachable by discovery is expected
+/// and unremarkable (e.g. every UDP-only peer's locators, when the local data
+/// transport is TCP), not a configuration problem worth flagging.
+pub fn filterReachableLocatorsForData(
+    alloc: std.mem.Allocator,
+    locators: []const Locator,
+    reach: DataLocatorReachability,
+) []Locator {
+    var out: std.ArrayList(Locator) = .empty;
+    for (locators) |loc| {
+        if (loc.isInvalidOrReserved()) continue;
+        if (reach.reaches(&loc)) {
+            out.append(alloc, loc) catch {
+                out.deinit(alloc);
+                return &.{};
+            };
+        }
     }
     return out.toOwnedSlice(alloc) catch {
         out.deinit(alloc);

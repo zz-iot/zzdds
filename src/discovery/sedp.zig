@@ -566,11 +566,19 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
 const ParticipantLocators = struct {
     unicast: []Locator, // owned
     multicast: []Locator, // owned
+    /// Same locators, filtered for reachability by the local participant's
+    /// data transport instead of discovery. Equal in practice to unicast/
+    /// multicast above when no data_reachable override is configured (the
+    /// common case) — see onParticipantDiscovered.
+    unicast_for_data: []Locator, // owned
+    multicast_for_data: []Locator, // owned
     alloc: std.mem.Allocator,
 
     fn deinit(self: *ParticipantLocators) void {
         self.alloc.free(self.unicast);
         self.alloc.free(self.multicast);
+        self.alloc.free(self.unicast_for_data);
+        self.alloc.free(self.multicast_for_data);
     }
 };
 
@@ -620,6 +628,11 @@ pub const SedpEndpoints = struct {
     unsupported_locator_mu: Mutex,
     unsupported_locator_kinds: std.AutoHashMap(i32, void),
 
+    // Set in start() from ParticipantAnnouncement.data_reachable. Null (the
+    // default) means the local participant's data transport is the same as
+    // this discovery transport.
+    data_reachable: ?iface.DataLocatorReachability,
+
     const Self = @This();
 
     pub fn init(alloc: std.mem.Allocator, transport: Transport) !*Self {
@@ -648,6 +661,7 @@ pub const SedpEndpoints = struct {
             .probe_result_fn = null,
             .sedp_seen_ctx = null,
             .sedp_seen_fn = null,
+            .data_reachable = null,
         };
         return self;
     }
@@ -735,6 +749,7 @@ pub const SedpEndpoints = struct {
     ) !void {
         self.callbacks = callbacks;
         self.local_prefix = local.guid.prefix;
+        self.data_reachable = local.data_reachable;
 
         // Metatraffic unicast port = first unicast locator port.
         if (local.metatraffic_unicast_locators.len > 0) {
@@ -837,6 +852,11 @@ pub const SedpEndpoints = struct {
         defer self.alloc.free(mc);
         const data_uc = self.filterReachableLocators(data.default_unicast_locators, "default unicast");
         const data_mc = self.filterReachableLocators(data.default_multicast_locators, "default multicast");
+        // SPDP already computed the data-transport-filtered variants (from the
+        // raw, pre-discovery-filter locators — see filterKnownParticipantLocators);
+        // just dupe them here rather than re-filtering.
+        const data_uc_for_data: []Locator = self.alloc.dupe(Locator, data.default_unicast_locators_for_data) catch &.{};
+        const data_mc_for_data: []Locator = self.alloc.dupe(Locator, data.default_multicast_locators_for_data) catch &.{};
 
         // Cache the participant's default data locators so endpoints that omit
         // explicit locators in their SEDP announcement can fall back to them.
@@ -848,6 +868,8 @@ pub const SedpEndpoints = struct {
                 self.participant_locs_mu.unlock();
                 self.alloc.free(data_uc);
                 self.alloc.free(data_mc);
+                self.alloc.free(data_uc_for_data);
+                self.alloc.free(data_mc_for_data);
                 return;
             };
             if (gop.found_existing) gop.value_ptr.deinit();
@@ -855,6 +877,8 @@ pub const SedpEndpoints = struct {
                 .alloc = self.alloc,
                 .unicast = data_uc,
                 .multicast = data_mc,
+                .unicast_for_data = data_uc_for_data,
+                .multicast_for_data = data_mc_for_data,
             };
             self.participant_locs_mu.unlock();
         }
@@ -1079,20 +1103,36 @@ pub const SedpEndpoints = struct {
         // participant's default unicast/multicast locators (from SPDP).
         // Take a local copy under participant_locs_mu so the SPDP thread can
         // safely mutate the map while we use the locators below.
+        //
+        // Read the *_for_data variants specifically: these are what's actually
+        // reachable by this participant's user-data transport (equal to the
+        // plain unicast/multicast fields when no data_reachable override is
+        // configured — see filterKnownParticipantLocators / onParticipantDiscovered).
         var pl_uc_copy: ?[]Locator = null;
         var pl_mc_copy: ?[]Locator = null;
         self.participant_locs_mu.lock();
         if (self.participant_locs.get(ep.guid.prefix)) |pl| {
-            pl_uc_copy = self.alloc.dupe(Locator, pl.unicast) catch null;
-            pl_mc_copy = self.alloc.dupe(Locator, pl.multicast) catch null;
+            pl_uc_copy = self.alloc.dupe(Locator, pl.unicast_for_data) catch null;
+            pl_mc_copy = self.alloc.dupe(Locator, pl.multicast_for_data) catch null;
         }
         self.participant_locs_mu.unlock();
         defer if (pl_uc_copy) |s| self.alloc.free(s);
         defer if (pl_mc_copy) |s| self.alloc.free(s);
 
-        const ep_uc = self.filterReachableLocators(ep.unicast, "endpoint unicast");
+        // Explicit per-endpoint locators (rare — zzdds never sets these locally;
+        // only a remote peer's own PID_UNICAST_LOCATOR/PID_MULTICAST_LOCATOR
+        // would populate ep.unicast/ep.multicast). Filtered the same way: via
+        // the data-transport check when configured, else via discovery
+        // reachability (identical to today's behavior).
+        const ep_uc = if (self.data_reachable) |dr|
+            iface.filterReachableLocatorsForData(self.alloc, ep.unicast, dr)
+        else
+            self.filterReachableLocators(ep.unicast, "endpoint unicast");
         defer self.alloc.free(ep_uc);
-        const ep_mc = self.filterReachableLocators(ep.multicast, "endpoint multicast");
+        const ep_mc = if (self.data_reachable) |dr|
+            iface.filterReachableLocatorsForData(self.alloc, ep.multicast, dr)
+        else
+            self.filterReachableLocators(ep.multicast, "endpoint multicast");
         defer self.alloc.free(ep_mc);
 
         const eff_uc: []const Locator = if (ep_uc.len > 0)
@@ -1108,6 +1148,15 @@ pub const SedpEndpoints = struct {
             s
         else
             ep_mc;
+
+        // A data-transport override is configured and neither the endpoint's own
+        // locators nor its participant's default locators are reachable by it:
+        // this pair cannot actually exchange data. Treat it the same as a QoS
+        // incompatibility — no match — rather than firing a matched-callback
+        // that can never deliver anything. Gated on data_reachable so the
+        // default (no override, discovery transport == data transport) path is
+        // completely unchanged.
+        if (self.data_reachable != null and eff_uc.len == 0 and eff_mc.len == 0) return;
 
         if (is_writer) {
             const wd = WriterData{

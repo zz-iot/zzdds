@@ -70,6 +70,14 @@ pub const TransportConfig = struct {
 };
 
 pub const TcpConfig = struct {
+    /// When true, this participant's user-data (DataWriter/DataReader) traffic
+    /// uses a dedicated TCP transport instead of the shared UDP transport.
+    /// SPDP/SEDP discovery traffic is unaffected and always uses UDP; the
+    /// resulting TCP locator is carried in the normal SPDP announcement so
+    /// peers can match against it. Requires bind_address to be set to a
+    /// concrete, reachable address (TCP cannot advertise a wildcard address).
+    enabled: bool = false,
+
     /// Interface address to bind the listen socket to. "" = INADDR_ANY (all interfaces).
     bind_address: []const u8 = "",
 

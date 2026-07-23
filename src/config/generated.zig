@@ -25,6 +25,7 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
     runtime.participant.guid_strategy = toGuidStrategy(cfg.participant.guid_strategy);
     runtime.participant.timer_clock_name = try dupeString(allocator, cfg.participant.timer_clock_name);
     runtime.transport.udp = try toUdpConfig(allocator, &cfg.transport.udp);
+    runtime.transport.tcp.enabled = cfg.transport.tcp.enabled;
     runtime.transport.tcp.bind_address = try dupeString(allocator, cfg.transport.tcp.bind_address);
     runtime.transport.tcp.reuse_connection_by_host = cfg.transport.tcp.reuse_connection_by_host;
     runtime.rtps.fragment_size = cfg.rtps.fragment_size;

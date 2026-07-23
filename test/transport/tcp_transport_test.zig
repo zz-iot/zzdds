@@ -718,6 +718,58 @@ test "tcp transport: connection recovery after fd close" {
     try testing.expectEqual(@as(usize, 2), latch.n);
 }
 
+test "tcp transport: connectionGeneration increments on reconnect, not on ordinary reuse" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    const st = server.transport();
+
+    var latch = Latch{};
+    var ctr = LatchCounter{ .latch = &latch };
+
+    const port = try listenAndGetPort(st, ctr.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), ctr.handler());
+
+    sleepMs(20);
+
+    const client = try TcpTransport.init(alloc, .{ .reuse_connection_by_host = false });
+    defer client.deinit();
+    const ct = client.transport();
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+
+    // A locator never connected to reports generation 0 — matches a
+    // connectionless/UDP transport's constant-0 default, so RTPS code can
+    // check unconditionally without caring which transport kind it has.
+    try testing.expectEqual(@as(u32, 0), ct.connectionGeneration(&dest));
+
+    // Initial connect: generation becomes 1.
+    try ct.send(&dest, "first");
+    latch.waitFor(1);
+    try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
+
+    // Ordinary reuse of the still-live connection must NOT bump the
+    // generation — only a genuine new/reconnected TcpConnection should.
+    try ct.send(&dest, "again");
+    latch.waitFor(2);
+    try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
+
+    // Close the client-side connection fd to simulate network failure.
+    {
+        client.conn_mu.lock();
+        var key = tcp_mod.RemoteKey{ .addr = std.mem.zeroes([16]u8), .port = port, .family = .v4 };
+        @memcpy(key.addr[0..4], &[_]u8{ 127, 0, 0, 1 });
+        const conn = client.connections.get(key);
+        if (conn) |co| _ = std.c.close(co.fd);
+        client.conn_mu.unlock();
+    }
+
+    // Reconnect: generation becomes 2.
+    try ct.send(&dest, "second");
+    latch.waitFor(3);
+    try testing.expectEqual(@as(u32, 2), ct.connectionGeneration(&dest));
+}
+
 // ── IPv6 loopback send + receive ──────────────────────────────────────────────
 
 test "tcp transport: IPv6 loopback send and receive" {

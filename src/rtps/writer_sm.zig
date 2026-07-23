@@ -298,6 +298,12 @@ pub const ReaderProxy = struct {
     /// vtAddMatchedReader; defaults to false (Example 3, the smaller spec-legal
     /// end-of-coherent-set form) for readers with no known quirk.
     needs_pid_coherent_set_marker: bool = false,
+    /// Sum of transport.connectionGeneration() across this proxy's effective
+    /// locators, as of the last time we replayed to it (at match, or on a
+    /// detected reconnect). UDP/connectionless locators always report
+    /// generation 0, so this stays 0 and is never acted on for them. Checked
+    /// periodically from the heartbeat thread — see checkConnectionGenerations.
+    last_seen_connection_generation: u32 = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -613,6 +619,12 @@ pub const StatefulWriter = struct {
                 rp.reliable = proxy.reliable;
                 rp.expects_inline_qos = proxy.expects_inline_qos;
                 rp.wants_replay = proxy.wants_replay;
+                // Locators may have changed on this refresh; reset the
+                // tracked generation against the (possibly new) locators so
+                // checkConnectionGenerations doesn't compare against a value
+                // that no longer corresponds to what effectiveLocators()
+                // returns now.
+                rp.last_seen_connection_generation = self.connectionGenerationSumLocked(rp);
                 // Dispose the incoming proxy's empty locator lists.
                 var discarded = proxy;
                 discarded.unicast_locators = .empty;
@@ -628,6 +640,7 @@ pub const StatefulWriter = struct {
             return err;
         };
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
+        new_rp.last_seen_connection_generation = self.connectionGenerationSumLocked(new_rp);
         // Replay only applies when BOTH the writer offers TRANSIENT_LOCAL+ AND
         // this specific reader requested it. A VOLATILE-requesting reader has
         // no use for history and must not be held back waiting for an ACKNACK
@@ -675,6 +688,48 @@ pub const StatefulWriter = struct {
     }
 
     /// Send all cached changes to a single reader proxy (called under mu).
+    /// Sum of transport.connectionGeneration() across rp's effective locators.
+    /// A sum rather than per-locator tracking: TCP proxies overwhelmingly have
+    /// exactly one effective locator, and for the rare multi-homed case any
+    /// single locator's generation changing is enough to want a resync — a sum
+    /// detects that without needing a second per-locator array. UDP locators
+    /// always report 0, so this is 0 (and never triggers a resync) whenever
+    /// none of a proxy's locators are backed by a connection-oriented transport.
+    fn connectionGenerationSumLocked(self: *Self, rp: *const ReaderProxy) u32 {
+        var sum: u32 = 0;
+        for (rp.effectiveLocators()) |loc| {
+            sum +%= self.transport.connectionGeneration(&loc);
+        }
+        return sum;
+    }
+
+    /// Detect a transport-level reconnect (e.g. a TCP connection that dropped
+    /// and re-established) for any matched reader proxy, and resync by
+    /// replaying the current cache to it — the only correct fallback without
+    /// AckNack-driven gap tracking, since the writer has no way to know
+    /// exactly which samples (if any) were lost during the gap. Applies
+    /// uniformly to RELIABLE and BEST_EFFORT proxies alike: RELIABLE proxies
+    /// already self-heal via ordinary AckNack-driven retransmission (this
+    /// just gets there faster), but BEST_EFFORT proxies have no other
+    /// recovery path at all for data lost during a connection gap. Not gated
+    /// on replay_on_match/wants_replay — those govern DURABILITY-driven
+    /// late-join replay, a different concern from recovering an ongoing
+    /// pairing's connection gap. Called periodically from heartbeatThread
+    /// (reuses that existing timer rather than adding a second one); a no-op
+    /// for any proxy whose locators are all UDP, since connectionGeneration()
+    /// is then always 0.
+    pub fn checkConnectionGenerations(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.reader_proxies.items) |*rp| {
+            const current = self.connectionGenerationSumLocked(rp);
+            if (current != rp.last_seen_connection_generation) {
+                rp.last_seen_connection_generation = current;
+                self.replayHistoryToProxyLocked(rp);
+            }
+        }
+    }
+
     fn replayHistoryToProxyLocked(self: *Self, rp: *const ReaderProxy) void {
         const locs = rp.effectiveLocators();
         if (locs.len == 0) {
@@ -1767,6 +1822,7 @@ pub const StatefulWriter = struct {
             if (self.hb_stopping.load(.acquire)) break;
             self.sendHeartbeat(false);
             self.checkProbeDeadlines();
+            self.checkConnectionGenerations();
         }
     }
 

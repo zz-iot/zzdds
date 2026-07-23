@@ -271,6 +271,15 @@ pub const TcpTransport = struct {
     /// Connections that close mid-session are removed from `connections` but stay
     /// here until deinit.
     all_connections: std.ArrayListUnmanaged(*TcpConnection),
+    /// Per-remote connection generation, incremented each time a *new*
+    /// TcpConnection is registered for a RemoteKey (first connect or a
+    /// reconnect after a drop). Deliberately never removed when a connection
+    /// drops — a later reconnect needs to see a higher value than whatever
+    /// the RTPS layer last observed, not start over from zero. Exposed via
+    /// vtConnectionGeneration so StatefulWriter can detect "this proxy's
+    /// connection was re-established" without the transport knowing anything
+    /// about proxies. Guarded by conn_mu.
+    connection_generations: std.AutoHashMapUnmanaged(RemoteKey, u32),
 
     /// Guards handlers list. Separate from conn_mu to avoid deadlock:
     /// recv threads call dispatchToHandlers without holding conn_mu.
@@ -304,6 +313,7 @@ pub const TcpTransport = struct {
             .conn_mu = .{},
             .connections = .empty,
             .all_connections = .empty,
+            .connection_generations = .empty,
             .handler_mu = .{},
             .handlers = .empty,
             .listen_fd = null,
@@ -352,8 +362,19 @@ pub const TcpTransport = struct {
 
         self.all_connections.deinit(self.alloc);
         self.connections.deinit(self.alloc);
+        self.connection_generations.deinit(self.alloc);
         self.handlers.deinit(self.alloc);
         self.alloc.destroy(self);
+    }
+
+    /// Record that a new (first or reconnected) connection now exists for `key`.
+    /// Caller must hold conn_mu. OOM is silently ignored — worst case a
+    /// reconnect isn't detected and the writer falls back to its normal
+    /// heartbeat-driven resync timing (RELIABLE) or just doesn't replay
+    /// (BEST_EFFORT, same as today), not a correctness break.
+    fn bumpGenerationLocked(self: *Self, key: RemoteKey) void {
+        const gop = self.connection_generations.getOrPut(self.alloc, key) catch return;
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* +% 1 else 1;
     }
 
     pub fn transport(self: *Self) Transport {
@@ -496,6 +517,7 @@ pub const TcpTransport = struct {
             self.alloc.destroy(new_conn);
             return err;
         };
+        self.bumpGenerationLocked(key);
         self.conn_mu.unlock();
         return new_conn;
     }
@@ -691,6 +713,14 @@ pub const TcpTransport = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.deinit();
     }
+
+    fn vtConnectionGeneration(ctx: *anyopaque, loc: *const Locator) u32 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const key = locatorToRemoteKey(loc) orelse return 0;
+        self.conn_mu.lock();
+        defer self.conn_mu.unlock();
+        return self.connection_generations.get(key) orelse 0;
+    }
 };
 
 // ── Vtable singleton ──────────────────────────────────────────────────────────
@@ -706,6 +736,7 @@ const tcp_vtable = Transport.Vtable{
     .unicast_locators = TcpTransport.vtUnicastLocators,
     .set_locator_change_handler = TcpTransport.vtSetLocatorChangeHandler,
     .close = TcpTransport.vtClose,
+    .connection_generation = TcpTransport.vtConnectionGeneration,
 };
 
 // ── Accept loop ───────────────────────────────────────────────────────────────
@@ -816,6 +847,7 @@ fn acceptLoop(self: *TcpTransport) void {
             self.alloc.destroy(conn);
             continue;
         };
+        self.bumpGenerationLocked(remote);
         self.conn_mu.unlock();
     }
 }

@@ -62,6 +62,11 @@ const Capture = struct {
 const Recording = struct {
     caps: [MAX_CAPS]Capture = undefined,
     n: usize = 0,
+    /// Test-controlled connection generation, returned uniformly for every
+    /// locator via connectionGeneration(). Defaults to 0 (never changes,
+    /// matching a connectionless transport); tests bump it to simulate a
+    /// transport-level reconnect.
+    connection_generation: u32 = 0,
 
     pub fn reset(self: *@This()) void {
         self.n = 0;
@@ -93,6 +98,10 @@ const Recording = struct {
     }
     fn setLocatorChangeHandler(_: *anyopaque, _: ?LocatorChangeHandler) void {}
     fn closeFn(_: *anyopaque) void {}
+    fn connectionGenerationFn(ctx: *anyopaque, _: *const Locator) u32 {
+        const self: *Recording = @ptrCast(@alignCast(ctx));
+        return self.connection_generation;
+    }
 
     const vtable: Transport.Vtable = .{
         .capabilities = .{},
@@ -105,6 +114,7 @@ const Recording = struct {
         .unicast_locators = unicastLocators,
         .set_locator_change_handler = setLocatorChangeHandler,
         .close = closeFn,
+        .connection_generation = connectionGenerationFn,
     };
 };
 
@@ -1050,4 +1060,49 @@ test "addMatchedReader: lease refresh recomputes cached selection when locators 
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
     try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7509));
     try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7510));
+}
+
+test "checkConnectionGenerations: replays to a proxy whose connection generation changed" {
+    const writer_guid = makeGuid(0x70, WRITER_EID);
+    const reader_guid = makeGuid(0x71, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7520);
+
+    var rec: Recording = .{};
+    // replay_on_match=false (VOLATILE): reconnect-triggered replay must NOT
+    // depend on durability-driven replay-on-match — recovering an ongoing
+    // pairing's connection gap is a different concern from late-join replay.
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    // BEST_EFFORT proxy: this is the case with no other recovery path at all
+    // for data lost during a connection gap, so it must also get replayed to.
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+    rec.reset();
+
+    // Generation unchanged (still 0, matching a connectionless/UDP locator
+    // or a TCP connection that never dropped): no replay.
+    w.checkConnectionGenerations();
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+
+    // Simulate a transport-level reconnect (e.g. TCP dropped and re-dialed).
+    rec.connection_generation = 1;
+    w.checkConnectionGenerations();
+    try testing.expectEqual(@as(usize, 2), countAllData(&rec));
+
+    // Generation unchanged since the last check: no further replay.
+    rec.reset();
+    w.checkConnectionGenerations();
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
 }
