@@ -502,3 +502,38 @@ test "createParticipantWithConfig: TCP enabled with empty bind_address fails cle
     // the wildcard and leave discovery working while data delivery is broken.
     try testing.expect(dp.ptr == nil.NIL_PTR);
 }
+
+test "createParticipantWithConfig: TCP enabled with a concrete bind_address succeeds and binds a real port" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+    const loc = Locator.udp4(.{ 127, 0, 0, 0x91 }, 7991);
+    const t = try MockTransport.init(testing.allocator, net, &.{loc});
+    defer t.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(
+        testing.allocator,
+        t.transport(),
+        noopDisc(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer factory.deinit();
+
+    var config = config_mod.Config{};
+    config.transport.tcp.enabled = true;
+    config.transport.tcp.bind_address = "127.0.0.1";
+
+    const qos = DDS.DomainParticipantQos{};
+    const dp = factory.createParticipantWithConfig(0, &qos, null, 0, config);
+    defer {
+        if (dp.ptr != nil.NIL_PTR) _ = factory.toDDSFactory().delete_participant(dp);
+    }
+
+    // Unlike the empty-bind_address case, a concrete address is something a
+    // remote peer really can connect to — construction must succeed, and the
+    // TCP branch must have actually bound a real (OS-assigned) port rather
+    // than leaving data_listen_port at its zero-value default.
+    try testing.expect(dp.ptr != nil.NIL_PTR);
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    try testing.expect(impl.data_listen_port != 0);
+}

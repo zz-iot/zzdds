@@ -754,13 +754,20 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
     latch.waitFor(2);
     try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
 
-    // Close the client-side connection fd to simulate network failure.
+    // Shut down the client-side connection to simulate network failure.
+    // Uses shutdown(), not close(): the production code itself only relies
+    // on shutdown() to reliably break a connection cross-platform (see
+    // TcpTransport.deinit()'s comment on why shutdown() before close() is
+    // required, "same on Windows with Winsock") — close() alone on a raw
+    // socket handle is not something this codebase already depends on
+    // behaving identically across platforms, so this test shouldn't be the
+    // first thing to lean on that assumption either.
     {
         client.conn_mu.lock();
         var key = tcp_mod.RemoteKey{ .addr = std.mem.zeroes([16]u8), .port = port, .family = .v4 };
         @memcpy(key.addr[0..4], &[_]u8{ 127, 0, 0, 1 });
         const conn = client.connections.get(key);
-        if (conn) |co| _ = std.c.close(co.fd);
+        if (conn) |co| _ = std.c.shutdown(co.fd, 2); // SHUT_RDWR
         client.conn_mu.unlock();
     }
 
