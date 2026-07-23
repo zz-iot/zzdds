@@ -766,17 +766,23 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
     // client-side self-shutdown-and-keep-using-it: that isn't a real failure
     // mode any actual network event produces, and CI showed it isn't even
     // reliably observable — on Windows, a same-process send() on a socket
-    // that process just shut down itself can still report success (the
-    // "second" write silently went nowhere, forever, instead of failing and
-    // triggering the redial). A remote FIN/RST from the actual peer is
-    // unambiguous and reliably observable on every platform, which turned
-    // out not to be true of a local self-shutdown.
+    // that process just shut down itself can still report success.
     std.debug.print("DIAG: about to shut down the server's accepted connection\n", .{});
     {
         server.conn_mu.lock();
         for (server.all_connections.items) |co| _ = std.c.shutdown(co.fd, 2); // SHUT_RDWR
         server.conn_mu.unlock();
     }
+    // Give the kernel a moment to actually process and propagate the
+    // shutdown before testing behavior that depends on it having happened.
+    // This is the well-known TCP characteristic where the first send() after
+    // a remote RST can still succeed locally (the RST hasn't been processed
+    // by the local stack yet) — the failure only surfaces on a later send or
+    // read. CI showed this isn't just a theoretical race: it reproduced on
+    // both Windows and (previously-passing) macOS once the send followed the
+    // shutdown closely enough, so this is a real cross-platform TCP settling
+    // delay to account for, not a platform-specific quirk.
+    sleepMs(100);
     std.debug.print("DIAG: server-side shutdown returned; sending 'second'\n", .{});
 
     // Reconnect: generation becomes 2.
