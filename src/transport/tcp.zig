@@ -579,6 +579,7 @@ pub const TcpTransport = struct {
                 break :blk true;
             };
             conn.send_mu.unlock();
+            std.debug.print("DIAG vtSend: first attempt send_ok={} fd={}\n", .{ send_ok, conn.fd });
             if (send_ok) return;
         }
 
@@ -594,13 +595,17 @@ pub const TcpTransport = struct {
         // later calls closeConnFdOnce, the CAS will see fd_open=false and
         // skip the close, preventing it from closing the reused fd.
         closeConnFdOnce(conn);
+        std.debug.print("DIAG vtSend: redialing\n", .{});
         const new_conn = try self.ensureConnection(key);
+        std.debug.print("DIAG vtSend: redial got fd={}\n", .{new_conn.fd});
 
         std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
         new_conn.send_mu.lock();
         defer new_conn.send_mu.unlock();
         try writeAll(new_conn.fd, &len_buf);
+        std.debug.print("DIAG vtSend: redial len_buf write ok\n", .{});
         try writeAll(new_conn.fd, data);
+        std.debug.print("DIAG vtSend: redial data write ok\n", .{});
     }
 
     fn vtListen(ctx: *anyopaque, locator: *const Locator, handler: ReceiveHandler) anyerror!void {
@@ -834,6 +839,7 @@ fn acceptLoop(self: *TcpTransport) void {
             continue :outer;
         };
         self.conn_mu.unlock();
+        std.debug.print("DIAG acceptLoop: accepted new conn fd={}\n", .{conn_fd});
 
         setSockNoSigPipe(conn_fd);
 
@@ -923,8 +929,12 @@ fn recvLoop(conn: *TcpConnection) void {
             if (pfds[0].revents & posix.POLL.IN == 0) break; // POLLERR/POLLHUP
         }
 
+        std.debug.print("DIAG recvLoop: poll woke with data, fd={}\n", .{conn.fd});
         var len_buf: [4]u8 = undefined;
-        readExact(conn.fd, &len_buf) catch break :outer;
+        readExact(conn.fd, &len_buf) catch |err| {
+            std.debug.print("DIAG recvLoop: readExact(len_buf) failed fd={} err={}\n", .{ conn.fd, err });
+            break :outer;
+        };
 
         const msg_len = std.mem.readInt(u32, &len_buf, .big);
         if (msg_len == 0 or msg_len > MAX_MSG_LEN) break :outer;
@@ -932,11 +942,16 @@ fn recvLoop(conn: *TcpConnection) void {
         const buf = conn.owner.alloc.alloc(u8, msg_len) catch break :outer;
         defer conn.owner.alloc.free(buf);
 
-        readExact(conn.fd, buf) catch break :outer;
+        readExact(conn.fd, buf) catch |err| {
+            std.debug.print("DIAG recvLoop: readExact(data) failed fd={} err={}\n", .{ conn.fd, err });
+            break :outer;
+        };
 
+        std.debug.print("DIAG recvLoop: dispatching {} bytes, fd={}\n", .{ buf.len, conn.fd });
         const src = remoteKeyToLocator(&conn.remote);
         conn.owner.dispatchToHandlers(buf, src);
     }
+    std.debug.print("DIAG recvLoop: exiting outer loop, fd={}\n", .{conn.fd});
 
     conn.owner.removeConnection(conn);
     // Close the fd immediately to release the OS resource. deinit will skip
