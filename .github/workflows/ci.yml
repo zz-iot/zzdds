@@ -93,7 +93,16 @@ jobs:
         run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
 
       - name: Test
-        run: zig build test
+        # --test-timeout: diagnostic for the Windows hang investigation —
+        # Zig's own test runner terminates and *names* whichever individual
+        # test exceeds this, instead of the whole job running out the
+        # timeout-minutes budget with no indication of which test binary (or
+        # test within it) was actually stuck. 60s is generous headroom for
+        # any single test; the whole suite normally finishes in well under
+        # 10 minutes on every platform. Safe to leave in permanently once
+        # this investigation is done — it's a real safety net, not just a
+        # temporary probe.
+        run: zig build test --test-timeout 60s
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
