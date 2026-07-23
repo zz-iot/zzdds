@@ -212,8 +212,22 @@ fn readExact(fd: posix.socket_t, buf: []u8) !void {
     while (off < buf.len) {
         const n = c.recv(fd, buf.ptr + off, buf.len - off, 0);
         if (n < 0) {
-            const err = posix.errno(n);
-            if (err == .INTR) continue;
+            // posix.errno() reads the CRT's errno, which POSIX send()/recv()
+            // set on failure — but Winsock never touches it; Windows reports
+            // socket errors exclusively via WSAGetLastError(). Checking
+            // posix.errno() here on Windows reads stale/unrelated state, not
+            // the real failure reason: at best that just always misses the
+            // EINTR retry (harmless — Windows sockets here are blocking, so
+            // there's no legitimate EINTR-equivalent to retry for anyway),
+            // but if that stale value ever happens to coincide with EINTR's
+            // numeric code, this becomes an infinite busy-retry on a socket
+            // that will never succeed. Skip the classification entirely on
+            // Windows and fail immediately — correct either way, and never
+            // a hang.
+            if (comptime builtin.os.tag != .windows) {
+                const err = posix.errno(n);
+                if (err == .INTR) continue;
+            }
             return error.RecvFailed;
         }
         if (n == 0) return error.ConnectionClosed;
@@ -226,8 +240,12 @@ fn writeAll(fd: posix.socket_t, data: []const u8) !void {
     while (off < data.len) {
         const n = c.send(fd, data.ptr + off, data.len - off, @intCast(MSG_NOSIGNAL));
         if (n < 0) {
-            const err = posix.errno(n);
-            if (err == .INTR) continue;
+            // See the matching comment in readExact — posix.errno() is not a
+            // valid way to classify a Winsock failure on Windows.
+            if (comptime builtin.os.tag != .windows) {
+                const err = posix.errno(n);
+                if (err == .INTR) continue;
+            }
             return error.SendFailed;
         }
         off += @intCast(n);
@@ -798,12 +816,21 @@ fn acceptLoop(self: *TcpTransport) void {
         const conn_fd = socketAccept(listen_snapshot.fd, &client_addr, &client_len) orelse {
             self.conn_mu.unlock();
             if (self.stopping.load(.acquire)) return;
-            const err = posix.errno(@as(c_int, -1));
-            if (err == .INTR or err == .AGAIN) continue :outer;
-            // Transient errors (ECONNABORTED, EMFILE, ENOBUFS, …) should be
-            // retried; a permanent shutdown is signalled by the stopping flag
-            // or listen_fd going null, both checked at the top of the loop.
-            log.transport.warn("tcp: transient accept error: {}", .{err});
+            // Every path here retries (continue :outer) regardless of the
+            // specific error — this classification only decides whether to
+            // also log a warning. posix.errno() cannot see the real reason
+            // on Windows (see readExact's comment on why); skip straight to
+            // the fallback warning there rather than misreport it as INTR/AGAIN.
+            if (comptime builtin.os.tag != .windows) {
+                const err = posix.errno(@as(c_int, -1));
+                if (err == .INTR or err == .AGAIN) continue :outer;
+                // Transient errors (ECONNABORTED, EMFILE, ENOBUFS, …) should be
+                // retried; a permanent shutdown is signalled by the stopping flag
+                // or listen_fd going null, both checked at the top of the loop.
+                log.transport.warn("tcp: transient accept error: {}", .{err});
+                continue :outer;
+            }
+            log.transport.warn("tcp: transient accept error", .{});
             continue :outer;
         };
         self.conn_mu.unlock();
