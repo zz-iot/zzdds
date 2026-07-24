@@ -935,16 +935,51 @@ pub fn build(b: *std.Build) void {
 
     const tsan_step = b.step("test-tsan", "Run Zenzen DDS tests under ThreadSanitizer");
 
+    const zidl_dep_tsan = b.dependency("zidl", .{
+        .target = target,
+        .optimize = optimize,
+        .@"sanitize-thread" = true,
+    });
+    const zidl_rt_mod_tsan = zidl_dep_tsan.module("zidl_rt");
+
+    const generated_dcps_mod_tsan = b.createModule(.{
+        .root_source_file = gen_output_dir.path(b, "dcps.zig"),
+        .target = target,
+        .sanitize_thread = true,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+        },
+    });
+
+    const generated_zzdds_mod_tsan = b.createModule(.{
+        .root_source_file = generated_zzdds_root,
+        .target = target,
+        .sanitize_thread = true,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
+        },
+    });
+
+    const generated_rtps_disc_mod_tsan = b.createModule(.{
+        .root_source_file = gen_rtps_disc_dir.path(b, "rtps_discovery.zig"),
+        .target = target,
+        .sanitize_thread = true,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+        },
+    });
+
     const zzdds_mod_tsan = b.addModule("zzdds_tsan", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = true,
         .imports = &.{
-            .{ .name = "zidl_rt", .module = zidl_rt_mod },
-            .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod },
-            .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
+            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_tsan },
+            .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_tsan },
         },
     });
     zzdds_mod_tsan.addOptions("build_options", build_options);
@@ -976,8 +1011,8 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = true,
             .imports = &.{
                 .{ .name = "zzdds", .module = zzdds_mod_tsan },
-                .{ .name = "zzdds_generated", .module = generated_dcps_mod },
-                .{ .name = "zidl_rt", .module = zidl_rt_mod },
+                .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
+                .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
             },
         }) });
         t.root_module.link_libc = true;
