@@ -744,20 +744,14 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
     try testing.expectEqual(@as(u32, 0), ct.connectionGeneration(&dest));
 
     // Initial connect: generation becomes 1.
-    std.debug.print("DIAG: sending 'first'\n", .{});
     try ct.send(&dest, "first");
-    std.debug.print("DIAG: send 'first' returned; waiting for latch=1\n", .{});
     latch.waitFor(1);
-    std.debug.print("DIAG: latch=1 reached\n", .{});
     try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
 
     // Ordinary reuse of the still-live connection must NOT bump the
     // generation — only a genuine new/reconnected TcpConnection should.
-    std.debug.print("DIAG: sending 'again'\n", .{});
     try ct.send(&dest, "again");
-    std.debug.print("DIAG: send 'again' returned; waiting for latch=2\n", .{});
     latch.waitFor(2);
-    std.debug.print("DIAG: latch=2 reached\n", .{});
     try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
 
     // Force the SERVER side to hang up, simulating a genuine peer-initiated
@@ -767,7 +761,6 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
     // mode any actual network event produces, and CI showed it isn't even
     // reliably observable — on Windows, a same-process send() on a socket
     // that process just shut down itself can still report success.
-    std.debug.print("DIAG: about to shut down the server's accepted connection\n", .{});
     {
         server.conn_mu.lock();
         for (server.all_connections.items) |co| _ = std.c.shutdown(co.fd, 2); // SHUT_RDWR
@@ -783,15 +776,11 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
     // shutdown closely enough, so this is a real cross-platform TCP settling
     // delay to account for, not a platform-specific quirk.
     sleepMs(100);
-    std.debug.print("DIAG: server-side shutdown returned; sending 'second'\n", .{});
 
     // Reconnect: generation becomes 2.
     try ct.send(&dest, "second");
-    std.debug.print("DIAG: send 'second' returned; waiting for latch=3 (currently {d})\n", .{latch.n});
     latch.waitFor(3);
-    std.debug.print("DIAG: latch=3 reached; checking final generation\n", .{});
     try testing.expectEqual(@as(u32, 2), ct.connectionGeneration(&dest));
-    std.debug.print("DIAG: test complete\n", .{});
 }
 
 // ── IPv6 loopback send + receive ──────────────────────────────────────────────
