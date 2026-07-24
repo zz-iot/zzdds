@@ -3,12 +3,17 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
 
     const zzdds_version = "0.1.1-zig.0.16.0-dev";
 
     // ── Dependencies ──────────────────────────────────────────────────────────
 
-    const zidl_dep = b.dependency("zidl", .{ .target = target, .optimize = optimize });
+    const zidl_dep = b.dependency("zidl", .{
+        .target = target,
+        .optimize = optimize,
+        .@"sanitize-thread" = sanitize_thread,
+    });
     const zidl_exe = zidl_dep.artifact("zidl");
     const zidl_rt_mod = zidl_dep.module("zidl_rt");
 
@@ -57,6 +62,7 @@ pub fn build(b: *std.Build) void {
     const generated_dcps_mod = b.addModule("zzdds_generated", .{
         .root_source_file = gen_output_dir.path(b, "dcps.zig"),
         .target = target,
+        .sanitize_thread = sanitize_thread,
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
         },
@@ -120,6 +126,7 @@ pub fn build(b: *std.Build) void {
     const generated_zzdds_mod = b.addModule("zzdds_ext_generated", .{
         .root_source_file = generated_zzdds_root,
         .target = target,
+        .sanitize_thread = sanitize_thread,
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod },
@@ -149,6 +156,7 @@ pub fn build(b: *std.Build) void {
     const generated_rtps_disc_mod = b.createModule(.{
         .root_source_file = gen_rtps_disc_dir.path(b, "rtps_discovery.zig"),
         .target = target,
+        .sanitize_thread = sanitize_thread,
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
         },
@@ -199,6 +207,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
             .{ .name = "zzdds_generated", .module = generated_dcps_mod },
