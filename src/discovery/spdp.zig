@@ -651,6 +651,15 @@ pub const SpdpEndpoints = struct {
         // saw them.
         const old_data_uc = kp.data.default_unicast_locators;
         const old_data_mc = kp.data.default_multicast_locators;
+        // This function runs on every SPDP re-announcement from an
+        // already-known peer, not just the first — these two fields already
+        // hold a real heap allocation from the previous call (or the
+        // struct's `&.{}` default on the very first call, for which
+        // Allocator.free is a guaranteed no-op regardless). Capture before
+        // overwriting so both branches below free the prior allocation
+        // instead of leaking it on every re-announcement.
+        const old_data_uc_for_data = kp.data.default_unicast_locators_for_data;
+        const old_data_mc_for_data = kp.data.default_multicast_locators_for_data;
 
         if (self.data_reachable) |dr| {
             kp.data.default_unicast_locators_for_data = iface.filterReachableLocatorsForData(self.alloc, old_data_uc, dr);
@@ -670,6 +679,8 @@ pub const SpdpEndpoints = struct {
 
         self.alloc.free(old_data_uc);
         self.alloc.free(old_data_mc);
+        self.alloc.free(old_data_uc_for_data);
+        self.alloc.free(old_data_mc_for_data);
     }
 
     fn filterReachableLocators(self: *Self, locators: []const Locator, context: []const u8) []Locator {
