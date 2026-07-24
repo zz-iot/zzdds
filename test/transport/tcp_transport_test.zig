@@ -718,6 +718,71 @@ test "tcp transport: connection recovery after fd close" {
     try testing.expectEqual(@as(usize, 2), latch.n);
 }
 
+test "tcp transport: connectionGeneration increments on reconnect, not on ordinary reuse" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    const st = server.transport();
+
+    var latch = Latch{};
+    var ctr = LatchCounter{ .latch = &latch };
+
+    const port = try listenAndGetPort(st, ctr.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), ctr.handler());
+
+    sleepMs(20);
+
+    const client = try TcpTransport.init(alloc, .{ .reuse_connection_by_host = false });
+    defer client.deinit();
+    const ct = client.transport();
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+
+    // A locator never connected to reports generation 0 — matches a
+    // connectionless/UDP transport's constant-0 default, so RTPS code can
+    // check unconditionally without caring which transport kind it has.
+    try testing.expectEqual(@as(u32, 0), ct.connectionGeneration(&dest));
+
+    // Initial connect: generation becomes 1.
+    try ct.send(&dest, "first");
+    latch.waitFor(1);
+    try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
+
+    // Ordinary reuse of the still-live connection must NOT bump the
+    // generation — only a genuine new/reconnected TcpConnection should.
+    try ct.send(&dest, "again");
+    latch.waitFor(2);
+    try testing.expectEqual(@as(u32, 1), ct.connectionGeneration(&dest));
+
+    // Force the SERVER side to hang up, simulating a genuine peer-initiated
+    // disconnect (crash, network partition, …) — the actual scenario
+    // vtSend's redial-on-failure exists to recover from. Deliberately NOT a
+    // client-side self-shutdown-and-keep-using-it: that isn't a real failure
+    // mode any actual network event produces, and CI showed it isn't even
+    // reliably observable — on Windows, a same-process send() on a socket
+    // that process just shut down itself can still report success.
+    {
+        server.conn_mu.lock();
+        for (server.all_connections.items) |co| _ = std.c.shutdown(co.fd, 2); // SHUT_RDWR
+        server.conn_mu.unlock();
+    }
+    // Give the kernel a moment to actually process and propagate the
+    // shutdown before testing behavior that depends on it having happened.
+    // This is the well-known TCP characteristic where the first send() after
+    // a remote RST can still succeed locally (the RST hasn't been processed
+    // by the local stack yet) — the failure only surfaces on a later send or
+    // read. CI showed this isn't just a theoretical race: it reproduced on
+    // both Windows and (previously-passing) macOS once the send followed the
+    // shutdown closely enough, so this is a real cross-platform TCP settling
+    // delay to account for, not a platform-specific quirk.
+    sleepMs(100);
+
+    // Reconnect: generation becomes 2.
+    try ct.send(&dest, "second");
+    latch.waitFor(3);
+    try testing.expectEqual(@as(u32, 2), ct.connectionGeneration(&dest));
+}
+
 // ── IPv6 loopback send + receive ──────────────────────────────────────────────
 
 test "tcp transport: IPv6 loopback send and receive" {

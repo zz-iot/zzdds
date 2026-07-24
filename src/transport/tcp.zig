@@ -212,8 +212,22 @@ fn readExact(fd: posix.socket_t, buf: []u8) !void {
     while (off < buf.len) {
         const n = c.recv(fd, buf.ptr + off, buf.len - off, 0);
         if (n < 0) {
-            const err = posix.errno(n);
-            if (err == .INTR) continue;
+            // posix.errno() reads the CRT's errno, which POSIX send()/recv()
+            // set on failure — but Winsock never touches it; Windows reports
+            // socket errors exclusively via WSAGetLastError(). Checking
+            // posix.errno() here on Windows reads stale/unrelated state, not
+            // the real failure reason: at best that just always misses the
+            // EINTR retry (harmless — Windows sockets here are blocking, so
+            // there's no legitimate EINTR-equivalent to retry for anyway),
+            // but if that stale value ever happens to coincide with EINTR's
+            // numeric code, this becomes an infinite busy-retry on a socket
+            // that will never succeed. Skip the classification entirely on
+            // Windows and fail immediately — correct either way, and never
+            // a hang.
+            if (comptime builtin.os.tag != .windows) {
+                const err = posix.errno(n);
+                if (err == .INTR) continue;
+            }
             return error.RecvFailed;
         }
         if (n == 0) return error.ConnectionClosed;
@@ -226,8 +240,12 @@ fn writeAll(fd: posix.socket_t, data: []const u8) !void {
     while (off < data.len) {
         const n = c.send(fd, data.ptr + off, data.len - off, @intCast(MSG_NOSIGNAL));
         if (n < 0) {
-            const err = posix.errno(n);
-            if (err == .INTR) continue;
+            // See the matching comment in readExact — posix.errno() is not a
+            // valid way to classify a Winsock failure on Windows.
+            if (comptime builtin.os.tag != .windows) {
+                const err = posix.errno(n);
+                if (err == .INTR) continue;
+            }
             return error.SendFailed;
         }
         off += @intCast(n);
@@ -271,6 +289,15 @@ pub const TcpTransport = struct {
     /// Connections that close mid-session are removed from `connections` but stay
     /// here until deinit.
     all_connections: std.ArrayListUnmanaged(*TcpConnection),
+    /// Per-remote connection generation, incremented each time a *new*
+    /// TcpConnection is registered for a RemoteKey (first connect or a
+    /// reconnect after a drop). Deliberately never removed when a connection
+    /// drops — a later reconnect needs to see a higher value than whatever
+    /// the RTPS layer last observed, not start over from zero. Exposed via
+    /// vtConnectionGeneration so StatefulWriter can detect "this proxy's
+    /// connection was re-established" without the transport knowing anything
+    /// about proxies. Guarded by conn_mu.
+    connection_generations: std.AutoHashMapUnmanaged(RemoteKey, u32),
 
     /// Guards handlers list. Separate from conn_mu to avoid deadlock:
     /// recv threads call dispatchToHandlers without holding conn_mu.
@@ -304,6 +331,7 @@ pub const TcpTransport = struct {
             .conn_mu = .{},
             .connections = .empty,
             .all_connections = .empty,
+            .connection_generations = .empty,
             .handler_mu = .{},
             .handlers = .empty,
             .listen_fd = null,
@@ -352,8 +380,19 @@ pub const TcpTransport = struct {
 
         self.all_connections.deinit(self.alloc);
         self.connections.deinit(self.alloc);
+        self.connection_generations.deinit(self.alloc);
         self.handlers.deinit(self.alloc);
         self.alloc.destroy(self);
+    }
+
+    /// Record that a new (first or reconnected) connection now exists for `key`.
+    /// Caller must hold conn_mu. OOM is silently ignored — worst case a
+    /// reconnect isn't detected and the writer falls back to its normal
+    /// heartbeat-driven resync timing (RELIABLE) or just doesn't replay
+    /// (BEST_EFFORT, same as today), not a correctness break.
+    fn bumpGenerationLocked(self: *Self, key: RemoteKey) void {
+        const gop = self.connection_generations.getOrPut(self.alloc, key) catch return;
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* +% 1 else 1;
     }
 
     pub fn transport(self: *Self) Transport {
@@ -496,6 +535,7 @@ pub const TcpTransport = struct {
             self.alloc.destroy(new_conn);
             return err;
         };
+        self.bumpGenerationLocked(key);
         self.conn_mu.unlock();
         return new_conn;
     }
@@ -691,6 +731,14 @@ pub const TcpTransport = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.deinit();
     }
+
+    fn vtConnectionGeneration(ctx: *anyopaque, loc: *const Locator) u32 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const key = locatorToRemoteKey(loc) orelse return 0;
+        self.conn_mu.lock();
+        defer self.conn_mu.unlock();
+        return self.connection_generations.get(key) orelse 0;
+    }
 };
 
 // ── Vtable singleton ──────────────────────────────────────────────────────────
@@ -706,6 +754,7 @@ const tcp_vtable = Transport.Vtable{
     .unicast_locators = TcpTransport.vtUnicastLocators,
     .set_locator_change_handler = TcpTransport.vtSetLocatorChangeHandler,
     .close = TcpTransport.vtClose,
+    .connection_generation = TcpTransport.vtConnectionGeneration,
 };
 
 // ── Accept loop ───────────────────────────────────────────────────────────────
@@ -728,9 +777,17 @@ fn acceptLoop(self: *TcpTransport) void {
                 .events = WinPoll.POLLIN,
                 .revents = 0,
             }};
+            // WSAPoll returns SOCKET_ERROR (-1) on a real error, 0 on timeout,
+            // and a positive count when revents is non-empty — these need to
+            // be told apart the same way the POSIX branch below tells a
+            // genuine poll() error from a timeout. Treating -1 the same as 0
+            // (as `if (n <= 0) continue;` used to) meant a real poll error on
+            // Windows was silently treated as "nothing happened yet, keep
+            // polling forever" instead of breaking out of the loop.
             const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
-            if (n <= 0) continue;
-            if (pfds[0].revents & WinPoll.POLLIN == 0) break;
+            if (n < 0) break; // WSAPoll error
+            if (n == 0) continue; // timeout — re-check stopping
+            if (pfds[0].revents & WinPoll.POLLIN == 0) break; // POLLERR/POLLHUP
         } else {
             var pfds = [1]posix.pollfd{.{
                 .fd = listen_snapshot.fd,
@@ -759,12 +816,21 @@ fn acceptLoop(self: *TcpTransport) void {
         const conn_fd = socketAccept(listen_snapshot.fd, &client_addr, &client_len) orelse {
             self.conn_mu.unlock();
             if (self.stopping.load(.acquire)) return;
-            const err = posix.errno(@as(c_int, -1));
-            if (err == .INTR or err == .AGAIN) continue :outer;
-            // Transient errors (ECONNABORTED, EMFILE, ENOBUFS, …) should be
-            // retried; a permanent shutdown is signalled by the stopping flag
-            // or listen_fd going null, both checked at the top of the loop.
-            log.transport.warn("tcp: transient accept error: {}", .{err});
+            // Every path here retries (continue :outer) regardless of the
+            // specific error — this classification only decides whether to
+            // also log a warning. posix.errno() cannot see the real reason
+            // on Windows (see readExact's comment on why); skip straight to
+            // the fallback warning there rather than misreport it as INTR/AGAIN.
+            if (comptime builtin.os.tag != .windows) {
+                const err = posix.errno(@as(c_int, -1));
+                if (err == .INTR or err == .AGAIN) continue :outer;
+                // Transient errors (ECONNABORTED, EMFILE, ENOBUFS, …) should be
+                // retried; a permanent shutdown is signalled by the stopping flag
+                // or listen_fd going null, both checked at the top of the loop.
+                log.transport.warn("tcp: transient accept error: {}", .{err});
+                continue :outer;
+            }
+            log.transport.warn("tcp: transient accept error", .{});
             continue :outer;
         };
         self.conn_mu.unlock();
@@ -816,6 +882,7 @@ fn acceptLoop(self: *TcpTransport) void {
             self.alloc.destroy(conn);
             continue;
         };
+        self.bumpGenerationLocked(remote);
         self.conn_mu.unlock();
     }
 }
@@ -831,9 +898,17 @@ fn recvLoop(conn: *TcpConnection) void {
                 .events = WinPoll.POLLIN,
                 .revents = 0,
             }};
+            // WSAPoll returns SOCKET_ERROR (-1) on a real error, 0 on timeout,
+            // and a positive count when revents is non-empty — these need to
+            // be told apart the same way the POSIX branch below tells a
+            // genuine poll() error from a timeout. Treating -1 the same as 0
+            // (as `if (n <= 0) continue;` used to) meant a real poll error on
+            // Windows was silently treated as "nothing happened yet, keep
+            // polling forever" instead of breaking out of the loop.
             const n = WinPoll.WSAPoll(&pfds, 1, POLL_TIMEOUT_MS);
-            if (n <= 0) continue;
-            if (pfds[0].revents & WinPoll.POLLIN == 0) break;
+            if (n < 0) break; // WSAPoll error
+            if (n == 0) continue; // timeout — re-check stopping
+            if (pfds[0].revents & WinPoll.POLLIN == 0) break; // POLLERR/POLLHUP
         } else {
             var pfds = [1]posix.pollfd{.{
                 .fd = conn.fd,

@@ -68,6 +68,7 @@ module zzdds {
     };
 
     struct TcpConfig {
+        @default(FALSE) boolean enabled;
         @default("")    string  bind_address;
         @default(FALSE) boolean reuse_connection_by_host;
     };

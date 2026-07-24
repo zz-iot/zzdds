@@ -34,6 +34,7 @@ const history_mod = @import("../rtps/history.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const disc = @import("../discovery/interface.zig");
 const transport_if = @import("../transport/interface.zig");
+const TcpTransport = @import("../transport/tcp.zig").TcpTransport;
 const security_if = @import("../security/interface.zig");
 const parser_mod = @import("../rtps/message/parser.zig");
 const submsg_mod = @import("../rtps/message/submessage.zig");
@@ -58,6 +59,13 @@ pub const SecurityPlugins = security_if.SecurityPlugins;
 
 fn parseIpv4(s: []const u8) ![4]u8 {
     return (try std.Io.net.Ip4Address.parse(s, 0)).bytes;
+}
+
+/// DataLocatorReachability.can_reach implementation: ctx is a *const Transport
+/// pointing at this participant's own (possibly TCP) data transport field.
+fn dataTransportCanReach(ctx: *anyopaque, loc: *const Locator) bool {
+    const tr: *const Transport = @ptrCast(@alignCast(ctx));
+    return tr.canReach(loc);
 }
 
 // ── Noop ProtocolReader for built-in subscriber DataReaders ──────────────────
@@ -627,7 +635,19 @@ pub const DomainParticipantImpl = struct {
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
+    /// User-data (DataWriter/DataReader) transport. Normally the same handle as
+    /// discovery_transport; when config.transport.tcp.enabled, this is instead
+    /// a privately-owned TcpTransport (see owned_tcp_transport) so user data
+    /// rides TCP while SPDP/SEDP keep using UDP unconditionally.
     transport: Transport,
+    /// The shared UDP transport passed in at construction, always used for
+    /// deriving this participant's metatraffic_unicast_locators in start().
+    /// Distinct from `transport` only when TCP user-data is enabled.
+    discovery_transport: Transport,
+    /// Non-null when `transport` above is a TcpTransport this participant
+    /// privately constructed and must deinit() itself. Null when `transport`
+    /// is just the shared, externally-owned discovery_transport (the default).
+    owned_tcp_transport: ?*TcpTransport,
     discovery: Discovery,
     security: SecurityPlugins,
     config: config_mod.Config,
@@ -731,6 +751,17 @@ pub const DomainParticipantImpl = struct {
         tracer: trace_mod.Tracer,
         timer_clock: time_mod.Clock,
     ) !*Self {
+        // When TCP user-data is enabled, construct a dedicated TcpTransport for
+        // this participant's DataWriter/DataReader traffic. SPDP/SEDP keep using
+        // `transport` (renamed discovery_transport below) unconditionally.
+        var owned_tcp: ?*TcpTransport = null;
+        errdefer if (owned_tcp) |t| t.deinit();
+        const data_transport: Transport = if (config.transport.tcp.enabled) blk: {
+            const tcp = try TcpTransport.init(alloc, config.transport.tcp);
+            owned_tcp = tcp;
+            break :blk tcp.transport();
+        } else transport;
+
         const self = try alloc.create(Self);
         self.* = .{
             .alloc = alloc,
@@ -742,7 +773,9 @@ pub const DomainParticipantImpl = struct {
             .instance_handle = handle,
             .status_changes = 0,
             .status_cond = null,
-            .transport = transport,
+            .transport = data_transport,
+            .discovery_transport = transport,
+            .owned_tcp_transport = owned_tcp,
             .discovery = discovery,
             .security = security,
             .config = config,
@@ -798,18 +831,53 @@ pub const DomainParticipantImpl = struct {
         const udp_cfg = &self.config.transport.udp;
         const part_cfg = &self.config.participant;
 
-        // Metatraffic unicast locators come from the transport (already computed
-        // using the configured port formula).
+        // Metatraffic unicast locators always come from discovery_transport (UDP)
+        // regardless of the user-data transport in use — SPDP/SEDP are unaffected
+        // by config.transport.tcp.enabled.
         var meta_locators: std.ArrayListUnmanaged(Locator) = .empty;
         defer meta_locators.deinit(self.alloc);
-        try self.transport.unicastLocators(&meta_locators, self.alloc);
+        try self.discovery_transport.unicastLocators(&meta_locators, self.alloc);
 
-        // Data unicast locators. Two cases:
-        //   data_unicast_port override → fixed port for all interfaces
-        //   default → meta port + (D3 - D1) offset
+        // Data (user-data) unicast locators, and this participant's data-listen
+        // port. Two shapes, mutually exclusive:
+        //   TCP enabled → bind self.transport (a TcpTransport) directly and
+        //     announce whatever real address/port it resolves to; the UDP
+        //     meta-port formula below doesn't apply to a connection-oriented
+        //     transport with no port-formula concept.
+        //   UDP (default) → data_unicast_port override, or meta port + (D3 - D1)
+        //     offset, exactly as before.
         var data_locators: std.ArrayListUnmanaged(Locator) = .empty;
         defer data_locators.deinit(self.alloc);
-        if (udp_cfg.data_unicast_port) |dp| {
+        var mc_locs_buf: [1]Locator = undefined;
+        var mc_locs: []const Locator = &.{};
+        if (self.config.transport.tcp.enabled) {
+            const tcp_cfg = &self.config.transport.tcp;
+            const bind_addr = if (tcp_cfg.bind_address.len > 0)
+                try parseIpv4(tcp_cfg.bind_address)
+            else
+                [4]u8{ 0, 0, 0, 0 };
+            const ephemeral = Locator.tcp4(bind_addr, 0);
+            // Bind now (rather than in the generic listen block below) so the
+            // real, OS-assigned address/port is known in time to announce it.
+            try self.transport.listen(&ephemeral, transport_if.ReceiveHandler{
+                .ctx = self,
+                .on_receive = userDataOnReceive,
+            });
+            var tcp_locs: std.ArrayListUnmanaged(Locator) = .empty;
+            defer tcp_locs.deinit(self.alloc);
+            try self.transport.unicastLocators(&tcp_locs, self.alloc);
+            for (tcp_locs.items) |loc| {
+                try data_locators.append(self.alloc, loc);
+                if (self.data_listen_port == 0) {
+                    self.data_listen_port = switch (loc) {
+                        .tcp_v4 => |t| t.port,
+                        .tcp_v6 => |t| t.port,
+                        else => 0,
+                    };
+                }
+            }
+            // No multicast over TCP; mc_locs stays empty.
+        } else if (udp_cfg.data_unicast_port) |dp| {
             for (meta_locators.items) |loc| {
                 switch (loc) {
                     .udp_v4 => |u| try data_locators.append(self.alloc, Locator.udp4(u.addr, dp)),
@@ -837,18 +905,21 @@ pub const DomainParticipantImpl = struct {
             }
         }
 
-        // SPDP metatraffic multicast locator derived from config.
-        const mc_port = config_mod.metatrafficMulticastPort(udp_cfg, self.domain_id);
-        var mc_locs_buf: [1]Locator = undefined;
-        var mc_locs: []const Locator = &.{};
-        if (udp_cfg.multicast_group_v4.len > 0) {
-            const mc_ip = parseIpv4(udp_cfg.multicast_group_v4) catch blk: {
-                log_mod.dcps.warn("participant: invalid multicast_group_v4 '{s}'; skipping multicast locator", .{udp_cfg.multicast_group_v4});
-                break :blk null;
-            };
-            if (mc_ip) |ip| {
-                mc_locs_buf[0] = Locator.udp4(ip, mc_port);
-                mc_locs = mc_locs_buf[0..1];
+        // SPDP metatraffic multicast locator derived from config. Always
+        // computed regardless of config.transport.tcp.enabled — this is
+        // SPDP's own rendezvous group (discovery is always UDP); it has
+        // nothing to do with which transport user-data traffic uses.
+        {
+            const mc_port = config_mod.metatrafficMulticastPort(udp_cfg, self.domain_id);
+            if (udp_cfg.multicast_group_v4.len > 0) {
+                const mc_ip = parseIpv4(udp_cfg.multicast_group_v4) catch blk: {
+                    log_mod.dcps.warn("participant: invalid multicast_group_v4 '{s}'; skipping multicast locator", .{udp_cfg.multicast_group_v4});
+                    break :blk null;
+                };
+                if (mc_ip) |ip| {
+                    mc_locs_buf[0] = Locator.udp4(ip, mc_port);
+                    mc_locs = mc_locs_buf[0..1];
+                }
             }
         }
 
@@ -861,6 +932,16 @@ pub const DomainParticipantImpl = struct {
             0x00000010 | // DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_ANNOUNCER
             0x00000020; // DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR
 
+        // When TCP user-data is enabled, give discovery a way to ask "is this
+        // locator reachable by the participant's data transport" without
+        // discovery ever holding that transport itself — see the
+        // DataLocatorReachability doc comment. &self.transport is stable for
+        // the participant's lifetime, well past this start() call.
+        const data_reachable: ?disc.DataLocatorReachability = if (self.config.transport.tcp.enabled)
+            .{ .ctx = &self.transport, .can_reach = dataTransportCanReach }
+        else
+            null;
+
         const ann = disc.ParticipantAnnouncement{
             .guid = self.guid,
             .domain_id = self.domain_id,
@@ -872,11 +953,14 @@ pub const DomainParticipantImpl = struct {
             .lease_duration_ms = part_cfg.lease_duration_ms,
             .builtin_endpoint_set = BUILTIN_ENDPOINTS,
             .initial_peers = udp_cfg.initial_peers,
+            .data_reachable = data_reachable,
         };
         try self.discovery.start(&ann, &self.disc_callbacks);
 
-        // Listen on the data unicast port for user DataWriter traffic.
-        if (self.data_listen_port != 0) {
+        // Listen on the data unicast port for user DataWriter traffic. When TCP
+        // user-data is enabled this already happened above (binding was needed
+        // early, to learn the real address/port before announcing it).
+        if (!self.config.transport.tcp.enabled and self.data_listen_port != 0) {
             const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
             try self.transport.listen(&listen_loc, transport_if.ReceiveHandler{
                 .ctx = self,
@@ -968,6 +1052,11 @@ pub const DomainParticipantImpl = struct {
         if (self.config_deinit_allocator) |cfg_alloc| {
             generated_config_mod.deinitRuntimeConfig(cfg_alloc, &self.config);
         }
+
+        // Torn down last: writers/readers above may still hold and use
+        // self.transport (e.g. sending final BYE/unregister traffic) during
+        // their own deinit.
+        if (self.owned_tcp_transport) |t| t.deinit();
 
         self.alloc.destroy(self);
     }
