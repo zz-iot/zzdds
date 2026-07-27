@@ -596,14 +596,21 @@ fn factorySetDefaultParticipantConfig(ctx: *anyopaque, config: *const ZZDDS.Doma
 
 /// Caller contract: any heap-allocated fields in *config must have been
 /// allocated with c_allocator (or *config must be zero-initialised) — same
-/// contract as get_default_participant_qos.
+/// contract as get_default_participant_qos. The returned config is always
+/// c_allocator-owned too, regardless of which allocator this factory itself
+/// was created with (owner.alloc) — decoupling the caller-facing contract
+/// from the factory's own internal allocator is what makes repeated calls
+/// safe on a factory created via zzdds_create_factory_with_allocator(custom):
+/// freeing/filling *config with owner.alloc would free caller-supplied,
+/// c_allocator-owned memory through the wrong allocator (or vice versa on a
+/// second call), an invalid free / memory corruption either way.
 fn factoryGetDefaultParticipantConfig(ctx: *anyopaque, config: *ZZDDS.DomainParticipantConfig) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     owner.mu.lock();
     defer owner.mu.unlock();
-    const cloned = owner.default_config.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-    config.deinit(owner.alloc);
+    const cloned = owner.default_config.clone(std.heap.c_allocator) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    config.deinit(std.heap.c_allocator);
     config.* = cloned;
     return DDS.RETCODE_OK;
 }
@@ -626,15 +633,19 @@ fn factorySetDefaultParticipantQos(ctx: *anyopaque, qos: *const DDS.DomainPartic
 
 /// Caller contract: any heap-allocated fields in *qos must have been allocated
 /// with c_allocator (or *qos must be zero-initialised). The function frees
-/// existing content with c_allocator before writing the cloned default.
+/// existing content with c_allocator before writing the cloned default —
+/// this used to say that but actually free/fill with owner.alloc instead, an
+/// allocator mismatch on a factory created via
+/// zzdds_create_factory_with_allocator(custom) (same class of bug as
+/// factoryGetDefaultParticipantConfig above; found while fixing that one).
 fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     owner.mu.lock();
     defer owner.mu.unlock();
     // Clone first so caller's existing QoS is untouched if OOM occurs.
-    const cloned = owner.default_dp_qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-    qos.deinit(owner.alloc);
+    const cloned = owner.default_dp_qos.clone(std.heap.c_allocator) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    qos.deinit(std.heap.c_allocator);
     qos.* = cloned;
     return DDS.RETCODE_OK;
 }

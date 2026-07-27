@@ -261,6 +261,60 @@ test "support factory: zzdds_create_factory_with_allocator routes every allocati
     try testing.expect(track.free_calls > 0);
 }
 
+test "support factory: get_default_participant_config on a custom-allocator factory doesn't mismatch the caller's c_allocator-owned input" {
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_rt.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc);
+    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
+
+    // Simulate a caller-supplied config whose existing content came from
+    // c_allocator (e.g. zzdds_DomainParticipantConfig_default()'s strdup),
+    // per the documented caller contract -- deliberately NOT from this
+    // factory's own (testing.allocator-tracked) custom allocator. Before the
+    // fix, get_default_participant_config freed *config with owner.alloc
+    // (the factory's custom allocator) instead of c_allocator, which
+    // testing.allocator's own tracking would reject as an invalid free.
+    var config = ZZDDS.DomainParticipantConfig{};
+    config._toml_applied = true;
+    config.participant.timer_clock_name = try std.heap.c_allocator.dupe(u8, "external-default");
+    defer config.deinit(std.heap.c_allocator);
+
+    try testing.expectEqual(DDS.RETCODE_OK, ext_factory.get_default_participant_config(&config));
+    // The returned config must be genuinely c_allocator-owned -- not
+    // owner.alloc-owned -- so the `defer` above (and any subsequent call)
+    // frees it correctly regardless of the factory's own allocator.
+    try testing.expectEqualStrings("default", config.participant.timer_clock_name);
+}
+
+test "support factory: get_default_participant_qos on a custom-allocator factory doesn't mismatch the caller's c_allocator-owned input" {
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_rt.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc);
+    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
+    const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
+
+    // Same scenario as the config test above, for the sibling QoS getter,
+    // which had the identical bug (and an already-incorrect doc comment
+    // claiming it didn't).
+    var qos = DDS.DomainParticipantQos{};
+    qos.user_data.value = .{ ._buffer = (try std.heap.c_allocator.dupe(u8, "abc")).ptr, ._length = 3, ._maximum = 3, ._release = true };
+    defer qos.deinit(std.heap.c_allocator);
+
+    try testing.expectEqual(DDS.RETCODE_OK, factory.get_default_participant_qos(&qos));
+}
+
 fn DDS_DomainParticipantFactory_create_participant_for_test(
     factory: DDS.DomainParticipantFactory,
     domain_id: DDS.DomainId_t,
