@@ -28,11 +28,12 @@ is required. The `zig-pkg/` directory (gitignored) holds any manually pre-fetche
 
 ## Generated Code
 
-`build.zig` runs `zidl` at build time to generate two Zig modules:
+`build.zig` runs `zidl` at build time to generate three Zig modules:
 
 | IDL | Output module | Flags |
 |---|---|---|
 | `idl/dcps.idl` | `zzdds_generated` | `-b zig --generate-interfaces --split-files` |
+| `idl/zzdds.idl` | `zzdds_ext_generated` | `-b zig --generate-interfaces --single-file --no-typesupport --no-typeobject-support --zig-generate-toml-config` (vendor extension types — `DomainParticipantConfig`, `ProcessConfig`, etc. — plus the `set_default_participant_config`/`create_participant_ex` extension interface; `--zig-generate-toml-config` is what generates the `applyToml` used by `src/config/resolve.zig`) |
 | `idl/rtps_discovery.idl` | `zzdds_disc_generated` | `-b zig --zig-pl-cdr --no-typesupport --no-typeobject-support --split-files` |
 
 Output goes into the Zig build cache (not checked in). Run `zig build gen-only` to inspect

@@ -1,11 +1,9 @@
 //! Zenzen DDS configuration schema.
 //!
-//! Config is resolved by merging (highest priority first):
-//!   1. Programmatic — values set on Config before passing to factory
-//!   2. Environment variables — ZZDDS_* prefix (see env.zig)
-//!   3. Config file — TOML (see file.zig); searched at ZZDDS_CONFIG, ./zzdds.toml,
-//!                    ~/.config/zzdds/config.toml
-//!   4. Defaults — the zero/default values in this file
+//! This is the internal runtime shape used by the factory/participant impls.
+//! It is not resolved directly — see `resolve.zig` (resolveParticipantConfig
+//! et al.), which operates on the IDL-generated `zzdds::DomainParticipantConfig`
+//! and converts to this shape via `generated.zig`'s `toRuntimeConfig`.
 //!
 //! All durations are in milliseconds unless noted.
 

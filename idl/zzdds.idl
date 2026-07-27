@@ -104,6 +104,15 @@ module zzdds {
         QosDefaults       qos;
     };
 
+    // Process-wide configuration. Deliberately minimal for now — just what a
+    // newly-created DomainParticipantFactory seeds its own default participant
+    // config from. Room to grow (threading/event-loop behavior, a process-wide
+    // network-monitor interval, etc.) later; adding fields here needs no change
+    // to the resolve/TOML-codegen machinery itself, only to this struct.
+    struct ProcessConfig {
+        DomainParticipantConfig default_participant_config;
+    };
+
     struct SerializedSample {
         OctetSeq             cdr;
         DDS::InstanceHandle_t instance_handle;
@@ -118,6 +127,11 @@ module zzdds {
             in DDS::DomainParticipantListener    a_listener,
             in DDS::StatusMask                   mask,
             in DomainParticipantConfig           config);
+
+        DDS::ReturnCode_t set_default_participant_config(
+            in DomainParticipantConfig config);
+        DDS::ReturnCode_t get_default_participant_config(
+            inout DomainParticipantConfig config);
     };
 
     interface DomainParticipant : DDS::DomainParticipant {

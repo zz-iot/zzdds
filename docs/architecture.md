@@ -23,10 +23,21 @@ payloads. See `docs/design/history-cache.md`.
 are built on the stack. The iovec list is flattened to a stack buffer at the transport
 boundary (`Transport.send`). See `docs/design/rtps-message-builder.md`.
 
-**Configuration precedence (highest to lowest):**
-`Programmatic API → Environment variables (ZZDDS_*) → Config file (TOML) → Built-in defaults`
+**Configuration: no env vars, no merge precedence.** `resolveParticipantConfig()`
+(`src/config/resolve.zig`) returns just the IDL `@default`s; `resolveParticipantConfigFrom(alloc,
+path)` applies a named TOML file over them. Whichever you call, `create_participant_ex`/
+`set_default_participant_config` always use exactly the struct you hand them — there is no
+further merging, and no environment-variable layer at all (env vars are one value per process;
+`DomainParticipantConfig` is per-participant/per-factory, and this codebase explicitly supports
+many of each per process, so a flat env var can't express "which one"). Want an env-driven
+tweak? Read it yourself and mutate the resolved struct — same as any other override. See
+`docs/decisions.md` §Configuration for the full rationale.
 
-Config file search order: `$ZZDDS_CONFIG` → `./zzdds.toml` → `~/.config/zzdds/config.toml`
+Process-wide config (`resolveProcessConfig`/`resolveProcessConfigFrom`, `src/config/process.zig`)
+is a deliberate, singular exception: `zzdds_create_factory()` lazily resolves+installs it at
+most once per process (trying `./zzdds.toml`) unless the app already called
+`zzdds_process_configure()` itself, then seeds each new factory's default participant config
+from it.
 
 **Conditional compilation (build-time feature flags).** Dead-code elimination for constrained targets:
 
@@ -185,12 +196,23 @@ samples pass through.
 
 ---
 
-## Configuration Schema (`src/config/schema.zig`)
+## Configuration Schema (`idl/zzdds.idl`'s `DomainParticipantConfig`)
 
-The table below mirrors the full in-memory schema. Programmatic configuration can set all
-fields. TOML/env coverage currently lags the schema: `file.zig` / `resolve.zig` do not yet
-parse or override `participant.timer_clock_name`, the `[rtps]` section, or the UDP
-`meta_unicast_port` / `data_unicast_port` fields.
+The schema is IDL, not hand-written: `zzdds::DomainParticipantConfig` in `idl/zzdds.idl` is the
+source of truth, and `zidl -b zig --zig-generate-toml-config` (see `build.zig`'s `gen_zzdds_vendor`
+step) generates the TOML-applying code for every field directly from it — there is no separate,
+hand-maintained parser to fall out of sync, and no partial coverage: every field the IDL declares
+is covered, because the codegen walks the IDL struct itself rather than a curated list. (The
+converse also holds: only the field-type subset the codegen backend supports — scalars, strings,
+enums, nested structs, `sequence<string>` — can appear in one of these structs at all; anything
+else is a compile error in `zidl`'s own generated code, not a silent gap here.) `src/config/schema.zig`
+is a separate, internal runtime representation the factory/participant impls use internally;
+`src/config/generated.zig` converts from the IDL-generated type into it.
+
+TOML values for enum fields are the exact IDL enumerator identifier (e.g. `"GUID_SPEC_RANDOM"`,
+not a shortened alias) — mechanically derived by the codegen, not curated by hand. A key you omit
+entirely is left at its IDL `@default`; there is no `null` literal (TOML doesn't have one, by
+design — see `docs/decisions.md` §Configuration).
 
 ```toml
 [domain]
@@ -200,7 +222,7 @@ id = 0
 name = ""                   # empty = auto
 lease_duration_ms = 10000
 announcement_period_ms = 3000
-guid_strategy = "random"    # "random" | "host_based"
+guid_strategy = "GUID_SPEC_RANDOM"  # "GUID_SPEC_RANDOM" | "GUID_HOST_BASED" | "GUID_FULLY_RANDOM"
 timer_clock_name = "default" # clock used for all timers: "default" | "monotonic" | "realtime" | "boottime"
 
 [rtps]
@@ -220,12 +242,9 @@ meta_unicast_offset = 10    # D1
 data_multicast_offset = 1   # D2
 data_unicast_offset = 11    # D3
 
-# null = auto-assign (try min_valid..max_valid until bind succeeds)
-participant_id = null
-
-# Override computed port numbers (null = use RTPS formula)
-meta_unicast_port = null
-data_unicast_port = null
+# participant_id, meta_unicast_port, data_unicast_port: omit entirely for
+# auto-assign / the computed RTPS-formula port. There's no "null" override —
+# just don't mention the key.
 
 # Interface names ("eth0") or IPs ("192.168.1.5"). Empty = all interfaces.
 interfaces = []
@@ -241,25 +260,21 @@ recv_buffer_size = 0          # 0 = OS default
 interface_poll_interval_ms = 5000
 
 [discovery]
-kind = "spdp"           # "spdp" (implemented) | "static" | "broker" (planned) | custom
-initial_peers = []      # e.g. ["192.168.1.100:7400"]
+kind = "DISCOVERY_SPDP"  # "DISCOVERY_SPDP" (implemented) | "DISCOVERY_STATIC" | "DISCOVERY_BROKER" (planned) | custom
+initial_peers = []       # e.g. ["192.168.1.100:7400"]
 static_config_file = ""
 
-[qos.defaults]
-reliability = "best_effort"
-durability  = "volatile"
-history_kind = "keep_last"
+[qos]
+reliability_kind = "BEST_EFFORT_RELIABILITY_QOS"  # or "RELIABLE_RELIABILITY_QOS"
+durability_kind = "VOLATILE_DURABILITY_QOS"       # or "TRANSIENT_LOCAL_DURABILITY_QOS" | "TRANSIENT_DURABILITY_QOS" | "PERSISTENT_DURABILITY_QOS"
+history_kind = "KEEP_LAST_HISTORY_QOS"            # or "KEEP_ALL_HISTORY_QOS"
 history_depth = 1
 ```
 
-Environment variable overrides use `ZZDDS_` prefix + path in uppercase:
-
-```
-ZZDDS_DOMAIN_ID=5
-ZZDDS_TRANSPORT_UDP_MULTICAST_GROUP_V4=239.255.0.2
-ZZDDS_DISCOVERY_KIND=static
-ZZDDS_DISCOVERY_STATIC_CONFIG_FILE=/etc/zzdds/peers.toml
-```
+`ProcessConfig` (also in `idl/zzdds.idl`) is deliberately minimal today — just
+`{ default_participant_config: DomainParticipantConfig }`, read from `./zzdds.toml` by
+`resolveProcessConfig`. Adding more process-wide fields later (a network-monitor interval,
+say) is just adding a member to that IDL struct — no codegen or parser changes needed.
 
 ---
 

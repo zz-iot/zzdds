@@ -153,4 +153,18 @@ inline std::shared_ptr<DomainParticipantFactory> create_factory(const ZidlAlloca
     return detail::wrapFactoryHandle(zzdds_create_factory_with_allocator(allocator));
 }
 
+/**
+ * Resolve `path` as a zzdds TOML config file and install the result as the
+ * process-wide configuration, entirely through `allocator` (nullptr for the
+ * default, libc malloc/free) -- see zzdds_process_configure_from_file's
+ * contract in zzdds_c.h. Call this before create_factory()/
+ * create_factory(allocator), with the SAME allocator you'll pass to the
+ * latter, to avoid the ambient lazy-default path's libc malloc use for the
+ * process-wide config's own persistent storage.
+ */
+inline ::DDS::ReturnCode_t process_configure_from_file(const char* path, const ZidlAllocator* allocator)
+{
+    return zzdds_process_configure_from_file(path, allocator);
+}
+
 } // namespace zzdds
