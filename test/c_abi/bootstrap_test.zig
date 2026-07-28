@@ -281,7 +281,7 @@ test "support factory: get_default_participant_config on a custom-allocator fact
     // (the factory's custom allocator) instead of c_allocator, which
     // testing.allocator's own tracking would reject as an invalid free.
     var config = ZZDDS.DomainParticipantConfig{};
-    config._toml_applied = true;
+    config.participant._toml_applied = true;
     config.participant.timer_clock_name = try std.heap.c_allocator.dupe(u8, "external-default");
     defer config.deinit(std.heap.c_allocator);
 
