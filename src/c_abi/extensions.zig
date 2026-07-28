@@ -9,6 +9,7 @@ const c_abi_handle = @import("../util/c_abi_handle.zig");
 
 const config_generated = @import("../config/generated.zig");
 const config_mod = @import("../config/schema.zig");
+const process_config = @import("../config/process.zig");
 const DomainParticipantFactoryImpl = @import("../dcps/factory.zig").DomainParticipantFactoryImpl;
 const participant_mod = @import("../dcps/participant.zig");
 const DomainParticipantImpl = participant_mod.DomainParticipantImpl;
@@ -39,6 +40,10 @@ const FactoryOwner = struct {
     stacks: std.ArrayListUnmanaged(*ParticipantStack) = .empty,
     default_dp_qos: DDS.DomainParticipantQos = .{},
     factory_qos: DDS.DomainParticipantFactoryQos = .{},
+    /// What plain create_participant() uses; seeded from the process-wide
+    /// config at construction (see createFactory), independently overridable
+    /// per-factory via set_default_participant_config from there on.
+    default_config: ZZDDS.DomainParticipantConfig = .{},
     // Two distinct C-ABI views of the same FactoryOwner (ZZDDS.DomainParticipantFactory
     // via factory_vtable, DDS.DomainParticipantFactory via dds_factory_vtable) — each
     // needs its own cache slot, same as any other multi-view concrete impl.
@@ -51,6 +56,7 @@ const FactoryOwner = struct {
         for (self.stacks.items) |stack| stack.deinit();
         self.stacks.deinit(self.alloc);
         self.default_dp_qos.deinit(self.alloc);
+        self.default_config.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -209,6 +215,8 @@ const ParticipantStack = struct {
 
 pub const factory_vtable = ZZDDS.DomainParticipantFactory.Vtable{
     .create_participant_ex = factoryCreateParticipantEx,
+    .set_default_participant_config = factorySetDefaultParticipantConfig,
+    .get_default_participant_config = factoryGetDefaultParticipantConfig,
     .deinit = factoryDeinit,
     .get_c_abi_handle = factoryGetCAbiHandleZzdds,
     .as_DomainParticipantFactory = factoryAsDdsFactory,
@@ -369,6 +377,63 @@ pub export fn zzdds_destroy_factory(factory: *anyopaque) callconv(.c) void {
     f.vtable.deinit(f.ptr);
 }
 
+/// Explicitly install the process-wide configuration. Must be called before
+/// any factory has been created in this process (zzdds_create_factory
+/// resolves+commits the ambient default lazily on first use if this was never
+/// called) — returns RETCODE_PRECONDITION_NOT_MET if a process-wide config is
+/// already installed either way. See config/process.zig.
+///
+/// NOTE: not currently a safely-callable C entry point — `config`'s pointee
+/// (`ZZDDS.ProcessConfig`, the `--zig-generate-toml-config` type used
+/// internally) is a plain Zig struct with `[]const u8` string fields, not an
+/// `extern struct`; there is no C-ABI-compatible way to actually construct
+/// one from outside Zig, and it is (deliberately) not declared in
+/// `zzdds_c.h`. Exported for Zig-native callers and internal tests only.
+/// Always clones via `std.heap.c_allocator` internally, regardless of the
+/// caller — a real gap for a Zig-native caller wanting to avoid libc
+/// `malloc` here too, but out of scope for the embedded C/C++ showcase this
+/// was written for (see `zzdds_process_configure_from_file` below, which is
+/// the actual supported entry point for that).
+pub export fn zzdds_process_configure(config: *const ZZDDS.ProcessConfig) callconv(.c) DDS.ReturnCode_t {
+    const cloned = config.clone(std.heap.c_allocator) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    process_config.configure(std.heap.c_allocator, cloned) catch return DDS.RETCODE_PRECONDITION_NOT_MET;
+    return DDS.RETCODE_OK;
+}
+
+/// Resolve `path` as a zzdds TOML config file and install the result as the
+/// process-wide configuration, in one step — entirely through `allocator`
+/// (NULL for the default, `std.heap.c_allocator`). This is the actual,
+/// C/C++-usable way to avoid `zzdds_create_factory_with_allocator`'s ambient
+/// lazy-default path (`config/process.zig`'s `getForNewFactory`), which
+/// always resolves through `std.heap.c_allocator` regardless of the
+/// allocator passed to it: call this first, with the SAME allocator you'll
+/// later pass to `zzdds_create_factory_with_allocator`, and the process-wide
+/// singleton's own persistent storage will live in that allocator for the
+/// rest of the process's lifetime instead.
+///
+/// Must be called before any factory has been created in this process —
+/// returns RETCODE_PRECONDITION_NOT_MET if a process-wide config is already
+/// installed (whether from an earlier call to this function, to
+/// zzdds_process_configure, or from a factory already having resolved the
+/// ambient default), RETCODE_ERROR if `path` doesn't exist or fails to parse
+/// (a missing/malformed file is treated as a real error here, not silently
+/// ignored — a caller who named a specific path almost certainly wants to
+/// know if it didn't work).
+pub export fn zzdds_process_configure_from_file(
+    path: [*:0]const u8,
+    allocator: ?*const zidl_rt.ZidlAllocator,
+) callconv(.c) DDS.ReturnCode_t {
+    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
+    process_config.configureFromFile(alloc, std.mem.span(path)) catch |err| {
+        std.log.err("zzdds_process_configure_from_file: {}", .{err});
+        return switch (err) {
+            error.AlreadyConfigured => DDS.RETCODE_PRECONDITION_NOT_MET,
+            else => DDS.RETCODE_ERROR,
+        };
+    };
+    return DDS.RETCODE_OK;
+}
+
 // Every ZZDDS.* → DDS.* upcast (zzdds_X_as_DDS_X) and every DDS-internal
 // upcast (DDS_X_as_DDS_Y, where Y is a declared base of X) is now generated
 // by zidl directly from the IDL-declared inheritance (`interface Topic :
@@ -434,7 +499,14 @@ fn createFactory(allocator: ?*const zidl_rt.ZidlAllocator) !ZZDDS.DomainParticip
     const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
     const owner = try alloc.create(FactoryOwner);
     errdefer alloc.destroy(owner);
-    owner.* = .{ .alloc = alloc };
+    // Lazily resolves+commits the process-wide config on the very first factory
+    // in the process, if the app never called zzdds_process_configure itself.
+    // ProcessConfig has exactly one field today, so taking it by value here and
+    // never separately deinit-ing proc_cfg is a full, non-leaking ownership
+    // transfer into owner.default_config — if ProcessConfig ever grows more
+    // fields, whichever of them aren't moved into `owner` will need freeing here.
+    const proc_cfg = try process_config.getForNewFactory(alloc);
+    owner.* = .{ .alloc = alloc, .default_config = proc_cfg.default_participant_config };
     return .{ .ptr = owner, .vtable = &factory_vtable };
 }
 
@@ -451,10 +523,25 @@ fn factoryCreateParticipant(
 ) DDS.DomainParticipant {
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
-    // config = .{} uses schema default literals (no heap allocation); config_deinit_allocator
-    // = null tells DomainParticipantImpl.deinit not to call deinitRuntimeConfig.
-    // factoryCreateParticipantEx uses runtime-converted config with config_deinit_allocator set.
-    return owner.createParticipant(domain_id, qos, a_listener, mask, .{}, null) catch |err| {
+
+    owner.mu.lock();
+    var cfg_snap = owner.default_config.clone(owner.alloc) catch |err| {
+        owner.mu.unlock();
+        std.log.err("create_participant: default_config clone failed: {}", .{err});
+        return nil.nil_participant;
+    };
+    owner.mu.unlock();
+    // toRuntimeConfig dupes whatever it needs into its own runtime_config; this
+    // snapshot's own memory is never kept past this call either way.
+    defer cfg_snap.deinit(owner.alloc);
+
+    const runtime_config = config_generated.toRuntimeConfig(owner.alloc, &cfg_snap) catch |err| {
+        std.log.err("create_participant: config conversion failed: {}", .{err});
+        return nil.nil_participant;
+    };
+    return owner.createParticipant(domain_id, qos, a_listener, mask, runtime_config, owner.alloc) catch |err| {
+        var cfg = runtime_config;
+        config_generated.deinitRuntimeConfig(owner.alloc, &cfg);
         std.log.err("create_participant: {}", .{err});
         return nil.nil_participant;
     };
@@ -494,6 +581,40 @@ fn factoryLookupParticipant(ctx: *anyopaque, domain_id: DDS.DomainId_t) DDS.Doma
     return owner.lookupParticipant(domain_id);
 }
 
+fn factorySetDefaultParticipantConfig(ctx: *anyopaque, config: *const ZZDDS.DomainParticipantConfig) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    const new_config = config.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    owner.mu.lock();
+    defer owner.mu.unlock();
+    owner.default_config.deinit(owner.alloc);
+    owner.default_config = new_config;
+    // Only affects participants created after this call, same as
+    // set_default_participant_qos — no propagation to existing inner factories.
+    return DDS.RETCODE_OK;
+}
+
+/// Caller contract: any heap-allocated fields in *config must have been
+/// allocated with c_allocator (or *config must be zero-initialised) — same
+/// contract as get_default_participant_qos. The returned config is always
+/// c_allocator-owned too, regardless of which allocator this factory itself
+/// was created with (owner.alloc) — decoupling the caller-facing contract
+/// from the factory's own internal allocator is what makes repeated calls
+/// safe on a factory created via zzdds_create_factory_with_allocator(custom):
+/// freeing/filling *config with owner.alloc would free caller-supplied,
+/// c_allocator-owned memory through the wrong allocator (or vice versa on a
+/// second call), an invalid free / memory corruption either way.
+fn factoryGetDefaultParticipantConfig(ctx: *anyopaque, config: *ZZDDS.DomainParticipantConfig) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    owner.mu.lock();
+    defer owner.mu.unlock();
+    const cloned = owner.default_config.clone(std.heap.c_allocator) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    config.deinit(std.heap.c_allocator);
+    config.* = cloned;
+    return DDS.RETCODE_OK;
+}
+
 fn factorySetDefaultParticipantQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
@@ -512,15 +633,19 @@ fn factorySetDefaultParticipantQos(ctx: *anyopaque, qos: *const DDS.DomainPartic
 
 /// Caller contract: any heap-allocated fields in *qos must have been allocated
 /// with c_allocator (or *qos must be zero-initialised). The function frees
-/// existing content with c_allocator before writing the cloned default.
+/// existing content with c_allocator before writing the cloned default —
+/// this used to say that but actually free/fill with owner.alloc instead, an
+/// allocator mismatch on a factory created via
+/// zzdds_create_factory_with_allocator(custom) (same class of bug as
+/// factoryGetDefaultParticipantConfig above; found while fixing that one).
 fn factoryGetDefaultParticipantQos(ctx: *anyopaque, qos: *DDS.DomainParticipantQos) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
     owner.mu.lock();
     defer owner.mu.unlock();
     // Clone first so caller's existing QoS is untouched if OOM occurs.
-    const cloned = owner.default_dp_qos.clone(owner.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-    qos.deinit(owner.alloc);
+    const cloned = owner.default_dp_qos.clone(std.heap.c_allocator) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+    qos.deinit(std.heap.c_allocator);
     qos.* = cloned;
     return DDS.RETCODE_OK;
 }

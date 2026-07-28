@@ -78,9 +78,10 @@ pub fn build(b: *std.Build) void {
 
     const gen_zzdds_vendor = b.addRunArtifact(zidl_exe);
     gen_zzdds_vendor.addArgs(&.{
-        "-b",                    "zig",
-        "--generate-interfaces", "--single-file",
-        "--no-typesupport",      "--no-typeobject-support",
+        "-b",                         "zig",
+        "--generate-interfaces",      "--single-file",
+        "--no-typesupport",           "--no-typeobject-support",
+        "--zig-generate-toml-config",
     });
     if (need_c_abi) gen_zzdds_vendor.addArg("--zig-generate-c-api");
     gen_zzdds_vendor.addArg("-o");
@@ -109,13 +110,16 @@ pub fn build(b: *std.Build) void {
         \\pub const DomainParticipantQos = Generated.DomainParticipantQos;
         \\pub const DomainParticipantFactoryQos = Generated.DomainParticipantFactoryQos;
         \\pub const DurabilityQosPolicyKind = Generated.DurabilityQosPolicyKind;
+        \\pub const DurabilityQosPolicyKind_fromString = Generated.DurabilityQosPolicyKind_fromString;
         \\pub const HistoryQosPolicyKind = Generated.HistoryQosPolicyKind;
+        \\pub const HistoryQosPolicyKind_fromString = Generated.HistoryQosPolicyKind_fromString;
         \\pub const InstanceHandle_t = Generated.InstanceHandle_t;
         \\pub const LivelinessLostStatus = Generated.LivelinessLostStatus;
         \\pub const OfferedDeadlineMissedStatus = Generated.OfferedDeadlineMissedStatus;
         \\pub const OfferedIncompatibleQosStatus = Generated.OfferedIncompatibleQosStatus;
         \\pub const PublicationMatchedStatus = Generated.PublicationMatchedStatus;
         \\pub const ReliabilityQosPolicyKind = Generated.ReliabilityQosPolicyKind;
+        \\pub const ReliabilityQosPolicyKind_fromString = Generated.ReliabilityQosPolicyKind_fromString;
         \\pub const ReturnCode_t = Generated.ReturnCode_t;
         \\pub const StatusCondition = Generated.StatusCondition;
         \\pub const StatusMask = Generated.StatusMask;

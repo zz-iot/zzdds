@@ -46,7 +46,7 @@ idl/
   rtps_discovery.idl      # Derived RTPS discovery ParameterList schema for zidl PL_CDR
 src/
   root.zig, log.zig, trace.zig
-  config/                 # Schema, TOML parser, config precedence resolver
+  config/                 # Runtime schema, generic TOML value-tree parser, resolve/process-wide config
   dcps/                   # Factory, participant, publisher, subscriber, writer, reader, topic, WaitSet
   discovery/              # SPDP, SEDP, combined wrapper
   protocol/               # DCPS ↔ RTPS vtable seam

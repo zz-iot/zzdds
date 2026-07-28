@@ -69,6 +69,28 @@ zzdds_DomainParticipantFactory zzdds_create_factory_with_allocator(const ZidlAll
 
 bool zzdds_factory_is_nil(zzdds_DomainParticipantFactory factory);
 void zzdds_destroy_factory(zzdds_DomainParticipantFactory factory);
+
+/**
+ * Resolve `path` as a zzdds TOML config file and install the result as the
+ * process-wide configuration, in one step -- entirely through `allocator`
+ * (NULL for the default, libc malloc/free). Must be called before any
+ * factory has been created in this process.
+ *
+ * This is the actual, C/C++-usable way to avoid zzdds_create_factory_with_allocator's
+ * ambient lazy-default path resolving through libc malloc regardless of the
+ * allocator you give it: call this first, with the SAME allocator you'll
+ * pass to zzdds_create_factory_with_allocator, and the process-wide config's
+ * own persistent storage will live in that allocator for the rest of the
+ * process's lifetime instead.
+ *
+ * Returns DDS_RETCODE_PRECONDITION_NOT_MET if a process-wide config is
+ * already installed, DDS_RETCODE_ERROR if `path` doesn't exist or fails to
+ * parse.
+ */
+DDS_ReturnCode_t zzdds_process_configure_from_file(
+    const char *path,
+    const ZidlAllocator *allocator
+);
 DDS_DomainParticipantFactory zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zzdds_DomainParticipantFactory factory);
 zzdds_DomainParticipantFactory DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(DDS_DomainParticipantFactory factory);
 DDS_DomainParticipant zzdds_DomainParticipant_as_DDS_DomainParticipant(zzdds_DomainParticipant participant);

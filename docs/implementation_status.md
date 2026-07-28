@@ -143,9 +143,6 @@ The `Transport` vtable has no vectored-send method. See `docs/design/rtps-messag
 interface writes into an `ArrayListUnmanaged` even in the noop case. A tagged-union return
 would eliminate this allocation. Deferred until a real Cryptographic implementation is begun.
 
-**Config TOML coverage.** Not all `schema.zig` fields have environment variable (`ZZDDS_*`)
-mappings. `resolve.zig` covers the most commonly used fields; a full audit is deferred.
-
 **MTU-aware fragment sizing.** `rtps.fragment_size` is static. There is no interface-MTU or
 path-MTU based auto-calculation, so deployments must configure a conservative value manually
 when they need to avoid IP-level fragmentation.

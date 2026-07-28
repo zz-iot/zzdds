@@ -180,10 +180,46 @@ audiences (developers vs. protocol analyzers) and different verbosity profiles.
 
 ## Configuration
 
-**Precedence order (highest to lowest):**
-Programmatic API → Environment variables (`ZZDDS_*`) → Config file (TOML) → Built-in defaults.
+**No env vars; no merge precedence — `create_participant`/factory calls always use exactly
+the config object they're handed.** `resolveParticipantConfig()`/`resolveParticipantConfigFrom(alloc,
+path)` and `resolveProcessConfig(alloc)`/`resolveProcessConfigFrom(alloc, path)`
+(`src/config/resolve.zig`) each just return a concrete struct — defaults, or defaults with a
+named TOML file applied over them. There is no further merging once you have that struct:
+customizing it from there is plain field mutation, not a separate "programmatic overrides"
+layer. Two things ruled this out on purpose:
+- **No programmatic-overrides input type.** The only case where a separate overrides-as-input
+  earns its keep over direct field mutation is "re-resolve repeatedly with sticky pins" (e.g.
+  config-file hot-reload) — not planned, so it would be pure complexity with no payoff.
+- **No environment variables at all.** Env vars are one value per process; `DomainParticipantConfig`
+  is inherently per-participant/per-factory, and this codebase explicitly supports many of each
+  per process — a flat env var has no way to say which one it's talking about. An app that wants
+  env-driven tweaks reads them itself and mutates the resolved struct, same as any other override.
 
-Config file search: `$ZZDDS_CONFIG` → `./zzdds.toml` → `~/.config/zzdds/config.toml`.
+`resolveParticipantConfigFrom`/`resolveProcessConfigFrom` propagate every failure (missing file,
+malformed TOML, a value that doesn't fit its field) — nothing is silently swallowed for an
+explicitly-named path. The zero-arg `resolveProcessConfig` is the one exception: it tries
+`./zzdds.toml`, and only `FileNotFound`/`AccessDenied` fall back to defaults; a file that
+*exists* but fails to parse is still a real, propagated error, since that's far more likely a
+real mistake than an intentional absence.
+
+Process-wide config (`src/config/process.zig`) is a deliberate, singular exception to this
+codebase's "not a singleton" stance (`factory.zig`'s own doc comment) — a process genuinely has
+exactly one ambient environment/filesystem, unlike a `DomainParticipantConfig`. `zzdds_create_factory()`
+lazily resolves and installs it at most once per process if the app never called
+`zzdds_process_configure()` itself, then seeds the new factory's default participant config from it.
+
+TOML itself has no null literal, by design (it's a config format, not a general data-interchange
+one — that's also why there's no OMG-style "IDL-to-TOML" spec the way there is for XML/JSON).
+A field you want left at its default is simply omitted from the file; there is no `= null`
+override syntax.
+
+The TOML (de)serialization code itself isn't hand-written: `zidl`'s `--zig-generate-toml-config`
+backend flag generates `applyToml(alloc, table: anytype) !void` per IDL struct directly from
+`idl/zzdds.idl`, so config coverage can never lag the schema the way a hand-maintained parser
+could. `table` is duck-typed (`anytype`) — `zidl` has no compile-time dependency on any concrete
+TOML parser; `zzdds`'s own `src/config/toml.zig` (a generic value-tree tokenizer, replacing the
+old schema-specific `file.zig`) is what actually implements the expected accessor contract
+(`getString`/`getBool`/`getInt`/`getFloat`/`getTable`/`getStringArray`).
 
 **GUID prefix strategy: `.random` default, `.host_based` optional.**
 `.random`: 12 OS-entropy bytes on supported platforms, with a clock/counter fallback on

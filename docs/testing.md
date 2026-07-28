@@ -21,7 +21,7 @@ python3 scripts/run_deterministic_matrix.py
 - DATA_FRAG fragmentation + reassembly
 - SequenceNumber arithmetic (high/low word boundary rollover)
 - QoS matching (all 22 policies, compatible + incompatible combinations)
-- Config resolver (env var overrides, TOML file parsing, precedence order)
+- Config resolution (generic TOML value-tree parsing in `toml.zig`; `resolveParticipantConfig[From]`/`resolveProcessConfig[From]` in `resolve.zig`; process-wide singleton state in `process.zig`)
 - Time utilities
 
 **Tier 2 — in-process DCPS tests (IntraProcessDelivery):**

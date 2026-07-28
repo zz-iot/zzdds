@@ -43,6 +43,8 @@ pub const noop_security = @import("security/noop.zig");
 pub const intraprocess = @import("delivery/intraprocess.zig");
 pub const config = @import("config/schema.zig");
 pub const generated_config = @import("config/generated.zig");
+pub const resolve_config = @import("config/resolve.zig");
+pub const process_config = @import("config/process.zig");
 pub const factory = @import("factory.zig");
 pub const rtps = @import("rtps/root.zig");
 pub const qos = @import("qos/policy.zig");
@@ -100,8 +102,9 @@ test {
 
     _ = @import("config/schema.zig");
     _ = @import("config/generated.zig");
-    _ = @import("config/file.zig");
+    _ = @import("config/toml.zig");
     _ = @import("config/resolve.zig");
+    _ = @import("config/process.zig");
     _ = @import("factory.zig");
     _ = @import("transport/interface.zig");
     _ = @import("transport/udp.zig");
