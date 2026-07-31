@@ -43,7 +43,10 @@ static pthread_mutex_t zzdds_java_class_cache_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* Resolves `class_name`'s (jclass, "(J)V" constructor) pair into `*cache`,
  * caching it globally after the first successful call. Returns false
- * (leaving `*cache` untouched) if FindClass fails. Safe to call
+ * (leaving `*cache` untouched, so a later call retries from scratch) if
+ * FindClass, NewGlobalRef, or GetMethodID fails — a Java exception is left
+ * pending in each case; callers return NULL and let it propagate rather
+ * than passing a null jclass/jmethodID into NewObject. Safe to call
  * concurrently from multiple threads. */
 static bool zzdds_java_get_or_cache_class(JNIEnv *env, zzdds_java_class_cache *cache, const char *class_name) {
     pthread_mutex_lock(&zzdds_java_class_cache_mu);
@@ -55,7 +58,17 @@ static bool zzdds_java_get_or_cache_class(JNIEnv *env, zzdds_java_class_cache *c
         }
         jclass global = (jclass)(*env)->NewGlobalRef(env, local);
         (*env)->DeleteLocalRef(env, local);
-        cache->ctor = (*env)->GetMethodID(env, global, "<init>", "(J)V");
+        if (global == NULL) {
+            pthread_mutex_unlock(&zzdds_java_class_cache_mu);
+            return false;
+        }
+        jmethodID ctor = (*env)->GetMethodID(env, global, "<init>", "(J)V");
+        if (ctor == NULL) {
+            (*env)->DeleteGlobalRef(env, global);
+            pthread_mutex_unlock(&zzdds_java_class_cache_mu);
+            return false;
+        }
+        cache->ctor = ctor;
         cache->cls = global;
     }
     pthread_mutex_unlock(&zzdds_java_class_cache_mu);
