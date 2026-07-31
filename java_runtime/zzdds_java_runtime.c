@@ -106,15 +106,19 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
  * zzdds/src/dcps/participant.zig, which already reclaims TypeSupport ctx
  * this way for the non-Java C ABI path too.
  */
-static JavaVM *zzdds_java_vm = NULL;
+/* zidl's generated dcps_jni.c (compiled into this same libzzdds_jni.so)
+ * already defines JNI_OnLoad and captures the JavaVM* into its own
+ * zidl_java_vm exactly once, before any native method in this library can
+ * be called from Java — a second JNI_OnLoad here would be a duplicate
+ * symbol at link time, and a lazily-captured JavaVM* of our own (e.g. on
+ * first registerTypeSupport call) would leave a real race: a transport
+ * thread's key-hash dispatch could observe it still NULL if it raced the
+ * very first registration. Reuse zidl's already-correct capture instead of
+ * duplicating the mechanism. */
+extern JNIEnv *zidl_java_get_env(void);
 
 static JNIEnv *zzdds_java_get_env(void) {
-    JNIEnv *env = NULL;
-    if (zzdds_java_vm == NULL) return NULL;
-    if ((*zzdds_java_vm)->GetEnv(zzdds_java_vm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
-        (*zzdds_java_vm)->AttachCurrentThreadAsDaemon(zzdds_java_vm, (void **)&env, NULL);
-    }
-    return env;
+    return zidl_java_get_env();
 }
 
 typedef struct {
@@ -147,7 +151,6 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     JNIEnv *env, jclass self_cls, jobject participant, jstring typeName, jclass typeClass)
 {
     (void)self_cls;
-    (*env)->GetJavaVM(env, &zzdds_java_vm);
 
     zzdds_java_ts_ctx *ctx = malloc(sizeof(*ctx));
     if (ctx == NULL) return -1;
