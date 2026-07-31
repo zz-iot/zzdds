@@ -17,6 +17,7 @@ const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const listener_lifecycle = @import("../util/listener_lifecycle.zig");
 
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 pub const ParticipantCbs = struct {
@@ -138,6 +139,7 @@ pub const SubscriberImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        listener_lifecycle.release(self.listener);
         if (self.status_cond) |sc| sc.deinit();
         self.sub_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -418,6 +420,7 @@ pub const SubscriberImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.SubscriberListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
+        listener_lifecycle.release(self.listener);
         self.listener = if (a_listener) |l| l.* else DDS.noop_SubscriberListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;

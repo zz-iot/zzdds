@@ -136,7 +136,14 @@ still-open root cause this PR did not touch.
   `v0.2.10-zig.0.16.0` zidl release zzdds currently pins (`build.zig.zon`). Verified against
   a real `zig build install`: the generated `zig-out/src/dcps_impl.cpp` has zero `TODO`
   markers.
-- **Java binding** — planned; zidl Java backend; inline CDR; JNI bridge.
+- **Java binding** — done; zidl Java backend generates a real entity JNI bridge
+  (unbox/box entities, full QoS/status struct marshaling, listener JNI
+  upcalls) plus `--generate-zzdds-wrappers` typed DataWriter/DataReader
+  classes with inline CDR. Verified with a real two-JVM-process example
+  (`zzdds-java-example/`) and an in-process `test-bindings` smoke test.
+  Remaining gaps: bare `sequence<T>` params (not inside a struct) on a few
+  DCPS ops; `zzdds.idl`'s vendor extensions (cross-file type references
+  aren't tracked by zidl's Java backend yet).
 - **Python / .NET** — planned; inline CDR; C-ABI layer via ctypes / P/Invoke.
 - **Rust** — planned; dual-mode (`pure` via `zidl-rs`; `zig-ffi` for embedded/perf).
   See zidl roadmap for Rust backend steps.

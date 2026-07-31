@@ -139,14 +139,24 @@ installed via per-language flags:
 zig build -Dc-binding=true      # dcps.h + zidl_cdr.h → zig-out/include/
                                  # libzzdds.so         → zig-out/lib/
 zig build -Dcpp-binding=true    # implies -Dc-binding; also dcps.hpp
-zig build -Djava-binding=true   # Java sources         → zig-out/java/
-zig build test-bindings -Dc-binding=true -Dcpp-binding=true
-                                # compile/run Zig, C, and C++ generated wrapper smoke tests
+zig build -Djava-binding=true   # Java sources + dcps_jni.c → zig-out/java/
+                                 # libzzdds_jni.so           → zig-out/lib/
+zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true
+                                # compile/run Zig, C, C++, and Java generated wrapper smoke tests
 ```
 
-Zig is always built (it is the runtime, not a binding). Python, .NET, and Rust
+`-Djava-binding=true` implies the C-ABI prerequisite (needed for the JNI
+bridge to link against `libzzdds`). It requires a JDK (`JAVA_HOME` pointing at
+one, for `jni.h`) and additionally generates entity Java classes
+(`*Impl.java`), the JNI bridge (`dcps_jni.c`, compiled into
+`libzzdds_jni.so`), and the hand-written `io.zzdds.runtime.ZzddsRuntime`
+native runtime shim used by `--generate-zzdds-wrappers` typed DataWriter/
+DataReader classes. See `zzdds-java-example/` for a full two-process
+end-to-end example.
+
+Zig is always built (it is the runtime, not a binding). Python and .NET
 flags are not yet implemented; they will also set the C-ABI prerequisite when
-they arrive.
+they arrive. Rust is planned as a separate dual-mode design (see zidl roadmap).
 
 ---
 

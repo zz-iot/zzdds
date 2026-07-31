@@ -18,6 +18,7 @@ const history_mod = @import("../rtps/history.zig");
 const waitset = @import("waitset.zig");
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const listener_lifecycle = @import("../util/listener_lifecycle.zig");
 
 const Guid = proto.Guid;
 
@@ -32,6 +33,7 @@ fn durationIsActive(d: DDS.Duration_t) bool {
 fn listenerExFromBase(l: DDS.DataWriterListener) ZZDDS.DataWriterListenerEx {
     return .{
         .listener_data = l.listener_data,
+        .release_listener_data = l.release_listener_data,
         .on_offered_deadline_missed = l.on_offered_deadline_missed,
         .on_offered_incompatible_qos = l.on_offered_incompatible_qos,
         .on_liveliness_lost = l.on_liveliness_lost,
@@ -45,6 +47,7 @@ fn listenerExFromBase(l: DDS.DataWriterListener) ZZDDS.DataWriterListenerEx {
 fn baseFromListenerEx(l: ZZDDS.DataWriterListenerEx) DDS.DataWriterListener {
     return .{
         .listener_data = l.listener_data,
+        .release_listener_data = l.release_listener_data,
         .on_offered_deadline_missed = l.on_offered_deadline_missed,
         .on_offered_incompatible_qos = l.on_offered_incompatible_qos,
         .on_liveliness_lost = l.on_liveliness_lost,
@@ -163,6 +166,7 @@ pub const DataWriterImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        listener_lifecycle.release(self.listener_ex);
         if (self.status_cond) |sc| sc.deinit();
         self.dw_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -403,6 +407,7 @@ pub const DataWriterImpl = struct {
 
     /// Backs `zzdds::DataWriter::set_listener_ex` (see src/c_abi/extensions.zig).
     pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) void {
+        listener_lifecycle.release(self.listener_ex);
         self.listener_ex = listener_ex;
         self.listener_mask = mask;
     }
@@ -527,6 +532,7 @@ pub const DataWriterImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataWriterListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
+        listener_lifecycle.release(self.listener_ex);
         self.listener_ex = listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener);
         self.listener_mask = mask;
         return DDS.RETCODE_OK;

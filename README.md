@@ -10,7 +10,7 @@ A Zig implementation of OMG DDS v1.4 DCPS with RTPS 2.5 wire interoperability.
 - RTPS 2.5 wire interoperability
 - Pluggable transport, discovery, and security — UDP and SPDP/SEDP default; DDS-Security v1.2 planned
 - Language bindings for C, C++, Java, others via `zidl --generate-interfaces`
-- Unified configuration: programmatic API > env vars > config file > built-in defaults
+- Configuration: built-in defaults or a TOML config file, returned as a plain struct you can mutate directly — no env vars, no merge precedence
 
 ## Build
 

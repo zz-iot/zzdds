@@ -24,6 +24,7 @@ const writer_mod = @import("writer.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const listener_lifecycle = @import("../util/listener_lifecycle.zig");
 
 const Guid = proto.Guid;
 
@@ -370,6 +371,7 @@ pub const DataReaderImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        listener_lifecycle.release(self.listener);
         if (self.status_cond) |sc| sc.deinit();
         self.dr_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -1844,6 +1846,7 @@ pub const DataReaderImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataReaderListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
+        listener_lifecycle.release(self.listener);
         self.listener = if (a_listener) |l| l.* else DDS.noop_DataReaderListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;

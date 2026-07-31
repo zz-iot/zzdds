@@ -46,6 +46,7 @@ const reader_mod = @import("reader.zig");
 const writer_mod = @import("writer.zig");
 const zidl_rt = @import("zidl_rt");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const listener_lifecycle = @import("../util/listener_lifecycle.zig");
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
@@ -970,6 +971,7 @@ pub const DomainParticipantImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        listener_lifecycle.release(self.listener);
         self.discovery.stop();
 
         // Stop receiving user data before tearing down readers.
@@ -2962,6 +2964,7 @@ pub const DomainParticipantImpl = struct {
         mask: DDS.StatusMask,
     ) DDS.ReturnCode_t {
         const self = cast(ctx);
+        listener_lifecycle.release(self.listener);
         self.listener = if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;

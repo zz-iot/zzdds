@@ -11,6 +11,7 @@ const nil = @import("nil.zig");
 const waitset = @import("waitset.zig");
 const filter_mod = @import("filter.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const listener_lifecycle = @import("../util/listener_lifecycle.zig");
 
 // Forward reference: participant is defined in participant.zig.
 // We use *anyopaque here to avoid a circular import; the vtable forwarding
@@ -80,6 +81,7 @@ pub const TopicImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        listener_lifecycle.release(self.listener);
         if (self.status_cond) |sc| sc.deinit();
         self.topic_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -176,6 +178,7 @@ pub const TopicImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.TopicListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
+        listener_lifecycle.release(self.listener);
         self.listener = if (a_listener) |l| l.* else DDS.noop_TopicListener;
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
