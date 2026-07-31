@@ -20,6 +20,7 @@ const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const Mutex = @import("../util/mutex.zig").Mutex;
+const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 
 const Guid = proto.Guid;
 
@@ -72,6 +73,10 @@ pub const DataWriterImpl = struct {
     /// Guards `listener_ex_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
+    /// Guards this entity's own lifetime against a background-thread
+    /// callback (RTPS heartbeat/receive, timer, discovery) racing
+    /// `deinit()` — see entity_quiesce.zig.
+    quiesce: EntityQuiesce = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -171,7 +176,16 @@ pub const DataWriterImpl = struct {
         return self;
     }
 
+    /// Drops this entity's own quiesce reference; the real teardown
+    /// (`reallyDeinit`) runs immediately unless a background callback is
+    /// genuinely in flight, in which case that callback's own release runs
+    /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.listener_ex_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.dw_c_abi.free(self.alloc);
@@ -317,6 +331,8 @@ pub const DataWriterImpl = struct {
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyPublicationMatched(ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         if (added) self.pub_matched_total += 1;
         self.pub_matched_total_change += if (added) 1 else 0;
         const delta: i32 = if (added) 1 else -1;
@@ -349,6 +365,8 @@ pub const DataWriterImpl = struct {
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyIncompatibleQos(ctx: *anyopaque, policy_id: i32) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.incompat_total += 1;
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
@@ -371,6 +389,8 @@ pub const DataWriterImpl = struct {
     /// Fire on_offered_deadline_missed if the listener is registered for it.
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyDeadlineMissed(self: *Self) void {
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.OFFERED_DEADLINE_MISSED_STATUS;
@@ -390,6 +410,8 @@ pub const DataWriterImpl = struct {
     /// Fire on_liveliness_lost if the listener is registered for it.
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyLivelinessLost(self: *Self) void {
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.liveliness_lost_total += 1;
         self.liveliness_lost_total_change += 1;
         self.status_changes |= DDS.LIVELINESS_LOST_STATUS;
@@ -414,6 +436,8 @@ pub const DataWriterImpl = struct {
     /// this is a vendor extension callback only.
     pub fn notifyReaderProtocolReady(ctx: *anyopaque, reader_guid: Guid, ready: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         const box = self.acquireListenerEx();
         defer box.releaseRef(self.alloc);
         if (box.listener.on_reliable_reader_ready) |cb| {
@@ -454,6 +478,8 @@ pub const DataWriterImpl = struct {
     /// Called while participant.mu is held; must not re-enter participant.
     pub fn checkTimersFn(ctx: *anyopaque, now_ns: i64) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
 
         const dl = self.qos.deadline.period;
         if (durationIsActive(dl)) {

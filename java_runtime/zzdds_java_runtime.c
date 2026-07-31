@@ -6,6 +6,8 @@
  * JNI bridge (dcps_jni.c) — see build.zig's -Djava-binding=true section.
  */
 #include <jni.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,46 @@ static void *zzdds_java_unbox(JNIEnv *env, jobject obj) {
     jclass cls = (*env)->GetObjectClass(env, obj);
     jfieldID fid = (*env)->GetFieldID(env, cls, "ptr_", "J");
     return (void *)(intptr_t)(*env)->GetLongField(env, obj, fid);
+}
+
+/* ── Lazily-cached (jclass, "(J)V" ctor jmethodID) pairs ─────────────────
+ *
+ * createFactory()/asZzddsDataWriter() each resolve their target class once
+ * and cache it in a `static` local for subsequent calls. Without
+ * synchronization, two threads racing on the *first* call can interleave:
+ * one observes the other's non-NULL `cls` (a plain store, visible as soon
+ * as it happens to land in this thread's view of memory — nothing enforces
+ * an ordering) before that thread has finished writing `ctor`, and calls
+ * NewObject with a NULL/stale method ID — a JNI fatal error or crash. One
+ * shared mutex serializes both the first-time init and every subsequent
+ * read of the pair, so a fully-initialized cache is always observed as a
+ * whole. */
+typedef struct {
+    jclass cls;
+    jmethodID ctor;
+} zzdds_java_class_cache;
+
+static pthread_mutex_t zzdds_java_class_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Resolves `class_name`'s (jclass, "(J)V" constructor) pair into `*cache`,
+ * caching it globally after the first successful call. Returns false
+ * (leaving `*cache` untouched) if FindClass fails. Safe to call
+ * concurrently from multiple threads. */
+static bool zzdds_java_get_or_cache_class(JNIEnv *env, zzdds_java_class_cache *cache, const char *class_name) {
+    pthread_mutex_lock(&zzdds_java_class_cache_mu);
+    if (cache->cls == NULL) {
+        jclass local = (*env)->FindClass(env, class_name);
+        if (local == NULL) {
+            pthread_mutex_unlock(&zzdds_java_class_cache_mu);
+            return false;
+        }
+        jclass global = (jclass)(*env)->NewGlobalRef(env, local);
+        (*env)->DeleteLocalRef(env, local);
+        cache->ctor = (*env)->GetMethodID(env, global, "<init>", "(J)V");
+        cache->cls = global;
+    }
+    pthread_mutex_unlock(&zzdds_java_class_cache_mu);
+    return true;
 }
 
 /* ── Factory bootstrap ──────────────────────────────────────────────────
@@ -33,16 +75,9 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
     if (zzdds_factory_is_nil(zf)) return NULL;
     DDS_DomainParticipantFactory df = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(zf);
 
-    static jclass cls = NULL;
-    static jmethodID ctor = NULL;
-    if (cls == NULL) {
-        jclass local = (*env)->FindClass(env, "io/zzdds/dcps/DomainParticipantFactoryImpl");
-        if (local == NULL) return NULL;
-        cls = (jclass)(*env)->NewGlobalRef(env, local);
-        (*env)->DeleteLocalRef(env, local);
-        ctor = (*env)->GetMethodID(env, cls, "<init>", "(J)V");
-    }
-    return (*env)->NewObject(env, cls, ctor, (jlong)(intptr_t)df);
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/DomainParticipantFactoryImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)df);
 }
 
 /* ── TypeSupport registration: one native trampoline, ctx-carrying ──────
@@ -196,14 +231,7 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsDataWriter(
     DDS_DataWriter w = (DDS_DataWriter)zzdds_java_unbox(env, writer);
     zzdds_DataWriter zw = DDS_DataWriter_as_zzdds_DataWriter(w);
 
-    static jclass cls = NULL;
-    static jmethodID ctor = NULL;
-    if (cls == NULL) {
-        jclass local = (*env)->FindClass(env, "io/zzdds/ext/DataWriterImpl");
-        if (local == NULL) return NULL;
-        cls = (jclass)(*env)->NewGlobalRef(env, local);
-        (*env)->DeleteLocalRef(env, local);
-        ctor = (*env)->GetMethodID(env, cls, "<init>", "(J)V");
-    }
-    return (*env)->NewObject(env, cls, ctor, (jlong)(intptr_t)zw);
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/ext/DataWriterImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zw);
 }

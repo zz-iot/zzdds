@@ -132,6 +132,7 @@ test {
     _ = @import("util/guid_gen.zig");
     _ = @import("util/mutex.zig");
     _ = @import("util/listener_box.zig");
+    _ = @import("util/entity_quiesce.zig");
     _ = @import("qos/policy.zig");
     _ = @import("dcps/qos_match.zig");
     _ = @import("dcps/nil.zig");

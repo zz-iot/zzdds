@@ -25,6 +25,7 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 
 const Guid = proto.Guid;
 
@@ -163,6 +164,10 @@ pub const DataReaderImpl = struct {
     /// dispatch or any other call, so it can never participate in a
     /// deadlock with `mu` or any other lock (see listener_box.zig).
     listener_mu: Mutex = .{},
+    /// Guards this entity's own lifetime against a background-thread
+    /// callback (RTPS receive, timer, discovery) racing `deinit()` — see
+    /// entity_quiesce.zig.
+    quiesce: EntityQuiesce = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -376,7 +381,16 @@ pub const DataReaderImpl = struct {
         return self;
     }
 
+    /// Drops this entity's own quiesce reference; the real teardown
+    /// (`reallyDeinit`) runs immediately unless a background callback is
+    /// genuinely in flight, in which case that callback's own release runs
+    /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.dr_c_abi.free(self.alloc);
@@ -486,6 +500,8 @@ pub const DataReaderImpl = struct {
     /// Used by the built-in subscriber to push discovery-sourced samples.
     /// `cdr` is borrowed; it is copied internally.
     pub fn pushCdr(self: *Self, cdr: []const u8) void {
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         const copy = self.alloc.dupe(u8, cdr) catch return;
         self.mu.lock();
         const ih = writer_mod.keyHashToHandle(std.mem.zeroes([16]u8));
@@ -540,6 +556,8 @@ pub const DataReaderImpl = struct {
     /// for this writer without adding a sample to the pending queue.
     fn onEocCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         if (!self.subscriber_presentation.coherent_access) return;
         self.mu.lock();
         // Remember this writer uses EOC so onHeartbeatCb stops issuing premature commits.
@@ -563,6 +581,8 @@ pub const DataReaderImpl = struct {
     /// Must not block; must not call back into the ProtocolReader.
     fn onDataCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
 
         const copy = self.alloc.dupe(u8, change.data) catch return;
         self.mu.lock();
@@ -962,6 +982,8 @@ pub const DataReaderImpl = struct {
     /// all DATA datagrams on a real UDP network where datagrams may reorder.
     fn onHeartbeatCb(ctx: *anyopaque, writer_guid: Guid, last_sn: history_mod.SequenceNumber) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         if (!self.subscriber_presentation.coherent_access) return;
         self.mu.lock();
         const committed = if (self.coherent_wip.getPtr(writer_guid)) |entry| blk: {
@@ -1003,6 +1025,8 @@ pub const DataReaderImpl = struct {
 
     fn onWriterMatchedCb(ctx: *anyopaque, info: *const proto.MatchedWriterInfo) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
@@ -1039,6 +1063,8 @@ pub const DataReaderImpl = struct {
 
     fn onWriterAliveCb(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
         if (self.writer_liveliness.getPtr(guid)) |entry| {
@@ -1057,6 +1083,8 @@ pub const DataReaderImpl = struct {
 
     fn onWriterUnmatchedCb(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         _ = self.writer_strengths.remove(guid);
         _ = self.writer_lifespans.remove(guid);
@@ -1554,6 +1582,8 @@ pub const DataReaderImpl = struct {
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyIncompatibleQos(ctx: *anyopaque, policy_id: i32) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         self.incompat_total += 1;
         self.incompat_total_change += 1;
@@ -1584,6 +1614,8 @@ pub const DataReaderImpl = struct {
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifySubscriptionMatched(ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         const delta: i32 = if (added) 1 else -1;
         self.mu.lock();
         if (added) self.sub_matched_total += 1;
@@ -1623,6 +1655,8 @@ pub const DataReaderImpl = struct {
     }
 
     pub fn notifySampleLost(self: *Self, count: i32) void {
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         self.sample_lost_total += count;
         self.sample_lost_total_change += count;
@@ -1667,6 +1701,8 @@ pub const DataReaderImpl = struct {
     /// Fire on_requested_deadline_missed if the listener is registered for it.
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyDeadlineMissed(self: *Self) void {
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.REQUESTED_DEADLINE_MISSED_STATUS;
@@ -1688,6 +1724,8 @@ pub const DataReaderImpl = struct {
     /// Called while participant.mu is held; must not re-enter participant.
     pub fn checkTimersFn(ctx: *anyopaque, now_ns: i64) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
 
         // DEADLINE check.
         const dl = self.qos.deadline.period;
