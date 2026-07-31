@@ -11,6 +11,8 @@ const nil = @import("nil.zig");
 const waitset = @import("waitset.zig");
 const filter_mod = @import("filter.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const Mutex = @import("../util/mutex.zig").Mutex;
 
 // Forward reference: participant is defined in participant.zig.
 // We use *anyopaque here to avoid a circular import; the vtable forwarding
@@ -24,7 +26,10 @@ pub const TopicImpl = struct {
     participant_ptr: *anyopaque, // borrowed — points to ParticipantImpl
     get_participant_fn: *const fn (*anyopaque) DDS.DomainParticipant,
     qos: DDS.TopicQos,
-    listener: DDS.TopicListener,
+    listener_box: *ListenerBox(DDS.TopicListener),
+    /// Guards `listener_box` swaps/acquires only — never held across a
+    /// dispatch or any other call (see listener_box.zig).
+    listener_mu: Mutex = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -60,6 +65,8 @@ pub const TopicImpl = struct {
         errdefer alloc.free(tt);
         var qos_clone = try qos.clone(alloc);
         errdefer qos_clone.deinit(alloc);
+        const listener_box = try ListenerBox(DDS.TopicListener).create(alloc, listener);
+        errdefer alloc.destroy(listener_box);
         self.* = .{
             .alloc = alloc,
             .topic_name = tn,
@@ -67,7 +74,7 @@ pub const TopicImpl = struct {
             .participant_ptr = participant_ptr,
             .get_participant_fn = get_participant_fn,
             .qos = qos_clone,
-            .listener = listener,
+            .listener_box = listener_box,
             .listener_mask = mask,
             .instance_handle = instance_handle,
             .status_changes = 0,
@@ -80,6 +87,7 @@ pub const TopicImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.topic_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -176,13 +184,29 @@ pub const TopicImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.TopicListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.listener = if (a_listener) |l| l.* else DDS.noop_TopicListener;
+        self.swapListener(if (a_listener) |l| l.* else DDS.noop_TopicListener);
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.TopicListener {
-        return cast(ctx).listener;
+        const self = cast(ctx);
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.listener;
+    }
+
+    /// Installs `new_listener`, releasing whatever it replaces. Safe against
+    /// a concurrently in-flight dispatch acquired via `acquireListener` (see
+    /// listener_box.zig).
+    fn swapListener(self: *Self, new_listener: DDS.TopicListener) void {
+        const new_box = ListenerBox(DDS.TopicListener).create(self.alloc, new_listener) catch
+            @panic("zzdds: out of memory boxing listener");
+        self.listener_mu.lock();
+        const old_box = self.listener_box;
+        self.listener_box = new_box;
+        self.listener_mu.unlock();
+        old_box.releaseRef(self.alloc);
     }
 
     fn vtGetInconsistent(ctx: *anyopaque, a_status: *DDS.InconsistentTopicStatus) DDS.ReturnCode_t {

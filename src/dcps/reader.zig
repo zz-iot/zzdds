@@ -24,6 +24,8 @@ const writer_mod = @import("writer.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 
 const Guid = proto.Guid;
 
@@ -157,7 +159,15 @@ pub const DataReaderImpl = struct {
     subscriber: DDS.Subscriber,
     proto_reader: proto.ProtocolReader,
     qos: DDS.DataReaderQos,
-    listener: DDS.DataReaderListener,
+    listener_box: *ListenerBox(DDS.DataReaderListener),
+    /// Guards `listener_box` swaps/acquires only — never held across a
+    /// dispatch or any other call, so it can never participate in a
+    /// deadlock with `mu` or any other lock (see listener_box.zig).
+    listener_mu: Mutex = .{},
+    /// Guards this entity's own lifetime against a background-thread
+    /// callback (RTPS receive, timer, discovery) racing `deinit()` — see
+    /// entity_quiesce.zig.
+    quiesce: EntityQuiesce = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -326,7 +336,7 @@ pub const DataReaderImpl = struct {
             .subscriber = subscriber,
             .proto_reader = proto_reader,
             .qos = .{},
-            .listener = listener,
+            .listener_box = undefined,
             .listener_mask = mask,
             .instance_handle = instance_handle,
             .status_changes = 0,
@@ -342,6 +352,8 @@ pub const DataReaderImpl = struct {
             .seen_instances = .empty,
         };
         errdefer alloc.destroy(self);
+        self.listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, listener);
+        errdefer alloc.destroy(self.listener_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         // Register delivery callback with the RTPS layer.
@@ -369,7 +381,17 @@ pub const DataReaderImpl = struct {
         return self;
     }
 
+    /// Drops this entity's own quiesce reference; the real teardown
+    /// (`reallyDeinit`) runs immediately unless a background callback is
+    /// genuinely in flight, in which case that callback's own release runs
+    /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.dr_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -478,6 +500,8 @@ pub const DataReaderImpl = struct {
     /// Used by the built-in subscriber to push discovery-sourced samples.
     /// `cdr` is borrowed; it is copied internally.
     pub fn pushCdr(self: *Self, cdr: []const u8) void {
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         const copy = self.alloc.dupe(u8, cdr) catch return;
         self.mu.lock();
         const ih = writer_mod.keyHashToHandle(std.mem.zeroes([16]u8));
@@ -509,7 +533,9 @@ pub const DataReaderImpl = struct {
         self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
         if (self.status_cond) |sc| sc.notifyWakeup();
         if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-            if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
+            const box = self.acquireListener();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
         }
     }
 
@@ -530,6 +556,8 @@ pub const DataReaderImpl = struct {
     /// for this writer without adding a sample to the pending queue.
     fn onEocCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         if (!self.subscriber_presentation.coherent_access) return;
         self.mu.lock();
         // Remember this writer uses EOC so onHeartbeatCb stops issuing premature commits.
@@ -542,7 +570,9 @@ pub const DataReaderImpl = struct {
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
+                const box = self.acquireListener();
+                defer box.releaseRef(self.alloc);
+                if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
             }
         }
     }
@@ -551,6 +581,8 @@ pub const DataReaderImpl = struct {
     /// Must not block; must not call back into the ProtocolReader.
     fn onDataCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
 
         const copy = self.alloc.dupe(u8, change.data) catch return;
         self.mu.lock();
@@ -738,7 +770,9 @@ pub const DataReaderImpl = struct {
             if (transition_committed or data_committed) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
                 if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                    if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
+                    const box = self.acquireListener();
+                    defer box.releaseRef(self.alloc);
+                    if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
                 }
             }
             return;
@@ -845,12 +879,14 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (fire) {
-                if (self.listener.on_sample_rejected) |cb| cb(vtable.get_c_abi_handle(self), &.{
+                const box = self.acquireListener();
+                defer box.releaseRef(self.alloc);
+                if (box.listener.on_sample_rejected) |cb| cb(vtable.get_c_abi_handle(self), &.{
                     .total_count = self.sample_rejected_total,
                     .total_count_change = 1,
                     .last_reason = reason,
                     .last_instance_handle = ih,
-                }, self.listener.listener_data);
+                }, box.listener.listener_data);
             }
             return;
         }
@@ -911,7 +947,9 @@ pub const DataReaderImpl = struct {
 
         // Fire listener if registered for DATA_AVAILABLE.
         if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-            if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
+            const box = self.acquireListener();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
         }
     }
 
@@ -944,6 +982,8 @@ pub const DataReaderImpl = struct {
     /// all DATA datagrams on a real UDP network where datagrams may reorder.
     fn onHeartbeatCb(ctx: *anyopaque, writer_guid: Guid, last_sn: history_mod.SequenceNumber) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         if (!self.subscriber_presentation.coherent_access) return;
         self.mu.lock();
         const committed = if (self.coherent_wip.getPtr(writer_guid)) |entry| blk: {
@@ -974,7 +1014,9 @@ pub const DataReaderImpl = struct {
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
+                const box = self.acquireListener();
+                defer box.releaseRef(self.alloc);
+                if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
             }
         }
     }
@@ -983,6 +1025,8 @@ pub const DataReaderImpl = struct {
 
     fn onWriterMatchedCb(ctx: *anyopaque, info: *const proto.MatchedWriterInfo) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
@@ -1019,6 +1063,8 @@ pub const DataReaderImpl = struct {
 
     fn onWriterAliveCb(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
         if (self.writer_liveliness.getPtr(guid)) |entry| {
@@ -1037,6 +1083,8 @@ pub const DataReaderImpl = struct {
 
     fn onWriterUnmatchedCb(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         _ = self.writer_strengths.remove(guid);
         _ = self.writer_lifespans.remove(guid);
@@ -1134,7 +1182,9 @@ pub const DataReaderImpl = struct {
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             if (self.status_cond) |sc| sc.notifyWakeup();
             if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                if (self.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), self.listener.listener_data);
+                const box = self.acquireListener();
+                defer box.releaseRef(self.alloc);
+                if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
             }
         }
     }
@@ -1532,6 +1582,8 @@ pub const DataReaderImpl = struct {
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyIncompatibleQos(ctx: *anyopaque, policy_id: i32) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         self.incompat_total += 1;
         self.incompat_total_change += 1;
@@ -1551,7 +1603,9 @@ pub const DataReaderImpl = struct {
             status.total_count = self.incompat_total;
             status.total_count_change = 1;
             status.last_policy_id = policy_id;
-            if (self.listener.on_requested_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
+            const box = self.acquireListener();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_requested_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -1560,6 +1614,8 @@ pub const DataReaderImpl = struct {
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifySubscriptionMatched(ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         const delta: i32 = if (added) 1 else -1;
         self.mu.lock();
         if (added) self.sub_matched_total += 1;
@@ -1586,7 +1642,9 @@ pub const DataReaderImpl = struct {
             self.sub_matched_total_change = 0;
             self.sub_matched_current_change = 0;
             self.mu.unlock();
-            if (self.listener.on_subscription_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
+            const box = self.acquireListener();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_subscription_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -1597,6 +1655,8 @@ pub const DataReaderImpl = struct {
     }
 
     pub fn notifySampleLost(self: *Self, count: i32) void {
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         self.sample_lost_total += count;
         self.sample_lost_total_change += count;
@@ -1609,10 +1669,12 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         if (self.status_cond) |sc| sc.notifyWakeup();
         if (fire) {
-            if (self.listener.on_sample_lost) |cb| cb(vtable.get_c_abi_handle(self), &.{
+            const box = self.acquireListener();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_sample_lost) |cb| cb(vtable.get_c_abi_handle(self), &.{
                 .total_count = self.sample_lost_total,
                 .total_count_change = count,
-            }, self.listener.listener_data);
+            }, box.listener.listener_data);
         }
     }
 
@@ -1630,13 +1692,17 @@ pub const DataReaderImpl = struct {
             self.liveliness_alive_count_change = 0;
             self.liveliness_not_alive_count_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
-            if (self.listener.on_liveliness_changed) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
+            const box = self.acquireListener();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_liveliness_changed) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
     /// Fire on_requested_deadline_missed if the listener is registered for it.
     /// May be called while participant.mu is held; must not re-enter participant.
     pub fn notifyDeadlineMissed(self: *Self) void {
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.REQUESTED_DEADLINE_MISSED_STATUS;
@@ -1647,7 +1713,9 @@ pub const DataReaderImpl = struct {
             status.total_count_change = 1;
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.REQUESTED_DEADLINE_MISSED_STATUS;
-            if (self.listener.on_requested_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener.listener_data);
+            const box = self.acquireListener();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_requested_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -1656,6 +1724,8 @@ pub const DataReaderImpl = struct {
     /// Called while participant.mu is held; must not re-enter participant.
     pub fn checkTimersFn(ctx: *anyopaque, now_ns: i64) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
 
         // DEADLINE check.
         const dl = self.qos.deadline.period;
@@ -1844,13 +1914,43 @@ pub const DataReaderImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataReaderListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.listener = if (a_listener) |l| l.* else DDS.noop_DataReaderListener;
+        self.swapListener(if (a_listener) |l| l.* else DDS.noop_DataReaderListener);
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.DataReaderListener {
-        return cast(ctx).listener;
+        const self = cast(ctx);
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.listener;
+    }
+
+    /// Installs `new_listener`, releasing whatever it replaces. Safe against
+    /// a concurrently in-flight dispatch acquired via `acquireListener` (see
+    /// listener_box.zig) — the entity's own "installed" reference is what
+    /// gets dropped here; an in-flight dispatch's own extra reference keeps
+    /// the old box (and its native context) alive until that dispatch
+    /// finishes and releases it.
+    fn swapListener(self: *Self, new_listener: DDS.DataReaderListener) void {
+        const new_box = ListenerBox(DDS.DataReaderListener).create(self.alloc, new_listener) catch
+            @panic("zzdds: out of memory boxing listener");
+        self.listener_mu.lock();
+        const old_box = self.listener_box;
+        self.listener_box = new_box;
+        self.listener_mu.unlock();
+        old_box.releaseRef(self.alloc);
+    }
+
+    /// Call with no lock held. Returns a box the caller may safely read/
+    /// dispatch through with no lock held; must call `releaseRef` on it when
+    /// done (see listener_box.zig). `pub`: also used by `subscriber.zig`'s
+    /// coherent-access batch dispatch, which snapshots multiple readers'
+    /// listeners under `subscriber.mu` before firing any of them.
+    pub fn acquireListener(self: *Self) *ListenerBox(DDS.DataReaderListener) {
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.acquireLocked();
     }
 
     fn vtGetTopicDesc(ctx: *anyopaque) DDS.TopicDescription {
@@ -2047,7 +2147,7 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener = nil.nil_dr_listener,
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -2080,6 +2180,7 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
+        dr.listener_box.releaseRef(alloc);
     }
 
     const writer_guid = @import("../rtps/guid.zig").Guid{
@@ -2145,7 +2246,7 @@ test "coherent WIP: CS transition discards incomplete previous WIP" {
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener = nil.nil_dr_listener,
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -2178,6 +2279,7 @@ test "coherent WIP: CS transition discards incomplete previous WIP" {
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
+        dr.listener_box.releaseRef(alloc);
         dr.coherent_writer_guids.deinit(alloc);
         var wit = dr.writer_instances.valueIterator();
         while (wit.next()) |v| v.deinit(alloc);
@@ -2230,7 +2332,7 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener = nil.nil_dr_listener,
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -2263,6 +2365,7 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
+        dr.listener_box.releaseRef(alloc);
         dr.coherent_writer_guids.deinit(alloc);
         var wit = dr.writer_instances.valueIterator();
         while (wit.next()) |v| v.deinit(alloc);
@@ -2313,7 +2416,7 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener = nil.nil_dr_listener,
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -2338,6 +2441,7 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
+        dr.listener_box.releaseRef(alloc);
     }
 
     const d = try alloc.dupe(u8, &.{0xAA});
@@ -2359,7 +2463,7 @@ fn mkTestReaderForGenerationTests(alloc: std.mem.Allocator, clock: *time_test.Ma
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener = nil.nil_dr_listener,
+        .listener_box = ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener) catch unreachable,
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -2386,6 +2490,7 @@ fn deinitTestReader(dr: *DataReaderImpl, alloc: std.mem.Allocator) void {
         while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
     }
     dr.seen_instances.deinit(alloc);
+    dr.listener_box.releaseRef(alloc);
 }
 
 test "determineStatesLocked: disposed_generation_count increments only on resurrection from DISPOSED" {

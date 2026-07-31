@@ -1,4 +1,32 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Directories containing `jni.h`/`jni_md.h` for the JDK backing `java_path`
+/// (the `java` executable's own path, e.g. from `b.findProgram`). Resolves
+/// symlink chains (PATH/update-alternatives-style) back to a real
+/// `$JAVA_HOME/bin/java` first. Returns null if not found (e.g. a JRE-only
+/// install with no JNI headers) — callers should skip the Java native build,
+/// not fail it.
+const JniIncludeDirs = struct { base: []const u8, platform: []const u8 };
+
+fn findJniIncludeDir(b: *std.Build, java_path: []const u8) ?JniIncludeDirs {
+    const io = b.graph.io;
+    const resolved = std.Io.Dir.realPathFileAbsoluteAlloc(io, java_path, b.allocator) catch
+        (b.allocator.dupeZ(u8, java_path) catch return null);
+    const bin_dir = std.fs.path.dirname(resolved) orelse return null;
+    const java_home = std.fs.path.dirname(bin_dir) orelse return null;
+    const base = std.fs.path.join(b.allocator, &.{ java_home, "include" }) catch return null;
+    const platform_name = switch (builtin.os.tag) {
+        .linux => "linux",
+        .macos => "darwin",
+        .windows => "win32",
+        else => return null,
+    };
+    const platform = std.fs.path.join(b.allocator, &.{ base, platform_name }) catch return null;
+    const jni_h = std.fs.path.join(b.allocator, &.{ base, "jni.h" }) catch return null;
+    std.Io.Dir.cwd().access(io, jni_h, .{}) catch return null;
+    return .{ .base = base, .platform = platform };
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -32,8 +60,17 @@ pub fn build(b: *std.Build) void {
     // const dotnet_binding = b.option(bool, "dotnet-binding", ...) orelse false;  // TODO
     // const rust_binding   = b.option(bool, "rust-binding",   ...) orelse false;  // TODO
 
-    // C ABI layer is a shared prerequisite for C, C++, Python, .NET, Rust zig-ffi.
-    const need_c_abi = c_binding or cpp_binding;
+    // C ABI layer is a shared prerequisite for C, C++, Java, Python, .NET, Rust zig-ffi
+    // — Java's JNI bridge links against libzzdds/dcps.h the same way C/C++ do.
+    const need_c_abi = c_binding or cpp_binding or java_binding;
+
+    // Hoisted out of the `if (need_c_abi)` block below so the Java binding
+    // section (which needs `need_c_abi` too, but is declared later in this
+    // file) can reuse the same generated dcps.h dir and libzzdds Compile step
+    // instead of stamping out its own redundant copies.
+    var gen_c_dir_for_reuse: ?std.Build.LazyPath = null;
+    var gen_zzdds_c_dir_for_reuse: ?std.Build.LazyPath = null;
+    var zzdds_lib_for_reuse: ?*std.Build.Step.Compile = null;
 
     // ── Code generation: idl/dcps.idl → generated/dcps.zig ───────────────────
 
@@ -278,6 +315,7 @@ pub fn build(b: *std.Build) void {
         const gen_dcps_c = b.addRunArtifact(zidl_exe);
         gen_dcps_c.addArgs(&.{ "-b", "c", "--generate-interfaces", "-o" });
         const gen_c_dir = gen_dcps_c.addOutputDirectoryArg("zzdds-c-binding");
+        gen_c_dir_for_reuse = gen_c_dir;
         if (xtypes) gen_dcps_c.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
         gen_dcps_c.addFileArg(dcps_idl);
 
@@ -286,6 +324,7 @@ pub fn build(b: *std.Build) void {
         const gen_zzdds_c = b.addRunArtifact(zidl_exe);
         gen_zzdds_c.addArgs(&.{ "-b", "c", "--generate-interfaces", "-o" });
         const gen_zzdds_c_dir = gen_zzdds_c.addOutputDirectoryArg("zzdds-c-ext-binding");
+        gen_zzdds_c_dir_for_reuse = gen_zzdds_c_dir;
         gen_zzdds_c.addFileArg(b.path("idl/zzdds.idl"));
         gen_only_step.dependOn(&gen_zzdds_c.step);
 
@@ -386,6 +425,7 @@ pub fn build(b: *std.Build) void {
             zzdds_lib.root_module.linkSystemLibrary("ws2_32", .{});
         }
         b.installArtifact(zzdds_lib);
+        zzdds_lib_for_reuse = zzdds_lib;
 
         const gen_smoke_c = b.addRunArtifact(zidl_exe);
         gen_smoke_c.addArgs(&.{ "-b", "c", "--generate-zzdds-wrappers", "-o" });
@@ -713,34 +753,170 @@ pub fn build(b: *std.Build) void {
     // ── Java language binding ─────────────────────────────────────────────────
 
     if (java_binding) {
+        // dcps.idl and zzdds.idl's Java ext-binding are generated with
+        // different --java-package values (io.zzdds.dcps / io.zzdds.ext):
+        // several ext-binding interfaces share a simple name with a
+        // dcps.idl one (e.g. `DomainParticipantFactory`), so both would
+        // clobber the same *Impl.java filename if installed into the same
+        // flat directory — separate packages (and therefore separate
+        // install subdirectories) avoid that collision entirely. Java
+        // forbids a named package from referencing the unnamed one, which
+        // is why dcps.idl gets a real package too, not just the extension.
         const gen_dcps_java = b.addRunArtifact(zidl_exe);
-        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "-o" });
+        gen_dcps_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "--java-jni-library", "zzdds_jni", "--java-package", "io.zzdds.dcps", "-o" });
         const gen_java_dir = gen_dcps_java.addOutputDirectoryArg("zzdds-java-binding");
         if (xtypes) gen_dcps_java.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
         gen_dcps_java.addFileArg(dcps_idl);
 
         gen_only_step.dependOn(&gen_dcps_java.step);
 
-        const gen_zzdds_java = b.addRunArtifact(zidl_exe);
-        gen_zzdds_java.addArgs(&.{ "-b", "java", "--generate-interfaces", "-o" });
-        const gen_zzdds_java_dir = gen_zzdds_java.addOutputDirectoryArg("zzdds-java-ext-binding");
-        gen_zzdds_java.addFileArg(b.path("idl/zzdds.idl"));
-        gen_only_step.dependOn(&gen_zzdds_java.step);
+        // idl/zzdds.idl's Java "ext binding" (create_participant_ex,
+        // DataWriterListenerEx, …) — needs zidl's cross-file Java type
+        // support (--java-import-package tells it dcps.idl's own output
+        // lives in a different package than this one) to correctly resolve
+        // its `DDS::*` references instead of a bare (nonexistent) `DDS.Foo`.
+        const gen_zzdds_ext_java = b.addRunArtifact(zidl_exe);
+        gen_zzdds_ext_java.addArgs(&.{
+            "-b",                    "java",
+            "--generate-interfaces", "--java-jni-library",
+            "zzdds_jni",             "--java-package",
+            "io.zzdds.ext",          "--java-import-package",
+            "DDS=io.zzdds.dcps",     "-o",
+        });
+        const gen_zzdds_ext_java_dir = gen_zzdds_ext_java.addOutputDirectoryArg("zzdds-ext-java-binding");
+        gen_zzdds_ext_java.addFileArg(b.path("idl/zzdds.idl"));
 
-        // Install generated Java sources → zig-out/java/
+        gen_only_step.dependOn(&gen_zzdds_ext_java.step);
+
+        // Install generated Java sources → zig-out/java/io/zzdds/{dcps,ext}/
+        // — matching each file's own --java-package so a plain `javac`/`java`
+        // run against zig-out/java (as the classpath root) resolves them.
         const install_java = b.addInstallDirectory(.{
             .source_dir = gen_java_dir,
             .install_dir = .{ .custom = "java" },
-            .install_subdir = "",
+            .install_subdir = "io/zzdds/dcps",
         });
         b.getInstallStep().dependOn(&install_java.step);
 
-        const install_zzdds_java = b.addInstallDirectory(.{
-            .source_dir = gen_zzdds_java_dir,
+        const install_zzdds_ext_java = b.addInstallDirectory(.{
+            .source_dir = gen_zzdds_ext_java_dir,
             .install_dir = .{ .custom = "java" },
-            .install_subdir = "",
+            .install_subdir = "io/zzdds/ext",
         });
-        b.getInstallStep().dependOn(&install_zzdds_java.step);
+        b.getInstallStep().dependOn(&install_zzdds_ext_java.step);
+
+        // Install the hand-written io.zzdds.runtime.ZzddsRuntime.java — the
+        // small fixed contract the generated --generate-zzdds-wrappers Java
+        // output calls into (see java_runtime/ZzddsRuntime.java's javadoc).
+        // Must land at the path matching its package for a plain `javac`
+        // over zig-out/java/ to find it.
+        const install_zzdds_runtime_java = b.addInstallFileWithDir(
+            b.path("java_runtime/ZzddsRuntime.java"),
+            .{ .custom = "java/io/zzdds/runtime" },
+            "ZzddsRuntime.java",
+        );
+        b.getInstallStep().dependOn(&install_zzdds_runtime_java.step);
+
+        // Compile the generated entity JNI bridge (dcps_jni.c) + the
+        // hand-written ZzddsRuntime native implementation into one shared
+        // library, linked against libzzdds. Needs a real JDK (for jni.h) —
+        // skipped with a warning if one isn't found, same as zidl's own
+        // Java JNI integration test.
+        const maybe_java_for_jni = b.findProgram(&.{"java"}, &.{}) catch null;
+        const jni_include = if (maybe_java_for_jni) |java_path| findJniIncludeDir(b, java_path) else null;
+        if (jni_include) |jni_inc| {
+            const zzdds_jni_mod = b.createModule(.{
+                .root_source_file = null,
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            zzdds_jni_mod.addCSourceFile(.{
+                .file = gen_java_dir.path(b, "dcps_jni.c"),
+                .flags = &.{"-std=c99"},
+            });
+            zzdds_jni_mod.addCSourceFile(.{
+                .file = gen_zzdds_ext_java_dir.path(b, "zzdds_jni.c"),
+                .flags = &.{"-std=c99"},
+            });
+            zzdds_jni_mod.addCSourceFile(.{
+                .file = b.path("java_runtime/zzdds_java_runtime.c"),
+                .flags = &.{"-std=c99"},
+            });
+            zzdds_jni_mod.addIncludePath(gen_c_dir_for_reuse.?);
+            zzdds_jni_mod.addIncludePath(gen_zzdds_c_dir_for_reuse.?);
+            zzdds_jni_mod.addIncludePath(b.path("include"));
+            zzdds_jni_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            zzdds_jni_mod.addIncludePath(.{ .cwd_relative = jni_inc.base });
+            zzdds_jni_mod.addIncludePath(.{ .cwd_relative = jni_inc.platform });
+            zzdds_jni_mod.linkLibrary(zzdds_lib_for_reuse.?);
+            const zzdds_jni_lib = b.addLibrary(.{
+                .name = "zzdds_jni",
+                .linkage = .dynamic,
+                .root_module = zzdds_jni_mod,
+            });
+            b.installArtifact(zzdds_jni_lib);
+
+            // Java binding smoke test — see JavaSmoke.java's own doc comment
+            // for why this one is a real end-to-end run (two participants,
+            // real discovery, a firing listener) rather than the shallow
+            // CDR-only check the other languages' smoke tests do.
+            if (b.findProgram(&.{"javac"}, &.{}) catch null) |javac| {
+                const gen_smoke_java = b.addRunArtifact(zidl_exe);
+                gen_smoke_java.addArgs(&.{ "-b", "java", "--generate-zzdds-wrappers", "--java-import-package", "DDS=io.zzdds.dcps", "-o" });
+                const gen_smoke_java_dir = gen_smoke_java.addOutputDirectoryArg("zzdds-java-binding-smoke");
+                gen_smoke_java.addFileArg(smoke_idl);
+
+                const compile_java_smoke = b.addSystemCommand(&.{ javac, "-d", "build-tmp/java-binding-smoke" });
+                compile_java_smoke.addArgs(&.{"test/bindings/smoke/JavaSmoke.java"});
+                for (&[_][]const u8{ "Binding_smoke.java", "BindingSmokeStatusTypeSupport.java", "BindingSmokeStatusDataWriter.java", "BindingSmokeStatusDataReader.java" }) |f| {
+                    compile_java_smoke.addFileArg(gen_smoke_java_dir.path(b, f));
+                }
+                for (&[_][]const u8{
+                    "Dcps.java",                     "ConditionImpl.java",
+                    "ContentFilteredTopicImpl.java", "DataReaderImpl.java",
+                    "DataReaderListenerImpl.java",   "DataWriterImpl.java",
+                    "DataWriterListenerImpl.java",   "DomainParticipantFactoryImpl.java",
+                    "DomainParticipantImpl.java",    "DomainParticipantListenerImpl.java",
+                    "EntityImpl.java",               "GuardConditionImpl.java",
+                    "ListenerImpl.java",             "MultiTopicImpl.java",
+                    "PublisherImpl.java",            "PublisherListenerImpl.java",
+                    "QueryConditionImpl.java",       "ReadConditionImpl.java",
+                    "StatusConditionImpl.java",      "SubscriberImpl.java",
+                    "SubscriberListenerImpl.java",   "TopicDescriptionImpl.java",
+                    "TopicImpl.java",                "TopicListenerImpl.java",
+                    "TypeSupportImpl.java",          "WaitSetImpl.java",
+                }) |f| {
+                    compile_java_smoke.addFileArg(gen_java_dir.path(b, f));
+                }
+                // idl/zzdds.idl's ext binding (DataWriterListenerEx /
+                // on_reliable_reader_ready, …) — see JavaSmoke.java's use of
+                // ZzddsRuntime.asZzddsDataWriter/set_listener_ex.
+                for (&[_][]const u8{
+                    "Zzdds.java",
+                    "DataReaderImpl.java",
+                    "DataWriterImpl.java",
+                    "DataWriterListenerExImpl.java",
+                    "DomainParticipantFactoryImpl.java",
+                    "DomainParticipantImpl.java",
+                    "TopicImpl.java",
+                }) |f| {
+                    compile_java_smoke.addFileArg(gen_zzdds_ext_java_dir.path(b, f));
+                }
+                compile_java_smoke.addFileArg(b.path("java_runtime/ZzddsRuntime.java"));
+
+                const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "-cp", "build-tmp/java-binding-smoke" });
+                run_java_smoke.addPrefixedDirectoryArg("-Djava.library.path=", zzdds_jni_lib.getEmittedBinDirectory());
+                run_java_smoke.addArg("JavaSmoke");
+                run_java_smoke.step.dependOn(&compile_java_smoke.step);
+                run_java_smoke.step.dependOn(&zzdds_jni_lib.step);
+                binding_smoke_step.dependOn(&run_java_smoke.step);
+            } else {
+                std.log.warn("javac not found — skipping Java binding smoke test", .{});
+            }
+        } else {
+            std.log.warn("jni.h not found under the detected JAVA_HOME — skipping libzzdds_jni.so (Java entity/runtime JNI bridge)", .{});
+        }
     }
 
     // ── Unit tests ────────────────────────────────────────────────────────────
