@@ -17,7 +17,7 @@ const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const listener_lifecycle = @import("../util/listener_lifecycle.zig");
+const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 pub const ParticipantCbs = struct {
@@ -89,7 +89,10 @@ pub const SubscriberImpl = struct {
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
     qos: DDS.SubscriberQos,
-    listener: DDS.SubscriberListener,
+    listener_box: *ListenerBox(DDS.SubscriberListener),
+    /// Guards `listener_box` swaps/acquires only — never held across a
+    /// dispatch or any other call (see listener_box.zig).
+    listener_mu: Mutex = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -121,7 +124,7 @@ pub const SubscriberImpl = struct {
             .participant = participant,
             .cbs = cbs,
             .qos = .{},
-            .listener = listener,
+            .listener_box = undefined,
             .listener_mask = mask,
             .instance_handle = handle,
             .status_changes = 0,
@@ -131,6 +134,8 @@ pub const SubscriberImpl = struct {
             .mu = .{},
         };
         errdefer alloc.destroy(self);
+        self.listener_box = try ListenerBox(DDS.SubscriberListener).create(alloc, listener);
+        errdefer alloc.destroy(self.listener_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
@@ -139,7 +144,7 @@ pub const SubscriberImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        listener_lifecycle.release(self.listener);
+        self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.sub_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -398,7 +403,9 @@ pub const SubscriberImpl = struct {
         for (self.readers.items) |r| {
             if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
                 const dr = r.toDDSDataReader();
-                if (r.listener.on_data_available) |cb| cb(dr.vtable.get_c_abi_handle(dr.ptr), r.listener.listener_data);
+                const box = r.acquireListener();
+                defer box.releaseRef(r.alloc);
+                if (box.listener.on_data_available) |cb| cb(dr.vtable.get_c_abi_handle(dr.ptr), box.listener.listener_data);
             }
         }
         return DDS.RETCODE_OK;
@@ -420,14 +427,29 @@ pub const SubscriberImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.SubscriberListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        listener_lifecycle.release(self.listener);
-        self.listener = if (a_listener) |l| l.* else DDS.noop_SubscriberListener;
+        self.swapListener(if (a_listener) |l| l.* else DDS.noop_SubscriberListener);
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.SubscriberListener {
-        return cast(ctx).listener;
+        const self = cast(ctx);
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.listener;
+    }
+
+    /// Installs `new_listener`, releasing whatever it replaces. Safe against
+    /// a concurrently in-flight dispatch acquired via `acquireListener` (see
+    /// listener_box.zig).
+    fn swapListener(self: *Self, new_listener: DDS.SubscriberListener) void {
+        const new_box = ListenerBox(DDS.SubscriberListener).create(self.alloc, new_listener) catch
+            @panic("zzdds: out of memory boxing listener");
+        self.listener_mu.lock();
+        const old_box = self.listener_box;
+        self.listener_box = new_box;
+        self.listener_mu.unlock();
+        old_box.releaseRef(self.alloc);
     }
 
     fn vtBeginAccess(ctx: *anyopaque) DDS.ReturnCode_t {
@@ -440,9 +462,20 @@ pub const SubscriberImpl = struct {
         // lock is released.  Avoids use-after-free from a concurrent delete_datareader:
         // delete_datareader must acquire subscriber.mu, so it cannot free a reader
         // while we are still accessing its fields inside the lock.
-        const ListenerSnap = struct { listener: DDS.DataReaderListener, dr: DDS.DataReader };
+        const ListenerSnap = struct {
+            box: *ListenerBox(DDS.DataReaderListener),
+            alloc: std.mem.Allocator,
+            dr: DDS.DataReader,
+        };
         var listener_snaps: std.ArrayListUnmanaged(ListenerSnap) = .empty;
-        defer listener_snaps.deinit(self.alloc);
+        // Each entry's acquired box reference is released by the dispatch
+        // loop below (the normal path) or, if this function returns before
+        // reaching it, by this defer instead — never both: the dispatch
+        // loop clears the list after releasing, so this is a no-op then.
+        defer {
+            for (listener_snaps.items) |snap| snap.box.releaseRef(snap.alloc);
+            listener_snaps.deinit(self.alloc);
+        }
 
         // Snapshot time before acquiring any lock — nanoTimestamp() is a vDSO call
         // but still avoids holding the lock longer than necessary.  All readers in
@@ -525,10 +558,12 @@ pub const SubscriberImpl = struct {
                         r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
                         if (r.status_cond) |sc| sc.notifyWakeup();
                         if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
+                            const box = r.acquireListener();
                             listener_snaps.append(self.alloc, .{
-                                .listener = r.listener,
+                                .box = box,
+                                .alloc = r.alloc,
                                 .dr = r.toDDSDataReader(),
-                            }) catch {};
+                            }) catch box.releaseRef(r.alloc);
                         }
                     }
                 }
@@ -569,12 +604,18 @@ pub const SubscriberImpl = struct {
 
         self.mu.unlock();
 
-        // Fire listener callbacks without any lock held, using pre-captured snapshots.
-        // Listener context validity is the application's responsibility (standard DDS
-        // contract: don't delete a reader while its callbacks may be in-flight).
+        // Fire listener callbacks without any lock held, using pre-captured
+        // snapshots — each carrying its own acquired ListenerBox reference,
+        // so a concurrent replace/delete on the owning reader can't free the
+        // listener's native context out from under this dispatch (see
+        // listener_box.zig). Released here, then the list is cleared so the
+        // top-level defer (a safety net for an early-return path) doesn't
+        // double-release.
         for (listener_snaps.items) |snap| {
-            if (snap.listener.on_data_available) |cb| cb(snap.dr.vtable.get_c_abi_handle(snap.dr.ptr), snap.listener.listener_data);
+            if (snap.box.listener.on_data_available) |cb| cb(snap.dr.vtable.get_c_abi_handle(snap.dr.ptr), snap.box.listener.listener_data);
+            snap.box.releaseRef(snap.alloc);
         }
+        listener_snaps.clearRetainingCapacity();
         return DDS.RETCODE_OK;
     }
 

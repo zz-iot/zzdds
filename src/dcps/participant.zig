@@ -46,7 +46,7 @@ const reader_mod = @import("reader.zig");
 const writer_mod = @import("writer.zig");
 const zidl_rt = @import("zidl_rt");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const listener_lifecycle = @import("../util/listener_lifecycle.zig");
+const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
@@ -631,7 +631,10 @@ pub const DomainParticipantImpl = struct {
     domain_id: DDS.DomainId_t,
     guid: Guid,
     qos: DDS.DomainParticipantQos,
-    listener: DDS.DomainParticipantListener,
+    listener_box: *ListenerBox(DDS.DomainParticipantListener),
+    /// Guards `listener_box` swaps/acquires only — never held across a
+    /// dispatch or any other call (see listener_box.zig).
+    listener_mu: Mutex = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -769,7 +772,7 @@ pub const DomainParticipantImpl = struct {
             .domain_id = domain_id,
             .guid = guid,
             .qos = .{},
-            .listener = listener,
+            .listener_box = undefined,
             .listener_mask = mask,
             .instance_handle = handle,
             .status_changes = 0,
@@ -818,6 +821,8 @@ pub const DomainParticipantImpl = struct {
             .mu = .{},
         };
         errdefer alloc.destroy(self);
+        self.listener_box = try ListenerBox(DDS.DomainParticipantListener).create(alloc, listener);
+        errdefer alloc.destroy(self.listener_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
@@ -971,7 +976,7 @@ pub const DomainParticipantImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        listener_lifecycle.release(self.listener);
+        self.listener_box.releaseRef(self.alloc);
         self.discovery.stop();
 
         // Stop receiving user data before tearing down readers.
@@ -2964,14 +2969,31 @@ pub const DomainParticipantImpl = struct {
         mask: DDS.StatusMask,
     ) DDS.ReturnCode_t {
         const self = cast(ctx);
-        listener_lifecycle.release(self.listener);
-        self.listener = if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener;
+        self.swapListener(if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener);
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.DomainParticipantListener {
-        return cast(ctx).listener;
+        const self = cast(ctx);
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.listener;
+    }
+
+    /// Installs `new_listener`, releasing whatever it replaces. Safe against
+    /// a concurrently in-flight dispatch acquired via an `acquireListener`-
+    /// style helper (see listener_box.zig) — DomainParticipantListener
+    /// itself is never dispatched anywhere in this codebase today, but the
+    /// swap must still be safe against a concurrent `get_listener()` read.
+    fn swapListener(self: *Self, new_listener: DDS.DomainParticipantListener) void {
+        const new_box = ListenerBox(DDS.DomainParticipantListener).create(self.alloc, new_listener) catch
+            @panic("zzdds: out of memory boxing listener");
+        self.listener_mu.lock();
+        const old_box = self.listener_box;
+        self.listener_box = new_box;
+        self.listener_mu.unlock();
+        old_box.releaseRef(self.alloc);
     }
 
     fn vtIgnoreParticipant(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {

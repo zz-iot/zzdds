@@ -45,19 +45,20 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
     return (*env)->NewObject(env, cls, ctor, (jlong)(intptr_t)df);
 }
 
-/* ── TypeSupport registration: bounded key-hash callback slot table ──────
+/* ── TypeSupport registration: one native trampoline, ctx-carrying ──────
  *
- * zzdds_compute_key_hash_fn (const uint8_t *, size_t, uint8_t[16]) -> int
- * carries no user-data parameter, so one C function pointer can't dispatch
- * to "whichever Java Class<?> this registration was for" on its own. Each
- * concurrently-registered Java topic type gets its own slot (and its own
- * tiny trampoline function, generated below via X-macro) instead.
+ * zzdds_register_type_support_ctx_c (see zzdds_c.h) forwards an opaque ctx
+ * to every compute_key_hash call, so — unlike the plain, no-ctx
+ * zzdds_register_type_support_c that C/C++/Zig use — one shared trampoline
+ * here can dispatch to whichever Java Class<?>/jmethodID a given
+ * registration was for, with no fixed slot table and no per-registration
+ * lock: each registration gets its own independent heap allocation, freed
+ * by zzdds core (via ctx_deinit) exactly when that registration is replaced
+ * or its participant is destroyed — see registerTypeSupport/deinit in
+ * zzdds/src/dcps/participant.zig, which already reclaims TypeSupport ctx
+ * this way for the non-Java C ABI path too.
  */
-#define ZZDDS_JAVA_KEYHASH_SLOTS 32
-
 static JavaVM *zzdds_java_vm = NULL;
-static jclass zzdds_java_keyhash_cls[ZZDDS_JAVA_KEYHASH_SLOTS];
-static jmethodID zzdds_java_keyhash_mid[ZZDDS_JAVA_KEYHASH_SLOTS];
 
 static JNIEnv *zzdds_java_get_env(void) {
     JNIEnv *env = NULL;
@@ -68,34 +69,31 @@ static JNIEnv *zzdds_java_get_env(void) {
     return env;
 }
 
-static int zzdds_java_keyhash_dispatch(int slot, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
+typedef struct {
+    jclass cls;    /* global ref */
+    jmethodID mid;
+} zzdds_java_ts_ctx;
+
+static int zzdds_java_compute_key_hash_ctx(void *ctx_v, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
+    zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
     JNIEnv *env = zzdds_java_get_env();
-    if (env == NULL || zzdds_java_keyhash_cls[slot] == NULL) return -1;
+    if (env == NULL) return -1;
     jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
     (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte *)payload);
-    jbyteArray hash = (jbyteArray)(*env)->CallStaticObjectMethod(
-        env, zzdds_java_keyhash_cls[slot], zzdds_java_keyhash_mid[slot], arr);
+    jbyteArray hash = (jbyteArray)(*env)->CallStaticObjectMethod(env, ctx->cls, ctx->mid, arr);
     if (hash == NULL) return -1;
     (*env)->GetByteArrayRegion(env, hash, 0, 16, (jbyte *)hash_out);
     return 0;
 }
 
-#define ZZDDS_KEYHASH_SLOT_FN(N) \
-    static int zzdds_java_keyhash_slot_##N(const uint8_t *payload, size_t len, uint8_t hash_out[16]) { \
-        return zzdds_java_keyhash_dispatch(N, payload, len, hash_out); \
-    }
-#define ZZDDS_KEYHASH_SLOTS_X(X) \
-    X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) \
-    X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) \
-    X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) \
-    X(24) X(25) X(26) X(27) X(28) X(29) X(30) X(31)
-
-ZZDDS_KEYHASH_SLOTS_X(ZZDDS_KEYHASH_SLOT_FN)
-
-#define ZZDDS_KEYHASH_SLOT_REF(N) zzdds_java_keyhash_slot_##N,
-static const zzdds_compute_key_hash_fn zzdds_java_keyhash_table[ZZDDS_JAVA_KEYHASH_SLOTS] = {
-    ZZDDS_KEYHASH_SLOTS_X(ZZDDS_KEYHASH_SLOT_REF)
-};
+/* Called by zzdds core exactly once, when this registration is replaced or
+ * its participant is destroyed (see the block comment above). */
+static void zzdds_java_ts_ctx_deinit(void *ctx_v) {
+    zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
+    JNIEnv *env = zzdds_java_get_env();
+    if (env != NULL) (*env)->DeleteGlobalRef(env, ctx->cls);
+    free(ctx);
+}
 
 JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     JNIEnv *env, jclass self_cls, jobject participant, jstring typeName, jclass typeClass)
@@ -103,19 +101,23 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     (void)self_cls;
     (*env)->GetJavaVM(env, &zzdds_java_vm);
 
-    int slot = -1;
-    for (int i = 0; i < ZZDDS_JAVA_KEYHASH_SLOTS; i++) {
-        if (zzdds_java_keyhash_cls[i] == NULL) { slot = i; break; }
-    }
-    if (slot < 0) return -1; /* all slots in use — see ZZDDS_JAVA_KEYHASH_SLOTS */
-
-    zzdds_java_keyhash_cls[slot] = (jclass)(*env)->NewGlobalRef(env, typeClass);
-    zzdds_java_keyhash_mid[slot] = (*env)->GetStaticMethodID(env, typeClass, "computeKeyHashFromCdr", "([B)[B");
+    zzdds_java_ts_ctx *ctx = malloc(sizeof(*ctx));
+    if (ctx == NULL) return -1;
+    ctx->cls = (jclass)(*env)->NewGlobalRef(env, typeClass);
+    ctx->mid = (*env)->GetStaticMethodID(env, typeClass, "computeKeyHashFromCdr", "([B)[B");
 
     void *p = zzdds_java_unbox(env, participant);
     const char *type_name_c = (*env)->GetStringUTFChars(env, typeName, NULL);
-    int rc = zzdds_register_type_support_c(p, type_name_c, zzdds_java_keyhash_table[slot]);
+    int rc = zzdds_register_type_support_ctx_c(p, type_name_c, zzdds_java_compute_key_hash_ctx, ctx, zzdds_java_ts_ctx_deinit);
     (*env)->ReleaseStringUTFChars(env, typeName, type_name_c);
+
+    if (rc != 0) {
+        /* Registration didn't take — nothing installed it, so nothing will
+         * ever call ctx_deinit for it; release what we just allocated
+         * ourselves instead of leaking it. */
+        (*env)->DeleteGlobalRef(env, ctx->cls);
+        free(ctx);
+    }
     return rc;
 }
 

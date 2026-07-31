@@ -104,3 +104,99 @@ pub export fn zzdds_register_type_support_c(
 
     return 0;
 }
+
+/// `ctx`-carrying compute_key_hash function type.
+///
+/// Unlike `ZzddsComputeKeyHashFn`, this variant carries a caller-owned `ctx`
+/// through to every call — needed by any binding that can't generate a fresh,
+/// uniquely-addressed native function per registered type the way `zidl -b c`/
+/// `-b cpp` do (e.g. classic JNI: a Java `Class<?>` has no native function
+/// pointer of its own, so one shared trampoline needs `ctx` to know which
+/// class/method to dispatch to). C/C++/Zig callers don't need this — keep
+/// using `zzdds_register_type_support_c` above.
+pub const ZzddsComputeKeyHashCtxFn = *const fn (
+    ctx: ?*anyopaque,
+    payload: [*]const u8,
+    len: usize,
+    hash_out: *[16]u8,
+) callconv(.c) c_int;
+
+/// Per-registration adapter forwarding to a caller-supplied `ctx` (as opposed
+/// to `CKeyHashAdapter`, which wraps a bare, type-specific C function that
+/// needs no ctx of its own). Heap-allocated when
+/// `zzdds_register_type_support_ctx_c` is called; freed (calling the caller's
+/// own `user_deinit` first, if any) when the participant deinits or replaces
+/// this TypeSupport registration — see `DomainParticipantImpl.deinit`/
+/// `registerTypeSupport` in `src/dcps/participant.zig`, unchanged by this.
+const CtxKeyHashAdapter = struct {
+    c_fn: ZzddsComputeKeyHashCtxFn,
+    user_ctx: ?*anyopaque,
+    user_deinit: ?*const fn (?*anyopaque) callconv(.c) void,
+
+    fn computeKeyHash(ctx: *anyopaque, payload: []const u8) [16]u8 {
+        const self: *CtxKeyHashAdapter = @ptrCast(@alignCast(ctx));
+        var hash: [16]u8 = std.mem.zeroes([16]u8);
+        _ = self.c_fn(self.user_ctx, payload.ptr, payload.len, &hash);
+        return hash;
+    }
+
+    fn deinitAdapter(ctx: *anyopaque) void {
+        const self: *CtxKeyHashAdapter = @ptrCast(@alignCast(ctx));
+        if (self.user_deinit) |f| f(self.user_ctx);
+        std.heap.c_allocator.destroy(self);
+    }
+};
+
+/// Register a C-ABI TypeSupport with a DomainParticipant, with a `ctx`
+/// forwarded to `compute_key_hash_fn` on every call.
+///
+/// @param participant          Same as `zzdds_register_type_support_c`.
+/// @param type_name            Null-terminated type name string.
+/// @param compute_key_hash_fn  Function computing the key hash from raw CDR
+///                             bytes, given the `ctx` below. Pass NULL for
+///                             keyless types (ctx/ctx_deinit are ignored then).
+/// @param ctx                  Opaque, caller-owned context passed to every
+///                             `compute_key_hash_fn` call for this registration.
+/// @param ctx_deinit           Optional cleanup for `ctx`, called exactly once
+///                             when this registration is replaced or its
+///                             participant is destroyed. NULL if `ctx` needs
+///                             no cleanup (e.g. it isn't heap-allocated).
+///
+/// Returns 0 on success, -1 if the internal allocation failed.
+pub export fn zzdds_register_type_support_ctx_c(
+    participant: *anyopaque,
+    type_name: [*:0]const u8,
+    compute_key_hash_fn: ?ZzddsComputeKeyHashCtxFn,
+    ctx: ?*anyopaque,
+    ctx_deinit: ?*const fn (?*anyopaque) callconv(.c) void,
+) callconv(.c) c_int {
+    if (@intFromPtr(participant) == 0) return -1;
+    const p = zidl_rt.unboxAs(DDS.DomainParticipant, participant);
+    if (nil.isNil(p)) return -1;
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
+    const name = std.mem.span(type_name);
+
+    if (compute_key_hash_fn) |c_fn| {
+        const adapter = std.heap.c_allocator.create(CtxKeyHashAdapter) catch return -1;
+        adapter.* = .{ .c_fn = c_fn, .user_ctx = ctx, .user_deinit = ctx_deinit };
+        if (!impl.registerTypeSupport(name, TypeSupport{
+            .ctx = adapter,
+            .compute_key_hash = CtxKeyHashAdapter.computeKeyHash,
+            .deinit = CtxKeyHashAdapter.deinitAdapter,
+        })) {
+            std.heap.c_allocator.destroy(adapter);
+            return -1;
+        }
+    } else {
+        if (!impl.registerTypeSupport(name, TypeSupport{
+            .ctx = undefined,
+            .compute_key_hash = struct {
+                fn f(_: *anyopaque, _: []const u8) [16]u8 {
+                    return std.mem.zeroes([16]u8);
+                }
+            }.f,
+        })) return -1;
+    }
+
+    return 0;
+}

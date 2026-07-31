@@ -95,6 +95,7 @@ pub const util = struct {
     pub const guid_gen = @import("util/guid_gen.zig");
     pub const mutex = @import("util/mutex.zig");
     pub const condvar = @import("util/condvar.zig");
+    pub const listener_box = @import("util/listener_box.zig");
 };
 
 test {
@@ -130,6 +131,7 @@ test {
     _ = @import("util/clock_registry.zig");
     _ = @import("util/guid_gen.zig");
     _ = @import("util/mutex.zig");
+    _ = @import("util/listener_box.zig");
     _ = @import("qos/policy.zig");
     _ = @import("dcps/qos_match.zig");
     _ = @import("dcps/nil.zig");

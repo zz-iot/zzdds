@@ -150,6 +150,95 @@ test "c_abi TypeSupport: NULL participant handle returns error instead of crashi
     try testing.expectEqual(@as(c_int, -1), rc);
 }
 
+// ── ctx-carrying variant ──────────────────────────────────────────────────────
+//
+// Simulates a binding (e.g. Java/JNI) that can't generate a fresh, uniquely
+// addressed native function per registered type -- one shared C function,
+// disambiguated only by the ctx it's given.
+
+fn stubComputeKeyHashCtx(ctx: ?*anyopaque, payload: [*]const u8, len: usize, hash_out: *[16]u8) callconv(.c) c_int {
+    const tag: *const u8 = @ptrCast(@alignCast(ctx.?));
+    hash_out.* = std.mem.zeroes([16]u8);
+    if (len < 1) return -1;
+    hash_out.*[0] = tag.*; // prove *this* ctx (not some other registration's) was used
+    hash_out.*[1] = payload[0];
+    return 0;
+}
+
+var ctx_deinit_calls: u32 = 0;
+
+fn stubCtxDeinit(ctx: ?*anyopaque) callconv(.c) void {
+    _ = ctx;
+    ctx_deinit_calls += 1;
+}
+
+test "c_abi TypeSupport: zzdds_register_type_support_ctx_c forwards ctx to every call" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    var tag: u8 = 0xAB;
+    const rc = c_abi_ts.zzdds_register_type_support_ctx_c(
+        fx.dp_boxed,
+        "CtxType",
+        stubComputeKeyHashCtx,
+        &tag,
+        null,
+    );
+    try testing.expectEqual(@as(c_int, 0), rc);
+
+    const ts = fx.impl().type_support_registry.get("CtxType");
+    try testing.expect(ts != null);
+    const payload = [_]u8{0x42};
+    const hash = ts.?.compute_key_hash(ts.?.ctx, &payload);
+    try testing.expectEqual(@as(u8, 0xAB), hash[0]);
+    try testing.expectEqual(@as(u8, 0x42), hash[1]);
+}
+
+test "c_abi TypeSupport: ctx_deinit fires on replace and on participant deinit" {
+    ctx_deinit_calls = 0;
+    var tag: u8 = 1;
+    {
+        var fx = try Fixture.init(testing.allocator);
+        defer fx.deinit();
+
+        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_ctx_c(
+            fx.dp_boxed,
+            "ReplacedType",
+            stubComputeKeyHashCtx,
+            &tag,
+            stubCtxDeinit,
+        ));
+        try testing.expectEqual(@as(u32, 0), ctx_deinit_calls);
+
+        // Re-registering the same type_name replaces the entry -- the OLD
+        // registration's ctx_deinit must fire (see
+        // DomainParticipantImpl.registerTypeSupport's replace path).
+        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_ctx_c(
+            fx.dp_boxed,
+            "ReplacedType",
+            stubComputeKeyHashCtx,
+            &tag,
+            stubCtxDeinit,
+        ));
+        try testing.expectEqual(@as(u32, 1), ctx_deinit_calls);
+    }
+    // fx.deinit() destroys the participant -- the still-installed second
+    // registration's ctx_deinit must fire too.
+    try testing.expectEqual(@as(u32, 2), ctx_deinit_calls);
+}
+
+test "c_abi TypeSupport: ctx_deinit variant NULL participant handle returns error instead of crashing" {
+    var tag: u8 = 0;
+    const rc = c_abi_ts.zzdds_register_type_support_ctx_c(
+        makeNullHandle(),
+        "TestType",
+        stubComputeKeyHashCtx,
+        &tag,
+        null,
+    );
+    try testing.expectEqual(@as(c_int, -1), rc);
+}
+
 test "c_abi TypeSupport: NULL compute_key_hash registers zeroed-hash fallback" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();

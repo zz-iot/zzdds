@@ -30,13 +30,10 @@ public final class ZzddsRuntime {
      * `typeClass` must declare a `static byte[] computeKeyHashFromCdr(byte[])`
      * method (zidl generates this on every `@key` topic struct).
      *
-     * Bounded: at most 32 distinct Java topic types may have a TypeSupport
-     * registered at once in a single process (see zzdds_java_runtime.c's
-     * fixed-size key-hash callback slot table — the underlying
-     * zzdds_compute_key_hash_fn C callback type carries no user-data
-     * parameter, so each concurrently-registered type needs its own small
-     * dispatcher). Raise ZZDDS_JAVA_KEYHASH_SLOTS in zzdds_java_runtime.c if
-     * a real application needs more than that many at once.
+     * Backed by `zzdds_register_type_support_ctx_c` (see `zzdds_c.h`), which
+     * forwards a per-registration native context to the key-hash callback —
+     * unbounded (no fixed slot count) and reclaimed automatically when this
+     * registration is replaced or `participant` is destroyed.
      */
     public static native int registerTypeSupport(Object participant, String typeName, Class<?> typeClass);
 

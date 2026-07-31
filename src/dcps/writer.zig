@@ -18,7 +18,8 @@ const history_mod = @import("../rtps/history.zig");
 const waitset = @import("waitset.zig");
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const listener_lifecycle = @import("../util/listener_lifecycle.zig");
+const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const Mutex = @import("../util/mutex.zig").Mutex;
 
 const Guid = proto.Guid;
 
@@ -67,7 +68,10 @@ pub const DataWriterImpl = struct {
     // zzdds `set_listener_ex()` extension populate this same representation
     // (see listenerExFromBase/baseFromListenerEx) so on_reliable_reader_ready
     // and the standard callbacks are always dispatched from one place.
-    listener_ex: ZZDDS.DataWriterListenerEx,
+    listener_ex_box: *ListenerBox(ZZDDS.DataWriterListenerEx),
+    /// Guards `listener_ex_box` swaps/acquires only — never held across a
+    /// dispatch or any other call (see listener_box.zig).
+    listener_mu: Mutex = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -143,7 +147,7 @@ pub const DataWriterImpl = struct {
             .publisher = publisher,
             .proto_writer = proto_writer,
             .qos = .{},
-            .listener_ex = listenerExFromBase(listener),
+            .listener_ex_box = undefined,
             .listener_mask = mask,
             .instance_handle = instance_handle,
             .status_changes = 0,
@@ -153,6 +157,8 @@ pub const DataWriterImpl = struct {
             .liveliness_last_ns = .init(now),
         };
         errdefer alloc.destroy(self);
+        self.listener_ex_box = try ListenerBox(ZZDDS.DataWriterListenerEx).create(alloc, listenerExFromBase(listener));
+        errdefer alloc.destroy(self.listener_ex_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         // Wire up the StatusCondition.
@@ -166,7 +172,7 @@ pub const DataWriterImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        listener_lifecycle.release(self.listener_ex);
+        self.listener_ex_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.dw_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -331,7 +337,9 @@ pub const DataWriterImpl = struct {
             self.status_changes &= ~DDS.PUBLICATION_MATCHED_STATUS;
             self.pub_matched_total_change = 0;
             self.pub_matched_current_change = 0;
-            if (self.listener_ex.on_publication_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener_ex.listener_data);
+            const box = self.acquireListenerEx();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_publication_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -354,7 +362,9 @@ pub const DataWriterImpl = struct {
             status.last_policy_id = policy_id;
             self.incompat_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
-            if (self.listener_ex.on_offered_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener_ex.listener_data);
+            const box = self.acquireListenerEx();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_offered_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -371,7 +381,9 @@ pub const DataWriterImpl = struct {
             status.total_count_change = 1;
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_DEADLINE_MISSED_STATUS;
-            if (self.listener_ex.on_offered_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener_ex.listener_data);
+            const box = self.acquireListenerEx();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_offered_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -388,7 +400,9 @@ pub const DataWriterImpl = struct {
             status.total_count_change = 1;
             self.liveliness_lost_total_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_LOST_STATUS;
-            if (self.listener_ex.on_liveliness_lost) |cb| cb(vtable.get_c_abi_handle(self), &status, self.listener_ex.listener_data);
+            const box = self.acquireListenerEx();
+            defer box.releaseRef(self.alloc);
+            if (box.listener.on_liveliness_lost) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -400,16 +414,39 @@ pub const DataWriterImpl = struct {
     /// this is a vendor extension callback only.
     pub fn notifyReaderProtocolReady(ctx: *anyopaque, reader_guid: Guid, ready: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (self.listener_ex.on_reliable_reader_ready) |cb| {
-            cb(guidToHandle(reader_guid), ready, self.listener_ex.listener_data);
+        const box = self.acquireListenerEx();
+        defer box.releaseRef(self.alloc);
+        if (box.listener.on_reliable_reader_ready) |cb| {
+            cb(guidToHandle(reader_guid), ready, box.listener.listener_data);
         }
     }
 
     /// Backs `zzdds::DataWriter::set_listener_ex` (see src/c_abi/extensions.zig).
     pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) void {
-        listener_lifecycle.release(self.listener_ex);
-        self.listener_ex = listener_ex;
+        self.swapListenerEx(listener_ex);
         self.listener_mask = mask;
+    }
+
+    /// Installs `new_listener_ex`, releasing whatever it replaces. Safe
+    /// against a concurrently in-flight dispatch acquired via
+    /// `acquireListenerEx` (see listener_box.zig).
+    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataWriterListenerEx) void {
+        const new_box = ListenerBox(ZZDDS.DataWriterListenerEx).create(self.alloc, new_listener_ex) catch
+            @panic("zzdds: out of memory boxing listener");
+        self.listener_mu.lock();
+        const old_box = self.listener_ex_box;
+        self.listener_ex_box = new_box;
+        self.listener_mu.unlock();
+        old_box.releaseRef(self.alloc);
+    }
+
+    /// Call with no lock held. Returns a box the caller may safely read/
+    /// dispatch through with no lock held; must call `releaseRef` on it
+    /// when done (see listener_box.zig).
+    fn acquireListenerEx(self: *Self) *ListenerBox(ZZDDS.DataWriterListenerEx) {
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_ex_box.acquireLocked();
     }
 
     /// Called by participant.checkTimers() for each active writer.
@@ -532,14 +569,16 @@ pub const DataWriterImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataWriterListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        listener_lifecycle.release(self.listener_ex);
-        self.listener_ex = listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener);
+        self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener));
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.DataWriterListener {
-        return baseFromListenerEx(cast(ctx).listener_ex);
+        const self = cast(ctx);
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return baseFromListenerEx(self.listener_ex_box.listener);
     }
 
     fn vtGetTopic(ctx: *anyopaque) DDS.Topic {

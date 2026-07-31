@@ -16,7 +16,7 @@ const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
-const listener_lifecycle = @import("../util/listener_lifecycle.zig");
+const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 /// All function pointers must remain valid for the lifetime of the PublisherImpl.
@@ -94,7 +94,10 @@ pub const PublisherImpl = struct {
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
     qos: DDS.PublisherQos,
-    listener: DDS.PublisherListener,
+    listener_box: *ListenerBox(DDS.PublisherListener),
+    /// Guards `listener_box` swaps/acquires only — never held across a
+    /// dispatch or any other call (see listener_box.zig).
+    listener_mu: Mutex = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -139,7 +142,7 @@ pub const PublisherImpl = struct {
             .participant = participant,
             .cbs = cbs,
             .qos = .{},
-            .listener = listener,
+            .listener_box = undefined,
             .listener_mask = mask,
             .instance_handle = handle,
             .status_changes = 0,
@@ -152,6 +155,8 @@ pub const PublisherImpl = struct {
             .group_seq_num_counter = 0,
         };
         errdefer alloc.destroy(self);
+        self.listener_box = try ListenerBox(DDS.PublisherListener).create(alloc, listener);
+        errdefer alloc.destroy(self.listener_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
@@ -160,7 +165,7 @@ pub const PublisherImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        listener_lifecycle.release(self.listener);
+        self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.pub_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
@@ -393,14 +398,38 @@ pub const PublisherImpl = struct {
 
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.PublisherListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
-        listener_lifecycle.release(self.listener);
-        self.listener = if (a_listener) |l| l.* else DDS.noop_PublisherListener;
+        self.swapListener(if (a_listener) |l| l.* else DDS.noop_PublisherListener);
         self.listener_mask = mask;
         return DDS.RETCODE_OK;
     }
 
     fn vtGetListener(ctx: *anyopaque) DDS.PublisherListener {
-        return cast(ctx).listener;
+        const self = cast(ctx);
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.listener;
+    }
+
+    /// Installs `new_listener`, releasing whatever it replaces. Safe against
+    /// a concurrently in-flight dispatch acquired via `acquireListener` (see
+    /// listener_box.zig).
+    fn swapListener(self: *Self, new_listener: DDS.PublisherListener) void {
+        const new_box = ListenerBox(DDS.PublisherListener).create(self.alloc, new_listener) catch
+            @panic("zzdds: out of memory boxing listener");
+        self.listener_mu.lock();
+        const old_box = self.listener_box;
+        self.listener_box = new_box;
+        self.listener_mu.unlock();
+        old_box.releaseRef(self.alloc);
+    }
+
+    /// Call with no lock held. Returns a box the caller may safely read/
+    /// dispatch through with no lock held; must call `releaseRef` on it when
+    /// done (see listener_box.zig).
+    fn acquireListener(self: *Self) *ListenerBox(DDS.PublisherListener) {
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.acquireLocked();
     }
 
     fn vtSuspendPublications(ctx: *anyopaque) DDS.ReturnCode_t {

@@ -114,6 +114,29 @@ int zzdds_register_type_support_c(
     zzdds_compute_key_hash_fn compute_key_hash_fn
 );
 
+/* ctx-carrying variant of zzdds_compute_key_hash_fn/zzdds_register_type_support_c
+ * — for bindings that can't generate a fresh, uniquely-addressed native
+ * function per registered type the way zidl -b c/-b cpp do (e.g. classic JNI:
+ * a Java Class<?> has no native function pointer of its own, so one shared
+ * trampoline needs ctx to know which class/method to dispatch to). C/C++/Zig
+ * callers don't need this — use zzdds_register_type_support_c above. */
+typedef int (*zzdds_compute_key_hash_ctx_fn)(void *ctx, const uint8_t *payload, size_t len, uint8_t hash_out[16]);
+
+/**
+ * Same as zzdds_register_type_support_c, but compute_key_hash_fn additionally
+ * receives ctx on every call. ctx_deinit (may be NULL) is called exactly once
+ * when this registration is replaced (a later call for the same type_name) or
+ * when participant is destroyed — same reclaim path as the non-ctx variant's
+ * internal adapter, just exposed to the caller's own ctx here.
+ */
+int zzdds_register_type_support_ctx_c(
+    DDS_DomainParticipant participant,
+    const char *type_name,
+    zzdds_compute_key_hash_ctx_fn compute_key_hash_fn,
+    void *ctx,
+    void (*ctx_deinit)(void *ctx)
+);
+
 /* handle: pass DDS_HANDLE_NIL to derive the instance automatically from
  * key_hash, or a handle previously returned by zzdds_register_instance_raw
  * (or a prior write) for that same key. Any other value returns
