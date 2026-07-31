@@ -152,7 +152,16 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     zzdds_java_ts_ctx *ctx = malloc(sizeof(*ctx));
     if (ctx == NULL) return -1;
     ctx->cls = (jclass)(*env)->NewGlobalRef(env, typeClass);
+    if (ctx->cls == NULL) {
+        free(ctx);
+        return -1;
+    }
     ctx->mid = (*env)->GetStaticMethodID(env, typeClass, "computeKeyHashFromCdr", "([B)[B");
+    if (ctx->mid == NULL) {
+        (*env)->DeleteGlobalRef(env, ctx->cls);
+        free(ctx);
+        return -1;
+    }
 
     void *p = zzdds_java_unbox(env, participant);
     const char *type_name_c = (*env)->GetStringUTFChars(env, typeName, NULL);
