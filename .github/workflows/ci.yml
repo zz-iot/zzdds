@@ -104,6 +104,62 @@ jobs:
         # temporary probe.
         run: zig build test --test-timeout 60s
 
+  # ── zzdds-examples smoke test ──────────────────────────────────────────────
+  #
+  # Builds zzdds with every binding enabled, then runs zz-iot/zzdds-examples'
+  # own orchestrator (run-all.sh) against that build — catches a PR breaking
+  # any of the C/C++/Java example apps, or their cross-binding-interop/opencv
+  # smoke tests, independent of the dds-rtps interop coverage below.
+  #
+  # --strict turns "zzdds-examples couldn't find a binding/dependency it
+  # needs" into a hard failure instead of a silent skip — appropriate here
+  # since every binding and OpenCV are deliberately installed in this job, so
+  # a skip would mean something regressed, not that the environment is just
+  # missing an optional piece (see run-all.sh's own default, unstrict
+  # behavior for the latter case).
+
+  examples:
+    name: zzdds-examples
+    needs: test-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+
+      - name: Check out zzdds-examples
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/zzdds-examples
+          path: zzdds-examples
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Install JDK (java-binding needs jni.h, not just a JRE)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install OpenCV (for cpp/opencv_zzdds)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopencv-dev
+
+      - name: Build zzdds (all bindings)
+        working-directory: zzdds
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
+
+      - name: Run zzdds-examples (strict)
+        working-directory: zzdds-examples
+        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zzdds/zig-out" ./run-all.sh --strict
+
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
   # Builds all test binaries to zig-out/tests/, runs each through kcov
