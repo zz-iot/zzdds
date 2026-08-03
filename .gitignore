@@ -1,0 +1,23 @@
+# Out-of-source CMake build directories (every C/C++ example builds into
+# its own build/ — see each example's README).
+build/
+
+# Stray in-source CMake artifacts, in case `cmake .` ever gets run from an
+# example's source root by mistake instead of its build/ directory.
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# zidl-generated sources (regenerated at build time by every example).
+zzdds-gen/
+generated/
+
+# Java build output.
+build/classes/
+*.class
+
+# Editor/OS cruft.
+*.swp
+.DS_Store

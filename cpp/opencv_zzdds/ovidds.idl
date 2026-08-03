@@ -1,0 +1,37 @@
+/*
+ * ovidds.idl
+ *
+ * Open Video over DDS — type definitions.
+ *
+ * Original: included DdsDcpsCore.idl and used DDS::OctetSeq for the image
+ * buffer.  Ported to zzdds: DDS::OctetSeq is typedef sequence<octet>, so we
+ * inline the sequence definition directly.  The rest of the module is
+ * unchanged.
+ */
+
+module ovidds {
+
+  @topic
+  struct Frame {
+    @key long source_id;
+    long count;
+    long type;
+    long format;
+    long size_x;
+    long size_y;
+    sequence<octet> data;
+  };
+
+  @topic
+  struct ROI {
+    @key long source_id;
+    long frame_source_id;
+    long count;
+    long type;
+    long off_x;
+    long off_y;
+    long size_x;
+    long size_y;
+  };
+
+};
