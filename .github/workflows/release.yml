@@ -125,7 +125,7 @@ jobs:
     needs: [prepare, test]
     runs-on: ubuntu-latest
     env:
-      INTEROP_RTPS_REF: zenzen-38fa15e
+      INTEROP_RTPS_REF: zenzen-063c34d
 
     steps:
       - name: Check out zzdds
