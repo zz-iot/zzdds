@@ -42,7 +42,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-38fa15e' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-063c34d' }}
   # Pinned zz-iot/zzdds-examples commit for the examples-smoke-test job below.
   # Deliberately a commit, not "main" — the examples job executes that repo's
   # own scripts directly in this workflow's authenticated context, so a
