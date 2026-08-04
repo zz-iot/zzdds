@@ -51,7 +51,7 @@ env:
   # Bump deliberately (its own small PR) when zzdds-examples gains something
   # this job should pick up. Override via the zzdds_examples_ref
   # workflow_dispatch input to test against a different commit/branch/tag.
-  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || 'ce20e0747f33422ed624a812d3bedca60ca7f67d' }}
+  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || '1b43a747ecc50d64c200e237bba2831735209d02' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────

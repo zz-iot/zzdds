@@ -82,6 +82,7 @@ const Harness = struct {
             alloc,
             dcps.nil_participant,
             cbs,
+            .{},
             qos,
             dcps.nil_sub_listener,
             0,

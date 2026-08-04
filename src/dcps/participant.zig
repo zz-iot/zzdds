@@ -240,6 +240,7 @@ const BuiltinSubscriberState = struct {
             alloc,
             dp,
             noop_cbs,
+            .{}, // builtin subscriber: fixed internal QoS, not user-config-driven
             .{},
             nil.nil_sub_listener,
             0,
@@ -827,6 +828,11 @@ pub const DomainParticipantImpl = struct {
         errdefer self.qos.deinit(alloc);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
+        // Seed default_topic_qos's durability/reliability/history from the
+        // resolved config's QosDefaults -- previously computed by
+        // toRuntimeConfig and stored on self.config, but never read again by
+        // any entity-creation path (see config/schema.zig's QosDefaults doc).
+        generated_config_mod.applyQosDefaults(&self.default_topic_qos, &self.config.qos);
         self.builtin_sub = BuiltinSubscriberState.init(alloc, self) catch null;
         return self;
     }
@@ -2659,6 +2665,7 @@ pub const DomainParticipantImpl = struct {
             self.alloc,
             self.toDDSParticipant(),
             self.makePubCbs(),
+            self.config.qos,
             qos.*,
             if (a_listener) |l| l.* else DDS.noop_PublisherListener,
             mask,
@@ -2706,6 +2713,7 @@ pub const DomainParticipantImpl = struct {
             self.alloc,
             self.toDDSParticipant(),
             self.makeSubCbs(),
+            self.config.qos,
             qos.*,
             if (a_listener) |l| l.* else DDS.noop_SubscriberListener,
             mask,

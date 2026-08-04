@@ -177,6 +177,52 @@ fn toHistoryKind(kind: DDS.HistoryQosPolicyKind) schema.HistoryKind {
     };
 }
 
+// ── Reverse mapping: schema.QosDefaults -> real DDS QoS policy fields ────────
+//
+// Used at Topic/Publisher/Subscriber construction time to seed
+// default_topic_qos/default_dw_qos/default_dr_qos from the participant's
+// resolved config.qos. This is the only place a config-file QosDefaults value
+// can reach a real entity: create_topic/create_datawriter/create_datareader
+// always take a caller-supplied literal QoS value in this implementation
+// (there is no DATAWRITER_QOS_DEFAULT-style sentinel the create call
+// special-cases), so get_default_{topic,datawriter,datareader}_qos() -- which
+// an application calls to fetch "the default" before overriding just the
+// fields it cares about -- is what actually needs to reflect the config file.
+
+pub fn fromReliabilityKind(kind: schema.ReliabilityKind) DDS.ReliabilityQosPolicyKind {
+    return switch (kind) {
+        .best_effort => .BEST_EFFORT_RELIABILITY_QOS,
+        .reliable => .RELIABLE_RELIABILITY_QOS,
+    };
+}
+
+pub fn fromDurabilityKind(kind: schema.DurabilityKind) DDS.DurabilityQosPolicyKind {
+    return switch (kind) {
+        .volatile_ => .VOLATILE_DURABILITY_QOS,
+        .transient_local => .TRANSIENT_LOCAL_DURABILITY_QOS,
+        .transient => .TRANSIENT_DURABILITY_QOS,
+        .persistent => .PERSISTENT_DURABILITY_QOS,
+    };
+}
+
+pub fn fromHistoryKind(kind: schema.HistoryKind) DDS.HistoryQosPolicyKind {
+    return switch (kind) {
+        .keep_last => .KEEP_LAST_HISTORY_QOS,
+        .keep_all => .KEEP_ALL_HISTORY_QOS,
+    };
+}
+
+/// Applies to any QoS struct with `.durability.kind`, `.reliability.kind`, and
+/// `.history.{kind,depth}` fields -- DDS.TopicQos, DDS.DataWriterQos, and
+/// DDS.DataReaderQos all qualify (see idl/dcps.idl); resolved via Zig's
+/// comptime duck typing rather than one copy per concrete type.
+pub fn applyQosDefaults(qos: anytype, defaults: *const schema.QosDefaults) void {
+    qos.durability.kind = fromDurabilityKind(defaults.durability_kind);
+    qos.reliability.kind = fromReliabilityKind(defaults.reliability_kind);
+    qos.history.kind = fromHistoryKind(defaults.history_kind);
+    qos.history.depth = defaults.history_depth;
+}
+
 test "generated DomainParticipantConfig defaults convert to runtime defaults" {
     const generated = ext.DomainParticipantConfig.default();
     var runtime = try toRuntimeConfig(std.testing.allocator, &generated);
