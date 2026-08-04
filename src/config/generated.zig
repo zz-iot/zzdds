@@ -32,6 +32,12 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
     runtime.discovery.kind = toDiscoveryKind(cfg.discovery.kind);
     runtime.discovery.initial_peers = try stringSeqSlice(allocator, &cfg.discovery.initial_peers);
     runtime.discovery.static_config_file = try dupeString(allocator, cfg.discovery.static_config_file);
+    // Writer/reader creation (participant.zig's HistoryCache sizing) reads
+    // this back as `@bitCast(qos.history.depth)` into a u32 -- a non-positive
+    // signed depth reinterprets as a huge unsigned limit, silently disabling
+    // KEEP_LAST eviction instead of erroring, so reject it here at the config
+    // boundary rather than let a bad TOML value reach a live entity.
+    if (cfg.qos.history_depth <= 0) return error.InvalidValue;
     runtime.qos = .{
         .reliability_kind = toReliabilityKind(cfg.qos.reliability_kind),
         .durability_kind = toDurabilityKind(cfg.qos.durability_kind),
@@ -245,4 +251,19 @@ test "generated DomainParticipantConfig adapter maps overrides" {
     try std.testing.expectEqual(schema.DiscoveryKind.static, runtime.discovery.kind);
     try std.testing.expectEqual(schema.ReliabilityKind.reliable, runtime.qos.reliability_kind);
     try std.testing.expectEqual(@as(i32, 8), runtime.qos.history_depth);
+}
+
+test "generated DomainParticipantConfig adapter rejects non-positive history_depth" {
+    // A negative depth fits fine in the schema's i32 field (unlike e.g. an
+    // out-of-range port_base, which a natural integer-width overflow already
+    // rejects at the TOML-decode layer), so this needs its own explicit
+    // check here -- before it reaches a downstream @bitCast to u32 in
+    // participant.zig/reader.zig, which would turn -1 into a ~4-billion
+    // history limit and silently disable KEEP_LAST eviction.
+    var generated = ext.DomainParticipantConfig.default();
+    generated.qos.history_depth = -1;
+    try std.testing.expectError(error.InvalidValue, toRuntimeConfig(std.testing.allocator, &generated));
+
+    generated.qos.history_depth = 0;
+    try std.testing.expectError(error.InvalidValue, toRuntimeConfig(std.testing.allocator, &generated));
 }
