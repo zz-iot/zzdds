@@ -18,6 +18,11 @@ generated/
 build/classes/
 *.class
 
+# java/shape's --config MVP: run.sh/ShapeMain.java stage the user's chosen
+# --config file here at run time (see java/shape/README.md) -- not a
+# committed example config like java/listener-pubsub/zzdds.toml.
+java/shape/zzdds.toml
+
 # Editor/OS cruft.
 *.swp
 .DS_Store

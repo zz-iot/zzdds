@@ -17,6 +17,7 @@ cmake_minimum_required(VERSION 3.16)
 project(zzdds_cpp_examples)
 
 add_subdirectory(custom-allocator)
+add_subdirectory(shape)
 
 # opencv_zzdds additionally needs OpenCV, which isn't available on every
 # build machine (e.g. CI images without libopencv-dev). Probe for it here,

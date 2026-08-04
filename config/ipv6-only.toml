@@ -1,0 +1,4 @@
+# Isolates: forcing IPv4 off entirely, so a participant using this file only
+# creates IPv6 UDP sockets/multicast. Mirror of ipv4-only.toml.
+[default_participant_config.transport.udp]
+ipv4_enabled = false

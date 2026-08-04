@@ -38,6 +38,19 @@ zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
 Then see each example's own README for exact prerequisites and run steps.
 
+## Config file library
+
+`config/` holds a handful of standalone `zzdds.toml`-style scenarios
+(`ipv4-only.toml`, `ipv6-only.toml`, `tcp-non-discovery.toml`,
+`unicast-only.toml`, `custom-ports.toml`, `short-lease.toml`) that any
+binding's `--config <path>` support can point at, to reproduce/isolate a
+reported interop or config-resolution bug without writing new code each
+time. Each file has a top comment describing exactly what it isolates and
+why. All four `shape` ports (`zig/shape`, `c/shape`, `cpp/shape`,
+`java/shape`) support `--config`; see each one's own README for how it's
+wired up (Java uses an MVP copy-trick rather than a direct call -- see
+`java/shape/README.md`).
+
 ## Running everything at once
 
 ```sh

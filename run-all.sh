@@ -141,6 +141,14 @@ else
     skip_or_fail "interop/cross-binding" "needs both c-binding and cpp-binding"
 fi
 
+# ── Shape cross-binding interop (needs c, cpp, and java; zig is native) ───
+if [ "$C_BINDING" -eq 1 ] && [ "$CPP_BINDING" -eq 1 ] && [ "$JAVA_BINDING" -eq 1 ]; then
+    run_section "interop/shape-cross-binding" env ZZDDS_ZIG_OUT="$ZZDDS_ZIG_OUT" \
+        "$SCRIPT_DIR/interop/shape-cross-binding-smoke-test.sh"
+else
+    skip_or_fail "interop/shape-cross-binding" "needs c-binding, cpp-binding, and java-binding"
+fi
+
 # ── opencv_zzdds (needs cpp-binding and OpenCV) ────────────────────────────
 if [ "$CPP_BINDING" -eq 1 ] && [ "$OPENCV" -eq 1 ]; then
     run_section "cpp/opencv_zzdds" env ZZDDS_ZIG_OUT="$ZZDDS_ZIG_OUT" \

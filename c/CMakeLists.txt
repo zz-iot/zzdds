@@ -13,3 +13,4 @@ cmake_minimum_required(VERSION 3.14)
 project(zzdds_c_examples)
 
 add_subdirectory(custom-allocator)
+add_subdirectory(shape)

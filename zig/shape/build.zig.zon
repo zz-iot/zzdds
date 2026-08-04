@@ -1,0 +1,29 @@
+.{
+    .name = .zzdds_examples_shape_zig,
+    .version = "0.0.0",
+    .fingerprint = 0xaf8e5a7817a24ee3,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Every example in this repo builds against a local zzdds checkout
+        // (see top-level README.md) -- unlike dds-rtps's copy of this build
+        // (which defaults to a tagged release URL, for its own upstream
+        // dependency contract), zig/shape has no such contract to keep, so
+        // it points straight at the sibling checkouts this workspace already
+        // assumes exist (../../../zzdds, ../../../zidl), same layout as the
+        // "zzdds-examples" CI job in zzdds/.github/workflows/ci.yml, which
+        // checks out zzdds/ and zzdds-examples/ as siblings.
+        .zzdds = .{
+            .path = "../../../zzdds",
+        },
+        .zidl = .{
+            .path = "../../../zidl",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "shape_main.zig",
+        "dds_impl.zig",
+        "idl",
+    },
+}
