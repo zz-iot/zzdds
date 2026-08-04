@@ -32,6 +32,12 @@ pub fn toRuntimeConfig(allocator: std.mem.Allocator, cfg: *const ext.DomainParti
     runtime.discovery.kind = toDiscoveryKind(cfg.discovery.kind);
     runtime.discovery.initial_peers = try stringSeqSlice(allocator, &cfg.discovery.initial_peers);
     runtime.discovery.static_config_file = try dupeString(allocator, cfg.discovery.static_config_file);
+    // Writer/reader creation (participant.zig's HistoryCache sizing) reads
+    // this back as `@bitCast(qos.history.depth)` into a u32 -- a non-positive
+    // signed depth reinterprets as a huge unsigned limit, silently disabling
+    // KEEP_LAST eviction instead of erroring, so reject it here at the config
+    // boundary rather than let a bad TOML value reach a live entity.
+    if (cfg.qos.history_depth <= 0) return error.InvalidValue;
     runtime.qos = .{
         .reliability_kind = toReliabilityKind(cfg.qos.reliability_kind),
         .durability_kind = toDurabilityKind(cfg.qos.durability_kind),
@@ -177,6 +183,52 @@ fn toHistoryKind(kind: DDS.HistoryQosPolicyKind) schema.HistoryKind {
     };
 }
 
+// ── Reverse mapping: schema.QosDefaults -> real DDS QoS policy fields ────────
+//
+// Used at Topic/Publisher/Subscriber construction time to seed
+// default_topic_qos/default_dw_qos/default_dr_qos from the participant's
+// resolved config.qos. This is the only place a config-file QosDefaults value
+// can reach a real entity: create_topic/create_datawriter/create_datareader
+// always take a caller-supplied literal QoS value in this implementation
+// (there is no DATAWRITER_QOS_DEFAULT-style sentinel the create call
+// special-cases), so get_default_{topic,datawriter,datareader}_qos() -- which
+// an application calls to fetch "the default" before overriding just the
+// fields it cares about -- is what actually needs to reflect the config file.
+
+pub fn fromReliabilityKind(kind: schema.ReliabilityKind) DDS.ReliabilityQosPolicyKind {
+    return switch (kind) {
+        .best_effort => .BEST_EFFORT_RELIABILITY_QOS,
+        .reliable => .RELIABLE_RELIABILITY_QOS,
+    };
+}
+
+pub fn fromDurabilityKind(kind: schema.DurabilityKind) DDS.DurabilityQosPolicyKind {
+    return switch (kind) {
+        .volatile_ => .VOLATILE_DURABILITY_QOS,
+        .transient_local => .TRANSIENT_LOCAL_DURABILITY_QOS,
+        .transient => .TRANSIENT_DURABILITY_QOS,
+        .persistent => .PERSISTENT_DURABILITY_QOS,
+    };
+}
+
+pub fn fromHistoryKind(kind: schema.HistoryKind) DDS.HistoryQosPolicyKind {
+    return switch (kind) {
+        .keep_last => .KEEP_LAST_HISTORY_QOS,
+        .keep_all => .KEEP_ALL_HISTORY_QOS,
+    };
+}
+
+/// Applies to any QoS struct with `.durability.kind`, `.reliability.kind`, and
+/// `.history.{kind,depth}` fields -- DDS.TopicQos, DDS.DataWriterQos, and
+/// DDS.DataReaderQos all qualify (see idl/dcps.idl); resolved via Zig's
+/// comptime duck typing rather than one copy per concrete type.
+pub fn applyQosDefaults(qos: anytype, defaults: *const schema.QosDefaults) void {
+    qos.durability.kind = fromDurabilityKind(defaults.durability_kind);
+    qos.reliability.kind = fromReliabilityKind(defaults.reliability_kind);
+    qos.history.kind = fromHistoryKind(defaults.history_kind);
+    qos.history.depth = defaults.history_depth;
+}
+
 test "generated DomainParticipantConfig defaults convert to runtime defaults" {
     const generated = ext.DomainParticipantConfig.default();
     var runtime = try toRuntimeConfig(std.testing.allocator, &generated);
@@ -199,4 +251,19 @@ test "generated DomainParticipantConfig adapter maps overrides" {
     try std.testing.expectEqual(schema.DiscoveryKind.static, runtime.discovery.kind);
     try std.testing.expectEqual(schema.ReliabilityKind.reliable, runtime.qos.reliability_kind);
     try std.testing.expectEqual(@as(i32, 8), runtime.qos.history_depth);
+}
+
+test "generated DomainParticipantConfig adapter rejects non-positive history_depth" {
+    // A negative depth fits fine in the schema's i32 field (unlike e.g. an
+    // out-of-range port_base, which a natural integer-width overflow already
+    // rejects at the TOML-decode layer), so this needs its own explicit
+    // check here -- before it reaches a downstream @bitCast to u32 in
+    // participant.zig/reader.zig, which would turn -1 into a ~4-billion
+    // history limit and silently disable KEEP_LAST eviction.
+    var generated = ext.DomainParticipantConfig.default();
+    generated.qos.history_depth = -1;
+    try std.testing.expectError(error.InvalidValue, toRuntimeConfig(std.testing.allocator, &generated));
+
+    generated.qos.history_depth = 0;
+    try std.testing.expectError(error.InvalidValue, toRuntimeConfig(std.testing.allocator, &generated));
 }

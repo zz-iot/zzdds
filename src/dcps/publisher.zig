@@ -17,6 +17,8 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const config_mod = @import("../config/schema.zig");
+const generated_config_mod = @import("../config/generated.zig");
 
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 /// All function pointers must remain valid for the lifetime of the PublisherImpl.
@@ -131,6 +133,7 @@ pub const PublisherImpl = struct {
         alloc: std.mem.Allocator,
         participant: DDS.DomainParticipant,
         cbs: ParticipantCbs,
+        qos_defaults: config_mod.QosDefaults,
         qos: DDS.PublisherQos,
         listener: DDS.PublisherListener,
         mask: DDS.StatusMask,
@@ -159,6 +162,9 @@ pub const PublisherImpl = struct {
         errdefer alloc.destroy(self.listener_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
+        // See config/generated.zig's applyQosDefaults doc comment: this is the
+        // one place a config-file QosDefaults value reaches get_default_datawriter_qos().
+        generated_config_mod.applyQosDefaults(&self.default_dw_qos, &qos_defaults);
         const sc = try waitset.StatusConditionImpl.init(alloc, self.toEntity(), getStatusFn);
         self.status_cond = sc;
         return self;

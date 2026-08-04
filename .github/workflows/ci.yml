@@ -51,7 +51,7 @@ env:
   # Bump deliberately (its own small PR) when zzdds-examples gains something
   # this job should pick up. Override via the zzdds_examples_ref
   # workflow_dispatch input to test against a different commit/branch/tag.
-  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || 'ce20e0747f33422ed624a812d3bedca60ca7f67d' }}
+  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || '1b43a747ecc50d64c200e237bba2831735209d02' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -154,6 +154,33 @@ jobs:
           repository: zz-iot/zzdds-examples
           ref: ${{ env.ZZDDS_EXAMPLES_REF }}
           path: zzdds-examples
+          persist-credentials: false
+
+      - name: Resolve zidl ref from zzdds/build.zig.zon
+        # zig/shape's build.zig.zon depends on ../../../zidl (a sibling of
+        # zzdds-examples, i.e. $GITHUB_WORKSPACE/zidl) — without checking it
+        # out, its build fails outright since that path never exists
+        # otherwise. Deliberately read out of zzdds's OWN pinned .zidl.url
+        # here rather than a second independently-maintained ref: the whole
+        # point of this job is to build zig/shape against the exact zidl
+        # zzdds itself was just built with, so there is only one source of
+        # truth to bump (build.zig.zon) — not two that can drift apart.
+        id: zidl_ref
+        run: |
+          set -euo pipefail
+          TAG=$(grep -A2 '\.zidl = \.{' zzdds/build.zig.zon | grep -oP 'refs/tags/\K[^"]+(?=\.tar\.gz)')
+          if [ -z "$TAG" ]; then
+            echo "FAIL: could not parse a zidl tag out of zzdds/build.zig.zon's .zidl.url" >&2
+            exit 1
+          fi
+          echo "ref=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check out zidl (${{ steps.zidl_ref.outputs.ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/zidl
+          ref: ${{ steps.zidl_ref.outputs.ref }}
+          path: zidl
           persist-credentials: false
 
       - name: Install Zig

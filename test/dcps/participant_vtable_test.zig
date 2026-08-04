@@ -537,3 +537,101 @@ test "createParticipantWithConfig: TCP enabled with a concrete bind_address succ
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
     try testing.expect(impl.data_listen_port != 0);
 }
+
+// ── config.qos (QosDefaults) actually reaching real entities ──────────────────
+//
+// Regression test for the gap docs/design/shape-reference-app.md flagged:
+// config.qos was resolved from TOML by toRuntimeConfig but never read again by
+// any entity-creation path. get_default_{topic,datawriter,datareader}_qos()
+// is the one spot an application can observe it (create_topic/
+// create_datawriter/create_datareader all take a caller-supplied literal QoS
+// here — there's no QOS_DEFAULT-style sentinel to special-case).
+
+test "createParticipantWithConfig: config.qos seeds default_topic_qos" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+    const loc = Locator.udp4(.{ 127, 0, 0, 0x92 }, 7992);
+    const t = try MockTransport.init(testing.allocator, net, &.{loc});
+    defer t.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(
+        testing.allocator,
+        t.transport(),
+        noopDisc(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer factory.deinit();
+
+    var config = config_mod.Config{};
+    config.qos = .{
+        .reliability_kind = .reliable,
+        .durability_kind = .transient_local,
+        .history_kind = .keep_all,
+        .history_depth = 8,
+    };
+
+    const qos = DDS.DomainParticipantQos{};
+    const dp = factory.createParticipantWithConfig(0, &qos, null, 0, config);
+    defer {
+        if (dp.ptr != nil.NIL_PTR) _ = factory.toDDSFactory().delete_participant(dp);
+    }
+    try testing.expect(dp.ptr != nil.NIL_PTR);
+
+    var got = DDS.TopicQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_default_topic_qos(dp.ptr, &got));
+    try testing.expectEqual(DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS, got.reliability.kind);
+    try testing.expectEqual(DDS.DurabilityQosPolicyKind.TRANSIENT_LOCAL_DURABILITY_QOS, got.durability.kind);
+    try testing.expectEqual(DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS, got.history.kind);
+    try testing.expectEqual(@as(i32, 8), got.history.depth);
+}
+
+test "createParticipantWithConfig: config.qos seeds Publisher's default_datawriter_qos and Subscriber's default_datareader_qos" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+    const loc = Locator.udp4(.{ 127, 0, 0, 0x93 }, 7993);
+    const t = try MockTransport.init(testing.allocator, net, &.{loc});
+    defer t.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(
+        testing.allocator,
+        t.transport(),
+        noopDisc(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer factory.deinit();
+
+    var config = config_mod.Config{};
+    config.qos = .{
+        .reliability_kind = .reliable,
+        .durability_kind = .persistent,
+        .history_kind = .keep_all,
+        .history_depth = 4,
+    };
+
+    const qos = DDS.DomainParticipantQos{};
+    const dp = factory.createParticipantWithConfig(0, &qos, null, 0, config);
+    defer {
+        if (dp.ptr != nil.NIL_PTR) _ = factory.toDDSFactory().delete_participant(dp);
+    }
+    try testing.expect(dp.ptr != nil.NIL_PTR);
+
+    const publisher = dp.create_publisher(.{}, null, 0);
+    defer _ = dp.vtable.delete_publisher(dp.ptr, publisher);
+    var dw_qos = DDS.DataWriterQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, publisher.vtable.get_default_datawriter_qos(publisher.ptr, &dw_qos));
+    try testing.expectEqual(DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS, dw_qos.reliability.kind);
+    try testing.expectEqual(DDS.DurabilityQosPolicyKind.PERSISTENT_DURABILITY_QOS, dw_qos.durability.kind);
+    try testing.expectEqual(DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS, dw_qos.history.kind);
+    try testing.expectEqual(@as(i32, 4), dw_qos.history.depth);
+
+    const subscriber = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, subscriber);
+    var dr_qos = DDS.DataReaderQos{};
+    try testing.expectEqual(DDS.RETCODE_OK, subscriber.vtable.get_default_datareader_qos(subscriber.ptr, &dr_qos));
+    try testing.expectEqual(DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS, dr_qos.reliability.kind);
+    try testing.expectEqual(DDS.DurabilityQosPolicyKind.PERSISTENT_DURABILITY_QOS, dr_qos.durability.kind);
+    try testing.expectEqual(DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS, dr_qos.history.kind);
+    try testing.expectEqual(@as(i32, 4), dr_qos.history.depth);
+}
