@@ -7,14 +7,11 @@
 # binaries (see CMakeLists.txt), and both programs run with that as their cwd.
 #
 # [default_participant_config.transport.udp]
-# interface_poll_interval_ms = 0 replaces the separate -Dinterface-monitor=false
-# *build* flag this showcase used to require: 0 is PollingMonitor's own runtime
-# sentinel for "no periodic re-poll thread at all" (see
-# zzdds/docs/design/allocator-strategy.md and this example's own README finding
-# #3) -- getifaddrs() re-enumeration otherwise mallocs via libc every
-# interface_poll_interval_ms with no allocator hook. Config-file-driven means
-# the same zzdds.so build now supports both "poll for interface changes" and
-# "never re-poll" deployments, chosen at run time instead of compile time.
+# interface_poll_interval_ms = 0 is PollingMonitor's runtime sentinel for "no
+# periodic re-poll thread at all" -- without it, network-interface
+# re-enumeration mallocs via libc's getifaddrs() on every poll interval, with
+# no allocator hook. Needed here so the zero-allocation acceptance test below
+# can pass with a default zzdds build.
 [default_participant_config.transport.udp]
 interface_poll_interval_ms = 0
 

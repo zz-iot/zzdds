@@ -62,7 +62,7 @@ int main() {
         std::fprintf(stderr, "FAIL: create_participant returned null\n");
         return 1;
     }
-    auto dp_handle = std::static_pointer_cast<::DDS::DomainParticipantImpl>(dp)->native_handle();
+    auto dp_handle = dp->native_handle();
 
     check(SensorSampleTypeSupport::register_type(dp_handle), "register_type");
 
@@ -73,35 +73,18 @@ int main() {
         return 1;
     }
 
-    // create_datareader wants a genuine TopicDescriptionImpl-backed object,
-    // not just anything convertible to shared_ptr<TopicDescription> --
-    // passing `topic` directly (a TopicImpl, upcast via the shared_ptr
-    // converting constructor) throws std::invalid_argument at the C-ABI
-    // boundary, since TopicImpl doesn't inherit from TopicDescriptionImpl
-    // (each concrete DDS::*Impl class implements exactly one interface's
-    // pure virtuals; the dynamic_cast-based entity-parameter adaptation for
-    // a widened interface parameter only tries the one concrete type its
-    // name literally maps to). lookup_topicdescription re-wraps the same
-    // underlying handle as a real TopicDescriptionImpl -- the C++ analogue
-    // of the C API's zzdds_topic_as_description().
-    auto topic_desc = dp->lookup_topicdescription("SensorTopic");
-    if (!topic_desc) {
-        std::fprintf(stderr, "FAIL: lookup_topicdescription returned null\n");
-        return 1;
-    }
-
     auto sub = dp->create_subscriber(::DDS::SubscriberQos::default_value(), nullptr, 0);
     if (!sub) {
         std::fprintf(stderr, "FAIL: create_subscriber returned null\n");
         return 1;
     }
 
-    auto dr = sub->create_datareader(topic_desc, ::DDS::DataReaderQos::default_value(), nullptr, 0);
+    auto dr = sub->create_datareader(topic, ::DDS::DataReaderQos::default_value(), nullptr, 0);
     if (!dr) {
         std::fprintf(stderr, "FAIL: create_datareader returned null\n");
         return 1;
     }
-    auto dr_handle = std::static_pointer_cast<::DDS::DataReaderImpl>(dr)->native_handle();
+    auto dr_handle = dr->native_handle();
 
     SensorSampleDataReader typed_reader(dr_handle);
 
@@ -114,20 +97,12 @@ int main() {
         return 1;
     }
 
-    // Same lookup_topicdescription workaround as SensorTopic above -- needed
-    // per-topic, not a one-time setup step.
-    auto log_topic_desc = dp->lookup_topicdescription("SensorLogTopic");
-    if (!log_topic_desc) {
-        std::fprintf(stderr, "FAIL: lookup_topicdescription (SensorLog) returned null\n");
-        return 1;
-    }
-
-    auto log_dr = sub->create_datareader(log_topic_desc, ::DDS::DataReaderQos::default_value(), nullptr, 0);
+    auto log_dr = sub->create_datareader(log_topic, ::DDS::DataReaderQos::default_value(), nullptr, 0);
     if (!log_dr) {
         std::fprintf(stderr, "FAIL: create_datareader (SensorLog) returned null\n");
         return 1;
     }
-    auto log_dr_handle = std::static_pointer_cast<::DDS::DataReaderImpl>(log_dr)->native_handle();
+    auto log_dr_handle = log_dr->native_handle();
 
     SensorLogDataReader log_reader(log_dr_handle);
 

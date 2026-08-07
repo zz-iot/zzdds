@@ -1,0 +1,20 @@
+// zig/hello_world's wire type -- deliberately the simplest possible payload
+// (an incrementing count plus a fixed string), unkeyed, single instance.
+// See docs/design/hello-world-reference-app.md at the repo root for the
+// full spec. Byte-identical copy required in c/hello_world, cpp/hello_world,
+// java/hello_world once those ports exist (same discipline shape.idl
+// already follows across bindings).
+//
+// No @key: per DDS 1.4 2.2.2.1, "If no key is provided, the data set
+// associated with the Topic is restricted to a single instance" -- a
+// keyless Topic is fully spec-legitimate, not a corner case, and zidl's
+// --generate-zzdds-wrappers now generates DataWriter/DataReader for it
+// (fixed in zidl/src/backend/zig.zig -- see isZzddsTopicStruct and
+// emitStructSerializeFns' --generate-zzdds-wrappers branch; previously it
+// required a @key, which had this example keying on `message` as a
+// workaround -- no longer needed).
+@appendable
+struct HelloWorld {
+    int32 count;
+    string<256> message;
+};

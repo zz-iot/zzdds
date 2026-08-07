@@ -21,10 +21,17 @@ pub fn build(b: *std.Build) void {
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
 
-    // Acquire the zidl executable and zidl_rt module from the zidl dependency.
-    const zidl_dep = b.dependency("zidl", .{ .target = target, .optimize = optimize });
-    const zidl_exe = zidl_dep.artifact("zidl");
-    const zidl_rt_mod = zidl_dep.module("zidl_rt");
+    // Get zidl's executable and zidl_rt module *through* zzdds (which
+    // re-exposes both) rather than declaring our own separate dependency on
+    // zidl -- when zidl is a `.path` dependency (as it is during zidl+zzdds
+    // co-development, pre-release), a second independent `.path` dependency
+    // on the same directory doesn't get deduplicated by Zig's package
+    // manager, and the build fails outright the moment one compilation unit
+    // ends up importing both instances of the same file under two module
+    // names ("file exists in modules 'zidl_rt' and 'zidl_rt0'"). See zzdds's
+    // own build.zig for where these are re-exposed.
+    const zidl_exe = zzdds_dep.artifact("zidl");
+    const zidl_rt_mod = zzdds_dep.module("zidl_rt");
 
     // "dds" shim module (see dds_impl.zig) -- shape_main.zig's vendor-agnostic
     // interface contract, implemented here against zzdds directly.
@@ -68,7 +75,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "dds", .module = dds_mod },
                 .{ .name = "shape_gen", .module = shape_gen_mod },
-                .{ .name = "zidl_rt", .module = zidl_rt_mod },
                 .{ .name = "shape_main_options", .module = shape_main_options.createModule() },
             },
         }),

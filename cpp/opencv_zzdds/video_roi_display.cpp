@@ -81,9 +81,7 @@ public:
     }
 
     void on_data_available(std::shared_ptr<::DDS::DataReader> the_reader) override {
-        auto reader_impl = std::dynamic_pointer_cast<DDS::DataReaderImpl>(the_reader);
-        if (!reader_impl) return;
-        ovidds::FrameDataReader frame_dr(reader_impl->native_handle());
+        ovidds::FrameDataReader frame_dr(the_reader->native_handle());
 
         ovidds::FrameDataReader::Loan loan;
         if (frame_dr.take_loaned(loan) != 1)
@@ -164,12 +162,7 @@ int main(int /*argc*/, char** /*argv*/)
         std::cerr << "Failed to create participant." << std::endl;
         return 1;
     }
-    auto participant_impl = std::dynamic_pointer_cast<DDS::DomainParticipantImpl>(participant);
-    if (!participant_impl) {
-        std::cerr << "Participant is not backed by the generated zzdds implementation." << std::endl;
-        return 1;
-    }
-    DDS_DomainParticipant raw_part = participant_impl->native_handle();
+    DDS_DomainParticipant raw_part = participant->native_handle();
 
     if (ovidds::FrameTypeSupport::register_type(raw_part, FRAME_TYPE_NAME) != 0) {
         std::cerr << "Failed to register Frame type." << std::endl;

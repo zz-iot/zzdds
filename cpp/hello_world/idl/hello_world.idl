@@ -1,0 +1,14 @@
+// cpp/hello_world's wire type -- byte-identical to
+// zig/hello_world/idl/hello_world.idl and c/hello_world/idl/hello_world.idl.
+// See docs/design/hello-world-reference-app.md at the repo root for the
+// full spec. Deliberately keyless: per DDS 1.4 2.2.2.1, "If no key is
+// provided, the data set associated with the Topic is restricted to a
+// single instance" -- a keyless Topic is fully spec-legitimate, and zidl's
+// --generate-zzdds-wrappers (C++ backend) generates DataWriter/DataReader
+// for it (see zidl/src/backend/cpp.zig's isZzddsTopicStructCpp and
+// emitStructFns' --generate-zzdds-wrappers branch).
+@appendable
+struct HelloWorld {
+    int32 count;
+    string<256> message;
+};

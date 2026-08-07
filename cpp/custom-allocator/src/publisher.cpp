@@ -74,7 +74,7 @@ int main() {
         std::fprintf(stderr, "FAIL: create_participant returned null\n");
         return 1;
     }
-    auto dp_handle = std::static_pointer_cast<::DDS::DomainParticipantImpl>(dp)->native_handle();
+    auto dp_handle = dp->native_handle();
 
     check(SensorSampleTypeSupport::register_type(dp_handle), "register_type");
 
@@ -96,7 +96,7 @@ int main() {
         std::fprintf(stderr, "FAIL: create_datawriter returned null\n");
         return 1;
     }
-    auto dw_handle = std::static_pointer_cast<::DDS::DataWriterImpl>(dw)->native_handle();
+    auto dw_handle = dw->native_handle();
 
     SensorSampleDataWriter typed_writer(dw_handle);
 
@@ -119,7 +119,7 @@ int main() {
         std::fprintf(stderr, "FAIL: create_datawriter (SensorLog) returned null\n");
         return 1;
     }
-    auto log_dw_handle = std::static_pointer_cast<::DDS::DataWriterImpl>(log_dw)->native_handle();
+    auto log_dw_handle = log_dw->native_handle();
 
     SensorLogDataWriter log_writer(log_dw_handle);
 

@@ -12,13 +12,7 @@ const zzdds_gen = @import("zzdds_generated");
 
 pub const DDS = zzdds_gen.DDS;
 
-const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
-const DataWriterImpl = zzdds.dcps.DataWriterImpl;
-const DataReaderImpl = zzdds.dcps.DataReaderImpl;
-const TopicImpl = zzdds.dcps.TopicImpl;
-const ContentFilteredTopicImpl = zzdds.dcps.ContentFilteredTopicImpl;
 const nil = zzdds.dcps;
-const filter_mod = zzdds.dcps.filter;
 
 // ── Participant bootstrapping ─────────────────────────────────────────────────
 
@@ -68,55 +62,13 @@ pub fn destroyParticipant(p: *Participant) void {
     p.alloc.destroy(p);
 }
 
-// ── Topic name ────────────────────────────────────────────────────────────────
-
-pub fn topicName(topic: DDS.Topic) []const u8 {
-    const impl: *TopicImpl = @ptrCast(@alignCast(topic.ptr));
-    return impl.topic_name;
-}
-
 // ── DataWriter extras ─────────────────────────────────────────────────────────
 
 pub fn writerWaitForAck(dw: DDS.DataWriter, timeout: DDS.Duration_t) DDS.ReturnCode_t {
     return dw.vtable.wait_for_acknowledgments(dw.ptr, &timeout);
 }
 
-pub fn writerMatchedCount(dw: DDS.DataWriter) usize {
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
-    return impl.matchedReaderCount();
-}
-
-pub fn writerNotifyDeadline(dw: DDS.DataWriter) void {
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
-    impl.notifyDeadlineMissed();
-}
-
 // ── DataReader extras ─────────────────────────────────────────────────────────
-
-pub fn readerMatchedCount(dr: DDS.DataReader) usize {
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
-    return impl.matchedWriterCount();
-}
-
-pub fn readerNotifyDeadline(dr: DDS.DataReader) void {
-    const impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
-    impl.notifyDeadlineMissed();
-}
-
-// ── ContentFilteredTopic evaluation ──────────────────────────────────────────
-
-pub const FilterValue = filter_mod.FilterValue;
-pub const FieldAccessor = filter_mod.FieldAccessor;
-
-pub fn cftMatchSample(cft: DDS.ContentFilteredTopic, acc: FieldAccessor) bool {
-    const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
-    return impl.matchSample(acc);
-}
-
-pub fn cftTopicDescription(cft: DDS.ContentFilteredTopic) DDS.TopicDescription {
-    const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
-    return impl.toTopicDescription();
-}
 
 // ── TypeSupport ───────────────────────────────────────────────────────────────
 
@@ -127,8 +79,7 @@ pub fn registerTypeSupport(
     type_name: []const u8,
     ts: TypeSupport,
 ) void {
-    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
-    _ = impl.registerTypeSupport(type_name, ts);
+    _ = zzdds.registerTypeSupport(dp, type_name, ts);
 }
 
 // ── Nil sentinel helpers ──────────────────────────────────────────────────────

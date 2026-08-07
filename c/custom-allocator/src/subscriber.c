@@ -66,8 +66,8 @@ int main(void) {
         return 1;
     }
 
-    check(zzdds_register_type_support_c(dp, "SensorSample", SensorSample_compute_key_hash_from_cdr),
-          "register_type_support_c");
+    check(zzdds_register_type_support(dp, "SensorSample", SensorSample_compute_key_hash_from_cdr, SensorSample_get_field_from_cdr),
+          "register_type_support");
 
     DDS_Topic topic = DDS_DomainParticipant_create_topic(dp, "SensorTopic", "SensorSample", NULL, NULL, 0);
     if (!topic) {
@@ -91,8 +91,8 @@ int main(void) {
     SensorSampleDataReader typed_reader;
     SensorSampleDataReader_init(&typed_reader, dr);
 
-    check(zzdds_register_type_support_c(dp, "SensorLog", SensorLog_compute_key_hash_from_cdr),
-          "register_type_support_c (SensorLog)");
+    check(zzdds_register_type_support(dp, "SensorLog", SensorLog_compute_key_hash_from_cdr, SensorLog_get_field_from_cdr),
+          "register_type_support (SensorLog)");
 
     DDS_Topic log_topic = DDS_DomainParticipant_create_topic(dp, "SensorLogTopic", "SensorLog", NULL, NULL, 0);
     if (!log_topic) {

@@ -8,15 +8,18 @@
         // (see top-level README.md) -- unlike dds-rtps's copy of this build
         // (which defaults to a tagged release URL, for its own upstream
         // dependency contract), zig/shape has no such contract to keep, so
-        // it points straight at the sibling checkouts this workspace already
-        // assumes exist (../../../zzdds, ../../../zidl), same layout as the
+        // it points straight at the sibling checkout this workspace already
+        // assumes exists (../../../zzdds), same layout as the
         // "zzdds-examples" CI job in zzdds/.github/workflows/ci.yml, which
         // checks out zzdds/ and zzdds-examples/ as siblings.
+        //
+        // No direct dependency on zidl here -- build.zig gets the zidl
+        // executable and zidl_rt module *through* zzdds instead (which
+        // re-exposes both), so there's only ever one zidl resolution in the
+        // whole graph. See build.zig's comment for why a second, independent
+        // one breaks the build outright when zidl is a `.path` dependency.
         .zzdds = .{
             .path = "../../../zzdds",
-        },
-        .zidl = .{
-            .path = "../../../zidl",
         },
     },
     .paths = .{

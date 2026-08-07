@@ -1,13 +1,13 @@
 /*
  * C port of zig/shape's shape_main -- the OMG DDS-Interoperability "Shapes"
  * demo app, talking to zzdds through its C ABI. CLI/behavior spec is
- * dds-rtps's srcZig/shape_main.zig (see zig/shape); this implements the
- * "Must-have (v1)" flag subset from docs/design/shape-reference-app.md plus
- * --config -- not the stretch flags (deadline, lifespan, ownership
- * strength, xcdr repr, partition, multi-instance/topic,
- * additional-payload/size-modulo, content-filtering, presentation/coherent,
- * take-read/read-only). One binary, -P/-S selects mode, matching the
- * dds-rtps interop harness convention of one binary path for both roles.
+ * dds-rtps's srcZig/shape_main.zig (see zig/shape); this now implements the
+ * full stretch-flag set from docs/design/shape-reference-app.md, matching
+ * zig/shape's exact semantics (deadline, lifespan, ownership strength, xcdr
+ * repr, partition, multi-instance/topic, additional-payload/size-modulo,
+ * content-filtering, presentation/coherent, take-read/read-only). One
+ * binary, -P/-S selects mode, matching the dds-rtps interop harness
+ * convention of one binary path for both roles.
  */
 #include "shape.h"
 #include "zzdds_c.h"
@@ -19,6 +19,11 @@
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
+#include <inttypes.h>
+
+#define MAX_TOPICS 16
+#define MAX_SAMPLES_PER_READ 256
+#define MAX_IH_CACHE 256
 
 /* ── Options ─────────────────────────────────────────────────────────────── */
 
@@ -29,14 +34,33 @@ typedef struct {
     bool best_effort;
     bool reliable;
     int32_t history_depth; /* -1 = use default KEEP_LAST 1 */
+    uint64_t deadline_ms;
+    uint64_t lifespan_ms; /* 0 = infinite */
+    int32_t ownership_strength; /* -1 = SHARED */
     const char *topic_name;
     const char *color;
+    const char *partition;
     char durability; /* 'v', 'l', 't', 'p' */
+    uint16_t data_representation; /* 1=XCDR1, 2=XCDR2 */
     bool print_writer_samples;
     int32_t shapesize;
     long write_period_ms;
     long read_period_ms;
     int64_t num_iterations; /* -1 = infinite */
+    uint32_t num_instances;
+    uint32_t additional_payload;
+    int32_t size_modulo;
+    const char *cft_expression;
+    uint64_t time_filter_ms;
+    char final_instance_state; /* 0, 'u', 'd' */
+    char access_scope; /* 'i', 't', 'g' */
+    bool ordered_access;
+    bool coherent_access;
+    uint32_t num_topics;
+    bool take_read;
+    bool read_only;
+    uint32_t coherent_sample_count;
+    uint32_t periodic_announcement_ms;
     const char *config_path;
 } Options;
 
@@ -44,13 +68,18 @@ static Options default_options(void) {
     Options o;
     memset(&o, 0, sizeof(o));
     o.history_depth = -1;
+    o.ownership_strength = -1;
     o.topic_name = "Square";
-    o.color = "BLUE";
+    o.color = NULL;
     o.durability = 'v';
+    o.data_representation = 1;
     o.shapesize = 20;
     o.write_period_ms = 33;
     o.read_period_ms = 100;
     o.num_iterations = -1;
+    o.num_instances = 1;
+    o.num_topics = 1;
+    o.access_scope = 'i';
     return o;
 }
 
@@ -105,6 +134,17 @@ static void on_offered_incompatible_qos(
            lc->topic_name, (int)status->last_policy_id, policy_name(status->last_policy_id));
 }
 
+static void on_offered_deadline_missed(
+    DDS_DataWriter writer,
+    const DDS_OfferedDeadlineMissedStatus *status,
+    void *listener_data
+) {
+    (void)writer;
+    const ListenerCtx *lc = (const ListenerCtx *)listener_data;
+    printf("on_offered_deadline_missed() topic: '%s'  type: 'ShapeType' : (total = %d, change = %d)\n",
+           lc->topic_name, (int)status->total_count, (int)status->total_count_change);
+}
+
 static void on_requested_incompatible_qos(
     DDS_DataReader reader,
     const DDS_RequestedIncompatibleQosStatus *status,
@@ -114,6 +154,17 @@ static void on_requested_incompatible_qos(
     const ListenerCtx *lc = (const ListenerCtx *)listener_data;
     printf("on_requested_incompatible_qos() topic: '%s'  type: 'ShapeType' : %d (%s)\n",
            lc->topic_name, (int)status->last_policy_id, policy_name(status->last_policy_id));
+}
+
+static void on_requested_deadline_missed(
+    DDS_DataReader reader,
+    const DDS_RequestedDeadlineMissedStatus *status,
+    void *listener_data
+) {
+    (void)reader;
+    const ListenerCtx *lc = (const ListenerCtx *)listener_data;
+    printf("on_requested_deadline_missed() topic: '%s'  type: 'ShapeType' : (total = %d, change = %d)\n",
+           lc->topic_name, (int)status->total_count, (int)status->total_count_change);
 }
 
 /* ── QoS builders ──────────────────────────────────────────────────────────── */
@@ -136,28 +187,59 @@ static DDS_DurabilityQosPolicyKind durability_kind(char d) {
 }
 
 /* zig/shape always explicitly offers/requests a one-element
- * DataRepresentationId sequence (XCDR1 by default) rather than leaving it
- * empty -- an empty sequence here is DATAREPRESENTATION-incompatible with
- * that against zzdds's QoS matching (confirmed by cross-binding testing:
- * before this was added, every C<->Zig pair failed to match with
- * on_offered/on_requested_incompatible_qos() : 23 (DATAREPRESENTATION)).
- * Static storage, so _release must stay false -- nothing ever frees it. */
-static DDS_DataRepresentationId_t g_default_repr = DDS_XCDR_DATA_REPRESENTATION;
+ * DataRepresentationId sequence rather than leaving it empty -- an empty
+ * sequence here is DATAREPRESENTATION-incompatible with that against
+ * zzdds's QoS matching (confirmed by cross-binding testing: before this was
+ * added, every C<->Zig pair failed to match with on_offered/
+ * on_requested_incompatible_qos() : 23 (DATAREPRESENTATION)). -x selects
+ * XCDR1 (default) vs XCDR2 via this same mechanism. Static storage, so
+ * _release must stay false -- nothing ever frees it; shared between the
+ * writer/reader QoS builders since only one role is ever built per process. */
+static DDS_DataRepresentationId_t g_repr_value = DDS_XCDR_DATA_REPRESENTATION;
 
-static void set_default_representation(DDS_DataRepresentationQosPolicy *repr) {
-    repr->value._buffer = &g_default_repr;
+static void set_representation(DDS_DataRepresentationQosPolicy *repr, uint16_t data_representation) {
+    g_repr_value = (data_representation == 2) ? DDS_XCDR2_DATA_REPRESENTATION : DDS_XCDR_DATA_REPRESENTATION;
+    repr->value._buffer = &g_repr_value;
     repr->value._length = 1;
     repr->value._maximum = 1;
     repr->value._release = false;
 }
 
+static void set_duration_from_ms(DDS_Duration_t *d, uint64_t ms) {
+    d->sec = (int32_t)(ms / 1000);
+    d->nanosec = (uint32_t)((ms % 1000) * 1000000ULL);
+}
+
+/* Partition name storage: DDS_StringSeq's _buffer is char** (C PSM layout).
+ * Static, single-element, non-owning (_release=false) -- opts->partition
+ * (argv, process-lifetime) outlives every QoS use of this. */
+static const char *g_partition_cstr;
+
+static void set_partition(DDS_PartitionQosPolicy *partition, const char *name) {
+    if (!name) {
+        memset(partition, 0, sizeof(*partition));
+        return;
+    }
+    g_partition_cstr = name;
+    partition->name._buffer = (char **)&g_partition_cstr;
+    partition->name._length = 1;
+    partition->name._maximum = 1;
+    partition->name._release = false;
+}
+
+static DDS_PresentationQosPolicyAccessScopeKind access_scope_kind(char c) {
+    switch (c) {
+        case 't': return DDS_PresentationQosPolicyAccessScopeKind_TOPIC_PRESENTATION_QOS;
+        case 'g': return DDS_PresentationQosPolicyAccessScopeKind_GROUP_PRESENTATION_QOS;
+        default: return DDS_PresentationQosPolicyAccessScopeKind_INSTANCE_PRESENTATION_QOS;
+    }
+}
+
 static void build_writer_qos(DDS_DataWriterQos *qos, const Options *opts) {
     /* Zero-init, not DDS_DataWriterQos_default() -- dcps.idl declares no
      * @default annotations at all, so IDL-default == zero-value for every
-     * QoS policy field here; DDS_DataWriterQos_default is declared in
-     * dcps.h but not actually exported by libzzdds.so (verified via
-     * `nm -D libzzdds.so` -- a real zzdds C-ABI codegen gap, out of scope
-     * for this examples-repo work). */
+     * QoS policy field here. Either approach works; this just avoids the
+     * extra call. */
     memset(qos, 0, sizeof(*qos));
     qos->reliability.kind = reliability_kind(opts);
     if (opts->history_depth == 0) {
@@ -167,7 +249,13 @@ static void build_writer_qos(DDS_DataWriterQos *qos, const Options *opts) {
         qos->history.depth = opts->history_depth;
     }
     qos->durability.kind = durability_kind(opts->durability);
-    set_default_representation(&qos->data_representation);
+    if (opts->deadline_ms > 0) set_duration_from_ms(&qos->deadline.period, opts->deadline_ms);
+    if (opts->lifespan_ms > 0) set_duration_from_ms(&qos->lifespan.duration, opts->lifespan_ms);
+    if (opts->ownership_strength >= 0) {
+        qos->ownership.kind = DDS_OwnershipQosPolicyKind_EXCLUSIVE_OWNERSHIP_QOS;
+        qos->ownership_strength.value = opts->ownership_strength;
+    }
+    set_representation(&qos->data_representation, opts->data_representation);
 }
 
 static void build_reader_qos(DDS_DataReaderQos *qos, const Options *opts) {
@@ -181,48 +269,141 @@ static void build_reader_qos(DDS_DataReaderQos *qos, const Options *opts) {
         qos->history.depth = opts->history_depth;
     }
     qos->durability.kind = durability_kind(opts->durability);
-    set_default_representation(&qos->data_representation);
+    if (opts->deadline_ms > 0) set_duration_from_ms(&qos->deadline.period, opts->deadline_ms);
+    if (opts->ownership_strength >= 0) qos->ownership.kind = DDS_OwnershipQosPolicyKind_EXCLUSIVE_OWNERSHIP_QOS;
+    if (opts->time_filter_ms > 0) set_duration_from_ms(&qos->time_based_filter.minimum_separation, opts->time_filter_ms);
+    set_representation(&qos->data_representation, opts->data_representation);
+}
+
+/* ── Multi-topic helpers ───────────────────────────────────────────────────── */
+
+/* Holds the extra topics (index 1..num_topics-1) created alongside the base
+ * topic. The base topic (index 0) is owned by main() and its name is
+ * opts->topic_name. Mirrors zig/shape's ExtraTopics. */
+typedef struct {
+    DDS_Topic topics[MAX_TOPICS];
+    char *names[MAX_TOPICS];
+    uint32_t count;
+} ExtraTopics;
+
+static void extra_topics_free(ExtraTopics *et) {
+    for (uint32_t i = 0; i < et->count; i++) free(et->names[i]);
+}
+
+static DDS_Topic topic_at(const ExtraTopics *et, DDS_Topic base, uint32_t i) {
+    return (i == 0) ? base : et->topics[i - 1];
+}
+
+static const char *name_at(const ExtraTopics *et, const char *base_name, uint32_t i) {
+    return (i == 0) ? base_name : et->names[i - 1];
+}
+
+static int create_extra_topics(DDS_DomainParticipant dp, const Options *opts, ExtraTopics *et) {
+    memset(et, 0, sizeof(*et));
+    et->count = opts->num_topics - 1;
+    for (uint32_t i = 0; i < et->count; i++) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%s%u", opts->topic_name, i + 1);
+        et->names[i] = strdup(buf);
+        printf("Create topic: %s\n", et->names[i]);
+        et->topics[i] = DDS_DomainParticipant_create_topic(dp, et->names[i], "ShapeType", NULL, NULL, 0);
+        if (!et->topics[i]) {
+            for (uint32_t j = 0; j <= i; j++) free(et->names[j]);
+            et->count = 0;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Returns color for instance index: inst=0 -> base, inst>0 -> "{base}{inst}". */
+static const char *instance_color(const char *base, uint32_t inst, char *buf, size_t buf_size) {
+    if (inst == 0) return base;
+    snprintf(buf, buf_size, "%s%u", base, inst);
+    return buf;
 }
 
 /* ── Publisher ─────────────────────────────────────────────────────────────── */
 
-static int run_publisher(DDS_DomainParticipant dp, DDS_Topic topic, const Options *opts) {
-    DDS_Publisher pub = DDS_DomainParticipant_create_publisher(dp, NULL, NULL, 0);
+static int run_publisher(DDS_DomainParticipant dp, DDS_Topic base_topic, const Options *opts) {
+    const char *base_color = opts->color ? opts->color : "BLUE";
+    uint32_t n = opts->num_topics;
+
+    ExtraTopics et;
+    if (create_extra_topics(dp, opts, &et) != 0) {
+        fprintf(stderr, "FAIL: failed to create extra topics\n");
+        return 1;
+    }
+
+    DDS_PublisherQos pub_qos;
+    memset(&pub_qos, 0, sizeof(pub_qos));
+    pub_qos.presentation.access_scope = access_scope_kind(opts->access_scope);
+    pub_qos.presentation.coherent_access = opts->coherent_access;
+    pub_qos.presentation.ordered_access = opts->ordered_access;
+    set_partition(&pub_qos.partition, opts->partition);
+
+    DDS_Publisher pub = DDS_DomainParticipant_create_publisher(dp, &pub_qos, NULL, 0);
     if (!pub) {
         fprintf(stderr, "FAIL: create_publisher returned NULL\n");
+        extra_topics_free(&et);
         return 1;
     }
 
     DDS_DataWriterQos dw_qos;
     build_writer_qos(&dw_qos, opts);
 
-    ListenerCtx lc = { .topic_name = opts->topic_name };
-    DDS_DataWriterListener listener;
-    memset(&listener, 0, sizeof(listener));
-    listener.listener_data = &lc;
-    listener.on_offered_incompatible_qos = on_offered_incompatible_qos;
+    ListenerCtx lctxs[MAX_TOPICS];
+    DDS_DataWriter dw_handles[MAX_TOPICS];
+    ShapeTypeDataWriter typed_writers[MAX_TOPICS];
+    DDS_StatusMask listener_mask = DDS_OFFERED_INCOMPATIBLE_QOS_STATUS | DDS_OFFERED_DEADLINE_MISSED_STATUS;
 
-    DDS_DataWriter dw = DDS_Publisher_create_datawriter(
-        pub, topic, &dw_qos, &listener, DDS_OFFERED_INCOMPATIBLE_QOS_STATUS);
-    if (!dw) {
-        fprintf(stderr, "FAIL: create_datawriter returned NULL\n");
-        return 1;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *tn = name_at(&et, opts->topic_name, i);
+        lctxs[i].topic_name = tn;
+        DDS_DataWriterListener listener;
+        memset(&listener, 0, sizeof(listener));
+        listener.listener_data = &lctxs[i];
+        listener.on_offered_incompatible_qos = on_offered_incompatible_qos;
+        listener.on_offered_deadline_missed = on_offered_deadline_missed;
+
+        DDS_Topic t = topic_at(&et, base_topic, i);
+        dw_handles[i] = DDS_Publisher_create_datawriter(pub, t, &dw_qos, &listener, listener_mask);
+        if (!dw_handles[i]) {
+            fprintf(stderr, "FAIL: create_datawriter returned NULL\n");
+            extra_topics_free(&et);
+            return 1;
+        }
+        ShapeTypeDataWriter_init(&typed_writers[i], dw_handles[i], (opts->data_representation == 2) ? ZIDL_XCDR2 : ZIDL_XCDR1);
+        printf("Create writer for topic: %s color: %s\n", tn, base_color);
     }
-
-    ShapeTypeDataWriter typed_writer;
-    ShapeTypeDataWriter_init(&typed_writer, dw, ZIDL_XCDR1);
-
-    printf("Create writer for topic: %s color: %s\n", opts->topic_name, opts->color);
 
     ShapeType shape;
     memset(&shape, 0, sizeof(shape));
-    strncpy(shape.color, opts->color, sizeof(shape.color) - 1);
+    strncpy(shape.color, base_color, sizeof(shape.color) - 1);
     shape.shapesize = (opts->shapesize == 0) ? 1 : opts->shapesize;
+
+    if (opts->additional_payload > 0) {
+        uint8_t *payload_buf = (uint8_t *)malloc(opts->additional_payload);
+        memset(payload_buf, 0, opts->additional_payload - 1);
+        payload_buf[opts->additional_payload - 1] = 255;
+        shape.additional_payload_size._buffer = payload_buf;
+        shape.additional_payload_size._length = opts->additional_payload;
+        shape.additional_payload_size._maximum = opts->additional_payload;
+        shape.additional_payload_size._release = true;
+    }
 
     srand((unsigned)mono_ns());
 
     const int64_t match_deadline = mono_ns() + 10LL * 1000000000LL;
     bool printed_matched = false;
+
+    /* Coherent set gating: each outer write-loop iteration is one whole
+     * coherent window (begin_coherent_changes -> `sc` consecutive samples per
+     * instance -> end_coherent_changes). Default sc=1 when coherent_access is
+     * enabled without an explicit count, so PID_COHERENT_SET is still emitted
+     * for single-sample sets (required by Connext). */
+    uint32_t sc = (opts->coherent_sample_count > 0) ? opts->coherent_sample_count : 1;
+    bool use_coherent_gating = opts->coherent_access || opts->ordered_access;
 
     int64_t iteration = 0;
     while (!g_all_done) {
@@ -231,100 +412,376 @@ static int run_publisher(DDS_DomainParticipant dp, DDS_Topic topic, const Option
         if (!printed_matched) {
             DDS_PublicationMatchedStatus status;
             memset(&status, 0, sizeof(status));
-            DDS_DataWriter_get_publication_matched_status(dw, &status);
+            DDS_DataWriter_get_publication_matched_status(dw_handles[0], &status);
             if (status.current_count > 0) {
                 printf("on_publication_matched() topic: '%s'  type: 'ShapeType' : matched readers %d (change = 1)\n",
-                       opts->topic_name, (int)status.current_count);
+                       lctxs[0].topic_name, (int)status.current_count);
                 printed_matched = true;
             } else if (mono_ns() > match_deadline) {
+                if (opts->additional_payload > 0) free(shape.additional_payload_size._buffer);
+                extra_topics_free(&et);
                 return 0; /* READER_NOT_MATCHED */
             }
         }
 
-        shape.x = rand() % 320;
-        shape.y = rand() % 240;
+        /* For coherent publishers, hold off writing until a reader has
+         * matched -- Connext's GROUP coherent subscriber requires the group
+         * sequence to start from 1; writing before match would advance the
+         * GSN so the subscriber joins mid-stream and never receives a
+         * complete set. */
+        if (use_coherent_gating && !printed_matched) {
+            usleep((useconds_t)(opts->write_period_ms * 1000));
+            continue;
+        }
 
-        int rc = ShapeTypeDataWriter_write(&typed_writer, &shape, DDS_HANDLE_NIL);
-        if (rc != DDS_RETCODE_OK) {
-            fprintf(stderr, "FAIL: DataWriter_write (rc=%d)\n", rc);
-            return 1;
-        }
-        if (opts->print_writer_samples) {
-            printf("%-10s %-10s %03d %03d [%d]\n",
-                   opts->topic_name, shape.color, (int)shape.x, (int)shape.y, (int)shape.shapesize);
-        }
-        if (opts->shapesize == 0) {
-            shape.shapesize++;
+        /* DEADLINE QoS is enforced automatically by zzdds's own background
+         * timer (DomainParticipantImpl.checkTimers(), driven by a per-
+         * participant thread) -- no manual elapsed-time tracking needed
+         * here; on_offered_deadline_missed() fires on its own. */
+
+        if (use_coherent_gating) {
+            DDS_Publisher_begin_coherent_changes(pub);
+            for (uint32_t ti = 0; ti < n; ti++) {
+                for (uint32_t inst = 0; inst < opts->num_instances; inst++) {
+                    char color_buf[160];
+                    const char *inst_color = instance_color(base_color, inst, color_buf, sizeof(color_buf));
+                    strncpy(shape.color, inst_color, sizeof(shape.color) - 1);
+                    shape.color[sizeof(shape.color) - 1] = '\0';
+                    for (uint32_t s = 0; s < sc; s++) {
+                        shape.x = rand() % 320;
+                        shape.y = rand() % 240;
+                        int rc = ShapeTypeDataWriter_write(&typed_writers[ti], &shape, DDS_HANDLE_NIL);
+                        if (rc != DDS_RETCODE_OK) {
+                            fprintf(stderr, "FAIL: DataWriter_write (rc=%d)\n", rc);
+                            if (opts->additional_payload > 0) free(shape.additional_payload_size._buffer);
+                            extra_topics_free(&et);
+                            return 1;
+                        }
+                        if (opts->print_writer_samples) {
+                            printf("%-10s %-10s %03d %03d [%d]\n",
+                                   lctxs[ti].topic_name, inst_color, (int)shape.x, (int)shape.y, (int)shape.shapesize);
+                        }
+                        if (opts->shapesize == 0) {
+                            shape.shapesize++;
+                            if (opts->size_modulo > 0 && shape.shapesize > opts->size_modulo) shape.shapesize = 1;
+                        }
+                    }
+                }
+            }
+            DDS_Publisher_end_coherent_changes(pub);
+        } else {
+            shape.x = rand() % 320;
+            shape.y = rand() % 240;
+
+            for (uint32_t ti = 0; ti < n; ti++) {
+                for (uint32_t inst = 0; inst < opts->num_instances; inst++) {
+                    char color_buf[160];
+                    const char *inst_color = instance_color(base_color, inst, color_buf, sizeof(color_buf));
+                    strncpy(shape.color, inst_color, sizeof(shape.color) - 1);
+                    shape.color[sizeof(shape.color) - 1] = '\0';
+                    int rc = ShapeTypeDataWriter_write(&typed_writers[ti], &shape, DDS_HANDLE_NIL);
+                    if (rc != DDS_RETCODE_OK) {
+                        fprintf(stderr, "FAIL: DataWriter_write (rc=%d)\n", rc);
+                        if (opts->additional_payload > 0) free(shape.additional_payload_size._buffer);
+                        extra_topics_free(&et);
+                        return 1;
+                    }
+                    if (opts->print_writer_samples) {
+                        printf("%-10s %-10s %03d %03d [%d]\n",
+                               lctxs[ti].topic_name, inst_color, (int)shape.x, (int)shape.y, (int)shape.shapesize);
+                    }
+                }
+            }
+            if (opts->shapesize == 0) {
+                shape.shapesize++;
+                if (opts->size_modulo > 0 && shape.shapesize > opts->size_modulo) shape.shapesize = 1;
+            }
         }
 
         iteration++;
         usleep((useconds_t)(opts->write_period_ms * 1000));
     }
 
+    /* Unregister/dispose all instances across all topics on finite run. */
     if (opts->num_iterations >= 0) {
+        bool do_dispose = (opts->final_instance_state == 'd');
+        for (uint32_t ti = 0; ti < n; ti++) {
+            for (uint32_t inst = 0; inst < opts->num_instances; inst++) {
+                char color_buf[160];
+                const char *inst_color = instance_color(base_color, inst, color_buf, sizeof(color_buf));
+                ShapeType key;
+                memset(&key, 0, sizeof(key));
+                strncpy(key.color, inst_color, sizeof(key.color) - 1);
+                if (do_dispose) {
+                    ShapeTypeDataWriter_dispose(&typed_writers[ti], &key, DDS_HANDLE_NIL);
+                } else {
+                    ShapeTypeDataWriter_unregister(&typed_writers[ti], &key, DDS_HANDLE_NIL);
+                }
+            }
+        }
+        /* Wait until all reliable readers have ACKed the NOT_ALIVE changes,
+         * or up to 5 s, to avoid exiting before RELIABLE transport has
+         * delivered the unregister/dispose changes to matched readers. */
         DDS_Duration_t ack_timeout = { .sec = 5, .nanosec = 0 };
-        DDS_Publisher_wait_for_acknowledgments(pub, &ack_timeout);
+        for (uint32_t ti = 0; ti < n; ti++) {
+            DDS_DataWriter_wait_for_acknowledgments(dw_handles[ti], &ack_timeout);
+        }
     }
+
+    if (opts->additional_payload > 0) free(shape.additional_payload_size._buffer);
+    extra_topics_free(&et);
     return 0;
 }
 
 /* ── Subscriber ────────────────────────────────────────────────────────────── */
 
-static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic topic, const Options *opts) {
-    DDS_Subscriber sub = DDS_DomainParticipant_create_subscriber(dp, NULL, NULL, 0);
+/* Maps instance_handle -> color for recovering key identity from NOT_ALIVE
+ * samples that arrive without a serialized key payload. Fixed-size linear
+ * cache -- ample for a demo app's instance counts. */
+typedef struct {
+    DDS_InstanceHandle_t handle;
+    char color[129];
+    bool used;
+} IhColorEntry;
+
+static IhColorEntry g_ih_cache[MAX_IH_CACHE];
+
+static void ih_cache_put(DDS_InstanceHandle_t handle, const char *color) {
+    for (int i = 0; i < MAX_IH_CACHE; i++) {
+        if (g_ih_cache[i].used && g_ih_cache[i].handle == handle) {
+            strncpy(g_ih_cache[i].color, color, sizeof(g_ih_cache[i].color) - 1);
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_IH_CACHE; i++) {
+        if (!g_ih_cache[i].used) {
+            g_ih_cache[i].used = true;
+            g_ih_cache[i].handle = handle;
+            strncpy(g_ih_cache[i].color, color, sizeof(g_ih_cache[i].color) - 1);
+            return;
+        }
+    }
+}
+
+static const char *ih_cache_get(DDS_InstanceHandle_t handle) {
+    for (int i = 0; i < MAX_IH_CACHE; i++) {
+        if (g_ih_cache[i].used && g_ih_cache[i].handle == handle) return g_ih_cache[i].color;
+    }
+    return "";
+}
+
+static void print_not_alive(const char *topic_name, const char *color, uint32_t instance_state) {
+    const char *state_str = (instance_state == DDS_NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+        ? "NOT_ALIVE_DISPOSED_INSTANCE_STATE"
+        : "NOT_ALIVE_NO_WRITERS_INSTANCE_STATE";
+    printf("%-10s %-10s %s\n", topic_name, color, state_str);
+}
+
+typedef struct {
+    ShapeType v;
+    zzdds_sample_info i;
+} ShapeSample;
+
+static int sample_cmp_by_handle(const void *a, const void *b) {
+    const ShapeSample *sa = (const ShapeSample *)a;
+    const ShapeSample *sb = (const ShapeSample *)b;
+    if (sa->i.instance_handle < sb->i.instance_handle) return -1;
+    if (sa->i.instance_handle > sb->i.instance_handle) return 1;
+    return 0;
+}
+
+static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const Options *opts) {
+    uint32_t n = opts->num_topics;
+
+    ExtraTopics et;
+    if (create_extra_topics(dp, opts, &et) != 0) {
+        fprintf(stderr, "FAIL: failed to create extra topics\n");
+        return 1;
+    }
+
+    /* Content-filtered topic for topic[0] only (when --cft or -c COLOR is
+     * specified) -- matches zig/shape's effective_cft_expr synthesis. */
+    char synth_cft_buf[160];
+    const char *effective_cft_expr = opts->cft_expression;
+    if (!effective_cft_expr && opts->color) {
+        snprintf(synth_cft_buf, sizeof(synth_cft_buf), "color = '%s'", opts->color);
+        effective_cft_expr = synth_cft_buf;
+    }
+
+    DDS_ContentFilteredTopic cft = NULL;
+    if (effective_cft_expr) {
+        char cft_name[192];
+        snprintf(cft_name, sizeof(cft_name), "%s_cft", opts->topic_name);
+        cft = DDS_DomainParticipant_create_contentfilteredtopic(dp, cft_name, base_topic, effective_cft_expr, NULL);
+    }
+
+    DDS_SubscriberQos sub_qos;
+    memset(&sub_qos, 0, sizeof(sub_qos));
+    sub_qos.presentation.access_scope = access_scope_kind(opts->access_scope);
+    sub_qos.presentation.coherent_access = opts->coherent_access;
+    sub_qos.presentation.ordered_access = opts->ordered_access;
+    set_partition(&sub_qos.partition, opts->partition);
+
+    DDS_Subscriber sub = DDS_DomainParticipant_create_subscriber(dp, &sub_qos, NULL, 0);
     if (!sub) {
         fprintf(stderr, "FAIL: create_subscriber returned NULL\n");
+        extra_topics_free(&et);
         return 1;
     }
 
     DDS_DataReaderQos dr_qos;
     build_reader_qos(&dr_qos, opts);
 
-    ListenerCtx lc = { .topic_name = opts->topic_name };
-    DDS_DataReaderListener listener;
-    memset(&listener, 0, sizeof(listener));
-    listener.listener_data = &lc;
-    listener.on_requested_incompatible_qos = on_requested_incompatible_qos;
+    ListenerCtx lctxs[MAX_TOPICS];
+    DDS_DataReader dr_handles[MAX_TOPICS];
+    ShapeTypeDataReader typed_readers[MAX_TOPICS];
+    DDS_StatusMask listener_mask = DDS_REQUESTED_INCOMPATIBLE_QOS_STATUS | DDS_REQUESTED_DEADLINE_MISSED_STATUS;
 
-    DDS_TopicDescription topic_desc = zzdds_topic_as_description(topic);
-    DDS_DataReader dr = DDS_Subscriber_create_datareader(
-        sub, topic_desc, &dr_qos, &listener, DDS_REQUESTED_INCOMPATIBLE_QOS_STATUS);
-    if (!dr) {
-        fprintf(stderr, "FAIL: create_datareader returned NULL\n");
-        return 1;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *tn = name_at(&et, opts->topic_name, i);
+        lctxs[i].topic_name = tn;
+        DDS_DataReaderListener listener;
+        memset(&listener, 0, sizeof(listener));
+        listener.listener_data = &lctxs[i];
+        listener.on_requested_incompatible_qos = on_requested_incompatible_qos;
+        listener.on_requested_deadline_missed = on_requested_deadline_missed;
+
+        DDS_TopicDescription topic_desc = (i == 0 && cft)
+            ? DDS_ContentFilteredTopic_as_DDS_TopicDescription(cft)
+            : zzdds_topic_as_description(topic_at(&et, base_topic, i));
+
+        printf("Create reader for topic: %s\n", tn);
+        dr_handles[i] = DDS_Subscriber_create_datareader(sub, topic_desc, &dr_qos, &listener, listener_mask);
+        if (!dr_handles[i]) {
+            fprintf(stderr, "FAIL: create_datareader returned NULL\n");
+            extra_topics_free(&et);
+            return 1;
+        }
+        ShapeTypeDataReader_init(&typed_readers[i], dr_handles[i]);
     }
 
-    ShapeTypeDataReader typed_reader;
-    ShapeTypeDataReader_init(&typed_reader, dr);
-
-    printf("Create reader for topic: %s\n", opts->topic_name);
+    bool use_access = opts->coherent_access || opts->ordered_access;
 
     int64_t iteration = 0;
     while (!g_all_done) {
         if (opts->num_iterations >= 0 && iteration >= opts->num_iterations) break;
 
-        /* HANDLE_NIL every call (not the last-seen handle) drains each
-         * instance fully before moving to the next -- matches
-         * zig/shape's take_next_instance loop. */
-        for (;;) {
-            ShapeType value;
-            zzdds_sample_info info;
-            memset(&value, 0, sizeof(value));
-            memset(&info, 0, sizeof(info));
-            uint8_t buf[256];
-            size_t cdr_len = 0;
-
-            int rc = ShapeTypeDataReader_take_next_instance(
-                &typed_reader, &value, &info, DDS_HANDLE_NIL, buf, sizeof(buf), &cdr_len);
-            if (rc != DDS_RETCODE_OK || !info.valid_data) break;
-
-            printf("%-10s %-10s %03d %03d [%d]\n",
-                   opts->topic_name, value.color, (int)value.x, (int)value.y, (int)value.shapesize);
+        if (use_access) {
+            if (opts->coherent_access) printf("Reading coherent sets, iteration %" PRId64 "\n", iteration);
+            if (opts->ordered_access) printf("Reading with ordered access, iteration %" PRId64 "\n", iteration);
+            DDS_Subscriber_begin_access(sub);
         }
+
+        for (uint32_t ti = 0; ti < n; ti++) {
+            const char *tn = lctxs[ti].topic_name;
+
+            if (opts->read_only) {
+                /* -R (non-destructive read): bulk-fetch every NOT_READ sample
+                 * once per topic per outer iteration (flips them to READ so
+                 * they won't re-match), then hand them out one at a time.
+                 * --take-read still picks FIFO vs grouped-by-instance
+                 * ordering, applied here via the sort. */
+                ShapeSample buf[MAX_SAMPLES_PER_READ];
+                ShapeType values[MAX_SAMPLES_PER_READ];
+                zzdds_sample_info infos[MAX_SAMPLES_PER_READ];
+                memset(values, 0, sizeof(values));
+                memset(infos, 0, sizeof(infos));
+                int got = ShapeTypeDataReader_read_n(&typed_readers[ti], values, infos, MAX_SAMPLES_PER_READ,
+                                                      DDS_NOT_READ_SAMPLE_STATE, DDS_ANY_VIEW_STATE, DDS_ANY_INSTANCE_STATE);
+                if (got < 0) got = 0;
+                for (int k = 0; k < got; k++) {
+                    buf[k].v = values[k];
+                    buf[k].i = infos[k];
+                }
+                if (!opts->take_read) {
+                    qsort(buf, (size_t)got, sizeof(buf[0]), sample_cmp_by_handle);
+                }
+
+                for (int k = 0; k < got; k++) {
+                    ShapeType *value = &buf[k].v;
+                    zzdds_sample_info *info = &buf[k].i;
+
+                    if (!info->valid_data ||
+                        info->instance_state == DDS_NOT_ALIVE_NO_WRITERS_INSTANCE_STATE ||
+                        info->instance_state == DDS_NOT_ALIVE_DISPOSED_INSTANCE_STATE)
+                    {
+                        const char *key_color = (value->color[0] != '\0') ? value->color : ih_cache_get(info->instance_handle);
+                        print_not_alive(tn, key_color, info->instance_state);
+                        ShapeType_free(value);
+                        continue;
+                    }
+
+                    ih_cache_put(info->instance_handle, value->color);
+
+                    uint32_t extra_len = value->additional_payload_size._length;
+                    if (extra_len > 0 && value->additional_payload_size._buffer) {
+                        uint8_t last_byte = value->additional_payload_size._buffer[extra_len - 1];
+                        printf("%-10s %-10s %03d %03d [%d] {%d}\n",
+                               tn, value->color, (int)value->x, (int)value->y, (int)value->shapesize, (int)last_byte);
+                    } else {
+                        printf("%-10s %-10s %03d %03d [%d]\n",
+                               tn, value->color, (int)value->x, (int)value->y, (int)value->shapesize);
+                    }
+                    ShapeType_free(value);
+                }
+            } else {
+                /* HANDLE_NIL every call (not the last-seen handle) drains
+                 * each instance fully before moving to the next -- matches
+                 * zig/shape's take_next_instance loop. --take-read uses
+                 * FIFO take() delivery order instead. */
+                for (;;) {
+                    ShapeType value;
+                    zzdds_sample_info info;
+                    memset(&value, 0, sizeof(value));
+                    memset(&info, 0, sizeof(info));
+                    uint8_t cdr_buf[512];
+                    size_t cdr_len = 0;
+
+                    int rc = opts->take_read
+                        ? ShapeTypeDataReader_take(&typed_readers[ti], &value, &info, cdr_buf, sizeof(cdr_buf), &cdr_len)
+                        : ShapeTypeDataReader_take_next_instance(&typed_readers[ti], &value, &info, DDS_HANDLE_NIL, cdr_buf, sizeof(cdr_buf), &cdr_len);
+                    if (rc != DDS_RETCODE_OK || !info.valid_data) {
+                        if (rc == DDS_RETCODE_OK && !info.valid_data &&
+                            (info.instance_state == DDS_NOT_ALIVE_NO_WRITERS_INSTANCE_STATE ||
+                             info.instance_state == DDS_NOT_ALIVE_DISPOSED_INSTANCE_STATE))
+                        {
+                            const char *key_color = (value.color[0] != '\0') ? value.color : ih_cache_get(info.instance_handle);
+                            print_not_alive(tn, key_color, info.instance_state);
+                            ShapeType_free(&value);
+                            continue;
+                        }
+                        ShapeType_free(&value);
+                        break;
+                    }
+
+                    ih_cache_put(info.instance_handle, value.color);
+
+                    uint32_t extra_len = value.additional_payload_size._length;
+                    if (extra_len > 0 && value.additional_payload_size._buffer) {
+                        uint8_t last_byte = value.additional_payload_size._buffer[extra_len - 1];
+                        printf("%-10s %-10s %03d %03d [%d] {%d}\n",
+                               tn, value.color, (int)value.x, (int)value.y, (int)value.shapesize, (int)last_byte);
+                    } else {
+                        printf("%-10s %-10s %03d %03d [%d]\n",
+                               tn, value.color, (int)value.x, (int)value.y, (int)value.shapesize);
+                    }
+                    ShapeType_free(&value);
+                }
+            }
+        }
+
+        if (use_access) DDS_Subscriber_end_access(sub);
+
+        /* DEADLINE QoS is enforced automatically by zzdds's own background
+         * timer -- no manual elapsed-time tracking needed here;
+         * on_requested_deadline_missed() fires on its own. */
 
         iteration++;
         usleep((useconds_t)(opts->read_period_ms * 1000));
     }
+
+    if (cft) DDS_DomainParticipant_delete_contentfilteredtopic(dp, cft);
+    extra_topics_free(&et);
     return 0;
 }
 
@@ -343,24 +800,42 @@ static int parse_args(int argc, char **argv, Options *opts) {
             opts->reliable = true;
         } else if (strcmp(arg, "-w") == 0) {
             opts->print_writer_samples = true;
+        } else if (strcmp(arg, "-R") == 0) {
+            opts->read_only = true;
         } else if (strcmp(arg, "-d") == 0) {
             if (++i >= argc) return -1;
             opts->domain_id = (uint32_t)strtoul(argv[i], NULL, 10);
         } else if (strcmp(arg, "-k") == 0) {
             if (++i >= argc) return -1;
             opts->history_depth = (int32_t)strtol(argv[i], NULL, 10);
+        } else if (strcmp(arg, "-f") == 0 || strcmp(arg, "--deadline") == 0) {
+            if (++i >= argc) return -1;
+            opts->deadline_ms = strtoull(argv[i], NULL, 10);
+        } else if (strcmp(arg, "-s") == 0) {
+            if (++i >= argc) return -1;
+            opts->ownership_strength = (int32_t)strtol(argv[i], NULL, 10);
         } else if (strcmp(arg, "-t") == 0) {
             if (++i >= argc) return -1;
             opts->topic_name = argv[i];
         } else if (strcmp(arg, "-c") == 0) {
             if (++i >= argc) return -1;
             opts->color = argv[i];
+        } else if (strcmp(arg, "-p") == 0) {
+            if (++i >= argc) return -1;
+            opts->partition = argv[i];
         } else if (strcmp(arg, "-D") == 0) {
             if (++i >= argc) return -1;
             opts->durability = argv[i][0] ? argv[i][0] : 'v';
+        } else if (strcmp(arg, "-x") == 0) {
+            if (++i >= argc) return -1;
+            opts->data_representation = (uint16_t)strtoul(argv[i], NULL, 10);
+            if (opts->data_representation != 2) opts->data_representation = 1;
         } else if (strcmp(arg, "-z") == 0) {
             if (++i >= argc) return -1;
             opts->shapesize = (int32_t)strtol(argv[i], NULL, 10);
+        } else if (strcmp(arg, "-n") == 0 || strcmp(arg, "--num-instances") == 0) {
+            if (++i >= argc) return -1;
+            opts->num_instances = (uint32_t)strtoul(argv[i], NULL, 10);
         } else if (strcmp(arg, "--write-period") == 0) {
             if (++i >= argc) return -1;
             opts->write_period_ms = strtol(argv[i], NULL, 10);
@@ -370,9 +845,50 @@ static int parse_args(int argc, char **argv, Options *opts) {
         } else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--num-iterations") == 0) {
             if (++i >= argc) return -1;
             opts->num_iterations = strtoll(argv[i], NULL, 10);
+        } else if (strcmp(arg, "--additional-payload") == 0 || strcmp(arg, "--additional-payload-size") == 0) {
+            if (++i >= argc) return -1;
+            opts->additional_payload = (uint32_t)strtoul(argv[i], NULL, 10);
+        } else if (strcmp(arg, "--size-modulo") == 0) {
+            if (++i >= argc) return -1;
+            opts->size_modulo = (int32_t)strtol(argv[i], NULL, 10);
+        } else if (strcmp(arg, "--cft") == 0) {
+            if (++i >= argc) return -1;
+            opts->cft_expression = argv[i];
+        } else if (strcmp(arg, "--time-filter") == 0) {
+            if (++i >= argc) return -1;
+            opts->time_filter_ms = strtoull(argv[i], NULL, 10);
+        } else if (strcmp(arg, "--lifespan") == 0) {
+            if (++i >= argc) return -1;
+            opts->lifespan_ms = strtoull(argv[i], NULL, 10);
+        } else if (strcmp(arg, "--final-instance-state") == 0) {
+            if (++i >= argc) return -1;
+            opts->final_instance_state = argv[i][0] ? argv[i][0] : 0;
+        } else if (strcmp(arg, "--access-scope") == 0) {
+            if (++i >= argc) return -1;
+            opts->access_scope = argv[i][0] ? argv[i][0] : 'i';
+        } else if (strcmp(arg, "--ordered") == 0) {
+            opts->ordered_access = true;
+        } else if (strcmp(arg, "--coherent") == 0) {
+            opts->coherent_access = true;
+        } else if (strcmp(arg, "--num-topics") == 0) {
+            if (++i >= argc) return -1;
+            opts->num_topics = (uint32_t)strtoul(argv[i], NULL, 10);
+        } else if (strcmp(arg, "--take-read") == 0) {
+            opts->take_read = true;
+        } else if (strcmp(arg, "--coherent-sample-count") == 0) {
+            if (++i >= argc) return -1;
+            opts->coherent_sample_count = (uint32_t)strtoul(argv[i], NULL, 10);
+        } else if (strcmp(arg, "--periodic-announcement") == 0) {
+            if (++i >= argc) return -1;
+            opts->periodic_announcement_ms = (uint32_t)strtoul(argv[i], NULL, 10);
         } else if (strcmp(arg, "--config") == 0) {
             if (++i >= argc) return -1;
             opts->config_path = argv[i];
+        } else if (strcmp(arg, "--publisher-matches") == 0 || strcmp(arg, "--subscriber-matches") == 0) {
+            /* Consume argument value and ignore -- unimplemented options; no
+             * reference implementation elsewhere in this repo defines their
+             * semantics and no interop test exercises them. */
+            if (++i >= argc) return -1;
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             printf(
                 "Usage: shape_main -P|-S [options]\n"
@@ -386,33 +902,54 @@ static int parse_args(int argc, char **argv, Options *opts) {
                 "  -r                  RELIABLE reliability (explicit)\n"
                 "  -k <depth>          History depth; 0 = KEEP_ALL (default: KEEP_LAST 1)\n"
                 "  -D v|l|t|p          Durability: volatile, transient-local, transient, persistent\n"
+                "  -f, --deadline <ms> Deadline period in milliseconds\n"
+                "  --lifespan <ms>     Sample lifespan in milliseconds (writer only; 0 = infinite)\n"
+                "  -s <strength>       Ownership strength (enables EXCLUSIVE ownership)\n"
+                "  -x 1|2              Data representation: 1=XCDR1 (default), 2=XCDR2\n"
+                "  -p <name>           Partition name\n"
                 "\n"
                 "Topic / data:\n"
                 "  -t <name>           Topic name (default: Square)\n"
                 "  -c <color>          Color / key value (default: BLUE)\n"
                 "  -z <size>           Shape size; 0 = auto-increment each sample (default: 20)\n"
+                "  -n <count>          Number of instances to publish (default: 1)\n"
+                "  --num-topics <n>    Number of topics (Square, Square1, Square2, ...) (default: 1)\n"
+                "  --additional-payload <bytes>  Extra zero bytes appended to each sample\n"
+                "  --size-modulo <n>   Cycle shapesize 1..n when -z 0 is active\n"
+                "  --cft <expr>        Content filter expression (subscriber only)\n"
                 "\n"
                 "Timing / iterations:\n"
                 "  -i, --num-iterations <n>   Stop after n samples (-1 = infinite, default)\n"
                 "  --write-period <ms>         Publish interval in ms (default: 33)\n"
                 "  --read-period <ms>          Read poll interval in ms (default: 100)\n"
                 "\n"
+                "Presentation / coherent:\n"
+                "  --access-scope i|t|g        Presentation access scope (default: i)\n"
+                "  --ordered                   Enable ordered access\n"
+                "  --coherent                   Enable coherent access\n"
+                "  --coherent-sample-count <n>  Samples per coherent set (0 = no gating)\n"
+                "  --take-read                  Use take() instead of take_next_instance()\n"
+                "  -R                           Use read() instead of take() (non-destructive)\n"
+                "\n"
                 "Other:\n"
                 "  -d <id>             Domain ID (default: 0)\n"
                 "  -w                  Print each sample on the writer side\n"
+                "  --periodic-announcement <ms>  SPDP participant re-announcement period\n"
+                "                                (0 = use zzdds's own default)\n"
                 "  --config <path>     Load a zzdds.toml-style config file as the process-wide\n"
                 "                      default participant config before creating the factory\n"
                 "                      (see zzdds-examples/config/ for example scenarios)\n"
                 "  -h, --help          Show this help and exit\n"
                 "\n"
-                "This C port implements the \"Must-have (v1)\" flag subset only -- see\n"
-                "zig/shape -h for the full CLI/behavior spec (stretch flags not yet ported).\n"
             );
             exit(0);
         } else {
             fprintf(stderr, "warning: unrecognised option: %s\n", arg);
         }
     }
+
+    if (opts->publish && !opts->color) opts->color = "BLUE";
+
     return 0;
 }
 
@@ -430,6 +967,17 @@ int main(int argc, char **argv) {
     if (!opts.publish && !opts.subscribe) {
         fprintf(stderr, "specify -P (publish) or -S (subscribe)\n");
         return 1;
+    }
+
+    if (opts.num_topics < 1 || opts.num_topics > MAX_TOPICS) {
+        fprintf(stderr, "--num-topics must be between 1 and %d (got %u)\n", MAX_TOPICS, opts.num_topics);
+        return 1;
+    }
+
+    if (opts.periodic_announcement_ms > 0) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%u", opts.periodic_announcement_ms);
+        setenv("ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS", buf, 1);
     }
 
     if (opts.config_path) {
@@ -454,7 +1002,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    zzdds_register_type_support_c(dp, "ShapeType", ShapeType_compute_key_hash_from_cdr);
+    zzdds_register_type_support(dp, "ShapeType", ShapeType_compute_key_hash_from_cdr, ShapeType_get_field_from_cdr);
 
     DDS_Topic topic = DDS_DomainParticipant_create_topic(dp, opts.topic_name, "ShapeType", NULL, NULL, 0);
     if (!topic) {

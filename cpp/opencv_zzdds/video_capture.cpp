@@ -250,12 +250,7 @@ int main(int /*argc*/, char** /*argv*/)
         std::cerr << "Failed to create participant." << std::endl;
         return 1;
     }
-    auto participant_impl = std::dynamic_pointer_cast<DDS::DomainParticipantImpl>(participant);
-    if (!participant_impl) {
-        std::cerr << "Participant is not backed by the generated zzdds implementation." << std::endl;
-        return 1;
-    }
-    DDS_DomainParticipant raw_part = participant_impl->native_handle();
+    DDS_DomainParticipant raw_part = participant->native_handle();
 
     // D3: get_qos now has out-direction C→C++ adaptation — quick sanity check.
     {

@@ -7,18 +7,32 @@ One top-level directory per binding language, one subdirectory per example
 within it:
 
 ```
+zig/
+  hello_world/        minimal pub/sub, native Zig API, no C ABI
+  shape/              configurable pub/sub (see docs/design/shape-reference-app.md)
 c/
+  hello_world/        C port of zig/hello_world
+  shape/              C port of zig/shape
   custom-allocator/   zero-heap-allocation pub/sub over real UDP discovery
 cpp/
+  hello_world/        C++ port of zig/hello_world
+  shape/              C++ port of zig/shape
   custom-allocator/   C++ version of c/custom-allocator
   opencv_zzdds/       video capture -> ROI detection -> display over DDS, using OpenCV
 java/
+  hello_world/        Java port of zig/hello_world
+  shape/              Java port of zig/shape
   listener-pubsub/    pub/sub over real UDP discovery, exercising the JNI listener path
 interop/
-  cross-binding-smoke-test.sh   verifies C and C++ actually interoperate over the wire
+  cross-binding-smoke-test.sh          C and C++ custom-allocator interop
+  shape-cross-binding-smoke-test.sh    all 12 ordered pairs of the 4 shape ports
 
 run-all.sh   builds+runs everything above at once, skipping what your zzdds build doesn't support
 ```
+
+`docs/design/` has a short "what this demonstrates" reference for
+`hello_world` and `shape` shared across all four language ports — see
+those before diving into a specific language's README.
 
 Every example builds against a local zzdds checkout — none of these are
 released/tagged against a specific zzdds version, or pinned via a git
@@ -98,6 +112,15 @@ ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./build_all.sh
 ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.sh
 ```
 
+Zig examples are plain `zig build` packages with no shared aggregator —
+build each one directly (see `zig/hello_world/README.md` /
+`zig/shape/README.md`):
+
+```sh
+cd zig/hello_world && zig build
+cd zig/shape && zig build
+```
+
 ## CI-friendly execution checks
 
 Also covered by `run-all.sh`. Building everything is necessary but not
@@ -106,5 +129,6 @@ no camera/display/hardware required:
 
 ```sh
 ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/cross-binding-smoke-test.sh
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/shape-cross-binding-smoke-test.sh
 ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./cpp/opencv_zzdds/smoke-test.sh
 ```

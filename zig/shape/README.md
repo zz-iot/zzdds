@@ -1,38 +1,33 @@
 # zig/shape
 
-Native-Zig port of `dds-rtps`'s `srcZig/shape_main.zig` — the OMG
-DDS-Interoperability "Shapes" demo app (`ShapeType`: a keyed `color` string
-plus `x`/`y`/`shapesize`), talking to zzdds directly through its native Zig
-API (no C ABI involved). One binary, `-P`/`-S` selects publisher/subscriber
-mode. See `docs/design/shape-reference-app.md` at the repo root for the full
-spec — this is step 1 of that plan (Zig first: the one real existing port,
-lowest risk, and the CLI/behavior reference `c/shape`, `cpp/shape`, and
-`java/shape` are built against once they land).
+Native-Zig port of the OMG DDS-Interoperability "Shapes" demo app
+(`ShapeType`: a keyed `color` string plus `x`/`y`/`shapesize`), talking to
+zzdds directly through its native Zig API — no C ABI involved, unlike the
+`c/`, `cpp/`, and `java/shape` ports. One binary, `-P`/`-S` selects
+publisher/subscriber mode. See
+[`docs/design/shape-reference-app.md`](../../docs/design/shape-reference-app.md)
+at the repo root for what this example demonstrates and the full CLI/QoS
+surface; this README covers build/run and the Zig-specific bits.
 
-`shape_main.zig` and `dds_impl.zig` are carried over from `dds-rtps` almost
-as-is — paths in `build.zig` changed, and `--config` support (see below) was
-added on top, since it's a real capability dds-rtps's own `shape_main`
-doesn't have; everything else, including the rest of the CLI behavior, is
-unmodified so this stays the authoritative reference the other three ports
-are built against. `dds_impl.zig` implements the small "dds" vendor-shim
-contract `shape_main.zig` expects (participant bootstrap, QoS status/listener
-glue, nil-handle checks — see the contract description in
-`dds-rtps/srcZig/dds.zig` if you need the full interface), plus one addition
-beyond that contract: `configureFromFile`, below. CDR serialization/key-
-hashing is handled by the zidl-generated `shape_gen` module, built at
-`zig build` time from `idl/shape.idl`.
+`dds_impl.zig` implements the small "dds" vendor-shim contract
+`shape_main.zig` expects (participant bootstrap, QoS status/listener glue,
+nil-handle checks), plus one addition: `configureFromFile`, below. CDR
+serialization/key-hashing is handled by the zidl-generated `shape_gen`
+module, built at `zig build` time from `idl/shape.idl`.
 
 ## Prerequisites
 
 - Zig 0.16.0.
-- Local `zzdds` and `zidl` checkouts as siblings of `zzdds-examples` (i.e.
-  `../../../zzdds` and `../../../zidl` relative to this directory) — matches
-  this repo's own convention of always building against a local zzdds
-  checkout (see the top-level README), and the checkout layout
-  `zzdds`'s own CI uses for its `zzdds-examples` smoke-test job. No
-  `zig build install` step is needed first: `build.zig.zon` depends on the
-  zzdds/zidl *source trees* directly (Zig module dependencies, not the
-  installed C ABI), so anything committed in those checkouts is picked up.
+- A local `zzdds` checkout as a sibling of `zzdds-examples`
+  (`../../../zzdds` relative to this directory) — matches this repo's own
+  convention of always building against a local zzdds checkout (see the
+  top-level README). No `zig build install` step needed first:
+  `build.zig.zon` depends on zzdds's *source tree* directly (a Zig module
+  dependency, not the installed C ABI), so anything committed there is
+  picked up. `zidl` itself is resolved transitively through zzdds's own
+  dependency (a tagged release by default, or a local checkout if zzdds's
+  own `build.zig.zon` is pointed at one) — no separate `zidl` checkout is
+  needed here.
 
 ## Build and run
 

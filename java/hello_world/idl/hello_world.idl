@@ -1,0 +1,20 @@
+// java/hello_world's wire type -- byte-identical to zig/hello_world,
+// c/hello_world, and cpp/hello_world's idl/hello_world.idl. See
+// docs/design/hello-world-reference-app.md at the repo root for the full
+// spec. Deliberately keyless: per DDS 1.4 2.2.2.1, "If no key is provided,
+// the data set associated with the Topic is restricted to a single
+// instance" -- a keyless Topic is fully spec-legitimate, and zidl's
+// --generate-zzdds-wrappers (Java backend) generates
+// TypeSupport/DataWriter/DataReader for it (see
+// zidl/src/backend/java.zig's isZzddsTopicStructJava and
+// emitStructSerializeFns' --generate-zzdds-wrappers branch).
+//
+// Note: the generated outer wrapper class is named from this file's stem
+// ("Hello_world"), not from the struct name -- HelloWorld itself (and its
+// DataWriter/DataReader/TypeSupport) are named directly from the struct,
+// so there's no collision; see java/hello_world/README.md.
+@appendable
+struct HelloWorld {
+    int32 count;
+    string<256> message;
+};

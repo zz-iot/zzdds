@@ -14,11 +14,10 @@ Reliability is explicitly set to `RELIABLE` on both the DataWriter and
 DataReader. This isn't optional: a `Frame` at 640x480x3 is ~900KB, fragmented
 into hundreds of RTPS/UDP datagrams, and under the default `BEST_EFFORT` a
 single dropped fragment silently loses the entire sample — no full
-reassembly, ever. Confirmed by testing: shrinking `Frame` down to a few bytes
-(no fragmentation needed) delivers fine even at `BEST_EFFORT`, while
-full-size frames only ever arrive with `RELIABLE`. Not a zzdds bug, just the
-wrong QoS default for a payload this size — worth remembering if you copy
-this pattern for another large/unbounded-sample type.
+reassembly, ever. Worth remembering if you copy this pattern for another
+large/unbounded-sample type: `BEST_EFFORT` is fine for small samples, but
+the larger and more fragmented a sample gets, the more a single lost
+datagram costs you.
 
 ## Build and run
 

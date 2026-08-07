@@ -1,13 +1,15 @@
 # zzdds Java pub/sub example
 
-A real, runnable proof that zzdds's Java binding works end-to-end: two
-separate JVM processes (`Publisher`, `Subscriber`) that discover each other
-over real UDP DDS discovery and exchange `SensorSample` samples — the same
-shape of example as `c/custom-allocator`, for Java.
+Two separate JVM processes (`Publisher`, `Subscriber`) that discover each
+other over real UDP DDS discovery and exchange `SensorSample` samples — the
+same shape of example as `c/custom-allocator`, for Java.
 
 `Subscriber` registers a real `DataReaderListener` (`on_data_available`),
-exercising the native JNI upcall path; `Publisher` polls
-`get_publication_matched_status()` instead, to keep that side minimal and
+which exercises the native-code-calling-back-into-Java JNI upcall path —
+worth calling out specifically, since that direction (native → JVM) needs
+more care than the more familiar Java → native direction every other call
+in this example uses. `Publisher` instead polls
+`get_publication_matched_status()`, to keep that side minimal and
 single-threaded.
 
 ## Prerequisites
@@ -62,18 +64,9 @@ Both `Publisher`/`Subscriber` use nothing but the generated Java API —
 typed `SensorSampleTypeSupport`/`DataWriter`/`DataReader` wrappers generated
 from `idl/sensor.idl` by `zidl -b java --generate-zzdds-wrappers`.
 
-## Known limitations (see zzdds's `docs/language-bindings.md` and
-`docs/roadmap.md` for the full list)
+## Known limitations
 
 - Replacing a listener already registered on the same entity (a second
   `set_listener`-style call) leaks the old global reference — not an issue
-  for this example (each entity's listener is set once).
-- `zzdds.idl`'s vendor extensions (`create_participant_ex`,
-  `DataWriterListenerEx`, serialized-sample fast paths) aren't available in
-  Java yet — cross-file type references aren't tracked by zidl's Java
-  backend. The core DDS API (everything used by this example) is
-  unaffected.
-- A handful of DCPS operations that take a bare `sequence<T>` parameter
-  directly (not inside a struct) — e.g. `WaitSet.wait`,
-  `Subscriber.get_datareaders` — aren't implemented yet and throw
-  `UnsupportedOperationException`.
+  for this example (each entity's listener is set once). See zzdds's
+  `docs/language-bindings.md` for the full list of Java-binding notes.
