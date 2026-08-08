@@ -1021,17 +1021,18 @@ pub const DomainParticipantImpl = struct {
             });
         }
 
-        // Last step, deliberately: nothing below this can fail, so there is
-        // no path where start() returns an error after this thread exists
-        // (which would otherwise require error-path cleanup to stop/join it).
-        // A spawn failure itself still isn't propagated as a start() error
-        // (same reasoning), but silently storing null here used to leave no
-        // trace at all -- DEADLINE/LIVELINESS enforcement would just never
-        // fire, with nothing in the logs to explain why. Warn instead, so
-        // the failure is at least observable.
-        self.timer_thread = std.Thread.spawn(.{}, timerThreadFn, .{self}) catch |err| blk: {
+        // Last step, deliberately: no thread exists yet at this point, so a
+        // spawn failure here needs no stop/join cleanup of its own. Without
+        // this thread, DEADLINE/LIVELINESS enforcement never fires with
+        // nothing to explain why -- too severe to degrade silently, so this
+        // is propagated as a start() error like every other setup failure
+        // above. factory.zig's create_participant() already handles a
+        // start() error by calling p.deinit() (which tolerates a null
+        // timer_thread) and returning null, so no new cleanup path is
+        // needed here.
+        self.timer_thread = std.Thread.spawn(.{}, timerThreadFn, .{self}) catch |err| {
             log_mod.dcps.warn("participant: failed to spawn timer thread ({s}) -- DEADLINE/LIVELINESS QoS will not be enforced for this participant", .{@errorName(err)});
-            break :blk null;
+            return err;
         };
     }
 
