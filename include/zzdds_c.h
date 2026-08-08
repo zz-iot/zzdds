@@ -52,6 +52,51 @@ typedef struct zzdds_raw_sample_array {
 
 typedef int (*zzdds_compute_key_hash_fn)(const uint8_t *payload, size_t len, uint8_t hash_out[16]);
 
+/* Discriminated field value used by get_field_from_cdr (below) and by
+ * zzdds_cft_match_sample (see its own section further down): kind 0 = int
+ * (i valid), 1 = float (f valid), 2 = string (s_ptr/s_len valid). */
+typedef struct zzdds_filter_value {
+    int kind;
+    int64_t i;
+    double f;
+    const uint8_t *s_ptr;
+    size_t s_len;
+} zzdds_filter_value;
+
+/*
+ * Resolve a named field (e.g. "color", "x") from a raw, not-yet-deserialized
+ * CDR payload -- used to evaluate ContentFilteredTopic expressions
+ * automatically, at delivery time, for a reader created against a CFT (see
+ * zzdds_register_type_support(_ctx)'s get_field_fn parameter below). Return
+ * false for an unknown/unsupported field.
+ *
+ * `scratch`/`scratch_len`: a returned string value's bytes MUST be copied
+ * into `scratch` (`out->s_ptr = scratch`, `out->s_len <= scratch_len`)
+ * rather than pointing into any locally-deserialized value -- the caller
+ * only guarantees `scratch` (not any local you deserialize `payload` into)
+ * valid beyond this one call. Return false if the matched string doesn't
+ * fit in `scratch` (matches zzdds's own "an evaluation error passes the
+ * sample through" semantics, safer than truncating and risking a wrong
+ * comparison result).
+ */
+typedef bool (*zzdds_get_field_from_cdr_fn)(
+    const uint8_t *payload, size_t payload_len,
+    const char *field, size_t field_len,
+    zzdds_filter_value *out,
+    uint8_t *scratch, size_t scratch_len
+);
+
+/* ctx-carrying variant of zzdds_get_field_from_cdr_fn -- see
+ * zzdds_compute_key_hash_ctx_fn's doc comment below for why this exists
+ * (same reasoning, same callers). */
+typedef bool (*zzdds_get_field_from_cdr_ctx_fn)(
+    void *ctx,
+    const uint8_t *payload, size_t payload_len,
+    const char *field, size_t field_len,
+    zzdds_filter_value *out,
+    uint8_t *scratch, size_t scratch_len
+);
+
 zzdds_DomainParticipantFactory zzdds_create_factory(void);
 
 /**
@@ -108,31 +153,47 @@ DDS_DataReader zzdds_DataReader_as_DDS_DataReader(zzdds_DataReader reader);
 zzdds_DataReader DDS_DataReader_as_zzdds_DataReader(DDS_DataReader reader);
 DDS_TopicDescription zzdds_topic_as_description(DDS_Topic topic);
 
-int zzdds_register_type_support_c(
+/**
+ * @param get_field_fn  Optional (NULL if the type has no fields a
+ *                       ContentFilteredTopic expression could reference).
+ *                       When set, a DataReader created against a CFT for
+ *                       this type filters automatically, at the reader
+ *                       layer -- the app never needs to re-check samples
+ *                       itself (contrast with zzdds_cft_match_sample further
+ *                       down, a lower-level tool for the case where that
+ *                       isn't set, or for testing a sample outside the
+ *                       context of a live DataReader).
+ */
+int zzdds_register_type_support(
     DDS_DomainParticipant participant,
     const char *type_name,
-    zzdds_compute_key_hash_fn compute_key_hash_fn
+    zzdds_compute_key_hash_fn compute_key_hash_fn,
+    zzdds_get_field_from_cdr_fn get_field_fn
 );
 
-/* ctx-carrying variant of zzdds_compute_key_hash_fn/zzdds_register_type_support_c
+/* ctx-carrying variant of zzdds_compute_key_hash_fn/zzdds_register_type_support
  * — for bindings that can't generate a fresh, uniquely-addressed native
  * function per registered type the way zidl -b c/-b cpp do (e.g. classic JNI:
  * a Java Class<?> has no native function pointer of its own, so one shared
  * trampoline needs ctx to know which class/method to dispatch to). C/C++/Zig
- * callers don't need this — use zzdds_register_type_support_c above. */
+ * callers don't need this — use zzdds_register_type_support above. */
 typedef int (*zzdds_compute_key_hash_ctx_fn)(void *ctx, const uint8_t *payload, size_t len, uint8_t hash_out[16]);
 
 /**
- * Same as zzdds_register_type_support_c, but compute_key_hash_fn additionally
- * receives ctx on every call. ctx_deinit (may be NULL) is called exactly once
- * when this registration is replaced (a later call for the same type_name) or
- * when participant is destroyed — same reclaim path as the non-ctx variant's
- * internal adapter, just exposed to the caller's own ctx here.
+ * Same as zzdds_register_type_support, but compute_key_hash_fn/get_field_fn
+ * additionally receive ctx on every call (the SAME ctx for both -- one
+ * shared per-registration context, not two). ctx_deinit (may be NULL) is
+ * called exactly once when this registration is replaced (a later call for
+ * the same type_name) or when participant is destroyed — same reclaim path
+ * as the non-ctx variant's internal adapter, just exposed to the caller's
+ * own ctx here. get_field_fn is optional (NULL if the type has no
+ * filterable fields), same as zzdds_register_type_support's.
  */
-int zzdds_register_type_support_ctx_c(
+int zzdds_register_type_support_ctx(
     DDS_DomainParticipant participant,
     const char *type_name,
     zzdds_compute_key_hash_ctx_fn compute_key_hash_fn,
+    zzdds_get_field_from_cdr_ctx_fn get_field_fn,
     void *ctx,
     void (*ctx_deinit)(void *ctx)
 );
@@ -251,6 +312,36 @@ int zzdds_get_key_value_reader(
 );
 
 DDS_InstanceHandle_t zzdds_lookup_instance_reader(DDS_DataReader reader, const uint8_t key_hash[16]);
+
+/*
+ * ContentFilteredTopic matching for a sample you already have in hand.
+ *
+ * If get_field_fn was registered (see zzdds_register_type_support(_ctx)
+ * above), a DataReader created against a CFT already filters automatically
+ * -- you don't need this. Use zzdds_cft_match_sample when get_field_fn
+ * wasn't set for a type, or to test an already-deserialized sample against
+ * a filter outside the context of a live DataReader (e.g. tooling/tests).
+ * Uses the SAME parser/evaluator zzdds uses internally (no need to
+ * reimplement the filter grammar in application code).
+ */
+
+/* Resolve a named field (e.g. "color", "x") to a zzdds_filter_value, from an
+ * already-deserialized sample (contrast with zzdds_get_field_from_cdr_fn
+ * above, which parses raw CDR bytes). Return false for an unknown field. */
+typedef bool (*zzdds_field_get_fn)(
+    void *ctx,
+    const char *field,
+    size_t field_len,
+    zzdds_filter_value *out
+);
+
+/* Returns true if the sample passes cft's filter expression (should be
+ * delivered) -- also true for a NULL/nil cft or a non-CFT handle. */
+bool zzdds_cft_match_sample(
+    DDS_ContentFilteredTopic cft,
+    void *ctx,
+    zzdds_field_get_fn get
+);
 
 #ifdef __cplusplus
 }

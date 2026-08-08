@@ -300,3 +300,86 @@ test "registerInstanceRaw: returns stable nonzero handle for keyless topic" {
     // Deterministic: same key → same handle.
     try testing.expectEqual(handle, DataWriterImpl.registerInstanceRaw(NIL_KEY));
 }
+
+// ── Keyless topic, end-to-end via a real on_data_available listener ─────────
+//
+// Everything above this point already writes with NIL_KEY, but always with
+// the *same* PAYLOAD and always drains via direct takeRaw() polling — never
+// varying content, and never through a real DataReaderListener. Neither
+// actually exercises the DDS 1.4 §2.2.2.1 guarantee this file's tests are
+// implicitly relying on: "If no key is provided, the data set associated
+// with the Topic is restricted to a single instance" — i.e. that *varying*
+// content on a keyless topic still resolves to one instance, not one
+// instance per distinct payload. This test writes three different payloads
+// and confirms that invariant end-to-end through the same
+// listener-driven on_data_available path a real subscriber uses (matching
+// zzdds-examples' zig/hello_world), not just the isolated registerInstanceRaw
+// mechanism above.
+
+const KeylessListenerState = struct {
+    dr: *DataReaderImpl = undefined,
+    alloc: std.mem.Allocator,
+    // Last payload byte of each delivered sample, in delivery order.
+    payloads: std.ArrayListUnmanaged(u8) = .empty,
+    handles: std.ArrayListUnmanaged(DDS.InstanceHandle_t) = .empty,
+
+    fn deinit(self: *@This()) void {
+        self.payloads.deinit(self.alloc);
+        self.handles.deinit(self.alloc);
+    }
+};
+
+fn onKeylessDataAvailable(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+    const state: *KeylessListenerState = @ptrCast(@alignCast(ld.?));
+    while (state.dr.takeRaw()) |s| {
+        defer state.alloc.free(s.data);
+        if (!s.info.valid_data) continue;
+        state.payloads.append(state.alloc, s.data[s.data.len - 1]) catch unreachable;
+        state.handles.append(state.alloc, s.info.instance_handle) catch unreachable;
+    }
+}
+
+test "keyless topic: varying-content alive samples are one instance, delivered in order via on_data_available" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    var state = KeylessListenerState{ .alloc = alloc };
+    defer state.deinit();
+
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
+    const dr_raw = fx.sub_r.create_datareader(topic_desc_r, dr_qos, .{
+        .listener_data = &state,
+        .on_data_available = onKeylessDataAvailable,
+    }, DDS.DATA_AVAILABLE_STATUS);
+    state.dr = @ptrCast(@alignCast(dr_raw.ptr));
+
+    const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
+
+    // Same NIL_KEY on every write, but three *different* payloads -- per DDS
+    // 1.4 §2.2.2.1 a keyless Topic is exactly one instance regardless of
+    // content, so all three must land on the same instance_handle, not three
+    // different ones.
+    var payload1 = PAYLOAD;
+    payload1[4] = 0x10;
+    var payload2 = PAYLOAD;
+    payload2[4] = 0x20;
+    var payload3 = PAYLOAD;
+    payload3[4] = 0x30;
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload1);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload2);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &payload3);
+
+    // Delivered in write order, via the listener, not by polling.
+    try testing.expectEqualSlices(u8, &.{ 0x10, 0x20, 0x30 }, state.payloads.items);
+
+    // All one instance, despite varying content.
+    try testing.expectEqual(@as(usize, 3), state.handles.items.len);
+    try testing.expectEqual(state.handles.items[0], state.handles.items[1]);
+    try testing.expectEqual(state.handles.items[1], state.handles.items[2]);
+    try testing.expect(state.handles.items[0] != 0);
+}

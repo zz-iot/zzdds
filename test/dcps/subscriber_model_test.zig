@@ -150,8 +150,8 @@ const Harness = struct {
     fn registerMatchedNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
     fn announceReader(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) void {}
     fn registerTimerNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void) void {}
-    fn getFieldFn(_: *anyopaque, _: []const u8) ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue {
-        return null;
+    fn getFieldFn(_: *anyopaque, _: []const u8) ?filter_mod.CdrFieldGetter {
+        return null; // unchanged: no field lookups exercised by these tests
     }
 };
 

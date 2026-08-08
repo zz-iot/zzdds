@@ -21,6 +21,7 @@ const DataReaderImpl = reader_mod.DataReaderImpl;
 const topic_mod = @import("../dcps/topic.zig");
 const TopicImpl = topic_mod.TopicImpl;
 const ContentFilteredTopicImpl = topic_mod.ContentFilteredTopicImpl;
+const filter_mod = @import("../dcps/filter.zig");
 const waitset_mod = @import("../dcps/waitset.zig");
 const GuardConditionImpl = waitset_mod.GuardConditionImpl;
 const StatusConditionImpl = waitset_mod.StatusConditionImpl;
@@ -259,7 +260,7 @@ fn factoryGetCAbiHandleDds(ctx: *anyopaque) *anyopaque {
     return owner.dds_fac_c_abi.get(owner.alloc, ctx, &dds_factory_vtable);
 }
 
-const participant_vtable = ZZDDS.DomainParticipant.Vtable{
+pub const participant_vtable = ZZDDS.DomainParticipant.Vtable{
     .register_type_support = participantRegisterTypeSupport,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = participantGetCAbiHandleZzdds,
@@ -280,7 +281,7 @@ fn participantGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
     return impl.zzdds_participant_c_abi.get(impl.alloc, ctx, &participant_vtable);
 }
 
-const topic_vtable = ZZDDS.Topic.Vtable{
+pub const topic_vtable = ZZDDS.Topic.Vtable{
     .as_topic_description = topicAsTopicDescription,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = topicGetCAbiHandleZzdds,
@@ -301,7 +302,7 @@ fn topicGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
     return impl.zzdds_topic_c_abi.get(impl.alloc, ctx, &topic_vtable);
 }
 
-const writer_vtable = ZZDDS.DataWriter.Vtable{
+pub const writer_vtable = ZZDDS.DataWriter.Vtable{
     .write_serialized = writerWriteSerialized,
     .set_listener_ex = writerSetListenerEx,
     .deinit = borrowedDeinit,
@@ -323,7 +324,7 @@ fn writerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
     return impl.zzdds_dw_c_abi.get(impl.alloc, ctx, &writer_vtable);
 }
 
-const reader_vtable = ZZDDS.DataReader.Vtable{
+pub const reader_vtable = ZZDDS.DataReader.Vtable{
     .take_serialized = readerTakeSerialized,
     .take_next_instance_serialized = readerTakeNextInstanceSerialized,
     .deinit = borrowedDeinit,
@@ -444,6 +445,12 @@ pub export fn zzdds_process_configure_from_file(
 // a base handle down to a specific derived type) remain hand-written below —
 // IDL inheritance can't express "which concrete derived type is this," so
 // these still need a runtime vtable-identity check.
+//
+// `participant_vtable`/`topic_vtable`/`writer_vtable`/`reader_vtable` below
+// are `pub` so `raw_ops.zig`'s pure-Zig `asZzdds{Topic,DataWriter,DataReader,
+// DomainParticipant}` (the same runtime check, minus the C-ABI handle-boxing
+// step) can reference the same canonical vtable instances rather than a
+// second, address-distinct copy.
 
 /// Only valid for participants created through a FactoryOwner factory (i.e., via
 /// zzdds_create_factory → create_participant_ex). Returns a nil handle for any
@@ -493,6 +500,136 @@ pub export fn DDS_DataReader_as_zzdds_DataReader(reader: *anyopaque) callconv(.c
     if (rd.vtable != &DataReaderImpl.vtable) return readerGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DataReader = .{ .ptr = rd.ptr, .vtable = &reader_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+// ── Condition hierarchy checked downcasts ─────────────────────────────────────
+//
+// zidl's C backend declares a checked downcast (`<Base>_as_<Derived>`) for
+// every direct interface-inheritance edge in dcps.h, documented as
+// "returns a null handle when the base object is not an instance of
+// <Derived>" -- a literal NULL, unlike the DDS_X_as_zzdds_X nil-sentinel
+// conversions above. But zig.zig's native C-API generator only auto-emits
+// the always-safe upcast direction (via each concrete impl's own
+// `as_{Base}` vtable slot; see emitCApiAsBase) -- it has no visibility into
+// which hand-written zzdds-core struct backs a given vtable, so it can't
+// generically answer "is this handle actually a GuardCondition". These
+// four are hand-written for exactly that reason, mirroring the vtable-
+// identity checks waitset.zig's own vtAttach/vtDetach already use
+// internally. Condition is the only interface in zzdds with multiple
+// concrete sibling implementors, so it's the only hierarchy that needs this.
+pub export fn DDS_Condition_as_DDS_GuardCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const c = zidl_rt.unboxAs(DDS.Condition, base);
+    if (c.vtable != &GuardConditionImpl.cond_vtable) return null;
+    const r: DDS.GuardCondition = .{ .ptr = c.ptr, .vtable = &GuardConditionImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_Condition_as_DDS_StatusCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const c = zidl_rt.unboxAs(DDS.Condition, base);
+    if (c.vtable != &StatusConditionImpl.cond_vtable) return null;
+    const r: DDS.StatusCondition = .{ .ptr = c.ptr, .vtable = &StatusConditionImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_Condition_as_DDS_ReadCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const c = zidl_rt.unboxAs(DDS.Condition, base);
+    if (c.vtable != &ReadConditionImpl.cond_vtable) return null;
+    const r: DDS.ReadCondition = .{ .ptr = c.ptr, .vtable = &ReadConditionImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+/// Always reports "not a QueryCondition", not a bug: QueryConditionImpl
+/// embeds (rather than separately allocates) a ReadConditionImpl field, and
+/// its toCondition()/as_ReadCondition views deliberately return that
+/// embedded field's *own* vtable/ptr -- reusing ReadConditionImpl's global
+/// vtable constants -- so that WaitSetImpl.vtAttach/vtDetach treat a
+/// QueryCondition exactly like a ReadCondition (see the comment on
+/// QueryConditionImpl in waitset.zig). That sharing means a genuine
+/// QueryCondition's ReadCondition view is indistinguishable, by vtable
+/// identity, from a standalone ReadCondition -- there's no safe way to
+/// recover "this handle's ptr is actually the .rc field inside a
+/// QueryConditionImpl" without a runtime type tag neither struct carries.
+/// Reporting "not a match" here is honest; guessing would risk reinterpreting
+/// a real standalone ReadConditionImpl as a QueryConditionImpl.
+pub export fn DDS_ReadCondition_as_DDS_QueryCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
+    _ = base;
+    return null;
+}
+
+// ── ContentFilteredTopic matching for C/C++/Java app-side post-filtering ──────
+//
+// zzdds's own internal CFT filtering (reader.zig's cft_filter) activates
+// automatically once TypeSupport.get_field is wired up -- zzdds_register_type_support{,_ctx}
+// both take a get_field_fn parameter (see zzdds_c.h), and every generated
+// binding (Zig/C/C++/Java) now populates it, so a DataReader created against
+// a ContentFilteredTopic filters on its own with no app-side re-checking.
+// This export remains as a documented fallback/lower-level tool: for a type
+// with no get_field (e.g. a hand-written TypeSupport predating that
+// contract), or to test an already-deserialized sample against a filter
+// outside the context of a live DataReader (tooling/tests). Exports
+// ContentFilteredTopicImpl's own, single, canonical matchSample directly:
+// callers supply a field accessor via ctx+get, same shape as filter.zig's own
+// FieldAccessor, translated to a C-callable extern struct/fn pointer pair.
+
+/// Discriminated value returned by a caller-supplied `ZzddsFieldGetFn`.
+/// kind: 0 = int (`i` valid), 1 = float (`f` valid), 2 = string (`s_ptr`/`s_len` valid).
+/// A plain extern struct with one field per variant (rather than a real
+/// tagged union) sidesteps any C-ABI union-layout ambiguity across
+/// C/C++/JNI callers.
+pub const ZzddsFilterValue = extern struct {
+    kind: c_int = 0,
+    i: i64 = 0,
+    f: f64 = 0,
+    s_ptr: ?[*]const u8 = null,
+    s_len: usize = 0,
+};
+
+/// Resolves a named ShapeType-style field (e.g. "color", "x") to a
+/// ZzddsFilterValue. Returns false if the field is unknown -- matches
+/// filter.zig's FieldAccessor.get returning `null`.
+pub const ZzddsFieldGetFn = *const fn (
+    ctx: ?*anyopaque,
+    field: [*]const u8,
+    field_len: usize,
+    out: *ZzddsFilterValue,
+) callconv(.c) bool;
+
+/// Evaluate `cft`'s filter expression against one sample, via `get` for field
+/// lookups. Returns true if the sample passes the filter (should be
+/// delivered) -- also true for a NULL/nil `cft` handle or a handle that isn't
+/// actually a ContentFilteredTopic, matching filter.zig's own "no filter ==
+/// everything passes" convention rather than silently dropping samples on a
+/// caller error.
+pub export fn zzdds_cft_match_sample(
+    cft: *anyopaque,
+    ctx: ?*anyopaque,
+    get: ZzddsFieldGetFn,
+) callconv(.c) bool {
+    if (@intFromPtr(cft) == 0) return true;
+    const c = zidl_rt.unboxAs(DDS.ContentFilteredTopic, cft);
+    if (nil.isNil(c)) return true;
+    if (c.vtable != &ContentFilteredTopicImpl.cft_vtable) return true;
+    const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(c.ptr));
+
+    const Wrap = struct {
+        ctx: ?*anyopaque,
+        get: ZzddsFieldGetFn,
+
+        fn getField(wctx: *anyopaque, field: []const u8) ?filter_mod.FilterValue {
+            const self: *@This() = @ptrCast(@alignCast(wctx));
+            var out: ZzddsFilterValue = .{};
+            if (!self.get(self.ctx, field.ptr, field.len, &out)) return null;
+            return switch (out.kind) {
+                0 => filter_mod.FilterValue{ .int = out.i },
+                1 => filter_mod.FilterValue{ .float = out.f },
+                2 => filter_mod.FilterValue{ .string = (out.s_ptr orelse return null)[0..out.s_len] },
+                else => null,
+            };
+        }
+    };
+    var wrap = Wrap{ .ctx = ctx, .get = get };
+    const accessor = filter_mod.FieldAccessor{ .ctx = &wrap, .get = Wrap.getField };
+    return impl.matchSample(accessor);
 }
 
 fn createFactory(allocator: ?*const zidl_rt.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
@@ -867,4 +1004,41 @@ test "zzdds extension factory creates participant with generated default config"
 
     const dds_factory = factory.vtable.as_DomainParticipantFactory(factory.ptr);
     try std.testing.expectEqual(DDS.RETCODE_OK, dds_factory.delete_participant(dp));
+}
+
+test "zzdds_cft_match_sample: real filter evaluation through the C ABI" {
+    const factory = try createFactory(null);
+    defer factory.vtable.deinit(factory.ptr);
+    const dds_factory = factory.vtable.as_DomainParticipantFactory(factory.ptr);
+
+    const dp = dds_factory.create_participant(204, .{}, null, 0);
+    try std.testing.expect(!nil.isNil(dp));
+    defer _ = dds_factory.delete_participant(dp);
+
+    const topic = dp.create_topic("CftMatchSampleT", "CftMatchSampleT", .{}, null, 0);
+    const cft = dp.create_contentfilteredtopic("CftMatchSampleT_cft", topic, "x = 5", null);
+    try std.testing.expect(!nil.isNil(cft));
+    defer _ = dp.delete_contentfilteredtopic(cft);
+    const cft_handle = cft.vtable.get_c_abi_handle(cft.ptr);
+
+    // A minimal FieldAccessor-shaped C struct resolving only "x", mirroring
+    // what a real app (c/shape's ShapeAccessor) supplies for its own fields.
+    const Sample = struct {
+        x: i64,
+
+        fn get(ctx: ?*anyopaque, field: [*]const u8, field_len: usize, out: *ZzddsFilterValue) callconv(.c) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            if (std.mem.eql(u8, field[0..field_len], "x")) {
+                out.* = .{ .kind = 0, .i = self.x };
+                return true;
+            }
+            return false;
+        }
+    };
+
+    const matching = Sample{ .x = 5 };
+    try std.testing.expect(zzdds_cft_match_sample(cft_handle, @constCast(&matching), Sample.get));
+
+    const non_matching = Sample{ .x = 6 };
+    try std.testing.expect(!zzdds_cft_match_sample(cft_handle, @constCast(&non_matching), Sample.get));
 }

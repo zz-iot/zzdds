@@ -230,7 +230,7 @@ const BuiltinSubscriberState = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void) void {}
             }.f,
             .get_field_fn = struct {
-                fn f(_: *anyopaque, _: []const u8) ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue {
+                fn f(_: *anyopaque, _: []const u8) ?filter_mod.CdrFieldGetter {
                     return null;
                 }
             }.f,
@@ -586,9 +586,14 @@ pub const TypeSupport = struct {
     /// Optional: extract a named field value from a raw CDR payload.
     /// Used to evaluate ContentFilteredTopic expressions at delivery time.
     /// null = CFT evaluation deferred to the typed DataReader layer.
-    /// NOTE: get_field does not yet receive ctx — it will be threaded through
-    /// when the ContentFilteredTopic C-ABI binding is designed.
-    get_field: ?*const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue = null,
+    /// Receives the same `ctx` as `compute_key_hash` above (one shared
+    /// per-registration context, not a second one) — see the C-ABI's
+    /// `zzdds_register_type_support_ctx`/Java's `zzdds_java_ts_ctx` for the
+    /// two callbacks sharing one adapter object. `scratch` is caller-owned
+    /// storage for a returned string value — see `filter_mod.CdrFieldGetter`'s
+    /// doc comment for why a returned string must be copied there rather
+    /// than pointing into this function's own locals.
+    get_field: ?*const fn (ctx: *anyopaque, payload: []const u8, field: []const u8, scratch: []u8) ?filter_mod.FilterValue = null,
     /// Optional cleanup called when the participant deinits this TypeSupport entry.
     /// Use to free any ctx allocation.  null = no cleanup needed (e.g. ctx = undefined).
     deinit: ?*const fn (ctx: *anyopaque) void = null,
@@ -600,6 +605,11 @@ const ActiveWriter = struct {
     proto: proto.ProtocolWriter,
     topic_name: []const u8, // borrowed from topic_name slice in active list
     type_name: []const u8,
+    // qos.data_representation.value must be zzdds-owned (cloned by
+    // pubCreateProtoWriter before storing here, freed by
+    // pubDestroyProtoWriter/deinit) -- the caller only guarantees its buffer
+    // valid for the duration of the create_datawriter call, same class of
+    // bug dupePartitionNames already exists to avoid for partition_names.
     qos: DDS.DataWriterQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
@@ -615,6 +625,8 @@ const ActiveReader = struct {
     proto: proto.ProtocolReader,
     topic_name: []const u8,
     type_name: []const u8,
+    // See ActiveWriter.qos's matching comment: data_representation.value
+    // must be zzdds-owned, cloned by subCreateProtoReader.
     qos: DDS.DataReaderQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
@@ -733,6 +745,20 @@ pub const DomainParticipantImpl = struct {
 
     mu: Mutex,
 
+    /// Background thread periodically calling checkTimers() to enforce
+    /// DEADLINE and LIVELINESS QoS -- previously nothing called checkTimers()
+    /// at all, so those statuses only ever fired under a test's ManualClock.
+    /// Spawned once at the end of start(), stopped as the very first step of
+    /// deinit() (before anything else is torn down) so it can never observe
+    /// partially-destroyed participant state -- same lifetime discipline as
+    /// writer_sm.zig's per-writer heartbeat thread and spdp.zig's
+    /// per-participant announcement timer (thread lifetime strictly bounded
+    /// by the owning object's own init/deinit, never reaching across
+    /// objects -- see docs/roadmap.md's "Background thread usage" entry for
+    /// why that matters here specifically).
+    timer_thread: ?std.Thread = null,
+    timer_stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     // ZZDDS.DomainParticipant is a separate "borrowed view" (same ptr, its own
@@ -740,6 +766,9 @@ pub const DomainParticipantImpl = struct {
     zzdds_participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
+
+    /// Interval between periodic DEADLINE/LIVELINESS timer checks.
+    const TIMER_CHECK_INTERVAL_MS: u64 = 100;
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -979,9 +1008,39 @@ pub const DomainParticipantImpl = struct {
                 .on_receive = userDataOnReceive,
             });
         }
+
+        // Last step, deliberately: nothing below this can fail, so there is
+        // no path where start() returns an error after this thread exists
+        // (which would otherwise require error-path cleanup to stop/join it).
+        self.timer_thread = std.Thread.spawn(.{}, timerThreadFn, .{self}) catch null;
+    }
+
+    /// Periodically calls checkTimers() to enforce DEADLINE/LIVELINESS QoS.
+    /// Stopped by setting timer_stopping before calling timer_thread.join()
+    /// (see deinit()) -- same shape as writer_sm.zig's heartbeatThread.
+    fn timerThreadFn(self: *Self) void {
+        while (!self.timer_stopping.load(.acquire)) {
+            var slept_ms: u64 = 0;
+            while (slept_ms < TIMER_CHECK_INTERVAL_MS and !self.timer_stopping.load(.acquire)) {
+                time_mod.sleepNs(50 * std.time.ns_per_ms);
+                slept_ms += 50;
+            }
+            if (self.timer_stopping.load(.acquire)) break;
+            self.checkTimers();
+        }
     }
 
     pub fn deinit(self: *Self) void {
+        // Stop and join the timer thread before anything else -- it calls
+        // checkTimers(), which touches self.mu and self.active_writers/
+        // active_readers; nothing past this point may run concurrently with
+        // it. See timer_thread's field doc comment for why this has to be
+        // the very first thing deinit() does.
+        self.timer_stopping.store(true, .release);
+        if (self.timer_thread) |t| {
+            t.join();
+            self.timer_thread = null;
+        }
         self.listener_box.releaseRef(self.alloc);
         self.discovery.stop();
 
@@ -1034,12 +1093,14 @@ pub const DomainParticipantImpl = struct {
         while (wit.next()) |aw| {
             aw.proto.deinit();
             freePartitionNames(self.alloc, aw.partition_names);
+            aw.qos.data_representation.value.deinit(self.alloc);
         }
         self.active_writers.deinit(self.alloc);
         var rit = self.active_readers.valueIterator();
         while (rit.next()) |ar| {
             ar.proto.deinit();
             freePartitionNames(self.alloc, ar.partition_names);
+            ar.qos.data_representation.value.deinit(self.alloc);
         }
         self.active_readers.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
@@ -1207,6 +1268,18 @@ pub const DomainParticipantImpl = struct {
 
         const pw = adapter.toProtocolWriter();
 
+        // qos.data_representation.value._buffer, as received here, borrows
+        // storage the caller only guarantees valid for the duration of this
+        // call (e.g. the C++ binding's create_datawriter passes qos by value
+        // through a chain of stack-local copies that get destroyed once this
+        // whole call returns -- see ActiveWriter.qos's doc comment). Clone it
+        // the same way dupePartitionNames already does for partition_names,
+        // or writerQosSnapshot() re-reads this later (at match time, against
+        // a newly-discovered remote reader) and gets garbage -- confirmed via
+        // a real repro: -x 2 matching flakiness traced to exactly this.
+        var owned_qos = qos;
+        owned_qos.data_representation.value = try qos.data_representation.value.clone(self.alloc);
+
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -1216,7 +1289,7 @@ pub const DomainParticipantImpl = struct {
                 .proto = pw,
                 .topic_name = topic_name,
                 .type_name = type_name,
-                .qos = qos,
+                .qos = owned_qos,
                 .presentation = presentation,
             });
         }
@@ -1229,6 +1302,7 @@ pub const DomainParticipantImpl = struct {
         var found_guid: ?Guid = null;
         var found_proto: ?proto.ProtocolWriter = null;
         var found_parts: []const []const u8 = &.{};
+        var found_repr: DDS.DataRepresentationIdSeq = .{};
 
         self.mu.lock();
         var writ = self.active_writers.valueIterator();
@@ -1237,6 +1311,7 @@ pub const DomainParticipantImpl = struct {
                 found_guid = aw.guid;
                 found_proto = aw.proto;
                 found_parts = aw.partition_names;
+                found_repr = aw.qos.data_representation.value;
                 break;
             }
         }
@@ -1244,6 +1319,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
+        found_repr.deinit(self.alloc);
         if (found_guid) |g| self.discovery.retractWriter(g);
         if (found_proto) |p| p.deinit();
     }
@@ -1294,6 +1370,13 @@ pub const DomainParticipantImpl = struct {
 
         const pr = adapter.toProtocolReader();
 
+        // See pubCreateProtoWriter's matching comment: qos.data_representation
+        // .value must be cloned into zzdds-owned storage before being stashed
+        // in ActiveReader, or a later readerQosSnapshot() call reads a
+        // dangling buffer.
+        var owned_qos = qos;
+        owned_qos.data_representation.value = try qos.data_representation.value.clone(self.alloc);
+
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -1303,7 +1386,7 @@ pub const DomainParticipantImpl = struct {
                 .proto = pr,
                 .topic_name = topic_name,
                 .type_name = type_name,
-                .qos = qos,
+                .qos = owned_qos,
                 .presentation = presentation,
                 .key_hash_ctx = if (self.type_support_registry.get(type_name)) |ts| ts.ctx else undefined,
                 .key_hash_fn = if (self.type_support_registry.get(type_name)) |ts|
@@ -1321,6 +1404,7 @@ pub const DomainParticipantImpl = struct {
         var found_guid: ?Guid = null;
         var found_proto: ?proto.ProtocolReader = null;
         var found_parts: []const []const u8 = &.{};
+        var found_repr: DDS.DataRepresentationIdSeq = .{};
 
         self.mu.lock();
         var rrit = self.active_readers.valueIterator();
@@ -1329,6 +1413,7 @@ pub const DomainParticipantImpl = struct {
                 found_guid = ar.guid;
                 found_proto = ar.proto;
                 found_parts = ar.partition_names;
+                found_repr = ar.qos.data_representation.value;
                 break;
             }
         }
@@ -1336,6 +1421,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
+        found_repr.deinit(self.alloc);
         if (found_guid) |g| self.discovery.retractReader(g);
         if (found_proto) |p| p.deinit();
     }
@@ -2522,11 +2608,14 @@ pub const DomainParticipantImpl = struct {
     fn subGetFieldFn(
         ctx: *anyopaque,
         type_name: []const u8,
-    ) ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue {
+    ) ?filter_mod.CdrFieldGetter {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.type_support_registry.get(type_name)) |ts| return ts.get_field;
+        if (self.type_support_registry.get(type_name)) |ts| {
+            const func = ts.get_field orelse return null;
+            return .{ .ctx = ts.ctx, .func = func };
+        }
         return null;
     }
 

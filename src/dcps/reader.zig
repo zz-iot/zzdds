@@ -34,10 +34,11 @@ const Guid = proto.Guid;
 /// get_field function is available for this type.
 pub const CftFilterState = struct {
     cft_ptr: *topic_mod.ContentFilteredTopicImpl,
-    get_field_fn: *const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue,
+    get_field_fn: filter_mod.CdrFieldGetter,
 
     pub fn matches(self: *const CftFilterState, payload: []const u8) bool {
-        var ctx = FieldCtx{ .payload = payload, .get_fn = self.get_field_fn };
+        var pool = filter_mod.ScratchPool{};
+        var ctx = FieldCtx{ .payload = payload, .get_fn = self.get_field_fn, .pool = &pool };
         const accessor = filter_mod.FieldAccessor{
             .ctx = &ctx,
             .get = FieldCtx.get,
@@ -47,11 +48,12 @@ pub const CftFilterState = struct {
 
     const FieldCtx = struct {
         payload: []const u8,
-        get_fn: *const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+        get_fn: filter_mod.CdrFieldGetter,
+        pool: *filter_mod.ScratchPool,
 
         fn get(ctx: *anyopaque, field: []const u8) ?filter_mod.FilterValue {
             const self: *const FieldCtx = @ptrCast(@alignCast(ctx));
-            return self.get_fn(self.payload, field);
+            return self.get_fn.get(self.payload, field, self.pool.nextSlot());
         }
     };
 };
@@ -146,7 +148,7 @@ fn matchesSample(
 fn matchesQuery(
     pc: PendingChange,
     maybe_qc: ?*const waitset.QueryConditionImpl,
-    get_field_fn: ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+    get_field_fn: ?filter_mod.CdrFieldGetter,
 ) bool {
     const qc = maybe_qc orelse return true;
     const gff = get_field_fn orelse return true;
@@ -252,7 +254,7 @@ pub const DataReaderImpl = struct {
     /// Field accessor for QueryCondition evaluation at read/take time.
     /// Set from TypeSupport.get_field when available; null otherwise.
     /// Set once after init by the subscriber; read-only thereafter.
-    get_field_fn: ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue = null,
+    get_field_fn: ?filter_mod.CdrFieldGetter = null,
 
     /// SampleLost status counters. Guarded by `mu`.
     sample_lost_total: i32 = 0,

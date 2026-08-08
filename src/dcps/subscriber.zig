@@ -83,7 +83,7 @@ pub const ParticipantCbs = struct {
     get_field_fn: *const fn (
         ctx: *anyopaque,
         type_name: []const u8,
-    ) ?*const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue,
+    ) ?filter_mod.CdrFieldGetter,
 };
 
 pub const SubscriberImpl = struct {

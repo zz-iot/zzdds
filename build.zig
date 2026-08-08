@@ -45,6 +45,25 @@ pub fn build(b: *std.Build) void {
     const zidl_exe = zidl_dep.artifact("zidl");
     const zidl_rt_mod = zidl_dep.module("zidl_rt");
 
+    // Re-expose zidl's own executable and `zidl_rt` module as zzdds's own, so
+    // a downstream Zig consumer (e.g. a zzdds-examples zig/* example) can get
+    // both *through* zzdds (`zzdds_dep.artifact("zidl")` /
+    // `zzdds_dep.module("zidl_rt")`) instead of declaring its own separate
+    // top-level dependency on zidl. That matters specifically when zidl is a
+    // `.path` dependency (as it is while developing zidl and zzdds together,
+    // pre-release): Zig's package manager doesn't deduplicate two independent
+    // `.path` dependencies on the same directory declared by two different
+    // build.zig files, even though they resolve to the identical files —
+    // each gets instantiated as its own module, and the build then fails
+    // outright ("file exists in modules 'zidl_rt' and 'zidl_rt0'") the moment
+    // any single compilation unit ends up importing both. Unconditional
+    // (not gated behind `need_c_abi` like the artifact install below used to
+    // be) because a pure-Zig consumer needing only `zidl_rt` + the `zidl`
+    // binary for its own IDL codegen shouldn't have to opt into the C/C++/Java
+    // binding pipeline just to get them.
+    b.modules.put(b.graph.arena, b.dupe("zidl_rt"), zidl_rt_mod) catch @panic("OOM");
+    b.installArtifact(zidl_exe);
+
     // ── Language binding flags ────────────────────────────────────────────────
     //
     // Declared early because they affect what gets generated for dcps.idl.
@@ -328,6 +347,31 @@ pub fn build(b: *std.Build) void {
         gen_zzdds_c.addFileArg(b.path("idl/zzdds.idl"));
         gen_only_step.dependOn(&gen_zzdds_c.step);
 
+        // Second, separate generation pass over the same two IDL files, this
+        // time with --c-no-free: its .c output (dcps_cdr.c / zzdds_cdr.c)
+        // is what actually gets compiled into zzdds_lib below, alongside
+        // libzzdds's own native --zig-generate-c-api exports. The two can't
+        // share one generation run: dcps.h/zzdds.h (installed above, for
+        // every C/C++ consumer) must still *declare* _free -- it's a real,
+        // available function, just implemented natively in Zig -- but the
+        // .c file compiled in here must not *define* it a second time.
+        // Confirmed by hitting this directly, not by inspection: compiling
+        // the --c-no-free=false dcps_cdr.c into zzdds_lib produces 25
+        // duplicate-symbol link errors, one per QoS/status/config struct
+        // with a sequence field, all already exported via the native path.
+        const gen_dcps_c_lib = b.addRunArtifact(zidl_exe);
+        gen_dcps_c_lib.addArgs(&.{ "-b", "c", "--generate-interfaces", "--c-no-free", "-o" });
+        const gen_c_lib_dir = gen_dcps_c_lib.addOutputDirectoryArg("zzdds-c-binding-lib");
+        if (xtypes) gen_dcps_c_lib.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
+        gen_dcps_c_lib.addFileArg(dcps_idl);
+        gen_only_step.dependOn(&gen_dcps_c_lib.step);
+
+        const gen_zzdds_c_lib = b.addRunArtifact(zidl_exe);
+        gen_zzdds_c_lib.addArgs(&.{ "-b", "c", "--generate-interfaces", "--c-no-free", "-o" });
+        const gen_zzdds_c_lib_dir = gen_zzdds_c_lib.addOutputDirectoryArg("zzdds-c-ext-binding-lib");
+        gen_zzdds_c_lib.addFileArg(b.path("idl/zzdds.idl"));
+        gen_only_step.dependOn(&gen_zzdds_c_lib.step);
+
         // Install dcps.h → zig-out/include/
         const install_dcps_h = b.addInstallFileWithDir(
             gen_c_dir.path(b, "dcps.h"),
@@ -378,9 +422,8 @@ pub fn build(b: *std.Build) void {
         );
         b.getInstallStep().dependOn(&install_zzdds_c_h.step);
 
-        // Install the zidl code-generator binary → bin/zidl.
-        // Consumers use it to regenerate typed wrappers for their own IDL.
-        b.installArtifact(zidl_exe);
+        // zidl_exe is now installed unconditionally near the top of this
+        // function (see the comment there) — no longer gated on need_c_abi.
 
         // Build and install the CDR runtime as a pre-compiled static library.
         // C/C++ users link against libzidl_cdr.a rather than compiling zidl_cdr.c
@@ -424,6 +467,32 @@ pub fn build(b: *std.Build) void {
         if (target.result.os.tag == .windows) {
             zzdds_lib.root_module.linkSystemLibrary("ws2_32", .{});
         }
+
+        // Compile in the plain-struct CDR functions (serialize/deserialize/
+        // skip/default/key -- see the --c-no-free generation pass above for
+        // why _free is excluded here even though it's fully declared in the
+        // installed dcps.h/zzdds.h) that the C ABI header promises but,
+        // until now, nothing ever linked: the entity/vtable half of the C
+        // ABI (create_topic, create_datawriter, ...) has always come from
+        // the native --zig-generate-c-api path below, which made it easy to
+        // assume the plain-struct half worked the same way. It didn't --
+        // DDS_DataWriterQos_default and friends were declared in dcps.h with
+        // no body anywhere in libzzdds.so. Found via zzdds-examples'
+        // hello_world C port; see docs/roadmap.md.
+        zzdds_lib.root_module.addCSourceFile(.{
+            .file = gen_c_lib_dir.path(b, "dcps_cdr.c"),
+            .flags = &.{"-std=c99"},
+        });
+        zzdds_lib.root_module.addCSourceFile(.{
+            .file = gen_zzdds_c_lib_dir.path(b, "zzdds_cdr.c"),
+            .flags = &.{"-std=c99"},
+        });
+        zzdds_lib.root_module.addIncludePath(gen_c_lib_dir);
+        zzdds_lib.root_module.addIncludePath(gen_zzdds_c_lib_dir);
+        zzdds_lib.root_module.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+        zzdds_lib.root_module.addIncludePath(b.path("include"));
+        zzdds_lib.root_module.linkLibrary(zidl_cdr_lib);
+
         b.installArtifact(zzdds_lib);
         zzdds_lib_for_reuse = zzdds_lib;
 
@@ -697,8 +766,37 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_zzdds_hpp.step);
 
         // Generate dcps_impl.hpp + dcps_impl.cpp (B1+B3 concrete Impl + listener bridges).
+        //
+        // --cpp-impl-override x4 + --cpp-impl-include: dcps.idl's own generation
+        // pass has no visibility into zzdds.idl's separately-generated
+        // zzdds::TopicImpl/DataWriterImpl/DataReaderImpl/DomainParticipantImpl --
+        // without this, PublisherImpl::create_datawriter/DomainParticipantImpl::
+        // create_topic/etc. always construct the base DDS::*Impl, and the
+        // natural C++ idiom for reaching set_listener_ex/as_topic_description
+        // (static_pointer_cast<zzdds::DataWriterImpl>(dw)) is undefined
+        // behavior -- confirmed directly as a real segfault through a
+        // corrupted vtable, not just by inspection. Found via zzdds-examples'
+        // cpp/hello_world port; see docs/roadmap.md.
+        //
+        // The override targets aren't the raw generated zzdds::*Impl classes
+        // (those are abstract -- entity interfaces don't get cross-module
+        // operation flattening, so they only implement the *new* zzdds
+        // methods, not the inherited DDS::* base ones) but the hand-written
+        // *Support classes in zzdds_cpp.hpp that compose a full DDS::*Impl
+        // and delegate every base method to it, same shape as the existing
+        // DomainParticipantFactorySupport (which doesn't need this flag --
+        // it's a bootstrap singleton, never constructed via another entity's
+        // factory method).
         const gen_dcps_cpp_impl = b.addRunArtifact(zidl_exe);
-        gen_dcps_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl", "-o" });
+        gen_dcps_cpp_impl.addArgs(&.{
+            "-b",                                                               "cpp",
+            "--cpp-generate-impl",                                              "--cpp-impl-override",
+            "DDS::Topic=::zzdds::detail::TopicSupport",                         "--cpp-impl-override",
+            "DDS::DataWriter=::zzdds::detail::DataWriterSupport",               "--cpp-impl-override",
+            "DDS::DataReader=::zzdds::detail::DataReaderSupport",               "--cpp-impl-override",
+            "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport", "--cpp-impl-include",
+            "zzdds_cpp.hpp",                                                    "-o",
+        });
         const gen_cpp_impl_dir = gen_dcps_cpp_impl.addOutputDirectoryArg("zzdds-cpp-impl");
         if (xtypes) gen_dcps_cpp_impl.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
         gen_dcps_cpp_impl.addFileArg(dcps_idl);

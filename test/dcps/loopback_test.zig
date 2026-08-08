@@ -417,3 +417,72 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     }
     try std.testing.expectEqual(@as(usize, 0), received.len);
 }
+
+test "loopback: a single participant's own writer and reader on the same topic match and exchange data (A10)" {
+    // Regression test for a real bug: SPDP deliberately never "discovers"
+    // this participant itself (a legitimate anti-echo optimization -- see
+    // spdp.zig's processSpdpPayload), but SEDP's built-in publications/
+    // subscriptions writer<->reader matching used to be bootstrapped ONLY via
+    // that same SPDP "participant discovered" notification -- so a writer and
+    // reader on the SAME participant/topic never matched over the real
+    // transport, at any timing, regardless of QoS. Fixed in combined.zig's
+    // vtStart by calling sedp.onParticipantDiscovered once for the local
+    // participant itself, reusing the exact same proxy-wiring path already
+    // proven correct for remote participants (the other tests in this file).
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 12 }, 0, null);
+    defer udp.deinit();
+    const disc = try SpdpSedpDiscovery.init(alloc, udp.transport(), 0, 1_000);
+    var factory = try DomainParticipantFactoryImpl.init(
+        alloc,
+        udp.transport(),
+        disc.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory.deinit();
+        disc.deinit();
+    }
+
+    const dpf = factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("SelfLoopbackTopic", "SelfLoopbackType", .{}, null, 0);
+    const dw = pub_.create_datawriter(topic, dw_qos, null, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    const sub_ = dp.create_subscriber(.{}, null, 0);
+    const topic_desc = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const dr = sub_.create_datareader(topic_desc, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    // Wait for the writer and reader to actually match before writing --
+    // this is the exact condition that never became true before the fix.
+    const match_deadline_ns = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < match_deadline_ns) {
+        if (dw_impl.matchedReaderCount() > 0 and dr_impl.matchedWriterCount() > 0) break;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(dw_impl.matchedReaderCount() > 0);
+    try std.testing.expect(dr_impl.matchedWriterCount() > 0);
+
+    const p: []const u8 = &PAYLOAD_1;
+    _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), ZERO_KEY, ZERO_KEY, p);
+
+    const received = try collectSamples(alloc, dr_impl, 1, 5 * std.time.ns_per_s);
+    defer {
+        for (received) |s| alloc.free(s);
+        alloc.free(received);
+    }
+    try std.testing.expectEqual(@as(usize, 1), received.len);
+    try std.testing.expectEqualSlices(u8, p, received[0]);
+}

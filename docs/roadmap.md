@@ -21,7 +21,429 @@ wire issue).
 
 ## Planned (after Phase 33)
 
-**C-ABI TypeSupport** — complete. `zzdds_register_type_support_c` in
+**`WaitSet`/`GuardCondition` have no C-ABI constructor path.** No binding
+(C/C++/Java) can construct a `WaitSet` or `GuardCondition` today — an
+exhaustive grep finds no `zzdds_create_waitset`/`_create_guardcondition`-style
+export anywhere. This blocks live end-to-end verification of
+`WaitSet.wait()`/`get_conditions()` in any binding via the real C ABI (the
+underlying vtable methods themselves work correctly once a `WaitSet` exists,
+per zidl's own entity-sequence C-ABI fix in `v0.3.2-zig.0.16.0`). Likely a
+small, mechanical C-ABI-export addition mirroring the existing
+`create_readcondition`/`create_querycondition` pattern on `DataReader`.
+Deliberately deferred: better scoped as part of a new zzdds-examples example
+exercising WaitSets and all the condition types end-to-end, rather than
+fixed in isolation with no example to verify it against.
+
+**New C ABI export: `zzdds_cft_match_sample` (2026-08-06).** Found while
+porting every remaining "stretch" CLI flag from `zig/shape` to `c/shape`/
+`cpp/shape`/`java/shape` in zzdds-examples, specifically `--cft`: zzdds's own
+internal ContentFilteredTopic filtering (`reader.zig`'s `cft_filter`) only
+activates when `TypeSupport.get_field` is wired up, which none of
+`zzdds_register_type_support`/`_ctx` (the only registration path every
+C-ABI-based binding uses) ever sets — confirmed already true for Zig's own
+`dds_impl.zig` earlier, but until now C/C++/Java had no way to invoke
+zzdds's own filter parser/evaluator (`filter.zig`) themselves either, so the
+only alternative would have been reimplementing the SQL-subset filter
+grammar three separate times in three languages. Added `zzdds_cft_match_sample`
+(`src/c_abi/extensions.zig`, declared in `zzdds_c.h`) instead: takes a
+`DDS_ContentFilteredTopic` handle plus a `ctx`+field-getter-callback pair
+(mirroring `filter_mod.FieldAccessor`'s shape) and calls
+`ContentFilteredTopicImpl.matchSample` directly. `c/shape`/`cpp/shape` use it
+via the plain C callback; `java/shape` gained a matching JNI native method
+(`ZzddsRuntime.cftMatchSample`, `java_runtime/zzdds_java_runtime.c`) that
+upcalls into a small Java `FieldAccessor` interface per field lookup. Real
+unit test added (`extensions.zig`'s new `test "zzdds_cft_match_sample..."`)
+constructing a real CFT and checking both a matching and non-matching
+sample, not just a smoke call.
+
+**Root-cause fix: `TypeSupport.get_field` now wired for every binding — automatic
+CFT filtering, `zzdds_cft_match_sample` no longer required (2026-08-07).**
+The entry above shipped a workaround (`zzdds_cft_match_sample` + per-app
+manual re-check) rather than the real fix; this closes the actual gap.
+`TypeSupport.get_field`'s signature gained the same `ctx: *anyopaque` first
+parameter `compute_key_hash` already had (`src/dcps/participant.zig`), plus
+a caller-supplied `scratch: []u8` buffer so a matched string value can be
+copied out rather than returned as a pointer into a callback-local
+deserialized value (the same dangling-pointer class as the
+`data_representation` bug below) — see `filter.zig`'s new `CdrFieldGetter`/
+`ScratchPool`. `zzdds_register_type_support`/`_ctx` (`zzdds_c.h`) gained a
+`get_field_fn` parameter wired into the same per-registration adapter
+`compute_key_hash_fn` already uses. zidl's Zig/C/C++ backends now generate
+`getFieldFromCdr`/`_get_field_from_cdr` per topic struct (full deserialize,
+not a selective parse — a filter expression can reference any simple-typed
+member, not just `@key` ones); the Java backend generates a
+`getFieldFromCdr` static method, resolved by `ZzddsRuntime.
+registerTypeSupport` and invoked through a new JNI trampoline
+(`zzdds_java_get_field_from_cdr_ctx`). All four `*/shape` ports' manual
+`zzdds_cft_match_sample`/`cftMatchSample` re-check workarounds are deleted;
+`--cft` now filters automatically at the reader layer, verified end-to-end
+(cross-process, real UDP discovery) for all four. `zzdds_cft_match_sample`/
+`ZzddsRuntime.cftMatchSample` themselves are kept, not deleted — documented
+as a fallback for a type with no `get_field`/`getFieldFromCdr`, or for
+testing an already-deserialized sample outside a live `DataReader`.
+
+Java also needed an unrelated, narrower fix to unblock `create_contentfilteredtopic`
+itself (separate from filtering activating): zidl's Java backend never
+generated JNI marshaling for a bare `sequence<T>` used as an operation's own
+parameter (only nested inside a struct member) — `expression_parameters:
+StringSeq` hit exactly that gap, as did `create_multitopic`/
+`get_discovered_participants`/`get_discovered_topics`. Fixed generally (a
+new `SeqParamMarshalGenerator` in `java.zig`, plus refactoring
+`paramIsSupportedValueStruct`/the cross-file-reference collector), not
+special-cased to one operation.
+
+**Real bug: `data_representation` QoS re-matching read a dangling pointer
+after the entity that offered/requested it was created (2026-08-06).** Found
+via the same stretch-flag work above, specifically `-x 2` (XCDR2)
+intermittently failing to match even when both a writer and reader
+correctly declared `[XCDR2_DATA_REPRESENTATION]` — confirmed via a live
+repro (add debug prints at `writerQosSnapshot`/`readerQosSnapshot`'s call
+sites; the *first* call at entity-creation time read the correct value,
+a *later* call — triggered by matching against a newly-discovered remote
+peer — read garbage). Root cause: `DomainParticipantImpl.pubCreateProtoWriter`/
+`subCreateProtoReader` stored their `qos: DDS.DataWriterQos`/`DataReaderQos`
+parameter into the `active_writers`/`active_readers` registry by shallow
+value — for the one sequence-typed field added for XTypes support
+(`data_representation.value`), that copies the buffer *pointer*, not the
+bytes. The caller (in the C/C++ bindings' case, a C-ABI call originating
+from a short-lived stack-local QoS struct) only guarantees that buffer valid
+for the duration of the original `create_datawriter`/`create_datareader`
+call; a later QoS re-check reads freed memory. `partition_names` already had
+an identical bug fixed for it long ago (`dupePartitionNames`) — this was the
+one QoS sequence field added since that didn't get the same treatment.
+Fixed in `src/dcps/participant.zig`: clone `data_representation.value` into
+zzdds-owned storage before storing it in `ActiveWriter`/`ActiveReader`, freed
+at every teardown path `partition_names` already frees at
+(`pubDestroyProtoWriter`/`subDestroyProtoReader`, and the participant-level
+`deinit` sweep for any writers/readers that outlive their own `delete_*`
+call). `zig build test` and every affected example binding (C, C++, cross-
+binding against each other) re-verified clean after the fix.
+
+**C ABI: plain-struct CDR functions (`_serialize`/`_deserialize`/`_skip`/`_default`) were
+declared in `dcps.h` but not linkable from `libzzdds.so` — fixed in `build.zig`, blocked
+on a zidl release before it actually takes effect.** Found while porting zzdds-examples'
+`hello_world` to C (2026-08-04): `DDS_DataWriterQos_default` and its siblings for every
+plain (non-entity) struct in `dcps.idl` — QoS policy structs, `SampleInfo`,
+`PublicationMatchedStatus`, etc. — were declared in the installed header but had no body
+anywhere in `libzzdds.so`. Root cause: `gen_dcps_c` generates `dcps.h` + `dcps_cdr.c` from
+`dcps.idl`, installs `dcps.h`, but never added `dcps_cdr.c` as a source file to
+`zzdds_lib` — the entity/vtable half of the C ABI (`create_topic`, `create_datawriter`,
+...) is separately hand-integrated via zidl's `--generate-c-api` native-Zig path and *is*
+correctly exported, which is what masked this. `DDS_DataWriterQos_free` was exported for
+the same reason (native path); `_serialize`/`_deserialize`/`_skip`/`_default` weren't,
+because they only ever existed in the uncompiled `dcps_cdr.c`. Confirmed nothing in
+zzdds's own test suite exercised this either — `c_smoke_mod` only compiles its own
+generated smoke type's CDR file, never `dcps_cdr.c`.
+
+Naive fix attempt (just compile `dcps_cdr.c`/the `zzdds.idl` extension's own generated
+`.c` into `zzdds_lib`) doesn't work as-is: confirmed via a real build, not by inspection —
+25 duplicate-symbol link errors, one per QoS/status/config struct with a sequence field.
+Every one of them is `_free`: the native `--zig-generate-c-api` path already exports
+`_free` for these exact structs (see above), and it's the *only* function that overlaps —
+`_serialize`/`_deserialize`/`_skip`/`_default` really were cleanly absent, confirmed by
+the fact that removing just `_free` from the mix cleared every error. Landed as a new
+zidl C-backend flag, `--c-no-free` (suppresses `{Type}_free()` prototype+body for a whole
+generation pass), used on a **second, separate** `-b c --generate-interfaces` pass over
+`dcps.idl`/`zzdds.idl` whose `.c` output is what's compiled into `zzdds_lib` — the
+existing pass (unchanged, no `--c-no-free`) still produces the installed `dcps.h`/
+`zzdds.h`, which correctly keeps declaring `_free` (it's real, just implemented
+natively). One pass can't serve both purposes: the header must keep declaring `_free`,
+the `.c` compiled into the `.so` must not redefine it.
+
+Verified past the point of "compiles": `nm -D` confirms `_default`/`_serialize`/
+`_deserialize`/`_skip` are now exported and `_free` is still exported exactly once (native
+path, unchanged); `zig build test`/`test-bindings` all green including the Java
+`on_reliable_reader_ready` smoke test; and a standalone C program serializing +
+deserializing a real `DDS_DataWriterQos` (encap header written explicitly via
+`zidl_cdr_write_encap`, matching how the generated topic wrappers already do it) round-
+trips correctly with no crash, matching content. (First attempt at that standalone
+verification skipped the encap-header step and both truncated and segfaulted on
+`ZidlCdrReader`'s implicit `pos` starting at 4 — a bug in the throwaway test, not in the
+fix; recorded here so it isn't mistaken for a real regression if rediscovered.)
+
+**Not active yet**: `--c-no-free` only exists in an unreleased local zidl checkout;
+`zzdds`'s own `build.zig.zon` still pins the tagged `v0.3.1-zig.0.16.0` release, which
+predates it. The `build.zig` change above is real and correct but **dormant** — `zig build
+-Dc-binding=true` against the current pin builds exactly as it did before this fix, since
+the new second generation pass simply can't run (`--c-no-free` is an unknown flag to the
+pinned zidl). Needs a new zidl release tagged and the pin bumped before this actually
+takes effect; don't assume it's live without checking which zidl the pin currently
+resolves to.
+
+**C++ ABI: `create_datawriter`/`create_topic` couldn't return zzdds's own extended entity
+classes — fixed in `build.zig` + `zzdds_cpp.hpp`, blocked on a zidl release before it
+actually takes effect.** Also found via the `hello_world` C++ port: the natural C++ idiom
+for reaching `set_listener_ex`/`as_topic_description`
+(`static_pointer_cast<zzdds::DataWriterImpl>(dw)`) was undefined behavior, because
+`PublisherImpl::create_datawriter` (zzdds's own generated `dcps_impl.cpp`) always
+constructed the base `DDS::DataWriterImpl`, never zzdds's own extended
+`zzdds::DataWriterImpl` — confirmed by reproducing a segfault through a corrupted vtable,
+not just by inspection.
+
+Fixed using zidl's new `--cpp-impl-override`/`--cpp-impl-include` flags (see zidl's
+`docs/roadmap.md` "C and C++ backends" for the generator-side mechanism), wired in
+`build.zig`'s `gen_dcps_cpp_impl` invocation, pointing four interfaces at four new
+hand-written `zzdds::detail` classes in `include/zzdds_cpp.hpp`: `DDS::Topic` →
+`TopicSupport`, `DDS::DataWriter` → `DataWriterSupport`, `DDS::DataReader` →
+`DataReaderSupport`, `DDS::DomainParticipant` → `DomainParticipantSupport`.
+`DomainParticipantFactory` doesn't need an override — it already has its own working,
+unrelated construction path (`zzdds::create_factory()` →
+`detail::DomainParticipantFactorySupport`, hand-written, never goes through another
+entity's factory method).
+
+Each `*Support final : public zzdds::*Impl` class **composes** (not inherits) a private
+`DDS::*Impl dds_` member and delegates every inherited base-interface method to it —
+mirroring `DomainParticipantFactorySupport`'s pre-existing shape exactly. Composition, not
+inheritance, because `zzdds::*Impl` (generated from `zzdds.idl` alone, via
+`--cpp-generate-impl`) is abstract: entity interfaces don't get cross-module operation
+flattening, so it only implements the *new* zzdds-specific methods (`set_listener_ex`,
+`as_topic_description`, ...) — the inherited base ones (`write`, `dispose`, ...) are left
+unimplemented, and multiple-inheriting both would create a genuine diamond on `DDS::Topic`
+et al. since no virtual inheritance exists anywhere in the generated hierarchy.
+
+**A subtlety found only by getting a real link/compile error, not by inspection**: each
+`*Support` class also needs its own `friend DDS_Topic zidl_concrete_handle(const
+TopicSupport&) noexcept { return self.dds_.native_handle(); }` overload (and equivalents
+for the other three). Without it, ADL finds the *base* class's `zidl_concrete_handle`
+friend (inherited from `zzdds::TopicImpl`, returning the zzdds-extension handle type, not
+the base `DDS_Topic` handle `dcps_impl.cpp`'s call sites need) — a more-derived friend of
+the same name in the `*Support` class itself wins overload resolution via exact-match
+preference once added.
+
+Verified past "compiles": zzdds's own `zig build test`/`test-bindings` (Java smoke test,
+`cpp_allocator_smoke`, ...) green with no regressions; `cpp/hello_world` in
+zzdds-examples now uses the natural C++ OO path with zero raw-C-ABI workarounds (removed);
+full 6-pair cross-binding matrix (C++↔Zig, C++↔C, C++↔Java, both directions each) passes
+on real UDP discovery, distinct domains per run.
+
+**Not active yet** — same caveat as the C ABI fix above: `--cpp-impl-override`/
+`--cpp-impl-include` only exist in an unreleased local zidl checkout; `zzdds`'s own
+`build.zig.zon` still pins the tagged `v0.3.1-zig.0.16.0` release, which predates them.
+The `build.zig`/`zzdds_cpp.hpp` changes above are real and correct but **dormant** — `zig
+build` against the current pin builds exactly as it did before this fix, since
+`gen_dcps_cpp_impl` simply can't pass unknown flags to the pinned zidl. Needs a new zidl
+release tagged and the pin bumped before this actually takes effect; don't assume it's
+live without checking which zidl the pin currently resolves to.
+
+**C ABI naming: `zzdds_register_type_support_c`/`_ctx_c` renamed to
+`zzdds_register_type_support`/`_ctx`, blocked on a zidl release before it actually takes
+effect.** Found by inspection while reviewing the `hello_world` examples for rough edges
+(2026-08-05): these were the *only* two functions in all of `zzdds_c.h` with a `_c`
+suffix — every other function (`zzdds_create_factory`, `zzdds_write_raw`, ...) has none,
+despite being equally C-ABI. Not a meaningful marker, just an inconsistency; the suffix
+also leaked into generated code, since zidl's C and C++ backends both hardcode a call to
+`zzdds_register_type_support_c` by that exact name inside generated
+`<Type>TypeSupport::register_type` / `<Type>_register_type` (`c.zig`/`cpp.zig`). Renamed
+in `src/c_abi/typesupport.zig`, `zzdds_c.h`, and the two zidl backend call sites, plus
+every doc/comment/test referencing the old names. **Same "dormant" caveat as the two ABI
+fixes above**: the pinned `v0.3.1-zig.0.16.0` zidl release still emits the old
+`zzdds_register_type_support_c` call in generated code, so this only takes effect once a
+new zidl release is tagged and the pin is bumped — verified against a local zidl
+checkout in the meantime (`zzdds`'s own `zig build test`/`test-bindings`, plus all three
+of `c/hello_world`, `cpp/hello_world`, and `java/hello_world` in zzdds-examples, built and
+run standalone).
+
+**Longer-term direction, not just this one flag list**: zidl's roadmap also records a
+"pull implementation-specific codegen decisions into implementation-owned plugins"
+direction — in practice, this means zzdds eventually owns a set of zidl plugins (one per
+binding it ships) that supply exactly this kind of "which concrete class implements
+interface X" policy, instead of zzdds's `build.zig` hand-listing `--cpp-impl-override`
+flags and zidl core slowly accumulating more zzdds-shaped flags over time. Not started;
+the flag-based mechanism above is intentionally being built to be pluggable-into later
+(a plugin could emit the same flags programmatically), not superseded by it.
+
+**Zig-native TypeSupport registration ergonomics + a real, live string-cleanup leak fix,
+blocked on a zidl release before either takes effect.** Found while reviewing the
+`hello_world` examples for rough edges (2026-08-06): pure-Zig callers had to downcast
+`participant.ptr` to `*DomainParticipantImpl` themselves to call `registerTypeSupport` —
+every other binding (C/C++/Java) goes through zzdds's own C-ABI shim
+(`zzdds_register_type_support`), which does that exact downcast internally, but nothing
+equivalent existed for Zig. Fixed by adding `registerTypeSupport` to `src/raw_ops.zig`
+(re-exported from `src/root.zig`), mirroring `registerInstanceRaw`'s existing shape exactly.
+
+Separately, zidl's Zig backend never generated the equivalent of C/C++'s
+`{Type}_compute_key_hash_from_cdr` — Zig callers had to hand-write the CDR-deserialize-then-
+hash glue. Fixed via a new `computeKeyHashFromCdr(ctx: *anyopaque, payload: []const u8)
+[16]u8` generated per topic struct (see zidl's roadmap "Zig backend" for the codegen side).
+Unlike C (which resolves its allocator from a global, process-wide override defaulting to
+malloc/free), this stays consistent with the rest of the Zig runtime's explicit-allocator
+idiom: `ctx` is a `*const std.mem.Allocator`, supplied by the caller at registration time.
+
+**While verifying this, found a real, live memory leak — not hypothetical, already
+shipping**: zidl's Zig backend's `deinit()`/`clone()` generation only ever counted
+unbounded *sequences* as needing cleanup, never plain unbounded `string`/`wstring` fields
+(outside `--zig-generate-toml-config`) — a narrower version of a bug zidl already found and
+fixed for the C backend (see zidl's roadmap "C backend: `{Type}_free()` is declared but
+never given a body"), just never ported to Zig. Confirmed live in `dcps.idl` itself:
+`TopicBuiltinTopicData`/`PublicationBuiltinTopicData`/`SubscriptionBuiltinTopicData` all
+have plain unbounded `string name`/`type_name`/`topic_name` fields that `deinit()` (and
+therefore the C-ABI `DDS_*BuiltinTopicData_free()` zzdds ships) silently never freed.
+Fixed in zidl's `zig.zig` (see its own roadmap entry for the full design, including why a
+member with a non-empty `@default` string needed a careful, narrow exclusion to avoid
+trading a leak for a worse bug — freeing static string-literal storage). Verified against
+real generated code: `TopicBuiltinTopicData.deinit()` now frees `name`/`type_name`; `zig
+build test`/`test-bindings` (Java smoke test, `cpp_allocator_smoke`) green with no
+regressions; a standalone test confirmed `computeKeyHashFromCdr` on a real keyed struct
+with a variable-length key field no longer leaks.
+
+**Not active yet** — same caveat as the other zidl-flag-dependent fixes above:
+`computeKeyHashFromCdr` and the widened cleanup only exist in an unreleased local zidl
+checkout. `registerTypeSupport` (the `raw_ops.zig` addition) has *no* zidl dependency and
+is live today regardless of the pin.
+
+**Zig-native `setListenerEx` ergonomics — same gap, same fix shape as `registerTypeSupport`
+above, no zidl dependency.** Found continuing the same `hello_world` review (2026-08-06):
+`zig/hello_world` and `zig/shape` (zzdds-examples) both reached `set_listener_ex`
+(`DataWriterListenerEx::on_reliable_reader_ready`) by downcasting `writer.ptr` straight to
+`*DataWriterImpl` — the same category of gap `registerTypeSupport` closed, just for a
+different call. C's C-ABI equivalent (`DDS_DataWriter_as_zzdds_DataWriter`) and Java's
+(`ZzddsRuntime.asZzddsDataWriter`) both do a real vtable-identity check instead; Zig had
+neither, even though the check itself already existed internally in
+`c_abi/extensions.zig`, just never exposed.
+
+Added `asZzddsTopic`/`asZzddsDataWriter`/`asZzddsDataReader`/`asZzddsDomainParticipant` to
+`raw_ops.zig` (re-exported from `root.zig`), matching the C-ABI family of four (the fifth,
+`DomainParticipantFactory`, doesn't need one — pure-Zig callers get it directly from
+`zzdds.createFactory()`, never losing the type). Each does the same vtable check as its
+C-ABI sibling and returns the properly-typed `zzdds.*` interface value (not a raw impl
+pointer) — required making `participant_vtable`/`topic_vtable`/`writer_vtable`/
+`reader_vtable` `pub` in `c_abi/extensions.zig` so both sides reference the same canonical
+vtable instances rather than a second, address-distinct copy. No zidl dependency at all;
+live today regardless of the pin. `zig/hello_world`/`zig/shape` (zzdds-examples) and
+dds-rtps's own zzdds `shape_main` port all updated to call `zzdds.asZzddsDataWriter(dw)`
+instead of downcasting.
+
+Verified: new `raw_ops.zig` unit tests (real participant/topic/writer/reader through the
+upcast, `set_listener_ex` actually called on the result; plus a negative case against the
+nil sentinel) — `zig build test` 945/945, `test-bindings` green. `zig/hello_world`,
+`zig/shape`, and dds-rtps's `shape_main` all rebuilt and run standalone (and, for the shape
+ports, cross-binding against each other) over real UDP discovery with correct output.
+
+**Found and fixed along the way: a standing Zig build-graph bug, not new to this
+session.** `zig build` failed outright for `zig/hello_world` *and* `zig/shape`
+(zzdds-examples) — and dds-rtps's own zzdds `shape_main` port — the moment `zzdds`'s own
+`zidl` dependency was a `.path` dependency rather than a hashed release (exactly the state
+needed to test any of zidl's unreleased fixes against a real Zig-native consumer, not just
+zzdds's own test suite): `error: file exists in modules 'zidl_rt' and 'zidl_rt0'`. Root
+cause: each of those consumers declared its *own*, separate top-level dependency on `zidl`
+(to get `zidl_rt` + the `zidl` binary for their own IDL codegen) in addition to depending
+on `zzdds`, which *also* depends on `zidl` internally. Zig's package manager doesn't
+deduplicate two independent `.path` dependencies on the same directory declared by two
+different `build.zig` files, even though they resolve to the identical files — each gets
+instantiated as its own module instance, and the build fails the moment any single
+compilation unit imports both. Never mattered before because `zzdds`'s own pin was only
+ever flipped to a local path transiently, for verification, then reverted immediately.
+
+Fixed by having `zzdds`'s own `build.zig` re-expose its already-resolved `zidl_rt` module
+(via `b.modules.put`, reusing the exact same `*Module` instance zidl_dep.module("zidl_rt")`
+returns — not a second, address-distinct copy) and the `zidl` executable (moved
+`b.installArtifact(zidl_exe)` out of the `need_c_abi`-gated block, now unconditional — a
+pure-Zig consumer needing only `zidl_rt` + the binary for its own codegen shouldn't have to
+opt into the C/C++/Java binding pipeline to get them) as part of its own public
+dependency/module surface. Consumers now get both *through* `zzdds`
+(`zzdds_dep.artifact("zidl")` / `zzdds_dep.module("zidl_rt")`) instead of declaring their
+own separate `zidl` dependency — guaranteeing only one `zidl` resolution ever exists in the
+whole graph. `zig/hello_world`/`zig/shape` (zzdds-examples) and dds-rtps's `shape_main`
+`build.zig`/`build.zig.zon` all updated to match; the now-dead direct `.zidl`
+`build.zig.zon` entries removed (dds-rtps's pinned copy keeps a comment explaining it's
+inert until its own `zzdds` pin is bumped past this fix, same "dormant" pattern as
+everything else zidl-dependent in this session).
+
+**DEADLINE/LIVELINESS QoS is now enforced automatically — previously nothing drove it at
+all.** Found continuing the same `hello_world`/`shape_main` review (2026-08-06), while
+auditing `writerNotifyDeadline`/`readerNotifyDeadline` (two more `dds_impl.zig` downcasts
+found alongside `setListenerEx` above): `DomainParticipantImpl.checkTimers()`
+(`participant.zig`) already correctly checks every active writer/reader's DEADLINE and
+LIVELINESS periods and fires the right notifications — but nothing ever called it outside
+tests using a `ManualClock`. `zzdds.createFactory()`'s bootstrap never spawned a timer
+thread; `shape_main` (zzdds-examples' `zig/shape` and dds-rtps's own zzdds port) worked
+around this by re-implementing its own parallel elapsed-time tracking and manually calling
+the lower-level `notifyDeadlineMissed()` hook directly — not an ergonomics problem, a real
+gap in automatic OMG-spec-mandated behavior that happened to be visible through the same
+kind of downcast as the ergonomics fixes.
+
+Fixed with a per-participant background thread (`DomainParticipantImpl.timer_thread`),
+spawned at the end of `start()`, ticking every 100ms (`TIMER_CHECK_INTERVAL_MS`) and
+calling `self.checkTimers()`. Not a new threading pattern for zzdds — `writer_sm.zig`
+already lazily spawns a per-writer heartbeat thread on first match, `spdp.zig` already
+eagerly spawns a per-participant SPDP re-announcement timer, and `UdpTransport`'s receive
+threads are already unconditional — all four already-existing background threads follow
+the identical "sleep in 50ms chunks checking an atomic stop flag" idiom, which this one
+matches. See the new "Background thread usage" entry below for the broader thread-strategy
+question this raised.
+
+**Deliberately scoped to *one thread per participant*, not one thread per factory
+iterating all its participants — found a real race with the latter before writing any
+code, not after.** The first design considered was a single `FactoryOwner`-level thread
+walking `stacks` and calling `checkTimers()` on each. Traced the actual teardown path
+before implementing: `factory.zig`'s `vtDeleteParticipant` calls `p.deinit()` completely
+outside any lock, and `DomainParticipantImpl.deinit()` itself deliberately does **not**
+acquire `self.mu` (existing comment: publisher/subscriber teardown re-locks `mu`, so
+holding it during `deinit()` would deadlock) — while `checkTimers()` *does* acquire
+`self.mu`. A factory-level thread calling `checkTimers()` on a handle grabbed from
+`FactoryOwner.stacks` would have no protection against that same participant being
+mid-`deinit()` on another thread — a real use-after-free, not a theoretical one. Holding
+`FactoryOwner.mu` across the call doesn't fix it either: `checkTimers()` fires listener
+callbacks, and a callback calling back into `delete_participant`/`lookup_participant`
+would self-deadlock on that same lock (the exact reason `deleteParticipant` already
+releases `FactoryOwner.mu` before calling into the inner factory). Scoping the thread to
+the participant's own lifetime instead — spawned in `start()`, stopped as the *first* line
+of `deinit()`, before anything else is torn down — sidesteps the cross-object lifetime
+problem entirely rather than adding new synchronization to work around it, and matches how
+`writer_sm.zig`'s and `spdp.zig`'s existing timer threads are already scoped.
+
+Verified past "compiles": `zig build test` (945/945) and `test-bindings` (Java smoke test,
+`cpp_allocator_smoke`) green with no regressions. Real, not just unit-tested: rebuilt
+`zig/hello_world`'s sibling `zig/shape` example with its own app-side
+`writerNotifyDeadline`/`readerNotifyDeadline` calls *removed entirely* (along with the
+manual elapsed-time tracking that fed them) and confirmed `on_offered_deadline_missed()`/
+`on_requested_deadline_missed()` still fire correctly and repeatedly, unassisted, in both
+`zig/shape` and dds-rtps's own zzdds `shape_main` port — plus re-verified the plain-match
+and CFT-filtering scenarios from the `setListenerEx` fix still pass unchanged.
+
+**Background thread usage — revisit holistically, not started.** Prompted directly by
+adding the DEADLINE/LIVELINESS timer thread above: that's the *tenth* `std.Thread.spawn`
+call site in zzdds, and — checked, not assumed — only five of the ten ever block on a
+socket (`UdpTransport` recv ×2, `TcpTransport` recv ×2, `TcpTransport` accept ×1). The
+other five are pure periodic-tick threads with no socket involved at all: the new
+DEADLINE/LIVELINESS thread, `writer_sm.zig`'s per-writer heartbeat, `spdp.zig`'s
+per-participant announcement timer, `transport/monitor/polling.zig`'s interface-change
+poll, and `trace.zig`'s wire-trace flush. All five already share one idiom (sleep in 50ms
+chunks checking an atomic stop flag, so shutdown stays responsive) — that consistency
+happened by convention, one thread at a time, not by design.
+
+Worth a dedicated pass to (at minimum) consolidate: do periodic-tick threads need to be
+one-per-object at all, or could DEADLINE/LIVELINESS, the interface-change poll, and the
+wire-trace flush share a single scheduler thread with multiple registered callbacks,
+cutting thread count without changing semantics? (The heartbeat and SPDP timers are more
+naturally per-object — heartbeat is lazily spawned only once a writer has a matched
+reader, SPDP timing is participant-specific — so consolidating *those* two is a separate,
+harder question, if it's worth doing at all.) Beyond consolidation: zzdds has never stated
+an overall concurrency strategy — one-thread-per-concern has just been the default every
+time a new periodic need came up. Worth deciding deliberately whether that stays the
+model, or whether some/all of this should move to Zig's `std.Io` async/evented
+abstractions instead (the same `Io` interface `zig/hello_world`'s portable sleep fix
+already uses) — and if so, whether that's an outright replacement or a configurable choice
+(thread-per-concern vs. a shared event loop) so different deployment targets (embedded/
+real-time vs. a normal server process) can pick what fits. Not scoped further than this;
+deciding the shape of that choice is the point of picking this up, not something to
+pre-decide here.
+
+**Separately found while verifying this, unrelated to the above, and already broken
+today — not just dormant**: `zig build install -Dc-binding=true` (and therefore
+`-Dcpp-binding=true`/`-Djava-binding=true`, which imply it) currently **fails outright**
+against the pinned `v0.3.1-zig.0.16.0` zidl release — `build.zig`'s `--c-no-free` pass
+(the Issue 1 fix, see above) unconditionally passes that flag to whichever zidl the pin
+resolves to, and the pinned one doesn't understand it (`error: unknown option:
+--c-no-free`). This contradicts this roadmap's own earlier claim that Issue 1 was
+"dormant" against the pin ("`zig build -Dc-binding=true` ... builds exactly as it did
+before this fix") — that claim was never actually verified by running the command against
+a reverted pin, only reasoned about. Confirmed by actually running it. Whoever bumps the
+pin next should budget for this: `-D{c,cpp,java}-binding=true` needs a real zidl release
+containing `--c-no-free`/`--cpp-impl-override` before it builds at all, not just before
+those specific fixes take effect.
+
+**C-ABI TypeSupport** — complete. `zzdds_register_type_support` in
 `src/c_abi/typesupport.zig` bridges a C function pointer to the Zig `TypeSupport`
 vtable via a heap-allocated `CKeyHashAdapter`. Pass the
 `<Type>_compute_key_hash_from_cdr` function generated by `zidl -b c` as the callback;
@@ -119,12 +541,20 @@ signaled before any is joined, so teardown cost is one bounded wait regardless o
 count. The `beginProbe` 1-second-deadline-per-in-flight-probe cause above is a separate,
 still-open root cause this PR did not touch.
 
+*Small addition to this same budget (2026-08-06):* the new per-participant DEADLINE/
+LIVELINESS timer thread (see "DEADLINE/LIVELINESS QoS is now enforced automatically"
+below) adds up to ~50ms to every participant's `deinit()` — its stop flag is checked in
+50ms sleep chunks, matching every other timer thread in the codebase, so a `join()` right
+after setting the flag can wait that long in the worst case. Negligible next to the
+multi-second issue above, but worth naming here so it isn't mistaken for a new mystery
+delay if someone's specifically hunting sub-100ms teardown latency later.
+
 **Language bindings** — see `docs/language-bindings.md` for the distribution model
 (three-artifact structure, build flags, version coupling). Current status:
 
 - **C ABI (`zzdds_c.h` + `libzzdds`)** — complete. Opaque handle + free-function surface
   generated by `zidl -b c --generate-interfaces`; C export wrappers from
-  `zidl -b zig --zig-generate-c-api`; TypeSupport via `zzdds_register_type_support_c`.
+  `zidl -b zig --zig-generate-c-api`; TypeSupport via `zzdds_register_type_support`.
   Build artifacts (`libzidl_cdr.a`, `zzdds.pc`, `zzdds-config.cmake`) installed by
   `zig build install`. See `docs/language-bindings.md` §"C binding API design".
 - **C++ binding** — complete. `zidl -b cpp --generate-interfaces --cpp-generate-impl`
@@ -322,7 +752,12 @@ existing suite should be extended to cover the condvar path.
 - **DDS-RPC** — deferred; no concrete use case yet.
 - **DDS-XRCE** — embedded profile; separate project or downstream fork.
 - **TRANSIENT / PERSISTENT durability** — requires a persistence service; deferred.
-- **MultiTopic** — complex; deferred.
+- **MultiTopic** — complex; deferred. `vtCreateMultiTopic` (`src/dcps/participant.zig`)
+  always returns nil. Note for anyone touching binding marshaling near this: a binding's
+  `create_multitopic` *marshaling* working correctly (argument/return plumbing across the
+  C ABI or JNI boundary) is independent of this stub — a caller can get all the way to
+  the nil return with no marshaling error, which is easy to mistake for partial
+  functionality. It isn't; nothing behind `create_multitopic` works yet in any binding.
 - **Retroactive unmatching for ignored publications/subscriptions** — the ignore APIs filter
   future discovery callbacks today. Ignoring an already-discovered publication or
   subscription is treated as a permitted no-op; actively removing existing RTPS proxies is

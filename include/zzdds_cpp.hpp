@@ -5,6 +5,8 @@
 
 #include <memory>
 #include <memory_resource>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 namespace zzdds {
@@ -82,6 +84,368 @@ public:
 private:
     ::DDS::DomainParticipantFactoryImpl dds_;
     zzdds_DomainParticipantFactory handle_;
+};
+
+} // namespace detail
+
+namespace detail {
+
+// TopicSupport/DataWriterSupport/DataReaderSupport/DomainParticipantSupport
+// exist for the same reason DomainParticipantFactorySupport above does: the
+// zidl-generated zzdds::TopicImpl/DataWriterImpl/DataReaderImpl/
+// DomainParticipantImpl (from zzdds_impl.hpp, generated from zzdds.idl
+// alone) only implement the *new* zzdds-specific methods
+// (as_topic_description, write_serialized/set_listener_ex,
+// take_serialized/take_next_instance_serialized, register_type_support) --
+// entity interfaces don't get cross-module operation flattening, so the
+// inherited DDS::Topic/DataWriter/DataReader/DomainParticipant base methods
+// are left unimplemented (abstract) on those classes. Composing a
+// fully-implemented DDS::*Impl member and delegating every base method to
+// it, same shape as DomainParticipantFactorySupport, makes each one
+// concrete.
+//
+// Unlike the factory (a bootstrap singleton constructed directly from
+// zzdds_create_factory(), never via another entity's factory method), these
+// four *are* constructed via the ordinary generic entity path --
+// DomainParticipant::create_topic() and friends, whose generated
+// implementation only ever has a DDS_Topic/DDS_DataWriter/... handle to
+// hand over (see --cpp-impl-override in zidl's docs/roadmap.md). That's a
+// real difference from the factory case: the base DDS_* handle has to be
+// converted to the zzdds_* one explicitly (DDS_Topic_as_zzdds_Topic and
+// siblings, from zzdds.h) before zzdds::TopicImpl's own constructor -- which
+// only accepts its own zzdds_Topic -- can be called at all. No custom
+// destructor is needed here the way the factory's is: entity teardown goes
+// through delete_topic()/delete_datawriter()/... (the composed dds_ member's
+// own destructor, and the C-ABI entity itself, outlive this wrapper), not a
+// destructor-triggered top-level C-ABI call.
+
+class TopicSupport final : public TopicImpl {
+public:
+    explicit TopicSupport(DDS_Topic handle)
+        : TopicImpl(DDS_Topic_as_zzdds_Topic(handle)),
+          dds_(handle)
+    {}
+
+    // as_topic_description() is already implemented by TopicImpl (base).
+
+    ::DDS::ReturnCode_t enable() override { return dds_.enable(); }
+    std::shared_ptr<::DDS::StatusCondition> get_statuscondition() override { return dds_.get_statuscondition(); }
+    ::DDS::StatusMask get_status_changes() override { return dds_.get_status_changes(); }
+    ::DDS::InstanceHandle_t get_instance_handle() override { return dds_.get_instance_handle(); }
+    std::string get_type_name() override { return dds_.get_type_name(); }
+    std::string get_name() override { return dds_.get_name(); }
+    std::shared_ptr<::DDS::DomainParticipant> get_participant() override { return dds_.get_participant(); }
+    ::DDS::ReturnCode_t set_qos(::DDS::TopicQos qos) override { return dds_.set_qos(qos); }
+    ::DDS::ReturnCode_t get_qos(::DDS::TopicQos& qos) override { return dds_.get_qos(qos); }
+    ::DDS::ReturnCode_t set_listener(std::shared_ptr<::DDS::TopicListener> a_listener, ::DDS::StatusMask mask) override {
+        return dds_.set_listener(std::move(a_listener), mask);
+    }
+    std::shared_ptr<::DDS::TopicListener> get_listener() override { return dds_.get_listener(); }
+    ::DDS::ReturnCode_t get_inconsistent_topic_status(::DDS::InconsistentTopicStatus& a_status) override {
+        return dds_.get_inconsistent_topic_status(a_status);
+    }
+
+    static std::shared_ptr<TopicSupport> _getOrCreate(DDS_Topic h) {
+        if (!h) return nullptr;
+        static std::mutex _mtx;
+        static std::unordered_map<DDS_Topic, std::weak_ptr<TopicSupport>> _cache;
+        std::lock_guard<std::mutex> _lock(_mtx);
+        auto _it = _cache.find(h);
+        if (_it != _cache.end()) {
+            if (auto _sp = _it->second.lock()) return _sp;
+        }
+        auto _sp = std::allocate_shared<TopicSupport>(
+            std::pmr::polymorphic_allocator<TopicSupport>(std::pmr::get_default_resource()), h);
+        if (_it != _cache.end()) {
+            _it->second = _sp;
+        } else {
+            _cache.emplace(h, _sp);
+        }
+        return _sp;
+    }
+
+private:
+    // Shadows the inherited TopicImpl (base) friend of the same name, which
+    // returns the zzdds *extension* handle (zzdds_Topic) -- wrong type for
+    // call sites expecting the base DDS_Topic (confirmed directly: without
+    // this, dcps_impl.cpp fails to compile with "cannot convert zzdds_Topic
+    // to DDS_Topic"). Exact-match overload resolution prefers this one over
+    // the inherited const TopicImpl& version.
+    friend DDS_Topic zidl_concrete_handle(const TopicSupport& self) noexcept { return self.dds_.native_handle(); }
+    ::DDS::TopicImpl dds_;
+};
+
+class DataWriterSupport final : public DataWriterImpl {
+public:
+    explicit DataWriterSupport(DDS_DataWriter handle)
+        : DataWriterImpl(DDS_DataWriter_as_zzdds_DataWriter(handle)),
+          dds_(handle)
+    {}
+
+    // write_serialized()/set_listener_ex() are already implemented by
+    // DataWriterImpl (base).
+
+    ::DDS::ReturnCode_t enable() override { return dds_.enable(); }
+    std::shared_ptr<::DDS::StatusCondition> get_statuscondition() override { return dds_.get_statuscondition(); }
+    ::DDS::StatusMask get_status_changes() override { return dds_.get_status_changes(); }
+    ::DDS::InstanceHandle_t get_instance_handle() override { return dds_.get_instance_handle(); }
+    ::DDS::ReturnCode_t set_qos(::DDS::DataWriterQos qos) override { return dds_.set_qos(qos); }
+    ::DDS::ReturnCode_t get_qos(::DDS::DataWriterQos& qos) override { return dds_.get_qos(qos); }
+    ::DDS::ReturnCode_t set_listener(std::shared_ptr<::DDS::DataWriterListener> a_listener, ::DDS::StatusMask mask) override {
+        return dds_.set_listener(std::move(a_listener), mask);
+    }
+    std::shared_ptr<::DDS::DataWriterListener> get_listener() override { return dds_.get_listener(); }
+    std::shared_ptr<::DDS::Topic> get_topic() override { return dds_.get_topic(); }
+    std::shared_ptr<::DDS::Publisher> get_publisher() override { return dds_.get_publisher(); }
+    ::DDS::ReturnCode_t wait_for_acknowledgments(::DDS::Duration_t max_wait) override { return dds_.wait_for_acknowledgments(max_wait); }
+    ::DDS::ReturnCode_t get_liveliness_lost_status(::DDS::LivelinessLostStatus& p0) override { return dds_.get_liveliness_lost_status(p0); }
+    ::DDS::ReturnCode_t get_offered_deadline_missed_status(::DDS::OfferedDeadlineMissedStatus& status) override {
+        return dds_.get_offered_deadline_missed_status(status);
+    }
+    ::DDS::ReturnCode_t get_offered_incompatible_qos_status(::DDS::OfferedIncompatibleQosStatus& status) override {
+        return dds_.get_offered_incompatible_qos_status(status);
+    }
+    ::DDS::ReturnCode_t get_publication_matched_status(::DDS::PublicationMatchedStatus& status) override {
+        return dds_.get_publication_matched_status(status);
+    }
+    ::DDS::ReturnCode_t assert_liveliness() override { return dds_.assert_liveliness(); }
+    ::DDS::ReturnCode_t get_matched_subscriptions(::DDS::InstanceHandleSeq& subscription_handles) override {
+        return dds_.get_matched_subscriptions(subscription_handles);
+    }
+    ::DDS::ReturnCode_t get_matched_subscription_data(
+        ::DDS::SubscriptionBuiltinTopicData& subscription_data, ::DDS::InstanceHandle_t subscription_handle
+    ) override {
+        return dds_.get_matched_subscription_data(subscription_data, subscription_handle);
+    }
+
+    static std::shared_ptr<DataWriterSupport> _getOrCreate(DDS_DataWriter h) {
+        if (!h) return nullptr;
+        static std::mutex _mtx;
+        static std::unordered_map<DDS_DataWriter, std::weak_ptr<DataWriterSupport>> _cache;
+        std::lock_guard<std::mutex> _lock(_mtx);
+        auto _it = _cache.find(h);
+        if (_it != _cache.end()) {
+            if (auto _sp = _it->second.lock()) return _sp;
+        }
+        auto _sp = std::allocate_shared<DataWriterSupport>(
+            std::pmr::polymorphic_allocator<DataWriterSupport>(std::pmr::get_default_resource()), h);
+        if (_it != _cache.end()) {
+            _it->second = _sp;
+        } else {
+            _cache.emplace(h, _sp);
+        }
+        return _sp;
+    }
+
+private:
+    // See TopicSupport's matching comment.
+    friend DDS_DataWriter zidl_concrete_handle(const DataWriterSupport& self) noexcept { return self.dds_.native_handle(); }
+    ::DDS::DataWriterImpl dds_;
+};
+
+class DataReaderSupport final : public DataReaderImpl {
+public:
+    explicit DataReaderSupport(DDS_DataReader handle)
+        : DataReaderImpl(DDS_DataReader_as_zzdds_DataReader(handle)),
+          dds_(handle)
+    {}
+
+    // take_serialized()/take_next_instance_serialized() are already
+    // implemented by DataReaderImpl (base).
+
+    ::DDS::ReturnCode_t enable() override { return dds_.enable(); }
+    std::shared_ptr<::DDS::StatusCondition> get_statuscondition() override { return dds_.get_statuscondition(); }
+    ::DDS::StatusMask get_status_changes() override { return dds_.get_status_changes(); }
+    ::DDS::InstanceHandle_t get_instance_handle() override { return dds_.get_instance_handle(); }
+    std::shared_ptr<::DDS::ReadCondition> create_readcondition(
+        ::DDS::SampleStateMask sample_states, ::DDS::ViewStateMask view_states, ::DDS::InstanceStateMask instance_states
+    ) override {
+        return dds_.create_readcondition(sample_states, view_states, instance_states);
+    }
+    std::shared_ptr<::DDS::QueryCondition> create_querycondition(
+        ::DDS::SampleStateMask sample_states, ::DDS::ViewStateMask view_states, ::DDS::InstanceStateMask instance_states,
+        std::string query_expression, ::DDS::StringSeq query_parameters
+    ) override {
+        return dds_.create_querycondition(sample_states, view_states, instance_states, std::move(query_expression), query_parameters);
+    }
+    ::DDS::ReturnCode_t delete_readcondition(std::shared_ptr<::DDS::ReadCondition> a_condition) override {
+        return dds_.delete_readcondition(std::move(a_condition));
+    }
+    ::DDS::ReturnCode_t delete_contained_entities() override { return dds_.delete_contained_entities(); }
+    ::DDS::ReturnCode_t set_qos(::DDS::DataReaderQos qos) override { return dds_.set_qos(qos); }
+    ::DDS::ReturnCode_t get_qos(::DDS::DataReaderQos& qos) override { return dds_.get_qos(qos); }
+    ::DDS::ReturnCode_t set_listener(std::shared_ptr<::DDS::DataReaderListener> a_listener, ::DDS::StatusMask mask) override {
+        return dds_.set_listener(std::move(a_listener), mask);
+    }
+    std::shared_ptr<::DDS::DataReaderListener> get_listener() override { return dds_.get_listener(); }
+    std::shared_ptr<::DDS::TopicDescription> get_topicdescription() override { return dds_.get_topicdescription(); }
+    std::shared_ptr<::DDS::Subscriber> get_subscriber() override { return dds_.get_subscriber(); }
+    ::DDS::ReturnCode_t get_sample_rejected_status(::DDS::SampleRejectedStatus& status) override {
+        return dds_.get_sample_rejected_status(status);
+    }
+    ::DDS::ReturnCode_t get_liveliness_changed_status(::DDS::LivelinessChangedStatus& status) override {
+        return dds_.get_liveliness_changed_status(status);
+    }
+    ::DDS::ReturnCode_t get_requested_deadline_missed_status(::DDS::RequestedDeadlineMissedStatus& status) override {
+        return dds_.get_requested_deadline_missed_status(status);
+    }
+    ::DDS::ReturnCode_t get_requested_incompatible_qos_status(::DDS::RequestedIncompatibleQosStatus& status) override {
+        return dds_.get_requested_incompatible_qos_status(status);
+    }
+    ::DDS::ReturnCode_t get_subscription_matched_status(::DDS::SubscriptionMatchedStatus& status) override {
+        return dds_.get_subscription_matched_status(status);
+    }
+    ::DDS::ReturnCode_t get_sample_lost_status(::DDS::SampleLostStatus& status) override { return dds_.get_sample_lost_status(status); }
+    ::DDS::ReturnCode_t wait_for_historical_data(::DDS::Duration_t max_wait) override { return dds_.wait_for_historical_data(max_wait); }
+    ::DDS::ReturnCode_t get_matched_publications(::DDS::InstanceHandleSeq& publication_handles) override {
+        return dds_.get_matched_publications(publication_handles);
+    }
+    ::DDS::ReturnCode_t get_matched_publication_data(
+        ::DDS::PublicationBuiltinTopicData& publication_data, ::DDS::InstanceHandle_t publication_handle
+    ) override {
+        return dds_.get_matched_publication_data(publication_data, publication_handle);
+    }
+
+    static std::shared_ptr<DataReaderSupport> _getOrCreate(DDS_DataReader h) {
+        if (!h) return nullptr;
+        static std::mutex _mtx;
+        static std::unordered_map<DDS_DataReader, std::weak_ptr<DataReaderSupport>> _cache;
+        std::lock_guard<std::mutex> _lock(_mtx);
+        auto _it = _cache.find(h);
+        if (_it != _cache.end()) {
+            if (auto _sp = _it->second.lock()) return _sp;
+        }
+        auto _sp = std::allocate_shared<DataReaderSupport>(
+            std::pmr::polymorphic_allocator<DataReaderSupport>(std::pmr::get_default_resource()), h);
+        if (_it != _cache.end()) {
+            _it->second = _sp;
+        } else {
+            _cache.emplace(h, _sp);
+        }
+        return _sp;
+    }
+
+private:
+    // See TopicSupport's matching comment.
+    friend DDS_DataReader zidl_concrete_handle(const DataReaderSupport& self) noexcept { return self.dds_.native_handle(); }
+    ::DDS::DataReaderImpl dds_;
+};
+
+class DomainParticipantSupport final : public DomainParticipantImpl {
+public:
+    explicit DomainParticipantSupport(DDS_DomainParticipant handle)
+        : DomainParticipantImpl(DDS_DomainParticipant_as_zzdds_DomainParticipant(handle)),
+          dds_(handle)
+    {}
+
+    // register_type_support() is already implemented by DomainParticipantImpl (base).
+
+    ::DDS::ReturnCode_t enable() override { return dds_.enable(); }
+    std::shared_ptr<::DDS::StatusCondition> get_statuscondition() override { return dds_.get_statuscondition(); }
+    ::DDS::StatusMask get_status_changes() override { return dds_.get_status_changes(); }
+    ::DDS::InstanceHandle_t get_instance_handle() override { return dds_.get_instance_handle(); }
+    std::shared_ptr<::DDS::Publisher> create_publisher(
+        ::DDS::PublisherQos qos, std::shared_ptr<::DDS::PublisherListener> a_listener, ::DDS::StatusMask mask
+    ) override {
+        return dds_.create_publisher(qos, std::move(a_listener), mask);
+    }
+    ::DDS::ReturnCode_t delete_publisher(std::shared_ptr<::DDS::Publisher> p) override { return dds_.delete_publisher(std::move(p)); }
+    std::shared_ptr<::DDS::Subscriber> create_subscriber(
+        ::DDS::SubscriberQos qos, std::shared_ptr<::DDS::SubscriberListener> a_listener, ::DDS::StatusMask mask
+    ) override {
+        return dds_.create_subscriber(qos, std::move(a_listener), mask);
+    }
+    ::DDS::ReturnCode_t delete_subscriber(std::shared_ptr<::DDS::Subscriber> s) override { return dds_.delete_subscriber(std::move(s)); }
+    std::shared_ptr<::DDS::Subscriber> get_builtin_subscriber() override { return dds_.get_builtin_subscriber(); }
+    std::shared_ptr<::DDS::Topic> create_topic(
+        std::string topic_name, std::string type_name, ::DDS::TopicQos qos,
+        std::shared_ptr<::DDS::TopicListener> a_listener, ::DDS::StatusMask mask
+    ) override {
+        return dds_.create_topic(std::move(topic_name), std::move(type_name), qos, std::move(a_listener), mask);
+    }
+    ::DDS::ReturnCode_t delete_topic(std::shared_ptr<::DDS::Topic> a_topic) override { return dds_.delete_topic(std::move(a_topic)); }
+    std::shared_ptr<::DDS::Topic> find_topic(std::string topic_name, ::DDS::Duration_t timeout) override {
+        return dds_.find_topic(std::move(topic_name), timeout);
+    }
+    std::shared_ptr<::DDS::TopicDescription> lookup_topicdescription(std::string name) override {
+        return dds_.lookup_topicdescription(std::move(name));
+    }
+    std::shared_ptr<::DDS::ContentFilteredTopic> create_contentfilteredtopic(
+        std::string name, std::shared_ptr<::DDS::Topic> related_topic, std::string filter_expression,
+        ::DDS::StringSeq expression_parameters
+    ) override {
+        return dds_.create_contentfilteredtopic(std::move(name), std::move(related_topic), std::move(filter_expression), expression_parameters);
+    }
+    ::DDS::ReturnCode_t delete_contentfilteredtopic(std::shared_ptr<::DDS::ContentFilteredTopic> a_contentfilteredtopic) override {
+        return dds_.delete_contentfilteredtopic(std::move(a_contentfilteredtopic));
+    }
+    std::shared_ptr<::DDS::MultiTopic> create_multitopic(
+        std::string name, std::string type_name, std::string subscription_expression, ::DDS::StringSeq expression_parameters
+    ) override {
+        return dds_.create_multitopic(std::move(name), std::move(type_name), std::move(subscription_expression), expression_parameters);
+    }
+    ::DDS::ReturnCode_t delete_multitopic(std::shared_ptr<::DDS::MultiTopic> a_multitopic) override {
+        return dds_.delete_multitopic(std::move(a_multitopic));
+    }
+    ::DDS::ReturnCode_t delete_contained_entities() override { return dds_.delete_contained_entities(); }
+    ::DDS::ReturnCode_t set_qos(::DDS::DomainParticipantQos qos) override { return dds_.set_qos(qos); }
+    ::DDS::ReturnCode_t get_qos(::DDS::DomainParticipantQos& qos) override { return dds_.get_qos(qos); }
+    ::DDS::ReturnCode_t set_listener(std::shared_ptr<::DDS::DomainParticipantListener> a_listener, ::DDS::StatusMask mask) override {
+        return dds_.set_listener(std::move(a_listener), mask);
+    }
+    std::shared_ptr<::DDS::DomainParticipantListener> get_listener() override { return dds_.get_listener(); }
+    ::DDS::ReturnCode_t ignore_participant(::DDS::InstanceHandle_t handle) override { return dds_.ignore_participant(handle); }
+    ::DDS::ReturnCode_t ignore_topic(::DDS::InstanceHandle_t handle) override { return dds_.ignore_topic(handle); }
+    ::DDS::ReturnCode_t ignore_publication(::DDS::InstanceHandle_t handle) override { return dds_.ignore_publication(handle); }
+    ::DDS::ReturnCode_t ignore_subscription(::DDS::InstanceHandle_t handle) override { return dds_.ignore_subscription(handle); }
+    ::DDS::DomainId_t get_domain_id() override { return dds_.get_domain_id(); }
+    ::DDS::ReturnCode_t assert_liveliness() override { return dds_.assert_liveliness(); }
+    ::DDS::ReturnCode_t set_default_publisher_qos(::DDS::PublisherQos qos) override { return dds_.set_default_publisher_qos(qos); }
+    ::DDS::ReturnCode_t get_default_publisher_qos(::DDS::PublisherQos& qos) override { return dds_.get_default_publisher_qos(qos); }
+    ::DDS::ReturnCode_t set_default_subscriber_qos(::DDS::SubscriberQos qos) override { return dds_.set_default_subscriber_qos(qos); }
+    ::DDS::ReturnCode_t get_default_subscriber_qos(::DDS::SubscriberQos& qos) override { return dds_.get_default_subscriber_qos(qos); }
+    ::DDS::ReturnCode_t set_default_topic_qos(::DDS::TopicQos qos) override { return dds_.set_default_topic_qos(qos); }
+    ::DDS::ReturnCode_t get_default_topic_qos(::DDS::TopicQos& qos) override { return dds_.get_default_topic_qos(qos); }
+    ::DDS::ReturnCode_t get_discovered_participants(::DDS::InstanceHandleSeq& participant_handles) override {
+        return dds_.get_discovered_participants(participant_handles);
+    }
+    ::DDS::ReturnCode_t get_discovered_participant_data(
+        ::DDS::ParticipantBuiltinTopicData& participant_data, ::DDS::InstanceHandle_t participant_handle
+    ) override {
+        return dds_.get_discovered_participant_data(participant_data, participant_handle);
+    }
+    ::DDS::ReturnCode_t get_discovered_topics(::DDS::InstanceHandleSeq& topic_handles) override {
+        return dds_.get_discovered_topics(topic_handles);
+    }
+    ::DDS::ReturnCode_t get_discovered_topic_data(::DDS::TopicBuiltinTopicData& topic_data, ::DDS::InstanceHandle_t topic_handle) override {
+        return dds_.get_discovered_topic_data(topic_data, topic_handle);
+    }
+    bool contains_entity(::DDS::InstanceHandle_t a_handle) override { return dds_.contains_entity(a_handle); }
+    ::DDS::ReturnCode_t get_current_time(::DDS::Time_t& current_time) override { return dds_.get_current_time(current_time); }
+
+    static std::shared_ptr<DomainParticipantSupport> _getOrCreate(DDS_DomainParticipant h) {
+        if (!h) return nullptr;
+        static std::mutex _mtx;
+        static std::unordered_map<DDS_DomainParticipant, std::weak_ptr<DomainParticipantSupport>> _cache;
+        std::lock_guard<std::mutex> _lock(_mtx);
+        auto _it = _cache.find(h);
+        if (_it != _cache.end()) {
+            if (auto _sp = _it->second.lock()) return _sp;
+        }
+        auto _sp = std::allocate_shared<DomainParticipantSupport>(
+            std::pmr::polymorphic_allocator<DomainParticipantSupport>(std::pmr::get_default_resource()), h);
+        if (_it != _cache.end()) {
+            _it->second = _sp;
+        } else {
+            _cache.emplace(h, _sp);
+        }
+        return _sp;
+    }
+
+private:
+    // See TopicSupport's matching comment.
+    friend DDS_DomainParticipant zidl_concrete_handle(const DomainParticipantSupport& self) noexcept { return self.dds_.native_handle(); }
+    ::DDS::DomainParticipantImpl dds_;
 };
 
 } // namespace detail

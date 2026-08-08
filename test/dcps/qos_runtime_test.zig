@@ -1207,7 +1207,7 @@ fn qcNilKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
 
 // Per-payload get_field used by the TypeSupport — payload is passed directly
 // by the subscriber machinery when it calls subGetFieldFn.
-fn qcCdrGetField(payload: []const u8, field: []const u8) ?filter_mod.FilterValue {
+fn qcCdrGetField(_: *anyopaque, payload: []const u8, field: []const u8, _: []u8) ?filter_mod.FilterValue {
     if (std.mem.eql(u8, field, "value")) {
         if (payload.len > 4) return .{ .int = payload[4] };
     }

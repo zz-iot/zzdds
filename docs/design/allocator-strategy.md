@@ -114,7 +114,7 @@ interface) must not be heap-boxed. Concretely: `std.mem.Allocator` is just `{ pt
 }`, where `zidl_allocator_adapter_vtable` is a single process-wide `static const` and `ptr`
 points directly at the caller's own `ZidlAllocator` struct. The caller owns that struct's
 storage (documented lifetime contract: must outlive the factory, same discipline already
-used for `zzdds_register_type_support_c`'s callback pointer) — zzdds allocates *nothing* to
+used for `zzdds_register_type_support`'s callback pointer) — zzdds allocates *nothing* to
 represent it. Getting this wrong (e.g. `alloc.create(Adapter)`-ing a copy) would silently
 defeat the entire point for a caller whose own `alloc` function is a static pool with no
 spare capacity for zzdds's own bookkeeping.
