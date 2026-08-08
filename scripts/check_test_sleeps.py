@@ -15,8 +15,12 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 ALLOWLIST = {
-    # Full UDP loopback tests use receive threads and real sockets.
-    "test/dcps/loopback_test.zig": (2, "UDP loopback receive/discovery polling"),
+    # Full UDP loopback tests use receive threads and real sockets. Third
+    # sleep added with the same-participant self-matching regression test
+    # (a real writer+reader on one participant, waiting for real SPDP/SEDP
+    # discovery to complete before writing) -- same category as the other
+    # two, not a new one.
+    "test/dcps/loopback_test.zig": (3, "UDP loopback receive/discovery polling"),
     # MockTransport avoids sockets, but SPDP timer threads still announce on intervals.
     "test/dcps/mock_loopback_test.zig": (14, "SPDP timer-thread discovery polling"),
     # API and WaitSet tests intentionally wake waits from another thread.

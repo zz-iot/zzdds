@@ -84,6 +84,17 @@ pub const ParticipantCbs = struct {
         ctx: *anyopaque,
         type_name: []const u8,
     ) ?filter_mod.CdrFieldGetter,
+
+    /// Register a callback so a later registerTypeSupport() replacement for
+    /// this reader's type can push the new get_field getter in, instead of
+    /// leaving the reader's cached copy (set once at creation time below)
+    /// pointing at a freed TypeSupport ctx.
+    register_get_field_refresh: *const fn (
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        refresh_fn: *const fn (notify_ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void,
+    ) void,
 };
 
 pub const SubscriberImpl = struct {
@@ -297,6 +308,15 @@ pub const SubscriberImpl = struct {
         );
         // Wire up get_field_fn for QueryCondition evaluation (always, when available).
         dr.get_field_fn = self.cbs.get_field_fn(self.cbs.ctx, type_name);
+        // Let a later TypeSupport re-registration for this type refresh
+        // dr.get_field_fn/dr.cft_filter.get_field_fn instead of leaving them
+        // pointing at a freed ctx -- see reader.zig's refreshGetFieldFn.
+        self.cbs.register_get_field_refresh(
+            self.cbs.ctx,
+            sub_handle,
+            dr,
+            reader_mod.DataReaderImpl.refreshGetFieldFn,
+        );
         // Store subscriber's presentation QoS for coherent-set buffering decisions.
         dr.subscriber_presentation = presentation;
         // Wire up ContentFilteredTopic if the topic description is a CFT.

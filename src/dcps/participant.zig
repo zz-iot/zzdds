@@ -234,6 +234,9 @@ const BuiltinSubscriberState = struct {
                     return null;
                 }
             }.f,
+            .register_get_field_refresh = struct {
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {}
+            }.f,
         };
 
         self.sub = try subscriber_mod.SubscriberImpl.init(
@@ -499,6 +502,14 @@ const TimerNotify = struct {
     check: *const fn (ctx: *anyopaque, now_ns: i64) void,
 };
 
+/// Callback registered by DataReaderImpl so that registerTypeSupport()'s
+/// replacement path can push a freshly-registered get_field getter into a
+/// reader that cached the old one -- see reader.zig's refreshGetFieldFn.
+const RefreshGetField = struct {
+    ctx: *anyopaque,
+    refresh: *const fn (ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void,
+};
+
 /// Callback registered by DataWriterImpl so that the participant can assert
 /// liveliness on all relevant writers via vtAssertLiveliness().
 const AssertNotify = struct {
@@ -635,6 +646,7 @@ const ActiveReader = struct {
     timer_check: ?TimerNotify = null,
     key_hash_ctx: *anyopaque = undefined,
     key_hash_fn: ?*const fn (*anyopaque, []const u8) [16]u8 = null,
+    refresh_get_field: ?RefreshGetField = null,
 };
 
 // ── DomainParticipantImpl ────────────────────────────────────────────────────
@@ -1012,7 +1024,15 @@ pub const DomainParticipantImpl = struct {
         // Last step, deliberately: nothing below this can fail, so there is
         // no path where start() returns an error after this thread exists
         // (which would otherwise require error-path cleanup to stop/join it).
-        self.timer_thread = std.Thread.spawn(.{}, timerThreadFn, .{self}) catch null;
+        // A spawn failure itself still isn't propagated as a start() error
+        // (same reasoning), but silently storing null here used to leave no
+        // trace at all -- DEADLINE/LIVELINESS enforcement would just never
+        // fire, with nothing in the logs to explain why. Warn instead, so
+        // the failure is at least observable.
+        self.timer_thread = std.Thread.spawn(.{}, timerThreadFn, .{self}) catch |err| blk: {
+            log_mod.dcps.warn("participant: failed to spawn timer thread ({s}) -- DEADLINE/LIVELINESS QoS will not be enforced for this participant", .{@errorName(err)});
+            break :blk null;
+        };
     }
 
     /// Periodically calls checkTimers() to enforce DEADLINE/LIVELINESS QoS.
@@ -1169,6 +1189,20 @@ pub const DomainParticipantImpl = struct {
                 if (std.mem.eql(u8, ar.type_name, type_name)) {
                     ar.key_hash_ctx = ts.ctx;
                     ar.key_hash_fn = ts.compute_key_hash;
+                    // Also refresh whatever the reader itself cached at
+                    // creation time (get_field_fn, and cft_filter.get_field_fn
+                    // if it was created against a ContentFilteredTopic) --
+                    // otherwise it keeps pointing at the old TypeSupport's
+                    // now-freed ctx until the next reader/filter is created,
+                    // and a CFT/QueryCondition evaluation in between
+                    // dereferences freed memory.
+                    if (ar.refresh_get_field) |rf| {
+                        const new_get_field: ?filter_mod.CdrFieldGetter = if (ts.get_field) |f|
+                            .{ .ctx = ts.ctx, .func = f }
+                        else
+                            null;
+                        rf.refresh(rf.ctx, new_get_field);
+                    }
                 }
             }
         }
@@ -2590,6 +2624,24 @@ pub const DomainParticipantImpl = struct {
         }
     }
 
+    fn subRegisterReaderGetFieldRefresh(
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        refresh_fn: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void,
+    ) void {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        var ar_it9 = self.active_readers.valueIterator();
+        while (ar_it9.next()) |ar| {
+            if (ar.handle == handle) {
+                ar.refresh_get_field = .{ .ctx = notify_ctx, .refresh = refresh_fn };
+                break;
+            }
+        }
+    }
+
     fn makePubCbs(self: *Self) publisher_mod.ParticipantCbs {
         return .{
             .ctx = self,
@@ -2631,24 +2683,44 @@ pub const DomainParticipantImpl = struct {
             .timer_clock = self.timer_clock,
             .register_timer_notify = subRegisterReaderTimerNotify,
             .get_field_fn = subGetFieldFn,
+            .register_get_field_refresh = subRegisterReaderGetFieldRefresh,
         };
     }
 
     /// Check all active writer and reader deadline/liveliness timers and fire
     /// notifications for any that have expired.  Call from a timer thread or
     /// directly from tests (with a ManualClock) for deterministic control.
+    ///
+    /// Collects the callbacks to fire while `self.mu` is held (cheap: just
+    /// copying `TimerNotify` pairs out of the map), then releases the lock
+    /// *before* actually calling any of them. `cb.check` (DataWriterImpl/
+    /// DataReaderImpl's `checkTimersFn`) may notify a user-supplied listener,
+    /// and DDS listeners are allowed to call back into the participant --
+    /// e.g. `delete_datawriter`/`delete_participant` from inside
+    /// `on_offered_deadline_missed` is spec-legal application behavior, and
+    /// that call needs `self.mu` too. Firing while still holding it would
+    /// deadlock. Safe to fire after unlocking despite the entity possibly
+    /// having been deleted in the meantime: `checkTimersFn` and the
+    /// `notifyDeadlineMissed`/`notifyLivelinessLost` calls it may make all
+    /// start with `self.quiesce.acquire()`, the same entity-teardown guard
+    /// already relied on elsewhere in this file for out-of-lock callbacks.
     pub fn checkTimers(self: *Self) void {
         const now_ns = self.timer_clock.nowNs();
-        self.mu.lock();
-        defer self.mu.unlock();
-        var aw_it8 = self.active_writers.valueIterator();
-        while (aw_it8.next()) |aw| {
-            if (aw.timer_check) |cb| cb.check(cb.ctx, now_ns);
+        var due: std.ArrayListUnmanaged(TimerNotify) = .empty;
+        defer due.deinit(self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            var aw_it8 = self.active_writers.valueIterator();
+            while (aw_it8.next()) |aw| {
+                if (aw.timer_check) |cb| due.append(self.alloc, cb) catch continue;
+            }
+            var ar_it7 = self.active_readers.valueIterator();
+            while (ar_it7.next()) |ar| {
+                if (ar.timer_check) |cb| due.append(self.alloc, cb) catch continue;
+            }
         }
-        var ar_it7 = self.active_readers.valueIterator();
-        while (ar_it7.next()) |ar| {
-            if (ar.timer_check) |cb| cb.check(cb.ctx, now_ns);
-        }
+        for (due.items) |cb| cb.check(cb.ctx, now_ns);
     }
 
     // ── Entity vtable ─────────────────────────────────────────────────────────

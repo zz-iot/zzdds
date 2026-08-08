@@ -1701,7 +1701,8 @@ pub const DataReaderImpl = struct {
     }
 
     /// Fire on_requested_deadline_missed if the listener is registered for it.
-    /// May be called while participant.mu is held; must not re-enter participant.
+    /// Only called from checkTimersFn, with participant.mu NOT held -- see
+    /// that function's doc comment.
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
@@ -1723,7 +1724,12 @@ pub const DataReaderImpl = struct {
 
     /// Called by participant.checkTimers() for each active reader.
     /// Checks DEADLINE and LIVELINESS lease expiry; fires notifications when thresholds exceeded.
-    /// Called while participant.mu is held; must not re-enter participant.
+    /// Called with participant.mu NOT held (checkTimers() collects the due
+    /// callbacks under the lock, then releases it before calling any of
+    /// them) -- safe for this (and notifyDeadlineMissed/notifyLivelinessChanged
+    /// below, which this may call) to re-enter the participant, e.g. if a
+    /// user listener reacts to a deadline-missed notification by deleting
+    /// the reader/participant.
     pub fn checkTimersFn(ctx: *anyopaque, now_ns: i64) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
@@ -1760,6 +1766,30 @@ pub const DataReaderImpl = struct {
         }
         self.mu.unlock();
         if (liveliness_changed) self.notifyLivelinessChanged();
+    }
+
+    /// Registered with the participant (see participant.zig's
+    /// subRegisterReaderGetFieldRefresh / ActiveReader.refresh_get_field) so
+    /// that re-registering TypeSupport for this reader's type can push the
+    /// new get_field getter in -- without this, get_field_fn (and
+    /// cft_filter.get_field_fn, if this reader was created against a
+    /// ContentFilteredTopic) would keep pointing at the old TypeSupport's
+    /// ctx after registerTypeSupport() frees it, and the next CFT/
+    /// QueryCondition evaluation would dereference freed memory.
+    pub fn refreshGetFieldFn(ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.get_field_fn = new_get_field;
+        if (self.cft_filter) |*cft| {
+            if (new_get_field) |gf| {
+                cft.get_field_fn = gf;
+            } else {
+                // TypeSupport no longer offers get_field -- there's no
+                // CftFilterState shape for "no getter" (get_field_fn is
+                // non-optional there), so drop CFT filtering entirely
+                // rather than leave a stale function pointer in place.
+                self.cft_filter = null;
+            }
+        }
     }
 
     // ── Entity vtable ─────────────────────────────────────────────────────────

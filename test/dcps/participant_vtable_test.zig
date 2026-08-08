@@ -142,6 +142,72 @@ test "registerTypeSupport: double-registration calls deinit on the old entry" {
     try testing.expect(deinit_called);
 }
 
+test "registerTypeSupport: replacement refreshes an active reader's cached get_field getter (not just key_hash)" {
+    // Regression test: a DataReader caches the get_field getter (and, if
+    // created against a ContentFilteredTopic, its cft_filter's copy too)
+    // once at creation time. Re-registering TypeSupport for the same type
+    // used to free the old ctx and refresh only ActiveReader's key_hash
+    // fields -- the reader's own cached getters kept pointing at the freed
+    // ctx until a new reader/filter happened to be created, and a CFT/
+    // QueryCondition evaluation in between would dereference freed memory.
+    var fx = try Fixture.init(4);
+    defer fx.deinit();
+
+    // Not zero-sized: Zig doesn't guarantee distinct addresses for
+    // zero-sized types (`struct {}`), which would make the pointer-identity
+    // assertions below vacuously true regardless of whether the refresh
+    // actually happened -- found live, while verifying this test actually
+    // catches the bug it's meant to catch.
+    const CtxA = struct { tag: u8 = 0xAA };
+    const CtxB = struct { tag: u8 = 0xBB };
+    var ctx_a = CtxA{};
+    var ctx_b = CtxB{};
+
+    const getFieldA = struct {
+        fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) ?zzdds.dcps.filter.FilterValue {
+            return .{ .int = 1 };
+        }
+    }.f;
+    const getFieldB = struct {
+        fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) ?zzdds.dcps.filter.FilterValue {
+            return .{ .int = 2 };
+        }
+    }.f;
+
+    _ = fx.impl().registerTypeSupport("CftType", .{
+        .ctx = &ctx_a,
+        .compute_key_hash = zeroed_key_hash,
+        .get_field = getFieldA,
+    });
+
+    const topic = fx.dp.create_topic("CftTopic", "CftType", .{}, null, 0);
+    const cft = fx.dp.create_contentfilteredtopic("CftAlias", topic, "x = 1", &DDS.StringSeq{});
+    const sub = fx.dp.create_subscriber(.{}, null, 0);
+    const cft_impl: *zzdds.dcps.ContentFilteredTopicImpl = @ptrCast(@alignCast(cft.ptr));
+    const dr = sub.create_datareader(cft_impl.toTopicDescription(), .{}, null, 0);
+    const dr_impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    try testing.expect(dr_impl.get_field_fn != null);
+    try testing.expectEqual(@as(*anyopaque, &ctx_a), dr_impl.get_field_fn.?.ctx);
+    try testing.expect(dr_impl.cft_filter != null);
+    try testing.expectEqual(@as(*anyopaque, &ctx_a), dr_impl.cft_filter.?.get_field_fn.ctx);
+
+    // Re-register the same type with a different ctx/getter -- simulates
+    // e.g. a Java caller replacing its TypeSupport registration.
+    _ = fx.impl().registerTypeSupport("CftType", .{
+        .ctx = &ctx_b,
+        .compute_key_hash = zeroed_key_hash,
+        .get_field = getFieldB,
+    });
+
+    // Both of the reader's cached copies must now point at the new ctx --
+    // not the freed old one.
+    try testing.expect(dr_impl.get_field_fn != null);
+    try testing.expectEqual(@as(*anyopaque, &ctx_b), dr_impl.get_field_fn.?.ctx);
+    try testing.expect(dr_impl.cft_filter != null);
+    try testing.expectEqual(@as(*anyopaque, &ctx_b), dr_impl.cft_filter.?.get_field_fn.ctx);
+}
+
 test "registerTypeSupport: deinit on participant teardown calls entry deinit" {
     // TypeSupport.deinit is also called at participant deinit (line 840).
     var net = try MockNetwork.init(testing.allocator);

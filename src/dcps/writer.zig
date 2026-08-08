@@ -387,7 +387,8 @@ pub const DataWriterImpl = struct {
     }
 
     /// Fire on_offered_deadline_missed if the listener is registered for it.
-    /// May be called while participant.mu is held; must not re-enter participant.
+    /// Only called from checkTimersFn, with participant.mu NOT held -- see
+    /// that function's doc comment.
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
@@ -408,7 +409,8 @@ pub const DataWriterImpl = struct {
     }
 
     /// Fire on_liveliness_lost if the listener is registered for it.
-    /// May be called while participant.mu is held; must not re-enter participant.
+    /// Only called from checkTimersFn, with participant.mu NOT held -- see
+    /// that function's doc comment.
     pub fn notifyLivelinessLost(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
@@ -475,7 +477,12 @@ pub const DataWriterImpl = struct {
 
     /// Called by participant.checkTimers() for each active writer.
     /// Checks DEADLINE and LIVELINESS; fires notifications when thresholds are exceeded.
-    /// Called while participant.mu is held; must not re-enter participant.
+    /// Called with participant.mu NOT held (checkTimers() collects the due
+    /// callbacks under the lock, then releases it before calling any of
+    /// them) -- safe for this (and notifyDeadlineMissed/notifyLivelinessLost
+    /// below, which this may call) to re-enter the participant, e.g. if a
+    /// user listener reacts to a deadline-missed notification by deleting
+    /// the writer/participant.
     pub fn checkTimersFn(ctx: *anyopaque, now_ns: i64) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;

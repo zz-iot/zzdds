@@ -77,6 +77,7 @@ const Harness = struct {
             .timer_clock = clock.clock(),
             .register_timer_notify = registerTimerNotify,
             .get_field_fn = getFieldFn,
+            .register_get_field_refresh = registerGetFieldRefresh,
         };
         const sub = try SubscriberImpl.init(
             alloc,
@@ -153,6 +154,7 @@ const Harness = struct {
     fn getFieldFn(_: *anyopaque, _: []const u8) ?filter_mod.CdrFieldGetter {
         return null; // unchanged: no field lookups exercised by these tests
     }
+    fn registerGetFieldRefresh(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {}
 };
 
 fn modelBeginAccess(
