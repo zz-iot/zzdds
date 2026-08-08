@@ -783,7 +783,17 @@ pub const DomainParticipantImpl = struct {
     /// objects -- see docs/roadmap.md's "Background thread usage" entry for
     /// why that matters here specifically).
     timer_thread: ?std.Thread = null,
+    /// Set by timerThreadFn as its first action, read by deinit() to detect
+    /// a self-join (see deinit()'s doc comment). 0 = not yet set; real
+    /// std.Thread.Id values are never 0 in practice on any supported
+    /// platform, so it doubles as the "unset" sentinel.
+    timer_thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
     timer_stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by deinit() instead of freeing `self` immediately, when deinit()
+    /// is reached reentrantly from the timer thread itself (see deinit()'s
+    /// doc comment). Only ever written and read from that same thread, so
+    /// a plain bool is fine -- no cross-thread visibility is needed for it.
+    pending_self_destroy: bool = false,
 
     participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
@@ -1054,6 +1064,15 @@ pub const DomainParticipantImpl = struct {
     /// Stopped by setting timer_stopping before calling timer_thread.join()
     /// (see deinit()) -- same shape as writer_sm.zig's heartbeatThread.
     fn timerThreadFn(self: *Self) void {
+        // Captured before the loop, and used only after the loop below has
+        // genuinely exited -- see the pending_self_destroy branch at the
+        // end of this function and deinit()'s matching comment. Reading
+        // self.alloc directly at that point would also be safe (self isn't
+        // freed until this exact line runs), but capturing it up front
+        // keeps that safety argument local to this function instead of
+        // depending on deinit() never having touched the field.
+        const alloc = self.alloc;
+        self.timer_thread_id.store(std.Thread.getCurrentId(), .release);
         while (!self.timer_stopping.load(.acquire)) {
             var slept_ms: u64 = 0;
             while (slept_ms < TIMER_CHECK_INTERVAL_MS and !self.timer_stopping.load(.acquire)) {
@@ -1063,6 +1082,12 @@ pub const DomainParticipantImpl = struct {
             if (self.timer_stopping.load(.acquire)) break;
             self.checkTimers();
         }
+        // A reentrant deinit() (see its doc comment) deferred the actual
+        // free to here, since it couldn't safely free `self` out from
+        // under this still-running function. The loop above has now
+        // genuinely exited (timer_stopping is true either way), so it's
+        // safe to do now -- nothing below touches `self` again.
+        if (self.pending_self_destroy) alloc.destroy(self);
     }
 
     pub fn deinit(self: *Self) void {
@@ -1072,8 +1097,27 @@ pub const DomainParticipantImpl = struct {
         // it. See timer_thread's field doc comment for why this has to be
         // the very first thing deinit() does.
         self.timer_stopping.store(true, .release);
+        // deinit() can be reached from the timer thread itself:
+        // checkTimers() -> a DEADLINE/LIVELINESS notification -> a user
+        // listener that (spec-legally) reentrantly deletes every child
+        // entity and then the participant itself, synchronously, from
+        // inside the callback. Detected once, used below both to avoid
+        // joining the calling thread from itself (deadlock) and to avoid
+        // freeing `self` while checkTimers()/timerThreadFn are still
+        // executing further up this very call stack (see the
+        // pending_self_destroy branch at the end of this function).
+        const self_reentrant = std.Thread.getCurrentId() == self.timer_thread_id.load(.acquire);
         if (self.timer_thread) |t| {
-            t.join();
+            if (self_reentrant) {
+                // A thread joining itself deadlocks, so detach instead --
+                // timer_stopping is already set above, so once this call
+                // unwinds back up to timerThreadFn's loop condition it
+                // exits on its own, and a detached thread's resources are
+                // reclaimed by the OS without a join.
+                t.detach();
+            } else {
+                t.join();
+            }
             self.timer_thread = null;
         }
         self.listener_box.releaseRef(self.alloc);
@@ -1167,7 +1211,20 @@ pub const DomainParticipantImpl = struct {
         // their own deinit.
         if (self.owned_tcp_transport) |t| t.deinit();
 
-        self.alloc.destroy(self);
+        // Every step above only touches self's own fields and owned
+        // sub-resources, so it's safe to run reentrantly regardless of
+        // which thread called deinit(). Freeing `self` itself is the one
+        // exception: checkTimers() and timerThreadFn are still executing
+        // further up this exact call stack when self_reentrant is true,
+        // and still need `self` (e.g. to read timer_stopping, already true
+        // above) to unwind safely. Defer the actual free to timerThreadFn,
+        // which performs it as the very last thing it does once its own
+        // loop has genuinely exited -- see timerThreadFn.
+        if (self_reentrant) {
+            self.pending_self_destroy = true;
+        } else {
+            self.alloc.destroy(self);
+        }
     }
 
     pub fn toDDSParticipant(self: *Self) DDS.DomainParticipant {
@@ -1194,11 +1251,16 @@ pub const DomainParticipantImpl = struct {
             return false;
         };
         if (gop.found_existing) {
-            // Replacing: deinit old value, swap in new owned key (free the old one).
-            if (gop.value_ptr.deinit) |f| f(gop.value_ptr.ctx);
-            self.alloc.free(gop.key_ptr.*);
-            gop.key_ptr.* = owned_key;
-            // Propagate new ctx/fn to active readers that cached the old (now freed) pointers.
+            // Replacing: propagate new ctx/fn to active readers that cached
+            // the old pointers BEFORE freeing the old TypeSupport's ctx
+            // below -- this must run first. refresh_get_field's swap is
+            // synchronized by the reader's own mu, not participant.mu, so a
+            // concurrent QueryCondition/CFT evaluation (which only takes
+            // reader.mu, never participant.mu) can run at any point during
+            // this whole function; freeing the old ctx before every reader
+            // has been refreshed would leave that evaluation free to read
+            // the still-old cached getter and invoke it with already-freed
+            // ctx.
             var ar_it = self.active_readers.valueIterator();
             while (ar_it.next()) |ar| {
                 if (std.mem.eql(u8, ar.type_name, type_name)) {
@@ -1208,9 +1270,9 @@ pub const DomainParticipantImpl = struct {
                     // creation time (get_field_fn, and cft_filter.get_field_fn
                     // if it was created against a ContentFilteredTopic) --
                     // otherwise it keeps pointing at the old TypeSupport's
-                    // now-freed ctx until the next reader/filter is created,
-                    // and a CFT/QueryCondition evaluation in between
-                    // dereferences freed memory.
+                    // ctx until the next reader/filter is created, and a
+                    // CFT/QueryCondition evaluation in between dereferences
+                    // freed memory once the deinit below runs.
                     if (ar.refresh_get_field) |rf| {
                         const new_get_field: ?filter_mod.CdrFieldGetter = if (ts.get_field) |f|
                             .{ .ctx = ts.ctx, .func = f }
@@ -1220,6 +1282,14 @@ pub const DomainParticipantImpl = struct {
                     }
                 }
             }
+            // Now safe: every active reader for this type has been
+            // refreshed off the old ctx (refresh_get_field's internal
+            // reader.mu lock/unlock happened-before this point, so any
+            // subsequent reader.mu-protected read observes the new getter,
+            // never the old one), so it can be freed and swapped in.
+            if (gop.value_ptr.deinit) |f| f(gop.value_ptr.ctx);
+            self.alloc.free(gop.key_ptr.*);
+            gop.key_ptr.* = owned_key;
         }
         gop.value_ptr.* = ts;
         return true;

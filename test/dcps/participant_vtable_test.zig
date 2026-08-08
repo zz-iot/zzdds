@@ -17,6 +17,7 @@ const config_mod = zzdds.config;
 const noop_security = zzdds.noop_security.noop_security_plugins;
 const mock_tr = zzdds.mock_transport;
 const iface = zzdds.discovery;
+const time_mod = zzdds.util.time;
 
 const MockNetwork = mock_tr.MockNetwork;
 const MockTransport = mock_tr.MockTransport;
@@ -700,4 +701,97 @@ test "createParticipantWithConfig: config.qos seeds Publisher's default_datawrit
     try testing.expectEqual(DDS.DurabilityQosPolicyKind.PERSISTENT_DURABILITY_QOS, dr_qos.durability.kind);
     try testing.expectEqual(DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS, dr_qos.history.kind);
     try testing.expectEqual(@as(i32, 4), dr_qos.history.depth);
+}
+
+// ── deinit() reentrancy from the timer thread ───────────────────────────────
+
+const SelfDeleteCtx = struct {
+    fired: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    caller_thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
+    factory: DDS.DomainParticipantFactory,
+    dp: DDS.DomainParticipant,
+    pub_: DDS.Publisher,
+    dw: DDS.DataWriter,
+    topic: DDS.Topic,
+};
+
+fn selfDeleteOnDeadlineMissed(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+    const ctx: *SelfDeleteCtx = @ptrCast(@alignCast(ld));
+    if (ctx.fired.swap(true, .acq_rel)) return; // one shot: everything below is gone after the first firing
+    ctx.caller_thread_id.store(std.Thread.getCurrentId(), .release);
+    // Spec-legal, if unusual: reentrantly tear down the entire entity graph
+    // -- including the participant itself -- from inside a DEADLINE listener
+    // callback fired by the participant's own timer thread.
+    _ = ctx.pub_.delete_datawriter(ctx.dw);
+    _ = ctx.dp.delete_publisher(ctx.pub_);
+    _ = ctx.dp.delete_topic(ctx.topic);
+    _ = ctx.factory.delete_participant(ctx.dp);
+    ctx.done.store(true, .release);
+}
+
+test "deinit: reentrant delete_participant from a timer-driven listener does not self-deadlock or use-after-free" {
+    // checkTimers() runs on the participant's own background timer thread
+    // and may fire a DEADLINE-missed listener. DDS listeners are spec-legal
+    // to reentrantly delete every entity -- including the participant
+    // itself -- from inside that callback, which makes delete_participant()
+    // -> deinit() run FROM the timer thread deinit() is trying to stop:
+    // joining that thread from itself would deadlock, and freeing the
+    // participant struct while checkTimers()/timerThreadFn are still
+    // executing further up that same call stack would be a use-after-free
+    // (see deinit()'s and timerThreadFn's doc comments). This needs a real
+    // background thread and real wall-clock time -- ManualClock only ever
+    // advances from the calling test thread, so it can never reach this
+    // scenario -- audited in check_test_sleeps.py's allowlist alongside
+    // this codebase's other real-thread tests.
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+    const loc = Locator.udp4(.{ 127, 0, 0, 0x94 }, 7994);
+    const t = try MockTransport.init(testing.allocator, net, &.{loc});
+    defer t.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(
+        testing.allocator,
+        t.transport(),
+        noopDisc(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer factory.deinit();
+    const dpf = factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, null, 0);
+    try testing.expect(dp.ptr != nil.NIL_PTR);
+
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("SelfDeleteTopic", "SelfDeleteType", .{}, null, 0);
+
+    var ctx = SelfDeleteCtx{
+        .factory = dpf,
+        .dp = dp,
+        .pub_ = pub_,
+        .dw = undefined,
+        .topic = topic,
+    };
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.deadline.period = .{ .sec = 0, .nanosec = 50_000_000 }; // 50 ms: well under TIMER_CHECK_INTERVAL_MS's 100ms poll granularity's headroom for a prompt first firing
+    const dw = pub_.create_datawriter(topic, dw_qos, DDS.DataWriterListener{
+        .listener_data = &ctx,
+        .on_offered_deadline_missed = selfDeleteOnDeadlineMissed,
+    }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
+    ctx.dw = dw;
+
+    const test_thread_id = std.Thread.getCurrentId();
+    const deadline_ns = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (!ctx.done.load(.acquire)) {
+        if (time_mod.nanoTimestamp() >= deadline_ns) {
+            try testing.expect(false); // timed out: the fix regressed (self-join deadlock)
+            return;
+        }
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+
+    // Confirms this genuinely exercised the timer-thread path, not just a
+    // same-thread synchronous call (which wouldn't hit self-join/self-free
+    // at all).
+    try testing.expect(ctx.caller_thread_id.load(.acquire) != test_thread_id);
 }

@@ -28,6 +28,11 @@ ALLOWLIST = {
     "test/dcps/waitset_test.zig": (1, "threaded WaitSet wakeup"),
     # TCP transport tests exercise real listener/connection threads.
     "test/transport/tcp_transport_test.zig": (1, "TCP listener thread startup"),
+    # Regression test for deinit() reentrancy from the participant's own
+    # background timer thread: needs the real timer thread to notice a real
+    # DEADLINE expiry (ManualClock only ever advances from the calling test
+    # thread, so it can't reach this path), polled with a bounded timeout.
+    "test/dcps/participant_vtable_test.zig": (1, "timer-thread self-delete polling"),
 }
 
 PATTERNS = (
