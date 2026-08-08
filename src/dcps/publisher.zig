@@ -74,11 +74,16 @@ pub const ParticipantCbs = struct {
 
     /// Register a timer-check callback (DEADLINE + LIVELINESS) for a writer.
     /// Called once per DataWriter after create_proto_writer succeeds.
+    /// quiesce_acquire/quiesce_release let checkTimers() hold the writer's
+    /// EntityQuiesce reference across its own unlock-then-dispatch window --
+    /// see DataWriterImpl.quiesceAcquireFn's doc comment.
     register_timer_notify: *const fn (
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (notify_ctx: *anyopaque, now_ns: i64) void,
+        quiesce_acquire: *const fn (notify_ctx: *anyopaque) bool,
+        quiesce_release: *const fn (notify_ctx: *anyopaque) void,
     ) void,
 
     /// Register a liveliness-assert callback for a writer.
@@ -317,6 +322,8 @@ pub const PublisherImpl = struct {
             pub_handle,
             dw,
             writer_mod.DataWriterImpl.checkTimersFn,
+            writer_mod.DataWriterImpl.quiesceAcquireFn,
+            writer_mod.DataWriterImpl.quiesceReleaseFn,
         );
         self.cbs.register_liveliness_assert(
             self.cbs.ctx,

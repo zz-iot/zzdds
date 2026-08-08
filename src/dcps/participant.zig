@@ -227,7 +227,7 @@ const BuiltinSubscriberState = struct {
             }.f,
             .timer_clock = participant.timer_clock,
             .register_timer_notify = struct {
-                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void) void {}
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void, _: *const fn (*anyopaque) bool, _: *const fn (*anyopaque) void) void {}
             }.f,
             .get_field_fn = struct {
                 fn f(_: *anyopaque, _: []const u8) ?filter_mod.CdrFieldGetter {
@@ -497,9 +497,23 @@ const MatchedNotify = struct {
 
 /// Callback registered by DataWriterImpl / DataReaderImpl so that the participant
 /// can invoke periodic timer checks (DEADLINE, LIVELINESS) via checkTimers().
+///
+/// quiesce_acquire/quiesce_release let checkTimers() hold the entity's
+/// EntityQuiesce reference across its own unlock-then-dispatch window, not
+/// just the acquire/release `check` itself takes internally. Without this,
+/// `ctx` -- a raw pointer copied out of the participant's map while `mu` is
+/// held -- has no protection against becoming dangling in the window
+/// between releasing `mu` and `check` actually running: EntityQuiesce can't
+/// protect a pointer that was already invalid before acquire() was called
+/// on it (see entity_quiesce.zig's module doc comment). Calling
+/// quiesce_acquire while `mu` is still held (so the entity is provably
+/// still live at that point) and holding the reference until after `check`
+/// returns closes that gap.
 const TimerNotify = struct {
     ctx: *anyopaque,
     check: *const fn (ctx: *anyopaque, now_ns: i64) void,
+    quiesce_acquire: *const fn (ctx: *anyopaque) bool,
+    quiesce_release: *const fn (ctx: *anyopaque) void,
 };
 
 /// Callback registered by DataReaderImpl so that registerTypeSupport()'s
@@ -2576,6 +2590,8 @@ pub const DomainParticipantImpl = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (*anyopaque, i64) void,
+        quiesce_acquire: *const fn (*anyopaque) bool,
+        quiesce_release: *const fn (*anyopaque) void,
     ) void {
         const self = cast(ctx);
         self.mu.lock();
@@ -2583,7 +2599,7 @@ pub const DomainParticipantImpl = struct {
         var aw_it6 = self.active_writers.valueIterator();
         while (aw_it6.next()) |aw| {
             if (aw.handle == handle) {
-                aw.timer_check = .{ .ctx = notify_ctx, .check = notify_fn };
+                aw.timer_check = .{ .ctx = notify_ctx, .check = notify_fn, .quiesce_acquire = quiesce_acquire, .quiesce_release = quiesce_release };
                 break;
             }
         }
@@ -2612,6 +2628,8 @@ pub const DomainParticipantImpl = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (*anyopaque, i64) void,
+        quiesce_acquire: *const fn (*anyopaque) bool,
+        quiesce_release: *const fn (*anyopaque) void,
     ) void {
         const self = cast(ctx);
         self.mu.lock();
@@ -2619,7 +2637,7 @@ pub const DomainParticipantImpl = struct {
         var ar_it6 = self.active_readers.valueIterator();
         while (ar_it6.next()) |ar| {
             if (ar.handle == handle) {
-                ar.timer_check = .{ .ctx = notify_ctx, .check = notify_fn };
+                ar.timer_check = .{ .ctx = notify_ctx, .check = notify_fn, .quiesce_acquire = quiesce_acquire, .quiesce_release = quiesce_release };
                 break;
             }
         }
@@ -2700,11 +2718,18 @@ pub const DomainParticipantImpl = struct {
     /// e.g. `delete_datawriter`/`delete_participant` from inside
     /// `on_offered_deadline_missed` is spec-legal application behavior, and
     /// that call needs `self.mu` too. Firing while still holding it would
-    /// deadlock. Safe to fire after unlocking despite the entity possibly
-    /// having been deleted in the meantime: `checkTimersFn` and the
-    /// `notifyDeadlineMissed`/`notifyLivelinessLost` calls it may make all
-    /// start with `self.quiesce.acquire()`, the same entity-teardown guard
-    /// already relied on elsewhere in this file for out-of-lock callbacks.
+    /// deadlock.
+    ///
+    /// A copied `cb.ctx` is NOT, on its own, safe to dereference later --
+    /// `checkTimersFn`'s own internal `self.quiesce.acquire()` can't protect
+    /// a pointer that's already dangling before it's even called (see
+    /// entity_quiesce.zig's module doc comment; this file previously
+    /// (wrongly) assumed it could). So `cb.quiesce_acquire(cb.ctx)` is
+    /// called here, still under `self.mu`, at a point where the entity is
+    /// provably still live (it's still in the map, so teardown hasn't
+    /// removed it yet) -- and the reference is held until after `cb.check`
+    /// returns, guaranteeing the entity can't be freed out from under the
+    /// call. If acquire fails, teardown is already underway; skip it.
     pub fn checkTimers(self: *Self) void {
         const now_ns = self.timer_clock.nowNs();
         var due: std.ArrayListUnmanaged(TimerNotify) = .empty;
@@ -2714,14 +2739,25 @@ pub const DomainParticipantImpl = struct {
             defer self.mu.unlock();
             var aw_it8 = self.active_writers.valueIterator();
             while (aw_it8.next()) |aw| {
-                if (aw.timer_check) |cb| due.append(self.alloc, cb) catch continue;
+                if (aw.timer_check) |cb| {
+                    if (cb.quiesce_acquire(cb.ctx)) {
+                        due.append(self.alloc, cb) catch cb.quiesce_release(cb.ctx);
+                    }
+                }
             }
             var ar_it7 = self.active_readers.valueIterator();
             while (ar_it7.next()) |ar| {
-                if (ar.timer_check) |cb| due.append(self.alloc, cb) catch continue;
+                if (ar.timer_check) |cb| {
+                    if (cb.quiesce_acquire(cb.ctx)) {
+                        due.append(self.alloc, cb) catch cb.quiesce_release(cb.ctx);
+                    }
+                }
             }
         }
-        for (due.items) |cb| cb.check(cb.ctx, now_ns);
+        for (due.items) |cb| {
+            cb.check(cb.ctx, now_ns);
+            cb.quiesce_release(cb.ctx);
+        }
     }
 
     // ── Entity vtable ─────────────────────────────────────────────────────────

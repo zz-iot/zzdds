@@ -1722,6 +1722,26 @@ pub const DataReaderImpl = struct {
         }
     }
 
+    /// Registered alongside checkTimersFn so that participant.checkTimers()
+    /// can hold a quiesce reference across its own unlock-then-dispatch
+    /// window, not just the one checkTimersFn takes internally below. A raw
+    /// `ctx` pointer copied out of the participant's map while `mu` is held
+    /// isn't itself protected from becoming dangling before checkTimersFn
+    /// ever runs -- EntityQuiesce can't protect a pointer that's already
+    /// invalid before acquire() is called on it (see entity_quiesce.zig's
+    /// module doc comment). Calling this (while `mu` is still held, so the
+    /// entity is provably still live) and holding it until after `check`
+    /// returns closes that gap.
+    pub fn quiesceAcquireFn(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+
+    pub fn quiesceReleaseFn(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
+    }
+
     /// Called by participant.checkTimers() for each active reader.
     /// Checks DEADLINE and LIVELINESS lease expiry; fires notifications when thresholds exceeded.
     /// Called with participant.mu NOT held (checkTimers() collects the due
@@ -1778,6 +1798,12 @@ pub const DataReaderImpl = struct {
     /// QueryCondition evaluation would dereference freed memory.
     pub fn refreshGetFieldFn(ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // get_field_fn and cft_filter are read under self.mu everywhere else
+        // (on_receive's CFT check, readFiltered/takeFiltered's QueryCondition
+        // evaluation) -- take it here too, or a concurrent evaluation can
+        // observe a torn/inconsistent write to either field.
+        self.mu.lock();
+        defer self.mu.unlock();
         self.get_field_fn = new_get_field;
         if (self.cft_filter) |*cft| {
             if (new_get_field) |gf| {

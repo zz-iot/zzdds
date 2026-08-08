@@ -71,11 +71,16 @@ pub const ParticipantCbs = struct {
 
     /// Register a timer-check callback (DEADLINE) for a reader.
     /// Called once per DataReader after create_proto_reader succeeds.
+    /// quiesce_acquire/quiesce_release let checkTimers() hold the reader's
+    /// EntityQuiesce reference across its own unlock-then-dispatch window --
+    /// see DataReaderImpl.quiesceAcquireFn's doc comment.
     register_timer_notify: *const fn (
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (notify_ctx: *anyopaque, now_ns: i64) void,
+        quiesce_acquire: *const fn (notify_ctx: *anyopaque) bool,
+        quiesce_release: *const fn (notify_ctx: *anyopaque) void,
     ) void,
 
     /// Look up the optional get_field function for a given type name.
@@ -305,6 +310,8 @@ pub const SubscriberImpl = struct {
             sub_handle,
             dr,
             reader_mod.DataReaderImpl.checkTimersFn,
+            reader_mod.DataReaderImpl.quiesceAcquireFn,
+            reader_mod.DataReaderImpl.quiesceReleaseFn,
         );
         // Wire up get_field_fn for QueryCondition evaluation (always, when available).
         dr.get_field_fn = self.cbs.get_field_fn(self.cbs.ctx, type_name);

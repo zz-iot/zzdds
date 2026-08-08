@@ -475,6 +475,26 @@ pub const DataWriterImpl = struct {
         return self.listener_ex_box.acquireLocked();
     }
 
+    /// Registered alongside checkTimersFn so that participant.checkTimers()
+    /// can hold a quiesce reference across its own unlock-then-dispatch
+    /// window, not just the one checkTimersFn takes internally below. A raw
+    /// `ctx` pointer copied out of the participant's map while `mu` is held
+    /// isn't itself protected from becoming dangling before checkTimersFn
+    /// ever runs -- EntityQuiesce can't protect a pointer that's already
+    /// invalid before acquire() is called on it (see entity_quiesce.zig's
+    /// module doc comment). Calling this (while `mu` is still held, so the
+    /// entity is provably still live) and holding it until after `check`
+    /// returns closes that gap.
+    pub fn quiesceAcquireFn(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+
+    pub fn quiesceReleaseFn(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
+    }
+
     /// Called by participant.checkTimers() for each active writer.
     /// Checks DEADLINE and LIVELINESS; fires notifications when thresholds are exceeded.
     /// Called with participant.mu NOT held (checkTimers() collects the due
