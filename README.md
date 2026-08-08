@@ -24,11 +24,22 @@ java/
   shape/              Java port of zig/shape
   listener-pubsub/    pub/sub over real UDP discovery, exercising the JNI listener path
 interop/
-  cross-binding-smoke-test.sh          C and C++ custom-allocator interop
-  shape-cross-binding-smoke-test.sh    all 12 ordered pairs of the 4 shape ports
+  cross_binding_smoke_test.py              C and C++ custom-allocator interop
+  shape_cross_binding_smoke_test.py        all 12 ordered pairs of the 4 shape ports, plus --cft
+  hello_world_cross_binding_smoke_test.py  all 12 ordered pairs of the 4 hello_world ports
 
-run-all.sh   builds+runs everything above at once, skipping what your zzdds build doesn't support
+_common.py   shared Python helpers (env/path resolution, bounded process lifecycle) used by every .py script above
+run_all.py   builds+runs everything above at once, skipping what your zzdds build doesn't support
 ```
+
+Every `.py` script in this repo (`java/*/{build,run}.py`, `java/{build_all,run_all}.py`,
+`cpp/opencv_zzdds/smoke_test.py`, `interop/*.py`, `run_all.py` itself) needs
+Python 3.10+ and imports the shared `_common.py` module — deliberately
+Python rather than shell, since managing a long-running pub/sub process's
+lifecycle correctly (bounded waits, escalating to a forceful kill if a
+graceful shutdown signal doesn't land — a JVM in particular isn't
+guaranteed to react to `SIGINT` the way a native binary does) is much
+easier to get right in Python than bash.
 
 `docs/design/` has a short "what this demonstrates" reference for
 `hello_world` and `shape` shared across all four language ports — see
@@ -41,7 +52,7 @@ you want to test. If you just want a known-good baseline rather than testing
 your own local zzdds, `ZZDDS_VERSION` names the zzdds commit these examples
 are last confirmed to fully pass against.
 
-Build zzdds first with whatever bindings you need — `run-all.sh` (below)
+Build zzdds first with whatever bindings you need — `run_all.py` (below)
 detects which of these you actually built and skips accordingly, so it's
 fine to only build what you're testing:
 
@@ -68,7 +79,7 @@ wired up (Java uses an MVP copy-trick rather than a direct call -- see
 ## Running everything at once
 
 ```sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run-all.sh
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.py
 ```
 
 Builds and runs every example and smoke test below in one pass. Whatever
@@ -85,16 +96,16 @@ failure, in both modes — `--strict` only changes how a *missing
 prerequisite* is treated.
 
 ```sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run-all.sh --strict
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.py --strict
 ```
 
 ## Building everything for one language
 
-`run-all.sh` covers all of this at once; the commands below are the same
+`run_all.py` covers all of this at once; the commands below are the same
 work broken out per language, for when you only want one of them:
 
 Each example is a self-contained build unit (own `CMakeLists.txt` in
-c/cpp, own `build.sh`/`run.sh` in java), but each language directory also has
+c/cpp, own `build.py`/`run.py` in java), but each language directory also has
 a single entrypoint that builds every example under it in one shot:
 
 ```sh
@@ -108,8 +119,8 @@ cmake --build cpp/build
 
 # Java
 cd java
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./build_all.sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.sh
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./build_all.py
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.py
 ```
 
 Zig examples are plain `zig build` packages with no shared aggregator —
@@ -123,12 +134,13 @@ cd zig/shape && zig build
 
 ## CI-friendly execution checks
 
-Also covered by `run-all.sh`. Building everything is necessary but not
+Also covered by `run_all.py`. Building everything is necessary but not
 sufficient — these actually run each example and check for correct output,
 no camera/display/hardware required:
 
 ```sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/cross-binding-smoke-test.sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/shape-cross-binding-smoke-test.sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./cpp/opencv_zzdds/smoke-test.sh
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/cross_binding_smoke_test.py
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/shape_cross_binding_smoke_test.py
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/hello_world_cross_binding_smoke_test.py
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./cpp/opencv_zzdds/smoke_test.py
 ```

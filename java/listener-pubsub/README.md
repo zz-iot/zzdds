@@ -16,6 +16,7 @@ single-threaded.
 
 - A JDK (not just a JRE — building zzdds's own JNI bridge needs `jni.h`).
   `JAVA_HOME` should point at it.
+- Python 3.10+.
 - A zzdds checkout, built with the Java binding enabled:
 
   ```sh
@@ -33,8 +34,8 @@ single-threaded.
 
 ```sh
 export ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out   # defaults to ../zzdds/zig-out
-./build.sh
-./run.sh
+./build.py
+./run.py
 ```
 
 Expected output (interleaved from two processes):

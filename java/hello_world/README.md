@@ -6,7 +6,7 @@ at the repo root for what this example demonstrates and why (keyless topic,
 fixed RELIABLE/KEEP_ALL QoS, reader-ready-gated write loop). This directory
 is just the Java/JNI-specific build/run wiring.
 
-Uses `java/listener-pubsub`'s JNI build pattern (`build.sh`/`run.sh`,
+Uses `java/listener-pubsub`'s JNI build pattern (`build.py`/`run.py`,
 `ZzddsRuntime`), plus the `DataWriterListenerEx` extension listener (see
 `zzdds/test/bindings/smoke/JavaSmoke.java` for another example of the same
 pattern) to implement `on_reliable_reader_ready`.
@@ -15,26 +15,27 @@ pattern) to implement `on_reliable_reader_ready`.
 
 - A zzdds checkout built with `zig build -Djava-binding=true install`.
 - `JAVA_HOME` set to a full JDK.
+- Python 3.10+.
 
 ## Build and run
 
 ```sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./build.sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run.sh -d 42
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./build.py
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run.py -d 42
 ```
 
 or run `Subscriber`/`Publisher` as two separate JVM processes directly
-(see `run.sh` for the exact `java` invocation). `-d`/`--domain <id>`
+(see `run.py` for the exact `java` invocation). `-d`/`--domain <id>`
 (default 0) is the only flag either class takes.
 
-`build.sh` accepts a `ZIDL_EXECUTABLE` override if you want to generate
+`build.py` accepts a `ZIDL_EXECUTABLE` override if you want to generate
 against a different `zidl` build than the one bundled with your zzdds
 checkout:
 
 ```sh
 ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out \
 ZIDL_EXECUTABLE=/path/to/zidl/zig-out/bin/zidl \
-./build.sh
+./build.py
 ```
 
 ## Notes

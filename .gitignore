@@ -26,3 +26,8 @@ java/shape/zzdds.toml
 # Editor/OS cruft.
 *.swp
 .DS_Store
+
+# Python bytecode cache, and the per-run pub/sub logs interop/*.py smoke
+# tests write while a check is in flight.
+__pycache__/
+interop/.smoke-logs/

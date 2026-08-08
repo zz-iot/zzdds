@@ -46,11 +46,12 @@ Both programs work without real hardware:
   on an interactive stdin line (`video_capture`) or a 'q'/ESC keypress in a
   window that doesn't exist (`video_roi_display`).
 
-`smoke-test.sh` builds both and runs this combination end to end, checking
-that frames actually got delivered (not just that the processes exited 0):
+`smoke_test.py` (needs Python 3.10+) builds both and runs this combination
+end to end, checking that frames actually got delivered (not just that the
+processes exited 0):
 
 ```sh
-ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./smoke-test.sh
+ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./smoke_test.py
 ```
 
 `roi_generator` still needs a real camera and display — it's a standalone

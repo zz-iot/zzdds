@@ -13,8 +13,8 @@ convention rather than `java/listener-pubsub`'s separate
 
 ## Prerequisites
 
-Same as `java/listener-pubsub`: a JDK (`JAVA_HOME` set, needs `jni.h`), and
-a zzdds checkout built with the Java binding:
+Same as `java/listener-pubsub`: a JDK (`JAVA_HOME` set, needs `jni.h`),
+Python 3.10+, and a zzdds checkout built with the Java binding:
 
 ```sh
 cd /path/to/zzdds
@@ -25,11 +25,11 @@ zig build -Djava-binding=true -Dxtypes=true install
 
 ```sh
 export ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out   # defaults to ../zzdds/zig-out
-./build.sh
-./run.sh
+./build.py
+./run.py
 ```
 
-`run.sh` runs a subscriber and publisher as two JVM processes (real
+`run.py` runs a subscriber and publisher as two JVM processes (real
 loopback UDP discovery), checks both exit 0 and that a real sample line
 reached the subscriber, then runs a `--config` smoke test (see below).
 
@@ -54,10 +54,10 @@ working directory. Every binding's `create_factory()` (Java included, via
 its own ambient `ProcessConfig` lazy-resolve) already picks up a file with
 exactly that name/location automatically — the same mechanism
 `java/listener-pubsub`'s own `zzdds.toml` relies on, just staged at run
-time here instead of shipped as a permanent file. `run.sh`'s config smoke
+time here instead of shipped as a permanent file. `run.py`'s config smoke
 test exercises this for real: `config/custom-ports.toml` makes the
-subscriber bind port 20010 instead of the default 7410, checked via
-`ss -uln`.
+subscriber bind port 20010 instead of the default 7410, checked with a
+plain Python socket bind probe (no external tool dependency).
 
 ## Wire format note (XCDR1 vs XCDR2)
 
