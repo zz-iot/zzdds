@@ -2551,7 +2551,20 @@ pub const DomainParticipantImpl = struct {
                         if (!std.mem.eql(u8, dw.topic_name, ar.topic_name)) continue;
                         if (!std.mem.eql(u8, dw.type_name, ar.type_name)) continue;
                         const result = qm_mod.checkSnapshots(dw.qos, local_snap);
-                        if (!result.isCompatible()) continue;
+                        if (!result.isCompatible()) {
+                            // Mirrors onWriterDiscovered's live-discovery path below --
+                            // without this, a writer whose (incompatible) SEDP
+                            // announcement won the race against this reader's own
+                            // creation was silently skipped here with no
+                            // REQUESTED_INCOMPATIBLE_QOS notification at all, ever
+                            // (onWriterDiscovered never gets a second chance to see
+                            // this reader, since it only scans readers that already
+                            // exist at discovery time -- this retroactive path is the
+                            // only place that ever looks at this pairing again).
+                            if (ar.incompat_qos) |cb|
+                                cb.notify(cb.ctx, @as(i32, @intCast(@intFromEnum(result.incompatible))));
+                            continue;
+                        }
                         const part_result = qm_mod.checkPartition(
                             .{ .name = dw.qos.partition_names },
                             .{ .name = ar.partition_names },

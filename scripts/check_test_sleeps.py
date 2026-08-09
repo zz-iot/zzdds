@@ -21,8 +21,11 @@ ALLOWLIST = {
     # discovery to complete before writing) -- same category as the other
     # two, not a new one.
     "test/dcps/loopback_test.zig": (3, "UDP loopback receive/discovery polling"),
-    # MockTransport avoids sockets, but SPDP timer threads still announce on intervals.
-    "test/dcps/mock_loopback_test.zig": (14, "SPDP timer-thread discovery polling"),
+    # MockTransport avoids sockets, but SPDP timer threads still announce on
+    # intervals. 15th sleep added with the writer-discovered-before-reader
+    # retroactive-match regression test (polling discovered_writers via real
+    # SPDP/SEDP timer-thread announcements) -- same category as the rest.
+    "test/dcps/mock_loopback_test.zig": (15, "SPDP timer-thread discovery polling"),
     # API and WaitSet tests intentionally wake waits from another thread.
     "test/dcps/api_test.zig": (1, "threaded WaitSet wakeup"),
     "test/dcps/waitset_test.zig": (1, "threaded WaitSet wakeup"),
