@@ -125,7 +125,7 @@ jobs:
     needs: [prepare, test]
     runs-on: ubuntu-latest
     env:
-      INTEROP_RTPS_REF: zenzen-063c34d
+      INTEROP_RTPS_REF: zenzen-a9f61ee
 
     steps:
       - name: Check out zzdds
@@ -140,23 +140,20 @@ jobs:
           ref: ${{ env.INTEROP_RTPS_REF }}
           path: dds-rtps
 
-      - name: Wire packages/zzdds and packages/zidl symlinks
+      - name: Wire packages/zzdds symlink
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-          # Clone zidl at the same tag declared by the local zzdds checkout.
-          ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
-            dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
-          if [[ -z "$ZIDL_TAG" ]]; then
-            echo "::error::Could not extract zidl tag from packages/zzdds/build.zig.zon"
-            exit 1
-          fi
-          git clone --depth=1 --branch "$ZIDL_TAG" \
-            https://github.com/zz-iot/zidl.git zidl
-          ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
+          # zzdds now re-exports zidl's own artifact and zidl_rt module (see
+          # zzdds's build.zig comment on b.modules.put(... "zidl_rt" ...) /
+          # b.installArtifact(zidl_exe)), and dds-rtps's build.zig.zon no
+          # longer declares its own .zidl dependency — zig resolves zidl
+          # transitively through this zzdds path dep, so no separate zidl
+          # checkout/symlink is needed here anymore.
+          #
           # zig-pkg/ is gitignored so actions/checkout does not clean it between
           # runs on the same runner.  Stale URL-fetched packages shadow the path
-          # deps above via fingerprint deduplication — wipe them first.
+          # dep above via fingerprint deduplication — wipe them first.
           rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
           (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
 
