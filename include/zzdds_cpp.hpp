@@ -517,6 +517,121 @@ inline std::shared_ptr<DomainParticipantFactory> create_factory(const ZidlAlloca
     return detail::wrapFactoryHandle(zzdds_create_factory_with_allocator(allocator));
 }
 
+namespace detail {
+
+// WaitSet and GuardCondition are the only two condition-family types with no
+// factory operation in dcps.idl (per OMG spec, both are app-instantiated
+// directly), so — like DomainParticipantFactorySupport above — they need a
+// thin subclass over the generated ::DDS::WaitSetImpl/::DDS::GuardConditionImpl
+// (whose own destructor is `= default` and does not call zzdds_destroy_*)
+// adding the C-ABI teardown call. Unlike DomainParticipantFactorySupport,
+// neither interface is vendor-extended by zzdds.idl, so these subclass the
+// plain ::DDS:: generated impl classes directly — no --cpp-impl-override
+// wiring needed, and no *Support class for zzdds::create_waitset() to
+// register anywhere (nothing else in the generated code ever constructs a
+// WaitSet/GuardCondition, so there is no `_getOrCreate`/identity-cache
+// concern here the way there is for e.g. TopicSupport).
+
+class WaitSetSupport final : public ::DDS::WaitSetImpl {
+public:
+    explicit WaitSetSupport(DDS_WaitSet handle) noexcept
+        : ::DDS::WaitSetImpl(handle), handle_(handle)
+    {}
+
+    ~WaitSetSupport() override
+    {
+        zzdds_destroy_waitset(handle_);
+    }
+
+private:
+    DDS_WaitSet handle_;
+};
+
+class GuardConditionSupport final : public ::DDS::GuardConditionImpl {
+public:
+    explicit GuardConditionSupport(DDS_GuardCondition handle) noexcept
+        : ::DDS::GuardConditionImpl(handle), handle_(handle)
+    {}
+
+    ~GuardConditionSupport() override
+    {
+        zzdds_destroy_guardcondition(handle_);
+    }
+
+private:
+    DDS_GuardCondition handle_;
+};
+
+// Same allocate_shared-against-the-process-wide-pmr-resource shape as
+// wrapFactoryHandle above; see its comment for why this is a separate knob
+// from `handle`'s own allocator.
+inline std::shared_ptr<::DDS::WaitSet> wrapWaitSetHandle(DDS_WaitSet handle)
+{
+    if (zzdds_waitset_is_nil(handle)) return {};
+
+    try {
+        return std::allocate_shared<WaitSetSupport>(
+            std::pmr::polymorphic_allocator<WaitSetSupport>(
+                std::pmr::get_default_resource()),
+            handle
+        );
+    } catch (...) {
+        zzdds_destroy_waitset(handle);
+        throw;
+    }
+}
+
+inline std::shared_ptr<::DDS::GuardCondition> wrapGuardConditionHandle(DDS_GuardCondition handle)
+{
+    if (zzdds_guardcondition_is_nil(handle)) return {};
+
+    try {
+        return std::allocate_shared<GuardConditionSupport>(
+            std::pmr::polymorphic_allocator<GuardConditionSupport>(
+                std::pmr::get_default_resource()),
+            handle
+        );
+    } catch (...) {
+        zzdds_destroy_guardcondition(handle);
+        throw;
+    }
+}
+
+} // namespace detail
+
+inline std::shared_ptr<::DDS::WaitSet> create_waitset()
+{
+    return detail::wrapWaitSetHandle(zzdds_create_waitset());
+}
+
+/**
+ * Same as create_waitset(), but every allocation the WaitSet itself makes is
+ * routed through `allocator` instead of the default libc malloc/free (see
+ * zzdds_create_waitset_with_allocator's contract in zzdds_c.h). `allocator`
+ * must outlive the returned WaitSet. Pass nullptr for the default
+ * (equivalent to create_waitset()).
+ */
+inline std::shared_ptr<::DDS::WaitSet> create_waitset(const ZidlAllocator* allocator)
+{
+    return detail::wrapWaitSetHandle(zzdds_create_waitset_with_allocator(allocator));
+}
+
+inline std::shared_ptr<::DDS::GuardCondition> create_guardcondition()
+{
+    return detail::wrapGuardConditionHandle(zzdds_create_guardcondition());
+}
+
+/**
+ * Same as create_guardcondition(), but the GuardCondition itself is
+ * allocated through `allocator` instead of the default libc malloc/free.
+ * `allocator` must outlive the returned GuardCondition. Pass nullptr for
+ * the default (equivalent to create_guardcondition()).
+ */
+inline std::shared_ptr<::DDS::GuardCondition> create_guardcondition(const ZidlAllocator* allocator)
+{
+    return detail::wrapGuardConditionHandle(zzdds_create_guardcondition_with_allocator(allocator));
+}
+
 /**
  * Resolve `path` as a zzdds TOML config file and install the result as the
  * process-wide configuration, entirely through `allocator` (nullptr for the

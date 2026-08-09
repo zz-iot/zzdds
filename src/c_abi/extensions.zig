@@ -23,6 +23,7 @@ const TopicImpl = topic_mod.TopicImpl;
 const ContentFilteredTopicImpl = topic_mod.ContentFilteredTopicImpl;
 const filter_mod = @import("../dcps/filter.zig");
 const waitset_mod = @import("../dcps/waitset.zig");
+const WaitSetImpl = waitset_mod.WaitSetImpl;
 const GuardConditionImpl = waitset_mod.GuardConditionImpl;
 const StatusConditionImpl = waitset_mod.StatusConditionImpl;
 const ReadConditionImpl = waitset_mod.ReadConditionImpl;
@@ -376,6 +377,79 @@ pub export fn zzdds_destroy_factory(factory: *anyopaque) callconv(.c) void {
     const f = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, factory);
     if (f.ptr == nil.NIL_PTR) return;
     f.vtable.deinit(f.ptr);
+}
+
+/// `WaitSet` and `GuardCondition` are the only two condition-family types
+/// with no factory operation in dcps.idl (per OMG spec, both are
+/// app-instantiated directly, not obtained from an existing entity/reader —
+/// unlike StatusCondition/ReadCondition/QueryCondition, which already have a
+/// full C-ABI path via get_statuscondition()/create_readcondition()). These
+/// four functions are the hand-written bootstrap for that gap, mirroring
+/// zzdds_create_factory()/zzdds_create_factory_with_allocator() exactly.
+pub export fn zzdds_create_waitset() callconv(.c) *anyopaque {
+    return zzdds_create_waitset_with_allocator(null);
+}
+
+/// Same as zzdds_create_waitset, but every allocation the WaitSet itself
+/// makes (its `conditions` list) is routed through `allocator` instead of
+/// the default std.heap.c_allocator. Pass NULL for the default. `allocator`
+/// must outlive the WaitSet returned here — see ZidlAllocator's contract in
+/// zidl_allocator.h.
+pub export fn zzdds_create_waitset_with_allocator(allocator: ?*const zidl_rt.ZidlAllocator) callconv(.c) *anyopaque {
+    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
+    const ws = WaitSetImpl.init(alloc) catch |err| {
+        std.log.err("zzdds_create_waitset_with_allocator: {}", .{err});
+        return nil.nil_waitset.vtable.get_c_abi_handle(nil.nil_waitset.ptr);
+    };
+    const r = ws.toDDSWaitSet();
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn zzdds_create_guardcondition() callconv(.c) *anyopaque {
+    return zzdds_create_guardcondition_with_allocator(null);
+}
+
+/// Same as zzdds_create_guardcondition, but the GuardCondition itself is
+/// allocated through `allocator` instead of the default std.heap.c_allocator.
+/// Pass NULL for the default. `allocator` must outlive the GuardCondition
+/// returned here — see ZidlAllocator's contract in zidl_allocator.h.
+pub export fn zzdds_create_guardcondition_with_allocator(allocator: ?*const zidl_rt.ZidlAllocator) callconv(.c) *anyopaque {
+    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
+    const gc = GuardConditionImpl.init(alloc) catch |err| {
+        std.log.err("zzdds_create_guardcondition_with_allocator: {}", .{err});
+        return nil.nil_guardcondition.vtable.get_c_abi_handle(nil.nil_guardcondition.ptr);
+    };
+    const r = gc.toDDSGuardCondition();
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+/// Mirrors zzdds_factory_is_nil -- lets a caller (e.g. the C++ binding's
+/// create_waitset()/create_guardcondition() wrappers, which need to know
+/// whether to return an empty shared_ptr) tell a real WaitSet/GuardCondition
+/// apart from the boxed nil sentinel zzdds_create_waitset[_with_allocator]
+/// returns on allocation failure.
+pub export fn zzdds_waitset_is_nil(waitset: *anyopaque) callconv(.c) bool {
+    const w = zidl_rt.unboxAs(DDS.WaitSet, waitset);
+    return w.ptr == nil.NIL_PTR;
+}
+
+pub export fn zzdds_guardcondition_is_nil(guardcondition: *anyopaque) callconv(.c) bool {
+    const g = zidl_rt.unboxAs(DDS.GuardCondition, guardcondition);
+    return g.ptr == nil.NIL_PTR;
+}
+
+/// WaitSet/GuardCondition have no owning factory to delete them through
+/// (see zzdds_create_waitset's doc comment) — mirrors zzdds_destroy_factory.
+pub export fn zzdds_destroy_waitset(waitset: *anyopaque) callconv(.c) void {
+    const w = zidl_rt.unboxAs(DDS.WaitSet, waitset);
+    if (w.ptr == nil.NIL_PTR) return;
+    w.vtable.deinit(w.ptr);
+}
+
+pub export fn zzdds_destroy_guardcondition(guardcondition: *anyopaque) callconv(.c) void {
+    const g = zidl_rt.unboxAs(DDS.GuardCondition, guardcondition);
+    if (g.ptr == nil.NIL_PTR) return;
+    g.vtable.deinit(g.ptr);
 }
 
 /// Explicitly install the process-wide configuration. Must be called before

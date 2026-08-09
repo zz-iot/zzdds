@@ -1181,6 +1181,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/entity_routing_test.zig",
         "test/dcps/wait_for_historical_test.zig",
         "test/dcps/waitset_test.zig",
+        "test/dcps/waitset_lifecycle_test.zig",
         "test/dcps/pubsub_vtable_test.zig",
         "test/dcps/topic_vtable_test.zig",
         "test/dcps/reader_vtable_test.zig",

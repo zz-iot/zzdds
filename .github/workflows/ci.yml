@@ -51,7 +51,7 @@ env:
   # Bump deliberately (its own small PR) when zzdds-examples gains something
   # this job should pick up. Override via the zzdds_examples_ref
   # workflow_dispatch input to test against a different commit/branch/tag.
-  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || 'e213e5d7ec702d815c6f2686cecffe9f2e011e4b' }}
+  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || '738b4bc5bc975061ad7173f349c88ab47cc4d8fa' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -211,6 +211,139 @@ jobs:
       - name: Run zzdds-examples (strict)
         working-directory: zzdds-examples
         run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zzdds/zig-out" ./run_all.py --strict
+
+  # ── zzdds-examples: WaitSet + ThreadSanitizer ────────────────────────────
+  #
+  # Separate from the `examples` job above, which builds/runs ALL of
+  # zzdds-examples with a plain (non-TSAN) build. This job instead builds
+  # zzdds with -Dsanitize-thread=true and runs specifically the zig/waitset
+  # and cpp/waitset examples under TSAN -- the ones whose whole point is
+  # exercising real concurrency (a watchdog thread and the main thread's
+  # WaitSet.wait() loop both touching the same WaitSet/GuardCondition at
+  # once; see zzdds-examples' docs/design/waitset-reference-app.md).
+  #
+  # c/waitset and java/waitset are deliberately NOT run under TSAN here yet:
+  # c/waitset's own CMakeLists.txt already supports it
+  # (-DWAITSET_SANITIZE_THREAD=ON, same option cpp/waitset uses below) and
+  # could be added with the identical pattern in a follow-up; java/waitset is
+  # left out because JVM+TSAN is a known-hard combination in general (see
+  # vendor-interop-tsan's own comment on RTI Connext under TSAN for the same
+  # class of "known-flaky-under-TSan-timing" precedent elsewhere in this
+  # workflow) -- not attempted here rather than assumed to work. This job
+  # covers what it covers; extending it further is a stretch goal, not
+  # something this comment claims is done.
+
+  examples-tsan:
+    name: zzdds-examples (WaitSet, TSAN)
+    needs: test-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+          persist-credentials: false
+
+      - name: Check out zzdds-examples (${{ env.ZZDDS_EXAMPLES_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/zzdds-examples
+          ref: ${{ env.ZZDDS_EXAMPLES_REF }}
+          path: zzdds-examples
+          persist-credentials: false
+
+      # See the `examples` job above's identical step for why this reads
+      # zzdds's own pinned .zidl.url rather than a second, independently
+      # maintained ref.
+      - name: Resolve zidl ref from zzdds/build.zig.zon
+        id: zidl_ref
+        run: |
+          set -euo pipefail
+          TAG=$(grep -A2 '\.zidl = \.{' zzdds/build.zig.zon | grep -oP 'refs/tags/\K[^"]+(?=\.tar\.gz)')
+          if [ -z "$TAG" ]; then
+            echo "FAIL: could not parse a zidl tag out of zzdds/build.zig.zon's .zidl.url" >&2
+            exit 1
+          fi
+          echo "ref=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check out zidl (${{ steps.zidl_ref.outputs.ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/zidl
+          ref: ${{ steps.zidl_ref.outputs.ref }}
+          path: zidl
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build zzdds (C + C++ bindings, ThreadSanitizer)
+        working-directory: zzdds
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Dsanitize-thread=true install
+
+      - name: Build zig/waitset (ThreadSanitizer)
+        working-directory: zzdds-examples/zig/waitset
+        run: zig build -Dsanitize-thread=true
+
+      - name: Build cpp/waitset (ThreadSanitizer)
+        run: |
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DWAITSET_SANITIZE_THREAD=ON \
+            -B zzdds-examples/cpp/waitset/build -S zzdds-examples/cpp/waitset
+          cmake --build zzdds-examples/cpp/waitset/build
+
+      # Each step backgrounds the subscriber, runs the publisher with an
+      # explicit timeout, then waits on the subscriber's own PID (not a bare
+      # `wait`, which would only report the last-started job) so both exit
+      # codes are actually checked -- a wire/QoS mismatch or a hang can still
+      # exit 0 on one side, so the "received all 10 samples" marker is
+      # checked too, matching zzdds-examples' own
+      # waitset_cross_binding_smoke_test.py.
+      - name: Run zig/waitset under TSAN
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+        run: |
+          set -uo pipefail
+          BIN=zzdds-examples/zig/waitset/zig-out/bin
+          "$BIN"/waitset_sub -d 30 > /tmp/zig-ws-sub.log 2>&1 &
+          SUB_PID=$!
+          sleep 1
+          timeout 40 "$BIN"/waitset_pub -d 30 > /tmp/zig-ws-pub.log 2>&1
+          PUB_RC=$?
+          wait "$SUB_PID"
+          SUB_RC=$?
+          cat /tmp/zig-ws-pub.log /tmp/zig-ws-sub.log
+          if [ "$PUB_RC" -ne 0 ] || [ "$SUB_RC" -ne 0 ]; then
+            echo "FAIL: zig/waitset pub_rc=$PUB_RC sub_rc=$SUB_RC"
+            exit 1
+          fi
+          grep -q "Publisher: done." /tmp/zig-ws-pub.log
+          grep -q "Subscriber: received all 10 samples." /tmp/zig-ws-sub.log
+
+      - name: Run cpp/waitset under TSAN
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+          LD_LIBRARY_PATH: ${{ github.workspace }}/zzdds/zig-out/lib
+        run: |
+          set -uo pipefail
+          BIN=zzdds-examples/cpp/waitset/build
+          "$BIN"/waitset_sub -d 31 > /tmp/cpp-ws-sub.log 2>&1 &
+          SUB_PID=$!
+          sleep 1
+          timeout 40 "$BIN"/waitset_pub -d 31 > /tmp/cpp-ws-pub.log 2>&1
+          PUB_RC=$?
+          wait "$SUB_PID"
+          SUB_RC=$?
+          cat /tmp/cpp-ws-pub.log /tmp/cpp-ws-sub.log
+          if [ "$PUB_RC" -ne 0 ] || [ "$SUB_RC" -ne 0 ]; then
+            echo "FAIL: cpp/waitset pub_rc=$PUB_RC sub_rc=$SUB_RC"
+            exit 1
+          fi
+          grep -q "Publisher: done." /tmp/cpp-ws-pub.log
+          grep -q "Subscriber: received all 10 samples." /tmp/cpp-ws-sub.log
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #

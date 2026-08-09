@@ -983,6 +983,57 @@ fn nilQueryconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
     return nil_querycondition_c_abi.get(nil_alloc, ctx, &nil_querycondition_vtable);
 }
 
+var nil_guardcondition_vtable = DDS.GuardCondition.Vtable{
+    .get_trigger_value = struct {
+        fn f(_: *anyopaque) bool {
+            return false;
+        }
+    }.f,
+    .set_trigger_value = struct {
+        fn f(_: *anyopaque, _: bool) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .deinit = nilDeinit,
+    .get_c_abi_handle = nilGuardconditionGetCAbiHandle,
+    .as_Condition = nilAsCondition,
+};
+pub const nil_guardcondition = DDS.GuardCondition{ .ptr = NIL_PTR, .vtable = &nil_guardcondition_vtable };
+var nil_guardcondition_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilGuardconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_guardcondition_c_abi.get(nil_alloc, ctx, &nil_guardcondition_vtable);
+}
+
+var nil_waitset_vtable = DDS.WaitSet.Vtable{
+    .wait = struct {
+        fn f(_: *anyopaque, _: ?*DDS.ConditionSeq, _: *const DDS.Duration_t) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .attach_condition = struct {
+        fn f(_: *anyopaque, _: DDS.Condition) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .detach_condition = struct {
+        fn f(_: *anyopaque, _: DDS.Condition) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .get_conditions = struct {
+        fn f(_: *anyopaque, _: ?*DDS.ConditionSeq) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .deinit = nilDeinit,
+    .get_c_abi_handle = nilWaitsetGetCAbiHandle,
+};
+pub const nil_waitset = DDS.WaitSet{ .ptr = NIL_PTR, .vtable = &nil_waitset_vtable };
+var nil_waitset_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+fn nilWaitsetGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    return nil_waitset_c_abi.get(nil_alloc, ctx, &nil_waitset_vtable);
+}
+
 // ── Nil DomainParticipantFactory ──────────────────────────────────────────────
 
 pub const nil_dp_listener = DDS.noop_DomainParticipantListener;

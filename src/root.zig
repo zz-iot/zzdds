@@ -86,6 +86,7 @@ pub const takeNextInstanceRaw = raw_ops.takeNextInstanceRaw;
 pub const readNextInstanceRaw = raw_ops.readNextInstanceRaw;
 pub const takeFilteredRaw = raw_ops.takeFilteredRaw;
 pub const readFilteredRaw = raw_ops.readFilteredRaw;
+pub const takeWithQueryConditionRaw = raw_ops.takeWithQueryConditionRaw;
 pub const getKeyValueRawReader = raw_ops.getKeyValueRawReader;
 pub const lookupInstanceReader = raw_ops.lookupInstanceReader;
 pub const registerTypeSupport = raw_ops.registerTypeSupport;
@@ -93,6 +94,8 @@ pub const asZzddsDataWriter = raw_ops.asZzddsDataWriter;
 pub const asZzddsDataReader = raw_ops.asZzddsDataReader;
 pub const asZzddsTopic = raw_ops.asZzddsTopic;
 pub const asZzddsDomainParticipant = raw_ops.asZzddsDomainParticipant;
+pub const createWaitSet = raw_ops.createWaitSet;
+pub const createGuardCondition = raw_ops.createGuardCondition;
 
 pub const util = struct {
     pub const time = @import("util/time.zig");

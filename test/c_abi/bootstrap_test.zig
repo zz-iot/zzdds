@@ -1104,6 +1104,115 @@ test "waitset: get_c_abi_handle boxes real WaitSet, conditions, and their Condit
     _ = qc_as_rc.vtable.get_c_abi_handle(qc_as_rc.ptr);
 }
 
+// ── zzdds_create_waitset / zzdds_create_guardcondition ──────────────────────────
+//
+// WaitSet and GuardCondition have no factory operation in dcps.idl (per OMG
+// spec, both are app-instantiated directly), so — like
+// zzdds_create_factory — they need a hand-written C-ABI bootstrap rather than
+// generated construction. These tests exercise that bootstrap through the
+// real C-ABI entry points (not WaitSetImpl.init directly, as the boxing test
+// above does), matching zzdds_create_factory_with_allocator's own coverage
+// shape: a plain construct/use/destroy round trip, then an allocator-tracking
+// test proving the injected allocator is actually used, not just accepted.
+
+test "waitset: zzdds_waitset_is_nil/zzdds_guardcondition_is_nil" {
+    const ws_boxed = extensions.zzdds_create_waitset();
+    defer extensions.zzdds_destroy_waitset(ws_boxed);
+    try testing.expect(!extensions.zzdds_waitset_is_nil(ws_boxed));
+
+    const gc_boxed = extensions.zzdds_create_guardcondition();
+    defer extensions.zzdds_destroy_guardcondition(gc_boxed);
+    try testing.expect(!extensions.zzdds_guardcondition_is_nil(gc_boxed));
+
+    const nil_ws = zzdds.dcps.nil_waitset;
+    try testing.expect(extensions.zzdds_waitset_is_nil(nil_ws.vtable.get_c_abi_handle(nil_ws.ptr)));
+    const nil_gc = zzdds.dcps.nil_guardcondition;
+    try testing.expect(extensions.zzdds_guardcondition_is_nil(nil_gc.vtable.get_c_abi_handle(nil_gc.ptr)));
+}
+
+test "waitset: zzdds_create_waitset/zzdds_create_guardcondition round trip through the real C ABI" {
+    const ws_boxed = extensions.zzdds_create_waitset();
+    defer extensions.zzdds_destroy_waitset(ws_boxed);
+    const ws = zidl_rt.unboxAs(DDS.WaitSet, ws_boxed);
+    try testing.expect(ws.ptr != zzdds.dcps.NIL_PTR);
+
+    const gc_boxed = extensions.zzdds_create_guardcondition();
+    defer extensions.zzdds_destroy_guardcondition(gc_boxed);
+    const gc = zidl_rt.unboxAs(DDS.GuardCondition, gc_boxed);
+    try testing.expect(gc.ptr != zzdds.dcps.NIL_PTR);
+
+    const cond = gc.vtable.as_Condition(gc.ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attach_condition(cond));
+    try testing.expectEqual(DDS.RETCODE_OK, gc.set_trigger_value(true));
+
+    var active = DDS.ConditionSeq{};
+    const zero = DDS.Duration_t{ .sec = 0, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, ws.wait(&active, zero));
+    try testing.expectEqual(@as(u32, 1), active._length);
+    if (active._release) {
+        // zzdds_create_waitset() (no allocator arg) uses std.heap.c_allocator,
+        // not testing.allocator -- free with the matching allocator.
+        if (active._buffer) |b| std.heap.c_allocator.free(b[0..active._maximum]);
+    }
+}
+
+test "waitset: zzdds_destroy_waitset/zzdds_destroy_guardcondition are safe on a nil handle" {
+    // Mirrors "support factory: destroy_factory is safe on nil handle" above.
+    const nil_ws = zzdds.dcps.nil_waitset;
+    extensions.zzdds_destroy_waitset(nil_ws.vtable.get_c_abi_handle(nil_ws.ptr));
+    const nil_gc = zzdds.dcps.nil_guardcondition;
+    extensions.zzdds_destroy_guardcondition(nil_gc.vtable.get_c_abi_handle(nil_gc.ptr));
+}
+
+test "waitset: zzdds_create_waitset_with_allocator/zzdds_create_guardcondition_with_allocator route allocations through the caller's allocator" {
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_rt.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+
+    const ws_boxed = extensions.zzdds_create_waitset_with_allocator(&c_alloc);
+    const gc_boxed = extensions.zzdds_create_guardcondition_with_allocator(&c_alloc);
+    try testing.expect(track.alloc_calls > 0);
+    const calls_after_create = track.alloc_calls;
+
+    const ws = zidl_rt.unboxAs(DDS.WaitSet, ws_boxed);
+    const gc = zidl_rt.unboxAs(DDS.GuardCondition, gc_boxed);
+    // Attaching grows WaitSet's `conditions` list — another allocation
+    // through the same injected allocator, not a silent fallback.
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attach_condition(gc.vtable.as_Condition(gc.ptr)));
+    try testing.expect(track.alloc_calls > calls_after_create);
+
+    extensions.zzdds_destroy_waitset(ws_boxed);
+    extensions.zzdds_destroy_guardcondition(gc_boxed);
+    try testing.expect(track.free_calls > 0);
+}
+
+// ── Zig-native createWaitSet / createGuardCondition (raw_ops.zig) ───────────────
+
+test "waitset: Zig-native zzdds.createWaitSet/createGuardCondition round trip" {
+    const alloc = testing.allocator;
+
+    const ws = try zzdds.createWaitSet(alloc);
+    defer ws.deinit();
+    const gc = try zzdds.createGuardCondition(alloc);
+    defer gc.deinit();
+
+    const cond = gc.vtable.as_Condition(gc.ptr);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.attach_condition(cond));
+    try testing.expectEqual(DDS.RETCODE_OK, gc.set_trigger_value(true));
+
+    var active = DDS.ConditionSeq{};
+    const zero = DDS.Duration_t{ .sec = 0, .nanosec = 0 };
+    try testing.expectEqual(DDS.RETCODE_OK, ws.wait(&active, zero));
+    try testing.expectEqual(@as(u32, 1), active._length);
+    if (active._release) {
+        if (active._buffer) |b| alloc.free(b[0..active._maximum]);
+    }
+}
+
 // ── C-ABI handle coverage: real Topic / ContentFilteredTopic ──────────────────
 
 test "topic: get_c_abi_handle boxes Topic, Entity, and TopicDescription views" {

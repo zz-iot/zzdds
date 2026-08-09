@@ -93,6 +93,54 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
     return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)df);
 }
 
+/* ── WaitSet / GuardCondition bootstrap ──────────────────────────────────
+ *
+ * Same reasoning as createFactory() above: neither has a factory operation
+ * in dcps.idl (per OMG spec, both are app-instantiated directly), so both
+ * bootstrap through the same hand-written zzdds_create_waitset()/
+ * zzdds_create_guardcondition() the C/C++ examples use. Unlike
+ * DomainParticipantFactory, neither is a zzdds-extended type, so the boxed
+ * handle these return is already the right DDS_WaitSet/DDS_GuardCondition
+ * shape -- no _as_DDS_ upcast step needed before boxing into the generated
+ * WaitSetImpl/GuardConditionImpl Java class.
+ */
+JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createWaitSet(JNIEnv *env, jclass self_cls) {
+    (void)self_cls;
+    DDS_WaitSet ws = zzdds_create_waitset();
+    if (zzdds_waitset_is_nil(ws)) return NULL;
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/WaitSetImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)ws);
+}
+
+JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createGuardCondition(JNIEnv *env, jclass self_cls) {
+    (void)self_cls;
+    DDS_GuardCondition gc = zzdds_create_guardcondition();
+    if (zzdds_guardcondition_is_nil(gc)) return NULL;
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/GuardConditionImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)gc);
+}
+
+/* WaitSet/GuardCondition have no owning factory to delete them through --
+ * mirrors zzdds_destroy_factory's role, just with no Java-callable
+ * equivalent to reach for otherwise (unlike DomainParticipant, entity
+ * interfaces have no deinit() exposed as a Java method at all -- see
+ * Dcps.DDS.WaitSet/GuardCondition's generated interface). */
+JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyWaitSet(JNIEnv *env, jclass self_cls, jobject waitset) {
+    (void)self_cls;
+    DDS_WaitSet ws = (DDS_WaitSet)zzdds_java_unbox(env, waitset);
+    if (ws == NULL) return;
+    zzdds_destroy_waitset(ws);
+}
+
+JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyGuardCondition(JNIEnv *env, jclass self_cls, jobject guardcondition) {
+    (void)self_cls;
+    DDS_GuardCondition gc = (DDS_GuardCondition)zzdds_java_unbox(env, guardcondition);
+    if (gc == NULL) return;
+    zzdds_destroy_guardcondition(gc);
+}
+
 /* ── TypeSupport registration: one native trampoline, ctx-carrying ──────
  *
  * zzdds_register_type_support_ctx (see zzdds_c.h) forwards an opaque ctx

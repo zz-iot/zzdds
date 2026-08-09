@@ -209,6 +209,14 @@ pub const DataReaderImpl = struct {
     /// Guarded by `mu`.
     data_notifiers: std.ArrayListUnmanaged(waitset.DataNotifyFn),
 
+    /// Every ReadCondition/QueryCondition created against this reader that
+    /// hasn't been explicitly deleted via delete_readcondition() yet.
+    /// Guarded by `mu`. Torn down (each condition's real deinit(), which
+    /// detaches it from any attached WaitSet) in reallyDeinit() so deleting
+    /// the reader without deleting its conditions first is safe rather than
+    /// leaking them or leaving a WaitSet with a dangling entry.
+    read_conditions: std.ArrayListUnmanaged(DDS.Condition),
+
     /// Pending incoming samples; guarded by `mu`.
     pending: std.ArrayListUnmanaged(PendingChange),
     /// Working buffer for the currently-receiving coherent set.
@@ -356,6 +364,7 @@ pub const DataReaderImpl = struct {
             .status_changes = 0,
             .status_cond = null,
             .data_notifiers = .empty,
+            .read_conditions = .empty,
             .pending = .empty,
             .coherent_wip = .{},
             .coherent_committed = .empty,
@@ -410,6 +419,19 @@ pub const DataReaderImpl = struct {
         self.dr_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
         self.zzdds_dr_c_abi.free(self.alloc);
+        // Tear down any ReadCondition/QueryCondition the app never explicitly
+        // deleted via delete_readcondition(). Each condition's own deinit()
+        // detaches it from any WaitSet that still has it attached, removes
+        // its data_notifiers registration, and calls back into
+        // removeReadCondition() to remove itself from read_conditions — so
+        // this must run before data_notifiers.deinit() and before `self` is
+        // freed. Take ownership of the list and reset the field to .empty
+        // first: deinit() mutating (swapRemove) the very list a `for` loop is
+        // iterating over would skip or double-visit entries.
+        var conditions_to_free = self.read_conditions;
+        self.read_conditions = .empty;
+        for (conditions_to_free.items) |cond| cond.deinit();
+        conditions_to_free.deinit(self.alloc);
         self.data_notifiers.deinit(self.alloc);
         // Drain pending queues (including coherent buffers).
         for (self.pending.items) |p| p.deinit();
@@ -1924,7 +1946,9 @@ pub const DataReaderImpl = struct {
             self,
             addDataNotifier,
             removeDataNotifier,
+            removeReadCondition,
         ) catch return nil.nil_readcondition;
+        self.trackReadCondition(rc.toCondition());
         return rc.toDDSReadCondition();
     }
 
@@ -1957,12 +1981,43 @@ pub const DataReaderImpl = struct {
             self,
             addDataNotifier,
             removeDataNotifier,
+            removeReadCondition,
         ) catch return nil.nil_querycondition;
+        self.trackReadCondition(qc.toCondition());
         return qc.toDDSQueryCondition();
     }
 
+    /// Records a newly-created ReadCondition/QueryCondition so reallyDeinit()
+    /// can tear it down safely if the app deletes this reader without first
+    /// calling delete_readcondition() on it.
+    fn trackReadCondition(self: *Self, cond: DDS.Condition) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.read_conditions.append(self.alloc, cond) catch {};
+    }
+
+    /// Called by ReadConditionImpl/QueryConditionImpl's own deinit() — not by
+    /// vtDeleteReadCondition directly — so this list stays correct whether a
+    /// condition is destroyed via delete_readcondition() or a direct
+    /// .deinit() call on the handle (both are valid; WaitSet/GuardCondition
+    /// have no "delete" op at all and are only ever destroyed the latter way).
+    /// ctx is a *DataReaderImpl; ptr matches a tracked DDS.Condition's own .ptr.
+    pub fn removeReadCondition(ctx: *anyopaque, cond_ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.read_conditions.items, 0..) |c, i| {
+            if (c.ptr == cond_ptr) {
+                _ = self.read_conditions.swapRemove(i);
+                return;
+            }
+        }
+    }
+
     fn vtDeleteReadCondition(_: *anyopaque, a_condition: DDS.ReadCondition) DDS.ReturnCode_t {
-        // Destroy the condition via its vtable.
+        // Destroy the condition via its vtable — this also detaches it from
+        // any WaitSet that still has it attached, and removes it from this
+        // reader's read_conditions tracking list (see waitset.zig).
         a_condition.deinit();
         return DDS.RETCODE_OK;
     }
@@ -2228,6 +2283,7 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2327,6 +2383,7 @@ test "coherent WIP: CS transition discards incomplete previous WIP" {
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2413,6 +2470,7 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2497,6 +2555,7 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2544,6 +2603,7 @@ fn mkTestReaderForGenerationTests(alloc: std.mem.Allocator, clock: *time_test.Ma
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
