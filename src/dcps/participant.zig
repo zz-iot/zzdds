@@ -230,9 +230,7 @@ const BuiltinSubscriberState = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void, _: *const fn (*anyopaque) bool, _: *const fn (*anyopaque) void) void {}
             }.f,
             .register_get_field_refresh = struct {
-                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) ?filter_mod.CdrFieldGetter {
-                    return null;
-                }
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {}
             }.f,
         };
 
@@ -2729,7 +2727,7 @@ pub const DomainParticipantImpl = struct {
         type_name: []const u8,
         notify_ctx: *anyopaque,
         refresh_fn: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void,
-    ) ?filter_mod.CdrFieldGetter {
+    ) void {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -2740,14 +2738,16 @@ pub const DomainParticipantImpl = struct {
                 break;
             }
         }
-        // Same critical section as the refresh_get_field registration above --
-        // see ParticipantCbs.register_get_field_refresh's doc comment for why
-        // these must not be two separate lock acquisitions.
-        if (self.type_support_registry.get(type_name)) |ts| {
-            const func = ts.get_field orelse return null;
-            return .{ .ctx = ts.ctx, .func = func };
-        }
-        return null;
+        // Same critical section as the refresh_get_field registration above,
+        // and invoked synchronously here rather than returned for the caller
+        // to assign -- see ParticipantCbs.register_get_field_refresh's doc
+        // comment for why these must not be two separate lock acquisitions,
+        // and why this must not be a return value assigned outside them.
+        const current: ?filter_mod.CdrFieldGetter = if (self.type_support_registry.get(type_name)) |ts|
+            if (ts.get_field) |func| .{ .ctx = ts.ctx, .func = func } else null
+        else
+            null;
+        refresh_fn(notify_ctx, current);
     }
 
     fn makePubCbs(self: *Self) publisher_mod.ParticipantCbs {

@@ -247,13 +247,25 @@ pub const DataReaderImpl = struct {
     /// Presentation QoS from the owning Subscriber; set once after init.
     subscriber_presentation: DDS.PresentationQosPolicy = .{},
 
-    /// ContentFilteredTopic filter; null when no CFT or no get_field fn registered.
-    /// Set once after init by the subscriber; read-only thereafter.
+    /// ContentFilteredTopic this reader was created against, if any. Set once
+    /// by the subscriber before the first refreshGetFieldFn call and never
+    /// mutated after -- unlike cft_filter/get_field_fn below, this is safe to
+    /// read without `mu`. Kept separate from cft_filter so that losing (and
+    /// later regaining) a get_field getter doesn't lose the CFT association:
+    /// refreshGetFieldFn derives cft_filter from this pointer every time
+    /// rather than mutating a previously-built CftFilterState in place.
+    cft_ptr: ?*topic_mod.ContentFilteredTopicImpl = null,
+
+    /// ContentFilteredTopic filter; null when no CFT or no get_field fn
+    /// currently registered. Populated/refreshed exclusively by
+    /// refreshGetFieldFn, under `mu` -- read under `mu` everywhere else
+    /// (on_receive's CFT check, readFiltered/takeFiltered's QueryCondition
+    /// evaluation).
     cft_filter: ?CftFilterState = null,
 
     /// Field accessor for QueryCondition evaluation at read/take time.
     /// Set from TypeSupport.get_field when available; null otherwise.
-    /// Set once after init by the subscriber; read-only thereafter.
+    /// Populated/refreshed exclusively by refreshGetFieldFn, under `mu`.
     get_field_fn: ?filter_mod.CdrFieldGetter = null,
 
     /// SampleLost status counters. Guarded by `mu`.
@@ -1805,16 +1817,19 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.get_field_fn = new_get_field;
-        if (self.cft_filter) |*cft| {
-            if (new_get_field) |gf| {
-                cft.get_field_fn = gf;
-            } else {
-                // TypeSupport no longer offers get_field -- there's no
-                // CftFilterState shape for "no getter" (get_field_fn is
-                // non-optional there), so drop CFT filtering entirely
-                // rather than leave a stale function pointer in place.
-                self.cft_filter = null;
-            }
+        // Always derive cft_filter from cft_ptr (immutable, set once at
+        // creation) rather than mutating/dropping a previously-built
+        // CftFilterState -- CftFilterState.get_field_fn is non-optional, so
+        // there's no shape for "CFT but no getter", but dropping cft_ptr
+        // along with it (as a prior version of this function did) would
+        // permanently disable CFT filtering for this reader the moment a
+        // TypeSupport re-registration transiently had no get_field, even if
+        // a later re-registration brought one back.
+        if (self.cft_ptr) |cft_ptr| {
+            self.cft_filter = if (new_get_field) |gf|
+                .{ .cft_ptr = cft_ptr, .get_field_fn = gf }
+            else
+                null;
         }
     }
 
