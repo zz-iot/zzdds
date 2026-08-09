@@ -783,7 +783,7 @@ test "QueryConditionImpl: matchSample with simple field expression" {
     defer qc.deinit();
 
     const GetField = struct {
-        fn get(payload: []const u8, field: []const u8) ?zzdds.dcps.filter.FilterValue {
+        fn get(_: *anyopaque, payload: []const u8, field: []const u8, _: []u8) ?zzdds.dcps.filter.FilterValue {
             _ = payload;
             if (std.mem.eql(u8, field, "x"))
                 return .{ .string = "hello" };
@@ -791,7 +791,7 @@ test "QueryConditionImpl: matchSample with simple field expression" {
         }
     };
 
-    try testing.expect(qc.matchSample("ignored", GetField.get));
+    try testing.expect(qc.matchSample("ignored", .{ .ctx = undefined, .func = GetField.get }));
 }
 
 // ── Prior-buffer-free paths ───────────────────────────────────────────────────

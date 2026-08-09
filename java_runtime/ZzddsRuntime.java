@@ -28,10 +28,22 @@ public final class ZzddsRuntime {
     /**
      * Registers `typeClass`'s TypeSupport with zzdds under `typeName`.
      * `typeClass` must declare a `static byte[] computeKeyHashFromCdr(byte[])`
-     * method (zidl generates this on every `@key` topic struct).
+     * method (zidl generates this on every topic struct, keyed or keyless).
      *
-     * Backed by `zzdds_register_type_support_ctx_c` (see `zzdds_c.h`), which
-     * forwards a per-registration native context to the key-hash callback —
+     * `typeClass` may additionally declare a
+     * `static Object getFieldFromCdr(byte[] payload, String field)` method
+     * (zidl generates this on every topic struct too) — when present, a
+     * `DataReader` created against a `ContentFilteredTopic` for this type
+     * filters automatically, at the reader layer, with no app-side
+     * re-checking. Returns `null` for an unknown field, a boxed
+     * `Long`/`Double` for an int-like/float-like field, or a `String` for a
+     * string-like one. Optional: a `typeClass` without one still registers
+     * fine, it just gets no automatic CFT filtering (every sample passes
+     * through unfiltered, the same as any other binding's TypeSupport with
+     * a NULL get_field callback).
+     *
+     * Backed by `zzdds_register_type_support_ctx` (see `zzdds_c.h`), which
+     * forwards a per-registration native context to both callbacks —
      * unbounded (no fixed slot count) and reclaimed automatically when this
      * registration is replaced or `participant` is destroyed.
      */
@@ -49,6 +61,67 @@ public final class ZzddsRuntime {
     public static native byte[] takeRaw(Object reader, int maxSize, long[] handleOut, boolean[] validOut);
 
     public static native byte[] readRaw(Object reader, int maxSize, long[] handleOut, boolean[] validOut);
+
+    /**
+     * Takes/reads the next sample of the instance identified by `prev`
+     * (`DDS_HANDLE_NIL`/`0` to start at the first instance), draining that
+     * instance before moving to the next — same semantics as C/C++'s
+     * `take_next_instance`/`read_next_instance`. Returns null if none was
+     * available. `handleOut`/`validOut` must be pre-allocated 1-element
+     * arrays; `maxSize` bounds the receive buffer, same as {@link #takeRaw}.
+     */
+    public static native byte[] takeNextInstanceRaw(Object reader, long prev, int maxSize, long[] handleOut, boolean[] validOut);
+
+    public static native byte[] readNextInstanceRaw(Object reader, long prev, int maxSize, long[] handleOut, boolean[] validOut);
+
+    /**
+     * Batch take/read of up to `max` samples matching the given sample/view/
+     * instance state masks (e.g. {@code Dcps.DDS.ANY_SAMPLE_STATE.value}) —
+     * same semantics as C/C++'s `take_n`/`read_n`. `max` must be positive
+     * (unlike the underlying C ABI, which also accepts <= 0 for "everything
+     * currently available" — not exposed here, since `handlesOut`/
+     * `validsOut` must be sized by the caller *before* the call, which is
+     * only possible when `max` is a known, fixed bound).
+     *
+     * Returns a {@code byte[][]} of `N <= max` raw payloads (`N` is the true
+     * count — may be less than `max` if fewer samples were available).
+     * `handlesOut`/`validsOut` must be pre-allocated to length `max`; only
+     * their first `N` entries are meaningful, parallel to the returned
+     * array. Unlike {@link #takeRaw}, there is no per-sample buffer-size
+     * bound to pass: each sample's buffer is allocated by zzdds core,
+     * sized exactly to that sample's real length.
+     */
+    public static native byte[][] takeNRaw(Object reader, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
+
+    public static native byte[][] readNRaw(Object reader, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
+
+    /** Resolves a named field (e.g. "color", "x") on whatever sample the
+     * caller currently has in hand, for {@link #cftMatchSample}. Return a
+     * {@code String} or a boxed {@code Long}; {@code null} for an unknown
+     * field (matches zzdds's own FieldAccessor.get returning null). */
+    public interface FieldAccessor {
+        Object get(String field);
+    }
+
+    /**
+     * Evaluates {@code cft}'s filter expression against one sample via
+     * {@code accessor}, using zzdds's own filter parser/evaluator.
+     *
+     * If the type's {@code getFieldFromCdr} static method is present (see
+     * {@link #registerTypeSupport}), a {@code DataReader} created against a
+     * {@code ContentFilteredTopic} already filters automatically at the
+     * reader layer -- you don't need this. Use {@code cftMatchSample} when
+     * a type has no {@code getFieldFromCdr} (e.g. a hand-written
+     * TypeSupport class predating that contract), or to test an
+     * already-deserialized sample against a filter outside the context of a
+     * live {@code DataReader} (e.g. tooling/tests) -- mirrors {@code
+     * zzdds_c.h}'s {@code zzdds_cft_match_sample}, the same fallback/
+     * lower-level role for C/C++.
+     *
+     * Returns true if the sample passes the filter (should be delivered) --
+     * also true for a null {@code cft} (no filter active).
+     */
+    public static native boolean cftMatchSample(Object cft, FieldAccessor accessor);
 
     /**
      * Narrows a plain {@code io.zzdds.dcps.Dcps.DDS.DataWriter} (as returned

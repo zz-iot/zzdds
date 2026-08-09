@@ -1,6 +1,6 @@
 //! Tests for the C-ABI TypeSupport registration shim.
 //!
-//! Verifies that zzdds_register_type_support_c correctly bridges a C-style
+//! Verifies that zzdds_register_type_support correctly bridges a C-style
 //! compute_key_hash function pointer into the Zig TypeSupport infrastructure.
 
 const std = @import("std");
@@ -62,7 +62,7 @@ const Fixture = struct {
     dp: DDS.DomainParticipant,
     /// Boxed C-ABI handle for `dp` -- what a real C caller actually has
     /// (zzdds_c.h's DDS_DomainParticipant is an opaque pointer, not the
-    /// native {ptr, vtable} fat pointer). zzdds_register_type_support_c must
+    /// native {ptr, vtable} fat pointer). zzdds_register_type_support must
     /// be exercised with *this*, not `dp` directly, or the test never
     /// catches a C-ABI signature mismatch (it previously didn't: passing
     /// `dp` natively happened to typecheck against the function's old,
@@ -108,14 +108,15 @@ const Fixture = struct {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-test "c_abi TypeSupport: zzdds_register_type_support_c wires compute_key_hash" {
+test "c_abi TypeSupport: zzdds_register_type_support wires compute_key_hash" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
-    const rc = c_abi_ts.zzdds_register_type_support_c(
+    const rc = c_abi_ts.zzdds_register_type_support(
         fx.dp_boxed,
         "TestType",
         stubComputeKeyHashFromCdr,
+        null,
     );
     try testing.expectEqual(@as(c_int, 0), rc);
 
@@ -142,10 +143,11 @@ test "c_abi TypeSupport: NULL participant handle returns error instead of crashi
     // expected "no object" value in C, not UB) must be caught before
     // unboxing, not after -- @ptrFromInt(0) constructs the same bit pattern
     // a real C caller's NULL would produce at the ABI boundary.
-    const rc = c_abi_ts.zzdds_register_type_support_c(
+    const rc = c_abi_ts.zzdds_register_type_support(
         makeNullHandle(),
         "TestType",
         stubComputeKeyHashFromCdr,
+        null,
     );
     try testing.expectEqual(@as(c_int, -1), rc);
 }
@@ -172,15 +174,16 @@ fn stubCtxDeinit(ctx: ?*anyopaque) callconv(.c) void {
     ctx_deinit_calls += 1;
 }
 
-test "c_abi TypeSupport: zzdds_register_type_support_ctx_c forwards ctx to every call" {
+test "c_abi TypeSupport: zzdds_register_type_support_ctx forwards ctx to every call" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
     var tag: u8 = 0xAB;
-    const rc = c_abi_ts.zzdds_register_type_support_ctx_c(
+    const rc = c_abi_ts.zzdds_register_type_support_ctx(
         fx.dp_boxed,
         "CtxType",
         stubComputeKeyHashCtx,
+        null,
         &tag,
         null,
     );
@@ -201,10 +204,11 @@ test "c_abi TypeSupport: ctx_deinit fires on replace and on participant deinit" 
         var fx = try Fixture.init(testing.allocator);
         defer fx.deinit();
 
-        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_ctx_c(
+        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_ctx(
             fx.dp_boxed,
             "ReplacedType",
             stubComputeKeyHashCtx,
+            null,
             &tag,
             stubCtxDeinit,
         ));
@@ -213,10 +217,11 @@ test "c_abi TypeSupport: ctx_deinit fires on replace and on participant deinit" 
         // Re-registering the same type_name replaces the entry -- the OLD
         // registration's ctx_deinit must fire (see
         // DomainParticipantImpl.registerTypeSupport's replace path).
-        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_ctx_c(
+        try testing.expectEqual(@as(c_int, 0), c_abi_ts.zzdds_register_type_support_ctx(
             fx.dp_boxed,
             "ReplacedType",
             stubComputeKeyHashCtx,
+            null,
             &tag,
             stubCtxDeinit,
         ));
@@ -229,10 +234,11 @@ test "c_abi TypeSupport: ctx_deinit fires on replace and on participant deinit" 
 
 test "c_abi TypeSupport: ctx_deinit variant NULL participant handle returns error instead of crashing" {
     var tag: u8 = 0;
-    const rc = c_abi_ts.zzdds_register_type_support_ctx_c(
+    const rc = c_abi_ts.zzdds_register_type_support_ctx(
         makeNullHandle(),
         "TestType",
         stubComputeKeyHashCtx,
+        null,
         &tag,
         null,
     );
@@ -243,9 +249,10 @@ test "c_abi TypeSupport: NULL compute_key_hash registers zeroed-hash fallback" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
 
-    const rc = c_abi_ts.zzdds_register_type_support_c(
+    const rc = c_abi_ts.zzdds_register_type_support(
         fx.dp_boxed,
         "KeylessType",
+        null,
         null,
     );
     try testing.expectEqual(@as(c_int, 0), rc);
@@ -256,4 +263,92 @@ test "c_abi TypeSupport: NULL compute_key_hash registers zeroed-hash fallback" {
     const payload = [_]u8{ 0x00, 0x07, 0x00, 0x00, 0xFF };
     const hash = ts.?.compute_key_hash(ts.?.ctx, &payload);
     try testing.expectEqualSlices(u8, &std.mem.zeroes([16]u8), &hash);
+}
+
+// ── get_field_from_cdr wiring ─────────────────────────────────────────────────
+//
+// Simulates what `zidl -b c` generates: reads a fake 1-byte "x" field at
+// payload offset 4 (after the 4-byte encap header) when asked for field "x",
+// otherwise reports no match. Exercises the scratch-buffer contract on a
+// second, string-valued field ("name") to prove a real caller must copy into
+// `scratch` rather than return a pointer into a local.
+
+fn stubGetFieldFromCdr(
+    payload: [*]const u8,
+    payload_len: usize,
+    field: [*]const u8,
+    field_len: usize,
+    out: *c_abi_ts.ZzddsFilterValue,
+    scratch: [*]u8,
+    scratch_len: usize,
+) callconv(.c) bool {
+    const field_name = field[0..field_len];
+    if (std.mem.eql(u8, field_name, "x")) {
+        if (payload_len < 5) return false;
+        out.* = .{ .kind = 0, .i = payload[4] };
+        return true;
+    }
+    if (std.mem.eql(u8, field_name, "name")) {
+        // Deliberately materialize into a local first (as a real generated
+        // deserializer would), then copy out of it -- proving the adapter's
+        // contract (copy into `scratch`, don't point into a local) is
+        // actually exercised, not just declared.
+        const local_name = [_]u8{ 'R', 'E', 'D' };
+        if (scratch_len < local_name.len) return false;
+        @memcpy(scratch[0..local_name.len], &local_name);
+        out.* = .{ .kind = 2, .s_ptr = scratch, .s_len = local_name.len };
+        return true;
+    }
+    return false;
+}
+
+test "c_abi TypeSupport: zzdds_register_type_support wires get_field_from_cdr" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const rc = c_abi_ts.zzdds_register_type_support(
+        fx.dp_boxed,
+        "FilterableType",
+        stubComputeKeyHashFromCdr,
+        stubGetFieldFromCdr,
+    );
+    try testing.expectEqual(@as(c_int, 0), rc);
+
+    const ts = fx.impl().type_support_registry.get("FilterableType");
+    try testing.expect(ts != null);
+    try testing.expect(ts.?.get_field != null);
+
+    const payload = [_]u8{
+        0x00, 0x07, 0x00, 0x00, // encap: XCDR2 LE
+        0x2A, // x = 42
+    };
+    var scratch: [64]u8 = undefined;
+
+    const x_val = ts.?.get_field.?(ts.?.ctx, &payload, "x", &scratch);
+    try testing.expect(x_val != null);
+    try testing.expectEqual(@as(i64, 42), x_val.?.int);
+
+    const name_val = ts.?.get_field.?(ts.?.ctx, &payload, "name", &scratch);
+    try testing.expect(name_val != null);
+    try testing.expectEqualStrings("RED", name_val.?.string);
+
+    const missing_val = ts.?.get_field.?(ts.?.ctx, &payload, "nope", &scratch);
+    try testing.expect(missing_val == null);
+}
+
+test "c_abi TypeSupport: NULL get_field_from_cdr leaves TypeSupport.get_field unset" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const rc = c_abi_ts.zzdds_register_type_support(
+        fx.dp_boxed,
+        "NoFilterType",
+        stubComputeKeyHashFromCdr,
+        null,
+    );
+    try testing.expectEqual(@as(c_int, 0), rc);
+
+    const ts = fx.impl().type_support_registry.get("NoFilterType");
+    try testing.expect(ts != null);
+    try testing.expect(ts.?.get_field == null);
 }

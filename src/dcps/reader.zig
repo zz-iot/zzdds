@@ -34,10 +34,11 @@ const Guid = proto.Guid;
 /// get_field function is available for this type.
 pub const CftFilterState = struct {
     cft_ptr: *topic_mod.ContentFilteredTopicImpl,
-    get_field_fn: *const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue,
+    get_field_fn: filter_mod.CdrFieldGetter,
 
     pub fn matches(self: *const CftFilterState, payload: []const u8) bool {
-        var ctx = FieldCtx{ .payload = payload, .get_fn = self.get_field_fn };
+        var pool = filter_mod.ScratchPool{};
+        var ctx = FieldCtx{ .payload = payload, .get_fn = self.get_field_fn, .pool = &pool };
         const accessor = filter_mod.FieldAccessor{
             .ctx = &ctx,
             .get = FieldCtx.get,
@@ -47,11 +48,12 @@ pub const CftFilterState = struct {
 
     const FieldCtx = struct {
         payload: []const u8,
-        get_fn: *const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+        get_fn: filter_mod.CdrFieldGetter,
+        pool: *filter_mod.ScratchPool,
 
         fn get(ctx: *anyopaque, field: []const u8) ?filter_mod.FilterValue {
             const self: *const FieldCtx = @ptrCast(@alignCast(ctx));
-            return self.get_fn(self.payload, field);
+            return self.get_fn.get(self.payload, field, self.pool.nextSlot());
         }
     };
 };
@@ -146,7 +148,7 @@ fn matchesSample(
 fn matchesQuery(
     pc: PendingChange,
     maybe_qc: ?*const waitset.QueryConditionImpl,
-    get_field_fn: ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+    get_field_fn: ?filter_mod.CdrFieldGetter,
 ) bool {
     const qc = maybe_qc orelse return true;
     const gff = get_field_fn orelse return true;
@@ -245,14 +247,26 @@ pub const DataReaderImpl = struct {
     /// Presentation QoS from the owning Subscriber; set once after init.
     subscriber_presentation: DDS.PresentationQosPolicy = .{},
 
-    /// ContentFilteredTopic filter; null when no CFT or no get_field fn registered.
-    /// Set once after init by the subscriber; read-only thereafter.
+    /// ContentFilteredTopic this reader was created against, if any. Set once
+    /// by the subscriber before the first refreshGetFieldFn call and never
+    /// mutated after -- unlike cft_filter/get_field_fn below, this is safe to
+    /// read without `mu`. Kept separate from cft_filter so that losing (and
+    /// later regaining) a get_field getter doesn't lose the CFT association:
+    /// refreshGetFieldFn derives cft_filter from this pointer every time
+    /// rather than mutating a previously-built CftFilterState in place.
+    cft_ptr: ?*topic_mod.ContentFilteredTopicImpl = null,
+
+    /// ContentFilteredTopic filter; null when no CFT or no get_field fn
+    /// currently registered. Populated/refreshed exclusively by
+    /// refreshGetFieldFn, under `mu` -- read under `mu` everywhere else
+    /// (on_receive's CFT check, readFiltered/takeFiltered's QueryCondition
+    /// evaluation).
     cft_filter: ?CftFilterState = null,
 
     /// Field accessor for QueryCondition evaluation at read/take time.
     /// Set from TypeSupport.get_field when available; null otherwise.
-    /// Set once after init by the subscriber; read-only thereafter.
-    get_field_fn: ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue = null,
+    /// Populated/refreshed exclusively by refreshGetFieldFn, under `mu`.
+    get_field_fn: ?filter_mod.CdrFieldGetter = null,
 
     /// SampleLost status counters. Guarded by `mu`.
     sample_lost_total: i32 = 0,
@@ -1699,7 +1713,8 @@ pub const DataReaderImpl = struct {
     }
 
     /// Fire on_requested_deadline_missed if the listener is registered for it.
-    /// May be called while participant.mu is held; must not re-enter participant.
+    /// Only called from checkTimersFn, with participant.mu NOT held -- see
+    /// that function's doc comment.
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
@@ -1719,9 +1734,34 @@ pub const DataReaderImpl = struct {
         }
     }
 
+    /// Registered alongside checkTimersFn so that participant.checkTimers()
+    /// can hold a quiesce reference across its own unlock-then-dispatch
+    /// window, not just the one checkTimersFn takes internally below. A raw
+    /// `ctx` pointer copied out of the participant's map while `mu` is held
+    /// isn't itself protected from becoming dangling before checkTimersFn
+    /// ever runs -- EntityQuiesce can't protect a pointer that's already
+    /// invalid before acquire() is called on it (see entity_quiesce.zig's
+    /// module doc comment). Calling this (while `mu` is still held, so the
+    /// entity is provably still live) and holding it until after `check`
+    /// returns closes that gap.
+    pub fn quiesceAcquireFn(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+
+    pub fn quiesceReleaseFn(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
+    }
+
     /// Called by participant.checkTimers() for each active reader.
     /// Checks DEADLINE and LIVELINESS lease expiry; fires notifications when thresholds exceeded.
-    /// Called while participant.mu is held; must not re-enter participant.
+    /// Called with participant.mu NOT held (checkTimers() collects the due
+    /// callbacks under the lock, then releases it before calling any of
+    /// them) -- safe for this (and notifyDeadlineMissed/notifyLivelinessChanged
+    /// below, which this may call) to re-enter the participant, e.g. if a
+    /// user listener reacts to a deadline-missed notification by deleting
+    /// the reader/participant.
     pub fn checkTimersFn(ctx: *anyopaque, now_ns: i64) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
@@ -1758,6 +1798,39 @@ pub const DataReaderImpl = struct {
         }
         self.mu.unlock();
         if (liveliness_changed) self.notifyLivelinessChanged();
+    }
+
+    /// Registered with the participant (see participant.zig's
+    /// subRegisterReaderGetFieldRefresh / ActiveReader.refresh_get_field) so
+    /// that re-registering TypeSupport for this reader's type can push the
+    /// new get_field getter in -- without this, get_field_fn (and
+    /// cft_filter.get_field_fn, if this reader was created against a
+    /// ContentFilteredTopic) would keep pointing at the old TypeSupport's
+    /// ctx after registerTypeSupport() frees it, and the next CFT/
+    /// QueryCondition evaluation would dereference freed memory.
+    pub fn refreshGetFieldFn(ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        // get_field_fn and cft_filter are read under self.mu everywhere else
+        // (on_receive's CFT check, readFiltered/takeFiltered's QueryCondition
+        // evaluation) -- take it here too, or a concurrent evaluation can
+        // observe a torn/inconsistent write to either field.
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.get_field_fn = new_get_field;
+        // Always derive cft_filter from cft_ptr (immutable, set once at
+        // creation) rather than mutating/dropping a previously-built
+        // CftFilterState -- CftFilterState.get_field_fn is non-optional, so
+        // there's no shape for "CFT but no getter", but dropping cft_ptr
+        // along with it (as a prior version of this function did) would
+        // permanently disable CFT filtering for this reader the moment a
+        // TypeSupport re-registration transiently had no get_field, even if
+        // a later re-registration brought one back.
+        if (self.cft_ptr) |cft_ptr| {
+            self.cft_filter = if (new_get_field) |gf|
+                .{ .cft_ptr = cft_ptr, .get_field_fn = gf }
+            else
+                null;
+        }
     }
 
     // ── Entity vtable ─────────────────────────────────────────────────────────

@@ -88,6 +88,11 @@ pub const takeFilteredRaw = raw_ops.takeFilteredRaw;
 pub const readFilteredRaw = raw_ops.readFilteredRaw;
 pub const getKeyValueRawReader = raw_ops.getKeyValueRawReader;
 pub const lookupInstanceReader = raw_ops.lookupInstanceReader;
+pub const registerTypeSupport = raw_ops.registerTypeSupport;
+pub const asZzddsDataWriter = raw_ops.asZzddsDataWriter;
+pub const asZzddsDataReader = raw_ops.asZzddsDataReader;
+pub const asZzddsTopic = raw_ops.asZzddsTopic;
+pub const asZzddsDomainParticipant = raw_ops.asZzddsDomainParticipant;
 
 pub const util = struct {
     pub const time = @import("util/time.zig");

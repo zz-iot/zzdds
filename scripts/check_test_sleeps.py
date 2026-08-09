@@ -15,15 +15,27 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 ALLOWLIST = {
-    # Full UDP loopback tests use receive threads and real sockets.
-    "test/dcps/loopback_test.zig": (2, "UDP loopback receive/discovery polling"),
-    # MockTransport avoids sockets, but SPDP timer threads still announce on intervals.
-    "test/dcps/mock_loopback_test.zig": (14, "SPDP timer-thread discovery polling"),
+    # Full UDP loopback tests use receive threads and real sockets. Third
+    # sleep added with the same-participant self-matching regression test
+    # (a real writer+reader on one participant, waiting for real SPDP/SEDP
+    # discovery to complete before writing) -- same category as the other
+    # two, not a new one.
+    "test/dcps/loopback_test.zig": (3, "UDP loopback receive/discovery polling"),
+    # MockTransport avoids sockets, but SPDP timer threads still announce on
+    # intervals. 15th sleep added with the writer-discovered-before-reader
+    # retroactive-match regression test (polling discovered_writers via real
+    # SPDP/SEDP timer-thread announcements) -- same category as the rest.
+    "test/dcps/mock_loopback_test.zig": (15, "SPDP timer-thread discovery polling"),
     # API and WaitSet tests intentionally wake waits from another thread.
     "test/dcps/api_test.zig": (1, "threaded WaitSet wakeup"),
     "test/dcps/waitset_test.zig": (1, "threaded WaitSet wakeup"),
     # TCP transport tests exercise real listener/connection threads.
     "test/transport/tcp_transport_test.zig": (1, "TCP listener thread startup"),
+    # Regression test for deinit() reentrancy from the participant's own
+    # background timer thread: needs the real timer thread to notice a real
+    # DEADLINE expiry (ManualClock only ever advances from the calling test
+    # thread, so it can't reach this path), polled with a bounded timeout.
+    "test/dcps/participant_vtable_test.zig": (1, "timer-thread self-delete polling"),
 }
 
 PATTERNS = (

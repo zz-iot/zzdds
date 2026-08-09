@@ -9,13 +9,20 @@
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const dcps_writer = @import("dcps/writer.zig");
 const dcps_reader = @import("dcps/reader.zig");
+const dcps_participant = @import("dcps/participant.zig");
+const dcps_topic = @import("dcps/topic.zig");
+const filter_mod = @import("dcps/filter.zig");
+const zzdds_ext = @import("c_abi/extensions.zig");
 const history_mod = @import("rtps/history.zig");
 const time_mod = @import("util/time.zig");
 
 const DataWriterImpl = dcps_writer.DataWriterImpl;
 const DataReaderImpl = dcps_reader.DataReaderImpl;
+const DomainParticipantImpl = dcps_participant.DomainParticipantImpl;
+const TopicImpl = dcps_topic.TopicImpl;
 
 /// Write kind for module-level write operations.
 pub const WriteKind = enum { alive, dispose, unregister };
@@ -40,6 +47,63 @@ fn toChangeKind(kind: WriteKind, impl: *DataWriterImpl) history_mod.ChangeKind {
         else
             .not_alive_unregistered,
     };
+}
+
+// ── Participant operations ────────────────────────────────────────────────────
+
+/// Register a TypeSupport with a DomainParticipant under `type_name`, replacing
+/// any existing registration under the same name.  The pure-Zig equivalent of
+/// the C ABI's `zzdds_register_type_support` (src/c_abi/typesupport.zig) --
+/// that shim does this same handle-to-impl unboxing internally for C/C++/Java
+/// callers; this gives Zig callers the same one-call surface instead of
+/// requiring them to downcast `participant.ptr` to `*DomainParticipantImpl`
+/// themselves.  Returns false if the participant is being torn down.
+pub fn registerTypeSupport(
+    participant: DDS.DomainParticipant,
+    type_name: []const u8,
+    ts: dcps_participant.TypeSupport,
+) bool {
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(participant.ptr));
+    return impl.registerTypeSupport(type_name, ts);
+}
+
+/// Upcast a base DDS entity handle to its zzdds-extended interface view --
+/// e.g. so a writer created via the plain `DDS.Publisher.create_datawriter`
+/// can reach `set_listener_ex` (`DataWriterListenerEx::on_reliable_reader_ready`,
+/// the vendor extension this hello_world/shape/listener-pubsub family of
+/// examples exists partly to demonstrate). A real vtable-identity check, the
+/// pure-Zig equivalent of the C ABI's `DDS_DataWriter_as_zzdds_DataWriter`
+/// (`src/c_abi/extensions.zig`) -- that shim does this same check internally
+/// for C/C++/Java callers (Java's own `ZzddsRuntime.asZzddsDataWriter` is the
+/// same idea again, one layer further out); this gives Zig callers the same
+/// safe upcast instead of requiring them to blindly downcast `writer.ptr` to
+/// `*DataWriterImpl` themselves. Returns `null` for a handle not issued by
+/// this implementation (today, in a single-vendor-per-process reality, that
+/// should never actually happen for a handle that came from this same
+/// zzdds -- but the check is what makes this a real upcast rather than the
+/// blind cast it replaces).
+pub fn asZzddsDataWriter(writer: DDS.DataWriter) ?ZZDDS.DataWriter {
+    if (writer.vtable != &DataWriterImpl.vtable) return null;
+    return .{ .ptr = writer.ptr, .vtable = &zzdds_ext.writer_vtable };
+}
+
+/// See `asZzddsDataWriter` -- same shape, for `DataReader`.
+pub fn asZzddsDataReader(reader: DDS.DataReader) ?ZZDDS.DataReader {
+    if (reader.vtable != &DataReaderImpl.vtable) return null;
+    return .{ .ptr = reader.ptr, .vtable = &zzdds_ext.reader_vtable };
+}
+
+/// See `asZzddsDataWriter` -- same shape, for `Topic` (reaches
+/// `as_topic_description` and friends).
+pub fn asZzddsTopic(topic: DDS.Topic) ?ZZDDS.Topic {
+    if (topic.vtable != &TopicImpl.topic_vtable) return null;
+    return .{ .ptr = topic.ptr, .vtable = &zzdds_ext.topic_vtable };
+}
+
+/// See `asZzddsDataWriter` -- same shape, for `DomainParticipant`.
+pub fn asZzddsDomainParticipant(participant: DDS.DomainParticipant) ?ZZDDS.DomainParticipant {
+    if (participant.vtable != &DomainParticipantImpl.vtable) return null;
+    return .{ .ptr = participant.ptr, .vtable = &zzdds_ext.participant_vtable };
 }
 
 // ── QoS helpers ──────────────────────────────────────────────────────────────
@@ -247,4 +311,188 @@ pub fn lookupInstanceReader(
 ) ?DDS.InstanceHandle_t {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
     return if (impl.lookupInstance(handle)) handle else null;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const intraprocess = @import("delivery/intraprocess.zig");
+const noop_security = @import("security/noop.zig").noop_security_plugins;
+const DomainParticipantFactoryImpl = @import("dcps/factory.zig").DomainParticipantFactoryImpl;
+
+const TestFixture = struct {
+    delivery: intraprocess.IntraProcessDelivery,
+    t: *intraprocess.MemoryTransport,
+    d: *intraprocess.DirectDiscovery,
+    factory: *DomainParticipantFactoryImpl,
+    dp: DDS.DomainParticipant,
+
+    fn init(alloc: std.mem.Allocator) !TestFixture {
+        var delivery = try intraprocess.IntraProcessDelivery.init(alloc);
+        errdefer delivery.deinit();
+        const t = try delivery.newTransport();
+        errdefer t.deinit();
+        const d = try delivery.newDiscovery();
+        errdefer d.deinit();
+        const factory = try DomainParticipantFactoryImpl.init(
+            alloc,
+            t.transport(),
+            d.toDiscovery(),
+            noop_security,
+            .spec_random,
+            .{},
+        );
+        errdefer factory.deinit();
+        const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+        return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp };
+    }
+
+    fn deinit(self: *TestFixture) void {
+        _ = self.factory.toDDSFactory().delete_participant(self.dp);
+        self.factory.deinit();
+        self.d.deinit();
+        self.t.deinit();
+        self.delivery.deinit();
+    }
+};
+
+test "asZzddsDomainParticipant/Topic/DataWriter/DataReader: real vtable-checked upcast" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const zdp = asZzddsDomainParticipant(fx.dp) orelse return error.TestUnexpectedResult;
+    try testing.expect(zdp.ptr == fx.dp.ptr);
+
+    const topic = fx.dp.create_topic("T", "T", .{}, null, 0);
+    const ztopic = asZzddsTopic(topic) orelse return error.TestUnexpectedResult;
+    try testing.expect(ztopic.ptr == topic.ptr);
+
+    const pub_ = fx.dp.create_publisher(.{}, null, 0);
+    const dw = pub_.create_datawriter(topic, .{}, null, 0);
+    const zdw = asZzddsDataWriter(dw) orelse return error.TestUnexpectedResult;
+    try testing.expect(zdw.ptr == dw.ptr);
+    // set_listener_ex is the whole point of this upcast -- confirm it's
+    // actually callable on the returned interface value, not just that the
+    // upcast itself succeeded.
+    try testing.expectEqual(DDS.RETCODE_OK, zdw.set_listener_ex(null, 0));
+
+    const sub_ = fx.dp.create_subscriber(.{}, null, 0);
+    const topic_desc = fx.dp.lookup_topicdescription("T");
+    const dr = sub_.create_datareader(topic_desc, .{}, null, 0);
+    const zdr = asZzddsDataReader(dr) orelse return error.TestUnexpectedResult;
+    try testing.expect(zdr.ptr == dr.ptr);
+}
+
+test "asZzddsDataWriter: null for a handle not issued by this implementation" {
+    // The nil sentinel's vtable doesn't match DataWriterImpl.vtable -- the
+    // simplest available handle whose vtable is known *not* to match,
+    // without a second DDS implementation in-repo to construct a genuinely
+    // foreign one.
+    const nil = @import("dcps/nil.zig");
+    try testing.expect(asZzddsDataWriter(nil.nil_datawriter) == null);
+}
+
+// Phase 0 of "make CFT filtering spec-compliant across all bindings": proves
+// that wiring a real TypeSupport.get_field (no codegen involved -- this is a
+// hand-written closure over an intentionally trivial one-byte "payload") is
+// enough, on its own, for subscriber.zig/reader.zig's EXISTING cft_filter
+// machinery to activate and actually filter -- before any backend generates
+// a real get_field_from_cdr. If this test passes, the remaining phases are
+// purely "teach each backend to generate the callback", not "fix the runtime".
+//
+// Writer and reader deliberately live on SEPARATE participants (own
+// transport/discovery each, sharing one IntraProcessDelivery to route
+// between them) -- a single participant's own reader does not receive its
+// own writer's data in this harness (confirmed: an earlier same-participant
+// version of this test never delivered anything at all). Mirrors
+// test/dcps/qos_runtime_test.zig's `Fixture`.
+test "TypeSupport.get_field wires cft_filter automatically: reader delivers only matching samples" {
+    const nil = @import("dcps/nil.zig");
+    const alloc = testing.allocator;
+
+    var delivery = try intraprocess.IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+
+    const t_w = try delivery.newTransport();
+    defer t_w.deinit();
+    const d_w = try delivery.newDiscovery();
+    defer d_w.deinit();
+    const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
+    defer factory_w.deinit();
+    const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = factory_w.toDDSFactory().delete_participant(dp_w);
+
+    const t_r = try delivery.newTransport();
+    defer t_r.deinit();
+    const d_r = try delivery.newDiscovery();
+    defer d_r.deinit();
+    const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
+    defer factory_r.deinit();
+    const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = factory_r.toDDSFactory().delete_participant(dp_r);
+
+    const GetField = struct {
+        // Trivial fake wire format for this test only: byte 0 = "x" (int),
+        // byte 1 = "color"'s length, bytes 2.. = "color"'s bytes. Real
+        // backends generate a real CDR parse; get_field's contract doesn't
+        // care how payload is structured -- deliberately exercises the
+        // string/scratch path too (not just an int field), since that's the
+        // actual shape zzdds-examples' `--cft "color = 'RED'"` needs and the
+        // dangling-pointer hazard `scratch` exists to avoid only applies to
+        // strings.
+        fn get(_: *anyopaque, payload: []const u8, field: []const u8, scratch: []u8) ?filter_mod.FilterValue {
+            if (std.mem.eql(u8, field, "x")) {
+                if (payload.len > 0) return .{ .int = payload[0] };
+                return null;
+            }
+            if (std.mem.eql(u8, field, "color")) {
+                if (payload.len < 2) return null;
+                const len = payload[1];
+                if (payload.len < 2 + @as(usize, len) or len > scratch.len) return null;
+                @memcpy(scratch[0..len], payload[2 .. 2 + len]);
+                return .{ .string = scratch[0..len] };
+            }
+            return null;
+        }
+        fn keyHash(_: *anyopaque, _: []const u8) [16]u8 {
+            return std.mem.zeroes([16]u8);
+        }
+    };
+
+    // Only the READER's participant needs a get_field registration --
+    // subGetFieldFn looks it up per-participant, and CFT filtering happens
+    // on the receiving side.
+    const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
+    try testing.expect(dp_r_impl.registerTypeSupport("CftAutoT", .{
+        .ctx = undefined,
+        .compute_key_hash = GetField.keyHash,
+        .get_field = GetField.get,
+    }));
+
+    const topic_w = dp_w.create_topic("CftAutoT", "CftAutoT", .{}, null, 0);
+    const topic_r = dp_r.create_topic("CftAutoT", "CftAutoT", .{}, null, 0);
+    const cft = dp_r.create_contentfilteredtopic("CftAutoT_cft", topic_r, "x = 5 AND color = 'RED'", null);
+    try testing.expect(!nil.isNil(cft));
+    defer _ = dp_r.delete_contentfilteredtopic(cft);
+
+    const pub_ = dp_w.create_publisher(.{}, null, 0);
+    const dw = pub_.create_datawriter(topic_w, .{}, null, 0);
+    const sub_ = dp_r.create_subscriber(.{}, null, 0);
+    const dr = sub_.create_datareader(cft.vtable.as_TopicDescription(cft.ptr), .{}, null, 0);
+
+    const zero_key = std.mem.zeroes([16]u8);
+    const matching = [_]u8{ 5, 3, 'R', 'E', 'D' }; // x=5, color="RED" -- matches
+    const wrong_x = [_]u8{ 6, 3, 'R', 'E', 'D' }; // x=6 -- fails the int comparison
+    const wrong_color = [_]u8{ 5, 3, 'B', 'L', 'U' }; // color="BLU" -- fails the string comparison
+    try writeRaw(dw, .alive, zero_key, &matching);
+    try writeRaw(dw, .alive, zero_key, &wrong_x);
+    try writeRaw(dw, .alive, zero_key, &wrong_color);
+
+    // The app never re-checks the filter itself here -- if cft_filter wasn't
+    // wired up, all three samples would come through.
+    const first = takeRaw(dr) orelse return error.TestUnexpectedResult;
+    defer first.deinit();
+    try testing.expectEqualSlices(u8, &matching, first.data);
+
+    try testing.expect(takeRaw(dr) == null);
 }

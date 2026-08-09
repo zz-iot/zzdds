@@ -76,7 +76,7 @@ const Harness = struct {
             .announce_reader = announceReader,
             .timer_clock = clock.clock(),
             .register_timer_notify = registerTimerNotify,
-            .get_field_fn = getFieldFn,
+            .register_get_field_refresh = registerGetFieldRefresh,
         };
         const sub = try SubscriberImpl.init(
             alloc,
@@ -149,9 +149,9 @@ const Harness = struct {
     fn registerIncompatQos(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i32) void) void {}
     fn registerMatchedNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
     fn announceReader(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) void {}
-    fn registerTimerNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void) void {}
-    fn getFieldFn(_: *anyopaque, _: []const u8) ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue {
-        return null;
+    fn registerTimerNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void, _: *const fn (*anyopaque) bool, _: *const fn (*anyopaque) void) void {}
+    fn registerGetFieldRefresh(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {
+        // unchanged: no field lookups exercised by these tests
     }
 };
 

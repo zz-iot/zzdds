@@ -23,6 +23,7 @@ const MockTransport = zzdds.mock_transport.MockTransport;
 const Locator = zzdds.transport.Locator;
 const SpdpSedpDiscovery = zzdds.combined_discovery.SpdpSedpDiscovery;
 const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
+const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
@@ -305,6 +306,110 @@ test "mock_loopback: incompatible QoS — best_effort writer vs reliable reader"
     try std.testing.expect(dw_impl.incompat_total > 0);
 
     // No sample should have been delivered.
+    try std.testing.expect(dr_impl.takeRaw() == null);
+}
+
+test "mock_loopback: incompatible QoS detected when writer discovered before reader exists (retroactive match)" {
+    // Regression test: the sibling test above creates the reader BEFORE the
+    // writer, which only exercises onWriterDiscovered's live-discovery
+    // match loop. onWriterDiscovered only scans readers that already exist
+    // at the moment a writer is discovered -- a writer discovered first is
+    // matched later, retroactively, by subAnnounceProtoReader's own loop
+    // over discovered_writers when the reader is finally created. That
+    // retroactive loop used to silently `continue` past an incompatible
+    // writer with no REQUESTED_INCOMPATIBLE_QOS notification at all, since
+    // (unlike onWriterDiscovered) it never called ar.incompat_qos.notify().
+    // This orders writer creation (and discovery) strictly before reader
+    // creation to exercise that retroactive path specifically.
+    const alloc = std.testing.allocator;
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
+    defer mock_w.deinit();
+    const disc_w = try SpdpSedpDiscovery.init(alloc, mock_w.transport(), 0, 100);
+    var factory_w = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_w.transport(),
+        disc_w.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_w.deinit();
+        disc_w.deinit();
+    }
+    const dpf_w = factory_w.toDDSFactory();
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    defer _ = dpf_w.delete_participant(dp_w);
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic(
+        "RetroIncompatTopic",
+        "RetroIncompatType",
+        .{},
+        null,
+        0,
+    );
+    _ = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
+
+    const mock_r = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_R, PORT_META_R)});
+    defer mock_r.deinit();
+    const disc_r = try SpdpSedpDiscovery.init(alloc, mock_r.transport(), 0, 100);
+    var factory_r = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_r.transport(),
+        disc_r.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_r.deinit();
+        disc_r.deinit();
+    }
+    const dpf_r = factory_r.toDDSFactory();
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    defer _ = dpf_r.delete_participant(dp_r);
+    const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
+
+    // Drive discovery until the writer lands in discovered_writers -- with
+    // no reader created yet, this can only be reached through that path,
+    // never onWriterDiscovered's live-match loop (nothing in
+    // active_readers for it to scan).
+    const disc_deadline_ns = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < disc_deadline_ns) {
+        net.deliverAll();
+        if (dp_r_impl.discovered_writers.items.len > 0) break;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(dp_r_impl.discovered_writers.items.len > 0);
+
+    // Now create the reader -- subAnnounceProtoReader's retroactive-match
+    // loop should notice the already-discovered incompatible writer.
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic(
+        "RetroIncompatTopic",
+        "RetroIncompatType",
+        .{},
+        null,
+        0,
+    );
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    const dr = sub_r.create_datareader(
+        topic_desc_r,
+        dr_qos,
+        null,
+        0,
+    );
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    try std.testing.expect(dr_impl.incompat_total > 0);
     try std.testing.expect(dr_impl.takeRaw() == null);
 }
 

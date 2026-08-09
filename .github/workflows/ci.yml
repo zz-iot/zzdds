@@ -42,7 +42,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-063c34d' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-a9f61ee' }}
   # Pinned zz-iot/zzdds-examples commit for the examples-smoke-test job below.
   # Deliberately a commit, not "main" — the examples job executes that repo's
   # own scripts directly in this workflow's authenticated context, so a
@@ -51,7 +51,7 @@ env:
   # Bump deliberately (its own small PR) when zzdds-examples gains something
   # this job should pick up. Override via the zzdds_examples_ref
   # workflow_dispatch input to test against a different commit/branch/tag.
-  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || '1b43a747ecc50d64c200e237bba2831735209d02' }}
+  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || 'e213e5d7ec702d815c6f2686cecffe9f2e011e4b' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -121,7 +121,7 @@ jobs:
   # ── zzdds-examples smoke test ──────────────────────────────────────────────
   #
   # Builds zzdds with every binding enabled, then runs zz-iot/zzdds-examples'
-  # own orchestrator (run-all.sh) against that build — catches a PR breaking
+  # own orchestrator (run_all.py) against that build — catches a PR breaking
   # any of the C/C++/Java example apps, or their cross-binding-interop/opencv
   # smoke tests, independent of the dds-rtps interop coverage below.
   #
@@ -129,7 +129,7 @@ jobs:
   # needs" into a hard failure instead of a silent skip — appropriate here
   # since every binding and OpenCV are deliberately installed in this job, so
   # a skip would mean something regressed, not that the environment is just
-  # missing an optional piece (see run-all.sh's own default, unstrict
+  # missing an optional piece (see run_all.py's own default, unstrict
   # behavior for the latter case).
 
   examples:
@@ -194,6 +194,11 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Install Python (zzdds-examples' build/run/smoke-test scripts)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install OpenCV (for cpp/opencv_zzdds)
         run: |
           sudo apt-get update
@@ -205,7 +210,7 @@ jobs:
 
       - name: Run zzdds-examples (strict)
         working-directory: zzdds-examples
-        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zzdds/zig-out" ./run-all.sh --strict
+        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zzdds/zig-out" ./run_all.py --strict
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
@@ -467,23 +472,20 @@ jobs:
           path: dds-rtps
           persist-credentials: false
 
-      - name: Wire packages/zzdds and packages/zidl symlinks
+      - name: Wire packages/zzdds symlink
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-          # Clone zidl at the same tag declared by the local zzdds checkout.
-          ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
-            dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
-          if [[ -z "$ZIDL_TAG" ]]; then
-            echo "::error::Could not extract zidl tag from packages/zzdds/build.zig.zon"
-            exit 1
-          fi
-          git clone --depth=1 --branch "$ZIDL_TAG" \
-            https://github.com/zz-iot/zidl.git zidl
-          ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
+          # zzdds now re-exports zidl's own artifact and zidl_rt module (see
+          # zzdds's build.zig comment on b.modules.put(... "zidl_rt" ...) /
+          # b.installArtifact(zidl_exe)), and dds-rtps's build.zig.zon no
+          # longer declares its own .zidl dependency — zig resolves zidl
+          # transitively through this zzdds path dep, so no separate zidl
+          # checkout/symlink is needed here anymore.
+          #
           # zig-pkg/ is gitignored so actions/checkout does not clean it between
           # runs on the same runner.  Stale URL-fetched packages shadow the path
-          # deps above via fingerprint deduplication — wipe them first.
+          # dep above via fingerprint deduplication — wipe them first.
           rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
           (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
 
@@ -544,19 +546,14 @@ jobs:
           path: dds-rtps
           persist-credentials: false
 
-      - name: Wire packages/zzdds and packages/zidl symlinks
+      - name: Wire packages/zzdds symlink
         run: |
           mkdir -p dds-rtps/srcZig/zzdds/packages
           ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-          ZIDL_TAG=$(grep -oP 'tags/\K[^"]+(?=\.tar\.gz)' \
-            dds-rtps/srcZig/zzdds/packages/zzdds/build.zig.zon | head -1)
-          if [[ -z "$ZIDL_TAG" ]]; then
-            echo "::error::Could not extract zidl tag from packages/zzdds/build.zig.zon"
-            exit 1
-          fi
-          git clone --depth=1 --branch "$ZIDL_TAG" \
-            https://github.com/zz-iot/zidl.git zidl
-          ln -s ../../../../zidl dds-rtps/srcZig/zzdds/packages/zidl
+          # zzdds re-exports zidl's own artifact/zidl_rt module and
+          # dds-rtps's build.zig.zon no longer declares its own .zidl
+          # dependency, so no separate zidl checkout/symlink is needed here
+          # (see the self-interop job above for the full explanation).
           rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
           (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
 

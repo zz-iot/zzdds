@@ -30,7 +30,7 @@ const zidl_rt = @import("zidl_rt");
 // layout mismatch: the struct is 16 bytes (two pointer fields) where the
 // actual C caller only ever has an 8-byte opaque pointer, corrupting every
 // argument after it in the call. Confirmed via a real crash from a real C
-// program (not just a hypothetical) — see zzdds_register_type_support_c's
+// program (not just a hypothetical) — see zzdds_register_type_support's
 // fix in typesupport.zig for the first instance of this bug and the repro
 // that found it.
 

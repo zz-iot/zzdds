@@ -24,6 +24,56 @@ pub const FieldAccessor = struct {
     get: *const fn (ctx: *anyopaque, field: []const u8) ?FilterValue,
 };
 
+/// Bundles a `TypeSupport.get_field`-shaped callback (extracts a named field
+/// from a raw, not-yet-deserialized CDR payload) with the `ctx` it must be
+/// invoked with — the same `ctx` a registration's `compute_key_hash` uses,
+/// not a second one. Threaded as one unit through
+/// `ParticipantCbs.get_field_fn` → `DataReaderImpl.get_field_fn` →
+/// `CftFilterState`/`QueryConditionImpl.matchSample` so no call site has to
+/// separately track which `ctx` pairs with which function pointer.
+///
+/// `scratch` exists because an implementation necessarily deserializes
+/// `payload` into a *local* value to read a field out of it — if a returned
+/// `FilterValue.string` pointed into that local, it would dangle the instant
+/// the function returns, before the caller (still inside the same
+/// synchronous filter-evaluation call) ever reads it. Every implementation
+/// must copy matched string bytes into `scratch` (caller-owned, allocated
+/// one frame up so it outlives this one call) rather than returning a
+/// pointer into its own locals — same discipline as the C-ABI's
+/// `zzdds_get_field_from_cdr_fn`, applied here too since the hazard is
+/// identical in pure Zig.
+pub const CdrFieldGetter = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, payload: []const u8, field: []const u8, scratch: []u8) ?FilterValue,
+
+    pub fn get(self: CdrFieldGetter, payload: []const u8, field: []const u8, scratch: []u8) ?FilterValue {
+        return self.func(self.ctx, payload, field, scratch);
+    }
+};
+
+/// Small round-robin pool of fixed-size scratch buffers for `CdrFieldGetter`
+/// string results, one per `matches()`/`matchSample()` call. Bounds "how many
+/// distinct field lookups' string values can be alive at once" to `SLOTS`
+/// instead of needing precise per-expression dependency tracking: a single
+/// `compare`/`between` AST node resolves at most 3 operands (a field plus a
+/// BETWEEN lo/hi, each independently possibly a field) before comparing any
+/// of them, and separate AND/OR clauses evaluate strictly left-to-right
+/// (Zig's `and`/`or` short-circuits), so their scratch use never overlaps —
+/// `SLOTS` only ever needs to cover the worst case *within* one compare node.
+pub const ScratchPool = struct {
+    const SLOT_SIZE = 256;
+    const SLOTS = 4;
+
+    bufs: [SLOTS][SLOT_SIZE]u8 = undefined,
+    next: usize = 0,
+
+    pub fn nextSlot(self: *ScratchPool) []u8 {
+        const slot = &self.bufs[self.next % SLOTS];
+        self.next += 1;
+        return slot;
+    }
+};
+
 /// Relational operator.
 pub const RelOp = enum { eq, ne, lt, le, gt, ge, like };
 

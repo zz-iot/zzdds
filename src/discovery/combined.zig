@@ -17,6 +17,7 @@ const spdp = @import("spdp.zig");
 const sedp = @import("sedp.zig");
 const tr = @import("../transport/interface.zig");
 const trace = @import("../trace.zig");
+const header_mod = @import("../rtps/message/header.zig");
 
 pub const Discovery = iface.Discovery;
 pub const Callbacks = iface.Callbacks;
@@ -114,6 +115,57 @@ pub const SpdpSedpDiscovery = struct {
         // before SPDP fires its initial announcement and the remote peer begins
         // sending SEDP traffic.
         try self.sedp.start(local, cbs);
+
+        // SPDP deliberately never "discovers" this participant itself (see
+        // spdp.zig's processSpdpPayload "ignore our own announcements" check --
+        // a legitimate anti-echo optimization: a participant already knows its
+        // own info, it doesn't need to receive its own multicast back to learn
+        // it). But SEDP's built-in publications/subscriptions writer<->reader
+        // matching is bootstrapped ONLY via that same SPDP "participant
+        // discovered" notification (see sedp.onParticipantDiscovered, wired
+        // below via setSedp) -- so without this call, the local participant's
+        // own SEDP built-in writers never get a matched-reader-proxy for its
+        // own SEDP built-in readers, and endpoint-discovery data for user
+        // topics never transmits between a participant and itself, at any
+        // timing: a writer and reader on the same participant/topic would
+        // never match over the real transport.
+        //
+        // Fix: call the exact same function SPDP uses for every genuinely
+        // remote discovered participant, once, for ourselves -- reusing the
+        // proven-correct proxy-wiring/data-exchange path rather than adding a
+        // separate self-matching shortcut. ParticipantAnnouncement and
+        // ParticipantData share every field this needs (see interface.zig);
+        // vendor_id uses the same VENDOR_ID constant SPDP stamps on its own
+        // outgoing announcement.
+        //
+        // default_unicast/multicast_locators_for_data must mirror the plain
+        // default_unicast/multicast_locators fields, NOT their zero default:
+        // sedp.zig's handleEndpointChange falls back to participant_locs'
+        // *_for_data fields specifically (the locators reachable by this
+        // participant's user-data transport) when an endpoint's own
+        // announcement omits explicit locators (the normal case -- zzdds
+        // never sets per-endpoint locators locally). For a real remote
+        // participant, spdp.zig's filterKnownParticipantLocators populates
+        // these by duplicating the plain locators whenever no data_reachable
+        // override is configured (the common case, matched here) -- leaving
+        // them at `&.{}` would make every local writer/reader look
+        // unreachable and silently drop the match without a real proxy.
+        const self_data = iface.ParticipantData{
+            .guid = local.guid,
+            .domain_id = local.domain_id,
+            .name = local.name,
+            .metatraffic_unicast_locators = local.metatraffic_unicast_locators,
+            .metatraffic_multicast_locators = local.metatraffic_multicast_locators,
+            .default_unicast_locators = local.default_unicast_locators,
+            .default_multicast_locators = local.default_multicast_locators,
+            .default_unicast_locators_for_data = local.default_unicast_locators,
+            .default_multicast_locators_for_data = local.default_multicast_locators,
+            .lease_duration_ms = local.lease_duration_ms,
+            .builtin_endpoint_set = local.builtin_endpoint_set,
+            .vendor_id = header_mod.VENDOR_ID,
+        };
+        sedp.SedpEndpoints.onParticipantDiscovered(self.sedp, &self_data);
+
         try self.spdp.start(local, cbs);
     }
 

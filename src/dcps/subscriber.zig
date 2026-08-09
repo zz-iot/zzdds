@@ -71,19 +71,44 @@ pub const ParticipantCbs = struct {
 
     /// Register a timer-check callback (DEADLINE) for a reader.
     /// Called once per DataReader after create_proto_reader succeeds.
+    /// quiesce_acquire/quiesce_release let checkTimers() hold the reader's
+    /// EntityQuiesce reference across its own unlock-then-dispatch window --
+    /// see DataReaderImpl.quiesceAcquireFn's doc comment.
     register_timer_notify: *const fn (
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (notify_ctx: *anyopaque, now_ns: i64) void,
+        quiesce_acquire: *const fn (notify_ctx: *anyopaque) bool,
+        quiesce_release: *const fn (notify_ctx: *anyopaque) void,
     ) void,
 
-    /// Look up the optional get_field function for a given type name.
-    /// Returns null when no TypeSupport with a get_field fn is registered.
-    get_field_fn: *const fn (
+    /// Registers a callback so a later registerTypeSupport() replacement for
+    /// this reader's type can push the new get_field getter in, instead of
+    /// leaving the reader's cached copy pointing at a freed TypeSupport ctx
+    /// -- and, in the SAME participant-lock critical section, invokes
+    /// `refresh_fn` with type_name's *current* get_field getter (this is the
+    /// reader's initial refresh). Bundling both into one call, with
+    /// `refresh_fn` invoked synchronously rather than the current getter
+    /// being returned for the caller to assign afterwards, closes a race: an
+    /// out-of-line "return, then caller assigns" step would leave a window,
+    /// after this call releases the participant lock but before the caller's
+    /// assignment runs, in which a concurrent registerTypeSupport()
+    /// replacement could refresh the reader through `refresh_fn` and free
+    /// the old ctx -- only for the caller's now-stale assignment to
+    /// overwrite that fresh value right back with a getter into freed
+    /// memory. Routing the initial value through the same `refresh_fn` used
+    /// by the replacement path means whichever one runs first (they're
+    /// mutually excluded by the participant lock) always wins, with no
+    /// separate unsynchronized step after it -- see participant.zig's
+    /// subRegisterReaderGetFieldRefresh.
+    register_get_field_refresh: *const fn (
         ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
         type_name: []const u8,
-    ) ?*const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue,
+        notify_ctx: *anyopaque,
+        refresh_fn: *const fn (notify_ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void,
+    ) void,
 };
 
 pub const SubscriberImpl = struct {
@@ -294,17 +319,34 @@ pub const SubscriberImpl = struct {
             sub_handle,
             dr,
             reader_mod.DataReaderImpl.checkTimersFn,
+            reader_mod.DataReaderImpl.quiesceAcquireFn,
+            reader_mod.DataReaderImpl.quiesceReleaseFn,
         );
-        // Wire up get_field_fn for QueryCondition evaluation (always, when available).
-        dr.get_field_fn = self.cbs.get_field_fn(self.cbs.ctx, type_name);
         // Store subscriber's presentation QoS for coherent-set buffering decisions.
         dr.subscriber_presentation = presentation;
-        // Wire up ContentFilteredTopic if the topic description is a CFT.
+        // Record the ContentFilteredTopic association (if any) before the
+        // get_field registration below, so its synchronous initial refresh
+        // (which runs refreshGetFieldFn) can build cft_filter from it.
         if (topic_mod.asCft(a_topic)) |cft| {
-            if (dr.get_field_fn) |get_field| {
-                dr.cft_filter = .{ .cft_ptr = cft, .get_field_fn = get_field };
-            }
+            dr.cft_ptr = cft;
         }
+        // Wire up get_field_fn (and cft_filter, via cft_ptr above) for
+        // QueryCondition/CFT evaluation, and arm this reader for a later
+        // TypeSupport re-registration to refresh them instead of leaving
+        // them pointing at a freed ctx -- see reader.zig's refreshGetFieldFn.
+        // Both the registration and the initial refresh happen in one call
+        // (one participant-lock critical section, refresh_fn invoked
+        // synchronously) so a concurrent registerTypeSupport() can never
+        // land in between and have its own refresh overwritten by a stale
+        // value here -- see ParticipantCbs.register_get_field_refresh's doc
+        // comment.
+        self.cbs.register_get_field_refresh(
+            self.cbs.ctx,
+            sub_handle,
+            type_name,
+            dr,
+            reader_mod.DataReaderImpl.refreshGetFieldFn,
+        );
         // Convert partition name StringSeq (C extern struct) to []const []const u8 for announce_reader.
         const pname_seq = &self.qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;

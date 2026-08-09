@@ -95,9 +95,9 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
 
 /* ── TypeSupport registration: one native trampoline, ctx-carrying ──────
  *
- * zzdds_register_type_support_ctx_c (see zzdds_c.h) forwards an opaque ctx
+ * zzdds_register_type_support_ctx (see zzdds_c.h) forwards an opaque ctx
  * to every compute_key_hash call, so — unlike the plain, no-ctx
- * zzdds_register_type_support_c that C/C++/Zig use — one shared trampoline
+ * zzdds_register_type_support that C/C++/Zig use — one shared trampoline
  * here can dispatch to whichever Java Class<?>/jmethodID a given
  * registration was for, with no fixed slot table and no per-registration
  * lock: each registration gets its own independent heap allocation, freed
@@ -124,6 +124,13 @@ static JNIEnv *zzdds_java_get_env(void) {
 typedef struct {
     jclass cls;    /* global ref */
     jmethodID mid;
+    /* Optional: resolved from the type's own generated `getFieldFromCdr`
+     * static method (see java.zig's `Generator.emitGetFieldFromCdr`). NULL
+     * if the class has no such method (e.g. a hand-written TypeSupport
+     * class predating this contract) -- CFT auto-filtering just doesn't
+     * activate for that type, same as any other binding's TypeSupport with
+     * a NULL get_field_fn. */
+    jmethodID get_field_mid;
 } zzdds_java_ts_ctx;
 
 static int zzdds_java_compute_key_hash_ctx(void *ctx_v, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
@@ -136,6 +143,97 @@ static int zzdds_java_compute_key_hash_ctx(void *ctx_v, const uint8_t *payload, 
     if (hash == NULL) return -1;
     (*env)->GetByteArrayRegion(env, hash, 0, 16, (jbyte *)hash_out);
     return 0;
+}
+
+/* Trampoline for zzdds_get_field_from_cdr_ctx_fn (zzdds_c.h) -- calls the
+ * type's generated `static Object getFieldFromCdr(byte[] payload, String
+ * field)` (see java.zig's `Generator.emitGetFieldFromCdr`) and converts its
+ * boxed Long/Double/String result into `*out`. Unlike the C/C++ backends'
+ * generated get_field_from_cdr, there is no dangling-pointer hazard to
+ * design `scratch` around on the Java side -- the JVM's GC keeps a returned
+ * String's backing memory alive on its own -- but the wire contract (a
+ * caller-supplied `scratch` buffer for the matched string's bytes) is fixed
+ * by zzdds_c.h for every ctx-carrying binding alike, so this still copies
+ * into it rather than inventing a Java-only shortcut.
+ */
+static bool zzdds_java_get_field_from_cdr_ctx(
+    void *ctx_v,
+    const uint8_t *payload, size_t payload_len,
+    const char *field, size_t field_len,
+    zzdds_filter_value *out,
+    uint8_t *scratch, size_t scratch_len)
+{
+    zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
+    if (ctx->get_field_mid == NULL) return false;
+    JNIEnv *env = zzdds_java_get_env();
+    if (env == NULL) return false;
+
+    jbyteArray arr = (*env)->NewByteArray(env, (jsize)payload_len);
+    (*env)->SetByteArrayRegion(env, arr, 0, (jsize)payload_len, (const jbyte *)payload);
+
+    /* `field`/`field_len` is a non-null-terminated byte range (matches every
+     * other binding's get_field_from_cdr contract) -- NewStringUTF needs a
+     * null-terminated one. Field names are short IDL identifiers; a filter
+     * expression referencing one longer than this never matches any real
+     * member anyway, so treating it as "no match" here is harmless. */
+    char namebuf[128];
+    if (field_len >= sizeof(namebuf)) return false;
+    memcpy(namebuf, field, field_len);
+    namebuf[field_len] = '\0';
+    jstring jfield = (*env)->NewStringUTF(env, namebuf);
+
+    jobject result = (*env)->CallStaticObjectMethod(env, ctx->cls, ctx->get_field_mid, arr, jfield);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return false;
+    }
+    if (result == NULL) return false;
+
+    /* Benign race across concurrent first calls (see emitBoxHelper's own
+     * doc comment on this exact pattern): FindClass/GetMethodID are
+     * idempotent, so a redundant lookup is harmless. */
+    static jclass long_cls = NULL, double_cls = NULL, string_cls = NULL;
+    static jmethodID long_value_mid = NULL, double_value_mid = NULL;
+    if (long_cls == NULL) {
+        jclass local = (*env)->FindClass(env, "java/lang/Long");
+        long_cls = (jclass)(*env)->NewGlobalRef(env, local);
+        long_value_mid = (*env)->GetMethodID(env, long_cls, "longValue", "()J");
+    }
+    if (double_cls == NULL) {
+        jclass local = (*env)->FindClass(env, "java/lang/Double");
+        double_cls = (jclass)(*env)->NewGlobalRef(env, local);
+        double_value_mid = (*env)->GetMethodID(env, double_cls, "doubleValue", "()D");
+    }
+    if (string_cls == NULL) {
+        jclass local = (*env)->FindClass(env, "java/lang/String");
+        string_cls = (jclass)(*env)->NewGlobalRef(env, local);
+    }
+
+    if ((*env)->IsInstanceOf(env, result, long_cls)) {
+        out->kind = 0;
+        out->i = (int64_t)(*env)->CallLongMethod(env, result, long_value_mid);
+        return true;
+    }
+    if ((*env)->IsInstanceOf(env, result, double_cls)) {
+        out->kind = 1;
+        out->f = (*env)->CallDoubleMethod(env, result, double_value_mid);
+        return true;
+    }
+    if ((*env)->IsInstanceOf(env, result, string_cls)) {
+        const char *cs = (*env)->GetStringUTFChars(env, (jstring)result, NULL);
+        size_t len = strlen(cs);
+        if (len > scratch_len) {
+            (*env)->ReleaseStringUTFChars(env, (jstring)result, cs);
+            return false;
+        }
+        memcpy(scratch, cs, len);
+        (*env)->ReleaseStringUTFChars(env, (jstring)result, cs);
+        out->kind = 2;
+        out->s_ptr = scratch;
+        out->s_len = len;
+        return true;
+    }
+    return false;
 }
 
 /* Called by zzdds core exactly once, when this registration is replaced or
@@ -165,10 +263,21 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
         free(ctx);
         return -1;
     }
+    /* Optional (see zzdds_java_ts_ctx's doc comment) -- clear the pending
+     * NoSuchMethodError rather than letting it propagate, unlike mid above. */
+    ctx->get_field_mid = (*env)->GetStaticMethodID(env, typeClass, "getFieldFromCdr", "([BLjava/lang/String;)Ljava/lang/Object;");
+    if (ctx->get_field_mid == NULL) (*env)->ExceptionClear(env);
 
     void *p = zzdds_java_unbox(env, participant);
     const char *type_name_c = (*env)->GetStringUTFChars(env, typeName, NULL);
-    int rc = zzdds_register_type_support_ctx_c(p, type_name_c, zzdds_java_compute_key_hash_ctx, ctx, zzdds_java_ts_ctx_deinit);
+    /* Only wire the get_field trampoline in when the class actually has a
+     * getFieldFromCdr to call -- passing it unconditionally would still
+     * behave correctly (the trampoline itself checks get_field_mid and
+     * returns false, which zzdds's filter evaluator treats the same as "no
+     * get_field": pass every sample through), but skips a pointless
+     * per-field JNI round trip for a class that will never resolve one. */
+    zzdds_get_field_from_cdr_ctx_fn get_field_fn = ctx->get_field_mid != NULL ? zzdds_java_get_field_from_cdr_ctx : NULL;
+    int rc = zzdds_register_type_support_ctx(p, type_name_c, zzdds_java_compute_key_hash_ctx, get_field_fn, ctx, zzdds_java_ts_ctx_deinit);
     (*env)->ReleaseStringUTFChars(env, typeName, type_name_c);
 
     if (rc != 0) {
@@ -242,6 +351,200 @@ JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readRaw(
 {
     (void)self_cls;
     return zzdds_java_take_or_read(env, reader, maxSize, handleOut, validOut, 0);
+}
+
+/* ── Take/read next instance ─────────────────────────────────────────── */
+
+static jbyteArray zzdds_java_take_or_read_instance(
+    JNIEnv *env, jobject reader_obj, jlong prev, jint max_size, jlongArray handle_out, jbooleanArray valid_out, int is_take)
+{
+    void *reader = zzdds_java_unbox(env, reader_obj);
+    uint8_t *buf = malloc((size_t)max_size);
+    if (buf == NULL) return NULL;
+
+    zzdds_sample_info info;
+    size_t cdr_len = 0;
+    int n = is_take
+        ? zzdds_take_one_raw_instance(reader, (DDS_InstanceHandle_t)prev, buf, (size_t)max_size, &cdr_len, &info)
+        : zzdds_read_one_raw_instance(reader, (DDS_InstanceHandle_t)prev, buf, (size_t)max_size, &cdr_len, &info);
+    if (n != 1) {
+        free(buf);
+        return NULL;
+    }
+
+    jlong handle_val = (jlong)info.instance_handle;
+    jboolean valid_val = info.valid_data ? JNI_TRUE : JNI_FALSE;
+    (*env)->SetLongArrayRegion(env, handle_out, 0, 1, &handle_val);
+    (*env)->SetBooleanArrayRegion(env, valid_out, 0, 1, &valid_val);
+
+    jbyteArray result = (*env)->NewByteArray(env, (jsize)cdr_len);
+    (*env)->SetByteArrayRegion(env, result, 0, (jsize)cdr_len, (const jbyte *)buf);
+    free(buf);
+    return result;
+}
+
+JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_takeNextInstanceRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jlong prev, jint maxSize, jlongArray handleOut, jbooleanArray validOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_instance(env, reader, prev, maxSize, handleOut, validOut, 1);
+}
+
+JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readNextInstanceRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jlong prev, jint maxSize, jlongArray handleOut, jbooleanArray validOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_instance(env, reader, prev, maxSize, handleOut, validOut, 0);
+}
+
+/* ── Bulk take/read ───────────────────────────────────────────────────────
+ *
+ * Unlike takeRaw/readRaw/takeNextInstanceRaw/readNextInstanceRaw, zzdds_take_n_raw/
+ * zzdds_read_n_raw allocate each sample's buffer themselves, sized exactly to
+ * that sample's real CDR length -- there is no caller-supplied max-per-sample
+ * buffer size to plumb through here, unlike the single-sample calls above.
+ * `max` (`ss`/`vs`/`is` mask-filtered) IS still caller-bounded, same as C/C++'s
+ * own take_n/read_n -- Java's `handlesOut`/`validsOut` are pre-sized to `max`
+ * by the caller (see ZzddsRuntime.takeNRaw/readNRaw's javadoc): this function
+ * only ever fills the first N <= max entries, where N is the returned
+ * byte[][]'s own length (the true count) -- the caller must not treat the
+ * rest of handlesOut/validsOut as meaningful.
+ */
+
+static jobjectArray zzdds_java_take_or_read_n(
+    JNIEnv *env, jobject reader_obj, jint max, jint ss, jint vs, jint is_mask,
+    jlongArray handles_out, jbooleanArray valids_out, int is_take)
+{
+    void *reader = zzdds_java_unbox(env, reader_obj);
+    jclass byte_array_cls = (*env)->FindClass(env, "[B");
+    if (byte_array_cls == NULL) return NULL;
+
+    zzdds_raw_sample_array arr;
+    int n = is_take
+        ? zzdds_take_n_raw(reader, (uint32_t)ss, (uint32_t)vs, (uint32_t)is_mask, (int)max, &arr)
+        : zzdds_read_n_raw(reader, (uint32_t)ss, (uint32_t)vs, (uint32_t)is_mask, (int)max, &arr);
+    if (n <= 0) {
+        return (*env)->NewObjectArray(env, 0, byte_array_cls, NULL);
+    }
+
+    jobjectArray result = (*env)->NewObjectArray(env, (jsize)arr.count, byte_array_cls, NULL);
+    for (size_t i = 0; i < arr.count; i++) {
+        zzdds_raw_sample *s = &arr.samples[i];
+        jbyteArray payload = (*env)->NewByteArray(env, (jsize)s->data_len);
+        (*env)->SetByteArrayRegion(env, payload, 0, (jsize)s->data_len, (const jbyte *)s->data);
+        (*env)->SetObjectArrayElement(env, result, (jsize)i, payload);
+        (*env)->DeleteLocalRef(env, payload);
+
+        jlong handle_val = (jlong)s->info.instance_handle;
+        jboolean valid_val = s->info.valid_data ? JNI_TRUE : JNI_FALSE;
+        (*env)->SetLongArrayRegion(env, handles_out, (jsize)i, 1, &handle_val);
+        (*env)->SetBooleanArrayRegion(env, valids_out, (jsize)i, 1, &valid_val);
+    }
+    zzdds_return_raw_samples(reader, &arr);
+    return result;
+}
+
+JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_takeNRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jint max, jint ss, jint vs, jint is_mask,
+    jlongArray handlesOut, jbooleanArray validsOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_n(env, reader, max, ss, vs, is_mask, handlesOut, validsOut, 1);
+}
+
+JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readNRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jint max, jint ss, jint vs, jint is_mask,
+    jlongArray handlesOut, jbooleanArray validsOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_n(env, reader, max, ss, vs, is_mask, handlesOut, validsOut, 0);
+}
+
+/* ── ContentFilteredTopic matching ──────────────────────────────────────
+ *
+ * Mirrors the C/C++ zzdds_cft_match_sample addition (see zzdds_c.h's doc
+ * comment on it): zzdds's own internal CFT filtering only activates when
+ * TypeSupport.get_field is wired up, which registerTypeSupport above never
+ * does for any binding -- so a DataReader created against a
+ * DDS_ContentFilteredTopic still delivers every sample unfiltered unless the
+ * app re-checks the filter itself. Rather than reimplementing the filter
+ * grammar a second time in Java, this JNI method calls back into a small
+ * Java-side FieldAccessor (see ZzddsRuntime.FieldAccessor) once per field
+ * the native filter evaluator needs, converting each String/Long result to
+ * a zzdds_filter_value, and defers to zzdds's own canonical parser/evaluator
+ * via zzdds_cft_match_sample.
+ */
+#define ZZDDS_JAVA_CFT_MAX_STRINGS 8
+
+typedef struct {
+    JNIEnv *env;
+    jobject accessor;
+    jmethodID get_mid;
+    jstring kept[ZZDDS_JAVA_CFT_MAX_STRINGS];
+    const char *kept_chars[ZZDDS_JAVA_CFT_MAX_STRINGS];
+    size_t kept_count;
+} zzdds_java_cft_ctx;
+
+static bool zzdds_java_cft_get(void *ctx_v, const char *field, size_t field_len, zzdds_filter_value *out) {
+    zzdds_java_cft_ctx *ctx = (zzdds_java_cft_ctx *)ctx_v;
+    JNIEnv *env = ctx->env;
+
+    char field_buf[64];
+    if (field_len >= sizeof(field_buf)) return false;
+    memcpy(field_buf, field, field_len);
+    field_buf[field_len] = '\0';
+
+    jstring jfield = (*env)->NewStringUTF(env, field_buf);
+    jobject result = (*env)->CallObjectMethod(env, ctx->accessor, ctx->get_mid, jfield);
+    (*env)->DeleteLocalRef(env, jfield);
+    if (result == NULL || (*env)->ExceptionCheck(env)) return false;
+
+    jclass long_cls = (*env)->FindClass(env, "java/lang/Long");
+    if ((*env)->IsInstanceOf(env, result, long_cls)) {
+        jmethodID long_val_mid = (*env)->GetMethodID(env, long_cls, "longValue", "()J");
+        out->kind = 0;
+        out->i = (int64_t)(*env)->CallLongMethod(env, result, long_val_mid);
+        (*env)->DeleteLocalRef(env, result);
+        return true;
+    }
+
+    /* Anything else must be a String -- kept alive (not released) until the
+     * whole zzdds_cft_match_sample call returns, since filter.zig's eval may
+     * still be borrowing out->s_ptr from a prior call at that point. */
+    if (ctx->kept_count >= ZZDDS_JAVA_CFT_MAX_STRINGS) {
+        (*env)->DeleteLocalRef(env, result);
+        return false;
+    }
+    jstring jstr = (jstring)result;
+    const char *cstr = (*env)->GetStringUTFChars(env, jstr, NULL);
+    out->kind = 2;
+    out->s_ptr = (const uint8_t *)cstr;
+    out->s_len = strlen(cstr);
+    ctx->kept[ctx->kept_count] = jstr;
+    ctx->kept_chars[ctx->kept_count] = cstr;
+    ctx->kept_count++;
+    return true;
+}
+
+JNIEXPORT jboolean JNICALL Java_io_zzdds_runtime_ZzddsRuntime_cftMatchSample(
+    JNIEnv *env, jclass self_cls, jobject cft, jobject accessor)
+{
+    (void)self_cls;
+    if (cft == NULL) return JNI_TRUE;
+    void *c = zzdds_java_unbox(env, cft);
+
+    jclass acc_cls = (*env)->GetObjectClass(env, accessor);
+    jmethodID get_mid = (*env)->GetMethodID(env, acc_cls, "get", "(Ljava/lang/String;)Ljava/lang/Object;");
+    if (get_mid == NULL) return JNI_TRUE;
+
+    zzdds_java_cft_ctx ctx = { .env = env, .accessor = accessor, .get_mid = get_mid, .kept_count = 0 };
+    bool matched = zzdds_cft_match_sample(c, &ctx, zzdds_java_cft_get);
+
+    for (size_t i = 0; i < ctx.kept_count; i++) {
+        (*env)->ReleaseStringUTFChars(env, ctx.kept[i], ctx.kept_chars[i]);
+        (*env)->DeleteLocalRef(env, ctx.kept[i]);
+    }
+    return matched ? JNI_TRUE : JNI_FALSE;
 }
 
 /* ── zzdds extension-view narrowing ─────────────────────────────────────

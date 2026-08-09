@@ -706,9 +706,10 @@ pub const QueryConditionImpl = struct {
     pub fn matchSample(
         self: *const Self,
         payload: []const u8,
-        get_field_fn: *const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+        get_field_fn: filter_mod.CdrFieldGetter,
     ) bool {
-        var ctx = FieldCtx{ .payload = payload, .get_fn = get_field_fn };
+        var pool = filter_mod.ScratchPool{};
+        var ctx = FieldCtx{ .payload = payload, .get_fn = get_field_fn, .pool = &pool };
         const accessor = filter_mod.FieldAccessor{ .ctx = &ctx, .get = FieldCtx.get };
         const params_slice: []const []const u8 = @ptrCast(self.query_parameters.items);
         return filter_mod.eval(self.parsed_expr, accessor, params_slice);
@@ -716,11 +717,12 @@ pub const QueryConditionImpl = struct {
 
     const FieldCtx = struct {
         payload: []const u8,
-        get_fn: *const fn ([]const u8, []const u8) ?filter_mod.FilterValue,
+        get_fn: filter_mod.CdrFieldGetter,
+        pool: *filter_mod.ScratchPool,
 
         fn get(ctx: *anyopaque, field: []const u8) ?filter_mod.FilterValue {
             const self: *const FieldCtx = @ptrCast(@alignCast(ctx));
-            return self.get_fn(self.payload, field);
+            return self.get_fn.get(self.payload, field, self.pool.nextSlot());
         }
     };
 

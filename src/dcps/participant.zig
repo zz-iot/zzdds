@@ -227,12 +227,10 @@ const BuiltinSubscriberState = struct {
             }.f,
             .timer_clock = participant.timer_clock,
             .register_timer_notify = struct {
-                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void) void {}
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void, _: *const fn (*anyopaque) bool, _: *const fn (*anyopaque) void) void {}
             }.f,
-            .get_field_fn = struct {
-                fn f(_: *anyopaque, _: []const u8) ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue {
-                    return null;
-                }
+            .register_get_field_refresh = struct {
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {}
             }.f,
         };
 
@@ -494,9 +492,31 @@ const MatchedNotify = struct {
 
 /// Callback registered by DataWriterImpl / DataReaderImpl so that the participant
 /// can invoke periodic timer checks (DEADLINE, LIVELINESS) via checkTimers().
+///
+/// quiesce_acquire/quiesce_release let checkTimers() hold the entity's
+/// EntityQuiesce reference across its own unlock-then-dispatch window, not
+/// just the acquire/release `check` itself takes internally. Without this,
+/// `ctx` -- a raw pointer copied out of the participant's map while `mu` is
+/// held -- has no protection against becoming dangling in the window
+/// between releasing `mu` and `check` actually running: EntityQuiesce can't
+/// protect a pointer that was already invalid before acquire() was called
+/// on it (see entity_quiesce.zig's module doc comment). Calling
+/// quiesce_acquire while `mu` is still held (so the entity is provably
+/// still live at that point) and holding the reference until after `check`
+/// returns closes that gap.
 const TimerNotify = struct {
     ctx: *anyopaque,
     check: *const fn (ctx: *anyopaque, now_ns: i64) void,
+    quiesce_acquire: *const fn (ctx: *anyopaque) bool,
+    quiesce_release: *const fn (ctx: *anyopaque) void,
+};
+
+/// Callback registered by DataReaderImpl so that registerTypeSupport()'s
+/// replacement path can push a freshly-registered get_field getter into a
+/// reader that cached the old one -- see reader.zig's refreshGetFieldFn.
+const RefreshGetField = struct {
+    ctx: *anyopaque,
+    refresh: *const fn (ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void,
 };
 
 /// Callback registered by DataWriterImpl so that the participant can assert
@@ -586,9 +606,14 @@ pub const TypeSupport = struct {
     /// Optional: extract a named field value from a raw CDR payload.
     /// Used to evaluate ContentFilteredTopic expressions at delivery time.
     /// null = CFT evaluation deferred to the typed DataReader layer.
-    /// NOTE: get_field does not yet receive ctx — it will be threaded through
-    /// when the ContentFilteredTopic C-ABI binding is designed.
-    get_field: ?*const fn (payload: []const u8, field: []const u8) ?filter_mod.FilterValue = null,
+    /// Receives the same `ctx` as `compute_key_hash` above (one shared
+    /// per-registration context, not a second one) — see the C-ABI's
+    /// `zzdds_register_type_support_ctx`/Java's `zzdds_java_ts_ctx` for the
+    /// two callbacks sharing one adapter object. `scratch` is caller-owned
+    /// storage for a returned string value — see `filter_mod.CdrFieldGetter`'s
+    /// doc comment for why a returned string must be copied there rather
+    /// than pointing into this function's own locals.
+    get_field: ?*const fn (ctx: *anyopaque, payload: []const u8, field: []const u8, scratch: []u8) ?filter_mod.FilterValue = null,
     /// Optional cleanup called when the participant deinits this TypeSupport entry.
     /// Use to free any ctx allocation.  null = no cleanup needed (e.g. ctx = undefined).
     deinit: ?*const fn (ctx: *anyopaque) void = null,
@@ -600,6 +625,11 @@ const ActiveWriter = struct {
     proto: proto.ProtocolWriter,
     topic_name: []const u8, // borrowed from topic_name slice in active list
     type_name: []const u8,
+    // qos.data_representation.value must be zzdds-owned (cloned by
+    // pubCreateProtoWriter before storing here, freed by
+    // pubDestroyProtoWriter/deinit) -- the caller only guarantees its buffer
+    // valid for the duration of the create_datawriter call, same class of
+    // bug dupePartitionNames already exists to avoid for partition_names.
     qos: DDS.DataWriterQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
@@ -615,6 +645,8 @@ const ActiveReader = struct {
     proto: proto.ProtocolReader,
     topic_name: []const u8,
     type_name: []const u8,
+    // See ActiveWriter.qos's matching comment: data_representation.value
+    // must be zzdds-owned, cloned by subCreateProtoReader.
     qos: DDS.DataReaderQos,
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
@@ -623,6 +655,7 @@ const ActiveReader = struct {
     timer_check: ?TimerNotify = null,
     key_hash_ctx: *anyopaque = undefined,
     key_hash_fn: ?*const fn (*anyopaque, []const u8) [16]u8 = null,
+    refresh_get_field: ?RefreshGetField = null,
 };
 
 // ── DomainParticipantImpl ────────────────────────────────────────────────────
@@ -733,6 +766,30 @@ pub const DomainParticipantImpl = struct {
 
     mu: Mutex,
 
+    /// Background thread periodically calling checkTimers() to enforce
+    /// DEADLINE and LIVELINESS QoS -- previously nothing called checkTimers()
+    /// at all, so those statuses only ever fired under a test's ManualClock.
+    /// Spawned once at the end of start(), stopped as the very first step of
+    /// deinit() (before anything else is torn down) so it can never observe
+    /// partially-destroyed participant state -- same lifetime discipline as
+    /// writer_sm.zig's per-writer heartbeat thread and spdp.zig's
+    /// per-participant announcement timer (thread lifetime strictly bounded
+    /// by the owning object's own init/deinit, never reaching across
+    /// objects -- see docs/roadmap.md's "Background thread usage" entry for
+    /// why that matters here specifically).
+    timer_thread: ?std.Thread = null,
+    /// Set by timerThreadFn as its first action, read by deinit() to detect
+    /// a self-join (see deinit()'s doc comment). 0 = not yet set; real
+    /// std.Thread.Id values are never 0 in practice on any supported
+    /// platform, so it doubles as the "unset" sentinel.
+    timer_thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
+    timer_stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by deinit() instead of freeing `self` immediately, when deinit()
+    /// is reached reentrantly from the timer thread itself (see deinit()'s
+    /// doc comment). Only ever written and read from that same thread, so
+    /// a plain bool is fine -- no cross-thread visibility is needed for it.
+    pending_self_destroy: bool = false,
+
     participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     // ZZDDS.DomainParticipant is a separate "borrowed view" (same ptr, its own
@@ -740,6 +797,9 @@ pub const DomainParticipantImpl = struct {
     zzdds_participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
+
+    /// Interval between periodic DEADLINE/LIVELINESS timer checks.
+    const TIMER_CHECK_INTERVAL_MS: u64 = 100;
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -979,9 +1039,82 @@ pub const DomainParticipantImpl = struct {
                 .on_receive = userDataOnReceive,
             });
         }
+
+        // Last step, deliberately: no thread exists yet at this point, so a
+        // spawn failure here needs no stop/join cleanup of its own. Without
+        // this thread, DEADLINE/LIVELINESS enforcement never fires with
+        // nothing to explain why -- too severe to degrade silently, so this
+        // is propagated as a start() error like every other setup failure
+        // above. factory.zig's create_participant() already handles a
+        // start() error by calling p.deinit() (which tolerates a null
+        // timer_thread) and returning null, so no new cleanup path is
+        // needed here.
+        self.timer_thread = std.Thread.spawn(.{}, timerThreadFn, .{self}) catch |err| {
+            log_mod.dcps.warn("participant: failed to spawn timer thread ({s}) -- DEADLINE/LIVELINESS QoS will not be enforced for this participant", .{@errorName(err)});
+            return err;
+        };
+    }
+
+    /// Periodically calls checkTimers() to enforce DEADLINE/LIVELINESS QoS.
+    /// Stopped by setting timer_stopping before calling timer_thread.join()
+    /// (see deinit()) -- same shape as writer_sm.zig's heartbeatThread.
+    fn timerThreadFn(self: *Self) void {
+        // Captured before the loop, and used only after the loop below has
+        // genuinely exited -- see the pending_self_destroy branch at the
+        // end of this function and deinit()'s matching comment. Reading
+        // self.alloc directly at that point would also be safe (self isn't
+        // freed until this exact line runs), but capturing it up front
+        // keeps that safety argument local to this function instead of
+        // depending on deinit() never having touched the field.
+        const alloc = self.alloc;
+        self.timer_thread_id.store(std.Thread.getCurrentId(), .release);
+        while (!self.timer_stopping.load(.acquire)) {
+            var slept_ms: u64 = 0;
+            while (slept_ms < TIMER_CHECK_INTERVAL_MS and !self.timer_stopping.load(.acquire)) {
+                time_mod.sleepNs(50 * std.time.ns_per_ms);
+                slept_ms += 50;
+            }
+            if (self.timer_stopping.load(.acquire)) break;
+            self.checkTimers();
+        }
+        // A reentrant deinit() (see its doc comment) deferred the actual
+        // free to here, since it couldn't safely free `self` out from
+        // under this still-running function. The loop above has now
+        // genuinely exited (timer_stopping is true either way), so it's
+        // safe to do now -- nothing below touches `self` again.
+        if (self.pending_self_destroy) alloc.destroy(self);
     }
 
     pub fn deinit(self: *Self) void {
+        // Stop and join the timer thread before anything else -- it calls
+        // checkTimers(), which touches self.mu and self.active_writers/
+        // active_readers; nothing past this point may run concurrently with
+        // it. See timer_thread's field doc comment for why this has to be
+        // the very first thing deinit() does.
+        self.timer_stopping.store(true, .release);
+        // deinit() can be reached from the timer thread itself:
+        // checkTimers() -> a DEADLINE/LIVELINESS notification -> a user
+        // listener that (spec-legally) reentrantly deletes every child
+        // entity and then the participant itself, synchronously, from
+        // inside the callback. Detected once, used below both to avoid
+        // joining the calling thread from itself (deadlock) and to avoid
+        // freeing `self` while checkTimers()/timerThreadFn are still
+        // executing further up this very call stack (see the
+        // pending_self_destroy branch at the end of this function).
+        const self_reentrant = std.Thread.getCurrentId() == self.timer_thread_id.load(.acquire);
+        if (self.timer_thread) |t| {
+            if (self_reentrant) {
+                // A thread joining itself deadlocks, so detach instead --
+                // timer_stopping is already set above, so once this call
+                // unwinds back up to timerThreadFn's loop condition it
+                // exits on its own, and a detached thread's resources are
+                // reclaimed by the OS without a join.
+                t.detach();
+            } else {
+                t.join();
+            }
+            self.timer_thread = null;
+        }
         self.listener_box.releaseRef(self.alloc);
         self.discovery.stop();
 
@@ -1034,12 +1167,14 @@ pub const DomainParticipantImpl = struct {
         while (wit.next()) |aw| {
             aw.proto.deinit();
             freePartitionNames(self.alloc, aw.partition_names);
+            aw.qos.data_representation.value.deinit(self.alloc);
         }
         self.active_writers.deinit(self.alloc);
         var rit = self.active_readers.valueIterator();
         while (rit.next()) |ar| {
             ar.proto.deinit();
             freePartitionNames(self.alloc, ar.partition_names);
+            ar.qos.data_representation.value.deinit(self.alloc);
         }
         self.active_readers.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
@@ -1071,7 +1206,20 @@ pub const DomainParticipantImpl = struct {
         // their own deinit.
         if (self.owned_tcp_transport) |t| t.deinit();
 
-        self.alloc.destroy(self);
+        // Every step above only touches self's own fields and owned
+        // sub-resources, so it's safe to run reentrantly regardless of
+        // which thread called deinit(). Freeing `self` itself is the one
+        // exception: checkTimers() and timerThreadFn are still executing
+        // further up this exact call stack when self_reentrant is true,
+        // and still need `self` (e.g. to read timer_stopping, already true
+        // above) to unwind safely. Defer the actual free to timerThreadFn,
+        // which performs it as the very last thing it does once its own
+        // loop has genuinely exited -- see timerThreadFn.
+        if (self_reentrant) {
+            self.pending_self_destroy = true;
+        } else {
+            self.alloc.destroy(self);
+        }
     }
 
     pub fn toDDSParticipant(self: *Self) DDS.DomainParticipant {
@@ -1098,18 +1246,45 @@ pub const DomainParticipantImpl = struct {
             return false;
         };
         if (gop.found_existing) {
-            // Replacing: deinit old value, swap in new owned key (free the old one).
-            if (gop.value_ptr.deinit) |f| f(gop.value_ptr.ctx);
-            self.alloc.free(gop.key_ptr.*);
-            gop.key_ptr.* = owned_key;
-            // Propagate new ctx/fn to active readers that cached the old (now freed) pointers.
+            // Replacing: propagate new ctx/fn to active readers that cached
+            // the old pointers BEFORE freeing the old TypeSupport's ctx
+            // below -- this must run first. refresh_get_field's swap is
+            // synchronized by the reader's own mu, not participant.mu, so a
+            // concurrent QueryCondition/CFT evaluation (which only takes
+            // reader.mu, never participant.mu) can run at any point during
+            // this whole function; freeing the old ctx before every reader
+            // has been refreshed would leave that evaluation free to read
+            // the still-old cached getter and invoke it with already-freed
+            // ctx.
             var ar_it = self.active_readers.valueIterator();
             while (ar_it.next()) |ar| {
                 if (std.mem.eql(u8, ar.type_name, type_name)) {
                     ar.key_hash_ctx = ts.ctx;
                     ar.key_hash_fn = ts.compute_key_hash;
+                    // Also refresh whatever the reader itself cached at
+                    // creation time (get_field_fn, and cft_filter.get_field_fn
+                    // if it was created against a ContentFilteredTopic) --
+                    // otherwise it keeps pointing at the old TypeSupport's
+                    // ctx until the next reader/filter is created, and a
+                    // CFT/QueryCondition evaluation in between dereferences
+                    // freed memory once the deinit below runs.
+                    if (ar.refresh_get_field) |rf| {
+                        const new_get_field: ?filter_mod.CdrFieldGetter = if (ts.get_field) |f|
+                            .{ .ctx = ts.ctx, .func = f }
+                        else
+                            null;
+                        rf.refresh(rf.ctx, new_get_field);
+                    }
                 }
             }
+            // Now safe: every active reader for this type has been
+            // refreshed off the old ctx (refresh_get_field's internal
+            // reader.mu lock/unlock happened-before this point, so any
+            // subsequent reader.mu-protected read observes the new getter,
+            // never the old one), so it can be freed and swapped in.
+            if (gop.value_ptr.deinit) |f| f(gop.value_ptr.ctx);
+            self.alloc.free(gop.key_ptr.*);
+            gop.key_ptr.* = owned_key;
         }
         gop.value_ptr.* = ts;
         return true;
@@ -1207,6 +1382,18 @@ pub const DomainParticipantImpl = struct {
 
         const pw = adapter.toProtocolWriter();
 
+        // qos.data_representation.value._buffer, as received here, borrows
+        // storage the caller only guarantees valid for the duration of this
+        // call (e.g. the C++ binding's create_datawriter passes qos by value
+        // through a chain of stack-local copies that get destroyed once this
+        // whole call returns -- see ActiveWriter.qos's doc comment). Clone it
+        // the same way dupePartitionNames already does for partition_names,
+        // or writerQosSnapshot() re-reads this later (at match time, against
+        // a newly-discovered remote reader) and gets garbage -- confirmed via
+        // a real repro: -x 2 matching flakiness traced to exactly this.
+        var owned_qos = qos;
+        owned_qos.data_representation.value = try qos.data_representation.value.clone(self.alloc);
+
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -1216,7 +1403,7 @@ pub const DomainParticipantImpl = struct {
                 .proto = pw,
                 .topic_name = topic_name,
                 .type_name = type_name,
-                .qos = qos,
+                .qos = owned_qos,
                 .presentation = presentation,
             });
         }
@@ -1229,6 +1416,7 @@ pub const DomainParticipantImpl = struct {
         var found_guid: ?Guid = null;
         var found_proto: ?proto.ProtocolWriter = null;
         var found_parts: []const []const u8 = &.{};
+        var found_repr: DDS.DataRepresentationIdSeq = .{};
 
         self.mu.lock();
         var writ = self.active_writers.valueIterator();
@@ -1237,6 +1425,7 @@ pub const DomainParticipantImpl = struct {
                 found_guid = aw.guid;
                 found_proto = aw.proto;
                 found_parts = aw.partition_names;
+                found_repr = aw.qos.data_representation.value;
                 break;
             }
         }
@@ -1244,6 +1433,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
+        found_repr.deinit(self.alloc);
         if (found_guid) |g| self.discovery.retractWriter(g);
         if (found_proto) |p| p.deinit();
     }
@@ -1294,6 +1484,13 @@ pub const DomainParticipantImpl = struct {
 
         const pr = adapter.toProtocolReader();
 
+        // See pubCreateProtoWriter's matching comment: qos.data_representation
+        // .value must be cloned into zzdds-owned storage before being stashed
+        // in ActiveReader, or a later readerQosSnapshot() call reads a
+        // dangling buffer.
+        var owned_qos = qos;
+        owned_qos.data_representation.value = try qos.data_representation.value.clone(self.alloc);
+
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -1303,7 +1500,7 @@ pub const DomainParticipantImpl = struct {
                 .proto = pr,
                 .topic_name = topic_name,
                 .type_name = type_name,
-                .qos = qos,
+                .qos = owned_qos,
                 .presentation = presentation,
                 .key_hash_ctx = if (self.type_support_registry.get(type_name)) |ts| ts.ctx else undefined,
                 .key_hash_fn = if (self.type_support_registry.get(type_name)) |ts|
@@ -1321,6 +1518,7 @@ pub const DomainParticipantImpl = struct {
         var found_guid: ?Guid = null;
         var found_proto: ?proto.ProtocolReader = null;
         var found_parts: []const []const u8 = &.{};
+        var found_repr: DDS.DataRepresentationIdSeq = .{};
 
         self.mu.lock();
         var rrit = self.active_readers.valueIterator();
@@ -1329,6 +1527,7 @@ pub const DomainParticipantImpl = struct {
                 found_guid = ar.guid;
                 found_proto = ar.proto;
                 found_parts = ar.partition_names;
+                found_repr = ar.qos.data_representation.value;
                 break;
             }
         }
@@ -1336,6 +1535,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         freePartitionNames(self.alloc, found_parts);
+        found_repr.deinit(self.alloc);
         if (found_guid) |g| self.discovery.retractReader(g);
         if (found_proto) |p| p.deinit();
     }
@@ -2346,7 +2546,20 @@ pub const DomainParticipantImpl = struct {
                         if (!std.mem.eql(u8, dw.topic_name, ar.topic_name)) continue;
                         if (!std.mem.eql(u8, dw.type_name, ar.type_name)) continue;
                         const result = qm_mod.checkSnapshots(dw.qos, local_snap);
-                        if (!result.isCompatible()) continue;
+                        if (!result.isCompatible()) {
+                            // Mirrors onWriterDiscovered's live-discovery path below --
+                            // without this, a writer whose (incompatible) SEDP
+                            // announcement won the race against this reader's own
+                            // creation was silently skipped here with no
+                            // REQUESTED_INCOMPATIBLE_QOS notification at all, ever
+                            // (onWriterDiscovered never gets a second chance to see
+                            // this reader, since it only scans readers that already
+                            // exist at discovery time -- this retroactive path is the
+                            // only place that ever looks at this pairing again).
+                            if (ar.incompat_qos) |cb|
+                                cb.notify(cb.ctx, @as(i32, @intCast(@intFromEnum(result.incompatible))));
+                            continue;
+                        }
                         const part_result = qm_mod.checkPartition(
                             .{ .name = dw.qos.partition_names },
                             .{ .name = ar.partition_names },
@@ -2455,6 +2668,8 @@ pub const DomainParticipantImpl = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (*anyopaque, i64) void,
+        quiesce_acquire: *const fn (*anyopaque) bool,
+        quiesce_release: *const fn (*anyopaque) void,
     ) void {
         const self = cast(ctx);
         self.mu.lock();
@@ -2462,7 +2677,7 @@ pub const DomainParticipantImpl = struct {
         var aw_it6 = self.active_writers.valueIterator();
         while (aw_it6.next()) |aw| {
             if (aw.handle == handle) {
-                aw.timer_check = .{ .ctx = notify_ctx, .check = notify_fn };
+                aw.timer_check = .{ .ctx = notify_ctx, .check = notify_fn, .quiesce_acquire = quiesce_acquire, .quiesce_release = quiesce_release };
                 break;
             }
         }
@@ -2491,6 +2706,8 @@ pub const DomainParticipantImpl = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (*anyopaque, i64) void,
+        quiesce_acquire: *const fn (*anyopaque) bool,
+        quiesce_release: *const fn (*anyopaque) void,
     ) void {
         const self = cast(ctx);
         self.mu.lock();
@@ -2498,10 +2715,39 @@ pub const DomainParticipantImpl = struct {
         var ar_it6 = self.active_readers.valueIterator();
         while (ar_it6.next()) |ar| {
             if (ar.handle == handle) {
-                ar.timer_check = .{ .ctx = notify_ctx, .check = notify_fn };
+                ar.timer_check = .{ .ctx = notify_ctx, .check = notify_fn, .quiesce_acquire = quiesce_acquire, .quiesce_release = quiesce_release };
                 break;
             }
         }
+    }
+
+    fn subRegisterReaderGetFieldRefresh(
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        type_name: []const u8,
+        notify_ctx: *anyopaque,
+        refresh_fn: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void,
+    ) void {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        var ar_it9 = self.active_readers.valueIterator();
+        while (ar_it9.next()) |ar| {
+            if (ar.handle == handle) {
+                ar.refresh_get_field = .{ .ctx = notify_ctx, .refresh = refresh_fn };
+                break;
+            }
+        }
+        // Same critical section as the refresh_get_field registration above,
+        // and invoked synchronously here rather than returned for the caller
+        // to assign -- see ParticipantCbs.register_get_field_refresh's doc
+        // comment for why these must not be two separate lock acquisitions,
+        // and why this must not be a return value assigned outside them.
+        const current: ?filter_mod.CdrFieldGetter = if (self.type_support_registry.get(type_name)) |ts|
+            if (ts.get_field) |func| .{ .ctx = ts.ctx, .func = func } else null
+        else
+            null;
+        refresh_fn(notify_ctx, current);
     }
 
     fn makePubCbs(self: *Self) publisher_mod.ParticipantCbs {
@@ -2519,17 +2765,6 @@ pub const DomainParticipantImpl = struct {
         };
     }
 
-    fn subGetFieldFn(
-        ctx: *anyopaque,
-        type_name: []const u8,
-    ) ?*const fn ([]const u8, []const u8) ?filter_mod.FilterValue {
-        const self = cast(ctx);
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.type_support_registry.get(type_name)) |ts| return ts.get_field;
-        return null;
-    }
-
     fn makeSubCbs(self: *Self) subscriber_mod.ParticipantCbs {
         return .{
             .ctx = self,
@@ -2541,24 +2776,61 @@ pub const DomainParticipantImpl = struct {
             .announce_reader = subAnnounceProtoReader,
             .timer_clock = self.timer_clock,
             .register_timer_notify = subRegisterReaderTimerNotify,
-            .get_field_fn = subGetFieldFn,
+            .register_get_field_refresh = subRegisterReaderGetFieldRefresh,
         };
     }
 
     /// Check all active writer and reader deadline/liveliness timers and fire
     /// notifications for any that have expired.  Call from a timer thread or
     /// directly from tests (with a ManualClock) for deterministic control.
+    ///
+    /// Collects the callbacks to fire while `self.mu` is held (cheap: just
+    /// copying `TimerNotify` pairs out of the map), then releases the lock
+    /// *before* actually calling any of them. `cb.check` (DataWriterImpl/
+    /// DataReaderImpl's `checkTimersFn`) may notify a user-supplied listener,
+    /// and DDS listeners are allowed to call back into the participant --
+    /// e.g. `delete_datawriter`/`delete_participant` from inside
+    /// `on_offered_deadline_missed` is spec-legal application behavior, and
+    /// that call needs `self.mu` too. Firing while still holding it would
+    /// deadlock.
+    ///
+    /// A copied `cb.ctx` is NOT, on its own, safe to dereference later --
+    /// `checkTimersFn`'s own internal `self.quiesce.acquire()` can't protect
+    /// a pointer that's already dangling before it's even called (see
+    /// entity_quiesce.zig's module doc comment; this file previously
+    /// (wrongly) assumed it could). So `cb.quiesce_acquire(cb.ctx)` is
+    /// called here, still under `self.mu`, at a point where the entity is
+    /// provably still live (it's still in the map, so teardown hasn't
+    /// removed it yet) -- and the reference is held until after `cb.check`
+    /// returns, guaranteeing the entity can't be freed out from under the
+    /// call. If acquire fails, teardown is already underway; skip it.
     pub fn checkTimers(self: *Self) void {
         const now_ns = self.timer_clock.nowNs();
-        self.mu.lock();
-        defer self.mu.unlock();
-        var aw_it8 = self.active_writers.valueIterator();
-        while (aw_it8.next()) |aw| {
-            if (aw.timer_check) |cb| cb.check(cb.ctx, now_ns);
+        var due: std.ArrayListUnmanaged(TimerNotify) = .empty;
+        defer due.deinit(self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            var aw_it8 = self.active_writers.valueIterator();
+            while (aw_it8.next()) |aw| {
+                if (aw.timer_check) |cb| {
+                    if (cb.quiesce_acquire(cb.ctx)) {
+                        due.append(self.alloc, cb) catch cb.quiesce_release(cb.ctx);
+                    }
+                }
+            }
+            var ar_it7 = self.active_readers.valueIterator();
+            while (ar_it7.next()) |ar| {
+                if (ar.timer_check) |cb| {
+                    if (cb.quiesce_acquire(cb.ctx)) {
+                        due.append(self.alloc, cb) catch cb.quiesce_release(cb.ctx);
+                    }
+                }
+            }
         }
-        var ar_it7 = self.active_readers.valueIterator();
-        while (ar_it7.next()) |ar| {
-            if (ar.timer_check) |cb| cb.check(cb.ctx, now_ns);
+        for (due.items) |cb| {
+            cb.check(cb.ctx, now_ns);
+            cb.quiesce_release(cb.ctx);
         }
     }
 
