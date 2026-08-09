@@ -10,19 +10,23 @@ within it:
 zig/
   hello_world/        minimal pub/sub, native Zig API, no C ABI
   shape/              configurable pub/sub (see docs/design/shape-reference-app.md)
+  waitset/            WaitSet + all four condition types (see docs/design/waitset-reference-app.md)
 c/
   hello_world/        C port of zig/hello_world
   shape/              C port of zig/shape
   custom-allocator/   zero-heap-allocation pub/sub over real UDP discovery
+  waitset/            C port of zig/waitset
 cpp/
   hello_world/        C++ port of zig/hello_world
   shape/              C++ port of zig/shape
   custom-allocator/   C++ version of c/custom-allocator
   opencv_zzdds/       video capture -> ROI detection -> display over DDS, using OpenCV
+  waitset/            C++ port of zig/waitset
 java/
   hello_world/        Java port of zig/hello_world
   shape/              Java port of zig/shape
   listener-pubsub/    pub/sub over real UDP discovery, exercising the JNI listener path
+  waitset/            Java port of zig/waitset
 interop/
   cross_binding_smoke_test.py              C and C++ custom-allocator interop
   shape_cross_binding_smoke_test.py        all 12 ordered pairs of the 4 shape ports, plus --cft

@@ -1,0 +1,11 @@
+// zig/waitset's wire type. Deliberately close to hello_world's HelloWorld
+// (keyless, one incrementing count, one fixed string) plus one extra field,
+// `priority`, whose only purpose is giving QueryCondition's filter
+// expression something real to select on -- see
+// docs/design/waitset-reference-app.md at the repo root for the full spec.
+@appendable
+struct WaitsetSample {
+    int32 count;
+    int32 priority;
+    string<256> message;
+};

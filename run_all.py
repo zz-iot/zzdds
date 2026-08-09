@@ -174,6 +174,12 @@ def main() -> int:
     else:
         skip_or_fail("interop/hello-world-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
 
+    # ── WaitSet cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section("interop/waitset-cross-binding", lambda: run_script(SCRIPT_DIR / "interop" / "waitset_cross_binding_smoke_test.py", env=env))
+    else:
+        skip_or_fail("interop/waitset-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
     # ── opencv_zzdds (needs cpp-binding and OpenCV) ─────────────────────
     if cpp_binding and opencv:
         run_section("cpp/opencv_zzdds", lambda: run_script(SCRIPT_DIR / "cpp" / "opencv_zzdds" / "smoke_test.py", env=env))
