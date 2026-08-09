@@ -83,23 +83,24 @@ pub const ParticipantCbs = struct {
         quiesce_release: *const fn (notify_ctx: *anyopaque) void,
     ) void,
 
-    /// Look up the optional get_field function for a given type name.
-    /// Returns null when no TypeSupport with a get_field fn is registered.
-    get_field_fn: *const fn (
-        ctx: *anyopaque,
-        type_name: []const u8,
-    ) ?filter_mod.CdrFieldGetter,
-
-    /// Register a callback so a later registerTypeSupport() replacement for
+    /// Registers a callback so a later registerTypeSupport() replacement for
     /// this reader's type can push the new get_field getter in, instead of
-    /// leaving the reader's cached copy (set once at creation time below)
-    /// pointing at a freed TypeSupport ctx.
+    /// leaving the reader's cached copy pointing at a freed TypeSupport ctx
+    /// -- and, in the SAME participant-lock critical section, returns
+    /// type_name's *current* get_field getter for the caller to cache.
+    /// Bundling both into one call (rather than a separate get_field_fn
+    /// lookup before this) closes a race: if those were two separate lock
+    /// acquisitions, a registerTypeSupport() replacement landing between
+    /// them could free the ctx this call already cached, while this
+    /// reader's refresh_get_field wasn't registered yet to catch the
+    /// update -- see participant.zig's subRegisterReaderGetFieldRefresh.
     register_get_field_refresh: *const fn (
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
+        type_name: []const u8,
         notify_ctx: *anyopaque,
         refresh_fn: *const fn (notify_ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void,
-    ) void,
+    ) ?filter_mod.CdrFieldGetter,
 };
 
 pub const SubscriberImpl = struct {
@@ -313,14 +314,18 @@ pub const SubscriberImpl = struct {
             reader_mod.DataReaderImpl.quiesceAcquireFn,
             reader_mod.DataReaderImpl.quiesceReleaseFn,
         );
-        // Wire up get_field_fn for QueryCondition evaluation (always, when available).
-        dr.get_field_fn = self.cbs.get_field_fn(self.cbs.ctx, type_name);
-        // Let a later TypeSupport re-registration for this type refresh
-        // dr.get_field_fn/dr.cft_filter.get_field_fn instead of leaving them
-        // pointing at a freed ctx -- see reader.zig's refreshGetFieldFn.
-        self.cbs.register_get_field_refresh(
+        // Wire up get_field_fn for QueryCondition evaluation (always, when
+        // available), and arm this reader for a later TypeSupport
+        // re-registration to refresh dr.get_field_fn/dr.cft_filter.get_field_fn
+        // instead of leaving them pointing at a freed ctx -- see reader.zig's
+        // refreshGetFieldFn. Both happen in one call (one participant-lock
+        // critical section) so a concurrent registerTypeSupport() can never
+        // land in between and free the ctx this just cached -- see
+        // ParticipantCbs.register_get_field_refresh's doc comment.
+        dr.get_field_fn = self.cbs.register_get_field_refresh(
             self.cbs.ctx,
             sub_handle,
+            type_name,
             dr,
             reader_mod.DataReaderImpl.refreshGetFieldFn,
         );

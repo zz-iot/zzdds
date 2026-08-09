@@ -229,13 +229,10 @@ const BuiltinSubscriberState = struct {
             .register_timer_notify = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void, _: *const fn (*anyopaque) bool, _: *const fn (*anyopaque) void) void {}
             }.f,
-            .get_field_fn = struct {
-                fn f(_: *anyopaque, _: []const u8) ?filter_mod.CdrFieldGetter {
+            .register_get_field_refresh = struct {
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) ?filter_mod.CdrFieldGetter {
                     return null;
                 }
-            }.f,
-            .register_get_field_refresh = struct {
-                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {}
             }.f,
         };
 
@@ -2729,9 +2726,10 @@ pub const DomainParticipantImpl = struct {
     fn subRegisterReaderGetFieldRefresh(
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
+        type_name: []const u8,
         notify_ctx: *anyopaque,
         refresh_fn: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void,
-    ) void {
+    ) ?filter_mod.CdrFieldGetter {
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -2742,6 +2740,14 @@ pub const DomainParticipantImpl = struct {
                 break;
             }
         }
+        // Same critical section as the refresh_get_field registration above --
+        // see ParticipantCbs.register_get_field_refresh's doc comment for why
+        // these must not be two separate lock acquisitions.
+        if (self.type_support_registry.get(type_name)) |ts| {
+            const func = ts.get_field orelse return null;
+            return .{ .ctx = ts.ctx, .func = func };
+        }
+        return null;
     }
 
     fn makePubCbs(self: *Self) publisher_mod.ParticipantCbs {
@@ -2759,20 +2765,6 @@ pub const DomainParticipantImpl = struct {
         };
     }
 
-    fn subGetFieldFn(
-        ctx: *anyopaque,
-        type_name: []const u8,
-    ) ?filter_mod.CdrFieldGetter {
-        const self = cast(ctx);
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.type_support_registry.get(type_name)) |ts| {
-            const func = ts.get_field orelse return null;
-            return .{ .ctx = ts.ctx, .func = func };
-        }
-        return null;
-    }
-
     fn makeSubCbs(self: *Self) subscriber_mod.ParticipantCbs {
         return .{
             .ctx = self,
@@ -2784,7 +2776,6 @@ pub const DomainParticipantImpl = struct {
             .announce_reader = subAnnounceProtoReader,
             .timer_clock = self.timer_clock,
             .register_timer_notify = subRegisterReaderTimerNotify,
-            .get_field_fn = subGetFieldFn,
             .register_get_field_refresh = subRegisterReaderGetFieldRefresh,
         };
     }
