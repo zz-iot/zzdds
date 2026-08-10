@@ -264,10 +264,26 @@ test "WakeupList: register returns false when all slots are full" {
     const cond = gc.toCondition();
     for (waitsets[0..4]) |ws| _ = ws.toDDSWaitSet().attach_condition(cond);
 
-    // 5th attach: all slots full — register returns false, attach still succeeds
-    // (condition is recorded but push notification is silently dropped).
-    const rc5 = waitsets[4].toDDSWaitSet().attach_condition(cond);
-    try testing.expectEqual(DDS.RETCODE_OK, rc5);
+    // 5th attach: all slots full — register() returns false, and
+    // attach_condition() must report that honestly (RETCODE_OUT_OF_RESOURCES)
+    // rather than recording a condition it could never be woken by or safely
+    // invalidated from. Previously this silently returned RETCODE_OK instead
+    // — see vtAttach's own comment on why that was a real dangling-pointer
+    // risk (this WaitSet's `conditions` list would hold an entry the
+    // condition's own teardown could never reach to remove).
+    const dws5 = waitsets[4].toDDSWaitSet();
+    const rc5 = dws5.attach_condition(cond);
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc5);
+
+    // The failed attach must roll back cleanly: get_conditions() should
+    // report nothing attached, not a half-registered entry.
+    var active: DDS.ConditionSeq = .{};
+    defer if (active._release) {
+        if (active._buffer) |b| a.free(b[0..active._maximum]);
+    };
+    const grc = dws5.get_conditions(&active);
+    try testing.expectEqual(DDS.RETCODE_OK, grc);
+    try testing.expectEqual(@as(usize, 0), active._length);
 }
 
 // ── WaitSet: infinite-timeout wait (condvar.wait path) ───────────────────────

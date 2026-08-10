@@ -1948,7 +1948,10 @@ pub const DataReaderImpl = struct {
             removeDataNotifier,
             removeReadCondition,
         ) catch return nil.nil_readcondition;
-        self.trackReadCondition(rc.toCondition());
+        if (!self.trackReadCondition(rc.toCondition())) {
+            rc.deinit();
+            return nil.nil_readcondition;
+        }
         return rc.toDDSReadCondition();
     }
 
@@ -1983,17 +1986,26 @@ pub const DataReaderImpl = struct {
             removeDataNotifier,
             removeReadCondition,
         ) catch return nil.nil_querycondition;
-        self.trackReadCondition(qc.toCondition());
+        if (!self.trackReadCondition(qc.toCondition())) {
+            qc.deinit();
+            return nil.nil_querycondition;
+        }
         return qc.toDDSQueryCondition();
     }
 
     /// Records a newly-created ReadCondition/QueryCondition so reallyDeinit()
     /// can tear it down safely if the app deletes this reader without first
-    /// calling delete_readcondition() on it.
-    fn trackReadCondition(self: *Self, cond: DDS.Condition) void {
+    /// calling delete_readcondition() on it. Returns false on allocation
+    /// failure -- the caller must not hand the condition back to the app in
+    /// that case (see vtCreateReadCondition/vtCreateQueryCondition): an
+    /// untracked condition would survive the reader's own teardown holding
+    /// a reader_ctx/remove_notify_fn pointing at freed memory, since nothing
+    /// would tear it down along with the reader.
+    fn trackReadCondition(self: *Self, cond: DDS.Condition) bool {
         self.mu.lock();
         defer self.mu.unlock();
-        self.read_conditions.append(self.alloc, cond) catch {};
+        self.read_conditions.append(self.alloc, cond) catch return false;
+        return true;
     }
 
     /// Called by ReadConditionImpl/QueryConditionImpl's own deinit() — not by

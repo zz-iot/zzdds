@@ -44,6 +44,7 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const Condvar = @import("../util/condvar.zig").Condvar;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 
 // ── Push-notification types ───────────────────────────────────────────────────
 
@@ -149,6 +150,26 @@ pub const WaitSetImpl = struct {
     cv_cond: Condvar,
     notified: bool,
     ws_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    // Guards against a genuine use-after-free: WakeupList.invalidateAll()
+    // (a condition's own teardown path) deliberately copies out its
+    // registered handles and calls invalidate() on each one *after*
+    // releasing the list's mutex (see invalidateAll()'s own doc comment on
+    // why — holding it across the call would invert the documented
+    // WaitSet.mu → WakeupList.mu lock order and deadlock). That means a
+    // WakeupHandle{.ctx = this WaitSet} can still be "in flight" toward
+    // vtInvalidateHandle even after this WaitSet's own deinit() has run
+    // unregisterFromCondition() for that same condition (unregister() only
+    // guarantees the *registration* is gone, not that an already-copied
+    // handle's callback has finished). Confirmed as a real race, not just
+    // in theory: nothing previously stopped deinit() from freeing `self`
+    // while such a copied handle's invalidate() call was still on its way
+    // in from another thread. Same refcounted quiesce guard already used
+    // for the equivalent background-callback-vs-teardown race on
+    // DataReaderImpl/DataWriterImpl (see entity_quiesce.zig) — deinit()
+    // drops its own "alive" reference instead of freeing directly, and
+    // whichever side (deinit() or a still-in-flight vtInvalidateHandle
+    // call) turns out to release the last reference does the real free.
+    quiesce: EntityQuiesce = .{},
 
     const Self = @This();
 
@@ -166,6 +187,11 @@ pub const WaitSetImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
         // Unregister from every still-attached condition before freeing
         // self, so their own WakeupList doesn't keep a WakeupHandle
         // pointing at this (about-to-be-freed) WaitSet — the symmetric
@@ -320,18 +346,36 @@ pub const WaitSetImpl = struct {
             if (c.ptr == cond.ptr) return DDS.RETCODE_OK;
         }
         self.conditions.append(self.alloc, cond) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-        // Register push-notification with the condition.
+        // Register push-notification with the condition. WakeupList has a
+        // fixed WAKEUP_SLOTS capacity (see its own doc comment) -- if a 5th
+        // WaitSet tries to attach to a condition already attached to
+        // WAKEUP_SLOTS others, register() returns false. Roll back the
+        // append above and report the real failure rather than returning
+        // RETCODE_OK for a condition this WaitSet could never be woken by
+        // or safely invalidated from (a previously silently-ignored gap:
+        // register()'s bool return was discarded here, leaving this
+        // WaitSet's `conditions` list holding an entry the condition's own
+        // teardown could never reach to remove, i.e. a live dangling
+        // pointer once that condition was freed). Register before
+        // add_notify_fn for ReadCondition specifically so a failed register
+        // never leaves a live reader-side notifier this WaitSet has no
+        // record of holding.
         const h = WakeupHandle{ .ctx = self, .wake = wakeNotify, .invalidate = vtInvalidateHandle };
-        if (cond.vtable == &ReadConditionImpl.cond_vtable) {
+        const registered = if (cond.vtable == &ReadConditionImpl.cond_vtable) reg: {
             const rc: *ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            if (!rc.wakeups.register(h)) break :reg false;
             rc.add_notify_fn(rc.reader_ctx, DataNotifyFn{ .ctx = self, .on_data = wakeNotify });
-            _ = rc.wakeups.register(h);
-        } else if (cond.vtable == &StatusConditionImpl.cond_vtable) {
+            break :reg true;
+        } else if (cond.vtable == &StatusConditionImpl.cond_vtable) reg: {
             const sc: *StatusConditionImpl = @ptrCast(@alignCast(cond.ptr));
-            _ = sc.wakeups.register(h);
-        } else if (cond.vtable == &GuardConditionImpl.cond_vtable) {
+            break :reg sc.wakeups.register(h);
+        } else if (cond.vtable == &GuardConditionImpl.cond_vtable) reg: {
             const gc: *GuardConditionImpl = @ptrCast(@alignCast(cond.ptr));
-            _ = gc.wakeups.register(h);
+            break :reg gc.wakeups.register(h);
+        } else true;
+        if (!registered) {
+            _ = self.conditions.swapRemove(self.conditions.items.len - 1);
+            return DDS.RETCODE_OUT_OF_RESOURCES;
         }
         return DDS.RETCODE_OK;
     }
@@ -387,8 +431,15 @@ pub const WaitSetImpl = struct {
     /// to drop `cond_ptr` from this WaitSet's `conditions` list before the
     /// condition frees itself. A no-op if it's already gone (e.g. an explicit
     /// detach_condition() raced this and won).
+    ///
+    /// Reached via a handle copied out of the condition's WakeupList, quite
+    /// possibly after this very WaitSet's own deinit() has already started
+    /// (or even finished) tearing it down — see `quiesce`'s doc comment.
+    /// Must acquire before touching anything else on `self`.
     fn vtInvalidateHandle(ctx: *anyopaque, cond_ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
         for (self.conditions.items, 0..) |c, i| {

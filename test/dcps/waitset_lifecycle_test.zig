@@ -279,3 +279,41 @@ test "WaitSet: concurrent wait() vs. attach/delete-entity/detach cycling doesn't
     ctx.stop.store(true, .release);
     t.join();
 }
+
+test "WaitSet: concurrent WaitSet deinit races GuardCondition deinit without use-after-free" {
+    const alloc = testing.allocator;
+
+    // Regression for a real race Greptile flagged on zzdds PR #60:
+    // GuardConditionImpl.deinit() -> WakeupList.invalidateAll() deliberately
+    // copies out its registered WakeupHandle(s) and calls invalidate() on
+    // each one *after* releasing the list's own mutex (see invalidateAll's
+    // doc comment on why -- holding it across the call would invert the
+    // documented WaitSet.mu -> WakeupList.mu lock order and deadlock). That
+    // leaves a window where a WakeupHandle{.ctx = ws} can still be in
+    // flight toward WaitSetImpl.vtInvalidateHandle even after `ws.deinit()`
+    // has started concurrently on another thread -- nothing previously
+    // stopped that deinit() from freeing `ws` while the copied handle's
+    // callback was still on its way in. Loop many times to make the race
+    // window likely to be hit at least once; DebugAllocator (testing.allocator)
+    // catches the resulting use-after-free/double-free if the fix regresses.
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const gc = try zzdds.dcps.GuardConditionImpl.init(alloc);
+        const ws = try WaitSetImpl.init(alloc);
+        try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(gc.toCondition()));
+
+        const Ctx = struct {
+            gc: *zzdds.dcps.GuardConditionImpl,
+            fn run(self: *@This()) void {
+                self.gc.deinit();
+            }
+        };
+        var ctx = Ctx{ .gc = gc };
+        const t = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+        // Race: tear down the WaitSet on this thread while the spawned
+        // thread concurrently tears down the GuardCondition it's still
+        // attached to.
+        ws.deinit();
+        t.join();
+    }
+}
