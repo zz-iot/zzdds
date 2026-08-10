@@ -56,6 +56,27 @@ pub const WakeupHandle = struct {
     /// the WaitSet at `ctx` forgets about `cond_ptr` instead of being left
     /// with a dangling entry in its `conditions` list.
     invalidate: *const fn (ctx: *anyopaque, cond_ptr: *anyopaque) void,
+    /// Attempts to keep `ctx` (always a *WaitSetImpl in practice) alive long
+    /// enough for a subsequent `invalidate()` call to safely touch it.
+    /// MUST be called while still holding the owning WakeupList's own mutex
+    /// (see `drain()`), never afterward — calling it only once execution
+    /// has already reached `invalidate()` is too late: nothing before that
+    /// point would have stopped the WaitSet's own teardown from concluding
+    /// no reference was ever taken and freeing itself first, so `invalidate`
+    /// itself could already be touching freed memory by the time it tried
+    /// to acquire. Calling it *while the list's mutex is still held* is
+    /// what makes this safe: the WaitSet's own teardown (`unregisterFromCondition`)
+    /// needs that exact same mutex to remove its registration, and cannot
+    /// reach `alloc.destroy` until that call returns — so as long as this
+    /// handle is still sitting in the list (mutex held), the WaitSet cannot
+    /// yet have freed itself. Returns false if the WaitSet has already
+    /// begun (or finished) tearing down; the caller must then drop this
+    /// handle instead of calling `invalidate()` on it.
+    acquire: *const fn (ctx: *anyopaque) bool,
+    /// Pairs with a successful `acquire()` — call exactly once, after the
+    /// paired `invalidate()` call (or immediately, if `invalidate()` wasn't
+    /// called for some other reason).
+    release: *const fn (ctx: *anyopaque) void,
 };
 
 /// Callback registered by a WaitSet (via ReadCondition) in the DataReader.
@@ -107,10 +128,11 @@ pub const WakeupList = struct {
         }
     }
 
-    /// Call invalidate(ctx, cond_ptr) on every registered handle and clear
-    /// the list. Used by a condition's own `deinit()`, before it frees
-    /// itself, so every WaitSet that still has it attached forgets about it
-    /// instead of being left with a dangling `conditions` entry.
+    /// Call invalidate(ctx, cond_ptr) on every successfully-acquired
+    /// registered handle, release each one afterward, and clear the list.
+    /// Used by a condition's own `deinit()`, before it frees itself, so
+    /// every WaitSet that still has it attached forgets about it instead of
+    /// being left with a dangling `conditions` entry.
     ///
     /// Deliberately does NOT hold self.mu while calling invalidate(): the
     /// callee (WaitSetImpl.vtInvalidateHandle) acquires WaitSet.mu, and
@@ -118,24 +140,41 @@ pub const WakeupList = struct {
     /// lock-ordering note at the top of this file) — holding this list's mu
     /// across the call would invert that order against a concurrent
     /// attach/detach on the same condition and deadlock. drain() releases
-    /// this list's mu before any handle is touched.
+    /// this list's mu before any handle is touched — see its own doc
+    /// comment for why the acquire()/release() pairing (not this function)
+    /// is what actually keeps that safe.
     pub fn invalidateAll(self: *WakeupList, cond_ptr: *anyopaque) void {
         const slots = self.drain();
         for (slots) |maybe_h| {
-            if (maybe_h) |h| h.invalidate(h.ctx, cond_ptr);
+            if (maybe_h) |h| {
+                h.invalidate(h.ctx, cond_ptr);
+                h.release(h.ctx);
+            }
         }
     }
 
-    /// Removes every registered handle and returns them (as a fixed-size
-    /// array of optionals, matching `slots`' own shape) without calling
-    /// anything on them. Used when a caller needs to act on each handle
-    /// itself (e.g. also calling a second, unrelated callback per handle)
-    /// without holding `self.mu` across those calls.
+    /// Removes every registered handle and returns the ones whose
+    /// `acquire()` succeeded (as a fixed-size array of optionals, matching
+    /// `slots`' own shape) — a handle whose `acquire()` fails is dropped
+    /// silently, without ever being returned to the caller: its target has
+    /// already begun tearing down, so there is nothing left for a caller to
+    /// usefully do with it (see WakeupHandle.acquire's own doc comment for
+    /// why this must happen here, while still holding `self.mu`, rather
+    /// than being left to the caller once this list's mu is released).
+    /// Used when a caller needs to act on each handle itself (e.g. also
+    /// calling a second, unrelated callback per handle) without holding
+    /// `self.mu` across those calls. Every handle returned here must be
+    /// paired with exactly one later call to its own `release()`.
     pub fn drain(self: *WakeupList) [WAKEUP_SLOTS]?WakeupHandle {
         self.mu.lock();
         defer self.mu.unlock();
-        const out = self.slots;
-        self.slots = [_]?WakeupHandle{null} ** WAKEUP_SLOTS;
+        var out: [WAKEUP_SLOTS]?WakeupHandle = [_]?WakeupHandle{null} ** WAKEUP_SLOTS;
+        for (&self.slots, 0..) |*s, i| {
+            if (s.*) |h| {
+                if (h.acquire(h.ctx)) out[i] = h;
+                s.* = null;
+            }
+        }
         return out;
     }
 };
@@ -158,17 +197,33 @@ pub const WaitSetImpl = struct {
     // WaitSet.mu → WakeupList.mu lock order and deadlock). That means a
     // WakeupHandle{.ctx = this WaitSet} can still be "in flight" toward
     // vtInvalidateHandle even after this WaitSet's own deinit() has run
-    // unregisterFromCondition() for that same condition (unregister() only
-    // guarantees the *registration* is gone, not that an already-copied
-    // handle's callback has finished). Confirmed as a real race, not just
-    // in theory: nothing previously stopped deinit() from freeing `self`
-    // while such a copied handle's invalidate() call was still on its way
-    // in from another thread. Same refcounted quiesce guard already used
-    // for the equivalent background-callback-vs-teardown race on
-    // DataReaderImpl/DataWriterImpl (see entity_quiesce.zig) — deinit()
-    // drops its own "alive" reference instead of freeing directly, and
-    // whichever side (deinit() or a still-in-flight vtInvalidateHandle
-    // call) turns out to release the last reference does the real free.
+    // unregisterFromCondition() for that same condition. Confirmed as a
+    // real race, not just in theory: nothing previously stopped deinit()
+    // from freeing `self` while such a copied handle's invalidate() call
+    // was still on its way in from another thread. Same refcounted quiesce
+    // guard already used for the equivalent background-callback-vs-teardown
+    // race on DataReaderImpl/DataWriterImpl (see entity_quiesce.zig) —
+    // deinit() drops its own "alive" reference instead of freeing directly,
+    // and whichever side (deinit() or a still-acquired reference) turns out
+    // to release the last one does the real free.
+    //
+    // The `acquire()` call itself MUST happen from `WakeupList.drain()`,
+    // while that list's own mutex is still held (see WakeupHandle.acquire's
+    // doc comment) — not from inside vtInvalidateHandle after the mutex is
+    // released. An earlier version of this fix got exactly that wrong:
+    // acquiring only once vtInvalidateHandle was already running is too
+    // late, since deinit()'s own unregisterFromCondition() call for that
+    // same condition — which is what deinit() needs before it can free
+    // `self` — is only guaranteed to block on that same mutex if a drain()
+    // is still holding it; once drain() has released the mutex, deinit()'s
+    // unregister() finds nothing there (already drained), no longer has
+    // any reason to wait, and is free to finish tearing `self` down before
+    // the drained handle's acquire() attempt ever runs. Holding the mutex
+    // across the acquire() call closes that gap: deinit()'s unregister()
+    // for this condition cannot return (and therefore deinit() cannot reach
+    // the free) until drain() — which is what performs the acquire — has
+    // released it, so `self` is provably still live at the moment acquire()
+    // runs.
     quiesce: EntityQuiesce = .{},
 
     const Self = @This();
@@ -360,7 +415,7 @@ pub const WaitSetImpl = struct {
         // add_notify_fn for ReadCondition specifically so a failed register
         // never leaves a live reader-side notifier this WaitSet has no
         // record of holding.
-        const h = WakeupHandle{ .ctx = self, .wake = wakeNotify, .invalidate = vtInvalidateHandle };
+        const h = WakeupHandle{ .ctx = self, .wake = wakeNotify, .invalidate = vtInvalidateHandle, .acquire = quiesceAcquire, .release = quiesceRelease };
         const registered = if (cond.vtable == &ReadConditionImpl.cond_vtable) reg: {
             const rc: *ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
             if (!rc.wakeups.register(h)) break :reg false;
@@ -432,14 +487,15 @@ pub const WaitSetImpl = struct {
     /// condition frees itself. A no-op if it's already gone (e.g. an explicit
     /// detach_condition() raced this and won).
     ///
-    /// Reached via a handle copied out of the condition's WakeupList, quite
-    /// possibly after this very WaitSet's own deinit() has already started
-    /// (or even finished) tearing it down — see `quiesce`'s doc comment.
-    /// Must acquire before touching anything else on `self`.
+    /// Reached via a handle drained out of the condition's WakeupList — safe
+    /// to touch `self` unconditionally here because the caller (WakeupList.
+    /// drain()/invalidateAll()) already holds an acquired `quiesce` reference
+    /// on our behalf for the whole acquire()..invalidate()..release() span
+    /// (see `quiesce`'s doc comment and WakeupHandle.acquire's own doc
+    /// comment on why that reference has to be taken earlier, while the
+    /// list's own mutex is still held, rather than here).
     fn vtInvalidateHandle(ctx: *anyopaque, cond_ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (!self.quiesce.acquire()) return;
-        defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
         for (self.conditions.items, 0..) |c, i| {
@@ -448,6 +504,17 @@ pub const WaitSetImpl = struct {
                 return;
             }
         }
+    }
+
+    /// `WakeupHandle.acquire`/`.release` implementations — see WakeupHandle's
+    /// own doc comment for the safety argument these depend on.
+    fn quiesceAcquire(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+    fn quiesceRelease(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
     }
 };
 
@@ -631,13 +698,20 @@ pub const ReadConditionImpl = struct {
     /// is freed, so it must happen here rather than being left to a later
     /// explicit detach_condition() call that may never come (e.g. the owning
     /// DataReader was deleted directly). drain() releases wakeups.mu before
-    /// any of these calls, matching invalidateAll()'s own reasoning.
+    /// any of these calls, matching invalidateAll()'s own reasoning — and,
+    /// like invalidateAll(), only returns handles that already passed
+    /// drain()'s own acquire() check (see WakeupHandle's doc comment), so
+    /// `h.ctx` is safe to dereference via invalidate() here. remove_notify_fn
+    /// never dereferences `h.ctx` itself (just uses it as an opaque lookup
+    /// key into the reader's own notifier list), so it's safe to call
+    /// regardless of that acquire outcome.
     fn detachFromAllWaitSets(self: *Self) void {
         const slots = self.wakeups.drain();
         for (slots) |maybe_h| {
             const h = maybe_h orelse continue;
             h.invalidate(h.ctx, self);
             self.remove_notify_fn(self.reader_ctx, h.ctx);
+            h.release(h.ctx);
         }
     }
 
