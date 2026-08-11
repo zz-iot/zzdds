@@ -672,6 +672,205 @@ test "bootstrap: read_n_raw is non-destructive" {
     try testing.expectEqual(@as(c_int, 1), m);
 }
 
+// ── take_n_instance_raw / read_n_instance_raw ──────────────────────────────────
+//
+// Additive siblings of take_n_raw/read_n_raw scoped to one instance -- the
+// raw path to what the OMG spec calls take_instance/read_instance.
+
+test "bootstrap: take_n_instance_raw restricts to one instance" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var k1: [16]u8 = std.mem.zeroes([16]u8);
+    k1[0] = 1;
+    var k2: [16]u8 = std.mem.zeroes([16]u8);
+    k2[0] = 2;
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    const ih1 = DataWriterImpl.registerInstanceRaw(k1);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_n_instance_raw(pair.dr_boxed, ih1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &arr);
+    try testing.expectEqual(@as(c_int, 1), n);
+    try testing.expectEqual(ih1, arr.samples.?[0].info.instance_handle);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
+
+    // Instance 2's sample is still in queue.
+    var arr2: bootstrap.CRawSampleArray = undefined;
+    const n2 = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &arr2);
+    try testing.expectEqual(@as(c_int, 1), n2);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr2);
+}
+
+test "bootstrap: read_n_instance_raw is non-destructive" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var k1: [16]u8 = std.mem.zeroes([16]u8);
+    k1[0] = 1;
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    const ih1 = DataWriterImpl.registerInstanceRaw(k1);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_read_n_instance_raw(pair.dr_boxed, ih1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &arr);
+    try testing.expectEqual(@as(c_int, 1), n);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
+
+    var arr2: bootstrap.CRawSampleArray = undefined;
+    const n2 = bootstrap.zzdds_take_n_instance_raw(pair.dr_boxed, ih1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &arr2);
+    try testing.expectEqual(@as(c_int, 1), n2);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr2);
+}
+
+// ── take_w_condition_raw / read_w_condition_raw ─────────────────────────────────
+//
+// The raw path to what the OMG spec calls take_w_condition/read_w_condition,
+// through a real boxed DDS_ReadCondition handle (as a real C caller has).
+
+test "bootstrap: take_w_condition_raw applies the condition's own state masks" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+
+    const rc = pair.dr.create_readcondition(DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = pair.dr.delete_readcondition(rc);
+    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_w_condition_raw(pair.dr_boxed, rc_boxed, -1, &arr);
+    try testing.expectEqual(@as(c_int, 1), n);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
+
+    // A second call sees nothing left (the one NOT_READ sample was taken).
+    var arr2: bootstrap.CRawSampleArray = undefined;
+    const n2 = bootstrap.zzdds_take_w_condition_raw(pair.dr_boxed, rc_boxed, -1, &arr2);
+    try testing.expectEqual(@as(c_int, 0), n2);
+}
+
+test "bootstrap: take_w_condition_raw with a QueryCondition (via as_ReadCondition) applies its query filter" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const GetField = struct {
+        fn get(_: *anyopaque, payload: []const u8, field: []const u8, _: []u8) ?zzdds.dcps.filter.FilterValue {
+            if (!std.mem.eql(u8, field, "tag")) return null;
+            return .{ .int = payload[payload.len - 1] };
+        }
+        fn computeKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
+            return std.mem.zeroes([16]u8);
+        }
+    };
+    try testing.expect(zzdds.registerTypeSupport(fx.dp_r, "BootType", .{
+        .ctx = undefined,
+        .compute_key_hash = GetField.computeKeyHash,
+        .get_field = GetField.get,
+    }));
+    const pair = fx.makeWriterReader();
+
+    var payload_1 = PAYLOAD;
+    payload_1[4] = 1;
+    var payload_2 = PAYLOAD;
+    payload_2[4] = 2;
+    var k1: [16]u8 = std.mem.zeroes([16]u8);
+    k1[0] = 1;
+    var k2: [16]u8 = std.mem.zeroes([16]u8);
+    k2[0] = 2;
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &payload_1, payload_1.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &payload_2, payload_2.len);
+
+    var params = [_][*:0]const u8{"2"};
+    var params_seq = DDS.StringSeq{ ._buffer = &params, ._length = 1, ._maximum = 1, ._release = false };
+    const qc = pair.dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "tag = %0", &params_seq);
+    try testing.expect(qc.ptr != nil.NIL_PTR);
+    const rc = qc.vtable.as_ReadCondition(qc.ptr);
+    defer _ = pair.dr.delete_readcondition(rc);
+    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_w_condition_raw(pair.dr_boxed, rc_boxed, -1, &arr);
+    try testing.expectEqual(@as(c_int, 1), n);
+    try testing.expectEqual(@as(u8, 2), arr.samples.?[0].data.?[arr.samples.?[0].data_len - 1]);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
+}
+
+test "bootstrap: take_w_condition_raw returns -1 for a NULL condition handle" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_w_condition_raw(pair.dr_boxed, makeNullHandle(), -1, &arr);
+    try testing.expectEqual(@as(c_int, -1), n);
+    try testing.expect(arr.samples == null);
+}
+
+// ── take_next_instance_w_condition_raw / read_next_instance_w_condition_raw ────
+
+test "bootstrap: take_next_instance_w_condition_raw skips a non-matching instance" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    var k1: [16]u8 = std.mem.zeroes([16]u8);
+    k1[0] = 1;
+    var k2: [16]u8 = std.mem.zeroes([16]u8);
+    k2[0] = 2;
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    const ih1 = DataWriterImpl.registerInstanceRaw(k1);
+    const ih2 = DataWriterImpl.registerInstanceRaw(k2);
+    const excluded_ih = @min(ih1, ih2);
+
+    // Mark the lower-handle instance's sample READ, leaving the other NOT_READ.
+    var mark_read: bootstrap.CRawSampleArray = undefined;
+    const nr = bootstrap.zzdds_read_n_instance_raw(pair.dr_boxed, excluded_ih, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &mark_read);
+    try testing.expectEqual(@as(c_int, 1), nr);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &mark_read);
+
+    const rc = pair.dr.create_readcondition(DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = pair.dr.delete_readcondition(rc);
+    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_next_instance_w_condition_raw(pair.dr_boxed, rc_boxed, DDS.HANDLE_NIL, -1, &arr);
+    try testing.expectEqual(@as(c_int, 1), n);
+    // Must have selected the OTHER (still NOT_READ) instance, not simply the
+    // smallest handle -- that's the whole point of the _w_condition variant.
+    try testing.expect(arr.samples.?[0].info.instance_handle != excluded_ih);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
+}
+
+test "bootstrap: read_next_instance_w_condition_raw is non-destructive" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+
+    const rc = pair.dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = pair.dr.delete_readcondition(rc);
+    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_read_next_instance_w_condition_raw(pair.dr_boxed, rc_boxed, DDS.HANDLE_NIL, -1, &arr);
+    try testing.expectEqual(@as(c_int, 1), n);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
+
+    var arr2: bootstrap.CRawSampleArray = undefined;
+    const n2 = bootstrap.zzdds_take_next_instance_w_condition_raw(pair.dr_boxed, rc_boxed, DDS.HANDLE_NIL, -1, &arr2);
+    try testing.expectEqual(@as(c_int, 1), n2);
+    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr2);
+}
+
 // ── get_key_value_writer / lookup_instance_writer ─────────────────────────────
 
 test "bootstrap: get_key_value_writer returns CDR payload after alive write" {

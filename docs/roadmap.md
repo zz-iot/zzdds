@@ -239,6 +239,42 @@ section for the full writeup; not duplicated here.
 
 ---
 
+**`take_w_condition` family + other typed reader/writer spec gaps closed
+(2026-08-10).** Follow-on from the WaitSet/condition example above: the race
+fix to `zig/waitset`'s subscriber (two independently-locked take calls
+racing incoming data) raised the question of why the other three bindings
+never had a real `take_w_condition` to hit the same race with in the first
+place. Answer, confirmed against the DDS 1.4 spec directly: the entire
+`read_w_condition`/`take_w_condition`/`read_next_instance_w_condition`/
+`take_next_instance_w_condition` family was missing from every binding's
+generated typed DataReader, plus several smaller gaps (batch
+`read_instance`/`take_instance` for C/C++/Java; `get_key_value`/
+`lookup_instance` and most of `register_instance`/`write_w_timestamp`/
+`dispose_w_timestamp`/`unregister_w_timestamp` missing from Java
+specifically; `register_instance_w_timestamp` missing everywhere). New zzdds
+core: `DataReaderImpl.takeNextInstanceFiltered`/`readNextInstanceFiltered`
+(`src/dcps/reader.zig`) — instance *selection* itself now respects the
+condition's masks/query per spec, not just "the next instance with any
+sample," extending `takeFiltered`/`readRaw`'s existing `maybe_qc` support
+rather than needing new filter-evaluation logic. New C-ABI:
+`zzdds_take_w_condition_raw`/`zzdds_read_w_condition_raw`,
+`zzdds_take_next_instance_w_condition_raw`/
+`zzdds_read_next_instance_w_condition_raw`,
+`zzdds_take_n_instance_raw`/`zzdds_read_n_instance_raw` (`src/c_abi/
+bootstrap.zig`) — all additive, no existing exported signature changed. Java
+also gained genuinely new JNI native methods (`java_runtime/ZzddsRuntime
+.java` + `zzdds_java_runtime.c`), not just codegen, since several of these
+had no underlying capability there at all before. Full writeup (the spec
+audit table, per-backend gap breakdown, and the explicit loan-variant
+exclusion) lives in zidl's own roadmap under "Typed DataReader/DataWriter
+spec completeness" — not duplicated here. All four `zzdds-examples/
+{zig,c,cpp,java}/waitset` subscribers now use the real generated
+`take_w_condition` uniformly; verified via `zig build test`/`test-tsan`,
+Valgrind on the new C-ABI tests, and the full 8-pair cross-binding smoke
+test.
+
+---
+
 **New C ABI export: `zzdds_cft_match_sample` (2026-08-06).** Found while
 porting every remaining "stretch" CLI flag from `zig/shape` to `c/shape`/
 `cpp/shape`/`java/shape` in zzdds-examples, specifically `--cft`: zzdds's own

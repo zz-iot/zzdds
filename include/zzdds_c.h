@@ -346,6 +346,59 @@ int zzdds_read_n_raw(
     zzdds_raw_sample_array *out
 );
 
+int zzdds_take_n_instance_raw(
+    DDS_DataReader reader,
+    DDS_InstanceHandle_t instance_handle,
+    uint32_t ss,
+    uint32_t vs,
+    uint32_t is,
+    int max,
+    zzdds_raw_sample_array *out
+);
+
+int zzdds_read_n_instance_raw(
+    DDS_DataReader reader,
+    DDS_InstanceHandle_t instance_handle,
+    uint32_t ss,
+    uint32_t vs,
+    uint32_t is,
+    int max,
+    zzdds_raw_sample_array *out
+);
+
+/* `condition` is a DDS_ReadCondition -- or a DDS_QueryCondition, upcast via
+ * its own generated as_ReadCondition() -- from this same reader. State masks
+ * (and, for a QueryCondition, the query filter) come from `condition` itself. */
+int zzdds_take_w_condition_raw(
+    DDS_DataReader reader,
+    DDS_ReadCondition condition,
+    int max,
+    zzdds_raw_sample_array *out
+);
+
+int zzdds_read_w_condition_raw(
+    DDS_DataReader reader,
+    DDS_ReadCondition condition,
+    int max,
+    zzdds_raw_sample_array *out
+);
+
+int zzdds_take_next_instance_w_condition_raw(
+    DDS_DataReader reader,
+    DDS_ReadCondition condition,
+    DDS_InstanceHandle_t prev,
+    int max,
+    zzdds_raw_sample_array *out
+);
+
+int zzdds_read_next_instance_w_condition_raw(
+    DDS_DataReader reader,
+    DDS_ReadCondition condition,
+    DDS_InstanceHandle_t prev,
+    int max,
+    zzdds_raw_sample_array *out
+);
+
 void zzdds_return_raw_samples(DDS_DataReader reader, zzdds_raw_sample_array *arr);
 
 int zzdds_get_key_value_reader(

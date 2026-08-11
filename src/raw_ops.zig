@@ -329,6 +329,148 @@ pub fn takeWithQueryConditionRaw(
     tmp.items.len = 0;
 }
 
+/// Batch take restricted to an arbitrary ReadCondition -- which may itself be
+/// a QueryCondition upcast via `as_ReadCondition()` (see
+/// `ReadConditionImpl.owner_qc`, which tells us so and carries the query
+/// filter to apply if it is). State masks come from the condition itself.
+/// The Zig-native raw path to what the OMG spec calls `take_w_condition`
+/// (`dcps.idl`'s `DataReader` interface comment names the full generated-
+/// operation set this belongs to). More general than `takeWithQueryConditionRaw`
+/// above (which requires a `DDS.QueryCondition`-typed parameter specifically);
+/// kept alongside it rather than replacing it, since that one still has a
+/// caller.
+pub fn takeWithReadConditionRaw(
+    reader: DDS.DataReader,
+    cond: DDS.ReadCondition,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.takeFiltered(
+        &tmp,
+        rc_impl.sample_state_mask,
+        rc_impl.view_state_mask,
+        rc_impl.instance_state_mask,
+        max,
+        null,
+        rc_impl.owner_qc,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
+}
+
+/// Non-destructive analog of `takeWithReadConditionRaw` -- the raw path to
+/// what the OMG spec calls `read_w_condition`.
+pub fn readWithReadConditionRaw(
+    reader: DDS.DataReader,
+    cond: DDS.ReadCondition,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.readRaw(
+        &tmp,
+        rc_impl.sample_state_mask,
+        rc_impl.view_state_mask,
+        rc_impl.instance_state_mask,
+        max,
+        null,
+        rc_impl.owner_qc,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
+}
+
+/// Batch take restricted to an arbitrary ReadCondition AND scoped to the
+/// "next instance" after `prev` -- the raw path to what the OMG spec calls
+/// `take_next_instance_w_condition`. See
+/// `DataReaderImpl.takeNextInstanceFiltered`'s doc comment for the
+/// instance-selection semantics (the target instance must itself have a
+/// matching sample, not just any sample).
+pub fn takeNextInstanceWithReadConditionRaw(
+    reader: DDS.DataReader,
+    cond: DDS.ReadCondition,
+    prev: DDS.InstanceHandle_t,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.takeNextInstanceFiltered(
+        &tmp,
+        prev,
+        rc_impl.sample_state_mask,
+        rc_impl.view_state_mask,
+        rc_impl.instance_state_mask,
+        max,
+        rc_impl.owner_qc,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
+}
+
+/// Non-destructive analog of `takeNextInstanceWithReadConditionRaw` -- the raw
+/// path to what the OMG spec calls `read_next_instance_w_condition`.
+pub fn readNextInstanceWithReadConditionRaw(
+    reader: DDS.DataReader,
+    cond: DDS.ReadCondition,
+    prev: DDS.InstanceHandle_t,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.readNextInstanceFiltered(
+        &tmp,
+        prev,
+        rc_impl.sample_state_mask,
+        rc_impl.view_state_mask,
+        rc_impl.instance_state_mask,
+        max,
+        rc_impl.owner_qc,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
+}
+
 /// Batch read: non-destructively return samples matching the given masks.
 /// Appends to `out`; caller owns all appended OwnedRawSample values.
 /// Pass max < 0 for no limit.

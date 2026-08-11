@@ -16,6 +16,7 @@ const DDS = @import("zzdds_generated").DDS;
 const DataWriterImpl = @import("../dcps/writer.zig").DataWriterImpl;
 const DataReaderImpl = @import("../dcps/reader.zig").DataReaderImpl;
 const TopicImpl = @import("../dcps/topic.zig").TopicImpl;
+const dcps_waitset = @import("../dcps/waitset.zig");
 const time_mod = @import("../util/time.zig");
 const history_mod = @import("../rtps/history.zig");
 const nil = @import("../dcps/nil.zig");
@@ -424,6 +425,7 @@ fn nRawImpl(
     max: c_int,
     out: *CRawSampleArray,
     destructive: bool,
+    maybe_ih: ?DDS.InstanceHandle_t,
 ) c_int {
     out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
     if (isNullHandle(reader)) return -1;
@@ -448,7 +450,7 @@ fn nRawImpl(
             for (peek.items) |s| impl.alloc.free(s.data);
             peek.deinit(impl.alloc);
         }
-        impl.readRaw(&peek, ss, vs, is, -1, null, null) catch return -1;
+        impl.readRaw(&peek, ss, vs, is, -1, maybe_ih, null) catch return -1;
         if (peek.items.len == 0) {
             out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
             return 0;
@@ -476,12 +478,12 @@ fn nRawImpl(
     }
     if (destructive) {
         const take_max = if (max <= 0) unbounded_take_max else max;
-        impl.takeFiltered(&tmp, ss, vs, is, take_max, null, null) catch {
+        impl.takeFiltered(&tmp, ss, vs, is, take_max, maybe_ih, null) catch {
             if (pre_arr.len > 0) alloc.free(pre_arr);
             return -1;
         };
     } else {
-        impl.readRaw(&tmp, ss, vs, is, max, null, null) catch return -1;
+        impl.readRaw(&tmp, ss, vs, is, max, maybe_ih, null) catch return -1;
     }
     if (tmp.items.len == 0) {
         if (pre_arr.len > 0) alloc.free(pre_arr);
@@ -529,7 +531,7 @@ pub export fn zzdds_take_n_raw(
     max: c_int,
     out: *CRawSampleArray,
 ) callconv(.c) c_int {
-    return nRawImpl(reader, ss, vs, is, max, out, true);
+    return nRawImpl(reader, ss, vs, is, max, out, true, null);
 }
 
 /// Batch read: non-destructively return up to `max` samples matching the masks.
@@ -543,7 +545,39 @@ pub export fn zzdds_read_n_raw(
     max: c_int,
     out: *CRawSampleArray,
 ) callconv(.c) c_int {
-    return nRawImpl(reader, ss, vs, is, max, out, false);
+    return nRawImpl(reader, ss, vs, is, max, out, false, null);
+}
+
+/// Batch take restricted to one instance: the raw path to what the OMG spec
+/// calls `take_instance`. Additive sibling of zzdds_take_n_raw -- identical
+/// otherwise, just scoped to `instance_handle` (HANDLE_NIL is not a valid
+/// instance here; pass a real handle, e.g. from a prior take/read's
+/// CSampleInfo.instance_handle).
+pub export fn zzdds_take_n_instance_raw(
+    reader: *anyopaque,
+    instance_handle: DDS.InstanceHandle_t,
+    ss: DDS.SampleStateMask,
+    vs: DDS.ViewStateMask,
+    is: DDS.InstanceStateMask,
+    max: c_int,
+    out: *CRawSampleArray,
+) callconv(.c) c_int {
+    return nRawImpl(reader, ss, vs, is, max, out, true, instance_handle);
+}
+
+/// Batch read restricted to one instance: the raw path to what the OMG spec
+/// calls `read_instance`. Additive sibling of zzdds_read_n_raw -- see
+/// zzdds_take_n_instance_raw's doc comment.
+pub export fn zzdds_read_n_instance_raw(
+    reader: *anyopaque,
+    instance_handle: DDS.InstanceHandle_t,
+    ss: DDS.SampleStateMask,
+    vs: DDS.ViewStateMask,
+    is: DDS.InstanceStateMask,
+    max: c_int,
+    out: *CRawSampleArray,
+) callconv(.c) c_int {
+    return nRawImpl(reader, ss, vs, is, max, out, false, instance_handle);
 }
 
 /// Free a CRawSampleArray returned by zzdds_take_n_raw or zzdds_read_n_raw.
@@ -560,6 +594,167 @@ pub export fn zzdds_return_raw_samples(
         alloc.free(samples[0..arr._alloc_capacity]);
     }
     arr.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+}
+
+/// Copies each TakenSample in `items` into a freshly heap-allocated CRawSample
+/// array (std.heap.c_allocator, matching zzdds_return_raw_samples' own free)
+/// and populates `out`. Returns the count, or -1 on OOM -- unlike
+/// zzdds_take_n_raw's own nRawImpl, this does not pre-allocate to protect
+/// already-*taken* (destructive) samples from an OOM during the copy step:
+/// these condition/instance-scoped batches are expected to be small, and
+/// duplicating that optimization here for every new *_w_condition/*_instance
+/// export was judged not worth the added surface area.
+fn packageTakenSamples(
+    items: []const @import("../dcps/reader.zig").TakenSample,
+    out: *CRawSampleArray,
+) c_int {
+    if (items.len == 0) {
+        out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+        return 0;
+    }
+    const alloc = std.heap.c_allocator;
+    const arr = alloc.alloc(CRawSample, items.len) catch {
+        out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+        return -1;
+    };
+    for (items, 0..) |s, i| {
+        const copy = alloc.dupe(u8, s.data) catch {
+            for (arr[0..i]) |prev| alloc.free(prev.data.?[0..prev.data_len]);
+            alloc.free(arr);
+            out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+            return -1;
+        };
+        arr[i] = .{
+            .data = copy.ptr,
+            .data_len = copy.len,
+            .info = .{
+                .valid_data = s.info.valid_data,
+                .instance_state = s.info.instance_state,
+                .instance_handle = s.info.instance_handle,
+            },
+        };
+    }
+    out.* = .{ .samples = arr.ptr, .count = items.len, ._alloc_capacity = arr.len };
+    return @intCast(items.len);
+}
+
+/// Unboxes `condition` as a DDS.ReadCondition and returns the concrete impl --
+/// safe for a plain ReadCondition OR a QueryCondition upcast via
+/// `as_ReadCondition()` (both produce the same vtable; see
+/// ReadConditionImpl.owner_qc's doc comment for how the two are told apart).
+fn unboxReadCondition(condition: *anyopaque) ?*const dcps_waitset.ReadConditionImpl {
+    if (isNullHandle(condition)) return null;
+    const c = zidl_rt.unboxAs(DDS.ReadCondition, condition);
+    if (nil.isNil(c)) return null;
+    if (c.vtable != &dcps_waitset.ReadConditionImpl.vtable) return null;
+    return @ptrCast(@alignCast(c.ptr));
+}
+
+fn wConditionRawImpl(
+    reader: *anyopaque,
+    condition: *anyopaque,
+    max: c_int,
+    out: *CRawSampleArray,
+    destructive: bool,
+) c_int {
+    out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+    if (isNullHandle(reader)) return -1;
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -1;
+    const rc_impl = unboxReadCondition(condition) orelse return -1;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
+
+    var tmp: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    if (destructive) {
+        impl.takeFiltered(&tmp, rc_impl.sample_state_mask, rc_impl.view_state_mask, rc_impl.instance_state_mask, max, null, rc_impl.owner_qc) catch return -1;
+    } else {
+        impl.readRaw(&tmp, rc_impl.sample_state_mask, rc_impl.view_state_mask, rc_impl.instance_state_mask, max, null, rc_impl.owner_qc) catch return -1;
+    }
+    return packageTakenSamples(tmp.items, out);
+}
+
+/// Batch take restricted to a `DDS.ReadCondition` (or a `DDS.QueryCondition`
+/// upcast via `as_ReadCondition()`): the raw path to what the OMG spec calls
+/// `take_w_condition`. State masks (and, for a QueryCondition, the query
+/// filter) come from `condition` itself.
+pub export fn zzdds_take_w_condition_raw(
+    reader: *anyopaque,
+    condition: *anyopaque,
+    max: c_int,
+    out: *CRawSampleArray,
+) callconv(.c) c_int {
+    return wConditionRawImpl(reader, condition, max, out, true);
+}
+
+/// Non-destructive analog of zzdds_take_w_condition_raw -- the raw path to
+/// what the OMG spec calls `read_w_condition`.
+pub export fn zzdds_read_w_condition_raw(
+    reader: *anyopaque,
+    condition: *anyopaque,
+    max: c_int,
+    out: *CRawSampleArray,
+) callconv(.c) c_int {
+    return wConditionRawImpl(reader, condition, max, out, false);
+}
+
+fn nextInstanceWConditionRawImpl(
+    reader: *anyopaque,
+    condition: *anyopaque,
+    prev: DDS.InstanceHandle_t,
+    max: c_int,
+    out: *CRawSampleArray,
+    destructive: bool,
+) c_int {
+    out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+    if (isNullHandle(reader)) return -1;
+    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    if (nil.isNil(r)) return -1;
+    const rc_impl = unboxReadCondition(condition) orelse return -1;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
+
+    var tmp: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    if (destructive) {
+        impl.takeNextInstanceFiltered(&tmp, prev, rc_impl.sample_state_mask, rc_impl.view_state_mask, rc_impl.instance_state_mask, max, rc_impl.owner_qc) catch return -1;
+    } else {
+        impl.readNextInstanceFiltered(&tmp, prev, rc_impl.sample_state_mask, rc_impl.view_state_mask, rc_impl.instance_state_mask, max, rc_impl.owner_qc) catch return -1;
+    }
+    return packageTakenSamples(tmp.items, out);
+}
+
+/// Batch take restricted to a `DDS.ReadCondition` AND scoped to the "next
+/// instance" after `prev`: the raw path to what the OMG spec calls
+/// `take_next_instance_w_condition`. See
+/// `DataReaderImpl.takeNextInstanceFiltered`'s doc comment for the
+/// instance-selection semantics (the target instance must itself have a
+/// matching sample, not just any sample).
+pub export fn zzdds_take_next_instance_w_condition_raw(
+    reader: *anyopaque,
+    condition: *anyopaque,
+    prev: DDS.InstanceHandle_t,
+    max: c_int,
+    out: *CRawSampleArray,
+) callconv(.c) c_int {
+    return nextInstanceWConditionRawImpl(reader, condition, prev, max, out, true);
+}
+
+/// Non-destructive analog of zzdds_take_next_instance_w_condition_raw -- the
+/// raw path to what the OMG spec calls `read_next_instance_w_condition`.
+pub export fn zzdds_read_next_instance_w_condition_raw(
+    reader: *anyopaque,
+    condition: *anyopaque,
+    prev: DDS.InstanceHandle_t,
+    max: c_int,
+    out: *CRawSampleArray,
+) callconv(.c) c_int {
+    return nextInstanceWConditionRawImpl(reader, condition, prev, max, out, false);
 }
 
 /// Copy the stored CDR payload for `handle` into `buf[0..buf_size]`.

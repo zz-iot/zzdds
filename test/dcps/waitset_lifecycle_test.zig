@@ -256,6 +256,18 @@ test "WaitSet: concurrent wait() vs. attach/delete-entity/detach cycling doesn't
                     if (seq._buffer) |b| self.ws.alloc.free(b[0..seq._maximum]);
                     seq = .{};
                 }
+                // A real (if small) backoff, not a pure busy-spin: still
+                // gives the main thread's attach/delete-entity/detach cycle
+                // plenty of interleaving opportunities against this thread's
+                // wait() calls -- that's the actual property under test --
+                // without hammering `ws.mu` at native CPU-bound frequency.
+                // Confirmed necessary, not just nice-to-have: under Valgrind
+                // (which instruments every memory access, easily 20-50x
+                // slower), the zero-backoff version of this loop combined
+                // with 50 real DDS entity lifecycles took long enough to
+                // blow through CI's Valgrind job timeout without even
+                // finishing this one test.
+                zzdds.util.time.sleepNs(200 * std.time.ns_per_us);
             }
         }
     };

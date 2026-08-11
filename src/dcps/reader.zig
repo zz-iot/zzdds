@@ -1464,6 +1464,151 @@ pub const DataReaderImpl = struct {
         return null;
     }
 
+    /// DDS `take_next_instance_w_condition` semantics: like `takeNextInstanceRaw`,
+    /// but instance selection AND per-sample inclusion are both restricted to
+    /// samples matching `sample_mask`/`view_mask`/`instance_mask` (and
+    /// `maybe_qc`'s query expression, if given) -- per spec §2.2.2.5.3.19, the
+    /// target instance is the smallest instance_handle > `prev_instance_handle`
+    /// *among instances that have at least one sample satisfying the
+    /// condition*, not just the next instance with any sample at all. Appends
+    /// every matching sample of that one instance (up to `max_samples`) to
+    /// `out`. Mirrors `takeFiltered`'s locking/expiry-purge/in-place-compaction
+    /// shape, restricted to the selected instance.
+    pub fn takeNextInstanceFiltered(
+        self: *Self,
+        out: *std.ArrayListUnmanaged(TakenSample),
+        prev_instance_handle: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) anyerror!void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const now_ns = time_mod.nanoTimestamp();
+
+        var ei: usize = 0;
+        while (ei < self.pending.items.len) {
+            if (self.pending.items[ei].expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    const expired = self.pending.orderedRemove(ei);
+                    expired.deinit();
+                    continue;
+                }
+            }
+            ei += 1;
+        }
+        if (self.pending.items.len == 0) {
+            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        }
+
+        // Smallest instance_handle > prev (or overall smallest if prev == 0)
+        // among instances with at least one sample matching the condition.
+        var target_ih: ?DDS.InstanceHandle_t = null;
+        for (self.pending.items) |pc| {
+            const ih = pc.info.instance_handle;
+            if (prev_instance_handle != 0 and ih <= prev_instance_handle) continue;
+            if (target_ih != null and ih >= target_ih.?) continue;
+            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
+            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
+            target_ih = ih;
+        }
+        const tgt = target_ih orelse return;
+
+        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+
+        var match_count: usize = 0;
+        for (self.pending.items) |pc| {
+            if (match_count >= limit) break;
+            if (pc.info.instance_handle != tgt) continue;
+            if (matchesSample(pc, sample_mask, view_mask, instance_mask, null) and
+                matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
+        }
+        try out.ensureUnusedCapacity(self.alloc, match_count);
+        const start = out.items.len;
+
+        var write: usize = 0;
+        var taken: usize = 0;
+        for (self.pending.items) |pc| {
+            if (pc.info.instance_handle == tgt and taken < limit and
+                matchesSample(pc, sample_mask, view_mask, instance_mask, null) and
+                matchesQuery(pc, maybe_qc, self.get_field_fn))
+            {
+                out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info });
+                taken += 1;
+            } else {
+                self.pending.items[write] = pc;
+                write += 1;
+            }
+        }
+        self.pending.items.len = write;
+        if (self.pending.items.len == 0) {
+            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        }
+        self.finalizeGenerationRanksLocked(out.items[start..]);
+    }
+
+    /// Non-destructive analog to `takeNextInstanceFiltered` -- see its doc
+    /// comment for the instance-selection semantics. Matching samples are
+    /// cloned into `out` and marked READ_SAMPLE_STATE in-place, same as `readRaw`.
+    pub fn readNextInstanceFiltered(
+        self: *Self,
+        out: *std.ArrayListUnmanaged(TakenSample),
+        prev_instance_handle: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) anyerror!void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const now_ns = time_mod.nanoTimestamp();
+
+        var ei: usize = 0;
+        while (ei < self.pending.items.len) {
+            if (self.pending.items[ei].expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    const expired = self.pending.orderedRemove(ei);
+                    expired.deinit();
+                    continue;
+                }
+            }
+            ei += 1;
+        }
+        if (self.pending.items.len == 0) {
+            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        }
+
+        var target_ih: ?DDS.InstanceHandle_t = null;
+        for (self.pending.items) |pc| {
+            const ih = pc.info.instance_handle;
+            if (prev_instance_handle != 0 and ih <= prev_instance_handle) continue;
+            if (target_ih != null and ih >= target_ih.?) continue;
+            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
+            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
+            target_ih = ih;
+        }
+        const tgt = target_ih orelse return;
+
+        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+        const start = out.items.len;
+        var count: usize = 0;
+        for (self.pending.items) |*pc| {
+            if (count >= limit) break;
+            if (pc.info.instance_handle != tgt) continue;
+            if (!matchesSample(pc.*, sample_mask, view_mask, instance_mask, null)) continue;
+            if (!matchesQuery(pc.*, maybe_qc, self.get_field_fn)) continue;
+            const clone = try self.alloc.dupe(u8, pc.data);
+            errdefer self.alloc.free(clone);
+            try out.append(self.alloc, .{ .data = clone, .info = pc.info });
+            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+            count += 1;
+        }
+        self.finalizeGenerationRanksLocked(out.items[start..]);
+    }
+
     /// Return the stored CDR payload for the given instance handle, or null if
     /// no alive sample has arrived for this instance.
     /// The returned slice is valid until the next write to this reader or deinit.

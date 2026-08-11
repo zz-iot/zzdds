@@ -67,6 +67,26 @@ public final class ZzddsRuntime {
     /** kind: 0 = write (alive), 1 = dispose, 2 = unregister (matches zzdds_write_kind). */
     public static native int writeRaw(Object writer, int kind, byte[] keyHash, long handle, byte[] payload);
 
+    /** Same as {@link #writeRaw}, plus an explicit source timestamp
+     * (DDS_Time_t's sec/nanosec fields, passed separately since JNI can't
+     * marshal a C struct by value). */
+    public static native int writeRawWTimestamp(Object writer, int kind, byte[] keyHash, long handle, byte[] payload, int sec, int nanosec);
+
+    /** Computes the deterministic instance handle for `keyHash` -- the raw
+     * path to `register_instance`. zzdds's own instance registration has no
+     * side effects beyond this computation (see zzdds_register_instance_raw). */
+    public static native long registerInstanceRaw(Object writer, byte[] keyHash);
+
+    /** Returns the stored key-only CDR payload for `handle`, or null if no
+     * alive write has been made for that instance -- the raw path to the
+     * writer-side `get_key_value`. */
+    public static native byte[] getKeyValueWriterRaw(Object writer, long handle);
+
+    /** Looks up the instance handle for `keyHash` -- the raw path to the
+     * writer-side `lookup_instance`. Returns `DDS_HANDLE_NIL` (0) if no
+     * alive write has been made for that key. */
+    public static native long lookupInstanceWriterRaw(Object writer, byte[] keyHash);
+
     /**
      * Takes/reads one raw (still-encoded) sample. Returns null if none was
      * available. `handleOut`/`validOut` must be pre-allocated 1-element
@@ -109,6 +129,49 @@ public final class ZzddsRuntime {
     public static native byte[][] takeNRaw(Object reader, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
 
     public static native byte[][] readNRaw(Object reader, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
+
+    /**
+     * Batch take/read restricted to one instance -- the raw path to
+     * `take_instance`/`read_instance`. Same masks/`handlesOut`/`validsOut`/
+     * return shape as {@link #takeNRaw}, scoped to `instanceHandle` (a real
+     * instance handle, not `DDS_HANDLE_NIL` -- there is no "no filter"
+     * sentinel here, unlike {@link #takeNRaw}).
+     */
+    public static native byte[][] takeNInstanceRaw(Object reader, long instanceHandle, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
+
+    public static native byte[][] readNInstanceRaw(Object reader, long instanceHandle, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
+
+    /**
+     * Batch take/read restricted to a `ReadCondition` (or a `QueryCondition`
+     * upcast via its own generated `as_ReadCondition()`) -- the raw path to
+     * `take_w_condition`/`read_w_condition`. State masks (and, for a
+     * QueryCondition, the query filter) come from `condition` itself. Same
+     * `handlesOut`/`validsOut`/return shape as {@link #takeNRaw}.
+     */
+    public static native byte[][] takeWConditionRaw(Object reader, Object condition, int max, long[] handlesOut, boolean[] validsOut);
+
+    public static native byte[][] readWConditionRaw(Object reader, Object condition, int max, long[] handlesOut, boolean[] validsOut);
+
+    /**
+     * Batch take/read restricted to a `ReadCondition` AND scoped to the
+     * "next instance" after `prev` -- the raw path to
+     * `take_next_instance_w_condition`/`read_next_instance_w_condition`. Per
+     * spec, instance *selection* itself is restricted to instances with a
+     * matching sample, not just the next instance with any sample at all.
+     */
+    public static native byte[][] takeNextInstanceWConditionRaw(Object reader, Object condition, long prev, int max, long[] handlesOut, boolean[] validsOut);
+
+    public static native byte[][] readNextInstanceWConditionRaw(Object reader, Object condition, long prev, int max, long[] handlesOut, boolean[] validsOut);
+
+    /** Returns the stored CDR payload for `handle`, or null if no alive
+     * sample has arrived for that instance -- the raw path to the
+     * reader-side `get_key_value`. */
+    public static native byte[] getKeyValueReaderRaw(Object reader, long handle);
+
+    /** Looks up the instance handle for `keyHash` -- the raw path to the
+     * reader-side `lookup_instance`. Returns `DDS_HANDLE_NIL` (0) if no
+     * alive sample has arrived for that key. */
+    public static native long lookupInstanceReaderRaw(Object reader, byte[] keyHash);
 
     /** Resolves a named field (e.g. "color", "x") on whatever sample the
      * caller currently has in hand, for {@link #cftMatchSample}. Return a
