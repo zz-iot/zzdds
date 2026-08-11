@@ -1276,12 +1276,17 @@ pub const DataReaderImpl = struct {
     }
 
     /// Register a WaitSet notification callback.  Called by ReadConditionImpl
-    /// when a WaitSet attaches the condition.  Guarded by mu (caller holds it).
-    pub fn addDataNotifier(ctx: *anyopaque, n: waitset.DataNotifyFn) void {
+    /// when a WaitSet attaches the condition.  Returns false if the
+    /// allocator couldn't grow `data_notifiers` -- the caller (vtAttach) must
+    /// treat that as attachment failure and roll back, not report
+    /// RETCODE_OK for a WaitSet that will never see a real data-arrival
+    /// wakeup.
+    pub fn addDataNotifier(ctx: *anyopaque, n: waitset.DataNotifyFn) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
-        self.data_notifiers.append(self.alloc, n) catch {};
+        self.data_notifiers.append(self.alloc, n) catch return false;
+        return true;
     }
 
     /// Remove the notification callback for `waitset_ctx`.  Called by

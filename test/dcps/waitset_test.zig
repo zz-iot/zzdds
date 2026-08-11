@@ -81,8 +81,9 @@ var g_notify_fn: ?DataNotifyFn = null;
 fn readerHasData(_: *anyopaque) bool {
     return g_has_data;
 }
-fn readerAddNotify(_: *anyopaque, n: DataNotifyFn) void {
+fn readerAddNotify(_: *anyopaque, n: DataNotifyFn) bool {
     g_notify_fn = n;
+    return true;
 }
 fn readerRemoveNotify(_: *anyopaque, _: *anyopaque) void {
     g_notify_fn = null;

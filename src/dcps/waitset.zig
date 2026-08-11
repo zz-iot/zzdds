@@ -414,12 +414,21 @@ pub const WaitSetImpl = struct {
         // pointer once that condition was freed). Register before
         // add_notify_fn for ReadCondition specifically so a failed register
         // never leaves a live reader-side notifier this WaitSet has no
-        // record of holding.
+        // record of holding. The reverse failure -- register() succeeds but
+        // add_notify_fn then can't grow the reader's data_notifiers (OOM) --
+        // is rolled back explicitly below: without it, this WaitSet would
+        // report RETCODE_OK yet never receive a real data-arrival wakeup
+        // (only whatever the condition's own WakeupList happens to trigger
+        // for unrelated reasons), timing out or blocking forever despite
+        // matching data being available.
         const h = WakeupHandle{ .ctx = self, .wake = wakeNotify, .invalidate = vtInvalidateHandle, .acquire = quiesceAcquire, .release = quiesceRelease };
         const registered = if (cond.vtable == &ReadConditionImpl.cond_vtable) reg: {
             const rc: *ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
             if (!rc.wakeups.register(h)) break :reg false;
-            rc.add_notify_fn(rc.reader_ctx, DataNotifyFn{ .ctx = self, .on_data = wakeNotify });
+            if (!rc.add_notify_fn(rc.reader_ctx, DataNotifyFn{ .ctx = self, .on_data = wakeNotify })) {
+                rc.wakeups.unregister(self);
+                break :reg false;
+            }
             break :reg true;
         } else if (cond.vtable == &StatusConditionImpl.cond_vtable) reg: {
             const sc: *StatusConditionImpl = @ptrCast(@alignCast(cond.ptr));
@@ -627,8 +636,10 @@ pub const ReadConditionImpl = struct {
     has_data_fn: *const fn (reader_ptr: *anyopaque) bool,
     /// Opaque pointer to the owning DataReaderImpl (used by add/remove_notify_fn).
     reader_ctx: *anyopaque,
-    /// Called by vtAttach: adds a DataNotifyFn to the DataReader.
-    add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) void,
+    /// Called by vtAttach: adds a DataNotifyFn to the DataReader. False means
+    /// the reader couldn't allocate room for it -- vtAttach must treat that
+    /// as attachment failure, the same as a failed wakeups.register() above.
+    add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) bool,
     /// Called by vtDetach: removes the DataNotifyFn keyed by waitset_ctx pointer.
     remove_notify_fn: *const fn (reader_ctx: *anyopaque, waitset_ctx: *anyopaque) void,
     /// Called by deinit(): removes this condition from the owning reader's
@@ -670,7 +681,7 @@ pub const ReadConditionImpl = struct {
         instance_states: DDS.InstanceStateMask,
         has_data_fn: *const fn (reader_ptr: *anyopaque) bool,
         reader_ctx: *anyopaque,
-        add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) void,
+        add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) bool,
         remove_notify_fn: *const fn (reader_ctx: *anyopaque, waitset_ctx: *anyopaque) void,
         remove_condition_fn: *const fn (reader_ctx: *anyopaque, cond_ptr: *anyopaque) void,
     ) !*Self {
@@ -948,7 +959,7 @@ pub const QueryConditionImpl = struct {
         query_parameters: DDS.StringSeq,
         has_data_fn: *const fn (reader_ptr: *anyopaque) bool,
         reader_ctx: *anyopaque,
-        add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) void,
+        add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) bool,
         remove_notify_fn: *const fn (reader_ctx: *anyopaque, waitset_ctx: *anyopaque) void,
         remove_condition_fn: *const fn (reader_ctx: *anyopaque, cond_ptr: *anyopaque) void,
     ) !*Self {
