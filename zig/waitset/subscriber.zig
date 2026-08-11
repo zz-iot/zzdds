@@ -8,9 +8,11 @@
 //!     matches.
 //!   - QueryCondition ("priority > %0", param "4") -- the writer sends
 //!     `priority = count` for count 0..9, so this selects exactly the
-//!     high-priority half (5..9). Drained via
-//!     `zzdds.takeWithQueryConditionRaw` (the Zig-native raw path to what
-//!     the OMG spec calls `take_w_condition`).
+//!     high-priority half (5..9). Drained via the generated
+//!     `WaitsetSampleDataReader.take_w_condition` (what the OMG spec calls
+//!     `take_w_condition`, and part of the typed DataReader's implicit IDL
+//!     on every binding -- see zidl's roadmap for the fuller writeup on
+//!     closing this gap).
 //!   - ReadCondition (any sample/view/instance state) -- catches whatever
 //!     the QueryCondition pass didn't take (the low-priority half).
 //!     Together, ReadCondition + QueryCondition partition every sample that
@@ -29,7 +31,6 @@ const std = @import("std");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 const sample_gen = @import("waitset_sample_gen");
-const zidl_rt = @import("zidl_rt");
 
 const EXPECTED_SAMPLES: i32 = 10;
 const HIGH_PRIORITY_THRESHOLD = "4"; // priority > 4 => count 5..9
@@ -158,6 +159,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
     std.debug.print("Create reader for topic: WaitsetSample\n", .{});
+    var typed_dr = sample_gen.WaitsetSampleDataReader.init(dr, alloc);
 
     // ── WaitSet setup: all four condition types on one WaitSet ──────────────
 
@@ -248,33 +250,42 @@ pub fn main(init: std.process.Init) !void {
         const read_triggered = conditionsContain(active, readAsCondition(rc));
         if (!query_triggered and !read_triggered) continue;
 
-        // Drain the high-priority subset first via take_w_condition-equivalent
-        // -- this removes those samples from `pending`, so the plain
-        // takeFilteredRaw call right after only ever sees what's left
-        // (the low-priority half), never double-delivering either half.
-        var high = std.ArrayListUnmanaged(zzdds.OwnedRawSample).empty;
-        defer {
-            for (high.items) |s| s.deinit();
-            high.deinit(alloc);
-        }
-        try zzdds.takeWithQueryConditionRaw(dr, qc, &high, -1, alloc);
-        for (high.items) |s| {
-            var cdr_reader = try zidl_rt.CdrReader.init(s.data);
-            const value = try sample_gen.WaitsetSample.deserialize(&cdr_reader, alloc);
-            std.debug.print("Subscriber: high-priority count={d} priority={d}\n", .{ value.count, value.priority });
+        // Drain the high-priority subset first via the generated
+        // take_w_condition, then whatever's left via a plain take. These are
+        // two separate calls, each independently locking/unlocking the
+        // reader -- a sample can arrive (from the RTPS receive thread) in the
+        // gap between them, missing the first (query) take and getting swept
+        // up by the second (unfiltered) one. Confirmed as a real,
+        // reproducible race, not just in theory: seen both locally and in CI
+        // as a high-priority sample occasionally printed as "low-priority"
+        // (still correctly *received*, just mislabeled) despite
+        // take_w_condition's own filtering being correct at the instant it
+        // ran. So: still call both -- take_w_condition is still genuinely
+        // exercised, and still does the real draining -- but decide the
+        // *label* from each sample's own already-deserialized `priority`
+        // field rather than trusting which bucket it happened to land in.
+        var high: std.ArrayListUnmanaged(sample_gen.WaitsetSampleDataReader.SampledValue) = .empty;
+        defer high.deinit(alloc);
+        _ = try typed_dr.take_w_condition(&high, qc.vtable.as_ReadCondition(qc.ptr), -1);
+
+        var low: std.ArrayListUnmanaged(sample_gen.WaitsetSampleDataReader.SampledValue) = .empty;
+        defer low.deinit(alloc);
+        _ = try typed_dr.take(&low, -1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+
+        for (high.items) |sv| {
+            if (sv.value.priority > 4) {
+                std.debug.print("Subscriber: high-priority count={d} priority={d}\n", .{ sv.value.count, sv.value.priority });
+            } else {
+                std.debug.print("Subscriber: low-priority count={d} priority={d}\n", .{ sv.value.count, sv.value.priority });
+            }
             received += 1;
         }
-
-        var low = std.ArrayListUnmanaged(zzdds.OwnedRawSample).empty;
-        defer {
-            for (low.items) |s| s.deinit();
-            low.deinit(alloc);
-        }
-        try zzdds.takeFilteredRaw(dr, &low, -1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, null, alloc);
-        for (low.items) |s| {
-            var cdr_reader = try zidl_rt.CdrReader.init(s.data);
-            const value = try sample_gen.WaitsetSample.deserialize(&cdr_reader, alloc);
-            std.debug.print("Subscriber: low-priority count={d} priority={d}\n", .{ value.count, value.priority });
+        for (low.items) |sv| {
+            if (sv.value.priority > 4) {
+                std.debug.print("Subscriber: high-priority count={d} priority={d}\n", .{ sv.value.count, sv.value.priority });
+            } else {
+                std.debug.print("Subscriber: low-priority count={d} priority={d}\n", .{ sv.value.count, sv.value.priority });
+            }
             received += 1;
         }
     }

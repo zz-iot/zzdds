@@ -57,16 +57,22 @@ One `WaitSet`, four conditions attached at once:
 
 - `StatusCondition` (`SUBSCRIPTION_MATCHED_STATUS`) — logs the match.
 - `QueryCondition` (`"priority > %0"`, parameter `"4"`) — the high-priority
-  half. Drained via `zzdds.takeWithQueryConditionRaw`, the Zig-native raw
-  path to what the OMG spec calls `take_w_condition` (`dcps.idl` had
-  documented this operation as not yet implemented anywhere — this example
-  is what motivated adding the first path to it).
+  half. Drained via the generated typed DataReader's `take_w_condition`
+  (what the OMG spec calls `take_w_condition`) on every binding — this
+  example is what surfaced that the whole `_w_condition` family was missing
+  from every binding's generated typed reader/writer, not just Zig's; see
+  zidl's roadmap for the full spec-completeness writeup that followed.
 - `ReadCondition` (any sample/view/instance state) — everything the
-  `QueryCondition` pass didn't take. Draining the `QueryCondition` match
-  first, then draining everything else via a plain filtered take, means
-  every sample that arrives is delivered exactly once, split into exactly
-  two streams (`high-priority`/`low-priority`) each cycle — a realistic
-  content-based-routing pattern, not just a filtering demo.
+  `QueryCondition` pass didn't take. `take_w_condition` and the plain
+  filtered take that follows are two separate calls, each independently
+  locking/unlocking the reader — a sample can arrive from the network in the
+  gap between them, missing the query take and getting swept into the
+  "everything else" bucket. Confirmed as a real, reproducible race (not just
+  in theory) on every binding once each got its own real `take_w_condition`
+  to race against. Worked around uniformly: every binding still drains via
+  both calls (so `take_w_condition` stays genuinely exercised), but decides
+  each sample's printed label from its own already-deserialized `priority`
+  field rather than trusting which call it came from.
 - `GuardCondition` — same watchdog pattern as the publisher.
 
 On the main `wait()` loop, `get_conditions()`'s result is checked against

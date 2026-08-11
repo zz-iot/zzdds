@@ -7,13 +7,13 @@
 //
 //   - StatusCondition (SUBSCRIPTION_MATCHED_STATUS) -- logs the match.
 //   - QueryCondition ("priority > %0", param "4") -- real attach/trigger/
-//     query-expression/parameters exercise. Like c/waitset and cpp/waitset
-//     (see their subscriber comments), no binding's C ABI exposes a
-//     take_w_condition-equivalent operation yet, so QueryCondition's
-//     trigger fires the same as ReadCondition's, and the actual high/low
-//     split below is a plain field check in application code after
-//     draining -- an honest, currently-available demonstration, not a
-//     workaround for a bug.
+//     query-expression/parameters exercise. Drained via the generated
+//     WaitsetSampleDataReader.take_w_condition (what the OMG spec calls
+//     take_w_condition, and part of the typed DataReader's implicit IDL on
+//     every binding -- see zidl's roadmap for the fuller writeup on closing
+//     this gap). QueryCondition satisfies ReadCondition directly via Java's
+//     own interface inheritance -- no upcast needed, unlike C/C++'s
+//     as_ReadCondition()/native_handle() dance.
 //   - ReadCondition (any sample/view/instance state) -- same trigger
 //     condition as QueryCondition above.
 //   - GuardCondition -- same watchdog-thread pattern as the publisher.
@@ -208,9 +208,34 @@ public class Subscriber {
             boolean readTriggered = rcCond.get_trigger_value();
             if (!queryTriggered && !readTriggered) continue;
 
-            WaitsetSampleDataReader.Sample[] samples = reader.take_n(
+            // Drain the high-priority subset first via take_w_condition,
+            // then whatever's left via a plain take_n. These are two
+            // separate calls, each independently locking/unlocking the
+            // reader -- a sample can arrive (from the RTPS receive thread)
+            // in the gap between them, missing the first (query) take and
+            // getting swept up by the second (unfiltered) one. Confirmed as
+            // a real, reproducible race in zig/waitset (not just in
+            // theory): a high-priority sample occasionally printed as
+            // "low-priority" (still correctly *received*, just mislabeled)
+            // despite take_w_condition's own filtering being correct at the
+            // instant it ran. So: still call both -- take_w_condition is
+            // still genuinely exercised, and still does the real draining
+            // -- but decide the *label* from each sample's own
+            // already-deserialized `priority` field rather than trusting
+            // which call it came from.
+            WaitsetSampleDataReader.Sample[] highSamples = reader.take_w_condition(qcCond, EXPECTED_SAMPLES);
+            WaitsetSampleDataReader.Sample[] lowSamples = reader.take_n(
                 EXPECTED_SAMPLES, Dcps.DDS.ANY_SAMPLE_STATE.value, Dcps.DDS.ANY_VIEW_STATE.value, Dcps.DDS.ANY_INSTANCE_STATE.value);
-            for (WaitsetSampleDataReader.Sample s : samples) {
+            for (WaitsetSampleDataReader.Sample s : highSamples) {
+                if (!s.validData) continue;
+                if (s.data.get_priority() > 4) {
+                    System.out.println("Subscriber: high-priority count=" + s.data.get_count() + " priority=" + s.data.get_priority());
+                } else {
+                    System.out.println("Subscriber: low-priority count=" + s.data.get_count() + " priority=" + s.data.get_priority());
+                }
+                received++;
+            }
+            for (WaitsetSampleDataReader.Sample s : lowSamples) {
                 if (!s.validData) continue;
                 if (s.data.get_priority() > 4) {
                     System.out.println("Subscriber: high-priority count=" + s.data.get_count() + " priority=" + s.data.get_priority());

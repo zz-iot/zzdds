@@ -6,13 +6,11 @@
  *
  *   - StatusCondition (SUBSCRIPTION_MATCHED_STATUS) -- logs the match.
  *   - QueryCondition ("priority > %0", param "4") -- real attach/trigger/
- *     query-expression/parameters exercise. Like cpp/waitset (see its
- *     subscriber.cpp comment), no binding's C ABI exposes a
- *     take_w_condition-equivalent operation yet, so QueryCondition's
- *     trigger fires the same as ReadCondition's, and the actual high/low
- *     split below is a plain field check in application code after
- *     draining -- an honest, currently-available demonstration, not a
- *     workaround for a bug.
+ *     query-expression/parameters exercise. Drained via the generated
+ *     WaitsetSampleDataReader_take_w_condition (what the OMG spec calls
+ *     take_w_condition, and part of the typed DataReader's implicit IDL on
+ *     every binding -- see zidl's roadmap for the fuller writeup on closing
+ *     this gap).
  *   - ReadCondition (any sample/view/instance state) -- same trigger
  *     condition as QueryCondition above.
  *   - GuardCondition -- same watchdog-thread pattern as the publisher.
@@ -214,18 +212,49 @@ int main(int argc, char **argv) {
         bool read_triggered = DDS_ReadCondition_get_trigger_value(rc_cond);
         if (!query_triggered && !read_triggered) continue;
 
-        WaitsetSample values[EXPECTED_SAMPLES];
-        zzdds_sample_info infos[EXPECTED_SAMPLES];
-        memset(values, 0, sizeof(values));
-        memset(infos, 0, sizeof(infos));
-        int n = WaitsetSampleDataReader_take_n(&reader, values, infos, EXPECTED_SAMPLES,
-                                                DDS_ANY_SAMPLE_STATE, DDS_ANY_VIEW_STATE, DDS_ANY_INSTANCE_STATE);
-        for (int i = 0; i < n; i++) {
-            if (!infos[i].valid_data) continue;
-            if (values[i].priority > 4) {
-                printf("Subscriber: high-priority count=%d priority=%d\n", values[i].count, values[i].priority);
+        /* Drain the high-priority subset first via take_w_condition, then
+         * whatever's left via a plain take_n. These are two separate calls,
+         * each independently locking/unlocking the reader -- a sample can
+         * arrive (from the RTPS receive thread) in the gap between them,
+         * missing the first (query) take and getting swept up by the
+         * second (unfiltered) one. Confirmed as a real, reproducible race
+         * in zig/waitset and cpp/waitset (not just in theory): a
+         * high-priority sample occasionally printed as "low-priority"
+         * (still correctly *received*, just mislabeled) despite
+         * take_w_condition's own filtering being correct at the instant it
+         * ran. So: still call both -- take_w_condition is still genuinely
+         * exercised, and still does the real draining -- but decide the
+         * *label* from each sample's own already-deserialized `priority`
+         * field rather than trusting which call it came from. */
+        WaitsetSample high_values[EXPECTED_SAMPLES];
+        zzdds_sample_info high_infos[EXPECTED_SAMPLES];
+        memset(high_values, 0, sizeof(high_values));
+        memset(high_infos, 0, sizeof(high_infos));
+        int n_high = WaitsetSampleDataReader_take_w_condition(
+            &reader, DDS_QueryCondition_as_DDS_ReadCondition(qc_cond), high_values, high_infos, EXPECTED_SAMPLES);
+
+        WaitsetSample low_values[EXPECTED_SAMPLES];
+        zzdds_sample_info low_infos[EXPECTED_SAMPLES];
+        memset(low_values, 0, sizeof(low_values));
+        memset(low_infos, 0, sizeof(low_infos));
+        int n_low = WaitsetSampleDataReader_take_n(&reader, low_values, low_infos, EXPECTED_SAMPLES,
+                                                     DDS_ANY_SAMPLE_STATE, DDS_ANY_VIEW_STATE, DDS_ANY_INSTANCE_STATE);
+
+        for (int i = 0; i < n_high; i++) {
+            if (!high_infos[i].valid_data) continue;
+            if (high_values[i].priority > 4) {
+                printf("Subscriber: high-priority count=%d priority=%d\n", high_values[i].count, high_values[i].priority);
             } else {
-                printf("Subscriber: low-priority count=%d priority=%d\n", values[i].count, values[i].priority);
+                printf("Subscriber: low-priority count=%d priority=%d\n", high_values[i].count, high_values[i].priority);
+            }
+            received++;
+        }
+        for (int i = 0; i < n_low; i++) {
+            if (!low_infos[i].valid_data) continue;
+            if (low_values[i].priority > 4) {
+                printf("Subscriber: high-priority count=%d priority=%d\n", low_values[i].count, low_values[i].priority);
+            } else {
+                printf("Subscriber: low-priority count=%d priority=%d\n", low_values[i].count, low_values[i].priority);
             }
             received++;
         }

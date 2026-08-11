@@ -7,18 +7,11 @@
  *
  *   - StatusCondition (SUBSCRIPTION_MATCHED_STATUS) -- logs the match.
  *   - QueryCondition ("priority > %0", param "4") -- real attach/trigger/
- *     query-expression/parameters exercise. Unlike zig/waitset (which has a
- *     Zig-native raw path straight into DataReaderImpl's own query-scoped
- *     take), no binding's C ABI exposes a take_w_condition-equivalent
- *     operation yet (dcps.idl documents that operation as not yet
- *     implemented at all) -- so here, QueryCondition's trigger fires the
- *     same as ReadCondition's (both just mean "there is pending data
- *     matching the state masks"), and the actual high/low split below is a
- *     plain field check in application code after draining. This is an
- *     honest, currently-available demonstration of QueryCondition
- *     (attach/trigger/expression/parameters all real), not a workaround for
- *     a bug -- see zig/waitset's own subscriber.zig for the one binding
- *     that *can* reach real query-scoped draining today.
+ *     query-expression/parameters exercise. Drained via the generated
+ *     WaitsetSampleDataReader::take_w_condition (what the OMG spec calls
+ *     take_w_condition, and part of the typed DataReader's implicit IDL on
+ *     every binding -- see zidl's roadmap for the fuller writeup on closing
+ *     this gap).
  *   - ReadCondition (any sample/view/instance state) -- same trigger
  *     condition as QueryCondition above; both together just mean "there is
  *     data," and either one triggering drains everything pending.
@@ -235,16 +228,46 @@ int main(int argc, char **argv) {
         bool read_triggered = rc_cond->get_trigger_value();
         if (!query_triggered && !read_triggered) continue;
 
-        std::vector<WaitsetSample> values(EXPECTED_SAMPLES);
-        std::vector<zzdds_sample_info> infos(EXPECTED_SAMPLES);
-        int n = reader.take_n(values.data(), infos.data(), EXPECTED_SAMPLES,
-                               ::DDS::ANY_SAMPLE_STATE, ::DDS::ANY_VIEW_STATE, ::DDS::ANY_INSTANCE_STATE);
-        for (int i = 0; i < n; i++) {
-            if (!infos[i].valid_data) continue;
-            if (values[i].priority > 4) {
-                std::printf("Subscriber: high-priority count=%d priority=%d\n", values[i].count, values[i].priority);
+        // Drain the high-priority subset first via take_w_condition, then
+        // whatever's left via a plain take_n. These are two separate calls,
+        // each independently locking/unlocking the reader -- a sample can
+        // arrive (from the RTPS receive thread) in the gap between them,
+        // missing the first (query) take and getting swept up by the
+        // second (unfiltered) one. Confirmed as a real, reproducible race
+        // in zig/waitset (not just in theory): a high-priority sample
+        // occasionally printed as "low-priority" (still correctly
+        // *received*, just mislabeled) despite take_w_condition's own
+        // filtering being correct at the instant it ran. So: still call
+        // both -- take_w_condition is still genuinely exercised, and still
+        // does the real draining -- but decide the *label* from each
+        // sample's own already-deserialized `priority` field rather than
+        // trusting which call it came from.
+        std::vector<WaitsetSample> high_values(EXPECTED_SAMPLES);
+        std::vector<zzdds_sample_info> high_infos(EXPECTED_SAMPLES);
+        int n_high = reader.take_w_condition(
+            DDS_QueryCondition_as_DDS_ReadCondition(qc_cond->native_handle()),
+            high_values.data(), high_infos.data(), EXPECTED_SAMPLES);
+
+        std::vector<WaitsetSample> low_values(EXPECTED_SAMPLES);
+        std::vector<zzdds_sample_info> low_infos(EXPECTED_SAMPLES);
+        int n_low = reader.take_n(low_values.data(), low_infos.data(), EXPECTED_SAMPLES,
+                                   ::DDS::ANY_SAMPLE_STATE, ::DDS::ANY_VIEW_STATE, ::DDS::ANY_INSTANCE_STATE);
+
+        for (int i = 0; i < n_high; i++) {
+            if (!high_infos[i].valid_data) continue;
+            if (high_values[i].priority > 4) {
+                std::printf("Subscriber: high-priority count=%d priority=%d\n", high_values[i].count, high_values[i].priority);
             } else {
-                std::printf("Subscriber: low-priority count=%d priority=%d\n", values[i].count, values[i].priority);
+                std::printf("Subscriber: low-priority count=%d priority=%d\n", high_values[i].count, high_values[i].priority);
+            }
+            received++;
+        }
+        for (int i = 0; i < n_low; i++) {
+            if (!low_infos[i].valid_data) continue;
+            if (low_values[i].priority > 4) {
+                std::printf("Subscriber: high-priority count=%d priority=%d\n", low_values[i].count, low_values[i].priority);
+            } else {
+                std::printf("Subscriber: low-priority count=%d priority=%d\n", low_values[i].count, low_values[i].priority);
             }
             received++;
         }
