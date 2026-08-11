@@ -329,3 +329,26 @@ test "WaitSet: concurrent WaitSet deinit races GuardCondition deinit without use
         t.join();
     }
 }
+
+// A create_readcondition()-vs-reader-deinit() regression (the other race
+// Greptile flagged on the same PR) deliberately isn't tested here as a real
+// two-thread race: an unsynchronized delete_datareader() can legitimately
+// win outright and free the whole reader before a spawned thread doing the
+// create is even scheduled -- a different, and for a raw handle with no
+// other synchronization fundamentally unfixable, hazard, not the race this
+// fix addresses (confirmed the hard way: a real-thread version of this test
+// segfaulted on `self.quiesce.acquire()` dereferencing an already-freed
+// reader even with the fix in place). That race is instead driven
+// deterministically in src/dcps/reader.zig's own white-box test suite
+// (private to DataReaderImpl there), which can hold the quiesce reference
+// by hand to force the exact interleaving Greptile's finding describes
+// without depending on OS thread scheduling luck.
+
+// A delete_readcondition()-vs-reader-deinit() regression (the third race
+// from the same Greptile finding as above) is, for the same reason, also
+// driven deterministically in src/dcps/reader.zig's own white-box test
+// suite rather than as a real two-thread race here -- confirmed directly
+// that a real-thread version of this test segfaults on quiesce.acquire()
+// dereferencing an already-freed reader too, whenever delete_datareader()
+// wins outright before the spawned thread's delete_readcondition() call is
+// even scheduled.
