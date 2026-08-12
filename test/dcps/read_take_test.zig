@@ -445,3 +445,194 @@ test "getKeyValueRaw (writer): returns null for handle with no prior write" {
     const ih = DataWriterImpl.registerInstanceRaw(KEY_A);
     try testing.expect(pair.dw.getKeyValueRaw(ih) == null);
 }
+
+// ── takeWithReadConditionRaw / readWithReadConditionRaw ────────────────────────
+//
+// The raw path to what the OMG spec calls take_w_condition/read_w_condition
+// (see zidl's roadmap / zzdds/idl/dcps.idl's DataReader comment). These wrap
+// DataReaderImpl.takeFiltered/readRaw, pulling the state masks (and, for a
+// QueryCondition, the query filter via ReadConditionImpl.owner_qc) off an
+// arbitrary DDS.ReadCondition instead of requiring the caller to already know
+// which masks to pass -- most of the mask-handling correctness itself is
+// already covered by the takeFiltered/readRaw tests above; these focus on the
+// new dispatch (does the right condition's state actually get used) and on
+// query filtering being honored end-to-end through a real QueryCondition.
+
+/// Query-filterable field: the last byte of PAYLOAD, overridable per write so
+/// tests can distinguish "matching" from "non-matching" samples without a
+/// real typed CDR struct.
+fn writeTagged(dw: *DataWriterImpl, key: [16]u8, tag: u8) !void {
+    var payload = PAYLOAD;
+    payload[4] = tag;
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, key, &payload);
+}
+
+const TagField = struct {
+    fn get(_: *anyopaque, payload: []const u8, field: []const u8, _: []u8) ?zzdds.dcps.filter.FilterValue {
+        if (!std.mem.eql(u8, field, "tag")) return null;
+        return .{ .int = payload[payload.len - 1] };
+    }
+    fn computeKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
+        return std.mem.zeroes([16]u8); // unused: these tests pass key hashes explicitly to writeRaw.
+    }
+};
+
+fn freeOwned(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(zzdds.OwnedRawSample)) void {
+    for (out.items) |s| s.deinit();
+    out.deinit(alloc);
+}
+
+test "takeWithReadConditionRaw: plain ReadCondition applies its own state masks" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+    try writeAlive(pair.dw);
+    try writeAlive(pair.dw);
+
+    const dr = pair.dr.toDDSDataReader();
+    // Mark the first sample READ, leaving both in queue (mirrors the
+    // existing "takeFiltered: removes only NOT_READ" test above).
+    var read_out: std.ArrayListUnmanaged(TakenSample) = .empty;
+    try pair.dr.readRaw(&read_out, DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 1, null, null);
+    freeOut(alloc, &read_out);
+
+    const rc = dr.create_readcondition(DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr.delete_readcondition(rc);
+
+    var out: std.ArrayListUnmanaged(zzdds.OwnedRawSample) = .empty;
+    defer freeOwned(alloc, &out);
+    try zzdds.takeWithReadConditionRaw(dr, rc, &out, -1, alloc);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(DDS.NOT_READ_SAMPLE_STATE, out.items[0].info.sample_state);
+
+    // The READ sample is still in queue -- only the NOT_READ one was taken.
+    const remaining = pair.dr.takeRaw() orelse return error.NoSample;
+    defer alloc.free(remaining.data);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE, remaining.info.sample_state);
+}
+
+test "takeWithReadConditionRaw: QueryCondition (owner_qc) applies its query filter" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    try testing.expect(zzdds.registerTypeSupport(fx.dp_r, "RTType", .{
+        .ctx = undefined,
+        .compute_key_hash = TagField.computeKeyHash,
+        .get_field = TagField.get,
+    }));
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const pair = fx.makeWriterReader(.{}, dr_qos);
+    try writeTagged(pair.dw, KEY_A, 1);
+    try writeTagged(pair.dw, KEY_B, 2);
+
+    const dr = pair.dr.toDDSDataReader();
+    var params = [_][*:0]const u8{"2"};
+    var params_seq = DDS.StringSeq{ ._buffer = &params, ._length = 1, ._maximum = 1, ._release = false };
+    const qc = dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "tag = %0", &params_seq);
+    try testing.expect(qc.ptr != nil.NIL_PTR);
+    const rc = qc.vtable.as_ReadCondition(qc.ptr);
+    defer _ = dr.delete_readcondition(rc);
+
+    var out: std.ArrayListUnmanaged(zzdds.OwnedRawSample) = .empty;
+    defer freeOwned(alloc, &out);
+    try zzdds.takeWithReadConditionRaw(dr, rc, &out, -1, alloc);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u8, 2), out.items[0].data[out.items[0].data.len - 1]);
+
+    // The non-matching sample (tag=1) is still in queue.
+    const remaining = pair.dr.takeRaw() orelse return error.NoSample;
+    defer alloc.free(remaining.data);
+    try testing.expectEqual(@as(u8, 1), remaining.data[remaining.data.len - 1]);
+}
+
+test "readWithReadConditionRaw: non-destructive, matching sample remains for a later take" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+    try writeAlive(pair.dw);
+
+    const dr = pair.dr.toDDSDataReader();
+    const rc = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr.delete_readcondition(rc);
+
+    var out: std.ArrayListUnmanaged(zzdds.OwnedRawSample) = .empty;
+    defer freeOwned(alloc, &out);
+    try zzdds.readWithReadConditionRaw(dr, rc, &out, -1, alloc);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+
+    const taken = pair.dr.takeRaw() orelse return error.NoSample;
+    defer alloc.free(taken.data);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE, taken.info.sample_state);
+}
+
+// ── takeNextInstanceWithReadConditionRaw / readNextInstanceWithReadConditionRaw ─
+//
+// The raw path to take_next_instance_w_condition/read_next_instance_w_condition.
+// Per spec §2.2.2.5.3.18-19, instance *selection* itself must be restricted to
+// instances with a matching sample -- not just "the next instance with any
+// sample," which is what plain takeNextInstanceRaw does. These tests target
+// exactly that difference.
+
+test "takeNextInstanceWithReadConditionRaw: instance selection skips a non-matching instance" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+
+    // Instance A's only sample is marked READ (via a prior read); instance B's
+    // sample is untouched (NOT_READ). A plain takeNextInstanceRaw(0) would
+    // still select whichever instance has the smaller handle, regardless of
+    // sample_state -- takeNextInstanceWithReadConditionRaw must skip an
+    // instance whose only sample doesn't match the condition's own mask.
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_B, &PAYLOAD);
+    const ih_a = DataWriterImpl.registerInstanceRaw(KEY_A);
+    const ih_b = DataWriterImpl.registerInstanceRaw(KEY_B);
+    const first_ih = @min(ih_a, ih_b);
+    const excluded_ih = first_ih; // whichever instance sorts first gets excluded below.
+
+    var mark_read: std.ArrayListUnmanaged(TakenSample) = .empty;
+    try pair.dr.readNextInstanceFiltered(&mark_read, 0, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null);
+    try testing.expectEqual(@as(usize, 1), mark_read.items.len);
+    try testing.expectEqual(excluded_ih, mark_read.items[0].info.instance_handle);
+    freeOut(alloc, &mark_read);
+
+    const dr = pair.dr.toDDSDataReader();
+    const rc = dr.create_readcondition(DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr.delete_readcondition(rc);
+
+    var out: std.ArrayListUnmanaged(zzdds.OwnedRawSample) = .empty;
+    defer freeOwned(alloc, &out);
+    try zzdds.takeNextInstanceWithReadConditionRaw(dr, rc, 0, &out, -1, alloc);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    // Must have selected the OTHER instance (the one still NOT_READ), not
+    // simply the smallest handle.
+    try testing.expect(out.items[0].info.instance_handle != excluded_ih);
+    try testing.expectEqual(DDS.NOT_READ_SAMPLE_STATE, out.items[0].info.sample_state);
+}
+
+test "readNextInstanceWithReadConditionRaw: non-destructive, sample remains for a later take" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader(.{}, .{});
+    _ = try pair.dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, KEY_A, &PAYLOAD);
+
+    const dr = pair.dr.toDDSDataReader();
+    const rc = dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = dr.delete_readcondition(rc);
+
+    var out: std.ArrayListUnmanaged(zzdds.OwnedRawSample) = .empty;
+    defer freeOwned(alloc, &out);
+    try zzdds.readNextInstanceWithReadConditionRaw(dr, rc, 0, &out, -1, alloc);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+
+    const taken = pair.dr.takeNextInstanceRaw(0) orelse return error.NoSample;
+    defer alloc.free(taken.data);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE, taken.info.sample_state);
+}

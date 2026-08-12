@@ -93,6 +93,54 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
     return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)df);
 }
 
+/* ── WaitSet / GuardCondition bootstrap ──────────────────────────────────
+ *
+ * Same reasoning as createFactory() above: neither has a factory operation
+ * in dcps.idl (per OMG spec, both are app-instantiated directly), so both
+ * bootstrap through the same hand-written zzdds_create_waitset()/
+ * zzdds_create_guardcondition() the C/C++ examples use. Unlike
+ * DomainParticipantFactory, neither is a zzdds-extended type, so the boxed
+ * handle these return is already the right DDS_WaitSet/DDS_GuardCondition
+ * shape -- no _as_DDS_ upcast step needed before boxing into the generated
+ * WaitSetImpl/GuardConditionImpl Java class.
+ */
+JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createWaitSet(JNIEnv *env, jclass self_cls) {
+    (void)self_cls;
+    DDS_WaitSet ws = zzdds_create_waitset();
+    if (zzdds_waitset_is_nil(ws)) return NULL;
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/WaitSetImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)ws);
+}
+
+JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createGuardCondition(JNIEnv *env, jclass self_cls) {
+    (void)self_cls;
+    DDS_GuardCondition gc = zzdds_create_guardcondition();
+    if (zzdds_guardcondition_is_nil(gc)) return NULL;
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/GuardConditionImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)gc);
+}
+
+/* WaitSet/GuardCondition have no owning factory to delete them through --
+ * mirrors zzdds_destroy_factory's role, just with no Java-callable
+ * equivalent to reach for otherwise (unlike DomainParticipant, entity
+ * interfaces have no deinit() exposed as a Java method at all -- see
+ * Dcps.DDS.WaitSet/GuardCondition's generated interface). */
+JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyWaitSet(JNIEnv *env, jclass self_cls, jobject waitset) {
+    (void)self_cls;
+    DDS_WaitSet ws = (DDS_WaitSet)zzdds_java_unbox(env, waitset);
+    if (ws == NULL) return;
+    zzdds_destroy_waitset(ws);
+}
+
+JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyGuardCondition(JNIEnv *env, jclass self_cls, jobject guardcondition) {
+    (void)self_cls;
+    DDS_GuardCondition gc = (DDS_GuardCondition)zzdds_java_unbox(env, guardcondition);
+    if (gc == NULL) return;
+    zzdds_destroy_guardcondition(gc);
+}
+
 /* ── TypeSupport registration: one native trampoline, ctx-carrying ──────
  *
  * zzdds_register_type_support_ctx (see zzdds_c.h) forwards an opaque ctx
@@ -309,6 +357,56 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_writeRaw(
     return rc;
 }
 
+JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_writeRawWTimestamp(
+    JNIEnv *env, jclass self_cls, jobject writer, jint kind, jbyteArray keyHash, jlong handle, jbyteArray payload, jint sec, jint nanosec)
+{
+    (void)self_cls;
+    void *w = zzdds_java_unbox(env, writer);
+    jbyte hash_buf[16];
+    (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
+    jsize payload_len = (*env)->GetArrayLength(env, payload);
+    jbyte *payload_buf = (*env)->GetByteArrayElements(env, payload, NULL);
+    DDS_Time_t timestamp = { .sec = (int32_t)sec, .nanosec = (uint32_t)nanosec };
+    int rc = zzdds_write_raw_w_timestamp(
+        w, (zzdds_write_kind)kind, (const uint8_t *)hash_buf,
+        (DDS_InstanceHandle_t)handle, (const uint8_t *)payload_buf, (size_t)payload_len, timestamp);
+    (*env)->ReleaseByteArrayElements(env, payload, payload_buf, JNI_ABORT);
+    return rc;
+}
+
+JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerInstanceRaw(
+    JNIEnv *env, jclass self_cls, jobject writer, jbyteArray keyHash)
+{
+    (void)self_cls;
+    void *w = zzdds_java_unbox(env, writer);
+    jbyte hash_buf[16];
+    (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
+    return (jlong)zzdds_register_instance_raw(w, (const uint8_t *)hash_buf);
+}
+
+JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueWriterRaw(
+    JNIEnv *env, jclass self_cls, jobject writer, jlong handle)
+{
+    (void)self_cls;
+    void *w = zzdds_java_unbox(env, writer);
+    uint8_t buf[4096];
+    size_t len = 0;
+    if (zzdds_get_key_value_writer(w, (DDS_InstanceHandle_t)handle, buf, sizeof(buf), &len) != 0) return NULL;
+    jbyteArray result = (*env)->NewByteArray(env, (jsize)len);
+    (*env)->SetByteArrayRegion(env, result, 0, (jsize)len, (const jbyte *)buf);
+    return result;
+}
+
+JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceWriterRaw(
+    JNIEnv *env, jclass self_cls, jobject writer, jbyteArray keyHash)
+{
+    (void)self_cls;
+    void *w = zzdds_java_unbox(env, writer);
+    jbyte hash_buf[16];
+    (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
+    return (jlong)zzdds_lookup_instance_writer(w, (const uint8_t *)hash_buf);
+}
+
 /* ── Take/read ───────────────────────────────────────────────────────── */
 
 static jbyteArray zzdds_java_take_or_read(
@@ -411,25 +509,26 @@ JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readNextInstance
  * rest of handlesOut/validsOut as meaningful.
  */
 
-static jobjectArray zzdds_java_take_or_read_n(
-    JNIEnv *env, jobject reader_obj, jint max, jint ss, jint vs, jint is_mask,
-    jlongArray handles_out, jbooleanArray valids_out, int is_take)
+/* Packages a zzdds_raw_sample_array into a jbyteArray[], filling
+ * handles_out/valids_out in parallel, and frees `arr` either way. Shared
+ * tail of every bulk take/read JNI function below (take_n/read_n,
+ * take_instance/read_instance, take_w_condition/read_w_condition,
+ * take_next_instance_w_condition/read_next_instance_w_condition), which
+ * otherwise only differ in which zzdds_*_raw call produces `arr`. `n <= 0`
+ * (already checked by the caller) means `arr` was never populated -- callers
+ * must not reach here in that case. */
+static jobjectArray zzdds_java_package_arr(
+    JNIEnv *env, void *reader, zzdds_raw_sample_array *arr,
+    jlongArray handles_out, jbooleanArray valids_out)
 {
-    void *reader = zzdds_java_unbox(env, reader_obj);
     jclass byte_array_cls = (*env)->FindClass(env, "[B");
-    if (byte_array_cls == NULL) return NULL;
-
-    zzdds_raw_sample_array arr;
-    int n = is_take
-        ? zzdds_take_n_raw(reader, (uint32_t)ss, (uint32_t)vs, (uint32_t)is_mask, (int)max, &arr)
-        : zzdds_read_n_raw(reader, (uint32_t)ss, (uint32_t)vs, (uint32_t)is_mask, (int)max, &arr);
-    if (n <= 0) {
-        return (*env)->NewObjectArray(env, 0, byte_array_cls, NULL);
+    if (byte_array_cls == NULL) {
+        zzdds_return_raw_samples(reader, arr);
+        return NULL;
     }
-
-    jobjectArray result = (*env)->NewObjectArray(env, (jsize)arr.count, byte_array_cls, NULL);
-    for (size_t i = 0; i < arr.count; i++) {
-        zzdds_raw_sample *s = &arr.samples[i];
+    jobjectArray result = (*env)->NewObjectArray(env, (jsize)arr->count, byte_array_cls, NULL);
+    for (size_t i = 0; i < arr->count; i++) {
+        zzdds_raw_sample *s = &arr->samples[i];
         jbyteArray payload = (*env)->NewByteArray(env, (jsize)s->data_len);
         (*env)->SetByteArrayRegion(env, payload, 0, (jsize)s->data_len, (const jbyte *)s->data);
         (*env)->SetObjectArrayElement(env, result, (jsize)i, payload);
@@ -440,8 +539,24 @@ static jobjectArray zzdds_java_take_or_read_n(
         (*env)->SetLongArrayRegion(env, handles_out, (jsize)i, 1, &handle_val);
         (*env)->SetBooleanArrayRegion(env, valids_out, (jsize)i, 1, &valid_val);
     }
-    zzdds_return_raw_samples(reader, &arr);
+    zzdds_return_raw_samples(reader, arr);
     return result;
+}
+
+static jobjectArray zzdds_java_take_or_read_n(
+    JNIEnv *env, jobject reader_obj, jint max, jint ss, jint vs, jint is_mask,
+    jlongArray handles_out, jbooleanArray valids_out, int is_take)
+{
+    void *reader = zzdds_java_unbox(env, reader_obj);
+    zzdds_raw_sample_array arr;
+    int n = is_take
+        ? zzdds_take_n_raw(reader, (uint32_t)ss, (uint32_t)vs, (uint32_t)is_mask, (int)max, &arr)
+        : zzdds_read_n_raw(reader, (uint32_t)ss, (uint32_t)vs, (uint32_t)is_mask, (int)max, &arr);
+    if (n <= 0) {
+        jclass byte_array_cls = (*env)->FindClass(env, "[B");
+        return byte_array_cls == NULL ? NULL : (*env)->NewObjectArray(env, 0, byte_array_cls, NULL);
+    }
+    return zzdds_java_package_arr(env, reader, &arr, handles_out, valids_out);
 }
 
 JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_takeNRaw(
@@ -458,6 +573,137 @@ JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readNRaw(
 {
     (void)self_cls;
     return zzdds_java_take_or_read_n(env, reader, max, ss, vs, is_mask, handlesOut, validsOut, 0);
+}
+
+/* ── Instance-scoped / condition-scoped bulk take/read ───────────────────
+ *
+ * take_instance/read_instance, take_w_condition/read_w_condition,
+ * take_next_instance_w_condition/read_next_instance_w_condition -- the raw
+ * paths to the matching OMG spec operations. Share zzdds_java_package_arr's
+ * output-packaging with take_n_raw/read_n_raw above.
+ */
+
+static jobjectArray zzdds_java_take_or_read_n_instance(
+    JNIEnv *env, jobject reader_obj, jlong instance_handle, jint max, jint ss, jint vs, jint is_mask,
+    jlongArray handles_out, jbooleanArray valids_out, int is_take)
+{
+    void *reader = zzdds_java_unbox(env, reader_obj);
+    zzdds_raw_sample_array arr;
+    int n = is_take
+        ? zzdds_take_n_instance_raw(reader, (DDS_InstanceHandle_t)instance_handle, (uint32_t)ss, (uint32_t)vs, (uint32_t)is_mask, (int)max, &arr)
+        : zzdds_read_n_instance_raw(reader, (DDS_InstanceHandle_t)instance_handle, (uint32_t)ss, (uint32_t)vs, (uint32_t)is_mask, (int)max, &arr);
+    if (n <= 0) {
+        jclass byte_array_cls = (*env)->FindClass(env, "[B");
+        return byte_array_cls == NULL ? NULL : (*env)->NewObjectArray(env, 0, byte_array_cls, NULL);
+    }
+    return zzdds_java_package_arr(env, reader, &arr, handles_out, valids_out);
+}
+
+JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_takeNInstanceRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jlong instanceHandle, jint max, jint ss, jint vs, jint is_mask,
+    jlongArray handlesOut, jbooleanArray validsOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_n_instance(env, reader, instanceHandle, max, ss, vs, is_mask, handlesOut, validsOut, 1);
+}
+
+JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readNInstanceRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jlong instanceHandle, jint max, jint ss, jint vs, jint is_mask,
+    jlongArray handlesOut, jbooleanArray validsOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_n_instance(env, reader, instanceHandle, max, ss, vs, is_mask, handlesOut, validsOut, 0);
+}
+
+static jobjectArray zzdds_java_take_or_read_w_condition(
+    JNIEnv *env, jobject reader_obj, jobject condition_obj, jint max,
+    jlongArray handles_out, jbooleanArray valids_out, int is_take)
+{
+    void *reader = zzdds_java_unbox(env, reader_obj);
+    void *condition = zzdds_java_unbox(env, condition_obj);
+    zzdds_raw_sample_array arr;
+    int n = is_take
+        ? zzdds_take_w_condition_raw(reader, condition, (int)max, &arr)
+        : zzdds_read_w_condition_raw(reader, condition, (int)max, &arr);
+    if (n <= 0) {
+        jclass byte_array_cls = (*env)->FindClass(env, "[B");
+        return byte_array_cls == NULL ? NULL : (*env)->NewObjectArray(env, 0, byte_array_cls, NULL);
+    }
+    return zzdds_java_package_arr(env, reader, &arr, handles_out, valids_out);
+}
+
+JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_takeWConditionRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jobject condition, jint max,
+    jlongArray handlesOut, jbooleanArray validsOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_w_condition(env, reader, condition, max, handlesOut, validsOut, 1);
+}
+
+JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readWConditionRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jobject condition, jint max,
+    jlongArray handlesOut, jbooleanArray validsOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_w_condition(env, reader, condition, max, handlesOut, validsOut, 0);
+}
+
+static jobjectArray zzdds_java_take_or_read_next_instance_w_condition(
+    JNIEnv *env, jobject reader_obj, jobject condition_obj, jlong prev, jint max,
+    jlongArray handles_out, jbooleanArray valids_out, int is_take)
+{
+    void *reader = zzdds_java_unbox(env, reader_obj);
+    void *condition = zzdds_java_unbox(env, condition_obj);
+    zzdds_raw_sample_array arr;
+    int n = is_take
+        ? zzdds_take_next_instance_w_condition_raw(reader, condition, (DDS_InstanceHandle_t)prev, (int)max, &arr)
+        : zzdds_read_next_instance_w_condition_raw(reader, condition, (DDS_InstanceHandle_t)prev, (int)max, &arr);
+    if (n <= 0) {
+        jclass byte_array_cls = (*env)->FindClass(env, "[B");
+        return byte_array_cls == NULL ? NULL : (*env)->NewObjectArray(env, 0, byte_array_cls, NULL);
+    }
+    return zzdds_java_package_arr(env, reader, &arr, handles_out, valids_out);
+}
+
+JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_takeNextInstanceWConditionRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jobject condition, jlong prev, jint max,
+    jlongArray handlesOut, jbooleanArray validsOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_next_instance_w_condition(env, reader, condition, prev, max, handlesOut, validsOut, 1);
+}
+
+JNIEXPORT jobjectArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readNextInstanceWConditionRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jobject condition, jlong prev, jint max,
+    jlongArray handlesOut, jbooleanArray validsOut)
+{
+    (void)self_cls;
+    return zzdds_java_take_or_read_next_instance_w_condition(env, reader, condition, prev, max, handlesOut, validsOut, 0);
+}
+
+/* ── get_key_value / lookup_instance (reader) ─────────────────────────── */
+
+JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueReaderRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jlong handle)
+{
+    (void)self_cls;
+    void *r = zzdds_java_unbox(env, reader);
+    uint8_t buf[4096];
+    size_t len = 0;
+    if (zzdds_get_key_value_reader(r, (DDS_InstanceHandle_t)handle, buf, sizeof(buf), &len) != 0) return NULL;
+    jbyteArray result = (*env)->NewByteArray(env, (jsize)len);
+    (*env)->SetByteArrayRegion(env, result, 0, (jsize)len, (const jbyte *)buf);
+    return result;
+}
+
+JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceReaderRaw(
+    JNIEnv *env, jclass self_cls, jobject reader, jbyteArray keyHash)
+{
+    (void)self_cls;
+    void *r = zzdds_java_unbox(env, reader);
+    jbyte hash_buf[16];
+    (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
+    return (jlong)zzdds_lookup_instance_reader(r, (const uint8_t *)hash_buf);
 }
 
 /* ── ContentFilteredTopic matching ──────────────────────────────────────

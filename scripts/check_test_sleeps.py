@@ -36,6 +36,13 @@ ALLOWLIST = {
     # DEADLINE expiry (ManualClock only ever advances from the calling test
     # thread, so it can't reach this path), polled with a bounded timeout.
     "test/dcps/participant_vtable_test.zig": (1, "timer-thread self-delete polling"),
+    # Concurrent wait()-vs-attach/delete-entity/detach cycling test: a real
+    # (if small) backoff, not a pure busy-spin, so its worker thread doesn't
+    # hammer ws.mu at native CPU-bound frequency. Confirmed necessary, not
+    # just nice-to-have -- under Valgrind (20-50x slower), the zero-backoff
+    # version combined with 50 real DDS entity lifecycles blew through CI's
+    # Valgrind job timeout without even finishing this one test.
+    "test/dcps/waitset_lifecycle_test.zig": (1, "concurrent wait()-vs-entity-cycling backoff, avoids Valgrind CI timeout"),
 }
 
 PATTERNS = (

@@ -209,6 +209,14 @@ pub const DataReaderImpl = struct {
     /// Guarded by `mu`.
     data_notifiers: std.ArrayListUnmanaged(waitset.DataNotifyFn),
 
+    /// Every ReadCondition/QueryCondition created against this reader that
+    /// hasn't been explicitly deleted via delete_readcondition() yet.
+    /// Guarded by `mu`. Torn down (each condition's real deinit(), which
+    /// detaches it from any attached WaitSet) in reallyDeinit() so deleting
+    /// the reader without deleting its conditions first is safe rather than
+    /// leaking them or leaving a WaitSet with a dangling entry.
+    read_conditions: std.ArrayListUnmanaged(DDS.Condition),
+
     /// Pending incoming samples; guarded by `mu`.
     pending: std.ArrayListUnmanaged(PendingChange),
     /// Working buffer for the currently-receiving coherent set.
@@ -356,6 +364,7 @@ pub const DataReaderImpl = struct {
             .status_changes = 0,
             .status_cond = null,
             .data_notifiers = .empty,
+            .read_conditions = .empty,
             .pending = .empty,
             .coherent_wip = .{},
             .coherent_committed = .empty,
@@ -410,6 +419,45 @@ pub const DataReaderImpl = struct {
         self.dr_c_abi.free(self.alloc);
         self.entity_c_abi.free(self.alloc);
         self.zzdds_dr_c_abi.free(self.alloc);
+        // Tear down any ReadCondition/QueryCondition the app never explicitly
+        // deleted via delete_readcondition(). Each condition's own teardown
+        // detaches it from any WaitSet that still has it attached, removes
+        // its data_notifiers registration, and calls back into
+        // removeReadCondition() to remove itself from read_conditions — so
+        // this must run before data_notifiers.deinit() and before `self` is
+        // freed. Take ownership of the list and reset the field to .empty
+        // first: mutating (swapRemove) the very list a `for` loop is
+        // iterating over would skip or double-visit entries. Locked: this
+        // reader's own quiesce reference is already down to zero by the time
+        // reallyDeinit runs (see vtCreateReadCondition/vtCreateQueryCondition,
+        // which hold a reference across their own tracking append, and
+        // ReadConditionImpl.deinit()/QueryConditionImpl.deinit() in
+        // waitset.zig, which now do the same across delete_readcondition()
+        // or a direct .deinit() call), but removeReadCondition() only locks
+        // this same mu, not this reader's quiesce -- so this snapshot must
+        // lock it too, or the two could still corrupt read_conditions's
+        // ArrayList fields concurrently.
+        self.mu.lock();
+        var conditions_to_free = self.read_conditions;
+        self.read_conditions = .empty;
+        self.mu.unlock();
+        // Calls …AssumeReaderQuiescing() directly, not the public deinit():
+        // this reader's quiesce reference is already down to zero here (see
+        // above), so a fresh acquire would always fail, silently skipping
+        // every condition's real teardown. `cond.ptr` is always a
+        // *ReadConditionImpl -- QueryConditionImpl.toCondition() returns a
+        // view backed by its own embedded `rc` (see owner_qc's doc comment)
+        // -- so owner_qc tells us which concrete deinitAssumeReaderQuiescing
+        // actually owns the allocation.
+        for (conditions_to_free.items) |cond| {
+            const rc: *waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            if (rc.owner_qc) |qc| {
+                qc.deinitAssumeReaderQuiescing();
+            } else {
+                rc.deinitAssumeReaderQuiescing();
+            }
+        }
+        conditions_to_free.deinit(self.alloc);
         self.data_notifiers.deinit(self.alloc);
         // Drain pending queues (including coherent buffers).
         for (self.pending.items) |p| p.deinit();
@@ -1254,12 +1302,32 @@ pub const DataReaderImpl = struct {
     }
 
     /// Register a WaitSet notification callback.  Called by ReadConditionImpl
-    /// when a WaitSet attaches the condition.  Guarded by mu (caller holds it).
-    pub fn addDataNotifier(ctx: *anyopaque, n: waitset.DataNotifyFn) void {
+    /// when a WaitSet attaches the condition.  Returns false if the
+    /// allocator couldn't grow `data_notifiers` -- the caller (vtAttach) must
+    /// treat that as attachment failure and roll back, not report
+    /// RETCODE_OK for a WaitSet that will never see a real data-arrival
+    /// wakeup.
+    pub fn addDataNotifier(ctx: *anyopaque, n: waitset.DataNotifyFn) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
-        self.data_notifiers.append(self.alloc, n) catch {};
+        self.data_notifiers.append(self.alloc, n) catch return false;
+        return true;
+    }
+
+    /// ReadConditionImpl/QueryConditionImpl's `reader_quiesce_acquire` --
+    /// held across their own deinit() so it can never race this reader's
+    /// own reallyDeinit() (see there, and ReadConditionImpl.deinit()'s doc
+    /// comment).
+    pub fn readerQuiesceAcquire(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+
+    /// Pairs with a successful readerQuiesceAcquire above.
+    pub fn readerQuiesceRelease(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
     }
 
     /// Remove the notification callback for `waitset_ctx`.  Called by
@@ -1440,6 +1508,151 @@ pub const DataReaderImpl = struct {
             }
         }
         return null;
+    }
+
+    /// DDS `take_next_instance_w_condition` semantics: like `takeNextInstanceRaw`,
+    /// but instance selection AND per-sample inclusion are both restricted to
+    /// samples matching `sample_mask`/`view_mask`/`instance_mask` (and
+    /// `maybe_qc`'s query expression, if given) -- per spec §2.2.2.5.3.19, the
+    /// target instance is the smallest instance_handle > `prev_instance_handle`
+    /// *among instances that have at least one sample satisfying the
+    /// condition*, not just the next instance with any sample at all. Appends
+    /// every matching sample of that one instance (up to `max_samples`) to
+    /// `out`. Mirrors `takeFiltered`'s locking/expiry-purge/in-place-compaction
+    /// shape, restricted to the selected instance.
+    pub fn takeNextInstanceFiltered(
+        self: *Self,
+        out: *std.ArrayListUnmanaged(TakenSample),
+        prev_instance_handle: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) anyerror!void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const now_ns = time_mod.nanoTimestamp();
+
+        var ei: usize = 0;
+        while (ei < self.pending.items.len) {
+            if (self.pending.items[ei].expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    const expired = self.pending.orderedRemove(ei);
+                    expired.deinit();
+                    continue;
+                }
+            }
+            ei += 1;
+        }
+        if (self.pending.items.len == 0) {
+            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        }
+
+        // Smallest instance_handle > prev (or overall smallest if prev == 0)
+        // among instances with at least one sample matching the condition.
+        var target_ih: ?DDS.InstanceHandle_t = null;
+        for (self.pending.items) |pc| {
+            const ih = pc.info.instance_handle;
+            if (prev_instance_handle != 0 and ih <= prev_instance_handle) continue;
+            if (target_ih != null and ih >= target_ih.?) continue;
+            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
+            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
+            target_ih = ih;
+        }
+        const tgt = target_ih orelse return;
+
+        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+
+        var match_count: usize = 0;
+        for (self.pending.items) |pc| {
+            if (match_count >= limit) break;
+            if (pc.info.instance_handle != tgt) continue;
+            if (matchesSample(pc, sample_mask, view_mask, instance_mask, null) and
+                matchesQuery(pc, maybe_qc, self.get_field_fn)) match_count += 1;
+        }
+        try out.ensureUnusedCapacity(self.alloc, match_count);
+        const start = out.items.len;
+
+        var write: usize = 0;
+        var taken: usize = 0;
+        for (self.pending.items) |pc| {
+            if (pc.info.instance_handle == tgt and taken < limit and
+                matchesSample(pc, sample_mask, view_mask, instance_mask, null) and
+                matchesQuery(pc, maybe_qc, self.get_field_fn))
+            {
+                out.appendAssumeCapacity(.{ .data = pc.data, .info = pc.info });
+                taken += 1;
+            } else {
+                self.pending.items[write] = pc;
+                write += 1;
+            }
+        }
+        self.pending.items.len = write;
+        if (self.pending.items.len == 0) {
+            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        }
+        self.finalizeGenerationRanksLocked(out.items[start..]);
+    }
+
+    /// Non-destructive analog to `takeNextInstanceFiltered` -- see its doc
+    /// comment for the instance-selection semantics. Matching samples are
+    /// cloned into `out` and marked READ_SAMPLE_STATE in-place, same as `readRaw`.
+    pub fn readNextInstanceFiltered(
+        self: *Self,
+        out: *std.ArrayListUnmanaged(TakenSample),
+        prev_instance_handle: DDS.InstanceHandle_t,
+        sample_mask: DDS.SampleStateMask,
+        view_mask: DDS.ViewStateMask,
+        instance_mask: DDS.InstanceStateMask,
+        max_samples: i32,
+        maybe_qc: ?*const waitset.QueryConditionImpl,
+    ) anyerror!void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const now_ns = time_mod.nanoTimestamp();
+
+        var ei: usize = 0;
+        while (ei < self.pending.items.len) {
+            if (self.pending.items[ei].expiry_ns) |exp| {
+                if (now_ns >= exp) {
+                    const expired = self.pending.orderedRemove(ei);
+                    expired.deinit();
+                    continue;
+                }
+            }
+            ei += 1;
+        }
+        if (self.pending.items.len == 0) {
+            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+        }
+
+        var target_ih: ?DDS.InstanceHandle_t = null;
+        for (self.pending.items) |pc| {
+            const ih = pc.info.instance_handle;
+            if (prev_instance_handle != 0 and ih <= prev_instance_handle) continue;
+            if (target_ih != null and ih >= target_ih.?) continue;
+            if (!matchesSample(pc, sample_mask, view_mask, instance_mask, null)) continue;
+            if (!matchesQuery(pc, maybe_qc, self.get_field_fn)) continue;
+            target_ih = ih;
+        }
+        const tgt = target_ih orelse return;
+
+        const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
+        const start = out.items.len;
+        var count: usize = 0;
+        for (self.pending.items) |*pc| {
+            if (count >= limit) break;
+            if (pc.info.instance_handle != tgt) continue;
+            if (!matchesSample(pc.*, sample_mask, view_mask, instance_mask, null)) continue;
+            if (!matchesQuery(pc.*, maybe_qc, self.get_field_fn)) continue;
+            const clone = try self.alloc.dupe(u8, pc.data);
+            errdefer self.alloc.free(clone);
+            try out.append(self.alloc, .{ .data = clone, .info = pc.info });
+            pc.info.sample_state = DDS.READ_SAMPLE_STATE;
+            count += 1;
+        }
+        self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
     /// Return the stored CDR payload for the given instance handle, or null if
@@ -1914,6 +2127,20 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
     ) DDS.ReadCondition {
         const self = cast(ctx);
+        // Without this, a create racing this reader's own deinit() could
+        // track a new condition into read_conditions after reallyDeinit()
+        // already snapshotted-and-cleared it (never torn down, holding a
+        // reader_ctx pointing at freed memory once the reader is gone) --
+        // or race the snapshot itself, corrupting read_conditions's
+        // internal ArrayList fields with no synchronization at all. Holding
+        // a quiesce reference across trackReadCondition() below guarantees
+        // reallyDeinit() (which only runs once the last reference is
+        // released) can't observe a half-updated list, and can't run at
+        // all until this create has either tracked the condition or given
+        // up -- so it's always still in the loop reallyDeinit() sees when
+        // teardown didn't already win the race.
+        if (!self.quiesce.acquire()) return nil.nil_readcondition;
+        defer self.quiesce.release(self, reallyDeinit);
         const rc = waitset.ReadConditionImpl.init(
             self.alloc,
             self.toDDSDataReader(),
@@ -1924,7 +2151,14 @@ pub const DataReaderImpl = struct {
             self,
             addDataNotifier,
             removeDataNotifier,
+            removeReadCondition,
+            readerQuiesceAcquire,
+            readerQuiesceRelease,
         ) catch return nil.nil_readcondition;
+        if (!self.trackReadCondition(rc.toCondition())) {
+            rc.deinit();
+            return nil.nil_readcondition;
+        }
         return rc.toDDSReadCondition();
     }
 
@@ -1944,6 +2178,9 @@ pub const DataReaderImpl = struct {
         // rather than creating a condition that does nothing.
         if (qe_s.len > 0 and self.get_field_fn == null)
             return nil.nil_querycondition;
+        // See vtCreateReadCondition's comment: same race, same fix.
+        if (!self.quiesce.acquire()) return nil.nil_querycondition;
+        defer self.quiesce.release(self, reallyDeinit);
         const empty_seq = DDS.StringSeq{};
         const qc = waitset.QueryConditionImpl.init(
             self.alloc,
@@ -1957,12 +2194,58 @@ pub const DataReaderImpl = struct {
             self,
             addDataNotifier,
             removeDataNotifier,
+            removeReadCondition,
+            readerQuiesceAcquire,
+            readerQuiesceRelease,
         ) catch return nil.nil_querycondition;
+        if (!self.trackReadCondition(qc.toCondition())) {
+            qc.deinit();
+            return nil.nil_querycondition;
+        }
         return qc.toDDSQueryCondition();
     }
 
+    /// Records a newly-created ReadCondition/QueryCondition so reallyDeinit()
+    /// can tear it down safely if the app deletes this reader without first
+    /// calling delete_readcondition() on it. Returns false on allocation
+    /// failure -- the caller must not hand the condition back to the app in
+    /// that case (see vtCreateReadCondition/vtCreateQueryCondition): an
+    /// untracked condition would survive the reader's own teardown holding
+    /// a reader_ctx/remove_notify_fn pointing at freed memory, since nothing
+    /// would tear it down along with the reader.
+    fn trackReadCondition(self: *Self, cond: DDS.Condition) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.read_conditions.append(self.alloc, cond) catch return false;
+        return true;
+    }
+
+    /// Called by ReadConditionImpl/QueryConditionImpl's own deinit() — not by
+    /// vtDeleteReadCondition directly — so this list stays correct whether a
+    /// condition is destroyed via delete_readcondition() or a direct
+    /// .deinit() call on the handle (both are valid; WaitSet/GuardCondition
+    /// have no "delete" op at all and are only ever destroyed the latter way).
+    /// ctx is a *DataReaderImpl; ptr matches a tracked DDS.Condition's own .ptr.
+    pub fn removeReadCondition(ctx: *anyopaque, cond_ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.read_conditions.items, 0..) |c, i| {
+            if (c.ptr == cond_ptr) {
+                _ = self.read_conditions.swapRemove(i);
+                return;
+            }
+        }
+    }
+
     fn vtDeleteReadCondition(_: *anyopaque, a_condition: DDS.ReadCondition) DDS.ReturnCode_t {
-        // Destroy the condition via its vtable.
+        // Destroy the condition via its vtable — ReadConditionImpl.deinit()/
+        // QueryConditionImpl.deinit() hold the owning reader's quiesce
+        // reference themselves now (see waitset.zig), so this call can't
+        // race reallyDeinit()'s bulk loop regardless of caller -- no guard
+        // needed at this specific call site anymore. Also detaches from any
+        // WaitSet that still has it attached and removes it from this
+        // reader's read_conditions tracking list.
         a_condition.deinit();
         return DDS.RETCODE_OK;
     }
@@ -2228,6 +2511,7 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2327,6 +2611,7 @@ test "coherent WIP: CS transition discards incomplete previous WIP" {
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2413,6 +2698,7 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2497,6 +2783,7 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2544,6 +2831,7 @@ fn mkTestReaderForGenerationTests(alloc: std.mem.Allocator, clock: *time_test.Ma
         .timer_clock = clock.clock(),
         .last_received_ns = .init(clock.clock().nowNs()),
         .data_notifiers = .empty,
+        .read_conditions = .empty,
         .pending = .empty,
         .coherent_wip = .{},
         .coherent_committed = .empty,
@@ -2682,4 +2970,364 @@ test "takeRaw: absolute_generation_rank reflects live generation ahead of a stal
     try testing.expectEqual(@as(i32, 0), taken.info.sample_rank);
     try testing.expectEqual(@as(i32, 0), taken.info.generation_rank);
     try testing.expectEqual(@as(i32, 1), taken.info.absolute_generation_rank);
+}
+
+test "vtCreateReadCondition: a condition tracked while deinit() is racing is still torn down, not left dangling" {
+    // Regression for a real race Greptile flagged on zzdds PR #60: without
+    // vtCreateReadCondition holding a quiesce reference across its own
+    // trackReadCondition() append, a create racing this reader's own
+    // deinit() could track a new condition into read_conditions *after*
+    // reallyDeinit() already snapshotted-and-cleared it -- left un-torn-
+    // down, holding a reader_ctx pointing at freed memory the moment the
+    // reader itself finished tearing down.
+    //
+    // A real two-thread version of this test isn't safe: an unsynchronized
+    // delete_datareader() can legitimately win outright and free the whole
+    // reader before a spawned thread doing the create is even scheduled --
+    // a different, and for a raw handle with no other synchronization
+    // fundamentally unfixable, hazard, not the one this fix addresses
+    // (confirmed directly: a real-thread version of this test segfaulted on
+    // quiesce.acquire() dereferencing an already-freed reader even with the
+    // fix in place). Driving the exact interleaving deterministically by
+    // hand -- mirroring vtCreateReadCondition's own acquire()/track/release
+    // sequence -- tests the actual mechanism without depending on OS thread
+    // scheduling luck, and without ever risking a genuinely dangling `dr`.
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    const dr = try alloc.create(DataReaderImpl);
+    dr.* = .{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .read_conditions = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .seen_instances = .empty,
+    };
+
+    // Simulate vtCreateReadCondition's opening move: a create call has
+    // validly entered (dr is still fully alive -- nothing has started
+    // tearing it down yet) and successfully acquired a quiesce reference.
+    try testing.expect(dr.quiesce.acquire());
+
+    // Now race in the reader's own deinit(). Our simulated create above
+    // still holds a reference, so this must NOT free `dr` yet -- if it did,
+    // everything below would be a use-after-free.
+    dr.deinit();
+
+    // Simulate the rest of vtCreateReadCondition: build a real condition
+    // and track it, exactly like trackReadCondition() does (inlined here
+    // rather than calling it directly, to also exercise mu locking exactly
+    // as production code does).
+    const rc = try waitset.ReadConditionImpl.init(
+        alloc,
+        dr.toDDSDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        DataReaderImpl.hasPendingDataFn,
+        dr,
+        DataReaderImpl.addDataNotifier,
+        DataReaderImpl.removeDataNotifier,
+        DataReaderImpl.removeReadCondition,
+        DataReaderImpl.readerQuiesceAcquire,
+        DataReaderImpl.readerQuiesceRelease,
+    );
+    dr.mu.lock();
+    try dr.read_conditions.append(alloc, rc.toCondition());
+    dr.mu.unlock();
+
+    // Release our simulated create's reference -- the last one outstanding
+    // (deinit() already dropped its own), so this must synchronously
+    // trigger reallyDeinit() now, which must find and tear down the
+    // condition just tracked above.
+    dr.quiesce.release(dr, DataReaderImpl.reallyDeinit);
+
+    // If reallyDeinit() had incorrectly already run before the track above
+    // (the bug this regresses), this test would already have use-after-freed
+    // `dr` and leaked `rc` -- testing.allocator's DebugAllocator catches
+    // both.
+}
+
+test "vtDeleteReadCondition: winning the race removes the condition before reallyDeinit's bulk loop can double-free it" {
+    // Delete-side half of the same Greptile finding as the create-side test
+    // above: without vtDeleteReadCondition holding a quiesce reference
+    // across its own delete, reallyDeinit()'s bulk loop (from its own
+    // already-taken read_conditions snapshot) and an explicit
+    // delete_readcondition() call could independently decide to free the
+    // same condition -- a double free.
+    //
+    // Driven deterministically for the same reason as the create-side test:
+    // a real-thread version of this test also segfaults on
+    // quiesce.acquire() dereferencing an already-freed reader whenever
+    // delete_datareader() happens to win outright before the spawned
+    // thread's delete_readcondition() call is even scheduled -- confirmed
+    // directly, not hypothetically -- which is a different, out-of-scope
+    // hazard, not the double-free this fix addresses.
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    const dr = try alloc.create(DataReaderImpl);
+    dr.* = .{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .read_conditions = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .seen_instances = .empty,
+    };
+
+    // Create and track a real condition up front -- single-threaded, no
+    // race yet. This is the condition both "sides" below race to free.
+    const rc = try waitset.ReadConditionImpl.init(
+        alloc,
+        dr.toDDSDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        DataReaderImpl.hasPendingDataFn,
+        dr,
+        DataReaderImpl.addDataNotifier,
+        DataReaderImpl.removeDataNotifier,
+        DataReaderImpl.removeReadCondition,
+        DataReaderImpl.readerQuiesceAcquire,
+        DataReaderImpl.readerQuiesceRelease,
+    );
+    try dr.read_conditions.append(alloc, rc.toCondition());
+
+    // Simulate vtDeleteReadCondition's opening move: a delete call has
+    // validly entered (dr is still fully alive) and successfully acquired.
+    try testing.expect(dr.quiesce.acquire());
+
+    // Race in the reader's own deinit(). Our simulated delete above still
+    // holds a reference, so this must NOT free `dr` (or touch `rc`) yet.
+    dr.deinit();
+
+    // Simulate the rest of vtDeleteReadCondition: actually delete the
+    // condition. This removes it from dr.read_conditions (via
+    // ReadConditionImpl.deinit() -> remove_condition_fn ->
+    // removeReadCondition, mu-locked) and frees it.
+    rc.toCondition().deinit();
+
+    // Release our simulated delete's reference -- the last one outstanding
+    // (deinit() already dropped its own), so this must synchronously
+    // trigger reallyDeinit() now. Its bulk loop must find read_conditions
+    // already empty (rc removed itself above) and must not try to free
+    // `rc` a second time.
+    dr.quiesce.release(dr, DataReaderImpl.reallyDeinit);
+
+    // If reallyDeinit() had incorrectly also tried to free `rc` above (the
+    // bug this regresses), this would be a double free --
+    // testing.allocator's DebugAllocator catches it.
+}
+
+// The two tests above simulate vtCreateReadCondition's/vtDeleteReadCondition's
+// own acquire()/…/release() sequence by hand -- they prove the *protocol*
+// (quiesce coordination + read_conditions bookkeeping) is correct if
+// followed, but calling dr.quiesce.acquire() directly means they'd still
+// pass even if the real guard were deleted from those two functions. The
+// two tests below close that gap: they call the real, public
+// create_readcondition()/delete_readcondition() and check the guard is
+// actually there, using a spare held reference (rather than a second
+// thread) to keep `dr` alive past deinit() without ever risking the
+// already-freed-pointer hazard explained above.
+
+test "vtCreateReadCondition: refuses to create once reader teardown has started" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    const dr = try alloc.create(DataReaderImpl);
+    dr.* = .{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .read_conditions = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .seen_instances = .empty,
+    };
+
+    // Hold a spare reference so deinit() below sets the tearing-down flag
+    // without being able to free `dr` out from under this test yet.
+    try testing.expect(dr.quiesce.acquire());
+    dr.deinit();
+
+    // With the fix, create_readcondition() must see the tearing-down flag
+    // and refuse -- returning nil without ever touching read_conditions.
+    // Without it, it would construct and track a real condition anyway
+    // (dr.mu/read_conditions are still perfectly valid memory here, thanks
+    // to the spare reference above), which no later snapshot could ever
+    // find or tear down once this test's own release drops the reference.
+    const rc = dr.toDDSDataReader().create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    try testing.expectEqual(nil.nil_readcondition.ptr, rc.ptr);
+    try testing.expectEqual(@as(usize, 0), dr.read_conditions.items.len);
+
+    // Release the spare reference -- the last one outstanding, so this
+    // correctly and synchronously tears `dr` down now.
+    dr.quiesce.release(dr, DataReaderImpl.reallyDeinit);
+}
+
+test "vtDeleteReadCondition: backs off entirely once reader teardown has started" {
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    const dr = try alloc.create(DataReaderImpl);
+    dr.* = .{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .read_conditions = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .seen_instances = .empty,
+    };
+
+    // Create and track a real condition up front, single-threaded.
+    const rc = try waitset.ReadConditionImpl.init(
+        alloc,
+        dr.toDDSDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        DataReaderImpl.hasPendingDataFn,
+        dr,
+        DataReaderImpl.addDataNotifier,
+        DataReaderImpl.removeDataNotifier,
+        DataReaderImpl.removeReadCondition,
+        DataReaderImpl.readerQuiesceAcquire,
+        DataReaderImpl.readerQuiesceRelease,
+    );
+    try dr.read_conditions.append(alloc, rc.toCondition());
+
+    // Hold a spare reference so deinit() below sets the tearing-down flag
+    // without being able to free `dr` (or tear down `rc` via its own bulk
+    // loop) out from under this test yet.
+    try testing.expect(dr.quiesce.acquire());
+    dr.deinit();
+
+    // With the fix, delete_readcondition() must see the tearing-down flag
+    // and back off, touching neither `rc` nor read_conditions at all --
+    // leaving `rc` for reallyDeinit()'s own bulk loop to free once this
+    // test's release below lets it actually run. Without the fix, this call
+    // would free `rc` here itself, and then reallyDeinit()'s bulk loop
+    // would try to free the same (now-dangling) entry again.
+    _ = dr.toDDSDataReader().delete_readcondition(rc.toDDSReadCondition());
+    try testing.expectEqual(@as(usize, 1), dr.read_conditions.items.len);
+
+    dr.quiesce.release(dr, DataReaderImpl.reallyDeinit);
+}
+
+test "ReadConditionImpl.deinit: a direct call (bypassing delete_readcondition) also backs off once reader teardown has started" {
+    // A second real gap in the same Greptile finding as the two tests
+    // above: vtDeleteReadCondition's own guard only covered
+    // delete_readcondition() -- a direct `.deinit()` call on the handle is
+    // an equally valid, documented way to destroy a condition (see
+    // remove_condition_fn's doc comment; a Zig-native caller can reach it
+    // without going through the C-ABI's delete_readcondition() at all), and
+    // was still completely unguarded. Fixed by moving the guard down into
+    // ReadConditionImpl.deinit()/QueryConditionImpl.deinit() themselves, so
+    // every caller gets it regardless of entry point. This test is
+    // identical to the one above except for calling `.deinit()` straight on
+    // the handle instead of going through delete_readcondition().
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    const dr = try alloc.create(DataReaderImpl);
+    dr.* = .{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .read_conditions = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .seen_instances = .empty,
+    };
+
+    const rc = try waitset.ReadConditionImpl.init(
+        alloc,
+        dr.toDDSDataReader(),
+        DDS.ANY_SAMPLE_STATE,
+        DDS.ANY_VIEW_STATE,
+        DDS.ANY_INSTANCE_STATE,
+        DataReaderImpl.hasPendingDataFn,
+        dr,
+        DataReaderImpl.addDataNotifier,
+        DataReaderImpl.removeDataNotifier,
+        DataReaderImpl.removeReadCondition,
+        DataReaderImpl.readerQuiesceAcquire,
+        DataReaderImpl.readerQuiesceRelease,
+    );
+    try dr.read_conditions.append(alloc, rc.toCondition());
+
+    try testing.expect(dr.quiesce.acquire());
+    dr.deinit();
+
+    // Direct call, not through delete_readcondition()/vtDeleteReadCondition
+    // at all -- must still see the tearing-down flag and back off.
+    rc.deinit();
+    try testing.expectEqual(@as(usize, 1), dr.read_conditions.items.len);
+
+    dr.quiesce.release(dr, DataReaderImpl.reallyDeinit);
 }

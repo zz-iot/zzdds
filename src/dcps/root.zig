@@ -50,4 +50,6 @@ pub const nil_multitopic = @import("nil.zig").nil_multitopic;
 pub const nil_condition = @import("nil.zig").nil_condition;
 pub const nil_readcondition = @import("nil.zig").nil_readcondition;
 pub const nil_querycondition = @import("nil.zig").nil_querycondition;
+pub const nil_waitset = @import("nil.zig").nil_waitset;
+pub const nil_guardcondition = @import("nil.zig").nil_guardcondition;
 pub const nil_factory = @import("nil.zig").nil_factory;

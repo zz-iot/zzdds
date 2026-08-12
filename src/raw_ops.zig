@@ -14,6 +14,7 @@ const dcps_writer = @import("dcps/writer.zig");
 const dcps_reader = @import("dcps/reader.zig");
 const dcps_participant = @import("dcps/participant.zig");
 const dcps_topic = @import("dcps/topic.zig");
+const dcps_waitset = @import("dcps/waitset.zig");
 const filter_mod = @import("dcps/filter.zig");
 const zzdds_ext = @import("c_abi/extensions.zig");
 const history_mod = @import("rtps/history.zig");
@@ -23,6 +24,8 @@ const DataWriterImpl = dcps_writer.DataWriterImpl;
 const DataReaderImpl = dcps_reader.DataReaderImpl;
 const DomainParticipantImpl = dcps_participant.DomainParticipantImpl;
 const TopicImpl = dcps_topic.TopicImpl;
+const WaitSetImpl = dcps_waitset.WaitSetImpl;
+const GuardConditionImpl = dcps_waitset.GuardConditionImpl;
 
 /// Write kind for module-level write operations.
 pub const WriteKind = enum { alive, dispose, unregister };
@@ -104,6 +107,29 @@ pub fn asZzddsTopic(topic: DDS.Topic) ?ZZDDS.Topic {
 pub fn asZzddsDomainParticipant(participant: DDS.DomainParticipant) ?ZZDDS.DomainParticipant {
     if (participant.vtable != &DomainParticipantImpl.vtable) return null;
     return .{ .ptr = participant.ptr, .vtable = &zzdds_ext.participant_vtable };
+}
+
+// ── WaitSet / GuardCondition construction ───────────────────────────────────
+
+/// WaitSet and GuardCondition are the only two condition-family types with no
+/// factory operation in dcps.idl (per OMG spec, both are app-instantiated
+/// directly -- unlike StatusCondition/ReadCondition/QueryCondition, which are
+/// obtained from an existing entity/reader and already have a pure-Zig path
+/// via `entity.get_statuscondition()`/`reader.create_readcondition()`
+/// directly on their generated interface types). This mirrors the C ABI's
+/// `zzdds_create_waitset` (src/c_abi/extensions.zig) -- that shim does this
+/// same construction internally for C/C++/Java callers; this gives Zig
+/// callers the same one-call surface instead of requiring them to reach
+/// `WaitSetImpl.init` themselves.
+pub fn createWaitSet(alloc: std.mem.Allocator) !DDS.WaitSet {
+    const ws = try WaitSetImpl.init(alloc);
+    return ws.toDDSWaitSet();
+}
+
+/// See `createWaitSet` -- same shape, for `GuardCondition`.
+pub fn createGuardCondition(alloc: std.mem.Allocator) !DDS.GuardCondition {
+    const gc = try GuardConditionImpl.init(alloc);
+    return gc.toDDSGuardCondition();
 }
 
 // ── QoS helpers ──────────────────────────────────────────────────────────────
@@ -261,6 +287,188 @@ pub fn takeFilteredRaw(
         out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
     }
     tmp.items.len = 0; // transferred ownership; prevent deinit double-free
+}
+
+/// Batch take restricted to a QueryCondition: state masks come from the
+/// condition itself, and only samples whose fields pass its query expression
+/// are returned. The Zig-native raw path to what the OMG spec calls
+/// `take_w_condition` (`dcps.idl` notes this operation as not yet
+/// implemented at the `DDS.DataReader` interface level — `DataReaderImpl`
+/// already supports it internally via `takeFiltered`'s `maybe_qc` parameter;
+/// this is simply the first public entry point to it). Requires the reader's
+/// TypeSupport to have a `get_field_from_cdr` callback registered — see
+/// `create_querycondition`'s own precondition (a non-empty query expression
+/// with no `get_field_fn` returns NIL, never gets this far).
+pub fn takeWithQueryConditionRaw(
+    reader: DDS.DataReader,
+    qc: DDS.QueryCondition,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const qc_impl: *const dcps_waitset.QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.takeFiltered(
+        &tmp,
+        qc_impl.rc.sample_state_mask,
+        qc_impl.rc.view_state_mask,
+        qc_impl.rc.instance_state_mask,
+        max,
+        null,
+        qc_impl,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
+}
+
+/// Batch take restricted to an arbitrary ReadCondition -- which may itself be
+/// a QueryCondition upcast via `as_ReadCondition()` (see
+/// `ReadConditionImpl.owner_qc`, which tells us so and carries the query
+/// filter to apply if it is). State masks come from the condition itself.
+/// The Zig-native raw path to what the OMG spec calls `take_w_condition`
+/// (`dcps.idl`'s `DataReader` interface comment names the full generated-
+/// operation set this belongs to). More general than `takeWithQueryConditionRaw`
+/// above (which requires a `DDS.QueryCondition`-typed parameter specifically);
+/// kept alongside it rather than replacing it, since that one still has a
+/// caller.
+pub fn takeWithReadConditionRaw(
+    reader: DDS.DataReader,
+    cond: DDS.ReadCondition,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.takeFiltered(
+        &tmp,
+        rc_impl.sample_state_mask,
+        rc_impl.view_state_mask,
+        rc_impl.instance_state_mask,
+        max,
+        null,
+        rc_impl.owner_qc,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
+}
+
+/// Non-destructive analog of `takeWithReadConditionRaw` -- the raw path to
+/// what the OMG spec calls `read_w_condition`.
+pub fn readWithReadConditionRaw(
+    reader: DDS.DataReader,
+    cond: DDS.ReadCondition,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.readRaw(
+        &tmp,
+        rc_impl.sample_state_mask,
+        rc_impl.view_state_mask,
+        rc_impl.instance_state_mask,
+        max,
+        null,
+        rc_impl.owner_qc,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
+}
+
+/// Batch take restricted to an arbitrary ReadCondition AND scoped to the
+/// "next instance" after `prev` -- the raw path to what the OMG spec calls
+/// `take_next_instance_w_condition`. See
+/// `DataReaderImpl.takeNextInstanceFiltered`'s doc comment for the
+/// instance-selection semantics (the target instance must itself have a
+/// matching sample, not just any sample).
+pub fn takeNextInstanceWithReadConditionRaw(
+    reader: DDS.DataReader,
+    cond: DDS.ReadCondition,
+    prev: DDS.InstanceHandle_t,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.takeNextInstanceFiltered(
+        &tmp,
+        prev,
+        rc_impl.sample_state_mask,
+        rc_impl.view_state_mask,
+        rc_impl.instance_state_mask,
+        max,
+        rc_impl.owner_qc,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
+}
+
+/// Non-destructive analog of `takeNextInstanceWithReadConditionRaw` -- the raw
+/// path to what the OMG spec calls `read_next_instance_w_condition`.
+pub fn readNextInstanceWithReadConditionRaw(
+    reader: DDS.DataReader,
+    cond: DDS.ReadCondition,
+    prev: DDS.InstanceHandle_t,
+    out: *std.ArrayListUnmanaged(OwnedRawSample),
+    max: i32,
+    caller_alloc: std.mem.Allocator,
+) !void {
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
+    var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
+    defer {
+        for (tmp.items) |s| impl.alloc.free(s.data);
+        tmp.deinit(impl.alloc);
+    }
+    try impl.readNextInstanceFiltered(
+        &tmp,
+        prev,
+        rc_impl.sample_state_mask,
+        rc_impl.view_state_mask,
+        rc_impl.instance_state_mask,
+        max,
+        rc_impl.owner_qc,
+    );
+    try out.ensureUnusedCapacity(caller_alloc, tmp.items.len);
+    for (tmp.items) |s| {
+        out.appendAssumeCapacity(.{ .data = s.data, .info = s.info, ._alloc = impl.alloc });
+    }
+    tmp.items.len = 0;
 }
 
 /// Batch read: non-destructively return samples matching the given masks.
@@ -495,4 +703,104 @@ test "TypeSupport.get_field wires cft_filter automatically: reader delivers only
     try testing.expectEqualSlices(u8, &matching, first.data);
 
     try testing.expect(takeRaw(dr) == null);
+}
+
+// Same GetField-registration shape as the CFT test above, but exercising
+// takeWithQueryConditionRaw on a plain (non-filtered) topic's QueryCondition
+// instead of a ContentFilteredTopic -- proves the reader-side
+// take_w_condition path applies the query independently of CFT.
+test "takeWithQueryConditionRaw: only samples matching the QueryCondition's expression are returned" {
+    const alloc = testing.allocator;
+
+    var delivery = try intraprocess.IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+
+    const t_w = try delivery.newTransport();
+    defer t_w.deinit();
+    const d_w = try delivery.newDiscovery();
+    defer d_w.deinit();
+    const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
+    defer factory_w.deinit();
+    const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = factory_w.toDDSFactory().delete_participant(dp_w);
+
+    const t_r = try delivery.newTransport();
+    defer t_r.deinit();
+    const d_r = try delivery.newDiscovery();
+    defer d_r.deinit();
+    const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
+    defer factory_r.deinit();
+    const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+    defer _ = factory_r.toDDSFactory().delete_participant(dp_r);
+
+    const GetField = struct {
+        // payload byte 0 = "x" (int); get_field's contract doesn't care
+        // about a real CDR parse, matching the CFT test's own convention.
+        fn get(_: *anyopaque, payload: []const u8, field: []const u8, _: []u8) ?filter_mod.FilterValue {
+            if (std.mem.eql(u8, field, "x")) {
+                if (payload.len > 0) return .{ .int = payload[0] };
+                return null;
+            }
+            return null;
+        }
+        fn keyHash(_: *anyopaque, _: []const u8) [16]u8 {
+            return std.mem.zeroes([16]u8);
+        }
+    };
+
+    const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
+    try testing.expect(dp_r_impl.registerTypeSupport("QueryCondT", .{
+        .ctx = undefined,
+        .compute_key_hash = GetField.keyHash,
+        .get_field = GetField.get,
+    }));
+
+    const topic_w = dp_w.create_topic("QueryCondT", "QueryCondT", .{}, null, 0);
+    const topic_r = dp_r.create_topic("QueryCondT", "QueryCondT", .{}, null, 0);
+
+    // KEEP_ALL on both sides -- every write below shares the same zero key
+    // (single instance), and the default KEEP_LAST depth=1 would otherwise
+    // evict an unread sample the moment the next one for the same instance
+    // arrives, before this test ever gets to take_w_condition.
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    const pub_ = dp_w.create_publisher(.{}, null, 0);
+    const dw = pub_.create_datawriter(topic_w, dw_qos, null, 0);
+    const sub_ = dp_r.create_subscriber(.{}, null, 0);
+    const topic_desc_r = topic_r.vtable.as_TopicDescription(topic_r.ptr);
+    const dr = sub_.create_datareader(topic_desc_r, dr_qos, null, 0);
+
+    const qc = dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "x = 5", null);
+    try testing.expect(qc.ptr != @import("dcps/nil.zig").NIL_PTR);
+    defer _ = dr.delete_readcondition(qc.vtable.as_ReadCondition(qc.ptr));
+
+    const zero_key = std.mem.zeroes([16]u8);
+    try writeRaw(dw, .alive, zero_key, &[_]u8{5}); // x=5 -- matches
+    try writeRaw(dw, .alive, zero_key, &[_]u8{6}); // x=6 -- doesn't match
+
+    // Plain takeRaw sees both -- the query only applies through the
+    // condition-restricted path, not automatically at delivery time (that's
+    // ContentFilteredTopic's job, a separate mechanism covered above).
+    var all = std.ArrayListUnmanaged(OwnedRawSample).empty;
+    defer {
+        for (all.items) |s| s.deinit();
+        all.deinit(alloc);
+    }
+    try takeFilteredRaw(dr, &all, -1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, null, alloc);
+    try testing.expectEqual(@as(usize, 2), all.items.len);
+
+    try writeRaw(dw, .alive, zero_key, &[_]u8{5});
+    try writeRaw(dw, .alive, zero_key, &[_]u8{6});
+
+    var filtered = std.ArrayListUnmanaged(OwnedRawSample).empty;
+    defer {
+        for (filtered.items) |s| s.deinit();
+        filtered.deinit(alloc);
+    }
+    try takeWithQueryConditionRaw(dr, qc, &filtered, -1, alloc);
+    try testing.expectEqual(@as(usize, 1), filtered.items.len);
+    try testing.expectEqualSlices(u8, &[_]u8{5}, filtered.items[0].data);
 }

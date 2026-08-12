@@ -19,20 +19,261 @@ wire issue).
 
 ---
 
-## Planned (after Phase 33)
+## WaitSet / condition example (2026-08-09/10) — all four bindings done
 
-**`WaitSet`/`GuardCondition` have no C-ABI constructor path.** No binding
-(C/C++/Java) can construct a `WaitSet` or `GuardCondition` today — an
-exhaustive grep finds no `zzdds_create_waitset`/`_create_guardcondition`-style
-export anywhere. This blocks live end-to-end verification of
-`WaitSet.wait()`/`get_conditions()` in any binding via the real C ABI (the
-underlying vtable methods themselves work correctly once a `WaitSet` exists,
-per zidl's own entity-sequence C-ABI fix in `v0.3.2-zig.0.16.0`). Likely a
-small, mechanical C-ABI-export addition mirroring the existing
-`create_readcondition`/`create_querycondition` pattern on `DataReader`.
-Deliberately deferred: better scoped as part of a new zzdds-examples example
-exercising WaitSets and all the condition types end-to-end, rather than
-fixed in isolation with no example to verify it against.
+A new `zzdds-examples` example (`zig/waitset`, `cpp/waitset`) exercising `WaitSet`
+and all four condition types (`GuardCondition`, `StatusCondition`,
+`ReadCondition`, `QueryCondition`) together on one `WaitSet`, per-binding.
+Found and fixed a cluster of real bugs, none reachable before because
+nothing could construct a `WaitSet` through any binding until now.
+
+**`WaitSet`/`GuardCondition` C-ABI + Zig-native construction — Done.**
+`zzdds_create_waitset()`/`_with_allocator()`, `zzdds_create_guardcondition()`/
+`_with_allocator()`, `zzdds_destroy_waitset()`/`_destroy_guardcondition()`,
+and `zzdds_waitset_is_nil()`/`_guardcondition_is_nil()` added to
+`src/c_abi/extensions.zig`/`zzdds_c.h`, mirroring `zzdds_create_factory()`'s
+existing hand-written-bootstrap pattern exactly (both interfaces have no
+factory operation in `dcps.idl` — per OMG spec, both are app-instantiated
+directly). `zzdds.createWaitSet(alloc)`/`createGuardCondition(alloc)` added
+to `src/raw_ops.zig` for pure-Zig callers, matching `registerTypeSupport`'s
+existing shape. New `nil_waitset`/`nil_guardcondition` sentinels added to
+`src/dcps/nil.zig` (previously didn't exist — nothing had ever needed a nil
+fallback for either type). C++: `zzdds::create_waitset()`/
+`create_guardcondition()` added to `zzdds_cpp.hpp` — thin `WaitSetSupport`/
+`GuardConditionSupport` subclasses over the generated
+`::DDS::WaitSetImpl`/`::DDS::GuardConditionImpl` adding the C-ABI teardown
+call their `= default` destructors don't make (same reasoning as
+`DomainParticipantFactorySupport`); no `--cpp-impl-override` needed since
+`zzdds.idl` doesn't extend either interface. Verified past "compiles" at
+every layer: `nm -D` confirms all new C-ABI symbols export; a standalone C
+program and a standalone C++ program each do a real construct → attach →
+trigger → `wait()` → detach → destroy cycle against the real built library.
+
+**Real, live bug: condition/entity lifecycle safety — Done.** Before this,
+`StatusConditionImpl`/`ReadConditionImpl`/`QueryConditionImpl` were freed
+unconditionally by their owning entity/reader's teardown with no regard for
+whether a `WaitSet` still had them attached, and `WaitSetImpl.deinit()`
+never unregistered itself from conditions it still held — either direction
+left a dangling pointer live in the other object. Never exercised before
+because nothing could construct a `WaitSet` through any binding. Fixed
+symmetrically in `src/dcps/waitset.zig`: a condition's own `deinit()` now
+calls `WakeupList.invalidateAll()` before freeing itself, so every attached
+`WaitSet` drops it from `conditions` instead of being left dangling;
+`WaitSetImpl.deinit()` now calls a new `unregisterFromCondition()` (shared
+with `vtDetach`) for every still-attached condition before freeing itself,
+so a condition that outlives its `WaitSet` doesn't keep a stale
+`WakeupHandle`/`DataNotifyFn` either. `ReadConditionImpl`/
+`QueryConditionImpl` also gained a `remove_condition_fn` callback so a
+reader's new `read_conditions` tracking list (added so `delete_datareader`
+can safely tear down any conditions the app never explicitly deleted) stays
+correct whether a condition is destroyed via `delete_readcondition()` or a
+direct `.deinit()` call on the handle — both are valid in this codebase.
+Found via getting a real crash, not by inspection, at every step: the first
+version of the condition-side fix alone immediately crashed the *existing*
+test suite (`WaitSetImpl.deinit()`'s own missing half of the fix, found by
+the crash, not predicted in advance). New `test/dcps/waitset_lifecycle_test.zig`
+covers both directions with real entities (not stub vtables) via
+`IntraProcessDelivery`, including a genuine concurrent-access stress test
+(background thread cycling `wait()` while the main thread repeatedly
+creates/attaches/deletes real writers). `zig build test`/`test-tsan` both
+green throughout.
+
+**Real, live bug: `QueryCondition` deleted via its spec-correct `ReadCondition`
+upcast corrupts memory — Done.** Found while adding
+`zzdds.takeWithQueryConditionRaw` (below): `delete_readcondition(qc.as_ReadCondition())`
+— the *only* spec-correct way to delete a `QueryCondition` through
+`DataReader.delete_readcondition`, whose parameter type is `ReadCondition` —
+dispatched through `ReadConditionImpl.deinit()` on `&qc.rc`, the `rc` field
+*embedded inside* the larger `QueryConditionImpl` allocation, calling
+`alloc.destroy(self)` on it as if it were its own separate heap allocation.
+Confirmed via a real `DebugAllocator` "allocation size does not match free
+size" crash. Fixed with a new `owner_qc: ?*QueryConditionImpl` back-pointer
+on `ReadConditionImpl`, set only for the embedded `rc`; its `deinit()` now
+checks this first and delegates to the real owner's `deinit()` instead of
+destroying itself.
+
+**Real, live bug: `WaitSetImpl.vtWait`'s two-pass count-then-fill loop races
+against a condition's trigger value changing between passes — Done.** Found
+via a real crash under real concurrent load (a `GuardCondition` set from a
+background "watchdog" thread while `wait()` ran on another thread — exactly
+the concurrency pattern this whole example was built partly to exercise):
+`index out of bounds` writing into a buffer sized from the first
+(*counting*) pass's result, once the second (*filling*) pass found MORE
+triggered conditions than the first pass counted, because a condition's
+trigger flipped in between. Fixed by collapsing the two passes into one,
+appending to a growable `std.ArrayListUnmanaged(DDS.Condition)` and calling
+`get_trigger_value()` exactly once per condition per `wait()` attempt — a
+single pass can't observe cross-pass inconsistency. Separately,
+`GuardConditionImpl.trigger` itself was a plain `bool` read/written with no
+synchronization at all from what's explicitly meant to be an
+arbitrary-application-thread-signaled field (`set_trigger_value`) — a
+genuine data race independent of the two-pass bug, fixed by making it a
+`std.atomic.Value(bool)` (acquire/release). Verified via a real crash
+reproduction (C++ example, before the fix) and clean re-runs after (Zig and
+C++ examples, both under plain builds and TSAN, 5+ consecutive runs each
+with no crash/race).
+
+**Real, live zidl bug (C++ backend): `WaitSet.attach_condition`/
+`detach_condition`'s generated `Condition`-parameter `dynamic_cast` cascade
+never included `ReadConditionImpl` — fixed in zidl.** See zidl's own
+roadmap "C and C++ backends" for the full writeup — `collectBaseImplementors`
+incorrectly reused `entity_base_ifaces` (a set scoped for a narrower,
+unrelated question) to decide which interfaces are valid cascade
+candidates, wrongly excluding `ReadCondition` even though `ReadConditionImpl`
+is a real, independently-constructible class returned as-is by
+`create_readcondition()` whenever the app doesn't ask for a
+`QueryCondition`. Confirmed via a real crash
+(`std::invalid_argument("zidl: incompatible entity implementation for
+DDS::Condition")`) attaching a plain `ReadCondition` to a `WaitSet`.
+
+**Real, live zidl bug (Zig backend): a `sequence<EntityInterface>`
+typedef's C-ABI `_free` function used the wrong element size — fixed in
+zidl.** See zidl's own roadmap "Zig backend" for the full writeup —
+`DDS_ConditionSeq_free` (and every other `sequence<EntityInterface>`
+typedef's generated free function) called the native `.deinit()`, which
+frees using the *native* 16-byte `{ptr,vtable}` fat-pointer element stride —
+correct for `ConditionSeq` values built directly in Zig, but every instance
+a C/C++/Java caller actually holds (e.g. `WaitSet.wait()`'s own out-param)
+was boxed to one 8-byte opaque pointer per element by the existing
+entity-sequence C-ABI adaptation before ever crossing the ABI. Confirmed via
+valgrind on a real crash (`munmap_chunk(): invalid pointer`, every single
+call, not a rare race) inside a real `WaitSetImpl::wait()` C++ call — the
+first real exercise of `wait()`'s C-ABI output path with actual attached
+conditions since the entity-sequence boxing fix (`v0.3.2-zig.0.16.0`) shipped.
+
+**Known, deliberately-not-fixed-yet gap: `WaitSet.wait()`/`get_conditions()`'s
+returned `Condition` objects don't recover their original concrete type in
+C++ (and, unverified, likely C/Java too), breaking identity comparison
+against the originally-attached concrete handle.** Found while building
+`cpp/waitset`: the generated C++ `WaitSetImpl::wait()`/`get_conditions()`
+always wrap each returned element via `::DDS::ConditionImpl::_getOrCreate`
+(the *base* interface's own default concrete class) — unlike entity
+*parameter* adaptation (`attach_condition`'s own cascade, just fixed above),
+there's no attempt to recover a more-derived candidate
+(`GuardConditionImpl`/`StatusConditionImpl`/`ReadConditionImpl`/
+`QueryConditionImpl`) on the *return* path. Since each condition-family
+interface's C-ABI handle is independently cached per-*view*
+(`GuardConditionImpl.gc_c_abi` vs `.cond_c_abi`, e.g. — see
+`src/util/c_abi_handle.zig` and each condition impl's own fields in
+`waitset.zig`), a `Condition` returned from `wait()` can never be
+`std::shared_ptr`-identity-equal to (or `dynamic_pointer_cast`-recoverable
+as) the concretely-typed shared_ptr the application originally attached,
+even though both refer to the same underlying condition. `cpp/waitset`
+works around this by branching on each held condition's own
+`get_trigger_value()` directly instead of matching `wait()`'s returned list
+— a legitimate, spec-compliant alternative, not a hack, but real
+applications following the more common "iterate `active_conditions`" idiom
+would hit this. A real fix needs either an output-path implementor cascade
+mirroring the existing input-path one (determining which concrete class a
+bare `DDS_Condition` handle was *really* boxed from isn't information the
+handle alone carries — would need a runtime "what interface is this"
+tag/query, or unifying per-view C-ABI handle caching so every view of the
+same object boxes to the same address) — a real design question, not a
+mechanical fix; out of scope for this round. Zig-native code is unaffected
+(`zig/waitset` compares native `{ptr,vtable}` values directly, no boxing
+involved) — this is a C-ABI-crossing-specific gap.
+
+**`c/waitset` — Done, confirms the prediction below.** Ported straight from
+`zig/waitset` once the C++ fixes above landed, using the same "check each
+condition's own `get_trigger_value()` directly" pattern as `cpp/waitset`
+(not confirmed C shares the identity gap that motivated it there, but
+consistent either way). Built and ran clean on the very first attempt — no
+new root-cause bugs, confirming the C-ABI/Zig-core fixes found via
+`cpp/waitset` were the shared bottleneck. Verified the same way as the Zig
+and C++ ports: 4+ consecutive clean runs, valgrind (0 errors, 0 leaks), and
+a manual `-fsanitize=thread` build (no races).
+
+**`java/waitset` — Done. `ZzddsRuntime.createWaitSet()`/`createGuardCondition()`/
+`destroyWaitSet()`/`destroyGuardCondition()` added to `java_runtime/ZzddsRuntime.java`/
+`zzdds_java_runtime.c`, mirroring `createFactory()`'s cached-jclass/jmethodID
+bootstrap pattern exactly** (`WaitSetImpl`/`GuardConditionImpl`'s generated
+Java classes already existed — nothing on the generated-entity side was
+missing, only the bootstrap). `destroyWaitSet`/`destroyGuardCondition` are
+new relative to the C/C++ pattern this mirrors: unlike `DomainParticipant`,
+entity interfaces have no `deinit()` exposed as a callable Java method at
+all, so — like the C/C++ layers needing `zzdds_destroy_waitset`/
+`_guardcondition` — Java needed its own explicit destroy path too, or a
+`WaitSet`/`GuardCondition` would have no way to be released from Java at
+all.
+
+**Real, live zidl bug (Java backend): `getFieldFromCdr` was a `return null;`
+stub for a keyless topic — fixed in zidl.** See zidl's own roadmap "Java
+backend" for the full writeup — the keyless-topic `--generate-zzdds-wrappers`
+branch (added when that flag was extended past keyed structs) never called
+the real field-extraction generator, only the keyed-struct branch did,
+silently breaking `QueryCondition`/`ContentFilteredTopic` filtering for
+every keyless topic in Java — confirmed live via `WaitsetSample` (keyless,
+matching `hello_world`'s own convention). The C and C++ backends don't share
+this gap; both call their own equivalent unconditionally. Confirmed fixed
+via a real, minimal, targeted check (not just golden-diff): serialized a
+real value to CDR bytes by hand and called the generated
+`getFieldFromCdr(payload, "priority")` directly before and after the fix.
+
+Built and ran clean on the first real run — no new root-cause bugs beyond
+the `getFieldFromCdr` one above, consistent with `c/waitset`'s own
+"confirms the prediction" note (the C-ABI/Zig-core fixes found via
+`cpp/waitset` were the shared bottleneck for the two lower-level bindings;
+Java's own remaining gap was backend-local and specific to it). 4 consecutive
+clean runs. TSAN not attempted for Java — JVM+TSAN is a known-hard
+combination in general (see this roadmap's existing TSan+Connext-flaky
+precedent); left for Phase 7 (CI) to scope explicitly rather than assumed
+here.
+
+**All four bindings (`zig/waitset`, `cpp/waitset`, `c/waitset`,
+`java/waitset`) done.** Five real bugs found and fixed across zzdds/zidl in
+total (condition/entity lifecycle safety, the `QueryCondition`-via-
+`ReadCondition`-upcast double-free, the `vtWait` two-pass race +
+`GuardConditionImpl.trigger` data race, the C++ `dynamic_cast` cascade gap,
+the `sequence<EntityInterface>` `_free` size mismatch, and the Java
+`getFieldFromCdr` keyless-topic stub — six, actually, by final count). One
+deeper design gap (condition identity doesn't round-trip through `wait()`'s
+C-ABI boxing in C++, and by extension probably C/Java) is documented, not
+silently worked around. Remaining planned work: a cross-binding smoke test
+(`interop/waitset_cross_binding_smoke_test.py`) and CI (TSAN for at least
+the Zig/C++ examples) — see zzdds-examples' own tracking for those, not
+duplicated here. The condition-identity gap itself, plus other
+inheritance/C-ABI-boxing tradeoffs noticed while chasing it, are recorded as
+a not-yet-started review item in zidl's own roadmap — see zidl's "Binding
+design review: interfaces vs. impls, inheritance, and C-ABI identity"
+section for the full writeup; not duplicated here.
+
+---
+
+**`take_w_condition` family + other typed reader/writer spec gaps closed
+(2026-08-10).** Follow-on from the WaitSet/condition example above: the race
+fix to `zig/waitset`'s subscriber (two independently-locked take calls
+racing incoming data) raised the question of why the other three bindings
+never had a real `take_w_condition` to hit the same race with in the first
+place. Answer, confirmed against the DDS 1.4 spec directly: the entire
+`read_w_condition`/`take_w_condition`/`read_next_instance_w_condition`/
+`take_next_instance_w_condition` family was missing from every binding's
+generated typed DataReader, plus several smaller gaps (batch
+`read_instance`/`take_instance` for C/C++/Java; `get_key_value`/
+`lookup_instance` and most of `register_instance`/`write_w_timestamp`/
+`dispose_w_timestamp`/`unregister_w_timestamp` missing from Java
+specifically; `register_instance_w_timestamp` missing everywhere). New zzdds
+core: `DataReaderImpl.takeNextInstanceFiltered`/`readNextInstanceFiltered`
+(`src/dcps/reader.zig`) — instance *selection* itself now respects the
+condition's masks/query per spec, not just "the next instance with any
+sample," extending `takeFiltered`/`readRaw`'s existing `maybe_qc` support
+rather than needing new filter-evaluation logic. New C-ABI:
+`zzdds_take_w_condition_raw`/`zzdds_read_w_condition_raw`,
+`zzdds_take_next_instance_w_condition_raw`/
+`zzdds_read_next_instance_w_condition_raw`,
+`zzdds_take_n_instance_raw`/`zzdds_read_n_instance_raw` (`src/c_abi/
+bootstrap.zig`) — all additive, no existing exported signature changed. Java
+also gained genuinely new JNI native methods (`java_runtime/ZzddsRuntime
+.java` + `zzdds_java_runtime.c`), not just codegen, since several of these
+had no underlying capability there at all before. Full writeup (the spec
+audit table, per-backend gap breakdown, and the explicit loan-variant
+exclusion) lives in zidl's own roadmap under "Typed DataReader/DataWriter
+spec completeness" — not duplicated here. All four `zzdds-examples/
+{zig,c,cpp,java}/waitset` subscribers now use the real generated
+`take_w_condition` uniformly; verified via `zig build test`/`test-tsan`,
+Valgrind on the new C-ABI tests, and the full 8-pair cross-binding smoke
+test.
+
+---
 
 **New C ABI export: `zzdds_cft_match_sample` (2026-08-06).** Found while
 porting every remaining "stretch" CLI flag from `zig/shape` to `c/shape`/

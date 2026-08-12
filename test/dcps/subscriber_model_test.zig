@@ -114,6 +114,7 @@ const Harness = struct {
             .timer_clock = self.clock.clock(),
             .last_received_ns = .init(self.clock.clock().nowNs()),
             .data_notifiers = .empty,
+            .read_conditions = .empty,
             .pending = .empty,
             .coherent_wip = .{},
             .coherent_committed = .empty,

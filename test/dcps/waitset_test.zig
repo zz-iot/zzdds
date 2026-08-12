@@ -81,12 +81,21 @@ var g_notify_fn: ?DataNotifyFn = null;
 fn readerHasData(_: *anyopaque) bool {
     return g_has_data;
 }
-fn readerAddNotify(_: *anyopaque, n: DataNotifyFn) void {
+fn readerAddNotify(_: *anyopaque, n: DataNotifyFn) bool {
     g_notify_fn = n;
+    return true;
 }
 fn readerRemoveNotify(_: *anyopaque, _: *anyopaque) void {
     g_notify_fn = null;
 }
+fn readerRemoveCondition(_: *anyopaque, _: *anyopaque) void {}
+// These tests never exercise "the reader is concurrently tearing down" --
+// the stub reader has no real quiesce state at all, so acquire always
+// succeeds and release is a no-op.
+fn readerQuiesceAcquire(_: *anyopaque) bool {
+    return true;
+}
+fn readerQuiesceRelease(_: *anyopaque) void {}
 
 // DataReader vtable stubs — never called during these tests.
 fn drNoop1(_: *anyopaque) DDS.ReturnCode_t {
@@ -210,6 +219,9 @@ fn makeRC(a: std.mem.Allocator) !*ReadConditionImpl {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
 }
 
@@ -262,10 +274,26 @@ test "WakeupList: register returns false when all slots are full" {
     const cond = gc.toCondition();
     for (waitsets[0..4]) |ws| _ = ws.toDDSWaitSet().attach_condition(cond);
 
-    // 5th attach: all slots full — register returns false, attach still succeeds
-    // (condition is recorded but push notification is silently dropped).
-    const rc5 = waitsets[4].toDDSWaitSet().attach_condition(cond);
-    try testing.expectEqual(DDS.RETCODE_OK, rc5);
+    // 5th attach: all slots full — register() returns false, and
+    // attach_condition() must report that honestly (RETCODE_OUT_OF_RESOURCES)
+    // rather than recording a condition it could never be woken by or safely
+    // invalidated from. Previously this silently returned RETCODE_OK instead
+    // — see vtAttach's own comment on why that was a real dangling-pointer
+    // risk (this WaitSet's `conditions` list would hold an entry the
+    // condition's own teardown could never reach to remove).
+    const dws5 = waitsets[4].toDDSWaitSet();
+    const rc5 = dws5.attach_condition(cond);
+    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc5);
+
+    // The failed attach must roll back cleanly: get_conditions() should
+    // report nothing attached, not a half-registered entry.
+    var active: DDS.ConditionSeq = .{};
+    defer if (active._release) {
+        if (active._buffer) |b| a.free(b[0..active._maximum]);
+    };
+    const grc = dws5.get_conditions(&active);
+    try testing.expectEqual(DDS.RETCODE_OK, grc);
+    try testing.expectEqual(@as(usize, 0), active._length);
 }
 
 // ── WaitSet: infinite-timeout wait (condvar.wait path) ───────────────────────
@@ -497,6 +525,9 @@ test "ReadConditionImpl: vtable accessors return constructed values" {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer rc.deinit();
 
@@ -596,6 +627,9 @@ test "QueryConditionImpl: empty expression init and deinit" {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     qc.deinit();
 }
@@ -616,6 +650,9 @@ test "QueryConditionImpl: vtable accessors return constructed values" {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -648,6 +685,9 @@ test "QueryConditionImpl: get_trigger_value reflects has_data_fn" {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -679,6 +719,9 @@ test "QueryConditionImpl: get_query_parameters and set_query_parameters" {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -735,6 +778,9 @@ test "QueryConditionImpl: toCondition delegates to embedded ReadConditionImpl" {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -759,6 +805,9 @@ test "QueryConditionImpl: deinit via DDS.QueryCondition vtable" {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     qc.toDDSQueryCondition().deinit(); // exercises vtDeinit
 }
@@ -779,6 +828,9 @@ test "QueryConditionImpl: matchSample with simple field expression" {
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -870,6 +922,9 @@ test "QueryConditionImpl: get_query_parameters frees prior _release buffer on se
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
     const dds_qc = qc.toDDSQueryCondition();
@@ -911,6 +966,9 @@ test "QueryConditionImpl: set_query_parameters OOM at first alloc preserves old 
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
     const dds_qc = qc.toDDSQueryCondition();
@@ -951,6 +1009,9 @@ test "QueryConditionImpl: set_query_parameters OOM mid-loop preserves old params
         &g_reader_sentinel,
         readerAddNotify,
         readerRemoveNotify,
+        readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
     const dds_qc = qc.toDDSQueryCondition();

@@ -65,6 +65,38 @@ pub const EntityQuiesce = struct {
         }
     }
 
+    /// Weaker than `acquire()`: succeeds as long as the entity hasn't been
+    /// *fully* torn down yet (refcount != 0), even if teardown has already
+    /// *started* (the tearing-down bit is set) -- unlike `acquire()`, which
+    /// refuses the instant teardown starts, regardless of whether the
+    /// entity is still transiently alive waiting on some other outstanding
+    /// reference to release. Racing this against a concurrent `release()`
+    /// that's dropping the last reference is safe for the same reason
+    /// `acquire()`'s own CAS loop is: the two atomic RMWs on `state` are
+    /// mutually exclusive, so either this call's CAS lands first (count
+    /// goes N -> N+1, the later `release()` then only takes it back to N,
+    /// `on_last` never fires) or `release()`'s `fetchSub` lands first (count
+    /// hits 0, `on_last` fires synchronously on *that* thread), in which
+    /// case this call's next loop iteration re-reads the now-zero count and
+    /// correctly fails -- there is no window where both observe a state
+    /// that lets them each believe they safely "own" the entity.
+    ///
+    /// Use this only for an operation that's *always* safe to perform on a
+    /// live-but-tearing-down entity (e.g. removing yourself from a list it
+    /// still owns, itself guarded by a mutex independent of this refcount)
+    /// -- never for anything that assumes the entity is in a fully
+    /// initialized, steady-state condition (that's what `acquire()` is
+    /// for). Getting this wrong reintroduces exactly the class of bug this
+    /// type exists to prevent elsewhere -- don't add a new caller without
+    /// confirming the operation it guards is genuinely that narrow.
+    pub fn acquireIfAlive(self: *EntityQuiesce) bool {
+        while (true) {
+            const cur = self.state.load(.acquire);
+            if (cur & count_mask == 0) return false;
+            if (self.state.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return true;
+        }
+    }
+
     /// Pairs with a successful `acquire()`. Runs `on_last(ctx)` iff this was
     /// the last outstanding reference — synchronously, on whichever
     /// caller's release happens to be last (normally `beginTeardown()`'s
@@ -146,4 +178,68 @@ test "EntityQuiesce: acquire fails after a plain teardown with nothing in flight
     q.beginTeardown(&q, Static.onLast);
     try testing.expectEqual(@as(u32, 1), calls);
     try testing.expect(!q.acquire());
+}
+
+test "EntityQuiesce: acquireIfAlive succeeds after teardown starts, as long as another reference is still outstanding" {
+    // Regression for a real race Greptile flagged on zzdds PR #60: WaitSet's
+    // condition-invalidation callback used plain acquire() here, which
+    // (correctly, by design) refuses the instant teardown starts -- but
+    // that meant a *second* condition tearing down concurrently, after the
+    // WaitSet's own deinit() had already set the tearing-down bit but
+    // *before* refcount reached zero (a first, still-in-flight condition
+    // holding the last reference), could never successfully invalidate
+    // itself out of the WaitSet's tracking list, leaving a dangling entry
+    // for reallyDeinit() to dereference later.
+    var q = EntityQuiesce{};
+    var calls: u32 = 0;
+    const Static = struct {
+        var counter: *u32 = undefined;
+        fn onLast(_: *anyopaque) void {
+            counter.* += 1;
+        }
+    };
+    Static.counter = &calls;
+
+    // Simulate the first, already-in-flight reference (e.g. condition A's
+    // own drain() having already acquired).
+    try testing.expect(q.acquire());
+    // The entity's own deinit() begins teardown concurrently -- not the
+    // last ref (A's callback still holds its own), so on_last doesn't fire.
+    q.beginTeardown(&q, Static.onLast);
+    try testing.expectEqual(@as(u32, 0), calls);
+
+    // A late-arriving acquire() (condition B's own drain()) correctly fails
+    // -- this is the existing, unchanged, stricter behavior.
+    try testing.expect(!q.acquire());
+    // But acquireIfAlive() succeeds: the entity is still alive (A's
+    // reference proves it), even though teardown has started.
+    try testing.expect(q.acquireIfAlive());
+    try testing.expectEqual(@as(u32, 0), calls);
+
+    // Both in-flight references release -- the second (acquireIfAlive's)
+    // isn't last, the first (A's) is.
+    q.release(&q, Static.onLast);
+    try testing.expectEqual(@as(u32, 0), calls);
+    q.release(&q, Static.onLast);
+    try testing.expectEqual(@as(u32, 1), calls);
+}
+
+test "EntityQuiesce: acquireIfAlive fails once the entity is fully torn down" {
+    var q = EntityQuiesce{};
+    var calls: u32 = 0;
+    const Static = struct {
+        var counter: *u32 = undefined;
+        fn onLast(_: *anyopaque) void {
+            counter.* += 1;
+        }
+    };
+    Static.counter = &calls;
+    // Nothing in flight -- beginTeardown() drops the only reference itself,
+    // running on_last synchronously right here.
+    q.beginTeardown(&q, Static.onLast);
+    try testing.expectEqual(@as(u32, 1), calls);
+    // The entity is genuinely gone now (in a real caller, `q` itself would
+    // have been freed by on_last) -- acquireIfAlive() must refuse just like
+    // acquire() does, not just "as long as teardown hasn't started."
+    try testing.expect(!q.acquireIfAlive());
 }
