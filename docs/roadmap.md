@@ -228,10 +228,13 @@ the `sequence<EntityInterface>` `_free` size mismatch, and the Java
 `getFieldFromCdr` keyless-topic stub — six, actually, by final count). One
 deeper design gap (condition identity doesn't round-trip through `wait()`'s
 C-ABI boxing in C++, and by extension probably C/Java) is documented, not
-silently worked around. Remaining planned work: a cross-binding smoke test
-(`interop/waitset_cross_binding_smoke_test.py`) and CI (TSAN for at least
-the Zig/C++ examples) — see zzdds-examples' own tracking for those, not
-duplicated here. The condition-identity gap itself, plus other
+silently worked around. The cross-binding smoke test
+(`interop/waitset_cross_binding_smoke_test.py`) and CI TSAN coverage
+(`examples-tsan` job in `zzdds/.github/workflows/ci.yml`, covering
+`zig/waitset` and `cpp/waitset` since this landed, `c/waitset` added
+2026-08-12) are both done — not planned work anymore. `java/waitset` is
+deliberately left out of TSAN CI (JVM+TSAN is a known-hard combination, see
+that job's own comment). The condition-identity gap itself, plus other
 inheritance/C-ABI-boxing tradeoffs noticed while chasing it, are recorded as
 a not-yet-started review item in zidl's own roadmap — see zidl's "Binding
 design review: interfaces vs. impls, inheritance, and C-ABI identity"
@@ -402,18 +405,16 @@ verification skipped the encap-header step and both truncated and segfaulted on
 `ZidlCdrReader`'s implicit `pos` starting at 4 — a bug in the throwaway test, not in the
 fix; recorded here so it isn't mistaken for a real regression if rediscovered.)
 
-**Not active yet**: `--c-no-free` only exists in an unreleased local zidl checkout;
-`zzdds`'s own `build.zig.zon` still pins the tagged `v0.3.1-zig.0.16.0` release, which
-predates it. The `build.zig` change above is real and correct but **dormant** — `zig build
--Dc-binding=true` against the current pin builds exactly as it did before this fix, since
-the new second generation pass simply can't run (`--c-no-free` is an unknown flag to the
-pinned zidl). Needs a new zidl release tagged and the pin bumped before this actually
-takes effect; don't assume it's live without checking which zidl the pin currently
-resolves to.
+**Active as of `v0.3.4-zig.0.16.0`** (the pin `zzdds`'s `build.zig.zon` currently resolves
+to, bumped past `v0.3.1-zig.0.16.0` in PR #59/#60) — `--c-no-free` is understood by the
+pinned zidl and this fix takes effect on a normal `zig build -Dc-binding=true`; no local
+checkout needed. Recorded here at the time as "not active yet" against the then-current
+`v0.3.1-zig.0.16.0` pin; left unresolved this long only because nothing revisited it after
+the pin moved.
 
 **C++ ABI: `create_datawriter`/`create_topic` couldn't return zzdds's own extended entity
-classes — fixed in `build.zig` + `zzdds_cpp.hpp`, blocked on a zidl release before it
-actually takes effect.** Also found via the `hello_world` C++ port: the natural C++ idiom
+classes — fixed in `build.zig` + `zzdds_cpp.hpp`, active as of `v0.3.4-zig.0.16.0`.** Also
+found via the `hello_world` C++ port: the natural C++ idiom
 for reaching `set_listener_ex`/`as_topic_description`
 (`static_pointer_cast<zzdds::DataWriterImpl>(dw)`) was undefined behavior, because
 `PublisherImpl::create_datawriter` (zzdds's own generated `dcps_impl.cpp`) always
@@ -457,29 +458,23 @@ zzdds-examples now uses the natural C++ OO path with zero raw-C-ABI workarounds 
 full 6-pair cross-binding matrix (C++↔Zig, C++↔C, C++↔Java, both directions each) passes
 on real UDP discovery, distinct domains per run.
 
-**Not active yet** — same caveat as the C ABI fix above: `--cpp-impl-override`/
-`--cpp-impl-include` only exist in an unreleased local zidl checkout; `zzdds`'s own
-`build.zig.zon` still pins the tagged `v0.3.1-zig.0.16.0` release, which predates them.
-The `build.zig`/`zzdds_cpp.hpp` changes above are real and correct but **dormant** — `zig
-build` against the current pin builds exactly as it did before this fix, since
-`gen_dcps_cpp_impl` simply can't pass unknown flags to the pinned zidl. Needs a new zidl
-release tagged and the pin bumped before this actually takes effect; don't assume it's
-live without checking which zidl the pin currently resolves to.
+**Active as of `v0.3.4-zig.0.16.0`** — same as the C ABI fix above: `--cpp-impl-override`/
+`--cpp-impl-include` are understood by the pinned zidl and this fix takes effect on a
+normal `zig build`; no local checkout needed. Recorded here at the time as "not active
+yet" against the then-current `v0.3.1-zig.0.16.0` pin.
 
 **C ABI naming: `zzdds_register_type_support_c`/`_ctx_c` renamed to
-`zzdds_register_type_support`/`_ctx`, blocked on a zidl release before it actually takes
-effect.** Found by inspection while reviewing the `hello_world` examples for rough edges
-(2026-08-05): these were the *only* two functions in all of `zzdds_c.h` with a `_c`
+`zzdds_register_type_support`/`_ctx`, active as of `v0.3.4-zig.0.16.0`.** Found by
+inspection while reviewing the `hello_world` examples for rough edges (2026-08-05): these
+were the *only* two functions in all of `zzdds_c.h` with a `_c`
 suffix — every other function (`zzdds_create_factory`, `zzdds_write_raw`, ...) has none,
 despite being equally C-ABI. Not a meaningful marker, just an inconsistency; the suffix
 also leaked into generated code, since zidl's C and C++ backends both hardcode a call to
 `zzdds_register_type_support_c` by that exact name inside generated
 `<Type>TypeSupport::register_type` / `<Type>_register_type` (`c.zig`/`cpp.zig`). Renamed
 in `src/c_abi/typesupport.zig`, `zzdds_c.h`, and the two zidl backend call sites, plus
-every doc/comment/test referencing the old names. **Same "dormant" caveat as the two ABI
-fixes above**: the pinned `v0.3.1-zig.0.16.0` zidl release still emits the old
-`zzdds_register_type_support_c` call in generated code, so this only takes effect once a
-new zidl release is tagged and the pin is bumped — verified against a local zidl
+every doc/comment/test referencing the old names. Pin has since moved to
+`v0.3.4-zig.0.16.0`, which emits the renamed call — verified against a local zidl
 checkout in the meantime (`zzdds`'s own `zig build test`/`test-bindings`, plus all three
 of `c/hello_world`, `cpp/hello_world`, and `java/hello_world` in zzdds-examples, built and
 run standalone).
@@ -494,7 +489,7 @@ the flag-based mechanism above is intentionally being built to be pluggable-into
 (a plugin could emit the same flags programmatically), not superseded by it.
 
 **Zig-native TypeSupport registration ergonomics + a real, live string-cleanup leak fix,
-blocked on a zidl release before either takes effect.** Found while reviewing the
+active as of `v0.3.4-zig.0.16.0`.** Found while reviewing the
 `hello_world` examples for rough edges (2026-08-06): pure-Zig callers had to downcast
 `participant.ptr` to `*DomainParticipantImpl` themselves to call `registerTypeSupport` —
 every other binding (C/C++/Java) goes through zzdds's own C-ABI shim
@@ -527,10 +522,10 @@ build test`/`test-bindings` (Java smoke test, `cpp_allocator_smoke`) green with 
 regressions; a standalone test confirmed `computeKeyHashFromCdr` on a real keyed struct
 with a variable-length key field no longer leaks.
 
-**Not active yet** — same caveat as the other zidl-flag-dependent fixes above:
-`computeKeyHashFromCdr` and the widened cleanup only exist in an unreleased local zidl
-checkout. `registerTypeSupport` (the `raw_ops.zig` addition) has *no* zidl dependency and
-is live today regardless of the pin.
+**Active as of `v0.3.4-zig.0.16.0`** — same as the other zidl-flag-dependent fixes above:
+`computeKeyHashFromCdr` and the widened cleanup are in the pinned zidl release.
+`registerTypeSupport` (the `raw_ops.zig` addition) has *no* zidl dependency and was live
+regardless of the pin from the start.
 
 **Zig-native `setListenerEx` ergonomics — same gap, same fix shape as `registerTypeSupport`
 above, no zidl dependency.** Found continuing the same `hello_world` review (2026-08-06):
@@ -670,19 +665,20 @@ real-time vs. a normal server process) can pick what fits. Not scoped further th
 deciding the shape of that choice is the point of picking this up, not something to
 pre-decide here.
 
-**Separately found while verifying this, unrelated to the above, and already broken
-today — not just dormant**: `zig build install -Dc-binding=true` (and therefore
-`-Dcpp-binding=true`/`-Djava-binding=true`, which imply it) currently **fails outright**
-against the pinned `v0.3.1-zig.0.16.0` zidl release — `build.zig`'s `--c-no-free` pass
-(the Issue 1 fix, see above) unconditionally passes that flag to whichever zidl the pin
-resolves to, and the pinned one doesn't understand it (`error: unknown option:
---c-no-free`). This contradicts this roadmap's own earlier claim that Issue 1 was
-"dormant" against the pin ("`zig build -Dc-binding=true` ... builds exactly as it did
-before this fix") — that claim was never actually verified by running the command against
-a reverted pin, only reasoned about. Confirmed by actually running it. Whoever bumps the
-pin next should budget for this: `-D{c,cpp,java}-binding=true` needs a real zidl release
-containing `--c-no-free`/`--cpp-impl-override` before it builds at all, not just before
-those specific fixes take effect.
+**Resolved by the `v0.3.4-zig.0.16.0` pin bump (PR #59/#60).** At the time this was found,
+`zig build install -Dc-binding=true` (and therefore `-Dcpp-binding=true`/
+`-Djava-binding=true`, which imply it) failed outright against the then-pinned
+`v0.3.1-zig.0.16.0` zidl release — `build.zig`'s `--c-no-free` pass (the Issue 1 fix, see
+above) unconditionally passes that flag to whichever zidl the pin resolves to, and
+`v0.3.1` didn't understand it (`error: unknown option: --c-no-free`). This contradicted
+this roadmap's own earlier claim that Issue 1 was "dormant" against the pin — that claim
+was never actually verified by running the command against a reverted pin, only reasoned
+about; confirmed broken by actually running it. Left as a warning for whoever bumped the
+pin next, budgeting for the fact that `-D{c,cpp,java}-binding=true` needed a real zidl
+release containing `--c-no-free`/`--cpp-impl-override` before it would build at all, not
+just before those specific fixes took effect. The pin has since moved to
+`v0.3.4-zig.0.16.0`, which contains both flags — `-D{c,cpp,java}-binding=true` builds
+clean today.
 
 **C-ABI TypeSupport** — complete. `zzdds_register_type_support` in
 `src/c_abi/typesupport.zig` bridges a C function pointer to the Zig `TypeSupport`
