@@ -517,9 +517,24 @@ pub const WaitSetImpl = struct {
 
     /// `WakeupHandle.acquire`/`.release` implementations — see WakeupHandle's
     /// own doc comment for the safety argument these depend on.
+    ///
+    /// Uses acquireIfAlive(), not acquire(): the operation this guards
+    /// (vtInvalidateHandle, a single self.mu-guarded removal from
+    /// self.conditions) is always safe to run on a live-but-tearing-down
+    /// WaitSet. A plain acquire() would refuse the instant this WaitSet's
+    /// own deinit() sets the tearing-down bit, even though `self` can
+    /// still be alive for a while yet (waiting on some other condition's
+    /// own already-in-flight drain(), racing this exact same handle) --
+    /// leaving THIS condition's handle silently dropped without ever
+    /// calling vtInvalidateHandle, so it frees itself while still dangling
+    /// in self.conditions. reallyDeinit()'s bulk loop later dereferences
+    /// that freed entry once the other condition's reference finally
+    /// releases and reallyDeinit() actually runs. Confirmed as a real,
+    /// reproducible race requiring two conditions on the same WaitSet, not
+    /// just in theory -- see the regression test for it.
     fn quiesceAcquire(ctx: *anyopaque) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.quiesce.acquire();
+        return self.quiesce.acquireIfAlive();
     }
     fn quiesceRelease(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -649,6 +664,17 @@ pub const ReadConditionImpl = struct {
     /// codebase (see e.g. WaitSet/GuardCondition, which have no "delete" op
     /// at all), so this must not assume the former.
     remove_condition_fn: *const fn (reader_ctx: *anyopaque, cond_ptr: *anyopaque) void,
+    /// Called by the public deinit() (not by reallyDeinit()'s own bulk
+    /// loop -- see deinitAssumeReaderQuiescing) to hold the owning reader's
+    /// quiesce reference across the whole teardown below. Without this, a
+    /// direct `.deinit()` call on this condition's handle (a documented-
+    /// valid way to destroy it, same as delete_readcondition()) could race
+    /// the reader's own concurrent teardown: freeing this condition while
+    /// the reader's reallyDeinit() bulk loop -- from its own already-taken
+    /// read_conditions snapshot -- independently frees the same object.
+    reader_quiesce_acquire: *const fn (reader_ctx: *anyopaque) bool,
+    /// Pairs with a successful reader_quiesce_acquire above.
+    reader_quiesce_release: *const fn (reader_ctx: *anyopaque) void,
     /// Tracks which WaitSets have this condition attached, purely so deinit()
     /// can detach from all of them before freeing itself. NOT used for actual
     /// wakeups — those still go through add_notify_fn/remove_notify_fn on the
@@ -684,6 +710,8 @@ pub const ReadConditionImpl = struct {
         add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) bool,
         remove_notify_fn: *const fn (reader_ctx: *anyopaque, waitset_ctx: *anyopaque) void,
         remove_condition_fn: *const fn (reader_ctx: *anyopaque, cond_ptr: *anyopaque) void,
+        reader_quiesce_acquire: *const fn (reader_ctx: *anyopaque) bool,
+        reader_quiesce_release: *const fn (reader_ctx: *anyopaque) void,
     ) !*Self {
         const self = try alloc.create(Self);
         self.* = .{
@@ -697,6 +725,8 @@ pub const ReadConditionImpl = struct {
             .add_notify_fn = add_notify_fn,
             .remove_notify_fn = remove_notify_fn,
             .remove_condition_fn = remove_condition_fn,
+            .reader_quiesce_acquire = reader_quiesce_acquire,
+            .reader_quiesce_release = reader_quiesce_release,
         };
         return self;
     }
@@ -726,18 +756,47 @@ pub const ReadConditionImpl = struct {
         }
     }
 
+    /// Public entry point: reachable via delete_readcondition() or a direct
+    /// `.deinit()` call on the handle (both valid -- see remove_condition_fn's
+    /// doc comment). Holds the owning reader's quiesce reference across the
+    /// whole teardown so it can never race the reader's own reallyDeinit();
+    /// backs off entirely (touching nothing) if the reader is already tearing
+    /// down, trusting its bulk loop (see deinitAssumeReaderQuiescing) to free
+    /// this condition instead.
     pub fn deinit(self: *Self) void {
         // See owner_qc's doc comment: reached via a QueryCondition's
         // as_ReadCondition() upcast view, `self` is really `&qc.rc`, embedded
         // inside a larger QueryConditionImpl allocation — destroying it here
         // directly would corrupt memory. Delegate to the real owner's own
-        // deinit(), which handles this same struct's cleanup (via
-        // detachFromAllWaitSets()/remove_condition_fn(), never by calling
-        // back into this function) plus the rest of the QueryConditionImpl.
+        // deinit(), which holds its *own* reader-quiesce guard around this
+        // same struct's cleanup (via detachFromAllWaitSets()/
+        // remove_condition_fn(), never by calling back into this function)
+        // plus the rest of the QueryConditionImpl.
         if (self.owner_qc) |qc| {
             qc.deinit();
             return;
         }
+        if (!self.reader_quiesce_acquire(self.reader_ctx)) return;
+        // Captured into locals *before* the call below, which frees `self`
+        // as its last step -- `defer self.reader_quiesce_release(...)` would
+        // read those two fields back out of `self` after it's already gone.
+        const reader_ctx = self.reader_ctx;
+        const release_fn = self.reader_quiesce_release;
+        defer release_fn(reader_ctx);
+        self.deinitAssumeReaderQuiescing();
+    }
+
+    /// Actual teardown. Called by deinit() above once it's established (via
+    /// a fresh acquire) that it's safe to touch the owning reader, *or*
+    /// directly by the reader's own reallyDeinit() bulk loop, which runs
+    /// synchronously as part of the reader's own teardown -- self is
+    /// provably still valid there without a fresh acquire (which would
+    /// always fail anyway: the reader is by definition already tearing down
+    /// at that point), so it calls this directly instead of deinit().
+    /// NOT reachable through owner_qc delegation -- reallyDeinit()'s bulk
+    /// loop dispatches each tracked condition to the right one of this or
+    /// QueryConditionImpl.deinitAssumeReaderQuiescing() itself (see reader.zig).
+    pub fn deinitAssumeReaderQuiescing(self: *Self) void {
         self.detachFromAllWaitSets();
         self.remove_condition_fn(self.reader_ctx, self);
         self.rc_c_abi.free(self.alloc);
@@ -962,6 +1021,8 @@ pub const QueryConditionImpl = struct {
         add_notify_fn: *const fn (reader_ctx: *anyopaque, n: DataNotifyFn) bool,
         remove_notify_fn: *const fn (reader_ctx: *anyopaque, waitset_ctx: *anyopaque) void,
         remove_condition_fn: *const fn (reader_ctx: *anyopaque, cond_ptr: *anyopaque) void,
+        reader_quiesce_acquire: *const fn (reader_ctx: *anyopaque) bool,
+        reader_quiesce_release: *const fn (reader_ctx: *anyopaque) void,
     ) !*Self {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
@@ -997,6 +1058,8 @@ pub const QueryConditionImpl = struct {
                 .add_notify_fn = add_notify_fn,
                 .remove_notify_fn = remove_notify_fn,
                 .remove_condition_fn = remove_condition_fn,
+                .reader_quiesce_acquire = reader_quiesce_acquire,
+                .reader_quiesce_release = reader_quiesce_release,
             },
             .query_expression = expr_copy,
             .query_parameters = params,
@@ -1008,11 +1071,28 @@ pub const QueryConditionImpl = struct {
         return self;
     }
 
+    /// Public entry point -- see ReadConditionImpl.deinit()'s doc comment
+    /// for why this holds the owning reader's quiesce reference across the
+    /// whole teardown.
     pub fn deinit(self: *Self) void {
+        if (!self.rc.reader_quiesce_acquire(self.rc.reader_ctx)) return;
+        // Captured into locals *before* the call below, which frees `self`
+        // (and its embedded `rc`) as its last step -- see
+        // ReadConditionImpl.deinit()'s identical comment.
+        const reader_ctx = self.rc.reader_ctx;
+        const release_fn = self.rc.reader_quiesce_release;
+        defer release_fn(reader_ctx);
+        self.deinitAssumeReaderQuiescing();
+    }
+
+    /// Actual teardown -- see ReadConditionImpl.deinitAssumeReaderQuiescing's
+    /// doc comment for who calls this directly (without a fresh acquire) and
+    /// why that's safe.
+    pub fn deinitAssumeReaderQuiescing(self: *Self) void {
         // self.rc is embedded by value, not a separately-owned ReadConditionImpl,
-        // so ReadConditionImpl.deinit() (which would also alloc.destroy(&self.rc))
-        // can't be called here — detach from attached WaitSets and free its
-        // cache fields directly instead.
+        // so ReadConditionImpl.deinitAssumeReaderQuiescing() (which would also
+        // alloc.destroy(&self.rc)) can't be called here — detach from attached
+        // WaitSets and free its cache fields directly instead.
         self.rc.detachFromAllWaitSets();
         self.rc.remove_condition_fn(self.rc.reader_ctx, &self.rc);
         if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
@@ -1173,3 +1253,78 @@ pub const QueryConditionImpl = struct {
         return @ptrCast(@alignCast(ctx));
     }
 };
+
+const testing = std.testing;
+
+test "WaitSet: a second condition's drain() still succeeds and invalidates itself while a WaitSet teardown it raced against is still deferred" {
+    // Regression for a real race Greptile flagged on zzdds PR #60:
+    // WaitSetImpl.reallyDeinit()'s bulk loop assumes every remaining
+    // WaitSetImpl.conditions entry is still live (see its own doc comment).
+    // That invariant depended on vtInvalidateHandle always eventually being
+    // called for every attached condition's own teardown -- but
+    // quiesceAcquire used to be backed by plain EntityQuiesce.acquire(),
+    // which (correctly, for ITS purpose) refuses the instant this WaitSet's
+    // own deinit() sets the tearing-down bit, even while `self` is
+    // demonstrably still alive because some OTHER condition's own drain()
+    // is still in flight, holding the last reference. A second condition's
+    // drain() racing in during that window used to be silently dropped
+    // (never invalidated), then still tore itself down anyway -- leaving a
+    // dangling WaitSetImpl.conditions entry for reallyDeinit()'s eventual,
+    // deferred bulk loop to dereference. Needs two attached conditions:
+    // this can't happen with only one.
+    const alloc = testing.allocator;
+    const ws = try WaitSetImpl.init(alloc);
+    const gc_a = try GuardConditionImpl.init(alloc);
+    const gc_b = try GuardConditionImpl.init(alloc);
+
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(gc_a.toCondition()));
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(gc_b.toCondition()));
+    try testing.expectEqual(@as(usize, 2), ws.conditions.items.len);
+
+    // Simulate the first step of condition A's own teardown (e.g.
+    // GuardConditionImpl.deinit() -> wakeups.invalidateAll() ->
+    // wakeups.drain()) having already run and grabbed its WakeupHandle for
+    // `ws`, but not yet gone on to call invalidate()/release() on it -- as
+    // if still "in flight" on another thread when `ws`'s own deinit() races
+    // in below. Doing this via the real wakeups.drain() (not a hand-rolled
+    // substitute) means A's own bookkeeping stays fully consistent with
+    // what's actually captured. drain() itself already performs the
+    // acquire() internally -- only a handle whose acquire() succeeded is
+    // ever included in its returned slots (see its own doc comment) -- so
+    // `h` below is already-acquired; no separate acquire() call needed (or
+    // wanted: that would be a second, unbalanced reference never released).
+    const a_slots = gc_a.wakeups.drain();
+    var a_handle: ?WakeupHandle = null;
+    for (a_slots) |s| {
+        if (s) |h| a_handle = h;
+    }
+    const h = a_handle orelse return error.TestExpectedNonNull;
+
+    // `ws`'s own deinit(): sets the tearing-down bit and drops its own
+    // initial reference -- A's held reference (above) keeps the count above
+    // zero, so reallyDeinit() is deferred.
+    ws.deinit();
+
+    // Condition B's real, complete teardown, running *after* the
+    // tearing-down bit was set. With the fix, its own drain()'s
+    // quiesceAcquire call (backed by EntityQuiesce.acquireIfAlive) still
+    // succeeds -- `ws` is demonstrably still alive, A's held reference
+    // proves it -- so vtInvalidateHandle correctly removes it from
+    // ws.conditions before it frees itself.
+    gc_b.deinit();
+    try testing.expectEqual(@as(usize, 1), ws.conditions.items.len);
+    try testing.expectEqual(gc_a.toCondition().ptr, ws.conditions.items[0].ptr);
+
+    // Finish simulating A's own drain()/invalidateAll(): invalidate then
+    // release, exactly like invalidateAll()'s own loop body. This is the
+    // last outstanding reference, so it triggers reallyDeinit() now --
+    // its bulk loop must find ws.conditions already empty (nothing left to
+    // dereference).
+    h.invalidate(h.ctx, gc_a);
+    h.release(h.ctx);
+
+    // gc_a's own remaining teardown: its wakeups list is already empty
+    // (drain() above consumed the only slot), so this doesn't touch `ws`
+    // (now fully freed) at all. Safe regardless.
+    gc_a.deinit();
+}

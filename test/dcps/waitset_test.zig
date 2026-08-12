@@ -89,6 +89,13 @@ fn readerRemoveNotify(_: *anyopaque, _: *anyopaque) void {
     g_notify_fn = null;
 }
 fn readerRemoveCondition(_: *anyopaque, _: *anyopaque) void {}
+// These tests never exercise "the reader is concurrently tearing down" --
+// the stub reader has no real quiesce state at all, so acquire always
+// succeeds and release is a no-op.
+fn readerQuiesceAcquire(_: *anyopaque) bool {
+    return true;
+}
+fn readerQuiesceRelease(_: *anyopaque) void {}
 
 // DataReader vtable stubs — never called during these tests.
 fn drNoop1(_: *anyopaque) DDS.ReturnCode_t {
@@ -213,6 +220,8 @@ fn makeRC(a: std.mem.Allocator) !*ReadConditionImpl {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
 }
 
@@ -517,6 +526,8 @@ test "ReadConditionImpl: vtable accessors return constructed values" {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer rc.deinit();
 
@@ -617,6 +628,8 @@ test "QueryConditionImpl: empty expression init and deinit" {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     qc.deinit();
 }
@@ -638,6 +651,8 @@ test "QueryConditionImpl: vtable accessors return constructed values" {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -671,6 +686,8 @@ test "QueryConditionImpl: get_trigger_value reflects has_data_fn" {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -703,6 +720,8 @@ test "QueryConditionImpl: get_query_parameters and set_query_parameters" {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -760,6 +779,8 @@ test "QueryConditionImpl: toCondition delegates to embedded ReadConditionImpl" {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -785,6 +806,8 @@ test "QueryConditionImpl: deinit via DDS.QueryCondition vtable" {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     qc.toDDSQueryCondition().deinit(); // exercises vtDeinit
 }
@@ -806,6 +829,8 @@ test "QueryConditionImpl: matchSample with simple field expression" {
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
 
@@ -898,6 +923,8 @@ test "QueryConditionImpl: get_query_parameters frees prior _release buffer on se
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
     const dds_qc = qc.toDDSQueryCondition();
@@ -940,6 +967,8 @@ test "QueryConditionImpl: set_query_parameters OOM at first alloc preserves old 
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
     const dds_qc = qc.toDDSQueryCondition();
@@ -981,6 +1010,8 @@ test "QueryConditionImpl: set_query_parameters OOM mid-loop preserves old params
         readerAddNotify,
         readerRemoveNotify,
         readerRemoveCondition,
+        readerQuiesceAcquire,
+        readerQuiesceRelease,
     );
     defer qc.deinit();
     const dds_qc = qc.toDDSQueryCondition();
