@@ -222,16 +222,13 @@ jobs:
   # WaitSet.wait() loop both touching the same WaitSet/GuardCondition at
   # once; see zzdds-examples' docs/design/waitset-reference-app.md).
   #
-  # c/waitset and java/waitset are deliberately NOT run under TSAN here yet:
-  # c/waitset's own CMakeLists.txt already supports it
-  # (-DWAITSET_SANITIZE_THREAD=ON, same option cpp/waitset uses below) and
-  # could be added with the identical pattern in a follow-up; java/waitset is
-  # left out because JVM+TSAN is a known-hard combination in general (see
-  # vendor-interop-tsan's own comment on RTI Connext under TSAN for the same
-  # class of "known-flaky-under-TSan-timing" precedent elsewhere in this
-  # workflow) -- not attempted here rather than assumed to work. This job
-  # covers what it covers; extending it further is a stretch goal, not
-  # something this comment claims is done.
+  # java/waitset is deliberately NOT run under TSAN here: JVM+TSAN is a
+  # known-hard combination in general (see vendor-interop-tsan's own comment
+  # on RTI Connext under TSAN for the same class of
+  # "known-flaky-under-TSan-timing" precedent elsewhere in this workflow) --
+  # not attempted here rather than assumed to work. This job covers what it
+  # covers; extending it further is a stretch goal, not something this
+  # comment claims is done.
 
   examples-tsan:
     name: zzdds-examples (WaitSet, TSAN)
@@ -295,6 +292,12 @@ jobs:
             -B zzdds-examples/cpp/waitset/build -S zzdds-examples/cpp/waitset
           cmake --build zzdds-examples/cpp/waitset/build
 
+      - name: Build c/waitset (ThreadSanitizer)
+        run: |
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DWAITSET_SANITIZE_THREAD=ON \
+            -B zzdds-examples/c/waitset/build -S zzdds-examples/c/waitset
+          cmake --build zzdds-examples/c/waitset/build
+
       # Each step backgrounds the subscriber, runs the publisher with an
       # explicit timeout, then waits on the subscriber's own PID (not a bare
       # `wait`, which would only report the last-started job) so both exit
@@ -344,6 +347,28 @@ jobs:
           fi
           grep -q "Publisher: done." /tmp/cpp-ws-pub.log
           grep -q "Subscriber: received all 10 samples." /tmp/cpp-ws-sub.log
+
+      - name: Run c/waitset under TSAN
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+          LD_LIBRARY_PATH: ${{ github.workspace }}/zzdds/zig-out/lib
+        run: |
+          set -uo pipefail
+          BIN=zzdds-examples/c/waitset/build
+          "$BIN"/waitset_sub -d 32 > /tmp/c-ws-sub.log 2>&1 &
+          SUB_PID=$!
+          sleep 1
+          timeout 40 "$BIN"/waitset_pub -d 32 > /tmp/c-ws-pub.log 2>&1
+          PUB_RC=$?
+          wait "$SUB_PID"
+          SUB_RC=$?
+          cat /tmp/c-ws-pub.log /tmp/c-ws-sub.log
+          if [ "$PUB_RC" -ne 0 ] || [ "$SUB_RC" -ne 0 ]; then
+            echo "FAIL: c/waitset pub_rc=$PUB_RC sub_rc=$SUB_RC"
+            exit 1
+          fi
+          grep -q "Publisher: done." /tmp/c-ws-pub.log
+          grep -q "Subscriber: received all 10 samples." /tmp/c-ws-sub.log
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
