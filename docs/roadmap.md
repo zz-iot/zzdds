@@ -1484,6 +1484,25 @@ removed the `get_trigger_value()` waitset-example workarounds and normalized ret
 match this PR's own C-ABI changes; CI would otherwise keep exercising the pre-fix example code
 against the post-fix library.
 
+**Update (2026-08-13, later still): that bump itself surfaced a real, missed regression —
+`cpp/hello_world` — now fixed upstream and re-pinned.** The `zzdds-examples` CI job's
+`interop/hello-world-cross-binding` step failed: every cross-binding pair with a C++
+subscriber (`zig pub -> cpp sub`, `c pub -> cpp sub`, `java pub -> cpp sub`) failed
+immediately with `FAIL: take() CDR error (rc=11)`. Root cause:
+`cpp/hello_world/src/subscriber.cpp`'s `take()` polling loop still checked `if (rc != 0)
+FAIL`, a leftover from the old ambiguous retcode convention — under the now-normalized
+`DDS_ReturnCode_t` convention, `rc == 11` (`DDS_RETCODE_NO_DATA`) is the *normal*
+"queue empty, stop polling" signal, not an error. The exact same bug class as
+`c/hello_world/src/subscriber.c` and `cpp/custom-allocator` (both already fixed earlier in
+this same retcode-normalization pass) — this one file was simply missed. Fixed in
+zzdds-examples (commit `3338e67af4e8d46fa8569ceeafee2731f28978c2`, pushed directly to main)
+by mirroring `c/hello_world/src/subscriber.c`'s exact pattern:
+`if (rc == DDS_RETCODE_NO_DATA) break;` before the hard-fail check. Verified locally by
+running `interop/hello_world_cross_binding_smoke_test.py` directly (the same script CI
+runs) — all 12 cross-binding pairs pass. Also audited every other `take()`/`take_loaned()`
+call site across zzdds-examples (C, C++, Java) for the same stale-check pattern; nothing
+else affected. `ZZDDS_EXAMPLES_REF` re-pinned to this new commit.
+
 ---
 
 ## Deferred / Out of Scope for v1
