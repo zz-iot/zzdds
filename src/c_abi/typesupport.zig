@@ -131,7 +131,7 @@ pub export fn zzdds_register_type_support(
     // catches an *already-unboxed* entity's ptr == NIL_PTR sentinel, which a
     // raw NULL C pointer would never reach without crashing first.
     if (@intFromPtr(participant) == 0) return -1;
-    const p = zidl_rt.unboxAs(DDS.DomainParticipant, participant);
+    const p = zidl_rt.unboxAsView(DDS.DomainParticipant, participant);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const name = std.mem.span(type_name);
@@ -245,7 +245,7 @@ pub export fn zzdds_register_type_support_ctx(
     ctx_deinit: ?*const fn (?*anyopaque) callconv(.c) void,
 ) callconv(.c) c_int {
     if (@intFromPtr(participant) == 0) return -1;
-    const p = zidl_rt.unboxAs(DDS.DomainParticipant, participant);
+    const p = zidl_rt.unboxAsView(DDS.DomainParticipant, participant);
     if (nil.isNil(p)) return -1;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const name = std.mem.span(type_name);

@@ -6,6 +6,7 @@
 #include <memory>
 #include <memory_resource>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -145,22 +146,28 @@ public:
         return dds_.get_inconsistent_topic_status(a_status);
     }
 
+    // Consults/populates ::DDS::EntityImpl's shared family cache (see
+    // dcps_impl.cpp's non-root _getOrCreate bodies for the generated-code
+    // side of the same pattern) instead of an independent cache of its own:
+    // TopicSupport is a real member of Entity's shared C-ABI box family
+    // (zzdds::Topic : DDS::Topic : DDS::Entity), and e.g.
+    // StatusCondition::get_entity() can return a generic ::DDS::Entity for
+    // the exact same handle this object wraps — without sharing the cache,
+    // that generic Entity would never compare identity-equal to this object.
     static std::shared_ptr<TopicSupport> _getOrCreate(DDS_Topic h) {
         if (!h) return nullptr;
-        static std::mutex _mtx;
-        static std::unordered_map<DDS_Topic, std::weak_ptr<TopicSupport>> _cache;
-        std::lock_guard<std::mutex> _lock(_mtx);
-        auto _it = _cache.find(h);
+        DDS_Entity _fh = DDS_Topic_as_DDS_Entity(h);
+        std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
+        auto& _cache = ::DDS::EntityImpl::_familyCache();
+        auto _it = _cache.find(_fh);
         if (_it != _cache.end()) {
-            if (auto _sp = _it->second.lock()) return _sp;
+            if (auto _base = _it->second.lock()) {
+                if (auto _sp = std::dynamic_pointer_cast<TopicSupport>(_base)) return _sp;
+            }
         }
         auto _sp = std::allocate_shared<TopicSupport>(
             std::pmr::polymorphic_allocator<TopicSupport>(std::pmr::get_default_resource()), h);
-        if (_it != _cache.end()) {
-            _it->second = _sp;
-        } else {
-            _cache.emplace(h, _sp);
-        }
+        _cache[_fh] = _sp;
         return _sp;
     }
 
@@ -218,22 +225,21 @@ public:
         return dds_.get_matched_subscription_data(subscription_data, subscription_handle);
     }
 
+    // See TopicSupport's matching comment.
     static std::shared_ptr<DataWriterSupport> _getOrCreate(DDS_DataWriter h) {
         if (!h) return nullptr;
-        static std::mutex _mtx;
-        static std::unordered_map<DDS_DataWriter, std::weak_ptr<DataWriterSupport>> _cache;
-        std::lock_guard<std::mutex> _lock(_mtx);
-        auto _it = _cache.find(h);
+        DDS_Entity _fh = DDS_DataWriter_as_DDS_Entity(h);
+        std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
+        auto& _cache = ::DDS::EntityImpl::_familyCache();
+        auto _it = _cache.find(_fh);
         if (_it != _cache.end()) {
-            if (auto _sp = _it->second.lock()) return _sp;
+            if (auto _base = _it->second.lock()) {
+                if (auto _sp = std::dynamic_pointer_cast<DataWriterSupport>(_base)) return _sp;
+            }
         }
         auto _sp = std::allocate_shared<DataWriterSupport>(
             std::pmr::polymorphic_allocator<DataWriterSupport>(std::pmr::get_default_resource()), h);
-        if (_it != _cache.end()) {
-            _it->second = _sp;
-        } else {
-            _cache.emplace(h, _sp);
-        }
+        _cache[_fh] = _sp;
         return _sp;
     }
 
@@ -306,22 +312,21 @@ public:
         return dds_.get_matched_publication_data(publication_data, publication_handle);
     }
 
+    // See TopicSupport's matching comment.
     static std::shared_ptr<DataReaderSupport> _getOrCreate(DDS_DataReader h) {
         if (!h) return nullptr;
-        static std::mutex _mtx;
-        static std::unordered_map<DDS_DataReader, std::weak_ptr<DataReaderSupport>> _cache;
-        std::lock_guard<std::mutex> _lock(_mtx);
-        auto _it = _cache.find(h);
+        DDS_Entity _fh = DDS_DataReader_as_DDS_Entity(h);
+        std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
+        auto& _cache = ::DDS::EntityImpl::_familyCache();
+        auto _it = _cache.find(_fh);
         if (_it != _cache.end()) {
-            if (auto _sp = _it->second.lock()) return _sp;
+            if (auto _base = _it->second.lock()) {
+                if (auto _sp = std::dynamic_pointer_cast<DataReaderSupport>(_base)) return _sp;
+            }
         }
         auto _sp = std::allocate_shared<DataReaderSupport>(
             std::pmr::polymorphic_allocator<DataReaderSupport>(std::pmr::get_default_resource()), h);
-        if (_it != _cache.end()) {
-            _it->second = _sp;
-        } else {
-            _cache.emplace(h, _sp);
-        }
+        _cache[_fh] = _sp;
         return _sp;
     }
 
@@ -423,22 +428,21 @@ public:
     bool contains_entity(::DDS::InstanceHandle_t a_handle) override { return dds_.contains_entity(a_handle); }
     ::DDS::ReturnCode_t get_current_time(::DDS::Time_t& current_time) override { return dds_.get_current_time(current_time); }
 
+    // See TopicSupport's matching comment.
     static std::shared_ptr<DomainParticipantSupport> _getOrCreate(DDS_DomainParticipant h) {
         if (!h) return nullptr;
-        static std::mutex _mtx;
-        static std::unordered_map<DDS_DomainParticipant, std::weak_ptr<DomainParticipantSupport>> _cache;
-        std::lock_guard<std::mutex> _lock(_mtx);
-        auto _it = _cache.find(h);
+        DDS_Entity _fh = DDS_DomainParticipant_as_DDS_Entity(h);
+        std::lock_guard<std::mutex> _lock(::DDS::EntityImpl::_familyMutex());
+        auto& _cache = ::DDS::EntityImpl::_familyCache();
+        auto _it = _cache.find(_fh);
         if (_it != _cache.end()) {
-            if (auto _sp = _it->second.lock()) return _sp;
+            if (auto _base = _it->second.lock()) {
+                if (auto _sp = std::dynamic_pointer_cast<DomainParticipantSupport>(_base)) return _sp;
+            }
         }
         auto _sp = std::allocate_shared<DomainParticipantSupport>(
             std::pmr::polymorphic_allocator<DomainParticipantSupport>(std::pmr::get_default_resource()), h);
-        if (_it != _cache.end()) {
-            _it->second = _sp;
-        } else {
-            _cache.emplace(h, _sp);
-        }
+        _cache[_fh] = _sp;
         return _sp;
     }
 
@@ -528,9 +532,24 @@ namespace detail {
 // neither interface is vendor-extended by zzdds.idl, so these subclass the
 // plain ::DDS:: generated impl classes directly — no --cpp-impl-override
 // wiring needed, and no *Support class for zzdds::create_waitset() to
-// register anywhere (nothing else in the generated code ever constructs a
-// WaitSet/GuardCondition, so there is no `_getOrCreate`/identity-cache
-// concern here the way there is for e.g. TopicSupport).
+// register anywhere.
+//
+// WaitSet has no family to register into (not `@shared_c_abi_box`, no
+// concrete sibling implementors — every WaitSet view really is a WaitSet).
+// GuardCondition is different: it's a real member of Condition's shared
+// C-ABI box family (see dcps.idl's `@shared_c_abi_box` annotations and
+// zidl's docs/roadmap.md "Binding design review: decision"), and
+// `WaitSet::wait()`/`get_conditions()` construct a generic `::DDS::Condition`
+// for every handle they return via `::DDS::ConditionImpl::_getOrCreate` — the
+// same shared per-family cache `StatusConditionImpl`/`ReadConditionImpl`/
+// `QueryConditionImpl` all consult in dcps_impl.cpp. Because GuardCondition
+// is never wrapped via any generated `_getOrCreate` (nothing in dcps.idl
+// returns/holds a generic `Condition` value that's ever *constructed* from
+// this path — only `wait()`'s return path does that, from the OTHER side),
+// `wrapGuardConditionHandle` below has to register the object it constructs
+// into that same shared cache itself, or a later `wait()` call would
+// construct an unrelated second `ConditionImpl` for the identical handle —
+// exactly the identity-fragmentation bug the shared cache exists to prevent.
 
 class WaitSetSupport final : public ::DDS::WaitSetImpl {
 public:
@@ -540,11 +559,94 @@ public:
 
     ~WaitSetSupport() override
     {
+        // Every still-attached condition's release_fn (see attach_condition
+        // below) fires synchronously as part of this call, before it
+        // returns -- each one erases its own keepalive_ entry via
+        // release_trampoline, so keepalive_ is already empty by the time
+        // this object's members get torn down right after. No explicit
+        // cleanup needed here.
         zzdds_destroy_waitset(handle_);
     }
 
+    // Keeps a shared_ptr keep-alive for every attached condition, released
+    // via zzdds_waitset_attach_condition_with_release's release_fn exactly
+    // once the attachment actually ends (explicit detach_condition(), this
+    // WaitSet destroyed, or the condition itself destroyed -- no override of
+    // detach_condition() needed: the plain, inherited one already fires the
+    // same release_fn, since it's the SAME underlying C-ABI attachment
+    // record either way). Not because the DDS spec requires this (WaitSet
+    // attachment is not ownership) -- because a C++ app that drops its own
+    // last shared_ptr right after attaching, relying on the WaitSet to keep
+    // the condition alive the way wait()'s returned handles might suggest,
+    // would otherwise be left holding a dangling wrapper the moment the
+    // underlying C-ABI entity is torn down. See zidl's docs/roadmap.md
+    // "Binding design review: decision" -> "WaitSet-attached-condition
+    // release hook" for the C-ABI side of this, and its own "Explicitly not
+    // done" note this closes for C++.
+    ::DDS::ReturnCode_t attach_condition(std::shared_ptr<::DDS::Condition> cond) override
+    {
+        if (!cond) return ::DDS::WaitSetImpl::attach_condition(cond);
+        DDS_Condition h = resolve_handle(cond);
+        std::lock_guard<std::mutex> lock(mu_);
+        if (keepalive_.count(h)) {
+            // Already attached (and already tracked) -- a redundant
+            // re-attach is a documented no-op either way, and
+            // zzdds_waitset_attach_condition_with_release would silently
+            // ignore a second release_ctx/release_fn for an
+            // already-attached condition (never swapping one registration
+            // in for another), leaking this one -- go through the plain
+            // path instead of registering a context that would never fire.
+            return ::DDS::WaitSetImpl::attach_condition(cond);
+        }
+        auto* ctx = new ReleaseCtx{this, h};
+        auto rc = zzdds_waitset_attach_condition_with_release(handle_, h, ctx, &release_trampoline);
+        if (rc != DDS_RETCODE_OK) {
+            delete ctx;
+            return rc;
+        }
+        keepalive_.emplace(h, std::move(cond));
+        return rc;
+    }
+
 private:
+    struct ReleaseCtx {
+        WaitSetSupport* self;
+        DDS_Condition handle;
+    };
+
+    // Fires from inside zzdds, outside any zzdds-internal lock, on whichever
+    // of the three ways an attachment ends -- never synchronously from
+    // within attach_condition() itself (only detach/destroy paths fire it),
+    // so taking mu_ here can't deadlock against attach_condition() holding
+    // it across its own zzdds_waitset_attach_condition_with_release() call.
+    static void release_trampoline(void* ctx_raw)
+    {
+        std::unique_ptr<ReleaseCtx> ctx(static_cast<ReleaseCtx*>(ctx_raw));
+        std::lock_guard<std::mutex> lock(ctx->self->mu_);
+        ctx->self->keepalive_.erase(ctx->handle);
+    }
+
+    // Mirrors WaitSetImpl::attach_condition's own generated dynamic_cast
+    // cascade (dcps_impl.cpp) -- duplicated rather than shared because that
+    // one lives inline in a lambda with no separately-callable entry point.
+    static DDS_Condition resolve_handle(const std::shared_ptr<::DDS::Condition>& cond)
+    {
+        if (auto* impl = dynamic_cast<::DDS::ConditionImpl*>(cond.get()))
+            return zidl_concrete_handle(*impl);
+        if (auto* impl = dynamic_cast<::DDS::GuardConditionImpl*>(cond.get()))
+            return DDS_GuardCondition_as_DDS_Condition(zidl_concrete_handle(*impl));
+        if (auto* impl = dynamic_cast<::DDS::StatusConditionImpl*>(cond.get()))
+            return DDS_StatusCondition_as_DDS_Condition(zidl_concrete_handle(*impl));
+        if (auto* impl = dynamic_cast<::DDS::ReadConditionImpl*>(cond.get()))
+            return DDS_ReadCondition_as_DDS_Condition(zidl_concrete_handle(*impl));
+        if (auto* impl = dynamic_cast<::DDS::QueryConditionImpl*>(cond.get()))
+            return DDS_ReadCondition_as_DDS_Condition(DDS_QueryCondition_as_DDS_ReadCondition(zidl_concrete_handle(*impl)));
+        throw std::invalid_argument("zidl: incompatible entity implementation for DDS::Condition");
+    }
+
     DDS_WaitSet handle_;
+    std::mutex mu_;
+    std::unordered_map<DDS_Condition, std::shared_ptr<::DDS::Condition>> keepalive_;
 };
 
 class GuardConditionSupport final : public ::DDS::GuardConditionImpl {
@@ -586,11 +688,23 @@ inline std::shared_ptr<::DDS::GuardCondition> wrapGuardConditionHandle(DDS_Guard
     if (zzdds_guardcondition_is_nil(handle)) return {};
 
     try {
-        return std::allocate_shared<GuardConditionSupport>(
+        auto sp = std::allocate_shared<GuardConditionSupport>(
             std::pmr::polymorphic_allocator<GuardConditionSupport>(
                 std::pmr::get_default_resource()),
             handle
         );
+        // Register into Condition's shared family cache (see the comment
+        // above this function) so a later WaitSet::wait()/get_conditions()
+        // resolving the same handle via ::DDS::ConditionImpl::_getOrCreate
+        // finds THIS object instead of constructing an unrelated one.
+        // create_guardcondition() always mints a fresh handle, so this is
+        // always a first registration, never a "someone else already cached
+        // it" race to reconcile against.
+        {
+            std::lock_guard<std::mutex> _lock(::DDS::ConditionImpl::_familyMutex());
+            ::DDS::ConditionImpl::_familyCache()[DDS_GuardCondition_as_DDS_Condition(handle)] = sp;
+        }
+        return sp;
     } catch (...) {
         zzdds_destroy_guardcondition(handle);
         throw;

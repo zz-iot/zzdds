@@ -88,7 +88,7 @@ const Fixture = struct {
         );
         errdefer factory.deinit();
         const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
-        const dp_boxed = try zidl_rt.boxEntity(alloc, dp.ptr, dp.vtable);
+        const dp_boxed = try zidl_rt.boxEntity(alloc, dp.ptr, &DomainParticipantImpl.views);
         return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .dp_boxed = dp_boxed, .alloc = alloc };
     }
 

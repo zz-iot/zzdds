@@ -38,8 +38,20 @@ var nil_sc_vtable = DDS.StatusCondition.Vtable{
     .as_Condition = nilAsCondition,
 };
 var nil_sc_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+// `DDS.StatusCondition`/`.Condition` are `@shared_c_abi_box`-annotated (see
+// zidl/docs/roadmap.md "Binding design review: decision") -- `unboxAsView`
+// expects every box for these types to hold a `CAbiViews` pointer, not a
+// bare flat `Vtable` pointer, including nil sentinels: a nil condition can
+// legitimately be boxed and passed where a C signature declares the base
+// `Condition` type (e.g. `WaitSet.attach_condition`), which unboxes via
+// `unboxAsView(DDS.Condition, ...)` regardless of which concrete/nil type
+// originally created the box.
+const nil_sc_views = DDS.StatusCondition.CAbiViews{
+    .base = .{ .flat_vtable = &nil_condition_vtable },
+    .flat_vtable = &nil_sc_vtable,
+};
 fn scGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_sc_c_abi.get(nil_alloc, ctx, &nil_sc_vtable);
+    return nil_sc_c_abi.get(nil_alloc, ctx, &nil_sc_views);
 }
 fn scGetTrigger(_: *anyopaque) bool {
     return false;
@@ -67,8 +79,9 @@ var nil_entity_vtable = DDS.Entity.Vtable{
 };
 pub const nil_entity = DDS.Entity{ .ptr = NIL_PTR, .vtable = &nil_entity_vtable };
 var nil_entity_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_entity_views = DDS.Entity.CAbiViews{ .flat_vtable = &nil_entity_vtable };
 fn nilEntityGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_entity_c_abi.get(nil_alloc, ctx, &nil_entity_vtable);
+    return nil_entity_c_abi.get(nil_alloc, ctx, &nil_entity_views);
 }
 fn nilEnable(_: *anyopaque) DDS.ReturnCode_t {
     return DDS.RETCODE_ERROR;
@@ -299,8 +312,12 @@ var nil_participant_vtable = DDS.DomainParticipant.Vtable{
 };
 pub const nil_participant = DDS.DomainParticipant{ .ptr = NIL_PTR, .vtable = &nil_participant_vtable };
 var nil_participant_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_participant_views = DDS.DomainParticipant.CAbiViews{
+    .base = .{ .flat_vtable = &nil_entity_vtable },
+    .flat_vtable = &nil_participant_vtable,
+};
 fn nilParticipantGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_participant_c_abi.get(nil_alloc, ctx, &nil_participant_vtable);
+    return nil_participant_c_abi.get(nil_alloc, ctx, &nil_participant_views);
 }
 
 // ── Nil Publisher ─────────────────────────────────────────────────────────────
@@ -403,8 +420,12 @@ var nil_publisher_vtable = DDS.Publisher.Vtable{
 };
 pub const nil_publisher = DDS.Publisher{ .ptr = NIL_PTR, .vtable = &nil_publisher_vtable };
 var nil_publisher_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_publisher_views = DDS.Publisher.CAbiViews{
+    .base = .{ .flat_vtable = &nil_entity_vtable },
+    .flat_vtable = &nil_publisher_vtable,
+};
 fn nilPublisherGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_publisher_c_abi.get(nil_alloc, ctx, &nil_publisher_vtable);
+    return nil_publisher_c_abi.get(nil_alloc, ctx, &nil_publisher_views);
 }
 
 // ── Nil Subscriber ────────────────────────────────────────────────────────────
@@ -502,8 +523,12 @@ var nil_subscriber_vtable = DDS.Subscriber.Vtable{
 };
 pub const nil_subscriber = DDS.Subscriber{ .ptr = NIL_PTR, .vtable = &nil_subscriber_vtable };
 var nil_subscriber_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_subscriber_views = DDS.Subscriber.CAbiViews{
+    .base = .{ .flat_vtable = &nil_entity_vtable },
+    .flat_vtable = &nil_subscriber_vtable,
+};
 fn nilSubscriberGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_subscriber_c_abi.get(nil_alloc, ctx, &nil_subscriber_vtable);
+    return nil_subscriber_c_abi.get(nil_alloc, ctx, &nil_subscriber_views);
 }
 
 // ── Nil DataWriter ────────────────────────────────────────────────────────────
@@ -589,8 +614,12 @@ var nil_datawriter_vtable = DDS.DataWriter.Vtable{
 };
 pub const nil_datawriter = DDS.DataWriter{ .ptr = NIL_PTR, .vtable = &nil_datawriter_vtable };
 var nil_datawriter_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_datawriter_views = DDS.DataWriter.CAbiViews{
+    .base = .{ .flat_vtable = &nil_entity_vtable },
+    .flat_vtable = &nil_datawriter_vtable,
+};
 fn nilDatawriterGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_datawriter_c_abi.get(nil_alloc, ctx, &nil_datawriter_vtable);
+    return nil_datawriter_c_abi.get(nil_alloc, ctx, &nil_datawriter_views);
 }
 
 // ── Nil DataReader ────────────────────────────────────────────────────────────
@@ -701,8 +730,12 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
 };
 pub const nil_datareader = DDS.DataReader{ .ptr = NIL_PTR, .vtable = &nil_datareader_vtable };
 var nil_datareader_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_datareader_views = DDS.DataReader.CAbiViews{
+    .base = .{ .flat_vtable = &nil_entity_vtable },
+    .flat_vtable = &nil_datareader_vtable,
+};
 fn nilDatareaderGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_datareader_c_abi.get(nil_alloc, ctx, &nil_datareader_vtable);
+    return nil_datareader_c_abi.get(nil_alloc, ctx, &nil_datareader_views);
 }
 
 // ── Nil Topic / TopicDescription ─────────────────────────────────────────────
@@ -728,8 +761,9 @@ var nil_topic_description_vtable = DDS.TopicDescription.Vtable{
 };
 pub const nil_topic_description = DDS.TopicDescription{ .ptr = NIL_PTR, .vtable = &nil_topic_description_vtable };
 var nil_topic_description_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_topic_description_views = DDS.TopicDescription.CAbiViews{ .flat_vtable = &nil_topic_description_vtable };
 fn nilTopicDescriptionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_topic_description_c_abi.get(nil_alloc, ctx, &nil_topic_description_vtable);
+    return nil_topic_description_c_abi.get(nil_alloc, ctx, &nil_topic_description_views);
 }
 
 var nil_topic_vtable = DDS.Topic.Vtable{
@@ -784,8 +818,15 @@ var nil_topic_vtable = DDS.Topic.Vtable{
 };
 pub const nil_topic = DDS.Topic{ .ptr = NIL_PTR, .vtable = &nil_topic_vtable };
 var nil_topic_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+// Primary base only (Entity) -- TopicDescription is Topic's *secondary* base
+// and never shares a box, same rule as the real TopicImpl (see
+// zidl/docs/roadmap.md "Binding design review: decision").
+const nil_topic_views = DDS.Topic.CAbiViews{
+    .base = .{ .flat_vtable = &nil_entity_vtable },
+    .flat_vtable = &nil_topic_vtable,
+};
 fn nilTopicGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_topic_c_abi.get(nil_alloc, ctx, &nil_topic_vtable);
+    return nil_topic_c_abi.get(nil_alloc, ctx, &nil_topic_views);
 }
 
 // ── Nil ContentFilteredTopic ──────────────────────────────────────────────────
@@ -832,8 +873,12 @@ var nil_cft_vtable = DDS.ContentFilteredTopic.Vtable{
 };
 pub const nil_cft = DDS.ContentFilteredTopic{ .ptr = NIL_PTR, .vtable = &nil_cft_vtable };
 var nil_cft_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_cft_views = DDS.ContentFilteredTopic.CAbiViews{
+    .base = .{ .flat_vtable = &nil_topic_description_vtable },
+    .flat_vtable = &nil_cft_vtable,
+};
 fn nilCftGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_cft_c_abi.get(nil_alloc, ctx, &nil_cft_vtable);
+    return nil_cft_c_abi.get(nil_alloc, ctx, &nil_cft_views);
 }
 
 // ── Nil MultiTopic ────────────────────────────────────────────────────────────
@@ -892,8 +937,9 @@ var nil_condition_vtable = DDS.Condition.Vtable{
 };
 pub const nil_condition = DDS.Condition{ .ptr = NIL_PTR, .vtable = &nil_condition_vtable };
 var nil_condition_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_condition_views = DDS.Condition.CAbiViews{ .flat_vtable = &nil_condition_vtable };
 fn nilConditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_condition_c_abi.get(nil_alloc, ctx, &nil_condition_vtable);
+    return nil_condition_c_abi.get(nil_alloc, ctx, &nil_condition_views);
 }
 
 var nil_readcondition_vtable = DDS.ReadCondition.Vtable{
@@ -928,8 +974,12 @@ var nil_readcondition_vtable = DDS.ReadCondition.Vtable{
 };
 pub const nil_readcondition = DDS.ReadCondition{ .ptr = NIL_PTR, .vtable = &nil_readcondition_vtable };
 var nil_readcondition_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_readcondition_views = DDS.ReadCondition.CAbiViews{
+    .base = .{ .flat_vtable = &nil_condition_vtable },
+    .flat_vtable = &nil_readcondition_vtable,
+};
 fn nilReadconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_readcondition_c_abi.get(nil_alloc, ctx, &nil_readcondition_vtable);
+    return nil_readcondition_c_abi.get(nil_alloc, ctx, &nil_readcondition_views);
 }
 
 var nil_querycondition_vtable = DDS.QueryCondition.Vtable{
@@ -979,8 +1029,15 @@ var nil_querycondition_vtable = DDS.QueryCondition.Vtable{
 };
 pub const nil_querycondition = DDS.QueryCondition{ .ptr = NIL_PTR, .vtable = &nil_querycondition_vtable };
 var nil_querycondition_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_querycondition_views = DDS.QueryCondition.CAbiViews{
+    .base = .{
+        .base = .{ .flat_vtable = &nil_condition_vtable },
+        .flat_vtable = &nil_readcondition_vtable,
+    },
+    .flat_vtable = &nil_querycondition_vtable,
+};
 fn nilQueryconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_querycondition_c_abi.get(nil_alloc, ctx, &nil_querycondition_vtable);
+    return nil_querycondition_c_abi.get(nil_alloc, ctx, &nil_querycondition_views);
 }
 
 var nil_guardcondition_vtable = DDS.GuardCondition.Vtable{
@@ -1000,8 +1057,12 @@ var nil_guardcondition_vtable = DDS.GuardCondition.Vtable{
 };
 pub const nil_guardcondition = DDS.GuardCondition{ .ptr = NIL_PTR, .vtable = &nil_guardcondition_vtable };
 var nil_guardcondition_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_guardcondition_views = DDS.GuardCondition.CAbiViews{
+    .base = .{ .flat_vtable = &nil_condition_vtable },
+    .flat_vtable = &nil_guardcondition_vtable,
+};
 fn nilGuardconditionGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_guardcondition_c_abi.get(nil_alloc, ctx, &nil_guardcondition_vtable);
+    return nil_guardcondition_c_abi.get(nil_alloc, ctx, &nil_guardcondition_views);
 }
 
 var nil_waitset_vtable = DDS.WaitSet.Vtable{
@@ -1079,6 +1140,7 @@ var nil_factory_vtable = DDS.DomainParticipantFactory.Vtable{
 };
 pub const nil_factory = DDS.DomainParticipantFactory{ .ptr = NIL_PTR, .vtable = &nil_factory_vtable };
 var nil_factory_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_factory_views = DDS.DomainParticipantFactory.CAbiViews{ .flat_vtable = &nil_factory_vtable };
 fn nilFactoryGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-    return nil_factory_c_abi.get(nil_alloc, ctx, &nil_factory_vtable);
+    return nil_factory_c_abi.get(nil_alloc, ctx, &nil_factory_views);
 }

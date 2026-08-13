@@ -131,8 +131,10 @@ pub const SubscriberImpl = struct {
     readers: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl),
     mu: Mutex,
 
-    sub_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across every interface view
+    /// (Subscriber, Entity) — see `views` below and zidl/docs/roadmap.md
+    /// "Binding design review: decision".
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -177,8 +179,7 @@ pub const SubscriberImpl = struct {
     pub fn deinit(self: *Self) void {
         self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
-        self.sub_c_abi.free(self.alloc);
-        self.entity_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         for (self.readers.items) |r| {
             self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
             r.deinit();
@@ -199,19 +200,14 @@ pub const SubscriberImpl = struct {
 
     // ── Entity vtable ─────────────────────────────────────────────────────────
 
-    const entity_vtable = DDS.Entity.Vtable{
+    pub const entity_vtable = DDS.Entity.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleEntity,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
-    }
 
     // ── DDS.Subscriber vtable ─────────────────────────────────────────────────
 
@@ -237,13 +233,19 @@ pub const SubscriberImpl = struct {
         .get_default_datareader_qos = vtGetDefaultDrQos,
         .copy_from_topic_qos = vtCopyFromTopicQos,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleSubscriber,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_Entity = vtAsEntity,
     };
 
-    fn vtGetCAbiHandleSubscriber(ctx: *anyopaque) *anyopaque {
+    /// One `CAbiViews` value for the whole object (see `zidl_rt.unboxAsView`).
+    pub const views = DDS.Subscriber.CAbiViews{
+        .base = .{ .flat_vtable = &entity_vtable },
+        .flat_vtable = &vtable,
+    };
+
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.sub_c_abi.get(self.alloc, ctx, &vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn vtAsEntity(ctx: *anyopaque) DDS.Entity {

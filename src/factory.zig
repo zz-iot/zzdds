@@ -38,7 +38,7 @@ pub const DomainParticipantFactory = struct {
 
 pub fn createFactory() CreateFactoryError!DomainParticipantFactory {
     const boxed = extensions.zzdds_create_factory();
-    const handle = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, boxed);
+    const handle = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, boxed);
     if (nil.isNil(handle)) return error.FactoryCreateFailed;
     return .{ .handle = handle };
 }

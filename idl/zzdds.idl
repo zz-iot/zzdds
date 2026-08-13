@@ -120,7 +120,7 @@ module zzdds {
         unsigned long        instance_state;
     };
 
-    interface DomainParticipantFactory : DDS::DomainParticipantFactory {
+    @shared_c_abi_box interface DomainParticipantFactory : DDS::DomainParticipantFactory {
         DDS::DomainParticipant create_participant_ex(
             in DDS::DomainId_t                   domain_id,
             in DDS::DomainParticipantQos         qos,
@@ -134,12 +134,12 @@ module zzdds {
             inout DomainParticipantConfig config);
     };
 
-    interface DomainParticipant : DDS::DomainParticipant {
+    @shared_c_abi_box interface DomainParticipant : DDS::DomainParticipant {
         DDS::ReturnCode_t register_type_support(
             in string type_name);
     };
 
-    interface Topic : DDS::Topic {
+    @shared_c_abi_box interface Topic : DDS::Topic {
         DDS::TopicDescription as_topic_description();
     };
 
@@ -155,7 +155,7 @@ module zzdds {
             in boolean               is_ready);
     };
 
-    interface DataWriter : DDS::DataWriter {
+    @shared_c_abi_box interface DataWriter : DDS::DataWriter {
         DDS::ReturnCode_t write_serialized(
             in WriteKind kind,
             in OctetSeq key_hash,
@@ -165,7 +165,7 @@ module zzdds {
             in DDS::StatusMask      mask);
     };
 
-    interface DataReader : DDS::DataReader {
+    @shared_c_abi_box interface DataReader : DDS::DataReader {
         DDS::ReturnCode_t take_serialized(
             inout SerializedSample sample);
         DDS::ReturnCode_t take_next_instance_serialized(

@@ -124,6 +124,31 @@ public class JavaSmoke {
         System.out.println("  round-tripped sample: id=" + got.data.get_id()
             + " count=" + got.data.get_count() + " label=" + got.data.get_label());
 
+        // Sanity/link-level regression guard for zidl PR #39's Greptile
+        // MUST-FIX (StatusCondition.get_entity() returning a bare DDS.Entity
+        // instead of the real concrete type) and the zzdds-side companion
+        // fix it required (extensions.zig's DDS_Entity_as_DDS_* checked
+        // downcasts -- previously declared in dcps.h but never defined,
+        // caught as an UnsatisfiedLinkError at JNI load, not a compile
+        // error). dpWriter's handle is already cache-populated (by
+        // create_participant's own concrete box) by the time get_entity()
+        // runs here, so this specific call doesn't exercise the
+        // first-ever-box-through-the-bare-type miss the bug actually needed
+        // -- verified separately via a GC/weak-ref-forced cache-miss
+        // reproduction (deliberately re-broken and confirmed to throw
+        // ClassCastException, then confirmed fixed), not committed here
+        // since it's inherently GC-timing-dependent. This check still earns
+        // its place: it's what actually caught the real DDS_Entity_as_DDS_*
+        // link failure above, and confirms the Entity-family narrowing
+        // conversions are wired correctly end-to-end.
+        Dcps.DDS.StatusCondition sc = dpWriter.get_statuscondition();
+        check(sc != null, "get_statuscondition() returned non-null");
+        Dcps.DDS.Entity entityView = sc.get_entity();
+        check(entityView != null, "StatusCondition.get_entity() returned non-null");
+        Dcps.DDS.DomainParticipant dpFromEntity = (Dcps.DDS.DomainParticipant) entityView;
+        check(dpFromEntity == dpWriter, "get_entity() boxed the SAME identity-cached DomainParticipant, not a bare Entity");
+        System.out.println("  StatusCondition.get_entity() most-derived box: OK");
+
         System.out.println("All Java binding smoke checks passed.");
     }
 }

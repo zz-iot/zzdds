@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const history_mod = @import("../rtps/history.zig");
@@ -26,6 +27,7 @@ const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
+const extensions_mod = @import("../c_abi/extensions.zig");
 
 const Guid = proto.Guid;
 
@@ -332,10 +334,11 @@ pub const DataReaderImpl = struct {
     /// Used to determine view_state (NEW_VIEW vs NOT_NEW_VIEW) at enqueue time.
     seen_instances: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, InstanceEntry),
 
-    dr_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    // ZZDDS.DataReader borrowed view — see src/c_abi/extensions.zig.
-    zzdds_dr_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across every interface view
+    /// (DataReader, Entity, and ZZDDS.DataReader — see src/c_abi/extensions.zig)
+    /// — see `views` below and zidl/docs/roadmap.md "Binding design review:
+    /// decision".
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const OwnerEntry = struct { guid: Guid, strength: i32 };
     const Self = @This();
@@ -416,9 +419,7 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
-        self.dr_c_abi.free(self.alloc);
-        self.entity_c_abi.free(self.alloc);
-        self.zzdds_dr_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         // Tear down any ReadCondition/QueryCondition the app never explicitly
         // deleted via delete_readcondition(). Each condition's own teardown
         // detaches it from any WaitSet that still has it attached, removes
@@ -2048,19 +2049,14 @@ pub const DataReaderImpl = struct {
 
     // ── Entity vtable ─────────────────────────────────────────────────────────
 
-    const entity_vtable = DDS.Entity.Vtable{
+    pub const entity_vtable = DDS.Entity.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleEntity,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
-    }
 
     // ── DDS.DataReader vtable ─────────────────────────────────────────────────
 
@@ -2089,13 +2085,27 @@ pub const DataReaderImpl = struct {
         .get_matched_publications = vtGetMatchedPubs,
         .get_matched_publication_data = vtGetMatchedPubData,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleDataReader,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_Entity = vtAsEntity,
     };
 
-    fn vtGetCAbiHandleDataReader(ctx: *anyopaque) *anyopaque {
+    /// One `CAbiViews` value for the whole object, covering all three
+    /// interface views it presents (Entity, DataReader, and — via
+    /// `extensions.zig`'s `readerGetCAbiHandleZzdds`, which shares this same
+    /// `c_abi` field/`views` value — ZZDDS.DataReader too). See
+    /// `GuardConditionImpl.views`'s identical-shape doc comment for the
+    /// general mechanism.
+    pub const views = ZZDDS.DataReader.CAbiViews{
+        .base = .{
+            .base = .{ .flat_vtable = &entity_vtable },
+            .flat_vtable = &vtable,
+        },
+        .flat_vtable = &extensions_mod.reader_vtable,
+    };
+
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.dr_c_abi.get(self.alloc, ctx, &vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn vtAsEntity(ctx: *anyopaque) DDS.Entity {

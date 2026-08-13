@@ -15,6 +15,19 @@
 #include "dcps.h"
 #include "zzdds_c.h"
 
+/* Defined (non-static, on purpose) in the generated dcps_jni.c, compiled
+ * into the same libzzdds_jni.so -- see that function's own doc comment.
+ * GuardCondition has no factory operation in dcps.idl (app-instantiated
+ * directly per spec), so createGuardCondition() below constructs its Java
+ * object by hand rather than through the generated zidl_java_box_DDS_
+ * GuardCondition, and needs to register it into Condition's shared
+ * box-identity cache itself -- otherwise WaitSet.wait()'s generic
+ * zidl_java_box_DDS_Condition would still construct an unrelated second
+ * object for the same handle, even with the shared cache in place on the
+ * generated side. See zzdds's docs/roadmap.md and zidl's docs/roadmap.md
+ * "Binding design review: decision" for the fuller writeup. */
+extern void _zidl_family_DDS_Condition_register_external(JNIEnv *env, void *handle, jobject obj);
+
 static void *zzdds_java_unbox(JNIEnv *env, jobject obj) {
     if (obj == NULL) return NULL;
     jclass cls = (*env)->GetObjectClass(env, obj);
@@ -104,8 +117,195 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
  * shape -- no _as_DDS_ upcast step needed before boxing into the generated
  * WaitSetImpl/GuardConditionImpl Java class.
  */
+/* ── WaitSet condition-attachment keepalive ──────────────────────────────
+ *
+ * Mirrors zzdds_cpp.hpp's WaitSetSupport::attach_condition -- see that
+ * class's own doc comment for the full "why" (WaitSet attachment is not
+ * ownership per spec, but a caller who drops their only Java reference to
+ * an attached condition right after attaching would otherwise be left
+ * holding a dangling wrapper the moment the underlying C-ABI entity is torn
+ * down). Java has no equivalent of C++'s virtual-dispatch override (there is
+ * no --java-impl-override, and WaitSetImpl.java is plain generated code) --
+ * so instead of a subclass, this hooks in via JNI's RegisterNatives,
+ * overriding WaitSetImpl's own generated n_attach_condition native binding
+ * with the implementation below. Completely transparent to callers:
+ * WaitSetImpl.java's public attach_condition()/detach_condition() methods
+ * are unchanged, only which native implementation backs the private
+ * n_attach_condition dispatch point changes. detach_condition needs no
+ * override: the plain, inherited n_detach_condition already fires the same
+ * release_fn, since it's the same underlying C-ABI attachment record either
+ * way -- see zzdds_waitset_attach_condition_with_release's own doc comment
+ * in zzdds_c.h.
+ */
+
+/* zidl's generated dcps_jni.c (compiled into this same libzzdds_jni.so)
+ * already captures the JavaVM* in JNI_OnLoad -- see this file's own later
+ * zzdds_java_get_env() wrapper (TypeSupport section, below) for the fuller
+ * comment on why this is declared here rather than defined twice. Declared
+ * directly (not via that wrapper) because it's needed before that section
+ * of the file is reached. */
+extern JNIEnv *zidl_java_get_env(void);
+
+typedef struct zzdds_java_waitset_keepalive_node {
+    void *waitset;
+    void *handle;
+    jobject global_ref;
+    struct zzdds_java_waitset_keepalive_node *next;
+} zzdds_java_waitset_keepalive_node;
+
+static pthread_mutex_t zzdds_java_waitset_keepalive_mtx = PTHREAD_MUTEX_INITIALIZER;
+static zzdds_java_waitset_keepalive_node *zzdds_java_waitset_keepalive_head = NULL;
+
+/* Caller must hold zzdds_java_waitset_keepalive_mtx. */
+static bool zzdds_java_waitset_keepalive_contains_locked(void *waitset, void *handle) {
+    for (zzdds_java_waitset_keepalive_node *n = zzdds_java_waitset_keepalive_head; n != NULL; n = n->next) {
+        if (n->waitset == waitset && n->handle == handle) return true;
+    }
+    return false;
+}
+
+typedef struct {
+    void *waitset;
+    void *handle;
+} zzdds_java_waitset_release_ctx;
+
+/* Fires from inside zzdds, outside any zzdds-internal lock, on whichever of
+ * the three ways an attachment ends -- never synchronously from within
+ * zzdds_java_waitset_attach_condition itself (only detach/destroy paths
+ * fire it), so this can't deadlock against that function's own use of the
+ * same mutex. */
+static void zzdds_java_waitset_release_trampoline(void *ctx_raw) {
+    zzdds_java_waitset_release_ctx *ctx = (zzdds_java_waitset_release_ctx *)ctx_raw;
+    jobject global_ref = NULL;
+    pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
+    zzdds_java_waitset_keepalive_node **pp = &zzdds_java_waitset_keepalive_head;
+    while (*pp != NULL) {
+        zzdds_java_waitset_keepalive_node *n = *pp;
+        if (n->waitset == ctx->waitset && n->handle == ctx->handle) {
+            *pp = n->next;
+            global_ref = n->global_ref;
+            free(n);
+            break;
+        }
+        pp = &n->next;
+    }
+    pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+    free(ctx);
+    if (global_ref != NULL) {
+        JNIEnv *env = zidl_java_get_env();
+        if (env != NULL) (*env)->DeleteGlobalRef(env, global_ref);
+    }
+}
+
+/* Resolves `cond`'s raw DDS_Condition handle regardless of its concrete
+ * Java class -- mirrors zzdds_cpp.hpp's WaitSetSupport::resolve_handle
+ * (an IsInstanceOf cascade here instead of dynamic_cast, same shape as
+ * zidl's own generated zidl_java_unbox_as_DDS_Condition dispatcher in
+ * dcps_jni.c, which this doesn't reuse only because that one is file-local
+ * `static`, not because the logic needs to differ). */
+static void *zzdds_java_resolve_condition_handle(JNIEnv *env, jobject cond) {
+    void *raw = zzdds_java_unbox(env, cond);
+    static zzdds_java_class_cache guard_cache = {0}, status_cache = {0}, read_cache = {0}, query_cache = {0};
+    if (zzdds_java_get_or_cache_class(env, &guard_cache, "io/zzdds/dcps/GuardConditionImpl") &&
+        (*env)->IsInstanceOf(env, cond, guard_cache.cls)) {
+        return (void *)DDS_GuardCondition_as_DDS_Condition(raw);
+    }
+    if (zzdds_java_get_or_cache_class(env, &status_cache, "io/zzdds/dcps/StatusConditionImpl") &&
+        (*env)->IsInstanceOf(env, cond, status_cache.cls)) {
+        return (void *)DDS_StatusCondition_as_DDS_Condition(raw);
+    }
+    if (zzdds_java_get_or_cache_class(env, &query_cache, "io/zzdds/dcps/QueryConditionImpl") &&
+        (*env)->IsInstanceOf(env, cond, query_cache.cls)) {
+        return (void *)DDS_ReadCondition_as_DDS_Condition(DDS_QueryCondition_as_DDS_ReadCondition(raw));
+    }
+    if (zzdds_java_get_or_cache_class(env, &read_cache, "io/zzdds/dcps/ReadConditionImpl") &&
+        (*env)->IsInstanceOf(env, cond, read_cache.cls)) {
+        return (void *)DDS_ReadCondition_as_DDS_Condition(raw);
+    }
+    return raw; /* plain DDS_Condition (or an already-Condition-typed handle) */
+}
+
+static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject self, jlong ptr, jobject cond) {
+    (void)self;
+    void *waitset = (void *)(intptr_t)ptr;
+    if (cond == NULL) return (jint)DDS_WaitSet_attach_condition(waitset, NULL);
+    void *h = zzdds_java_resolve_condition_handle(env, cond);
+
+    pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
+    if (zzdds_java_waitset_keepalive_contains_locked(waitset, h)) {
+        pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+        /* Already attached (and already tracked) -- redundant re-attach is
+         * a documented no-op either way, and attach_condition_with_release
+         * would silently ignore a second registration for an
+         * already-attached condition (never swapping one in for another),
+         * leaking it -- go through the plain path instead of registering a
+         * context that would never fire. */
+        return (jint)DDS_WaitSet_attach_condition(waitset, h);
+    }
+    pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+
+    zzdds_java_waitset_release_ctx *ctx = malloc(sizeof(zzdds_java_waitset_release_ctx));
+    if (ctx == NULL) return (jint)DDS_WaitSet_attach_condition(waitset, h); /* best-effort: OOM just means no keepalive here */
+    ctx->waitset = waitset;
+    ctx->handle = h;
+
+    jint rc = (jint)zzdds_waitset_attach_condition_with_release(waitset, h, ctx, zzdds_java_waitset_release_trampoline);
+    if (rc != DDS_RETCODE_OK) {
+        free(ctx);
+        return rc;
+    }
+
+    jobject global_ref = (*env)->NewGlobalRef(env, cond);
+    zzdds_java_waitset_keepalive_node *node = global_ref != NULL
+        ? malloc(sizeof(zzdds_java_waitset_keepalive_node))
+        : NULL;
+    if (node == NULL) {
+        /* Can't track it here, but the attach itself already succeeded and
+         * the release_fn we already registered will still fire correctly
+         * later (ctx->waitset/ctx->handle are self-contained) -- it just
+         * won't find a node to remove, which is fine since none was ever
+         * inserted. Not a leak: if global_ref is NULL, nothing was created
+         * that needs freeing either. */
+        if (global_ref != NULL) (*env)->DeleteGlobalRef(env, global_ref);
+        return rc;
+    }
+    node->waitset = waitset;
+    node->handle = h;
+    node->global_ref = global_ref;
+    pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
+    node->next = zzdds_java_waitset_keepalive_head;
+    zzdds_java_waitset_keepalive_head = node;
+    pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+    return rc;
+}
+
+static pthread_once_t zzdds_java_waitset_natives_once = PTHREAD_ONCE_INIT;
+static JNIEnv *zzdds_java_waitset_natives_env = NULL;
+
+static void zzdds_java_waitset_natives_once_fn(void) {
+    JNIEnv *env = zzdds_java_waitset_natives_env;
+    jclass cls = (*env)->FindClass(env, "io/zzdds/dcps/WaitSetImpl");
+    if (cls == NULL) { (*env)->ExceptionClear(env); return; }
+    JNINativeMethod methods[] = {
+        { (char *)"n_attach_condition", (char *)"(JLio/zzdds/dcps/Dcps$DDS$Condition;)I",
+          (void *)zzdds_java_waitset_attach_condition },
+    };
+    (*env)->RegisterNatives(env, cls, methods, 1);
+    (*env)->DeleteLocalRef(env, cls);
+}
+
+/* Called from createWaitSet below, which always runs before any app could
+ * possibly have a WaitSet to attach a condition to -- pthread_once
+ * guarantees the actual registration happens exactly once regardless of how
+ * many threads call createWaitSet concurrently. */
+static void zzdds_java_ensure_waitset_natives_registered(JNIEnv *env) {
+    zzdds_java_waitset_natives_env = env;
+    pthread_once(&zzdds_java_waitset_natives_once, zzdds_java_waitset_natives_once_fn);
+}
+
 JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createWaitSet(JNIEnv *env, jclass self_cls) {
     (void)self_cls;
+    zzdds_java_ensure_waitset_natives_registered(env);
     DDS_WaitSet ws = zzdds_create_waitset();
     if (zzdds_waitset_is_nil(ws)) return NULL;
     static zzdds_java_class_cache cache = {0};
@@ -119,7 +319,10 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createGuardConditio
     if (zzdds_guardcondition_is_nil(gc)) return NULL;
     static zzdds_java_class_cache cache = {0};
     if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/dcps/GuardConditionImpl")) return NULL;
-    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)gc);
+    jobject obj = (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)gc);
+    if (obj == NULL) return NULL;
+    _zidl_family_DDS_Condition_register_external(env, (void *)DDS_GuardCondition_as_DDS_Condition(gc), obj);
+    return obj;
 }
 
 /* WaitSet/GuardCondition have no owning factory to delete them through --
@@ -418,10 +621,10 @@ static jbyteArray zzdds_java_take_or_read(
 
     zzdds_sample_info info;
     size_t cdr_len = 0;
-    int n = is_take
+    DDS_ReturnCode_t n = is_take
         ? zzdds_take_one_raw(reader, buf, (size_t)max_size, &cdr_len, &info)
         : zzdds_read_one_raw(reader, buf, (size_t)max_size, &cdr_len, &info);
-    if (n != 1) {
+    if (n != DDS_RETCODE_OK) {
         free(buf);
         return NULL;
     }
@@ -462,10 +665,10 @@ static jbyteArray zzdds_java_take_or_read_instance(
 
     zzdds_sample_info info;
     size_t cdr_len = 0;
-    int n = is_take
+    DDS_ReturnCode_t n = is_take
         ? zzdds_take_one_raw_instance(reader, (DDS_InstanceHandle_t)prev, buf, (size_t)max_size, &cdr_len, &info)
         : zzdds_read_one_raw_instance(reader, (DDS_InstanceHandle_t)prev, buf, (size_t)max_size, &cdr_len, &info);
-    if (n != 1) {
+    if (n != DDS_RETCODE_OK) {
         free(buf);
         return NULL;
     }
