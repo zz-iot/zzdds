@@ -18,9 +18,8 @@
 //     condition as QueryCondition above.
 //   - GuardCondition -- same watchdog-thread pattern as the publisher.
 //
-// Like publisher.java, branches on each held condition's own
-// get_trigger_value() directly rather than membership in wait()'s returned
-// active_conditions list.
+// Like publisher.java, branches on membership in wait()'s returned
+// active_conditions list -- see that file's comment for the full reasoning.
 //
 // Required stdout markers: "Create topic:", "Create reader for topic:",
 // "Subscriber: writer matched", "Subscriber: high-priority count=",
@@ -191,11 +190,11 @@ public class Subscriber {
                 System.err.println("FAIL: WaitSet.wait() returned " + wr);
                 System.exit(1);
             }
-            if (gc.get_trigger_value()) {
+            if (active.contains(gc)) {
                 System.err.println("FAIL: watchdog fired -- only received " + received + "/" + EXPECTED_SAMPLES + " samples");
                 System.exit(1);
             }
-            if (!matchedLogged && sc.get_trigger_value()) {
+            if (!matchedLogged && active.contains(sc)) {
                 Dcps.DDS.SubscriptionMatchedStatus status = new Dcps.DDS.SubscriptionMatchedStatus();
                 dr.get_subscription_matched_status(status);
                 if (status.get_current_count() > 0) {
@@ -204,8 +203,8 @@ public class Subscriber {
                 }
             }
 
-            boolean queryTriggered = qcCond.get_trigger_value();
-            boolean readTriggered = rcCond.get_trigger_value();
+            boolean queryTriggered = active.contains(qcCond);
+            boolean readTriggered = active.contains(rcCond);
             if (!queryTriggered && !readTriggered) continue;
 
             // Drain the high-priority subset first via take_w_condition,

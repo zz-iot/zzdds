@@ -128,13 +128,15 @@ int main(void) {
 
     int received = 0;
     for (int elapsed_ms = 0; elapsed_ms < MAX_WAIT_SECONDS * 1000 && received < EXPECTED_SAMPLES; elapsed_ms += 50) {
-        /* SensorSampleDataReader_take's return value is ambiguous: it's 0 both
-         * when the queue was empty (untouched out/info) AND when a sample was
-         * successfully taken and deserialized (ZIDL_CDR_OK == 0) -- the only
-         * reliable signal is info.valid_data, which is why out/info must be
-         * zeroed first: an empty queue never touches them, so a stale
-         * (non-zeroed) info.valid_data from a previous iteration's stack
-         * garbage could otherwise be misread as a real sample. */
+        /* SensorSampleDataReader_take returns DDS_RETCODE_OK (0) for a real
+         * sample and DDS_RETCODE_NO_DATA when the queue is empty -- no
+         * longer ambiguous (used to collide: both empty-queue and a
+         * successfully-deserialized sample returned 0, before
+         * zzdds_take_one_raw's own retcode convention was normalized -- see
+         * zidl's docs/roadmap.md "Binding design review: decision"). Still
+         * checking info.valid_data too, defensively: it's zeroed first so a
+         * dispose/unregister-only sample (key data, no real payload) is
+         * never misread as one with real data. */
         SensorSample out;
         zzdds_sample_info info;
         memset(&out, 0, sizeof(out));

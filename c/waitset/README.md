@@ -35,13 +35,19 @@ LD_LIBRARY_PATH=/path/to/zzdds/zig-out/lib ./build/waitset_pub -d 42
 
 ## Notes
 
-- Both `publisher.c` and `subscriber.c` branch on each held condition's own
-  `get_trigger_value()` directly, not on membership in `wait()`'s returned
-  `DDS_ConditionSeq` — see `cpp/waitset/src/publisher.cpp`'s comment for the
-  full reasoning (a real, found-while-building identity gap in
-  `WaitSet.wait()`'s C++ binding specifically; this C example just follows
-  the same, equally spec-compliant pattern for consistency, not because C
-  itself was confirmed to have the identical gap).
+- Both `publisher.c` and `subscriber.c` branch on membership in `wait()`'s
+  returned `DDS_ConditionSeq`, the spec-idiomatic pattern — a held handle
+  (e.g. `DDS_GuardCondition_as_DDS_Condition(gc)`) is `==`-comparable
+  against what `wait()` returns for the same underlying condition. This used
+  to require branching on each condition's own `get_trigger_value()`
+  directly instead, working around a real identity gap in `WaitSet.wait()`'s
+  handling of boxed C-ABI handles (confirmed at the raw C-ABI level, not
+  specific to any one binding) — see zidl's `docs/roadmap.md` "Binding
+  design review: decision" for the bug and its fix (zidl/zzdds, 2026-08-12).
+  Verified directly against the fixed zzdds (rebuilt, both binaries rerun
+  clean, twice) before switching to the membership-based form here —
+  including through `qc_cond`'s two-level `QueryCondition` →
+  `ReadCondition` → `Condition` upcast, the deepest chain the fix covers.
 - `QueryCondition`'s `"priority > %0"` expression is real (attach, trigger,
   and its query-expression/parameters are all genuinely exercised), but the
   actual high/low split is a plain field check after draining — see

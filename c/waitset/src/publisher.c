@@ -13,11 +13,14 @@
  *     on the same WaitSet/GuardCondition -- the same exercise zig/waitset's
  *     own watchdog demonstrates.
  *
- * Like cpp/waitset (see its publisher.cpp comment for the full writeup),
- * branches on each held condition's own get_trigger_value() directly
- * rather than membership in wait()'s returned DDS_ConditionSeq -- avoids
- * relying on C-ABI condition-handle boxing/caching identity guarantees this
- * example doesn't need to depend on.
+ * Branches on membership in wait()'s returned DDS_ConditionSeq, the
+ * spec-idiomatic pattern (DDS v1.4 Annex, "iterate active_conditions") --
+ * a handle this program already holds (e.g. DDS_GuardCondition_as_DDS_Condition(gc))
+ * is `==`-comparable against what wait() returns for the same underlying
+ * condition. Previously worked around here by calling each condition's own
+ * get_trigger_value() directly instead, because that identity didn't hold
+ * at the C-ABI level -- see zidl/docs/roadmap.md "Binding design review:
+ * decision" for the bug and its fix.
  *
  * After the run completes, delete_datawriter() is called WITHOUT first
  * detaching the writer's StatusCondition from the WaitSet -- deliberately,
@@ -63,6 +66,13 @@ static void *watchdog_run(void *arg) {
         elapsed_ms += WATCHDOG_POLL_MS;
     }
     return NULL;
+}
+
+static bool condition_active(const DDS_ConditionSeq *active, DDS_Condition c) {
+    for (uint32_t i = 0; i < active->_length; i++) {
+        if (active->_buffer[i] == c) return true;
+    }
+    return false;
 }
 
 static uint32_t parse_domain(int argc, char **argv) {
@@ -155,6 +165,9 @@ int main(int argc, char **argv) {
     pthread_t watchdog_thread;
     pthread_create(&watchdog_thread, NULL, watchdog_run, &watchdog);
 
+    DDS_Condition gc_cond = DDS_GuardCondition_as_DDS_Condition(gc);
+    DDS_Condition sc_cond = DDS_StatusCondition_as_DDS_Condition(sc);
+
     /* ── Wait for a reader to match ── */
 
     DDS_Duration_t wait_step = {WAIT_STEP_SEC, 0};
@@ -168,13 +181,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "FAIL: WaitSet.wait() returned %d\n", rc);
             return 1;
         }
+
+        bool gc_triggered = condition_active(&active, gc_cond);
+        bool sc_triggered = condition_active(&active, sc_cond);
         DDS_ConditionSeq_free(&active);
 
-        if (DDS_GuardCondition_get_trigger_value(gc)) {
+        if (gc_triggered) {
             fprintf(stderr, "FAIL: watchdog fired before any reader matched\n");
             return 1;
         }
-        if (DDS_StatusCondition_get_trigger_value(sc)) {
+        if (sc_triggered) {
             DDS_PublicationMatchedStatus status;
             DDS_DataWriter_get_publication_matched_status(dw, &status);
             if (status.current_count > 0) {
@@ -214,13 +230,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "FAIL: WaitSet.wait() returned %d\n", rc);
             return 1;
         }
+
+        bool gc_triggered = condition_active(&active, gc_cond);
+        bool sc_triggered = condition_active(&active, sc_cond);
         DDS_ConditionSeq_free(&active);
 
-        if (DDS_GuardCondition_get_trigger_value(gc)) {
+        if (gc_triggered) {
             fprintf(stderr, "FAIL: watchdog fired before the reader disconnected\n");
             return 1;
         }
-        if (DDS_StatusCondition_get_trigger_value(sc)) {
+        if (sc_triggered) {
             DDS_PublicationMatchedStatus status;
             DDS_DataWriter_get_publication_matched_status(dw, &status);
             if (status.current_count == 0) {

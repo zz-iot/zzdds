@@ -84,7 +84,7 @@ public:
         ovidds::FrameDataReader frame_dr(the_reader->native_handle());
 
         ovidds::FrameDataReader::Loan loan;
-        if (frame_dr.take_loaned(loan) != 1)
+        if (frame_dr.take_loaned(loan) != DDS_RETCODE_OK)
             return;
 
         std::unique_lock<std::mutex> lock(mutex_);

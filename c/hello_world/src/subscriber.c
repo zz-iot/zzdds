@@ -46,13 +46,15 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
         size_t cdr_len = 0;
 
         int rc = HelloWorldDataReader_take(state->reader, &value, &info, buf, sizeof(buf), &cdr_len);
-        if (rc != 0) {
+        if (rc == DDS_RETCODE_NO_DATA) break;
+        if (rc != DDS_RETCODE_OK) {
             fprintf(stderr, "FAIL: take() CDR error (rc=%d)\n", rc);
             exit(1);
         }
-        /* info is zeroed above, so an untouched valid_data==false here means
-         * the queue is now empty -- same ambiguity custom-allocator's
-         * subscriber.c documents, resolved the same way. */
+        /* Defensive, not load-bearing: rc == DDS_RETCODE_OK already means a
+         * real sample was taken and deserialized. Kept in case a dispose/
+         * unregister-only sample (key data, no real payload) ever reaches
+         * this reader -- still nothing to print, but not an error either. */
         if (!info.valid_data) break;
 
         if (value.count != state->expected_next) {

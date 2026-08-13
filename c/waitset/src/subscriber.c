@@ -15,9 +15,8 @@
  *     condition as QueryCondition above.
  *   - GuardCondition -- same watchdog-thread pattern as the publisher.
  *
- * Like publisher.c, branches on each held condition's own
- * get_trigger_value() directly rather than membership in wait()'s returned
- * DDS_ConditionSeq.
+ * Like publisher.c, branches on membership in wait()'s returned
+ * DDS_ConditionSeq -- see that file's comment for the full reasoning.
  *
  * Required stdout markers: "Create topic:", "Create reader for topic:",
  * "Subscriber: writer matched", "Subscriber: high-priority count=",
@@ -60,6 +59,13 @@ static void *watchdog_run(void *arg) {
         elapsed_ms += WATCHDOG_POLL_MS;
     }
     return NULL;
+}
+
+static bool condition_active(const DDS_ConditionSeq *active, DDS_Condition c) {
+    for (uint32_t i = 0; i < active->_length; i++) {
+        if (active->_buffer[i] == c) return true;
+    }
+    return false;
 }
 
 static uint32_t parse_domain(int argc, char **argv) {
@@ -162,10 +168,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (DDS_WaitSet_attach_condition(ws, DDS_StatusCondition_as_DDS_Condition(sc)) != DDS_RETCODE_OK ||
-        DDS_WaitSet_attach_condition(ws, DDS_ReadCondition_as_DDS_Condition(rc_cond)) != DDS_RETCODE_OK ||
-        DDS_WaitSet_attach_condition(ws, DDS_ReadCondition_as_DDS_Condition(DDS_QueryCondition_as_DDS_ReadCondition(qc_cond))) != DDS_RETCODE_OK ||
-        DDS_WaitSet_attach_condition(ws, DDS_GuardCondition_as_DDS_Condition(gc)) != DDS_RETCODE_OK)
+    /* Computed once and reused for both attach and the wait loop's
+     * membership checks below -- each is `==`-comparable against whatever
+     * wait() later returns for the same underlying condition, including
+     * qc_cond's two-level QueryCondition -> ReadCondition -> Condition
+     * upcast. */
+    DDS_Condition sc_cond = DDS_StatusCondition_as_DDS_Condition(sc);
+    DDS_Condition rc_as_cond = DDS_ReadCondition_as_DDS_Condition(rc_cond);
+    DDS_Condition qc_as_cond = DDS_ReadCondition_as_DDS_Condition(DDS_QueryCondition_as_DDS_ReadCondition(qc_cond));
+    DDS_Condition gc_cond = DDS_GuardCondition_as_DDS_Condition(gc);
+
+    if (DDS_WaitSet_attach_condition(ws, sc_cond) != DDS_RETCODE_OK ||
+        DDS_WaitSet_attach_condition(ws, rc_as_cond) != DDS_RETCODE_OK ||
+        DDS_WaitSet_attach_condition(ws, qc_as_cond) != DDS_RETCODE_OK ||
+        DDS_WaitSet_attach_condition(ws, gc_cond) != DDS_RETCODE_OK)
     {
         fprintf(stderr, "FAIL: attach_condition() failed\n");
         return 1;
@@ -193,13 +209,18 @@ int main(int argc, char **argv) {
             fprintf(stderr, "FAIL: WaitSet.wait() returned %d\n", wr);
             return 1;
         }
+
+        bool gc_triggered = condition_active(&active, gc_cond);
+        bool sc_triggered = condition_active(&active, sc_cond);
+        bool query_triggered = condition_active(&active, qc_as_cond);
+        bool read_triggered = condition_active(&active, rc_as_cond);
         DDS_ConditionSeq_free(&active);
 
-        if (DDS_GuardCondition_get_trigger_value(gc)) {
+        if (gc_triggered) {
             fprintf(stderr, "FAIL: watchdog fired -- only received %d/%d samples\n", received, EXPECTED_SAMPLES);
             return 1;
         }
-        if (!matched_logged && DDS_StatusCondition_get_trigger_value(sc)) {
+        if (!matched_logged && sc_triggered) {
             DDS_SubscriptionMatchedStatus status;
             DDS_DataReader_get_subscription_matched_status(dr, &status);
             if (status.current_count > 0) {
@@ -208,8 +229,6 @@ int main(int argc, char **argv) {
             }
         }
 
-        bool query_triggered = DDS_QueryCondition_get_trigger_value(qc_cond);
-        bool read_triggered = DDS_ReadCondition_get_trigger_value(rc_cond);
         if (!query_triggered && !read_triggered) continue;
 
         /* Drain the high-priority subset first via take_w_condition, then

@@ -18,12 +18,22 @@
 // system, so attach_condition(sc)/attach_condition(gc) just work -- no
 // as_Condition()-style workaround needed.
 //
-// Like cpp/waitset and c/waitset, branches on each held condition's own
-// get_trigger_value() directly rather than membership in wait()'s returned
-// active_conditions list -- see cpp/waitset/publisher.cpp's comment for the
-// full reasoning (a real, found-while-building identity gap in the C++
-// binding specifically; unverified whether Java shares it, but consistent
-// either way).
+// Branches on membership in wait()'s returned active_conditions list (plain
+// List.contains(), which falls back to Object's reference-identity equals()
+// -- no equals()/hashCode() override needed), the same idiom c/waitset and
+// cpp/waitset use. This used to be impossible for a more fundamental reason
+// than C++'s: Java's JNI bridge constructed a brand-new Java object on every
+// handle crossing, with no identity cache at all -- worse than C++'s
+// per-concrete-type cache, not the same shape. Fixed by giving
+// zidl_java_box_<c_name> a shared native (JNI weak-global-ref) cache per
+// @shared_c_abi_box family, plus a registration hook
+// (ZzddsRuntime.createGuardCondition() calls it directly) for GuardCondition,
+// which -- like C++'s GuardConditionSupport -- constructs its Java object by
+// hand rather than through any generated box helper. See zidl's
+// docs/roadmap.md "Binding design review: decision" and its "Java backend:
+// native weak-global-ref box cache" follow-up for the fuller writeup.
+// Confirmed by testing directly against the fixed zzdds, not just reasoned
+// about.
 //
 // After the run completes, delete_datawriter() is called WITHOUT first
 // detaching the writer's StatusCondition from the WaitSet -- deliberately,
@@ -172,11 +182,11 @@ public class Publisher {
                 System.err.println("FAIL: WaitSet.wait() returned " + rc);
                 System.exit(1);
             }
-            if (gc.get_trigger_value()) {
+            if (active.contains(gc)) {
                 System.err.println("FAIL: watchdog fired before any reader matched");
                 System.exit(1);
             }
-            if (sc.get_trigger_value()) {
+            if (active.contains(sc)) {
                 Dcps.DDS.PublicationMatchedStatus status = new Dcps.DDS.PublicationMatchedStatus();
                 dw.get_publication_matched_status(status);
                 if (status.get_current_count() > 0) {
@@ -213,11 +223,11 @@ public class Publisher {
                 System.err.println("FAIL: WaitSet.wait() returned " + rc);
                 System.exit(1);
             }
-            if (gc.get_trigger_value()) {
+            if (active.contains(gc)) {
                 System.err.println("FAIL: watchdog fired before the reader disconnected");
                 System.exit(1);
             }
-            if (sc.get_trigger_value()) {
+            if (active.contains(sc)) {
                 Dcps.DDS.PublicationMatchedStatus status = new Dcps.DDS.PublicationMatchedStatus();
                 dw.get_publication_matched_status(status);
                 if (status.get_current_count() == 0) {

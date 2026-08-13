@@ -20,22 +20,23 @@
  * std::shared_ptr's own conversion -- no as_Condition() workaround needed
  * (see zig/waitset/publisher.zig's comment on the Zig-side gap this avoids).
  *
- * Deliberately does NOT branch on membership in wait()'s returned
- * ConditionSeq (`if (active contains gc)`, the idiom zig/waitset's own
- * wait loop uses) -- checks each held condition's own get_trigger_value()
- * directly instead. Found while building this: WaitSet::wait()'s generated
- * C++ binding always re-wraps a returned Condition as the base
- * ::DDS::ConditionImpl (the generic entity-sequence return path has no
- * cascade trying more-derived candidates, unlike entity *parameter*
- * adaptation, which does -- see zidl's roadmap for the fuller writeup), so
- * it can never be std::shared_ptr-identity-equal to (or even
- * dynamic_pointer_cast-recoverable as) the GuardConditionSupport/
- * StatusConditionImpl this program already holds, even though both refer to
- * the same underlying condition. Checking each condition directly
- * sidesteps that identity gap entirely and is equally spec-correct --
- * wait()'s real job (blocking until something is ready) still gets
- * exercised for real either way. Zig is unaffected: it never boxes/unboxes
- * through the C ABI, so its own active-membership check is exact.
+ * Branches on membership in wait()'s returned ConditionSeq (`if (active
+ * contains gc)`), the same idiom zig/waitset's own wait loop uses. This used
+ * to be impossible: WaitSet::wait()'s generated C++ binding always re-wrapped
+ * a returned Condition as the base ::DDS::ConditionImpl, constructed via its
+ * own independent identity cache -- never the same C++ object as the
+ * GuardConditionSupport/StatusConditionImpl this program already holds, even
+ * though both refer to the same underlying condition (see zidl's
+ * docs/roadmap.md "Binding design review: decision" for the raw-C-ABI-handle
+ * fix, and its "shared-family _getOrCreate cache" follow-up for the
+ * C++-wrapper-layer fix this specifically needed on top of that -- the raw
+ * handle alone wasn't enough, since every condition subtype kept its own
+ * separate C++ object cache). Fixed by collapsing every sibling's cache into
+ * one shared per-family cache (zidl, `dcps_impl.cpp`'s `_familyMutex()`/
+ * `_familyCache()`) that GuardCondition also registers into on construction
+ * (zzdds's `zzdds_cpp.hpp`, since GuardCondition has no generated
+ * `_getOrCreate` of its own) -- confirmed by testing directly against the
+ * fixed zzdds, not just reasoned about.
  *
  * After the run completes, delete_datawriter() is called WITHOUT first
  * detaching the writer's StatusCondition from the WaitSet -- deliberately,
@@ -105,6 +106,13 @@ private:
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
+
+bool condition_active(const ::DDS::ConditionSeq& active, const std::shared_ptr<::DDS::Condition>& c) {
+    for (const auto& entry : active) {
+        if (entry == c) return true;
+    }
+    return false;
+}
 
 uint32_t parse_domain(int argc, char **argv) {
     for (int i = 1; i < argc - 1; i++) {
@@ -192,6 +200,12 @@ int main(int argc, char **argv) {
 
     Watchdog watchdog(gc, OVERALL_DEADLINE_MS);
 
+    // Implicit upcast via shared_ptr's own converting constructor -- real
+    // C++ polymorphism, no as_Condition()-style helper needed. `==`-comparable
+    // against whatever wait() later returns for the same underlying condition.
+    std::shared_ptr<::DDS::Condition> gc_cond = gc;
+    std::shared_ptr<::DDS::Condition> sc_cond = sc;
+
     // ── Wait for a reader to match ───────────────────────────────────────────
 
     bool matched = false;
@@ -203,11 +217,11 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "FAIL: WaitSet.wait() returned %d\n", rc);
             return 1;
         }
-        if (gc->get_trigger_value()) {
+        if (condition_active(active, gc_cond)) {
             std::fprintf(stderr, "FAIL: watchdog fired before any reader matched\n");
             return 1;
         }
-        if (sc->get_trigger_value()) {
+        if (condition_active(active, sc_cond)) {
             ::DDS::PublicationMatchedStatus status{};
             dw->get_publication_matched_status(status);
             if (status.current_count > 0) {
@@ -243,11 +257,11 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "FAIL: WaitSet.wait() returned %d\n", rc);
             return 1;
         }
-        if (gc->get_trigger_value()) {
+        if (condition_active(active, gc_cond)) {
             std::fprintf(stderr, "FAIL: watchdog fired before the reader disconnected\n");
             return 1;
         }
-        if (sc->get_trigger_value()) {
+        if (condition_active(active, sc_cond)) {
             ::DDS::PublicationMatchedStatus status{};
             dw->get_publication_matched_status(status);
             if (status.current_count == 0) {

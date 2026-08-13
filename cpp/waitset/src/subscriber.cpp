@@ -17,14 +17,8 @@
  *     data," and either one triggering drains everything pending.
  *   - GuardCondition -- same watchdog-thread pattern as the publisher.
  *
- * Like publisher.cpp, branches on each held condition's own
- * get_trigger_value() directly rather than membership in wait()'s returned
- * ConditionSeq -- see publisher.cpp's comment for why (a real, found-while-
- * building identity gap: wait()'s generated C++ binding always re-wraps a
- * returned Condition as the base ::DDS::ConditionImpl, never recovering the
- * more-derived type, so it can never match the StatusCondition/
- * ReadCondition/QueryCondition/GuardCondition shared_ptrs this program
- * already holds).
+ * Like publisher.cpp, branches on membership in wait()'s returned
+ * ConditionSeq -- see that file's comment for the full reasoning.
  *
  * Required stdout markers: "Create topic:", "Create reader for topic:",
  * "Subscriber: writer matched", "Subscriber: high-priority count=",
@@ -92,6 +86,13 @@ private:
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
+
+bool condition_active(const ::DDS::ConditionSeq& active, const std::shared_ptr<::DDS::Condition>& c) {
+    for (const auto& entry : active) {
+        if (entry == c) return true;
+    }
+    return false;
+}
 
 uint32_t parse_domain(int argc, char **argv) {
     for (int i = 1; i < argc - 1; i++) {
@@ -198,6 +199,15 @@ int main(int argc, char **argv) {
 
     Watchdog watchdog(gc, OVERALL_DEADLINE_MS);
 
+    // Implicit upcasts via shared_ptr's own converting constructor -- real
+    // C++ polymorphism, no as_Condition()-style helper needed. Each is
+    // `==`-comparable against whatever wait() later returns for the same
+    // underlying condition.
+    std::shared_ptr<::DDS::Condition> sc_cond = sc;
+    std::shared_ptr<::DDS::Condition> rc_as_cond = rc_cond;
+    std::shared_ptr<::DDS::Condition> qc_as_cond = qc_cond;
+    std::shared_ptr<::DDS::Condition> gc_cond = gc;
+
     // ── Main loop: wait, branch on which conditions triggered ───────────────
 
     WaitsetSampleDataReader reader(dr->native_handle());
@@ -211,11 +221,11 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "FAIL: WaitSet.wait() returned %d\n", wr);
             return 1;
         }
-        if (gc->get_trigger_value()) {
+        if (condition_active(active, gc_cond)) {
             std::fprintf(stderr, "FAIL: watchdog fired -- only received %d/%d samples\n", received, EXPECTED_SAMPLES);
             return 1;
         }
-        if (!matched_logged && sc->get_trigger_value()) {
+        if (!matched_logged && condition_active(active, sc_cond)) {
             ::DDS::SubscriptionMatchedStatus status{};
             dr->get_subscription_matched_status(status);
             if (status.current_count > 0) {
@@ -224,8 +234,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        bool query_triggered = qc_cond->get_trigger_value();
-        bool read_triggered = rc_cond->get_trigger_value();
+        bool query_triggered = condition_active(active, qc_as_cond);
+        bool read_triggered = condition_active(active, rc_as_cond);
         if (!query_triggered && !read_triggered) continue;
 
         // Drain the high-priority subset first via take_w_condition, then

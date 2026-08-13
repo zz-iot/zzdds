@@ -42,15 +42,24 @@ LD_LIBRARY_PATH=/path/to/zzdds/zig-out/lib ./build/waitset_pub -d 42
   `QueryCondition` to `ReadCondition`) implicitly via `std::shared_ptr`'s own
   conversion — `ws->attach_condition(sc)` just works, no equivalent of
   `zig/waitset`'s `statusAsCondition()`-style workaround needed.
-- Both `publisher.cpp` and `subscriber.cpp` branch on each held condition's
-  own `get_trigger_value()` directly, not on membership in `wait()`'s
-  returned `ConditionSeq` — see `publisher.cpp`'s top comment for why (a
-  real, found-while-building identity gap: `wait()`'s generated C++ binding
-  always re-wraps a returned `Condition` as the base `::DDS::ConditionImpl`,
-  never recovering the more-derived type, so it can never
-  `std::shared_ptr`-match the concrete condition objects this program
-  already holds — `wait()`'s actual blocking behavior is still exercised for
-  real either way).
+- Both `publisher.cpp` and `subscriber.cpp` branch on membership in `wait()`'s
+  returned `ConditionSeq`, the spec-idiomatic pattern — a held `shared_ptr`
+  (e.g. `std::shared_ptr<::DDS::Condition> gc_cond = gc;`, an implicit upcast)
+  is `==`-comparable against what `wait()` returns for the same underlying
+  condition. This used to be impossible even after the raw-C-ABI-handle
+  identity fix landed: `wait()`'s generated C++ binding boxes every returned
+  `Condition` via the base class's own `_getOrCreate`, which historically
+  kept its own independent identity cache per concrete class — a real,
+  C++-wrapper-layer gap on top of the C-ABI-level one, closed by collapsing
+  every condition-family (and entity-family) sibling's cache into one shared
+  per-family cache, plus registering `GuardCondition` into it on construction
+  (it has no generated `_getOrCreate` of its own) — see zidl's
+  `docs/roadmap.md` "Binding design review: decision" and its
+  "shared-family `_getOrCreate` cache" follow-up. Verified directly against
+  the fixed zzdds (rebuilt, both binaries rerun clean, twice) before
+  switching to the membership-based form here — including through
+  `qc_cond`'s two-level `QueryCondition` → `ReadCondition` → `Condition`
+  upcast, the deepest chain the fix covers.
 - `QueryCondition`'s "priority > %0" expression is real (attach, trigger,
   `get_query_expression()`/parameters all genuinely exercised), but the
   actual high/low split is a plain field check after draining — no
