@@ -249,41 +249,83 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
     ctx->waitset = waitset;
     ctx->handle = h;
 
-    jint rc = (jint)zzdds_waitset_attach_condition_with_release(waitset, h, ctx, zzdds_java_waitset_release_trampoline);
-    if (rc != DDS_RETCODE_OK) {
-        free(ctx);
-        return rc;
-    }
-
+    /* Build and insert the keepalive node BEFORE registering the release
+     * hook below, not after (as an earlier version of this function did).
+     * The release callback can fire from a concurrent detach/invalidate/
+     * WaitSet-destroy the instant the hook is registered -- if the node
+     * isn't inserted yet at that moment, the trampoline finds nothing to
+     * remove and this global_ref (and the node/ctx themselves) leak
+     * forever, since a release is documented -- and Zig-side-enforced -- to
+     * fire at most once (Greptile PR #62 P1: "keepalive insertion races
+     * release"). The hook can only ever be registered strictly *after* this
+     * insertion completes (see the call below), so a release can never
+     * observe a not-yet-inserted node. */
     jobject global_ref = (*env)->NewGlobalRef(env, cond);
     zzdds_java_waitset_keepalive_node *node = global_ref != NULL
         ? malloc(sizeof(zzdds_java_waitset_keepalive_node))
         : NULL;
-    if (node == NULL) {
-        /* Can't track it here, but the attach itself already succeeded and
-         * the release_fn we already registered will still fire correctly
-         * later (ctx->waitset/ctx->handle are self-contained) -- it just
-         * won't find a node to remove, which is fine since none was ever
-         * inserted. Not a leak: if global_ref is NULL, nothing was created
-         * that needs freeing either. */
-        if (global_ref != NULL) (*env)->DeleteGlobalRef(env, global_ref);
+    if (node != NULL) {
+        node->waitset = waitset;
+        node->handle = h;
+        node->global_ref = global_ref;
+        pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
+        node->next = zzdds_java_waitset_keepalive_head;
+        zzdds_java_waitset_keepalive_head = node;
+        pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+    } else if (global_ref != NULL) {
+        /* Couldn't allocate the node itself -- can't track it, so don't pin
+         * the Java object either. Not a leak: nothing was inserted that
+         * needs removing, and the attach below still proceeds (with ctx
+         * self-contained) exactly as the OOM fallback below describes. */
+        (*env)->DeleteGlobalRef(env, global_ref);
+        global_ref = NULL;
+    }
+
+    jint rc = (jint)zzdds_waitset_attach_condition_with_release(waitset, h, ctx, zzdds_java_waitset_release_trampoline);
+    if (rc != DDS_RETCODE_OK) {
+        /* Attach itself failed -- the Zig side never stored ctx or the
+         * release hook, so it will never fire. Undo the pre-insertion
+         * ourselves rather than leaving an orphaned node/global_ref behind. */
+        free(ctx);
+        if (node != NULL) {
+            pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
+            zzdds_java_waitset_keepalive_node **pp = &zzdds_java_waitset_keepalive_head;
+            while (*pp != NULL) {
+                if (*pp == node) {
+                    *pp = node->next;
+                    break;
+                }
+                pp = &(*pp)->next;
+            }
+            pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+            free(node);
+            (*env)->DeleteGlobalRef(env, global_ref);
+        }
         return rc;
     }
-    node->waitset = waitset;
-    node->handle = h;
-    node->global_ref = global_ref;
-    pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
-    node->next = zzdds_java_waitset_keepalive_head;
-    zzdds_java_waitset_keepalive_head = node;
-    pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
     return rc;
 }
 
 static pthread_once_t zzdds_java_waitset_natives_once = PTHREAD_ONCE_INIT;
-static JNIEnv *zzdds_java_waitset_natives_env = NULL;
 
+/* Deliberately does NOT take a JNIEnv from its caller -- an earlier version
+ * stashed the calling thread's env in a plain (unsynchronized) global
+ * before calling pthread_once, but pthread_once only guarantees the
+ * *callback* runs exactly once, not that it's the SAME thread that stashed
+ * the winning value: if two threads both reach createWaitSet for the first
+ * time concurrently, each writes its own env to that global before either
+ * calls pthread_once, so whichever thread's once callback actually runs
+ * could easily end up reading the OTHER thread's JNIEnv -- a JNIEnv is only
+ * valid on the thread that owns it, so using one from a different thread is
+ * undefined behavior (can crash or corrupt the JVM). Fixed (Greptile PR #62
+ * P1: "shared JNI environment crosses threads") by having the once callback
+ * fetch a JNIEnv valid for whichever thread actually ends up running it,
+ * via zidl_java_get_env() (JNI's JavaVM* is itself thread-safe to call from
+ * any thread), instead of trusting a value some other thread may have
+ * written. */
 static void zzdds_java_waitset_natives_once_fn(void) {
-    JNIEnv *env = zzdds_java_waitset_natives_env;
+    JNIEnv *env = zidl_java_get_env();
+    if (env == NULL) return;
     jclass cls = (*env)->FindClass(env, "io/zzdds/dcps/WaitSetImpl");
     if (cls == NULL) { (*env)->ExceptionClear(env); return; }
     JNINativeMethod methods[] = {
@@ -298,14 +340,13 @@ static void zzdds_java_waitset_natives_once_fn(void) {
  * possibly have a WaitSet to attach a condition to -- pthread_once
  * guarantees the actual registration happens exactly once regardless of how
  * many threads call createWaitSet concurrently. */
-static void zzdds_java_ensure_waitset_natives_registered(JNIEnv *env) {
-    zzdds_java_waitset_natives_env = env;
+static void zzdds_java_ensure_waitset_natives_registered(void) {
     pthread_once(&zzdds_java_waitset_natives_once, zzdds_java_waitset_natives_once_fn);
 }
 
 JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createWaitSet(JNIEnv *env, jclass self_cls) {
     (void)self_cls;
-    zzdds_java_ensure_waitset_natives_registered(env);
+    zzdds_java_ensure_waitset_natives_registered();
     DDS_WaitSet ws = zzdds_create_waitset();
     if (zzdds_waitset_is_nil(ws)) return NULL;
     static zzdds_java_class_cache cache = {0};

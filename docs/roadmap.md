@@ -1280,6 +1280,43 @@ with a scratchpad GC/`WeakReference`-forced cache-miss program, deliberately re-
 not committed to the permanent suite since it's inherently GC-timing-dependent, matching this
 repo's existing preference for scratchpad-only GC-based lifetime proofs over CI-committed ones.
 
+**PR #62 Greptile review (2026-08-13) — two real P1 races in `java_runtime/zzdds_java_runtime.c`,
+both fixed.** Confidence 3/5, both findings confirmed real and reachable, not speculative.
+
+1. **Keepalive insertion races release.** `zzdds_java_waitset_attach_condition` used to call
+   `zzdds_waitset_attach_condition_with_release()` (registering the one-shot native release
+   hook) *before* inserting its own bookkeeping node into the JNI-side keepalive list. If a
+   concurrent `detach_condition`/condition-invalidate/`WaitSet` destroy fired the release
+   callback in that window, the trampoline found no node to remove — and since a release is
+   documented (and Zig-side enforced) to fire at most once, the node/global ref inserted
+   moments later would never be cleaned up: a permanent JNI global-ref leak (pinning the
+   `Condition` object forever) plus a leaked heap node. Fixed by building and inserting the
+   keepalive node *before* registering the release hook — a release can only ever be possible
+   once the Zig side has stored the hook, which now strictly happens after the node exists, so
+   it can never observe a not-yet-inserted node. If the attach call itself then fails, the
+   pre-inserted node/global-ref are removed again explicitly (the Zig side never stored the
+   hook in that case, so no release will ever come to clean them up naturally).
+2. **Shared JNI environment crosses threads.** `zzdds_java_ensure_waitset_natives_registered`
+   wrote the calling thread's `JNIEnv` into a plain, unsynchronized global *before* calling
+   `pthread_once` — `pthread_once` only guarantees its callback runs exactly once, not that
+   it's the same thread that wrote the winning value, so two threads racing into
+   `createWaitSet` for the first time could have the once-callback run using a `JNIEnv` from a
+   *different* thread than the one that actually won the race — using another thread's
+   `JNIEnv` is undefined behavior (can crash or corrupt the JVM). Fixed by having the once
+   callback fetch its own `JNIEnv` via `zidl_java_get_env()` (backed by the thread-safe
+   `JavaVM*`) instead of trusting a value stashed by a possibly-different thread; the callback
+   now takes no `JNIEnv` parameter at all.
+
+Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+`test-bindings` (all three bindings) clean.
+
+**CI: `ZZDDS_EXAMPLES_REF` bumped to track the merged zzdds-examples PR (2026-08-13).**
+`.github/workflows/ci.yml`'s default pin moved to `6a856be513f4c8449e374972756abc5c915accee`
+(zzdds-examples "Waitset identity fixes, retcode cleanup, spike reorg", #6) — the commit that
+removed the `get_trigger_value()` waitset-example workarounds and normalized retcode checks to
+match this PR's own C-ABI changes; CI would otherwise keep exercising the pre-fix example code
+against the post-fix library.
+
 ---
 
 ## Deferred / Out of Scope for v1
