@@ -231,9 +231,46 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
     if (cond == NULL) return (jint)DDS_WaitSet_attach_condition(waitset, NULL);
     void *h = zzdds_java_resolve_condition_handle(env, cond);
 
+    zzdds_java_waitset_release_ctx *ctx = malloc(sizeof(zzdds_java_waitset_release_ctx));
+    if (ctx == NULL) return (jint)DDS_WaitSet_attach_condition(waitset, h); /* best-effort: OOM just means no keepalive here */
+    ctx->waitset = waitset;
+    ctx->handle = h;
+
+    /* Check "already tracked" and insert this attempt's own node in ONE
+     * critical section, not two (as an earlier version of this function
+     * did). Splitting them let two threads concurrently attaching the SAME
+     * (waitset, handle) pair for the first time both pass the "not yet
+     * attached" check before either inserted -- both would then call
+     * zzdds_waitset_attach_condition_with_release, but the Zig side
+     * (waitset.zig's attachConditionWithRelease) silently drops the SECOND
+     * caller's release_fn/ctx for an already-attached condition rather than
+     * replacing the first's, so the loser's node/global_ref/ctx would never
+     * be cleaned up by any release -- a permanent leak (Greptile PR #62 P1:
+     * "concurrent attachments leak keepalives"). Doing the check-and-insert
+     * as one atomic step under the same lock means only the thread that
+     * actually wins the mutex race ever gets to see "not yet attached" and
+     * insert; every other concurrent caller for the same pair is guaranteed
+     * to see it as already-tracked and takes the safe redundant-reattach
+     * path below instead. */
+    jobject global_ref = NULL;
+    zzdds_java_waitset_keepalive_node *node = NULL;
     pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
-    if (zzdds_java_waitset_keepalive_contains_locked(waitset, h)) {
-        pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+    bool already_attached = zzdds_java_waitset_keepalive_contains_locked(waitset, h);
+    if (!already_attached) {
+        global_ref = (*env)->NewGlobalRef(env, cond);
+        node = global_ref != NULL ? malloc(sizeof(zzdds_java_waitset_keepalive_node)) : NULL;
+        if (node != NULL) {
+            node->waitset = waitset;
+            node->handle = h;
+            node->global_ref = global_ref;
+            node->next = zzdds_java_waitset_keepalive_head;
+            zzdds_java_waitset_keepalive_head = node;
+        }
+    }
+    pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+
+    if (already_attached) {
+        free(ctx);
         /* Already attached (and already tracked) -- redundant re-attach is
          * a documented no-op either way, and attach_condition_with_release
          * would silently ignore a second registration for an
@@ -242,37 +279,7 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
          * context that would never fire. */
         return (jint)DDS_WaitSet_attach_condition(waitset, h);
     }
-    pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
-
-    zzdds_java_waitset_release_ctx *ctx = malloc(sizeof(zzdds_java_waitset_release_ctx));
-    if (ctx == NULL) return (jint)DDS_WaitSet_attach_condition(waitset, h); /* best-effort: OOM just means no keepalive here */
-    ctx->waitset = waitset;
-    ctx->handle = h;
-
-    /* Build and insert the keepalive node BEFORE registering the release
-     * hook below, not after (as an earlier version of this function did).
-     * The release callback can fire from a concurrent detach/invalidate/
-     * WaitSet-destroy the instant the hook is registered -- if the node
-     * isn't inserted yet at that moment, the trampoline finds nothing to
-     * remove and this global_ref (and the node/ctx themselves) leak
-     * forever, since a release is documented -- and Zig-side-enforced -- to
-     * fire at most once (Greptile PR #62 P1: "keepalive insertion races
-     * release"). The hook can only ever be registered strictly *after* this
-     * insertion completes (see the call below), so a release can never
-     * observe a not-yet-inserted node. */
-    jobject global_ref = (*env)->NewGlobalRef(env, cond);
-    zzdds_java_waitset_keepalive_node *node = global_ref != NULL
-        ? malloc(sizeof(zzdds_java_waitset_keepalive_node))
-        : NULL;
-    if (node != NULL) {
-        node->waitset = waitset;
-        node->handle = h;
-        node->global_ref = global_ref;
-        pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
-        node->next = zzdds_java_waitset_keepalive_head;
-        zzdds_java_waitset_keepalive_head = node;
-        pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
-    } else if (global_ref != NULL) {
+    if (node == NULL && global_ref != NULL) {
         /* Couldn't allocate the node itself -- can't track it, so don't pin
          * the Java object either. Not a leak: nothing was inserted that
          * needs removing, and the attach below still proceeds (with ctx
@@ -281,6 +288,14 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
         global_ref = NULL;
     }
 
+    /* The node above (when present) is already inserted before this call,
+     * not after -- the release callback can fire from a concurrent detach/
+     * invalidate/WaitSet-destroy the instant the hook is registered here,
+     * and a not-yet-inserted node would mean the trampoline finds nothing
+     * to remove, leaking this global_ref/node/ctx forever (a release is
+     * documented -- and Zig-side-enforced -- to fire at most once; see
+     * Greptile PR #62 P1: "keepalive insertion races release", fixed in an
+     * earlier revision of this function). */
     jint rc = (jint)zzdds_waitset_attach_condition_with_release(waitset, h, ctx, zzdds_java_waitset_release_trampoline);
     if (rc != DDS_RETCODE_OK) {
         /* Attach itself failed -- the Zig side never stored ctx or the

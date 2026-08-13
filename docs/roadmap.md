@@ -1310,6 +1310,36 @@ both fixed.** Confidence 3/5, both findings confirmed real and reachable, not sp
 Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
 `test-bindings` (all three bindings) clean.
 
+**Update (2026-08-13, later the same day): a third real P1, found by Greptile's re-review
+after the above two landed — confirmed and fixed.** Confidence rose to 4/5 once the first
+two were fixed; the remaining finding is a genuine follow-on the fix #1 above didn't close.
+
+3. **Concurrent attachments leak keepalives.** The "already tracked?" check and the node
+   insertion were still two separate critical sections (fix #1 above only reordered
+   insertion to happen before the release-hook registration *within* a single attach call —
+   it didn't make the check-then-insert sequence atomic *across* concurrent calls). Two Java
+   threads attaching the SAME condition to the SAME `WaitSet` for the first time could both
+   pass the "not yet attached" check before either inserted its node. Both would then call
+   `zzdds_waitset_attach_condition_with_release` — but the Zig side
+   (`waitset.zig`'s `attachConditionWithRelease`) silently drops a second registration's
+   `release_fn`/`ctx` for an already-attached condition rather than replacing the first's
+   (documented, intentional — see that function's own doc comment), so the *losing* thread's
+   node, JNI global reference, and `ctx` would never be cleaned up by any release: a
+   permanent leak. Fixed by merging the check and the insertion into one critical section —
+   only the thread that actually wins the mutex race ever observes "not yet attached" and
+   inserts; every other concurrent caller for the same pair is guaranteed to observe it as
+   already-tracked and takes the existing safe redundant-reattach path instead.
+
+   Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+   `test-bindings` clean, plus a scratchpad stress test (200 rounds × 8 threads concurrently
+   calling `attach_condition()` on the same freshly-created `GuardCondition`/`WaitSet` pair,
+   then a single `detach_condition()`) — no crash, deadlock, or hang across 1,600 concurrent
+   attach calls. Not a leak-counting instrument (the bug is a silent reference leak, not a
+   crash, so a purely functional stress test can't directly disprove it) — correctness here
+   rests on the fix itself being a textbook single-critical-section fix for a TOCTOU race,
+   verified by inspection rather than empirically re-broken like the two GC-timing-dependent
+   fixes above.
+
 **CI: `ZZDDS_EXAMPLES_REF` bumped to track the merged zzdds-examples PR (2026-08-13).**
 `.github/workflows/ci.yml`'s default pin moved to `6a856be513f4c8449e374972756abc5c915accee`
 (zzdds-examples "Waitset identity fixes, retcode cleanup, spike reorg", #6) — the commit that
