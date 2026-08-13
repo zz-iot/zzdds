@@ -1340,6 +1340,39 @@ two were fixed; the remaining finding is a genuine follow-on the fix #1 above di
    verified by inspection rather than empirically re-broken like the two GC-timing-dependent
    fixes above.
 
+**Update (2026-08-13, later still): fix #3 above was itself incomplete — Greptile's
+re-review caught the actual remaining window, now closed for real.** Confidence rose to 4/5
+again; genuinely the same underlying bug as #3, one layer deeper.
+
+4. **Hookless attachment leaks keepalive.** Fix #3 made the "already tracked?" check and the
+   node *insertion* atomic, but the native attach-with-release-hook call
+   (`zzdds_waitset_attach_condition_with_release`) still happened *after* releasing that
+   lock. That left a window where the node was published (visible to
+   `zzdds_java_waitset_keepalive_contains_locked`) before the actual Zig-side attachment
+   record — with its release hook — existed. A second concurrent caller for the same
+   (waitset, handle) pair could see "already attached" in that window, take the redundant
+   plain-attach fast path, and *win the race* to create the real Zig-side record first — with
+   no release hook at all (the plain path passes null/null). The first thread's own
+   attach-with-release call then arrives to find the condition already attached (by the
+   second thread's hookless attach) and, per `attachConditionWithRelease`'s documented
+   behavior, silently drops the first thread's `release_fn`/`ctx` rather than replacing the
+   existing hookless registration — permanently leaking the node, `ctx`, and JNI global
+   reference the first thread had already inserted. Fixed by extending the single critical
+   section from fix #3 to cover the *entire* claim-insert-register sequence, including the
+   native attach-with-release call itself — every Java-side `attach_condition()` call funnels
+   through this one function (the only entry point, via `RegisterNatives`), so holding the
+   mutex across the whole sequence means no concurrent caller can ever observe a
+   claimed-but-not-yet-hooked attachment. Safe to call into the Zig/C-ABI layer while holding
+   this JNI-private mutex: the release trampoline never fires synchronously from within an
+   attach call (only later, from a separate detach/invalidate/destroy, outside any
+   zzdds-internal lock per its own doc comment), so there's no reentrancy or lock-order-
+   inversion risk.
+
+   Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+   `test-bindings` clean, plus the same 200-round × 8-thread concurrent-`attach_condition()`
+   stress test as fix #3 rerun against this version — no crash, deadlock, or hang, confirming
+   the wider critical section doesn't introduce one.
+
 **CI: `ZZDDS_EXAMPLES_REF` bumped to track the merged zzdds-examples PR (2026-08-13).**
 `.github/workflows/ci.yml`'s default pin moved to `6a856be513f4c8449e374972756abc5c915accee`
 (zzdds-examples "Waitset identity fixes, retcode cleanup, spike reorg", #6) — the commit that
