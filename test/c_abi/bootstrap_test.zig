@@ -1365,6 +1365,150 @@ test "extensions: DDS_ReadCondition_as_DDS_QueryCondition recovers a real QueryC
     try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_ReadCondition_as_DDS_QueryCondition(rc_boxed));
 }
 
+// ── Condition hierarchy checked downcasts: DDS_Condition_as_DDS_* ─────────────
+//
+// Coverage gap closed 2026-08-13: these three checked downcasts (and the six
+// DDS_Entity_as_DDS_*/three DDS_TopicDescription_as_DDS_* ones below) had
+// zero direct unit tests before this -- only the ONE-level-deeper
+// DDS_ReadCondition_as_DDS_QueryCondition above did. They were only ever
+// exercised indirectly (Java's StatusCondition.get_entity() smoke test hits
+// DDS_Entity_as_DDS_DomainParticipant specifically), and that path isn't
+// visible to kcov at all (a separate JVM process calling into a separately
+// built .so, not a `zig build emit-tests` binary) -- so from the Zig test
+// suite's own coverage perspective they were entirely dark. Each test below
+// proves both branches: a real match recovers the SAME boxed handle the
+// concrete type's own get_c_abi_handle produces, and a genuine mismatch
+// returns null rather than a false positive.
+test "extensions: DDS_Condition_as_DDS_* checked downcasts recover the real concrete condition, reject the others" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const gc = try GuardConditionImpl.init(alloc);
+    defer gc.deinit();
+    const gc_dds = gc.toDDSGuardCondition();
+    const gc_boxed = gc_dds.vtable.get_c_abi_handle(gc_dds.ptr);
+    const gc_cond = gc_dds.vtable.as_Condition(gc_dds.ptr);
+    const gc_cond_boxed = gc_cond.vtable.get_c_abi_handle(gc_cond.ptr);
+
+    const sc = fx.dp_w.get_statuscondition();
+    const sc_boxed = sc.vtable.get_c_abi_handle(sc.ptr);
+    const sc_cond = sc.vtable.as_Condition(sc.ptr);
+    const sc_cond_boxed = sc_cond.vtable.get_c_abi_handle(sc_cond.ptr);
+
+    const rc = pair.dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+    defer _ = pair.dr.delete_readcondition(rc);
+    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
+    const rc_cond = rc.vtable.as_Condition(rc.ptr);
+    const rc_cond_boxed = rc_cond.vtable.get_c_abi_handle(rc_cond.ptr);
+
+    // DDS_Condition_as_DDS_GuardCondition
+    try testing.expectEqual(gc_boxed, extensions.DDS_Condition_as_DDS_GuardCondition(gc_cond_boxed).?);
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Condition_as_DDS_GuardCondition(sc_cond_boxed));
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Condition_as_DDS_GuardCondition(rc_cond_boxed));
+
+    // DDS_Condition_as_DDS_StatusCondition
+    try testing.expectEqual(sc_boxed, extensions.DDS_Condition_as_DDS_StatusCondition(sc_cond_boxed).?);
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Condition_as_DDS_StatusCondition(gc_cond_boxed));
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Condition_as_DDS_StatusCondition(rc_cond_boxed));
+
+    // DDS_Condition_as_DDS_ReadCondition
+    try testing.expectEqual(rc_boxed, extensions.DDS_Condition_as_DDS_ReadCondition(rc_cond_boxed).?);
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Condition_as_DDS_ReadCondition(gc_cond_boxed));
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Condition_as_DDS_ReadCondition(sc_cond_boxed));
+}
+
+// ── Entity hierarchy checked downcasts: DDS_Entity_as_DDS_* ───────────────────
+
+test "extensions: DDS_Entity_as_DDS_* checked downcasts recover the real concrete entity, reject the others" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const dp_boxed = fx.dp_w.vtable.get_c_abi_handle(fx.dp_w.ptr);
+    const dp_ent = fx.dp_w.vtable.as_Entity(fx.dp_w.ptr);
+    const dp_ent_boxed = dp_ent.vtable.get_c_abi_handle(dp_ent.ptr);
+
+    const topic_boxed = fx.topic_w.vtable.get_c_abi_handle(fx.topic_w.ptr);
+    const topic_ent = fx.topic_w.vtable.as_Entity(fx.topic_w.ptr);
+    const topic_ent_boxed = topic_ent.vtable.get_c_abi_handle(topic_ent.ptr);
+
+    const pub_boxed = fx.pub_w.vtable.get_c_abi_handle(fx.pub_w.ptr);
+    const pub_ent = fx.pub_w.vtable.as_Entity(fx.pub_w.ptr);
+    const pub_ent_boxed = pub_ent.vtable.get_c_abi_handle(pub_ent.ptr);
+
+    const sub_boxed = fx.sub_r.vtable.get_c_abi_handle(fx.sub_r.ptr);
+    const sub_ent = fx.sub_r.vtable.as_Entity(fx.sub_r.ptr);
+    const sub_ent_boxed = sub_ent.vtable.get_c_abi_handle(sub_ent.ptr);
+
+    const dw_boxed = pair.dw.vtable.get_c_abi_handle(pair.dw.ptr);
+    const dw_ent = pair.dw.vtable.as_Entity(pair.dw.ptr);
+    const dw_ent_boxed = dw_ent.vtable.get_c_abi_handle(dw_ent.ptr);
+
+    const dr_boxed = pair.dr.vtable.get_c_abi_handle(pair.dr.ptr);
+    const dr_ent = pair.dr.vtable.as_Entity(pair.dr.ptr);
+    const dr_ent_boxed = dr_ent.vtable.get_c_abi_handle(dr_ent.ptr);
+
+    // Each downcast: positive match on its own Entity view, negative (null)
+    // against every one of the other five.
+    const others_for_dp = [_]*anyopaque{ topic_ent_boxed, pub_ent_boxed, sub_ent_boxed, dw_ent_boxed, dr_ent_boxed };
+    try testing.expectEqual(dp_boxed, extensions.DDS_Entity_as_DDS_DomainParticipant(dp_ent_boxed).?);
+    for (others_for_dp) |other| try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Entity_as_DDS_DomainParticipant(other));
+
+    const others_for_topic = [_]*anyopaque{ dp_ent_boxed, pub_ent_boxed, sub_ent_boxed, dw_ent_boxed, dr_ent_boxed };
+    try testing.expectEqual(topic_boxed, extensions.DDS_Entity_as_DDS_Topic(topic_ent_boxed).?);
+    for (others_for_topic) |other| try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Entity_as_DDS_Topic(other));
+
+    const others_for_pub = [_]*anyopaque{ dp_ent_boxed, topic_ent_boxed, sub_ent_boxed, dw_ent_boxed, dr_ent_boxed };
+    try testing.expectEqual(pub_boxed, extensions.DDS_Entity_as_DDS_Publisher(pub_ent_boxed).?);
+    for (others_for_pub) |other| try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Entity_as_DDS_Publisher(other));
+
+    const others_for_sub = [_]*anyopaque{ dp_ent_boxed, topic_ent_boxed, pub_ent_boxed, dw_ent_boxed, dr_ent_boxed };
+    try testing.expectEqual(sub_boxed, extensions.DDS_Entity_as_DDS_Subscriber(sub_ent_boxed).?);
+    for (others_for_sub) |other| try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Entity_as_DDS_Subscriber(other));
+
+    const others_for_dw = [_]*anyopaque{ dp_ent_boxed, topic_ent_boxed, pub_ent_boxed, sub_ent_boxed, dr_ent_boxed };
+    try testing.expectEqual(dw_boxed, extensions.DDS_Entity_as_DDS_DataWriter(dw_ent_boxed).?);
+    for (others_for_dw) |other| try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Entity_as_DDS_DataWriter(other));
+
+    const others_for_dr = [_]*anyopaque{ dp_ent_boxed, topic_ent_boxed, pub_ent_boxed, sub_ent_boxed, dw_ent_boxed };
+    try testing.expectEqual(dr_boxed, extensions.DDS_Entity_as_DDS_DataReader(dr_ent_boxed).?);
+    for (others_for_dr) |other| try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_Entity_as_DDS_DataReader(other));
+}
+
+// ── TopicDescription hierarchy checked downcasts: DDS_TopicDescription_as_DDS_* ──
+
+test "extensions: DDS_TopicDescription_as_DDS_* checked downcasts recover the real concrete topic/CFT, reject the other; MultiTopic always null" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const topic_boxed = fx.topic_w.vtable.get_c_abi_handle(fx.topic_w.ptr);
+    const topic_td = fx.topic_w.vtable.as_TopicDescription(fx.topic_w.ptr);
+    const topic_td_boxed = topic_td.vtable.get_c_abi_handle(topic_td.ptr);
+
+    const cft = fx.dp_r.create_contentfilteredtopic("BootCftDowncast", fx.topic_r, "", &DDS.StringSeq{});
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft);
+    const cft_boxed = cft.vtable.get_c_abi_handle(cft.ptr);
+    const cft_td = cft.vtable.as_TopicDescription(cft.ptr);
+    const cft_td_boxed = cft_td.vtable.get_c_abi_handle(cft_td.ptr);
+
+    try testing.expectEqual(topic_boxed, extensions.DDS_TopicDescription_as_DDS_Topic(topic_td_boxed).?);
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_TopicDescription_as_DDS_Topic(cft_td_boxed));
+
+    try testing.expectEqual(cft_boxed, extensions.DDS_TopicDescription_as_DDS_ContentFilteredTopic(cft_td_boxed).?);
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_TopicDescription_as_DDS_ContentFilteredTopic(topic_td_boxed));
+
+    // MultiTopic is a permanent nil-only stub in zzdds (no MultiTopicImpl
+    // exists at all -- see the function's own doc comment in extensions.zig)
+    // -- no real TopicDescription view can ever be one, checked against both
+    // real views on hand here.
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_TopicDescription_as_DDS_MultiTopic(topic_td_boxed));
+    try testing.expectEqual(@as(?*anyopaque, null), extensions.DDS_TopicDescription_as_DDS_MultiTopic(cft_td_boxed));
+}
+
 // ── zzdds_create_waitset / zzdds_create_guardcondition ──────────────────────────
 //
 // WaitSet and GuardCondition have no factory operation in dcps.idl (per OMG

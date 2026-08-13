@@ -1503,6 +1503,39 @@ runs) — all 12 cross-binding pairs pass. Also audited every other `take()`/`ta
 call site across zzdds-examples (C, C++, Java) for the same stale-check pattern; nothing
 else affected. `ZZDDS_EXAMPLES_REF` re-pinned to this new commit.
 
+**Test coverage: closed a real gap in `src/c_abi/extensions.zig`'s checked downcasts
+(2026-08-13).** Codecov flagged this PR's patch coverage as low; pulled the CI `Coverage`
+job's kcov artifact (`cobertura.xml`) for the closest available successful run and
+cross-referenced its uncovered-line ranges against this PR's diff.
+`src/c_abi/extensions.zig` stood out — 58% covered overall, the second-lowest file in the
+repo after `nil.zig` (which is inherently low-value to chase: near-identical nil-singleton
+boilerplate, not real logic) — and its uncovered ranges lined up almost exactly with the 13
+checked-downcast functions this PR itself added (`DDS_Condition_as_DDS_GuardCondition`/
+`_StatusCondition`/`_ReadCondition`, the six `DDS_Entity_as_DDS_*`, and the three
+`DDS_TopicDescription_as_DDS_*`). Confirmed by grep: only ONE of the 13 (
+`DDS_ReadCondition_as_DDS_QueryCondition`) had a real unit test before this — the other 12
+were exercised, if at all, only indirectly via the Java smoke test's `StatusCondition.
+get_entity()` call (`DDS_Entity_as_DDS_DomainParticipant` only), and that path is invisible
+to kcov entirely (a separate JVM process calling into a separately-built `.so`, not a `zig
+build emit-tests` binary) — so from the Zig suite's own coverage perspective, 12 of 13 were
+completely dark.
+
+Added three new tests to `test/c_abi/bootstrap_test.zig`, one per family, each exercising
+both branches (real match recovers the same boxed handle the concrete type's own
+`get_c_abi_handle` produces; a genuine mismatch returns `null`, not a false positive) using
+the existing `Fixture` helper (already builds a full DomainParticipant/Topic/Publisher/
+Subscriber/DataWriter/DataReader intraprocess pair) plus real `GuardCondition`/
+`StatusCondition`/`ReadCondition`/`ContentFilteredTopic` instances — no new test
+infrastructure needed. `zig build test` green.
+
+Not chased further: `extensions.zig` still has real remaining gaps in its OOM/allocation-
+failure error paths (e.g. `factoryCreateParticipant`'s `config_generated.toRuntimeConfig`
+`catch` branches) — `testing.FailingAllocator` is an established pattern elsewhere in this
+suite (`discovery_interface_test.zig`, `waitset_test.zig`, `cft_test.zig`) that could cover
+these, but scoping and writing that is a separate, follow-up-sized task, not done here.
+`nil.zig` (12% covered) is lower priority — the uncovered lines there are overwhelmingly
+repetitive nil-singleton vtable wiring, not branchy logic worth a dedicated test per file.
+
 ---
 
 ## Deferred / Out of Scope for v1
