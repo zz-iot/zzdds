@@ -129,8 +129,10 @@ pub const PublisherImpl = struct {
     /// globally unique, write-ordered GSNs rather than independent per-writer sequences.
     group_seq_num_counter: i64,
 
-    pub_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across every interface view
+    /// (Publisher, Entity) — see `views` below and zidl/docs/roadmap.md
+    /// "Binding design review: decision".
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -178,8 +180,7 @@ pub const PublisherImpl = struct {
     pub fn deinit(self: *Self) void {
         self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
-        self.pub_c_abi.free(self.alloc);
-        self.entity_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         // Destroy all remaining DataWriters.
         for (self.writers.items) |w| {
             self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
@@ -201,19 +202,14 @@ pub const PublisherImpl = struct {
 
     // ── Entity vtable ─────────────────────────────────────────────────────────
 
-    const entity_vtable = DDS.Entity.Vtable{
+    pub const entity_vtable = DDS.Entity.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleEntity,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
-    }
 
     // ── DDS.Publisher vtable ──────────────────────────────────────────────────
 
@@ -240,13 +236,19 @@ pub const PublisherImpl = struct {
         .get_default_datawriter_qos = vtGetDefaultDwQos,
         .copy_from_topic_qos = vtCopyFromTopicQos,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandlePublisher,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_Entity = vtAsEntity,
     };
 
-    fn vtGetCAbiHandlePublisher(ctx: *anyopaque) *anyopaque {
+    /// One `CAbiViews` value for the whole object (see `zidl_rt.unboxAsView`).
+    pub const views = DDS.Publisher.CAbiViews{
+        .base = .{ .flat_vtable = &entity_vtable },
+        .flat_vtable = &vtable,
+    };
+
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.pub_c_abi.get(self.alloc, ctx, &vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn vtAsEntity(ctx: *anyopaque) DDS.Entity {

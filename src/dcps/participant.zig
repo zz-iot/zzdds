@@ -17,6 +17,8 @@
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = @import("zzdds_ext_generated").zzdds;
+const extensions_mod = @import("../c_abi/extensions.zig");
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const trace_mod = @import("../trace.zig");
@@ -790,11 +792,11 @@ pub const DomainParticipantImpl = struct {
     /// a plain bool is fine -- no cross-thread visibility is needed for it.
     pending_self_destroy: bool = false,
 
-    participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    // ZZDDS.DomainParticipant is a separate "borrowed view" (same ptr, its own
-    // vtable) exposed by src/c_abi/extensions.zig's vendor-extension layer.
-    zzdds_participant_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across every interface view
+    /// (DomainParticipant, Entity, and ZZDDS.DomainParticipant — see
+    /// src/c_abi/extensions.zig) — see `views` below and
+    /// zidl/docs/roadmap.md "Binding design review: decision".
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -1129,9 +1131,7 @@ pub const DomainParticipantImpl = struct {
 
         if (self.status_cond) |sc| sc.deinit();
         if (self.builtin_sub) |bs| bs.deinit();
-        self.participant_c_abi.free(self.alloc);
-        self.entity_c_abi.free(self.alloc);
-        self.zzdds_participant_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
 
         // Drain publishers, subscribers, topics.
         // Do NOT hold participant.mu while calling deinit() — publisher/subscriber
@@ -2836,19 +2836,14 @@ pub const DomainParticipantImpl = struct {
 
     // ── Entity vtable ─────────────────────────────────────────────────────────
 
-    const entity_vtable = DDS.Entity.Vtable{
+    pub const entity_vtable = DDS.Entity.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleEntity,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
-    }
 
     // ── DomainParticipant vtable ──────────────────────────────────────────────
 
@@ -2894,13 +2889,26 @@ pub const DomainParticipantImpl = struct {
         .contains_entity = vtContainsEntity,
         .get_current_time = vtGetCurrentTime,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleParticipant,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_Entity = vtAsEntity,
     };
 
-    fn vtGetCAbiHandleParticipant(ctx: *anyopaque) *anyopaque {
+    /// One `CAbiViews` value for the whole object, covering all three
+    /// interface views it presents (Entity, DomainParticipant, and — via
+    /// `extensions.zig`'s `participantGetCAbiHandleZzdds`, which shares this
+    /// same `c_abi` field/`views` value — ZZDDS.DomainParticipant too). See
+    /// `GuardConditionImpl.views`'s identical-shape doc comment.
+    pub const views = ZZDDS.DomainParticipant.CAbiViews{
+        .base = .{
+            .base = .{ .flat_vtable = &entity_vtable },
+            .flat_vtable = &vtable,
+        },
+        .flat_vtable = &extensions_mod.participant_vtable,
+    };
+
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.participant_c_abi.get(self.alloc, ctx, &vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn vtAsEntity(ctx: *anyopaque) DDS.Entity {

@@ -86,10 +86,13 @@ back to the C caller:
 
 ```zig
 pub export fn DDS_Topic_get_name(self: *anyopaque) callconv(.c) [*:0]const u8 {
-    const _self: DDS.Topic = zidl_rt.unboxAs(DDS.Topic, self);
+    const _self: DDS.Topic = zidl_rt.unboxAsView(DDS.Topic, self);
     return _self.vtable.get_name(_self.ptr);
 }
 ```
+
+(`unboxAsView`, not the older `unboxAs`, because `Topic` is `@shared_c_abi_box`-annotated
+— see below. An unannotated interface's wrapper still uses plain `unboxAs`.)
 
 Each concrete implementation's `get_c_abi_handle` is expected to cache and
 reuse its own boxed handle (freed in that object's own `deinit`) — this is
@@ -97,6 +100,19 @@ what makes repeated accessor calls return an identity-stable (`==`-comparable)
 handle and keeps widened-view accessors like `get_entity()` from leaking a
 fresh box on every call.  See zidl's `docs/ecosystem.md` ("`--zig-generate-c-api`
 C-ABI export layer") for the full design and rationale.
+
+**Cross-view identity:** for `@shared_c_abi_box`-annotated interfaces (every real DDS
+entity/condition type as of 2026-08-12 — see zidl/docs/roadmap.md "Binding design review:
+decision"), a concrete impl caches *one* box shared across every interface view it
+presents, not one box per view — so a `GuardCondition` handle and the `Condition` handle
+`WaitSet.wait()` later returns for that same object are the identical, `==`-comparable
+C-ABI address, not just each internally self-consistent. The box's payload for these
+interfaces is a nested `CAbiViews` value (not a bare `Vtable` pointer), unboxed via
+`zidl_rt.unboxAsView` rather than `unboxAs` — pick the right one based on whether the
+interface being unboxed carries the annotation, not on which interface's operation you're
+implementing a wrapper for (a parameter's type and the enclosing operation's interface can
+differ, e.g. `WaitSet.attach_condition`'s `Condition` parameter needs `unboxAsView` even
+though `WaitSet` itself isn't annotated).
 
 Listener interfaces (annotated `@callback` in `dcps.idl`) are still plain C
 callback structs — no heap allocation, no adapter struct — but any
@@ -129,6 +145,26 @@ generated per-type from the user's own IDL and use only C-compatible types
 (pointer to data + `InstanceHandle_t` integer).  Conversion overhead is zero on
 the data path; cold-path setup operations (topic name strings, QoS) are called
 at most once per entity.
+
+**FFI pitfall: `bool` (1 byte) vs. `int`-width (4 byte) mismatches.** Zig's
+`bool` is a 1-byte C ABI type (matching C's own `_Bool`/`<stdbool.h> bool`),
+but many FFI layers default a bound function's boolean-looking return to a
+4-byte `int`-width type unless told otherwise — a real, reproducible bug, not
+a hypothetical one: Haskell's `zzdds_factory_is_nil` binding declared the
+return as `CInt` where zzdds's actual C signature returns `bool`/`_Bool`,
+reading 3 bytes of adjacent stack/register garbage along with the real byte
+and getting a wrong answer intermittently rather than a clean crash — exactly
+the kind of bug that's hard to pin down after the fact. This is not specific
+to Haskell or to `zzdds_factory_is_nil`: it's a general risk for *any*
+hand-written, header-independent FFI binding (i.e. one that redeclares
+zzdds's C signatures itself — via Haskell's FFI import, Python's `ctypes`,
+Go's `cgo` with a hand-copied signature, etc. — rather than generating or
+parsing them mechanically from `zzdds_c.h`). Every zzdds C function that
+returns `bool` (the `*_is_nil` family, `*_get_trigger_value`, and others)
+is exposed to this risk. When binding by hand, double-check the declared
+width matches the real C type exactly rather than assuming a "boolean-ish"
+default; when generating a binding, prefer deriving signatures directly from
+`zzdds_c.h`/the IDL rather than a hand-maintained shadow copy.
 
 ## Build flags
 

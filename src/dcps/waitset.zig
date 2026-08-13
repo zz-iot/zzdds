@@ -181,9 +181,36 @@ pub const WakeupList = struct {
 
 // ── WaitSetImpl ───────────────────────────────────────────────────────────────
 
+/// One entry in a WaitSet's `conditions` list: the attached condition
+/// itself, plus an optional release hook fired exactly once when the
+/// attachment ends — however it ends (explicit `detach_condition()`, this
+/// WaitSet being destroyed while still attached, or the condition itself
+/// being destroyed while still attached) — mirroring `release_listener_data`'s
+/// contract (see `docs/decisions.md`) one level up: a binding that wants to
+/// know when it's safe to release its own keep-alive for an attached
+/// condition (a real gap with no existing hook — see zidl/docs/roadmap.md
+/// "Binding design review: decision") now has one. A plain `attach_condition()`
+/// call (the spec-mandated op) leaves both fields null; nothing fires for it
+/// — only `attachConditionWithRelease` populates them.
+pub const AttachedCondition = struct {
+    cond: DDS.Condition,
+    release_ctx: ?*anyopaque = null,
+    release_fn: ?*const fn (?*anyopaque) callconv(.c) void = null,
+
+    /// Never call while holding `WaitSetImpl.mu` (or any other lock this
+    /// file takes) — `release_fn` is arbitrary caller-supplied code (a
+    /// binding's own callback) that must be free to reentrantly call back
+    /// into this WaitSet (attach/detach another condition, even destroy it)
+    /// without deadlocking. Every call site below fires this only after its
+    /// own locked section has ended.
+    fn fireRelease(self: AttachedCondition) void {
+        if (self.release_fn) |f| f(self.release_ctx);
+    }
+};
+
 pub const WaitSetImpl = struct {
     alloc: std.mem.Allocator,
-    conditions: std.ArrayListUnmanaged(DDS.Condition),
+    conditions: std.ArrayListUnmanaged(AttachedCondition),
     mu: Mutex, // protects `conditions`
     cv_mu: Mutex, // protects `notified`
     cv_cond: Condvar,
@@ -257,8 +284,12 @@ pub const WaitSetImpl = struct {
         // from `self.conditions` via WakeupHandle.invalidate.
         // unregisterFromCondition() below only locks each condition's own
         // WakeupList mutex, never self.mu, so iterating self.conditions.items
-        // directly here (read-only) is safe.
-        for (self.conditions.items) |cond| unregisterFromCondition(self, cond);
+        // directly here (read-only) is safe. Same exclusivity is what makes
+        // firing each entry's release hook safe here too, with no lock held.
+        for (self.conditions.items) |entry| {
+            unregisterFromCondition(self, entry.cond);
+            entry.fireRelease();
+        }
         self.ws_c_abi.free(self.alloc);
         self.conditions.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -342,9 +373,9 @@ pub const WaitSetImpl = struct {
             // is only ever read once per wait() attempt.
             self.mu.lock();
             var triggered: std.ArrayListUnmanaged(DDS.Condition) = .empty;
-            for (self.conditions.items) |cond| {
-                if (cond.get_trigger_value()) {
-                    triggered.append(self.alloc, cond) catch {
+            for (self.conditions.items) |entry| {
+                if (entry.cond.get_trigger_value()) {
+                    triggered.append(self.alloc, entry.cond) catch {
                         triggered.deinit(self.alloc);
                         self.mu.unlock();
                         return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -395,12 +426,62 @@ pub const WaitSetImpl = struct {
 
     fn vtAttach(ctx: *anyopaque, cond: DDS.Condition) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.attachConditionWithRelease(cond, null, null, null);
+    }
+
+    /// Shared by the plain, spec-mandated `attach_condition()` (`vtAttach`,
+    /// via the C-ABI export `zzdds_waitset_attach_condition`, passing
+    /// null/null) and the hand-written extension
+    /// `zzdds_waitset_attach_condition_with_release` (`src/c_abi/extensions.zig`,
+    /// no equivalent IDL op exists — GuardCondition's own factory-less
+    /// bootstrap already has hand-written C-ABI extensions the same way).
+    /// `release_fn`, if set, fires exactly once when this specific attachment
+    /// ends, however it ends — see `AttachedCondition`'s own doc comment.
+    /// If `cond` is already attached, this is a no-op returning OK, same as
+    /// today's plain `attach_condition()` on an already-attached condition —
+    /// deliberately does NOT update or replace an existing registration's
+    /// release_ctx/release_fn (silently overwriting one would risk never
+    /// firing the original release for whatever owns that original context).
+    ///
+    /// `out_accepted`, if non-null, is set to whether THIS call's own
+    /// `release_ctx`/`release_fn` was actually stored (`true`) or discarded
+    /// because `cond` was already attached (`false`) — checked and set
+    /// atomically, under the same `self.mu` critical section as the
+    /// dedup check itself, before returning. Callers that keep their own
+    /// side bookkeeping alongside `release_ctx` (a JNI global ref, a C++
+    /// `shared_ptr` keepalive, ...) need this to decide, race-free, whether
+    /// to keep that bookkeeping or immediately discard it: previously, a
+    /// caller could only guess "is this a duplicate" via its own separate,
+    /// out-of-band cache, which could never be perfectly synchronized with
+    /// this function's own dedup check (a concurrent detach removing the
+    /// existing entry between the caller's cache check and this call, or a
+    /// concurrent attach for the same condition racing this call, could each
+    /// make that external cache stale) — see zidl-side PR review history
+    /// (Greptile PR #62) for the two real races this closes for good,
+    /// rather than one more heuristic timing fix. Deliberately does NOT fire
+    /// `release_fn` synchronously for the discarded case (unlike a real
+    /// release) — `fireRelease`'s own doc comment on why release_fn must
+    /// never run under `self.mu` would otherwise force this whole check out
+    /// from under the lock, reopening exactly the race this parameter exists
+    /// to close; reporting `false` and letting the caller clean up its own
+    /// ctx synchronously, on its own stack, needs no callback at all.
+    pub fn attachConditionWithRelease(
+        self: *Self,
+        cond: DDS.Condition,
+        release_ctx: ?*anyopaque,
+        release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
+        out_accepted: ?*bool,
+    ) DDS.ReturnCode_t {
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.conditions.items) |c| {
-            if (c.ptr == cond.ptr) return DDS.RETCODE_OK;
+        for (self.conditions.items) |entry| {
+            if (entry.cond.ptr == cond.ptr) {
+                if (out_accepted) |oa| oa.* = false;
+                return DDS.RETCODE_OK;
+            }
         }
-        self.conditions.append(self.alloc, cond) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        if (out_accepted) |oa| oa.* = true;
+        self.conditions.append(self.alloc, .{ .cond = cond, .release_ctx = release_ctx, .release_fn = release_fn }) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         // Register push-notification with the condition. WakeupList has a
         // fixed WAKEUP_SLOTS capacity (see its own doc comment) -- if a 5th
         // WaitSet tries to attach to a condition already attached to
@@ -446,16 +527,27 @@ pub const WaitSetImpl = struct {
 
     fn vtDetach(ctx: *anyopaque, cond: DDS.Condition) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        var removed: ?AttachedCondition = null;
         self.mu.lock();
-        defer self.mu.unlock();
-        for (self.conditions.items, 0..) |c, i| {
-            if (c.ptr == cond.ptr) {
-                _ = self.conditions.swapRemove(i);
+        for (self.conditions.items, 0..) |entry, i| {
+            if (entry.cond.ptr == cond.ptr) {
+                removed = self.conditions.swapRemove(i);
+                // Stays inside the lock, same as before this function grew a
+                // release hook: unregisterFromCondition must run before
+                // self.mu is released, or a concurrent vtAttach re-attaching
+                // this same condition in the gap could register a fresh
+                // WakeupHandle that this call would then wrongly strip back
+                // out (both registrations share the same ctx == self).
                 unregisterFromCondition(self, cond);
-                return DDS.RETCODE_OK;
+                break;
             }
         }
-        return DDS.RETCODE_PRECONDITION_NOT_MET;
+        self.mu.unlock();
+        const entry = removed orelse return DDS.RETCODE_PRECONDITION_NOT_MET;
+        // Fired only after releasing self.mu — see AttachedCondition.fireRelease's
+        // own doc comment for why.
+        entry.fireRelease();
+        return DDS.RETCODE_OK;
     }
 
     fn vtGetConditions(ctx: *anyopaque, out: ?*DDS.ConditionSeq) DDS.ReturnCode_t {
@@ -469,7 +561,8 @@ pub const WaitSetImpl = struct {
         seq.* = .{};
         const n = self.conditions.items.len;
         if (n == 0) return DDS.RETCODE_OK;
-        const buf = self.alloc.dupe(DDS.Condition, self.conditions.items) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        const buf = self.alloc.alloc(DDS.Condition, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        for (self.conditions.items, 0..) |entry, i| buf[i] = entry.cond;
         seq._buffer = buf.ptr;
         seq._length = @intCast(n);
         seq._maximum = @intCast(n);
@@ -505,14 +598,20 @@ pub const WaitSetImpl = struct {
     /// list's own mutex is still held, rather than here).
     fn vtInvalidateHandle(ctx: *anyopaque, cond_ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        var removed: ?AttachedCondition = null;
         self.mu.lock();
-        defer self.mu.unlock();
-        for (self.conditions.items, 0..) |c, i| {
-            if (c.ptr == cond_ptr) {
-                _ = self.conditions.swapRemove(i);
-                return;
+        for (self.conditions.items, 0..) |entry, i| {
+            if (entry.cond.ptr == cond_ptr) {
+                removed = self.conditions.swapRemove(i);
+                break;
             }
         }
+        self.mu.unlock();
+        // Fired only after releasing self.mu — see AttachedCondition.fireRelease's
+        // own doc comment for why (this call arrives from a condition's own
+        // teardown, via WakeupList.invalidateAll(), which already documents
+        // the identical reasoning for not holding its own mu across this call).
+        if (removed) |entry| entry.fireRelease();
     }
 
     /// `WakeupHandle.acquire`/`.release` implementations — see WakeupHandle's
@@ -558,8 +657,11 @@ pub const GuardConditionImpl = struct {
     /// to expose in WaitSetImpl.vtWait's own two-pass loop (see its comment).
     trigger: std.atomic.Value(bool),
     wakeups: WakeupList,
-    gc_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    cond_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across every interface view
+    /// (GuardCondition, Condition) — see `views` below and zidl/docs/roadmap.md
+    /// "Binding design review: decision" for why this replaces what used to be
+    /// two independently-cached, independently-addressed boxes.
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -571,8 +673,7 @@ pub const GuardConditionImpl = struct {
 
     pub fn deinit(self: *Self) void {
         self.wakeups.invalidateAll(self);
-        self.gc_c_abi.free(self.alloc);
-        self.cond_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -588,29 +689,33 @@ pub const GuardConditionImpl = struct {
         .get_trigger_value = vtGetTrigger,
         .set_trigger_value = vtSetTrigger,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleGuardCondition,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_Condition = vtAsConditionGuard,
+    };
+
+    /// One `CAbiViews` value for the whole object (see `zidl_rt.unboxAsView`).
+    /// Its `base` field nests Condition's own `CAbiViews`, at offset 0 — every
+    /// ancestor view's `get_c_abi_handle` below hands the *same* pointer
+    /// (`&views`) to the *same* `c_abi` cache, so both views share one box.
+    pub const views = DDS.GuardCondition.CAbiViews{
+        .base = .{ .flat_vtable = &cond_vtable },
+        .flat_vtable = &vtable,
     };
 
     fn vtAsConditionGuard(ctx: *anyopaque) DDS.Condition {
         return .{ .ptr = ctx, .vtable = &cond_vtable };
     }
 
-    fn vtGetCAbiHandleGuardCondition(ctx: *anyopaque) *anyopaque {
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.gc_c_abi.get(self.alloc, ctx, &vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     pub const cond_vtable = DDS.Condition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleCondition,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn vtGetCAbiHandleCondition(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.cond_c_abi.get(self.alloc, ctx, &cond_vtable);
-    }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
         return cast(ctx).trigger.load(.acquire);
@@ -694,8 +799,19 @@ pub const ReadConditionImpl = struct {
     /// is a field *inside* the larger QueryConditionImpl allocation, not its
     /// own. See deinit() below.
     owner_qc: ?*QueryConditionImpl = null,
-    rc_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    cond_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across every interface view
+    /// (ReadCondition, Condition) — see `views` below and
+    /// zidl/docs/roadmap.md "Binding design review: decision". Unused (never
+    /// populated) when `owner_qc != null`: an embedded `rc`'s own C-ABI
+    /// identity is `owner_qc`'s box instead — see `vtGetCAbiHandleReadCondition`/
+    /// `vtGetCAbiHandleCondition`'s `owner_qc` redirect below, which is what
+    /// makes QueryCondition/ReadCondition/Condition views of a QueryCondition
+    /// share ONE box despite `rc` being embedded at a non-zero offset inside
+    /// `QueryConditionImpl` (a real, different canonical `ptr` than `&self`,
+    /// so simply sharing a views/box *value* the way GuardCondition/
+    /// StatusCondition do above isn't enough here — see QueryConditionImpl's
+    /// own comment for the fuller picture).
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -797,10 +913,13 @@ pub const ReadConditionImpl = struct {
     /// loop dispatches each tracked condition to the right one of this or
     /// QueryConditionImpl.deinitAssumeReaderQuiescing() itself (see reader.zig).
     pub fn deinitAssumeReaderQuiescing(self: *Self) void {
+        // Never reached with owner_qc set -- see this function's own doc
+        // comment above ("NOT reachable through owner_qc delegation"), so
+        // `self.c_abi` here is always this standalone ReadCondition's own
+        // (unpopulated when embedded -- see that field's doc comment).
         self.detachFromAllWaitSets();
         self.remove_condition_fn(self.reader_ctx, self);
-        self.rc_c_abi.free(self.alloc);
-        self.cond_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -823,13 +942,35 @@ pub const ReadConditionImpl = struct {
         .as_Condition = vtAsConditionRead,
     };
 
+    /// One `CAbiViews` value for a *standalone* ReadCondition (`owner_qc ==
+    /// null`) — see `GuardConditionImpl.views`'s identical-shape doc comment.
+    /// Not used at all when embedded in a QueryConditionImpl — see
+    /// `vtGetCAbiHandleReadCondition`'s `owner_qc` redirect below and
+    /// QueryConditionImpl's own `views`/thunk-vtable pair.
+    pub const views = DDS.ReadCondition.CAbiViews{
+        .base = .{ .flat_vtable = &cond_vtable },
+        .flat_vtable = &vtable,
+    };
+
     fn vtAsConditionRead(ctx: *anyopaque) DDS.Condition {
         return .{ .ptr = ctx, .vtable = &cond_vtable };
     }
 
+    /// `ctx` is `self` for a standalone ReadCondition, but `&qc.rc` (a
+    /// non-zero-offset field inside a larger QueryConditionImpl allocation)
+    /// when this is QueryCondition's embedded `rc` — see `owner_qc`'s doc
+    /// comment. Boxing `&qc.rc` directly there would give QueryCondition's
+    /// ReadCondition/Condition views a *different* box address than its own
+    /// QueryCondition view's box (`&qc`), defeating cross-view identity for
+    /// exactly the object this whole mechanism exists to fix. Redirect to
+    /// the owning QueryConditionImpl's own shared box/views instead — see
+    /// that struct's `rc_thunk_vtable`/`cond_thunk_vtable`, which are safe to
+    /// call with `ctx = qc` (unlike this file's own `vtable`/`cond_vtable`
+    /// above, which assume `ctx` is `*ReadConditionImpl`).
     fn vtGetCAbiHandleReadCondition(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.rc_c_abi.get(self.alloc, ctx, &vtable);
+        if (self.owner_qc) |qc| return qc.c_abi.get(qc.alloc, qc, &QueryConditionImpl.views);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     pub const cond_vtable = DDS.Condition.Vtable{
@@ -838,9 +979,12 @@ pub const ReadConditionImpl = struct {
         .get_c_abi_handle = vtGetCAbiHandleCondition,
     };
 
+    /// Same `owner_qc` redirect as `vtGetCAbiHandleReadCondition` above, for
+    /// the same reason.
     fn vtGetCAbiHandleCondition(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.cond_c_abi.get(self.alloc, ctx, &cond_vtable);
+        if (self.owner_qc) |qc| return qc.c_abi.get(qc.alloc, qc, &QueryConditionImpl.views);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
@@ -883,8 +1027,10 @@ pub const StatusConditionImpl = struct {
     enabled_statuses: DDS.StatusMask,
     get_status_fn: *const fn (entity_ptr: *anyopaque) DDS.StatusMask,
     wakeups: WakeupList,
-    sc_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    cond_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across every interface view
+    /// (StatusCondition, Condition) — see `views` below and
+    /// zidl/docs/roadmap.md "Binding design review: decision".
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -906,8 +1052,7 @@ pub const StatusConditionImpl = struct {
 
     pub fn deinit(self: *Self) void {
         self.wakeups.invalidateAll(self);
-        self.sc_c_abi.free(self.alloc);
-        self.cond_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -930,29 +1075,31 @@ pub const StatusConditionImpl = struct {
         .set_enabled_statuses = vtSetEnabled,
         .get_entity = vtGetEntity,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleStatusCondition,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_Condition = vtAsConditionStatus,
+    };
+
+    /// One `CAbiViews` value for the whole object — see
+    /// `GuardConditionImpl.views`'s identical-shape doc comment.
+    pub const views = DDS.StatusCondition.CAbiViews{
+        .base = .{ .flat_vtable = &cond_vtable },
+        .flat_vtable = &vtable,
     };
 
     fn vtAsConditionStatus(ctx: *anyopaque) DDS.Condition {
         return .{ .ptr = ctx, .vtable = &cond_vtable };
     }
 
-    fn vtGetCAbiHandleStatusCondition(ctx: *anyopaque) *anyopaque {
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.sc_c_abi.get(self.alloc, ctx, &vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     pub const cond_vtable = DDS.Condition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleCondition,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn vtGetCAbiHandleCondition(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.cond_c_abi.get(self.alloc, ctx, &cond_vtable);
-    }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
         const self = cast(ctx);
@@ -1004,7 +1151,14 @@ pub const QueryConditionImpl = struct {
     /// returns error.ParseError from init, so the caller returns NIL.
     /// AST node slices borrow from `query_expression`; free before it.
     parsed_expr: ?*filter_mod.AstNode,
-    qc_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the *whole* object, shared across all three interface
+    /// views (QueryCondition, ReadCondition, Condition) — including the
+    /// ReadCondition/Condition views normally reached through the embedded
+    /// `rc` field. See `views`, `rc_thunk_vtable`/`cond_thunk_vtable` below,
+    /// and `ReadConditionImpl.vtGetCAbiHandleReadCondition`'s `owner_qc`
+    /// redirect, which is what routes those views here instead of to `rc`'s
+    /// own (deliberately unpopulated) box.
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -1096,9 +1250,10 @@ pub const QueryConditionImpl = struct {
         self.rc.detachFromAllWaitSets();
         self.rc.remove_condition_fn(self.rc.reader_ctx, &self.rc);
         if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
-        self.qc_c_abi.free(self.alloc);
-        self.rc.rc_c_abi.free(self.alloc);
-        self.rc.cond_c_abi.free(self.alloc);
+        // Frees the ONE shared box for all three views (QueryCondition,
+        // ReadCondition, Condition) -- self.rc.c_abi is never populated (see
+        // its own doc comment), nothing to free there.
+        self.c_abi.free(self.alloc);
         for (self.query_parameters.items) |p| self.alloc.free(p);
         self.query_parameters.deinit(self.alloc);
         self.alloc.free(self.query_expression);
@@ -1150,20 +1305,75 @@ pub const QueryConditionImpl = struct {
         .get_query_parameters = vtGetParams,
         .set_query_parameters = vtSetParams,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleQueryCondition,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_ReadCondition = vtAsReadCondition,
     };
 
     // The "ReadCondition view" of a QueryCondition is the embedded
     // ReadConditionImpl's own view (a different `ptr` — `&self.rc`, not
-    // `ctx`), same as `toCondition()` above already delegates to it.
+    // `ctx`), same as `toCondition()` above already delegates to it. This
+    // native value's `.vtable` is `ReadConditionImpl.vtable` (NOT
+    // `rc_thunk_vtable` below) — unchanged from before this file's C-ABI
+    // identity fix, since native Zig-to-Zig dispatch through `&self.rc` was
+    // never the bug (see zidl/docs/roadmap.md "Binding design review:
+    // decision"; only C-ABI box *addresses* diverged). `rc_thunk_vtable` is
+    // reached only via `ReadConditionImpl.vtGetCAbiHandleReadCondition`'s own
+    // `owner_qc` redirect, i.e. only when *boxing* for the C-ABI boundary.
     fn vtAsReadCondition(ctx: *anyopaque) DDS.ReadCondition {
         return cast(ctx).rc.toDDSReadCondition();
     }
 
-    fn vtGetCAbiHandleQueryCondition(ctx: *anyopaque) *anyopaque {
+    /// One `CAbiViews` value for the whole object, covering all three views
+    /// (QueryCondition, ReadCondition, Condition) — see `GuardConditionImpl.
+    /// views`'s identical-shape doc comment for the general mechanism.
+    /// `rc_thunk_vtable`/`cond_thunk_vtable` below (not `ReadConditionImpl.
+    /// vtable`/`.cond_vtable`) back the nested levels, since this box's `ptr`
+    /// is always `&self` (a QueryConditionImpl), never `&self.rc`.
+    pub const views = DDS.QueryCondition.CAbiViews{
+        .base = .{
+            .base = .{ .flat_vtable = &cond_thunk_vtable },
+            .flat_vtable = &rc_thunk_vtable,
+        },
+        .flat_vtable = &vtable,
+    };
+
+    /// ReadCondition-shaped vtable safe to call with `ctx = self` (a
+    /// `*QueryConditionImpl`), unlike `ReadConditionImpl.vtable` (which
+    /// assumes `ctx` is `*ReadConditionImpl`, i.e. `&self.rc`). Reuses this
+    /// struct's own `vtGetTrigger`/`vtGetSampleMask`/`vtGetViewMask`/
+    /// `vtGetInstMask`/`vtGetReader`/`vtDeinit` directly, since those already
+    /// take `ctx: *anyopaque` and cast to `*QueryConditionImpl` internally —
+    /// only `get_c_abi_handle`/`as_Condition` need QueryCondition-specific
+    /// bodies here.
+    pub const rc_thunk_vtable = DDS.ReadCondition.Vtable{
+        .get_trigger_value = vtGetTrigger,
+        .get_sample_state_mask = vtGetSampleMask,
+        .get_view_state_mask = vtGetViewMask,
+        .get_instance_state_mask = vtGetInstMask,
+        .get_datareader = vtGetReader,
+        .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandle,
+        .as_Condition = vtAsConditionThunk,
+    };
+
+    /// Condition-shaped vtable safe to call with `ctx = self` — same
+    /// reasoning as `rc_thunk_vtable` above, one level further up the chain.
+    pub const cond_thunk_vtable = DDS.Condition.Vtable{
+        .get_trigger_value = vtGetTrigger,
+        .deinit = vtDeinit,
+        .get_c_abi_handle = vtGetCAbiHandle,
+    };
+
+    fn vtAsConditionThunk(ctx: *anyopaque) DDS.Condition {
+        return .{ .ptr = ctx, .vtable = &cond_thunk_vtable };
+    }
+
+    /// Shared by all three views' `get_c_abi_handle` slots (the leaf
+    /// `vtable`, and both thunk vtables above) — same box, same `views`,
+    /// regardless of which view's slot got called, which is the whole point.
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.qc_c_abi.get(self.alloc, ctx, &vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
@@ -1313,7 +1523,7 @@ test "WaitSet: a second condition's drain() still succeeds and invalidates itsel
     // ws.conditions before it frees itself.
     gc_b.deinit();
     try testing.expectEqual(@as(usize, 1), ws.conditions.items.len);
-    try testing.expectEqual(gc_a.toCondition().ptr, ws.conditions.items[0].ptr);
+    try testing.expectEqual(gc_a.toCondition().ptr, ws.conditions.items[0].cond.ptr);
 
     // Finish simulating A's own drain()/invalidateAll(): invalidate then
     // release, exactly like invalidateAll()'s own loop body. This is the

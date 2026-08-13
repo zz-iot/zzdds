@@ -21,6 +21,7 @@ const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const Mutex = @import("../util/mutex.zig").Mutex;
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
+const extensions_mod = @import("../c_abi/extensions.zig");
 
 const Guid = proto.Guid;
 
@@ -124,10 +125,11 @@ pub const DataWriterImpl = struct {
     /// Populated on the first alive write per instance; never overwritten.
     key_registry: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, []u8) = .empty,
 
-    dw_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    // ZZDDS.DataWriter borrowed view — see src/c_abi/extensions.zig.
-    zzdds_dw_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across every interface view
+    /// (DataWriter, Entity, and ZZDDS.DataWriter — see src/c_abi/extensions.zig)
+    /// — see `views` below and zidl/docs/roadmap.md "Binding design review:
+    /// decision".
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -188,9 +190,7 @@ pub const DataWriterImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.listener_ex_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
-        self.dw_c_abi.free(self.alloc);
-        self.entity_c_abi.free(self.alloc);
-        self.zzdds_dw_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         self.qos.deinit(self.alloc);
         {
             var it = self.key_registry.valueIterator();
@@ -539,19 +539,14 @@ pub const DataWriterImpl = struct {
 
     // ── Entity vtable (shared subset) ────────────────────────────────────────
 
-    const entity_vtable = DDS.Entity.Vtable{
+    pub const entity_vtable = DDS.Entity.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleEntity,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
-    }
 
     // ── DDS.DataWriter vtable ─────────────────────────────────────────────────
 
@@ -575,13 +570,26 @@ pub const DataWriterImpl = struct {
         .get_matched_subscriptions = vtGetMatchedSubs,
         .get_matched_subscription_data = vtGetMatchedSubData,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleDataWriter,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_Entity = vtAsEntity,
     };
 
-    fn vtGetCAbiHandleDataWriter(ctx: *anyopaque) *anyopaque {
+    /// One `CAbiViews` value for the whole object, covering all three
+    /// interface views it presents (Entity, DataWriter, and — via
+    /// `extensions.zig`'s `writerGetCAbiHandleZzdds`, which shares this same
+    /// `c_abi` field/`views` value — ZZDDS.DataWriter too). See
+    /// `GuardConditionImpl.views`'s identical-shape doc comment.
+    pub const views = ZZDDS.DataWriter.CAbiViews{
+        .base = .{
+            .base = .{ .flat_vtable = &entity_vtable },
+            .flat_vtable = &vtable,
+        },
+        .flat_vtable = &extensions_mod.writer_vtable,
+    };
+
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.dw_c_abi.get(self.alloc, ctx, &vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn vtAsEntity(ctx: *anyopaque) DDS.Entity {

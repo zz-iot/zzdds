@@ -7,12 +7,14 @@
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = @import("zzdds_ext_generated").zzdds;
 const nil = @import("nil.zig");
 const waitset = @import("waitset.zig");
 const filter_mod = @import("filter.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const Mutex = @import("../util/mutex.zig").Mutex;
+const extensions_mod = @import("../c_abi/extensions.zig");
 
 // Forward reference: participant is defined in participant.zig.
 // We use *anyopaque here to avoid a circular import; the vtable forwarding
@@ -35,14 +37,15 @@ pub const TopicImpl = struct {
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
     inconsistent: DDS.InconsistentTopicStatus,
-    // One cache slot per distinct (ptr, vtable) view this object presents
-    // across the C-ABI — Topic, Entity, and TopicDescription are three
-    // different boxed values even though they share the same `self` pointer.
-    topic_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    entity_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    // Topic's primary base is Entity (`Topic : Entity, TopicDescription` —
+    // Entity listed first); TopicDescription is a *secondary* base and, per
+    // zidl/docs/roadmap.md "Binding design review: decision", can't share a
+    // box with the primary chain — it keeps its own independent box
+    // (`td_c_abi`/`td_views` below), permanently. `c_abi` is shared across
+    // every view on the PRIMARY chain instead: Topic, Entity, and (see
+    // `views` below and src/c_abi/extensions.zig) ZZDDS.Topic.
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
     td_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    // ZZDDS.Topic borrowed view — see src/c_abi/extensions.zig.
-    zzdds_topic_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -89,10 +92,8 @@ pub const TopicImpl = struct {
     pub fn deinit(self: *Self) void {
         self.listener_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
-        self.topic_c_abi.free(self.alloc);
-        self.entity_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         self.td_c_abi.free(self.alloc);
-        self.zzdds_topic_c_abi.free(self.alloc);
         self.qos.deinit(self.alloc);
         self.alloc.free(self.topic_name);
         self.alloc.free(self.type_name);
@@ -119,9 +120,22 @@ pub const TopicImpl = struct {
         .get_listener = vtGetListener,
         .get_inconsistent_topic_status = vtGetInconsistent,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleTopic,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_Entity = vtAsEntity,
         .as_TopicDescription = vtAsTopicDescription,
+    };
+
+    /// One `CAbiViews` value for Topic's PRIMARY chain only (Entity, Topic,
+    /// and — via `extensions.zig`'s `topicGetCAbiHandleZzdds`, which shares
+    /// this same `c_abi` field/`views` value — ZZDDS.Topic). Does NOT cover
+    /// the TopicDescription (secondary-base) view — see `td_views` below and
+    /// the `c_abi`/`td_c_abi` field split above.
+    pub const views = ZZDDS.Topic.CAbiViews{
+        .base = .{
+            .base = .{ .flat_vtable = &entity_vtable },
+            .flat_vtable = &topic_vtable,
+        },
+        .flat_vtable = &extensions_mod.topic_vtable,
     };
 
     fn vtAsEntity(ctx: *anyopaque) DDS.Entity {
@@ -132,9 +146,9 @@ pub const TopicImpl = struct {
         return .{ .ptr = ctx, .vtable = &td_vtable };
     }
 
-    fn vtGetCAbiHandleTopic(ctx: *anyopaque) *anyopaque {
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.topic_c_abi.get(self.alloc, ctx, &topic_vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
@@ -228,7 +242,7 @@ pub const TopicImpl = struct {
         return .{ .ptr = self, .vtable = &td_vtable };
     }
 
-    const td_vtable = DDS.TopicDescription.Vtable{
+    pub const td_vtable = DDS.TopicDescription.Vtable{
         .get_type_name = vtGetTypeName,
         .get_name = vtGetName,
         .get_participant = vtGetParticipant,
@@ -236,9 +250,15 @@ pub const TopicImpl = struct {
         .get_c_abi_handle = vtGetCAbiHandleTd,
     };
 
+    /// TopicDescription's own (secondary-base, independently-boxed)
+    /// `CAbiViews` — root-shaped since `TopicDescription` itself has no base.
+    /// Not shared with `views` above — see the `c_abi`/`td_c_abi` field
+    /// split's doc comment.
+    const td_views = DDS.TopicDescription.CAbiViews{ .flat_vtable = &td_vtable };
+
     fn vtGetCAbiHandleTd(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.td_c_abi.get(self.alloc, ctx, &td_vtable);
+        return self.td_c_abi.get(self.alloc, ctx, &td_views);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -247,19 +267,14 @@ pub const TopicImpl = struct {
         return .{ .ptr = self, .vtable = &entity_vtable };
     }
 
-    const entity_vtable = DDS.Entity.Vtable{
+    pub const entity_vtable = DDS.Entity.Vtable{
         .enable = vtEnable,
         .get_statuscondition = vtGetStatusCond,
         .get_status_changes = vtGetStatusChanges,
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
-        .get_c_abi_handle = vtGetCAbiHandleEntity,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn vtGetCAbiHandleEntity(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.entity_c_abi.get(self.alloc, ctx, &entity_vtable);
-    }
 
     fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
         return cast(entity_ptr).status_changes;
@@ -294,8 +309,10 @@ pub const ContentFilteredTopicImpl = struct {
     /// content-subscription profile is disabled.  AST node slices borrow from
     /// `filter_expr`, so this must be freed before `filter_expr`.
     parsed_expr: ?*filter_mod.AstNode,
-    td_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    cft_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across both interface views
+    /// (TopicDescription, ContentFilteredTopic) — see `views` below and
+    /// zidl/docs/roadmap.md "Binding design review: decision".
+    c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
 
@@ -347,8 +364,7 @@ pub const ContentFilteredTopicImpl = struct {
     pub fn deinit(self: *Self) void {
         // Free the AST before the expression string (AST slices borrow from it).
         if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
-        self.td_c_abi.free(self.alloc);
-        self.cft_c_abi.free(self.alloc);
+        self.c_abi.free(self.alloc);
         for (self.expr_params.items) |p| self.alloc.free(p);
         self.expr_params.deinit(self.alloc);
         self.alloc.free(self.filter_expr);
@@ -385,18 +401,13 @@ pub const ContentFilteredTopicImpl = struct {
     // meaningful at the application level; the wire protocol matches on the
     // related topic.  We therefore return the related topic name here so that
     // create_datareader can pass it straight through to create_proto_reader.
-    const td_vtable = DDS.TopicDescription.Vtable{
+    pub const td_vtable = DDS.TopicDescription.Vtable{
         .get_type_name = tdGetTypeName,
         .get_name = tdGetRelatedName,
         .get_participant = tdGetParticipant,
         .deinit = tdDeinit,
-        .get_c_abi_handle = tdGetCAbiHandle,
+        .get_c_abi_handle = vtGetCAbiHandle,
     };
-
-    fn tdGetCAbiHandle(ctx: *anyopaque) *anyopaque {
-        const self = cast(ctx);
-        return self.td_c_abi.get(self.alloc, ctx, &td_vtable);
-    }
 
     fn tdGetTypeName(ctx: *anyopaque) [*:0]const u8 {
         const r = cast(ctx).related;
@@ -425,13 +436,21 @@ pub const ContentFilteredTopicImpl = struct {
         .set_expression_parameters = cftSetParams,
         .get_related_topic = cftGetRelated,
         .deinit = cftDeinit,
-        .get_c_abi_handle = cftGetCAbiHandle,
+        .get_c_abi_handle = vtGetCAbiHandle,
         .as_TopicDescription = cftAsTopicDescription,
     };
 
-    fn cftGetCAbiHandle(ctx: *anyopaque) *anyopaque {
+    /// One `CAbiViews` value for the whole object, shared between both
+    /// interface views (TopicDescription, ContentFilteredTopic) — see
+    /// `GuardConditionImpl.views`'s identical-shape doc comment.
+    pub const views = DDS.ContentFilteredTopic.CAbiViews{
+        .base = .{ .flat_vtable = &td_vtable },
+        .flat_vtable = &cft_vtable,
+    };
+
+    fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
-        return self.cft_c_abi.get(self.alloc, ctx, &cft_vtable);
+        return self.c_abi.get(self.alloc, ctx, &views);
     }
 
     fn cftAsTopicDescription(ctx: *anyopaque) DDS.TopicDescription {

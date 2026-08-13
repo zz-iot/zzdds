@@ -89,7 +89,7 @@ const LoanedRawSample = struct {
 /// uncompilable in a Zig-only build.
 pub export fn zzdds_topic_as_description(topic: *anyopaque) callconv(.c) *anyopaque {
     if (isNullHandle(topic)) return nil.nil_topic_description.vtable.get_c_abi_handle(nil.nil_topic_description.ptr);
-    const t = zidl_rt.unboxAs(DDS.Topic, topic);
+    const t = zidl_rt.unboxAsView(DDS.Topic, topic);
     const r = t.vtable.as_TopicDescription(t.ptr);
     return r.vtable.get_c_abi_handle(r.ptr);
 }
@@ -122,7 +122,7 @@ pub export fn zzdds_write_raw_kind(
     data_len: usize,
 ) callconv(.c) DDS.ReturnCode_t {
     if (isNullHandle(writer)) return 1;
-    const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
+    const w = zidl_rt.unboxAsView(DDS.DataWriter, writer);
     if (nil.isNil(w)) return 1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
     const change_kind: history_mod.ChangeKind = switch (kind) {
@@ -165,38 +165,38 @@ pub export fn zzdds_take_one_raw(
     buf_size: usize,
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
-) callconv(.c) c_int {
-    if (isNullHandle(reader)) return -2;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
-    if (nil.isNil(r)) return -2;
+) callconv(.c) DDS.ReturnCode_t {
+    if (isNullHandle(reader)) return DDS.RETCODE_BAD_PARAMETER;
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
+    if (nil.isNil(r)) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-    const s = impl.takeRaw() orelse return 0;
+    const s = impl.takeRaw() orelse return DDS.RETCODE_NO_DATA;
     defer impl.alloc.free(s.data);
     cdr_len_out.* = s.data.len;
-    if (s.data.len > buf_size) return -1;
+    if (s.data.len > buf_size) return DDS.RETCODE_OUT_OF_RESOURCES;
     @memcpy(cdr_buf[0..s.data.len], s.data);
     info_out.* = .{
         .valid_data = s.info.valid_data,
         .instance_state = s.info.instance_state,
         .instance_handle = s.info.instance_handle,
     };
-    return 1;
+    return DDS.RETCODE_OK;
 }
 
 pub export fn zzdds_take_loaned_raw(
     reader: *anyopaque,
     loan_out: *CLoanedSample,
     info_out: *CSampleInfo,
-) callconv(.c) c_int {
-    if (isNullHandle(reader)) return -2;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
-    if (nil.isNil(r)) return -2;
+) callconv(.c) DDS.ReturnCode_t {
+    if (isNullHandle(reader)) return DDS.RETCODE_BAD_PARAMETER;
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
+    if (nil.isNil(r)) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-    const s = impl.takeRaw() orelse return 0;
+    const s = impl.takeRaw() orelse return DDS.RETCODE_NO_DATA;
     const owner = std.heap.c_allocator.create(LoanedRawSample) catch {
         std.log.err("zzdds_take_loaned_raw: sample permanently lost — OOM allocating loan handle", .{});
         impl.alloc.free(s.data);
-        return -1;
+        return DDS.RETCODE_OUT_OF_RESOURCES;
     };
     owner.* = .{ .data = s.data, .alloc = impl.alloc };
     loan_out.* = .{
@@ -209,7 +209,7 @@ pub export fn zzdds_take_loaned_raw(
         .instance_state = s.info.instance_state,
         .instance_handle = s.info.instance_handle,
     };
-    return 1;
+    return DDS.RETCODE_OK;
 }
 
 pub export fn zzdds_return_loaned_raw(
@@ -243,22 +243,22 @@ pub export fn zzdds_take_one_raw_instance(
     buf_size: usize,
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
-) callconv(.c) c_int {
-    if (isNullHandle(reader)) return -2;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
-    if (nil.isNil(r)) return -2;
+) callconv(.c) DDS.ReturnCode_t {
+    if (isNullHandle(reader)) return DDS.RETCODE_BAD_PARAMETER;
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
+    if (nil.isNil(r)) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-    const s = impl.takeNextInstanceRaw(prev_instance_handle) orelse return 0;
+    const s = impl.takeNextInstanceRaw(prev_instance_handle) orelse return DDS.RETCODE_NO_DATA;
     defer impl.alloc.free(s.data);
     cdr_len_out.* = s.data.len;
-    if (s.data.len > buf_size) return -1;
+    if (s.data.len > buf_size) return DDS.RETCODE_OUT_OF_RESOURCES;
     @memcpy(cdr_buf[0..s.data.len], s.data);
     info_out.* = .{
         .valid_data = s.info.valid_data,
         .instance_state = s.info.instance_state,
         .instance_handle = s.info.instance_handle,
     };
-    return 1;
+    return DDS.RETCODE_OK;
 }
 
 // ── New writer operations ────────────────────────────────────────────────────
@@ -284,7 +284,7 @@ pub export fn zzdds_write_raw_w_timestamp(
     ts: DDS.Time_t,
 ) callconv(.c) DDS.ReturnCode_t {
     if (isNullHandle(writer)) return 1;
-    const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
+    const w = zidl_rt.unboxAsView(DDS.DataWriter, writer);
     if (nil.isNil(w)) return 1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
     const change_kind: history_mod.ChangeKind = switch (kind) {
@@ -315,7 +315,7 @@ pub export fn zzdds_get_key_value_writer(
     len_out: *usize,
 ) callconv(.c) c_int {
     if (isNullHandle(writer)) return -1;
-    const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
+    const w = zidl_rt.unboxAsView(DDS.DataWriter, writer);
     if (nil.isNil(w)) return -1;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(w.ptr));
     const kv = impl.getKeyValueRaw(handle) orelse return -1;
@@ -344,10 +344,10 @@ pub export fn zzdds_read_one_raw(
     buf_size: usize,
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
-) callconv(.c) c_int {
-    if (isNullHandle(reader)) return -2;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
-    if (nil.isNil(r)) return -2;
+) callconv(.c) DDS.ReturnCode_t {
+    if (isNullHandle(reader)) return DDS.RETCODE_BAD_PARAMETER;
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
+    if (nil.isNil(r)) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     var tmp: std.ArrayListUnmanaged(@import("../dcps/reader.zig").TakenSample) = .empty;
     defer {
@@ -362,22 +362,21 @@ pub export fn zzdds_read_one_raw(
         1,
         null,
         null,
-    ) catch return -2;
-    if (tmp.items.len == 0) return 0;
+    ) catch return DDS.RETCODE_BAD_PARAMETER;
+    if (tmp.items.len == 0) return DDS.RETCODE_NO_DATA;
     const s = tmp.items[0];
     cdr_len_out.* = s.data.len;
-    if (s.data.len > buf_size) return -1;
+    if (s.data.len > buf_size) return DDS.RETCODE_OUT_OF_RESOURCES;
     @memcpy(cdr_buf[0..s.data.len], s.data);
     info_out.* = .{
         .valid_data = s.info.valid_data,
         .instance_state = s.info.instance_state,
         .instance_handle = s.info.instance_handle,
     };
-    return 1;
+    return DDS.RETCODE_OK;
 }
 
 /// read_next_instance: non-destructively return one sample for the next instance.
-/// Returns 1 on success, 0 if no qualifying sample, -1 on buffer-too-small.
 pub export fn zzdds_read_one_raw_instance(
     reader: *anyopaque,
     prev_instance_handle: DDS.InstanceHandle_t,
@@ -385,22 +384,22 @@ pub export fn zzdds_read_one_raw_instance(
     buf_size: usize,
     cdr_len_out: *usize,
     info_out: *CSampleInfo,
-) callconv(.c) c_int {
-    if (isNullHandle(reader)) return -2;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
-    if (nil.isNil(r)) return -2;
+) callconv(.c) DDS.ReturnCode_t {
+    if (isNullHandle(reader)) return DDS.RETCODE_BAD_PARAMETER;
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
+    if (nil.isNil(r)) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-    const s = impl.readNextInstanceRaw(prev_instance_handle) orelse return 0;
+    const s = impl.readNextInstanceRaw(prev_instance_handle) orelse return DDS.RETCODE_NO_DATA;
     defer impl.alloc.free(s.data);
     cdr_len_out.* = s.data.len;
-    if (s.data.len > buf_size) return -1;
+    if (s.data.len > buf_size) return DDS.RETCODE_OUT_OF_RESOURCES;
     @memcpy(cdr_buf[0..s.data.len], s.data);
     info_out.* = .{
         .valid_data = s.info.valid_data,
         .instance_state = s.info.instance_state,
         .instance_handle = s.info.instance_handle,
     };
-    return 1;
+    return DDS.RETCODE_OK;
 }
 
 /// C representation of a batch of raw samples.
@@ -429,7 +428,7 @@ fn nRawImpl(
 ) c_int {
     out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
     if (isNullHandle(reader)) return -1;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const alloc = std.heap.c_allocator;
@@ -640,14 +639,27 @@ fn packageTakenSamples(
 
 /// Unboxes `condition` as a DDS.ReadCondition and returns the concrete impl --
 /// safe for a plain ReadCondition OR a QueryCondition upcast via
-/// `as_ReadCondition()` (both produce the same vtable; see
-/// ReadConditionImpl.owner_qc's doc comment for how the two are told apart).
+/// `as_ReadCondition()`. These two cases are no longer boxed identically
+/// (binding-design-review Phase 1, 2026-08-12): a QueryCondition's
+/// ReadCondition-view box now unboxes to `owner_qc` itself (a
+/// `*QueryConditionImpl`) with `&QueryConditionImpl.rc_thunk_vtable`, not
+/// `&ReadConditionImpl.vtable` with `&qc.rc` — see
+/// `ReadConditionImpl.vtGetCAbiHandleReadCondition`'s `owner_qc` redirect —
+/// so both shapes need handling here, recovering the embedded `&qc.rc` in
+/// the second case (this function's callers all want a `*ReadConditionImpl`
+/// specifically, not a `*QueryConditionImpl`).
 fn unboxReadCondition(condition: *anyopaque) ?*const dcps_waitset.ReadConditionImpl {
     if (isNullHandle(condition)) return null;
-    const c = zidl_rt.unboxAs(DDS.ReadCondition, condition);
+    const c = zidl_rt.unboxAsView(DDS.ReadCondition, condition);
     if (nil.isNil(c)) return null;
-    if (c.vtable != &dcps_waitset.ReadConditionImpl.vtable) return null;
-    return @ptrCast(@alignCast(c.ptr));
+    if (c.vtable == &dcps_waitset.ReadConditionImpl.vtable) {
+        return @ptrCast(@alignCast(c.ptr));
+    }
+    if (c.vtable == &dcps_waitset.QueryConditionImpl.rc_thunk_vtable) {
+        const qc: *dcps_waitset.QueryConditionImpl = @ptrCast(@alignCast(c.ptr));
+        return &qc.rc;
+    }
+    return null;
 }
 
 fn wConditionRawImpl(
@@ -659,7 +671,7 @@ fn wConditionRawImpl(
 ) c_int {
     out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
     if (isNullHandle(reader)) return -1;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const rc_impl = unboxReadCondition(condition) orelse return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -711,7 +723,7 @@ fn nextInstanceWConditionRawImpl(
 ) c_int {
     out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
     if (isNullHandle(reader)) return -1;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const rc_impl = unboxReadCondition(condition) orelse return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
@@ -767,7 +779,7 @@ pub export fn zzdds_get_key_value_reader(
     len_out: *usize,
 ) callconv(.c) c_int {
     if (isNullHandle(reader)) return -1;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const kv = impl.getKeyValueRaw(handle) orelse return -1;
@@ -784,7 +796,7 @@ pub export fn zzdds_lookup_instance_reader(
     key_hash: *const [16]u8,
 ) callconv(.c) DDS.InstanceHandle_t {
     if (isNullHandle(reader)) return 0;
-    const r = zidl_rt.unboxAs(DDS.DataReader, reader);
+    const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return 0;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     // Compute handle from key hash and check if it's known alive.

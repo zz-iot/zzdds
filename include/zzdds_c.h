@@ -161,6 +161,51 @@ void zzdds_destroy_waitset(DDS_WaitSet waitset);
 void zzdds_destroy_guardcondition(DDS_GuardCondition guardcondition);
 
 /**
+ * Function pointer type for zzdds_waitset_attach_condition_with_release's
+ * release_fn parameter — same shape as a listener struct's
+ * release_listener_data field.
+ */
+typedef void (*zzdds_condition_release_fn)(void *release_ctx);
+
+/**
+ * Same as DDS_WaitSet_attach_condition, except release_fn (if non-NULL)
+ * fires exactly once when THIS attachment ends — however it ends: an
+ * explicit DDS_WaitSet_detach_condition() call, waitset being destroyed
+ * while condition is still attached, or condition being destroyed while
+ * still attached to waitset. No DCPS operation exists for this (WaitSet
+ * attachment is not ownership per the spec, so there is no lifecycle event
+ * to hang a release on other than this).
+ *
+ * A binding that wraps an attached condition in something with its own
+ * lifetime tracking (e.g. a reference-counted or GC-managed handle) can use
+ * this to learn when it's safe to release its own keep-alive for that
+ * condition, the same way a listener's release_listener_data lets it know
+ * when a listener's context is no longer needed.
+ *
+ * release_ctx/release_fn are ignored (as if this were a plain
+ * DDS_WaitSet_attach_condition() call) if condition is already attached to
+ * waitset — a second registration is never silently swapped in for the
+ * first.
+ *
+ * out_accepted, if non-NULL, is set to whether THIS call's own
+ * release_ctx/release_fn was actually stored (true) or discarded because
+ * condition was already attached (false) — checked and set atomically,
+ * under the same internal lock as the dedup check itself. A caller with its
+ * own side bookkeeping alongside release_ctx (a JNI global ref, a C++
+ * shared_ptr keepalive, ...) needs this to decide, race-free, whether to
+ * keep or immediately discard that bookkeeping: a separate, out-of-band
+ * "is this already attached" cache of the caller's own can never stay
+ * perfectly synchronized with this function's dedup check against a
+ * concurrent attach/detach for the same condition.
+ */
+DDS_ReturnCode_t zzdds_waitset_attach_condition_with_release(
+    DDS_WaitSet waitset,
+    DDS_Condition condition,
+    void *release_ctx,
+    zzdds_condition_release_fn release_fn,
+    bool *out_accepted);
+
+/**
  * Resolve `path` as a zzdds TOML config file and install the result as the
  * process-wide configuration, in one step -- entirely through `allocator`
  * (NULL for the default, libc malloc/free). Must be called before any
@@ -264,7 +309,16 @@ DDS_ReturnCode_t zzdds_write_raw_kind(
     size_t data_len
 );
 
-int zzdds_take_one_raw(
+/* zzdds_take_one_raw/_instance/_loaned all return a plain DDS_ReturnCode_t
+ * like every other zzdds C-ABI function: DDS_RETCODE_OK (a sample was
+ * taken), DDS_RETCODE_NO_DATA (none available -- not an error), or another
+ * DDS_RETCODE_* on a real error (DDS_RETCODE_BAD_PARAMETER for a null/
+ * invalid reader handle, DDS_RETCODE_OUT_OF_RESOURCES for a destination
+ * buffer too small to hold the sample or an allocation failure while
+ * constructing a loan). Every generated <Type>DataReader_take()/
+ * _take_next_instance()/_take_loaned() wrapper (C and C++) propagates this
+ * value directly as its own return value. */
+DDS_ReturnCode_t zzdds_take_one_raw(
     DDS_DataReader reader,
     uint8_t *cdr_buf,
     size_t buf_size,
@@ -272,7 +326,7 @@ int zzdds_take_one_raw(
     zzdds_sample_info *info_out
 );
 
-int zzdds_take_one_raw_instance(
+DDS_ReturnCode_t zzdds_take_one_raw_instance(
     DDS_DataReader reader,
     DDS_InstanceHandle_t prev_instance_handle,
     uint8_t *cdr_buf,
@@ -281,7 +335,7 @@ int zzdds_take_one_raw_instance(
     zzdds_sample_info *info_out
 );
 
-int zzdds_take_loaned_raw(
+DDS_ReturnCode_t zzdds_take_loaned_raw(
     DDS_DataReader reader,
     zzdds_loaned_sample *loan_out,
     zzdds_sample_info *info_out
@@ -311,7 +365,9 @@ int zzdds_get_key_value_writer(
 
 DDS_InstanceHandle_t zzdds_lookup_instance_writer(DDS_DataWriter writer, const uint8_t key_hash[16]);
 
-int zzdds_read_one_raw(
+/* Same DDS_ReturnCode_t convention as zzdds_take_one_raw/_instance/_loaned
+ * above -- see that comment. */
+DDS_ReturnCode_t zzdds_read_one_raw(
     DDS_DataReader reader,
     uint8_t *cdr_buf,
     size_t buf_size,
@@ -319,7 +375,7 @@ int zzdds_read_one_raw(
     zzdds_sample_info *info_out
 );
 
-int zzdds_read_one_raw_instance(
+DDS_ReturnCode_t zzdds_read_one_raw_instance(
     DDS_DataReader reader,
     DDS_InstanceHandle_t prev,
     uint8_t *cdr_buf,

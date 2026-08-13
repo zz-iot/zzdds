@@ -46,15 +46,19 @@ const FactoryOwner = struct {
     /// config at construction (see createFactory), independently overridable
     /// per-factory via set_default_participant_config from there on.
     default_config: ZZDDS.DomainParticipantConfig = .{},
-    // Two distinct C-ABI views of the same FactoryOwner (ZZDDS.DomainParticipantFactory
-    // via factory_vtable, DDS.DomainParticipantFactory via dds_factory_vtable) — each
-    // needs its own cache slot, same as any other multi-view concrete impl.
-    zzdds_fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
-    dds_fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// One box for the whole object, shared across both interface views
+    /// (ZZDDS.DomainParticipantFactory via `factory_vtable`,
+    /// DDS.DomainParticipantFactory via `dds_factory_vtable`) — see `views`
+    /// below and zidl/docs/roadmap.md "Binding design review: decision".
+    /// NOT the same object as `DomainParticipantFactoryImpl` (factory.zig) —
+    /// see that struct's own doc comment; `FactoryOwner` is the real,
+    /// app-visible factory identity, `DomainParticipantFactoryImpl` is an
+    /// internal per-`ParticipantStack` delegate with its own, independent,
+    /// single-view box.
+    fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     fn deinit(self: *@This()) void {
-        self.zzdds_fac_c_abi.free(self.alloc);
-        self.dds_fac_c_abi.free(self.alloc);
+        self.fac_c_abi.free(self.alloc);
         for (self.stacks.items) |stack| stack.deinit();
         self.stacks.deinit(self.alloc);
         self.default_dp_qos.deinit(self.alloc);
@@ -228,6 +232,15 @@ fn factoryAsDdsFactory(ctx: *anyopaque) DDS.DomainParticipantFactory {
     return .{ .ptr = ctx, .vtable = &dds_factory_vtable };
 }
 
+/// One `CAbiViews` value for the whole `FactoryOwner` object, covering both
+/// interface views it presents (DomainParticipantFactory, ZZDDS.
+/// DomainParticipantFactory) — see `GuardConditionImpl.views`'s
+/// identical-shape doc comment.
+pub const factory_views = ZZDDS.DomainParticipantFactory.CAbiViews{
+    .base = .{ .flat_vtable = &dds_factory_vtable },
+    .flat_vtable = &factory_vtable,
+};
+
 // Nil ZZDDS.* views (ptr == nil.NIL_PTR, but still the real vtable — see
 // DDS_..._as_zzdds_... below) need their own dedicated cache, same reasoning
 // as nil.zig's own nil-entity singletons: there's no real impl object to hang
@@ -237,7 +250,7 @@ var nil_zzdds_fac_c_abi: c_abi_handle.CachedCAbiHandle = .{};
 fn factoryGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
     if (ctx == nil.NIL_PTR) return nil_zzdds_fac_c_abi.get(std.heap.c_allocator, ctx, &factory_vtable);
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
-    return owner.zzdds_fac_c_abi.get(owner.alloc, ctx, &factory_vtable);
+    return owner.fac_c_abi.get(owner.alloc, ctx, &factory_views);
 }
 
 const dds_factory_vtable = DDS.DomainParticipantFactory.Vtable{
@@ -258,7 +271,7 @@ var nil_dds_fac_c_abi: c_abi_handle.CachedCAbiHandle = .{};
 fn factoryGetCAbiHandleDds(ctx: *anyopaque) *anyopaque {
     if (ctx == nil.NIL_PTR) return nil_dds_fac_c_abi.get(std.heap.c_allocator, ctx, &dds_factory_vtable);
     const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
-    return owner.dds_fac_c_abi.get(owner.alloc, ctx, &dds_factory_vtable);
+    return owner.fac_c_abi.get(owner.alloc, ctx, &factory_views);
 }
 
 pub const participant_vtable = ZZDDS.DomainParticipant.Vtable{
@@ -275,11 +288,18 @@ fn participantAsDds(ctx: *anyopaque) DDS.DomainParticipant {
 }
 
 var nil_zzdds_participant_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_zzdds_participant_views = ZZDDS.DomainParticipant.CAbiViews{
+    .base = .{
+        .base = .{ .flat_vtable = nil.nil_entity.vtable },
+        .flat_vtable = nil.nil_participant.vtable,
+    },
+    .flat_vtable = &participant_vtable,
+};
 
 fn participantGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
-    if (ctx == nil.NIL_PTR) return nil_zzdds_participant_c_abi.get(std.heap.c_allocator, ctx, &participant_vtable);
+    if (ctx == nil.NIL_PTR) return nil_zzdds_participant_c_abi.get(std.heap.c_allocator, ctx, &nil_zzdds_participant_views);
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(ctx));
-    return impl.zzdds_participant_c_abi.get(impl.alloc, ctx, &participant_vtable);
+    return impl.c_abi.get(impl.alloc, ctx, &DomainParticipantImpl.views);
 }
 
 pub const topic_vtable = ZZDDS.Topic.Vtable{
@@ -296,11 +316,18 @@ fn topicAsDds(ctx: *anyopaque) DDS.Topic {
 }
 
 var nil_zzdds_topic_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_zzdds_topic_views = ZZDDS.Topic.CAbiViews{
+    .base = .{
+        .base = .{ .flat_vtable = nil.nil_entity.vtable },
+        .flat_vtable = nil.nil_topic.vtable,
+    },
+    .flat_vtable = &topic_vtable,
+};
 
 fn topicGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
-    if (ctx == nil.NIL_PTR) return nil_zzdds_topic_c_abi.get(std.heap.c_allocator, ctx, &topic_vtable);
+    if (ctx == nil.NIL_PTR) return nil_zzdds_topic_c_abi.get(std.heap.c_allocator, ctx, &nil_zzdds_topic_views);
     const impl: *TopicImpl = @ptrCast(@alignCast(ctx));
-    return impl.zzdds_topic_c_abi.get(impl.alloc, ctx, &topic_vtable);
+    return impl.c_abi.get(impl.alloc, ctx, &TopicImpl.views);
 }
 
 pub const writer_vtable = ZZDDS.DataWriter.Vtable{
@@ -318,11 +345,18 @@ fn writerAsDds(ctx: *anyopaque) DDS.DataWriter {
 }
 
 var nil_zzdds_dw_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_zzdds_dw_views = ZZDDS.DataWriter.CAbiViews{
+    .base = .{
+        .base = .{ .flat_vtable = nil.nil_entity.vtable },
+        .flat_vtable = nil.nil_datawriter.vtable,
+    },
+    .flat_vtable = &writer_vtable,
+};
 
 fn writerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
-    if (ctx == nil.NIL_PTR) return nil_zzdds_dw_c_abi.get(std.heap.c_allocator, ctx, &writer_vtable);
+    if (ctx == nil.NIL_PTR) return nil_zzdds_dw_c_abi.get(std.heap.c_allocator, ctx, &nil_zzdds_dw_views);
     const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
-    return impl.zzdds_dw_c_abi.get(impl.alloc, ctx, &writer_vtable);
+    return impl.c_abi.get(impl.alloc, ctx, &DataWriterImpl.views);
 }
 
 pub const reader_vtable = ZZDDS.DataReader.Vtable{
@@ -340,11 +374,18 @@ fn readerAsDds(ctx: *anyopaque) DDS.DataReader {
 }
 
 var nil_zzdds_dr_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_zzdds_dr_views = ZZDDS.DataReader.CAbiViews{
+    .base = .{
+        .base = .{ .flat_vtable = nil.nil_entity.vtable },
+        .flat_vtable = nil.nil_datareader.vtable,
+    },
+    .flat_vtable = &reader_vtable,
+};
 
 fn readerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
-    if (ctx == nil.NIL_PTR) return nil_zzdds_dr_c_abi.get(std.heap.c_allocator, ctx, &reader_vtable);
+    if (ctx == nil.NIL_PTR) return nil_zzdds_dr_c_abi.get(std.heap.c_allocator, ctx, &nil_zzdds_dr_views);
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
-    return impl.zzdds_dr_c_abi.get(impl.alloc, ctx, &reader_vtable);
+    return impl.c_abi.get(impl.alloc, ctx, &DataReaderImpl.views);
 }
 
 pub export fn zzdds_create_factory() callconv(.c) *anyopaque {
@@ -369,12 +410,12 @@ pub export fn zzdds_create_factory_with_allocator(allocator: ?*const zidl_rt.Zid
 }
 
 pub export fn zzdds_factory_is_nil(factory: *anyopaque) callconv(.c) bool {
-    const f = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, factory);
+    const f = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, factory);
     return f.ptr == nil.NIL_PTR;
 }
 
 pub export fn zzdds_destroy_factory(factory: *anyopaque) callconv(.c) void {
-    const f = zidl_rt.unboxAs(ZZDDS.DomainParticipantFactory, factory);
+    const f = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, factory);
     if (f.ptr == nil.NIL_PTR) return;
     f.vtable.deinit(f.ptr);
 }
@@ -434,7 +475,7 @@ pub export fn zzdds_waitset_is_nil(waitset: *anyopaque) callconv(.c) bool {
 }
 
 pub export fn zzdds_guardcondition_is_nil(guardcondition: *anyopaque) callconv(.c) bool {
-    const g = zidl_rt.unboxAs(DDS.GuardCondition, guardcondition);
+    const g = zidl_rt.unboxAsView(DDS.GuardCondition, guardcondition);
     return g.ptr == nil.NIL_PTR;
 }
 
@@ -447,9 +488,47 @@ pub export fn zzdds_destroy_waitset(waitset: *anyopaque) callconv(.c) void {
 }
 
 pub export fn zzdds_destroy_guardcondition(guardcondition: *anyopaque) callconv(.c) void {
-    const g = zidl_rt.unboxAs(DDS.GuardCondition, guardcondition);
+    const g = zidl_rt.unboxAsView(DDS.GuardCondition, guardcondition);
     if (g.ptr == nil.NIL_PTR) return;
     g.vtable.deinit(g.ptr);
+}
+
+/// Same as the generated `attach_condition`, except `release_fn` (if
+/// non-null) fires exactly once when this specific attachment ends —
+/// however it ends: an explicit `detach_condition()`, `waitset` being
+/// destroyed while `condition` is still attached, or `condition` being
+/// destroyed while still attached to `waitset`. No IDL op exists for this
+/// (same reason `WaitSet`/`GuardCondition` needed hand-written
+/// create/destroy bootstrap above) — the equivalent of `release_listener_data`
+/// for a condition attachment, which no C-ABI-visible hook existed for
+/// before this: a binding wrapping an attached condition in something with
+/// its own lifetime tracking (e.g. a `std::shared_ptr`) previously had no
+/// way to learn "this condition just got detached/destroyed" — see
+/// zidl/docs/roadmap.md "Binding design review: decision".
+///
+/// `release_ctx`/`release_fn` are ignored (as if this were a plain
+/// `attach_condition()` call) if `condition` is already attached to
+/// `waitset` — see `WaitSetImpl.attachConditionWithRelease`'s own doc
+/// comment for why a second registration is never silently swapped in.
+///
+/// `out_accepted`, if non-null, is set to whether this call's own
+/// `release_ctx`/`release_fn` was actually stored (`true`) or discarded as a
+/// duplicate (`false`) — see `WaitSetImpl.attachConditionWithRelease`'s own
+/// doc comment for why a caller with its own side bookkeeping (a JNI global
+/// ref, a C++ `shared_ptr` keepalive, ...) needs this instead of maintaining
+/// a separate, inherently racy "is this already attached" cache of its own.
+pub export fn zzdds_waitset_attach_condition_with_release(
+    waitset: *anyopaque,
+    condition: *anyopaque,
+    release_ctx: ?*anyopaque,
+    release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
+    out_accepted: ?*bool,
+) callconv(.c) DDS.ReturnCode_t {
+    const w = zidl_rt.unboxAs(DDS.WaitSet, waitset);
+    if (w.ptr == nil.NIL_PTR) return DDS.RETCODE_ERROR;
+    const c = zidl_rt.unboxAsView(DDS.Condition, condition);
+    const impl: *WaitSetImpl = @ptrCast(@alignCast(w.ptr));
+    return impl.attachConditionWithRelease(c, release_ctx, release_fn, out_accepted);
 }
 
 /// Explicitly install the process-wide configuration. Must be called before
@@ -533,7 +612,7 @@ pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(fac
     // factory_vtable methods cast ctx to *FactoryOwner, so this conversion is
     // only valid for handles that were originally issued by zzdds_create_factory
     // (which sets vtable = &dds_factory_vtable via the generated as_DomainParticipantFactory export).
-    const f = zidl_rt.unboxAs(DDS.DomainParticipantFactory, factory);
+    const f = zidl_rt.unboxAsView(DDS.DomainParticipantFactory, factory);
     if (f.vtable != &dds_factory_vtable) return factoryGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DomainParticipantFactory = .{ .ptr = f.ptr, .vtable = &factory_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -543,7 +622,7 @@ pub export fn DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(fac
 /// zzdds_create_factory → create_participant_ex). Returns a nil handle for any
 /// handle not issued by this implementation.
 pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: *anyopaque) callconv(.c) *anyopaque {
-    const p = zidl_rt.unboxAs(DDS.DomainParticipant, participant);
+    const p = zidl_rt.unboxAsView(DDS.DomainParticipant, participant);
     if (p.vtable != &DomainParticipantImpl.vtable) return participantGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DomainParticipant = .{ .ptr = p.ptr, .vtable = &participant_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -552,7 +631,7 @@ pub export fn DDS_DomainParticipant_as_zzdds_DomainParticipant(participant: *any
 /// Only valid for topics created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_Topic_as_zzdds_Topic(topic: *anyopaque) callconv(.c) *anyopaque {
-    const t = zidl_rt.unboxAs(DDS.Topic, topic);
+    const t = zidl_rt.unboxAsView(DDS.Topic, topic);
     if (t.vtable != &TopicImpl.topic_vtable) return topicGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.Topic = .{ .ptr = t.ptr, .vtable = &topic_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -561,7 +640,7 @@ pub export fn DDS_Topic_as_zzdds_Topic(topic: *anyopaque) callconv(.c) *anyopaqu
 /// Only valid for writers created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: *anyopaque) callconv(.c) *anyopaque {
-    const w = zidl_rt.unboxAs(DDS.DataWriter, writer);
+    const w = zidl_rt.unboxAsView(DDS.DataWriter, writer);
     if (w.vtable != &DataWriterImpl.vtable) return writerGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DataWriter = .{ .ptr = w.ptr, .vtable = &writer_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -570,7 +649,7 @@ pub export fn DDS_DataWriter_as_zzdds_DataWriter(writer: *anyopaque) callconv(.c
 /// Only valid for readers created through a FactoryOwner-owned participant.
 /// Returns a nil handle for any handle not issued by this implementation.
 pub export fn DDS_DataReader_as_zzdds_DataReader(reader: *anyopaque) callconv(.c) *anyopaque {
-    const rd = zidl_rt.unboxAs(DDS.DataReader, reader);
+    const rd = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (rd.vtable != &DataReaderImpl.vtable) return readerGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DataReader = .{ .ptr = rd.ptr, .vtable = &reader_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
@@ -592,40 +671,130 @@ pub export fn DDS_DataReader_as_zzdds_DataReader(reader: *anyopaque) callconv(.c
 // internally. Condition is the only interface in zzdds with multiple
 // concrete sibling implementors, so it's the only hierarchy that needs this.
 pub export fn DDS_Condition_as_DDS_GuardCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const c = zidl_rt.unboxAs(DDS.Condition, base);
+    const c = zidl_rt.unboxAsView(DDS.Condition, base);
     if (c.vtable != &GuardConditionImpl.cond_vtable) return null;
     const r: DDS.GuardCondition = .{ .ptr = c.ptr, .vtable = &GuardConditionImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Condition_as_DDS_StatusCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const c = zidl_rt.unboxAs(DDS.Condition, base);
+    const c = zidl_rt.unboxAsView(DDS.Condition, base);
     if (c.vtable != &StatusConditionImpl.cond_vtable) return null;
     const r: DDS.StatusCondition = .{ .ptr = c.ptr, .vtable = &StatusConditionImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
 pub export fn DDS_Condition_as_DDS_ReadCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
-    const c = zidl_rt.unboxAs(DDS.Condition, base);
+    const c = zidl_rt.unboxAsView(DDS.Condition, base);
     if (c.vtable != &ReadConditionImpl.cond_vtable) return null;
     const r: DDS.ReadCondition = .{ .ptr = c.ptr, .vtable = &ReadConditionImpl.vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 
-/// Always reports "not a QueryCondition", not a bug: QueryConditionImpl
-/// embeds (rather than separately allocates) a ReadConditionImpl field, and
-/// its toCondition()/as_ReadCondition views deliberately return that
-/// embedded field's *own* vtable/ptr -- reusing ReadConditionImpl's global
-/// vtable constants -- so that WaitSetImpl.vtAttach/vtDetach treat a
-/// QueryCondition exactly like a ReadCondition (see the comment on
-/// QueryConditionImpl in waitset.zig). That sharing means a genuine
-/// QueryCondition's ReadCondition view is indistinguishable, by vtable
-/// identity, from a standalone ReadCondition -- there's no safe way to
-/// recover "this handle's ptr is actually the .rc field inside a
-/// QueryConditionImpl" without a runtime type tag neither struct carries.
-/// Reporting "not a match" here is honest; guessing would risk reinterpreting
-/// a real standalone ReadConditionImpl as a QueryConditionImpl.
+/// Implemented (2026-08-12, binding-design-review Phase 2 follow-up) using the
+/// real distinguishing signal the Phase 1 `owner_qc` redirect created: a
+/// QueryCondition's ReadCondition-view box unboxes (via `zidl_rt.unboxAsView`)
+/// to `&QueryConditionImpl.rc_thunk_vtable`, never `&ReadConditionImpl.vtable`
+/// — the two are genuinely distinguishable at the C-ABI level even though
+/// QueryConditionImpl embeds (rather than separately allocates) its
+/// ReadConditionImpl field and native `toCondition()`/`as_ReadCondition()`
+/// calls still return that embedded field's own vtable/ptr directly (see the
+/// comment on `QueryConditionImpl` in `waitset.zig` — that sharing is what
+/// lets `WaitSetImpl.vtAttach`/`vtDetach` treat a QueryCondition exactly like
+/// a ReadCondition, and is untouched by this function). No pointer-arithmetic
+/// reversal needed either: per that same `owner_qc` redirect, this box's
+/// `.ptr` is already the outer `*QueryConditionImpl`, not `&owner_qc.rc` —
+/// unlike a naive expectation, and unlike this function's three siblings
+/// above (which all return the input `.ptr` unchanged, since none of them
+/// have an embedding wrinkle to correct for).
 pub export fn DDS_ReadCondition_as_DDS_QueryCondition(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const c = zidl_rt.unboxAsView(DDS.ReadCondition, base);
+    if (c.vtable != &QueryConditionImpl.rc_thunk_vtable) return null;
+    const r: DDS.QueryCondition = .{ .ptr = c.ptr, .vtable = &QueryConditionImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+// ── Entity hierarchy checked downcasts ────────────────────────────────────────
+//
+// Same reasoning as the Condition hierarchy downcasts above: zidl's C backend
+// declares `DDS_Entity_as_DDS_<Derived>` in dcps.h for every direct
+// Entity-derived interface (Entity is `@shared_c_abi_box`), but generates no
+// body -- it has no way to know which concrete zzdds struct backs a given
+// `DDS.Entity` view. Left undefined until now because nothing called them: the
+// only existing runtime-type-check caller of a `_box_as_most_derived`-style
+// dispatcher was the Java backend's sequence-only mechanism (WaitSet's
+// `ConditionSeq`, Condition family only). Generalizing that mechanism to
+// single-value entity returns/attributes (`StatusCondition::get_entity()`,
+// zidl PR #39 Greptile fix) made the Java JNI bridge's own generated
+// `Entity_box_as_most_derived` dispatcher call these for the first time --
+// caught as an `UnsatisfiedLinkError: undefined symbol` at JNI library load,
+// not a compile-time error, since the C-ABI declaration alone was enough to
+// satisfy the generated caller's own compilation.
+pub export fn DDS_Entity_as_DDS_DomainParticipant(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    if (e.vtable != &DomainParticipantImpl.entity_vtable) return null;
+    const r: DDS.DomainParticipant = .{ .ptr = e.ptr, .vtable = &DomainParticipantImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_Entity_as_DDS_Topic(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    if (e.vtable != &TopicImpl.entity_vtable) return null;
+    const r: DDS.Topic = .{ .ptr = e.ptr, .vtable = &TopicImpl.topic_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_Entity_as_DDS_Publisher(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    if (e.vtable != &PublisherImpl.entity_vtable) return null;
+    const r: DDS.Publisher = .{ .ptr = e.ptr, .vtable = &PublisherImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_Entity_as_DDS_Subscriber(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    if (e.vtable != &SubscriberImpl.entity_vtable) return null;
+    const r: DDS.Subscriber = .{ .ptr = e.ptr, .vtable = &SubscriberImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_Entity_as_DDS_DataWriter(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    if (e.vtable != &DataWriterImpl.entity_vtable) return null;
+    const r: DDS.DataWriter = .{ .ptr = e.ptr, .vtable = &DataWriterImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_Entity_as_DDS_DataReader(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const e = zidl_rt.unboxAsView(DDS.Entity, base);
+    if (e.vtable != &DataReaderImpl.entity_vtable) return null;
+    const r: DDS.DataReader = .{ .ptr = e.ptr, .vtable = &DataReaderImpl.vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+// ── TopicDescription hierarchy checked downcasts ──────────────────────────────
+//
+// Same reasoning as the Entity/Condition downcasts above. `MultiTopic` is
+// permanently a nil-only stub in zzdds (`participant.zig`'s `vtCreateMultiTopic`
+// never returns a real handle -- no `MultiTopicImpl` exists at all), so no real
+// `DDS.TopicDescription` view can ever actually be one; the checked downcast
+// always returns null rather than comparing against a vtable nothing real ever
+// installs.
+pub export fn DDS_TopicDescription_as_DDS_Topic(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const td = zidl_rt.unboxAsView(DDS.TopicDescription, base);
+    if (td.vtable != &TopicImpl.td_vtable) return null;
+    const r: DDS.Topic = .{ .ptr = td.ptr, .vtable = &TopicImpl.topic_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_TopicDescription_as_DDS_ContentFilteredTopic(base: *anyopaque) callconv(.c) ?*anyopaque {
+    const td = zidl_rt.unboxAsView(DDS.TopicDescription, base);
+    if (td.vtable != &ContentFilteredTopicImpl.td_vtable) return null;
+    const r: DDS.ContentFilteredTopic = .{ .ptr = td.ptr, .vtable = &ContentFilteredTopicImpl.cft_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+pub export fn DDS_TopicDescription_as_DDS_MultiTopic(base: *anyopaque) callconv(.c) ?*anyopaque {
     _ = base;
     return null;
 }
@@ -680,7 +849,7 @@ pub export fn zzdds_cft_match_sample(
     get: ZzddsFieldGetFn,
 ) callconv(.c) bool {
     if (@intFromPtr(cft) == 0) return true;
-    const c = zidl_rt.unboxAs(DDS.ContentFilteredTopic, cft);
+    const c = zidl_rt.unboxAsView(DDS.ContentFilteredTopic, cft);
     if (nil.isNil(c)) return true;
     if (c.vtable != &ContentFilteredTopicImpl.cft_vtable) return true;
     const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(c.ptr));
@@ -1073,7 +1242,7 @@ test "zzdds extension factory creates participant with generated default config"
     const dp = factory.create_participant_ex(203, qos, null, 0, cfg);
     try std.testing.expect(!nil.isNil(dp));
 
-    const ext_dp = zidl_rt.unboxAs(ZZDDS.DomainParticipant, DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)));
+    const ext_dp = zidl_rt.unboxAsView(ZZDDS.DomainParticipant, DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr)));
     try std.testing.expectEqual(DDS.RETCODE_OK, ext_dp.register_type_support("KeylessSmoke"));
 
     const dds_factory = factory.vtable.as_DomainParticipantFactory(factory.ptr);

@@ -173,6 +173,65 @@ mechanical fix; out of scope for this round. Zig-native code is unaffected
 (`zig/waitset` compares native `{ptr,vtable}` values directly, no boxing
 involved) — this is a C-ABI-crossing-specific gap.
 
+**Decision recorded (2026-08-12) — Phase 1 implemented the same day. See zidl's roadmap
+"Binding design review: decision" for the full writeup, including the real implementation
+trail (bugs found in hand-written C-ABI code the codegen sweep couldn't reach, the
+`QueryConditionImpl` thunk-vtable resolution, and verification detail).** Root cause was the
+per-view `CachedCAbiHandle` split named above (`gc_c_abi`/`cond_c_abi`, e.g.), not the C++
+output path specifically — same root cause reachable at the raw C-ABI level too (see the
+Python spike finding just above). Fix: a second, boxing-only `CAbiViews` indirection struct
+per (`@shared_c_abi_box`-annotated) interface, nested per primary base via `extern struct`
+offset-0 composition, letting a concrete impl collapse to one `CachedCAbiHandle` field
+instead of one per view — no output-path cascade needed; `wait()`/`get_conditions()`'s
+existing dispatch already returns the right box for free once boxing is unified at the
+source. `QueryConditionImpl`'s embedded-`rc`-field pointer wrinkle (its `ReadCondition`/
+`Condition` views now box `&qc`, not `&qc.rc`) is resolved via new thunk vtables safe to call
+with `ctx = *QueryConditionImpl`. A real, C-ABI-level regression test (not just native Zig
+dispatch) proves the fix in `zzdds/test/c_abi/bootstrap_test.zig`. Topic's `TopicDescription`
+secondary-base view remains explicitly out of scope, permanently — no reported bug there and
+the fix doesn't generalize to secondary bases.
+
+**Phase 2 — Done (2026-08-12, same day).** Extended to every other entity impl
+(`DomainParticipant`/`Publisher`/`Subscriber`/`DataWriter`/`DataReader`/`Topic`/
+`TopicDescription`/`ContentFilteredTopic`/`DomainParticipantFactory`) plus, by deliberate
+decision at the start of this pass, the `ZZDDS.*` vendor-extension layer (`zzdds.idl`'s
+`DomainParticipantFactory`/`DomainParticipant`/`Topic`/`DataWriter`/`DataReader`) and
+`nil.zig`'s nil-entity sentinels (never touched by Phase 1 — a real, crash-confirmed gap,
+not just a theoretical one, once anything downstream started calling `unboxAsView` on a nil
+handle). See zidl's roadmap "Binding design review: decision" Phase 2 entry for the full
+implementation trail: a real zidl bug found and fixed along the way (cross-module
+`@shared_c_abi_box` annotations were silently discarded by the IR builder's import fill
+pass, the same class of bug `.bases` had already needed a similar carve-out for), the
+`FactoryOwner`-vs-`DomainParticipantFactoryImpl` distinction (two genuinely different
+objects, not one with extra views — collapsing them would have been a correctness bug, not
+a fix), and a second real C-ABI-level regression test proving the fix across the full
+3-level `Entity <- DataReader <- ZZDDS.DataReader` chain, including the dcps.idl/zzdds.idl
+module boundary.
+
+**The "unverified, likely C/Java too" above is now verified for C (2026-08-12),
+via `zzdds-examples/spikes/python/` — see zidl's roadmap "Binding design review"
+section for the full cross-language context.** Confirmed directly with `ctypes`
+against the raw C-ABI, independent of any wrapper-caching layer (Python's probe
+has none — a `DDS_Condition` handle is just a bare `c_void_p`): a `GuardCondition`
+handle and its own `DDS_GuardCondition_as_DDS_Condition(gc)` view are two
+genuinely different pointer values (confirmed, not assumed), and `get_conditions()`
+returns exactly the *second* one, never the raw `GuardCondition` handle. So the
+gap is real at the C-ABI level itself, not a C++-`_getOrCreate`-specific artifact
+— it affects every binding using the plain opaque-handle model (C, and by the
+same mechanism Go/Rust/Haskell's spikes, all of which pass raw handles with no
+wrapper cache of their own), not just C++'s richer wrapper layer. One useful,
+previously-unstated nuance found in the same check: comparing against the
+*correctly-cast* view (`DDS_GuardCondition_as_DDS_Condition(gc)`, called once and
+held) rather than the native-typed handle (`gc` itself) **does** match
+`get_conditions()`'s result cleanly — `CachedCAbiHandle`'s "same view, asked for
+repeatedly, gets the same box" guarantee holds correctly; the break is
+specifically in comparing *across* views (native type vs. base type), not a
+general loss of identity. A viable application-level (and C-ABI-only, no
+per-language plumbing needed) workaround already exists — cast your own held
+handle to the base view once and compare against that — but it's opt-in
+knowledge, not automatic, matching this entry's own "real applications following
+the more common iterate-`active_conditions` idiom would hit this" concern.
+
 **`c/waitset` — Done, confirms the prediction below.** Ported straight from
 `zig/waitset` once the C++ fixes above landed, using the same "check each
 condition's own `get_trigger_value()` directly" pattern as `cpp/waitset`
@@ -981,6 +1040,532 @@ shared flag.  Each such site should instead hold a `Mutex` + `Condvar` pair; the
 signals the condvar when the condition becomes true, and the waiter unblocks immediately
 rather than sleeping up to one interval past the event.  `ManualClock`-driven tests in the
 existing suite should be extended to cover the condvar path.
+
+**Gap identified 2026-08-12, scoped 2026-08-13 (see the triage entry below) — not yet
+implemented: "nearest enclosing non-null listener" fallback (DDS 1.4 §2.2.4.1.5, "Listener
+Access to Plain Communication Status") — every entity's listener is fully independent
+today.** Found while scoping the
+binding-design-review work (see zidl's roadmap "Binding design review" section), not
+discovered via a bug report. Per spec, when an entity's communication status changes (e.g. a
+`DataReader`'s `on_data_available`), an implementation must invoke the *closest* installed,
+non-null listener by walking up the containment hierarchy at the moment the event fires: the
+entity's own listener first; if that entity has none installed (or the relevant callback
+field is null), the parent's (`Subscriber`/`Publisher`); if that has none either, the
+`DomainParticipant`'s. This is why `DomainParticipantListener` widens (via IDL inheritance)
+`TopicListener`/`PublisherListener`/`SubscriberListener` into one combined interface — the
+same widen-into-one-struct shape already implemented for `zzdds::DataWriterListenerEx`
+extending `DDS::DataWriterListener` (see `writer.zig`'s `listener_ex_box`), just one level
+higher and spec-mandated rather than a zzdds extension. It is *not* "listener code inherits
+behavior" in an OOP sense — it's a runtime search-and-fallback rule the middleware is
+responsible for performing; the callback that ends up running still receives the originating
+entity (e.g. the `DataReader`) as its argument, even when it's the `Subscriber`'s or
+`Participant`'s installed listener object whose code actually executes.
+
+Confirmed unimplemented, not just unverified: grepped `writer.zig`/`reader.zig` for any
+fallback-to-parent dispatch when an entity's own listener callback is null — none exists.
+Each entity's `listener_box` is used strictly on its own; a `DataReader` with no listener
+installed for `on_data_available`, whose `Subscriber` *does* have one installed, will not
+have that `Subscriber`'s callback invoked today. This is a real DDS 1.4 conformance gap, not
+a design choice recorded elsewhere in this roadmap — worth its own triage (fix vs.
+deliberately defer, matching this roadmap's existing style for gaps like `MultiTopic`) rather
+than being silently assumed complete. Relevant to, but distinct from, the binding-design C-ABI
+review: implementing it later would introduce a new recurring pattern the review should be
+aware even if it doesn't need to solve it now — a single physical listener struct (the
+`Subscriber`'s, say) being invoked with a *different* entity's handle as its callback
+argument (a `DataReader` it doesn't own), which is a new shape of "whose `ctx` is this" question
+alongside the ones already catalogued for per-registration listener keepalive.
+
+**Confirmed compatible with the binding design review's decision (2026-08-12), no design
+change needed.** See zidl's roadmap "Binding design review: decision" — the listener
+keepalive shape decided there keys per-registration, not per-listener-identity, specifically
+because one listener object can already be registered on multiple entities today; a single
+physical listener struct later serving as the "nearest enclosing" fallback for multiple
+child entities is the same case under that same keying rule. This gap's own fix/defer triage
+is still zzdds's own to do, independent of the binding review.
+
+**Triage (2026-08-13): scoped, not implemented — smaller and more tractable than "not yet
+triaged" suggested, but still a real multi-file change, not a quick patch.** Investigated
+the actual dispatch code rather than reasoning from the spec alone, and found the
+prerequisites mostly already in place:
+
+- **Size**: ~19 direct `if (box.listener.on_X) |cb| cb(...)` dispatch sites would need the
+  fallback treatment — `reader.zig` (12, across `on_data_available`/`on_requested_deadline_
+  missed`/etc.), `writer.zig` (5), `subscriber.zig` (2, `vtNotifyDataReaders`'s own
+  reader-listener dispatch — a *different* spec operation already doing something adjacent,
+  see below). `topic.zig`'s `on_inconsistent_topic` and `subscriber.zig`'s own
+  `on_data_on_readers` have **zero** firing sites today — not a fallback gap for those two
+  specifically, a *prior*, separate gap (the underlying status detection isn't wired up at
+  all yet), worth noting but out of scope here.
+- **The hard part — cross-entity access — already has a working precedent in this
+  codebase**: `Subscriber::notify_datareaders()`'s implementation (`subscriber.zig`'s
+  `vtNotifyDataReaders`) already reaches into each of its `DataReader`s' listener boxes via
+  `r.acquireListener()`, a `pub fn` on `DataReaderImpl` built exactly for safe cross-entity
+  access (`listener_box.zig`'s `acquireLocked`, called while holding the *reader's* own
+  lock, returning a refcounted handle the caller can read/dispatch through after releasing
+  it — never holding a lock across the callback itself). The fallback chain needs the same
+  pattern one level higher (reader → subscriber → participant, writer → publisher →
+  participant) — `SubscriberImpl`/`PublisherImpl`/`DomainParticipantImpl` just need the same
+  `pub fn acquireListener()` `DataReaderImpl` already has; nothing new to invent.
+- **The other prerequisite — parent back-references — already exists too**: `DataReaderImpl.
+  subscriber`, `DataWriterImpl.publisher`, `SubscriberImpl.participant`, `PublisherImpl.
+  participant` are all plain fields already, needed for `get_subscriber()`/`get_publisher()`/
+  `get_participant()` regardless. No new plumbing.
+- **The IDL is already shaped for this**: `DomainParticipantListener : TopicListener,
+  PublisherListener, SubscriberListener` and `SubscriberListener : DataReaderListener`/
+  `PublisherListener : DataWriterListener` are real widened structs (`dcps.idl`), so every
+  level's callback for a given status has the *identical* signature, including which entity
+  is passed as the argument (always the originating child, e.g. `on_data_available(the_
+  reader)`, never `self`) — no adapter/wrapper struct needed at any level, direct
+  field-by-field reuse.
+- **Locking is tractable if kept to the same discipline the existing code already uses**:
+  acquire-snapshot-release at one level, fully release before moving to the next (never a
+  chain of simultaneously-held locks) — matches `acquireLocked`'s own existing contract and
+  `vtNotifyDataReaders`'s existing usage of it. This is the one place a fix could go wrong in
+  a way this codebase has real scar tissue from (the `WaitSet` release-hook and listener-
+  keepalive work earlier in this roadmap both needed careful lock-ordering to get right) —
+  worth real test coverage (including a TSan pass, matching this roadmap's existing standard
+  for lock-sensitive changes), not worth skipping care on just because the pattern exists.
+
+**Real open questions before implementing (not blocking the triage decision, but blocking
+starting the work casually):**
+1. Does zzdds actually *prevent* deleting a `Subscriber`/`Publisher`/`DomainParticipant`
+   while it still has live children? The fallback's safety assumption ("my parent is always
+   valid while I exist") depends on this holding — worth confirming against the real
+   `delete_contained_entities`/precondition-check code, not assumed from spec text.
+2. Does the fallback need to respect each level's `set_listener(listener, mask)` mask, or
+   purely the per-callback-field nullability (this section's current framing)? Real DDS
+   implementations aren't fully uniform on this nuance — worth deciding and documenting
+   explicitly rather than leaving it implicit, given how often this exact class of "which
+   check governs dispatch" subtlety has bitten related work.
+3. Worth a shared generic dispatch helper (comptime over the callback field name) instead of
+   hand-writing the 3-level check at all ~19 sites? Strongly preferred for maintainability,
+   but each `*Listener` struct's callbacks have different signatures (arg counts/types), so
+   it's a real small design question, not a given.
+
+**Recommendation: right-sized to schedule as a discrete follow-on, not to fix inline and not
+to defer indefinitely.** It's a genuine DDS 1.4 conformance gap with a real, if niche, usage
+pattern behind it (installing one participant-level listener as a catch-all instead of one
+per entity) — worth doing. It's also a real multi-file, concurrency-sensitive change that
+deserves its own focused pass (design the shared helper, answer the two open questions
+above, touch ~19 call sites plus 3 new `pub fn acquireListener()`s, test including TSan) —
+not something to fold into an unrelated change as a drive-by. Not started this session.
+
+**`WaitSet`-attached-condition release hook — Done (2026-08-12).** The gap this section's
+own earlier "no C-ABI-visible signal at all" finding named (a binding relying on
+`attach_condition()` implicitly keeping a reference alive gets no error when the condition
+vanishes out from under it) now has a real fix: `zzdds_waitset_attach_condition_with_release`
+(`src/c_abi/extensions.zig`, declared in `include/zzdds_c.h`), firing a caller-supplied
+`release_fn` exactly once whichever way the attachment ends (explicit `detach_condition()`,
+the `WaitSet` destroyed while attached, or the condition destroyed while attached). See
+zidl's roadmap "Binding design review: decision" for the full implementation trail,
+including the lock-ordering subtlety found while designing it (the release callback must
+never fire while `WaitSetImpl.mu` is held, since it's arbitrary caller code that must be free
+to reentrantly call back into the same `WaitSet`). Not yet wired into any binding's own
+wrapper layer — see that section's own "explicitly not done" note.
+
+**`zzdds_cpp.hpp`: hand-written glue joins the C++ shared-family `_getOrCreate` cache —
+Done (2026-08-12).** zidl's C++ backend now collapses per-concrete-class `_getOrCreate`
+caches into one shared cache per `@shared_c_abi_box` family (see zidl's roadmap "Binding
+design review: decision" → "shared-family `_getOrCreate` cache") — but two zzdds-specific
+things construct condition/entity wrappers *outside* any generated `_getOrCreate` at all,
+so they needed their own changes to actually participate:
+- `wrapGuardConditionHandle` (`detail::GuardConditionSupport`'s factory) now registers the
+  object it constructs into `::DDS::ConditionImpl::_familyCache()` directly, keyed by
+  `DDS_GuardCondition_as_DDS_Condition(handle)`. `GuardCondition` has no factory operation
+  in dcps.idl (app-instantiated directly per spec) and so was never wrapped via any
+  generated `_getOrCreate` — without this registration, `WaitSet::wait()`'s generic
+  `ConditionImpl::_getOrCreate` would still construct an unrelated second object for the
+  same handle, even with the shared cache in place on the generated side.
+- `TopicSupport`/`DataWriterSupport`/`DataReaderSupport`/`DomainParticipantSupport`
+  (zzdds.idl's four `--cpp-impl-override` classes, composing a fully-implemented
+  `DDS::*Impl` rather than being constructed through the generated path) had each kept
+  their own independent cache, same shape as the bug the generated-code fix closed. Now
+  consult/populate `::DDS::EntityImpl`'s shared cache instead, recovering their own
+  concrete type via `dynamic_pointer_cast` on a hit — needed for real, not just for
+  consistency: `StatusCondition::get_entity()` returns a generic `DDS::Entity`, which could
+  be the exact handle behind an app's already-held `zzdds::DataWriter`.
+
+Verified: `zig build test` / `test-bindings` green, a standalone `g++ -c` compile of the
+regenerated `dcps_impl.cpp` clean, and `zzdds-examples/cpp/waitset` rebuilt with its
+`get_trigger_value()` workaround actually replaced by `wait()`-membership comparison — two
+consecutive clean runs, zero `FAIL` lines, including through `GuardCondition` (the case
+that specifically required this file's changes, not just the codegen fix).
+
+**`java_runtime/zzdds_java_runtime.c`: `GuardCondition` joins the Java shared box-identity
+cache — Done (2026-08-12, later the same day).** zidl's Java backend now gives
+`zidl_java_box_<c_name>` a shared native (JNI weak-global-ref) cache per `@shared_c_abi_box`
+family (see zidl's roadmap "Binding design review: decision" → "Java backend: native
+weak-global-ref box cache") — the exact same "hand-written glue needs to participate too"
+gap the C++ side hit above applies here too, for the same reason: `GuardCondition` has no
+factory operation in dcps.idl, so `ZzddsRuntime.createGuardCondition()`'s native
+implementation constructs its Java object directly, never through any generated box helper.
+Fixed by having it call a new `extern`-declared `_zidl_family_DDS_Condition_
+register_external` (emitted by zidl specifically for this case) right after construction,
+registering itself into the same cache `WaitSet.wait()`'s generic
+`zidl_java_box_DDS_Condition` consults. Unlike the C++ side, no `zzdds.idl`-extension
+classes needed equivalent treatment — Java has no `--cpp-impl-override`-style hand-written
+subclass mechanism; `zzdds.idl`'s own entity types go through the ordinary generated path
+(itself only partially covered by the shared cache today — see zidl's roadmap entry on the
+cross-file family-root limitation this fix's own bug-fix pass found and worked around, not
+solved, for `Entity`'s family specifically).
+
+Verified: `zig build test` / `test-bindings` green (including the Java smoke test), and
+`zzdds-examples/java/waitset` rebuilt with its `get_trigger_value()` workaround actually
+replaced by `List.contains()` membership checks — two consecutive clean runs, including
+through `GuardCondition`'s registration path (the case that specifically required this
+file's changes, not just the codegen fix).
+
+**C++/Java wrapper layers now actually use the `WaitSet`-attached-condition release
+hook — Done (2026-08-13).** The release hook itself (`zzdds_waitset_attach_condition_
+with_release`, above) landed with an explicit "not adopted anywhere yet" caveat; asked to
+close that.
+- **`zzdds_cpp.hpp`**: `WaitSetSupport::attach_condition()` now uses the hook, holding a
+  `shared_ptr<Condition>` keepalive per attached condition in an internal
+  `std::unordered_map`, released via the hook's callback. `detach_condition()` didn't need
+  an override — the inherited plain one already fires the same release callback, since
+  it's the same underlying C-ABI attachment record either way.
+- **`java_runtime/zzdds_java_runtime.c`**: no C++-style virtual override available for
+  Java, and no `--java-impl-override` codegen mechanism exists for `dcps.idl`-level types
+  (only zzdds.idl's vendor extensions have a C++ equivalent of that) — so this hooks in via
+  JNI's `RegisterNatives`, overriding `WaitSetImpl`'s generated `n_attach_condition` native
+  binding with a hand-written replacement holding a JNI global ref keepalive (a hand-rolled
+  native linked list, same shape as the shared box-identity cache above, minus the
+  weak-ref part). Registered lazily and exactly once (`pthread_once`) from
+  `createWaitSet()`'s native implementation. Completely transparent to app code —
+  `WaitSetImpl.java`'s public API is unchanged.
+
+Both verified with real programs exercising actual object-lifetime behavior, not just
+compiled: a standalone C++ program using `std::weak_ptr`, and a standalone Java program
+using `WeakReference` + `System.gc()`, each observing the wrapper object's own lifetime
+directly across four scenarios (survives after the app drops its own reference post-attach,
+released on explicit detach, released when the `WaitSet` itself is destroyed while still
+attached, no leaked second registration on a redundant re-attach). Both deliberately
+re-broken (fix reverted, confirmed the same test fails at the expected assertion, restored)
+before being considered verified, matching this whole review's own established discipline
+for regression tests.
+
+**`src/c_abi/extensions.zig`: Entity/TopicDescription family checked downcasts — Done
+(2026-08-13), required companion to zidl PR #39's Java most-derived-box fix.** zidl's Java
+backend generalized its sequence-only `_box_as_most_derived` dispatcher to bare (non-sequence)
+entity-typed returns/attributes too (see zidl's roadmap, "PR #39 Greptile review"), which made
+`StatusCondition::get_entity()`'s generated JNI bridge call `DDS_Entity_as_DDS_DomainParticipant`/
+`_Topic`/`_Publisher`/`_DataWriter`/`_Subscriber`/`_DataReader` for the first time — these are
+declared in the generated `dcps.h` (zidl declares a checked narrowing conversion for every
+direct edge in an `@shared_c_abi_box` family) but, like the pre-existing `Condition` family
+downcasts, zidl's C backend never generates a *body* for them (it has no visibility into which
+concrete zzdds struct backs a given vtable) — left undefined because nothing had ever called
+them: the only prior caller of this dispatch style was the sequence-only mechanism, exercised
+solely by the `Condition` family (`WaitSet::wait()`'s `ConditionSeq`). Caught as an
+`UnsatisfiedLinkError: undefined symbol` at `libzzdds_jni.so` load time, not a compile error —
+the C-ABI declaration alone was enough to satisfy the generated caller's own compilation.
+
+Fixed by hand-writing the six `DDS_Entity_as_DDS_*` downcasts plus three more for the
+`TopicDescription` family (`DDS_TopicDescription_as_DDS_Topic`/`_ContentFilteredTopic`/
+`_MultiTopic`, needed for the same reason once that family's own bare-`TopicDescription`
+accessors were checked), mirroring the existing `DDS_Condition_as_DDS_*` pattern exactly:
+unbox as the base interface view, compare `.vtable` against the concrete impl's own
+(newly-`pub`) vtable constant, construct and box the derived view on a match, `null` otherwise.
+`DDS_TopicDescription_as_DDS_MultiTopic` always returns `null` — `MultiTopic` is a permanent
+nil-only stub in zzdds (no `MultiTopicImpl` exists), so no real handle can ever actually be one.
+
+Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+`test-bindings` (all three bindings) clean; a dedicated `JavaSmoke.java` regression check
+(`StatusCondition.get_entity()` cast to `DomainParticipant`, `== dpWriter` for identity)
+added — see its own comment for why that specific call site is a cache-*hit* sanity check,
+not a true miss reproduction. The actual `ClassCastException` scenario (a handle whose
+*first-ever* Java-side box goes through the bare `Entity` accessor) was verified separately
+with a scratchpad GC/`WeakReference`-forced cache-miss program, deliberately re-broken
+(reverted zidl's fix, confirmed `EntityImpl` was returned and the cast threw
+`ClassCastException`) and confirmed fixed (`DomainParticipantImpl` returned, cast succeeds) —
+not committed to the permanent suite since it's inherently GC-timing-dependent, matching this
+repo's existing preference for scratchpad-only GC-based lifetime proofs over CI-committed ones.
+
+**PR #62 Greptile review (2026-08-13) — two real P1 races in `java_runtime/zzdds_java_runtime.c`,
+both fixed.** Confidence 3/5, both findings confirmed real and reachable, not speculative.
+
+1. **Keepalive insertion races release.** `zzdds_java_waitset_attach_condition` used to call
+   `zzdds_waitset_attach_condition_with_release()` (registering the one-shot native release
+   hook) *before* inserting its own bookkeeping node into the JNI-side keepalive list. If a
+   concurrent `detach_condition`/condition-invalidate/`WaitSet` destroy fired the release
+   callback in that window, the trampoline found no node to remove — and since a release is
+   documented (and Zig-side enforced) to fire at most once, the node/global ref inserted
+   moments later would never be cleaned up: a permanent JNI global-ref leak (pinning the
+   `Condition` object forever) plus a leaked heap node. Fixed by building and inserting the
+   keepalive node *before* registering the release hook — a release can only ever be possible
+   once the Zig side has stored the hook, which now strictly happens after the node exists, so
+   it can never observe a not-yet-inserted node. If the attach call itself then fails, the
+   pre-inserted node/global-ref are removed again explicitly (the Zig side never stored the
+   hook in that case, so no release will ever come to clean them up naturally).
+2. **Shared JNI environment crosses threads.** `zzdds_java_ensure_waitset_natives_registered`
+   wrote the calling thread's `JNIEnv` into a plain, unsynchronized global *before* calling
+   `pthread_once` — `pthread_once` only guarantees its callback runs exactly once, not that
+   it's the same thread that wrote the winning value, so two threads racing into
+   `createWaitSet` for the first time could have the once-callback run using a `JNIEnv` from a
+   *different* thread than the one that actually won the race — using another thread's
+   `JNIEnv` is undefined behavior (can crash or corrupt the JVM). Fixed by having the once
+   callback fetch its own `JNIEnv` via `zidl_java_get_env()` (backed by the thread-safe
+   `JavaVM*`) instead of trusting a value stashed by a possibly-different thread; the callback
+   now takes no `JNIEnv` parameter at all.
+
+Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+`test-bindings` (all three bindings) clean.
+
+**Update (2026-08-13, later the same day): a third real P1, found by Greptile's re-review
+after the above two landed — confirmed and fixed.** Confidence rose to 4/5 once the first
+two were fixed; the remaining finding is a genuine follow-on the fix #1 above didn't close.
+
+3. **Concurrent attachments leak keepalives.** The "already tracked?" check and the node
+   insertion were still two separate critical sections (fix #1 above only reordered
+   insertion to happen before the release-hook registration *within* a single attach call —
+   it didn't make the check-then-insert sequence atomic *across* concurrent calls). Two Java
+   threads attaching the SAME condition to the SAME `WaitSet` for the first time could both
+   pass the "not yet attached" check before either inserted its node. Both would then call
+   `zzdds_waitset_attach_condition_with_release` — but the Zig side
+   (`waitset.zig`'s `attachConditionWithRelease`) silently drops a second registration's
+   `release_fn`/`ctx` for an already-attached condition rather than replacing the first's
+   (documented, intentional — see that function's own doc comment), so the *losing* thread's
+   node, JNI global reference, and `ctx` would never be cleaned up by any release: a
+   permanent leak. Fixed by merging the check and the insertion into one critical section —
+   only the thread that actually wins the mutex race ever observes "not yet attached" and
+   inserts; every other concurrent caller for the same pair is guaranteed to observe it as
+   already-tracked and takes the existing safe redundant-reattach path instead.
+
+   Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+   `test-bindings` clean, plus a scratchpad stress test (200 rounds × 8 threads concurrently
+   calling `attach_condition()` on the same freshly-created `GuardCondition`/`WaitSet` pair,
+   then a single `detach_condition()`) — no crash, deadlock, or hang across 1,600 concurrent
+   attach calls. Not a leak-counting instrument (the bug is a silent reference leak, not a
+   crash, so a purely functional stress test can't directly disprove it) — correctness here
+   rests on the fix itself being a textbook single-critical-section fix for a TOCTOU race,
+   verified by inspection rather than empirically re-broken like the two GC-timing-dependent
+   fixes above.
+
+**Update (2026-08-13, later still): fix #3 above was itself incomplete — Greptile's
+re-review caught the actual remaining window, now closed for real.** Confidence rose to 4/5
+again; genuinely the same underlying bug as #3, one layer deeper.
+
+4. **Hookless attachment leaks keepalive.** Fix #3 made the "already tracked?" check and the
+   node *insertion* atomic, but the native attach-with-release-hook call
+   (`zzdds_waitset_attach_condition_with_release`) still happened *after* releasing that
+   lock. That left a window where the node was published (visible to
+   `zzdds_java_waitset_keepalive_contains_locked`) before the actual Zig-side attachment
+   record — with its release hook — existed. A second concurrent caller for the same
+   (waitset, handle) pair could see "already attached" in that window, take the redundant
+   plain-attach fast path, and *win the race* to create the real Zig-side record first — with
+   no release hook at all (the plain path passes null/null). The first thread's own
+   attach-with-release call then arrives to find the condition already attached (by the
+   second thread's hookless attach) and, per `attachConditionWithRelease`'s documented
+   behavior, silently drops the first thread's `release_fn`/`ctx` rather than replacing the
+   existing hookless registration — permanently leaking the node, `ctx`, and JNI global
+   reference the first thread had already inserted. Fixed by extending the single critical
+   section from fix #3 to cover the *entire* claim-insert-register sequence, including the
+   native attach-with-release call itself — every Java-side `attach_condition()` call funnels
+   through this one function (the only entry point, via `RegisterNatives`), so holding the
+   mutex across the whole sequence means no concurrent caller can ever observe a
+   claimed-but-not-yet-hooked attachment. Safe to call into the Zig/C-ABI layer while holding
+   this JNI-private mutex: the release trampoline never fires synchronously from within an
+   attach call (only later, from a separate detach/invalidate/destroy, outside any
+   zzdds-internal lock per its own doc comment), so there's no reentrancy or lock-order-
+   inversion risk.
+
+   Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+   `test-bindings` clean, plus the same 200-round × 8-thread concurrent-`attach_condition()`
+   stress test as fix #3 rerun against this version — no crash, deadlock, or hang, confirming
+   the wider critical section doesn't introduce one.
+
+**Update (2026-08-13, later still): a fourth real P1, a different attach/detach interleaving
+than #3/#4 above — fixed.** Confidence rose to 4/5 again.
+
+5. **Stale keepalive creates hookless reattachment.** `WaitSetImpl.n_detach_condition` was
+   never overridden — the plain, inherited native binding fires the same `release_fn` as an
+   explicit detach either way, since it's the same underlying C-ABI attachment record (true,
+   and still true). But *when* that release fires matters: it runs asynchronously, outside
+   any zzdds-internal lock, strictly *after* the native attachment record is already removed
+   (`waitset.zig`'s detach path unlocks `self.mu` before invoking `release_fn`) — leaving a
+   window where this file's JNI-side keepalive node is stale: still present, but no longer
+   backed by any real native attachment. A concurrent `attach_condition()` for the same
+   (waitset, handle) racing into exactly that window sees "already attached" (the stale
+   node), takes the redundant plain-attach fast path from fix #3/#4, and — since the real
+   attachment is already gone — that plain call actually *succeeds* in creating a genuinely
+   NEW native attachment, with no release hook at all (the plain path passes null/null).
+   The condition wrapper can then be collected by the JVM while the WaitSet still natively
+   references it — precisely the bug this whole keepalive mechanism exists to prevent.
+
+   Fixed by overriding `n_detach_condition` too (same `RegisterNatives` mechanism as
+   `n_attach_condition`): after an explicit detach succeeds, this file's own keepalive node
+   is now removed *synchronously*, right there, instead of waiting for the async release
+   callback to eventually get around to it. The node-removal logic itself was factored out
+   into a shared `zzdds_java_waitset_keepalive_remove` helper, used by both the new detach
+   override and the release trampoline — idempotent by construction (a `(waitset, handle)`
+   search-and-remove), so it's safe for both to race to clean up the same node if a detach
+   happens to overlap a WaitSet-destroy/condition-invalidate instead of just a plain detach:
+   whichever gets the lock first wins, the other finds nothing and is a no-op.
+
+   Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+   `test-bindings` clean, plus a dedicated scratchpad stress test — two threads racing
+   `detach_condition()`/`attach_condition()` against each other on the same `GuardCondition`
+   in opposite phase for 50 rounds, each round settling into a known "attached" final state,
+   dropping the app's own strong reference, forcing a full GC, then verifying
+   `get_conditions()` still returns exactly one working condition and `detach_condition()`
+   still succeeds on it — no crash, and functional correctness held across every round. Not a
+   direct reproduction of the specific "hookless attachment" symptom itself (constructing an
+   assertion that only fails on a hookless-but-still-functioning attachment, distinct from a
+   healthy one, would need deeper native introspection than this test does) — verified via
+   heavy racing plus a final-state consistency check, same standard applied to fix #3/#4
+   above, and the fix's correctness itself follows directly from the same synchronous-
+   removal argument used for those.
+
+**Update (2026-08-13, later still): fix #5 was itself racy — Greptile's fourth review round
+found the actual remaining hole, and this time the fix is a root-cause redesign, not another
+patch on the same JNI-side cache-checking approach.** Confidence stayed at 4/5.
+
+6. **Stale keepalive survives native detach.** Fix #5's `n_detach_condition` override called
+   the plain native detach, THEN separately removed its own JNI keepalive node — but those
+   two steps aren't atomic with each other. Tracing through `waitset.zig`'s `vtDetach`
+   revealed the real problem is one level deeper and can't be closed from the JNI side at
+   all under the OLD design: `vtDetach` removes the attachment from `self.conditions` under
+   `self.mu`, unlocks `self.mu`, and only THEN (still synchronously, on the detaching
+   thread, but with no lock held) calls `fireRelease()`. A concurrent `attach_condition()`
+   for the same condition can acquire the JNI keepalive lock in the gap between "self.mu
+   unlocked" and "fireRelease() actually runs" — a gap entirely internal to `vtDetach`, with
+   no JNI-side call boundary to hook a wider lock around. Confirmed by tracing the actual
+   code, not assumed: an attempted "just hold the JNI mutex across the whole native detach
+   call too" fix (mirroring fix #4's approach for attach) would have caused a genuine
+   self-deadlock instead — `fireRelease` is documented as never safe to call while holding
+   `self.mu` specifically so `release_fn` (arbitrary caller code) can reentrantly attach/detach
+   without deadlocking, and the Java trampoline (like C++'s) locks the very same JNI mutex a
+   wider critical section would already be holding.
+
+   Root cause: the JNI (and, on inspection, C++ too — same pattern, same
+   `keepalive_.count(h)`-then-act shape, not yet flagged by Greptile but equally broken)
+   layer's "is this condition already attached" fast-path check was fundamentally the wrong
+   tool — no ordering of a caller-side cache check against a concurrent attach/detach on
+   another thread can ever be airtight when the cache and the real Zig-side state are guarded
+   by two different locks that are never held together. Three review rounds (fixes #3, #4,
+   #5) kept finding a new specific interleaving because each fix patched the *symptom* of
+   that mismatch rather than removing the mismatch itself.
+
+   Real fix: `WaitSetImpl.attachConditionWithRelease` (`waitset.zig`) and the C-ABI export
+   `zzdds_waitset_attach_condition_with_release` (`extensions.zig`/`zzdds_c.h`) gained a new
+   `out_accepted: ?*bool` / `bool *out_accepted` parameter, set atomically — under the same
+   `self.mu` critical section as the dedup check itself — to whether THIS call's own
+   `release_ctx`/`release_fn` was actually stored (`true`, a fresh registration) or discarded
+   because the condition was already attached (`false`, a no-op duplicate). Deliberately does
+   NOT fire `release_fn` synchronously for the discarded case (which would reopen the exact
+   `self.mu` reentrancy hazard above) — it just reports the answer and lets the caller clean
+   up its own already-allocated bookkeeping directly, on its own stack, no callback needed.
+   Both C++ and Java were rewritten around this to always attempt the real
+   with-release registration (no more pre-check, no more fast path) and trust
+   `out_accepted`:
+   - **Java** (`zzdds_java_runtime.c`): `zzdds_java_waitset_attach_condition` simplified
+     drastically — no more shared keepalive linked list, mutex, or `n_detach_condition`
+     override (all removed; fix #5's override is no longer needed at all under this design).
+     Each attachment's `release_ctx` now owns its JNI global ref *directly*, so
+     `release_trampoline` never looks anything up by a `(waitset, handle)` key a concurrent
+     reattach could have already reused for a different registration.
+   - **C++** (`zzdds_cpp.hpp`): `WaitSetSupport` lost its `mu_`/`keepalive_` map entirely —
+     `ReleaseCtx` now owns the `shared_ptr<Condition>` keepalive directly, same shape as
+     Java's redesign. This also closes C++'s own latent version of fix #3's original
+     duplicate-leak race, discovered while redesigning around the shared root cause rather
+     than by a separate Greptile finding against C++ specifically.
+
+   Verified: `zig build test` (including two new/updated `bootstrap_test.zig` assertions
+   directly exercising `out_accepted` — `true` on a fresh registration, `false` on a
+   redundant duplicate) and `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true
+   install`/`test-bindings` (all three bindings) all clean. Both scratchpad stress tests from
+   fixes #3–#5 (200 rounds × 8-way concurrent same-condition attach; 50 rounds of racing
+   detach/reattach with a final GC-survival check) rerun against this redesign — no crash,
+   deadlock, or regression in either.
+
+**CI: `ZZDDS_EXAMPLES_REF` bumped to track the merged zzdds-examples PR (2026-08-13).**
+`.github/workflows/ci.yml`'s default pin moved to `6a856be513f4c8449e374972756abc5c915accee`
+(zzdds-examples "Waitset identity fixes, retcode cleanup, spike reorg", #6) — the commit that
+removed the `get_trigger_value()` waitset-example workarounds and normalized retcode checks to
+match this PR's own C-ABI changes; CI would otherwise keep exercising the pre-fix example code
+against the post-fix library.
+
+**Update (2026-08-13, later still): that bump itself surfaced a real, missed regression —
+`cpp/hello_world` — now fixed upstream and re-pinned.** The `zzdds-examples` CI job's
+`interop/hello-world-cross-binding` step failed: every cross-binding pair with a C++
+subscriber (`zig pub -> cpp sub`, `c pub -> cpp sub`, `java pub -> cpp sub`) failed
+immediately with `FAIL: take() CDR error (rc=11)`. Root cause:
+`cpp/hello_world/src/subscriber.cpp`'s `take()` polling loop still checked `if (rc != 0)
+FAIL`, a leftover from the old ambiguous retcode convention — under the now-normalized
+`DDS_ReturnCode_t` convention, `rc == 11` (`DDS_RETCODE_NO_DATA`) is the *normal*
+"queue empty, stop polling" signal, not an error. The exact same bug class as
+`c/hello_world/src/subscriber.c` and `cpp/custom-allocator` (both already fixed earlier in
+this same retcode-normalization pass) — this one file was simply missed. Fixed in
+zzdds-examples (commit `3338e67af4e8d46fa8569ceeafee2731f28978c2`, pushed directly to main)
+by mirroring `c/hello_world/src/subscriber.c`'s exact pattern:
+`if (rc == DDS_RETCODE_NO_DATA) break;` before the hard-fail check. Verified locally by
+running `interop/hello_world_cross_binding_smoke_test.py` directly (the same script CI
+runs) — all 12 cross-binding pairs pass. Also audited every other `take()`/`take_loaned()`
+call site across zzdds-examples (C, C++, Java) for the same stale-check pattern; nothing
+else affected. `ZZDDS_EXAMPLES_REF` re-pinned to this new commit.
+
+**Test coverage: closed a real gap in `src/c_abi/extensions.zig`'s checked downcasts
+(2026-08-13).** Codecov flagged this PR's patch coverage as low; pulled the CI `Coverage`
+job's kcov artifact (`cobertura.xml`) for the closest available successful run and
+cross-referenced its uncovered-line ranges against this PR's diff.
+`src/c_abi/extensions.zig` stood out — 58% covered overall, the second-lowest file in the
+repo after `nil.zig` (which is inherently low-value to chase: near-identical nil-singleton
+boilerplate, not real logic) — and its uncovered ranges lined up almost exactly with the 13
+checked-downcast functions this PR itself added (`DDS_Condition_as_DDS_GuardCondition`/
+`_StatusCondition`/`_ReadCondition`, the six `DDS_Entity_as_DDS_*`, and the three
+`DDS_TopicDescription_as_DDS_*`). Confirmed by grep: only ONE of the 13 (
+`DDS_ReadCondition_as_DDS_QueryCondition`) had a real unit test before this — the other 12
+were exercised, if at all, only indirectly via the Java smoke test's `StatusCondition.
+get_entity()` call (`DDS_Entity_as_DDS_DomainParticipant` only), and that path is invisible
+to kcov entirely (a separate JVM process calling into a separately-built `.so`, not a `zig
+build emit-tests` binary) — so from the Zig suite's own coverage perspective, 12 of 13 were
+completely dark.
+
+Added three new tests to `test/c_abi/bootstrap_test.zig`, one per family, each exercising
+both branches (real match recovers the same boxed handle the concrete type's own
+`get_c_abi_handle` produces; a genuine mismatch returns `null`, not a false positive) using
+the existing `Fixture` helper (already builds a full DomainParticipant/Topic/Publisher/
+Subscriber/DataWriter/DataReader intraprocess pair) plus real `GuardCondition`/
+`StatusCondition`/`ReadCondition`/`ContentFilteredTopic` instances — no new test
+infrastructure needed. `zig build test` green.
+
+Not chased further: `extensions.zig` still has real remaining gaps in its OOM/allocation-
+failure error paths (e.g. `factoryCreateParticipant`'s `config_generated.toRuntimeConfig`
+`catch` branches) — `testing.FailingAllocator` is an established pattern elsewhere in this
+suite (`discovery_interface_test.zig`, `waitset_test.zig`, `cft_test.zig`) that could cover
+these, but scoping and writing that is a separate, follow-up-sized task, not done here.
+`nil.zig` (12% covered) is lower priority — the uncovered lines there are overwhelmingly
+repetitive nil-singleton vtable wiring, not branchy logic worth a dedicated test per file.
+
+**Update (2026-08-13, later still): a real gap the coverage pass' own `FailingAllocator`
+suggestion turned up in practice — Greptile's next review round, not a coincidence.** The
+"remaining OOM/allocation-failure error paths" note above was about `extensions.zig`'s
+*other* functions; this one is in the Java WaitSet keepalive path fixes #3–#6 already
+touched, and is worth calling out on its own.
+
+7. **OOM creates hookless attachment.** `zzdds_java_waitset_attach_condition`'s own OOM
+   fallbacks — `malloc` failing for the release context, or `NewGlobalRef` failing for the
+   keepalive reference — degraded to a plain, hookless attach (still returning
+   `DDS_RETCODE_OK`) rather than failing the call outright. Exactly backwards under memory
+   pressure: the moment resources are tight enough that the keepalive can't be built is
+   also the moment losing it matters most, and the caller had no way to tell "attached,
+   protected" from "attached, silently unprotected" apart — both returned OK. Fixed by
+   returning the real, standard `DDS_RETCODE_OUT_OF_RESOURCES` instead of falling back, for
+   both failure points — mirroring how `attachConditionWithRelease`'s own `WAKEUP_SLOTS`-full
+   case already refuses to silently succeed rather than reporting OK for an attachment it
+   knows is incomplete. An attach that returns OK is now unconditionally a fully
+   keepalive-protected one; a caller ignoring this specific non-OK code is no worse off than
+   one ignoring any other `DDS_ReturnCode_t`. Simplified `zzdds_java_waitset_release_ctx`'s
+   `global_ref` field to a non-optional invariant as a result — it's now always a real
+   global ref by the time a ctx reaches the trampoline or the cleanup path, never a
+   "maybe-NULL, OOM-degraded" value threading through both.
+
+   Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+   `test-bindings` (all three bindings) clean, plus both existing concurrency stress tests
+   (200-round concurrent-attach, 50-round detach/reattach race) rerun against this change —
+   no crash, deadlock, or regression. Confirmed C++'s `WaitSetSupport::attach_condition()`
+   doesn't share this bug: `new ReleaseCtx{...}` throws `std::bad_alloc` on failure rather
+   than returning a null/degraded placeholder to silently proceed with, so there's no
+   equivalent "OOM but attach anyway" path there to begin with.
 
 ---
 
