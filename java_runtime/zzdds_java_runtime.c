@@ -166,7 +166,11 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
 extern JNIEnv *zidl_java_get_env(void);
 
 typedef struct {
-    jobject global_ref; /* may be NULL: NewGlobalRef can fail under OOM */
+    /* Always a real, non-NULL global ref by the time a ctx reaches either
+     * this trampoline or attach_condition's own cleanup path below --
+     * zzdds_java_waitset_attach_condition never lets a ctx with a failed
+     * NewGlobalRef proceed any further (see its own doc comment). */
+    jobject global_ref;
 } zzdds_java_waitset_release_ctx;
 
 /* Fires from inside zzdds, outside any zzdds-internal lock, on whichever of
@@ -179,10 +183,8 @@ typedef struct {
  * this function only ever runs for a genuinely accepted registration. */
 static void zzdds_java_waitset_release_trampoline(void *ctx_raw) {
     zzdds_java_waitset_release_ctx *ctx = (zzdds_java_waitset_release_ctx *)ctx_raw;
-    if (ctx->global_ref != NULL) {
-        JNIEnv *env = zidl_java_get_env();
-        if (env != NULL) (*env)->DeleteGlobalRef(env, ctx->global_ref);
-    }
+    JNIEnv *env = zidl_java_get_env();
+    if (env != NULL) (*env)->DeleteGlobalRef(env, ctx->global_ref);
     free(ctx);
 }
 
@@ -227,9 +229,28 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
     if (cond == NULL) return (jint)DDS_WaitSet_attach_condition(waitset, NULL);
     void *h = zzdds_java_resolve_condition_handle(env, cond);
 
+    /* Both allocation steps below must fully succeed before this attaches
+     * anything -- an earlier revision fell back to a plain, hookless attach
+     * (still returning DDS_RETCODE_OK) when either failed, on the theory
+     * that "best effort, OOM just means no keepalive" was an acceptable
+     * degradation. It isn't: that path let attach_condition() report
+     * success while silently skipping the exact lifetime protection this
+     * whole mechanism exists to provide, right when memory pressure makes
+     * losing that protection most likely to actually matter (Greptile PR
+     * #62 P1: "OOM creates hookless attachment"). Reporting the real,
+     * standard DDS_RETCODE_OUT_OF_RESOURCES instead — mirroring how
+     * attachConditionWithRelease's own WAKEUP_SLOTS-full case already
+     * refuses to silently succeed — means an attach that returns OK is now
+     * unconditionally a fully-protected one; a caller that ignores this
+     * particular non-OK return code is no worse off than one that ignores
+     * any other DDS_ReturnCode_t. */
     zzdds_java_waitset_release_ctx *ctx = malloc(sizeof(zzdds_java_waitset_release_ctx));
-    if (ctx == NULL) return (jint)DDS_WaitSet_attach_condition(waitset, h); /* best-effort: OOM just means no keepalive here */
-    ctx->global_ref = (*env)->NewGlobalRef(env, cond); /* may be NULL under OOM -- ctx is still passed through */
+    if (ctx == NULL) return (jint)DDS_RETCODE_OUT_OF_RESOURCES;
+    ctx->global_ref = (*env)->NewGlobalRef(env, cond);
+    if (ctx->global_ref == NULL) {
+        free(ctx);
+        return (jint)DDS_RETCODE_OUT_OF_RESOURCES;
+    }
 
     bool accepted = false;
     jint rc = (jint)zzdds_waitset_attach_condition_with_release(waitset, h, ctx, zzdds_java_waitset_release_trampoline, &accepted);
@@ -240,7 +261,7 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
          * release_ctx/release_fn is untouched, exactly as documented).
          * Either way, release_trampoline will never run for this ctx; it's
          * safe -- and necessary -- to clean it up directly here. */
-        if (ctx->global_ref != NULL) (*env)->DeleteGlobalRef(env, ctx->global_ref);
+        (*env)->DeleteGlobalRef(env, ctx->global_ref);
         free(ctx);
     }
     return rc;

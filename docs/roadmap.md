@@ -1536,6 +1536,37 @@ these, but scoping and writing that is a separate, follow-up-sized task, not don
 `nil.zig` (12% covered) is lower priority — the uncovered lines there are overwhelmingly
 repetitive nil-singleton vtable wiring, not branchy logic worth a dedicated test per file.
 
+**Update (2026-08-13, later still): a real gap the coverage pass' own `FailingAllocator`
+suggestion turned up in practice — Greptile's next review round, not a coincidence.** The
+"remaining OOM/allocation-failure error paths" note above was about `extensions.zig`'s
+*other* functions; this one is in the Java WaitSet keepalive path fixes #3–#6 already
+touched, and is worth calling out on its own.
+
+7. **OOM creates hookless attachment.** `zzdds_java_waitset_attach_condition`'s own OOM
+   fallbacks — `malloc` failing for the release context, or `NewGlobalRef` failing for the
+   keepalive reference — degraded to a plain, hookless attach (still returning
+   `DDS_RETCODE_OK`) rather than failing the call outright. Exactly backwards under memory
+   pressure: the moment resources are tight enough that the keepalive can't be built is
+   also the moment losing it matters most, and the caller had no way to tell "attached,
+   protected" from "attached, silently unprotected" apart — both returned OK. Fixed by
+   returning the real, standard `DDS_RETCODE_OUT_OF_RESOURCES` instead of falling back, for
+   both failure points — mirroring how `attachConditionWithRelease`'s own `WAKEUP_SLOTS`-full
+   case already refuses to silently succeed rather than reporting OK for an attachment it
+   knows is incomplete. An attach that returns OK is now unconditionally a fully
+   keepalive-protected one; a caller ignoring this specific non-OK code is no worse off than
+   one ignoring any other `DDS_ReturnCode_t`. Simplified `zzdds_java_waitset_release_ctx`'s
+   `global_ref` field to a non-optional invariant as a result — it's now always a real
+   global ref by the time a ctx reaches the trampoline or the cleanup path, never a
+   "maybe-NULL, OOM-degraded" value threading through both.
+
+   Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+   `test-bindings` (all three bindings) clean, plus both existing concurrency stress tests
+   (200-round concurrent-attach, 50-round detach/reattach race) rerun against this change —
+   no crash, deadlock, or regression. Confirmed C++'s `WaitSetSupport::attach_condition()`
+   doesn't share this bug: `new ReleaseCtx{...}` throws `std::bad_alloc` on failure rather
+   than returning a null/degraded placeholder to silently proceed with, so there's no
+   equivalent "OOM but attach anyway" path there to begin with.
+
 ---
 
 ## Deferred / Out of Scope for v1
