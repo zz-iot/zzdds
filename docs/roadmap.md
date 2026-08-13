@@ -1373,6 +1373,48 @@ again; genuinely the same underlying bug as #3, one layer deeper.
    stress test as fix #3 rerun against this version — no crash, deadlock, or hang, confirming
    the wider critical section doesn't introduce one.
 
+**Update (2026-08-13, later still): a fourth real P1, a different attach/detach interleaving
+than #3/#4 above — fixed.** Confidence rose to 4/5 again.
+
+5. **Stale keepalive creates hookless reattachment.** `WaitSetImpl.n_detach_condition` was
+   never overridden — the plain, inherited native binding fires the same `release_fn` as an
+   explicit detach either way, since it's the same underlying C-ABI attachment record (true,
+   and still true). But *when* that release fires matters: it runs asynchronously, outside
+   any zzdds-internal lock, strictly *after* the native attachment record is already removed
+   (`waitset.zig`'s detach path unlocks `self.mu` before invoking `release_fn`) — leaving a
+   window where this file's JNI-side keepalive node is stale: still present, but no longer
+   backed by any real native attachment. A concurrent `attach_condition()` for the same
+   (waitset, handle) racing into exactly that window sees "already attached" (the stale
+   node), takes the redundant plain-attach fast path from fix #3/#4, and — since the real
+   attachment is already gone — that plain call actually *succeeds* in creating a genuinely
+   NEW native attachment, with no release hook at all (the plain path passes null/null).
+   The condition wrapper can then be collected by the JVM while the WaitSet still natively
+   references it — precisely the bug this whole keepalive mechanism exists to prevent.
+
+   Fixed by overriding `n_detach_condition` too (same `RegisterNatives` mechanism as
+   `n_attach_condition`): after an explicit detach succeeds, this file's own keepalive node
+   is now removed *synchronously*, right there, instead of waiting for the async release
+   callback to eventually get around to it. The node-removal logic itself was factored out
+   into a shared `zzdds_java_waitset_keepalive_remove` helper, used by both the new detach
+   override and the release trampoline — idempotent by construction (a `(waitset, handle)`
+   search-and-remove), so it's safe for both to race to clean up the same node if a detach
+   happens to overlap a WaitSet-destroy/condition-invalidate instead of just a plain detach:
+   whichever gets the lock first wins, the other finds nothing and is a no-op.
+
+   Verified: `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install` and
+   `test-bindings` clean, plus a dedicated scratchpad stress test — two threads racing
+   `detach_condition()`/`attach_condition()` against each other on the same `GuardCondition`
+   in opposite phase for 50 rounds, each round settling into a known "attached" final state,
+   dropping the app's own strong reference, forcing a full GC, then verifying
+   `get_conditions()` still returns exactly one working condition and `detach_condition()`
+   still succeeds on it — no crash, and functional correctness held across every round. Not a
+   direct reproduction of the specific "hookless attachment" symptom itself (constructing an
+   assertion that only fails on a hookless-but-still-functioning attachment, distinct from a
+   healthy one, would need deeper native introspection than this test does) — verified via
+   heavy racing plus a final-state consistency check, same standard applied to fix #3/#4
+   above, and the fix's correctness itself follows directly from the same synchronous-
+   removal argument used for those.
+
 **CI: `ZZDDS_EXAMPLES_REF` bumped to track the merged zzdds-examples PR (2026-08-13).**
 `.github/workflows/ci.yml`'s default pin moved to `6a856be513f4c8449e374972756abc5c915accee`
 (zzdds-examples "Waitset identity fixes, retcode cleanup, spike reorg", #6) — the commit that
