@@ -561,10 +561,9 @@ public:
     {
         // Every still-attached condition's release_fn (see attach_condition
         // below) fires synchronously as part of this call, before it
-        // returns -- each one erases its own keepalive_ entry via
-        // release_trampoline, so keepalive_ is already empty by the time
-        // this object's members get torn down right after. No explicit
-        // cleanup needed here.
+        // returns -- each one destroys its own ReleaseCtx (and the
+        // shared_ptr keepalive it owns directly) via release_trampoline, so
+        // there's nothing left to clean up here.
         zzdds_destroy_waitset(handle_);
     }
 
@@ -583,47 +582,58 @@ public:
     // "Binding design review: decision" -> "WaitSet-attached-condition
     // release hook" for the C-ABI side of this, and its own "Explicitly not
     // done" note this closes for C++.
+    //
+    // Deliberately does NOT pre-check "is this condition already attached"
+    // against any bookkeeping of its own before deciding whether to
+    // register a release hook (an earlier revision of this class did, via a
+    // keepalive_ map keyed by handle plus a mu_ guarding it) -- that
+    // out-of-band cache could never be perfectly synchronized with a
+    // concurrent attach/detach for the same condition on another thread, no
+    // matter how the check-then-act sequence was ordered (this is the exact
+    // failure mode zidl PR #62's Java-side Greptile review re-discovered
+    // three times in a row before the real fix -- a caller-side "already
+    // attached?" cache is fundamentally the wrong tool here, not just a
+    // timing detail to get right). Fixed at the root instead:
+    // zzdds_waitset_attach_condition_with_release's out_accepted parameter
+    // now reports, atomically under the Zig side's own internal lock,
+    // whether THIS call's own release_ctx/release_fn was actually stored
+    // (true) or discarded as a duplicate (false) -- always attempt the
+    // real registration and trust that answer, rather than guessing first.
     ::DDS::ReturnCode_t attach_condition(std::shared_ptr<::DDS::Condition> cond) override
     {
         if (!cond) return ::DDS::WaitSetImpl::attach_condition(cond);
         DDS_Condition h = resolve_handle(cond);
-        std::lock_guard<std::mutex> lock(mu_);
-        if (keepalive_.count(h)) {
-            // Already attached (and already tracked) -- a redundant
-            // re-attach is a documented no-op either way, and
-            // zzdds_waitset_attach_condition_with_release would silently
-            // ignore a second release_ctx/release_fn for an
-            // already-attached condition (never swapping one registration
-            // in for another), leaking this one -- go through the plain
-            // path instead of registering a context that would never fire.
-            return ::DDS::WaitSetImpl::attach_condition(cond);
-        }
-        auto* ctx = new ReleaseCtx{this, h};
-        auto rc = zzdds_waitset_attach_condition_with_release(handle_, h, ctx, &release_trampoline);
-        if (rc != DDS_RETCODE_OK) {
+        auto* ctx = new ReleaseCtx{std::move(cond)};
+        bool accepted = false;
+        auto rc = zzdds_waitset_attach_condition_with_release(handle_, h, ctx, &release_trampoline, &accepted);
+        if (rc != DDS_RETCODE_OK || !accepted) {
+            // Either the attach itself failed (ctx was never stored), or it
+            // succeeded but as a no-op duplicate of an existing attachment
+            // (ctx was still never stored -- the existing attachment's own
+            // release_ctx/release_fn is untouched, exactly as documented).
+            // Either way, release_trampoline will never run for this ctx;
+            // it's safe -- and necessary -- to destroy it here directly.
             delete ctx;
-            return rc;
         }
-        keepalive_.emplace(h, std::move(cond));
         return rc;
     }
 
 private:
+    // Owns the shared_ptr keepalive directly -- no shared map keyed by
+    // handle to synchronize against release_trampoline with, so no
+    // identity-vs-key ambiguity: a concurrent reattach for the same
+    // underlying handle, however it interleaves, always gets its own,
+    // entirely separate ReleaseCtx, and release_trampoline only ever touches
+    // the exact ctx it was handed.
     struct ReleaseCtx {
-        WaitSetSupport* self;
-        DDS_Condition handle;
+        std::shared_ptr<::DDS::Condition> cond;
     };
 
     // Fires from inside zzdds, outside any zzdds-internal lock, on whichever
-    // of the three ways an attachment ends -- never synchronously from
-    // within attach_condition() itself (only detach/destroy paths fire it),
-    // so taking mu_ here can't deadlock against attach_condition() holding
-    // it across its own zzdds_waitset_attach_condition_with_release() call.
+    // of the three ways an attachment ends.
     static void release_trampoline(void* ctx_raw)
     {
-        std::unique_ptr<ReleaseCtx> ctx(static_cast<ReleaseCtx*>(ctx_raw));
-        std::lock_guard<std::mutex> lock(ctx->self->mu_);
-        ctx->self->keepalive_.erase(ctx->handle);
+        delete static_cast<ReleaseCtx*>(ctx_raw);
     }
 
     // Mirrors WaitSetImpl::attach_condition's own generated dynamic_cast
@@ -645,8 +655,6 @@ private:
     }
 
     DDS_WaitSet handle_;
-    std::mutex mu_;
-    std::unordered_map<DDS_Condition, std::shared_ptr<::DDS::Condition>> keepalive_;
 };
 
 class GuardConditionSupport final : public ::DDS::GuardConditionImpl {

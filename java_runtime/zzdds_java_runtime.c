@@ -127,21 +127,34 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
  * down). Java has no equivalent of C++'s virtual-dispatch override (there is
  * no --java-impl-override, and WaitSetImpl.java is plain generated code) --
  * so instead of a subclass, this hooks in via JNI's RegisterNatives,
- * overriding WaitSetImpl's own generated n_attach_condition AND
- * n_detach_condition native bindings with the implementations below.
- * Completely transparent to callers: WaitSetImpl.java's public
- * attach_condition()/detach_condition() methods are unchanged, only which
- * native implementation backs each private dispatch point changes.
- * detach_condition's override exists purely for keepalive bookkeeping
- * timing, not because the release itself would otherwise be missed: the
- * plain C-ABI detach fires the same release_fn either way (same underlying
- * attachment record -- see zzdds_waitset_attach_condition_with_release's own
- * doc comment in zzdds_c.h), but that release fires asynchronously, outside
- * any zzdds-internal lock, strictly after the native attachment is already
- * gone -- leaving a window where a concurrent re-attach of the same
- * condition could see this file's own now-stale keepalive node and wrongly
- * treat it as still valid. See zzdds_java_waitset_detach_condition's own
- * doc comment for the full race this closes.
+ * overriding WaitSetImpl's own generated n_attach_condition native binding
+ * with the implementation below. Completely transparent to callers:
+ * WaitSetImpl.java's public attach_condition()/detach_condition() methods
+ * are unchanged, only which native implementation backs the private
+ * n_attach_condition dispatch point changes. detach_condition needs no
+ * override: the plain, inherited n_detach_condition already fires the same
+ * release_fn, since it's the same underlying C-ABI attachment record either
+ * way -- see zzdds_waitset_attach_condition_with_release's own doc comment
+ * in zzdds_c.h.
+ *
+ * An earlier revision of this section pre-checked "is this condition
+ * already attached" against a JNI-side list of its own before deciding
+ * whether to register a release hook, and (once that check itself was made
+ * atomic) also tried overriding n_detach_condition to keep that list in
+ * sync. Both were the wrong tool: no ordering of a caller-side cache check
+ * against a concurrent attach/detach on another thread can ever be made
+ * airtight, because the cache and the real Zig-side attachment state are
+ * protected by two different locks that are never held together (Greptile's
+ * PR #62 review re-discovered a new variant of this three times running).
+ * Fixed at the root instead: zzdds_waitset_attach_condition_with_release's
+ * out_accepted parameter now reports, atomically under the Zig side's own
+ * internal lock, whether THIS call's own release_ctx actually got stored
+ * (true) or discarded as a duplicate (false) -- always attempt the real
+ * registration and trust that answer, never guess first. And each
+ * registration's ctx now owns its own JNI global ref directly (no shared
+ * list at all), so release_trampoline never needs to look anything up by a
+ * (waitset, handle) key that a concurrent reattach could have already
+ * reused for a brand new, unrelated registration.
  */
 
 /* zidl's generated dcps_jni.c (compiled into this same libzzdds_jni.so)
@@ -152,69 +165,25 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createFactory(JNIEn
  * of the file is reached. */
 extern JNIEnv *zidl_java_get_env(void);
 
-typedef struct zzdds_java_waitset_keepalive_node {
-    void *waitset;
-    void *handle;
-    jobject global_ref;
-    struct zzdds_java_waitset_keepalive_node *next;
-} zzdds_java_waitset_keepalive_node;
-
-static pthread_mutex_t zzdds_java_waitset_keepalive_mtx = PTHREAD_MUTEX_INITIALIZER;
-static zzdds_java_waitset_keepalive_node *zzdds_java_waitset_keepalive_head = NULL;
-
-/* Caller must hold zzdds_java_waitset_keepalive_mtx. */
-static bool zzdds_java_waitset_keepalive_contains_locked(void *waitset, void *handle) {
-    for (zzdds_java_waitset_keepalive_node *n = zzdds_java_waitset_keepalive_head; n != NULL; n = n->next) {
-        if (n->waitset == waitset && n->handle == handle) return true;
-    }
-    return false;
-}
-
 typedef struct {
-    void *waitset;
-    void *handle;
+    jobject global_ref; /* may be NULL: NewGlobalRef can fail under OOM */
 } zzdds_java_waitset_release_ctx;
-
-/* Finds and removes the keepalive node for (waitset, handle), if any,
- * returning its global ref (NULL if no such node exists) for the caller to
- * delete with whatever JNIEnv it has. Shared by the release trampoline
- * below (fires later, asynchronously, with no JNIEnv of its own) and
- * zzdds_java_waitset_detach_condition (has a live JNIEnv already, and needs
- * this removal to happen synchronously -- see that function's own doc
- * comment for why). Idempotent: safe for both to race to remove the same
- * node for the same (waitset, handle) -- whichever gets the lock first wins,
- * the other finds nothing and returns NULL. */
-static jobject zzdds_java_waitset_keepalive_remove(void *waitset, void *handle) {
-    jobject global_ref = NULL;
-    pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
-    zzdds_java_waitset_keepalive_node **pp = &zzdds_java_waitset_keepalive_head;
-    while (*pp != NULL) {
-        zzdds_java_waitset_keepalive_node *n = *pp;
-        if (n->waitset == waitset && n->handle == handle) {
-            *pp = n->next;
-            global_ref = n->global_ref;
-            free(n);
-            break;
-        }
-        pp = &n->next;
-    }
-    pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
-    return global_ref;
-}
 
 /* Fires from inside zzdds, outside any zzdds-internal lock, on whichever of
  * the three ways an attachment ends -- never synchronously from within
- * zzdds_java_waitset_attach_condition itself (only detach/destroy paths
- * fire it), so this can't deadlock against that function's own use of the
- * same mutex. */
+ * zzdds_java_waitset_attach_condition itself for an ACCEPTED registration
+ * (only detach/destroy paths fire it for those); it CAN fire synchronously,
+ * inline, when the registration attempt was a discarded duplicate -- see
+ * zzdds_java_waitset_attach_condition's own handling of that case, which
+ * frees ctx directly instead of going through this trampoline at all, so
+ * this function only ever runs for a genuinely accepted registration. */
 static void zzdds_java_waitset_release_trampoline(void *ctx_raw) {
     zzdds_java_waitset_release_ctx *ctx = (zzdds_java_waitset_release_ctx *)ctx_raw;
-    jobject global_ref = zzdds_java_waitset_keepalive_remove(ctx->waitset, ctx->handle);
-    free(ctx);
-    if (global_ref != NULL) {
+    if (ctx->global_ref != NULL) {
         JNIEnv *env = zidl_java_get_env();
-        if (env != NULL) (*env)->DeleteGlobalRef(env, global_ref);
+        if (env != NULL) (*env)->DeleteGlobalRef(env, ctx->global_ref);
     }
+    free(ctx);
 }
 
 /* Resolves `cond`'s raw DDS_Condition handle regardless of its concrete
@@ -245,6 +214,13 @@ static void *zzdds_java_resolve_condition_handle(JNIEnv *env, jobject cond) {
     return raw; /* plain DDS_Condition (or an already-Condition-typed handle) */
 }
 
+/* Deliberately does NOT pre-check "is this condition already attached"
+ * against any bookkeeping of its own before deciding whether to register a
+ * release hook -- see this section's own top-of-file doc comment for why
+ * that approach (tried, and iterated on, across three rounds of PR #62
+ * review) was fundamentally the wrong tool. Always attempts the real
+ * with-release registration and trusts out_accepted, computed atomically by
+ * the Zig side itself. */
 static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject self, jlong ptr, jobject cond) {
     (void)self;
     void *waitset = (void *)(intptr_t)ptr;
@@ -253,130 +229,19 @@ static jint JNICALL zzdds_java_waitset_attach_condition(JNIEnv *env, jobject sel
 
     zzdds_java_waitset_release_ctx *ctx = malloc(sizeof(zzdds_java_waitset_release_ctx));
     if (ctx == NULL) return (jint)DDS_WaitSet_attach_condition(waitset, h); /* best-effort: OOM just means no keepalive here */
-    ctx->waitset = waitset;
-    ctx->handle = h;
+    ctx->global_ref = (*env)->NewGlobalRef(env, cond); /* may be NULL under OOM -- ctx is still passed through */
 
-    /* The ENTIRE "claim this (waitset, handle) pair, insert its keepalive
-     * node, and register the native release hook for it" sequence runs as
-     * one atomic unit under zzdds_java_waitset_keepalive_mtx -- not just the
-     * check-and-insert step. An earlier revision of this function made only
-     * that much atomic, which wasn't enough: publishing the node (making it
-     * visible to zzdds_java_waitset_keepalive_contains_locked) before the
-     * native attach-with-hook call below actually completes left a window
-     * where a SECOND concurrent caller for the SAME pair could see
-     * "already attached", take the redundant plain-attach fast path below,
-     * and WIN the race to create the actual Zig-side attachment record
-     * first -- with no release hook, since the plain path passes null/null.
-     * This thread's own attach-with-release call then arrives to find the
-     * condition already attached (by the plain attach) and, per
-     * attachConditionWithRelease's own documented behavior, silently drops
-     * this thread's release_fn/ctx rather than replacing the existing
-     * hookless registration -- permanently leaking the node, ctx, and JNI
-     * global reference just inserted (Greptile PR #62 P1: "Hookless
-     * attachment leaks keepalive"). Holding the mutex across the whole
-     * sequence closes this: every Java-side attach_condition() call funnels
-     * through this exact function (RegisterNatives replaced the only other
-     * entry point for WaitSetImpl.n_attach_condition), so no concurrent
-     * caller can ever observe a claimed-but-not-yet-hooked attachment.
-     * Calling into the Zig/C-ABI layer while holding this mutex is safe:
-     * zzdds_waitset_attach_condition_with_release never calls back into this
-     * file's own code, and the release trampoline itself explicitly never
-     * fires synchronously from within an attach call (only from a later,
-     * separate detach/invalidate/destroy) -- so there's no reentrancy or
-     * lock-order-inversion risk. */
-    pthread_mutex_lock(&zzdds_java_waitset_keepalive_mtx);
-    if (zzdds_java_waitset_keepalive_contains_locked(waitset, h)) {
-        pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
+    bool accepted = false;
+    jint rc = (jint)zzdds_waitset_attach_condition_with_release(waitset, h, ctx, zzdds_java_waitset_release_trampoline, &accepted);
+    if (rc != DDS_RETCODE_OK || !accepted) {
+        /* Either the attach itself failed (ctx was never stored), or it
+         * succeeded but as a no-op duplicate of an existing attachment
+         * (ctx was still never stored -- the existing attachment's own
+         * release_ctx/release_fn is untouched, exactly as documented).
+         * Either way, release_trampoline will never run for this ctx; it's
+         * safe -- and necessary -- to clean it up directly here. */
+        if (ctx->global_ref != NULL) (*env)->DeleteGlobalRef(env, ctx->global_ref);
         free(ctx);
-        /* Already attached (and already tracked) -- redundant re-attach is
-         * a documented no-op either way, and attach_condition_with_release
-         * would silently ignore a second registration for an
-         * already-attached condition (never swapping one in for another),
-         * leaking it -- go through the plain path instead of registering a
-         * context that would never fire. */
-        return (jint)DDS_WaitSet_attach_condition(waitset, h);
-    }
-
-    jobject global_ref = (*env)->NewGlobalRef(env, cond);
-    zzdds_java_waitset_keepalive_node *node = global_ref != NULL
-        ? malloc(sizeof(zzdds_java_waitset_keepalive_node))
-        : NULL;
-    if (node != NULL) {
-        node->waitset = waitset;
-        node->handle = h;
-        node->global_ref = global_ref;
-        node->next = zzdds_java_waitset_keepalive_head;
-        zzdds_java_waitset_keepalive_head = node;
-    } else if (global_ref != NULL) {
-        /* Couldn't allocate the node itself -- can't track it, so don't pin
-         * the Java object either. Not a leak: nothing was inserted that
-         * needs removing, and the attach below still proceeds (with ctx
-         * self-contained), same as the OOM fallback further below. */
-        (*env)->DeleteGlobalRef(env, global_ref);
-        global_ref = NULL;
-    }
-
-    jint rc = (jint)zzdds_waitset_attach_condition_with_release(waitset, h, ctx, zzdds_java_waitset_release_trampoline);
-    if (rc != DDS_RETCODE_OK && node != NULL) {
-        /* Attach itself failed -- the Zig side never stored ctx or the
-         * release hook, so it will never fire. Undo the insertion above
-         * ourselves, still under the same lock, rather than leaving an
-         * orphaned node/global_ref behind. */
-        zzdds_java_waitset_keepalive_node **pp = &zzdds_java_waitset_keepalive_head;
-        while (*pp != NULL) {
-            if (*pp == node) {
-                *pp = node->next;
-                break;
-            }
-            pp = &(*pp)->next;
-        }
-    }
-    pthread_mutex_unlock(&zzdds_java_waitset_keepalive_mtx);
-
-    if (rc != DDS_RETCODE_OK) {
-        free(ctx);
-        if (node != NULL) {
-            free(node);
-            (*env)->DeleteGlobalRef(env, global_ref);
-        }
-    }
-    return rc;
-}
-
-/* Overrides WaitSetImpl's generated n_detach_condition -- an earlier
- * revision of this file didn't need to (the plain, inherited native binding
- * fires the same release_fn as an explicit detach, since it's the same
- * underlying C-ABI attachment record either way), but that reasoning only
- * covered "does the release eventually happen", not "how long can a
- * concurrent caller keep observing stale state before it does". The release
- * callback fires OUTSIDE any zzdds-internal lock, strictly after the native
- * attachment record is already gone (see waitset.zig's AttachedCondition
- * doc comment) -- so there's a real window, between "native attachment
- * removed" and "release callback actually runs and removes our JNI node",
- * during which the keepalive node is stale: still present, but no longer
- * backed by a real attachment. A concurrent attach_condition() for the same
- * (waitset, handle) racing into that window sees "already attached" (the
- * stale node), takes the redundant plain-attach fast path, and ends up
- * creating a genuinely NEW native attachment with NO release hook at all --
- * the condition wrapper can then be collected while the WaitSet still
- * references it, exactly the bug this whole keepalive mechanism exists to
- * prevent (Greptile PR #62 P1: "Stale keepalive creates hookless
- * reattachment"). Fixed by removing our own node synchronously, right here,
- * the moment an explicit detach succeeds -- not waiting for the async
- * release callback for this path. Idempotent against that callback also
- * eventually running for the same removal (e.g. if this detach happens to
- * race a WaitSet-destroy/condition-invalidate instead of just a plain
- * detach): see zzdds_java_waitset_keepalive_remove's own doc comment. */
-static jint JNICALL zzdds_java_waitset_detach_condition(JNIEnv *env, jobject self, jlong ptr, jobject cond) {
-    (void)self;
-    void *waitset = (void *)(intptr_t)ptr;
-    if (cond == NULL) return (jint)DDS_WaitSet_detach_condition(waitset, NULL);
-    void *h = zzdds_java_resolve_condition_handle(env, cond);
-
-    jint rc = (jint)DDS_WaitSet_detach_condition(waitset, h);
-    if (rc == DDS_RETCODE_OK) {
-        jobject global_ref = zzdds_java_waitset_keepalive_remove(waitset, h);
-        if (global_ref != NULL) (*env)->DeleteGlobalRef(env, global_ref);
     }
     return rc;
 }
@@ -406,10 +271,8 @@ static void zzdds_java_waitset_natives_once_fn(void) {
     JNINativeMethod methods[] = {
         { (char *)"n_attach_condition", (char *)"(JLio/zzdds/dcps/Dcps$DDS$Condition;)I",
           (void *)zzdds_java_waitset_attach_condition },
-        { (char *)"n_detach_condition", (char *)"(JLio/zzdds/dcps/Dcps$DDS$Condition;)I",
-          (void *)zzdds_java_waitset_detach_condition },
     };
-    (*env)->RegisterNatives(env, cls, methods, 2);
+    (*env)->RegisterNatives(env, cls, methods, 1);
     (*env)->DeleteLocalRef(env, cls);
 }
 

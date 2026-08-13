@@ -426,7 +426,7 @@ pub const WaitSetImpl = struct {
 
     fn vtAttach(ctx: *anyopaque, cond: DDS.Condition) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.attachConditionWithRelease(cond, null, null);
+        return self.attachConditionWithRelease(cond, null, null, null);
     }
 
     /// Shared by the plain, spec-mandated `attach_condition()` (`vtAttach`,
@@ -442,17 +442,45 @@ pub const WaitSetImpl = struct {
     /// deliberately does NOT update or replace an existing registration's
     /// release_ctx/release_fn (silently overwriting one would risk never
     /// firing the original release for whatever owns that original context).
+    ///
+    /// `out_accepted`, if non-null, is set to whether THIS call's own
+    /// `release_ctx`/`release_fn` was actually stored (`true`) or discarded
+    /// because `cond` was already attached (`false`) — checked and set
+    /// atomically, under the same `self.mu` critical section as the
+    /// dedup check itself, before returning. Callers that keep their own
+    /// side bookkeeping alongside `release_ctx` (a JNI global ref, a C++
+    /// `shared_ptr` keepalive, ...) need this to decide, race-free, whether
+    /// to keep that bookkeeping or immediately discard it: previously, a
+    /// caller could only guess "is this a duplicate" via its own separate,
+    /// out-of-band cache, which could never be perfectly synchronized with
+    /// this function's own dedup check (a concurrent detach removing the
+    /// existing entry between the caller's cache check and this call, or a
+    /// concurrent attach for the same condition racing this call, could each
+    /// make that external cache stale) — see zidl-side PR review history
+    /// (Greptile PR #62) for the two real races this closes for good,
+    /// rather than one more heuristic timing fix. Deliberately does NOT fire
+    /// `release_fn` synchronously for the discarded case (unlike a real
+    /// release) — `fireRelease`'s own doc comment on why release_fn must
+    /// never run under `self.mu` would otherwise force this whole check out
+    /// from under the lock, reopening exactly the race this parameter exists
+    /// to close; reporting `false` and letting the caller clean up its own
+    /// ctx synchronously, on its own stack, needs no callback at all.
     pub fn attachConditionWithRelease(
         self: *Self,
         cond: DDS.Condition,
         release_ctx: ?*anyopaque,
         release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
+        out_accepted: ?*bool,
     ) DDS.ReturnCode_t {
         self.mu.lock();
         defer self.mu.unlock();
         for (self.conditions.items) |entry| {
-            if (entry.cond.ptr == cond.ptr) return DDS.RETCODE_OK;
+            if (entry.cond.ptr == cond.ptr) {
+                if (out_accepted) |oa| oa.* = false;
+                return DDS.RETCODE_OK;
+            }
         }
+        if (out_accepted) |oa| oa.* = true;
         self.conditions.append(self.alloc, .{ .cond = cond, .release_ctx = release_ctx, .release_fn = release_fn }) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         // Register push-notification with the condition. WakeupList has a
         // fixed WAKEUP_SLOTS capacity (see its own doc comment) -- if a 5th

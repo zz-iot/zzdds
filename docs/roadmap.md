@@ -1415,6 +1415,68 @@ than #3/#4 above — fixed.** Confidence rose to 4/5 again.
    above, and the fix's correctness itself follows directly from the same synchronous-
    removal argument used for those.
 
+**Update (2026-08-13, later still): fix #5 was itself racy — Greptile's fourth review round
+found the actual remaining hole, and this time the fix is a root-cause redesign, not another
+patch on the same JNI-side cache-checking approach.** Confidence stayed at 4/5.
+
+6. **Stale keepalive survives native detach.** Fix #5's `n_detach_condition` override called
+   the plain native detach, THEN separately removed its own JNI keepalive node — but those
+   two steps aren't atomic with each other. Tracing through `waitset.zig`'s `vtDetach`
+   revealed the real problem is one level deeper and can't be closed from the JNI side at
+   all under the OLD design: `vtDetach` removes the attachment from `self.conditions` under
+   `self.mu`, unlocks `self.mu`, and only THEN (still synchronously, on the detaching
+   thread, but with no lock held) calls `fireRelease()`. A concurrent `attach_condition()`
+   for the same condition can acquire the JNI keepalive lock in the gap between "self.mu
+   unlocked" and "fireRelease() actually runs" — a gap entirely internal to `vtDetach`, with
+   no JNI-side call boundary to hook a wider lock around. Confirmed by tracing the actual
+   code, not assumed: an attempted "just hold the JNI mutex across the whole native detach
+   call too" fix (mirroring fix #4's approach for attach) would have caused a genuine
+   self-deadlock instead — `fireRelease` is documented as never safe to call while holding
+   `self.mu` specifically so `release_fn` (arbitrary caller code) can reentrantly attach/detach
+   without deadlocking, and the Java trampoline (like C++'s) locks the very same JNI mutex a
+   wider critical section would already be holding.
+
+   Root cause: the JNI (and, on inspection, C++ too — same pattern, same
+   `keepalive_.count(h)`-then-act shape, not yet flagged by Greptile but equally broken)
+   layer's "is this condition already attached" fast-path check was fundamentally the wrong
+   tool — no ordering of a caller-side cache check against a concurrent attach/detach on
+   another thread can ever be airtight when the cache and the real Zig-side state are guarded
+   by two different locks that are never held together. Three review rounds (fixes #3, #4,
+   #5) kept finding a new specific interleaving because each fix patched the *symptom* of
+   that mismatch rather than removing the mismatch itself.
+
+   Real fix: `WaitSetImpl.attachConditionWithRelease` (`waitset.zig`) and the C-ABI export
+   `zzdds_waitset_attach_condition_with_release` (`extensions.zig`/`zzdds_c.h`) gained a new
+   `out_accepted: ?*bool` / `bool *out_accepted` parameter, set atomically — under the same
+   `self.mu` critical section as the dedup check itself — to whether THIS call's own
+   `release_ctx`/`release_fn` was actually stored (`true`, a fresh registration) or discarded
+   because the condition was already attached (`false`, a no-op duplicate). Deliberately does
+   NOT fire `release_fn` synchronously for the discarded case (which would reopen the exact
+   `self.mu` reentrancy hazard above) — it just reports the answer and lets the caller clean
+   up its own already-allocated bookkeeping directly, on its own stack, no callback needed.
+   Both C++ and Java were rewritten around this to always attempt the real
+   with-release registration (no more pre-check, no more fast path) and trust
+   `out_accepted`:
+   - **Java** (`zzdds_java_runtime.c`): `zzdds_java_waitset_attach_condition` simplified
+     drastically — no more shared keepalive linked list, mutex, or `n_detach_condition`
+     override (all removed; fix #5's override is no longer needed at all under this design).
+     Each attachment's `release_ctx` now owns its JNI global ref *directly*, so
+     `release_trampoline` never looks anything up by a `(waitset, handle)` key a concurrent
+     reattach could have already reused for a different registration.
+   - **C++** (`zzdds_cpp.hpp`): `WaitSetSupport` lost its `mu_`/`keepalive_` map entirely —
+     `ReleaseCtx` now owns the `shared_ptr<Condition>` keepalive directly, same shape as
+     Java's redesign. This also closes C++'s own latent version of fix #3's original
+     duplicate-leak race, discovered while redesigning around the shared root cause rather
+     than by a separate Greptile finding against C++ specifically.
+
+   Verified: `zig build test` (including two new/updated `bootstrap_test.zig` assertions
+   directly exercising `out_accepted` — `true` on a fresh registration, `false` on a
+   redundant duplicate) and `zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true
+   install`/`test-bindings` (all three bindings) all clean. Both scratchpad stress tests from
+   fixes #3–#5 (200 rounds × 8-way concurrent same-condition attach; 50 rounds of racing
+   detach/reattach with a final GC-survival check) rerun against this redesign — no crash,
+   deadlock, or regression in either.
+
 **CI: `ZZDDS_EXAMPLES_REF` bumped to track the merged zzdds-examples PR (2026-08-13).**
 `.github/workflows/ci.yml`'s default pin moved to `6a856be513f4c8449e374972756abc5c915accee`
 (zzdds-examples "Waitset identity fixes, retcode cleanup, spike reorg", #6) — the commit that

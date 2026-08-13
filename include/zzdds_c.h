@@ -186,12 +186,24 @@ typedef void (*zzdds_condition_release_fn)(void *release_ctx);
  * DDS_WaitSet_attach_condition() call) if condition is already attached to
  * waitset — a second registration is never silently swapped in for the
  * first.
+ *
+ * out_accepted, if non-NULL, is set to whether THIS call's own
+ * release_ctx/release_fn was actually stored (true) or discarded because
+ * condition was already attached (false) — checked and set atomically,
+ * under the same internal lock as the dedup check itself. A caller with its
+ * own side bookkeeping alongside release_ctx (a JNI global ref, a C++
+ * shared_ptr keepalive, ...) needs this to decide, race-free, whether to
+ * keep or immediately discard that bookkeeping: a separate, out-of-band
+ * "is this already attached" cache of the caller's own can never stay
+ * perfectly synchronized with this function's dedup check against a
+ * concurrent attach/detach for the same condition.
  */
 DDS_ReturnCode_t zzdds_waitset_attach_condition_with_release(
     DDS_WaitSet waitset,
     DDS_Condition condition,
     void *release_ctx,
-    zzdds_condition_release_fn release_fn);
+    zzdds_condition_release_fn release_fn,
+    bool *out_accepted);
 
 /**
  * Resolve `path` as a zzdds TOML config file and install the result as the

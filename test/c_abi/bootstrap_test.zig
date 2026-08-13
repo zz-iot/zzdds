@@ -1519,10 +1519,12 @@ test "waitset: attach_condition_with_release fires on explicit detach_condition,
     const gc_native = zidl_rt.unboxAsView(DDS.GuardCondition, gc_boxed);
     const cond_native = gc_native.vtable.as_Condition(gc_native.ptr);
     const c_boxed = cond_native.vtable.get_c_abi_handle(cond_native.ptr);
+    var accepted = false;
     try testing.expectEqual(
         DDS.RETCODE_OK,
-        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &tracker, trackRelease),
+        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &tracker, trackRelease, &accepted),
     );
+    try testing.expect(accepted);
     try testing.expectEqual(@as(u32, 0), tracker.fired_count);
 
     const ws = zidl_rt.unboxAs(DDS.WaitSet, ws_boxed);
@@ -1553,7 +1555,7 @@ test "waitset: attach_condition_with_release fires when the WaitSet is destroyed
     const c_boxed = cond_native.vtable.get_c_abi_handle(cond_native.ptr);
     try testing.expectEqual(
         DDS.RETCODE_OK,
-        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &tracker, trackRelease),
+        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &tracker, trackRelease, null),
     );
 
     // No explicit detach_condition() first -- exactly the case this hook
@@ -1581,7 +1583,7 @@ test "waitset: attach_condition_with_release fires when the condition is destroy
     const c_boxed = cond_native.vtable.get_c_abi_handle(cond_native.ptr);
     try testing.expectEqual(
         DDS.RETCODE_OK,
-        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &tracker, trackRelease),
+        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &tracker, trackRelease, null),
     );
 
     // No explicit detach_condition() first -- the condition's own teardown
@@ -1613,17 +1615,26 @@ test "waitset: attach_condition_with_release on an already-attached condition do
     const gc_native = zidl_rt.unboxAsView(DDS.GuardCondition, gc_boxed);
     const cond_native = gc_native.vtable.as_Condition(gc_native.ptr);
     const c_boxed = cond_native.vtable.get_c_abi_handle(cond_native.ptr);
+    var first_accepted = false;
     try testing.expectEqual(
         DDS.RETCODE_OK,
-        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &first, trackRelease),
+        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &first, trackRelease, &first_accepted),
     );
+    try testing.expect(first_accepted);
     // Redundant attach with a DIFFERENT context -- must be a no-op, per
     // WaitSetImpl.attachConditionWithRelease's own doc comment (silently
     // swapping the registration risks never firing `first`'s release).
+    // out_accepted must report false here -- this is the exact signal
+    // callers (java_runtime/zzdds_java_runtime.c, zzdds_cpp.hpp) now rely on
+    // to know, race-free, that `second` was never stored and must be
+    // cleaned up locally rather than waiting for a release that will never
+    // come (Greptile PR #62 review history).
+    var second_accepted = true;
     try testing.expectEqual(
         DDS.RETCODE_OK,
-        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &second, trackRelease),
+        extensions.zzdds_waitset_attach_condition_with_release(ws_boxed, c_boxed, &second, trackRelease, &second_accepted),
     );
+    try testing.expect(!second_accepted);
 
     const ws = zidl_rt.unboxAs(DDS.WaitSet, ws_boxed);
     const c = zidl_rt.unboxAsView(DDS.Condition, c_boxed);

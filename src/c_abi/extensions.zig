@@ -510,17 +510,25 @@ pub export fn zzdds_destroy_guardcondition(guardcondition: *anyopaque) callconv(
 /// `attach_condition()` call) if `condition` is already attached to
 /// `waitset` — see `WaitSetImpl.attachConditionWithRelease`'s own doc
 /// comment for why a second registration is never silently swapped in.
+///
+/// `out_accepted`, if non-null, is set to whether this call's own
+/// `release_ctx`/`release_fn` was actually stored (`true`) or discarded as a
+/// duplicate (`false`) — see `WaitSetImpl.attachConditionWithRelease`'s own
+/// doc comment for why a caller with its own side bookkeeping (a JNI global
+/// ref, a C++ `shared_ptr` keepalive, ...) needs this instead of maintaining
+/// a separate, inherently racy "is this already attached" cache of its own.
 pub export fn zzdds_waitset_attach_condition_with_release(
     waitset: *anyopaque,
     condition: *anyopaque,
     release_ctx: ?*anyopaque,
     release_fn: ?*const fn (?*anyopaque) callconv(.c) void,
+    out_accepted: ?*bool,
 ) callconv(.c) DDS.ReturnCode_t {
     const w = zidl_rt.unboxAs(DDS.WaitSet, waitset);
     if (w.ptr == nil.NIL_PTR) return DDS.RETCODE_ERROR;
     const c = zidl_rt.unboxAsView(DDS.Condition, condition);
     const impl: *WaitSetImpl = @ptrCast(@alignCast(w.ptr));
-    return impl.attachConditionWithRelease(c, release_ctx, release_fn);
+    return impl.attachConditionWithRelease(c, release_ctx, release_fn, out_accepted);
 }
 
 /// Explicitly install the process-wide configuration. Must be called before
