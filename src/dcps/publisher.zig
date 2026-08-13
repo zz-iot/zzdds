@@ -17,6 +17,8 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_fallback = @import("../util/listener_fallback.zig");
+const participant_mod = @import("participant.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
 
@@ -440,11 +442,36 @@ pub const PublisherImpl = struct {
 
     /// Call with no lock held. Returns a box the caller may safely read/
     /// dispatch through with no lock held; must call `releaseRef` on it when
-    /// done (see listener_box.zig).
-    fn acquireListener(self: *Self) *ListenerBox(DDS.PublisherListener) {
+    /// done (see listener_box.zig). `pub`: also used by `writer.zig`'s
+    /// DDS 1.4 §2.2.4.1.5 "nearest enclosing non-null listener" fallback.
+    pub fn acquireListener(self: *Self) *ListenerBox(DDS.PublisherListener) {
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
         return self.listener_box.acquireLocked();
+    }
+
+    /// Second link in the DDS 1.4 §2.2.4.1.5 "nearest enclosing non-null
+    /// listener" fallback chain for a contained DataWriter's status events —
+    /// consulted only after the writer itself had no usable listener for
+    /// `field`. `handle` remains the originating writer's own handle (per
+    /// spec — the callback that runs still receives the entity whose status
+    /// actually changed). Safe to downcast `self.participant.ptr`: every
+    /// `DDS.Publisher` in this codebase is backed by a `PublisherImpl`,
+    /// which is always constructed with a real `DomainParticipantImpl` (see
+    /// `DomainParticipantImpl.vtCreatePublisher`) — and per
+    /// `docs/decisions.md`'s "Listener hierarchy fallback" entry, this
+    /// publisher's own participant is guaranteed alive for the whole of
+    /// this call (participant teardown cascades through publishers
+    /// synchronously and never frees itself until every publisher's own
+    /// `deinit()`, including this one if it were mid-fallback, has
+    /// returned).
+    pub fn dispatchWriterFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
+        const box = self.acquireListener();
+        defer box.releaseRef(self.alloc);
+        if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
+        if (nil.isNil(self.participant)) return false;
+        const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
+        return p.dispatchFallback(field, bit, handle, args);
     }
 
     fn vtSuspendPublications(ctx: *anyopaque) DDS.ReturnCode_t {

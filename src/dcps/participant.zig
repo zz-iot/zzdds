@@ -49,6 +49,7 @@ const writer_mod = @import("writer.zig");
 const zidl_rt = @import("zidl_rt");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_fallback = @import("../util/listener_fallback.zig");
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
@@ -3270,10 +3271,8 @@ pub const DomainParticipantImpl = struct {
     }
 
     /// Installs `new_listener`, releasing whatever it replaces. Safe against
-    /// a concurrently in-flight dispatch acquired via an `acquireListener`-
-    /// style helper (see listener_box.zig) — DomainParticipantListener
-    /// itself is never dispatched anywhere in this codebase today, but the
-    /// swap must still be safe against a concurrent `get_listener()` read.
+    /// a concurrently in-flight dispatch acquired via `acquireListener`
+    /// (see listener_box.zig).
     fn swapListener(self: *Self, new_listener: DDS.DomainParticipantListener) void {
         const new_box = ListenerBox(DDS.DomainParticipantListener).create(self.alloc, new_listener) catch
             @panic("zzdds: out of memory boxing listener");
@@ -3282,6 +3281,40 @@ pub const DomainParticipantImpl = struct {
         self.listener_box = new_box;
         self.listener_mu.unlock();
         old_box.releaseRef(self.alloc);
+    }
+
+    /// Call with no lock held. Returns a box the caller may safely read/
+    /// dispatch through with no lock held; must call `releaseRef` on it
+    /// when done (see listener_box.zig). `pub`: also used by
+    /// `subscriber.zig`/`publisher.zig`'s DDS 1.4 §2.2.4.1.5 "nearest
+    /// enclosing non-null listener" fallback — the DomainParticipant is
+    /// always the terminal link in that chain.
+    pub fn acquireListener(self: *Self) *ListenerBox(DDS.DomainParticipantListener) {
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.acquireLocked();
+    }
+
+    /// Terminal link in the DDS 1.4 §2.2.4.1.5 "nearest enclosing non-null
+    /// listener" fallback chain for both a Subscriber's contained
+    /// DataReaders and a Publisher's contained DataWriters — the
+    /// DomainParticipant's own `DomainParticipantListener` (widened over
+    /// `TopicListener`/`PublisherListener`/`SubscriberListener` in
+    /// `dcps.idl`) shares one box/mask for every status kind, so one
+    /// function serves both chains. `handle` is always the entity whose
+    /// status actually changed (the originating DataReader/DataWriter),
+    /// never `self` — matches the spec's own framing: a "more specific"
+    /// listener's absence doesn't change which entity the callback reports.
+    /// If this level has no usable listener for `field` either, the event
+    /// is simply not delivered (matches this codebase's pre-existing
+    /// behavior for "nobody installed a listener for this status" at the
+    /// origin entity) and `false` is returned so the caller knows not to
+    /// reset its own change-counters (see `dispatchListener`'s doc comment
+    /// in `reader.zig`/`writer.zig` for why that matters).
+    pub fn dispatchFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
+        const box = self.acquireListener();
+        defer box.releaseRef(self.alloc);
+        return listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args);
     }
 
     fn vtIgnoreParticipant(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {

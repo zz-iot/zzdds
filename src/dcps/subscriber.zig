@@ -18,6 +18,8 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_fallback = @import("../util/listener_fallback.zig");
+const participant_mod = @import("participant.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
 
@@ -451,12 +453,8 @@ pub const SubscriberImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         for (self.readers.items) |r| {
-            if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                const dr = r.toDDSDataReader();
-                const box = r.acquireListener();
-                defer box.releaseRef(r.alloc);
-                if (box.listener.on_data_available) |cb| cb(dr.vtable.get_c_abi_handle(dr.ptr), box.listener.listener_data);
-            }
+            const dr = r.toDDSDataReader();
+            _ = r.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, dr.vtable.get_c_abi_handle(dr.ptr), .{});
         }
         return DDS.RETCODE_OK;
     }
@@ -502,6 +500,100 @@ pub const SubscriberImpl = struct {
         old_box.releaseRef(self.alloc);
     }
 
+    /// Call with no lock held. Returns a box the caller may safely read/
+    /// dispatch through with no lock held; must call `releaseRef` on it when
+    /// done (see listener_box.zig). `pub`: also used by `reader.zig`'s
+    /// DDS 1.4 §2.2.4.1.5 "nearest enclosing non-null listener" fallback,
+    /// and by this file's own coherent-access batch dispatch
+    /// (`resolveDataAvailableFallback`).
+    pub fn acquireListener(self: *Self) *ListenerBox(DDS.SubscriberListener) {
+        self.listener_mu.lock();
+        defer self.listener_mu.unlock();
+        return self.listener_box.acquireLocked();
+    }
+
+    /// Second link in the DDS 1.4 §2.2.4.1.5 "nearest enclosing non-null
+    /// listener" fallback chain for a contained DataReader's status events —
+    /// consulted only after the reader itself had no usable listener for
+    /// `field`. `handle` remains the originating reader's own handle (per
+    /// spec — the callback that runs still receives the entity whose status
+    /// actually changed). Safe to downcast `self.participant.ptr`: see
+    /// `publisher.zig`'s `dispatchWriterFallback` doc comment for why the
+    /// parent is guaranteed alive for the whole of this call — the same
+    /// reasoning applies symmetrically here.
+    pub fn dispatchReaderFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
+        const box = self.acquireListener();
+        defer box.releaseRef(self.alloc);
+        if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
+        if (nil.isNil(self.participant)) return false;
+        const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
+        return p.dispatchFallback(field, bit, handle, args);
+    }
+
+    /// The outcome of resolving (but not yet firing) `on_data_available`'s
+    /// DDS 1.4 §2.2.4.1.5 fallback chain for one reader — see
+    /// `resolveDataAvailableFallback`. `cb`/`listener_data` are `null`/
+    /// `null` iff no level in the chain had a usable listener, matching
+    /// this codebase's pre-existing "nobody wants it" behavior. Whichever
+    /// level's box was acquired to produce this resolution (possibly none,
+    /// if the reader itself won) is released exactly once via `release()`.
+    const DataAvailableResolution = struct {
+        cb: ?*const fn (*anyopaque, ?*anyopaque) callconv(.c) void,
+        listener_data: ?*anyopaque,
+        owner: union(enum) {
+            none,
+            reader: struct { box: *ListenerBox(DDS.DataReaderListener), alloc: std.mem.Allocator },
+            subscriber: struct { box: *ListenerBox(DDS.SubscriberListener), alloc: std.mem.Allocator },
+            participant: struct { box: *ListenerBox(DDS.DomainParticipantListener), alloc: std.mem.Allocator },
+        },
+
+        fn release(self: DataAvailableResolution) void {
+            switch (self.owner) {
+                .none => {},
+                .reader => |o| o.box.releaseRef(o.alloc),
+                .subscriber => |o| o.box.releaseRef(o.alloc),
+                .participant => |o| o.box.releaseRef(o.alloc),
+            }
+        }
+    };
+
+    /// Resolves (without firing) the DDS 1.4 §2.2.4.1.5 "nearest enclosing
+    /// non-null listener" chain for `r`'s `on_data_available`, walking
+    /// `r` -> `self` (this Subscriber) -> `self`'s participant. Boxes are
+    /// acquired eagerly (cheap: a mutex + refcount bump per level, no user
+    /// code runs) so the caller — `vtBeginAccess`'s coherent-access batch
+    /// dispatch — can defer the actual `cb()` call until after releasing
+    /// `subscriber.mu`, while still safely holding whichever box "won"
+    /// against a concurrent delete_datareader/delete_subscriber/
+    /// delete_participant (matches this call site's pre-existing reason for
+    /// pre-acquiring `r`'s own box before deferring the fire). Call with
+    /// `subscriber.mu` held (matches the call site; `self`/`self`'s
+    /// participant are therefore guaranteed alive per `publisher.zig`'s
+    /// `dispatchWriterFallback` doc comment).
+    fn resolveDataAvailableFallback(self: *Self, r: *reader_mod.DataReaderImpl) DataAvailableResolution {
+        const rbox = r.acquireListener();
+        if (listener_fallback.peek("on_data_available", r.listener_mask, DDS.DATA_AVAILABLE_STATUS, rbox.listener)) |cb| {
+            return .{ .cb = cb, .listener_data = rbox.listener.listener_data, .owner = .{ .reader = .{ .box = rbox, .alloc = r.alloc } } };
+        }
+        rbox.releaseRef(r.alloc);
+
+        const sbox = self.acquireListener();
+        if (listener_fallback.peek("on_data_available", self.listener_mask, DDS.DATA_AVAILABLE_STATUS, sbox.listener)) |cb| {
+            return .{ .cb = cb, .listener_data = sbox.listener.listener_data, .owner = .{ .subscriber = .{ .box = sbox, .alloc = self.alloc } } };
+        }
+        sbox.releaseRef(self.alloc);
+
+        if (nil.isNil(self.participant)) return .{ .cb = null, .listener_data = null, .owner = .none };
+        const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
+        const pbox = p.acquireListener();
+        if (listener_fallback.peek("on_data_available", p.listener_mask, DDS.DATA_AVAILABLE_STATUS, pbox.listener)) |cb| {
+            return .{ .cb = cb, .listener_data = pbox.listener.listener_data, .owner = .{ .participant = .{ .box = pbox, .alloc = p.alloc } } };
+        }
+        pbox.releaseRef(p.alloc);
+
+        return .{ .cb = null, .listener_data = null, .owner = .none };
+    }
+
     fn vtBeginAccess(ctx: *anyopaque) DDS.ReturnCode_t {
         const self = cast(ctx);
         const pres = self.qos.presentation;
@@ -512,10 +604,17 @@ pub const SubscriberImpl = struct {
         // lock is released.  Avoids use-after-free from a concurrent delete_datareader:
         // delete_datareader must acquire subscriber.mu, so it cannot free a reader
         // while we are still accessing its fields inside the lock.
+        //
+        // `resolution` is already the outcome of the full DDS 1.4 §2.2.4.1.5
+        // reader -> subscriber -> participant fallback walk (see
+        // `resolveDataAvailableFallback`), not just the reader's own box —
+        // resolved eagerly here (cheap: mutex + refcount bump per level, no
+        // user code runs) so the walk itself, like the reader-only box
+        // acquire it replaces, doesn't need to touch `r`/`self`/the
+        // participant again after the lock below is released.
         const ListenerSnap = struct {
-            box: *ListenerBox(DDS.DataReaderListener),
-            alloc: std.mem.Allocator,
             dr: DDS.DataReader,
+            resolution: DataAvailableResolution,
         };
         var listener_snaps: std.ArrayListUnmanaged(ListenerSnap) = .empty;
         // Each entry's acquired box reference is released by the dispatch
@@ -523,7 +622,7 @@ pub const SubscriberImpl = struct {
         // reaching it, by this defer instead — never both: the dispatch
         // loop clears the list after releasing, so this is a no-op then.
         defer {
-            for (listener_snaps.items) |snap| snap.box.releaseRef(snap.alloc);
+            for (listener_snaps.items) |snap| snap.resolution.release();
             listener_snaps.deinit(self.alloc);
         }
 
@@ -607,14 +706,11 @@ pub const SubscriberImpl = struct {
                     if (has_data) {
                         r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
                         if (r.status_cond) |sc| sc.notifyWakeup();
-                        if (r.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                            const box = r.acquireListener();
-                            listener_snaps.append(self.alloc, .{
-                                .box = box,
-                                .alloc = r.alloc,
-                                .dr = r.toDDSDataReader(),
-                            }) catch box.releaseRef(r.alloc);
-                        }
+                        const resolution = self.resolveDataAvailableFallback(r);
+                        listener_snaps.append(self.alloc, .{
+                            .dr = r.toDDSDataReader(),
+                            .resolution = resolution,
+                        }) catch resolution.release();
                     }
                 }
             }
@@ -662,8 +758,8 @@ pub const SubscriberImpl = struct {
         // top-level defer (a safety net for an early-return path) doesn't
         // double-release.
         for (listener_snaps.items) |snap| {
-            if (snap.box.listener.on_data_available) |cb| cb(snap.dr.vtable.get_c_abi_handle(snap.dr.ptr), snap.box.listener.listener_data);
-            snap.box.releaseRef(snap.alloc);
+            if (snap.resolution.cb) |cb| cb(snap.dr.vtable.get_c_abi_handle(snap.dr.ptr), snap.resolution.listener_data);
+            snap.resolution.release();
         }
         listener_snaps.clearRetainingCapacity();
         return DDS.RETCODE_OK;
