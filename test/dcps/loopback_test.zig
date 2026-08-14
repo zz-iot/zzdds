@@ -401,13 +401,13 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     // Wait up to 3 s for the incompat event (same mechanism as sample polling).
     const deadline_ns = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
     while (time_mod.nanoTimestamp() < deadline_ns) {
-        if (dr_impl.incompat_total > 0 and dw_impl.incompat_total > 0) break;
+        if (dr_impl.incompat_total.load(.acquire) > 0 and dw_impl.incompat_total.load(.acquire) > 0) break;
         time_mod.sleepNs(10 * std.time.ns_per_ms);
     }
 
     // Both sides must have recorded the incompatibility.
-    try std.testing.expect(dr_impl.incompat_total > 0);
-    try std.testing.expect(dw_impl.incompat_total > 0);
+    try std.testing.expect(dr_impl.incompat_total.load(.acquire) > 0);
+    try std.testing.expect(dw_impl.incompat_total.load(.acquire) > 0);
 
     // No sample should have been delivered.
     const received = try collectSamples(alloc, dr_impl, 1, 200 * std.time.ns_per_ms);

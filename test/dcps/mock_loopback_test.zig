@@ -298,12 +298,12 @@ test "mock_loopback: incompatible QoS — best_effort writer vs reliable reader"
     const deadline_ns = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
     while (time_mod.nanoTimestamp() < deadline_ns) {
         net.deliverAll();
-        if (dr_impl.incompat_total > 0 and dw_impl.incompat_total > 0) break;
+        if (dr_impl.incompat_total.load(.acquire) > 0 and dw_impl.incompat_total.load(.acquire) > 0) break;
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
 
-    try std.testing.expect(dr_impl.incompat_total > 0);
-    try std.testing.expect(dw_impl.incompat_total > 0);
+    try std.testing.expect(dr_impl.incompat_total.load(.acquire) > 0);
+    try std.testing.expect(dw_impl.incompat_total.load(.acquire) > 0);
 
     // No sample should have been delivered.
     try std.testing.expect(dr_impl.takeRaw() == null);
@@ -409,7 +409,7 @@ test "mock_loopback: incompatible QoS detected when writer discovered before rea
     );
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
-    try std.testing.expect(dr_impl.incompat_total > 0);
+    try std.testing.expect(dr_impl.incompat_total.load(.monotonic) > 0);
     try std.testing.expect(dr_impl.takeRaw() == null);
 }
 

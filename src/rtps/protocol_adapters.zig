@@ -22,6 +22,7 @@ const time_mod = @import("../util/time.zig");
 const submsg_mod = @import("message/submessage.zig");
 const msg_builder = @import("message/builder.zig");
 const sn_mod = @import("sequence_number.zig");
+const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 
 pub const StatefulWriter = writer_sm.StatefulWriter;
 pub const StatefulReader = reader_sm.StatefulReader;
@@ -41,6 +42,12 @@ pub const MatchedWriterInfo = protocol.MatchedWriterInfo;
 pub const RtpsProtocolWriter = struct {
     alloc: std.mem.Allocator,
     writer: *StatefulWriter,
+
+    /// Lets a caller keep this adapter (and the StatefulWriter it owns)
+    /// alive across a window where participant.mu is unlocked around
+    /// add_matched_reader's initial send -- see quiesce_acquire/release on
+    /// protocol/interface.zig's Vtable and util/entity_quiesce.zig.
+    quiesce: EntityQuiesce = .{},
 
     const Self = @This();
 
@@ -62,8 +69,23 @@ pub const RtpsProtocolWriter = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.writer.deinit();
         self.alloc.destroy(self);
+    }
+
+    fn vtQuiesceAcquire(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+
+    fn vtQuiesceRelease(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
     }
 
     pub fn setTracer(self: *Self, t: trace_mod.Tracer) void {
@@ -97,6 +119,8 @@ pub const RtpsProtocolWriter = struct {
         .flush_group_eoc_hb_only = vtFlushGroupEOCHBOnly,
         .deinit = vtDeinit,
         .set_protocol_ready_callback = vtSetProtocolReadyCallback,
+        .quiesce_acquire = vtQuiesceAcquire,
+        .quiesce_release = vtQuiesceRelease,
     };
 
     fn vtWrite(
@@ -313,6 +337,12 @@ pub const RtpsProtocolReader = struct {
     reader: *StatefulReader,
     writer_match_cb: ?protocol.WriterMatchCallback = null,
 
+    /// Lets a caller keep this adapter (and the StatefulReader it owns)
+    /// alive across a window where participant.mu is unlocked around
+    /// add_matched_writer's initial send -- see quiesce_acquire/release on
+    /// protocol/interface.zig's Vtable and util/entity_quiesce.zig.
+    quiesce: EntityQuiesce = .{},
+
     const Self = @This();
 
     pub fn init(
@@ -331,8 +361,23 @@ pub const RtpsProtocolReader = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.reader.deinit();
         self.alloc.destroy(self);
+    }
+
+    fn vtQuiesceAcquire(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+
+    fn vtQuiesceRelease(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
     }
 
     pub fn setTracer(self: *Self, t: trace_mod.Tracer) void {
@@ -357,6 +402,8 @@ pub const RtpsProtocolReader = struct {
         .handle_gap = vtHandleGap,
         .historical_delivered = vtHistoricalDelivered,
         .deinit = vtDeinit,
+        .quiesce_acquire = vtQuiesceAcquire,
+        .quiesce_release = vtQuiesceRelease,
     };
 
     fn vtSetDataCallback(ctx: *anyopaque, cb: protocol.DataCallback) void {

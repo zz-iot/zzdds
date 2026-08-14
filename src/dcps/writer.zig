@@ -88,9 +88,15 @@ pub const DataWriterImpl = struct {
     /// Sequence number of the most recently written sample; 0 = nothing written.
     last_sn: proto.SequenceNumber = 0,
 
-    /// Cumulative count of incompatible-QoS events; no separate mutex needed —
-    /// always written from the participant's discovery callback (participant.mu held).
-    incompat_total: i32 = 0,
+    /// Cumulative count of incompatible-QoS events; incompat_total_change/
+    /// incompat_last_policy need no separate mutex -- always written from the
+    /// participant's discovery callback (participant.mu held). incompat_total
+    /// itself is additionally read by vtGetIncompatQos (application thread,
+    /// no participant.mu) and polled lock-free by tests (see loopback_test.zig)
+    /// -- an atomic makes those unlocked cross-thread reads well-defined
+    /// instead of a data race (confirmed via TSan on reader.zig's mirror of
+    /// this same field; see its longer comment there).
+    incompat_total: std.atomic.Value(i32) = .init(0),
     incompat_total_change: i32 = 0,
     incompat_last_policy: i32 = 0,
 
@@ -373,17 +379,21 @@ pub const DataWriterImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        self.incompat_total += 1;
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
         self.status_changes |= DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
+        // Release ordering: publishes the plain-field writes above (program
+        // order on this thread) to any thread that observes this value via
+        // a paired .acquire load, without requiring that thread to take a lock.
+        const new_total = self.incompat_total.load(.monotonic) + 1;
+        self.incompat_total.store(new_total, .release);
         if (self.status_cond) |sc| sc.notifyWakeup();
 
         // See notifyPublicationMatched's comment: always attempt dispatch,
         // only reset change-counters if something in the DDS 1.4
         // §2.2.4.1.5 fallback chain actually consumed it.
         var status = DDS.OfferedIncompatibleQosStatus{};
-        status.total_count = self.incompat_total;
+        status.total_count = new_total;
         status.total_count_change = self.incompat_total_change;
         status.last_policy_id = policy_id;
         if (self.dispatchListener("on_offered_incompatible_qos", DDS.OFFERED_INCOMPATIBLE_QOS_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
@@ -721,7 +731,7 @@ pub const DataWriterImpl = struct {
     fn vtGetIncompatQos(ctx: *anyopaque, status: *DDS.OfferedIncompatibleQosStatus) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
         status.* = .{
-            .total_count = self.incompat_total,
+            .total_count = self.incompat_total.load(.monotonic),
             .total_count_change = self.incompat_total_change,
             .last_policy_id = self.incompat_last_policy,
         };

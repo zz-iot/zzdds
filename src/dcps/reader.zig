@@ -179,8 +179,13 @@ pub const DataReaderImpl = struct {
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
 
-    /// Cumulative count of incompatible-QoS events; guarded by `mu`.
-    incompat_total: i32 = 0,
+    /// Cumulative count of incompatible-QoS events; incompat_total_change/
+    /// incompat_last_policy are guarded by `mu`. incompat_total itself is
+    /// additionally polled lock-free by tests waiting for the event to fire
+    /// (see loopback_test.zig) -- an atomic (rather than plain i32) makes
+    /// that unlocked cross-thread read well-defined instead of a data race
+    /// (confirmed via TSan against notifyIncompatibleQos's locked writer).
+    incompat_total: std.atomic.Value(i32) = .init(0),
     incompat_total_change: i32 = 0,
     incompat_last_policy: i32 = 0,
 
@@ -1793,11 +1798,24 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        // Capture the fields status needs while still holding the lock --
+        // reading self.incompat_total/incompat_total_change again after
+        // unlocking would race a concurrent call to this same function
+        // (e.g. two incompatible remote writers discovered around the same
+        // time) doing its own locked increment (confirmed via TSan).
         self.mu.lock();
-        self.incompat_total += 1;
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
         self.status_changes |= DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS;
+        // Release ordering: publishes the plain-field writes above (program
+        // order on this thread) to any thread that observes this value via
+        // a paired .acquire load, without requiring that thread to take `mu`.
+        const new_total = self.incompat_total.load(.monotonic) + 1;
+        self.incompat_total.store(new_total, .release);
+        var status = DDS.RequestedIncompatibleQosStatus{};
+        status.total_count = new_total;
+        status.total_count_change = self.incompat_total_change;
+        status.last_policy_id = policy_id;
         self.mu.unlock();
 
         if (self.status_cond) |sc| sc.notifyWakeup();
@@ -1807,10 +1825,6 @@ pub const DataReaderImpl = struct {
         // `listener_mask` doesn't include the bit. Only reset the
         // change-counters if delivery actually happened somewhere in the
         // chain.
-        var status = DDS.RequestedIncompatibleQosStatus{};
-        status.total_count = self.incompat_total;
-        status.total_count_change = self.incompat_total_change;
-        status.last_policy_id = policy_id;
         if (self.dispatchListener("on_requested_incompatible_qos", DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.mu.lock();
             self.incompat_total_change = 0;
@@ -2381,7 +2395,7 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         status.* = .{
-            .total_count = self.incompat_total,
+            .total_count = self.incompat_total.load(.monotonic),
             .total_count_change = self.incompat_total_change,
             .last_policy_id = self.incompat_last_policy,
         };

@@ -281,8 +281,8 @@ test "intraprocess: incompatible QoS — no delivery, incompat counter increment
     }
 
     try testing.expectEqual(@as(usize, 0), samples.len);
-    try testing.expect(pair.dr.incompat_total > 0);
-    try testing.expect(pair.dw.incompat_total > 0);
+    try testing.expect(pair.dr.incompat_total.load(.acquire) > 0);
+    try testing.expect(pair.dw.incompat_total.load(.acquire) > 0);
 }
 
 test "intraprocess: writer created before reader — reader gets history via TRANSIENT_LOCAL" {

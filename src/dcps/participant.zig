@@ -1118,7 +1118,6 @@ pub const DomainParticipantImpl = struct {
             }
             self.timer_thread = null;
         }
-        self.listener_box.releaseRef(self.alloc);
         self.discovery.stop();
 
         // Stop receiving user data before tearing down readers.
@@ -1154,6 +1153,17 @@ pub const DomainParticipantImpl = struct {
         tops.deinit(self.alloc);
         for (cfts.items) |c| c.deinit();
         cfts.deinit(self.alloc);
+
+        // Drop the "installed" listener_box reference only now that every
+        // caller reaching it via dispatchFallback()/acquireListener() -- the
+        // UDP receive path (unlistened above) and every contained
+        // reader/writer's own fallback dispatch (drained just above) -- is
+        // fully torn down. This call doesn't take listener_mu (unlike
+        // acquireListener()), so releasing any earlier left a window where a
+        // still-running receive-thread dispatch could acquire this exact box
+        // concurrently with this thread freeing it -- a cross-thread
+        // double-free/use-after-free with no lock to serialize the two.
+        self.listener_box.releaseRef(self.alloc);
 
         self.type_info_registry.deinit(self.alloc);
         var ts_it = self.type_support_registry.iterator();
@@ -2031,9 +2041,17 @@ pub const DomainParticipantImpl = struct {
         };
     }
 
+    const MatchedWriterJob = struct {
+        proto: proto.ProtocolReader,
+        info: proto.MatchedWriterInfo,
+        notify: ?MatchedNotify,
+    };
+
     fn onWriterDiscovered(ctx: *anyopaque, data: *const disc.WriterData) void {
         const self = cast(ctx);
         var push_dr: ?*reader_mod.DataReaderImpl = null;
+        var jobs: std.ArrayListUnmanaged(MatchedWriterJob) = .empty;
+        defer jobs.deinit(self.alloc);
         self.mu.lock();
         for (self.ignored_prefixes.items) |p| {
             if (p.eql(data.guid.prefix)) {
@@ -2070,10 +2088,19 @@ pub const DomainParticipantImpl = struct {
                 .{ .name = ar.partition_names },
             );
             if (!part_result.isCompatible()) continue;
+            // Defer the actual addMatchedWriter (and its initial ACKNACK/
+            // replay send) until after self.mu is released below: it
+            // reenters into transport I/O, which can synchronously deliver
+            // to a peer participant (see transport/memory.zig) and lock
+            // that peer's own participant.mu -- doing that while still
+            // holding this participant's self.mu is a genuine lock-order
+            // hazard, not just a slow critical section. quiesceAcquire()
+            // keeps ar.proto (and the StatefulReader it owns) alive across
+            // that unlocked window even if a concurrent delete_datareader
+            // races it; see protocol/interface.zig's quiesce_acquire doc.
+            if (!ar.proto.quiesceAcquire()) continue;
             const info = buildMatchedWriterInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
-            ar.proto.addMatchedWriter(&info) catch {};
-            if (ar.matched_notify) |cb|
-                cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+            jobs.append(self.alloc, .{ .proto = ar.proto, .info = info, .notify = ar.matched_notify }) catch ar.proto.quiesceRelease();
         }
         upsertDiscoveredWriter(self, data);
         if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
@@ -2109,6 +2136,11 @@ pub const DomainParticipantImpl = struct {
             if (self.builtin_sub) |bs| push_topic_dr = bs.topic_dr;
         }
         self.mu.unlock();
+        for (jobs.items) |job| {
+            job.proto.addMatchedWriter(&job.info) catch {};
+            if (job.notify) |cb| cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+            job.proto.quiesceRelease();
+        }
         if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
             .key = topicNameToKey(dt.topic_name),
@@ -2170,9 +2202,17 @@ pub const DomainParticipantImpl = struct {
         };
     }
 
+    const MatchedReaderJob = struct {
+        proto: proto.ProtocolWriter,
+        info: proto.MatchedReaderInfo,
+        notify: ?MatchedNotify,
+    };
+
     fn onReaderDiscovered(ctx: *anyopaque, data: *const disc.ReaderData) void {
         const self = cast(ctx);
         var push_dr: ?*reader_mod.DataReaderImpl = null;
+        var jobs: std.ArrayListUnmanaged(MatchedReaderJob) = .empty;
+        defer jobs.deinit(self.alloc);
         self.mu.lock();
         for (self.ignored_prefixes.items) |p| {
             if (p.eql(data.guid.prefix)) {
@@ -2209,10 +2249,12 @@ pub const DomainParticipantImpl = struct {
                 .{ .name = data.qos.partition_names },
             );
             if (!part_result.isCompatible()) continue;
+            // See onWriterDiscovered's matching comment: defer the actual
+            // addMatchedReader (and its initial HEARTBEAT/replay send)
+            // until after self.mu is released below.
+            if (!aw.proto.quiesceAcquire()) continue;
             const info = self.buildMatchedReaderInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
-            aw.proto.addMatchedReader(&info) catch {};
-            if (aw.matched_notify) |cb|
-                cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+            jobs.append(self.alloc, .{ .proto = aw.proto, .info = info, .notify = aw.matched_notify }) catch aw.proto.quiesceRelease();
         }
         upsertDiscoveredReader(self, data);
         if (self.builtin_sub) |bs| push_dr = bs.sub_dr;
@@ -2248,6 +2290,11 @@ pub const DomainParticipantImpl = struct {
             if (self.builtin_sub) |bs| push_topic_dr = bs.topic_dr;
         }
         self.mu.unlock();
+        for (jobs.items) |job| {
+            job.proto.addMatchedReader(&job.info) catch {};
+            if (job.notify) |cb| cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+            job.proto.quiesceRelease();
+        }
         if (push_dr) |dr| pushBuiltinSubscriptionCdr(self.alloc, dr, data);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
             .key = topicNameToKey(dt.topic_name),
@@ -2421,6 +2468,15 @@ pub const DomainParticipantImpl = struct {
         if (names.len > 0) alloc.free(names);
     }
 
+    const AnnounceMatchedReaderJob = struct {
+        proto: proto.ProtocolWriter,
+        info: proto.MatchedReaderInfo,
+        notify: ?MatchedNotify,
+        remote_guid: Guid,
+        unicast_locs: []const Locator,
+        multicast_locs: []const Locator,
+    };
+
     fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
         // Find the writer and snapshot its announcement fields outside the lock.
@@ -2432,6 +2488,8 @@ pub const DomainParticipantImpl = struct {
             presentation: DDS.PresentationQosPolicy,
         } = null;
         const owned_names = dupePartitionNames(self.alloc, partition_names);
+        var jobs: std.ArrayListUnmanaged(AnnounceMatchedReaderJob) = .empty;
+        defer jobs.deinit(self.alloc);
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -2464,14 +2522,40 @@ pub const DomainParticipantImpl = struct {
                             .{ .name = dr.qos.partition_names },
                         );
                         if (!part_result.isCompatible()) continue;
-                        const info = self.buildMatchedReaderInfo(dr.guid, dr.qos, dr.unicast_locators, dr.multicast_locators);
-                        aw.proto.addMatchedReader(&info) catch continue;
-                        if (aw.matched_notify) |cb|
-                            cb.notify(cb.ctx, writer_mod.guidToHandle(dr.guid), true);
+                        // See onWriterDiscovered's matching comment: defer the
+                        // actual addMatchedReader send until after self.mu is
+                        // released below. dr.unicast_locators/multicast_locators
+                        // are borrowed from self.discovered_readers, which a
+                        // concurrent discovery callback could mutate/reallocate
+                        // once unlocked -- dupe them into job-owned memory now,
+                        // under the lock, rather than deferring that too.
+                        if (!aw.proto.quiesceAcquire()) continue;
+                        const uloc = dupeLocators(self.alloc, dr.unicast_locators);
+                        const mloc = dupeLocators(self.alloc, dr.multicast_locators);
+                        const info = self.buildMatchedReaderInfo(dr.guid, dr.qos, uloc, mloc);
+                        jobs.append(self.alloc, .{
+                            .proto = aw.proto,
+                            .info = info,
+                            .notify = aw.matched_notify,
+                            .remote_guid = dr.guid,
+                            .unicast_locs = uloc,
+                            .multicast_locs = mloc,
+                        }) catch {
+                            aw.proto.quiesceRelease();
+                            self.alloc.free(uloc);
+                            self.alloc.free(mloc);
+                        };
                     }
                     break;
                 }
             }
+        }
+        for (jobs.items) |job| {
+            job.proto.addMatchedReader(&job.info) catch {};
+            if (job.notify) |cb| cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+            job.proto.quiesceRelease();
+            self.alloc.free(job.unicast_locs);
+            self.alloc.free(job.multicast_locs);
         }
         const ann = ann_opt orelse {
             freePartitionNames(self.alloc, owned_names);
@@ -2511,6 +2595,15 @@ pub const DomainParticipantImpl = struct {
         }) catch {};
     }
 
+    const AnnounceMatchedWriterJob = struct {
+        proto: proto.ProtocolReader,
+        info: proto.MatchedWriterInfo,
+        notify: ?MatchedNotify,
+        remote_guid: Guid,
+        unicast_locs: []const Locator,
+        multicast_locs: []const Locator,
+    };
+
     fn subAnnounceProtoReader(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
         var ann_opt: ?struct {
@@ -2521,6 +2614,8 @@ pub const DomainParticipantImpl = struct {
             presentation: DDS.PresentationQosPolicy,
         } = null;
         const owned_names = dupePartitionNames(self.alloc, partition_names);
+        var jobs: std.ArrayListUnmanaged(AnnounceMatchedWriterJob) = .empty;
+        defer jobs.deinit(self.alloc);
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -2566,14 +2661,37 @@ pub const DomainParticipantImpl = struct {
                             .{ .name = ar.partition_names },
                         );
                         if (!part_result.isCompatible()) continue;
-                        const info = buildMatchedWriterInfo(dw.guid, dw.qos, dw.unicast_locators, dw.multicast_locators);
-                        ar.proto.addMatchedWriter(&info) catch continue;
-                        if (ar.matched_notify) |cb|
-                            cb.notify(cb.ctx, writer_mod.guidToHandle(dw.guid), true);
+                        // See onWriterDiscovered's matching comment: defer the
+                        // actual addMatchedWriter send until after self.mu is
+                        // released below, duping dw's locators (borrowed from
+                        // self.discovered_writers) into job-owned memory now.
+                        if (!ar.proto.quiesceAcquire()) continue;
+                        const uloc = dupeLocators(self.alloc, dw.unicast_locators);
+                        const mloc = dupeLocators(self.alloc, dw.multicast_locators);
+                        const info = buildMatchedWriterInfo(dw.guid, dw.qos, uloc, mloc);
+                        jobs.append(self.alloc, .{
+                            .proto = ar.proto,
+                            .info = info,
+                            .notify = ar.matched_notify,
+                            .remote_guid = dw.guid,
+                            .unicast_locs = uloc,
+                            .multicast_locs = mloc,
+                        }) catch {
+                            ar.proto.quiesceRelease();
+                            self.alloc.free(uloc);
+                            self.alloc.free(mloc);
+                        };
                     }
                     break;
                 }
             }
+        }
+        for (jobs.items) |job| {
+            job.proto.addMatchedWriter(&job.info) catch {};
+            if (job.notify) |cb| cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+            job.proto.quiesceRelease();
+            self.alloc.free(job.unicast_locs);
+            self.alloc.free(job.multicast_locs);
         }
         const ann = ann_opt orelse {
             freePartitionNames(self.alloc, owned_names);

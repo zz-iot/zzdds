@@ -433,6 +433,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .sanitize_thread = sanitize_thread,
         });
         zidl_cdr_mod.addCSourceFile(.{
             .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
@@ -443,6 +444,13 @@ pub fn build(b: *std.Build) void {
             .name = "zidl_cdr",
             .linkage = .static,
             .root_module = zidl_cdr_mod,
+            // -Dsanitize-thread=true silently no-ops on Zig 0.16's default
+            // self-hosted x86_64 backend for Debug builds -- it accepts
+            // -fsanitize-thread but doesn't actually instrument anything.
+            // Real TSan requires the LLVM backend. Confirmed empirically: a
+            // deliberate unsynchronized two-thread race went undetected
+            // without this, and was caught immediately with it.
+            .use_llvm = if (sanitize_thread) true else null,
         });
         b.installArtifact(zidl_cdr_lib);
 
@@ -454,6 +462,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/root.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
                 .imports = &.{
                     .{ .name = "zidl_rt", .module = zidl_rt_mod },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
@@ -461,6 +470,9 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod },
                 },
             }),
+            // See zidl_cdr_lib's matching comment: -Dsanitize-thread=true
+            // needs the LLVM backend forced to actually instrument anything.
+            .use_llvm = if (sanitize_thread) true else null,
         });
         zzdds_lib.root_module.addOptions("build_options", build_options);
         zzdds_lib.root_module.link_libc = true;
@@ -1267,7 +1279,15 @@ pub fn build(b: *std.Build) void {
     zzdds_mod_tsan.link_libc = true;
 
     // Library self-tests (TSan)
-    const zzdds_tests_tsan = b.addTest(.{ .root_module = zzdds_mod_tsan });
+    //
+    // .use_llvm = true is required on every Compile step below: Zig 0.16's
+    // default self-hosted backend for Debug/x86_64 accepts sanitize_thread
+    // but doesn't actually instrument anything under it (confirmed
+    // empirically -- a deliberate unsynchronized two-thread race went
+    // completely undetected without this, and was caught immediately with
+    // it). This whole block only exists for the test-tsan step, so forcing
+    // LLVM here unconditionally (no flag gating needed) is correct.
+    const zzdds_tests_tsan = b.addTest(.{ .root_module = zzdds_mod_tsan, .use_llvm = true });
     tsan_step.dependOn(&b.addRunArtifact(zzdds_tests_tsan).step);
 
     // RTPS tests (TSan) — writer_sm, reader_sm exercise concurrent send/recv
@@ -1279,7 +1299,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zzdds", .module = zzdds_mod_tsan },
             },
-        }) });
+        }), .use_llvm = true });
         t.root_module.link_libc = true;
         tsan_step.dependOn(&b.addRunArtifact(t).step);
     }
@@ -1295,7 +1315,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
                 .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
             },
-        }) });
+        }), .use_llvm = true });
         t.root_module.link_libc = true;
         tsan_step.dependOn(&b.addRunArtifact(t).step);
     }

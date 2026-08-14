@@ -706,6 +706,15 @@ test "createParticipantWithConfig: config.qos seeds Publisher's default_datawrit
 // ── deinit() reentrancy from the timer thread ───────────────────────────────
 
 const SelfDeleteCtx = struct {
+    // Set (release) by the main thread only once every field below has been
+    // populated; the callback checks it (acquire) before touching any of
+    // them. Without this, there's no happens-before edge between the main
+    // thread's plain (non-atomic) `ctx.dw = dw;` etc. and the timer thread
+    // potentially reading them the instant the deadline fires -- a genuine
+    // data race per the memory model even though the real timing (deadline
+    // period 50ms vs. this setup taking microseconds) makes it practically
+    // unhittable (confirmed via TSan).
+    ready: std.atomic.Value(bool) = .init(false),
     fired: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     caller_thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
@@ -718,6 +727,7 @@ const SelfDeleteCtx = struct {
 
 fn selfDeleteOnDeadlineMissed(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
     const ctx: *SelfDeleteCtx = @ptrCast(@alignCast(ld));
+    if (!ctx.ready.load(.acquire)) return; // too early: ctx isn't fully populated yet
     if (ctx.fired.swap(true, .acq_rel)) return; // one shot: everything below is gone after the first firing
     ctx.caller_thread_id.store(std.Thread.getCurrentId(), .release);
     // Spec-legal, if unusual: reentrantly tear down the entire entity graph
@@ -779,6 +789,7 @@ test "deinit: reentrant delete_participant from a timer-driven listener does not
         .on_offered_deadline_missed = selfDeleteOnDeadlineMissed,
     }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
     ctx.dw = dw;
+    ctx.ready.store(true, .release);
 
     const test_thread_id = std.Thread.getCurrentId();
     const deadline_ns = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
