@@ -1148,7 +1148,36 @@ pattern behind it (installing one participant-level listener as a catch-all inst
 per entity) — worth doing. It's also a real multi-file, concurrency-sensitive change that
 deserves its own focused pass (design the shared helper, answer the two open questions
 above, touch ~19 call sites plus 3 new `pub fn acquireListener()`s, test including TSan) —
-not something to fold into an unrelated change as a drive-by. Not started this session.
+not something to fold into an unrelated change as a drive-by.
+
+**Done (2026-08-13, same day).** Both open questions above resolved first (see
+`docs/decisions.md`'s "Listener hierarchy fallback" entry for the full write-up): (1) zzdds
+doesn't enforce the spec's `PRECONDITION_NOT_MET`-on-live-children precondition, but the
+parent-alive assumption holds anyway because `delete_subscriber`/`_publisher`/`_participant`
+cascade synchronously and never free the parent until every child's own `EntityQuiesce`-
+gated `deinit()` returns; (2) the fallback respects each level's own `listener_mask`, not
+just field-nullability, at every hop — matching every existing dispatch site's own
+pre-existing gating convention applied uniformly instead of only at the origin entity. New
+`src/util/listener_fallback.zig` (comptime-over-field-name `tryDispatch`/`peek`) backs
+`DataReaderImpl.dispatchListener` → `SubscriberImpl.dispatchReaderFallback` →
+`DomainParticipantImpl.dispatchFallback` and the symmetric writer/publisher chain, touching
+all ~19 call sites (12 reader.zig, 4 real-status writer.zig sites — `on_reliable_reader_ready`
+is a vendor extension with no participant-level equivalent, deliberately excluded — plus
+`subscriber.zig`'s `notify_datareaders()` and its coherent-access batch-dispatch path, which
+needed its own eager-resolve-then-deferred-fire design to keep the pre-existing
+"never hold `subscriber.mu` across a user callback" discipline). Two real bugs found only via
+a real crash/test failure, not by inspection: nil-sentinel parent pointers on standalone-
+constructed test fixtures (fixed with `nil.isNil(...)` guards at every downcast) and the
+status-with-counters call sites' pre-existing `if (fire)` gate still wrapping the whole
+block including the new fallback call, silently defeating it whenever the origin's own mask
+was clear — fixed by making the whole chain return `bool` ("did anything receive it") and
+gating change-counter resets on that instead of the origin's own mask (which also fixed a
+latent staleness bug: those sites hardcoded `total_count_change = 1` instead of reading the
+accumulated field, previously masked by the old gate always keeping the two in sync). New
+regression coverage in `test/dcps/listener_fallback_test.zig` using real two-participant
+`IntraProcessDelivery` trees; confirmed to actually catch the bug by deliberately reverting
+`dispatchListener` to its pre-fix form once and observing the expected test failures before
+restoring. Full `zig build test`/`test-tsan`/`test-bindings` (C/C++/Java) green throughout.
 
 **`WaitSet`-attached-condition release hook — Done (2026-08-12).** The gap this section's
 own earlier "no C-ABI-visible signal at all" finding named (a binding relying on

@@ -26,6 +26,8 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_fallback = @import("../util/listener_fallback.zig");
+const subscriber_mod = @import("subscriber.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const extensions_mod = @import("../c_abi/extensions.zig");
 
@@ -595,11 +597,7 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
         if (self.status_cond) |sc| sc.notifyWakeup();
-        if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-            const box = self.acquireListener();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
-        }
+        _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
     }
 
     // ── Data delivery ─────────────────────────────────────────────────────────
@@ -632,11 +630,7 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
-            if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                const box = self.acquireListener();
-                defer box.releaseRef(self.alloc);
-                if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
-            }
+            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
         }
     }
 
@@ -832,11 +826,7 @@ pub const DataReaderImpl = struct {
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             if (transition_committed or data_committed) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
-                if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                    const box = self.acquireListener();
-                    defer box.releaseRef(self.alloc);
-                    if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
-                }
+                _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
             }
             return;
         }
@@ -933,23 +923,26 @@ pub const DataReaderImpl = struct {
             self.sample_rejected_last_reason = reason;
             self.sample_rejected_last_handle = ih;
             self.status_changes |= DDS.SAMPLE_REJECTED_STATUS;
-            const fire = self.listener_mask & DDS.SAMPLE_REJECTED_STATUS != 0;
-            if (fire) {
-                self.sample_rejected_total_change = 0;
-                self.status_changes &= ~DDS.SAMPLE_REJECTED_STATUS;
-            }
             self.mu.unlock();
             self.alloc.free(copy);
             if (self.status_cond) |sc| sc.notifyWakeup();
-            if (fire) {
-                const box = self.acquireListener();
-                defer box.releaseRef(self.alloc);
-                if (box.listener.on_sample_rejected) |cb| cb(vtable.get_c_abi_handle(self), &.{
-                    .total_count = self.sample_rejected_total,
-                    .total_count_change = 1,
-                    .last_reason = reason,
-                    .last_instance_handle = ih,
-                }, box.listener.listener_data);
+            // Always attempt dispatch -- DDS 1.4 §2.2.4.1.5's fallback chain
+            // means a delivery can happen even when this reader's own
+            // `listener_mask` doesn't include the bit. Only reset the
+            // change-counters (under `mu`, matching `vtGetSampleRejected`'s
+            // own locking) if delivery actually happened somewhere in the
+            // chain.
+            const delivered = self.dispatchListener("on_sample_rejected", DDS.SAMPLE_REJECTED_STATUS, vtable.get_c_abi_handle(self), .{&DDS.SampleRejectedStatus{
+                .total_count = self.sample_rejected_total,
+                .total_count_change = self.sample_rejected_total_change,
+                .last_reason = reason,
+                .last_instance_handle = ih,
+            }});
+            if (delivered) {
+                self.mu.lock();
+                self.sample_rejected_total_change = 0;
+                self.status_changes &= ~DDS.SAMPLE_REJECTED_STATUS;
+                self.mu.unlock();
             }
             return;
         }
@@ -1009,11 +1002,7 @@ pub const DataReaderImpl = struct {
         if (self.status_cond) |sc| sc.notifyWakeup();
 
         // Fire listener if registered for DATA_AVAILABLE.
-        if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-            const box = self.acquireListener();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
-        }
+        _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
     }
 
     // ── Coherent set helpers ───────────────────────────────────────────────────
@@ -1076,11 +1065,7 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
-            if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                const box = self.acquireListener();
-                defer box.releaseRef(self.alloc);
-                if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
-            }
+            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
         }
     }
 
@@ -1244,11 +1229,7 @@ pub const DataReaderImpl = struct {
         if (had_synthetic) {
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             if (self.status_cond) |sc| sc.notifyWakeup();
-            if (self.listener_mask & DDS.DATA_AVAILABLE_STATUS != 0) {
-                const box = self.acquireListener();
-                defer box.releaseRef(self.alloc);
-                if (box.listener.on_data_available) |cb| cb(vtable.get_c_abi_handle(self), box.listener.listener_data);
-            }
+            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
         }
     }
 
@@ -1817,23 +1798,24 @@ pub const DataReaderImpl = struct {
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
         self.status_changes |= DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS;
-        const fire = self.listener_mask & DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS != 0;
-        if (fire) {
-            self.incompat_total_change = 0;
-            self.status_changes &= ~DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS;
-        }
         self.mu.unlock();
 
         if (self.status_cond) |sc| sc.notifyWakeup();
 
-        if (fire) {
-            var status = DDS.RequestedIncompatibleQosStatus{};
-            status.total_count = self.incompat_total;
-            status.total_count_change = 1;
-            status.last_policy_id = policy_id;
-            const box = self.acquireListener();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_requested_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
+        // Always attempt dispatch -- DDS 1.4 §2.2.4.1.5's fallback chain
+        // means a delivery can happen even when this reader's own
+        // `listener_mask` doesn't include the bit. Only reset the
+        // change-counters if delivery actually happened somewhere in the
+        // chain.
+        var status = DDS.RequestedIncompatibleQosStatus{};
+        status.total_count = self.incompat_total;
+        status.total_count_change = self.incompat_total_change;
+        status.last_policy_id = policy_id;
+        if (self.dispatchListener("on_requested_incompatible_qos", DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
+            self.incompat_total_change = 0;
+            self.status_changes &= ~DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS;
+            self.mu.unlock();
         }
     }
 
@@ -1852,27 +1834,25 @@ pub const DataReaderImpl = struct {
         self.sub_matched_current_change += delta;
         self.sub_matched_last_handle = remote_handle;
         self.status_changes |= DDS.SUBSCRIPTION_MATCHED_STATUS;
-        const fire = self.listener_mask & DDS.SUBSCRIPTION_MATCHED_STATUS != 0;
         self.mu.unlock();
 
         if (self.status_cond) |sc| sc.notifyWakeup();
 
-        if (fire) {
-            const status = DDS.SubscriptionMatchedStatus{
-                .total_count = self.sub_matched_total,
-                .total_count_change = if (added) 1 else 0,
-                .current_count = self.sub_matched_current,
-                .current_count_change = delta,
-                .last_publication_handle = remote_handle,
-            };
+        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
+        // why this can't be gated on this reader's own `listener_mask`.
+        const status = DDS.SubscriptionMatchedStatus{
+            .total_count = self.sub_matched_total,
+            .total_count_change = self.sub_matched_total_change,
+            .current_count = self.sub_matched_current,
+            .current_count_change = self.sub_matched_current_change,
+            .last_publication_handle = remote_handle,
+        };
+        if (self.dispatchListener("on_subscription_matched", DDS.SUBSCRIPTION_MATCHED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.mu.lock();
             self.status_changes &= ~DDS.SUBSCRIPTION_MATCHED_STATUS;
             self.sub_matched_total_change = 0;
             self.sub_matched_current_change = 0;
             self.mu.unlock();
-            const box = self.acquireListener();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_subscription_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -1889,40 +1869,38 @@ pub const DataReaderImpl = struct {
         self.sample_lost_total += count;
         self.sample_lost_total_change += count;
         self.status_changes |= DDS.SAMPLE_LOST_STATUS;
-        const fire = self.listener_mask & DDS.SAMPLE_LOST_STATUS != 0;
-        if (fire) {
-            self.sample_lost_total_change = 0;
-            self.status_changes &= ~DDS.SAMPLE_LOST_STATUS;
-        }
         self.mu.unlock();
         if (self.status_cond) |sc| sc.notifyWakeup();
-        if (fire) {
-            const box = self.acquireListener();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_sample_lost) |cb| cb(vtable.get_c_abi_handle(self), &.{
-                .total_count = self.sample_lost_total,
-                .total_count_change = count,
-            }, box.listener.listener_data);
+        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
+        // why this can't be gated on this reader's own `listener_mask`.
+        const delivered = self.dispatchListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS, vtable.get_c_abi_handle(self), .{&DDS.SampleLostStatus{
+            .total_count = self.sample_lost_total,
+            .total_count_change = self.sample_lost_total_change,
+        }});
+        if (delivered) {
+            self.mu.lock();
+            self.sample_lost_total_change = 0;
+            self.status_changes &= ~DDS.SAMPLE_LOST_STATUS;
+            self.mu.unlock();
         }
     }
 
     fn notifyLivelinessChanged(self: *Self) void {
         self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
         if (self.status_cond) |sc| sc.notifyWakeup();
-        if (self.listener_mask & DDS.LIVELINESS_CHANGED_STATUS != 0) {
-            const status = DDS.LivelinessChangedStatus{
-                .alive_count = self.liveliness_alive_count,
-                .not_alive_count = self.liveliness_not_alive_count,
-                .alive_count_change = self.liveliness_alive_count_change,
-                .not_alive_count_change = self.liveliness_not_alive_count_change,
-                .last_publication_handle = self.liveliness_last_handle,
-            };
+        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
+        // why this can't be gated on this reader's own `listener_mask`.
+        const status = DDS.LivelinessChangedStatus{
+            .alive_count = self.liveliness_alive_count,
+            .not_alive_count = self.liveliness_not_alive_count,
+            .alive_count_change = self.liveliness_alive_count_change,
+            .not_alive_count_change = self.liveliness_not_alive_count_change,
+            .last_publication_handle = self.liveliness_last_handle,
+        };
+        if (self.dispatchListener("on_liveliness_changed", DDS.LIVELINESS_CHANGED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.liveliness_alive_count_change = 0;
             self.liveliness_not_alive_count_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
-            const box = self.acquireListener();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_liveliness_changed) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -1936,15 +1914,14 @@ pub const DataReaderImpl = struct {
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.REQUESTED_DEADLINE_MISSED_STATUS;
         if (self.status_cond) |sc| sc.notifyWakeup();
-        if (self.listener_mask & DDS.REQUESTED_DEADLINE_MISSED_STATUS != 0) {
-            var status = DDS.RequestedDeadlineMissedStatus{};
-            status.total_count = self.deadline_missed_total;
-            status.total_count_change = 1;
+        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
+        // why this can't be gated on this reader's own `listener_mask`.
+        var status = DDS.RequestedDeadlineMissedStatus{};
+        status.total_count = self.deadline_missed_total;
+        status.total_count_change = self.deadline_missed_total_change;
+        if (self.dispatchListener("on_requested_deadline_missed", DDS.REQUESTED_DEADLINE_MISSED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.REQUESTED_DEADLINE_MISSED_STATUS;
-            const box = self.acquireListener();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_requested_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -2317,6 +2294,35 @@ pub const DataReaderImpl = struct {
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
         return self.listener_box.acquireLocked();
+    }
+
+    /// Dispatches `field` (a `DDS.DataReaderListener` callback) if this
+    /// reader's own listener has one installed and `self.listener_mask`
+    /// includes `bit`; otherwise walks the DDS 1.4 §2.2.4.1.5 "nearest
+    /// enclosing non-null listener" chain: this reader's Subscriber, then
+    /// its DomainParticipant (see `subscriber.zig`'s
+    /// `dispatchReaderFallback`). `handle` is always this reader's own
+    /// C-ABI handle, regardless of which level's listener actually ends up
+    /// running (per spec — the callback receives the entity whose status
+    /// changed, not the entity whose listener happened to fire). `pub`:
+    /// also used by `subscriber.zig`'s `notify_datareaders()`, which is a
+    /// different spec operation but the identical "does this reader have a
+    /// usable `on_data_available` listener" question.
+    ///
+    /// Returns `true` iff some level in the chain actually had a usable
+    /// listener and it was invoked — callers that reset per-status change-
+    /// counters (`_total_change`/`status_changes`) on delivery must gate
+    /// that reset on this return value, not on `self.listener_mask` alone:
+    /// a reader with no listener installed can still have its event
+    /// consumed by its Subscriber's or DomainParticipant's listener, and
+    /// *that* delivery is what the change-counters need to track.
+    pub fn dispatchListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: *anyopaque, args: anytype) bool {
+        const box = self.acquireListener();
+        defer box.releaseRef(self.alloc);
+        if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
+        if (nil.isNil(self.subscriber)) return false;
+        const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
+        return sub.dispatchReaderFallback(field, bit, handle, args);
     }
 
     fn vtGetTopicDesc(ctx: *anyopaque) DDS.TopicDescription {
@@ -2718,6 +2724,13 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
         .seen_instances = .empty,
     };
     defer {
+        // dispatchListener() (DDS 1.4 §2.2.4.1.5 fallback) always resolves
+        // this reader's own C-ABI handle before checking whether any level
+        // in the chain has a usable listener -- unlike this test's
+        // `nil.nil_dr_listener`/`listener_mask = 0`, which previously meant
+        // `get_c_abi_handle` was never reached at all. Free the resulting
+        // cached box the same way every real `deinit()` does.
+        dr.c_abi.free(alloc);
         var it = dr.coherent_wip.valueIterator();
         while (it.next()) |e| {
             for (e.samples.items) |pc| pc.deinit();

@@ -151,6 +151,64 @@ investigation — vendor binaries in CI may not reflect the latest implementatio
 wire-format changes are planned until the root cause is confirmed; deviating from the
 spec to chase a binary snapshot would risk breaking other vendor interop.
 
+**Listener hierarchy fallback (DDS 1.4 §2.2.4.1.5): reader/writer own listener first,
+then Subscriber/Publisher, then DomainParticipant — every level's `listener_mask`
+respected, not just field-nullability.** Closes a real conformance gap: previously each
+entity's listener was fully independent, so a `DataReader`/`DataWriter` with no listener
+installed never had its `Subscriber`/`Publisher`'s or `DomainParticipant`'s listener
+consulted even if one was installed for the same status. A new `src/util/listener_fallback.zig`
+(`tryDispatch`/`peek`, comptime over the callback field name) is shared by
+`DataReaderImpl.dispatchListener` → `SubscriberImpl.dispatchReaderFallback` →
+`DomainParticipantImpl.dispatchFallback`, and symmetrically
+`DataWriterImpl.dispatchListener` → `PublisherImpl.dispatchWriterFallback` →
+`DomainParticipantImpl.dispatchFallback` (one shared terminal function — participant has
+one box/mask for every status kind, widened over `Topic`/`Publisher`/`SubscriberListener`).
+Mask semantics: a level is skipped unless *both* its own `listener_mask` includes the bit
+*and* the relevant callback field is non-null — mirrors the gating every dispatch site
+already applied to the origin entity, just applied uniformly at every level in the chain,
+rather than treating the parent levels as field-nullability-only.
+
+`WaitSet`-style factory-less entities aside, the parent-lifetime safety assumption ("the
+Subscriber/Publisher/DomainParticipant a reader/writer downcasts to is still alive") holds
+not because zzdds enforces DDS's `PRECONDITION_NOT_MET`-on-live-children precondition (it
+doesn't — `delete_subscriber`/`delete_publisher`/`delete_participant` silently cascade,
+tearing down every contained child synchronously) but because that cascade never frees the
+parent's own storage until every child's `deinit()` (which itself blocks on the child's own
+`EntityQuiesce` until any in-flight dispatch, including a fallback walk touching the parent,
+completes) has returned — confirmed by reading `participant.zig`/`subscriber.zig`/
+`publisher.zig`'s `deinit()` directly, not assumed from spec text.
+
+Two real bugs found only via a real crash/test-failure, not by inspection: (1) test
+fixtures and other standalone-constructed entities set `.subscriber`/`.publisher`/
+`.participant` to `nil.nil_subscriber`/etc. (a real, first-class sentinel — see
+`nil.zig`'s `isNil`) rather than a live parent; the fallback downcast crashed on it until
+guarded with `nil.isNil(...)` checks at every hop. (2) The six/four status-with-counters
+dispatch sites (`on_sample_rejected`, `on_requested_incompatible_qos`,
+`on_subscription_matched`, `on_sample_lost`, `on_liveliness_changed`,
+`on_requested_deadline_missed` in `reader.zig`; `on_publication_matched`,
+`on_offered_incompatible_qos`, `on_offered_deadline_missed`, `on_liveliness_lost` in
+`writer.zig`) still had their pre-fallback `if (self.listener_mask & bit != 0)`/`if (fire)`
+gate wrapping the whole block — including the new fallback call — so the fallback chain
+was unreachable whenever the origin entity's own mask was clear, defeating the fix for
+every status except the simpler `on_data_available` sites. Fixed by making the whole
+dispatch chain (`tryDispatch`/`dispatchListener`/`dispatchReaderFallback`/
+`dispatchWriterFallback`/`dispatchFallback`) return `bool` ("did anything in the chain
+actually receive it"), always attempting dispatch, and gating each site's
+change-counter reset (`_total_change`/`status_changes`) on that return value instead of
+the origin's own mask — also fixing a latent staleness bug the old gate masked: those
+sites hardcoded `total_count_change = 1`/`delta` instead of the accumulated
+`self.*_total_change` field, which only ever matched by coincidence because the old gate
+guaranteed the field was always freshly reset before the next event.
+
+New regression coverage: `test/dcps/listener_fallback_test.zig` (reader→Subscriber,
+reader+Subscriber→DomainParticipant, reader's-own-listener-wins, writer→Publisher), using
+real two-participant `IntraProcessDelivery` trees (not stub vtables) so parent
+back-pointers are genuine. Confirmed to actually catch the bug by deliberately reverting
+`DataReaderImpl.dispatchListener` to its pre-fix (no-fallback) form once and observing two
+of the four tests fail with the expected `.none` result, before restoring. Full
+`zig build test`/`test-tsan`/`test-bindings -Dc-binding=true -Dcpp-binding=true
+-Djava-binding=true` green throughout.
+
 **SPDP liveness probe: EMA interval + 3× silence threshold, directed SEDP HBs.**
 When `FinalInstanceState_2` requires detecting participant exit without a BYE (e.g.,
 RTI Connext announces `lease_duration=100s` and exits silently), a poll-based lease

@@ -19,6 +19,8 @@ const waitset = @import("waitset.zig");
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
+const listener_fallback = @import("../util/listener_fallback.zig");
+const publisher_mod = @import("publisher.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const extensions_mod = @import("../c_abi/extensions.zig");
@@ -342,20 +344,24 @@ pub const DataWriterImpl = struct {
         self.status_changes |= DDS.PUBLICATION_MATCHED_STATUS;
         if (self.status_cond) |sc| sc.notifyWakeup();
 
-        if (self.listener_mask & DDS.PUBLICATION_MATCHED_STATUS != 0) {
-            const status = DDS.PublicationMatchedStatus{
-                .total_count = self.pub_matched_total,
-                .total_count_change = if (added) 1 else 0,
-                .current_count = self.pub_matched_current,
-                .current_count_change = delta,
-                .last_subscription_handle = remote_handle,
-            };
+        // Always attempt dispatch -- DDS 1.4 §2.2.4.1.5's fallback chain
+        // means a delivery can happen even when this writer's own
+        // `listener_mask` doesn't include the bit (the Publisher's or
+        // DomainParticipant's listener might still consume it). Only reset
+        // the change-counters if delivery actually happened somewhere in
+        // the chain, matching the pre-fallback behavior of resetting
+        // exactly when (and only when) a listener consumes the event.
+        const status = DDS.PublicationMatchedStatus{
+            .total_count = self.pub_matched_total,
+            .total_count_change = self.pub_matched_total_change,
+            .current_count = self.pub_matched_current,
+            .current_count_change = self.pub_matched_current_change,
+            .last_subscription_handle = remote_handle,
+        };
+        if (self.dispatchListener("on_publication_matched", DDS.PUBLICATION_MATCHED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.status_changes &= ~DDS.PUBLICATION_MATCHED_STATUS;
             self.pub_matched_total_change = 0;
             self.pub_matched_current_change = 0;
-            const box = self.acquireListenerEx();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_publication_matched) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -373,16 +379,16 @@ pub const DataWriterImpl = struct {
         self.status_changes |= DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
         if (self.status_cond) |sc| sc.notifyWakeup();
 
-        if (self.listener_mask & DDS.OFFERED_INCOMPATIBLE_QOS_STATUS != 0) {
-            var status = DDS.OfferedIncompatibleQosStatus{};
-            status.total_count = self.incompat_total;
-            status.total_count_change = 1;
-            status.last_policy_id = policy_id;
+        // See notifyPublicationMatched's comment: always attempt dispatch,
+        // only reset change-counters if something in the DDS 1.4
+        // §2.2.4.1.5 fallback chain actually consumed it.
+        var status = DDS.OfferedIncompatibleQosStatus{};
+        status.total_count = self.incompat_total;
+        status.total_count_change = self.incompat_total_change;
+        status.last_policy_id = policy_id;
+        if (self.dispatchListener("on_offered_incompatible_qos", DDS.OFFERED_INCOMPATIBLE_QOS_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.incompat_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
-            const box = self.acquireListenerEx();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_offered_incompatible_qos) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -396,15 +402,12 @@ pub const DataWriterImpl = struct {
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.OFFERED_DEADLINE_MISSED_STATUS;
         if (self.status_cond) |sc| sc.notifyWakeup();
-        if (self.listener_mask & DDS.OFFERED_DEADLINE_MISSED_STATUS != 0) {
-            var status = DDS.OfferedDeadlineMissedStatus{};
-            status.total_count = self.deadline_missed_total;
-            status.total_count_change = 1;
+        var status = DDS.OfferedDeadlineMissedStatus{};
+        status.total_count = self.deadline_missed_total;
+        status.total_count_change = self.deadline_missed_total_change;
+        if (self.dispatchListener("on_offered_deadline_missed", DDS.OFFERED_DEADLINE_MISSED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_DEADLINE_MISSED_STATUS;
-            const box = self.acquireListenerEx();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_offered_deadline_missed) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -418,15 +421,12 @@ pub const DataWriterImpl = struct {
         self.liveliness_lost_total_change += 1;
         self.status_changes |= DDS.LIVELINESS_LOST_STATUS;
         if (self.status_cond) |sc| sc.notifyWakeup();
-        if (self.listener_mask & DDS.LIVELINESS_LOST_STATUS != 0) {
-            var status = DDS.LivelinessLostStatus{};
-            status.total_count = self.liveliness_lost_total;
-            status.total_count_change = 1;
+        var status = DDS.LivelinessLostStatus{};
+        status.total_count = self.liveliness_lost_total;
+        status.total_count_change = self.liveliness_lost_total_change;
+        if (self.dispatchListener("on_liveliness_lost", DDS.LIVELINESS_LOST_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.liveliness_lost_total_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_LOST_STATUS;
-            const box = self.acquireListenerEx();
-            defer box.releaseRef(self.alloc);
-            if (box.listener.on_liveliness_lost) |cb| cb(vtable.get_c_abi_handle(self), &status, box.listener.listener_data);
         }
     }
 
@@ -473,6 +473,33 @@ pub const DataWriterImpl = struct {
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
         return self.listener_ex_box.acquireLocked();
+    }
+
+    /// Dispatches `field` (a `DDS.DataWriterListener` callback, read off
+    /// the wider `ZZDDS.DataWriterListenerEx` box that always backs it —
+    /// see `setListenerEx`'s widen/narrow scheme) if this writer's own
+    /// listener has one installed and `self.listener_mask` includes `bit`;
+    /// otherwise walks the DDS 1.4 §2.2.4.1.5 "nearest enclosing non-null
+    /// listener" chain: this writer's Publisher, then its
+    /// DomainParticipant (see `publisher.zig`'s `dispatchWriterFallback`).
+    /// `handle` is always this writer's own C-ABI handle, regardless of
+    /// which level's listener actually ends up running (per spec). Not
+    /// used for `on_reliable_reader_ready`: that's a vendor extension
+    /// callback, not a `DDS.StatusMask` status, and has no
+    /// `PublisherListener`/`DomainParticipantListener` equivalent to fall
+    /// back to.
+    ///
+    /// Returns `true` iff some level in the chain actually had a usable
+    /// listener and it was invoked — see `reader.zig`'s `dispatchListener`
+    /// doc comment for why callers must gate change-counter resets on this
+    /// return value rather than on `self.listener_mask` alone.
+    fn dispatchListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: *anyopaque, args: anytype) bool {
+        const box = self.acquireListenerEx();
+        defer box.releaseRef(self.alloc);
+        if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
+        if (nil.isNil(self.publisher)) return false;
+        const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
+        return pub_.dispatchWriterFallback(field, bit, handle, args);
     }
 
     /// Registered alongside checkTimersFn so that participant.checkTimers()
