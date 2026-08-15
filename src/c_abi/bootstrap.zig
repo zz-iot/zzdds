@@ -415,6 +415,19 @@ pub const CRawSampleArray = extern struct {
     samples: ?[*]CRawSample,
     count: usize,
     _alloc_capacity: usize, // internal; do not modify
+    // Self-describing ownership: the allocator this array (and each
+    // sample's .data) was actually built with, captured at build time --
+    // NOT re-derived from whatever DDS_DataReader handle is later passed to
+    // zzdds_return_raw_samples. The array can otherwise outlive the reader
+    // that produced it (deleted before the loan is returned) or be handed
+    // to the wrong reader by caller error; either way, deriving the
+    // freeing allocator from that handle risks an allocator mismatch or a
+    // use-after-free read of a destroyed reader's `impl.alloc` field
+    // (confirmed real: Greptile PR #64 review). Mirrors zzdds_loaned_sample
+    // (CLoanedSample)'s existing `owner` field, which solves the same
+    // problem for the single-sample loan path.
+    _alloc_ctx: ?*anyopaque = null, // internal; do not modify
+    _alloc_vtable: ?*const std.mem.Allocator.VTable = null, // internal; do not modify
 };
 
 fn nRawImpl(
@@ -516,7 +529,7 @@ fn nRawImpl(
             },
         };
     }
-    out.* = .{ .samples = arr.ptr, .count = tmp.items.len, ._alloc_capacity = arr.len };
+    out.* = .{ .samples = arr.ptr, .count = tmp.items.len, ._alloc_capacity = arr.len, ._alloc_ctx = alloc.ptr, ._alloc_vtable = alloc.vtable };
     return @intCast(tmp.items.len);
 }
 
@@ -581,33 +594,33 @@ pub export fn zzdds_read_n_instance_raw(
 }
 
 /// Free a CRawSampleArray returned by zzdds_take_n_raw or zzdds_read_n_raw.
+///
+/// `reader` is accepted (unused) only for API symmetry with the take
+/// functions -- freeing derives its allocator entirely from `arr` itself
+/// (see CRawSampleArray's `_alloc_ctx`/`_alloc_vtable` doc comment), not
+/// from `reader`. `reader` is NOT a reliable source for this: the array can
+/// outlive the reader that produced it (deleted before the loan is
+/// returned), or the caller can simply pass the wrong reader handle --
+/// either way, deriving the freeing allocator from it risked an allocator
+/// mismatch or a use-after-free read of a destroyed reader's `impl.alloc`
+/// (an earlier version of this function did exactly that; see Greptile PR
+/// #64 review).
 pub export fn zzdds_return_raw_samples(
     reader: *anyopaque,
     arr: *CRawSampleArray,
 ) callconv(.c) void {
+    _ = reader;
     if (arr.samples) |samples| {
-        // Must match whatever allocator nRawImpl/packageTakenSamples used to
-        // build this array -- both now resolve through the owning reader's
-        // impl.alloc (an invalid-allocator free otherwise, if the reader was
-        // ever created with a non-default allocator). A null/nil `reader`
-        // here would mean the array's own producer never ran either, so
-        // `arr.samples` would already be null and this branch unreached --
-        // isNullHandle must still be checked before unboxing, though:
-        // zidl_rt.unboxAs dereferences its argument unconditionally (see this
-        // file's top-of-file comment).
-        const alloc: std.mem.Allocator = blk: {
-            if (isNullHandle(reader)) break :blk std.heap.c_allocator;
-            const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
-            if (nil.isNil(r)) break :blk std.heap.c_allocator;
-            const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-            break :blk impl.alloc;
-        };
+        const alloc: std.mem.Allocator = if (arr._alloc_ctx) |ctx|
+            .{ .ptr = ctx, .vtable = arr._alloc_vtable.? }
+        else
+            std.heap.c_allocator;
         for (samples[0..arr.count]) |s| {
             if (s.data) |d| alloc.free(d[0..s.data_len]);
         }
         alloc.free(samples[0..arr._alloc_capacity]);
     }
-    arr.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+    arr.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0, ._alloc_ctx = null, ._alloc_vtable = null };
 }
 
 /// Copies each TakenSample in `items` into a freshly heap-allocated CRawSample
@@ -649,7 +662,7 @@ fn packageTakenSamples(
             },
         };
     }
-    out.* = .{ .samples = arr.ptr, .count = items.len, ._alloc_capacity = arr.len };
+    out.* = .{ .samples = arr.ptr, .count = items.len, ._alloc_capacity = arr.len, ._alloc_ctx = alloc.ptr, ._alloc_vtable = alloc.vtable };
     return @intCast(items.len);
 }
 

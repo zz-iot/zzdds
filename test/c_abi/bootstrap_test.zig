@@ -641,6 +641,33 @@ test "bootstrap: take_n_raw returns all samples and return_raw_samples frees" {
     try testing.expect(arr2.samples == null);
 }
 
+test "bootstrap: return_raw_samples frees via the array's own allocator, not whatever reader handle is passed" {
+    // Regression test for a real bug (Greptile PR #64 review): an earlier
+    // version of zzdds_return_raw_samples derived the freeing allocator by
+    // unboxing the `reader` parameter, which is unsound whenever that
+    // handle doesn't match (or no longer refers to a live) reader. Passing
+    // makeNullHandle() here exercises exactly that: if the free path still
+    // depended on `reader`, this would hit the isNullHandle/c_allocator
+    // fallback and free testing.allocator-backed memory with the wrong
+    // allocator -- testing.allocator's own leak/double-free detection would
+    // catch that. The array must instead free correctly using the
+    // allocator captured in CRawSampleArray itself at take time.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr);
+    try testing.expectEqual(@as(c_int, 1), n);
+
+    bootstrap.zzdds_return_raw_samples(makeNullHandle(), &arr);
+    try testing.expectEqual(@as(usize, 0), arr.count);
+    try testing.expect(arr.samples == null);
+}
+
 test "bootstrap: take_n_raw returns 0 when queue is empty" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

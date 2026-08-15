@@ -1530,6 +1530,12 @@ pub const StatefulWriter = struct {
                     self.sendFragsToProxyLocked(rp, ch, hb_count_snap, &scratch);
                 }
             }
+            // self.mu is held throughout this branch (no unlock above), so
+            // ch is still valid here -- unlike the non-fragmented branch
+            // below, which must use its own pre-captured ch_sn instead (see
+            // its matching comment).
+            if (ch.sequence_number > self.last_flushed_sn)
+                self.last_flushed_sn = ch.sequence_number;
         } else {
             // Snapshot everything this loop needs, then release self.mu before
             // touching the transport: MemoryTransport (used by
@@ -1623,7 +1629,6 @@ pub const StatefulWriter = struct {
             const self_transport = self.transport;
 
             self.mu.unlock();
-            defer self.mu.lock();
 
             for (snaps[0..n_snaps]) |s| {
                 var scratch: [SCRATCH_SIZE]u8 = undefined;
@@ -1656,9 +1661,17 @@ pub const StatefulWriter = struct {
                     self.sendHeartbeatUnlocked(s.guid, s.start_sn, s.locs[0..s.n_locs], false, hb.last_sn, hb.count, hb.cache_first);
                 }
             }
+
+            // Relock before touching self.last_flushed_sn (a plain field,
+            // needs the same protection as any other self.* mutation) --
+            // and use ch_sn (captured before the unlock above), not
+            // ch.sequence_number: a concurrent write() during the unlocked
+            // send loop above can evict/reallocate the cache's backing
+            // storage, leaving `ch` a dangling pointer even after mu is
+            // held again (Greptile PR #64 finding -- confirmed real).
+            self.mu.lock();
+            if (ch_sn > self.last_flushed_sn) self.last_flushed_sn = ch_sn;
         }
-        if (ch.sequence_number > self.last_flushed_sn)
-            self.last_flushed_sn = ch.sequence_number;
     }
 
     /// Rare-path fallback for sendChangeToAllLocked's non-fragmented branch

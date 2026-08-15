@@ -1848,12 +1848,11 @@ pub const DataReaderImpl = struct {
         self.sub_matched_current_change += delta;
         self.sub_matched_last_handle = remote_handle;
         self.status_changes |= DDS.SUBSCRIPTION_MATCHED_STATUS;
-        self.mu.unlock();
-
-        if (self.status_cond) |sc| sc.notifyWakeup();
-
         // Always attempt dispatch -- see notifyIncompatibleQos's comment on
         // why this can't be gated on this reader's own `listener_mask`.
+        // Snapshot while still locked -- building this from self.* after
+        // unlocking (the previous shape here) races vtGetSubMatched, which
+        // reads/mutates the same fields under the lock (confirmed via TSan).
         const status = DDS.SubscriptionMatchedStatus{
             .total_count = self.sub_matched_total,
             .total_count_change = self.sub_matched_total_change,
@@ -1861,6 +1860,10 @@ pub const DataReaderImpl = struct {
             .current_count_change = self.sub_matched_current_change,
             .last_publication_handle = remote_handle,
         };
+        self.mu.unlock();
+
+        if (self.status_cond) |sc| sc.notifyWakeup();
+
         if (self.dispatchListener("on_subscription_matched", DDS.SUBSCRIPTION_MATCHED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.mu.lock();
             self.status_changes &= ~DDS.SUBSCRIPTION_MATCHED_STATUS;
@@ -1883,14 +1886,17 @@ pub const DataReaderImpl = struct {
         self.sample_lost_total += count;
         self.sample_lost_total_change += count;
         self.status_changes |= DDS.SAMPLE_LOST_STATUS;
+        // Snapshot while still locked -- see notifySubscriptionMatched's
+        // matching comment (same bug, same fix, confirmed via TSan).
+        const status = DDS.SampleLostStatus{
+            .total_count = self.sample_lost_total,
+            .total_count_change = self.sample_lost_total_change,
+        };
         self.mu.unlock();
         if (self.status_cond) |sc| sc.notifyWakeup();
         // Always attempt dispatch -- see notifyIncompatibleQos's comment on
         // why this can't be gated on this reader's own `listener_mask`.
-        const delivered = self.dispatchListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS, vtable.get_c_abi_handle(self), .{&DDS.SampleLostStatus{
-            .total_count = self.sample_lost_total,
-            .total_count_change = self.sample_lost_total_change,
-        }});
+        const delivered = self.dispatchListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS, vtable.get_c_abi_handle(self), .{&status});
         if (delivered) {
             self.mu.lock();
             self.sample_lost_total_change = 0;
@@ -1900,10 +1906,11 @@ pub const DataReaderImpl = struct {
     }
 
     fn notifyLivelinessChanged(self: *Self) void {
+        self.mu.lock();
         self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
-        if (self.status_cond) |sc| sc.notifyWakeup();
-        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
-        // why this can't be gated on this reader's own `listener_mask`.
+        // Snapshot while still locked -- see notifySubscriptionMatched's
+        // matching comment (same bug, same fix, confirmed via TSan). This
+        // function previously took no lock at all.
         const status = DDS.LivelinessChangedStatus{
             .alive_count = self.liveliness_alive_count,
             .not_alive_count = self.liveliness_not_alive_count,
@@ -1911,10 +1918,16 @@ pub const DataReaderImpl = struct {
             .not_alive_count_change = self.liveliness_not_alive_count_change,
             .last_publication_handle = self.liveliness_last_handle,
         };
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
+        // why this can't be gated on this reader's own `listener_mask`.
         if (self.dispatchListener("on_liveliness_changed", DDS.LIVELINESS_CHANGED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
             self.liveliness_alive_count_change = 0;
             self.liveliness_not_alive_count_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
+            self.mu.unlock();
         }
     }
 
@@ -1924,18 +1937,25 @@ pub const DataReaderImpl = struct {
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        self.mu.lock();
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.REQUESTED_DEADLINE_MISSED_STATUS;
-        if (self.status_cond) |sc| sc.notifyWakeup();
-        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
-        // why this can't be gated on this reader's own `listener_mask`.
+        // Snapshot while still locked -- see notifySubscriptionMatched's
+        // matching comment (same bug, same fix, confirmed via TSan). This
+        // function previously took no lock at all.
         var status = DDS.RequestedDeadlineMissedStatus{};
         status.total_count = self.deadline_missed_total;
         status.total_count_change = self.deadline_missed_total_change;
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
+        // why this can't be gated on this reader's own `listener_mask`.
         if (self.dispatchListener("on_requested_deadline_missed", DDS.REQUESTED_DEADLINE_MISSED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.REQUESTED_DEADLINE_MISSED_STATUS;
+            self.mu.unlock();
         }
     }
 
@@ -2384,6 +2404,8 @@ pub const DataReaderImpl = struct {
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.RequestedDeadlineMissedStatus) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
         status.* = .{
             .total_count = self.deadline_missed_total,
             .total_count_change = self.deadline_missed_total_change,

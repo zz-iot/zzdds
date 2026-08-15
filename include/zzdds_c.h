@@ -47,7 +47,9 @@ typedef struct zzdds_raw_sample {
 typedef struct zzdds_raw_sample_array {
     zzdds_raw_sample *samples;
     size_t count;
-    size_t _alloc_capacity;
+    size_t _alloc_capacity;     /* internal; do not modify */
+    void *_alloc_ctx;           /* internal; do not modify */
+    const void *_alloc_vtable;  /* internal; do not modify */
 } zzdds_raw_sample_array;
 
 typedef int (*zzdds_compute_key_hash_fn)(const uint8_t *payload, size_t len, uint8_t hash_out[16]);
