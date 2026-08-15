@@ -1153,3 +1153,39 @@ test "addMatchedReader: lease refresh landing after a reconnect still replays (n
     w.checkConnectionGenerations();
     try testing.expectEqual(@as(usize, 0), countAllData(&rec));
 }
+
+// ── OOM fallback: sendChangeToAllLocked's allocation-failure path ───────────
+//
+// Regression test for Greptile PR #64 review: an earlier version of the OOM
+// fallback here sent synchronously while still holding self.mu, reintroducing
+// the writer.mu/reader.mu lock-order-inversion the unlock-before-send
+// restructuring elsewhere in write() exists to close. The fix removes the
+// send entirely on this rare path -- this test proves that structurally (no
+// send is attempted when the snapshot allocation fails), which is what
+// makes the deadlock impossible, rather than trying to reproduce a live
+// deadlock in a single-threaded test harness.
+test "write: snapshot-allocation OOM skips the live send instead of sending under self.mu" {
+    const writer_guid = makeGuid(0x01, WRITER_EID);
+    const reader_guid = makeGuid(0x02, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    // Confirm the normal (non-OOM) path still sends, as a control.
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "normal");
+    try testing.expect(countAllData(&rec) > 0);
+    rec.reset();
+
+    // Force the very next allocation through w.alloc (the snapshot array in
+    // sendChangeToAllLocked's non-fragmented branch) to fail. w.write()
+    // itself must still succeed (the sample lands in the cache regardless;
+    // only the immediate live push is skipped), and no DATA send may occur.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    w.alloc = fa.allocator();
+    defer w.alloc = testing.allocator;
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "oom");
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}

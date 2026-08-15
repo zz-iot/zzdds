@@ -292,15 +292,24 @@ jobs:
         working-directory: zzdds-examples/zig/waitset
         run: zig build -Dsanitize-thread=true
 
+      # -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ on every TSan
+      # build below: this runner's default `cc`/`c++` is GCC, whose libtsan
+      # is a different, incompatible runtime from the LLVM-based one Zig
+      # links into libzzdds.so (forced on via build.zig's .use_llvm fix).
+      # Linking both into one process is unsupported and crashes instantly
+      # with no TSan report at all (confirmed: this job passed on main only
+      # because libzzdds.so was never actually instrumented before that fix
+      # -- see build.zig's Phase 0 history). Forcing clang here keeps both
+      # sides on the same TSan runtime.
       - name: Build cpp/waitset (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DWAITSET_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DWAITSET_SANITIZE_THREAD=ON \
             -B zzdds-examples/cpp/waitset/build -S zzdds-examples/cpp/waitset
           cmake --build zzdds-examples/cpp/waitset/build
 
       - name: Build c/waitset (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DWAITSET_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DWAITSET_SANITIZE_THREAD=ON \
             -B zzdds-examples/c/waitset/build -S zzdds-examples/c/waitset
           cmake --build zzdds-examples/c/waitset/build
 
@@ -310,25 +319,25 @@ jobs:
 
       - name: Build cpp/shape (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DSHAPE_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DSHAPE_SANITIZE_THREAD=ON \
             -B zzdds-examples/cpp/shape/build -S zzdds-examples/cpp/shape
           cmake --build zzdds-examples/cpp/shape/build
 
       - name: Build c/shape (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DSHAPE_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DSHAPE_SANITIZE_THREAD=ON \
             -B zzdds-examples/c/shape/build -S zzdds-examples/c/shape
           cmake --build zzdds-examples/c/shape/build
 
       - name: Build cpp/custom-allocator (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
             -B zzdds-examples/cpp/custom-allocator/build -S zzdds-examples/cpp/custom-allocator
           cmake --build zzdds-examples/cpp/custom-allocator/build
 
       - name: Build c/custom-allocator (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
             -B zzdds-examples/c/custom-allocator/build -S zzdds-examples/c/custom-allocator
           cmake --build zzdds-examples/c/custom-allocator/build
 

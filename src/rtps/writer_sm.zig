@@ -1561,11 +1561,7 @@ pub const StatefulWriter = struct {
             const cache_first = self.cache.minSn();
 
             const snaps = self.alloc.alloc(ProxySnapshot, self.reader_proxies.items.len) catch {
-                // OOM on this tiny alloc: fall back to sending under lock for
-                // this one write rather than dropping the sample entirely --
-                // RELIABLE delivery still completes via later heartbeat/NACK
-                // retransmission from self.cache, just not on this call.
-                self.sendChangeToAllNonFragLockedFallback(ch, send_trailing_hb);
+                self.sendChangeToAllNonFragLockedFallback(ch);
                 if (ch.sequence_number > self.last_flushed_sn) self.last_flushed_sn = ch.sequence_number;
                 return;
             };
@@ -1612,7 +1608,7 @@ pub const StatefulWriter = struct {
             // concurrent write() or KEEP_LAST eviction) -- copy its payload
             // and fixed fields out now while still locked.
             const data_copy = self.alloc.dupe(u8, ch.data) catch {
-                self.sendChangeToAllNonFragLockedFallback(ch, send_trailing_hb);
+                self.sendChangeToAllNonFragLockedFallback(ch);
                 if (ch.sequence_number > self.last_flushed_sn) self.last_flushed_sn = ch.sequence_number;
                 return;
             };
@@ -1675,41 +1671,30 @@ pub const StatefulWriter = struct {
     }
 
     /// Rare-path fallback for sendChangeToAllLocked's non-fragmented branch
-    /// when the snapshot/payload-copy allocation fails: sends synchronously
-    /// under self.mu, exactly as the code did before the lock-order fix
-    /// (same pre-existing reentrancy caveat, only for this one send).
-    fn sendChangeToAllNonFragLockedFallback(self: *Self, ch: *const CacheChange, send_trailing_hb: bool) void {
-        var scratch: [SCRATCH_SIZE]u8 = undefined;
-        for (self.reader_proxies.items) |*rp| {
-            if (rp.suppress_live_data) continue;
-            const locs = rp.effectiveLocators();
-            if (locs.len == 0) continue;
-            var b = MessageBuilder.init(&scratch, self.guid.prefix);
-            b.addInfoDst(rp.guid.prefix);
-            b.addInfoTs(ch.source_timestamp);
-            b.addData(.{
-                .reader_entity_id = rp.guid.entity_id,
-                .writer_entity_id = self.guid.entity_id,
-                .writer_sn = ch.sequence_number,
-                .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
-                    ch.key_hash
-                else
-                    null,
-                .is_key = ch.kind != .alive,
-                .status_info = statusInfoFromKind(ch.kind),
-                .coherent_set_sn = ch.coherent_set_sn,
-                .group_seq_num = ch.group_seq_num,
-                .group_coherent_sn = ch.group_coherent_sn,
-                .lifespan = if (ch.kind == .alive) self.lifespan else null,
-            }, ch.data);
-            for (locs) |loc| {
-                sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
-                    error.UnsupportedLocatorKind => {},
-                    else => log.rtps.warn("StatefulWriter.write: send error: {}", .{err}),
-                };
-            }
-            if (rp.reliable and send_trailing_hb) self.sendHeartbeatToProxyLocked(rp, false);
-        }
+    /// when the snapshot/payload-copy allocation fails.
+    ///
+    /// Does NOT send anything -- an earlier version of this function sent
+    /// synchronously while still holding self.mu, exactly reintroducing the
+    /// writer.mu/reader.mu lock-order-inversion the unlock-before-send
+    /// restructuring above exists to close: MemoryTransport (used by
+    /// IntraProcessDelivery, zzdds's own conformance-testing harness)
+    /// delivers synchronously and can reenter a matched reader's own locked
+    /// code from inside sendIovecs, which combined with the reader's own
+    /// reader.mu -> writer.mu path is a genuine deadlock, not just a
+    /// theoretical race (confirmed real: Greptile PR #64 review). There's
+    /// no unlock/retry option here either -- we're already in the allocator
+    /// failure path that would be needed to build a safe-to-unlock snapshot.
+    ///
+    /// Silently skipping this one live push is safe: this change (`ch`) is
+    /// already durably in `self.cache` by the time sendChangeToAllLocked
+    /// runs, so RELIABLE proxies still receive it via the writer's regular
+    /// HEARTBEAT -> ACKNACK -> retransmission cycle, just not on this call.
+    /// BEST_EFFORT proxies have no such recovery path, but BEST_EFFORT
+    /// readers are spec-defined to tolerate exactly this kind of drop.
+    fn sendChangeToAllNonFragLockedFallback(self: *Self, ch: *const CacheChange) void {
+        log.rtps.warn("StatefulWriter({x}): OOM building the unlocked-send snapshot for sn={} -- skipping this live push; RELIABLE proxies will catch up via HEARTBEAT/ACKNACK retransmission, BEST_EFFORT proxies may miss this sample", .{
+            self.guid.entity_id.entity_key, ch.sequence_number,
+        });
     }
 
     /// Like sendHeartbeatToProxyLockedWithLastSnAndFirstSn, but for the case
