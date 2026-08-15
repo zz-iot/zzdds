@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
+    const debug_allocator = b.option(bool, "debug-allocator", "Route the default (allocator=NULL) factory allocation path through std.heap.DebugAllocator instead of std.heap.c_allocator, for fast attributable double-free/UAF diagnostics") orelse false;
 
     const zzdds_version = "0.1.1-zig.0.16.0-dev";
 
@@ -257,6 +258,7 @@ pub fn build(b: *std.Build) void {
         "content_subscription_profile",
         b.option(bool, "content-subscription-profile", "Enable Content-Subscription profile parser/evaluator for ContentFilteredTopic and QueryCondition; MultiTopic not implemented (DDS v1.4 Annex A, default: true)") orelse true,
     );
+    build_options.addOption(bool, "debug_allocator", debug_allocator);
     // Pass ZZDDS_XTYPES preprocessor define to zidl so dcps.idl gates XTypes
     // content (DataRepresentationQosPolicy and its uses) at code-generation time.
     if (xtypes) gen_dcps.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
@@ -539,6 +541,29 @@ pub fn build(b: *std.Build) void {
         c_smoke_mod.linkLibrary(zzdds_lib);
         const c_smoke = b.addExecutable(.{ .name = "zzdds_c_binding_smoke", .root_module = c_smoke_mod });
         binding_smoke_step.dependOn(&b.addRunArtifact(c_smoke).step);
+
+        // Plain-C counterpart to cpp_allocator_smoke.cpp below: proves
+        // zzdds_create_factory_with_allocator's C-ABI allocator injection
+        // reaches every downstream allocation. No generated per-sample-type
+        // CDR code needed (unlike c_smoke above) -- this only exercises
+        // factory/participant lifecycle, not serialization.
+        const c_alloc_smoke_mod = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        c_alloc_smoke_mod.addCSourceFiles(.{
+            .files = &.{"test/bindings/smoke/c_allocator_smoke.c"},
+            .flags = &.{ "-std=c99", "-Wall" },
+        });
+        c_alloc_smoke_mod.addIncludePath(gen_c_dir);
+        c_alloc_smoke_mod.addIncludePath(gen_zzdds_c_dir);
+        c_alloc_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+        c_alloc_smoke_mod.addIncludePath(b.path("include"));
+        c_alloc_smoke_mod.linkLibrary(zzdds_lib);
+        const c_alloc_smoke = b.addExecutable(.{ .name = "zzdds_c_allocator_smoke", .root_module = c_alloc_smoke_mod });
+        binding_smoke_step.dependOn(&b.addRunArtifact(c_alloc_smoke).step);
 
         if (cpp_binding) {
             const gen_smoke_cpp = b.addRunArtifact(zidl_exe);
@@ -1319,4 +1344,37 @@ pub fn build(b: *std.Build) void {
         t.root_module.link_libc = true;
         tsan_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // `zig build test-tsan-self-check` — regression guard proving TSan
+    // instrumentation can still fail. See test/tsan_self_check.zig and the
+    // long comment on zzdds_tests_tsan above for why this matters: Zig
+    // 0.16's self-hosted backend once silently no-op'd sanitize_thread, and
+    // every TSan job in this repo gave false confidence until that was
+    // caught. This binary has a deliberate, blatant, unsynchronized data
+    // race that TSan must catch every run; if it ever again goes
+    // undetected, this step fails loudly instead of the job quietly
+    // degrading back to zero real coverage.
+    const tsan_self_check_step = b.step("test-tsan-self-check", "Prove ThreadSanitizer can still catch a real data race (regression guard)");
+    const tsan_self_check_exe = b.addExecutable(.{
+        .name = "tsan_self_check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/tsan_self_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = true,
+            .link_libc = true,
+        }),
+        .use_llvm = true,
+    });
+    const run_tsan_self_check = b.addRunArtifact(tsan_self_check_exe);
+    // halt_on_error=1 is required: TSan's default behavior is to report a
+    // race and keep running, so without it the process reaches its own
+    // normal (0) exit code regardless of detection, defeating this check.
+    // exitcode=66 is an arbitrary but specific marker: it lets this step
+    // distinguish "TSan caught the race" (success) from either a clean
+    // exit (TSan silently failed to instrument -- the exact regression
+    // this step exists to catch) or some unrelated crash.
+    run_tsan_self_check.setEnvironmentVariable("TSAN_OPTIONS", "halt_on_error=1:exitcode=66");
+    run_tsan_self_check.expectExitCode(66);
+    tsan_self_check_step.dependOn(&run_tsan_self_check.step);
 }

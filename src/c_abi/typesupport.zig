@@ -67,9 +67,10 @@ pub const ZzddsGetFieldFromCdrFn = *const fn (
     scratch_len: usize,
 ) callconv(.c) bool;
 
-/// Per-registration adapter. Heap-allocated via std.heap.c_allocator when
-/// zzdds_register_type_support is called; freed when the participant deinits
-/// or replaces this registration.
+/// Per-registration adapter. Heap-allocated via the owning participant's
+/// allocator (impl.alloc) when zzdds_register_type_support is called; freed
+/// with the same allocator when the participant deinits or replaces this
+/// registration.
 ///
 /// Always allocated, even when both callbacks are null (a keyless,
 /// non-filterable type) — a single unconditional shape here is simpler than
@@ -79,6 +80,7 @@ pub const ZzddsGetFieldFromCdrFn = *const fn (
 /// a keyless type could still want get_field_fn (a keyless struct can have
 /// non-key fields a CFT expression filters on).
 const CTypeSupportAdapter = struct {
+    alloc: std.mem.Allocator,
     key_hash_fn: ?ZzddsComputeKeyHashFn,
     get_field_fn: ?ZzddsGetFieldFromCdrFn,
 
@@ -99,7 +101,7 @@ const CTypeSupportAdapter = struct {
 
     fn deinitAdapter(ctx: *anyopaque) void {
         const self: *CTypeSupportAdapter = @ptrCast(@alignCast(ctx));
-        std.heap.c_allocator.destroy(self);
+        self.alloc.destroy(self);
     }
 };
 
@@ -136,15 +138,15 @@ pub export fn zzdds_register_type_support(
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const name = std.mem.span(type_name);
 
-    const adapter = std.heap.c_allocator.create(CTypeSupportAdapter) catch return -1;
-    adapter.* = .{ .key_hash_fn = compute_key_hash_fn, .get_field_fn = get_field_fn };
+    const adapter = impl.alloc.create(CTypeSupportAdapter) catch return -1;
+    adapter.* = .{ .alloc = impl.alloc, .key_hash_fn = compute_key_hash_fn, .get_field_fn = get_field_fn };
     if (!impl.registerTypeSupport(name, TypeSupport{
         .ctx = adapter,
         .compute_key_hash = CTypeSupportAdapter.computeKeyHash,
         .get_field = if (get_field_fn != null) CTypeSupportAdapter.getField else null,
         .deinit = CTypeSupportAdapter.deinitAdapter,
     })) {
-        std.heap.c_allocator.destroy(adapter);
+        impl.alloc.destroy(adapter);
         return -1;
     }
 
@@ -188,6 +190,7 @@ pub const ZzddsGetFieldFromCdrCtxFn = *const fn (
 /// this TypeSupport registration — see `DomainParticipantImpl.deinit`/
 /// `registerTypeSupport` in `src/dcps/participant.zig`, unchanged by this.
 const CtxTypeSupportAdapter = struct {
+    alloc: std.mem.Allocator,
     key_hash_fn: ?ZzddsComputeKeyHashCtxFn,
     get_field_fn: ?ZzddsGetFieldFromCdrCtxFn,
     user_ctx: ?*anyopaque,
@@ -211,7 +214,7 @@ const CtxTypeSupportAdapter = struct {
     fn deinitAdapter(ctx: *anyopaque) void {
         const self: *CtxTypeSupportAdapter = @ptrCast(@alignCast(ctx));
         if (self.user_deinit) |f| f(self.user_ctx);
-        std.heap.c_allocator.destroy(self);
+        self.alloc.destroy(self);
     }
 };
 
@@ -250,15 +253,15 @@ pub export fn zzdds_register_type_support_ctx(
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(p.ptr));
     const name = std.mem.span(type_name);
 
-    const adapter = std.heap.c_allocator.create(CtxTypeSupportAdapter) catch return -1;
-    adapter.* = .{ .key_hash_fn = compute_key_hash_fn, .get_field_fn = get_field_fn, .user_ctx = ctx, .user_deinit = ctx_deinit };
+    const adapter = impl.alloc.create(CtxTypeSupportAdapter) catch return -1;
+    adapter.* = .{ .alloc = impl.alloc, .key_hash_fn = compute_key_hash_fn, .get_field_fn = get_field_fn, .user_ctx = ctx, .user_deinit = ctx_deinit };
     if (!impl.registerTypeSupport(name, TypeSupport{
         .ctx = adapter,
         .compute_key_hash = CtxTypeSupportAdapter.computeKeyHash,
         .get_field = if (get_field_fn != null) CtxTypeSupportAdapter.getField else null,
         .deinit = CtxTypeSupportAdapter.deinitAdapter,
     })) {
-        std.heap.c_allocator.destroy(adapter);
+        impl.alloc.destroy(adapter);
         return -1;
     }
 

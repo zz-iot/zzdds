@@ -3045,7 +3045,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtGetStatusChanges(ctx: *anyopaque) DDS.StatusMask {
-        return cast(ctx).status_changes;
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.status_changes;
     }
 
     fn vtGetHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
@@ -3697,7 +3700,10 @@ pub const DomainParticipantImpl = struct {
     // ── Status helper for StatusConditionImpl ─────────────────────────────────
 
     fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
-        return cast(entity_ptr).status_changes;
+        const self = cast(entity_ptr);
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.status_changes;
     }
 
     fn cast(ctx: *anyopaque) *Self {

@@ -13,6 +13,7 @@ const ZZDDS = zzdds.ZZDDS;
 
 const bootstrap = zzdds.c_abi.bootstrap;
 const extensions = zzdds.c_abi.extensions;
+const allocator_adapter = zzdds.c_abi.allocator_adapter;
 const zidl_rt = @import("zidl_rt");
 const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const MemoryTransport = zzdds.intraprocess.MemoryTransport;
@@ -204,22 +205,28 @@ const TrackingCtx = struct {
     free_calls: usize = 0,
 };
 
+// The actual std.mem.Allocator <-> ZidlAllocator forwarding logic lives in
+// the promoted src/c_abi/allocator_adapter.zig; these trampolines only add
+// the call counting this test needs, delegating everything else to it.
 fn trackAlloc(ctx: ?*anyopaque, len: usize, alignment: usize) callconv(.c) ?[*]u8 {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
     self.alloc_calls += 1;
-    return self.child.rawAlloc(len, std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    const inner = allocator_adapter.fromAllocator(&self.child);
+    return inner.alloc(inner.ctx, len, alignment);
 }
 
 fn trackResize(ctx: ?*anyopaque, ptr: ?[*]u8, old_len: usize, new_len: usize, alignment: usize) callconv(.c) bool {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
     self.resize_calls += 1;
-    return self.child.rawResize(ptr.?[0..old_len], std.mem.Alignment.fromByteUnits(alignment), new_len, @returnAddress());
+    const inner = allocator_adapter.fromAllocator(&self.child);
+    return inner.resize(inner.ctx, ptr, old_len, new_len, alignment);
 }
 
 fn trackFree(ctx: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callconv(.c) void {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
     self.free_calls += 1;
-    self.child.rawFree(ptr.?[0..len], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    const inner = allocator_adapter.fromAllocator(&self.child);
+    inner.free(inner.ctx, ptr, len, alignment);
 }
 
 test "support factory: zzdds_create_factory_with_allocator(NULL) matches zzdds_create_factory" {

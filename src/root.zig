@@ -59,6 +59,7 @@ comptime {
     _ = c_abi.typesupport;
     _ = c_abi.bootstrap;
     _ = c_abi.extensions;
+    _ = c_abi.allocator_adapter;
 }
 /// Re-export the generated DDS type definitions so generated code can do
 ///   const _zzdds = @import("zzdds");
@@ -67,6 +68,7 @@ pub const DDS = @import("zzdds_generated").DDS;
 pub const ZZDDS = @import("zzdds_ext_generated").zzdds;
 pub const DomainParticipantFactory = factory.DomainParticipantFactory;
 pub const createFactory = factory.createFactory;
+pub const createFactoryWithAllocator = factory.createFactoryWithAllocator;
 
 /// Module-level raw operations called by zidl-generated typed wrappers.
 pub const raw_ops = @import("raw_ops.zig");

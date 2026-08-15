@@ -9,3 +9,4 @@
 pub const typesupport = @import("typesupport.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const extensions = @import("extensions.zig");
+pub const allocator_adapter = @import("allocator_adapter.zig");

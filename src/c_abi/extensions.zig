@@ -1,6 +1,7 @@
 //! C ABI exports for generated zzdds extension interfaces.
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 const DDS = @import("zzdds_generated").DDS;
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
@@ -875,8 +876,22 @@ pub export fn zzdds_cft_match_sample(
     return impl.matchSample(accessor);
 }
 
+// Process-lifetime instance backing the -Ddebug-allocator=true test lane
+// (see build.zig's "debug-allocator" option). Only ever touched when
+// build_options.debug_allocator is true; never allocated/used otherwise.
+// A DebugAllocator, unlike bare c_allocator, attributes double-free/UAF to
+// the actual call site instead of silently corrupting the heap -- this is
+// what the original zig/shape heap-corruption investigation had to fall
+// back to manual DebugAllocator wiring to get, before this flag existed.
+var debug_gpa: std.heap.DebugAllocator(.{}) = .{};
+
 fn createFactory(allocator: ?*const zidl_rt.ZidlAllocator) !ZZDDS.DomainParticipantFactory {
-    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
+    const alloc = if (allocator) |a|
+        zidl_rt.toAllocator(a)
+    else if (build_options.debug_allocator)
+        debug_gpa.allocator()
+    else
+        std.heap.c_allocator;
     const owner = try alloc.create(FactoryOwner);
     errdefer alloc.destroy(owner);
     // Lazily resolves+commits the process-wide config on the very first factory
@@ -1125,6 +1140,22 @@ fn writerSetListenerEx(
 /// synchronized. Between readRaw (peek) and takeRaw, a concurrent consumer
 /// could remove the front sample; takeRaw would then return a different,
 /// potentially larger sample silently truncated to peek_len bytes.
+///
+/// `sample.cdr._buffer` is deliberately allocated via std.heap.c_allocator,
+/// not impl.alloc, despite the reader's own data possibly having come from a
+/// custom-allocator factory: unlike zzdds_take_n_raw/zzdds_return_raw_samples
+/// (which pair through a dedicated free export) or LoanedRawSample (which
+/// carries its own `.alloc` field), SerializedSample is a bare OMG-IDL-style
+/// bounded sequence {_buffer, _length, _maximum, _release} with no owner
+/// handle and no free export of its own -- callers across the C ABI free
+/// `_buffer` directly (see bootstrap_test.zig's
+/// "take_serialized via ZZDDS DataReader vtable" test, which does exactly
+/// that with a hardcoded std.heap.c_allocator.free). Switching this to
+/// impl.alloc would silently break every such caller for any reader created
+/// through a non-default allocator, with no way for them to discover which
+/// allocator to free with. Fixing this for real needs a dedicated owning-free
+/// export (mirroring zzdds_return_raw_samples) added to the C ABI first --
+/// tracked as follow-up work, not done here.
 fn readerTakeSerialized(ctx: *anyopaque, sample: *ZZDDS.SerializedSample) DDS.ReturnCode_t {
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));

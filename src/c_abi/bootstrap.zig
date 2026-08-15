@@ -193,7 +193,7 @@ pub export fn zzdds_take_loaned_raw(
     if (nil.isNil(r)) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const s = impl.takeRaw() orelse return DDS.RETCODE_NO_DATA;
-    const owner = std.heap.c_allocator.create(LoanedRawSample) catch {
+    const owner = impl.alloc.create(LoanedRawSample) catch {
         std.log.err("zzdds_take_loaned_raw: sample permanently lost — OOM allocating loan handle", .{});
         impl.alloc.free(s.data);
         return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -220,7 +220,8 @@ pub export fn zzdds_return_loaned_raw(
     const opaque_owner = loan.owner orelse return;
     const owner: *LoanedRawSample = @ptrCast(@alignCast(opaque_owner));
     owner.alloc.free(owner.data);
-    std.heap.c_allocator.destroy(owner);
+    const box_alloc = owner.alloc;
+    box_alloc.destroy(owner);
     loan.* = .{
         .data = null,
         .data_len = 0,
@@ -431,7 +432,7 @@ fn nRawImpl(
     const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-    const alloc = std.heap.c_allocator;
+    const alloc = impl.alloc;
 
     // For bounded destructive takes, pre-allocate the output struct array BEFORE
     // removing samples from the queue.  Without this, an OOM at the alloc step
@@ -584,9 +585,23 @@ pub export fn zzdds_return_raw_samples(
     reader: *anyopaque,
     arr: *CRawSampleArray,
 ) callconv(.c) void {
-    _ = reader;
     if (arr.samples) |samples| {
-        const alloc = std.heap.c_allocator;
+        // Must match whatever allocator nRawImpl/packageTakenSamples used to
+        // build this array -- both now resolve through the owning reader's
+        // impl.alloc (an invalid-allocator free otherwise, if the reader was
+        // ever created with a non-default allocator). A null/nil `reader`
+        // here would mean the array's own producer never ran either, so
+        // `arr.samples` would already be null and this branch unreached --
+        // isNullHandle must still be checked before unboxing, though:
+        // zidl_rt.unboxAs dereferences its argument unconditionally (see this
+        // file's top-of-file comment).
+        const alloc: std.mem.Allocator = blk: {
+            if (isNullHandle(reader)) break :blk std.heap.c_allocator;
+            const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
+            if (nil.isNil(r)) break :blk std.heap.c_allocator;
+            const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
+            break :blk impl.alloc;
+        };
         for (samples[0..arr.count]) |s| {
             if (s.data) |d| alloc.free(d[0..s.data_len]);
         }
@@ -596,14 +611,16 @@ pub export fn zzdds_return_raw_samples(
 }
 
 /// Copies each TakenSample in `items` into a freshly heap-allocated CRawSample
-/// array (std.heap.c_allocator, matching zzdds_return_raw_samples' own free)
-/// and populates `out`. Returns the count, or -1 on OOM -- unlike
-/// zzdds_take_n_raw's own nRawImpl, this does not pre-allocate to protect
-/// already-*taken* (destructive) samples from an OOM during the copy step:
-/// these condition/instance-scoped batches are expected to be small, and
-/// duplicating that optimization here for every new *_w_condition/*_instance
-/// export was judged not worth the added surface area.
+/// array using `alloc` (the caller's owning reader's impl.alloc, matching
+/// zzdds_return_raw_samples' own free) and populates `out`. Returns the
+/// count, or -1 on OOM -- unlike zzdds_take_n_raw's own nRawImpl, this does
+/// not pre-allocate to protect already-*taken* (destructive) samples from an
+/// OOM during the copy step: these condition/instance-scoped batches are
+/// expected to be small, and duplicating that optimization here for every
+/// new *_w_condition/*_instance export was judged not worth the added
+/// surface area.
 fn packageTakenSamples(
+    alloc: std.mem.Allocator,
     items: []const @import("../dcps/reader.zig").TakenSample,
     out: *CRawSampleArray,
 ) c_int {
@@ -611,7 +628,6 @@ fn packageTakenSamples(
         out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
         return 0;
     }
-    const alloc = std.heap.c_allocator;
     const arr = alloc.alloc(CRawSample, items.len) catch {
         out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
         return -1;
@@ -686,7 +702,7 @@ fn wConditionRawImpl(
     } else {
         impl.readRaw(&tmp, rc_impl.sample_state_mask, rc_impl.view_state_mask, rc_impl.instance_state_mask, max, null, rc_impl.owner_qc) catch return -1;
     }
-    return packageTakenSamples(tmp.items, out);
+    return packageTakenSamples(impl.alloc, tmp.items, out);
 }
 
 /// Batch take restricted to a `DDS.ReadCondition` (or a `DDS.QueryCondition`
@@ -738,7 +754,7 @@ fn nextInstanceWConditionRawImpl(
     } else {
         impl.readNextInstanceFiltered(&tmp, prev, rc_impl.sample_state_mask, rc_impl.view_state_mask, rc_impl.instance_state_mask, max, rc_impl.owner_qc) catch return -1;
     }
-    return packageTakenSamples(tmp.items, out);
+    return packageTakenSamples(impl.alloc, tmp.items, out);
 }
 
 /// Batch take restricted to a `DDS.ReadCondition` AND scoped to the "next
