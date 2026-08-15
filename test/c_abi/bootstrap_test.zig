@@ -668,6 +668,37 @@ test "bootstrap: return_raw_samples frees via the array's own allocator, not wha
     try testing.expect(arr.samples == null);
 }
 
+test "bootstrap: return_raw_samples falls back to c_allocator when the array carries no injected allocator" {
+    // Exercises the plain-c_allocator fallback branch in
+    // zzdds_return_raw_samples (arr._alloc_ctx == null) -- the path for an
+    // array that was never populated via zzdds_take_n_raw/zzdds_read_n_raw's
+    // allocator-injection machinery (both of those always set _alloc_ctx on
+    // success; this simulates a caller building a CRawSampleArray by hand).
+    // Backed by std.heap.c_allocator to match the allocator this fallback
+    // actually frees with -- a mismatched allocator here would abort/crash.
+    const c_alloc = std.heap.c_allocator;
+    const data = try c_alloc.alloc(u8, PAYLOAD.len);
+    @memcpy(data, &PAYLOAD);
+    const samples = try c_alloc.alloc(bootstrap.CRawSample, 1);
+    samples[0] = .{
+        .data = data.ptr,
+        .data_len = data.len,
+        .info = .{ .valid_data = true, .instance_state = 0, .instance_handle = DDS.HANDLE_NIL },
+    };
+
+    var arr: bootstrap.CRawSampleArray = .{
+        .samples = samples.ptr,
+        .count = 1,
+        ._alloc_capacity = 1,
+        ._alloc_ctx = null,
+        ._alloc_vtable = null,
+    };
+
+    bootstrap.zzdds_return_raw_samples(makeNullHandle(), &arr);
+    try testing.expectEqual(@as(usize, 0), arr.count);
+    try testing.expect(arr.samples == null);
+}
+
 test "bootstrap: take_n_raw returns 0 when queue is empty" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

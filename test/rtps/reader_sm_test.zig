@@ -59,6 +59,10 @@ const Capture = struct {
 const Recording = struct {
     caps: [MAX_CAPS]Capture = undefined,
     n: usize = 0,
+    /// When set, every send() call fails with this error instead of
+    /// recording -- used to exercise sendAckNack{Locked,Unlocked}'s
+    /// `catch |err| switch (err)` send-error handling.
+    send_error: ?anyerror = null,
 
     pub fn reset(self: *@This()) void {
         self.n = 0;
@@ -70,6 +74,7 @@ const Recording = struct {
 
     fn sendFn(ctx: *anyopaque, loc: *const Locator, data: []const u8) anyerror!void {
         const self: *Recording = @ptrCast(@alignCast(ctx));
+        if (self.send_error) |e| return e;
         if (self.n >= MAX_CAPS) return error.TooManySends;
         const c = &self.caps[self.n];
         c.locator = loc.*;
@@ -812,4 +817,46 @@ test "addMatchedWriter: lease refresh recomputes cached selection when locators 
     r.handleHeartbeat(writer_guid, 1, 0, 2, false);
     try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7525));
     try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7526));
+}
+
+// ── Transport send-error handling ────────────────────────────────────────────
+//
+// sendAckNackUnlocked (the path addMatchedWriter's initial AckNack goes
+// through) wraps every transport send in `catch |err| switch (err) {
+// error.UnsupportedLocatorKind => {}, else => log.rtps.warn(...) }` --
+// defence-in-depth, same rationale as StatefulWriter's matching handling.
+// Neither arm had a test.
+
+test "addMatchedWriter: UnsupportedLocatorKind send error is silently ignored" {
+    const reader_guid = makeGuid(0x50, READER_EID);
+    const writer_guid = makeGuid(0x51, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7527);
+
+    var rec: Recording = .{ .send_error = error.UnsupportedLocatorKind };
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true);
+    try r.addMatchedWriter(wp);
+    try testing.expectEqual(@as(usize, 0), rec.n);
+}
+
+test "addMatchedWriter: a non-UnsupportedLocatorKind send error is logged and swallowed" {
+    const reader_guid = makeGuid(0x52, READER_EID);
+    const writer_guid = makeGuid(0x53, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7528);
+
+    // A warning is logged here -- expected, not a real test failure.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var rec: Recording = .{ .send_error = error.ConnectionResetByPeer };
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true);
+    // Must not propagate the transport's send failure to the caller.
+    try r.addMatchedWriter(wp);
+    try testing.expectEqual(@as(usize, 0), rec.n);
 }

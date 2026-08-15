@@ -93,6 +93,19 @@ test "Topic: get_statuscondition returns non-nil condition" {
     try testing.expect(sc.ptr != nil.NIL_PTR);
 }
 
+test "Topic: status condition's trigger value reads status through getStatusFn" {
+    // Exercises TopicImpl.getStatusFn -- the callback StatusConditionImpl
+    // stores and calls from get_trigger_value, distinct from (and previously
+    // uncovered unlike) the entity vtable's own get_status_changes.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("TriggerTopic", "T", .{}, null, 0);
+    defer _ = fx.dp.vtable.delete_topic(fx.dp.ptr, topic);
+    const sc = topic.vtable.get_statuscondition(topic.ptr);
+    try testing.expectEqual(false, sc.vtable.get_trigger_value(sc.ptr));
+}
+
 test "Topic: get_participant returns a participant" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

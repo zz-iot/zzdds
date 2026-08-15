@@ -67,6 +67,11 @@ const Recording = struct {
     /// matching a connectionless transport); tests bump it to simulate a
     /// transport-level reconnect.
     connection_generation: u32 = 0,
+    /// When set, every send() call fails with this error instead of
+    /// recording -- used to exercise the writer's `catch |err| switch (err)`
+    /// send-error handling (UnsupportedLocatorKind silently ignored as
+    /// defence-in-depth vs. any other error logged and otherwise swallowed).
+    send_error: ?anyerror = null,
 
     pub fn reset(self: *@This()) void {
         self.n = 0;
@@ -78,6 +83,7 @@ const Recording = struct {
 
     fn sendFn(ctx: *anyopaque, loc: *const Locator, data: []const u8) anyerror!void {
         const self: *Recording = @ptrCast(@alignCast(ctx));
+        if (self.send_error) |e| return e;
         if (self.n >= MAX_CAPS) return error.TooManySends;
         const c = &self.caps[self.n];
         c.locator = loc.*;
@@ -179,6 +185,21 @@ fn findHeartbeat(rec: *const Recording) ?msg.submessage.HeartbeatSubmessage {
         while (it.next(&params) catch null) |sm| {
             switch (sm) {
                 .heartbeat => |hb| return hb,
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
+/// Find the first DATA_FRAG submessage in captures.
+fn findDataFrag(rec: *const Recording) ?msg.submessage.DataFragSubmessage {
+    for (rec.caps[0..rec.n]) |*cap| {
+        var it = MessageIterator.init(cap.buf[0..cap.len]) catch continue;
+        var params: [32]InlineQosParam = undefined;
+        while (it.next(&params) catch null) |sm| {
+            switch (sm) {
+                .data_frag => |df| return df,
                 else => {},
             }
         }
@@ -1251,4 +1272,88 @@ test "addMatchedReader: replay-snapshot OOM skips history replay instead of send
     try w.addMatchedReader(rp);
 
     try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+// ── Transport send-error handling ────────────────────────────────────────────
+//
+// write()'s unlocked send loop wraps every transport send in
+// `catch |err| switch (err) { error.UnsupportedLocatorKind => {}, else =>
+// log.rtps.warn(...) }` -- SEDP already filters proxy locators down to ones
+// the transport itself reports canReach(), so this is defence-in-depth, not
+// a path expected to fire in normal operation. Neither arm had a test.
+
+test "write: UnsupportedLocatorKind send error is silently ignored" {
+    const writer_guid = makeGuid(0x76, WRITER_EID);
+    const reader_guid = makeGuid(0x77, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7523);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    rec.send_error = error.UnsupportedLocatorKind;
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "unsupported-locator");
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+test "write: a non-UnsupportedLocatorKind send error is logged and swallowed" {
+    const writer_guid = makeGuid(0x78, WRITER_EID);
+    const reader_guid = makeGuid(0x79, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7524);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    // A warning is logged here -- expected, not a real test failure.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    rec.send_error = error.ConnectionResetByPeer;
+    // write() must not propagate the transport's send failure -- the sample
+    // still lands in the cache and can be retransmitted later via ACKNACK.
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "send-fails");
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+// ── Replay: large-fragment priming ───────────────────────────────────────────
+
+test "addMatchedReader: replay primes a RELIABLE proxy with DATA_FRAG for an already-fragmented cached change" {
+    // replayHistoryToProxyUnlocked's RELIABLE branch: a cached change larger
+    // than frag_size gets its first fragment sent directly ("priming") so
+    // the reader has something to NACK against immediately, rather than
+    // waiting for the writer's regular heartbeat/retransmission cycle to be
+    // the first thing that reveals the change is fragmented. Previously
+    // untested -- only the non-fragmented replay path had coverage.
+    const writer_guid = makeGuid(0x80, WRITER_EID);
+    const reader_guid = makeGuid(0x81, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7529);
+    const small_frag_size: u16 = 32;
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        small_frag_size,
+        true, // replay_on_match
+    );
+    defer w.deinit();
+
+    // Larger than small_frag_size, written before any reader is matched so
+    // it's already sitting in the cache when addMatchedReader triggers replay.
+    const big_payload = [_]u8{0xAB} ** 64;
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &big_payload);
+
+    // RELIABLE proxy: only the RELIABLE branch of replayHistoryToProxyUnlocked
+    // does large-fragment priming.
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+
+    const df = findDataFrag(&rec) orelse return error.TestExpectedDataFrag;
+    try testing.expectEqual(@as(u32, 1), df.fragment_starting_num);
 }
