@@ -292,24 +292,60 @@ jobs:
         working-directory: zzdds-examples/zig/waitset
         run: zig build -Dsanitize-thread=true
 
-      # -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ on every TSan
-      # build below: this runner's default `cc`/`c++` is GCC, whose libtsan
-      # is a different, incompatible runtime from the LLVM-based one Zig
-      # links into libzzdds.so (forced on via build.zig's .use_llvm fix).
-      # Linking both into one process is unsupported and crashes instantly
-      # with no TSan report at all (confirmed: this job passed on main only
-      # because libzzdds.so was never actually instrumented before that fix
-      # -- see build.zig's Phase 0 history). Forcing clang here keeps both
-      # sides on the same TSan runtime.
+      # Two distinct bugs were found and fixed here, both confirmed via
+      # standalone local repro (not just code review):
+      #
+      # 1. (All languages, any compiler) cpp/waitset and c/waitset both died
+      #    instantly on startup with no TSan report at all, deep inside the
+      #    TSan runtime's own __cxa_atexit interceptor. Cause: two independent
+      #    copies of the TSan runtime in one process -- one statically
+      #    embedded in libzzdds.so by Zig's own final link of that shared
+      #    library, another statically embedded in the example executable by
+      #    ITS OWN final link. Fixed at the CMakeLists.txt level (see
+      #    cpp/waitset/CMakeLists.txt's WAITSET_SANITIZE_THREAD option):
+      #    compile the example's own code with -fsanitize=thread as before,
+      #    but do NOT pass -fsanitize=thread to the final link, so only
+      #    libzzdds.so's runtime is ever loaded into the process -- the
+      #    example's own __tsan_*/interceptor references resolve against
+      #    that one runtime at load time. Confirmed both non-crashing and
+      #    still catching real races, including races entirely within
+      #    example code (not just inside zzdds), so this keeps full
+      #    instrumentation coverage. Sufficient by itself for the C examples.
+      #
+      # 2. (C++ examples specifically, only with the runner's default GCC/
+      #    GNU-ld toolchain) even after fixing (1), cpp/waitset still
+      #    crashed -- this time inside TSan's own SlotLock, called via its
+      #    pthread_once interceptor, called from libstdc++.so.6's OWN
+      #    constructor (std::ios_base_library_init, run by the dynamic
+      #    linker during process startup). Cause: libstdc++.so.6 is a
+      #    separate DT_NEEDED shared object with no ordering relationship to
+      #    libzzdds.so, so the dynamic linker can (and does, under GNU ld's
+      #    default link order) run libstdc++'s constructor -- which calls an
+      #    intercepted pthread_once -- before libzzdds.so's own constructor
+      #    has initialized TSan's per-thread state, crashing on a null/
+      #    not-yet-initialized ThreadState. `zig c++` sidesteps this
+      #    entirely by statically linking its C++ runtime (confirmed via
+      #    `ldd`: no libstdc++.so.6 dependency at all in the working build),
+      #    so there's no second, independently-ordered constructor to race
+      #    against. C examples never link libstdc++ and are unaffected --
+      #    confirmed c/waitset builds and runs clean with the plain runner
+      #    default compiler, no wrapper needed.
+      - name: Set up a zig c++ wrapper for the C++ TSan builds
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/zig-cc-wrappers"
+          printf '#!/usr/bin/env bash\nexec zig c++ "$@"\n' > "$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx"
+          chmod +x "$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx"
+
       - name: Build cpp/waitset (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DWAITSET_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DWAITSET_SANITIZE_THREAD=ON \
             -B zzdds-examples/cpp/waitset/build -S zzdds-examples/cpp/waitset
           cmake --build zzdds-examples/cpp/waitset/build
 
       - name: Build c/waitset (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DWAITSET_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DWAITSET_SANITIZE_THREAD=ON \
             -B zzdds-examples/c/waitset/build -S zzdds-examples/c/waitset
           cmake --build zzdds-examples/c/waitset/build
 
@@ -319,25 +355,25 @@ jobs:
 
       - name: Build cpp/shape (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DSHAPE_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DSHAPE_SANITIZE_THREAD=ON \
             -B zzdds-examples/cpp/shape/build -S zzdds-examples/cpp/shape
           cmake --build zzdds-examples/cpp/shape/build
 
       - name: Build c/shape (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DSHAPE_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DSHAPE_SANITIZE_THREAD=ON \
             -B zzdds-examples/c/shape/build -S zzdds-examples/c/shape
           cmake --build zzdds-examples/c/shape/build
 
       - name: Build cpp/custom-allocator (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
             -B zzdds-examples/cpp/custom-allocator/build -S zzdds-examples/cpp/custom-allocator
           cmake --build zzdds-examples/cpp/custom-allocator/build
 
       - name: Build c/custom-allocator (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
             -B zzdds-examples/c/custom-allocator/build -S zzdds-examples/c/custom-allocator
           cmake --build zzdds-examples/c/custom-allocator/build
 
@@ -461,7 +497,13 @@ jobs:
     name: Valgrind (memcheck)
     needs: test-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Was 15 -- loopback_test.zig's polling deadlines were just raised (5s/3s
+    # -> 20s/15s) to stop spurious failures on a busy shared runner (see that
+    # file's comments), which raises this job's own worst-case ceiling too.
+    # A normal passing run is unaffected either way (those deadlines only
+    # matter on the slow path); this just gives that slow path enough room
+    # to actually recover instead of getting killed by the job timeout first.
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4

@@ -885,9 +885,20 @@ pub const StatefulWriter = struct {
         };
         const n_changes = self.cache.changes.items.len;
         const changes = self.alloc.alloc(ChangeSnapshot, n_changes) catch {
-            // OOM on this tiny alloc: fall back to the fully-locked replay
-            // for this one match rather than dropping history delivery.
-            self.replayHistoryToProxyLocked(rp);
+            // Does NOT fall back to replayHistoryToProxyLocked here (an
+            // earlier version of this did): that sends synchronously while
+            // self.mu is still held, reintroducing the exact writer.mu <->
+            // reader.mu lock-order-inversion this function's own doc
+            // comment above describes -- a confirmed deadlock, not a
+            // theoretical one (Greptile PR #64 review). For a BEST_EFFORT
+            // proxy this is its only history-delivery path (no ACKNACK
+            // recovery), so this OOM genuinely does lose the initial
+            // replay -- but a lost delivery on an already-rare OOM path is
+            // strictly better than hanging the writer and reader threads
+            // (and everything else blocked behind their locks) forever.
+            log.rtps.warn("StatefulWriter({x}): OOM building the unlocked-replay snapshot for a newly-matched BEST_EFFORT proxy -- initial history replay skipped for this match", .{
+                self.guid.entity_id.entity_key,
+            });
             return;
         };
         defer self.alloc.free(changes);

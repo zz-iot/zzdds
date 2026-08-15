@@ -1186,6 +1186,69 @@ test "write: snapshot-allocation OOM skips the live send instead of sending unde
     w.alloc = fa.allocator();
     defer w.alloc = testing.allocator;
 
+    // The OOM fallback logs a warning -- expected here, not a real error.
+    // Suppress it so it doesn't read as a test failure in build output.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "oom");
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+// ── OOM fallback: replayHistoryToProxyUnlocked's allocation-failure path ────
+//
+// Regression test for Greptile PR #64 review (round 2): an earlier version of
+// this OOM fallback called replayHistoryToProxyLocked (a fully-locked
+// synchronous replay) when the unlocked-replay snapshot allocation failed,
+// reintroducing the same writer.mu/reader.mu lock-order-inversion described
+// above. The fix removes the send entirely on this rare path -- for a
+// BEST_EFFORT proxy (its only history-delivery path, since it never
+// ACKNACKs) this does mean the initial replay is genuinely lost on OOM,
+// which is the documented, accepted tradeoff. This test proves the "no send"
+// behavior structurally, matching the style of the write() OOM test above.
+test "addMatchedReader: replay-snapshot OOM skips history replay instead of sending under self.mu" {
+    const writer_guid = makeGuid(0x74, WRITER_EID);
+    const reader_guid = makeGuid(0x75, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7522);
+
+    var rec: Recording = .{};
+    // replay_on_match=true (TRANSIENT_LOCAL+): a newly-matched proxy that
+    // wants replay (ReaderProxy.wants_replay defaults to true) triggers
+    // replayHistoryToProxyUnlocked -- the path under test.
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        true,
+    );
+    defer w.deinit();
+
+    // Write history before any reader is matched, using the real allocator.
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+
+    // Force the second allocation through w.alloc to fail: the first
+    // (alloc_index 0) is reader_proxies.append growing from empty, which
+    // must succeed for the proxy to be matched at all; the second
+    // (alloc_index 1) is the replay snapshot array in
+    // replayHistoryToProxyUnlocked.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    w.alloc = fa.allocator();
+    defer w.alloc = testing.allocator;
+
+    // The OOM fallback logs a warning -- expected here, not a real error.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    // BEST_EFFORT proxy (reliable=false): its only history-delivery path.
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+
     try testing.expectEqual(@as(usize, 0), countAllData(&rec));
 }

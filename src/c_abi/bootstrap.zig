@@ -411,6 +411,14 @@ pub const CRawSample = extern struct {
     info: CSampleInfo,
 };
 
+/// NOTE (pre-1.0 ABI): this struct's layout has grown before (adding the
+/// `_alloc_*` fields below) and may grow again -- zzdds has no tagged 1.0
+/// release and no known external consumers yet, so there is no compiled
+/// caller anywhere linking an older layout of this struct to corrupt.
+/// Layout stability is a 1.0 commitment, not a pre-1.0 one: rebuild against
+/// the header you're linking. Once zzdds reaches 1.0 this struct's shape
+/// must be frozen (or ownership tracked out-of-band instead of inline, e.g.
+/// a pointer-keyed side table) rather than grown again in place.
 pub const CRawSampleArray = extern struct {
     samples: ?[*]CRawSample,
     count: usize,

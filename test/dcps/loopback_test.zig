@@ -153,7 +153,16 @@ fn runLoopback(
     }
 
     // ── Collect and assert ────────────────────────────────────────────────────
-    const received = try collectSamples(alloc, dr_impl, expected.len, 5 * std.time.ns_per_s);
+    // 20s, not the more typical few-hundred-ms native completion time: under
+    // Valgrind's 20-50x CPU slowdown (this file's tests run in the Valgrind
+    // CI job), a busy shared runner can occasionally push real delivery past
+    // a tighter deadline, failing the test spuriously even though nothing is
+    // actually wrong -- confirmed by re-running this file under Valgrind
+    // repeatedly and seeing different, non-deterministic tests time out each
+    // run. The loop above returns as soon as `expected_n` arrives, so this
+    // ceiling only matters on the genuinely-slow path; it never slows down a
+    // normal passing run.
+    const received = try collectSamples(alloc, dr_impl, expected.len, 20 * std.time.ns_per_s);
     defer {
         for (received) |s| alloc.free(s);
         alloc.free(received);
@@ -398,8 +407,10 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
         &PAYLOAD_1,
     );
 
-    // Wait up to 3 s for the incompat event (same mechanism as sample polling).
-    const deadline_ns = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    // Wait up to 15s for the incompat event (same mechanism as sample
+    // polling -- see collectSamples's matching comment on why this is
+    // generous rather than the few-hundred-ms native completion time).
+    const deadline_ns = time_mod.nanoTimestamp() + 15 * std.time.ns_per_s;
     while (time_mod.nanoTimestamp() < deadline_ns) {
         if (dr_impl.incompat_total.load(.acquire) > 0 and dw_impl.incompat_total.load(.acquire) > 0) break;
         time_mod.sleepNs(10 * std.time.ns_per_ms);
@@ -467,7 +478,9 @@ test "loopback: a single participant's own writer and reader on the same topic m
 
     // Wait for the writer and reader to actually match before writing --
     // this is the exact condition that never became true before the fix.
-    const match_deadline_ns = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    // 20s, not a tighter native-speed budget -- see collectSamples's
+    // matching comment on why (Valgrind CI job slowdown, not this test).
+    const match_deadline_ns = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
     while (time_mod.nanoTimestamp() < match_deadline_ns) {
         if (dw_impl.matchedReaderCount() > 0 and dr_impl.matchedWriterCount() > 0) break;
         time_mod.sleepNs(20 * std.time.ns_per_ms);
@@ -478,7 +491,7 @@ test "loopback: a single participant's own writer and reader on the same topic m
     const p: []const u8 = &PAYLOAD_1;
     _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), ZERO_KEY, ZERO_KEY, p);
 
-    const received = try collectSamples(alloc, dr_impl, 1, 5 * std.time.ns_per_s);
+    const received = try collectSamples(alloc, dr_impl, 1, 20 * std.time.ns_per_s);
     defer {
         for (received) |s| alloc.free(s);
         alloc.free(received);
