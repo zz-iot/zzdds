@@ -16,8 +16,9 @@ pub fn build(b: *std.Build) void {
         .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .info,
     };
     const log_level = b.option(LogLevel, "log-level", "shape_main std.log level: err, warn, info, debug (default matches Zig build mode)") orelse default_log_level;
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
 
-    const zzdds_dep = b.dependency("zzdds", .{ .target = target, .optimize = optimize });
+    const zzdds_dep = b.dependency("zzdds", .{ .target = target, .optimize = optimize, .@"sanitize-thread" = sanitize_thread });
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
 
@@ -39,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("dds_impl.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
         .imports = &.{
             .{ .name = "zzdds", .module = zzdds_mod },
             .{ .name = "zzdds_generated", .module = zzdds_gen },
@@ -57,6 +59,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = shape_gen_dir.path(b, "shape.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
             .{ .name = "zzdds", .module = zzdds_mod },
@@ -72,12 +75,17 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("shape_main.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
             .imports = &.{
                 .{ .name = "dds", .module = dds_mod },
                 .{ .name = "shape_gen", .module = shape_gen_mod },
                 .{ .name = "shape_main_options", .module = shape_main_options.createModule() },
             },
         }),
+        // Zig 0.16's self-hosted backend silently no-ops sanitize_thread
+        // without this (confirmed empirically upstream in zzdds's own
+        // build.zig) -- force the LLVM backend whenever TSan is requested.
+        .use_llvm = if (sanitize_thread) true else null,
     });
     exe.root_module.link_libc = true;
     b.installArtifact(exe);

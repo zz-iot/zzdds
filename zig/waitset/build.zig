@@ -57,6 +57,13 @@ pub fn build(b: *std.Build) void {
         .{ .name = "zidl_rt", .module = zidl_rt_mod },
     };
 
+    // Zig 0.16's self-hosted backend silently no-ops sanitize_thread
+    // without .use_llvm = true (confirmed empirically upstream in zzdds's
+    // own build.zig) -- force the LLVM backend whenever TSan is requested,
+    // on every TSan-tagged Compile step (each is its own independent
+    // backend decision, regardless of what imported modules request).
+    const use_llvm = if (sanitize_thread) true else null;
+
     const pub_exe = b.addExecutable(.{
         .name = "waitset_pub",
         .root_module = b.createModule(.{
@@ -66,6 +73,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
             .imports = common_imports,
         }),
+        .use_llvm = use_llvm,
     });
     pub_exe.root_module.link_libc = true;
     b.installArtifact(pub_exe);
@@ -79,6 +87,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
             .imports = common_imports,
         }),
+        .use_llvm = use_llvm,
     });
     sub_exe.root_module.link_libc = true;
     b.installArtifact(sub_exe);

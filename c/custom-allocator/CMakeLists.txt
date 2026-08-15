@@ -4,6 +4,16 @@ project(zzdds_custom_allocator_c_example C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# See c/waitset/CMakeLists.txt's matching option for the full rationale.
+# Particularly valuable here: static_pool_allocator.c's pthread_mutex_t-guarded
+# pool is real, application-owned concurrency that TSan has never instrumented
+# before this option existed.
+option(CUSTOM_ALLOCATOR_SANITIZE_THREAD "Build with -fsanitize=thread (requires zzdds built with -Dsanitize-thread=true)" OFF)
+if(CUSTOM_ALLOCATOR_SANITIZE_THREAD)
+    add_compile_options(-fsanitize=thread -g -O1)
+    add_link_options(-fsanitize=thread)
+endif()
+
 find_package(ZZDDS REQUIRED)
 find_package(Threads REQUIRED)
 

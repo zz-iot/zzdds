@@ -6,6 +6,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# See cpp/waitset/CMakeLists.txt's matching option for the full rationale.
+# Real concurrency here: timer thread + UDP receive thread + listener
+# dispatch vs. the main loop.
+option(SHAPE_SANITIZE_THREAD "Build with -fsanitize=thread (requires zzdds built with -Dsanitize-thread=true)" OFF)
+if(SHAPE_SANITIZE_THREAD)
+    add_compile_options(-fsanitize=thread -g -O1)
+    add_link_options(-fsanitize=thread)
+endif()
+
 find_package(ZZDDS REQUIRED)
 
 set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
