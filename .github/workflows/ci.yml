@@ -284,6 +284,20 @@ jobs:
         with:
           version: "0.16.0"
 
+      # ubuntu-latest's default ASLR entropy (vm.mmap_rnd_bits) is higher
+      # than TSan's fixed shadow-memory layout reliably tolerates -- an
+      # intermittent, run-to-run (ASLR-placement-dependent) failure during
+      # the TSan runtime's own startup, before it can print anything. Looks
+      # identical to a real crash (instant SIGSEGV, no TSan report at all)
+      # but is not one: confirmed by reproducing this job's exact cpp/waitset
+      # build+run locally, 6/6 clean, with the identical binaries and
+      # TSAN_OPTIONS -- if this were a real bug it would reproduce. Lowering
+      # entropy to a value TSan's own docs recommend is the standard fix for
+      # this class of flake (used by several major sanitizer-using OSS CI
+      # setups on GitHub-hosted runners).
+      - name: Reduce ASLR entropy for TSan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
       - name: Build zzdds (C + C++ bindings, ThreadSanitizer)
         working-directory: zzdds
         run: zig build -Dc-binding=true -Dcpp-binding=true -Dsanitize-thread=true install
