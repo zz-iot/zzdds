@@ -805,4 +805,26 @@ test "deinit: reentrant delete_participant from a timer-driven listener does not
     // same-thread synchronous call (which wouldn't hit self-join/self-free
     // at all).
     try testing.expect(ctx.caller_thread_id.load(.acquire) != test_thread_id);
+
+    // ctx.done is set by the listener callback itself, which runs *before*
+    // deinit()'s self-reentrant path detaches the timer thread -- the
+    // detached thread still has real work left after that point (unwinding
+    // back out through checkTimers()'s call chain, then timerThreadFn's own
+    // deferred `alloc.destroy(self)`), and detach() means this test has no
+    // way to join and wait for that to genuinely finish. Without this, the
+    // test function returns immediately once ctx.done flips, and the next
+    // test (or, since this is the last test in this file, the process-wide
+    // final leak check) can run concurrently with that still-in-flight
+    // alloc.destroy() -- a real, unsynchronized race on testing.allocator's
+    // *shared* internal state (used by every test in this binary), not a
+    // leak or use-after-free in zzdds itself. Confirmed via repeated local
+    // reproduction (both plain and, far more readily -- since it slows the
+    // detached thread specifically, widening the window -- under Valgrind):
+    // every single hit was the identical "possibly lost" pthread TLS block
+    // for *this* test's own timer thread, from allocate_dtv/pthread_create,
+    // never a real invalid access. This sleep is generous, not exact -- the
+    // remaining work after ctx.done (a handful of function returns, no I/O
+    // or further sleeps) normally finishes in well under a millisecond, so
+    // this is closer to belt-and-suspenders than a tight deadline.
+    time_mod.sleepNs(100 * std.time.ns_per_ms);
 }
