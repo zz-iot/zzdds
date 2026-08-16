@@ -13,7 +13,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(CUSTOM_ALLOCATOR_SANITIZE_THREAD "Build with -fsanitize=thread (requires zzdds built with -Dsanitize-thread=true)" OFF)
 if(CUSTOM_ALLOCATOR_SANITIZE_THREAD)
     add_compile_options(-fsanitize=thread -g -O1)
-    add_link_options(-fsanitize=thread)
 endif()
 
 find_package(ZZDDS REQUIRED)

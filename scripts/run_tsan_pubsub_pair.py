@@ -27,10 +27,31 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+
+def disable_aslr(cmd: list[str]) -> list[str]:
+    """Prepend `setarch <machine> -R` to disable ASLR for this one process.
+
+    TSan reserves large, fixed chunks of virtual address space upfront for
+    its shadow memory, assuming a layout from when Linux used much lower
+    ASLR entropy. On GitHub-hosted ubuntu-latest runners specifically, the
+    kernel's wider default ASLR range can occasionally place something where
+    TSan's shadow memory needs to go, corrupting its own startup bookkeeping
+    -- observed here as an instant SIGSEGV with no TSan report at all,
+    stack-overflowing inside the runtime's own __cxa_atexit interceptor
+    (confirmed via a CI-side gdb backtrace; never reproduced locally across
+    dozens of runs, consistent with this being ASLR-placement-dependent
+    rather than a real, deterministic bug). Lowering vm.mmap_rnd_bits alone
+    was tried first and did not resolve it; setarch -R disables ASLR for
+    this process outright rather than just narrowing its range, which is
+    the more reliable fix for this exact failure mode.
+    """
+    return ["setarch", platform.machine(), "-R", *cmd]
 
 
 def run_pair(
@@ -125,8 +146,8 @@ def main() -> int:
         env["LD_LIBRARY_PATH"] = f"{args.ld_library_path}:{existing}" if existing else args.ld_library_path
 
     return run_pair(
-        sub_cmd=shlex.split(args.sub_cmd),
-        pub_cmd=shlex.split(args.pub_cmd),
+        sub_cmd=disable_aslr(shlex.split(args.sub_cmd)),
+        pub_cmd=disable_aslr(shlex.split(args.pub_cmd)),
         sub_log=args.sub_log,
         pub_log=args.pub_log,
         sub_marker=args.sub_marker,

@@ -14,10 +14,25 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # -Dsanitize-thread=true against the SAME CMAKE_PREFIX_PATH -- mixing a
 # TSAN'd example with a non-TSAN'd libzzdds (or vice versa) doesn't reliably
 # detect races across that boundary.
+#
+# Compile-only, deliberately no add_link_options(-fsanitize=thread): the
+# final link must NOT also embed its own copy of the TSan runtime, or this
+# process ends up with two independent runtime instances (one statically
+# linked into this executable, one already inside libzzdds.so) fighting over
+# the same libc interceptors (__cxa_atexit, pthread_create, ...) -- confirmed
+# by direct repro to cause infinite interceptor recursion / stack-overflow
+# SIGSEGV on startup, every time, with zero TSan report. This is unrelated to
+# which compiler builds this example (GCC vs. clang vs. `zig cc` all hit it
+# identically) -- it's specifically about not double-linking the runtime.
+# Dropping the link flag here still gets full instrumentation of this
+# example's own code (compile-time flag is enough for that) while resolving
+# all __tsan_*/interceptor symbols at load time against the one real runtime
+# already embedded in libzzdds.so -- confirmed both non-crashing and still
+# catching real races (including races entirely within this example's own
+# code, not just inside zzdds) via a standalone repro before landing this.
 option(WAITSET_SANITIZE_THREAD "Build with -fsanitize=thread (requires zzdds built with -Dsanitize-thread=true)" OFF)
 if(WAITSET_SANITIZE_THREAD)
     add_compile_options(-fsanitize=thread -g -O1)
-    add_link_options(-fsanitize=thread)
 endif()
 
 find_package(ZZDDS REQUIRED)
