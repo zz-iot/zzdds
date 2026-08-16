@@ -286,15 +286,21 @@ jobs:
 
       # ubuntu-latest's default ASLR entropy (vm.mmap_rnd_bits) is higher
       # than TSan's fixed shadow-memory layout reliably tolerates -- an
-      # intermittent, run-to-run (ASLR-placement-dependent) failure during
-      # the TSan runtime's own startup, before it can print anything. Looks
-      # identical to a real crash (instant SIGSEGV, no TSan report at all)
-      # but is not one: confirmed by reproducing this job's exact cpp/waitset
-      # build+run locally, 6/6 clean, with the identical binaries and
-      # TSAN_OPTIONS -- if this were a real bug it would reproduce. Lowering
-      # entropy to a value TSan's own docs recommend is the standard fix for
-      # this class of flake (used by several major sanitizer-using OSS CI
-      # setups on GitHub-hosted runners).
+      # intermittent, ASLR-placement-dependent failure during the TSan
+      # runtime's own startup, before it can print anything. Looks identical
+      # to a real crash (instant SIGSEGV, no TSan report at all) but is not
+      # one: confirmed via a CI-side gdb backtrace (this exact job, since
+      # removed once its purpose was served) showing the crash deep inside
+      # the TSan runtime's own __cxa_atexit interceptor, on the main thread,
+      # before any application code runs -- and confirmed NOT reproducible
+      # locally across dozens of runs with byte-identical binaries/config.
+      # This lower-entropy sysctl alone was tried first and did NOT resolve
+      # it (still crashed identically on the next CI run); the actual
+      # per-process fix is disabling ASLR outright via `setarch -R`, applied
+      # to every TSAN pub/sub pair in run_tsan_pubsub_pair.py (zzdds-examples
+      # repo) -- kept here too since it's a legitimate, complementary
+      # belt-and-suspenders measure for anything setarch's wrapping doesn't
+      # cover (e.g. cmake's own build-time compiler probes).
       - name: Reduce ASLR entropy for TSan
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
@@ -356,28 +362,6 @@ jobs:
           cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DWAITSET_SANITIZE_THREAD=ON \
             -B zzdds-examples/cpp/waitset/build -S zzdds-examples/cpp/waitset
           cmake --build zzdds-examples/cpp/waitset/build
-
-      # TEMPORARY diagnostic step: cpp/waitset's TSAN run below has crashed
-      # (SIGSEGV, no TSan report at all) on two consecutive CI runs despite
-      # reproducing cleanly (6/6 local runs, byte-identical binaries/config)
-      # outside CI, and despite ruling out the previously-fixed double-
-      # runtime cause and a since-tried ASLR-entropy mitigation. Since it
-      # will not reproduce locally, get a real backtrace from the actual
-      # failing environment instead of continuing to guess -- gdb in batch
-      # mode against the standalone subscriber (no publisher needed: it
-      # crashed solo in every prior failure, immediately on startup).
-      # Remove this step once the real cause is found and fixed.
-      - name: DEBUG cpp/waitset TSAN crash backtrace
-        if: always()
-        run: |
-          set +e
-          command -v gdb >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends gdb
-          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/zzdds/zig-out/lib"
-          export TSAN_OPTIONS=abort_on_error=1
-          echo "=== gdb backtrace: cpp/waitset waitset_sub ==="
-          timeout 30 gdb -q -batch -ex run -ex "bt 40" -ex "info threads" \
-            --args zzdds-examples/cpp/waitset/build/waitset_sub -d 5
-          echo "=== end gdb backtrace ==="
 
       - name: Build c/waitset (ThreadSanitizer)
         run: |
