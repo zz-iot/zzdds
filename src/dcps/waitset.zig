@@ -308,7 +308,23 @@ pub const WaitSetImpl = struct {
             sc.wakeups.unregister(self);
         } else if (cond.vtable == &GuardConditionImpl.cond_vtable) {
             const gc: *GuardConditionImpl = @ptrCast(@alignCast(cond.ptr));
+            // Releases the quiesce reference vtAttach's GuardCondition
+            // branch acquired at attach time -- NOT a fresh acquireIfAlive()
+            // here (an earlier version of this fix tried that, and it's
+            // provably too late: `gc` itself might already be freed by the
+            // time this line runs, since nothing stops gc.deinit() from
+            // reaching alloc.destroy() before this function ever gets a
+            // chance to dereference gc.quiesce in the first place --
+            // confirmed via a real CI segfault reading gc.quiesce.state on
+            // already-freed memory, one call frame deeper than the original
+            // bug this same fix was meant to close). Releasing an already-
+            // held reference instead of acquiring a new one needs no such
+            // check: as long as this reference hasn't been released yet,
+            // GuardConditionImpl.reallyDeinit (the actual free) cannot have
+            // run yet either, by EntityQuiesce's own contract -- so `gc` is
+            // guaranteed live here unconditionally, no race window at all.
             gc.wakeups.unregister(self);
+            gc.quiesce.release(gc, GuardConditionImpl.reallyDeinit);
         }
     }
 
@@ -516,7 +532,20 @@ pub const WaitSetImpl = struct {
             break :reg sc.wakeups.register(h);
         } else if (cond.vtable == &GuardConditionImpl.cond_vtable) reg: {
             const gc: *GuardConditionImpl = @ptrCast(@alignCast(cond.ptr));
-            break :reg gc.wakeups.register(h);
+            // Acquire gc.quiesce's reference here, for this attachment's
+            // whole lifetime -- see gc.quiesce's own doc comment for why
+            // this (not a lazy re-acquire in unregisterFromCondition) is
+            // what makes that later call safe. `cond` is already assumed
+            // live at this point (gc.wakeups.register() below relies on the
+            // same assumption), so acquire() failing here specifically
+            // means gc is concurrently tearing down right now -- treat
+            // exactly like any other registration failure below.
+            if (!gc.quiesce.acquire()) break :reg false;
+            if (!gc.wakeups.register(h)) {
+                gc.quiesce.release(gc, GuardConditionImpl.reallyDeinit);
+                break :reg false;
+            }
+            break :reg true;
         } else true;
         if (!registered) {
             _ = self.conditions.swapRemove(self.conditions.items.len - 1);
@@ -607,11 +636,30 @@ pub const WaitSetImpl = struct {
             }
         }
         self.mu.unlock();
-        // Fired only after releasing self.mu — see AttachedCondition.fireRelease's
-        // own doc comment for why (this call arrives from a condition's own
-        // teardown, via WakeupList.invalidateAll(), which already documents
-        // the identical reasoning for not holding its own mu across this call).
-        if (removed) |entry| entry.fireRelease();
+        if (removed) |entry| {
+            // Release the quiesce reference this WaitSet's own vtAttach
+            // acquired on a GuardCondition at attach time (see
+            // GuardConditionImpl.quiesce's doc comment) -- this call is
+            // arriving from that same GuardCondition's own eager,
+            // unconditional invalidateAll() (see its deinit()'s comment),
+            // so `cond_ptr` (== gc) is guaranteed still live here
+            // regardless of this WaitSet's own teardown state. Not doing
+            // this would leak every GuardCondition destroyed while still
+            // attached to a live WaitSet: nothing else releases this
+            // specific reference once this entry is gone from
+            // self.conditions (confirmed via a real DebugAllocator leak
+            // report before this was added — see the regression test for
+            // the scenario that caught it).
+            if (entry.cond.vtable == &GuardConditionImpl.cond_vtable) {
+                const gc: *GuardConditionImpl = @ptrCast(@alignCast(cond_ptr));
+                gc.quiesce.release(gc, GuardConditionImpl.reallyDeinit);
+            }
+            // Fired only after releasing self.mu — see AttachedCondition.fireRelease's
+            // own doc comment for why (this call arrives from a condition's own
+            // teardown, via WakeupList.invalidateAll(), which already documents
+            // the identical reasoning for not holding its own mu across this call).
+            entry.fireRelease();
+        }
     }
 
     /// `WakeupHandle.acquire`/`.release` implementations — see WakeupHandle's
@@ -662,6 +710,58 @@ pub const GuardConditionImpl = struct {
     /// "Binding design review: decision" for why this replaces what used to be
     /// two independently-cached, independently-addressed boxes.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
+    /// Guards the *opposite* direction from WakeupHandle/quiesce above on
+    /// WaitSetImpl: that mechanism protects a WaitSet from being freed while
+    /// a condition's own invalidateAll() is calling into it, but nothing
+    /// previously protected a GuardCondition from being freed while a
+    /// WaitSet's own reallyDeinit() is concurrently calling into *it* --
+    /// GuardCondition is unlike ReadCondition/StatusCondition in having no
+    /// owning DataReader/DataWriter whose caller-enforced serialization
+    /// rules already make a concurrent-teardown race a documented
+    /// non-goal (see the file-level comment on why that owned-condition
+    /// case is treated differently). Confirmed as a real, reproducible
+    /// crash, not just in theory: WaitSetImpl.reallyDeinit()'s doc comment
+    /// assumes "a condition that was itself torn down first already
+    /// removed itself from self.conditions" -- true for *completed*
+    /// teardowns, but reallyDeinit() reads self.conditions.items without
+    /// holding self.mu, so a GuardCondition concurrently *mid*-teardown
+    /// can still have a live entry there when reallyDeinit()'s loop reads
+    /// it, then get freed by its own deinit() before
+    /// unregisterFromCondition()'s gc.wakeups.unregister(self) call runs.
+    ///
+    /// Acquired *once* per attachment, eagerly, in vtAttach's GuardCondition
+    /// branch (while `cond` is already known-live -- the same assumption
+    /// gc.wakeups.register() itself already relies on) -- NOT lazily,
+    /// re-acquired at teardown time (an earlier version of this fix tried
+    /// exactly that, via acquireIfAlive() called from
+    /// unregisterFromCondition itself) -- that's provably too late: `gc`
+    /// might already be freed by the time unregisterFromCondition even
+    /// tries to dereference gc.quiesce, since nothing stops a concurrent
+    /// gc.deinit() from reaching the actual free first if no reference is
+    /// already outstanding (confirmed via a real CI segfault reading
+    /// gc.quiesce.state on already-freed memory). Holding the reference for
+    /// the whole attached lifetime instead means GuardConditionImpl.
+    /// reallyDeinit (the actual free) provably cannot run until it's
+    /// released -- so `gc` is guaranteed live wherever this reference is
+    /// dereferenced, unconditionally, no acquire-time race at all.
+    ///
+    /// Released from exactly one of two places, whichever gets there first
+    /// (both are safe: `gc` is guaranteed live at either, by the invariant
+    /// above):
+    ///   - unregisterFromCondition, if the WaitSet's own teardown (or an
+    ///     explicit detach_condition()) gets there first;
+    ///   - vtInvalidateHandle, if this GuardCondition's own eager,
+    ///     unconditional deinit()-time invalidateAll() notifies this
+    ///     WaitSet first (the common, non-racing case).
+    /// deinit()'s invalidateAll() call is deliberately NOT gated behind
+    /// this same refcount (unlike the actual free) -- doing so would be
+    /// circular: invalidateAll() is what releases each attached WaitSet's
+    /// reference, so gating it behind those very references would mean
+    /// none could ever be released (confirmed the hard way: an earlier
+    /// version of this fix did gate it, and a pre-existing regression test
+    /// for a *different* race, exercising exactly this scenario, caught
+    /// the resulting permanent GuardCondition leak immediately).
+    quiesce: EntityQuiesce = .{},
 
     const Self = @This();
 
@@ -672,7 +772,24 @@ pub const GuardConditionImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // invalidateAll() stays eager/unconditional here (not gated behind
+        // quiesce, unlike reallyDeinit below) -- it's what releases the
+        // quiesce reference each still-attached WaitSet acquired at attach
+        // time (see vtInvalidateHandle), so gating it behind that same
+        // refcount would be circular: no attached WaitSet's reference could
+        // ever be released, since the release step itself couldn't run
+        // until they already were. In the common case (no concurrent
+        // WaitSet teardown racing this call) this synchronously drops every
+        // attached WaitSet's reference and reallyDeinit runs immediately,
+        // same as before quiesce existed at all -- deferral only happens
+        // for a WaitSet that's concurrently, itself, mid-teardown (see
+        // unregisterFromCondition's matching comment).
         self.wakeups.invalidateAll(self);
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.c_abi.free(self.alloc);
         self.alloc.destroy(self);
     }

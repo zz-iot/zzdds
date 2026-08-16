@@ -1411,3 +1411,54 @@ test "addMatchedReader: replay primes a RELIABLE proxy with DATA_FRAG for an alr
     const df = findDataFrag(&rec) orelse return error.TestExpectedDataFrag;
     try testing.expectEqual(@as(u32, 1), df.fragment_starting_num);
 }
+
+test "checkConnectionGenerations: retries after a mid-loop per-change copy OOM during replay" {
+    // Regression test for Greptile PR #64 review (round 3): unlike the
+    // snapshot-array allocation failure (tested above, fails before this
+    // loop even starts), a failure copying one INDIVIDUAL change's data
+    // mid-loop used to just `continue` past it silently, with no retry
+    // scheduled -- permanently dropping that one sample even though the
+    // rest of the replay otherwise "succeeded".
+    const writer_guid = makeGuid(0x84, WRITER_EID);
+    const reader_guid = makeGuid(0x85, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7531);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        true, // replay_on_match
+    );
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    {
+        // alloc_index 0: reader_proxies.append. 1: the snapshot array
+        // (must succeed to reach the per-change copy loop at all). 2: the
+        // first change's dupe() -- made to fail here, mid-loop.
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+        w.alloc = fa.allocator();
+        defer w.alloc = testing.allocator;
+
+        const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+        try w.addMatchedReader(rp);
+        // Only the change(s) after the failed one made it out this pass.
+        try testing.expect(countAllData(&rec) < 2);
+    }
+
+    rec.reset();
+    w.checkConnectionGenerations();
+    // The retry re-copies everything from scratch -- both changes arrive.
+    try testing.expectEqual(@as(usize, 2), countAllData(&rec));
+}

@@ -977,7 +977,20 @@ pub const StatefulWriter = struct {
                 self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch);
                 continue;
             }
-            const data_copy = self.alloc.dupe(u8, ch.data) catch continue; // OOM: skip this one change
+            const data_copy = self.alloc.dupe(u8, ch.data) catch {
+                // OOM copying this one change: skip it for this pass, but
+                // (unlike a plain `catch continue`, an earlier version of
+                // this) flag a retry -- checkConnectionGenerations' next
+                // tick re-invokes this whole function from scratch, so a
+                // successful retry re-copies every change, including this
+                // one, not just the ones that failed this time (Greptile
+                // PR #64 review, round 3: a mid-loop per-change failure
+                // here was the one remaining OOM path in this function that
+                // still silently dropped delivery without scheduling the
+                // retry the array-allocation OOM path above already got).
+                rp.pending_replay_retry = true;
+                continue;
+            };
             changes[n_snap] = .{
                 .data = data_copy,
                 .sn = ch.sequence_number,
