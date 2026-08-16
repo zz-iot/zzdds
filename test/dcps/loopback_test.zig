@@ -103,6 +103,35 @@ fn runLoopback(
     const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
+    // ── Write all payloads before the reader even exists ─────────────────────
+    // RELIABLE: samples sit in history cache and are replayed once the proxy
+    // is established via SEDP.  BEST_EFFORT: same courtesy replay behaviour.
+    // instance_handle and key_hash are the same value here, matching the
+    // production zzdds_write_raw* fix: the internal per-instance grouping key
+    // History's KEEP_LAST trimming uses must be the sample's real key hash,
+    // not a NIL placeholder shared by every instance.
+    //
+    // Deliberately done before the reader participant/datareader are even
+    // constructed below (an earlier version of this test created the reader
+    // first, then wrote, "before discovery completes" -- a timing
+    // assumption, not a guarantee: nothing stopped SEDP from completing the
+    // match mid-write-loop on a slow enough run, which would replay a
+    // partially-written cache and then additionally live-deliver the
+    // remaining writes, letting a since-superseded per-instance value slip
+    // through to a test that polls for only the final, trimmed count and
+    // stops as soon as it sees that many samples -- confirmed as a real,
+    // reproducible race under Valgrind, not just in theory: this exact
+    // ordering bug intermittently failed "KEEP_LAST depth=1, two distinct
+    // instances trimmed independently" below in CI, content-mismatched
+    // rather than short, meaning the race had already been won and lost by
+    // the time collectSamples' count check even ran). Constructing the
+    // reader only now makes "all writes -- and this writer's own KEEP_LAST
+    // trimming -- are durably settled before the reader can possibly match"
+    // an actual invariant instead of a hopeful one.
+    for (payloads, key_hashes) |p, kh| {
+        _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), kh, kh, p);
+    }
+
     // ── Reader participant ────────────────────────────────────────────────────
     const udp_r = try UdpTransport.init(alloc, .{ .participant_id = r_pid }, 0, null);
     defer udp_r.deinit();
@@ -140,17 +169,6 @@ fn runLoopback(
         0,
     );
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
-
-    // ── Write all payloads immediately (before discovery completes) ───────────
-    // RELIABLE: samples sit in history cache and are replayed once the proxy
-    // is established via SEDP.  BEST_EFFORT: same courtesy replay behaviour.
-    // instance_handle and key_hash are the same value here, matching the
-    // production zzdds_write_raw* fix: the internal per-instance grouping key
-    // History's KEEP_LAST trimming uses must be the sample's real key hash,
-    // not a NIL placeholder shared by every instance.
-    for (payloads, key_hashes) |p, kh| {
-        _ = try dw_impl.writeRaw(.alive, RtpsTimestamp.now(), kh, kh, p);
-    }
 
     // ── Collect and assert ────────────────────────────────────────────────────
     // 20s, not the more typical few-hundred-ms native completion time: under
