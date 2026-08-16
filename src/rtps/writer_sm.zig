@@ -128,6 +128,7 @@ pub const StatelessWriter = struct {
     pub fn deinit(self: *Self) void {
         self.cache.deinit();
         self.reader_locators.deinit(self.alloc);
+        self.mu.deinit();
         self.alloc.destroy(self);
     }
 
@@ -304,6 +305,19 @@ pub const ReaderProxy = struct {
     /// generation 0, so this stays 0 and is never acted on for them. Checked
     /// periodically from the heartbeat thread — see checkConnectionGenerations.
     last_seen_connection_generation: u32 = 0,
+    /// Set when replayHistoryToProxyUnlocked's BEST_EFFORT branch couldn't
+    /// build its unlocked-send snapshot (OOM) and had to skip the initial
+    /// history replay entirely -- this proxy's only history-delivery path,
+    /// since BEST_EFFORT never ACKNACKs. Retried on the next heartbeat-thread
+    /// tick (see checkConnectionGenerations) rather than left permanently
+    /// lost: the retry reuses the same deadlock-safe unlocked replay path,
+    /// just re-invoked later once the transient OOM has likely cleared
+    /// (Greptile PR #64 review: the original log-and-skip-forever behavior
+    /// was correctness-safe re: deadlock but silently dropped delivery with
+    /// no recovery path at all, unlike every other OOM-fallback in this file
+    /// where the change stays durably in self.cache for RELIABLE proxies to
+    /// recover via HEARTBEAT/ACKNACK).
+    pending_replay_retry: bool = false,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -548,6 +562,7 @@ pub const StatefulWriter = struct {
         self.reader_proxies.deinit(self.alloc);
         self.coherent_pending_sns.deinit(self.alloc);
         self.cache.deinit();
+        self.mu.deinit();
         self.alloc.destroy(self);
     }
 
@@ -678,7 +693,7 @@ pub const StatefulWriter = struct {
             new_rp.suppress_live_data = true;
             new_rp.history_floor_sn = self.cache.maxSn();
         }
-        if (should_replay) self.replayHistoryToProxyLocked(new_rp) else if (new_rp.reliable) self.sendHeartbeatToProxyLocked(new_rp, false);
+        if (should_replay) self.replayHistoryToProxyUnlocked(new_rp) else if (new_rp.reliable) self.sendInitialHeartbeatUnlocked(new_rp);
         // Start the periodic heartbeat thread on the first matched reader so
         // that dropped DATA or HEARTBEAT packets can be recovered via NACK.
         if (self.hb_thread == null) {
@@ -722,11 +737,51 @@ pub const StatefulWriter = struct {
     /// (reuses that existing timer rather than adding a second one); a no-op
     /// for any proxy whose locators are all UDP, since connectionGeneration()
     /// is then always 0.
+    ///
+    /// Also retries any proxy's pending_replay_retry (set when
+    /// replayHistoryToProxyUnlocked's BEST_EFFORT branch had to skip a
+    /// newly-matched proxy's initial replay due to a transient allocation
+    /// failure) — same periodic-timer reuse rationale, and clearing the
+    /// flag optimistically before retrying (rather than requiring
+    /// replayHistoryToProxyUnlocked's success path to do it) means a
+    /// repeat failure simply re-sets it for the next tick.
     pub fn checkConnectionGenerations(self: *Self) void {
         self.mu.lock();
         defer self.mu.unlock();
+
+        // Collect GUIDs (not pointers) of proxies pending a replay retry
+        // during this first, fully-locked pass -- resyncIfGenerationChangedLocked
+        // never unlocks, so this loop itself is safe.
+        var retry_guids_buf: [16]Guid = undefined;
+        var n_retry: usize = 0;
         for (self.reader_proxies.items) |*rp| {
             self.resyncIfGenerationChangedLocked(rp);
+            if (rp.pending_replay_retry and n_retry < retry_guids_buf.len) {
+                rp.pending_replay_retry = false;
+                retry_guids_buf[n_retry] = rp.guid;
+                n_retry += 1;
+            }
+        }
+
+        // Replay each pending-retry proxy by re-finding it via GUID, not by
+        // a pointer captured above: replayHistoryToProxyUnlocked releases
+        // self.mu internally while sending, during which a concurrent
+        // addMatchedReader could grow/reallocate self.reader_proxies and
+        // invalidate any pointer taken before that window -- the same class
+        // of stale-pointer-across-an-unlock hazard already fixed elsewhere
+        // in this file (see sendChangeToAllLocked's matching comment on
+        // ch_sn vs. re-dereferencing ch). Re-reading self.reader_proxies.items
+        // fresh on every outer iteration (rather than once before the loop)
+        // keeps each lookup valid against the array's current backing
+        // storage; if a proxy disconnected during the unlocked window, the
+        // inner loop simply finds no match and moves on.
+        for (retry_guids_buf[0..n_retry]) |guid| {
+            for (self.reader_proxies.items) |*rp| {
+                if (rp.guid.eql(guid)) {
+                    self.replayHistoryToProxyUnlocked(rp);
+                    break;
+                }
+            }
         }
     }
 
@@ -823,6 +878,183 @@ pub const StatefulWriter = struct {
                 }
             }
         }
+    }
+
+    /// Like replayHistoryToProxyLocked, but for addMatchedReader's
+    /// initial-match call specifically: for a RELIABLE proxy, behaves
+    /// EXACTLY like replayHistoryToProxyLocked (heartbeat + optional
+    /// fragmented-history priming, fully locked, unchanged) -- reliable
+    /// readers get their actual history via NACK-driven retransmission
+    /// later, not a direct push here, so there's nothing reentrant-into-the-
+    /// transport-heavy about this branch and no reason to touch it.
+    ///
+    /// For a BEST_EFFORT proxy, this is where the real fix lives: releases
+    /// self.mu before touching the transport for the direct-replay-all-
+    /// cached-changes loop (BEST_EFFORT readers never AckNack, so this is
+    /// their only history-delivery path), then reacquires it before
+    /// returning. Safe because nothing in addMatchedReader after this call
+    /// depends on `rp` remaining a live pointer or on self.mu having stayed
+    /// continuously held.
+    ///
+    /// Why: MemoryTransport (used by IntraProcessDelivery, zzdds's own DCPS
+    /// conformance-testing harness) delivers synchronously and can reenter
+    /// the matched reader's own locked receive path from inside sendIovecs
+    /// -- which, combined with the reader's own reader.mu -> writer.mu path
+    /// (addMatchedWriter -> sendAckNackUnlocked), is a genuine
+    /// writer.mu <-> reader.mu lock-order cycle (confirmed via TSan, at
+    /// exactly this BEST_EFFORT direct-replay call site). This is the
+    /// mirror-image trigger of the one sendChangeToAllLocked's
+    /// non-fragmented branch closes for live writes; see that comment for
+    /// the other half. Fragmented changes here are still sent under lock via
+    /// the existing sendFragsToProxyLocked, unchanged -- out of scope, same
+    /// as sendChangeToAllLocked's fragmented branch.
+    fn replayHistoryToProxyUnlocked(self: *Self, rp: *ReaderProxy) void {
+        const locs = rp.effectiveLocators();
+        if (locs.len == 0) return;
+
+        if (rp.reliable) {
+            self.sendHeartbeatToProxyLocked(rp, false);
+            var scratch: [SCRATCH_SIZE]u8 = undefined;
+            for (self.cache.changes.items) |*ch| {
+                if (ch.data.len <= self.frag_size) continue;
+                self.hb_count += 1;
+                self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
+                break; // only the first fragmented change needs priming
+            }
+            return;
+        }
+
+        var locs_buf: [8]Locator = undefined;
+        const n_locs = @min(locs.len, locs_buf.len);
+        @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
+        const rp_guid = rp.guid;
+
+        const ChangeSnapshot = struct {
+            data: []u8,
+            sn: SequenceNumber,
+            key_hash: [16]u8,
+            kind: ChangeKind,
+            source_timestamp: RtpsTimestamp,
+        };
+        const n_changes = self.cache.changes.items.len;
+        const changes = self.alloc.alloc(ChangeSnapshot, n_changes) catch {
+            // Does NOT fall back to replayHistoryToProxyLocked here (an
+            // earlier version of this did): that sends synchronously while
+            // self.mu is still held, reintroducing the exact writer.mu <->
+            // reader.mu lock-order-inversion this function's own doc
+            // comment above describes -- a confirmed deadlock, not a
+            // theoretical one (Greptile PR #64 review). For a BEST_EFFORT
+            // proxy this is its only history-delivery path (no ACKNACK
+            // recovery), so simply giving up here would silently and
+            // permanently lose the initial replay. Instead, flag it for a
+            // retry on the next heartbeat-thread tick (see
+            // checkConnectionGenerations) -- that retry calls back into this
+            // same unlocked, deadlock-safe path, just later, once the
+            // transient OOM has likely cleared (Greptile PR #64 review,
+            // round 2: log-and-skip-forever traded the deadlock for
+            // unconditional, unrecoverable data loss -- this closes that
+            // gap without reintroducing the lock-order-inversion).
+            rp.pending_replay_retry = true;
+            log.rtps.warn("StatefulWriter({x}): OOM building the unlocked-replay snapshot for a newly-matched BEST_EFFORT proxy -- initial history replay skipped for this match, will retry on next heartbeat tick", .{
+                self.guid.entity_id.entity_key,
+            });
+            return;
+        };
+        defer self.alloc.free(changes);
+        var n_snap: usize = 0;
+        var scratch: [SCRATCH_SIZE]u8 = undefined;
+        for (self.cache.changes.items) |*ch| {
+            self.tracer.submit(.{ .send_data = .{
+                .src_prefix = self.guid.prefix,
+                .writer_eid = self.guid.entity_id,
+                .reader_eid = rp_guid.entity_id,
+                .sn = ch.sequence_number,
+                .key_hash = ch.key_hash,
+                .data_len = @intCast(ch.data.len),
+            } });
+            if (ch.data.len > self.frag_size) {
+                self.hb_count += 1;
+                self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch);
+                continue;
+            }
+            const data_copy = self.alloc.dupe(u8, ch.data) catch {
+                // OOM copying this one change: skip it for this pass, but
+                // (unlike a plain `catch continue`, an earlier version of
+                // this) flag a retry -- checkConnectionGenerations' next
+                // tick re-invokes this whole function from scratch, so a
+                // successful retry re-copies every change, including this
+                // one, not just the ones that failed this time (Greptile
+                // PR #64 review, round 3: a mid-loop per-change failure
+                // here was the one remaining OOM path in this function that
+                // still silently dropped delivery without scheduling the
+                // retry the array-allocation OOM path above already got).
+                rp.pending_replay_retry = true;
+                continue;
+            };
+            changes[n_snap] = .{
+                .data = data_copy,
+                .sn = ch.sequence_number,
+                .key_hash = ch.key_hash,
+                .kind = ch.kind,
+                .source_timestamp = ch.source_timestamp,
+            };
+            n_snap += 1;
+        }
+        defer for (changes[0..n_snap]) |c| self.alloc.free(c.data);
+
+        const self_guid = self.guid;
+        const self_lifespan = self.lifespan;
+        const self_transport = self.transport;
+
+        self.mu.unlock();
+        defer self.mu.lock();
+
+        for (changes[0..n_snap]) |c| {
+            var b_scratch: [SCRATCH_SIZE]u8 = undefined;
+            var b = MessageBuilder.init(&b_scratch, self_guid.prefix);
+            b.addInfoDst(rp_guid.prefix);
+            b.addInfoTs(c.source_timestamp);
+            b.addData(.{
+                .reader_entity_id = rp_guid.entity_id,
+                .writer_entity_id = self_guid.entity_id,
+                .writer_sn = c.sn,
+                .key_hash = if (!std.mem.eql(u8, &c.key_hash, &std.mem.zeroes([16]u8)))
+                    c.key_hash
+                else
+                    null,
+                .is_key = c.kind != .alive,
+                .status_info = statusInfoFromKind(c.kind),
+                .lifespan = if (c.kind == .alive) self_lifespan else null,
+            }, c.data);
+            for (locs_buf[0..n_locs]) |loc| {
+                sendIovecs(self_transport, &loc, b.iovecs()) catch |err| switch (err) {
+                    error.UnsupportedLocatorKind => {},
+                    else => log.rtps.warn("StatefulWriter.addMatchedReader: replay error: {}", .{err}),
+                };
+            }
+        }
+    }
+
+    /// Sends the initial HEARTBEAT to a newly-matched reader proxy that
+    /// isn't getting a history replay (addMatchedReader's should_replay=false
+    /// case). Same rationale/scope as replayHistoryToProxyUnlocked.
+    fn sendInitialHeartbeatUnlocked(self: *Self, rp: *const ReaderProxy) void {
+        const locs = rp.effectiveLocators();
+        if (locs.len == 0) return;
+        var locs_buf: [8]Locator = undefined;
+        const n_locs = @min(locs.len, locs_buf.len);
+        @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
+        const rp_guid = rp.guid;
+        const rp_start_sn = rp.start_sn;
+        const cache_last = self.cache.maxSn();
+        const cache_first = self.cache.minSn();
+        self.hb_count += 1;
+        const count = self.hb_count;
+
+        self.mu.unlock();
+        defer self.mu.lock();
+
+        self.sendHeartbeatUnlocked(rp_guid, rp_start_sn, locs_buf[0..n_locs], false, cache_last, count, cache_first);
     }
 
     /// Send a Heartbeat to a single reader proxy (called under mu).
@@ -1352,24 +1584,25 @@ pub const StatefulWriter = struct {
             self.hb_count += 1;
         }
         const hb_count_snap = self.hb_count;
-        var scratch: [SCRATCH_SIZE]u8 = undefined;
-        for (self.reader_proxies.items) |*rp| {
-            if (rp.suppress_live_data) continue;
-            const locs = rp.effectiveLocators();
-            if (locs.len == 0) continue;
-            log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{
-                self.guid.entity_id.entity_key, ch.sequence_number,            locs.len,
-                rp.guid.entity_id.entity_key,   rp.guid.entity_id.entity_kind,
-            });
-            self.tracer.submit(.{ .send_data = .{
-                .src_prefix = self.guid.prefix,
-                .writer_eid = self.guid.entity_id,
-                .reader_eid = rp.guid.entity_id,
-                .sn = ch.sequence_number,
-                .key_hash = ch.key_hash,
-                .data_len = @intCast(ch.data.len),
-            } });
-            if (fragmented) {
+
+        if (fragmented) {
+            var scratch: [SCRATCH_SIZE]u8 = undefined;
+            for (self.reader_proxies.items) |*rp| {
+                if (rp.suppress_live_data) continue;
+                const locs = rp.effectiveLocators();
+                if (locs.len == 0) continue;
+                log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{
+                    self.guid.entity_id.entity_key, ch.sequence_number,            locs.len,
+                    rp.guid.entity_id.entity_key,   rp.guid.entity_id.entity_kind,
+                });
+                self.tracer.submit(.{ .send_data = .{
+                    .src_prefix = self.guid.prefix,
+                    .writer_eid = self.guid.entity_id,
+                    .reader_eid = rp.guid.entity_id,
+                    .sn = ch.sequence_number,
+                    .key_hash = ch.key_hash,
+                    .data_len = @intCast(ch.data.len),
+                } });
                 // Reliable readers: send only frag 1 + HEARTBEAT_FRAG.  The reader
                 // NACK_FRAGs the remaining fragments on demand.  Sending all N frags
                 // in the live path would saturate the reader's UDP recv buffer when
@@ -1379,48 +1612,213 @@ pub const StatefulWriter = struct {
                 } else {
                     self.sendFragsToProxyLocked(rp, ch, hb_count_snap, &scratch);
                 }
-            } else {
-                var b = MessageBuilder.init(&scratch, self.guid.prefix);
-                b.addInfoDst(rp.guid.prefix);
-                b.addInfoTs(ch.source_timestamp);
+            }
+            // self.mu is held throughout this branch (no unlock above), so
+            // ch is still valid here -- unlike the non-fragmented branch
+            // below, which must use its own pre-captured ch_sn instead (see
+            // its matching comment).
+            if (ch.sequence_number > self.last_flushed_sn)
+                self.last_flushed_sn = ch.sequence_number;
+        } else {
+            // Snapshot everything this loop needs, then release self.mu before
+            // touching the transport: MemoryTransport (used by
+            // IntraProcessDelivery, zzdds's own DCPS conformance-testing
+            // harness) delivers synchronously and can reenter a matched
+            // reader's own locked code (StatefulReader.isWriterMatched/
+            // handleData) from inside sendIovecs -- which, combined with the
+            // reader's own reader.mu -> writer.mu path (addMatchedWriter ->
+            // sendAckNackUnlocked), is a genuine writer.mu <-> reader.mu
+            // lock-order cycle (confirmed via TSan). Only this non-fragmented
+            // branch is covered -- the fragmented path above and the other
+            // sendHeartbeatToProxyLocked* call sites are unchanged/still
+            // locked; see reader_sm.zig's matching sendAckNackUnlocked
+            // comment for the other half of the cycle this closes.
+            const ProxySnapshot = struct {
+                guid: Guid,
+                start_sn: SequenceNumber,
+                locs: [8]Locator = undefined,
+                n_locs: usize = 0,
+                hb: ?struct { last_sn: SequenceNumber, cache_first: SequenceNumber, count: i32 } = null,
+            };
+            const cache_last = self.cache.maxSn();
+            const cache_first = self.cache.minSn();
+
+            const snaps = self.alloc.alloc(ProxySnapshot, self.reader_proxies.items.len) catch {
+                self.sendChangeToAllNonFragLockedFallback(ch);
+                if (ch.sequence_number > self.last_flushed_sn) self.last_flushed_sn = ch.sequence_number;
+                return;
+            };
+            defer self.alloc.free(snaps);
+            var n_snaps: usize = 0;
+
+            for (self.reader_proxies.items) |*rp| {
+                if (rp.suppress_live_data) continue;
+                const locs = rp.effectiveLocators();
+                if (locs.len == 0) continue;
+                log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{
+                    self.guid.entity_id.entity_key, ch.sequence_number,            locs.len,
+                    rp.guid.entity_id.entity_key,   rp.guid.entity_id.entity_kind,
+                });
+                self.tracer.submit(.{ .send_data = .{
+                    .src_prefix = self.guid.prefix,
+                    .writer_eid = self.guid.entity_id,
+                    .reader_eid = rp.guid.entity_id,
+                    .sn = ch.sequence_number,
+                    .key_hash = ch.key_hash,
+                    .data_len = @intCast(ch.data.len),
+                } });
+                var s = &snaps[n_snaps];
+                s.* = .{ .guid = rp.guid, .start_sn = rp.start_sn };
+                s.n_locs = @min(locs.len, s.locs.len);
+                @memcpy(s.locs[0..s.n_locs], locs[0..s.n_locs]);
+                // Follow each DATA with a non-final HEARTBEAT so the reader learns
+                // the current [first_sn, last_sn] range and replies with ACKNACK.
+                // Required for reliable delivery: implementations such as OpenDDS
+                // gate sample delivery on receiving a confirming HEARTBEAT.
+                // Skip for BEST_EFFORT proxies: they never send AckNack.
+                // Callers that flush a whole coherent set at once pass false here and
+                // send ONE heartbeat after all samples instead; this prevents the
+                // per-DATA heartbeat from triggering a premature coherent WIP flush
+                // on the subscriber side before all set samples have arrived.
+                if (rp.reliable and send_trailing_hb) {
+                    self.hb_count += 1;
+                    s.hb = .{ .last_sn = cache_last, .cache_first = cache_first, .count = self.hb_count };
+                }
+                n_snaps += 1;
+            }
+
+            // ch may become invalid once self.mu is released (e.g. a
+            // concurrent write() or KEEP_LAST eviction) -- copy its payload
+            // and fixed fields out now while still locked.
+            const data_copy = self.alloc.dupe(u8, ch.data) catch {
+                self.sendChangeToAllNonFragLockedFallback(ch);
+                if (ch.sequence_number > self.last_flushed_sn) self.last_flushed_sn = ch.sequence_number;
+                return;
+            };
+            defer self.alloc.free(data_copy);
+            const ch_sn = ch.sequence_number;
+            const ch_key_hash = ch.key_hash;
+            const ch_kind = ch.kind;
+            const ch_coherent_set_sn = ch.coherent_set_sn;
+            const ch_group_seq_num = ch.group_seq_num;
+            const ch_group_coherent_sn = ch.group_coherent_sn;
+            const ch_source_timestamp = ch.source_timestamp;
+            const self_guid = self.guid;
+            const self_lifespan = self.lifespan;
+            const self_transport = self.transport;
+
+            self.mu.unlock();
+
+            for (snaps[0..n_snaps]) |s| {
+                var scratch: [SCRATCH_SIZE]u8 = undefined;
+                var b = MessageBuilder.init(&scratch, self_guid.prefix);
+                b.addInfoDst(s.guid.prefix);
+                b.addInfoTs(ch_source_timestamp);
                 b.addData(.{
-                    .reader_entity_id = rp.guid.entity_id,
-                    .writer_entity_id = self.guid.entity_id,
-                    .writer_sn = ch.sequence_number,
-                    .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
-                        ch.key_hash
+                    .reader_entity_id = s.guid.entity_id,
+                    .writer_entity_id = self_guid.entity_id,
+                    .writer_sn = ch_sn,
+                    .key_hash = if (!std.mem.eql(u8, &ch_key_hash, &std.mem.zeroes([16]u8)))
+                        ch_key_hash
                     else
                         null,
-                    .is_key = ch.kind != .alive,
-                    .status_info = statusInfoFromKind(ch.kind),
-                    .coherent_set_sn = ch.coherent_set_sn,
-                    .group_seq_num = ch.group_seq_num,
-                    .group_coherent_sn = ch.group_coherent_sn,
-                    .lifespan = if (ch.kind == .alive) self.lifespan else null,
-                }, ch.data);
-                for (locs) |loc| {
-                    sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                    .is_key = ch_kind != .alive,
+                    .status_info = statusInfoFromKind(ch_kind),
+                    .coherent_set_sn = ch_coherent_set_sn,
+                    .group_seq_num = ch_group_seq_num,
+                    .group_coherent_sn = ch_group_coherent_sn,
+                    .lifespan = if (ch_kind == .alive) self_lifespan else null,
+                }, data_copy);
+                for (s.locs[0..s.n_locs]) |loc| {
+                    sendIovecs(self_transport, &loc, b.iovecs()) catch |err| switch (err) {
                         // SEDP already filtered proxy locators to those canReach(); this is defence-in-depth.
                         error.UnsupportedLocatorKind => {},
                         else => log.rtps.warn("StatefulWriter.write: send error: {}", .{err}),
                     };
                 }
-                // Follow each DATA with a non-final HEARTBEAT so the reader learns
-                // the current [first_sn, last_sn] range and replies with ACKNACK.
-                // Required for reliable delivery: implementations such as OpenDDS
-                // gate sample delivery on receiving a confirming HEARTBEAT.
-                // Skip for BEST_EFFORT proxies: they never send AckNack, and sending
-                // a Heartbeat would trigger a synchronous AckNack round-trip when
-                // using MemoryTransport, re-entering the writer's mutex.
-                // Callers that flush a whole coherent set at once pass false here and
-                // send ONE heartbeat after all samples instead; this prevents the
-                // per-DATA heartbeat from triggering a premature coherent WIP flush
-                // on the subscriber side before all set samples have arrived.
-                if (rp.reliable and send_trailing_hb) self.sendHeartbeatToProxyLocked(rp, false);
+                if (s.hb) |hb| {
+                    self.sendHeartbeatUnlocked(s.guid, s.start_sn, s.locs[0..s.n_locs], false, hb.last_sn, hb.count, hb.cache_first);
+                }
             }
+
+            // Relock before touching self.last_flushed_sn (a plain field,
+            // needs the same protection as any other self.* mutation) --
+            // and use ch_sn (captured before the unlock above), not
+            // ch.sequence_number: a concurrent write() during the unlocked
+            // send loop above can evict/reallocate the cache's backing
+            // storage, leaving `ch` a dangling pointer even after mu is
+            // held again (Greptile PR #64 finding -- confirmed real).
+            self.mu.lock();
+            if (ch_sn > self.last_flushed_sn) self.last_flushed_sn = ch_sn;
         }
-        if (ch.sequence_number > self.last_flushed_sn)
-            self.last_flushed_sn = ch.sequence_number;
+    }
+
+    /// Rare-path fallback for sendChangeToAllLocked's non-fragmented branch
+    /// when the snapshot/payload-copy allocation fails.
+    ///
+    /// Does NOT send anything -- an earlier version of this function sent
+    /// synchronously while still holding self.mu, exactly reintroducing the
+    /// writer.mu/reader.mu lock-order-inversion the unlock-before-send
+    /// restructuring above exists to close: MemoryTransport (used by
+    /// IntraProcessDelivery, zzdds's own conformance-testing harness)
+    /// delivers synchronously and can reenter a matched reader's own locked
+    /// code from inside sendIovecs, which combined with the reader's own
+    /// reader.mu -> writer.mu path is a genuine deadlock, not just a
+    /// theoretical race (confirmed real: Greptile PR #64 review). There's
+    /// no unlock/retry option here either -- we're already in the allocator
+    /// failure path that would be needed to build a safe-to-unlock snapshot.
+    ///
+    /// Silently skipping this one live push is safe: this change (`ch`) is
+    /// already durably in `self.cache` by the time sendChangeToAllLocked
+    /// runs, so RELIABLE proxies still receive it via the writer's regular
+    /// HEARTBEAT -> ACKNACK -> retransmission cycle, just not on this call.
+    /// BEST_EFFORT proxies have no such recovery path, but BEST_EFFORT
+    /// readers are spec-defined to tolerate exactly this kind of drop.
+    fn sendChangeToAllNonFragLockedFallback(self: *Self, ch: *const CacheChange) void {
+        log.rtps.warn("StatefulWriter({x}): OOM building the unlocked-send snapshot for sn={} -- skipping this live push; RELIABLE proxies will catch up via HEARTBEAT/ACKNACK retransmission, BEST_EFFORT proxies may miss this sample", .{
+            self.guid.entity_id.entity_key, ch.sequence_number,
+        });
+    }
+
+    /// Like sendHeartbeatToProxyLockedWithLastSnAndFirstSn, but for the case
+    /// where self.mu has already been released (see sendChangeToAllLocked's
+    /// non-fragmented branch): takes already-locked snapshots instead of a
+    /// live *const ReaderProxy / self.hb_count / self.cache.minSn(), and
+    /// only implements the extra_gap_sn=null, first_sn_override=null subset
+    /// of that function's GAP logic (the only branch reachable from this
+    /// caller). Every other heartbeat call site is unaffected and still
+    /// goes through the locked family unchanged.
+    fn sendHeartbeatUnlocked(
+        self: *Self,
+        rp_guid: Guid,
+        rp_start_sn: SequenceNumber,
+        locs: []const Locator,
+        final: bool,
+        last_sn: SequenceNumber,
+        hb_count: i32,
+        cache_first: SequenceNumber,
+    ) void {
+        if (locs.len == 0) return;
+        const hb_first_sn = hbFirstSn(cache_first, last_sn, rp_start_sn, null);
+        if (last_sn > 0 and hb_first_sn > last_sn) return;
+        var scratch: [SCRATCH_SIZE]u8 = undefined;
+        var b = MessageBuilder.init(&scratch, self.guid.prefix);
+        b.addInfoDst(rp_guid.prefix);
+        if (cache_first > 0 and rp_start_sn > 0 and cache_first > rp_start_sn) {
+            const gap_list = msg.submessage.SequenceNumberSet{
+                .base = cache_first,
+                .num_bits = 0,
+                .bitmap = std.mem.zeroes([8]u32),
+            };
+            b.addGap(rp_guid.entity_id, self.guid.entity_id, rp_start_sn, gap_list);
+        }
+        b.addHeartbeat(rp_guid.entity_id, self.guid.entity_id, hb_first_sn, last_sn, hb_count, final);
+        for (locs) |loc| {
+            sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                error.UnsupportedLocatorKind => {},
+                else => log.rtps.warn("StatefulWriter.addMatchedReader: heartbeat error: {}", .{err}),
+            };
+        }
     }
 
     /// Send a fragmented change to a single reader proxy as N DATA_FRAG datagrams

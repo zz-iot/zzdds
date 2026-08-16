@@ -179,8 +179,13 @@ pub const DataReaderImpl = struct {
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
 
-    /// Cumulative count of incompatible-QoS events; guarded by `mu`.
-    incompat_total: i32 = 0,
+    /// Cumulative count of incompatible-QoS events; incompat_total_change/
+    /// incompat_last_policy are guarded by `mu`. incompat_total itself is
+    /// additionally polled lock-free by tests waiting for the event to fire
+    /// (see loopback_test.zig) -- an atomic (rather than plain i32) makes
+    /// that unlocked cross-thread read well-defined instead of a data race
+    /// (confirmed via TSan against notifyIncompatibleQos's locked writer).
+    incompat_total: std.atomic.Value(i32) = .init(0),
     incompat_total_change: i32 = 0,
     incompat_last_policy: i32 = 0,
 
@@ -1793,11 +1798,24 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        // Capture the fields status needs while still holding the lock --
+        // reading self.incompat_total/incompat_total_change again after
+        // unlocking would race a concurrent call to this same function
+        // (e.g. two incompatible remote writers discovered around the same
+        // time) doing its own locked increment (confirmed via TSan).
         self.mu.lock();
-        self.incompat_total += 1;
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
         self.status_changes |= DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS;
+        // Release ordering: publishes the plain-field writes above (program
+        // order on this thread) to any thread that observes this value via
+        // a paired .acquire load, without requiring that thread to take `mu`.
+        const new_total = self.incompat_total.load(.monotonic) + 1;
+        self.incompat_total.store(new_total, .release);
+        var status = DDS.RequestedIncompatibleQosStatus{};
+        status.total_count = new_total;
+        status.total_count_change = self.incompat_total_change;
+        status.last_policy_id = policy_id;
         self.mu.unlock();
 
         if (self.status_cond) |sc| sc.notifyWakeup();
@@ -1807,10 +1825,6 @@ pub const DataReaderImpl = struct {
         // `listener_mask` doesn't include the bit. Only reset the
         // change-counters if delivery actually happened somewhere in the
         // chain.
-        var status = DDS.RequestedIncompatibleQosStatus{};
-        status.total_count = self.incompat_total;
-        status.total_count_change = self.incompat_total_change;
-        status.last_policy_id = policy_id;
         if (self.dispatchListener("on_requested_incompatible_qos", DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.mu.lock();
             self.incompat_total_change = 0;
@@ -1834,12 +1848,11 @@ pub const DataReaderImpl = struct {
         self.sub_matched_current_change += delta;
         self.sub_matched_last_handle = remote_handle;
         self.status_changes |= DDS.SUBSCRIPTION_MATCHED_STATUS;
-        self.mu.unlock();
-
-        if (self.status_cond) |sc| sc.notifyWakeup();
-
         // Always attempt dispatch -- see notifyIncompatibleQos's comment on
         // why this can't be gated on this reader's own `listener_mask`.
+        // Snapshot while still locked -- building this from self.* after
+        // unlocking (the previous shape here) races vtGetSubMatched, which
+        // reads/mutates the same fields under the lock (confirmed via TSan).
         const status = DDS.SubscriptionMatchedStatus{
             .total_count = self.sub_matched_total,
             .total_count_change = self.sub_matched_total_change,
@@ -1847,6 +1860,10 @@ pub const DataReaderImpl = struct {
             .current_count_change = self.sub_matched_current_change,
             .last_publication_handle = remote_handle,
         };
+        self.mu.unlock();
+
+        if (self.status_cond) |sc| sc.notifyWakeup();
+
         if (self.dispatchListener("on_subscription_matched", DDS.SUBSCRIPTION_MATCHED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
             self.mu.lock();
             self.status_changes &= ~DDS.SUBSCRIPTION_MATCHED_STATUS;
@@ -1869,14 +1886,17 @@ pub const DataReaderImpl = struct {
         self.sample_lost_total += count;
         self.sample_lost_total_change += count;
         self.status_changes |= DDS.SAMPLE_LOST_STATUS;
+        // Snapshot while still locked -- see notifySubscriptionMatched's
+        // matching comment (same bug, same fix, confirmed via TSan).
+        const status = DDS.SampleLostStatus{
+            .total_count = self.sample_lost_total,
+            .total_count_change = self.sample_lost_total_change,
+        };
         self.mu.unlock();
         if (self.status_cond) |sc| sc.notifyWakeup();
         // Always attempt dispatch -- see notifyIncompatibleQos's comment on
         // why this can't be gated on this reader's own `listener_mask`.
-        const delivered = self.dispatchListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS, vtable.get_c_abi_handle(self), .{&DDS.SampleLostStatus{
-            .total_count = self.sample_lost_total,
-            .total_count_change = self.sample_lost_total_change,
-        }});
+        const delivered = self.dispatchListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS, vtable.get_c_abi_handle(self), .{&status});
         if (delivered) {
             self.mu.lock();
             self.sample_lost_total_change = 0;
@@ -1886,10 +1906,11 @@ pub const DataReaderImpl = struct {
     }
 
     fn notifyLivelinessChanged(self: *Self) void {
+        self.mu.lock();
         self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
-        if (self.status_cond) |sc| sc.notifyWakeup();
-        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
-        // why this can't be gated on this reader's own `listener_mask`.
+        // Snapshot while still locked -- see notifySubscriptionMatched's
+        // matching comment (same bug, same fix, confirmed via TSan). This
+        // function previously took no lock at all.
         const status = DDS.LivelinessChangedStatus{
             .alive_count = self.liveliness_alive_count,
             .not_alive_count = self.liveliness_not_alive_count,
@@ -1897,10 +1918,16 @@ pub const DataReaderImpl = struct {
             .not_alive_count_change = self.liveliness_not_alive_count_change,
             .last_publication_handle = self.liveliness_last_handle,
         };
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
+        // why this can't be gated on this reader's own `listener_mask`.
         if (self.dispatchListener("on_liveliness_changed", DDS.LIVELINESS_CHANGED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
             self.liveliness_alive_count_change = 0;
             self.liveliness_not_alive_count_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
+            self.mu.unlock();
         }
     }
 
@@ -1910,18 +1937,25 @@ pub const DataReaderImpl = struct {
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        self.mu.lock();
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.REQUESTED_DEADLINE_MISSED_STATUS;
-        if (self.status_cond) |sc| sc.notifyWakeup();
-        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
-        // why this can't be gated on this reader's own `listener_mask`.
+        // Snapshot while still locked -- see notifySubscriptionMatched's
+        // matching comment (same bug, same fix, confirmed via TSan). This
+        // function previously took no lock at all.
         var status = DDS.RequestedDeadlineMissedStatus{};
         status.total_count = self.deadline_missed_total;
         status.total_count_change = self.deadline_missed_total_change;
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
+        // why this can't be gated on this reader's own `listener_mask`.
         if (self.dispatchListener("on_requested_deadline_missed", DDS.REQUESTED_DEADLINE_MISSED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.REQUESTED_DEADLINE_MISSED_STATUS;
+            self.mu.unlock();
         }
     }
 
@@ -2100,7 +2134,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetStatusChanges(ctx: *anyopaque) DDS.StatusMask {
-        return cast(ctx).status_changes;
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.status_changes;
     }
 
     fn vtGetHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
@@ -2367,6 +2404,8 @@ pub const DataReaderImpl = struct {
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.RequestedDeadlineMissedStatus) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
         status.* = .{
             .total_count = self.deadline_missed_total,
             .total_count_change = self.deadline_missed_total_change,
@@ -2381,7 +2420,7 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         defer self.mu.unlock();
         status.* = .{
-            .total_count = self.incompat_total,
+            .total_count = self.incompat_total.load(.monotonic),
             .total_count_change = self.incompat_total_change,
             .last_policy_id = self.incompat_last_policy,
         };
@@ -2490,7 +2529,10 @@ pub const DataReaderImpl = struct {
     // ── status helper for StatusConditionImpl ─────────────────────────────────
 
     fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
-        return cast(entity_ptr).status_changes;
+        const self = cast(entity_ptr);
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.status_changes;
     }
 
     fn cast(ctx: *anyopaque) *Self {

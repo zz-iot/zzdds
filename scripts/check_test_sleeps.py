@@ -35,7 +35,15 @@ ALLOWLIST = {
     # background timer thread: needs the real timer thread to notice a real
     # DEADLINE expiry (ManualClock only ever advances from the calling test
     # thread, so it can't reach this path), polled with a bounded timeout.
-    "test/dcps/participant_vtable_test.zig": (1, "timer-thread self-delete polling"),
+    # Second sleep in the same test: a fixed post-completion delay giving
+    # the detached timer thread (see deinit()'s self-reentrant/detach path)
+    # real time to finish its own deferred alloc.destroy() before this test
+    # function returns -- without it, that still-in-flight background
+    # thread activity can race the next test (or this file's own final leak
+    # check) on testing.allocator's shared state. See that sleep's own
+    # comment for the full story (confirmed via repeated local Valgrind
+    # reproduction, not just theory).
+    "test/dcps/participant_vtable_test.zig": (2, "timer-thread self-delete polling + post-detach settle"),
     # Concurrent wait()-vs-attach/delete-entity/detach cycling test: a real
     # (if small) backoff, not a pure busy-spin, so its worker thread doesn't
     # hammer ws.mu at native CPU-bound frequency. Confirmed necessary, not

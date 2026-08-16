@@ -308,6 +308,20 @@ test "WaitSet: concurrent WaitSet deinit races GuardCondition deinit without use
     // callback was still on its way in. Loop many times to make the race
     // window likely to be hit at least once; DebugAllocator (testing.allocator)
     // catches the resulting use-after-free/double-free if the fix regresses.
+    //
+    // Update (this PR): this same test caught the *opposite*-direction half
+    // of the same race live in CI (a real segfault, not just a leak) --
+    // WaitSetImpl.reallyDeinit()'s own loop calling into a GuardCondition
+    // that was concurrently freeing itself, since GuardConditionImpl had no
+    // protection symmetric to WaitSetImpl's own quiesce guard. Fixed by
+    // giving GuardConditionImpl its own `quiesce: EntityQuiesce` field and
+    // having WaitSetImpl.unregisterFromCondition's GuardCondition branch
+    // acquireIfAlive()/release() around gc.wakeups.unregister() -- see both
+    // types' doc comments. 500 local iterations were never enough to
+    // reproduce this specific direction (confirmed: many repeated local
+    // runs, thousands of iterations total, never crashed before this fix
+    // either) -- it took real CI timing to surface it, which is worth
+    // remembering next time this test passes locally but CI disagrees.
     var i: usize = 0;
     while (i < 500) : (i += 1) {
         const gc = try zzdds.dcps.GuardConditionImpl.init(alloc);

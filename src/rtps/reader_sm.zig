@@ -363,6 +363,7 @@ pub const StatefulReader = struct {
             outer.value_ptr.deinit(self.alloc);
         }
         self.pending_unmatched_reassembly.deinit(self.alloc);
+        self.mu.deinit();
         self.alloc.destroy(self);
     }
 
@@ -437,7 +438,7 @@ pub const StatefulReader = struct {
         // BEST_EFFORT writers (no periodic heartbeats per §8.4.15) this is the only
         // trigger that compensates for the race between writer-side replay and
         // reader-side proxy setup.
-        self.sendAckNackLocked(new_wp, 0, false);
+        self.sendAckNackUnlocked(new_wp, 0, false);
     }
 
     pub fn removeMatchedWriter(self: *Self, guid: Guid) void {
@@ -1040,6 +1041,61 @@ pub const StatefulReader = struct {
         );
         for (locs) |loc| {
             writer_sm.sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
+                error.UnsupportedLocatorKind => {},
+                else => log.rtps.warn("StatefulReader.sendAckNack: {}", .{err}),
+            };
+        }
+    }
+
+    /// Like sendAckNackLocked, but for callers where it is the last thing
+    /// done before returning (currently just addMatchedWriter): releases
+    /// self.mu before touching the transport, then reacquires it so the
+    /// caller's own `defer self.mu.unlock()` still balances correctly.
+    ///
+    /// Why: MemoryTransport (used by IntraProcessDelivery, zzdds's own DCPS
+    /// conformance-testing harness) delivers synchronously and can reenter
+    /// the matched writer's own locked code (StatefulWriter.handleAckNack)
+    /// from inside this call -- which, combined with the writer's own
+    /// writer.mu -> reader.mu path (write() -> sendChangeToAllLocked), is a
+    /// genuine reader.mu <-> writer.mu lock-order cycle (confirmed via
+    /// TSan). Not applied to sendAckNackLocked itself or its other caller
+    /// (handleHeartbeat, which loops over self.writer_proxies.items and
+    /// would need the whole list snapshotted first to release the lock
+    /// safely there too -- out of scope for this fix).
+    fn sendAckNackUnlocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber, final: bool) void {
+        const locs = wp.effectiveLocators();
+        if (locs.len == 0) return;
+        wp.ack_count += 1;
+        const sns = wp.missingSnSet(last_sn);
+        const count = wp.ack_count;
+        self.tracer.submit(.{ .send_acknack = .{
+            .src_prefix = self.guid.prefix,
+            .reader_eid = self.guid.entity_id,
+            .writer_eid = wp.guid.entity_id,
+            .base_sn = sns.base,
+            .bitmap = sns,
+            .count = count,
+            .final = final,
+        } });
+        // locs is a slice into wp.selected_locators -- copy the values out
+        // before releasing self.mu, since a concurrent mutation of wp's
+        // locators while unlocked would otherwise invalidate this slice.
+        var locs_buf: [8]Locator = undefined;
+        const n_locs = @min(locs.len, locs_buf.len);
+        @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
+        const self_guid = self.guid;
+        const wp_guid = wp.guid;
+        const transport = self.transport;
+
+        self.mu.unlock();
+        defer self.mu.lock();
+
+        var scratch: [SCRATCH_SIZE]u8 = undefined;
+        var b = MessageBuilder.init(&scratch, self_guid.prefix);
+        b.addInfoDst(wp_guid.prefix);
+        b.addAckNack(self_guid.entity_id, wp_guid.entity_id, sns, count, final);
+        for (locs_buf[0..n_locs]) |loc| {
+            writer_sm.sendIovecs(transport, &loc, b.iovecs()) catch |err| switch (err) {
                 error.UnsupportedLocatorKind => {},
                 else => log.rtps.warn("StatefulReader.sendAckNack: {}", .{err}),
             };

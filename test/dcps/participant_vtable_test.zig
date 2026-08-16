@@ -706,6 +706,15 @@ test "createParticipantWithConfig: config.qos seeds Publisher's default_datawrit
 // ── deinit() reentrancy from the timer thread ───────────────────────────────
 
 const SelfDeleteCtx = struct {
+    // Set (release) by the main thread only once every field below has been
+    // populated; the callback checks it (acquire) before touching any of
+    // them. Without this, there's no happens-before edge between the main
+    // thread's plain (non-atomic) `ctx.dw = dw;` etc. and the timer thread
+    // potentially reading them the instant the deadline fires -- a genuine
+    // data race per the memory model even though the real timing (deadline
+    // period 50ms vs. this setup taking microseconds) makes it practically
+    // unhittable (confirmed via TSan).
+    ready: std.atomic.Value(bool) = .init(false),
     fired: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     caller_thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
@@ -718,6 +727,7 @@ const SelfDeleteCtx = struct {
 
 fn selfDeleteOnDeadlineMissed(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
     const ctx: *SelfDeleteCtx = @ptrCast(@alignCast(ld));
+    if (!ctx.ready.load(.acquire)) return; // too early: ctx isn't fully populated yet
     if (ctx.fired.swap(true, .acq_rel)) return; // one shot: everything below is gone after the first firing
     ctx.caller_thread_id.store(std.Thread.getCurrentId(), .release);
     // Spec-legal, if unusual: reentrantly tear down the entire entity graph
@@ -779,6 +789,7 @@ test "deinit: reentrant delete_participant from a timer-driven listener does not
         .on_offered_deadline_missed = selfDeleteOnDeadlineMissed,
     }, DDS.OFFERED_DEADLINE_MISSED_STATUS);
     ctx.dw = dw;
+    ctx.ready.store(true, .release);
 
     const test_thread_id = std.Thread.getCurrentId();
     const deadline_ns = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
@@ -794,4 +805,26 @@ test "deinit: reentrant delete_participant from a timer-driven listener does not
     // same-thread synchronous call (which wouldn't hit self-join/self-free
     // at all).
     try testing.expect(ctx.caller_thread_id.load(.acquire) != test_thread_id);
+
+    // ctx.done is set by the listener callback itself, which runs *before*
+    // deinit()'s self-reentrant path detaches the timer thread -- the
+    // detached thread still has real work left after that point (unwinding
+    // back out through checkTimers()'s call chain, then timerThreadFn's own
+    // deferred `alloc.destroy(self)`), and detach() means this test has no
+    // way to join and wait for that to genuinely finish. Without this, the
+    // test function returns immediately once ctx.done flips, and the next
+    // test (or, since this is the last test in this file, the process-wide
+    // final leak check) can run concurrently with that still-in-flight
+    // alloc.destroy() -- a real, unsynchronized race on testing.allocator's
+    // *shared* internal state (used by every test in this binary), not a
+    // leak or use-after-free in zzdds itself. Confirmed via repeated local
+    // reproduction (both plain and, far more readily -- since it slows the
+    // detached thread specifically, widening the window -- under Valgrind):
+    // every single hit was the identical "possibly lost" pthread TLS block
+    // for *this* test's own timer thread, from allocate_dtv/pthread_create,
+    // never a real invalid access. This sleep is generous, not exact -- the
+    // remaining work after ctx.done (a handful of function returns, no I/O
+    // or further sleeps) normally finishes in well under a millisecond, so
+    // this is closer to belt-and-suspenders than a tight deadline.
+    time_mod.sleepNs(100 * std.time.ns_per_ms);
 }

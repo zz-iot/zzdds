@@ -242,6 +242,20 @@ pub const ProtocolWriter = struct {
         /// protocol-ready state transitions. Must be called before any reader
         /// proxies are added.
         set_protocol_ready_callback: *const fn (ctx: *anyopaque, cb: ProtocolReadyCallback) void,
+
+        /// Take a reference keeping this writer alive across a window where
+        /// the caller releases whatever lock ordinarily serializes it against
+        /// concurrent deinit() (e.g. participant.mu around an unlocked
+        /// add_matched_reader send) -- see util/entity_quiesce.zig. Returns
+        /// false if deinit() has already begun; the caller must then treat
+        /// this writer as gone rather than touching it further. Defaults to
+        /// an always-succeeds noop for implementations (built-in-topic noop
+        /// writers, test doubles) that are never deinit'd concurrently.
+        quiesce_acquire: *const fn (ctx: *anyopaque) bool = defaultQuiesceAcquire,
+
+        /// Pairs with a successful quiesce_acquire(). Defaults to a noop to
+        /// match quiesce_acquire's default.
+        quiesce_release: *const fn (ctx: *anyopaque) void = defaultQuiesceRelease,
     };
 
     pub fn write(
@@ -343,7 +357,21 @@ pub const ProtocolWriter = struct {
     pub fn setProtocolReadyCallback(self: ProtocolWriter, cb: ProtocolReadyCallback) void {
         self.vtable.set_protocol_ready_callback(self.ctx, cb);
     }
+
+    pub fn quiesceAcquire(self: ProtocolWriter) bool {
+        return self.vtable.quiesce_acquire(self.ctx);
+    }
+
+    pub fn quiesceRelease(self: ProtocolWriter) void {
+        self.vtable.quiesce_release(self.ctx);
+    }
 };
+
+fn defaultQuiesceAcquire(_: *anyopaque) bool {
+    return true;
+}
+
+fn defaultQuiesceRelease(_: *anyopaque) void {}
 
 /// Invoked by the protocol reader when a remote writer is matched or unmatched.
 /// Carries the same MatchedWriterInfo used to create the proxy; allows the
@@ -456,6 +484,20 @@ pub const ProtocolReader = struct {
 
         /// Destroy this reader and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
+
+        /// Take a reference keeping this reader alive across a window where
+        /// the caller releases whatever lock ordinarily serializes it against
+        /// concurrent deinit() (e.g. participant.mu around an unlocked
+        /// add_matched_writer send) -- see util/entity_quiesce.zig. Returns
+        /// false if deinit() has already begun; the caller must then treat
+        /// this reader as gone rather than touching it further. Defaults to
+        /// an always-succeeds noop for implementations (built-in-topic noop
+        /// readers, test doubles) that are never deinit'd concurrently.
+        quiesce_acquire: *const fn (ctx: *anyopaque) bool = defaultQuiesceAcquire,
+
+        /// Pairs with a successful quiesce_acquire(). Defaults to a noop to
+        /// match quiesce_acquire's default.
+        quiesce_release: *const fn (ctx: *anyopaque) void = defaultQuiesceRelease,
     };
 
     pub fn setDataCallback(self: ProtocolReader, cb: DataCallback) void {
@@ -557,5 +599,13 @@ pub const ProtocolReader = struct {
 
     pub fn deinit(self: ProtocolReader) void {
         self.vtable.deinit(self.ctx);
+    }
+
+    pub fn quiesceAcquire(self: ProtocolReader) bool {
+        return self.vtable.quiesce_acquire(self.ctx);
+    }
+
+    pub fn quiesceRelease(self: ProtocolReader) void {
+        self.vtable.quiesce_release(self.ctx);
     }
 };

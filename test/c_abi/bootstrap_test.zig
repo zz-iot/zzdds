@@ -13,6 +13,7 @@ const ZZDDS = zzdds.ZZDDS;
 
 const bootstrap = zzdds.c_abi.bootstrap;
 const extensions = zzdds.c_abi.extensions;
+const allocator_adapter = zzdds.c_abi.allocator_adapter;
 const zidl_rt = @import("zidl_rt");
 const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const MemoryTransport = zzdds.intraprocess.MemoryTransport;
@@ -204,22 +205,28 @@ const TrackingCtx = struct {
     free_calls: usize = 0,
 };
 
+// The actual std.mem.Allocator <-> ZidlAllocator forwarding logic lives in
+// the promoted src/c_abi/allocator_adapter.zig; these trampolines only add
+// the call counting this test needs, delegating everything else to it.
 fn trackAlloc(ctx: ?*anyopaque, len: usize, alignment: usize) callconv(.c) ?[*]u8 {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
     self.alloc_calls += 1;
-    return self.child.rawAlloc(len, std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    const inner = allocator_adapter.fromAllocator(&self.child);
+    return inner.alloc(inner.ctx, len, alignment);
 }
 
 fn trackResize(ctx: ?*anyopaque, ptr: ?[*]u8, old_len: usize, new_len: usize, alignment: usize) callconv(.c) bool {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
     self.resize_calls += 1;
-    return self.child.rawResize(ptr.?[0..old_len], std.mem.Alignment.fromByteUnits(alignment), new_len, @returnAddress());
+    const inner = allocator_adapter.fromAllocator(&self.child);
+    return inner.resize(inner.ctx, ptr, old_len, new_len, alignment);
 }
 
 fn trackFree(ctx: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callconv(.c) void {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
     self.free_calls += 1;
-    self.child.rawFree(ptr.?[0..len], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    const inner = allocator_adapter.fromAllocator(&self.child);
+    inner.free(inner.ctx, ptr, len, alignment);
 }
 
 test "support factory: zzdds_create_factory_with_allocator(NULL) matches zzdds_create_factory" {
@@ -632,6 +639,64 @@ test "bootstrap: take_n_raw returns all samples and return_raw_samples frees" {
     const n2 = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr2);
     try testing.expectEqual(@as(c_int, 0), n2);
     try testing.expect(arr2.samples == null);
+}
+
+test "bootstrap: return_raw_samples frees via the array's own allocator, not whatever reader handle is passed" {
+    // Regression test for a real bug (Greptile PR #64 review): an earlier
+    // version of zzdds_return_raw_samples derived the freeing allocator by
+    // unboxing the `reader` parameter, which is unsound whenever that
+    // handle doesn't match (or no longer refers to a live) reader. Passing
+    // makeNullHandle() here exercises exactly that: if the free path still
+    // depended on `reader`, this would hit the isNullHandle/c_allocator
+    // fallback and free testing.allocator-backed memory with the wrong
+    // allocator -- testing.allocator's own leak/double-free detection would
+    // catch that. The array must instead free correctly using the
+    // allocator captured in CRawSampleArray itself at take time.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+
+    var arr: bootstrap.CRawSampleArray = undefined;
+    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr);
+    try testing.expectEqual(@as(c_int, 1), n);
+
+    bootstrap.zzdds_return_raw_samples(makeNullHandle(), &arr);
+    try testing.expectEqual(@as(usize, 0), arr.count);
+    try testing.expect(arr.samples == null);
+}
+
+test "bootstrap: return_raw_samples falls back to c_allocator when the array carries no injected allocator" {
+    // Exercises the plain-c_allocator fallback branch in
+    // zzdds_return_raw_samples (arr._alloc_ctx == null) -- the path for an
+    // array that was never populated via zzdds_take_n_raw/zzdds_read_n_raw's
+    // allocator-injection machinery (both of those always set _alloc_ctx on
+    // success; this simulates a caller building a CRawSampleArray by hand).
+    // Backed by std.heap.c_allocator to match the allocator this fallback
+    // actually frees with -- a mismatched allocator here would abort/crash.
+    const c_alloc = std.heap.c_allocator;
+    const data = try c_alloc.alloc(u8, PAYLOAD.len);
+    @memcpy(data, &PAYLOAD);
+    const samples = try c_alloc.alloc(bootstrap.CRawSample, 1);
+    samples[0] = .{
+        .data = data.ptr,
+        .data_len = data.len,
+        .info = .{ .valid_data = true, .instance_state = 0, .instance_handle = DDS.HANDLE_NIL },
+    };
+
+    var arr: bootstrap.CRawSampleArray = .{
+        .samples = samples.ptr,
+        .count = 1,
+        ._alloc_capacity = 1,
+        ._alloc_ctx = null,
+        ._alloc_vtable = null,
+    };
+
+    bootstrap.zzdds_return_raw_samples(makeNullHandle(), &arr);
+    try testing.expectEqual(@as(usize, 0), arr.count);
+    try testing.expect(arr.samples == null);
 }
 
 test "bootstrap: take_n_raw returns 0 when queue is empty" {

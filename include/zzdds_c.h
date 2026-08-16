@@ -44,10 +44,20 @@ typedef struct zzdds_raw_sample {
     zzdds_sample_info info;
 } zzdds_raw_sample;
 
+/* NOTE (pre-1.0 ABI): this struct's layout has grown before (adding the
+ * _alloc_* fields below) and may grow again -- zzdds has no tagged 1.0
+ * release and no known external consumers yet, so there is no compiled
+ * caller anywhere linking an older layout of this struct to corrupt.
+ * Layout stability is a 1.0 commitment, not a pre-1.0 one: rebuild against
+ * the header you're linking. Once zzdds reaches 1.0 this struct's shape
+ * must be frozen (or ownership tracked out-of-band instead of inline, e.g.
+ * a pointer-keyed side table) rather than grown again in place. */
 typedef struct zzdds_raw_sample_array {
     zzdds_raw_sample *samples;
     size_t count;
-    size_t _alloc_capacity;
+    size_t _alloc_capacity;     /* internal; do not modify */
+    void *_alloc_ctx;           /* internal; do not modify */
+    const void *_alloc_vtable;  /* internal; do not modify */
 } zzdds_raw_sample_array;
 
 typedef int (*zzdds_compute_key_hash_fn)(const uint8_t *payload, size_t len, uint8_t hash_out[16]);

@@ -193,7 +193,7 @@ pub export fn zzdds_take_loaned_raw(
     if (nil.isNil(r)) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
     const s = impl.takeRaw() orelse return DDS.RETCODE_NO_DATA;
-    const owner = std.heap.c_allocator.create(LoanedRawSample) catch {
+    const owner = impl.alloc.create(LoanedRawSample) catch {
         std.log.err("zzdds_take_loaned_raw: sample permanently lost — OOM allocating loan handle", .{});
         impl.alloc.free(s.data);
         return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -220,7 +220,8 @@ pub export fn zzdds_return_loaned_raw(
     const opaque_owner = loan.owner orelse return;
     const owner: *LoanedRawSample = @ptrCast(@alignCast(opaque_owner));
     owner.alloc.free(owner.data);
-    std.heap.c_allocator.destroy(owner);
+    const box_alloc = owner.alloc;
+    box_alloc.destroy(owner);
     loan.* = .{
         .data = null,
         .data_len = 0,
@@ -410,10 +411,31 @@ pub const CRawSample = extern struct {
     info: CSampleInfo,
 };
 
+/// NOTE (pre-1.0 ABI): this struct's layout has grown before (adding the
+/// `_alloc_*` fields below) and may grow again -- zzdds has no tagged 1.0
+/// release and no known external consumers yet, so there is no compiled
+/// caller anywhere linking an older layout of this struct to corrupt.
+/// Layout stability is a 1.0 commitment, not a pre-1.0 one: rebuild against
+/// the header you're linking. Once zzdds reaches 1.0 this struct's shape
+/// must be frozen (or ownership tracked out-of-band instead of inline, e.g.
+/// a pointer-keyed side table) rather than grown again in place.
 pub const CRawSampleArray = extern struct {
     samples: ?[*]CRawSample,
     count: usize,
     _alloc_capacity: usize, // internal; do not modify
+    // Self-describing ownership: the allocator this array (and each
+    // sample's .data) was actually built with, captured at build time --
+    // NOT re-derived from whatever DDS_DataReader handle is later passed to
+    // zzdds_return_raw_samples. The array can otherwise outlive the reader
+    // that produced it (deleted before the loan is returned) or be handed
+    // to the wrong reader by caller error; either way, deriving the
+    // freeing allocator from that handle risks an allocator mismatch or a
+    // use-after-free read of a destroyed reader's `impl.alloc` field
+    // (confirmed real: Greptile PR #64 review). Mirrors zzdds_loaned_sample
+    // (CLoanedSample)'s existing `owner` field, which solves the same
+    // problem for the single-sample loan path.
+    _alloc_ctx: ?*anyopaque = null, // internal; do not modify
+    _alloc_vtable: ?*const std.mem.Allocator.VTable = null, // internal; do not modify
 };
 
 fn nRawImpl(
@@ -431,7 +453,7 @@ fn nRawImpl(
     const r = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (nil.isNil(r)) return -1;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(r.ptr));
-    const alloc = std.heap.c_allocator;
+    const alloc = impl.alloc;
 
     // For bounded destructive takes, pre-allocate the output struct array BEFORE
     // removing samples from the queue.  Without this, an OOM at the alloc step
@@ -515,7 +537,7 @@ fn nRawImpl(
             },
         };
     }
-    out.* = .{ .samples = arr.ptr, .count = tmp.items.len, ._alloc_capacity = arr.len };
+    out.* = .{ .samples = arr.ptr, .count = tmp.items.len, ._alloc_capacity = arr.len, ._alloc_ctx = alloc.ptr, ._alloc_vtable = alloc.vtable };
     return @intCast(tmp.items.len);
 }
 
@@ -580,30 +602,46 @@ pub export fn zzdds_read_n_instance_raw(
 }
 
 /// Free a CRawSampleArray returned by zzdds_take_n_raw or zzdds_read_n_raw.
+///
+/// `reader` is accepted (unused) only for API symmetry with the take
+/// functions -- freeing derives its allocator entirely from `arr` itself
+/// (see CRawSampleArray's `_alloc_ctx`/`_alloc_vtable` doc comment), not
+/// from `reader`. `reader` is NOT a reliable source for this: the array can
+/// outlive the reader that produced it (deleted before the loan is
+/// returned), or the caller can simply pass the wrong reader handle --
+/// either way, deriving the freeing allocator from it risked an allocator
+/// mismatch or a use-after-free read of a destroyed reader's `impl.alloc`
+/// (an earlier version of this function did exactly that; see Greptile PR
+/// #64 review).
 pub export fn zzdds_return_raw_samples(
     reader: *anyopaque,
     arr: *CRawSampleArray,
 ) callconv(.c) void {
     _ = reader;
     if (arr.samples) |samples| {
-        const alloc = std.heap.c_allocator;
+        const alloc: std.mem.Allocator = if (arr._alloc_ctx) |ctx|
+            .{ .ptr = ctx, .vtable = arr._alloc_vtable.? }
+        else
+            std.heap.c_allocator;
         for (samples[0..arr.count]) |s| {
             if (s.data) |d| alloc.free(d[0..s.data_len]);
         }
         alloc.free(samples[0..arr._alloc_capacity]);
     }
-    arr.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
+    arr.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0, ._alloc_ctx = null, ._alloc_vtable = null };
 }
 
 /// Copies each TakenSample in `items` into a freshly heap-allocated CRawSample
-/// array (std.heap.c_allocator, matching zzdds_return_raw_samples' own free)
-/// and populates `out`. Returns the count, or -1 on OOM -- unlike
-/// zzdds_take_n_raw's own nRawImpl, this does not pre-allocate to protect
-/// already-*taken* (destructive) samples from an OOM during the copy step:
-/// these condition/instance-scoped batches are expected to be small, and
-/// duplicating that optimization here for every new *_w_condition/*_instance
-/// export was judged not worth the added surface area.
+/// array using `alloc` (the caller's owning reader's impl.alloc, matching
+/// zzdds_return_raw_samples' own free) and populates `out`. Returns the
+/// count, or -1 on OOM -- unlike zzdds_take_n_raw's own nRawImpl, this does
+/// not pre-allocate to protect already-*taken* (destructive) samples from an
+/// OOM during the copy step: these condition/instance-scoped batches are
+/// expected to be small, and duplicating that optimization here for every
+/// new *_w_condition/*_instance export was judged not worth the added
+/// surface area.
 fn packageTakenSamples(
+    alloc: std.mem.Allocator,
     items: []const @import("../dcps/reader.zig").TakenSample,
     out: *CRawSampleArray,
 ) c_int {
@@ -611,7 +649,6 @@ fn packageTakenSamples(
         out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
         return 0;
     }
-    const alloc = std.heap.c_allocator;
     const arr = alloc.alloc(CRawSample, items.len) catch {
         out.* = .{ .samples = null, .count = 0, ._alloc_capacity = 0 };
         return -1;
@@ -633,7 +670,7 @@ fn packageTakenSamples(
             },
         };
     }
-    out.* = .{ .samples = arr.ptr, .count = items.len, ._alloc_capacity = arr.len };
+    out.* = .{ .samples = arr.ptr, .count = items.len, ._alloc_capacity = arr.len, ._alloc_ctx = alloc.ptr, ._alloc_vtable = alloc.vtable };
     return @intCast(items.len);
 }
 
@@ -686,7 +723,7 @@ fn wConditionRawImpl(
     } else {
         impl.readRaw(&tmp, rc_impl.sample_state_mask, rc_impl.view_state_mask, rc_impl.instance_state_mask, max, null, rc_impl.owner_qc) catch return -1;
     }
-    return packageTakenSamples(tmp.items, out);
+    return packageTakenSamples(impl.alloc, tmp.items, out);
 }
 
 /// Batch take restricted to a `DDS.ReadCondition` (or a `DDS.QueryCondition`
@@ -738,7 +775,7 @@ fn nextInstanceWConditionRawImpl(
     } else {
         impl.readNextInstanceFiltered(&tmp, prev, rc_impl.sample_state_mask, rc_impl.view_state_mask, rc_impl.instance_state_mask, max, rc_impl.owner_qc) catch return -1;
     }
-    return packageTakenSamples(tmp.items, out);
+    return packageTakenSamples(impl.alloc, tmp.items, out);
 }
 
 /// Batch take restricted to a `DDS.ReadCondition` AND scoped to the "next

@@ -41,7 +41,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--only",
-        choices=("format", "sleeps", "debug", "feature-minimal", "release-safe", "fuzz", "tsan"),
+        choices=(
+            "format",
+            "sleeps",
+            "debug",
+            "feature-minimal",
+            "release-safe",
+            "fuzz",
+            "tsan-self-check",
+            "tsan",
+        ),
         action="append",
         help="Run only the named step. May be passed more than once.",
     )
@@ -58,6 +67,14 @@ def steps(zig: str, include_tsan: bool) -> list[Step]:
         Step("fuzz", [zig, "build", "test-fuzz"]),
     ]
     if include_tsan:
+        # Runs first: a fast fail-fast regression guard proving TSan can
+        # still catch a real data race (see build.zig's
+        # test-tsan-self-check step and test/tsan_self_check.zig) before
+        # sinking time into the full, much slower tsan suite below. If TSan
+        # instrumentation ever silently breaks again (the exact failure
+        # mode that motivated adding this), this step fails loudly instead
+        # of the "tsan" step below quietly passing with zero real coverage.
+        all_steps.append(Step("tsan-self-check", [zig, "build", "test-tsan-self-check"]))
         all_steps.append(Step("tsan", [zig, "build", "test-tsan"]))
     return all_steps
 
@@ -83,8 +100,8 @@ def main() -> int:
         missing = wanted - {step.name for step in selected}
         if missing:
             hint = ""
-            if missing == {"tsan"}:
-                hint = " (pass --include-tsan to enable the tsan step)"
+            if missing <= {"tsan", "tsan-self-check"}:
+                hint = " (pass --include-tsan to enable the tsan/tsan-self-check steps)"
             print(
                 "Requested step(s) require additional flags: "
                 + ", ".join(sorted(missing))

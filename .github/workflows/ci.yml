@@ -51,7 +51,7 @@ env:
   # Bump deliberately (its own small PR) when zzdds-examples gains something
   # this job should pick up. Override via the zzdds_examples_ref
   # workflow_dispatch input to test against a different commit/branch/tag.
-  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || '3338e67af4e8d46fa8569ceeafee2731f28978c2' }}
+  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || '9a4d448c0cfa17607082facaf3c40a73992cb326' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -69,6 +69,9 @@ jobs:
 
       - name: Run deterministic matrix
         run: python3 scripts/run_deterministic_matrix.py --include-tsan
+
+      - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
+        run: zig build test -Ddebug-allocator=true
 
       - name: C/C++ binding smoke tests
         run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true
@@ -231,10 +234,13 @@ jobs:
   # comment claims is done.
 
   examples-tsan:
-    name: zzdds-examples (WaitSet, TSAN)
+    name: zzdds-examples (TSAN)
     needs: test-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Was 20 for 3 examples (zig/c/cpp waitset); now 8 examples (+shape,
+    # +custom-allocator in both C and C++) -- more builds and more runs,
+    # plus custom-allocator's own up-to-~40s-per-side internal poll timeout.
+    timeout-minutes: 35
 
     steps:
       - name: Check out zzdds
@@ -278,6 +284,26 @@ jobs:
         with:
           version: "0.16.0"
 
+      # ubuntu-latest's default ASLR entropy (vm.mmap_rnd_bits) is higher
+      # than TSan's fixed shadow-memory layout reliably tolerates -- an
+      # intermittent, ASLR-placement-dependent failure during the TSan
+      # runtime's own startup, before it can print anything. Looks identical
+      # to a real crash (instant SIGSEGV, no TSan report at all) but is not
+      # one: confirmed via a CI-side gdb backtrace (this exact job, since
+      # removed once its purpose was served) showing the crash deep inside
+      # the TSan runtime's own __cxa_atexit interceptor, on the main thread,
+      # before any application code runs -- and confirmed NOT reproducible
+      # locally across dozens of runs with byte-identical binaries/config.
+      # This lower-entropy sysctl alone was tried first and did NOT resolve
+      # it (still crashed identically on the next CI run); the actual
+      # per-process fix is disabling ASLR outright via `setarch -R`, applied
+      # to every TSAN pub/sub pair in run_tsan_pubsub_pair.py (zzdds-examples
+      # repo) -- kept here too since it's a legitimate, complementary
+      # belt-and-suspenders measure for anything setarch's wrapping doesn't
+      # cover (e.g. cmake's own build-time compiler probes).
+      - name: Reduce ASLR entropy for TSan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
       - name: Build zzdds (C + C++ bindings, ThreadSanitizer)
         working-directory: zzdds
         run: zig build -Dc-binding=true -Dcpp-binding=true -Dsanitize-thread=true install
@@ -286,9 +312,54 @@ jobs:
         working-directory: zzdds-examples/zig/waitset
         run: zig build -Dsanitize-thread=true
 
+      # Two distinct bugs were found and fixed here, both confirmed via
+      # standalone local repro (not just code review):
+      #
+      # 1. (All languages, any compiler) cpp/waitset and c/waitset both died
+      #    instantly on startup with no TSan report at all, deep inside the
+      #    TSan runtime's own __cxa_atexit interceptor. Cause: two independent
+      #    copies of the TSan runtime in one process -- one statically
+      #    embedded in libzzdds.so by Zig's own final link of that shared
+      #    library, another statically embedded in the example executable by
+      #    ITS OWN final link. Fixed at the CMakeLists.txt level (see
+      #    cpp/waitset/CMakeLists.txt's WAITSET_SANITIZE_THREAD option):
+      #    compile the example's own code with -fsanitize=thread as before,
+      #    but do NOT pass -fsanitize=thread to the final link, so only
+      #    libzzdds.so's runtime is ever loaded into the process -- the
+      #    example's own __tsan_*/interceptor references resolve against
+      #    that one runtime at load time. Confirmed both non-crashing and
+      #    still catching real races, including races entirely within
+      #    example code (not just inside zzdds), so this keeps full
+      #    instrumentation coverage. Sufficient by itself for the C examples.
+      #
+      # 2. (C++ examples specifically, only with the runner's default GCC/
+      #    GNU-ld toolchain) even after fixing (1), cpp/waitset still
+      #    crashed -- this time inside TSan's own SlotLock, called via its
+      #    pthread_once interceptor, called from libstdc++.so.6's OWN
+      #    constructor (std::ios_base_library_init, run by the dynamic
+      #    linker during process startup). Cause: libstdc++.so.6 is a
+      #    separate DT_NEEDED shared object with no ordering relationship to
+      #    libzzdds.so, so the dynamic linker can (and does, under GNU ld's
+      #    default link order) run libstdc++'s constructor -- which calls an
+      #    intercepted pthread_once -- before libzzdds.so's own constructor
+      #    has initialized TSan's per-thread state, crashing on a null/
+      #    not-yet-initialized ThreadState. `zig c++` sidesteps this
+      #    entirely by statically linking its C++ runtime (confirmed via
+      #    `ldd`: no libstdc++.so.6 dependency at all in the working build),
+      #    so there's no second, independently-ordered constructor to race
+      #    against. C examples never link libstdc++ and are unaffected --
+      #    confirmed c/waitset builds and runs clean with the plain runner
+      #    default compiler, no wrapper needed.
+      - name: Set up a zig c++ wrapper for the C++ TSan builds
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/zig-cc-wrappers"
+          printf '#!/usr/bin/env bash\nexec zig c++ "$@"\n' > "$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx"
+          chmod +x "$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx"
+
       - name: Build cpp/waitset (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DWAITSET_SANITIZE_THREAD=ON \
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DWAITSET_SANITIZE_THREAD=ON \
             -B zzdds-examples/cpp/waitset/build -S zzdds-examples/cpp/waitset
           cmake --build zzdds-examples/cpp/waitset/build
 
@@ -298,77 +369,140 @@ jobs:
             -B zzdds-examples/c/waitset/build -S zzdds-examples/c/waitset
           cmake --build zzdds-examples/c/waitset/build
 
-      # Each step backgrounds the subscriber, runs the publisher with an
-      # explicit timeout, then waits on the subscriber's own PID (not a bare
-      # `wait`, which would only report the last-started job) so both exit
-      # codes are actually checked -- a wire/QoS mismatch or a hang can still
-      # exit 0 on one side, so the "received all 10 samples" marker is
-      # checked too, matching zzdds-examples' own
-      # waitset_cross_binding_smoke_test.py.
+      - name: Build zig/shape (ThreadSanitizer)
+        working-directory: zzdds-examples/zig/shape
+        run: zig build -Dsanitize-thread=true
+
+      - name: Build cpp/shape (ThreadSanitizer)
+        run: |
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DSHAPE_SANITIZE_THREAD=ON \
+            -B zzdds-examples/cpp/shape/build -S zzdds-examples/cpp/shape
+          cmake --build zzdds-examples/cpp/shape/build
+
+      - name: Build c/shape (ThreadSanitizer)
+        run: |
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DSHAPE_SANITIZE_THREAD=ON \
+            -B zzdds-examples/c/shape/build -S zzdds-examples/c/shape
+          cmake --build zzdds-examples/c/shape/build
+
+      - name: Build cpp/custom-allocator (ThreadSanitizer)
+        run: |
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
+            -B zzdds-examples/cpp/custom-allocator/build -S zzdds-examples/cpp/custom-allocator
+          cmake --build zzdds-examples/cpp/custom-allocator/build
+
+      - name: Build c/custom-allocator (ThreadSanitizer)
+        run: |
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
+            -B zzdds-examples/c/custom-allocator/build -S zzdds-examples/c/custom-allocator
+          cmake --build zzdds-examples/c/custom-allocator/build
+
+      # Shared run/verify logic (background subscriber, foreground publisher
+      # with a timeout, check both exit codes AND a completion marker in
+      # each log -- a wire/QoS mismatch or a hang can still exit 0 on one
+      # side) lives in zzdds-examples/scripts/run_tsan_pubsub_pair.py, not
+      # copy-pasted per step: this job went from 3 examples to 8, and the
+      # hand-rolled ~15-20-line bash block per step doesn't scale past the
+      # original 3. Python, not bash, per that script's own docstring --
+      # this repo already hit a 40+ minute hang from a similar
+      # background/foreground pattern in bash.
       - name: Run zig/waitset under TSAN
         env:
           TSAN_OPTIONS: abort_on_error=1
         run: |
-          set -uo pipefail
-          BIN=zzdds-examples/zig/waitset/zig-out/bin
-          "$BIN"/waitset_sub -d 30 > /tmp/zig-ws-sub.log 2>&1 &
-          SUB_PID=$!
-          sleep 1
-          timeout 40 "$BIN"/waitset_pub -d 30 > /tmp/zig-ws-pub.log 2>&1
-          PUB_RC=$?
-          wait "$SUB_PID"
-          SUB_RC=$?
-          cat /tmp/zig-ws-pub.log /tmp/zig-ws-sub.log
-          if [ "$PUB_RC" -ne 0 ] || [ "$SUB_RC" -ne 0 ]; then
-            echo "FAIL: zig/waitset pub_rc=$PUB_RC sub_rc=$SUB_RC"
-            exit 1
-          fi
-          grep -q "Publisher: done." /tmp/zig-ws-pub.log
-          grep -q "Subscriber: received all 10 samples." /tmp/zig-ws-sub.log
+          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "zzdds-examples/zig/waitset/zig-out/bin/waitset_sub -d 30" \
+            --pub-cmd "zzdds-examples/zig/waitset/zig-out/bin/waitset_pub -d 30" \
+            --sub-log /tmp/zig-ws-sub.log --pub-log /tmp/zig-ws-pub.log \
+            --sub-marker "Subscriber: received all 10 samples." \
+            --pub-marker "Publisher: done." --timeout 40
 
       - name: Run cpp/waitset under TSAN
         env:
           TSAN_OPTIONS: abort_on_error=1
-          LD_LIBRARY_PATH: ${{ github.workspace }}/zzdds/zig-out/lib
         run: |
-          set -uo pipefail
-          BIN=zzdds-examples/cpp/waitset/build
-          "$BIN"/waitset_sub -d 31 > /tmp/cpp-ws-sub.log 2>&1 &
-          SUB_PID=$!
-          sleep 1
-          timeout 40 "$BIN"/waitset_pub -d 31 > /tmp/cpp-ws-pub.log 2>&1
-          PUB_RC=$?
-          wait "$SUB_PID"
-          SUB_RC=$?
-          cat /tmp/cpp-ws-pub.log /tmp/cpp-ws-sub.log
-          if [ "$PUB_RC" -ne 0 ] || [ "$SUB_RC" -ne 0 ]; then
-            echo "FAIL: cpp/waitset pub_rc=$PUB_RC sub_rc=$SUB_RC"
-            exit 1
-          fi
-          grep -q "Publisher: done." /tmp/cpp-ws-pub.log
-          grep -q "Subscriber: received all 10 samples." /tmp/cpp-ws-sub.log
+          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "zzdds-examples/cpp/waitset/build/waitset_sub -d 31" \
+            --pub-cmd "zzdds-examples/cpp/waitset/build/waitset_pub -d 31" \
+            --sub-log /tmp/cpp-ws-sub.log --pub-log /tmp/cpp-ws-pub.log \
+            --sub-marker "Subscriber: received all 10 samples." \
+            --pub-marker "Publisher: done." --timeout 40 \
+            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
 
       - name: Run c/waitset under TSAN
         env:
           TSAN_OPTIONS: abort_on_error=1
-          LD_LIBRARY_PATH: ${{ github.workspace }}/zzdds/zig-out/lib
         run: |
-          set -uo pipefail
-          BIN=zzdds-examples/c/waitset/build
-          "$BIN"/waitset_sub -d 32 > /tmp/c-ws-sub.log 2>&1 &
-          SUB_PID=$!
-          sleep 1
-          timeout 40 "$BIN"/waitset_pub -d 32 > /tmp/c-ws-pub.log 2>&1
-          PUB_RC=$?
-          wait "$SUB_PID"
-          SUB_RC=$?
-          cat /tmp/c-ws-pub.log /tmp/c-ws-sub.log
-          if [ "$PUB_RC" -ne 0 ] || [ "$SUB_RC" -ne 0 ]; then
-            echo "FAIL: c/waitset pub_rc=$PUB_RC sub_rc=$SUB_RC"
-            exit 1
-          fi
-          grep -q "Publisher: done." /tmp/c-ws-pub.log
-          grep -q "Subscriber: received all 10 samples." /tmp/c-ws-sub.log
+          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "zzdds-examples/c/waitset/build/waitset_sub -d 32" \
+            --pub-cmd "zzdds-examples/c/waitset/build/waitset_pub -d 32" \
+            --sub-log /tmp/c-ws-sub.log --pub-log /tmp/c-ws-pub.log \
+            --sub-marker "Subscriber: received all 10 samples." \
+            --pub-marker "Publisher: done." --timeout 40 \
+            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+
+      # shape_main exits on its own after -i iterations (no external
+      # duration/timeout needed the way waitset's -d flag provides); markers
+      # mirror zzdds-examples' own shape_cross_binding_smoke_test.py (a real
+      # match + a real received-sample line, not just a clean exit).
+      - name: Run zig/shape under TSAN
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+        run: |
+          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "zzdds-examples/zig/shape/zig-out/bin/shape_main -S -i 8 --read-period 300" \
+            --pub-cmd "zzdds-examples/zig/shape/zig-out/bin/shape_main -P -w -i 8 --write-period 300" \
+            --sub-log /tmp/zig-shape-sub.log --pub-log /tmp/zig-shape-pub.log \
+            --sub-marker "Square" --pub-marker "on_publication_matched()" --timeout 30
+
+      - name: Run cpp/shape under TSAN
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+        run: |
+          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "zzdds-examples/cpp/shape/build/shape_main -S -i 8 --read-period 300" \
+            --pub-cmd "zzdds-examples/cpp/shape/build/shape_main -P -w -i 8 --write-period 300" \
+            --sub-log /tmp/cpp-shape-sub.log --pub-log /tmp/cpp-shape-pub.log \
+            --sub-marker "Square" --pub-marker "on_publication_matched()" --timeout 30 \
+            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+
+      - name: Run c/shape under TSAN
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+        run: |
+          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "zzdds-examples/c/shape/build/shape_main -S -i 8 --read-period 300" \
+            --pub-cmd "zzdds-examples/c/shape/build/shape_main -P -w -i 8 --write-period 300" \
+            --sub-log /tmp/c-shape-sub.log --pub-log /tmp/c-shape-pub.log \
+            --sub-marker "Square" --pub-marker "on_publication_matched()" --timeout 30 \
+            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+
+      # custom-allocator's publisher/subscriber take no CLI flags (hardcoded
+      # sample/log counts and an internal poll-timeout of their own -- up to
+      # ~40s worst case under TSan's slowdown, hence the generous --timeout);
+      # markers match their own literal "done" print lines. Run from inside
+      # the build dir since these binaries look for ./zzdds.toml relative to cwd.
+      - name: Run cpp/custom-allocator under TSAN
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+        working-directory: zzdds-examples/cpp/custom-allocator/build
+        run: |
+          python3 "$GITHUB_WORKSPACE/zzdds-examples/scripts/run_tsan_pubsub_pair.py" \
+            --sub-cmd "./subscriber" --pub-cmd "./publisher" \
+            --sub-log /tmp/cpp-ca-sub.log --pub-log /tmp/cpp-ca-pub.log \
+            --sub-marker "subscriber: done" --pub-marker "publisher: done" --timeout 60 \
+            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+
+      - name: Run c/custom-allocator under TSAN
+        env:
+          TSAN_OPTIONS: abort_on_error=1
+        working-directory: zzdds-examples/c/custom-allocator/build
+        run: |
+          python3 "$GITHUB_WORKSPACE/zzdds-examples/scripts/run_tsan_pubsub_pair.py" \
+            --sub-cmd "./subscriber" --pub-cmd "./publisher" \
+            --sub-log /tmp/c-ca-sub.log --pub-log /tmp/c-ca-pub.log \
+            --sub-marker "subscriber: done" --pub-marker "publisher: done" --timeout 60 \
+            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
@@ -383,7 +517,13 @@ jobs:
     name: Valgrind (memcheck)
     needs: test-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Was 15 -- loopback_test.zig's polling deadlines were just raised (5s/3s
+    # -> 20s/15s) to stop spurious failures on a busy shared runner (see that
+    # file's comments), which raises this job's own worst-case ceiling too.
+    # A normal passing run is unaffected either way (those deadlines only
+    # matter on the slow path); this just gives that slow path enough room
+    # to actually recover instead of getting killed by the job timeout first.
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -924,3 +1064,157 @@ jobs:
         with:
           name: interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}
           path: /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+  # ── Interop: Zenzen DDS self-interop, DebugAllocator lane ─────────────────
+  #
+  # Mirrors self-interop-tsan's exact structure, but proves the *allocator*
+  # side of this repo's safety-net story instead of the threading side:
+  # every allocation the factory and everything it creates makes is routed
+  # through std.heap.DebugAllocator (see zzdds's -Ddebug-allocator option and
+  # dds-rtps's own matching option, both added together with
+  # createFactoryWithAllocator) -- fast, attributable double-free/UAF
+  # diagnostics instead of relying solely on the (slow, coarse) valgrind job
+  # or bare c_allocator's silent heap corruption. Self AND vendor interop
+  # both get this lane (not just self): different peer implementations
+  # produce different interop timing, and a purely self-interop-only lane
+  # would miss any timing-dependent allocator bug that only manifests
+  # against a real second implementation.
+  self-interop-debug-allocator:
+    name: self-interop (dds-rtps) + DebugAllocator
+    needs: test-linux
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+          persist-credentials: false
+
+      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/dds-rtps
+          ref: ${{ env.INTEROP_RTPS_REF }}
+          path: dds-rtps
+          persist-credentials: false
+
+      - name: Wire packages/zzdds symlink
+        run: |
+          mkdir -p dds-rtps/srcZig/zzdds/packages
+          ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
+          # zzdds re-exports zidl's own artifact/zidl_rt module and
+          # dds-rtps's build.zig.zon no longer declares its own .zidl
+          # dependency, so no separate zidl checkout/symlink is needed here
+          # (see the self-interop job above for the full explanation).
+          rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
+          (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Install Python dependencies
+        run: pip install pexpect junitparser
+
+      - name: Build shape_main (Debug + DebugAllocator)
+        working-directory: dds-rtps/srcZig/zzdds
+        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=Debug -Dlog-level=info -Ddebug-allocator=true
+
+      - name: Upload zzdds binary (DebugAllocator, for vendor-interop-debug-allocator jobs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: zzdds-shape-linux-debug-allocator
+          path: dds-rtps/srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux
+          retention-days: 1
+
+      - name: Run self-interop suite (DebugAllocator)
+        working-directory: dds-rtps
+        run: |
+          python3 interoperability_report.py \
+            -P srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
+            -S srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
+            -o /tmp/interop-debug-allocator-results.xml
+
+      - name: Check results
+        run: python3 zzdds/scripts/check_interop_results.py /tmp/interop-debug-allocator-results.xml
+
+      - name: Upload DebugAllocator report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-debug-allocator-results
+          path: /tmp/interop-debug-allocator-results.xml
+
+  vendor-interop-debug-allocator:
+    name: "DebugAllocator: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
+    needs: [setup-matrix, self-interop-debug-allocator]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        vendor: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        direction: [pub, sub]
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+        with:
+          path: zzdds
+          persist-credentials: false
+
+      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: zz-iot/dds-rtps
+          ref: ${{ env.INTEROP_RTPS_REF }}
+          path: dds-rtps
+          persist-credentials: false
+
+      - name: Install Python dependencies
+        run: pip install pexpect junitparser
+
+      - name: Download zzdds binary (DebugAllocator)
+        uses: actions/download-artifact@v4
+        with:
+          name: zzdds-shape-linux-debug-allocator
+          path: bins/
+
+      - name: Download vendor binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ${{ env.INTEROP_RELEASE_TAG }} \
+            --repo omg-dds/dds-rtps \
+            --pattern "${{ matrix.vendor.asset }}" \
+            -D bins/
+          unzip -o bins/${{ matrix.vendor.asset }} -d bins/
+
+      - name: Make binaries executable
+        run: chmod +x bins/zzdds_shape_main_linux bins/${{ matrix.vendor.binary }}
+
+      - name: Run interop DebugAllocator (${{ matrix.direction }})
+        working-directory: dds-rtps
+        run: |
+          ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
+          VENDOR="$GITHUB_WORKSPACE/bins/${{ matrix.vendor.binary }}"
+          if [ "${{ matrix.direction }}" = "pub" ]; then
+            PUB="$ZZDDS"; SUB="$VENDOR"
+          else
+            PUB="$VENDOR"; SUB="$ZZDDS"
+          fi
+          python3 interoperability_report.py -P "$PUB" -S "$SUB" \
+            -o /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Check results
+        run: |
+          python3 zzdds/scripts/check_interop_results.py \
+            /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+
+      - name: Upload DebugAllocator report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}
+          path: /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml

@@ -1630,14 +1630,19 @@ test "fan-out port dispatch delivers to all registered handlers" {
     const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
     const send_loc = Locator.udp4(.{ 127, 0, 0, 1 }, port);
 
-    var count_a: usize = 0;
-    var count_b: usize = 0;
+    // Atomics, not plain usize: the receive handler runs on UdpTransport's
+    // own background receive thread, while these assertions run on the main
+    // thread after only a sleepMs(100) -- a wall-clock delay gives no formal
+    // cross-thread visibility guarantee (confirmed via TSan: a plain usize
+    // here is a genuine data race, sleep or not).
+    var count_a: std.atomic.Value(usize) = .init(0);
+    var count_b: std.atomic.Value(usize) = .init(0);
 
     const Counter = struct {
-        n: *usize,
+        n: *std.atomic.Value(usize),
         fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.n.* += 1;
+            _ = self.n.fetchAdd(1, .monotonic);
         }
         fn handler(self: *@This()) ReceiveHandler {
             return .{ .ctx = self, .on_receive = f };
@@ -1653,15 +1658,15 @@ test "fan-out port dispatch delivers to all registered handlers" {
     // Send a datagram via loopback — both handlers should fire.
     try t.send(&send_loc, "ping");
     sleepMs(100);
-    try std.testing.expectEqual(@as(usize, 1), count_a);
-    try std.testing.expectEqual(@as(usize, 1), count_b);
+    try std.testing.expectEqual(@as(usize, 1), count_a.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), count_b.load(.monotonic));
 
     // Deregister handler A — only handler B should continue to receive.
     t.unlisten(&listen_loc, ctr_a.handler());
     try t.send(&send_loc, "pong");
     sleepMs(100);
-    try std.testing.expectEqual(@as(usize, 1), count_a);
-    try std.testing.expectEqual(@as(usize, 2), count_b);
+    try std.testing.expectEqual(@as(usize, 1), count_a.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), count_b.load(.monotonic));
 
     // Deregister handler B — socket is destroyed; no further deliveries.
     t.unlisten(&listen_loc, ctr_b.handler());
@@ -1682,14 +1687,16 @@ test "two participants share one UdpTransport; independent teardown" {
     const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
     const send_loc = Locator.udp4(.{ 127, 0, 0, 1 }, port);
 
-    var count_a: usize = 0;
-    var count_b: usize = 0;
+    // See the matching comment in "fan-out port dispatch..." above: atomics,
+    // not plain usize, since the handler runs on a background receive thread.
+    var count_a: std.atomic.Value(usize) = .init(0);
+    var count_b: std.atomic.Value(usize) = .init(0);
 
     const Counter = struct {
-        n: *usize,
+        n: *std.atomic.Value(usize),
         fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.n.* += 1;
+            _ = self.n.fetchAdd(1, .monotonic);
         }
         fn handler(self: *@This()) ReceiveHandler {
             return .{ .ctx = self, .on_receive = f };
@@ -1703,16 +1710,16 @@ test "two participants share one UdpTransport; independent teardown" {
 
     try t.send(&send_loc, "hello");
     sleepMs(100);
-    try std.testing.expectEqual(@as(usize, 1), count_a);
-    try std.testing.expectEqual(@as(usize, 1), count_b);
+    try std.testing.expectEqual(@as(usize, 1), count_a.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), count_b.load(.monotonic));
 
     // Simulate participant A tearing down. B must continue to receive.
     t.unlisten(&listen_loc, ctr_a.handler());
 
     try t.send(&send_loc, "world");
     sleepMs(100);
-    try std.testing.expectEqual(@as(usize, 1), count_a); // no new delivery
-    try std.testing.expectEqual(@as(usize, 2), count_b); // still active
+    try std.testing.expectEqual(@as(usize, 1), count_a.load(.monotonic)); // no new delivery
+    try std.testing.expectEqual(@as(usize, 2), count_b.load(.monotonic)); // still active
 
     // Verify send_fd_v4 is still valid (owned socket, never promoted).
     try std.testing.expect(udp.send_fd_v4.load(.acquire) != INVALID_SOCKET);
@@ -1744,12 +1751,14 @@ test "non-wildcard bind still receives loopback traffic" {
     const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
     const send_loc = Locator.udp4(.{ 127, 0, 0, 1 }, port);
 
-    var count: usize = 0;
+    // See the matching comment in "fan-out port dispatch..." above: atomics,
+    // not plain usize, since the handler runs on a background receive thread.
+    var count: std.atomic.Value(usize) = .init(0);
     const Counter = struct {
-        n: *usize,
+        n: *std.atomic.Value(usize),
         fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.n.* += 1;
+            _ = self.n.fetchAdd(1, .monotonic);
         }
         fn handler(self: *@This()) ReceiveHandler {
             return .{ .ctx = self, .on_receive = f };
@@ -1760,7 +1769,7 @@ test "non-wildcard bind still receives loopback traffic" {
     try t.listen(&listen_loc, ctr.handler());
     try t.send(&send_loc, "hello");
     sleepMs(100);
-    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 1), count.load(.monotonic));
 
     t.unlisten(&listen_loc, ctr.handler());
 }

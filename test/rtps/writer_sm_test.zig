@@ -67,6 +67,11 @@ const Recording = struct {
     /// matching a connectionless transport); tests bump it to simulate a
     /// transport-level reconnect.
     connection_generation: u32 = 0,
+    /// When set, every send() call fails with this error instead of
+    /// recording -- used to exercise the writer's `catch |err| switch (err)`
+    /// send-error handling (UnsupportedLocatorKind silently ignored as
+    /// defence-in-depth vs. any other error logged and otherwise swallowed).
+    send_error: ?anyerror = null,
 
     pub fn reset(self: *@This()) void {
         self.n = 0;
@@ -78,6 +83,7 @@ const Recording = struct {
 
     fn sendFn(ctx: *anyopaque, loc: *const Locator, data: []const u8) anyerror!void {
         const self: *Recording = @ptrCast(@alignCast(ctx));
+        if (self.send_error) |e| return e;
         if (self.n >= MAX_CAPS) return error.TooManySends;
         const c = &self.caps[self.n];
         c.locator = loc.*;
@@ -179,6 +185,21 @@ fn findHeartbeat(rec: *const Recording) ?msg.submessage.HeartbeatSubmessage {
         while (it.next(&params) catch null) |sm| {
             switch (sm) {
                 .heartbeat => |hb| return hb,
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
+/// Find the first DATA_FRAG submessage in captures.
+fn findDataFrag(rec: *const Recording) ?msg.submessage.DataFragSubmessage {
+    for (rec.caps[0..rec.n]) |*cap| {
+        var it = MessageIterator.init(cap.buf[0..cap.len]) catch continue;
+        var params: [32]InlineQosParam = undefined;
+        while (it.next(&params) catch null) |sm| {
+            switch (sm) {
+                .data_frag => |df| return df,
                 else => {},
             }
         }
@@ -1152,4 +1173,292 @@ test "addMatchedReader: lease refresh landing after a reconnect still replays (n
     rec.reset();
     w.checkConnectionGenerations();
     try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+// ── OOM fallback: sendChangeToAllLocked's allocation-failure path ───────────
+//
+// Regression test for Greptile PR #64 review: an earlier version of the OOM
+// fallback here sent synchronously while still holding self.mu, reintroducing
+// the writer.mu/reader.mu lock-order-inversion the unlock-before-send
+// restructuring elsewhere in write() exists to close. The fix removes the
+// send entirely on this rare path -- this test proves that structurally (no
+// send is attempted when the snapshot allocation fails), which is what
+// makes the deadlock impossible, rather than trying to reproduce a live
+// deadlock in a single-threaded test harness.
+test "write: snapshot-allocation OOM skips the live send instead of sending under self.mu" {
+    const writer_guid = makeGuid(0x01, WRITER_EID);
+    const reader_guid = makeGuid(0x02, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    // Confirm the normal (non-OOM) path still sends, as a control.
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "normal");
+    try testing.expect(countAllData(&rec) > 0);
+    rec.reset();
+
+    // Force the very next allocation through w.alloc (the snapshot array in
+    // sendChangeToAllLocked's non-fragmented branch) to fail. w.write()
+    // itself must still succeed (the sample lands in the cache regardless;
+    // only the immediate live push is skipped), and no DATA send may occur.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    w.alloc = fa.allocator();
+    defer w.alloc = testing.allocator;
+
+    // The OOM fallback logs a warning -- expected here, not a real error.
+    // Suppress it so it doesn't read as a test failure in build output.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "oom");
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+// ── OOM fallback: replayHistoryToProxyUnlocked's allocation-failure path ────
+//
+// Regression test for Greptile PR #64 review (round 2): an earlier version of
+// this OOM fallback called replayHistoryToProxyLocked (a fully-locked
+// synchronous replay) when the unlocked-replay snapshot allocation failed,
+// reintroducing the same writer.mu/reader.mu lock-order-inversion described
+// above. The fix removes the send entirely on this rare path -- for a
+// BEST_EFFORT proxy (its only history-delivery path, since it never
+// ACKNACKs) this does mean the initial replay is genuinely lost on OOM,
+// which is the documented, accepted tradeoff. This test proves the "no send"
+// behavior structurally, matching the style of the write() OOM test above.
+test "addMatchedReader: replay-snapshot OOM skips history replay instead of sending under self.mu" {
+    const writer_guid = makeGuid(0x74, WRITER_EID);
+    const reader_guid = makeGuid(0x75, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7522);
+
+    var rec: Recording = .{};
+    // replay_on_match=true (TRANSIENT_LOCAL+): a newly-matched proxy that
+    // wants replay (ReaderProxy.wants_replay defaults to true) triggers
+    // replayHistoryToProxyUnlocked -- the path under test.
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        true,
+    );
+    defer w.deinit();
+
+    // Write history before any reader is matched, using the real allocator.
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+
+    // Force the second allocation through w.alloc to fail: the first
+    // (alloc_index 0) is reader_proxies.append growing from empty, which
+    // must succeed for the proxy to be matched at all; the second
+    // (alloc_index 1) is the replay snapshot array in
+    // replayHistoryToProxyUnlocked.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    w.alloc = fa.allocator();
+    defer w.alloc = testing.allocator;
+
+    // The OOM fallback logs a warning -- expected here, not a real error.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    // BEST_EFFORT proxy (reliable=false): its only history-delivery path.
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+test "checkConnectionGenerations: retries a BEST_EFFORT proxy's OOM-skipped initial replay" {
+    // Regression test for Greptile PR #64 review (round 2): the OOM
+    // fallback above used to leave the initial replay permanently lost --
+    // the proxy's only history-delivery path, since BEST_EFFORT never
+    // ACKNACKs. It now sets pending_replay_retry, which
+    // checkConnectionGenerations (already polled periodically from
+    // heartbeatThread) retries. This proves the retry actually delivers
+    // once the transient OOM clears, not just that the flag gets set.
+    const writer_guid = makeGuid(0x82, WRITER_EID);
+    const reader_guid = makeGuid(0x83, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7530);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        true, // replay_on_match
+    );
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    {
+        // Same calibration as the OOM test above: alloc_index 0 is
+        // reader_proxies.append, alloc_index 1 is the replay snapshot.
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+        w.alloc = fa.allocator();
+        defer w.alloc = testing.allocator;
+
+        const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+        try w.addMatchedReader(rp);
+        try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    }
+
+    // w.alloc is back to the real allocator now -- the retry should succeed.
+    w.checkConnectionGenerations();
+    try testing.expectEqual(@as(usize, 2), countAllData(&rec));
+
+    // A second tick with nothing pending must not resend.
+    rec.reset();
+    w.checkConnectionGenerations();
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+// ── Transport send-error handling ────────────────────────────────────────────
+//
+// write()'s unlocked send loop wraps every transport send in
+// `catch |err| switch (err) { error.UnsupportedLocatorKind => {}, else =>
+// log.rtps.warn(...) }` -- SEDP already filters proxy locators down to ones
+// the transport itself reports canReach(), so this is defence-in-depth, not
+// a path expected to fire in normal operation. Neither arm had a test.
+
+test "write: UnsupportedLocatorKind send error is silently ignored" {
+    const writer_guid = makeGuid(0x76, WRITER_EID);
+    const reader_guid = makeGuid(0x77, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7523);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    rec.send_error = error.UnsupportedLocatorKind;
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "unsupported-locator");
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+test "write: a non-UnsupportedLocatorKind send error is logged and swallowed" {
+    const writer_guid = makeGuid(0x78, WRITER_EID);
+    const reader_guid = makeGuid(0x79, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7524);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    // A warning is logged here -- expected, not a real test failure.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    rec.send_error = error.ConnectionResetByPeer;
+    // write() must not propagate the transport's send failure -- the sample
+    // still lands in the cache and can be retransmitted later via ACKNACK.
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "send-fails");
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+// ── Replay: large-fragment priming ───────────────────────────────────────────
+
+test "addMatchedReader: replay primes a RELIABLE proxy with DATA_FRAG for an already-fragmented cached change" {
+    // replayHistoryToProxyUnlocked's RELIABLE branch: a cached change larger
+    // than frag_size gets its first fragment sent directly ("priming") so
+    // the reader has something to NACK against immediately, rather than
+    // waiting for the writer's regular heartbeat/retransmission cycle to be
+    // the first thing that reveals the change is fragmented. Previously
+    // untested -- only the non-fragmented replay path had coverage.
+    const writer_guid = makeGuid(0x80, WRITER_EID);
+    const reader_guid = makeGuid(0x81, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7529);
+    const small_frag_size: u16 = 32;
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        small_frag_size,
+        true, // replay_on_match
+    );
+    defer w.deinit();
+
+    // Larger than small_frag_size, written before any reader is matched so
+    // it's already sitting in the cache when addMatchedReader triggers replay.
+    const big_payload = [_]u8{0xAB} ** 64;
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &big_payload);
+
+    // RELIABLE proxy: only the RELIABLE branch of replayHistoryToProxyUnlocked
+    // does large-fragment priming.
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+
+    const df = findDataFrag(&rec) orelse return error.TestExpectedDataFrag;
+    try testing.expectEqual(@as(u32, 1), df.fragment_starting_num);
+}
+
+test "checkConnectionGenerations: retries after a mid-loop per-change copy OOM during replay" {
+    // Regression test for Greptile PR #64 review (round 3): unlike the
+    // snapshot-array allocation failure (tested above, fails before this
+    // loop even starts), a failure copying one INDIVIDUAL change's data
+    // mid-loop used to just `continue` past it silently, with no retry
+    // scheduled -- permanently dropping that one sample even though the
+    // rest of the replay otherwise "succeeded".
+    const writer_guid = makeGuid(0x84, WRITER_EID);
+    const reader_guid = makeGuid(0x85, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7531);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        true, // replay_on_match
+    );
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    {
+        // alloc_index 0: reader_proxies.append. 1: the snapshot array
+        // (must succeed to reach the per-change copy loop at all). 2: the
+        // first change's dupe() -- made to fail here, mid-loop.
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+        w.alloc = fa.allocator();
+        defer w.alloc = testing.allocator;
+
+        const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+        try w.addMatchedReader(rp);
+        // Only the change(s) after the failed one made it out this pass.
+        try testing.expect(countAllData(&rec) < 2);
+    }
+
+    rec.reset();
+    w.checkConnectionGenerations();
+    // The retry re-copies everything from scratch -- both changes arrive.
+    try testing.expectEqual(@as(usize, 2), countAllData(&rec));
 }

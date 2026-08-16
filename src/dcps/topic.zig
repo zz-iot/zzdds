@@ -32,6 +32,11 @@ pub const TopicImpl = struct {
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
+    /// Guards status_changes/inconsistent -- mirrors writer.zig's `mu`
+    /// (added for the same reason: an unlocked cross-thread getter racing a
+    /// locked mutator, confirmed via TSan there; TopicImpl had no
+    /// general-purpose mutex at all before this).
+    mu: Mutex = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -162,7 +167,10 @@ pub const TopicImpl = struct {
     }
 
     fn vtGetStatusChanges(ctx: *anyopaque) DDS.StatusMask {
-        return cast(ctx).status_changes;
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.status_changes;
     }
 
     fn vtGetHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
@@ -225,6 +233,8 @@ pub const TopicImpl = struct {
 
     fn vtGetInconsistent(ctx: *anyopaque, a_status: *DDS.InconsistentTopicStatus) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
         a_status.* = self.inconsistent;
         // Clear the change count after read-out (DDS §2.2.4.1.4).
         self.inconsistent.total_count_change = 0;
@@ -277,7 +287,10 @@ pub const TopicImpl = struct {
     };
 
     fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
-        return cast(entity_ptr).status_changes;
+        const self = cast(entity_ptr);
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.status_changes;
     }
 
     fn cast(ctx: *anyopaque) *Self {

@@ -1598,6 +1598,47 @@ touched, and is worth calling out on its own.
 
 ---
 
+## CI / release platform coverage gaps (follow-on, not started, 2026-08-15)
+
+Audit of `build.zig`'s options, `scripts/run_deterministic_matrix.py`, `ci.yml`, and
+`release.yml` against the platform/build-type matrix they actually exercise, prompted by a
+review of PR #64. Not exhaustive-coverage nitpicking — these are the gaps judged to be real,
+actionable risk for a DDS middleware library, ranked roughly by importance:
+
+1. **C/C++/Java bindings are validated on Linux x86_64 only.** The JNI bridge, generated
+   headers, and CMake/pkg-config install tree get zero CI signal on Windows, macOS, or
+   ARM64 — exactly the platforms where linking/ABI issues are most likely to diverge
+   silently, and the bindings are a core part of zzdds's value proposition.
+2. **`ReleaseFast` is never built or run anywhere** — not in CI, not in release.yml. The
+   optimize mode most production deployments would actually ship (safety checks stripped,
+   UB instead of panics) is completely unverified. (`ReleaseSmall` likewise unused, lower
+   priority.)
+3. **Real vendor/self RTPS interop (Connext/Cyclone/CoreDX/self) runs only on Linux
+   x86_64.** Wire-format, discovery, and CDR correctness against real vendors has no
+   coverage on Windows, macOS, or ARM64.
+4. **No Intel macOS coverage** — `macos-latest` in ci.yml/release.yml is Apple Silicon
+   only; Intel Mac consumers get no signal.
+5. **TSan/Valgrind/DebugAllocator lanes are Linux-only**, so concurrency/allocator bugs
+   specific to Windows or macOS threading/libc are structurally invisible to CI.
+6. **`release.yml` never builds a binding.** A tagged release could ship a binding
+   regression that `main`'s own CI didn't happen to catch between last-green and the
+   release trigger, since the release gate only requires a Linux x86_64 ReleaseSafe
+   self-interop pass.
+7. **No musl/static Linux target** — always glibc, always the native triple (`-Dtarget`
+   is never actually cross-compiled anywhere). Alpine/statically-linked deployments are
+   unvalidated.
+8. **No prebuilt release binaries at all.** `release.yml` publishes a git tag, changelog,
+   and `zig fetch` source URL only — no compiled `libzzdds.so`/`.dll`/`.dylib` is ever
+   built, uploaded, or smoke-tested as a distributable artifact.
+
+Suggested first move if this gets picked up: extend the existing 3-platform (Linux ARM64/
+macOS/Windows) CI jobs from bare `zig build test` to also build+run the C/C++ bindings
+smoke tests already used on Linux x86_64 (items 1 and, partially, 6) — highest
+risk-reduction for the least new CI surface, since the smoke tests and binding build steps
+already exist and just aren't wired to run there yet.
+
+---
+
 ## Deferred / Out of Scope for v1
 
 - **DDS-RPC** — deferred; no concrete use case yet.

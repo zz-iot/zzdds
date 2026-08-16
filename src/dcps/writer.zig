@@ -76,6 +76,15 @@ pub const DataWriterImpl = struct {
     /// Guards `listener_ex_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
+    /// Guards status_changes and the *_total/*_total_change/*_current
+    /// counters below (everything the notify*/vtGet* status functions
+    /// touch) -- confirmed via TSan (notifyPublicationMatched/
+    /// vtGetPubMatched racing on status_changes/pub_matched_* with zero
+    /// synchronization; unlike DataReaderImpl, DataWriterImpl had no
+    /// general-purpose mutex at all before this). Never held across
+    /// dispatchListener() or notifyWakeup() -- lock only around the plain
+    /// counter reads/writes, matching reader.zig's identical pattern.
+    mu: Mutex = .{},
     /// Guards this entity's own lifetime against a background-thread
     /// callback (RTPS heartbeat/receive, timer, discovery) racing
     /// `deinit()` — see entity_quiesce.zig.
@@ -88,9 +97,18 @@ pub const DataWriterImpl = struct {
     /// Sequence number of the most recently written sample; 0 = nothing written.
     last_sn: proto.SequenceNumber = 0,
 
-    /// Cumulative count of incompatible-QoS events; no separate mutex needed —
-    /// always written from the participant's discovery callback (participant.mu held).
-    incompat_total: i32 = 0,
+    /// Cumulative count of incompatible-QoS events. incompat_total_change/
+    /// incompat_last_policy are now guarded by `mu` (see its doc comment --
+    /// they previously relied solely on always being written from the
+    /// participant's discovery callback under participant.mu, which doesn't
+    /// protect vtGetIncompatQos reading them from an application thread with
+    /// no participant.mu held). incompat_total itself stays a separate
+    /// atomic: it's additionally polled lock-free by tests (see
+    /// loopback_test.zig), which don't take `mu` either -- an atomic makes
+    /// that unlocked cross-thread read well-defined instead of a data race
+    /// (confirmed via TSan on reader.zig's mirror of this same field; see
+    /// its longer comment there).
+    incompat_total: std.atomic.Value(i32) = .init(0),
     incompat_total_change: i32 = 0,
     incompat_last_policy: i32 = 0,
 
@@ -335,6 +353,7 @@ pub const DataWriterImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        self.mu.lock();
         if (added) self.pub_matched_total += 1;
         self.pub_matched_total_change += if (added) 1 else 0;
         const delta: i32 = if (added) 1 else -1;
@@ -342,8 +361,6 @@ pub const DataWriterImpl = struct {
         self.pub_matched_current_change += delta;
         self.pub_matched_last_handle = remote_handle;
         self.status_changes |= DDS.PUBLICATION_MATCHED_STATUS;
-        if (self.status_cond) |sc| sc.notifyWakeup();
-
         // Always attempt dispatch -- DDS 1.4 §2.2.4.1.5's fallback chain
         // means a delivery can happen even when this writer's own
         // `listener_mask` doesn't include the bit (the Publisher's or
@@ -358,10 +375,15 @@ pub const DataWriterImpl = struct {
             .current_count_change = self.pub_matched_current_change,
             .last_subscription_handle = remote_handle,
         };
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+
         if (self.dispatchListener("on_publication_matched", DDS.PUBLICATION_MATCHED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
             self.status_changes &= ~DDS.PUBLICATION_MATCHED_STATUS;
             self.pub_matched_total_change = 0;
             self.pub_matched_current_change = 0;
+            self.mu.unlock();
         }
     }
 
@@ -373,22 +395,30 @@ pub const DataWriterImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        self.incompat_total += 1;
+        self.mu.lock();
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
         self.status_changes |= DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
-        if (self.status_cond) |sc| sc.notifyWakeup();
-
+        // Release ordering: publishes the plain-field writes above (program
+        // order on this thread) to any thread that observes this value via
+        // a paired .acquire load, without requiring that thread to take a lock.
+        const new_total = self.incompat_total.load(.monotonic) + 1;
+        self.incompat_total.store(new_total, .release);
         // See notifyPublicationMatched's comment: always attempt dispatch,
         // only reset change-counters if something in the DDS 1.4
         // §2.2.4.1.5 fallback chain actually consumed it.
         var status = DDS.OfferedIncompatibleQosStatus{};
-        status.total_count = self.incompat_total;
+        status.total_count = new_total;
         status.total_count_change = self.incompat_total_change;
         status.last_policy_id = policy_id;
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+
         if (self.dispatchListener("on_offered_incompatible_qos", DDS.OFFERED_INCOMPATIBLE_QOS_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
             self.incompat_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_INCOMPATIBLE_QOS_STATUS;
+            self.mu.unlock();
         }
     }
 
@@ -398,16 +428,20 @@ pub const DataWriterImpl = struct {
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        self.mu.lock();
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.OFFERED_DEADLINE_MISSED_STATUS;
-        if (self.status_cond) |sc| sc.notifyWakeup();
         var status = DDS.OfferedDeadlineMissedStatus{};
         status.total_count = self.deadline_missed_total;
         status.total_count_change = self.deadline_missed_total_change;
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
         if (self.dispatchListener("on_offered_deadline_missed", DDS.OFFERED_DEADLINE_MISSED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
             self.deadline_missed_total_change = 0;
             self.status_changes &= ~DDS.OFFERED_DEADLINE_MISSED_STATUS;
+            self.mu.unlock();
         }
     }
 
@@ -417,16 +451,20 @@ pub const DataWriterImpl = struct {
     pub fn notifyLivelinessLost(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        self.mu.lock();
         self.liveliness_lost_total += 1;
         self.liveliness_lost_total_change += 1;
         self.status_changes |= DDS.LIVELINESS_LOST_STATUS;
-        if (self.status_cond) |sc| sc.notifyWakeup();
         var status = DDS.LivelinessLostStatus{};
         status.total_count = self.liveliness_lost_total;
         status.total_count_change = self.liveliness_lost_total_change;
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
         if (self.dispatchListener("on_liveliness_lost", DDS.LIVELINESS_LOST_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+            self.mu.lock();
             self.liveliness_lost_total_change = 0;
             self.status_changes &= ~DDS.LIVELINESS_LOST_STATUS;
+            self.mu.unlock();
         }
     }
 
@@ -634,7 +672,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetStatusChanges(ctx: *anyopaque) DDS.StatusMask {
-        return cast(ctx).status_changes;
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.status_changes;
     }
 
     fn vtGetHandle(ctx: *anyopaque) DDS.InstanceHandle_t {
@@ -698,6 +739,8 @@ pub const DataWriterImpl = struct {
 
     fn vtGetLivelinessLost(ctx: *anyopaque, status: *DDS.LivelinessLostStatus) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
         status.* = .{
             .total_count = self.liveliness_lost_total,
             .total_count_change = self.liveliness_lost_total_change,
@@ -709,6 +752,8 @@ pub const DataWriterImpl = struct {
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.OfferedDeadlineMissedStatus) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
         status.* = .{
             .total_count = self.deadline_missed_total,
             .total_count_change = self.deadline_missed_total_change,
@@ -720,8 +765,10 @@ pub const DataWriterImpl = struct {
 
     fn vtGetIncompatQos(ctx: *anyopaque, status: *DDS.OfferedIncompatibleQosStatus) DDS.ReturnCode_t {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
         status.* = .{
-            .total_count = self.incompat_total,
+            .total_count = self.incompat_total.load(.monotonic),
             .total_count_change = self.incompat_total_change,
             .last_policy_id = self.incompat_last_policy,
         };
@@ -732,6 +779,8 @@ pub const DataWriterImpl = struct {
 
     fn vtGetPubMatched(ctx: *anyopaque, status: *DDS.PublicationMatchedStatus) DDS.ReturnCode_t {
         const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
         status.* = .{
             .total_count = self.pub_matched_total,
             .total_count_change = self.pub_matched_total_change,
@@ -798,7 +847,10 @@ pub const DataWriterImpl = struct {
     // ── status helper for StatusConditionImpl ─────────────────────────────────
 
     fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
-        return cast(entity_ptr).status_changes;
+        const self = cast(entity_ptr);
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.status_changes;
     }
 
     fn cast(ctx: *anyopaque) *Self {
