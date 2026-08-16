@@ -1274,6 +1274,60 @@ test "addMatchedReader: replay-snapshot OOM skips history replay instead of send
     try testing.expectEqual(@as(usize, 0), countAllData(&rec));
 }
 
+test "checkConnectionGenerations: retries a BEST_EFFORT proxy's OOM-skipped initial replay" {
+    // Regression test for Greptile PR #64 review (round 2): the OOM
+    // fallback above used to leave the initial replay permanently lost --
+    // the proxy's only history-delivery path, since BEST_EFFORT never
+    // ACKNACKs. It now sets pending_replay_retry, which
+    // checkConnectionGenerations (already polled periodically from
+    // heartbeatThread) retries. This proves the retry actually delivers
+    // once the transient OOM clears, not just that the flag gets set.
+    const writer_guid = makeGuid(0x82, WRITER_EID);
+    const reader_guid = makeGuid(0x83, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7530);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        true, // replay_on_match
+    );
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    {
+        // Same calibration as the OOM test above: alloc_index 0 is
+        // reader_proxies.append, alloc_index 1 is the replay snapshot.
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+        w.alloc = fa.allocator();
+        defer w.alloc = testing.allocator;
+
+        const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+        try w.addMatchedReader(rp);
+        try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    }
+
+    // w.alloc is back to the real allocator now -- the retry should succeed.
+    w.checkConnectionGenerations();
+    try testing.expectEqual(@as(usize, 2), countAllData(&rec));
+
+    // A second tick with nothing pending must not resend.
+    rec.reset();
+    w.checkConnectionGenerations();
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
 // ── Transport send-error handling ────────────────────────────────────────────
 //
 // write()'s unlocked send loop wraps every transport send in

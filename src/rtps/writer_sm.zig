@@ -305,6 +305,19 @@ pub const ReaderProxy = struct {
     /// generation 0, so this stays 0 and is never acted on for them. Checked
     /// periodically from the heartbeat thread — see checkConnectionGenerations.
     last_seen_connection_generation: u32 = 0,
+    /// Set when replayHistoryToProxyUnlocked's BEST_EFFORT branch couldn't
+    /// build its unlocked-send snapshot (OOM) and had to skip the initial
+    /// history replay entirely -- this proxy's only history-delivery path,
+    /// since BEST_EFFORT never ACKNACKs. Retried on the next heartbeat-thread
+    /// tick (see checkConnectionGenerations) rather than left permanently
+    /// lost: the retry reuses the same deadlock-safe unlocked replay path,
+    /// just re-invoked later once the transient OOM has likely cleared
+    /// (Greptile PR #64 review: the original log-and-skip-forever behavior
+    /// was correctness-safe re: deadlock but silently dropped delivery with
+    /// no recovery path at all, unlike every other OOM-fallback in this file
+    /// where the change stays durably in self.cache for RELIABLE proxies to
+    /// recover via HEARTBEAT/ACKNACK).
+    pending_replay_retry: bool = false,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -724,11 +737,51 @@ pub const StatefulWriter = struct {
     /// (reuses that existing timer rather than adding a second one); a no-op
     /// for any proxy whose locators are all UDP, since connectionGeneration()
     /// is then always 0.
+    ///
+    /// Also retries any proxy's pending_replay_retry (set when
+    /// replayHistoryToProxyUnlocked's BEST_EFFORT branch had to skip a
+    /// newly-matched proxy's initial replay due to a transient allocation
+    /// failure) — same periodic-timer reuse rationale, and clearing the
+    /// flag optimistically before retrying (rather than requiring
+    /// replayHistoryToProxyUnlocked's success path to do it) means a
+    /// repeat failure simply re-sets it for the next tick.
     pub fn checkConnectionGenerations(self: *Self) void {
         self.mu.lock();
         defer self.mu.unlock();
+
+        // Collect GUIDs (not pointers) of proxies pending a replay retry
+        // during this first, fully-locked pass -- resyncIfGenerationChangedLocked
+        // never unlocks, so this loop itself is safe.
+        var retry_guids_buf: [16]Guid = undefined;
+        var n_retry: usize = 0;
         for (self.reader_proxies.items) |*rp| {
             self.resyncIfGenerationChangedLocked(rp);
+            if (rp.pending_replay_retry and n_retry < retry_guids_buf.len) {
+                rp.pending_replay_retry = false;
+                retry_guids_buf[n_retry] = rp.guid;
+                n_retry += 1;
+            }
+        }
+
+        // Replay each pending-retry proxy by re-finding it via GUID, not by
+        // a pointer captured above: replayHistoryToProxyUnlocked releases
+        // self.mu internally while sending, during which a concurrent
+        // addMatchedReader could grow/reallocate self.reader_proxies and
+        // invalidate any pointer taken before that window -- the same class
+        // of stale-pointer-across-an-unlock hazard already fixed elsewhere
+        // in this file (see sendChangeToAllLocked's matching comment on
+        // ch_sn vs. re-dereferencing ch). Re-reading self.reader_proxies.items
+        // fresh on every outer iteration (rather than once before the loop)
+        // keeps each lookup valid against the array's current backing
+        // storage; if a proxy disconnected during the unlocked window, the
+        // inner loop simply finds no match and moves on.
+        for (retry_guids_buf[0..n_retry]) |guid| {
+            for (self.reader_proxies.items) |*rp| {
+                if (rp.guid.eql(guid)) {
+                    self.replayHistoryToProxyUnlocked(rp);
+                    break;
+                }
+            }
         }
     }
 
@@ -855,7 +908,7 @@ pub const StatefulWriter = struct {
     /// the other half. Fragmented changes here are still sent under lock via
     /// the existing sendFragsToProxyLocked, unchanged -- out of scope, same
     /// as sendChangeToAllLocked's fragmented branch.
-    fn replayHistoryToProxyUnlocked(self: *Self, rp: *const ReaderProxy) void {
+    fn replayHistoryToProxyUnlocked(self: *Self, rp: *ReaderProxy) void {
         const locs = rp.effectiveLocators();
         if (locs.len == 0) return;
 
@@ -892,11 +945,17 @@ pub const StatefulWriter = struct {
             // comment above describes -- a confirmed deadlock, not a
             // theoretical one (Greptile PR #64 review). For a BEST_EFFORT
             // proxy this is its only history-delivery path (no ACKNACK
-            // recovery), so this OOM genuinely does lose the initial
-            // replay -- but a lost delivery on an already-rare OOM path is
-            // strictly better than hanging the writer and reader threads
-            // (and everything else blocked behind their locks) forever.
-            log.rtps.warn("StatefulWriter({x}): OOM building the unlocked-replay snapshot for a newly-matched BEST_EFFORT proxy -- initial history replay skipped for this match", .{
+            // recovery), so simply giving up here would silently and
+            // permanently lose the initial replay. Instead, flag it for a
+            // retry on the next heartbeat-thread tick (see
+            // checkConnectionGenerations) -- that retry calls back into this
+            // same unlocked, deadlock-safe path, just later, once the
+            // transient OOM has likely cleared (Greptile PR #64 review,
+            // round 2: log-and-skip-forever traded the deadlock for
+            // unconditional, unrecoverable data loss -- this closes that
+            // gap without reintroducing the lock-order-inversion).
+            rp.pending_replay_retry = true;
+            log.rtps.warn("StatefulWriter({x}): OOM building the unlocked-replay snapshot for a newly-matched BEST_EFFORT proxy -- initial history replay skipped for this match, will retry on next heartbeat tick", .{
                 self.guid.entity_id.entity_key,
             });
             return;
