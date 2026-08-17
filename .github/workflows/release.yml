@@ -113,10 +113,27 @@ jobs:
 
       # ThreadSanitizer (Clang/LLVM) has no real Windows support; macOS is
       # included alongside Linux here (Linux ARM64 stays out — see ci.yml's
-      # test-other job for the same scoping note).
+      # test-other job for the same scoping note). test-tsan-self-check runs
+      # first, same as ci.yml's equivalent lane -- it proves TSan
+      # instrumentation is actually active before trusting a clean test-tsan
+      # run as real coverage rather than silently-inert instrumentation
+      # (flagged by Greptile on the initial version of this PR, which had
+      # this step run test-tsan alone).
+      #
+      # MallocNanoZone=0: macOS-only, harmless elsewhere. Without it,
+      # TSan-instrumented binaries on macOS can crash with SIGSEGV during
+      # process startup (deep in the allocator, before any application code
+      # runs) instead of running normally -- a well-documented interaction
+      # between TSan's interceptors and macOS's nano malloc zone, unrelated
+      # to any actual race. Confirmed needed here: PR #65's first macOS TSan
+      # run hit exactly this signature on test-tsan-self-check.
       - name: Test (TSan)
         if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
-        run: zig build test-tsan
+        env:
+          MallocNanoZone: "0"
+        run: |
+          zig build test-tsan-self-check
+          zig build test-tsan
 
   # ── Self-interop gate (same as CI) ────────────────────────────────────────
   # Uses the stable binary name (no -Ddds-version) — the versioned name is for

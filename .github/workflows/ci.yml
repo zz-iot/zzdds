@@ -168,8 +168,16 @@ jobs:
       # docs/design/ci-platform-coverage-expansion.md item 3 -- macOS was the
       # concrete, scoped extension, not a stand-in for "every non-x86_64
       # Linux platform").
+      #
+      # MallocNanoZone=0 works around a well-documented TSan-vs-macOS-nano-
+      # malloc-zone interaction that otherwise crashes TSan-instrumented
+      # binaries with a startup-time SIGSEGV unrelated to any real race —
+      # confirmed needed here: PR #65's first macOS run hit exactly this on
+      # test-tsan-self-check.
       - name: TSan tests (macOS only)
         if: runner.os == 'macOS'
+        env:
+          MallocNanoZone: "0"
         run: |
           zig build test-tsan-self-check
           zig build test-tsan

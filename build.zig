@@ -91,6 +91,10 @@ pub fn build(b: *std.Build) void {
     var gen_c_dir_for_reuse: ?std.Build.LazyPath = null;
     var gen_zzdds_c_dir_for_reuse: ?std.Build.LazyPath = null;
     var zzdds_lib_for_reuse: ?*std.Build.Step.Compile = null;
+    // The Java binding smoke test (below) needs to wait for libzzdds itself
+    // to actually be installed next to libzzdds_jni -- see that step's own
+    // comment for why.
+    var zzdds_lib_install_step: ?*std.Build.Step = null;
 
     // ── Code generation: idl/dcps.idl → generated/dcps.zig ───────────────────
 
@@ -507,8 +511,10 @@ pub fn build(b: *std.Build) void {
         zzdds_lib.root_module.addIncludePath(b.path("include"));
         zzdds_lib.root_module.linkLibrary(zidl_cdr_lib);
 
-        b.installArtifact(zzdds_lib);
+        const install_zzdds_lib = b.addInstallArtifact(zzdds_lib, .{});
+        b.getInstallStep().dependOn(&install_zzdds_lib.step);
         zzdds_lib_for_reuse = zzdds_lib;
+        zzdds_lib_install_step = &install_zzdds_lib.step;
 
         const gen_smoke_c = b.addRunArtifact(zidl_exe);
         gen_smoke_c.addArgs(&.{ "-b", "c", "--generate-zzdds-wrappers", "-o" });
@@ -990,7 +996,8 @@ pub fn build(b: *std.Build) void {
                 .linkage = .dynamic,
                 .root_module = zzdds_jni_mod,
             });
-            b.installArtifact(zzdds_jni_lib);
+            const install_zzdds_jni_lib = b.addInstallArtifact(zzdds_jni_lib, .{});
+            b.getInstallStep().dependOn(&install_zzdds_jni_lib.step);
 
             // Java binding smoke test — see JavaSmoke.java's own doc comment
             // for why this one is a real end-to-end run (two participants,
@@ -1040,11 +1047,35 @@ pub fn build(b: *std.Build) void {
                 }
                 compile_java_smoke.addFileArg(b.path("java_runtime/ZzddsRuntime.java"));
 
+                // Both libzzdds and libzzdds_jni need to live in the SAME
+                // directory the JVM loads from -- not just libzzdds_jni's
+                // own build-cache emit dir (which is all -Djava.library.path
+                // pointed at before). On Linux/macOS this was moot: Zig
+                // auto-adds an rpath from libzzdds_jni to libzzdds's build
+                // output when one links the other in the same graph, so the
+                // dependency resolved regardless of directory layout. PE/COFF
+                // (Windows) has no rpath equivalent -- confirmed the hard way
+                // (PR #65 CI): the JVM loaded zzdds_jni.dll fine via
+                // java.library.path, but then failed with
+                // "UnsatisfiedLinkError: ... Can't find dependent libraries"
+                // because zzdds.dll (its dependency) wasn't anywhere Windows'
+                // DLL search order looks. Using the real install directory
+                // (both libraries install to the same dest_dir -- `bin` on
+                // Windows since .dll counts as isDll(), `lib` elsewhere, see
+                // InstallArtifact's own default dest_dir logic) and adding it
+                // to PATH via addPathDir fixes this on Windows and is a
+                // harmless no-op on Linux/macOS (their loader never
+                // consults PATH for this).
+                const zzdds_dll_install_dir: std.Build.InstallDir = if (target.result.os.tag == .windows) .bin else .lib;
+                const zzdds_dll_install_path = b.getInstallPath(zzdds_dll_install_dir, "");
+
                 const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "-cp", "build-tmp/java-binding-smoke" });
-                run_java_smoke.addPrefixedDirectoryArg("-Djava.library.path=", zzdds_jni_lib.getEmittedBinDirectory());
+                run_java_smoke.addArg(b.fmt("-Djava.library.path={s}", .{zzdds_dll_install_path}));
+                run_java_smoke.addPathDir(zzdds_dll_install_path);
                 run_java_smoke.addArg("JavaSmoke");
                 run_java_smoke.step.dependOn(&compile_java_smoke.step);
-                run_java_smoke.step.dependOn(&zzdds_jni_lib.step);
+                run_java_smoke.step.dependOn(&install_zzdds_jni_lib.step);
+                run_java_smoke.step.dependOn(zzdds_lib_install_step.?);
                 binding_smoke_step.dependOn(&run_java_smoke.step);
             } else {
                 std.log.warn("javac not found — skipping Java binding smoke test", .{});
