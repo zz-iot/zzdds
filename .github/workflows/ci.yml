@@ -147,6 +147,34 @@ jobs:
         shell: bash
         run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
 
+      # Diagnostics only, Windows only, only on failure: PR #65's Java smoke
+      # test has already hit two different native-crash signatures here (a
+      # stack overflow, then -- after raising -Xss -- a silent `java.exe`
+      # exit code 9 with NO output at all, not even a JVM crash banner). If
+      # the JVM's own crash handler produced an hs_err_pid*.log (written to
+      # the repo root, the process's cwd) it'll be here; if the process was
+      # killed before the JVM's handler could even run, the Windows
+      # Application event log is the only other place a reason could show up.
+      # Either way, print whatever exists instead of guessing blind again.
+      - name: Dump crash diagnostics (Windows, on failure)
+        if: failure() && runner.os == 'Windows'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in ./hs_err_pid*.log ./hs_err_pid*.mdmp; do
+            echo "::group::$f"
+            cat "$f" 2>/dev/null || echo "(binary or unreadable: $f)"
+            echo "::endgroup::"
+          done
+
+      - name: Dump Windows Application event log (Windows, on failure)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-WinEvent -LogName Application -MaxEvents 50 |
+            Where-Object { $_.Message -match 'java\.exe|zzdds' } |
+            Format-List TimeCreated, Id, LevelDisplayName, Message
+
       # build.zig downgrades a missing JDK/JNI headers or javac to a
       # std.log.warn + skip, not a build failure (see build.zig's two
       # "not found ... skipping" warnings) -- without this check, a broken
