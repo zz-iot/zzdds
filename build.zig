@@ -1083,6 +1083,33 @@ pub fn build(b: *std.Build) void {
                 const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
                 run_java_smoke.addArg(b.fmt("-Djava.library.path={s}", .{zzdds_dll_install_path}));
                 run_java_smoke.addPathDir(zzdds_dll_install_path);
+
+                // Diagnostics-only additions (PR #65): after the -Xss8m fix
+                // above, Windows CI moved from a JVM-reported native stack
+                // overflow to `java.exe` exiting with code 9 and *zero*
+                // output -- no hs_err_pid crash report, no Windows
+                // Application-log entry, Defender's own operational log
+                // ruled out too (see docs/roadmap.md item 2 for the full
+                // trail). That combination means the JVM's own crash handler
+                // never ran at all, so there's nothing here to actually fix
+                // yet -- only more visibility to add:
+                //   - ErrorFile: pointed at build-tmp/ (a directory we know
+                //     is writable, since compile_java_smoke already creates
+                //     it) instead of the default cwd-relative name, in case
+                //     the previous silence was the crash handler trying and
+                //     failing to write its report rather than never running.
+                //   - CreateMinidumpOnCrash (Windows only -- not a
+                //     recognized flag elsewhere): an actual .mdmp a
+                //     Windows-side debugger could load, if the handler runs
+                //     at all.
+                //   - -Xlog:exceptions=info: catches the case where this
+                //     is actually an ordinary (if unusually silent) Java
+                //     exception path, not a native crash.
+                run_java_smoke.addArg("-XX:ErrorFile=build-tmp/hs_err_pid%p.log");
+                run_java_smoke.addArg("-Xlog:exceptions=info");
+                if (target.result.os.tag == .windows) {
+                    run_java_smoke.addArg("-XX:+CreateMinidumpOnCrash");
+                }
                 run_java_smoke.addArg("JavaSmoke");
                 run_java_smoke.step.dependOn(&compile_java_smoke.step);
                 run_java_smoke.step.dependOn(&install_zzdds_jni_lib.step);

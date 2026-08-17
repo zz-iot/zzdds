@@ -170,22 +170,46 @@ jobs:
       # Diagnostics only, Windows only, only on failure: PR #65's Java smoke
       # test has already hit two different native-crash signatures here (a
       # stack overflow, then -- after raising -Xss -- a silent `java.exe`
-      # exit code 9 with NO output at all, not even a JVM crash banner). If
-      # the JVM's own crash handler produced an hs_err_pid*.log (written to
-      # the repo root, the process's cwd) it'll be here; if the process was
-      # killed before the JVM's handler could even run, the Windows
-      # Application event log is the only other place a reason could show up.
-      # Either way, print whatever exists instead of guessing blind again.
+      # exit code 9 with NO output at all, not even a JVM crash banner, and
+      # Defender ruled out). build.zig now passes -XX:ErrorFile pointing at
+      # build-tmp/ explicitly (a directory we know is writable) instead of
+      # relying on the default cwd-relative name, plus
+      # -XX:+CreateMinidumpOnCrash for an actual .mdmp -- if the JVM's crash
+      # handler runs at all, it should land there now. .log files are
+      # printed in full; .mdmp files are binary, so only listed (size/path)
+      # -- upload-artifact below is what actually preserves them for
+      # real analysis.
       - name: Dump crash diagnostics (Windows, on failure)
         if: failure() && runner.os == 'Windows'
         shell: bash
         run: |
           shopt -s nullglob
-          for f in ./hs_err_pid*.log ./hs_err_pid*.mdmp; do
+          for f in ./build-tmp/hs_err_pid*.log ./hs_err_pid*.log; do
             echo "::group::$f"
-            cat "$f" 2>/dev/null || echo "(binary or unreadable: $f)"
+            cat "$f" 2>/dev/null || echo "(unreadable: $f)"
             echo "::endgroup::"
           done
+          for f in ./build-tmp/hs_err_pid*.mdmp ./hs_err_pid*.mdmp; do
+            ls -la "$f"
+          done
+
+      # The .mdmp above is a real Windows minidump -- worth preserving as a
+      # downloadable artifact so it can actually be opened in WinDbg/Visual
+      # Studio, not just listed. if-no-files-found: ignore since this step
+      # should be a no-op (not a new failure) on the "handler never even ran"
+      # branch of this investigation, which is what every run so far has hit.
+      - name: Upload crash diagnostics (Windows, on failure)
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-jni-crash-diagnostics
+          path: |
+            build-tmp/hs_err_pid*.log
+            build-tmp/hs_err_pid*.mdmp
+            hs_err_pid*.log
+            hs_err_pid*.mdmp
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Dump Windows Application event log (Windows, on failure)
         if: failure() && runner.os == 'Windows'
