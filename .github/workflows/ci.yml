@@ -94,8 +94,12 @@ jobs:
     # No platform here has ever legitimately taken more than ~8 minutes; a
     # hang defaults to GitHub's 360-minute job cap otherwise, which is what
     # let a stuck Windows run burn ~58 minutes before it got noticed and
-    # cancelled by hand. 20 minutes is generous headroom, not a tight budget.
-    timeout-minutes: 20
+    # cancelled by hand. 20 minutes was generous headroom for the bare `zig
+    # build test` step alone; bumped to 40 now that this job also builds the
+    # DebugAllocator lane, C/C++/Java binding smoke tests, and (macOS only)
+    # the TSan suite -- starting budget, expected to need tuning down once
+    # real run times are observed.
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@v4
@@ -120,6 +124,55 @@ jobs:
         # this investigation is done — it's a real safety net, not just a
         # temporary probe.
         run: zig build test --test-timeout 60s
+
+      - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
+        run: zig build test -Ddebug-allocator=true
+
+      - name: Install JDK (java-binding needs jni.h, not just a JRE)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # See test-linux's identical step. -Djava-binding=true is included here
+      # (unlike test-linux) specifically because build.zig's Java/JNI build
+      # path is platform-aware (see build.zig's findJniIncludeDir, which
+      # switches on linux/darwin/win32 include-dir layout) but had never been
+      # exercised outside Linux before this -- this is the first CI signal on
+      # whether that path actually works on Windows/macOS.
+      # $RUNNER_TEMP (not /tmp) — the only temp-dir env var GitHub Actions
+      # guarantees exists and is writable on all three runner OSes, including
+      # Windows, where /tmp isn't a given outside Git Bash's own mapping.
+      - name: C/C++/Java binding smoke tests
+        shell: bash
+        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
+
+      # build.zig downgrades a missing JDK/JNI headers or javac to a
+      # std.log.warn + skip, not a build failure (see build.zig's two
+      # "not found ... skipping" warnings) -- without this check, a broken
+      # setup-java wiring on a given runner would silently pass instead of
+      # actually testing the Java binding, defeating the point of running it
+      # here at all.
+      - name: Verify no binding was silently skipped
+        shell: bash
+        run: |
+          if grep -qE "jni\.h not found|javac not found" "$RUNNER_TEMP/binding-smoke.log"; then
+            echo "::error::A binding was silently skipped instead of tested — see build.zig's std.log.warn fallbacks"
+            exit 1
+          fi
+
+      # ThreadSanitizer (Clang/LLVM) has no real Windows support, so this is
+      # macOS-only, not part of the shared matrix above. Linux ARM64 is
+      # deliberately not included either: TSan-on-ARM64 is a real gap of its
+      # own but wasn't part of this pass's scope (see docs/roadmap.md and
+      # docs/design/ci-platform-coverage-expansion.md item 3 -- macOS was the
+      # concrete, scoped extension, not a stand-in for "every non-x86_64
+      # Linux platform").
+      - name: TSan tests (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          zig build test-tsan-self-check
+          zig build test-tsan
 
   # ── zzdds-examples smoke test ──────────────────────────────────────────────
   #

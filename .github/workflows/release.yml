@@ -108,8 +108,14 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: Test (ReleaseFast)
+        run: zig build test -Doptimize=ReleaseFast
+
+      # ThreadSanitizer (Clang/LLVM) has no real Windows support; macOS is
+      # included alongside Linux here (Linux ARM64 stays out — see ci.yml's
+      # test-other job for the same scoping note).
       - name: Test (TSan)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
         run: zig build test-tsan
 
   # ── Self-interop gate (same as CI) ────────────────────────────────────────

@@ -3,8 +3,9 @@
 
 This is a convenience wrapper around the checks that are useful before pushing:
 formatting, sleep guardrails, Debug tests, feature-minimal tests, ReleaseSafe
-tests, and fuzz harness compile-checks.  ThreadSanitizer is available as an
-opt-in because it is slower and can be noisy on some local systems.
+tests, ReleaseFast tests, and fuzz harness compile-checks.  ThreadSanitizer is
+available as an opt-in because it is slower and can be noisy on some local
+systems.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ def parse_args() -> argparse.Namespace:
             "debug",
             "feature-minimal",
             "release-safe",
+            "release-fast",
             "fuzz",
             "tsan-self-check",
             "tsan",
@@ -64,6 +66,7 @@ def steps(zig: str, include_tsan: bool) -> list[Step]:
         Step("debug", [zig, "build", "test"]),
         Step("feature-minimal", [zig, "build", "test", "-Dipv6=false", "-Dinterface-monitor=false"]),
         Step("release-safe", [zig, "build", "test", "-Doptimize=ReleaseSafe"]),
+        Step("release-fast", [zig, "build", "test", "-Doptimize=ReleaseFast"]),
         Step("fuzz", [zig, "build", "test-fuzz"]),
     ]
     if include_tsan:

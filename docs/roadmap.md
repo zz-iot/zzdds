@@ -1598,44 +1598,65 @@ touched, and is worth calling out on its own.
 
 ---
 
-## CI / release platform coverage gaps (follow-on, not started, 2026-08-15)
+## CI / release platform coverage gaps (follow-on, re-reviewed 2026-08-16)
 
-Audit of `build.zig`'s options, `scripts/run_deterministic_matrix.py`, `ci.yml`, and
+Original audit of `build.zig`'s options, `scripts/run_deterministic_matrix.py`, `ci.yml`, and
 `release.yml` against the platform/build-type matrix they actually exercise, prompted by a
-review of PR #64. Not exhaustive-coverage nitpicking — these are the gaps judged to be real,
-actionable risk for a DDS middleware library, ranked roughly by importance:
+review of PR #64 (2026-08-15). Re-reviewed 2026-08-16 against the just-merged TSAN/
+DebugAllocator CI work (new `examples-tsan`, `self-interop-debug-allocator`, and
+`vendor-interop-debug-allocator` jobs, plus the `test-linux` DebugAllocator lane) — all of it
+Linux x86_64 only, confirmed line-by-line against the current `ci.yml`/`release.yml`. Every
+gap below is unchanged from the original audit or, for TSan/DebugAllocator specifically,
+larger in absolute footprint than when first written, since more Linux-only lanes now exist.
+Not exhaustive-coverage nitpicking — these are the gaps judged to be real, actionable risk
+for a DDS middleware library, re-ranked below given the concrete evidence the recent work
+provided:
 
-1. **C/C++/Java bindings are validated on Linux x86_64 only.** The JNI bridge, generated
+1. **DebugAllocator lane is untested outside Linux, and is the cheapest of these gaps to
+   close.** Pure-Zig, zero OS/compiler dependency (unlike TSan or Valgrind below) —
+   extending it to `test-other`'s Linux ARM64/macOS/Windows matrix is a one-line copy of
+   `test-linux`'s existing `-Ddebug-allocator=true` step (`ci.yml`:73-74). Bumped to #1 on
+   direct evidence: the just-merged DebugAllocator work found real allocator bugs on Linux;
+   there's no reason to expect Windows/macOS libc allocator interactions are less
+   bug-prone, and this is the lowest-effort way to find out.
+2. **C/C++/Java bindings are validated on Linux x86_64 only.** The JNI bridge, generated
    headers, and CMake/pkg-config install tree get zero CI signal on Windows, macOS, or
    ARM64 — exactly the platforms where linking/ABI issues are most likely to diverge
    silently, and the bindings are a core part of zzdds's value proposition.
-2. **`ReleaseFast` is never built or run anywhere** — not in CI, not in release.yml. The
+3. **TSan lane is Linux-only; macOS is a realistic extension, Windows is not.** Clang's
+   ThreadSanitizer supports Linux and macOS (x86_64/ARM64) but has no real Windows support,
+   so unlike DebugAllocator above, full parity isn't achievable — but macOS coverage is.
+   Same justification as #1 (the recent TSan work found real races on Linux) applied to the
+   subset of platforms where the tool actually works.
+4. **`ReleaseFast` is never built or run anywhere** — not in CI, not in release.yml. The
    optimize mode most production deployments would actually ship (safety checks stripped,
    UB instead of panics) is completely unverified. (`ReleaseSmall` likewise unused, lower
    priority.)
-3. **Real vendor/self RTPS interop (Connext/Cyclone/CoreDX/self) runs only on Linux
+5. **Real vendor/self RTPS interop (Connext/Cyclone/CoreDX/self) runs only on Linux
    x86_64.** Wire-format, discovery, and CDR correctness against real vendors has no
    coverage on Windows, macOS, or ARM64.
-4. **No Intel macOS coverage** — `macos-latest` in ci.yml/release.yml is Apple Silicon
+6. **No Intel macOS coverage** — `macos-latest` in ci.yml/release.yml is Apple Silicon
    only; Intel Mac consumers get no signal.
-5. **TSan/Valgrind/DebugAllocator lanes are Linux-only**, so concurrency/allocator bugs
-   specific to Windows or macOS threading/libc are structurally invisible to CI.
-6. **`release.yml` never builds a binding.** A tagged release could ship a binding
+7. **`release.yml` never builds a binding.** A tagged release could ship a binding
    regression that `main`'s own CI didn't happen to catch between last-green and the
    release trigger, since the release gate only requires a Linux x86_64 ReleaseSafe
    self-interop pass.
-7. **No musl/static Linux target** — always glibc, always the native triple (`-Dtarget`
+8. **No musl/static Linux target** — always glibc, always the native triple (`-Dtarget`
    is never actually cross-compiled anywhere). Alpine/statically-linked deployments are
    unvalidated.
-8. **No prebuilt release binaries at all.** `release.yml` publishes a git tag, changelog,
+9. **No prebuilt release binaries at all.** `release.yml` publishes a git tag, changelog,
    and `zig fetch` source URL only — no compiled `libzzdds.so`/`.dll`/`.dylib` is ever
    built, uploaded, or smoke-tested as a distributable artifact.
+10. **Valgrind has no viable non-Linux equivalent** — unmaintained/unreliable on Apple
+    Silicon, no native Windows support. Deprioritized to last: unlike DebugAllocator/TSan
+    above, there isn't a cheap or even clearly achievable extension here; treat as
+    effectively Linux-only permanently unless a specific non-Linux memory bug motivates
+    revisiting the tooling choice.
 
-Suggested first move if this gets picked up: extend the existing 3-platform (Linux ARM64/
-macOS/Windows) CI jobs from bare `zig build test` to also build+run the C/C++ bindings
-smoke tests already used on Linux x86_64 (items 1 and, partially, 6) — highest
-risk-reduction for the least new CI surface, since the smoke tests and binding build steps
-already exist and just aren't wired to run there yet.
+Suggested first move if this gets picked up: item 1 (DebugAllocator on `test-other`) —
+lowest effort, most direct evidence of payoff, and already-proven CI wiring to copy. Item 2
+(bindings smoke tests on the 3-platform matrix) is next: the smoke tests and binding build
+steps already exist and just aren't wired to run there yet.
 
 ---
 
