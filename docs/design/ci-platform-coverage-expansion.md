@@ -82,16 +82,48 @@ added; sketched as two above only to separate "needs JDK" from "doesn't").
 
 **Platforms:** Linux ARM64, macOS ARM64, Windows x86_64.
 
-**Risk:** medium. This is the item most likely to surface real, previously-invisible bugs
-per the roadmap's own reasoning (linking/ABI divergence) — that's the point of doing it, but
-expect this to be the item that actually takes iteration (e.g. a Windows-specific DLL export/
-`__declspec` issue, or an ARM64 calling-convention mismatch) rather than landing clean on the
-first try. `java-binding` additionally depends on JNI header layout under `findJniIncludeDir`
-actually matching each runner's JDK layout in practice, which has literally never been
-exercised outside Linux — treat "Java smoke test found nothing" on the first Windows/macOS
-run with mild suspicion (verify the JNI native lib actually got built and dlopen'd, not
-silently skipped — build.zig:1053's `std.log.warn("jni.h not found ...")` fallback would make
-a skip look like a pass).
+**Risk:** medium, assessed pre-implementation — correctly predicted "expect this to take
+iteration," undershot by how much. **Outcome (PR #65, 2026-08-17): C/C++ landed on all three
+platforms. Java/JNI landed on Linux ARM64 and macOS. Java/JNI on Windows is deferred, not
+achieved**, after three rounds of real bugs found and fixed/investigated:
+
+1. **`UnsatisfiedLinkError: ... Can't find dependent libraries`** — confirmed and fixed.
+   Windows PE/COFF has no `rpath` equivalent (unlike Linux/macOS, where Zig auto-adds one
+   when one build-graph library links another), and `-Djava.library.path` only pointed at
+   `zzdds_jni.dll`'s own build-cache directory, not wherever `zzdds.dll` (its dependency)
+   actually ended up. Fixed in `build.zig`: both libraries now install to the same real
+   directory (`.bin` on Windows, since `InstallArtifact` treats a `.dll` as `isDll()`), and
+   that directory is added to `PATH` via `run.addPathDir(...)`.
+2. **`EXCEPTION_STACK_OVERFLOW` inside `zzdds.dll`**, crashing at the first native call
+   (`createFactory()`) — despite that same call succeeding natively (no JNI) moments earlier
+   in the same CI job. Hypothesis: the JVM's default native thread stack (~1MB on Windows)
+   is smaller than this call path needs, while Linux/macOS pthread defaults (~8MB) have
+   enough headroom. "Fixed" with `-Xss8m` — this eliminated the stack-overflow signature.
+3. **`java.exe` exits with code 9, zero output**, same crash site, appeared *after* fix #2 —
+   a different, previously-masked failure, not caused by `-Xss8m` itself. Windows Defender
+   was the leading hypothesis (freshly-built unsigned native DLL, dynamically loaded via
+   JNI, on a runner with Defender active by default) — ruled out: an explicit workspace
+   exclusion was confirmed applied (via Defender's own config-change log) well before the
+   crash, and Defender's operational log shows no detection/block action anywhere near the
+   crash time. Explicit `-XX:ErrorFile`+`-XX:+CreateMinidumpOnCrash` flags were added to
+   force a crash file to a known-writable location — still produced nothing, which is
+   conclusive: the JVM's own crash handler never runs at all, not just writes somewhere
+   unexpected. Combined with zero Windows Error Reporting "Application" log entry, this
+   points at something terminating the process in a way that bypasses SEH entirely. Leading
+   (unconfirmed) hypothesis: **Control Flow Guard**. `jvm.dll` ships CFG-instrumented on
+   Windows; JNI is extremely function-pointer-heavy (the `JNIEnv*` passed to every native
+   method is a large vtable); `zig cc`-built DLLs are not known to be CFG-instrumented. An
+   indirect call across that boundary rejected by CFG enforcement would explain the total
+   silence — but this needs a live debugger (WinDbg) on real Windows hardware to confirm,
+   which CI cannot provide. A self-contained investigation brief (exact repro command, full
+   chronological trail, suggested next steps: check CFG status via `dumpbin`, attach a
+   debugger before the crash rather than post-mortem, isolate JNI from a minimal
+   non-JNI C harness) was written and handed off separately for whoever picks this up next
+   — not committed to this repo.
+
+`java-binding`'s dependency on `findJniIncludeDir` actually matching each runner's JDK layout
+did turn out to be fine on Linux ARM64 and macOS — no issues there, contrary to this
+section's original "treat with mild suspicion" caution.
 
 ## Item 3 — TSan extended to macOS (unit-test level only)
 

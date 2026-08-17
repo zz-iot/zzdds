@@ -114,25 +114,6 @@ jobs:
         if: runner.os == 'Windows'
         run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
 
-      # PR #65's Java binding smoke test hit a `java.exe` exit code 9 with
-      # zero forensic trace anywhere -- no hs_err_pid crash report (the JVM's
-      # own crash handler didn't fire) and no Windows "Application" event log
-      # entry either (a real access violation normally produces one via
-      # Windows Error Reporting even when hs_err doesn't). That combination
-      # -- silent termination, no crash evidence anywhere the JVM or WER
-      # would leave one -- is the signature of something external killing
-      # the process, not the process crashing itself. The leading suspect:
-      # Windows Defender's real-time scanner reacting to a freshly-built,
-      # unsigned native DLL (zzdds_jni.dll) being dynamically loaded via JNI
-      # from an unusual path -- a well-known false-positive trigger on
-      # GitHub-hosted Windows runners, which run Defender active by default.
-      # Excluding the whole workspace is the standard fix other Zig/Rust/Go
-      # projects use for this exact symptom.
-      - name: Exclude workspace from Windows Defender (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
-
       - name: Test
         # --test-timeout: diagnostic for the Windows hang investigation —
         # Zig's own test runner terminates and *names* whichever individual
@@ -148,86 +129,57 @@ jobs:
       - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
         run: zig build test -Ddebug-allocator=true
 
+      # Skipped on Windows: java-binding is deferred there (see below), so
+      # there's nothing on Windows that needs a JDK.
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
+        if: runner.os != 'Windows'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
 
-      # See test-linux's identical step. -Djava-binding=true is included here
-      # (unlike test-linux) specifically because build.zig's Java/JNI build
-      # path is platform-aware (see build.zig's findJniIncludeDir, which
-      # switches on linux/darwin/win32 include-dir layout) but had never been
-      # exercised outside Linux before this -- this is the first CI signal on
-      # whether that path actually works on Windows/macOS.
+      # Java binding on Windows is DEFERRED, not implemented here (PR #65).
+      # The DLL-search-path issue (Windows has no rpath equivalent) and a
+      # JVM-native-thread-stack-size issue were both found and fixed here,
+      # but a third failure followed: `java.exe` exits with code 9 and
+      # *zero* output right at the first JNI call (createFactory()) -- no
+      # JVM crash report (hs_err_pid*.log), no Windows Error Reporting
+      # "Application" event, and Windows Defender ruled out (its own
+      # operational log shows no detection/block action; an explicit
+      # workspace exclusion made no difference). Adding -XX:ErrorFile (an
+      # explicit, known-writable path) and -XX:+CreateMinidumpOnCrash still
+      # produced no crash file at all -- conclusive evidence the JVM's own
+      # crash handler never runs, not that it's writing somewhere
+      # unexpected. That signature (silent termination, zero trace anywhere
+      # the JVM or WER would normally leave one) points at something
+      # terminating the process in a way that bypasses SEH entirely --
+      # Control Flow Guard is the leading (unconfirmed) suspect: jvm.dll
+      # ships CFG-instrumented on Windows, JNI is extremely
+      # function-pointer-heavy, and zig cc-built DLLs are not known to be
+      # CFG-instrumented. Diagnosing further needs a live debugger on real
+      # Windows hardware, which CI can't provide -- see the handoff
+      # investigation brief and docs/roadmap.md item 2 for the full trail
+      # and suggested next steps for whoever picks this up.
+      #
+      # See test-linux's identical step for the non-Windows case (still
+      # includes -Djava-binding=true there and on macOS/Linux ARM64, where
+      # it works). -Djava-binding=true is included on those platforms
+      # (unlike test-linux, which only needs the Linux signal once) because
+      # build.zig's Java/JNI build path is platform-aware (see build.zig's
+      # findJniIncludeDir, which switches on linux/darwin/win32 include-dir
+      # layout) but had never been exercised outside Linux before this pass.
       # $RUNNER_TEMP (not /tmp) — the only temp-dir env var GitHub Actions
       # guarantees exists and is writable on all three runner OSes, including
       # Windows, where /tmp isn't a given outside Git Bash's own mapping.
       - name: C/C++/Java binding smoke tests
+        if: runner.os != 'Windows'
         shell: bash
         run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
 
-      # Diagnostics only, Windows only, only on failure: PR #65's Java smoke
-      # test has already hit two different native-crash signatures here (a
-      # stack overflow, then -- after raising -Xss -- a silent `java.exe`
-      # exit code 9 with NO output at all, not even a JVM crash banner, and
-      # Defender ruled out). build.zig now passes -XX:ErrorFile pointing at
-      # build-tmp/ explicitly (a directory we know is writable) instead of
-      # relying on the default cwd-relative name, plus
-      # -XX:+CreateMinidumpOnCrash for an actual .mdmp -- if the JVM's crash
-      # handler runs at all, it should land there now. .log files are
-      # printed in full; .mdmp files are binary, so only listed (size/path)
-      # -- upload-artifact below is what actually preserves them for
-      # real analysis.
-      - name: Dump crash diagnostics (Windows, on failure)
-        if: failure() && runner.os == 'Windows'
+      - name: C/C++ binding smoke tests (Windows -- Java deferred, see above)
+        if: runner.os == 'Windows'
         shell: bash
-        run: |
-          shopt -s nullglob
-          for f in ./build-tmp/hs_err_pid*.log ./hs_err_pid*.log; do
-            echo "::group::$f"
-            cat "$f" 2>/dev/null || echo "(unreadable: $f)"
-            echo "::endgroup::"
-          done
-          for f in ./build-tmp/hs_err_pid*.mdmp ./hs_err_pid*.mdmp; do
-            ls -la "$f"
-          done
-
-      # The .mdmp above is a real Windows minidump -- worth preserving as a
-      # downloadable artifact so it can actually be opened in WinDbg/Visual
-      # Studio, not just listed. if-no-files-found: ignore since this step
-      # should be a no-op (not a new failure) on the "handler never even ran"
-      # branch of this investigation, which is what every run so far has hit.
-      - name: Upload crash diagnostics (Windows, on failure)
-        if: failure() && runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-jni-crash-diagnostics
-          path: |
-            build-tmp/hs_err_pid*.log
-            build-tmp/hs_err_pid*.mdmp
-            hs_err_pid*.log
-            hs_err_pid*.mdmp
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Dump Windows Application event log (Windows, on failure)
-        if: failure() && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Get-WinEvent -LogName Application -MaxEvents 50 |
-            Where-Object { $_.Message -match 'java\.exe|zzdds' } |
-            Format-List TimeCreated, Id, LevelDisplayName, Message
-
-      # In case the Defender exclusion above didn't fully resolve it: a
-      # process Defender itself kills doesn't necessarily land in the
-      # "Application" log at all -- it has its own channel.
-      - name: Dump Windows Defender operational log (Windows, on failure)
-        if: failure() && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Get-WinEvent -LogName 'Microsoft-Windows-Windows Defender/Operational' -MaxEvents 50 |
-            Format-List TimeCreated, Id, LevelDisplayName, Message
+        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
 
       # build.zig downgrades a missing JDK/JNI headers or javac to a
       # std.log.warn + skip, not a build failure (see build.zig's two

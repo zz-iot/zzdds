@@ -1619,10 +1619,25 @@ provided:
    direct evidence: the just-merged DebugAllocator work found real allocator bugs on Linux;
    there's no reason to expect Windows/macOS libc allocator interactions are less
    bug-prone, and this is the lowest-effort way to find out.
-2. **C/C++/Java bindings are validated on Linux x86_64 only.** The JNI bridge, generated
-   headers, and CMake/pkg-config install tree get zero CI signal on Windows, macOS, or
-   ARM64 — exactly the platforms where linking/ABI issues are most likely to diverge
-   silently, and the bindings are a core part of zzdds's value proposition.
+2. **C/C++/Java bindings are validated on Linux x86_64 only — partially closed (PR #65,
+   2026-08-17).** C/C++ now run on Linux ARM64, macOS, and Windows too. Java/JNI runs on
+   Linux ARM64 and macOS. **Java/JNI on Windows is deferred, not achieved** — real bugs were
+   found and fixed along the way (Windows has no rpath equivalent, so `-Djava.library.path`
+   alone couldn't resolve `zzdds_jni.dll`'s dependency on `zzdds.dll`, fixed by installing
+   both to the same directory and adding it to `PATH`; the JVM's default native thread stack
+   was too small for this call path on Windows specifically, fixed with `-Xss8m`), but a
+   third failure remains unresolved: `java.exe` exits with code 9 and zero output at the
+   first JNI call, with no JVM crash report, no Windows Error Reporting event, and Defender
+   ruled out as the cause. Explicit `-XX:ErrorFile`/`-XX:+CreateMinidumpOnCrash` flags still
+   produced no crash file at all — conclusive evidence the JVM's crash handler never runs,
+   consistent with something bypassing SEH entirely (Control Flow Guard mismatch between
+   CFG-instrumented `jvm.dll` and non-CFG-instrumented `zig cc`-built DLLs is the leading,
+   unconfirmed hypothesis). Diagnosing further needs a live debugger (WinDbg) on real Windows
+   hardware, which CI can't provide. A self-contained investigation brief with the full
+   chronological trail and suggested next steps was handed off separately (not committed to
+   this repo — ask whoever's tracking this item for it). The remaining gap: JNI bridge,
+   generated headers, and CMake/pkg-config install tree on Windows specifically still get no
+   CI signal.
 3. **TSan lane is Linux-only; macOS was attempted (PR #65, 2026-08-17) and blocked, not
    achieved.** Clang's ThreadSanitizer supports Linux and macOS (x86_64/ARM64) but has no
    real Windows support. macOS coverage looked like a realistic extension of the same
