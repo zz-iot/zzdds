@@ -108,9 +108,26 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: Test (ReleaseFast)
+        run: zig build test -Doptimize=ReleaseFast
+
+      # ThreadSanitizer (Clang/LLVM) has no real Windows support. macOS is
+      # deliberately NOT included here either, despite being TSan-capable in
+      # principle -- see ci.yml's test-other job for why: even the minimal
+      # test-tsan-self-check segfaults with zero sanitizer output on macOS
+      # ARM64 (macos-latest), which looks like an upstream Zig/LLVM gap
+      # (suspected private Apple API breakage in libtsan's startup path), not
+      # something fixable from zzdds's side. test-tsan-self-check runs first
+      # here, same as ci.yml's equivalent lane -- it proves TSan
+      # instrumentation is actually active before trusting a clean test-tsan
+      # run as real coverage rather than silently-inert instrumentation
+      # (flagged by Greptile on an earlier version of this PR, which had this
+      # step run test-tsan alone).
       - name: Test (TSan)
         if: matrix.os == 'ubuntu-latest'
-        run: zig build test-tsan
+        run: |
+          zig build test-tsan-self-check
+          zig build test-tsan
 
   # ── Self-interop gate (same as CI) ────────────────────────────────────────
   # Uses the stable binary name (no -Ddds-version) — the versioned name is for

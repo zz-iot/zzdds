@@ -94,8 +94,13 @@ jobs:
     # No platform here has ever legitimately taken more than ~8 minutes; a
     # hang defaults to GitHub's 360-minute job cap otherwise, which is what
     # let a stuck Windows run burn ~58 minutes before it got noticed and
-    # cancelled by hand. 20 minutes is generous headroom, not a tight budget.
-    timeout-minutes: 20
+    # cancelled by hand. 20 minutes was generous headroom for the bare `zig
+    # build test` step alone; bumped to 40 now that this job also builds the
+    # DebugAllocator lane and C/C++/Java binding smoke tests -- starting
+    # budget, expected to need tuning down once real run times are observed.
+    # (macOS TSan was tried and deferred -- see docs/roadmap.md item 3 --
+    # so it's not a factor here.)
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@v4
@@ -120,6 +125,98 @@ jobs:
         # this investigation is done — it's a real safety net, not just a
         # temporary probe.
         run: zig build test --test-timeout 60s
+
+      - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
+        run: zig build test -Ddebug-allocator=true
+
+      # Skipped on Windows: java-binding is deferred there (see below), so
+      # there's nothing on Windows that needs a JDK.
+      - name: Install JDK (java-binding needs jni.h, not just a JRE)
+        if: runner.os != 'Windows'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Java binding on Windows is DEFERRED, not implemented here (PR #65).
+      # The DLL-search-path issue (Windows has no rpath equivalent) and a
+      # JVM-native-thread-stack-size issue were both found and fixed here,
+      # but a third failure followed: `java.exe` exits with code 9 and
+      # *zero* output right at the first JNI call (createFactory()) -- no
+      # JVM crash report (hs_err_pid*.log), no Windows Error Reporting
+      # "Application" event, and Windows Defender ruled out (its own
+      # operational log shows no detection/block action; an explicit
+      # workspace exclusion made no difference). Adding -XX:ErrorFile (an
+      # explicit, known-writable path) and -XX:+CreateMinidumpOnCrash still
+      # produced no crash file at all -- conclusive evidence the JVM's own
+      # crash handler never runs, not that it's writing somewhere
+      # unexpected. That signature (silent termination, zero trace anywhere
+      # the JVM or WER would normally leave one) points at something
+      # terminating the process in a way that bypasses SEH entirely --
+      # Control Flow Guard is the leading (unconfirmed) suspect: jvm.dll
+      # ships CFG-instrumented on Windows, JNI is extremely
+      # function-pointer-heavy, and zig cc-built DLLs are not known to be
+      # CFG-instrumented. Diagnosing further needs a live debugger on real
+      # Windows hardware, which CI can't provide -- see the handoff
+      # investigation brief and docs/roadmap.md item 2 for the full trail
+      # and suggested next steps for whoever picks this up.
+      #
+      # See test-linux's identical step for the non-Windows case (still
+      # includes -Djava-binding=true there and on macOS/Linux ARM64, where
+      # it works). -Djava-binding=true is included on those platforms
+      # (unlike test-linux, which only needs the Linux signal once) because
+      # build.zig's Java/JNI build path is platform-aware (see build.zig's
+      # findJniIncludeDir, which switches on linux/darwin/win32 include-dir
+      # layout) but had never been exercised outside Linux before this pass.
+      # $RUNNER_TEMP (not /tmp) — the only temp-dir env var GitHub Actions
+      # guarantees exists and is writable on all three runner OSes, including
+      # Windows, where /tmp isn't a given outside Git Bash's own mapping.
+      - name: C/C++/Java binding smoke tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
+
+      - name: C/C++ binding smoke tests (Windows -- Java deferred, see above)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
+
+      # build.zig downgrades a missing JDK/JNI headers or javac to a
+      # std.log.warn + skip, not a build failure (see build.zig's two
+      # "not found ... skipping" warnings) -- without this check, a broken
+      # setup-java wiring on a given runner would silently pass instead of
+      # actually testing the Java binding, defeating the point of running it
+      # here at all.
+      - name: Verify no binding was silently skipped
+        shell: bash
+        run: |
+          if grep -qE "jni\.h not found|javac not found" "$RUNNER_TEMP/binding-smoke.log"; then
+            echo "::error::A binding was silently skipped instead of tested — see build.zig's std.log.warn fallbacks"
+            exit 1
+          fi
+
+      # TSan-on-macOS is DEFERRED, not implemented here (PR #65). Even the
+      # minimal test-tsan-self-check (two threads, one deliberate race, no
+      # zzdds code at all) segfaults with zero sanitizer output before any
+      # application code runs -- not TSan's own memory-layout-incompatible
+      # diagnostic path (tsan_platform_posix.cpp's CheckAndProtect always
+      # prints before exiting cleanly; sanitizer Printf bypasses libc
+      # buffering, so a real diagnostic would have survived the crash).
+      # MallocNanoZone=0 (a real, documented TSan-vs-macOS interaction) was
+      # tried and did not help. Most likely cause based on reading Zig's
+      # bundled libtsan source: InitializePlatform() (tsan_platform_mac.cpp)
+      # calls Apple's private, undocumented pthread_introspection_hook_install
+      # API during its startup constructor -- sanitizer runtimes breaking
+      # against private Apple APIs after an OS/Xcode version drifts out from
+      # under a pinned LLVM release is a long-established failure class for
+      # TSan/ASan on macOS. Since GitHub's macos-latest image moves
+      # independently of Zig's release cadence, a mismatch between "macOS
+      # version the runner is actually on" and "what Zig 0.16.0's bundled
+      # compiler-rt TSan was built/tested against" is plausible. This looks
+      # like an upstream Zig/LLVM gap, not something fixable from zzdds's
+      # side -- see docs/roadmap.md and
+      # docs/design/ci-platform-coverage-expansion.md item 3 for the full
+      # writeup and follow-up tracking.
 
   # ── zzdds-examples smoke test ──────────────────────────────────────────────
   #
