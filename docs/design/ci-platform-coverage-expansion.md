@@ -117,13 +117,32 @@ deferred to its own follow-up — not assumed by this item.
 **Windows:** not attempted. Clang/LLVM TSan has no supported Windows target; this is a hard
 tooling limitation, not a prioritization choice.
 
-**Risk:** low-medium. The `.use_llvm = true` forcing and TSan step itself are OS-agnostic in
-build.zig already; main risk is macOS-specific runtime flakiness analogous to the
-Linux ASLR issue that `examples-tsan` hit — but that was specific to TSan-runtime-vs-ASLR
-interaction at process startup in a way tied to Linux's `vm.mmap_rnd_bits`, not something
-known to reproduce on macOS's ASLR implementation. Budget for at least one flake-diagnosis
-cycle before treating a macOS TSan failure as a real bug rather than environment noise —
-same posture the Linux TSan work already established.
+**Risk:** low-medium, assessed pre-implementation — turned out too optimistic. **Outcome
+(PR #65, 2026-08-17): NOT LANDED, deferred.** Even the minimal `test-tsan-self-check` (two
+threads, one deliberate race, no zzdds code at all) segfaults on macOS ARM64
+(`macos-latest`) with zero sanitizer output before any application code runs. Ruled out:
+
+- **macOS's nano-malloc-zone interaction** (`MallocNanoZone=0`, a real, documented
+  TSan-vs-macOS issue) — tried, did not help.
+- **The Linux ASLR/shadow-memory-layout class of bug** this section originally predicted —
+  ruled out by reading Zig's bundled `libtsan` source directly: that failure path
+  (`tsan_platform_posix.cpp`'s `CheckAndProtect`, shared between Linux and macOS) always
+  prints a `WARNING`/`FATAL` diagnostic via sanitizer `Printf` (which bypasses libc
+  buffering specifically so crash-adjacent output survives) before exiting cleanly. Zero
+  output before a real SIGSEGV rules this path out.
+
+Most likely cause based on that same source read: `InitializePlatform()`
+(`tsan_platform_mac.cpp`) calls Apple's private, undocumented
+`pthread_introspection_hook_install` API during TSan's startup constructor — sanitizer
+runtimes breaking against private Apple APIs after the OS/Xcode version drifts from under a
+pinned LLVM release is a long-established failure class for TSan/ASan on macOS. GitHub's
+`macos-latest` image moves independently of Zig's release cadence, so a mismatch between
+"macOS version the runner is on" and "what Zig 0.16.0's bundled compiler-rt TSan was
+built/tested against" is plausible. No matching open issue found in `ziglang/zig`'s tracker.
+This looks like an upstream Zig/LLVM gap, not something fixable from zzdds's CI config —
+revisit when Zig bundles a newer LLVM, or if someone can reproduce/bisect on real macOS
+hardware (this diagnosis was done entirely by reading source; nothing here was verified by
+actually running on macOS).
 
 ## Item 4 — `ReleaseFast` built and tested
 

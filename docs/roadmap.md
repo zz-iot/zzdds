@@ -1623,11 +1623,19 @@ provided:
    headers, and CMake/pkg-config install tree get zero CI signal on Windows, macOS, or
    ARM64 — exactly the platforms where linking/ABI issues are most likely to diverge
    silently, and the bindings are a core part of zzdds's value proposition.
-3. **TSan lane is Linux-only; macOS is a realistic extension, Windows is not.** Clang's
-   ThreadSanitizer supports Linux and macOS (x86_64/ARM64) but has no real Windows support,
-   so unlike DebugAllocator above, full parity isn't achievable — but macOS coverage is.
-   Same justification as #1 (the recent TSan work found real races on Linux) applied to the
-   subset of platforms where the tool actually works.
+3. **TSan lane is Linux-only; macOS was attempted (PR #65, 2026-08-17) and blocked, not
+   achieved.** Clang's ThreadSanitizer supports Linux and macOS (x86_64/ARM64) but has no
+   real Windows support. macOS coverage looked like a realistic extension of the same
+   justification as #1 (the recent TSan work found real races on Linux) — but even the
+   minimal `test-tsan-self-check` segfaults with zero sanitizer output on `macos-latest`
+   (Apple Silicon), before any application code runs. Diagnosed (from source, not verified
+   on real macOS hardware — see `docs/design/ci-platform-coverage-expansion.md` item 3 for
+   the full writeup) as a likely upstream Zig/LLVM issue: TSan's macOS startup path calls a
+   private, undocumented Apple API (`pthread_introspection_hook_install`), and sanitizer
+   runtimes breaking against private API drift after an OS/Xcode update is a well-established
+   failure class, plausible here since GitHub's `macos-latest` image version moves
+   independently of Zig's pinned LLVM release. Not something fixable from zzdds's CI config;
+   revisit when Zig bundles a newer LLVM, or if someone can bisect on real macOS hardware.
 4. **`ReleaseFast` is never built or run anywhere** — not in CI, not in release.yml. The
    optimize mode most production deployments would actually ship (safety checks stripped,
    UB instead of panics) is completely unverified. (`ReleaseSmall` likewise unused, lower

@@ -1069,7 +1069,18 @@ pub fn build(b: *std.Build) void {
                 const zzdds_dll_install_dir: std.Build.InstallDir = if (target.result.os.tag == .windows) .bin else .lib;
                 const zzdds_dll_install_path = b.getInstallPath(zzdds_dll_install_dir, "");
 
-                const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "-cp", "build-tmp/java-binding-smoke" });
+                // -Xss8m: PR #65 CI hit an immediate EXCEPTION_STACK_OVERFLOW
+                // inside libzzdds, crashing right as JavaSmoke's very first
+                // native call (createFactory()) enters the JNI bridge --
+                // despite that same native factory/participant bootstrap
+                // running clean under the plain (non-JNI) Windows test suite
+                // moments earlier in the same job. The JVM's default native
+                // thread stack (~1MB) is the prime suspect: it's the one
+                // thing genuinely smaller on Windows than the pthread
+                // defaults this call path apparently fits under on
+                // Linux/macOS (both closer to 8MB). 8MB matches that
+                // headroom; harmless to set on every platform.
+                const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
                 run_java_smoke.addArg(b.fmt("-Djava.library.path={s}", .{zzdds_dll_install_path}));
                 run_java_smoke.addPathDir(zzdds_dll_install_path);
                 run_java_smoke.addArg("JavaSmoke");
