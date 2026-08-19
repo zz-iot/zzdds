@@ -1248,7 +1248,18 @@ pub const StatefulWriter = struct {
             cache_last;
 
         for (self.reader_proxies.items) |*rp| {
-            if (!rp.reliable) continue; // BEST_EFFORT readers do not use HEARTBEAT/ACKNACK
+            // BEST_EFFORT readers don't participate in the reliable
+            // ACK/NACK protocol, so a routine keepalive heartbeat is
+            // pointless for them -- but a liveliness-flagged heartbeat
+            // (RTPS §8.7.2.2.3's MANUAL_BY_TOPIC assert_liveliness() path)
+            // is a different semantic: the reader still tracks and expires
+            // this writer's finite lease regardless of its own reliability
+            // kind, so it must still receive the assertion. Found via
+            // Greptile review: BEST_EFFORT-matched readers were silently
+            // dropped from every liveliness-flagged send, so an explicit
+            // assert_liveliness() on a MANUAL_BY_TOPIC writer never reached
+            // them, and their lease expired on schedule regardless.
+            if (!rp.reliable and !liveliness) continue;
             const locs = rp.effectiveLocators();
             if (locs.len == 0) continue;
             const last_sn = adj_last;
