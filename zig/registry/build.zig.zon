@@ -1,0 +1,33 @@
+.{
+    .name = .zzdds_examples_registry_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x42762751a43ca739,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // TEMPORARY, not the final state: points at the zzdds-liveliness
+        // fix worktree, not the normal sibling zzdds -- not because registry
+        // needs *those* fixes (it doesn't touch LIVELINESS at all), but
+        // because that worktree's own build.zig.zon happens to already be
+        // pointed at the zidl fix worktree (branch
+        // fix/getfieldfromcdr-unused-params) this example genuinely does
+        // need: SensorReading has no string-typed member, which hits the
+        // exact same generated-getFieldFromCdr unused-parameter bug
+        // zig/presence found. Revert this back to the plain sibling path
+        // below once that zidl fix is released and zzdds's own pin moves
+        // past it -- same "dormant until the pin moves" pattern as
+        // zig/presence's own build.zig.zon.
+        // .zzdds = .{
+        //     .path = "../../../zzdds",
+        // },
+        .zzdds = .{
+            .path = "../../../zzdds-liveliness-notify-on-alive",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "publisher.zig",
+        "subscriber.zig",
+        "idl",
+    },
+}

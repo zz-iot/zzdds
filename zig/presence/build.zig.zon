@@ -1,0 +1,42 @@
+.{
+    .name = .zzdds_examples_presence_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x7b20c5069297c8,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Same convention as zig/hello_world and zig/waitset: point straight
+        // at the sibling checkout this workspace already assumes exists,
+        // rather than a tagged release URL.
+        //
+        // No direct dependency on zidl here -- build.zig gets the zidl
+        // executable and zidl_rt module *through* zzdds instead (which
+        // re-exposes both), so there's only ever one zidl resolution in the
+        // whole graph. See build.zig's comment for why a second, independent
+        // one breaks the build outright when zidl is a `.path` dependency.
+        // TEMPORARY, not the final state: points at a sibling zzdds *fix*
+        // worktree (branch fix/liveliness-notify-on-alive), not the normal
+        // zzdds checkout -- this example needs 3 real zzdds core fixes found
+        // while building it (on_liveliness_changed never firing on writer
+        // match/recovery; PID_LIVELINESS never encoded on the wire, so a
+        // remote peer's LIVELINESS QoS was invisible; a RELIABLE writer's own
+        // background HEARTBEAT traffic wrongly counting as a MANUAL_BY_TOPIC/
+        // PARTICIPANT liveliness assertion). Revert this back to the normal
+        // sibling path below, matching every other zig/* example, once that
+        // worktree's fixes are reviewed/merged -- same "dormant until the pin
+        // moves" pattern this project already uses elsewhere (see e.g.
+        // dds-rtps's own zzdds pin comment).
+        // .zzdds = .{
+        //     .path = "../../../zzdds",
+        // },
+        .zzdds = .{
+            .path = "../../../zzdds-liveliness-notify-on-alive",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "publisher.zig",
+        "subscriber.zig",
+        "idl",
+    },
+}

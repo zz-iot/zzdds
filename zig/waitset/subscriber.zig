@@ -215,6 +215,26 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
+    // WaitSet.get_conditions() -- all four attached conditions, regardless of
+    // trigger state, distinct from wait()'s own out-param (only the ones
+    // that triggered *this* call). Otherwise unexercised anywhere in this
+    // project; a real assertion here (not just a call) is nearly free given
+    // this WaitSet's attached set is already known exactly.
+    {
+        var attached = DDS.ConditionSeq{};
+        defer if (attached._release) {
+            if (attached._buffer) |b| alloc.free(b[0..attached._maximum]);
+        };
+        if (ws.get_conditions(&attached) != DDS.RETCODE_OK) {
+            std.debug.print("FAIL: WaitSet.get_conditions() failed\n", .{});
+            std.process.exit(1);
+        }
+        if (attached._length != 4) {
+            std.debug.print("FAIL: WaitSet.get_conditions() returned {d} conditions, expected 4\n", .{attached._length});
+            std.process.exit(1);
+        }
+    }
+
     var watchdog = Watchdog{ .gc = gc, .io = io, .deadline_ns = monoNs(io) + OVERALL_DEADLINE_NS };
     const watchdog_thread = try std.Thread.spawn(.{}, Watchdog.run, .{&watchdog});
 

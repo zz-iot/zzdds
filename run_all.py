@@ -180,6 +180,24 @@ def main() -> int:
     else:
         skip_or_fail("interop/waitset-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
 
+    # ── Presence cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section("interop/presence-cross-binding", lambda: run_script(SCRIPT_DIR / "interop" / "presence_cross_binding_smoke_test.py", env=env))
+    else:
+        skip_or_fail("interop/presence-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
+    # ── Registry cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section("interop/registry-cross-binding", lambda: run_script(SCRIPT_DIR / "interop" / "registry_cross_binding_smoke_test.py", env=env))
+    else:
+        skip_or_fail("interop/registry-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
+    # ── Catchup cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section("interop/catchup-cross-binding", lambda: run_script(SCRIPT_DIR / "interop" / "catchup_cross_binding_smoke_test.py", env=env))
+    else:
+        skip_or_fail("interop/catchup-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
     # ── opencv_zzdds (needs cpp-binding and OpenCV) ─────────────────────
     if cpp_binding and opencv:
         run_section("cpp/opencv_zzdds", lambda: run_script(SCRIPT_DIR / "cpp" / "opencv_zzdds" / "smoke_test.py", env=env))

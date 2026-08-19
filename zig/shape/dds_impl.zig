@@ -78,8 +78,8 @@ pub fn registerTypeSupport(
     dp: DDS.DomainParticipant,
     type_name: []const u8,
     ts: TypeSupport,
-) void {
-    _ = zzdds.registerTypeSupport(dp, type_name, ts);
+) bool {
+    return zzdds.registerTypeSupport(dp, type_name, ts);
 }
 
 // ── Nil sentinel helpers ──────────────────────────────────────────────────────

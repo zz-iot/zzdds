@@ -169,6 +169,24 @@ public class Subscriber {
             System.exit(1);
         }
 
+        // WaitSet.get_conditions() -- all four attached conditions,
+        // regardless of trigger state, distinct from wait()'s own out-param
+        // (only the ones that triggered *this* call). Otherwise unexercised
+        // anywhere in this project; a real assertion here (not just a call)
+        // is nearly free given this WaitSet's attached set is already known
+        // exactly.
+        {
+            java.util.List<Dcps.DDS.Condition> attached = new java.util.ArrayList<>();
+            if (ws.get_conditions(attached) != 0) {
+                System.err.println("FAIL: WaitSet.get_conditions() failed");
+                System.exit(1);
+            }
+            if (attached.size() != 4) {
+                System.err.println("FAIL: WaitSet.get_conditions() returned " + attached.size() + " conditions, expected 4");
+                System.exit(1);
+            }
+        }
+
         Watchdog watchdog = new Watchdog(gc);
         Thread watchdogThread = new Thread(watchdog);
         watchdogThread.start();

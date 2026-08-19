@@ -116,10 +116,13 @@ pub fn main(init: std.process.Init) !void {
     // is keyless so it's never actually dereferenced here, but a real example
     // should still pass a real one rather than `undefined`.
     var ts_alloc = alloc;
-    _ = zzdds.registerTypeSupport(dp, "HelloWorld", .{
+    if (!zzdds.registerTypeSupport(dp, "HelloWorld", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = hello_gen.HelloWorld.computeKeyHashFromCdr,
-    });
+    })) {
+        std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
+        std.process.exit(1);
+    }
 
     const topic = dp.create_topic("HelloWorld", "HelloWorld", .{}, null, 0);
     if (topic.ptr == zzdds.dcps.NIL_PTR) {

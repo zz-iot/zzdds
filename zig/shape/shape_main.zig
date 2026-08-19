@@ -161,8 +161,9 @@ fn drOnDeadlineMissed(lc: *ListenerCtx, _: DDS.DataReader, status: DDS.Requested
 
 // ── DataWriter QoS builder ────────────────────────────────────────────────────
 
-fn buildWriterQos(alloc: std.mem.Allocator, opts: *const Options) !DDS.DataWriterQos {
-    var qos = DDS.DataWriterQos{};
+fn buildWriterQos(alloc: std.mem.Allocator, pub_: DDS.Publisher, opts: *const Options) !DDS.DataWriterQos {
+    var qos: DDS.DataWriterQos = undefined;
+    if (pub_.get_default_datawriter_qos(&qos) != DDS.RETCODE_OK) return error.GetDefaultQosFailed;
 
     // -r forces RELIABLE even if -b was also passed; otherwise -b selects
     // BEST_EFFORT and everything else (including the no-flags case) is RELIABLE.
@@ -215,8 +216,9 @@ fn buildWriterQos(alloc: std.mem.Allocator, opts: *const Options) !DDS.DataWrite
 
 // ── DataReader QoS builder ────────────────────────────────────────────────────
 
-fn buildReaderQos(alloc: std.mem.Allocator, opts: *const Options) !DDS.DataReaderQos {
-    var qos = DDS.DataReaderQos{};
+fn buildReaderQos(alloc: std.mem.Allocator, sub: DDS.Subscriber, opts: *const Options) !DDS.DataReaderQos {
+    var qos: DDS.DataReaderQos = undefined;
+    if (sub.get_default_datareader_qos(&qos) != DDS.RETCODE_OK) return error.GetDefaultQosFailed;
 
     // -r forces RELIABLE even if -b was also passed; otherwise -b selects
     // BEST_EFFORT and everything else (including the no-flags case) is RELIABLE.
@@ -371,7 +373,7 @@ fn runPublisher(
     const pub_ = dp.create_publisher(pub_qos, null, 0);
     if (isNilPub(pub_)) return error.PublisherFailed;
 
-    var dw_qos = try buildWriterQos(alloc, opts);
+    var dw_qos = try buildWriterQos(alloc, pub_, opts);
     defer dw_qos.deinit(alloc);
 
     // One ListenerCtx, raw DataWriter handle, and typed DataWriter per topic.
@@ -528,9 +530,15 @@ fn runPublisher(
                 defer if (inst > 0) alloc.free(inst_color);
                 const key = shape_gen.ShapeType{ .color = ShapeColor.fromSlice(inst_color) catch .{} };
                 if (do_dispose) {
-                    typed_writers[ti].dispose(key, 0) catch {};
+                    typed_writers[ti].dispose(key, 0) catch |err| {
+                        stdoutPrint("FAIL: dispose() failed: {s}\n", .{@errorName(err)});
+                        std.process.exit(1);
+                    };
                 } else {
-                    typed_writers[ti].unregister_instance(key, 0) catch {};
+                    typed_writers[ti].unregister_instance(key, 0) catch |err| {
+                        stdoutPrint("FAIL: unregister_instance() failed: {s}\n", .{@errorName(err)});
+                        std.process.exit(1);
+                    };
                 }
             }
         }
@@ -570,10 +578,10 @@ fn runSubscriber(
     const cft: ?DDS.ContentFilteredTopic = blk: {
         const expr = effective_cft_expr orelse break :blk null;
         const base_name = et.nameAt(opts.topic_name, 0);
-        const cft_name = std.fmt.allocPrintSentinel(alloc, "{s}_cft", .{base_name}, 0) catch break :blk null;
+        const cft_name = try std.fmt.allocPrintSentinel(alloc, "{s}_cft", .{base_name}, 0);
         defer alloc.free(cft_name);
         const c = dp.create_contentfilteredtopic(cft_name, base_topic, expr, null);
-        if (isNilCft(c)) break :blk null;
+        if (isNilCft(c)) return error.ContentFilteredTopicFailed;
         break :blk c;
     };
     defer {
@@ -600,7 +608,7 @@ fn runSubscriber(
     const sub = dp.create_subscriber(sub_qos, null, 0);
     if (isNilSub(sub)) return error.SubscriberFailed;
 
-    var dr_qos = try buildReaderQos(alloc, opts);
+    var dr_qos = try buildReaderQos(alloc, sub, opts);
     defer dr_qos.deinit(alloc);
 
     // One ListenerCtx, raw DataReader handle, and typed DataReader per topic.
@@ -737,6 +745,20 @@ fn runSubscriber(
                     continue;
                 }
 
+                // Content assertions: a key (color) must never change across
+                // samples of the same instance handle, and the writer only
+                // ever emits x/y in [0,320)/[0,240) with shapesize >= 1 --
+                // hard-fail if either invariant is violated.
+                if (ih_to_color.get(info.instance_handle)) |cached| {
+                    if (!std.mem.eql(u8, cached.slice(), value.color.slice())) {
+                        stdoutPrint("FAIL: instance {d} color changed from '{s}' to '{s}'\n", .{ info.instance_handle, cached.slice(), value.color.slice() });
+                        std.process.exit(1);
+                    }
+                }
+                if (value.x < 0 or value.x >= 320 or value.y < 0 or value.y >= 240 or value.shapesize < 1) {
+                    stdoutPrint("FAIL: sample out of bounds: x={d} y={d} shapesize={d}\n", .{ value.x, value.y, value.shapesize });
+                    std.process.exit(1);
+                }
                 ih_to_color.put(info.instance_handle, value.color) catch {};
 
                 // No app-side CFT re-check needed here anymore: zzdds's own
@@ -1036,11 +1058,14 @@ pub fn main(init: std.process.Init) !void {
     // history: it used to hand-call dds.cftMatchSample per received sample
     // because nothing ever set get_field; see zzdds's docs/roadmap.md).
     var ts_alloc = alloc;
-    dds.registerTypeSupport(dp, "ShapeType", .{
+    if (!dds.registerTypeSupport(dp, "ShapeType", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = shape_gen.ShapeType.computeKeyHashFromCdr,
         .get_field = shape_gen.ShapeType.getFieldFromCdr,
-    });
+    })) {
+        std.log.err("registerTypeSupport() failed", .{});
+        std.process.exit(1);
+    }
 
     // Create the base topic (index 0). Additional topics are created inside run functions.
     const base_topic = dp.create_topic(

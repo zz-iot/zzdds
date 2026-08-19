@@ -133,8 +133,11 @@ public class ShapeMain {
         return new Dcps.DDS.Duration_t((int) (ms / 1000), (int) ((ms % 1000) * 1_000_000));
     }
 
-    static Dcps.DDS.DataWriterQos buildWriterQos(Options opts) {
+    static Dcps.DDS.DataWriterQos buildWriterQos(Dcps.DDS.Publisher pub, Options opts) {
         Dcps.DDS.DataWriterQos qos = new Dcps.DDS.DataWriterQos();
+        if (pub.get_default_datawriter_qos(qos) != Dcps.DDS.RETCODE_OK.value) {
+            throw new RuntimeException("get_default_datawriter_qos() failed");
+        }
         qos.get_reliability().set_kind(reliabilityKind(opts));
         if (opts.historyDepth == 0) {
             qos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
@@ -157,8 +160,11 @@ public class ShapeMain {
         return qos;
     }
 
-    static Dcps.DDS.DataReaderQos buildReaderQos(Options opts) {
+    static Dcps.DDS.DataReaderQos buildReaderQos(Dcps.DDS.Subscriber sub, Options opts) {
         Dcps.DDS.DataReaderQos qos = new Dcps.DDS.DataReaderQos();
+        if (sub.get_default_datareader_qos(qos) != Dcps.DDS.RETCODE_OK.value) {
+            throw new RuntimeException("get_default_datareader_qos() failed");
+        }
         qos.get_reliability().set_kind(reliabilityKind(opts));
         if (opts.historyDepth == 0) {
             qos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
@@ -237,7 +243,7 @@ public class ShapeMain {
             return 1;
         }
 
-        Dcps.DDS.DataWriterQos dwQos = buildWriterQos(opts);
+        Dcps.DDS.DataWriterQos dwQos = buildWriterQos(pub, opts);
         int xcdrVersion = (opts.dataRepresentation == 2) ? ShapeTypeDataWriter.XCDR2 : ShapeTypeDataWriter.XCDR1;
         int dwMask = Dcps.DDS.OFFERED_INCOMPATIBLE_QOS_STATUS.value | Dcps.DDS.OFFERED_DEADLINE_MISSED_STATUS.value;
 
@@ -381,16 +387,20 @@ public class ShapeMain {
                 for (int inst = 0; inst < opts.numInstances; inst++) {
                     Shape.ShapeType key = new Shape.ShapeType();
                     key.set_color(instanceColor(baseColor, inst));
-                    if (doDispose) {
-                        typedWriters.get(ti).dispose(key, 0L);
-                    } else {
-                        typedWriters.get(ti).unregister(key, 0L);
+                    int rc = doDispose ? typedWriters.get(ti).dispose(key, 0L) : typedWriters.get(ti).unregister(key, 0L);
+                    if (rc != Dcps.DDS.RETCODE_OK.value) {
+                        System.err.printf("FAIL: %s() failed: %d%n", doDispose ? "dispose" : "unregister_instance", rc);
+                        return 1;
                     }
                 }
             }
             Dcps.DDS.Duration_t ackTimeout = new Dcps.DDS.Duration_t(5, 0);
             for (Dcps.DDS.DataWriter dw : writers) {
-                dw.wait_for_acknowledgments(ackTimeout);
+                int ackRc = dw.wait_for_acknowledgments(ackTimeout);
+                if (ackRc != Dcps.DDS.RETCODE_OK.value && ackRc != Dcps.DDS.RETCODE_TIMEOUT.value) {
+                    System.err.printf("FAIL: wait_for_acknowledgments() failed: %d%n", ackRc);
+                    return 1;
+                }
             }
         }
         return 0;
@@ -424,6 +434,10 @@ public class ShapeMain {
         Dcps.DDS.ContentFilteredTopic cft = null;
         if (effectiveCftExpr != null) {
             cft = dp.create_contentfilteredtopic(opts.topicName + "_cft", baseTopic, effectiveCftExpr, Collections.emptyList());
+            if (cft == null) {
+                System.err.println("FAIL: create_contentfilteredtopic returned null");
+                return 1;
+            }
         }
         final Dcps.DDS.ContentFilteredTopic cftFinal = cft;
 
@@ -439,7 +453,7 @@ public class ShapeMain {
             return 1;
         }
 
-        Dcps.DDS.DataReaderQos drQos = buildReaderQos(opts);
+        Dcps.DDS.DataReaderQos drQos = buildReaderQos(sub, opts);
         int drMask = Dcps.DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS.value | Dcps.DDS.REQUESTED_DEADLINE_MISSED_STATUS.value;
 
         List<String> topicNames = new ArrayList<>();
@@ -466,7 +480,11 @@ public class ShapeMain {
                 }
             };
 
-            Dcps.DDS.TopicDescription topicDesc = (i == 0 && cftFinal != null) ? cftFinal : topicAt(baseTopic, et, i);
+            Dcps.DDS.TopicDescription topicDesc = (i == 0 && cftFinal != null) ? cftFinal : dp.lookup_topicdescription(tn);
+            if (topicDesc == null) {
+                System.err.println("FAIL: lookup_topicdescription returned null for '" + tn + "'");
+                return 1;
+            }
             System.out.println("Create reader for topic: " + tn);
             Dcps.DDS.DataReader dr = sub.create_datareader(topicDesc, drQos, listener, drMask);
             if (dr == null) {
@@ -557,6 +575,21 @@ public class ShapeMain {
             return false;
         }
 
+        // Content assertions: a key (color) must never change across samples
+        // of the same instance handle, and the writer only ever emits x/y in
+        // [0,320)/[0,240) with shapesize >= 1 -- hard-fail if either is
+        // violated.
+        String cachedColor = ihCache.get(sample.instanceHandle);
+        if (cachedColor != null && !cachedColor.equals(sample.data.get_color())) {
+            throw new RuntimeException("instance " + sample.instanceHandle + " color changed from '"
+                    + cachedColor + "' to '" + sample.data.get_color() + "'");
+        }
+        if (sample.data.get_x() < 0 || sample.data.get_x() >= 320
+                || sample.data.get_y() < 0 || sample.data.get_y() >= 240
+                || sample.data.get_shapesize() < 1) {
+            throw new RuntimeException("sample out of bounds: x=" + sample.data.get_x()
+                    + " y=" + sample.data.get_y() + " shapesize=" + sample.data.get_shapesize());
+        }
         ihCache.put(sample.instanceHandle, sample.data.get_color());
 
         List<Byte> extra = sample.data.get_additional_payload_size();

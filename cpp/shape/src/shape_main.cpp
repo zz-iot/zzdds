@@ -197,8 +197,12 @@ void set_representation(::DDS::DataRepresentationQosPolicy &repr, uint16_t data_
     return ::DDS::Duration_t{ static_cast<int32_t>(ms / 1000), static_cast<uint32_t>((ms % 1000) * 1000000ULL) };
 }
 
-::DDS::DataWriterQos build_writer_qos(const Options &opts) {
-    auto qos = ::DDS::DataWriterQos::default_value();
+::DDS::DataWriterQos build_writer_qos(::DDS::Publisher *pub, const Options &opts) {
+    ::DDS::DataWriterQos qos;
+    if (pub->get_default_datawriter_qos(qos) != ::DDS::RETCODE_OK) {
+        std::fprintf(stderr, "FAIL: get_default_datawriter_qos() failed\n");
+        std::exit(1);
+    }
     qos.reliability.kind = reliability_kind(opts);
     if (opts.history_depth == 0) {
         qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
@@ -217,8 +221,12 @@ void set_representation(::DDS::DataRepresentationQosPolicy &repr, uint16_t data_
     return qos;
 }
 
-::DDS::DataReaderQos build_reader_qos(const Options &opts) {
-    auto qos = ::DDS::DataReaderQos::default_value();
+::DDS::DataReaderQos build_reader_qos(::DDS::Subscriber *sub, const Options &opts) {
+    ::DDS::DataReaderQos qos;
+    if (sub->get_default_datareader_qos(qos) != ::DDS::RETCODE_OK) {
+        std::fprintf(stderr, "FAIL: get_default_datareader_qos() failed\n");
+        std::exit(1);
+    }
     qos.reliability.kind = reliability_kind(opts);
     if (opts.history_depth == 0) {
         qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
@@ -296,7 +304,7 @@ int run_publisher(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr<
         return 1;
     }
 
-    auto dw_qos = build_writer_qos(opts);
+    auto dw_qos = build_writer_qos(pub.get(), opts);
     int xcdr_version = (opts.data_representation == 2) ? ZIDL_XCDR2 : ZIDL_XCDR1;
 
     std::vector<std::shared_ptr<::DDS::DataWriter>> dw_handles(n);
@@ -445,10 +453,11 @@ int run_publisher(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr<
             for (uint32_t inst = 0; inst < opts.num_instances; inst++) {
                 ShapeType key;
                 key.color = instance_color(base_color, inst);
-                if (do_dispose) {
-                    typed_writers[ti]->dispose(key);
-                } else {
-                    typed_writers[ti]->unregister_instance(key);
+                ::DDS::ReturnCode_t rc = do_dispose ? typed_writers[ti]->dispose(key)
+                                                     : typed_writers[ti]->unregister_instance(key);
+                if (rc != ::DDS::RETCODE_OK) {
+                    std::fprintf(stderr, "FAIL: %s() failed: %d\n", do_dispose ? "dispose" : "unregister_instance", rc);
+                    return 1;
                 }
             }
         }
@@ -456,7 +465,11 @@ int run_publisher(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr<
          * or up to 5 s, to avoid exiting before RELIABLE transport has
          * delivered the unregister/dispose changes to matched readers. */
         for (uint32_t ti = 0; ti < n; ti++) {
-            dw_handles[ti]->wait_for_acknowledgments(::DDS::Duration_t{5, 0});
+            ::DDS::ReturnCode_t ack_rc = dw_handles[ti]->wait_for_acknowledgments(::DDS::Duration_t{5, 0});
+            if (ack_rc != ::DDS::RETCODE_OK && ack_rc != ::DDS::RETCODE_TIMEOUT) {
+                std::fprintf(stderr, "FAIL: wait_for_acknowledgments() failed: %d\n", ack_rc);
+                return 1;
+            }
         }
     }
 
@@ -493,6 +506,10 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
     if (effective_cft_expr) {
         std::string cft_name = std::string(opts.topic_name) + "_cft";
         cft = dp->create_contentfilteredtopic(cft_name, base_topic, *effective_cft_expr, {});
+        if (!cft) {
+            std::fprintf(stderr, "FAIL: create_contentfilteredtopic returned null\n");
+            return 1;
+        }
     }
 
     auto sub_qos = ::DDS::SubscriberQos::default_value();
@@ -507,7 +524,7 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
         return 1;
     }
 
-    auto dr_qos = build_reader_qos(opts);
+    auto dr_qos = build_reader_qos(sub.get(), opts);
     std::vector<std::shared_ptr<::DDS::DataReader>> dr_handles(n);
     std::vector<std::unique_ptr<ShapeTypeDataReader>> typed_readers(n);
     std::vector<std::string> topic_names(n);
@@ -543,6 +560,25 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
     /* Maps instance_handle -> color for recovering key identity from
      * NOT_ALIVE samples that arrive without a serialized key payload. */
     std::unordered_map<DDS_InstanceHandle_t, std::string> ih_cache;
+
+    /* Content assertions: a key (color) must never change across samples of
+     * the same instance handle, and the writer only ever emits x/y in
+     * [0,320)/[0,240) with shapesize >= 1 -- hard-fail if either is
+     * violated. Returns false (and prints FAIL) on violation. */
+    auto assert_sample_content = [&](DDS_InstanceHandle_t ih, const ::ShapeType &value) -> bool {
+        auto it = ih_cache.find(ih);
+        if (it != ih_cache.end() && it->second != value.color.c_str()) {
+            std::fprintf(stderr, "FAIL: instance %llu color changed from '%s' to '%s'\n",
+                          static_cast<unsigned long long>(ih), it->second.c_str(), value.color.c_str());
+            return false;
+        }
+        if (value.x < 0 || value.x >= 320 || value.y < 0 || value.y >= 240 || value.shapesize < 1) {
+            std::fprintf(stderr, "FAIL: sample out of bounds: x=%d y=%d shapesize=%d\n",
+                          static_cast<int>(value.x), static_cast<int>(value.y), static_cast<int>(value.shapesize));
+            return false;
+        }
+        return true;
+    };
 
     const bool use_access = opts.coherent_access || opts.ordered_access;
 
@@ -592,6 +628,7 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
                         continue;
                     }
 
+                    if (!assert_sample_content(info.instance_handle, value)) return 1;
                     ih_cache[info.instance_handle] = value.color;
 
                     if (!value.additional_payload_size.empty()) {
@@ -632,6 +669,7 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
                         break;
                     }
 
+                    if (!assert_sample_content(sample.info.instance_handle, sample.value)) return 1;
                     ih_cache[sample.info.instance_handle] = sample.value.color;
 
                     if (!sample.value.additional_payload_size.empty()) {
@@ -875,7 +913,10 @@ int main(int argc, char **argv) {
     }
     auto dp_handle = dp->native_handle();
 
-    ShapeTypeTypeSupport::register_type(dp_handle);
+    if (ShapeTypeTypeSupport::register_type(dp_handle) != 0) {
+        std::fprintf(stderr, "registerTypeSupport() failed\n");
+        return 1;
+    }
 
     auto topic = dp->create_topic(opts.topic_name, "ShapeType", ::DDS::TopicQos::default_value(), nullptr, 0);
     if (!topic) {

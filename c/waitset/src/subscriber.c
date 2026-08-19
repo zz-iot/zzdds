@@ -187,6 +187,26 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* WaitSet.get_conditions() -- all four attached conditions, regardless
+     * of trigger state, distinct from wait()'s own out-param (only the ones
+     * that triggered *this* call). Otherwise unexercised anywhere in this
+     * project; a real assertion here (not just a call) is nearly free given
+     * this WaitSet's attached set is already known exactly. */
+    {
+        DDS_ConditionSeq attached;
+        memset(&attached, 0, sizeof(attached));
+        if (DDS_WaitSet_get_conditions(ws, &attached) != DDS_RETCODE_OK) {
+            fprintf(stderr, "FAIL: WaitSet_get_conditions() failed\n");
+            return 1;
+        }
+        if (attached._length != 4) {
+            fprintf(stderr, "FAIL: WaitSet_get_conditions() returned %u conditions, expected 4\n", attached._length);
+            DDS_ConditionSeq_free(&attached);
+            return 1;
+        }
+        DDS_ConditionSeq_free(&attached);
+    }
+
     Watchdog watchdog;
     watchdog.gc = gc;
     atomic_init(&watchdog.stop, false);

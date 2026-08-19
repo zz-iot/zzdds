@@ -235,12 +235,11 @@ static DDS_PresentationQosPolicyAccessScopeKind access_scope_kind(char c) {
     }
 }
 
-static void build_writer_qos(DDS_DataWriterQos *qos, const Options *opts) {
-    /* Zero-init, not DDS_DataWriterQos_default() -- dcps.idl declares no
-     * @default annotations at all, so IDL-default == zero-value for every
-     * QoS policy field here. Either approach works; this just avoids the
-     * extra call. */
-    memset(qos, 0, sizeof(*qos));
+static int build_writer_qos(DDS_Publisher pub, DDS_DataWriterQos *qos, const Options *opts) {
+    if (DDS_Publisher_get_default_datawriter_qos(pub, qos) != DDS_RETCODE_OK) {
+        fprintf(stderr, "FAIL: get_default_datawriter_qos() failed\n");
+        return -1;
+    }
     qos->reliability.kind = reliability_kind(opts);
     if (opts->history_depth == 0) {
         qos->history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
@@ -256,11 +255,14 @@ static void build_writer_qos(DDS_DataWriterQos *qos, const Options *opts) {
         qos->ownership_strength.value = opts->ownership_strength;
     }
     set_representation(&qos->data_representation, opts->data_representation);
+    return 0;
 }
 
-static void build_reader_qos(DDS_DataReaderQos *qos, const Options *opts) {
-    /* See build_writer_qos's comment: zero-init, not DDS_DataReaderQos_default(). */
-    memset(qos, 0, sizeof(*qos));
+static int build_reader_qos(DDS_Subscriber sub, DDS_DataReaderQos *qos, const Options *opts) {
+    if (DDS_Subscriber_get_default_datareader_qos(sub, qos) != DDS_RETCODE_OK) {
+        fprintf(stderr, "FAIL: get_default_datareader_qos() failed\n");
+        return -1;
+    }
     qos->reliability.kind = reliability_kind(opts);
     if (opts->history_depth == 0) {
         qos->history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
@@ -273,6 +275,7 @@ static void build_reader_qos(DDS_DataReaderQos *qos, const Options *opts) {
     if (opts->ownership_strength >= 0) qos->ownership.kind = DDS_OwnershipQosPolicyKind_EXCLUSIVE_OWNERSHIP_QOS;
     if (opts->time_filter_ms > 0) set_duration_from_ms(&qos->time_based_filter.minimum_separation, opts->time_filter_ms);
     set_representation(&qos->data_representation, opts->data_representation);
+    return 0;
 }
 
 /* ── Multi-topic helpers ───────────────────────────────────────────────────── */
@@ -350,7 +353,10 @@ static int run_publisher(DDS_DomainParticipant dp, DDS_Topic base_topic, const O
     }
 
     DDS_DataWriterQos dw_qos;
-    build_writer_qos(&dw_qos, opts);
+    if (build_writer_qos(pub, &dw_qos, opts) != 0) {
+        extra_topics_free(&et);
+        return 1;
+    }
 
     ListenerCtx lctxs[MAX_TOPICS];
     DDS_DataWriter dw_handles[MAX_TOPICS];
@@ -512,10 +518,14 @@ static int run_publisher(DDS_DomainParticipant dp, DDS_Topic base_topic, const O
                 ShapeType key;
                 memset(&key, 0, sizeof(key));
                 strncpy(key.color, inst_color, sizeof(key.color) - 1);
-                if (do_dispose) {
-                    ShapeTypeDataWriter_dispose(&typed_writers[ti], &key, DDS_HANDLE_NIL);
-                } else {
-                    ShapeTypeDataWriter_unregister(&typed_writers[ti], &key, DDS_HANDLE_NIL);
+                DDS_ReturnCode_t rc = do_dispose
+                    ? ShapeTypeDataWriter_dispose(&typed_writers[ti], &key, DDS_HANDLE_NIL)
+                    : ShapeTypeDataWriter_unregister(&typed_writers[ti], &key, DDS_HANDLE_NIL);
+                if (rc != DDS_RETCODE_OK) {
+                    fprintf(stderr, "FAIL: %s() failed: %d\n", do_dispose ? "dispose" : "unregister_instance", rc);
+                    if (opts->additional_payload > 0) free(shape.additional_payload_size._buffer);
+                    extra_topics_free(&et);
+                    return 1;
                 }
             }
         }
@@ -524,7 +534,13 @@ static int run_publisher(DDS_DomainParticipant dp, DDS_Topic base_topic, const O
          * delivered the unregister/dispose changes to matched readers. */
         DDS_Duration_t ack_timeout = { .sec = 5, .nanosec = 0 };
         for (uint32_t ti = 0; ti < n; ti++) {
-            DDS_DataWriter_wait_for_acknowledgments(dw_handles[ti], &ack_timeout);
+            DDS_ReturnCode_t ack_rc = DDS_DataWriter_wait_for_acknowledgments(dw_handles[ti], &ack_timeout);
+            if (ack_rc != DDS_RETCODE_OK && ack_rc != DDS_RETCODE_TIMEOUT) {
+                fprintf(stderr, "FAIL: wait_for_acknowledgments() failed: %d\n", ack_rc);
+                if (opts->additional_payload > 0) free(shape.additional_payload_size._buffer);
+                extra_topics_free(&et);
+                return 1;
+            }
         }
     }
 
@@ -613,6 +629,11 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
         char cft_name[192];
         snprintf(cft_name, sizeof(cft_name), "%s_cft", opts->topic_name);
         cft = DDS_DomainParticipant_create_contentfilteredtopic(dp, cft_name, base_topic, effective_cft_expr, NULL);
+        if (!cft) {
+            fprintf(stderr, "FAIL: create_contentfilteredtopic returned NULL\n");
+            extra_topics_free(&et);
+            return 1;
+        }
     }
 
     DDS_SubscriberQos sub_qos;
@@ -630,7 +651,10 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
     }
 
     DDS_DataReaderQos dr_qos;
-    build_reader_qos(&dr_qos, opts);
+    if (build_reader_qos(sub, &dr_qos, opts) != 0) {
+        extra_topics_free(&et);
+        return 1;
+    }
 
     ListenerCtx lctxs[MAX_TOPICS];
     DDS_DataReader dr_handles[MAX_TOPICS];
@@ -648,7 +672,12 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
 
         DDS_TopicDescription topic_desc = (i == 0 && cft)
             ? DDS_ContentFilteredTopic_as_DDS_TopicDescription(cft)
-            : zzdds_topic_as_description(topic_at(&et, base_topic, i));
+            : DDS_DomainParticipant_lookup_topicdescription(dp, tn);
+        if (!topic_desc) {
+            fprintf(stderr, "FAIL: lookup_topicdescription returned NULL for '%s'\n", tn);
+            extra_topics_free(&et);
+            return 1;
+        }
 
         printf("Create reader for topic: %s\n", tn);
         dr_handles[i] = DDS_Subscriber_create_datareader(sub, topic_desc, &dr_qos, &listener, listener_mask);
@@ -754,6 +783,25 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
                         break;
                     }
 
+                    /* Content assertions: a key (color) must never change
+                     * across samples of the same instance handle, and the
+                     * writer only ever emits x/y in [0,320)/[0,240) with
+                     * shapesize >= 1 -- hard-fail if either is violated. */
+                    const char *cached_color = ih_cache_get(info.instance_handle);
+                    if (cached_color[0] != '\0' && strcmp(cached_color, value.color) != 0) {
+                        fprintf(stderr, "FAIL: instance %llu color changed from '%s' to '%s'\n",
+                                (unsigned long long)info.instance_handle, cached_color, value.color);
+                        ShapeType_free(&value);
+                        extra_topics_free(&et);
+                        return 1;
+                    }
+                    if (value.x < 0 || value.x >= 320 || value.y < 0 || value.y >= 240 || value.shapesize < 1) {
+                        fprintf(stderr, "FAIL: sample out of bounds: x=%d y=%d shapesize=%d\n",
+                                (int)value.x, (int)value.y, (int)value.shapesize);
+                        ShapeType_free(&value);
+                        extra_topics_free(&et);
+                        return 1;
+                    }
                     ih_cache_put(info.instance_handle, value.color);
 
                     uint32_t extra_len = value.additional_payload_size._length;
@@ -1002,7 +1050,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    zzdds_register_type_support(dp, "ShapeType", ShapeType_compute_key_hash_from_cdr, ShapeType_get_field_from_cdr);
+    if (zzdds_register_type_support(dp, "ShapeType", ShapeType_compute_key_hash_from_cdr, ShapeType_get_field_from_cdr) != DDS_RETCODE_OK) {
+        fprintf(stderr, "registerTypeSupport() failed\n");
+        zzdds_destroy_factory(factory);
+        return 1;
+    }
 
     DDS_Topic topic = DDS_DomainParticipant_create_topic(dp, opts.topic_name, "ShapeType", NULL, NULL, 0);
     if (!topic) {

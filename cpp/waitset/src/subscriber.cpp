@@ -197,6 +197,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // WaitSet.get_conditions() -- all four attached conditions, regardless
+    // of trigger state, distinct from wait()'s own out-param (only the ones
+    // that triggered *this* call). Otherwise unexercised anywhere in this
+    // project; a real assertion here (not just a call) is nearly free given
+    // this WaitSet's attached set is already known exactly.
+    {
+        ::DDS::ConditionSeq attached;
+        if (ws->get_conditions(attached) != ::DDS::RETCODE_OK) {
+            std::fprintf(stderr, "FAIL: WaitSet::get_conditions() failed\n");
+            return 1;
+        }
+        if (attached.size() != 4) {
+            std::fprintf(stderr, "FAIL: WaitSet::get_conditions() returned %zu conditions, expected 4\n", attached.size());
+            return 1;
+        }
+    }
+
     Watchdog watchdog(gc, OVERALL_DEADLINE_MS);
 
     // Implicit upcasts via shared_ptr's own converting constructor -- real
