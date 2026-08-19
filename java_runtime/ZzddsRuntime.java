@@ -89,25 +89,29 @@ public final class ZzddsRuntime {
 
     /**
      * Takes/reads one raw (still-encoded) sample. Returns null if none was
-     * available. `handleOut`/`validOut` must be pre-allocated 1-element
-     * arrays; `maxSize` bounds the receive buffer (a sample larger than this
-     * is dropped — size generously for your topic).
+     * available. `handleOut`/`validOut`/`stateOut` must be pre-allocated
+     * 1-element arrays; `maxSize` bounds the receive buffer (a sample larger
+     * than this is dropped — size generously for your topic). `stateOut[0]`
+     * is the sample's raw `SampleInfo.instance_state` bitmask value
+     * (`Dcps.DDS.ALIVE_INSTANCE_STATE`/`NOT_ALIVE_DISPOSED_INSTANCE_STATE`/
+     * `NOT_ALIVE_NO_WRITERS_INSTANCE_STATE`).
      */
-    public static native byte[] takeRaw(Object reader, int maxSize, long[] handleOut, boolean[] validOut);
+    public static native byte[] takeRaw(Object reader, int maxSize, long[] handleOut, boolean[] validOut, int[] stateOut);
 
-    public static native byte[] readRaw(Object reader, int maxSize, long[] handleOut, boolean[] validOut);
+    public static native byte[] readRaw(Object reader, int maxSize, long[] handleOut, boolean[] validOut, int[] stateOut);
 
     /**
      * Takes/reads the next sample of the instance identified by `prev`
      * (`DDS_HANDLE_NIL`/`0` to start at the first instance), draining that
      * instance before moving to the next — same semantics as C/C++'s
      * `take_next_instance`/`read_next_instance`. Returns null if none was
-     * available. `handleOut`/`validOut` must be pre-allocated 1-element
-     * arrays; `maxSize` bounds the receive buffer, same as {@link #takeRaw}.
+     * available. `handleOut`/`validOut`/`stateOut` must be pre-allocated
+     * 1-element arrays; `maxSize` bounds the receive buffer, same as
+     * {@link #takeRaw}.
      */
-    public static native byte[] takeNextInstanceRaw(Object reader, long prev, int maxSize, long[] handleOut, boolean[] validOut);
+    public static native byte[] takeNextInstanceRaw(Object reader, long prev, int maxSize, long[] handleOut, boolean[] validOut, int[] stateOut);
 
-    public static native byte[] readNextInstanceRaw(Object reader, long prev, int maxSize, long[] handleOut, boolean[] validOut);
+    public static native byte[] readNextInstanceRaw(Object reader, long prev, int maxSize, long[] handleOut, boolean[] validOut, int[] stateOut);
 
     /**
      * Batch take/read of up to `max` samples matching the given sample/view/

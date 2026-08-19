@@ -1683,6 +1683,49 @@ steps already exist and just aren't wired to run there yet.
 
 ---
 
+## zzdds-examples repo split — revisit soon (2026-08-19)
+
+**Priority: sort out a better solution for the sake of development velocity.** Not urgent
+enough to drop everything for, but this has now caused real, repeated friction across
+multiple example-development sessions and should not keep being worked around indefinitely.
+
+**Why `zzdds-examples` is a separate repo today:** to keep the build/dependency footprint
+small for a consumer who only wants the core DDS library plus a single binding (say, just
+the C ABI) — they shouldn't need to clone or build four bindings' worth of example code,
+CMake projects, and a JVM toolchain just to `zig fetch` the library. That goal is real and
+still worth preserving.
+
+**What it's actually costing us:** the examples exist specifically to exercise DCPS APIs
+real applications use, which means writing a new example very often *finds* a real core bug
+— at which point the example and the fix are tightly coupled, but live in different repos.
+The workaround has been a temporary `.path` dependency in the example's `build.zig.zon`
+pointing at a sibling core-fix worktree, landed as its own separate zzdds PR, with an
+explicit "flip the example back to the normal dependency once merged" step. Concretely, in
+one recent round (presence/registry/catchup examples, 2026-08-17/19):
+- Three examples needed four separate core fixes (liveliness notify-on-alive, PID_LIVELINESS
+  wire encoding, a `wait_for_historical_data()` vacuous-true bug, and an `EntityQuiesce`
+  extension to the whole take/read/write API surface) before they could pass.
+- The "flip back to the normal dependency" step was missed — the examples PR merged with
+  three `build.zig.zon` files still pointing at a worktree that only exists on one machine,
+  which will break `zzdds`'s own CI (`ZZDDS_EXAMPLES_REF`) the moment that ref is bumped,
+  until a follow-up PR in `zzdds-examples` fixes it.
+- `ZZDDS_EXAMPLES_REF` itself is a manually-maintained pin in `ci.yml` that goes stale the
+  moment `zzdds-examples` merges anything without a coordinated follow-up bump here — the
+  same class of drift `release.yml` vs `ci.yml` self-interop staleness hit once already.
+
+**Leading option:** move `zzdds-examples` into an `examples/` subdirectory of this repo.
+The footprint goal doesn't actually require a separate repo — a subdirectory with its own
+`build.zig.zon`, never referenced by the core library's default `zig build`, and CI jobs
+gated on path filters, should preserve "don't force a single-binding consumer to build
+examples" while eliminating the cross-repo dependency dance entirely (a core fix and the
+example that needed it become one atomic commit). Tradeoffs to weigh before committing:
+CI duration/PR-review-unit size if example jobs aren't gated tightly, and what happens to
+`zzdds-examples`' existing history/issues/stars if it's folded in. Needs its own planning
+pass (repo restructuring, CI pipeline changes, any external links to the standalone repo)
+before executing — not a quick change.
+
+---
+
 ## Deferred / Out of Scope for v1
 
 - **DDS-RPC** — deferred; no concrete use case yet.

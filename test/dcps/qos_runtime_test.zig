@@ -1508,6 +1508,38 @@ test "liveliness: reader — on_liveliness_changed fires when writer lease expir
     try testing.expectEqual(@as(i32, 1), captured.not_alive_count);
 }
 
+test "liveliness: reader — on_liveliness_changed fires on initial writer match, not just expiry" {
+    // Regression test: onWriterMatchedCb/onWriterAliveCb used to only update
+    // status_changes/counts on the "went alive" transition (match, or
+    // recovery after an expired lease), never actually calling
+    // notifyLivelinessChanged() themselves -- only checkTimers()'s own
+    // lease-expiry loop ever did, and only for its own "just expired"
+    // direction. So on_liveliness_changed never fired at all for a match or
+    // a recovery, only for expiry -- confirmed live building
+    // zzdds-examples' `presence` example (MANUAL_BY_TOPIC liveliness): the
+    // writer matched (get_liveliness_changed_status already reflected
+    // alive_count=1, see the next test below) but the reader's listener was
+    // never actually invoked, no notifyWakeup either. This test asserts the
+    // listener itself fires, not just the polled status.
+    const alloc = testing.allocator;
+    var mc = ManualClock.init(0);
+    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    defer fx.deinit();
+
+    var captured = DDS.LivelinessChangedStatus{ .alive_count = -1 }; // sentinel: never touched
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
+    dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
+    _ = fx.makeReader(drListenerLiveliness(&captured), DDS.LIVELINESS_CHANGED_STATUS);
+    _ = fx.makeWriter(dw_qos);
+
+    // No checkTimers() call anywhere in this test -- the match itself must
+    // drive the listener directly, not a timer tick.
+    try testing.expectEqual(@as(i32, 1), captured.alive_count);
+    try testing.expectEqual(@as(i32, 1), captured.alive_count_change);
+    try testing.expectEqual(@as(i32, 0), captured.not_alive_count);
+}
+
 test "liveliness: reader — get_liveliness_changed_status reflects writer match and expiry" {
     const alloc = testing.allocator;
     var mc = ManualClock.init(0);

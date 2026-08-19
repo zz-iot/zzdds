@@ -206,6 +206,17 @@ pub const DataWriterImpl = struct {
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
+    /// See DataReaderImpl's matching pair (dcps/reader.zig) for the full
+    /// rationale -- same class of gap, mirrored here for the writer side's
+    /// own `raw_ops.zig` entry points (writeRaw, writeRawWithTimestamp,
+    /// getKeyValueRawWriter).
+    pub fn acquireQuiesce(self: *Self) bool {
+        return self.quiesce.acquire();
+    }
+    pub fn releaseQuiesce(self: *Self) void {
+        self.quiesce.release(self, reallyDeinit);
+    }
+
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.listener_ex_box.releaseRef(self.alloc);

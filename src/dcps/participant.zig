@@ -121,6 +121,16 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
             return true;
         }
     }.f,
+    // No real reader backs this stub, so there's nothing to ever match --
+    // `true` here (not `false`) is what lets vtWaitForHistorical's
+    // `is_zero_wait or hasMatchedWriters()` check still short-circuit to OK
+    // immediately for a stub/null reader, matching historical_delivered's
+    // own unconditional `true` above rather than blocking until max_wait.
+    .has_matched_writers = struct {
+        fn f(_: *anyopaque) bool {
+            return true;
+        }
+    }.f,
     .deinit = struct {
         fn f(_: *anyopaque) void {}
     }.f,
@@ -2036,6 +2046,7 @@ pub const DomainParticipantImpl = struct {
             .reliability = if (qos.reliability_kind == 1) .reliable else .best_effort,
             .ownership_strength = qos.ownership_strength,
             .liveliness_lease_ns = lease_ns,
+            .liveliness_kind = qos.liveliness_kind,
             .lifespan_ns = lifespan_ns,
             .history_expected = qos.durability_kind > 0 and qos.reliability_kind == 1,
         };

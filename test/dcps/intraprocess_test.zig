@@ -333,6 +333,66 @@ test "intraprocess: writer created before reader — reader gets history via TRA
     try testing.expectEqualSlices(u8, &PAYLOAD_B, samples[1]);
 }
 
+test "intraprocess: set_listener fires on_data_available immediately for already-buffered data" {
+    // Regression for a real bug found building zzdds-examples' `catchup`
+    // example: an application that creates a reader with no listener (to
+    // avoid dispatching into not-yet-initialized app state -- the fix for
+    // a *different* real bug, an uninitialized-listener-state race), then
+    // finishes its own setup, then calls set_listener() -- exactly this
+    // test's sequence. DDS status conditions/listeners are level-triggered:
+    // enabling a listener for an already-active status (here,
+    // DATA_AVAILABLE_STATUS, since the writer's historical batch was
+    // fully delivered into the reader's cache before the reader even
+    // existed) must notify immediately, not silently wait for a new
+    // arrival that may never come. wait_for_historical_data() tracks
+    // RTPS-level delivery, not listener dispatch, so it reports success
+    // regardless -- an application relying solely on its listener to learn
+    // "historical data arrived" would otherwise never find out.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "IPTopic", "IPType");
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    // Write BEFORE creating the reader -- the historical batch this
+    // example's whole design is about.
+    const topic_w = fx.topic_w;
+    const dw_raw = fx.pub_w.create_datawriter(topic_w, dw_qos, null, 0);
+    const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
+    try writeRaw(dw, &PAYLOAD_A);
+    try writeRaw(dw, &PAYLOAD_B);
+
+    // Create the reader with NO listener -- matching the real application
+    // pattern this regression is about. DirectDiscovery + MemoryTransport
+    // deliver synchronously, so by the time create_datareader() returns,
+    // PAYLOAD_A/B are already sitting in the reader's cache, unnotified.
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
+    const dr_raw = fx.sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+
+    var fired: i32 = 0;
+    const Ctx = struct {
+        fn onDataAvailable(_: *anyopaque, listener_data: ?*anyopaque) callconv(.c) void {
+            @as(*i32, @ptrCast(@alignCast(listener_data.?))).* += 1;
+        }
+    };
+    const listener = DDS.DataReaderListener{
+        .listener_data = &fired,
+        .on_data_available = Ctx.onDataAvailable,
+    };
+
+    // The fix under test: this must synchronously fire on_data_available
+    // for the data that arrived before the listener was ever attached.
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.set_listener(listener, DDS.DATA_AVAILABLE_STATUS));
+    try testing.expectEqual(@as(i32, 1), fired);
+}
+
 test "intraprocess: same-participant writer and reader — no self-delivery" {
     const alloc = testing.allocator;
     var delivery = try IntraProcessDelivery.init(alloc);
@@ -390,4 +450,67 @@ test "intraprocess: same-participant writer and reader — no self-delivery" {
     }
 
     try testing.expectEqual(@as(usize, 0), samples.len);
+}
+
+// Regression for a real gap found via zzdds-examples' `catchup` review
+// (Greptile flagged: a listener callback that's still draining its take()
+// loop can race an independent completion path that deletes the reader,
+// with nothing stopping the callback's own take() from dereferencing
+// already-freed memory). Every RTPS/protocol-dispatch callback in
+// dcps/reader.zig already guards itself with `self.quiesce.acquire()`
+// before touching `self`; `zzdds.takeRaw` (raw_ops.zig -- what every
+// binding's generated take()/read() wrapper actually calls) previously had
+// no such guard at all. This test doesn't reproduce the exact timing race
+// (that's what the isolated zzdds-examples repro loop is for) -- it proves
+// the behavioral contract the fix relies on: once a reader's teardown has
+// begun, `zzdds.takeRaw` must refuse to see even genuinely pending,
+// already-delivered data, rather than blindly dereferencing a struct that
+// might already be gone, regardless of whether *this specific* call
+// happens to race the free.
+test "intraprocess: zzdds.takeRaw refuses pending data once teardown has begun, even before the struct is freed" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, "IPTopic", "IPType");
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
+    const dr = fx.sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+    const dw = fx.pub_w.create_datawriter(fx.topic_w, dw_qos, null, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    try writeRaw(dw_impl, &PAYLOAD_A);
+
+    // Confirm delivery genuinely happened -- if this were empty, a refusal
+    // below wouldn't prove anything (could just be an empty queue).
+    const sanity = zzdds.takeRaw(dr) orelse return error.TestUnexpectedResult;
+    sanity.deinit();
+    try writeRaw(dw_impl, &PAYLOAD_B); // leave one real, pending sample behind
+
+    // Simulate a callback that's already "in flight" (acquired quiesce)
+    // when teardown begins -- deinit() must not free the struct out from
+    // under it.
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+    try testing.expect(dr_impl.acquireQuiesce());
+
+    // Deletes the reader from the application's point of view. Because our
+    // simulated in-flight reference is still held, the actual free is
+    // deferred, not run here -- this must not crash.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub_r.delete_datareader(dr));
+
+    // The struct is still technically alive (our reference kept it so) and
+    // PAYLOAD_B is still genuinely sitting in its pending queue, but
+    // teardown has begun: zzdds.takeRaw must refuse it outright, not
+    // blindly hand back data from a reader mid-teardown.
+    try testing.expect(zzdds.takeRaw(dr) == null);
+
+    // Release our simulated in-flight reference -- this is what actually
+    // frees the struct now (mirrors a real callback finishing up after
+    // delete_datareader() has already returned to the deleting thread).
+    dr_impl.releaseQuiesce();
 }

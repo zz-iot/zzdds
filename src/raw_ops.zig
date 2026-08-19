@@ -138,6 +138,8 @@ pub fn createGuardCondition(alloc: std.mem.Allocator) !DDS.GuardCondition {
 /// Reads the QoS directly from DataWriterImpl without allocating.
 pub fn writerUsesXcdr2(writer: DDS.DataWriter) bool {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    if (!impl.acquireQuiesce()) return false;
+    defer impl.releaseQuiesce();
     const rep = impl.qos.data_representation.value;
     if (rep._length == 0) return false;
     const buf = rep._buffer orelse return false;
@@ -154,6 +156,8 @@ pub fn writeRaw(
     data: []const u8,
 ) !void {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     const ck = toChangeKind(kind, impl);
     _ = try impl.writeRaw(ck, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, key_hash, data);
 }
@@ -167,6 +171,8 @@ pub fn writeRawWithTimestamp(
     ts: DDS.Time_t,
 ) !void {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     const ck = toChangeKind(kind, impl);
     const t = time_mod.Time{ .sec = ts.sec, .nanosec = ts.nanosec };
     const rtps_ts = time_mod.RtpsTimestamp.fromTime(t);
@@ -188,6 +194,8 @@ pub fn getKeyValueRawWriter(
     handle: DDS.InstanceHandle_t,
 ) ?[]u8 {
     const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+    if (!impl.acquireQuiesce()) return null;
+    defer impl.releaseQuiesce();
     return impl.getKeyValueRaw(handle);
 }
 
@@ -204,6 +212,8 @@ pub fn lookupInstanceWriter(key_hash: [16]u8) DDS.InstanceHandle_t {
 /// Caller owns the returned OwnedRawSample and must call deinit().
 pub fn takeRaw(reader: DDS.DataReader) ?OwnedRawSample {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return null;
+    defer impl.releaseQuiesce();
     const taken = impl.takeRaw() orelse return null;
     return .{ .data = taken.data, .info = taken.info, ._alloc = impl.alloc };
 }
@@ -213,6 +223,8 @@ pub fn takeRaw(reader: DDS.DataReader) ?OwnedRawSample {
 /// Caller owns the returned OwnedRawSample and must call deinit().
 pub fn readNextSampleRaw(reader: DDS.DataReader) ?OwnedRawSample {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return null;
+    defer impl.releaseQuiesce();
     // readRaw with ANY masks, limit 1, and no instance filter.
     var out: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
@@ -241,6 +253,8 @@ pub fn takeNextInstanceRaw(
     prev: DDS.InstanceHandle_t,
 ) ?OwnedRawSample {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return null;
+    defer impl.releaseQuiesce();
     const taken = impl.takeNextInstanceRaw(prev) orelse return null;
     return .{ .data = taken.data, .info = taken.info, ._alloc = impl.alloc };
 }
@@ -253,6 +267,8 @@ pub fn readNextInstanceRaw(
     prev: DDS.InstanceHandle_t,
 ) ?OwnedRawSample {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return null;
+    defer impl.releaseQuiesce();
     const taken = impl.readNextInstanceRaw(prev) orelse return null;
     return .{ .data = taken.data, .info = taken.info, ._alloc = impl.alloc };
 }
@@ -271,6 +287,8 @@ pub fn takeFilteredRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
         for (tmp.items) |s| impl.alloc.free(s.data);
@@ -307,6 +325,8 @@ pub fn takeWithQueryConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     const qc_impl: *const dcps_waitset.QueryConditionImpl = @ptrCast(@alignCast(qc.ptr));
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
@@ -347,6 +367,8 @@ pub fn takeWithReadConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
@@ -379,6 +401,8 @@ pub fn readWithReadConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
@@ -416,6 +440,8 @@ pub fn takeNextInstanceWithReadConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
@@ -449,6 +475,8 @@ pub fn readNextInstanceWithReadConditionRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     const rc_impl: *const dcps_waitset.ReadConditionImpl = @ptrCast(@alignCast(cond.ptr));
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
@@ -485,6 +513,8 @@ pub fn readFilteredRaw(
     caller_alloc: std.mem.Allocator,
 ) !void {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+    defer impl.releaseQuiesce();
     var tmp: std.ArrayListUnmanaged(dcps_reader.TakenSample) = .empty;
     defer {
         for (tmp.items) |s| impl.alloc.free(s.data);
@@ -508,6 +538,8 @@ pub fn getKeyValueRawReader(
     handle: DDS.InstanceHandle_t,
 ) ?[]u8 {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return null;
+    defer impl.releaseQuiesce();
     return impl.getKeyValueRaw(handle);
 }
 
@@ -518,6 +550,8 @@ pub fn lookupInstanceReader(
     handle: DDS.InstanceHandle_t,
 ) ?DDS.InstanceHandle_t {
     const impl: *DataReaderImpl = @ptrCast(@alignCast(reader.ptr));
+    if (!impl.acquireQuiesce()) return null;
+    defer impl.releaseQuiesce();
     return if (impl.lookupInstance(handle)) handle else null;
 }
 

@@ -81,6 +81,10 @@ pub const MatchedWriterInfo = struct {
     ownership_strength: i32 = 0,
     /// Liveliness lease duration in nanoseconds; 0 = infinite (no expiry tracking).
     liveliness_lease_ns: i64 = 0,
+    /// LivelinessQosPolicyKind as transmitted (0=AUTOMATIC, 1=MANUAL_BY_PARTICIPANT,
+    /// 2=MANUAL_BY_TOPIC — DDS enum ordinal order). Determines which AliveEvidence
+    /// kinds are a legitimate liveliness assertion for this writer; see AliveEvidence.
+    liveliness_kind: u8 = 0,
     /// Lifespan duration in nanoseconds; 0 = infinite (no expiry).
     lifespan_ns: i64 = 0,
     /// True when the writer offers TRANSIENT_LOCAL (or stronger) durability with RELIABLE
@@ -373,6 +377,17 @@ fn defaultQuiesceAcquire(_: *anyopaque) bool {
 
 fn defaultQuiesceRelease(_: *anyopaque) void {}
 
+/// What kind of incoming traffic is offered as evidence a writer is still
+/// alive. Only `.data` is a legitimate assertion for MANUAL_BY_TOPIC/
+/// MANUAL_BY_PARTICIPANT liveliness (an actual write() call happened);
+/// `.heartbeat` is routine RELIABLE-protocol keepalive traffic sent
+/// regardless of app activity, a legitimate assertion only for AUTOMATIC.
+/// The DCPS DataReader (reader.zig's onWriterAliveCb) is what actually
+/// applies this distinction, using the matched writer's own liveliness kind
+/// (MatchedWriterInfo.liveliness_kind) — this layer just reports which kind
+/// of traffic arrived, it doesn't itself know the writer's QoS.
+pub const AliveEvidence = enum { data, heartbeat };
+
 /// Invoked by the protocol reader when a remote writer is matched or unmatched.
 /// Carries the same MatchedWriterInfo used to create the proxy; allows the
 /// DCPS DataReader to track per-writer ownership strength.
@@ -382,7 +397,7 @@ pub const WriterMatchCallback = struct {
     on_writer_unmatched: *const fn (ctx: *anyopaque, guid: Guid) void,
     /// Optional: called when a DATA or HEARTBEAT is received from the writer,
     /// indicating the writer is still alive. Used for LIVELINESS tracking.
-    on_writer_alive: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
+    on_writer_alive: ?*const fn (ctx: *anyopaque, guid: Guid, evidence: AliveEvidence) void = null,
 };
 
 // ── ProtocolReader ────────────────────────────────────────────────────────────
@@ -479,8 +494,17 @@ pub const ProtocolReader = struct {
         /// Returns true when all matched TRANSIENT_LOCAL writers have delivered their
         /// complete history up to the floor sequence number established by the first
         /// HEARTBEAT.  Writers that do not have history_expected set are always considered
-        /// delivered.  Returns true immediately when no writers are matched.
+        /// delivered.  Returns true immediately when no writers are matched -- callers
+        /// waiting for a bounded duration must not treat that alone as "done"; see
+        /// has_matched_writers below.
         historical_delivered: *const fn (ctx: *anyopaque) bool,
+
+        /// True once at least one writer has ever matched this reader (sticky --
+        /// does not reset on unmatch). Lets DataReader.wait_for_historical_data
+        /// distinguish "no writer will ever come" from "no writer has matched
+        /// *yet*", which historical_delivered() alone can't: both report the
+        /// same vacuous `true` when no writer is currently matched.
+        has_matched_writers: *const fn (ctx: *anyopaque) bool,
 
         /// Destroy this reader and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
@@ -595,6 +619,10 @@ pub const ProtocolReader = struct {
 
     pub fn historicalDelivered(self: ProtocolReader) bool {
         return self.vtable.historical_delivered(self.ctx);
+    }
+
+    pub fn hasMatchedWriters(self: ProtocolReader) bool {
+        return self.vtable.has_matched_writers(self.ctx);
     }
 
     pub fn deinit(self: ProtocolReader) void {

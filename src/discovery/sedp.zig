@@ -156,6 +156,45 @@ fn snapshotDeadlineDuration(qos: QosSnapshot) time_mod.Duration {
     return .{ .sec = qos.deadline_sec, .nanosec = qos.deadline_nanosec };
 }
 
+fn snapshotLivelinessDuration(qos: QosSnapshot) time_mod.Duration {
+    return .{ .sec = qos.liveliness_lease_sec, .nanosec = qos.liveliness_lease_nanosec };
+}
+
+/// PID_LIVELINESS (RTPS 2.5 §9.6.3.7, 0x001b): kind(u32, 4 bytes) +
+/// lease_duration(RtpsDuration, 8 bytes) = 12 bytes total.
+///
+/// Only emitted when non-default (AUTOMATIC + INFINITE) -- same "omit a PID
+/// that equals the spec default" convention PID_DEADLINE/PID_LIFESPAN already
+/// use above, not a workaround for a real cross-vendor incompatibility:
+/// `writeRtpsDuration` already encodes DDS Duration_t's INFINITE sentinel as
+/// RTPS's own spec-defined DURATION_INFINITE (seconds=0x7fffffff,
+/// fraction=0xffffffff, RTPS 2.5 §9.3.2) via `RtpsDuration.fromDuration`'s
+/// existing `isInfinite()` special case -- exactly what Cyclone DDS sends,
+/// and what OpenDDS's own spec-compliance flag (used in OpenDDS's own interop
+/// test suite, not its default for backwards-compatibility reasons) expects.
+/// There is no real incompatibility to avoid here.
+///
+/// This PID used to be omitted *unconditionally*, meaning any non-default
+/// LIVELINESS (a kind other than AUTOMATIC, or a finite lease) was silently
+/// invisible to a remote peer regardless of configuration -- `checkSnapshots`
+/// always saw AUTOMATIC+INFINITE for the remote side, so `on_liveliness_changed`/
+/// `on_liveliness_lost` could never fire for a real cross-process peer under
+/// any QoS configuration, and RxO liveliness-kind compatibility was evaluated
+/// against a value that was never what the remote peer actually configured.
+/// The decode side (`PidTable.LIVELINESS` in the switch below) was already
+/// fully implemented and correct -- only the encode side omitted it. Found
+/// building zzdds-examples' `presence` example (first real end-to-end
+/// cross-process exercise of a non-default LIVELINESS QoS in this project).
+fn writeLivelinessPid(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), qos: QosSnapshot) !void {
+    const is_default = qos.liveliness_kind == 0 and
+        qos.liveliness_lease_sec == 0x7fff_ffff and
+        qos.liveliness_lease_nanosec == 0xffff_ffff;
+    if (is_default) return;
+    try writePidHdr(alloc, buf, PidTable.LIVELINESS, 12);
+    try writeU32Le(alloc, buf, qos.liveliness_kind);
+    try writeRtpsDuration(alloc, buf, snapshotLivelinessDuration(qos));
+}
+
 // ── DiscoveredWriterData encoding ─────────────────────────────────────────────
 
 fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![]u8 {
@@ -236,9 +275,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
         try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
-    // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
-    // Cyclone and OpenDDS use different on-wire representations for Duration_t
-    // INFINITE, so explicitly encoding it causes QoS-match failures.
+    try writeLivelinessPid(alloc, &buf, ann.qos);
     try writePidHdr(alloc, &buf, PidTable.OWNERSHIP, 4);
     try writeU32Le(alloc, &buf, ann.qos.ownership_kind);
     if (ann.qos.ownership_kind != 0) {
@@ -363,7 +400,7 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
         try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
         try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
     }
-    // PID_LIVELINESS is omitted: defaults to AUTOMATIC + INFINITE everywhere.
+    try writeLivelinessPid(alloc, &buf, ann.qos);
 
     // PID_TYPE_INFORMATION is omitted from reader announcements: when present,
     // OpenDDS 3.x initiates a TypeLookup round-trip to the remote reader, which
