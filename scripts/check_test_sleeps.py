@@ -27,10 +27,11 @@ ALLOWLIST = {
     # periodic driver and the reader-side lease-expiry check both need a
     # real timer thread ticking to prove the wire mechanism actually works,
     # not just the local bookkeeping) drives WLP sends and lease expiry.
-    # 6th sleep added with the BEST_EFFORT-matched-reader regression test
-    # (Greptile-reported: liveliness-flagged heartbeats were dropped for
-    # BEST_EFFORT reader proxies) -- same category as the rest.
-    "test/dcps/wlp_loopback_test.zig": (6, "UDP loopback WLP match/liveliness-status polling"),
+    # 3 positive-test assert loops were consolidated into one shared
+    # assertUntilAlive() poll helper (Valgrind-slowdown robustness), reducing
+    # this file's raw sleepNs count from 6 to 4 despite adding a 3rd positive
+    # test (BEST_EFFORT-matched-reader, a Greptile-reported regression).
+    "test/dcps/wlp_loopback_test.zig": (4, "UDP loopback WLP match/liveliness-status polling"),
     # MockTransport avoids sockets, but SPDP timer threads still announce on
     # intervals. 15th sleep added with the writer-discovered-before-reader
     # retroactive-match regression test (polling discovered_writers via real

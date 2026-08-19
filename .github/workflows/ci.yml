@@ -236,7 +236,13 @@ jobs:
     name: zzdds-examples
     needs: test-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30, not 20: the "Install OpenCV" step below (libopencv-dev, ~30
+    # transitive codec/graphics packages, uncached) has been observed taking
+    # long enough on a slow apt mirror day to blow a 20-minute budget on its
+    # own -- the actual build+run work here normally completes in ~15min
+    # even including that install. This is slack for mirror variance, not a
+    # sign the job's real work grew heavier.
+    timeout-minutes: 30
 
     steps:
       - name: Check out zzdds
@@ -635,14 +641,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends valgrind
 
-      - name: Build test binaries
-        run: zig build emit-tests -Doptimize=Debug
+      - name: Build test binaries (LLVM backend)
+        # emit-tests-llvm, not emit-tests: Zig 0.16's default self-hosted
+        # backend for Debug/x86_64 emits DWARF that Valgrind's own reader
+        # misparses, flooding the log with millions of "DWARF2 reader:
+        # Badly formed extended line op" warning lines (confirmed: a
+        # self-hosted-backend build of api_test alone produced 250k+ of
+        # them under `valgrind --quiet`; identical source rebuilt via
+        # emit-tests-llvm produced zero). See build.zig's emit-tests-llvm
+        # step comment for the full rationale.
+        run: zig build emit-tests-llvm -Doptimize=Debug
 
       - name: Run tests under Valgrind
         run: |
           set -e
           ERRORS=0
-          for bin in zig-out/tests/*; do
+          for bin in zig-out/tests-llvm/*; do
             [ -x "$bin" ] || continue
             echo "=== valgrind: $(basename $bin) ==="
             if ! valgrind \

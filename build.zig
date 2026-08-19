@@ -1290,6 +1290,192 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
 
+    // `zig build emit-tests-llvm` — like emit-tests above, but every binary
+    // is forced onto the LLVM backend (see the identical .use_llvm = true
+    // rationale on zzdds_tests_tsan below: Zig 0.16's self-hosted backend
+    // for Debug/x86_64 emits DWARF that external tools misparse). Confirmed
+    // empirically for Valgrind specifically: a self-hosted-backend
+    // api_test binary produced 250k+ "DWARF2 reader: Badly formed extended
+    // line op" warning lines under `valgrind --quiet`; the identical
+    // source rebuilt with use_llvm=true produced zero. This is the same
+    // root cause the coverage job's kcov step already works around by
+    // patching elfutils from source (see that job's comments) -- rebuilding
+    // with LLVM instead is the fix at the source for tools that read this
+    // step's binaries directly, which is Valgrind's case. Kept as a
+    // separate step (not applied to emit_tests_step itself) rather than
+    // switching that shared step wholesale: emit_tests_step also feeds the
+    // already-working, separately-tuned kcov pipeline, and changing what it
+    // produces was not what this step was added to fix. Installs to
+    // zig-out/tests-llvm/ (not tests/) so it can't collide with a
+    // previously-run emit-tests' self-hosted-backend binaries.
+    //
+    // Also uses a "baseline" CPU model, not the plain `target` (native) used
+    // everywhere else -- confirmed empirically that LLVM's default
+    // -mcpu=native codegen for this host emits SIMD instructions Valgrind's
+    // synthetic CPU cannot execute (SIGILL, illegal instruction), hit deep
+    // inside Zig's *own* stdlib (debug.SelfInfo.Elf / Io.Threaded.pathToPosix
+    // -- the panic/stack-trace-printing machinery linked into every binary,
+    // not zzdds's own code), across ~10 of the 47 test binaries. The
+    // self-hosted backend never hit this because it's deliberately more
+    // conservative about which CPU features it targets even for "native".
+    // A parallel module graph (mirroring zzdds_mod_tsan et al. below, same
+    // reason: a module's target can't be swapped after construction) rebuilds
+    // zidl_rt/generated code/zzdds itself against this safer target -- the
+    // *codegen outputs* (gen_output_dir, generated_zzdds_root,
+    // gen_rtps_disc_dir) are reused unchanged; only recompilation differs.
+    const target_llvm_safe = b.resolveTargetQuery(.{ .cpu_model = .baseline });
+
+    const zidl_dep_llvm_safe = b.dependency("zidl", .{
+        .target = target_llvm_safe,
+        .optimize = optimize,
+    });
+    const zidl_rt_mod_llvm_safe = zidl_dep_llvm_safe.module("zidl_rt");
+
+    const generated_dcps_mod_llvm_safe = b.createModule(.{
+        .root_source_file = gen_output_dir.path(b, "dcps.zig"),
+        .target = target_llvm_safe,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+        },
+    });
+
+    const generated_zzdds_mod_llvm_safe = b.createModule(.{
+        .root_source_file = generated_zzdds_root,
+        .target = target_llvm_safe,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+        },
+    });
+
+    const generated_rtps_disc_mod_llvm_safe = b.createModule(.{
+        .root_source_file = gen_rtps_disc_dir.path(b, "rtps_discovery.zig"),
+        .target = target_llvm_safe,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+        },
+    });
+
+    const zzdds_mod_llvm_safe = b.addModule("zzdds_llvm_safe", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target_llvm_safe,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_llvm_safe },
+            .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_llvm_safe },
+        },
+    });
+    zzdds_mod_llvm_safe.addOptions("build_options", build_options);
+    zzdds_mod_llvm_safe.link_libc = true;
+    if (target_llvm_safe.result.os.tag == .windows) {
+        zzdds_mod_llvm_safe.linkSystemLibrary("ws2_32", .{});
+    }
+
+    const emit_tests_llvm_step = b.step("emit-tests-llvm", "Build test binaries (LLVM backend, baseline CPU) for external DWARF-reading tools like Valgrind");
+
+    const zzdds_tests_llvm = b.addTest(.{
+        .name = "zzdds_lib",
+        .root_module = zzdds_mod_llvm_safe,
+        .use_llvm = true,
+    });
+    emit_tests_llvm_step.dependOn(&b.addInstallArtifact(zzdds_tests_llvm, .{
+        .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+    }).step);
+
+    for (fuzz_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target_llvm_safe,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+    }
+
+    for (transport_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target_llvm_safe,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+    }
+
+    for (discovery_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target_llvm_safe,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+    }
+
+    for (rtps_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target_llvm_safe,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+    }
+
+    for (dcps_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target_llvm_safe,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
+                    .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+                    .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+    }
+
     // ── TSan test step ────────────────────────────────────────────────────────
     // `zig build test-tsan` — compile and run tests with ThreadSanitizer enabled.
     // Covers concurrency in state machines, WaitSet, and discovery code.
