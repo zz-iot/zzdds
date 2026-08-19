@@ -21,6 +21,7 @@ const history_mod = @import("../rtps/history.zig");
 const submsg_mod = @import("../rtps/message/submessage.zig");
 
 pub const Guid = guid_mod.Guid;
+pub const GuidPrefix = guid_mod.GuidPrefix;
 pub const ChangeKind = history_mod.ChangeKind;
 pub const InstanceHandle = history_mod.InstanceHandle;
 pub const RtpsTimestamp = history_mod.RtpsTimestamp;
@@ -260,6 +261,13 @@ pub const ProtocolWriter = struct {
         /// Pairs with a successful quiesce_acquire(). Defaults to a noop to
         /// match quiesce_acquire's default.
         quiesce_release: *const fn (ctx: *anyopaque) void = defaultQuiesceRelease,
+
+        /// RTPS §8.7.2.2.3: assert a MANUAL_BY_TOPIC writer's liveliness on
+        /// demand (DataWriter.assert_liveliness() with no new data to send)
+        /// by sending an unsolicited Heartbeat with the LIVELINESS flag set
+        /// to every matched reader. No-op default for implementations that
+        /// don't need it (built-in-topic noop writers, test doubles).
+        send_liveliness_heartbeat: *const fn (ctx: *anyopaque) void = defaultSendLivelinessHeartbeat,
     };
 
     pub fn write(
@@ -369,6 +377,10 @@ pub const ProtocolWriter = struct {
     pub fn quiesceRelease(self: ProtocolWriter) void {
         self.vtable.quiesce_release(self.ctx);
     }
+
+    pub fn sendLivelinessHeartbeat(self: ProtocolWriter) void {
+        self.vtable.send_liveliness_heartbeat(self.ctx);
+    }
 };
 
 fn defaultQuiesceAcquire(_: *anyopaque) bool {
@@ -377,16 +389,22 @@ fn defaultQuiesceAcquire(_: *anyopaque) bool {
 
 fn defaultQuiesceRelease(_: *anyopaque) void {}
 
+fn defaultSendLivelinessHeartbeat(_: *anyopaque) void {}
+
 /// What kind of incoming traffic is offered as evidence a writer is still
 /// alive. Only `.data` is a legitimate assertion for MANUAL_BY_TOPIC/
 /// MANUAL_BY_PARTICIPANT liveliness (an actual write() call happened);
 /// `.heartbeat` is routine RELIABLE-protocol keepalive traffic sent
 /// regardless of app activity, a legitimate assertion only for AUTOMATIC.
-/// The DCPS DataReader (reader.zig's onWriterAliveCb) is what actually
-/// applies this distinction, using the matched writer's own liveliness kind
-/// (MatchedWriterInfo.liveliness_kind) — this layer just reports which kind
-/// of traffic arrived, it doesn't itself know the writer's QoS.
-pub const AliveEvidence = enum { data, heartbeat };
+/// `.manual_heartbeat` is an unsolicited Heartbeat with the RTPS LIVELINESS
+/// flag set (RTPS §8.7.2.2.3) — sent on-demand by DataWriter.assert_liveliness()
+/// for MANUAL_BY_TOPIC writers with no new data to send; a legitimate
+/// assertion only for MANUAL_BY_TOPIC. The DCPS DataReader (reader.zig's
+/// onWriterAliveCb) is what actually applies this distinction, using the
+/// matched writer's own liveliness kind (MatchedWriterInfo.liveliness_kind)
+/// — this layer just reports which kind of traffic arrived, it doesn't
+/// itself know the writer's QoS.
+pub const AliveEvidence = enum { data, heartbeat, manual_heartbeat };
 
 /// Invoked by the protocol reader when a remote writer is matched or unmatched.
 /// Carries the same MatchedWriterInfo used to create the proxy; allows the
@@ -461,6 +479,7 @@ pub const ProtocolReader = struct {
             last_sn: SequenceNumber,
             count: i32,
             final: bool,
+            liveliness: bool,
         ) void,
 
         /// Called when a DATA_FRAG submessage arrives. Accumulates fragments;
@@ -585,8 +604,9 @@ pub const ProtocolReader = struct {
         last_sn: SequenceNumber,
         count: i32,
         final: bool,
+        liveliness: bool,
     ) void {
-        self.vtable.handle_heartbeat(self.ctx, writer_guid, first_sn, last_sn, count, final);
+        self.vtable.handle_heartbeat(self.ctx, writer_guid, first_sn, last_sn, count, final, liveliness);
     }
 
     pub fn handleDataFrag(

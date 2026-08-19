@@ -111,10 +111,12 @@ const Recorder = struct {
             .on_writer_lost = onWriterLost,
             .on_reader_discovered = onReaderDiscovered,
             .on_reader_lost = onReaderLost,
+            .on_wlp_alive = noopWlpAlive,
         };
     }
 
     fn noopParticipant(_: *anyopaque, _: *const ParticipantData) void {}
+    fn noopWlpAlive(_: *anyopaque, _: GuidPrefix, _: u8) void {}
     fn noopParticipantLost(_: *anyopaque, _: Guid) void {}
 
     fn onWriterDiscovered(ctx: *anyopaque, d: *const WriterData) void {

@@ -111,6 +111,17 @@ pub const ParticipantCbs = struct {
         notify_ctx: *anyopaque,
         refresh_fn: *const fn (notify_ctx: *anyopaque, new_get_field: ?filter_mod.CdrFieldGetter) void,
     ) void,
+
+    /// Register a WLP (RTPS §8.4.13) alive-notification callback for a
+    /// reader. Called by participant.zig's wlpAliveFromDiscovery when an
+    /// incoming ParticipantMessageData asserts liveliness for a remote
+    /// participant this reader may have matched writers from.
+    register_wlp_alive_notify: *const fn (
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        notify_fn: *const fn (notify_ctx: *anyopaque, prefix: proto.GuidPrefix, kind: u8) void,
+    ) void,
 };
 
 pub const SubscriberImpl = struct {
@@ -353,6 +364,12 @@ pub const SubscriberImpl = struct {
             type_name,
             dr,
             reader_mod.DataReaderImpl.refreshGetFieldFn,
+        );
+        self.cbs.register_wlp_alive_notify(
+            self.cbs.ctx,
+            sub_handle,
+            dr,
+            reader_mod.DataReaderImpl.onParticipantAliveCb,
         );
         // Convert partition name StringSeq (C extern struct) to []const []const u8 for announce_reader.
         const pname_seq = &self.qos.partition.name;

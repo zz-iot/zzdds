@@ -32,6 +32,7 @@ const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const extensions_mod = @import("../c_abi/extensions.zig");
 
 const Guid = proto.Guid;
+const GuidPrefix = proto.GuidPrefix;
 
 /// CFT filter state held on the DataReaderImpl.
 /// Non-null only when the reader was created from a ContentFilteredTopic and a
@@ -1164,6 +1165,7 @@ pub const DataReaderImpl = struct {
     // DDS LivelinessQosPolicyKind enum ordinal order (dcps.idl).
     const LIVELINESS_AUTOMATIC: u8 = 0;
     const LIVELINESS_MANUAL_BY_PARTICIPANT: u8 = 1;
+    const LIVELINESS_MANUAL_BY_TOPIC: u8 = 2;
 
     fn onWriterAliveCb(ctx: *anyopaque, guid: Guid, evidence: proto.AliveEvidence) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -1182,6 +1184,13 @@ pub const DataReaderImpl = struct {
                 // vtHandleHeartbeat's comment (rtps/protocol_adapters.zig) for
                 // the bug this fixes.
                 if (evidence == .heartbeat and entry.kind != LIVELINESS_AUTOMATIC) return;
+                // An on-demand liveliness-flagged Heartbeat (RTPS §8.7.2.2.3)
+                // is only valid evidence for MANUAL_BY_TOPIC -- it's how a
+                // MANUAL_BY_TOPIC writer's assert_liveliness() reaches this
+                // reader when it has no new data to send (WLP's
+                // ParticipantMessageData mechanism explicitly excludes
+                // MANUAL_BY_TOPIC per RTPS §8.4.13.5).
+                if (evidence == .manual_heartbeat and entry.kind != LIVELINESS_MANUAL_BY_TOPIC) return;
                 const is_manual_by_participant = entry.kind == LIVELINESS_MANUAL_BY_PARTICIPANT;
                 self.refreshWriterAliveLocked(guid, entry, &liveliness_changed);
                 // Per DDS 1.4 §2.2.3.11: MANUAL_BY_PARTICIPANT liveliness is
@@ -1200,22 +1209,51 @@ pub const DataReaderImpl = struct {
                 // was genuinely alive and asserting through a different
                 // writer.
                 if (is_manual_by_participant) {
-                    var it = self.writer_liveliness.iterator();
-                    while (it.next()) |kv| {
-                        if (kv.key_ptr.eql(guid)) continue;
-                        if (!kv.key_ptr.prefix.eql(guid.prefix)) continue;
-                        if (kv.value_ptr.kind != LIVELINESS_MANUAL_BY_PARTICIPANT) continue;
-                        self.refreshWriterAliveLocked(kv.key_ptr.*, kv.value_ptr, &liveliness_changed);
-                    }
+                    self.refreshAllByPrefixAndKindLocked(guid.prefix, LIVELINESS_MANUAL_BY_PARTICIPANT, &liveliness_changed);
                 }
             }
         }
         if (liveliness_changed) self.notifyLivelinessChanged();
     }
 
-    /// Shared by onWriterAliveCb's direct-evidence path and its
-    /// MANUAL_BY_PARTICIPANT sibling-refresh loop above. Must be called
-    /// with `self.mu` held.
+    /// WLP wire ingestion (RTPS §8.4.13): a remote participant's
+    /// ParticipantMessageData arrived (relayed via participant.zig's
+    /// wlpAliveFromDiscovery), asserting liveliness of `kind` (AUTOMATIC or
+    /// MANUAL_BY_PARTICIPANT) for its whole participant `prefix`. Unlike
+    /// onWriterAliveCb, there is no single starting writer -- refresh every
+    /// matched writer from that prefix with that kind.
+    pub fn onParticipantAliveCb(ctx: *anyopaque, prefix: GuidPrefix, kind: u8) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
+        var liveliness_changed = false;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.refreshAllByPrefixAndKindLocked(prefix, kind, &liveliness_changed);
+        }
+        if (liveliness_changed) self.notifyLivelinessChanged();
+    }
+
+    /// Refresh every matched writer from remote participant `prefix` with
+    /// liveliness `kind` -- used both by onWriterAliveCb's MANUAL_BY_PARTICIPANT
+    /// sibling-refresh (which already has a starting writer, refreshed
+    /// separately, so redundantly refreshing it again here is harmless) and
+    /// by onParticipantAliveCb (WLP wire ingestion, which has no single
+    /// starting writer at all -- a ParticipantMessageData sample is
+    /// participant-scoped, not writer-scoped). Must be called with `self.mu`
+    /// held.
+    fn refreshAllByPrefixAndKindLocked(self: *Self, prefix: GuidPrefix, kind: u8, liveliness_changed: *bool) void {
+        var it = self.writer_liveliness.iterator();
+        while (it.next()) |kv| {
+            if (!kv.key_ptr.prefix.eql(prefix)) continue;
+            if (kv.value_ptr.kind != kind) continue;
+            self.refreshWriterAliveLocked(kv.key_ptr.*, kv.value_ptr, liveliness_changed);
+        }
+    }
+
+    /// Shared by onWriterAliveCb's direct-evidence path and the
+    /// prefix+kind-scoped refresh above. Must be called with `self.mu` held.
     fn refreshWriterAliveLocked(self: *Self, guid: Guid, entry: *WriterLivelinessEntry, liveliness_changed: *bool) void {
         entry.last_alive_ns = self.timer_clock.nowNs();
         if (!entry.is_alive) {

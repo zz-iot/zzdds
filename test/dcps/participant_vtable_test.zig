@@ -50,6 +50,9 @@ const noop_vtable = iface.Discovery.Vtable{
     .deinit = struct {
         fn f(_: *anyopaque) void {}
     }.f,
+    .wlp_tick = struct {
+        fn f(_: *anyopaque, _: i64, _: iface.WlpTickInfo) void {}
+    }.f,
 };
 
 fn noopDisc() iface.Discovery {

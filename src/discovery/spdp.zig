@@ -801,7 +801,13 @@ pub const SpdpEndpoints = struct {
         .announce_reader = vtAnnounceReader,
         .retract_reader = vtRetractReader,
         .deinit = vtDeinit,
+        // Standalone SpdpEndpoints has no SEDP/WLP siblings (used directly
+        // only by narrow tests) -- production wiring goes through
+        // combined.zig's SpdpSedpDiscovery instead.
+        .wlp_tick = noopWlpTick,
     };
+
+    fn noopWlpTick(_: *anyopaque, _: i64, _: iface.WlpTickInfo) void {}
 
     pub fn toDiscovery(self: *Self) Discovery {
         return .{ .ctx = self, .vtable = &vtable };

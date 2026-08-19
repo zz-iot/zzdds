@@ -65,8 +65,9 @@ p2p_builtin_participant_msg_reader:   { key={00,02,00}, kind=0xC7 }
 ```
 
 These entity IDs are defined in `src/rtps/guid.zig`. The `p2p_builtin_participant_message_writer/reader`
-endpoints are used by the Writer Liveliness Protocol (§8.4.13); the entity IDs are defined
-but the WLP endpoint is not yet instantiated (see `docs/roadmap.md`).
+endpoints implement the Writer Liveliness Protocol (§8.4.13) in `src/discovery/wlp.zig`
+(`WlpEndpoints`), wired into `src/discovery/combined.zig`'s `SpdpSedpDiscovery` alongside SPDP and
+SEDP -- see `docs/roadmap.md` for the rollout notes.
 
 ---
 

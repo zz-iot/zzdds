@@ -5,6 +5,53 @@ see `docs/implementation_status.md`.
 
 ---
 
+## Writer Liveliness Protocol (WLP) implemented (2026-08-19)
+
+`DomainParticipant.assert_liveliness()` / `DataWriter.assert_liveliness()` previously only
+updated local timestamps and never emitted RTPS wire traffic — a remote reader holding a finite
+MANUAL_BY_PARTICIPANT or MANUAL_BY_TOPIC lease had no way to learn about an explicit assertion
+unless the app also happened to write real data (found via Greptile review on the liveliness
+notify-on-alive PR). Fixed with the real RTPS 2.5 §8.4.13 mechanism, not a workaround:
+
+- `src/discovery/builtin_endpoint.zig` (new): `BuiltinPair`, a shared abstraction for RTPS builtin
+  endpoint pairs matched by well-known EntityId (bitmask-gated matching + entity-ID dispatch).
+  Extracted because SEDP already hand-duplicated this pattern internally across its
+  publications/subscriptions pairs, and WLP would otherwise have been a third hand-rolled copy —
+  XTypes and DDS-Security will each add more builtin endpoint pairs later and should build on this
+  instead of re-deriving the pattern again. `SedpEndpoints` was refactored onto it first (pure,
+  behavior-preserving refactor, verified against its own existing test suite unchanged) before WLP
+  was built as a thin consumer. Deliberately does *not* cover SPDP (stateless/multicast,
+  structurally different) or the wire codec (each protocol's payload shape differs too much for a
+  shared codec to be a good fit).
+- `src/discovery/wlp.zig` (new): `WlpEndpoints`, the `BuiltinParticipantMessageWriter/Reader` pair.
+  Shares SEDP's metatraffic unicast listener rather than opening a second one on the same port
+  (`SedpEndpoints.setWlpDispatch`) — the transport doesn't support two independent listeners on one
+  port. Handles AUTOMATIC and MANUAL_BY_PARTICIPANT liveliness kinds via `ParticipantMessageData`
+  (two orthogonal instances keyed by participantGuidPrefix+kind), driven periodically by
+  `participant.zig`'s existing `checkTimers()` tick (`Discovery.Vtable.wlp_tick`) rather than a new
+  thread, matching §8.7.2.2.3's literal algorithm (AUTOMATIC: periodic broadcast; MANUAL_BY_PARTICIPANT:
+  periodic *check*, send only if asserted since the last check).
+- MANUAL_BY_TOPIC is explicitly excluded from WLP by the spec (§8.4.13.5) — handled separately via
+  an on-demand unsolicited Heartbeat with the RTPS LIVELINESS flag set
+  (`StatefulWriter.sendLivelinessHeartbeat`, `AliveEvidence.manual_heartbeat`), the flag bit having
+  already been parsed on receive but never set on send or consumed downstream before this.
+- Deliberate simplifications, both noted in code: `BuiltinParticipantMessageReader` defaults to
+  RELIABLE unconditionally (spec allows BEST_EFFORT via an extra SPDP `builtinEndpointQos` flag,
+  not implemented); AUTOMATIC's send period uses `lease/3` floored at 100ms (spec only requires
+  "faster than the smallest lease," no concrete divisor mandated).
+- Found and fixed a real bug while writing the real-wire regression test (`test/dcps/wlp_loopback_test.zig`,
+  two genuine `UdpTransport` participants, not a `DirectDiscovery`/`ManualClock` shortcut — those
+  bypass WLP's wire mechanism entirely): the MANUAL_BY_PARTICIPANT periodic-check driver initially
+  read `DataWriterImpl.liveliness_last_ns`, which `checkTimersFn`'s own lease-expiry self-check
+  *also* resets (to rate-limit `on_liveliness_lost` to once per lease) — an unrelated side effect
+  that made WLP see a false "just asserted" reading once per lease period with zero application
+  activity, keeping remote readers alive forever regardless of whether `assert_liveliness()` was
+  ever called. Fixed with a dedicated `wlp_last_assert_ns` field updated only by genuine
+  write()/dispose()/unregister_instance()/assert_liveliness() calls, confirmed via the same
+  regression test failing when reverted.
+
+---
+
 ## Phase 33: dds-rtps Interop Validation — Complete
 
 All four vendors were verified at 48/48 in Phase 33 CI. RTI Connext had one

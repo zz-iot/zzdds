@@ -15,6 +15,7 @@ const std = @import("std");
 const iface = @import("interface.zig");
 const spdp = @import("spdp.zig");
 const sedp = @import("sedp.zig");
+const wlp_mod = @import("wlp.zig");
 const tr = @import("../transport/interface.zig");
 const trace = @import("../trace.zig");
 const header_mod = @import("../rtps/message/header.zig");
@@ -27,10 +28,28 @@ pub const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 pub const WriterAnnouncement = iface.WriterAnnouncement;
 pub const ReaderAnnouncement = iface.ReaderAnnouncement;
 
+/// Fans a single SPDP "participant discovered" notification out to both SEDP
+/// and WLP. SpdpEndpoints only supports one downstream listener (a single
+/// `sedp_ctx`/fn slot, see spdp.zig's setSedp) -- this shim lets that one
+/// slot reach two builtin-endpoint modules instead of hand-modifying SPDP
+/// itself for a second listener.
+const DiscoveredFanout = struct {
+    sedp: *sedp.SedpEndpoints,
+    wlp: *wlp_mod.WlpEndpoints,
+
+    fn onParticipantDiscovered(ctx: *anyopaque, data: *const iface.ParticipantData) void {
+        const self: *DiscoveredFanout = @ptrCast(@alignCast(ctx));
+        sedp.SedpEndpoints.onParticipantDiscovered(self.sedp, data);
+        wlp_mod.WlpEndpoints.onParticipantDiscovered(self.wlp, data);
+    }
+};
+
 pub const SpdpSedpDiscovery = struct {
     alloc: std.mem.Allocator,
     spdp: *spdp.SpdpEndpoints,
     sedp: *sedp.SedpEndpoints,
+    wlp: *wlp_mod.WlpEndpoints,
+    disc_fanout: DiscoveredFanout,
 
     const Self = @This();
 
@@ -53,9 +72,25 @@ pub const SpdpSedpDiscovery = struct {
         const se = try sedp.SedpEndpoints.init(alloc, transport);
         errdefer se.deinit();
 
-        // Wire SPDP → SEDP: on each participant discovery event, SEDP creates
-        // proxy state machines so it can exchange endpoint announcements.
-        sp.setSedp(se, sedp.SedpEndpoints.onParticipantDiscovered);
+        const wl = try wlp_mod.WlpEndpoints.init(alloc, transport);
+        errdefer wl.deinit();
+
+        const self = try alloc.create(Self);
+        self.* = .{
+            .alloc = alloc,
+            .spdp = sp,
+            .sedp = se,
+            .wlp = wl,
+            .disc_fanout = .{ .sedp = se, .wlp = wl },
+        };
+
+        // Wire SPDP → SEDP+WLP fanout: on each participant discovery event,
+        // both create proxy state machines so they can exchange traffic.
+        sp.setSedp(&self.disc_fanout, DiscoveredFanout.onParticipantDiscovered);
+
+        // WLP shares SEDP's metatraffic unicast listener rather than opening
+        // a second one on the same port (see sedp.zig's setWlpDispatch).
+        se.setWlpDispatch(wl, wlp_mod.WlpEndpoints.tryHandleFromSedp);
 
         // Wire SEDP → SPDP relay: unicast SPDP responses arrive on the metatraffic
         // unicast port (RTPS §9.6.1.1), which SEDP owns.  Forward them to SPDP.
@@ -71,22 +106,22 @@ pub const SpdpSedpDiscovery = struct {
         // endpoint data has been received from a peer.
         se.setSedpSeenFn(sp, spdp.SpdpEndpoints.markSedpSeen);
 
-        const self = try alloc.create(Self);
-        self.* = .{ .alloc = alloc, .spdp = sp, .sedp = se };
         return self;
     }
 
     pub fn deinit(self: *Self) void {
+        self.wlp.deinit();
         self.sedp.deinit();
         self.spdp.deinit();
         self.alloc.destroy(self);
     }
 
-    /// Set the wire tracer on both SPDP and SEDP state machines.
+    /// Set the wire tracer on SPDP, SEDP, and WLP state machines.
     /// Call before the factory creates a participant (before `start()` is invoked).
     pub fn setTracer(self: *Self, t: trace.Tracer) void {
         self.spdp.setTracer(t);
         self.sedp.setTracer(t);
+        self.wlp.setTracer(t);
     }
 
     pub fn toDiscovery(self: *Self) Discovery {
@@ -103,7 +138,13 @@ pub const SpdpSedpDiscovery = struct {
         .announce_reader = vtAnnounceReader,
         .retract_reader = vtRetractReader,
         .deinit = vtDeinit,
+        .wlp_tick = vtWlpTick,
     };
+
+    fn vtWlpTick(ctx: *anyopaque, now_ns: i64, info: iface.WlpTickInfo) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.wlp.tick(now_ns, info);
+    }
 
     fn vtStart(
         ctx: *anyopaque,
@@ -113,8 +154,11 @@ pub const SpdpSedpDiscovery = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         // SEDP must be started first so its metatraffic unicast listen is active
         // before SPDP fires its initial announcement and the remote peer begins
-        // sending SEDP traffic.
+        // sending SEDP traffic. WLP follows the same requirement for the same
+        // reason (its own metatraffic unicast listener must be up before any
+        // peer's WLP writer starts sending ParticipantMessageData).
         try self.sedp.start(local, cbs);
+        try self.wlp.start(local, cbs);
 
         // SPDP deliberately never "discovers" this participant itself (see
         // spdp.zig's processSpdpPayload "ignore our own announcements" check --
@@ -164,7 +208,7 @@ pub const SpdpSedpDiscovery = struct {
             .builtin_endpoint_set = local.builtin_endpoint_set,
             .vendor_id = header_mod.VENDOR_ID,
         };
-        sedp.SedpEndpoints.onParticipantDiscovered(self.sedp, &self_data);
+        DiscoveredFanout.onParticipantDiscovered(&self.disc_fanout, &self_data);
 
         try self.spdp.start(local, cbs);
     }
@@ -172,6 +216,7 @@ pub const SpdpSedpDiscovery = struct {
     fn vtStop(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.spdp.stop();
+        self.wlp.stop();
         self.sedp.stop();
     }
 

@@ -21,6 +21,13 @@ ALLOWLIST = {
     # discovery to complete before writing) -- same category as the other
     # two, not a new one.
     "test/dcps/loopback_test.zig": (3, "UDP loopback receive/discovery polling"),
+    # Real UDP loopback WLP tests: polling for SEDP match completion, and
+    # polling get_liveliness_changed_status while the real background
+    # checkTimers() thread (real wall-clock, not ManualClock -- WLP's
+    # periodic driver and the reader-side lease-expiry check both need a
+    # real timer thread ticking to prove the wire mechanism actually works,
+    # not just the local bookkeeping) drives WLP sends and lease expiry.
+    "test/dcps/wlp_loopback_test.zig": (5, "UDP loopback WLP match/liveliness-status polling"),
     # MockTransport avoids sockets, but SPDP timer threads still announce on
     # intervals. 15th sleep added with the writer-discovered-before-reader
     # retroactive-match regression test (polling discovered_writers via real

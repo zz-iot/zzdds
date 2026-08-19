@@ -1241,6 +1241,7 @@ pub fn build(b: *std.Build) void {
     // DCPS-level integration tests (need both zzdds and zzdds_generated).
     const dcps_test_files = [_][]const u8{
         "test/dcps/loopback_test.zig",
+        "test/dcps/wlp_loopback_test.zig",
         "test/dcps/api_test.zig",
         "test/dcps/mock_loopback_test.zig",
         "test/dcps/presentation_model_test.zig",

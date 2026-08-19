@@ -1152,6 +1152,7 @@ pub const StatefulWriter = struct {
             last_sn,
             self.hb_count,
             final,
+            false,
         );
         for (locs) |loc| {
             sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
@@ -1215,7 +1216,7 @@ pub const StatefulWriter = struct {
     /// `final = true` means readers need not reply; `false` requires an ACKNACK.
     /// Uses per-proxy start_sn as the floor for first_sn so VOLATILE readers
     /// do not see or NACK data written before they matched.
-    pub fn sendHeartbeat(self: *Self, final: bool) void {
+    pub fn sendHeartbeat(self: *Self, final: bool, liveliness: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.hb_count += 1;
@@ -1282,6 +1283,7 @@ pub const StatefulWriter = struct {
                 last_sn,
                 self.hb_count,
                 final,
+                liveliness,
             );
             self.tracer.submit(.{ .send_heartbeat = .{
                 .src_prefix = self.guid.prefix,
@@ -1299,6 +1301,16 @@ pub const StatefulWriter = struct {
                 };
             }
         }
+    }
+
+    /// RTPS §8.7.2.2.3: assert a MANUAL_BY_TOPIC writer's liveliness on
+    /// demand, without a real data write. Sends an unsolicited Heartbeat
+    /// with the FINAL and LIVELINESS flags set to every matched reader
+    /// proxy — reader.zig's onWriterAliveCb treats an incoming
+    /// liveliness-flagged Heartbeat as valid evidence for MANUAL_BY_TOPIC
+    /// writers specifically (see AliveEvidence.manual_heartbeat).
+    pub fn sendLivelinessHeartbeat(self: *Self) void {
+        self.sendHeartbeat(true, true);
     }
 
     /// Handle an incoming ACKNACK from a reader.
@@ -1812,7 +1824,7 @@ pub const StatefulWriter = struct {
             };
             b.addGap(rp_guid.entity_id, self.guid.entity_id, rp_start_sn, gap_list);
         }
-        b.addHeartbeat(rp_guid.entity_id, self.guid.entity_id, hb_first_sn, last_sn, hb_count, final);
+        b.addHeartbeat(rp_guid.entity_id, self.guid.entity_id, hb_first_sn, last_sn, hb_count, final, false);
         for (locs) |loc| {
             sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
                 error.UnsupportedLocatorKind => {},
@@ -2235,7 +2247,7 @@ pub const StatefulWriter = struct {
                 slept_ms += 50;
             }
             if (self.hb_stopping.load(.acquire)) break;
-            self.sendHeartbeat(false);
+            self.sendHeartbeat(false, false);
             self.checkProbeDeadlines();
             self.checkConnectionGenerations();
         }

@@ -120,8 +120,11 @@ const Tracker = struct {
             .on_writer_lost = noopGuid,
             .on_reader_discovered = noopRd,
             .on_reader_lost = noopGuid,
+            .on_wlp_alive = noopWlpAlive,
         };
     }
+
+    fn noopWlpAlive(_: *anyopaque, _: GuidPrefix, _: u8) void {}
 
     fn onDiscovered(ctx: *anyopaque, _: *const ParticipantData) void {
         const self: *Tracker = @ptrCast(@alignCast(ctx));

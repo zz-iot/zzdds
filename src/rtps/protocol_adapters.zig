@@ -121,7 +121,13 @@ pub const RtpsProtocolWriter = struct {
         .set_protocol_ready_callback = vtSetProtocolReadyCallback,
         .quiesce_acquire = vtQuiesceAcquire,
         .quiesce_release = vtQuiesceRelease,
+        .send_liveliness_heartbeat = vtSendLivelinessHeartbeat,
     };
+
+    fn vtSendLivelinessHeartbeat(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.sendLivelinessHeartbeat();
+    }
 
     fn vtWrite(
         ctx: *anyopaque,
@@ -517,6 +523,7 @@ pub const RtpsProtocolReader = struct {
         last_sn: history_mod.SequenceNumber,
         count: i32,
         final: bool,
+        liveliness: bool,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         // A heartbeat proves the writer's *process* is alive, but only signal
@@ -533,9 +540,15 @@ pub const RtpsProtocolReader = struct {
         // sent on a fixed schedule independent of write()/assert_liveliness()
         // activity -- the lease could never actually expire. Found building
         // zzdds-examples' `presence` example.
+        //
+        // `liveliness` (RTPS Heartbeat LIVELINESS flag, §8.3.7.5) distinguishes
+        // an on-demand MANUAL_BY_TOPIC assert_liveliness() Heartbeat from a
+        // routine one -- tagged `.manual_heartbeat` instead of `.heartbeat` so
+        // reader.zig treats it as valid evidence for MANUAL_BY_TOPIC (not
+        // AUTOMATIC) writers, per RTPS §8.7.2.2.3.
         if (self.reader.isWriterMatched(writer_guid)) {
             if (self.writer_match_cb) |cb| {
-                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid, .heartbeat);
+                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid, if (liveliness) .manual_heartbeat else .heartbeat);
             }
         }
         self.reader.handleHeartbeat(writer_guid, first_sn, last_sn, count, final);

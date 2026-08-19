@@ -351,7 +351,10 @@ pub const MessageBuilder = struct {
 
     // ── HEARTBEAT ─────────────────────────────────────────────────────────────
 
-    /// Add a HEARTBEAT submessage.
+    /// Add a HEARTBEAT submessage. `liveliness` sets the RTPS §8.3.7.5
+    /// LIVELINESS flag — used for the unsolicited Heartbeat that asserts a
+    /// MANUAL_BY_TOPIC writer's liveliness (RTPS §8.7.2.2.3) without a real
+    /// data write; ordinary heartbeats pass `false`.
     pub fn addHeartbeat(
         self: *MessageBuilder,
         reader_entity_id: EntityId,
@@ -360,9 +363,11 @@ pub const MessageBuilder = struct {
         last_sn: SequenceNumber,
         count: i32,
         final: bool,
+        liveliness: bool,
     ) void {
         var flags: u8 = sub.FLAG_ENDIANNESS;
         if (final) flags |= sub.HeartbeatFlags.final;
+        if (liveliness) flags |= sub.HeartbeatFlags.liveliness;
         // content: reader(4) + writer(4) + firstSN(8) + lastSN(8) + count(4) = 28
         writeSmHeader(&self.scratch, .heartbeat, flags, 28);
         self.scratch.writeEntityId(reader_entity_id);
@@ -659,6 +664,7 @@ test "MessageBuilder.addHeartbeat is single iovec" {
         1,
         100,
         1,
+        false,
         false,
     );
 

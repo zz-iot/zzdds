@@ -77,6 +77,7 @@ const Harness = struct {
             .timer_clock = clock.clock(),
             .register_timer_notify = registerTimerNotify,
             .register_get_field_refresh = registerGetFieldRefresh,
+            .register_wlp_alive_notify = registerWlpAliveNotify,
         };
         const sub = try SubscriberImpl.init(
             alloc,
@@ -154,6 +155,7 @@ const Harness = struct {
     fn registerGetFieldRefresh(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {
         // unchanged: no field lookups exercised by these tests
     }
+    fn registerWlpAliveNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, zzdds.protocol.GuidPrefix, u8) void) void {}
 };
 
 fn modelBeginAccess(

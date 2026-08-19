@@ -48,6 +48,7 @@ const CapturingDisc = struct {
         .announce_reader = noopAR,
         .retract_reader = noopRR,
         .deinit = noopDeinit,
+        .wlp_tick = noopWlpTick,
     };
 
     fn start(ctx: *anyopaque, _: *const iface.ParticipantAnnouncement, cbs: *const Callbacks) anyerror!void {
@@ -60,6 +61,7 @@ const CapturingDisc = struct {
     fn noopAR(_: *anyopaque, _: *const iface.ReaderAnnouncement) anyerror!void {}
     fn noopRR(_: *anyopaque, _: Guid) void {}
     fn noopDeinit(_: *anyopaque) void {}
+    fn noopWlpTick(_: *anyopaque, _: i64, _: iface.WlpTickInfo) void {}
 
     fn toDiscovery(self: *CapturingDisc) Discovery {
         return .{ .ctx = self, .vtable = &vtable };
@@ -279,7 +281,7 @@ test "wait_for_historical_data: matches and delivers *during* the wait, not befo
             // Empty history (first_sn=1, last_sn=0): floor=0, immediately satisfied
             // once history_established flips true -- see the "empty history"
             // test above for the same HEARTBEAT shape.
-            reader_impl.proto_reader.handleHeartbeat(writer_guid, 1, 0, 1, true);
+            reader_impl.proto_reader.handleHeartbeat(writer_guid, 1, 0, 1, true, false);
         }
     };
     const t = try std.Thread.spawn(.{}, MatchLater.run, .{ &about_to_wait, &h, dp_impl, dr_impl });
@@ -350,7 +352,7 @@ test "wait_for_historical_data: returns OK after first HB with empty history (la
 
     // Deliver first HEARTBEAT with empty writer history (first_sn=1, last_sn=0).
     // Per RTPS §8.3.7.5.1 this signals an empty cache; floor_sn=0 → immediately satisfied.
-    dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 0, 1, true);
+    dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 0, 1, true, false);
 
     const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
@@ -397,7 +399,7 @@ test "wait_for_historical_data: returns OK after history fully delivered (data b
     try testing.expectEqual(DDS.RETCODE_TIMEOUT, rc1);
 
     // First HEARTBEAT: sets floor=3; cumulativeAck=3 already satisfies the floor.
-    dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 3, 1, true);
+    dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 3, 1, true, false);
 
     const rc2 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc2);
@@ -435,7 +437,7 @@ test "wait_for_historical_data: returns OK once pending data fills history floor
     var payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0xEF, 0x01 };
 
     // HEARTBEAT arrives first: floor = 2.
-    dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 2, 1, false);
+    dr_impl.proto_reader.handleHeartbeat(writer_guid, 1, 2, 1, false, false);
 
     // History floor is established but no data yet → timeout.
     const rc1 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);

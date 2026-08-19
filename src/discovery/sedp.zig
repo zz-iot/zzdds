@@ -25,6 +25,8 @@ const qos_mod = @import("../qos/policy.zig");
 const qm_mod = @import("../dcps/qos_match.zig");
 const writer_sm_mod = @import("../rtps/writer_sm.zig");
 const reader_sm_mod = @import("../rtps/reader_sm.zig");
+const builtin_endpoint_mod = @import("builtin_endpoint.zig");
+const msg_mod = @import("../rtps/message/root.zig");
 const parser_mod = @import("../rtps/message/parser.zig");
 const history_mod = @import("../rtps/history.zig");
 const mutex_mod = @import("../util/mutex.zig");
@@ -42,8 +44,6 @@ const GuidPrefix = guid_mod.GuidPrefix;
 const EntityIds = guid_mod.EntityIds;
 const StatefulWriter = writer_sm_mod.StatefulWriter;
 const StatefulReader = reader_sm_mod.StatefulReader;
-const ReaderProxy = writer_sm_mod.ReaderProxy;
-const WriterProxy = reader_sm_mod.WriterProxy;
 const CacheChange = history_mod.CacheChange;
 const ChangeKind = history_mod.ChangeKind;
 const RtpsTimestamp = time_mod.RtpsTimestamp;
@@ -58,6 +58,7 @@ const ReaderData = iface.ReaderData;
 const QosSnapshot = iface.QosSnapshot;
 const PidTable = pid_mod.PidTable;
 const BuiltinEndpointSet = pid_mod.BuiltinEndpointSet;
+const BuiltinPair = builtin_endpoint_mod.BuiltinPair;
 
 const PLCDR_LE_ENCAP: [4]u8 = .{ 0x00, 0x03, 0x00, 0x00 };
 
@@ -658,6 +659,12 @@ pub const SedpEndpoints = struct {
     // stop retransmitting on that peer's behalf. See spdp.zig's SEDP-traffic-seen heuristic.
     sedp_seen_ctx: ?*anyopaque,
     sedp_seen_fn: ?*const fn (*anyopaque, GuidPrefix) void,
+    // Optional WLP dispatch fallback: WLP shares SEDP's metatraffic unicast
+    // listener rather than opening a second one on the same port (which the
+    // transport does not support) -- see combined.zig's wiring. Tried after
+    // SEDP's own pub/sub routing fails to match a submessage.
+    wlp_ctx: ?*anyopaque,
+    wlp_try_handle_fn: ?*const fn (*anyopaque, msg_mod.SubMessage, GuidPrefix) bool,
 
     // Cached default locators per participant (RTPS: endpoints inherit these
     // when DiscoveredWriter/ReaderData omits explicit locator PIDs).
@@ -698,6 +705,8 @@ pub const SedpEndpoints = struct {
             .probe_result_fn = null,
             .sedp_seen_ctx = null,
             .sedp_seen_fn = null,
+            .wlp_ctx = null,
+            .wlp_try_handle_fn = null,
             .data_reachable = null,
         };
         return self;
@@ -729,6 +738,17 @@ pub const SedpEndpoints = struct {
     ) void {
         self.spdp_relay_ctx = ctx;
         self.spdp_relay_fn = fn_ptr;
+    }
+
+    /// WLP shares this module's metatraffic unicast listener instead of
+    /// opening a second one on the same port. Must be called before start().
+    pub fn setWlpDispatch(
+        self: *Self,
+        ctx: *anyopaque,
+        fn_ptr: *const fn (*anyopaque, msg_mod.SubMessage, GuidPrefix) bool,
+    ) void {
+        self.wlp_ctx = ctx;
+        self.wlp_try_handle_fn = fn_ptr;
     }
 
     pub fn setSpdpByeFn(
@@ -874,6 +894,37 @@ pub const SedpEndpoints = struct {
         }
     }
 
+    // ── BuiltinPair views over the pub/sub state machines ──────────────────────
+    // Ephemeral wrappers (borrow the existing pointer fields, own no state of
+    // their own) used to share matching/dispatch logic with other builtin
+    // endpoint pairs (see builtin_endpoint.zig) without disturbing any other
+    // call site in this file — pub_writer/pub_reader/sub_writer/sub_reader
+    // remain the single source of truth.
+
+    fn pubPair(self: *Self) BuiltinPair {
+        return .{
+            .writer = self.pub_writer,
+            .reader = self.pub_reader,
+            .writer_entity_id = EntityIds.sedp_builtin_publications_writer,
+            .reader_entity_id = EntityIds.sedp_builtin_publications_reader,
+            .remote_writer_bit = BuiltinEndpointSet.DISC_BUILTIN_ENDPOINT_PUBLICATIONS_ANNOUNCER,
+            .remote_reader_bit = BuiltinEndpointSet.DISC_BUILTIN_ENDPOINT_PUBLICATIONS_DETECTOR,
+            .reliable = true,
+        };
+    }
+
+    fn subPair(self: *Self) BuiltinPair {
+        return .{
+            .writer = self.sub_writer,
+            .reader = self.sub_reader,
+            .writer_entity_id = EntityIds.sedp_builtin_subscriptions_writer,
+            .reader_entity_id = EntityIds.sedp_builtin_subscriptions_reader,
+            .remote_writer_bit = BuiltinEndpointSet.DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_ANNOUNCER,
+            .remote_reader_bit = BuiltinEndpointSet.DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR,
+            .reliable = true,
+        };
+    }
+
     // ── Called by SpdpEndpoints when a remote participant is found ────────────
 
     /// Wire the remote participant's SEDP built-in endpoints into our proxies.
@@ -882,7 +933,6 @@ pub const SedpEndpoints = struct {
         data: *const ParticipantData,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const eps = data.builtin_endpoint_set;
         const uc = self.filterReachableLocators(data.metatraffic_unicast_locators, "metatraffic unicast");
         defer self.alloc.free(uc);
         const mc = self.filterReachableLocators(data.metatraffic_multicast_locators, "metatraffic multicast");
@@ -920,53 +970,13 @@ pub const SedpEndpoints = struct {
             self.participant_locs_mu.unlock();
         }
 
-        // Remote has a publications announcer → add proxy to our pub_reader.
-        if (eps & BuiltinEndpointSet.DISC_BUILTIN_ENDPOINT_PUBLICATIONS_ANNOUNCER != 0) {
-            const rw_guid = Guid{
-                .prefix = data.guid.prefix,
-                .entity_id = EntityIds.sedp_builtin_publications_writer,
-            };
-            if (self.pub_reader) |pr| {
-                const wp = WriterProxy.init(self.alloc, rw_guid, uc, mc, true) catch return;
-                pr.addMatchedWriter(wp) catch {};
-            }
-        }
-
-        // Remote has a publications detector → add proxy to our pub_writer.
-        if (eps & BuiltinEndpointSet.DISC_BUILTIN_ENDPOINT_PUBLICATIONS_DETECTOR != 0) {
-            const rr_guid = Guid{
-                .prefix = data.guid.prefix,
-                .entity_id = EntityIds.sedp_builtin_publications_reader,
-            };
-            if (self.pub_writer) |pw| {
-                const rp = ReaderProxy.init(self.alloc, rr_guid, uc, mc, false, true) catch return;
-                pw.addMatchedReader(rp) catch {};
-            }
-        }
-
-        // Remote has a subscriptions announcer → add proxy to our sub_reader.
-        if (eps & BuiltinEndpointSet.DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_ANNOUNCER != 0) {
-            const rw_guid = Guid{
-                .prefix = data.guid.prefix,
-                .entity_id = EntityIds.sedp_builtin_subscriptions_writer,
-            };
-            if (self.sub_reader) |sr| {
-                const wp = WriterProxy.init(self.alloc, rw_guid, uc, mc, true) catch return;
-                sr.addMatchedWriter(wp) catch {};
-            }
-        }
-
-        // Remote has a subscriptions detector → add proxy to our sub_writer.
-        if (eps & BuiltinEndpointSet.DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR != 0) {
-            const rr_guid = Guid{
-                .prefix = data.guid.prefix,
-                .entity_id = EntityIds.sedp_builtin_subscriptions_reader,
-            };
-            if (self.sub_writer) |sw| {
-                const rp = ReaderProxy.init(self.alloc, rr_guid, uc, mc, false, true) catch return;
-                sw.addMatchedReader(rp) catch {};
-            }
-        }
+        // Match the remote's advertised BuiltinEndpointSet bits against our
+        // pub/sub pairs — see BuiltinPair.matchRemote for the shared logic
+        // (4 near-identical if-blocks previously hand-written here).
+        var pub_pair = self.pubPair();
+        pub_pair.matchRemote(self.alloc, data, uc, mc);
+        var sub_pair = self.subPair();
+        sub_pair.matchRemote(self.alloc, data, uc, mc);
     }
 
     // ── Local endpoint announcement ───────────────────────────────────────────
@@ -1014,6 +1024,8 @@ pub const SedpEndpoints = struct {
     fn onReceive(ctx: *anyopaque, data: []const u8, from: Locator) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         _ = from;
+        var pub_pair = self.pubPair();
+        var sub_pair = self.subPair();
         var it = parser_mod.MessageIterator.init(data) catch return;
         var param_buf: [32]@import("../rtps/message/submessage.zig").InlineQosParam = undefined;
 
@@ -1065,51 +1077,23 @@ pub const SedpEndpoints = struct {
                         if (self.spdp_relay_fn) |relay|
                             relay(self.spdp_relay_ctx.?, src_prefix, d.writer_sn, payload, it.header.vendor_id);
                         continue;
-                    } else if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
-                        if (self.pub_reader) |pr| {
-                            const ch = makeCacheChange(src_prefix, wid, d.writer_sn, payload);
-                            pr.handleData(Guid{ .prefix = src_prefix, .entity_id = wid }, ch) catch {};
-                        }
+                    }
+                    // Generic entity-ID-matched routing (BuiltinPair.tryHandle)
+                    // replaces the hand-written pub/sub wid.eql chains that
+                    // used to live here. Falls through to WLP (sharing this
+                    // module's metatraffic unicast listener, see
+                    // setWlpDispatch) if neither pub nor sub matched.
+                    if (pub_pair.tryHandle(sm, src_prefix)) {
                         if (self.sedp_seen_fn) |f| f(self.sedp_seen_ctx.?, src_prefix);
-                    } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
-                        if (self.sub_reader) |sr| {
-                            const ch = makeCacheChange(src_prefix, wid, d.writer_sn, payload);
-                            sr.handleData(Guid{ .prefix = src_prefix, .entity_id = wid }, ch) catch {};
-                        }
+                    } else if (sub_pair.tryHandle(sm, src_prefix)) {
                         if (self.sedp_seen_fn) |f| f(self.sedp_seen_ctx.?, src_prefix);
+                    } else if (self.wlp_try_handle_fn) |f| {
+                        _ = f(self.wlp_ctx.?, sm, src_prefix);
                     }
                 },
-                .heartbeat => |hb| {
-                    const wid = hb.writer_entity_id;
-                    const wguid = Guid{ .prefix = src_prefix, .entity_id = wid };
-                    if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
-                        if (self.pub_reader) |pr|
-                            pr.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
-                    } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
-                        if (self.sub_reader) |sr|
-                            sr.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
-                    }
-                },
-                .gap => |g| {
-                    const wid = g.writer_entity_id;
-                    const wguid = Guid{ .prefix = src_prefix, .entity_id = wid };
-                    if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
-                        if (self.pub_reader) |pr|
-                            pr.handleGap(wguid, g.gap_start, g.gap_list);
-                    } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
-                        if (self.sub_reader) |sr|
-                            sr.handleGap(wguid, g.gap_start, g.gap_list);
-                    }
-                },
-                .acknack => |an| {
-                    const rid = an.reader_entity_id;
-                    const rguid = Guid{ .prefix = src_prefix, .entity_id = rid };
-                    if (rid.eql(EntityIds.sedp_builtin_publications_reader)) {
-                        if (self.pub_writer) |pw|
-                            pw.handleAckNack(rguid, an.reader_sn_state.base - 1, an.reader_sn_state, an.count, an.isFinal());
-                    } else if (rid.eql(EntityIds.sedp_builtin_subscriptions_reader)) {
-                        if (self.sub_writer) |sw|
-                            sw.handleAckNack(rguid, an.reader_sn_state.base - 1, an.reader_sn_state, an.count, an.isFinal());
+                .heartbeat, .gap, .acknack => {
+                    if (!pub_pair.tryHandle(sm, src_prefix) and !sub_pair.tryHandle(sm, src_prefix)) {
+                        if (self.wlp_try_handle_fn) |f| _ = f(self.wlp_ctx.?, sm, src_prefix);
                     }
                 },
                 else => {},
@@ -1307,23 +1291,6 @@ fn encodeEndpointDisposalPayload(alloc: std.mem.Allocator, guid: Guid) ![]u8 {
     });
     try writePidHdr(alloc, &buf, PidTable.SENTINEL, 0);
     return buf.toOwnedSlice(alloc);
-}
-
-fn makeCacheChange(
-    prefix: GuidPrefix,
-    eid: guid_mod.EntityId,
-    sn: history_mod.SequenceNumber,
-    data: []const u8,
-) CacheChange {
-    return CacheChange{
-        .kind = .alive,
-        .writer_guid = .{ .prefix = prefix, .entity_id = eid },
-        .sequence_number = sn,
-        .source_timestamp = RtpsTimestamp.now(),
-        .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
-        .key_hash = std.mem.zeroes([16]u8),
-        .data = @constCast(data),
-    };
 }
 
 test "readDeadlineDuration preserves explicit zero QoS duration" {

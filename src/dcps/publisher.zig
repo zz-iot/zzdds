@@ -96,6 +96,17 @@ pub const ParticipantCbs = struct {
         notify_ctx: *anyopaque,
         assert_fn: *const fn (notify_ctx: *anyopaque) void,
     ) void,
+
+    /// Register a last-assertion-timestamp getter for a writer. Read by
+    /// checkTimers()'s WLP driver (RTPS §8.7.2.2.3) to decide whether a
+    /// MANUAL_BY_PARTICIPANT writer was asserted since the last periodic
+    /// check.
+    register_liveliness_query: *const fn (
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        last_assert_ns: *const fn (notify_ctx: *anyopaque) i64,
+    ) void,
 };
 
 pub const PublisherImpl = struct {
@@ -337,6 +348,12 @@ pub const PublisherImpl = struct {
             pub_handle,
             dw,
             writer_mod.DataWriterImpl.assertLivelinessFn,
+        );
+        self.cbs.register_liveliness_query(
+            self.cbs.ctx,
+            pub_handle,
+            dw,
+            writer_mod.DataWriterImpl.livelinessLastNsFn,
         );
         // Direct ProtocolWriter registration (not routed through ParticipantCbs
         // like the callbacks above): this signal is purely RTPS-internal

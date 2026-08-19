@@ -561,7 +561,7 @@ test "loss_nack_drop: initial NACK dropped, HB-triggered NACK recovers data" {
 
     // Simulate the writer's periodic heartbeat.
     // Forwarded by lossy_w (DropFirst(1) exhausted after seq 1).
-    writer.sendHeartbeat(false);
+    writer.sendHeartbeat(false, false);
 
     // Round 2: HB(c=2) → reader sees missing SNs 1,2,3, sends NACK(1,2,3);
     //          DropFirst(1) exhausted → passes to mt_w; mt_w delivers NACK →
@@ -660,7 +660,7 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
 
     // Simulate writer periodic heartbeat #1 (initial HB was dropped).
     // Forwarded (DropFirst(1) exhausted after seq 1).
-    writer.sendHeartbeat(false);
+    writer.sendHeartbeat(false, false);
 
     // Round 2: HB(c=2) → reader sees missing SNs 1,2,3, sends NACK(1,2,3) → dropped by
     //          lossy_r (DropFirst(2) seq 2); writer stays silent.
@@ -772,8 +772,8 @@ test "loss_keep_last_eviction: NACKed SN evicted from cache; HB virtual GAP unbl
     try reader.addMatchedWriter(wp); // initial NACK → mt_w.q
 
     // Shift the lossy_w sequence counter by 2 so DATA(SN2) falls at seq 6.
-    writer.sendHeartbeat(false); // seq 2: H(1,0,c=2) → pass
-    writer.sendHeartbeat(false); // seq 3: H(1,0,c=3) → DROP
+    writer.sendHeartbeat(false, false); // seq 2: H(1,0,c=2) → pass
+    writer.sendHeartbeat(false, false); // seq 3: H(1,0,c=3) → DROP
 
     try write(writer, "one"); // seq  4: D(SN1)    → pass
     // seq  5: H(1,1,c=4) → pass
@@ -884,7 +884,7 @@ test "suppress_live_data: live write during history replay is ordered after hist
     try testing.expectEqual(@as(usize, 3), col.samples.items.len);
 
     // Periodic HB reveals live range; reader NACKs non-finally for SN=4.
-    writer.sendHeartbeat(false);
+    writer.sendHeartbeat(false, false);
 
     // Round 4: NON-FINAL NACK(base=4) → highest_sn=3 >= floor=3 → suppress cleared;
     //          DATA(4) sent via bitmap.
