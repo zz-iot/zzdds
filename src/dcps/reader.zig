@@ -1161,8 +1161,9 @@ pub const DataReaderImpl = struct {
         if (liveliness_changed) self.notifyLivelinessChanged();
     }
 
-    // AUTOMATIC_LIVELINESS_QOS = 0 (DDS LivelinessQosPolicyKind enum ordinal order).
+    // DDS LivelinessQosPolicyKind enum ordinal order (dcps.idl).
     const LIVELINESS_AUTOMATIC: u8 = 0;
+    const LIVELINESS_MANUAL_BY_PARTICIPANT: u8 = 1;
 
     fn onWriterAliveCb(ctx: *anyopaque, guid: Guid, evidence: proto.AliveEvidence) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -1181,20 +1182,52 @@ pub const DataReaderImpl = struct {
                 // vtHandleHeartbeat's comment (rtps/protocol_adapters.zig) for
                 // the bug this fixes.
                 if (evidence == .heartbeat and entry.kind != LIVELINESS_AUTOMATIC) return;
-                entry.last_alive_ns = self.timer_clock.nowNs();
-                if (!entry.is_alive) {
-                    entry.is_alive = true;
-                    self.liveliness_alive_count += 1;
-                    self.liveliness_alive_count_change += 1;
-                    self.liveliness_not_alive_count -= 1;
-                    self.liveliness_not_alive_count_change -= 1;
-                    self.liveliness_last_handle = writer_mod.guidToHandle(guid);
-                    self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
-                    liveliness_changed = true;
+                const is_manual_by_participant = entry.kind == LIVELINESS_MANUAL_BY_PARTICIPANT;
+                self.refreshWriterAliveLocked(guid, entry, &liveliness_changed);
+                // Per DDS 1.4 §2.2.3.11: MANUAL_BY_PARTICIPANT liveliness is
+                // asserted by the *participant*, not the individual writer --
+                // any one writer on that participant asserting (write() or
+                // assert_liveliness(), arriving here as real `.data` evidence
+                // for that writer) must refresh every *other* matched writer
+                // from the same participant that also has
+                // MANUAL_BY_PARTICIPANT liveliness, not just the one that
+                // happened to send data. Found via Greptile review of the
+                // heartbeat-evidence-gating fix above: that fix correctly
+                // stopped counting routine RELIABLE heartbeats as a manual
+                // assertion, but left sibling writers on the same
+                // participant with no path to ever being refreshed at all,
+                // so they'd incorrectly expire even while the participant
+                // was genuinely alive and asserting through a different
+                // writer.
+                if (is_manual_by_participant) {
+                    var it = self.writer_liveliness.iterator();
+                    while (it.next()) |kv| {
+                        if (kv.key_ptr.eql(guid)) continue;
+                        if (!kv.key_ptr.prefix.eql(guid.prefix)) continue;
+                        if (kv.value_ptr.kind != LIVELINESS_MANUAL_BY_PARTICIPANT) continue;
+                        self.refreshWriterAliveLocked(kv.key_ptr.*, kv.value_ptr, &liveliness_changed);
+                    }
                 }
             }
         }
         if (liveliness_changed) self.notifyLivelinessChanged();
+    }
+
+    /// Shared by onWriterAliveCb's direct-evidence path and its
+    /// MANUAL_BY_PARTICIPANT sibling-refresh loop above. Must be called
+    /// with `self.mu` held.
+    fn refreshWriterAliveLocked(self: *Self, guid: Guid, entry: *WriterLivelinessEntry, liveliness_changed: *bool) void {
+        entry.last_alive_ns = self.timer_clock.nowNs();
+        if (!entry.is_alive) {
+            entry.is_alive = true;
+            self.liveliness_alive_count += 1;
+            self.liveliness_alive_count_change += 1;
+            self.liveliness_not_alive_count -= 1;
+            self.liveliness_not_alive_count_change -= 1;
+            self.liveliness_last_handle = writer_mod.guidToHandle(guid);
+            self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            liveliness_changed.* = true;
+        }
     }
 
     fn onWriterUnmatchedCb(ctx: *anyopaque, guid: Guid) void {

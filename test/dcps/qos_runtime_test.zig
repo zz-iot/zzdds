@@ -1540,6 +1540,54 @@ test "liveliness: reader — on_liveliness_changed fires on initial writer match
     try testing.expectEqual(@as(i32, 0), captured.not_alive_count);
 }
 
+test "liveliness: reader — MANUAL_BY_PARTICIPANT assertion from one writer refreshes sibling writers on the same participant" {
+    // Regression for a real gap found via Greptile review of the heartbeat-
+    // evidence-gating fix (onWriterAliveCb's `if (evidence == .heartbeat and
+    // entry.kind != LIVELINESS_AUTOMATIC) return;`): that fix correctly
+    // stopped routine RELIABLE heartbeat traffic from counting as a manual
+    // liveliness assertion, but only ever refreshed the *specific* writer
+    // that sent the DATA. Per DDS 1.4 Sec 2.2.3.11, MANUAL_BY_PARTICIPANT is
+    // asserted by the participant, not the individual writer: any one
+    // writer on a participant asserting liveliness must refresh *every*
+    // matched writer from that same participant with MANUAL_BY_PARTICIPANT
+    // liveliness, not just the one that happened to write. Two writers (A,
+    // B) on one participant, both MANUAL_BY_PARTICIPANT with a 1s lease;
+    // only A ever writes. Without the fix, B's last_alive_ns is stuck at
+    // its initial-match timestamp (t=0) and it incorrectly expires once the
+    // lease elapses from *that*, even though the participant is genuinely
+    // still alive (asserting through A).
+    const alloc = testing.allocator;
+    var mc = ManualClock.init(0);
+    var fx = try TwoPartyTimerFixture.init(alloc, mc.clock());
+    defer fx.deinit();
+
+    var captured = DDS.LivelinessChangedStatus{};
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.liveliness.kind = .MANUAL_BY_PARTICIPANT_LIVELINESS_QOS;
+    dw_qos.liveliness.lease_duration = .{ .sec = 1, .nanosec = 0 };
+    const dw_a = fx.makeWriter(dw_qos);
+    _ = fx.makeWriter(dw_qos); // writer B: same participant, same QoS, never writes
+    _ = fx.makeReader(drListenerLiveliness(&captured), DDS.LIVELINESS_CHANGED_STATUS);
+
+    // T=0: both writers just matched -- alive_count=2, neither expired yet.
+    try testing.expectEqual(@as(i32, 2), captured.alive_count);
+    try testing.expectEqual(@as(i32, 0), captured.not_alive_count);
+
+    // T=0.8s: writer A asserts (a real write -- MANUAL_BY_PARTICIPANT's
+    // valid evidence). With the fix, this also refreshes B.
+    mc.advance(std.time.ns_per_s / 10 * 8);
+    try writeRaw(dw_a, &PAYLOAD_A);
+
+    // T=1.5s: 0.7s since A's write (and, with the fix, since B's refresh
+    // too) -- both still within the 1s lease. Without the fix, B's
+    // last_alive_ns is still t=0, so 1.5s since match blows past its 1s
+    // lease and it incorrectly expires here.
+    mc.advance(std.time.ns_per_s / 10 * 7);
+    fx.dp_r_impl.checkTimers();
+    try testing.expectEqual(@as(i32, 2), captured.alive_count);
+    try testing.expectEqual(@as(i32, 0), captured.not_alive_count);
+}
+
 test "liveliness: reader — get_liveliness_changed_status reflects writer match and expiry" {
     const alloc = testing.allocator;
     var mc = ManualClock.init(0);
