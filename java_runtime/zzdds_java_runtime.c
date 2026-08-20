@@ -35,6 +35,53 @@ static void *zzdds_java_unbox(JNIEnv *env, jobject obj) {
     return (void *)(intptr_t)(*env)->GetLongField(env, obj, fid);
 }
 
+/* ── JNI boundary hardening ───────────────────────────────────────────────
+ *
+ * zzdds_java_unbox(env, NULL) returns a native NULL rather than crashing --
+ * but nearly every zzdds C-ABI function this file forwards an unboxed
+ * handle into declares its parameter as a non-nullable `*anyopaque`/
+ * `[*:0]const u8` and dereferences it unconditionally (entity-box vtable
+ * dispatch, std.mem.span on a string), so a Java caller passing an
+ * explicit `null` for one of ZzddsRuntime's `static native` handle/string
+ * parameters (unlike an instance-method receiver, the JVM does not
+ * null-check these on its own) still reached a native crash that took the
+ * whole JVM down instead of a catchable Java exception. Found via Greptile
+ * PR #67 review flagging it on the two new functions added there
+ * (configureFromFile/asZzddsFactory), then generalized here to every call
+ * site in this file with the same risk profile -- see docs/roadmap.md's
+ * matching entry for the full audit. Deliberately NOT applied to the
+ * handful of call sites where null already has real, documented meaning:
+ * destroyWaitSet/destroyGuardCondition's idempotent-destroy convention,
+ * cftMatchSample's cft==NULL "no filter" convention, and
+ * zzdds_java_waitset_attach_condition's explicit cond==NULL pass-through.
+ */
+
+/* Throws java.lang.NullPointerException naming `param_name` and returns
+ * false if `obj` is null; true (nothing thrown) otherwise. Callers must
+ * check the return and bail out immediately -- returning whatever their
+ * own JNI return type's "nothing happened" sentinel is (NULL/0/JNI_FALSE)
+ * -- leaving the exception to propagate back to the Java caller instead of
+ * proceeding into a native call that would dereference the null handle. */
+static bool zzdds_java_require_non_null(JNIEnv *env, jobject obj, const char *param_name) {
+    if (obj != NULL) return true;
+    jclass npe = (*env)->FindClass(env, "java/lang/NullPointerException");
+    if (npe != NULL) (*env)->ThrowNew(env, npe, param_name);
+    return false;
+}
+
+/* Same null-guard as zzdds_java_require_non_null, plus converts `str` to a
+ * NUL-terminated UTF-8 C string for the (several) C-ABI functions in this
+ * file that take a non-nullable `const char *`/`[*:0]const u8` path/name
+ * parameter. Returns NULL -- with a pending Java exception, either the
+ * NullPointerException thrown here or whatever GetStringUTFChars itself
+ * already threw on allocation failure per its own JNI contract -- on
+ * either failure; callers must check for NULL and bail out without calling
+ * ReleaseStringUTFChars. */
+static const char *zzdds_java_require_utf_chars(JNIEnv *env, jstring str, const char *param_name) {
+    if (!zzdds_java_require_non_null(env, (jobject)str, param_name)) return NULL;
+    return (*env)->GetStringUTFChars(env, str, NULL);
+}
+
 /* ── Lazily-cached (jclass, "(J)V" ctor jmethodID) pairs ─────────────────
  *
  * createFactory()/asZzddsDataWriter() each resolve their target class once
@@ -502,6 +549,9 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     JNIEnv *env, jclass self_cls, jobject participant, jstring typeName, jclass typeClass)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, participant, "participant")) return -1;
+    if (!zzdds_java_require_non_null(env, (jobject)typeName, "typeName")) return -1;
+    if (!zzdds_java_require_non_null(env, (jobject)typeClass, "typeClass")) return -1;
 
     zzdds_java_ts_ctx *ctx = malloc(sizeof(*ctx));
     if (ctx == NULL) return -1;
@@ -550,6 +600,7 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_writeRaw(
     JNIEnv *env, jclass self_cls, jobject writer, jint kind, jbyteArray keyHash, jlong handle, jbyteArray payload)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return -1;
     void *w = zzdds_java_unbox(env, writer);
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -566,6 +617,7 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_writeRawWTimestamp(
     JNIEnv *env, jclass self_cls, jobject writer, jint kind, jbyteArray keyHash, jlong handle, jbyteArray payload, jint sec, jint nanosec)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return -1;
     void *w = zzdds_java_unbox(env, writer);
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -583,6 +635,7 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerInstanceRaw(
     JNIEnv *env, jclass self_cls, jobject writer, jbyteArray keyHash)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return 0;
     void *w = zzdds_java_unbox(env, writer);
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -593,6 +646,7 @@ JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueWrite
     JNIEnv *env, jclass self_cls, jobject writer, jlong handle)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return NULL;
     void *w = zzdds_java_unbox(env, writer);
     uint8_t buf[4096];
     size_t len = 0;
@@ -606,6 +660,7 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceWriterR
     JNIEnv *env, jclass self_cls, jobject writer, jbyteArray keyHash)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return 0;
     void *w = zzdds_java_unbox(env, writer);
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -629,6 +684,7 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceWriterR
 static jbyteArray zzdds_java_take_or_read(
     JNIEnv *env, jobject reader_obj, jint max_size, jlongArray handle_out, jbooleanArray valid_out, jintArray state_out, int is_take)
 {
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
     void *reader = zzdds_java_unbox(env, reader_obj);
     uint8_t *buf = malloc((size_t)max_size);
     if (buf == NULL) return NULL;
@@ -675,6 +731,7 @@ JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readRaw(
 static jbyteArray zzdds_java_take_or_read_instance(
     JNIEnv *env, jobject reader_obj, jlong prev, jint max_size, jlongArray handle_out, jbooleanArray valid_out, jintArray state_out, int is_take)
 {
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
     void *reader = zzdds_java_unbox(env, reader_obj);
     uint8_t *buf = malloc((size_t)max_size);
     if (buf == NULL) return NULL;
@@ -768,6 +825,7 @@ static jobjectArray zzdds_java_take_or_read_n(
     JNIEnv *env, jobject reader_obj, jint max, jint ss, jint vs, jint is_mask,
     jlongArray handles_out, jbooleanArray valids_out, int is_take)
 {
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
     void *reader = zzdds_java_unbox(env, reader_obj);
     zzdds_raw_sample_array arr;
     int n = is_take
@@ -808,6 +866,7 @@ static jobjectArray zzdds_java_take_or_read_n_instance(
     JNIEnv *env, jobject reader_obj, jlong instance_handle, jint max, jint ss, jint vs, jint is_mask,
     jlongArray handles_out, jbooleanArray valids_out, int is_take)
 {
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
     void *reader = zzdds_java_unbox(env, reader_obj);
     zzdds_raw_sample_array arr;
     int n = is_take
@@ -840,6 +899,8 @@ static jobjectArray zzdds_java_take_or_read_w_condition(
     JNIEnv *env, jobject reader_obj, jobject condition_obj, jint max,
     jlongArray handles_out, jbooleanArray valids_out, int is_take)
 {
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
+    if (!zzdds_java_require_non_null(env, condition_obj, "condition")) return NULL;
     void *reader = zzdds_java_unbox(env, reader_obj);
     void *condition = zzdds_java_unbox(env, condition_obj);
     zzdds_raw_sample_array arr;
@@ -873,6 +934,8 @@ static jobjectArray zzdds_java_take_or_read_next_instance_w_condition(
     JNIEnv *env, jobject reader_obj, jobject condition_obj, jlong prev, jint max,
     jlongArray handles_out, jbooleanArray valids_out, int is_take)
 {
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
+    if (!zzdds_java_require_non_null(env, condition_obj, "condition")) return NULL;
     void *reader = zzdds_java_unbox(env, reader_obj);
     void *condition = zzdds_java_unbox(env, condition_obj);
     zzdds_raw_sample_array arr;
@@ -908,6 +971,7 @@ JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueReade
     JNIEnv *env, jclass self_cls, jobject reader, jlong handle)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, reader, "reader")) return NULL;
     void *r = zzdds_java_unbox(env, reader);
     uint8_t buf[4096];
     size_t len = 0;
@@ -921,6 +985,7 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceReaderR
     JNIEnv *env, jclass self_cls, jobject reader, jbyteArray keyHash)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, reader, "reader")) return 0;
     void *r = zzdds_java_unbox(env, reader);
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -998,6 +1063,7 @@ JNIEXPORT jboolean JNICALL Java_io_zzdds_runtime_ZzddsRuntime_cftMatchSample(
 {
     (void)self_cls;
     if (cft == NULL) return JNI_TRUE;
+    if (!zzdds_java_require_non_null(env, accessor, "accessor")) return JNI_FALSE;
     void *c = zzdds_java_unbox(env, cft);
 
     jclass acc_cls = (*env)->GetObjectClass(env, accessor);
@@ -1023,6 +1089,7 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsDataWriter(
     JNIEnv *env, jclass self_cls, jobject writer)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return NULL;
     DDS_DataWriter w = (DDS_DataWriter)zzdds_java_unbox(env, writer);
     zzdds_DataWriter zw = DDS_DataWriter_as_zzdds_DataWriter(w);
 
@@ -1039,7 +1106,8 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_configureFromFile(
     JNIEnv *env, jclass self_cls, jstring path)
 {
     (void)self_cls;
-    const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
+    const char *c_path = zzdds_java_require_utf_chars(env, path, "path");
+    if (c_path == NULL) return (jint)DDS_RETCODE_BAD_PARAMETER;
     DDS_ReturnCode_t rc = zzdds_process_configure_from_file(c_path, NULL);
     (*env)->ReleaseStringUTFChars(env, path, c_path);
     return (jint)rc;
@@ -1052,6 +1120,7 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsFactory(
     JNIEnv *env, jclass self_cls, jobject factory)
 {
     (void)self_cls;
+    if (!zzdds_java_require_non_null(env, factory, "factory")) return NULL;
     DDS_DomainParticipantFactory f = (DDS_DomainParticipantFactory)zzdds_java_unbox(env, factory);
     zzdds_DomainParticipantFactory zf = DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(f);
 

@@ -5,6 +5,41 @@ see `docs/implementation_status.md`.
 
 ---
 
+## Hardened `zzdds_java_runtime.c`'s JNI boundary against null/invalid handle inputs (2026-08-20)
+
+Greptile's review of PR #67 (the `configureFromFile`/`asZzddsFactory` JNI wrappers added there)
+flagged that both would crash the whole JVM — not throw a catchable exception — if a Java caller
+passed `null`: `zzdds_java_unbox(env, NULL)` itself returns a safe native `NULL`, but the
+downstream C-ABI functions it feeds (`zzdds_process_configure_from_file`'s `path:
+[*:0]const u8`, `DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory`'s `factory:
+*anyopaque`) declare non-nullable parameters and dereference them unconditionally. Verified this
+is real (not just theoretical): `DDS_DataWriter_as_zzdds_DataWriter` — `asZzddsDataWriter`'s
+already-merged target function — has the exact same non-nullable-`*anyopaque`-dereferenced-
+unconditionally shape, confirming this wasn't a one-off in the two new functions but a
+pattern already present (and unfixed) in the file.
+
+Generalized rather than patching just the two flagged functions: audited every `zzdds_java_unbox`
+(21 call sites) and `GetStringUTFChars` (4 call sites) use in the file. Added two helpers —
+`zzdds_java_require_non_null` (throws `NullPointerException` naming the parameter, returns
+false) and `zzdds_java_require_utf_chars` (same, plus the UTF-8 conversion) — and applied them
+to every call site whose Java-side object/string parameter has no existing null-tolerant
+semantics of its own. Deliberately left three call sites unguarded, because null already has
+real, documented meaning there: `destroyWaitSet`/`destroyGuardCondition`'s idempotent-destroy
+convention, and `cftMatchSample`'s `cft == NULL` "no content filter" convention (its `accessor`
+parameter, which has no such meaning, is guarded).
+
+Verified for real, not just by inspection: a standalone Java harness calling
+`configureFromFile(null)`, `asZzddsFactory(null)`, `asZzddsDataWriter(null)`, and
+`registerTypeSupport(null, ...)` confirmed all four now throw a catchable
+`NullPointerException` (previously: a JVM crash) — including confirming a normal
+`createFactory()` call still succeeds immediately afterward, i.e. the JNI environment isn't left
+in a bad state by the throw. Re-ran `zzdds-examples`' `participant-config` (exercises
+`registerTypeSupport`/write/take/`asZzddsFactory`/`configureFromFile` together) end-to-end on
+Java after the change — still passes cleanly, confirming the new guards don't reject legitimate
+non-null calls.
+
+---
+
 ## Examples cleanup list resolved — mostly already done, one real gap fixed (2026-08-20)
 
 Followed up on `docs/design/dcps-api-coverage-audit.md`'s "Per-binding asymmetries" and
