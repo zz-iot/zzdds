@@ -32,6 +32,7 @@ const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const extensions_mod = @import("../c_abi/extensions.zig");
 
 const Guid = proto.Guid;
+const GuidPrefix = proto.GuidPrefix;
 
 /// CFT filter state held on the DataReaderImpl.
 /// Non-null only when the reader was created from a ContentFilteredTopic and a
@@ -67,6 +68,10 @@ const WriterLivelinessEntry = struct {
     lease_ns: i64, // 0 = infinite (no expiry)
     last_alive_ns: i64,
     is_alive: bool,
+    /// LivelinessQosPolicyKind as transmitted (0=AUTOMATIC). Determines which
+    /// proto.AliveEvidence kinds onWriterAliveCb accepts as a real assertion —
+    /// see AliveEvidence's own doc comment in protocol/interface.zig.
+    kind: u8,
 };
 
 fn durationIsActive(d: DDS.Duration_t) bool {
@@ -420,6 +425,29 @@ pub const DataReaderImpl = struct {
     /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
         self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    /// Acquire/release pair for any application-facing call that touches
+    /// `self` after `create_datareader()` has already handed the caller a
+    /// `DDS.DataReader` -- unlike the RTPS/protocol-dispatch callbacks
+    /// above (`onDataCb` et al.), which already guard themselves this way,
+    /// `raw_ops.zig`'s take/read/get_key_value/lookup_instance family
+    /// previously dereferenced `self` with no such guard, so a
+    /// `delete_datareader()` racing a still-in-flight listener callback's
+    /// own `take()` call could free `self` (including `self.mu`) out from
+    /// under it -- a genuine use-after-free, not just a benign ordering
+    /// quirk (found via zzdds-examples' `catchup` review: a listener that
+    /// signals completion near the end of its take loop, and an
+    /// independent completion path on another thread, can each believe
+    /// it's safe to delete the reader while the other is still using it).
+    /// `reallyDeinit` itself stays private; these two methods are the only
+    /// sanctioned way for code outside this file to participate in the
+    /// same quiesce protocol the internal dispatch paths already use.
+    pub fn acquireQuiesce(self: *Self) bool {
+        return self.quiesce.acquire();
+    }
+    pub fn releaseQuiesce(self: *Self) void {
+        self.quiesce.release(self, reallyDeinit);
     }
 
     fn reallyDeinit(ctx: *anyopaque) void {
@@ -1076,61 +1104,167 @@ pub const DataReaderImpl = struct {
 
     // ── Ownership tracking ─────────────────────────────────────────────────────
 
+    // Both onWriterMatchedCb and onWriterAliveCb below fire notifyLivelinessChanged()
+    // themselves, on the "went alive" transition -- previously neither did:
+    // they only set status_changes/counts, on the (wrong) assumption that
+    // participant.checkTimers()'s own LIVELINESS lease-expiry loop would
+    // eventually surface it. It never does -- that loop only scans for
+    // currently-alive writers whose lease just expired (the opposite
+    // direction), so a reader's on_liveliness_changed listener never fired
+    // at all for a writer's initial match or its recovery after an expired
+    // lease, only for expiry itself. Found building zzdds-examples'
+    // `presence` example (MANUAL_BY_TOPIC liveliness, first real end-to-end
+    // exercise of this path in any binding). notifyLivelinessChanged() takes
+    // self.mu itself, so it must be called with the lock already released --
+    // same reason checkTimersFn's own call site unlocks first.
     fn onWriterMatchedCb(ctx: *anyopaque, info: *const proto.MatchedWriterInfo) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        self.mu.lock();
-        defer self.mu.unlock();
-        self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
-        if (info.lifespan_ns > 0)
-            self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
-        else
-            _ = self.writer_lifespans.remove(info.guid);
-        // Track liveliness for writers with a finite lease.
-        if (info.liveliness_lease_ns > 0) {
-            const prev = self.writer_liveliness.get(info.guid);
-            self.writer_liveliness.put(self.alloc, info.guid, .{
-                .lease_ns = info.liveliness_lease_ns,
-                .last_alive_ns = self.timer_clock.nowNs(),
-                .is_alive = true,
-            }) catch {};
-            if (prev == null) {
-                // Newly matched writer.
-                self.liveliness_alive_count += 1;
-                self.liveliness_alive_count_change += 1;
-                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
-                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
-            } else if (!prev.?.is_alive) {
-                // Re-announced after lease expiry — same transition as onWriterAliveCb.
-                self.liveliness_alive_count += 1;
-                self.liveliness_alive_count_change += 1;
-                self.liveliness_not_alive_count -= 1;
-                self.liveliness_not_alive_count_change -= 1;
-                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
-                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+        var liveliness_changed = false;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
+            if (info.lifespan_ns > 0)
+                self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
+            else
+                _ = self.writer_lifespans.remove(info.guid);
+            // Track liveliness for writers with a finite lease.
+            if (info.liveliness_lease_ns > 0) {
+                const prev = self.writer_liveliness.get(info.guid);
+                self.writer_liveliness.put(self.alloc, info.guid, .{
+                    .lease_ns = info.liveliness_lease_ns,
+                    .last_alive_ns = self.timer_clock.nowNs(),
+                    .is_alive = true,
+                    .kind = info.liveliness_kind,
+                }) catch {};
+                if (prev == null) {
+                    // Newly matched writer.
+                    self.liveliness_alive_count += 1;
+                    self.liveliness_alive_count_change += 1;
+                    self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                    self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+                    liveliness_changed = true;
+                } else if (!prev.?.is_alive) {
+                    // Re-announced after lease expiry — same transition as onWriterAliveCb.
+                    self.liveliness_alive_count += 1;
+                    self.liveliness_alive_count_change += 1;
+                    self.liveliness_not_alive_count -= 1;
+                    self.liveliness_not_alive_count_change -= 1;
+                    self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                    self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+                    liveliness_changed = true;
+                }
+                // else: re-announcement of an already-alive writer; update lease/timestamp only.
             }
-            // else: re-announcement of an already-alive writer; update lease/timestamp only.
         }
+        if (liveliness_changed) self.notifyLivelinessChanged();
     }
 
-    fn onWriterAliveCb(ctx: *anyopaque, guid: Guid) void {
+    // DDS LivelinessQosPolicyKind enum ordinal order (dcps.idl).
+    const LIVELINESS_AUTOMATIC: u8 = 0;
+    const LIVELINESS_MANUAL_BY_PARTICIPANT: u8 = 1;
+    const LIVELINESS_MANUAL_BY_TOPIC: u8 = 2;
+
+    fn onWriterAliveCb(ctx: *anyopaque, guid: Guid, evidence: proto.AliveEvidence) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.writer_liveliness.getPtr(guid)) |entry| {
-            entry.last_alive_ns = self.timer_clock.nowNs();
-            if (!entry.is_alive) {
-                entry.is_alive = true;
-                self.liveliness_alive_count += 1;
-                self.liveliness_alive_count_change += 1;
-                self.liveliness_not_alive_count -= 1;
-                self.liveliness_not_alive_count_change -= 1;
-                self.liveliness_last_handle = writer_mod.guidToHandle(guid);
-                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+        var liveliness_changed = false;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.writer_liveliness.getPtr(guid)) |entry| {
+                // Routine RELIABLE-protocol heartbeat traffic is only a valid
+                // liveliness assertion for AUTOMATIC -- MANUAL_BY_TOPIC/
+                // PARTICIPANT require a real write()/assert_liveliness() call
+                // (which arrives as `.data`, not `.heartbeat`). See
+                // AliveEvidence's doc comment (protocol/interface.zig) and
+                // vtHandleHeartbeat's comment (rtps/protocol_adapters.zig) for
+                // the bug this fixes.
+                if (evidence == .heartbeat and entry.kind != LIVELINESS_AUTOMATIC) return;
+                // An on-demand liveliness-flagged Heartbeat (RTPS §8.7.2.2.3)
+                // is only valid evidence for MANUAL_BY_TOPIC -- it's how a
+                // MANUAL_BY_TOPIC writer's assert_liveliness() reaches this
+                // reader when it has no new data to send (WLP's
+                // ParticipantMessageData mechanism explicitly excludes
+                // MANUAL_BY_TOPIC per RTPS §8.4.13.5).
+                if (evidence == .manual_heartbeat and entry.kind != LIVELINESS_MANUAL_BY_TOPIC) return;
+                const is_manual_by_participant = entry.kind == LIVELINESS_MANUAL_BY_PARTICIPANT;
+                self.refreshWriterAliveLocked(guid, entry, &liveliness_changed);
+                // Per DDS 1.4 §2.2.3.11: MANUAL_BY_PARTICIPANT liveliness is
+                // asserted by the *participant*, not the individual writer --
+                // any one writer on that participant asserting (write() or
+                // assert_liveliness(), arriving here as real `.data` evidence
+                // for that writer) must refresh every *other* matched writer
+                // from the same participant that also has
+                // MANUAL_BY_PARTICIPANT liveliness, not just the one that
+                // happened to send data. Found via Greptile review of the
+                // heartbeat-evidence-gating fix above: that fix correctly
+                // stopped counting routine RELIABLE heartbeats as a manual
+                // assertion, but left sibling writers on the same
+                // participant with no path to ever being refreshed at all,
+                // so they'd incorrectly expire even while the participant
+                // was genuinely alive and asserting through a different
+                // writer.
+                if (is_manual_by_participant) {
+                    self.refreshAllByPrefixAndKindLocked(guid.prefix, LIVELINESS_MANUAL_BY_PARTICIPANT, &liveliness_changed);
+                }
             }
+        }
+        if (liveliness_changed) self.notifyLivelinessChanged();
+    }
+
+    /// WLP wire ingestion (RTPS §8.4.13): a remote participant's
+    /// ParticipantMessageData arrived (relayed via participant.zig's
+    /// wlpAliveFromDiscovery), asserting liveliness of `kind` (AUTOMATIC or
+    /// MANUAL_BY_PARTICIPANT) for its whole participant `prefix`. Unlike
+    /// onWriterAliveCb, there is no single starting writer -- refresh every
+    /// matched writer from that prefix with that kind.
+    pub fn onParticipantAliveCb(ctx: *anyopaque, prefix: GuidPrefix, kind: u8) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
+        var liveliness_changed = false;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.refreshAllByPrefixAndKindLocked(prefix, kind, &liveliness_changed);
+        }
+        if (liveliness_changed) self.notifyLivelinessChanged();
+    }
+
+    /// Refresh every matched writer from remote participant `prefix` with
+    /// liveliness `kind` -- used both by onWriterAliveCb's MANUAL_BY_PARTICIPANT
+    /// sibling-refresh (which already has a starting writer, refreshed
+    /// separately, so redundantly refreshing it again here is harmless) and
+    /// by onParticipantAliveCb (WLP wire ingestion, which has no single
+    /// starting writer at all -- a ParticipantMessageData sample is
+    /// participant-scoped, not writer-scoped). Must be called with `self.mu`
+    /// held.
+    fn refreshAllByPrefixAndKindLocked(self: *Self, prefix: GuidPrefix, kind: u8, liveliness_changed: *bool) void {
+        var it = self.writer_liveliness.iterator();
+        while (it.next()) |kv| {
+            if (!kv.key_ptr.prefix.eql(prefix)) continue;
+            if (kv.value_ptr.kind != kind) continue;
+            self.refreshWriterAliveLocked(kv.key_ptr.*, kv.value_ptr, liveliness_changed);
+        }
+    }
+
+    /// Shared by onWriterAliveCb's direct-evidence path and the
+    /// prefix+kind-scoped refresh above. Must be called with `self.mu` held.
+    fn refreshWriterAliveLocked(self: *Self, guid: Guid, entry: *WriterLivelinessEntry, liveliness_changed: *bool) void {
+        entry.last_alive_ns = self.timer_clock.nowNs();
+        if (!entry.is_alive) {
+            entry.is_alive = true;
+            self.liveliness_alive_count += 1;
+            self.liveliness_alive_count_change += 1;
+            self.liveliness_not_alive_count -= 1;
+            self.liveliness_not_alive_count_change -= 1;
+            self.liveliness_last_handle = writer_mod.guidToHandle(guid);
+            self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            liveliness_changed.* = true;
         }
     }
 
@@ -2296,6 +2430,32 @@ pub const DataReaderImpl = struct {
         const self = cast(ctx);
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_DataReaderListener);
         self.listener_mask = mask;
+
+        // DDS status conditions/listeners are level-triggered, not
+        // edge-triggered: enabling a listener for a status that's *already*
+        // active must notify immediately, not silently wait for the next
+        // state transition that may never come. Without this, data that
+        // arrives (and is cached) before an application finishes wiring up
+        // its listener is never delivered via the listener path at all --
+        // a real, not hypothetical, gap for any app that defers
+        // set_listener() until after its own state init (to avoid
+        // dispatching into not-yet-initialized state on create_datareader's
+        // own listener param). Found via zzdds-examples' `catchup` example:
+        // the publisher's historical batch can fully arrive and populate
+        // the cache before set_listener() ever runs, and
+        // wait_for_historical_data() (which tracks RTPS-level delivery, not
+        // listener dispatch) then reports success while the application's
+        // own listener-driven bookkeeping stays empty. Scoped to
+        // DATA_AVAILABLE_STATUS specifically: unlike every other status
+        // kind here, its listener callback carries no status-data argument
+        // to reconstruct, so firing it retroactively (as a "go check now")
+        // has a clean semantic that the others don't.
+        self.mu.lock();
+        const data_available_now = self.status_changes & DDS.DATA_AVAILABLE_STATUS != 0;
+        self.mu.unlock();
+        if (mask & DDS.DATA_AVAILABLE_STATUS != 0 and data_available_now) {
+            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+        }
         return DDS.RETCODE_OK;
     }
 
@@ -2464,6 +2624,7 @@ pub const DataReaderImpl = struct {
         if (self.qos.durability.kind == .VOLATILE_DURABILITY_QOS) return DDS.RETCODE_OK;
 
         const POLL_NS: i64 = 1_000_000; // 1 ms
+        const is_zero_wait = max_wait.sec == 0 and max_wait.nanosec == 0;
         const deadline_ns: ?i64 = if (max_wait.sec == DDS.DURATION_INFINITE_SEC and
             max_wait.nanosec == DDS.DURATION_INFINITE_NSEC)
             null
@@ -2474,7 +2635,22 @@ pub const DataReaderImpl = struct {
         };
 
         while (true) {
-            if (self.proto_reader.historicalDelivered()) return DDS.RETCODE_OK;
+            if (self.proto_reader.historicalDelivered()) {
+                // historicalDelivered() reports the same vacuous `true` for
+                // "genuinely nothing to wait for" and "no writer has matched
+                // *yet*" (both look like an empty writer_proxies list). A
+                // zero-duration wait is a pure "check current state, don't
+                // block" query, so trust it immediately either way -- that
+                // matches this call's own documented zero-wait semantics.
+                // For a real (non-zero) wait, only trust it once we've seen
+                // at least one writer actually match; otherwise this would
+                // return OK on the very first poll for the single most
+                // common real call pattern (call this right after creating
+                // the reader, before discovery has had any chance to run) --
+                // found building zzdds-examples' `catchup` example, which
+                // does exactly that and got nothing back.
+                if (is_zero_wait or self.proto_reader.hasMatchedWriters()) return DDS.RETCODE_OK;
+            }
             if (deadline_ns) |dl| {
                 if (self.timer_clock.nowNs() >= dl) return DDS.RETCODE_TIMEOUT;
             }

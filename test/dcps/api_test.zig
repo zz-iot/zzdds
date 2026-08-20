@@ -54,6 +54,7 @@ const noop_disc_vtable = iface.Discovery.Vtable{
     .announce_reader = noopDiscAnnounceReader,
     .retract_reader = noopDiscRetractReader,
     .deinit = noopDiscDeinit,
+    .wlp_tick = noopDiscWlpTick,
 };
 
 fn noopDiscStart(_: *anyopaque, _: *const iface.ParticipantAnnouncement, _: *const Callbacks) anyerror!void {}
@@ -63,6 +64,7 @@ fn noopDiscRetractWriter(_: *anyopaque, _: Guid) void {}
 fn noopDiscAnnounceReader(_: *anyopaque, _: *const ReaderAnnouncement) anyerror!void {}
 fn noopDiscRetractReader(_: *anyopaque, _: Guid) void {}
 fn noopDiscDeinit(_: *anyopaque) void {}
+fn noopDiscWlpTick(_: *anyopaque, _: i64, _: iface.WlpTickInfo) void {}
 
 fn noopDiscovery() Discovery {
     return .{ .ctx = &noop_disc_sentinel, .vtable = &noop_disc_vtable };

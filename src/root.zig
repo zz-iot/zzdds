@@ -35,6 +35,7 @@ pub const monitor_polling = @import("transport/monitor/polling.zig");
 pub const discovery = @import("discovery/interface.zig");
 pub const spdp_discovery = @import("discovery/spdp.zig");
 pub const sedp_discovery = @import("discovery/sedp.zig");
+pub const wlp_discovery = @import("discovery/wlp.zig");
 pub const combined_discovery = @import("discovery/combined.zig");
 pub const direct_discovery = @import("discovery/direct.zig");
 pub const protocol = @import("protocol/interface.zig");
@@ -129,6 +130,7 @@ test {
     _ = @import("transport/lossy.zig");
     _ = @import("transport/monitor/polling.zig");
     _ = @import("discovery/interface.zig");
+    _ = @import("discovery/builtin_endpoint.zig");
     _ = @import("security/interface.zig");
     _ = @import("security/noop.zig");
     _ = @import("rtps/guid.zig");
@@ -161,6 +163,7 @@ test {
     _ = @import("rtps/protocol_adapters.zig");
     _ = @import("discovery/spdp.zig");
     _ = @import("discovery/sedp.zig");
+    _ = @import("discovery/wlp.zig");
     _ = @import("discovery/combined.zig");
     _ = @import("discovery/direct.zig");
     _ = @import("delivery/intraprocess.zig");

@@ -43,6 +43,7 @@ const CapturingDisc = struct {
         .announce_reader = noopAR,
         .retract_reader = noopRR,
         .deinit = noopDeinit,
+        .wlp_tick = noopWlpTick,
     };
 
     fn start(ctx: *anyopaque, _: *const iface.ParticipantAnnouncement, cbs: *const Callbacks) anyerror!void {
@@ -55,6 +56,7 @@ const CapturingDisc = struct {
     fn noopAR(_: *anyopaque, _: *const iface.ReaderAnnouncement) anyerror!void {}
     fn noopRR(_: *anyopaque, _: Guid) void {}
     fn noopDeinit(_: *anyopaque) void {}
+    fn noopWlpTick(_: *anyopaque, _: i64, _: iface.WlpTickInfo) void {}
 
     fn toDiscovery(self: *CapturingDisc) Discovery {
         return .{ .ctx = self, .vtable = &vtable };

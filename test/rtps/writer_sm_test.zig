@@ -441,11 +441,44 @@ test "sendHeartbeat: firstSN and lastSN reflect cache min/max" {
     const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
     defer w.deinit();
 
-    w.sendHeartbeat(true);
+    w.sendHeartbeat(true, false);
 
     const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
     try testing.expectEqual(@as(SequenceNumber, 1), hb.first_sn);
     try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
+}
+
+// ── sendLivelinessHeartbeat: RTPS §8.7.2.2.3 MANUAL_BY_TOPIC assert ─────────
+
+test "sendLivelinessHeartbeat sets the RTPS LIVELINESS flag" {
+    const writer_guid = makeGuid(0x12, WRITER_EID);
+    const reader_guid = makeGuid(0x13, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    w.sendLivelinessHeartbeat();
+
+    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expect(hb.isLiveliness());
+    try testing.expect(hb.isFinal());
+}
+
+test "sendHeartbeat without the liveliness path does not set the LIVELINESS flag" {
+    const writer_guid = makeGuid(0x14, WRITER_EID);
+    const reader_guid = makeGuid(0x15, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
+    defer w.deinit();
+
+    w.sendHeartbeat(true, false);
+
+    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expect(!hb.isLiveliness());
 }
 
 // ── Heartbeat: empty cache ────────────────────────────────────────────────────
@@ -474,7 +507,7 @@ test "sendHeartbeat: empty cache → firstSN=1, lastSN=0 (spec-legal empty range
     try w.addMatchedReader(rp);
     rec.reset();
 
-    w.sendHeartbeat(true);
+    w.sendHeartbeat(true, false);
 
     const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
     // §8.3.8.6 Example 4: empty writer → first=1, last=0.
@@ -496,13 +529,13 @@ test "sendHeartbeat: count increments monotonically" {
     // addMatchedReader sends one Heartbeat; capture the count before explicit calls.
     const hb_base = w.hb_count;
 
-    w.sendHeartbeat(true);
+    w.sendHeartbeat(true, false);
     try testing.expectEqual(hb_base + 1, w.hb_count);
 
-    w.sendHeartbeat(false);
+    w.sendHeartbeat(false, false);
     try testing.expectEqual(hb_base + 2, w.hb_count);
 
-    w.sendHeartbeat(true);
+    w.sendHeartbeat(true, false);
     try testing.expectEqual(hb_base + 3, w.hb_count);
 }
 
@@ -829,7 +862,7 @@ test "sendHeartbeat: coherent_active caps last_sn to last_flushed_sn" {
     rec.reset();
 
     // Periodic HB must cap last_sn to last_flushed_sn (3), not cache max (4).
-    w.sendHeartbeat(true);
+    w.sendHeartbeat(true, false);
 
     const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
     try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
@@ -877,7 +910,7 @@ test "sendHeartbeat: EOC SN advertised in HB lastSN for pull-based recovery" {
 
     // Periodic HB must advertise lastSN=3 (the EOC SN), not just lastSN=2 (cache max).
     // No inline GAP should be emitted — recovery is NACK-driven via the NACK handler.
-    w.sendHeartbeat(true);
+    w.sendHeartbeat(true, false);
 
     const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
     try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);

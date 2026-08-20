@@ -309,6 +309,10 @@ pub const StatefulReader = struct {
     /// Keyed by writer GUID then SN. Completed assemblies move to pending_unmatched;
     /// in-progress entries are migrated into the new WriterProxy in addMatchedWriter.
     pending_unmatched_reassembly: std.AutoHashMapUnmanaged(Guid, std.AutoHashMapUnmanaged(SequenceNumber, ReassemblyEntry)),
+    /// Sticky: true once any writer has ever matched, never reset back to
+    /// false on unmatch. See hasMatchedWriters()'s own doc comment for why
+    /// this needs to be "ever", not "currently".
+    ever_matched_writer: bool = false,
 
     const Self = @This();
     const MAX_UNMATCHED_BUFFER: usize = 64;
@@ -409,6 +413,7 @@ pub const StatefulReader = struct {
             }
         }
         try self.writer_proxies.append(self.alloc, proxy);
+        self.ever_matched_writer = true;
         const new_wp = &self.writer_proxies.items[self.writer_proxies.items.len - 1];
         // Replay any DATA that arrived in the window between first receiving data
         // from this writer and the writer proxy being established (SEDP race).
@@ -1004,7 +1009,11 @@ pub const StatefulReader = struct {
     /// Returns true when all matched writers with history_expected have delivered their
     /// complete history (cumulativeAck >= history_floor_sn).  Writers without history
     /// tracking (history_established = true from the start) are always counted as done.
-    /// Returns true immediately when no writers are matched.
+    /// Returns true immediately when no writers are matched -- callers waiting for a
+    /// bounded duration (DataReader.wait_for_historical_data with a non-zero max_wait)
+    /// must not treat that as "done": see hasMatchedWriters()'s own doc comment, this
+    /// function alone can't tell "genuinely nothing to wait for" apart from "discovery
+    /// just hasn't matched a writer yet".
     pub fn historicalDelivered(self: *Self) bool {
         self.mu.lock();
         defer self.mu.unlock();
@@ -1013,6 +1022,19 @@ pub const StatefulReader = struct {
             if (wp.received.cumulativeAck() < wp.history_floor_sn) return false;
         }
         return true;
+    }
+
+    /// True once at least one writer has matched this reader, ever (not
+    /// "currently matched" -- a writer that matched and later unmatched still
+    /// counts). Exists specifically so DataReader.wait_for_historical_data can
+    /// distinguish "no writer will ever come" from "no writer has matched
+    /// *yet*" -- historicalDelivered() alone reports the same vacuous `true`
+    /// for both when writer_proxies is currently empty, which is only correct
+    /// for the former.
+    pub fn hasMatchedWriters(self: *Self) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.ever_matched_writer;
     }
 
     fn sendAckNackLocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber, final: bool) void {

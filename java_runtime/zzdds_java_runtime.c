@@ -614,8 +614,20 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceWriterR
 
 /* ── Take/read ───────────────────────────────────────────────────────── */
 
+/* `state_out` (added alongside handle_out/valid_out): a struct's real
+ * instance_state was previously silently discarded here even though `info`
+ * (a full zzdds_sample_info) already carries it -- takeRaw/readRaw's Java
+ * caller had no way to observe ALIVE/NOT_ALIVE_DISPOSED/NOT_ALIVE_NO_WRITERS
+ * transitions at all, only whether a sample was valid_data or not. Found
+ * building zzdds-examples' `registry` example, whose whole point is
+ * asserting on exactly that. Deliberately scoped to just this
+ * single-sample family (takeRaw/readRaw/takeNextInstanceRaw/
+ * readNextInstanceRaw) -- the batch families (takeNRaw, takeWConditionRaw,
+ * etc.) are a separate, larger native-signature change not needed by this
+ * example; zidl's generated Sample class documents that gap explicitly
+ * rather than silently leaving it half-fixed. */
 static jbyteArray zzdds_java_take_or_read(
-    JNIEnv *env, jobject reader_obj, jint max_size, jlongArray handle_out, jbooleanArray valid_out, int is_take)
+    JNIEnv *env, jobject reader_obj, jint max_size, jlongArray handle_out, jbooleanArray valid_out, jintArray state_out, int is_take)
 {
     void *reader = zzdds_java_unbox(env, reader_obj);
     uint8_t *buf = malloc((size_t)max_size);
@@ -633,8 +645,10 @@ static jbyteArray zzdds_java_take_or_read(
 
     jlong handle_val = (jlong)info.instance_handle;
     jboolean valid_val = info.valid_data ? JNI_TRUE : JNI_FALSE;
+    jint state_val = (jint)info.instance_state;
     (*env)->SetLongArrayRegion(env, handle_out, 0, 1, &handle_val);
     (*env)->SetBooleanArrayRegion(env, valid_out, 0, 1, &valid_val);
+    (*env)->SetIntArrayRegion(env, state_out, 0, 1, &state_val);
 
     jbyteArray result = (*env)->NewByteArray(env, (jsize)cdr_len);
     (*env)->SetByteArrayRegion(env, result, 0, (jsize)cdr_len, (const jbyte *)buf);
@@ -643,23 +657,23 @@ static jbyteArray zzdds_java_take_or_read(
 }
 
 JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_takeRaw(
-    JNIEnv *env, jclass self_cls, jobject reader, jint maxSize, jlongArray handleOut, jbooleanArray validOut)
+    JNIEnv *env, jclass self_cls, jobject reader, jint maxSize, jlongArray handleOut, jbooleanArray validOut, jintArray stateOut)
 {
     (void)self_cls;
-    return zzdds_java_take_or_read(env, reader, maxSize, handleOut, validOut, 1);
+    return zzdds_java_take_or_read(env, reader, maxSize, handleOut, validOut, stateOut, 1);
 }
 
 JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readRaw(
-    JNIEnv *env, jclass self_cls, jobject reader, jint maxSize, jlongArray handleOut, jbooleanArray validOut)
+    JNIEnv *env, jclass self_cls, jobject reader, jint maxSize, jlongArray handleOut, jbooleanArray validOut, jintArray stateOut)
 {
     (void)self_cls;
-    return zzdds_java_take_or_read(env, reader, maxSize, handleOut, validOut, 0);
+    return zzdds_java_take_or_read(env, reader, maxSize, handleOut, validOut, stateOut, 0);
 }
 
 /* ── Take/read next instance ─────────────────────────────────────────── */
 
 static jbyteArray zzdds_java_take_or_read_instance(
-    JNIEnv *env, jobject reader_obj, jlong prev, jint max_size, jlongArray handle_out, jbooleanArray valid_out, int is_take)
+    JNIEnv *env, jobject reader_obj, jlong prev, jint max_size, jlongArray handle_out, jbooleanArray valid_out, jintArray state_out, int is_take)
 {
     void *reader = zzdds_java_unbox(env, reader_obj);
     uint8_t *buf = malloc((size_t)max_size);
@@ -677,8 +691,10 @@ static jbyteArray zzdds_java_take_or_read_instance(
 
     jlong handle_val = (jlong)info.instance_handle;
     jboolean valid_val = info.valid_data ? JNI_TRUE : JNI_FALSE;
+    jint state_val = (jint)info.instance_state;
     (*env)->SetLongArrayRegion(env, handle_out, 0, 1, &handle_val);
     (*env)->SetBooleanArrayRegion(env, valid_out, 0, 1, &valid_val);
+    (*env)->SetIntArrayRegion(env, state_out, 0, 1, &state_val);
 
     jbyteArray result = (*env)->NewByteArray(env, (jsize)cdr_len);
     (*env)->SetByteArrayRegion(env, result, 0, (jsize)cdr_len, (const jbyte *)buf);
@@ -687,17 +703,17 @@ static jbyteArray zzdds_java_take_or_read_instance(
 }
 
 JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_takeNextInstanceRaw(
-    JNIEnv *env, jclass self_cls, jobject reader, jlong prev, jint maxSize, jlongArray handleOut, jbooleanArray validOut)
+    JNIEnv *env, jclass self_cls, jobject reader, jlong prev, jint maxSize, jlongArray handleOut, jbooleanArray validOut, jintArray stateOut)
 {
     (void)self_cls;
-    return zzdds_java_take_or_read_instance(env, reader, prev, maxSize, handleOut, validOut, 1);
+    return zzdds_java_take_or_read_instance(env, reader, prev, maxSize, handleOut, validOut, stateOut, 1);
 }
 
 JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readNextInstanceRaw(
-    JNIEnv *env, jclass self_cls, jobject reader, jlong prev, jint maxSize, jlongArray handleOut, jbooleanArray validOut)
+    JNIEnv *env, jclass self_cls, jobject reader, jlong prev, jint maxSize, jlongArray handleOut, jbooleanArray validOut, jintArray stateOut)
 {
     (void)self_cls;
-    return zzdds_java_take_or_read_instance(env, reader, prev, maxSize, handleOut, validOut, 0);
+    return zzdds_java_take_or_read_instance(env, reader, prev, maxSize, handleOut, validOut, stateOut, 0);
 }
 
 /* ── Bulk take/read ───────────────────────────────────────────────────────

@@ -1152,6 +1152,7 @@ pub const StatefulWriter = struct {
             last_sn,
             self.hb_count,
             final,
+            false,
         );
         for (locs) |loc| {
             sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
@@ -1215,7 +1216,7 @@ pub const StatefulWriter = struct {
     /// `final = true` means readers need not reply; `false` requires an ACKNACK.
     /// Uses per-proxy start_sn as the floor for first_sn so VOLATILE readers
     /// do not see or NACK data written before they matched.
-    pub fn sendHeartbeat(self: *Self, final: bool) void {
+    pub fn sendHeartbeat(self: *Self, final: bool, liveliness: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.hb_count += 1;
@@ -1247,7 +1248,18 @@ pub const StatefulWriter = struct {
             cache_last;
 
         for (self.reader_proxies.items) |*rp| {
-            if (!rp.reliable) continue; // BEST_EFFORT readers do not use HEARTBEAT/ACKNACK
+            // BEST_EFFORT readers don't participate in the reliable
+            // ACK/NACK protocol, so a routine keepalive heartbeat is
+            // pointless for them -- but a liveliness-flagged heartbeat
+            // (RTPS §8.7.2.2.3's MANUAL_BY_TOPIC assert_liveliness() path)
+            // is a different semantic: the reader still tracks and expires
+            // this writer's finite lease regardless of its own reliability
+            // kind, so it must still receive the assertion. Found via
+            // Greptile review: BEST_EFFORT-matched readers were silently
+            // dropped from every liveliness-flagged send, so an explicit
+            // assert_liveliness() on a MANUAL_BY_TOPIC writer never reached
+            // them, and their lease expired on schedule regardless.
+            if (!rp.reliable and !liveliness) continue;
             const locs = rp.effectiveLocators();
             if (locs.len == 0) continue;
             const last_sn = adj_last;
@@ -1282,6 +1294,7 @@ pub const StatefulWriter = struct {
                 last_sn,
                 self.hb_count,
                 final,
+                liveliness,
             );
             self.tracer.submit(.{ .send_heartbeat = .{
                 .src_prefix = self.guid.prefix,
@@ -1299,6 +1312,16 @@ pub const StatefulWriter = struct {
                 };
             }
         }
+    }
+
+    /// RTPS §8.7.2.2.3: assert a MANUAL_BY_TOPIC writer's liveliness on
+    /// demand, without a real data write. Sends an unsolicited Heartbeat
+    /// with the FINAL and LIVELINESS flags set to every matched reader
+    /// proxy — reader.zig's onWriterAliveCb treats an incoming
+    /// liveliness-flagged Heartbeat as valid evidence for MANUAL_BY_TOPIC
+    /// writers specifically (see AliveEvidence.manual_heartbeat).
+    pub fn sendLivelinessHeartbeat(self: *Self) void {
+        self.sendHeartbeat(true, true);
     }
 
     /// Handle an incoming ACKNACK from a reader.
@@ -1812,7 +1835,7 @@ pub const StatefulWriter = struct {
             };
             b.addGap(rp_guid.entity_id, self.guid.entity_id, rp_start_sn, gap_list);
         }
-        b.addHeartbeat(rp_guid.entity_id, self.guid.entity_id, hb_first_sn, last_sn, hb_count, final);
+        b.addHeartbeat(rp_guid.entity_id, self.guid.entity_id, hb_first_sn, last_sn, hb_count, final, false);
         for (locs) |loc| {
             sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
                 error.UnsupportedLocatorKind => {},
@@ -2235,7 +2258,7 @@ pub const StatefulWriter = struct {
                 slept_ms += 50;
             }
             if (self.hb_stopping.load(.acquire)) break;
-            self.sendHeartbeat(false);
+            self.sendHeartbeat(false, false);
             self.checkProbeDeadlines();
             self.checkConnectionGenerations();
         }

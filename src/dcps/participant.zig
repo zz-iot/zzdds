@@ -105,7 +105,7 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber, _: ?i64) void {}
     }.f,
     .handle_heartbeat = struct {
-        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool) void {}
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool, _: bool) void {}
     }.f,
     .handle_data_frag = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.RtpsTimestamp, _: proto.DataFragSubmessage) void {}
@@ -117,6 +117,16 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumberSet) void {}
     }.f,
     .historical_delivered = struct {
+        fn f(_: *anyopaque) bool {
+            return true;
+        }
+    }.f,
+    // No real reader backs this stub, so there's nothing to ever match --
+    // `true` here (not `false`) is what lets vtWaitForHistorical's
+    // `is_zero_wait or hasMatchedWriters()` check still short-circuit to OK
+    // immediately for a stub/null reader, matching historical_delivered's
+    // own unconditional `true` above rather than blocking until max_wait.
+    .has_matched_writers = struct {
         fn f(_: *anyopaque) bool {
             return true;
         }
@@ -234,6 +244,9 @@ const BuiltinSubscriberState = struct {
             }.f,
             .register_get_field_refresh = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {}
+            }.f,
+            .register_wlp_alive_notify = struct {
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, GuidPrefix, u8) void) void {}
             }.f,
         };
 
@@ -529,6 +542,22 @@ const AssertNotify = struct {
     assert_fn: *const fn (ctx: *anyopaque) void,
 };
 
+/// Callback registered by DataWriterImpl so that checkTimers()'s WLP driver
+/// (RTPS §8.7.2.2.3) can read a writer's last-assertion timestamp without
+/// reaching into its private state -- see writer.zig's livelinessLastNsFn.
+const LivelinessQuery = struct {
+    ctx: *anyopaque,
+    last_assert_ns: *const fn (ctx: *anyopaque) i64,
+};
+
+/// Callback registered by DataReaderImpl so the participant can forward an
+/// incoming WLP ParticipantMessageData (see wlpAliveFromDiscovery) straight
+/// into DataReaderImpl.onParticipantAliveCb.
+const WlpAliveNotify = struct {
+    ctx: *anyopaque,
+    notify_fn: *const fn (ctx: *anyopaque, prefix: GuidPrefix, kind: u8) void,
+};
+
 const DiscoveredParticipant = struct {
     guid: Guid,
     handle: DDS.InstanceHandle_t,
@@ -640,6 +669,7 @@ const ActiveWriter = struct {
     matched_notify: ?MatchedNotify = null,
     timer_check: ?TimerNotify = null,
     liveliness_assert: ?AssertNotify = null,
+    liveliness_query: ?LivelinessQuery = null,
 };
 
 const ActiveReader = struct {
@@ -659,6 +689,7 @@ const ActiveReader = struct {
     key_hash_ctx: *anyopaque = undefined,
     key_hash_fn: ?*const fn (*anyopaque, []const u8) [16]u8 = null,
     refresh_get_field: ?RefreshGetField = null,
+    wlp_alive: ?WlpAliveNotify = null,
 };
 
 // ── DomainParticipantImpl ────────────────────────────────────────────────────
@@ -878,6 +909,7 @@ pub const DomainParticipantImpl = struct {
                 .on_writer_lost = onWriterLost,
                 .on_reader_discovered = onReaderDiscovered,
                 .on_reader_lost = onReaderLost,
+                .on_wlp_alive = wlpAliveFromDiscovery,
             },
             .data_listen_port = 0,
             .tracer = tracer,
@@ -998,14 +1030,17 @@ pub const DomainParticipantImpl = struct {
             }
         }
 
-        // All six SPDP + SEDP built-in endpoints (RTPS §8.5.4.2 Table 8.58).
+        // All six SPDP + SEDP built-in endpoints (RTPS §8.5.4.2 Table 8.58)
+        // plus WLP's Participant Message writer/reader (§8.4.13.2).
         const BUILTIN_ENDPOINTS: u32 =
             0x00000001 | // DISC_BUILTIN_ENDPOINT_PARTICIPANT_ANNOUNCER
             0x00000002 | // DISC_BUILTIN_ENDPOINT_PARTICIPANT_DETECTOR
             0x00000004 | // DISC_BUILTIN_ENDPOINT_PUBLICATIONS_ANNOUNCER
             0x00000008 | // DISC_BUILTIN_ENDPOINT_PUBLICATIONS_DETECTOR
             0x00000010 | // DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_ANNOUNCER
-            0x00000020; // DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR
+            0x00000020 | // DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR
+            0x00000400 | // BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_WRITER
+            0x00000800; // BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_READER
 
         // When TCP user-data is enabled, give discovery a way to ask "is this
         // locator reachable by the participant's data transport" without
@@ -1840,12 +1875,12 @@ pub const DomainParticipantImpl = struct {
                     if (hb.reader_entity_id.eql(EntityIds.unknown)) {
                         var fan_it = self.active_readers.valueIterator();
                         while (fan_it.next()) |ar| {
-                            ar.proto.handleHeartbeat(writer_guid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                            ar.proto.handleHeartbeat(writer_guid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal(), hb.isLiveliness());
                         }
                     } else {
                         const rkey = entityIdKey(hb.reader_entity_id);
                         if (self.active_readers.getPtr(rkey)) |ar| {
-                            ar.proto.handleHeartbeat(writer_guid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                            ar.proto.handleHeartbeat(writer_guid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal(), hb.isLiveliness());
                         }
                     }
                     self.mu.unlock();
@@ -2011,6 +2046,31 @@ pub const DomainParticipantImpl = struct {
         removeDiscoveredEndpointsForPrefix(self, prefix);
     }
 
+    /// WLP (RTPS §8.4.13): a remote participant's ParticipantMessageData
+    /// arrived, asserting liveliness of `kind` for its whole participant
+    /// (`prefix`) -- fan it out to every local DataReader that registered
+    /// interest, mirroring checkTimers()'s "collect callbacks under `mu`,
+    /// dispatch after releasing it" discipline (never call into a reader
+    /// while holding participant.mu -- see the RTPS proto quiesce work this
+    /// codebase already did for on_writer_alive/matched-writer dispatch).
+    /// Each notify_fn (DataReaderImpl.onParticipantAliveCb) does its own
+    /// EntityQuiesce acquire/release internally, so no separate quiesce pair
+    /// is needed here the way TimerNotify needs one.
+    fn wlpAliveFromDiscovery(ctx: *anyopaque, prefix: GuidPrefix, kind: u8) void {
+        const self = cast(ctx);
+        var due: std.ArrayListUnmanaged(WlpAliveNotify) = .empty;
+        defer due.deinit(self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            var ar_it = self.active_readers.valueIterator();
+            while (ar_it.next()) |ar| {
+                if (ar.wlp_alive) |cb| due.append(self.alloc, cb) catch {};
+            }
+        }
+        for (due.items) |cb| cb.notify_fn(cb.ctx, prefix, kind);
+    }
+
     fn buildMatchedWriterInfo(
         guid: Guid,
         qos: disc.QosSnapshot,
@@ -2036,6 +2096,7 @@ pub const DomainParticipantImpl = struct {
             .reliability = if (qos.reliability_kind == 1) .reliable else .best_effort,
             .ownership_strength = qos.ownership_strength,
             .liveliness_lease_ns = lease_ns,
+            .liveliness_kind = qos.liveliness_kind,
             .lifespan_ns = lifespan_ns,
             .history_expected = qos.durability_kind > 0 and qos.reliability_kind == 1,
         };
@@ -2820,6 +2881,24 @@ pub const DomainParticipantImpl = struct {
         }
     }
 
+    fn pubRegisterWriterLivelinessQuery(
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        last_assert_ns: *const fn (*anyopaque) i64,
+    ) void {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        var aw_it7b = self.active_writers.valueIterator();
+        while (aw_it7b.next()) |aw| {
+            if (aw.handle == handle) {
+                aw.liveliness_query = .{ .ctx = notify_ctx, .last_assert_ns = last_assert_ns };
+                break;
+            }
+        }
+    }
+
     fn subRegisterReaderTimerNotify(
         ctx: *anyopaque,
         handle: DDS.InstanceHandle_t,
@@ -2869,6 +2948,24 @@ pub const DomainParticipantImpl = struct {
         refresh_fn(notify_ctx, current);
     }
 
+    fn subRegisterReaderWlpAliveNotify(
+        ctx: *anyopaque,
+        handle: DDS.InstanceHandle_t,
+        notify_ctx: *anyopaque,
+        notify_fn: *const fn (*anyopaque, GuidPrefix, u8) void,
+    ) void {
+        const self = cast(ctx);
+        self.mu.lock();
+        defer self.mu.unlock();
+        var ar_it10 = self.active_readers.valueIterator();
+        while (ar_it10.next()) |ar| {
+            if (ar.handle == handle) {
+                ar.wlp_alive = .{ .ctx = notify_ctx, .notify_fn = notify_fn };
+                break;
+            }
+        }
+    }
+
     fn makePubCbs(self: *Self) publisher_mod.ParticipantCbs {
         return .{
             .ctx = self,
@@ -2881,6 +2978,7 @@ pub const DomainParticipantImpl = struct {
             .timer_clock = self.timer_clock,
             .register_timer_notify = pubRegisterWriterTimerNotify,
             .register_liveliness_assert = pubRegisterWriterLivelinessAssert,
+            .register_liveliness_query = pubRegisterWriterLivelinessQuery,
         };
     }
 
@@ -2896,6 +2994,7 @@ pub const DomainParticipantImpl = struct {
             .timer_clock = self.timer_clock,
             .register_timer_notify = subRegisterReaderTimerNotify,
             .register_get_field_refresh = subRegisterReaderGetFieldRefresh,
+            .register_wlp_alive_notify = subRegisterReaderWlpAliveNotify,
         };
     }
 
@@ -2927,6 +3026,15 @@ pub const DomainParticipantImpl = struct {
         const now_ns = self.timer_clock.nowNs();
         var due: std.ArrayListUnmanaged(TimerNotify) = .empty;
         defer due.deinit(self.alloc);
+        // WLP driver input (RTPS §8.7.2.2.3), accumulated in the same
+        // active_writers pass below rather than a second lock/iteration.
+        var wlp_info = disc.WlpTickInfo{
+            .has_automatic = false,
+            .min_automatic_lease_ns = 0,
+            .has_manual_by_participant = false,
+            .min_manual_lease_ns = 0,
+            .manual_asserted_since_ns = 0,
+        };
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -2935,6 +3043,33 @@ pub const DomainParticipantImpl = struct {
                 if (aw.timer_check) |cb| {
                     if (cb.quiesce_acquire(cb.ctx)) {
                         due.append(self.alloc, cb) catch cb.quiesce_release(cb.ctx);
+                    }
+                }
+                const ll = aw.qos.liveliness.lease_duration;
+                const lease_active = !(ll.sec == 0 and ll.nanosec == 0) and
+                    !(ll.sec == DDS.DURATION_INFINITE_SEC and ll.nanosec == DDS.DURATION_INFINITE_NSEC);
+                if (lease_active) {
+                    const lease_ns = @as(i64, ll.sec) * std.time.ns_per_s + @as(i64, ll.nanosec);
+                    switch (aw.qos.liveliness.kind) {
+                        .AUTOMATIC_LIVELINESS_QOS => {
+                            if (!wlp_info.has_automatic or lease_ns < wlp_info.min_automatic_lease_ns) {
+                                wlp_info.min_automatic_lease_ns = lease_ns;
+                            }
+                            wlp_info.has_automatic = true;
+                        },
+                        .MANUAL_BY_PARTICIPANT_LIVELINESS_QOS => {
+                            if (!wlp_info.has_manual_by_participant or lease_ns < wlp_info.min_manual_lease_ns) {
+                                wlp_info.min_manual_lease_ns = lease_ns;
+                            }
+                            wlp_info.has_manual_by_participant = true;
+                            if (aw.liveliness_query) |lq| {
+                                const asserted_ns = lq.last_assert_ns(lq.ctx);
+                                if (asserted_ns > wlp_info.manual_asserted_since_ns) {
+                                    wlp_info.manual_asserted_since_ns = asserted_ns;
+                                }
+                            }
+                        },
+                        else => {},
                     }
                 }
             }
@@ -2947,6 +3082,7 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
+        self.discovery.wlpTick(now_ns, wlp_info);
         for (due.items) |cb| {
             cb.check(cb.ctx, now_ns);
             cb.quiesce_release(cb.ctx);

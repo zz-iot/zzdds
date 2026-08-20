@@ -125,13 +125,15 @@ pub fn checkWriterReader(
 /// Compare two QosSnapshots for writer-reader compatibility.
 ///
 /// Covers the policies captured in QosSnapshot: DURABILITY, OWNERSHIP,
-/// LIVELINESS kind, RELIABILITY, DESTINATION_ORDER, DEADLINE,
-/// DATA_REPRESENTATION, and PRESENTATION (access_scope, coherent_access,
-/// ordered_access).
+/// LIVELINESS (kind and lease_duration), RELIABILITY, DESTINATION_ORDER,
+/// DEADLINE, DATA_REPRESENTATION, and PRESENTATION (access_scope,
+/// coherent_access, ordered_access).
 ///
-/// LATENCY_BUDGET and LIVELINESS.lease_duration are not present in QosSnapshot
-/// and are treated as spec defaults (infinite / zero), which are always mutually
-/// compatible.
+/// LATENCY_BUDGET is not present in QosSnapshot and is treated as always
+/// mutually compatible (spec default). LIVELINESS.lease_duration *is*
+/// present and checked below -- see PID_LIVELINESS's own encode-side comment
+/// in `discovery/sedp.zig` for why it wasn't previously (the PID used to be
+/// omitted from the wire entirely, not merely absent from this struct).
 pub fn checkSnapshots(offered: disc.QosSnapshot, requested: disc.QosSnapshot) MatchResult {
     // DURABILITY: offered.kind >= requested.kind (higher ordinal = stronger guarantee)
     if (offered.durability_kind < requested.durability_kind)
@@ -144,6 +146,18 @@ pub fn checkSnapshots(offered: disc.QosSnapshot, requested: disc.QosSnapshot) Ma
     // LIVELINESS kind: offered.kind >= requested.kind
     if (offered.liveliness_kind < requested.liveliness_kind)
         return .{ .incompatible = .liveliness };
+
+    // LIVELINESS lease_duration: offered.lease <= requested.lease (infinite = largest possible value)
+    {
+        const off_inf = offered.liveliness_lease_sec == 0x7fff_ffff and offered.liveliness_lease_nanosec == 0xffff_ffff;
+        const req_inf = requested.liveliness_lease_sec == 0x7fff_ffff and requested.liveliness_lease_nanosec == 0xffff_ffff;
+        if (!req_inf) { // finite reader lease — writer must also be finite and <=
+            if (off_inf) return .{ .incompatible = .liveliness };
+            const off_ns: i64 = @as(i64, offered.liveliness_lease_sec) * std.time.ns_per_s + @as(i64, offered.liveliness_lease_nanosec);
+            const req_ns: i64 = @as(i64, requested.liveliness_lease_sec) * std.time.ns_per_s + @as(i64, requested.liveliness_lease_nanosec);
+            if (off_ns > req_ns) return .{ .incompatible = .liveliness };
+        }
+    }
 
     // RELIABILITY: 0=best_effort, 1=reliable; offered >= requested
     if (offered.reliability_kind < requested.reliability_kind)

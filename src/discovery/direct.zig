@@ -545,7 +545,12 @@ const direct_vtable = Discovery.Vtable{
     .announce_reader = DirectDiscovery.vtAnnounceReader,
     .retract_reader = DirectDiscovery.vtRetractReader,
     .deinit = DirectDiscovery.vtDeinit,
+    // DirectDiscovery bypasses the wire entirely (see the module doc comment
+    // at the top of this file) -- WLP has nothing to drive here.
+    .wlp_tick = noopWlpTick,
 };
+
+fn noopWlpTick(_: *anyopaque, _: i64, _: disc_iface.WlpTickInfo) void {}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -612,8 +617,11 @@ const TestCallbacks = struct {
             .on_writer_lost = onWriterLost,
             .on_reader_discovered = onReaderDisc,
             .on_reader_lost = onReaderLost,
+            .on_wlp_alive = onWlpAlive,
         };
     }
+
+    fn onWlpAlive(_: *anyopaque, _: disc_iface.GuidPrefix, _: u8) void {}
 
     fn onPart(_: *anyopaque, _: *const ParticipantData) void {}
     fn onPartLost(_: *anyopaque, _: Guid) void {}

@@ -190,6 +190,28 @@ pub const Callbacks = struct {
     on_writer_lost: *const fn (ctx: *anyopaque, guid: Guid) void,
     on_reader_discovered: *const fn (ctx: *anyopaque, data: *const ReaderData) void,
     on_reader_lost: *const fn (ctx: *anyopaque, guid: Guid) void,
+    /// WLP (RTPS §8.4.13): a remote participant's ParticipantMessageData
+    /// arrived, asserting liveliness for `kind` (LivelinessQosPolicyKind
+    /// ordinal -- 0=AUTOMATIC, 1=MANUAL_BY_PARTICIPANT) across its whole
+    /// participant. `prefix` identifies the remote participant, not a
+    /// specific writer -- the callee must refresh every matched writer from
+    /// that prefix with that kind.
+    on_wlp_alive: *const fn (ctx: *anyopaque, prefix: GuidPrefix, kind: u8) void,
+};
+
+/// Per-tick facts fed into a Discovery plugin's WLP periodic driver (RTPS
+/// §8.7.2.2.3), gathered by participant.zig's checkTimers() from its
+/// active_writers. The plugin (see discovery/wlp.zig) owns all timing
+/// decisions -- this is raw input only.
+pub const WlpTickInfo = struct {
+    has_automatic: bool,
+    min_automatic_lease_ns: i64,
+    has_manual_by_participant: bool,
+    min_manual_lease_ns: i64,
+    /// max(per-writer last-assert timestamp) across MANUAL_BY_PARTICIPANT
+    /// writers -- write()/assert_liveliness()/dispose()/unregister_instance()
+    /// all count as an assertion (writer.zig's liveliness_last_ns).
+    manual_asserted_since_ns: i64,
 };
 
 /// The Discovery plugin vtable.
@@ -226,6 +248,13 @@ pub const Discovery = struct {
 
         /// Free the discovery plugin instance.
         deinit: *const fn (ctx: *anyopaque) void,
+
+        /// RTPS §8.7.2.2.3: drive WLP's periodic AUTOMATIC/MANUAL_BY_PARTICIPANT
+        /// liveliness broadcast. Called from participant.zig's checkTimers()
+        /// tick (piggybacking on the existing DEADLINE/LIVELINESS timer
+        /// thread rather than a dedicated one). No-op for plugins that don't
+        /// implement WLP (standalone SpdpEndpoints, DirectDiscovery).
+        wlp_tick: *const fn (ctx: *anyopaque, now_ns: i64, info: WlpTickInfo) void,
     };
 
     // Forwarding helpers
@@ -256,6 +285,10 @@ pub const Discovery = struct {
 
     pub fn deinit(self: Discovery) void {
         self.vtable.deinit(self.ctx);
+    }
+
+    pub fn wlpTick(self: Discovery, now_ns: i64, info: WlpTickInfo) void {
+        self.vtable.wlp_tick(self.ctx, now_ns, info);
     }
 };
 

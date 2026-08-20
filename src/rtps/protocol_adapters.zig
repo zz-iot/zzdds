@@ -121,7 +121,13 @@ pub const RtpsProtocolWriter = struct {
         .set_protocol_ready_callback = vtSetProtocolReadyCallback,
         .quiesce_acquire = vtQuiesceAcquire,
         .quiesce_release = vtQuiesceRelease,
+        .send_liveliness_heartbeat = vtSendLivelinessHeartbeat,
     };
+
+    fn vtSendLivelinessHeartbeat(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.sendLivelinessHeartbeat();
+    }
 
     fn vtWrite(
         ctx: *anyopaque,
@@ -401,6 +407,7 @@ pub const RtpsProtocolReader = struct {
         .handle_heartbeat_frag = vtHandleHeartbeatFrag,
         .handle_gap = vtHandleGap,
         .historical_delivered = vtHistoricalDelivered,
+        .has_matched_writers = vtHasMatchedWriters,
         .deinit = vtDeinit,
         .quiesce_acquire = vtQuiesceAcquire,
         .quiesce_release = vtQuiesceRelease,
@@ -440,7 +447,7 @@ pub const RtpsProtocolReader = struct {
         // Both fire only after addMatchedWriter succeeds so no callback leaks on OOM.
         if (self.writer_match_cb) |cb| {
             cb.on_writer_matched(cb.ctx, info);
-            if (cb.on_writer_alive) |f| f(cb.ctx, info.guid);
+            if (cb.on_writer_alive) |f| f(cb.ctx, info.guid, .data);
         }
     }
 
@@ -502,7 +509,7 @@ pub const RtpsProtocolReader = struct {
         // SEDP race — data arriving before the writer proxy is established — is recovered).
         if (self.reader.isWriterMatched(writer_guid)) {
             if (self.writer_match_cb) |cb| {
-                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid, .data);
             }
         }
         // handleData stores a copy; unmatched reliable-reader data is buffered for replay.
@@ -516,13 +523,32 @@ pub const RtpsProtocolReader = struct {
         last_sn: history_mod.SequenceNumber,
         count: i32,
         final: bool,
+        liveliness: bool,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        // A heartbeat proves the writer is alive, but only signal DCPS if the
-        // writer is already matched — unmatched senders should not inject liveliness.
+        // A heartbeat proves the writer's *process* is alive, but only signal
+        // DCPS if the writer is already matched — unmatched senders should not
+        // inject liveliness. Tagged `.heartbeat`, not `.data`: reader.zig's
+        // onWriterAliveCb decides whether routine RELIABLE-protocol keepalive
+        // traffic like this is actually a valid liveliness assertion for the
+        // matched writer's own QoS kind (only AUTOMATIC; MANUAL_BY_TOPIC/
+        // PARTICIPANT require a real write()/assert_liveliness(), which arrives
+        // via vtHandleData's `.data` tag instead) -- see AliveEvidence's doc
+        // comment. Previously untagged, this meant a RELIABLE writer's own
+        // background heartbeat thread silently kept any MANUAL_BY_* writer
+        // "alive" forever regardless of app behavior, since heartbeats are
+        // sent on a fixed schedule independent of write()/assert_liveliness()
+        // activity -- the lease could never actually expire. Found building
+        // zzdds-examples' `presence` example.
+        //
+        // `liveliness` (RTPS Heartbeat LIVELINESS flag, §8.3.7.5) distinguishes
+        // an on-demand MANUAL_BY_TOPIC assert_liveliness() Heartbeat from a
+        // routine one -- tagged `.manual_heartbeat` instead of `.heartbeat` so
+        // reader.zig treats it as valid evidence for MANUAL_BY_TOPIC (not
+        // AUTOMATIC) writers, per RTPS §8.7.2.2.3.
         if (self.reader.isWriterMatched(writer_guid)) {
             if (self.writer_match_cb) |cb| {
-                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid);
+                if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid, if (liveliness) .manual_heartbeat else .heartbeat);
             }
         }
         self.reader.handleHeartbeat(writer_guid, first_sn, last_sn, count, final);
@@ -562,6 +588,11 @@ pub const RtpsProtocolReader = struct {
     fn vtHistoricalDelivered(ctx: *anyopaque) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         return self.reader.historicalDelivered();
+    }
+
+    fn vtHasMatchedWriters(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.reader.hasMatchedWriters();
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

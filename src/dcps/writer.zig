@@ -138,8 +138,24 @@ pub const DataWriterImpl = struct {
     last_write_ns: std.atomic.Value(i64),
 
     /// Monotonic timestamp of the last liveliness assertion; reset by write() for
-    /// AUTOMATIC kind and by assert_liveliness() for MANUAL kinds.
+    /// AUTOMATIC kind and by assert_liveliness() for MANUAL kinds. Also reset
+    /// by checkTimersFn's own lease-expiry self-check below (rate-limits
+    /// notifyLivelinessLost to once per lease, not every 100ms tick) -- that
+    /// side effect makes this field unsafe to reuse as "was this writer ever
+    /// really asserted" for anything else. See wlp_last_assert_ns.
     liveliness_last_ns: std.atomic.Value(i64),
+
+    /// Monotonic timestamp of the last genuine RTPS §8.7.2.2.3 WLP-relevant
+    /// assertion for this writer: write()/dispose()/unregister_instance()
+    /// (any kind, regardless of LIVELINESS QoS -- see writeRaw) or an
+    /// explicit assert_liveliness() call. Deliberately separate from
+    /// liveliness_last_ns, which checkTimersFn's own lease-expiry check also
+    /// resets as a side effect unrelated to any real assertion -- reusing it
+    /// here caused WLP's periodic MANUAL_BY_PARTICIPANT checkTimers() driver
+    /// to see a false "just asserted" reading once per lease period even
+    /// with zero application activity, keeping remote readers alive forever.
+    /// Read by livelinessLastNsFn / participant.zig's WLP accumulation.
+    wlp_last_assert_ns: std.atomic.Value(i64),
 
     /// Maps instance_handle → last alive CDR payload for get_key_value support.
     /// Populated on the first alive write per instance; never overwritten.
@@ -182,6 +198,7 @@ pub const DataWriterImpl = struct {
             .timer_clock = timer_clock,
             .last_write_ns = .init(now),
             .liveliness_last_ns = .init(now),
+            .wlp_last_assert_ns = .init(now),
         };
         errdefer alloc.destroy(self);
         self.listener_ex_box = try ListenerBox(ZZDDS.DataWriterListenerEx).create(alloc, listenerExFromBase(listener));
@@ -204,6 +221,17 @@ pub const DataWriterImpl = struct {
     /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
         self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    /// See DataReaderImpl's matching pair (dcps/reader.zig) for the full
+    /// rationale -- same class of gap, mirrored here for the writer side's
+    /// own `raw_ops.zig` entry points (writeRaw, writeRawWithTimestamp,
+    /// getKeyValueRawWriter).
+    pub fn acquireQuiesce(self: *Self) bool {
+        return self.quiesce.acquire();
+    }
+    pub fn releaseQuiesce(self: *Self) void {
+        self.quiesce.release(self, reallyDeinit);
     }
 
     fn reallyDeinit(ctx: *anyopaque) void {
@@ -269,12 +297,18 @@ pub const DataWriterImpl = struct {
         }
         const now_ns = self.timer_clock.nowNs();
         self.last_write_ns.store(now_ns, .monotonic);
-        // AUTOMATIC: any write() counts as a liveliness assertion.
+        // AUTOMATIC: any write() counts as a liveliness assertion (for this
+        // writer's own on_liveliness_lost tracking -- see checkTimersFn).
         // MANUAL_BY_PARTICIPANT: only participant.assert_liveliness() counts.
         // MANUAL_BY_TOPIC: only writer.assert_liveliness() counts.
         if (self.qos.liveliness.kind == .AUTOMATIC_LIVELINESS_QOS) {
             self.liveliness_last_ns.store(now_ns, .monotonic);
         }
+        // RTPS §8.7.2.2.3's WLP-relevant assertion set is broader than the
+        // above: write()/dispose()/unregister_instance() (any kind, any
+        // LIVELINESS QoS kind) all count -- unlike liveliness_last_ns above,
+        // this is unconditional.
+        self.wlp_last_assert_ns.store(now_ns, .monotonic);
         return sn;
     }
 
@@ -599,7 +633,21 @@ pub const DataWriterImpl = struct {
     pub fn assertLivelinessFn(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (self.qos.liveliness.kind == .MANUAL_BY_TOPIC_LIVELINESS_QOS) return;
-        self.liveliness_last_ns.store(self.timer_clock.nowNs(), .monotonic);
+        const now_ns = self.timer_clock.nowNs();
+        self.liveliness_last_ns.store(now_ns, .monotonic);
+        self.wlp_last_assert_ns.store(now_ns, .monotonic);
+    }
+
+    /// Called by participant.zig's checkTimers() WLP driver (RTPS §8.7.2.2.3)
+    /// to read this MANUAL_BY_PARTICIPANT writer's last-assertion timestamp
+    /// without reaching into its private state. Reads wlp_last_assert_ns,
+    /// NOT liveliness_last_ns -- see wlp_last_assert_ns's doc comment for why
+    /// reusing the latter here previously caused WLP to spuriously treat
+    /// every writer as "just asserted" once per lease period regardless of
+    /// real application activity.
+    pub fn livelinessLastNsFn(ctx: *anyopaque) i64 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.wlp_last_assert_ns.load(.monotonic);
     }
 
     // ── Entity vtable (shared subset) ────────────────────────────────────────
@@ -796,7 +844,18 @@ pub const DataWriterImpl = struct {
 
     fn vtAssertLiveliness(ctx: *anyopaque) DDS.ReturnCode_t {
         const self = cast(ctx);
-        self.liveliness_last_ns.store(self.timer_clock.nowNs(), .monotonic);
+        const now_ns = self.timer_clock.nowNs();
+        self.liveliness_last_ns.store(now_ns, .monotonic);
+        self.wlp_last_assert_ns.store(now_ns, .monotonic);
+        // RTPS §8.4.13.5: MANUAL_BY_TOPIC is not covered by the Writer
+        // Liveliness Protocol's ParticipantMessageData at all -- per
+        // §8.7.2.2.3, an explicit assert with no new data to send must emit
+        // an unsolicited Heartbeat with the LIVELINESS flag set instead.
+        // AUTOMATIC/MANUAL_BY_PARTICIPANT are handled participant-wide via
+        // WLP (see participant.zig's periodic liveliness driver).
+        if (self.qos.liveliness.kind == .MANUAL_BY_TOPIC_LIVELINESS_QOS) {
+            self.proto_writer.sendLivelinessHeartbeat();
+        }
         return DDS.RETCODE_OK;
     }
 

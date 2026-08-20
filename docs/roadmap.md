@@ -5,6 +5,53 @@ see `docs/implementation_status.md`.
 
 ---
 
+## Writer Liveliness Protocol (WLP) implemented (2026-08-19)
+
+`DomainParticipant.assert_liveliness()` / `DataWriter.assert_liveliness()` previously only
+updated local timestamps and never emitted RTPS wire traffic — a remote reader holding a finite
+MANUAL_BY_PARTICIPANT or MANUAL_BY_TOPIC lease had no way to learn about an explicit assertion
+unless the app also happened to write real data (found via Greptile review on the liveliness
+notify-on-alive PR). Fixed with the real RTPS 2.5 §8.4.13 mechanism, not a workaround:
+
+- `src/discovery/builtin_endpoint.zig` (new): `BuiltinPair`, a shared abstraction for RTPS builtin
+  endpoint pairs matched by well-known EntityId (bitmask-gated matching + entity-ID dispatch).
+  Extracted because SEDP already hand-duplicated this pattern internally across its
+  publications/subscriptions pairs, and WLP would otherwise have been a third hand-rolled copy —
+  XTypes and DDS-Security will each add more builtin endpoint pairs later and should build on this
+  instead of re-deriving the pattern again. `SedpEndpoints` was refactored onto it first (pure,
+  behavior-preserving refactor, verified against its own existing test suite unchanged) before WLP
+  was built as a thin consumer. Deliberately does *not* cover SPDP (stateless/multicast,
+  structurally different) or the wire codec (each protocol's payload shape differs too much for a
+  shared codec to be a good fit).
+- `src/discovery/wlp.zig` (new): `WlpEndpoints`, the `BuiltinParticipantMessageWriter/Reader` pair.
+  Shares SEDP's metatraffic unicast listener rather than opening a second one on the same port
+  (`SedpEndpoints.setWlpDispatch`) — the transport doesn't support two independent listeners on one
+  port. Handles AUTOMATIC and MANUAL_BY_PARTICIPANT liveliness kinds via `ParticipantMessageData`
+  (two orthogonal instances keyed by participantGuidPrefix+kind), driven periodically by
+  `participant.zig`'s existing `checkTimers()` tick (`Discovery.Vtable.wlp_tick`) rather than a new
+  thread, matching §8.7.2.2.3's literal algorithm (AUTOMATIC: periodic broadcast; MANUAL_BY_PARTICIPANT:
+  periodic *check*, send only if asserted since the last check).
+- MANUAL_BY_TOPIC is explicitly excluded from WLP by the spec (§8.4.13.5) — handled separately via
+  an on-demand unsolicited Heartbeat with the RTPS LIVELINESS flag set
+  (`StatefulWriter.sendLivelinessHeartbeat`, `AliveEvidence.manual_heartbeat`), the flag bit having
+  already been parsed on receive but never set on send or consumed downstream before this.
+- Deliberate simplifications, both noted in code: `BuiltinParticipantMessageReader` defaults to
+  RELIABLE unconditionally (spec allows BEST_EFFORT via an extra SPDP `builtinEndpointQos` flag,
+  not implemented); AUTOMATIC's send period uses `lease/3` floored at 100ms (spec only requires
+  "faster than the smallest lease," no concrete divisor mandated).
+- Found and fixed a real bug while writing the real-wire regression test (`test/dcps/wlp_loopback_test.zig`,
+  two genuine `UdpTransport` participants, not a `DirectDiscovery`/`ManualClock` shortcut — those
+  bypass WLP's wire mechanism entirely): the MANUAL_BY_PARTICIPANT periodic-check driver initially
+  read `DataWriterImpl.liveliness_last_ns`, which `checkTimersFn`'s own lease-expiry self-check
+  *also* resets (to rate-limit `on_liveliness_lost` to once per lease) — an unrelated side effect
+  that made WLP see a false "just asserted" reading once per lease period with zero application
+  activity, keeping remote readers alive forever regardless of whether `assert_liveliness()` was
+  ever called. Fixed with a dedicated `wlp_last_assert_ns` field updated only by genuine
+  write()/dispose()/unregister_instance()/assert_liveliness() calls, confirmed via the same
+  regression test failing when reverted.
+
+---
+
 ## Phase 33: dds-rtps Interop Validation — Complete
 
 All four vendors were verified at 48/48 in Phase 33 CI. RTI Connext had one
@@ -1680,6 +1727,49 @@ Suggested first move if this gets picked up: item 1 (DebugAllocator on `test-oth
 lowest effort, most direct evidence of payoff, and already-proven CI wiring to copy. Item 2
 (bindings smoke tests on the 3-platform matrix) is next: the smoke tests and binding build
 steps already exist and just aren't wired to run there yet.
+
+---
+
+## zzdds-examples repo split — revisit soon (2026-08-19)
+
+**Priority: sort out a better solution for the sake of development velocity.** Not urgent
+enough to drop everything for, but this has now caused real, repeated friction across
+multiple example-development sessions and should not keep being worked around indefinitely.
+
+**Why `zzdds-examples` is a separate repo today:** to keep the build/dependency footprint
+small for a consumer who only wants the core DDS library plus a single binding (say, just
+the C ABI) — they shouldn't need to clone or build four bindings' worth of example code,
+CMake projects, and a JVM toolchain just to `zig fetch` the library. That goal is real and
+still worth preserving.
+
+**What it's actually costing us:** the examples exist specifically to exercise DCPS APIs
+real applications use, which means writing a new example very often *finds* a real core bug
+— at which point the example and the fix are tightly coupled, but live in different repos.
+The workaround has been a temporary `.path` dependency in the example's `build.zig.zon`
+pointing at a sibling core-fix worktree, landed as its own separate zzdds PR, with an
+explicit "flip the example back to the normal dependency once merged" step. Concretely, in
+one recent round (presence/registry/catchup examples, 2026-08-17/19):
+- Three examples needed four separate core fixes (liveliness notify-on-alive, PID_LIVELINESS
+  wire encoding, a `wait_for_historical_data()` vacuous-true bug, and an `EntityQuiesce`
+  extension to the whole take/read/write API surface) before they could pass.
+- The "flip back to the normal dependency" step was missed — the examples PR merged with
+  three `build.zig.zon` files still pointing at a worktree that only exists on one machine,
+  which will break `zzdds`'s own CI (`ZZDDS_EXAMPLES_REF`) the moment that ref is bumped,
+  until a follow-up PR in `zzdds-examples` fixes it.
+- `ZZDDS_EXAMPLES_REF` itself is a manually-maintained pin in `ci.yml` that goes stale the
+  moment `zzdds-examples` merges anything without a coordinated follow-up bump here — the
+  same class of drift `release.yml` vs `ci.yml` self-interop staleness hit once already.
+
+**Leading option:** move `zzdds-examples` into an `examples/` subdirectory of this repo.
+The footprint goal doesn't actually require a separate repo — a subdirectory with its own
+`build.zig.zon`, never referenced by the core library's default `zig build`, and CI jobs
+gated on path filters, should preserve "don't force a single-binding consumer to build
+examples" while eliminating the cross-repo dependency dance entirely (a core fix and the
+example that needed it become one atomic commit). Tradeoffs to weigh before committing:
+CI duration/PR-review-unit size if example jobs aren't gated tightly, and what happens to
+`zzdds-examples`' existing history/issues/stars if it's folded in. Needs its own planning
+pass (repo restructuring, CI pipeline changes, any external links to the standalone repo)
+before executing — not a quick change.
 
 ---
 

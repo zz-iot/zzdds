@@ -21,5 +21,6 @@ const std = @import("std");
 pub const rtps = std.log.scoped(.zzdds_rtps);
 pub const spdp = std.log.scoped(.zzdds_spdp);
 pub const sedp = std.log.scoped(.zzdds_sedp);
+pub const wlp = std.log.scoped(.zzdds_wlp);
 pub const transport = std.log.scoped(.zzdds_transport);
 pub const dcps = std.log.scoped(.zzdds_dcps);
