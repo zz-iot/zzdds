@@ -1,0 +1,8 @@
+// java/participant-config's wire type -- byte-identical to
+// zig/participant-config/idl/config_ping.idl. See
+// docs/design/participant-config-reference-app.md at the repo root for the
+// full spec.
+@appendable
+struct ConfigPing {
+    int32 count;
+};

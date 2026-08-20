@@ -1,0 +1,27 @@
+.{
+    .name = .zzdds_examples_discovery_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x9cfe4ea120c1b94c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Same convention as zig/participant-config: point straight at the
+        // sibling checkout this workspace already assumes exists, rather
+        // than a tagged release URL -- see zig/shape/build.zig.zon's comment.
+        //
+        // No direct dependency on zidl here -- build.zig gets the zidl
+        // executable and zidl_rt module *through* zzdds instead (which
+        // re-exposes both), so there's only ever one zidl resolution in the
+        // whole graph. See build.zig's comment for why a second, independent
+        // one breaks the build outright when zidl is a `.path` dependency.
+        .zzdds = .{
+            .path = "../../../zzdds",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "publisher.zig",
+        "subscriber.zig",
+        "idl",
+    },
+}

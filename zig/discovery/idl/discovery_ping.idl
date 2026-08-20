@@ -1,0 +1,8 @@
+// zig/discovery's wire type -- deliberately minimal (a bare counter,
+// keyless, single instance), matching participant-config's convention: this
+// example is about the DomainParticipant/DataWriter/DataReader *discovery*
+// operations, not the data type, so the type itself stays out of the way.
+@appendable
+struct DiscoveryPing {
+    int32 count;
+};

@@ -47,17 +47,20 @@ java --enable-native-access=ALL-UNNAMED -Djava.library.path=$ZZDDS_ZIG_OUT/lib \
 
 ## Config-file support (`--config <path>`)
 
-Java has no native JNI wrapper for zzdds's config-file-loading API yet, so
-this example works around it: before creating the factory, `ShapeMain.main()`
-copies the file named by `--config` to `./zzdds.toml` in the process's
-working directory. Every binding's `create_factory()` (Java included, via
-its own ambient `ProcessConfig` lazy-resolve) already picks up a file with
-exactly that name/location automatically — the same mechanism
-`java/listener-pubsub`'s own `zzdds.toml` relies on, just staged at run
-time here instead of shipped as a permanent file. `run.py`'s config smoke
-test exercises this for real: `config/custom-ports.toml` makes the
-subscriber bind port 20010 instead of the default 7410, checked with a
-plain Python socket bind probe (no external tool dependency).
+Before creating the factory, `ShapeMain.main()` loads the file named by
+`--config` via `ZzddsRuntime.configureFromFile(String)` (a thin JNI wrapper
+around `zzdds_process_configure_from_file`) as the process-wide default
+participant config. `run.py`'s config smoke test exercises this for real:
+`config/custom-ports.toml` makes the subscriber bind port 20010 instead of
+the default 7410, checked with a plain Python socket bind probe (no
+external tool dependency).
+
+`-Z`/`--datafrag-size` and `--periodic-announcement` compose with
+`--config`: when either is set, this port reads the factory's
+already-resolved default config (reflecting `--config`, if any) via
+`get_default_participant_config`, overrides just the field(s) that changed,
+and creates the participant via `create_participant_ex` — same approach as
+`c/shape`/`cpp/shape`/`zig/shape`.
 
 ## Wire format note (XCDR1 vs XCDR2)
 

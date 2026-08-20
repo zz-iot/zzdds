@@ -15,11 +15,9 @@
 // (here: one `java ShapeMain ...` invocation) handed to both roles.
 
 import io.zzdds.dcps.Dcps;
+import io.zzdds.ext.Zzdds;
 import io.zzdds.runtime.ZzddsRuntime;
 
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -69,6 +67,7 @@ public class ShapeMain {
         int coherentSampleCount = 0;
         int periodicAnnouncementMs = 0;
         String configPath = null;
+        int datafragSize = 0;
     }
 
     // ── Policy name mapping (matches zig/shape's policyName()) ────────────────
@@ -729,6 +728,23 @@ public class ShapeMain {
                     if (++i >= args.length) return -1;
                     opts.configPath = args[i];
                     break;
+                case "-Z":
+                case "--datafrag-size": {
+                    if (++i >= args.length) return -1;
+                    int v;
+                    try {
+                        v = Integer.parseInt(args[i]);
+                    } catch (NumberFormatException e) {
+                        System.err.println("incorrect value for datafrag-size, must be a non-negative integer <= 65535");
+                        return -1;
+                    }
+                    if (v < 0 || v > 65535) {
+                        System.err.println("incorrect value for datafrag-size, must be a non-negative integer <= 65535");
+                        return -1;
+                    }
+                    opts.datafragSize = v;
+                    break;
+                }
                 case "--publisher-matches":
                 case "--subscriber-matches":
                     // Consume argument value and ignore -- unimplemented
@@ -785,10 +801,11 @@ public class ShapeMain {
                         "  -w                  Print each sample on the writer side\n" +
                         "  --periodic-announcement <ms>  SPDP participant re-announcement period\n" +
                         "                                (0 = use zzdds's own default)\n" +
-                        "  --config <path>     Copy a zzdds.toml-style config file to ./zzdds.toml before\n" +
-                        "                      creating the factory -- zzdds's own ambient lazy-resolve then\n" +
-                        "                      picks it up automatically (see this port's README for why\n" +
-                        "                      this is a copy rather than a direct call)\n" +
+                        "  -Z, --datafrag-size <bytes>  DATA_FRAG fragment size in bytes, <= 65535\n" +
+                        "                                (0 = use zzdds's own default)\n" +
+                        "  --config <path>     Load a zzdds.toml-style config file as the process-wide\n" +
+                        "                      default participant config before creating the factory\n" +
+                        "                      (see zzdds-examples/config/ for example scenarios)\n" +
                         "  -h, --help          Show this help and exit\n" +
                         "\n"
                     );
@@ -826,65 +843,45 @@ public class ShapeMain {
             System.exit(1);
         }
 
-        if (opts.periodicAnnouncementMs > 0) {
-            // Java has no setenv (process-wide env vars are immutable from
-            // inside the JVM) -- zzdds reads
-            // ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS once, at factory
-            // creation, from *its own process's* environment, so this would
-            // need to be set before the JVM starts (e.g. by run.sh), not here.
-            System.err.println("warning: --periodic-announcement has no effect in this port " +
-                    "(Java cannot set its own process environment after startup -- set " +
-                    "ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS before launching the JVM instead)");
-        }
-
         if (opts.configPath != null) {
-            // MVP option from docs/design/shape-reference-app.md: no
-            // zzdds_process_configure_from_file JNI wrapper exists yet (grepped
-            // every `native` declaration in ZzddsRuntime.java -- confirmed
-            // absent), so stage the chosen file as ./zzdds.toml before the
-            // first factory is created in this process; zzdds's own ambient
-            // lazy-resolve (config/process.zig's getForNewFactory) picks up a
-            // file with exactly that name/location with zero explicit call.
-            //
-            // A real, pre-existing ./zzdds.toml in this cwd must not be
-            // permanently destroyed by staging ours over it -- back it up and
-            // restore it on exit via the same shutdown-hook mechanism as
-            // allDone above, so it survives Ctrl-C/SIGTERM as well as a
-            // normal run, not just System.exit(1) below on a copy failure.
-            java.nio.file.Path target = Paths.get("zzdds.toml");
-            java.nio.file.Path backup = Paths.get("zzdds.toml.orig." + ProcessHandle.current().pid());
-            try {
-                if (Files.exists(target)) {
-                    Files.move(target, backup, StandardCopyOption.REPLACE_EXISTING);
-                    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                        try {
-                            Files.move(backup, target, StandardCopyOption.REPLACE_EXISTING);
-                        } catch (java.io.IOException ignored) {
-                        }
-                    }));
-                } else {
-                    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                        try {
-                            Files.deleteIfExists(target);
-                        } catch (java.io.IOException ignored) {
-                        }
-                    }));
-                }
-                Files.copy(Paths.get(opts.configPath), target, StandardCopyOption.REPLACE_EXISTING);
-            } catch (java.io.IOException e) {
-                System.err.println("failed to load config file '" + opts.configPath + "': " + e.getMessage());
+            int cfgRc = io.zzdds.runtime.ZzddsRuntime.configureFromFile(opts.configPath);
+            if (cfgRc != Dcps.DDS.RETCODE_OK.value) {
+                System.err.println("failed to load config file '" + opts.configPath + "' (rc=" + cfgRc + ")");
                 System.exit(1);
             }
         }
 
-        Dcps.DDS.DomainParticipantFactory factory =
-            (Dcps.DDS.DomainParticipantFactory) io.zzdds.runtime.ZzddsRuntime.createFactory();
-        if (factory == null) {
+        Object baseFactory = io.zzdds.runtime.ZzddsRuntime.createFactory();
+        if (baseFactory == null) {
             System.err.println("FAIL: createFactory() returned null");
             System.exit(1);
         }
 
-        Dcps.DDS.DomainParticipant dp = factory.create_participant(opts.domainId, null, null, 0);
+        Dcps.DDS.DomainParticipant dp;
+        if (opts.datafragSize > 0 || opts.periodicAnnouncementMs > 0) {
+            // Start from the factory's already-resolved default (reflecting
+            // --config above, if any) rather than a bare new
+            // DomainParticipantConfig(), so this composes correctly with
+            // --config instead of overwriting it -- same reasoning as
+            // zig/shape's createParticipant().
+            Zzdds.zzdds.DomainParticipantFactory factory =
+                (Zzdds.zzdds.DomainParticipantFactory) io.zzdds.runtime.ZzddsRuntime.asZzddsFactory(baseFactory);
+            if (factory == null) {
+                System.err.println("FAIL: asZzddsFactory() failed");
+                System.exit(1);
+            }
+            Zzdds.zzdds.DomainParticipantConfig cfg = new Zzdds.zzdds.DomainParticipantConfig();
+            if (factory.get_default_participant_config(cfg) != Dcps.DDS.RETCODE_OK.value) {
+                System.err.println("FAIL: get_default_participant_config() failed");
+                System.exit(1);
+            }
+            if (opts.datafragSize > 0) cfg.get_rtps().set_fragment_size((short) opts.datafragSize);
+            if (opts.periodicAnnouncementMs > 0) cfg.get_participant().set_announcement_period_ms(opts.periodicAnnouncementMs);
+            dp = factory.create_participant_ex(opts.domainId, null, null, 0, cfg);
+        } else {
+            Dcps.DDS.DomainParticipantFactory factory = (Dcps.DDS.DomainParticipantFactory) baseFactory;
+            dp = factory.create_participant(opts.domainId, null, null, 0);
+        }
         if (dp == null) {
             System.err.println("failed to create participant on domain " + opts.domainId);
             System.exit(1);

@@ -24,10 +24,6 @@ const DDS = dds.DDS;
 const shape_gen = @import("shape_gen");
 const shape_main_options = @import("shape_main_options");
 
-// zzdds resolves its SPDP participant-announcement period from this env var
-// (see zzdds/src/config/resolve.zig); Zig's std.c doesn't expose setenv on Linux.
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-
 pub const std_options: std.Options = .{
     .log_level = std.meta.stringToEnum(std.log.Level, shape_main_options.log_level) orelse
         @compileError("invalid shape_main log level"),
@@ -115,6 +111,7 @@ const Options = struct {
     coherent_sample_count: u32 = 0, // --coherent-sample-count (0 = no coherent set gating)
     periodic_announcement_ms: u32 = 0, // --periodic-announcement (0 = use zzdds's own default)
     config_path: ?[:0]const u8 = null, // --config: zzdds.toml-style process config, installed before the factory is created
+    datafrag_size: u16 = 0, // --datafrag-size/-Z (0 = use zzdds's own default)
 };
 
 // ── Policy name mapping ───────────────────────────────────────────────────────
@@ -906,6 +903,14 @@ fn parseArgs(process_args: std.process.Args) !Options {
             opts.periodic_announcement_ms = std.fmt.parseInt(u32, v, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--config")) {
             opts.config_path = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "-Z") or std.mem.eql(u8, arg, "--datafrag-size")) {
+            const v = it.next() orelse return error.MissingValue;
+            // fragment_size is a u16 field in the type itself (RTPS spec: must be
+            // <= 65535 bytes), so parseInt already rejects an out-of-range value.
+            opts.datafrag_size = std.fmt.parseInt(u16, v, 10) catch {
+                std.log.err("incorrect value for datafrag-size, must be a non-negative integer <= 65535", .{});
+                return error.InvalidValue;
+            };
         } else if (std.mem.eql(u8, arg, "--publisher-matches") or
             std.mem.eql(u8, arg, "--subscriber-matches"))
         {
@@ -959,6 +964,8 @@ fn parseArgs(process_args: std.process.Args) !Options {
                 \\  -d <id>             Domain ID (default: 0)
                 \\  -w                  Print each sample on the writer side
                 \\  --periodic-announcement <ms>  SPDP participant re-announcement period
+                \\                                (0 = use zzdds's own default)
+                \\  -Z, --datafrag-size <bytes>  DATA_FRAG fragment size in bytes, <= 65535
                 \\                                (0 = use zzdds's own default)
                 \\  --config <path>     Load a zzdds.toml-style config file as the process-wide
                 \\                      default participant config before creating the factory
@@ -1018,12 +1025,6 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    if (opts.periodic_announcement_ms > 0) {
-        var buf: [16]u8 = undefined;
-        const val = std.fmt.bufPrintZ(&buf, "{d}", .{opts.periodic_announcement_ms}) catch unreachable;
-        _ = setenv("ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS", val, 1);
-    }
-
     // Must run before the first factory is created in this process (i.e.
     // before dds.createParticipant() below) -- see dds_impl.zig's
     // configureFromFile doc comment. Deliberately std.heap.c_allocator, not
@@ -1041,7 +1042,10 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    const participant = dds.createParticipant(alloc, opts.domain_id) catch |err| {
+    const participant = dds.createParticipant(alloc, opts.domain_id, .{
+        .fragment_size = opts.datafrag_size,
+        .announcement_period_ms = opts.periodic_announcement_ms,
+    }) catch |err| {
         std.log.err("failed to create participant on domain {d}: {}", .{ opts.domain_id, err });
         std.process.exit(1);
     };

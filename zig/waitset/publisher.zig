@@ -125,10 +125,13 @@ pub fn main(init: std.process.Init) !void {
     defer _ = dpf.delete_participant(dp);
 
     var ts_alloc = alloc;
-    _ = zzdds.registerTypeSupport(dp, "WaitsetSample", .{
+    if (!zzdds.registerTypeSupport(dp, "WaitsetSample", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = sample_gen.WaitsetSample.computeKeyHashFromCdr,
-    });
+    })) {
+        std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
+        std.process.exit(1);
+    }
 
     const topic = dp.create_topic("WaitsetSample", "WaitsetSample", .{}, null, 0);
     if (topic.ptr == zzdds.dcps.NIL_PTR) {

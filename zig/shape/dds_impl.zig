@@ -36,15 +36,38 @@ pub fn configureFromFile(alloc: std.mem.Allocator, path: []const u8) !void {
     return zzdds.process_config.configureFromFile(alloc, path);
 }
 
-pub fn createParticipant(alloc: std.mem.Allocator, domain_id: u32) !*Participant {
+/// RTPS-level tunables with no standard DCPS QoS equivalent. A field value of
+/// 0 means "leave whatever the factory's current default_participant_config
+/// already has" -- which, when --config loaded one via configureFromFile
+/// above, is that file's value, not zzdds's own built-in default.
+pub const ParticipantOptions = struct {
+    fragment_size: u16 = 0,
+    announcement_period_ms: u32 = 0,
+};
+
+pub fn createParticipant(alloc: std.mem.Allocator, domain_id: u32, opts: ParticipantOptions) !*Participant {
     const p = try alloc.create(Participant);
     errdefer alloc.destroy(p);
 
     var factory = try zzdds.createFactory();
     errdefer factory.deinit();
-    const dpf = factory.toDDSFactory();
 
-    const dp = dpf.create_participant(domain_id, .{}, null, 0);
+    const dp = if (opts.fragment_size > 0 or opts.announcement_period_ms > 0) blk: {
+        // get_default_participant_config's caller contract requires *config to
+        // be zero-initialised (not a `.{}` literal -- several fields default to
+        // non-empty string literals, which the c_allocator-owned clone this
+        // writes back would try to free). Starting from the factory's current
+        // default (rather than a bare `.{}`) is what lets this compose
+        // correctly with --config/configureFromFile above. See
+        // factoryGetDefaultParticipantConfig's doc comment in zzdds's
+        // src/c_abi/extensions.zig.
+        var cfg: zzdds.ZZDDS.DomainParticipantConfig = std.mem.zeroes(zzdds.ZZDDS.DomainParticipantConfig);
+        _ = factory.toZZDDSFactory().get_default_participant_config(&cfg);
+        defer cfg.deinit(std.heap.c_allocator);
+        if (opts.fragment_size > 0) cfg.rtps.fragment_size = opts.fragment_size;
+        if (opts.announcement_period_ms > 0) cfg.participant.announcement_period_ms = opts.announcement_period_ms;
+        break :blk factory.toZZDDSFactory().create_participant_ex(domain_id, .{}, null, 0, cfg);
+    } else factory.toDDSFactory().create_participant(domain_id, .{}, null, 0);
     if (dp.ptr == nil.NIL_PTR) return error.ParticipantFailed;
 
     p.* = .{

@@ -19,6 +19,7 @@
 #include <csignal>
 #include <ctime>
 #include <cinttypes>
+#include <unistd.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -69,6 +70,7 @@ struct Options {
     uint32_t coherent_sample_count = 0;
     uint32_t periodic_announcement_ms = 0;
     const char *config_path = nullptr;
+    uint16_t datafrag_size = 0;
 };
 
 /* ── Policy name mapping (matches zig/shape's policyName()) ────────────────── */
@@ -799,6 +801,15 @@ int parse_args(int argc, char **argv, Options &opts) {
         } else if (std::strcmp(arg, "--config") == 0) {
             if (++i >= argc) return -1;
             opts.config_path = argv[i];
+        } else if (std::strcmp(arg, "-Z") == 0 || std::strcmp(arg, "--datafrag-size") == 0) {
+            if (++i >= argc) return -1;
+            char *endp = nullptr;
+            unsigned long v = std::strtoul(argv[i], &endp, 10);
+            if (endp == argv[i] || v > 65535ul) {
+                std::fprintf(stderr, "incorrect value for datafrag-size, must be a non-negative integer <= 65535\n");
+                return -1;
+            }
+            opts.datafrag_size = static_cast<uint16_t>(v);
         } else if (std::strcmp(arg, "--publisher-matches") == 0 || std::strcmp(arg, "--subscriber-matches") == 0) {
             /* Consume argument value and ignore -- unimplemented options; no
              * reference implementation elsewhere in this repo defines their
@@ -851,6 +862,8 @@ int parse_args(int argc, char **argv, Options &opts) {
                 "  -w                  Print each sample on the writer side\n"
                 "  --periodic-announcement <ms>  SPDP participant re-announcement period\n"
                 "                                (0 = use zzdds's own default)\n"
+                "  -Z, --datafrag-size <bytes>  DATA_FRAG fragment size in bytes, <= 65535\n"
+                "                                (0 = use zzdds's own default)\n"
                 "  --config <path>     Load a zzdds.toml-style config file as the process-wide\n"
                 "                      default participant config before creating the factory\n"
                 "                      (see zzdds-examples/config/ for example scenarios)\n"
@@ -888,10 +901,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (opts.periodic_announcement_ms > 0) {
-        setenv("ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS", std::to_string(opts.periodic_announcement_ms).c_str(), 1);
-    }
-
     if (opts.config_path) {
         auto cfg_rc = zzdds::process_configure_from_file(opts.config_path, nullptr);
         if (cfg_rc != DDS_RETCODE_OK) {
@@ -906,7 +915,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    auto dp = factory->create_participant(opts.domain_id, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+    std::shared_ptr<::DDS::DomainParticipant> dp;
+    if (opts.datafrag_size > 0 || opts.periodic_announcement_ms > 0) {
+        // Start from the factory's already-resolved default (reflecting
+        // --config above, if any) rather than a bare default_value(), so
+        // this composes correctly with --config instead of overwriting it
+        // -- same reasoning as zig/shape's createParticipant().
+        auto cfg = ::zzdds::DomainParticipantConfig::default_value();
+        if (factory->get_default_participant_config(cfg) != ::DDS::RETCODE_OK) {
+            std::fprintf(stderr, "FAIL: get_default_participant_config() failed\n");
+            return 1;
+        }
+        if (opts.datafrag_size > 0) cfg.rtps.fragment_size = opts.datafrag_size;
+        if (opts.periodic_announcement_ms > 0) cfg.participant.announcement_period_ms = opts.periodic_announcement_ms;
+        dp = factory->create_participant_ex(opts.domain_id, ::DDS::DomainParticipantQos::default_value(), nullptr, 0, cfg);
+    } else {
+        dp = factory->create_participant(opts.domain_id, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
+    }
     if (!dp) {
         std::fprintf(stderr, "failed to create participant on domain %u\n", opts.domain_id);
         return 1;

@@ -62,6 +62,7 @@ typedef struct {
     uint32_t coherent_sample_count;
     uint32_t periodic_announcement_ms;
     const char *config_path;
+    uint16_t datafrag_size;
 } Options;
 
 static Options default_options(void) {
@@ -932,6 +933,15 @@ static int parse_args(int argc, char **argv, Options *opts) {
         } else if (strcmp(arg, "--config") == 0) {
             if (++i >= argc) return -1;
             opts->config_path = argv[i];
+        } else if (strcmp(arg, "-Z") == 0 || strcmp(arg, "--datafrag-size") == 0) {
+            if (++i >= argc) return -1;
+            char *endp = NULL;
+            unsigned long v = strtoul(argv[i], &endp, 10);
+            if (endp == argv[i] || v > 65535ul) {
+                fprintf(stderr, "incorrect value for datafrag-size, must be a non-negative integer <= 65535\n");
+                return -1;
+            }
+            opts->datafrag_size = (uint16_t)v;
         } else if (strcmp(arg, "--publisher-matches") == 0 || strcmp(arg, "--subscriber-matches") == 0) {
             /* Consume argument value and ignore -- unimplemented options; no
              * reference implementation elsewhere in this repo defines their
@@ -984,6 +994,8 @@ static int parse_args(int argc, char **argv, Options *opts) {
                 "  -w                  Print each sample on the writer side\n"
                 "  --periodic-announcement <ms>  SPDP participant re-announcement period\n"
                 "                                (0 = use zzdds's own default)\n"
+                "  -Z, --datafrag-size <bytes>  DATA_FRAG fragment size in bytes, <= 65535\n"
+                "                                (0 = use zzdds's own default)\n"
                 "  --config <path>     Load a zzdds.toml-style config file as the process-wide\n"
                 "                      default participant config before creating the factory\n"
                 "                      (see zzdds-examples/config/ for example scenarios)\n"
@@ -1022,12 +1034,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (opts.periodic_announcement_ms > 0) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%u", opts.periodic_announcement_ms);
-        setenv("ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS", buf, 1);
-    }
-
     if (opts.config_path) {
         DDS_ReturnCode_t cfg_rc = zzdds_process_configure_from_file(opts.config_path, NULL);
         if (cfg_rc != DDS_RETCODE_OK) {
@@ -1041,9 +1047,28 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: zzdds_create_factory returned nil\n");
         return 1;
     }
-    DDS_DomainParticipantFactory dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
 
-    DDS_DomainParticipant dp = DDS_DomainParticipantFactory_create_participant(dds_factory, opts.domain_id, NULL, NULL, 0);
+    DDS_DomainParticipant dp;
+    if (opts.datafrag_size > 0 || opts.periodic_announcement_ms > 0) {
+        /* Start from the factory's already-resolved default (reflecting
+         * --config above, if any) rather than a bare zeroed struct, so this
+         * composes correctly with --config instead of overwriting it --
+         * same reasoning as zig/shape's createParticipant(). */
+        zzdds_DomainParticipantConfig cfg;
+        zzdds_DomainParticipantConfig_default(&cfg);
+        if (zzdds_DomainParticipantFactory_get_default_participant_config(factory, &cfg) != DDS_RETCODE_OK) {
+            fprintf(stderr, "FAIL: get_default_participant_config() failed\n");
+            zzdds_destroy_factory(factory);
+            return 1;
+        }
+        if (opts.datafrag_size > 0) cfg.rtps.fragment_size = opts.datafrag_size;
+        if (opts.periodic_announcement_ms > 0) cfg.participant.announcement_period_ms = opts.periodic_announcement_ms;
+        dp = zzdds_DomainParticipantFactory_create_participant_ex(factory, opts.domain_id, NULL, NULL, 0, &cfg);
+        zzdds_DomainParticipantConfig_free(&cfg);
+    } else {
+        DDS_DomainParticipantFactory dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
+        dp = DDS_DomainParticipantFactory_create_participant(dds_factory, opts.domain_id, NULL, NULL, 0);
+    }
     if (!dp) {
         fprintf(stderr, "failed to create participant on domain %u\n", opts.domain_id);
         zzdds_destroy_factory(factory);

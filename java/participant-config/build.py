@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Builds the zzdds Java shape example.
+"""Builds the zzdds Java participant-config example.
 
 Prerequisites:
   - A zzdds checkout built with `zig build -Djava-binding=true install`
     (set ZZDDS_ZIG_OUT to its zig-out/ dir; defaults to ../../zzdds/zig-out).
   - JAVA_HOME set to a full JDK (needs jni.h -- a JRE isn't enough for
     zzdds's own build, though this script itself only needs javac/java).
+  - ZIDL_EXECUTABLE, to point at a different zidl than the one zzdds's own
+    build.zig.zon pins, if you need one.
 """
 from __future__ import annotations
 
 import glob
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -25,18 +28,21 @@ CLASSES_DIR = BUILD_DIR / "classes"
 
 def main() -> int:
     zig_out = zzdds_zig_out()
-    zidl_exe = zig_out / "bin" / "zidl"
+    zidl_exe = Path(os.environ.get("ZIDL_EXECUTABLE", str(zig_out / "bin" / "zidl")))
 
     if not require_path(
         zidl_exe,
         "Build zzdds first: (cd zzdds && zig build -Djava-binding=true install)",
-        "Or point ZZDDS_ZIG_OUT at a zzdds zig-out/ directory that has one.",
+        "Or set ZIDL_EXECUTABLE to a local zidl build.",
     ):
         return 1
-    if not require_path(zig_out / "java", "Rebuild zzdds with -Djava-binding=true."):
+    if not require_path(
+        zig_out / "java",
+        "Rebuild zzdds with -Djava-binding=true.",
+    ):
         return 1
 
-    print("Generating ShapeType TypeSupport/DataWriter/DataReader from idl/shape.idl...")
+    print("Generating ConfigPing TypeSupport/DataWriter/DataReader from idl/config_ping.idl...")
     if GENERATED_DIR.exists():
         shutil.rmtree(GENERATED_DIR)
     GENERATED_DIR.mkdir(parents=True)
@@ -47,7 +53,7 @@ def main() -> int:
             "--generate-zzdds-wrappers",
             "--java-import-package", "DDS=io.zzdds.dcps",
             "-o", str(GENERATED_DIR),
-            str(SCRIPT_DIR / "idl" / "shape.idl"),
+            str(SCRIPT_DIR / "idl" / "config_ping.idl"),
         ],
         cwd=SCRIPT_DIR,
         log_path=BUILD_DIR / "zidl.log",
@@ -64,7 +70,7 @@ def main() -> int:
         + glob.glob(str(zig_out / "java" / "io" / "zzdds" / "ext" / "*.java"))
         + glob.glob(str(zig_out / "java" / "io" / "zzdds" / "runtime" / "*.java"))
         + glob.glob(str(GENERATED_DIR / "*.java"))
-        + [str(SCRIPT_DIR / "ShapeMain.java")]
+        + [str(SCRIPT_DIR / "Publisher.java"), str(SCRIPT_DIR / "Subscriber.java")]
     )
     if not run_build(
         ["javac", "-d", str(CLASSES_DIR), *sources],
