@@ -1030,3 +1030,32 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsDataWriter(
     if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/ext/DataWriterImpl")) return NULL;
     return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zw);
 }
+
+/* Mirrors zzdds_c.h's zzdds_process_configure_from_file -- a plain string-in,
+ * retcode-out call, so (unlike create_participant_ex/get_default_participant_
+ * config's DomainParticipantConfig struct parameter -- see this project's own
+ * roadmap for the ABI gap there) there is no struct-marshaling risk here. */
+JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_configureFromFile(
+    JNIEnv *env, jclass self_cls, jstring path)
+{
+    (void)self_cls;
+    const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
+    DDS_ReturnCode_t rc = zzdds_process_configure_from_file(c_path, NULL);
+    (*env)->ReleaseStringUTFChars(env, path, c_path);
+    return (jint)rc;
+}
+
+/* Same narrowing as asZzddsDataWriter above, for the factory createFactory()
+ * itself always boxes as the base io/zzdds/dcps/DomainParticipantFactoryImpl
+ * view -- see that function's own doc comment. */
+JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsFactory(
+    JNIEnv *env, jclass self_cls, jobject factory)
+{
+    (void)self_cls;
+    DDS_DomainParticipantFactory f = (DDS_DomainParticipantFactory)zzdds_java_unbox(env, factory);
+    zzdds_DomainParticipantFactory zf = DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(f);
+
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/ext/DomainParticipantFactoryImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zf);
+}

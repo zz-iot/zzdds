@@ -5,6 +5,272 @@ see `docs/implementation_status.md`.
 
 ---
 
+## Examples cleanup list resolved — mostly already done, one real gap fixed (2026-08-20)
+
+Followed up on `docs/design/dcps-api-coverage-audit.md`'s "Per-binding asymmetries" and
+"Examples" cleanup list (written 2026-08-14) as a short follow-on to the `-Z`/`--datafrag-size`
+work above. Re-checking against current code (not the audit's 2026-08-14 snapshot) found two
+of the three per-binding asymmetries, the `shape` content-assertion gap, and the `WaitSet.
+get_conditions()` gap **already resolved** — landed sometime during the presence/registry/
+catchup/waitset PRs since the audit was written, just never reflected back into the audit doc
+itself (now updated to say so, to stop it misleading whoever reads it next).
+
+The one real, still-live gap: `zig/waitset`'s publisher and subscriber were the only example in
+the whole repo still discarding `registerTypeSupport`'s return value (`_ =
+zzdds.registerTypeSupport(...)`) — every other example (including every other `waitset` port:
+`c`/`cpp`/`java`) checks it and hard-fails loudly on `false`. Fixed to match
+(`zig/waitset/publisher.zig`/`subscriber.zig`). Verified via a rebuilt `zig build` and a real
+single-process smoke run of both binaries past `registerTypeSupport` with no `FAIL` printed.
+
+---
+
+## Real, live bug found, not yet fixed: `create_participant_ex`/`set_default_participant_config`/
+`get_default_participant_config`'s exported C-ABI symbols use the wrong struct layout for every
+non-Zig-native caller (2026-08-20)
+
+Found while adding `-Z`/`--datafrag-size` to zzdds-examples' C/C++/Java `shape` ports (see the
+"datafrag-size rolled out to every binding" entry below) — attempting the obvious implementation
+(fetch the factory's current default config, override `rtps.fragment_size`, call
+`create_participant_ex`) crashed for real on Java, and by code inspection affects C and C++ too,
+never previously caught because nothing had called any of these three operations across the C-ABI
+boundary before (`zig/shape`/`dds-rtps`'s own zzdds port both call the pure-Zig
+`ZZDDS.DomainParticipantFactory` wrapper directly, never crossing it).
+
+**Root cause, confirmed via a real JVM crash (`zzdds_UdpConfig.deinit` dereferencing garbage), not
+just by inspection**: `zzdds.zzdds.DomainParticipantConfig` (`src/config/generated.zig`'s sibling —
+the type `factory.zig`/`extensions.zig` actually operate on, imported as
+`@import("zzdds_ext_generated").zzdds`) is a plain Zig `struct` (not `extern struct`) carrying a
+hidden `_toml_applied: bool` bookkeeping field (added by zidl's `--zig-generate-toml-config`,
+gating whether `deinit()` is allowed to free a struct's string/sequence fields — see zidl's own
+roadmap for the field's purpose). The three exported C-ABI symbols
+(`zzdds_DomainParticipantFactory_create_participant_ex`/`_set_default_participant_config`/
+`_get_default_participant_config`, `src/c_abi/extensions.zig`'s generated wrappers) declare their
+`config` parameter as `*zzdds.DomainParticipantConfig` — that same non-`extern`, `_toml_applied`-
+carrying Zig type — while the *public* header (`zzdds.h`) declares `zzdds_DomainParticipantConfig`
+(and every nested config struct) **without** `_toml_applied` at all, matching only the
+IDL-declared fields. Every C/C++/Java caller builds a value using the header's (smaller, no
+`_toml_applied`) layout; the exported function then reads/writes through it as the larger Zig-native
+layout, and `factoryGetDefaultParticipantConfig`'s own `config.deinit(std.heap.c_allocator)` step
+(called on the caller-supplied struct before overwriting it, per its own "must be zero-initialised
+or c_allocator-owned" caller contract) ends up freeing through garbage field offsets.
+
+Likely introduced in "Config File Improvements" (#54), which added `_toml_applied` to
+`DomainParticipantConfig` and *also* added `get_default_participant_config`/
+`set_default_participant_config` in the same PR — `create_participant_ex` itself predates that PR
+(existed at `v0.2.0-zig.0.16.0`) and was very likely fine before it; #54 silently broke it for
+every non-Zig caller without anyone noticing, since nothing exercised the cross-language path
+until now.
+
+**Blocks real functionality today**: any C/C++/Java caller passing a non-default
+`DomainParticipantConfig` to any of these three operations is affected, not just the
+`fragment_size` case that found it. The workaround used for `-Z`/`--periodic-announcement` in
+`c/shape`/`cpp/shape`/`java/shape` (route through `zzdds_process_configure_from_file` — a plain
+path string, no struct crossing — instead) sidesteps this specific gap but means those three ports
+can't compose `--config` with `-Z`/`--periodic-announcement` in the same run (documented in each
+port's own `--help`); `zig/shape` and `dds-rtps`'s own port aren't affected (pure-Zig callers,
+never cross the C ABI) and do compose them.
+
+**Not fixed here** — needs a real design decision, not a quick patch: either (a) make the C-ABI
+codegen pass aware of `_toml_applied` and include it in the public header/struct too (changes the
+public ABI), or (b) give `--zig-generate-toml-config` types a genuinely separate C-ABI-facing
+struct that excludes internal-only bookkeeping fields, with an explicit conversion step at the
+C-ABI boundary (more machinery, keeps the public header unchanged). Whoever picks this up should
+start from `test/c_abi/bootstrap_test.zig`'s existing
+`"support factory: get_default_participant_config on a custom-allocator factory doesn't mismatch
+the caller's c_allocator-owned input"` test — it already exercises this function but only with a
+pure-Zig-constructed `ZZDDS.DomainParticipantConfig{}` (correct layout), so it never had a chance
+to catch this; a real regression test needs to go through the actual C-ABI struct shape a C/C++/Java
+caller would build.
+
+**Update (2026-08-20), confirmed via a dedicated example, not just inspection**: built
+`zzdds-examples`' `participant-config` example (all four bindings) specifically to reproduce this
+end-to-end — see `zzdds-examples/docs/design/participant-config-reference-app.md` for the full
+writeup. Confirms this is genuinely **one root cause across all three non-Zig bindings**, not
+three separate ones: `zzdds_jni.c`'s generated JNI glue is itself plain C, compiled against the
+same public `zzdds.h` header C/C++ build against (not a separate, JNI-only struct shape as
+originally suspected) — so Java crosses into the identical broken exported symbol with the
+identical layout mismatch, just surfacing differently (a hard segfault inside
+`zzdds_DomainParticipantConfig_free`'s `StringSeq.deinit`, called as `set_default_participant_
+config`'s own JNI-wrapper post-call cleanup) than C/C++'s clean `RETCODE_OUT_OF_RESOURCES` failure
+(a garbage string length making `DomainParticipantConfig.clone()`'s allocation fail rather than
+crash). Also confirmed the same string-layout half of this bug (independent of `_toml_applied`,
+see below) is real via a standalone C probe against `DDS_TopicBuiltinTopicData_free` — not
+zzdds.idl-specific, and not yet confirmed per-operation for
+`get_matched_publication_data`/`get_matched_subscription_data` specifically (same struct family,
+inferred not yet individually reproduced; see the `discovery` example, not yet built).
+`participant-config` is written to become the fix's regression test once this lands — right now
+its programmatic-mode assertion is expected to fail/crash on `c`/`cpp`/`java`, and does.
+
+**Fixed (2026-08-20), in zidl, released in `v0.3.7-zig.0.16.0`**: implemented option (b) above — zidl's
+Zig backend (`src/backend/zig.zig`) now generates a genuinely `extern struct`-compatible "C-ABI
+mirror" type (`{Name}CAbi`) for any struct that needs one (has `_toml_applied` added by *this*
+invocation, or contains an unbounded string anywhere in its field tree), laid out to exactly match
+what the `-b c` backend independently emits for the same IDL struct: unbounded strings as
+`?[*:0]const u8`, `@optional` scalars stored as bare values gated by a `_present: u64` bitmask
+(mirroring the C backend's own bit-assignment order), everything else unchanged. Generated
+`{Name}FromCAbi`/`{Name}ToCAbi`/`{Name}CAbiFree` conversion functions convert between the mirror
+and internal representations at the C-ABI boundary, allocating/freeing via `std.heap.c_allocator`.
+`cApiExportTypeRef` (the exported-wrapper-facing type resolver) now points operation params/
+returns at the mirror type instead of the internal one; `emitCApiOp` converts mirror↔internal
+around the vtable call; the standalone per-struct `_free` export (`emitStructCApiFree`, generated
+independently of `emitCApiOp` — the last bug found here, via a real SIGSEGV traced with `gdb bt
+full` to `zzdds_DomainParticipantConfig_free` → `StringSeq.deinit`) now routes through the mirror
+too. A cross-file subtlety: a struct declared in a different IDL file than the one setting
+`--zig-generate-toml-config` must not be mirrored on that flag alone, since it's never walked by
+this invocation's own `emitStruct` — fixed via a `toml_applied_structs` set populated only when
+`emitStruct` itself adds the field.
+
+Verified end-to-end against the real, previously-crashing repro: `zzdds-examples`'
+`participant-config` programmatic mode now prints `Config round-trip OK: ...` and completes a full
+3-sample reliable pub/sub exchange cleanly on **all three** previously-broken bindings (`c`, `cpp`,
+`java`), rebuilt against a local zidl checkout with the fix. `zig build test` in both zidl and zzdds
+pass clean, no leaks.
+
+**Released (2026-08-20)**: zidl `v0.3.7-zig.0.16.0` (zidl PR #41) ships this fix, plus two rounds of
+Greptile review findings fixed in the same PR before merge — see the dedicated entry below for the
+full list. `zzdds/build.zig.zon` now pins that release (bumped from `v0.3.6-zig.0.16.0`); rebuilt
+and re-verified `participant-config` against the real pinned release (not just a local checkout) on
+all four bindings, still passing.
+
+**Update (2026-08-20) — `dcps.idl` half also verified**: built `zzdds-examples`'
+`discovery` example (all four bindings) specifically to exercise `get_discovered_topic_data`/
+`get_matched_publication_data`/`get_matched_subscription_data` (the three `dcps.idl` operations
+sharing the string-layout half of this bug, independent of `_toml_applied` — see the standalone
+C probe against `DDS_TopicBuiltinTopicData_free` noted above). All three now round-trip correctly
+on `c`/`cpp`/`java`, confirming the mirror mechanism generalizes with no extra per-struct handling
+needed — re-verified against the real released `v0.3.7-zig.0.16.0`, not just the local checkout
+used when this was first found. One pre-existing, unrelated flake found
+while verifying `java/discovery`: `on_reliable_reader_ready` intermittently never fires on the
+publisher side under back-to-back JVM startups in this sandbox (~2/7 runs) — A/B tested against
+`java/participant-config` (no discovery calls, already known-good) at a similar failure rate on
+fresh domains, confirming it's pre-existing Java handshake timing flakiness, not a regression from
+this fix or the new example. See `zzdds-examples/docs/design/discovery-reference-app.md` for the
+full writeup.
+
+---
+
+## Real zidl bug found and fixed: Java JNI `@optional` scalar marshaling crashed the JVM,
+never previously exercised (2026-08-20)
+
+Found in the same `-Z`/`--datafrag-size` rollout above, one step before the ABI bug: the *first*
+call to `get_default_participant_config` from Java crashed immediately, inside
+`zzdds_UdpConfig_from_java` (a `jni_CallIntMethod` on what turned out to be a NULL `jmethodID`).
+Root cause, in zidl's Java backend (`src/backend/java.zig`, `StructMarshalGenerator`, the generator
+behind every QoS/status/config struct's `_from_java`/`_fill_java` JNI glue — distinct from the
+regular CDR-serialization generator, which already had correct `@optional` handling and has its
+own passing tests): `emitMemberFromJava`/`emitMemberFillJava`'s `.scalar` case never checked
+`m.annotations.is_optional` at all, always emitting the plain-primitive `GetMethodID(cls, "get_x",
+"()I")`/`CallIntMethod` pattern — but an `@optional` scalar's real Java getter/setter is boxed
+(`Integer`/`Short`/...) per `memberJavaType`, so `GetMethodID` silently fails to find a match and
+returns NULL, and the next call dereferences it. Only reachable via `UdpConfig`'s five `@optional`
+port/participant-id fields (the only `@optional` scalars anywhere in `dcps.idl`/`zzdds.idl`) —
+never hit before because nothing had ever exercised this specific generator's output for a struct
+with an `@optional` member from Java specifically.
+
+Fixed with a boxed-aware branch mirroring the existing seq-scalar boxing pattern already used
+elsewhere in the same file (`unboxMethodName`/`jniAccessorName`/`boxedClassName`, all pre-existing
+helpers) plus the `_present` bitmask read/write (`out->_present |= (1ULL << bit)` /
+`in->_present & (1ULL << bit)`), threading a running per-struct optional-bit-index counter through
+`emitStruct`'s two member loops the same way the C backend's `optBitIdxForMember` already does.
+Scoped deliberately to the `.scalar` shape only (matching what's actually declared in the IDL
+today) — a `@optional` string/nested/seq member would need the same treatment extended to its own
+branch, not implemented since nothing exercises it yet.
+
+**Also found and fixed along the way, in the same generator**: `descriptor()`'s (`javaFieldDescriptor`)
+return value was never freed at any of its four call sites in this generator (`.scalar`/`.enum_`/
+`.nested_struct` in `emitMemberFromJava`, `.scalar` in `emitMemberFillJava`) — a real, live
+allocator leak, confirmed via `testing.allocator` once this session's new regression test became
+the *first* test to make `StructMarshalGenerator` emit a struct body (not just an `extern`
+declaration) for a struct with a plain scalar member. Fixed with `defer self.alloc.free(desc)` at
+each site.
+
+New regression test: `"java: @optional scalar struct member gets boxed-type JNI marshaling in
+StructMarshalGenerator"` (`src/backend/java.zig`) — constructs a standalone struct+interface pair
+(not the real `zzdds.idl`, to isolate the generator), asserts the boxed descriptor strings and
+`_present` bit are actually emitted. **Released in zidl `v0.3.7-zig.0.16.0`**, bundled into the
+same PR (#41) as the C-ABI mirror-struct fix above — `zzdds/build.zig.zon` now pins that release.
+
+---
+
+## `-Z`/`--datafrag-size` rolled out to every `shape` port; `--periodic-announcement` was
+silently broken everywhere, now genuinely wired (2026-08-20)
+
+Follow-on from `docs/design/dds-rtps-interop-suite-audit.md`'s top action item (`dds-rtps`'s own
+zzdds `shape_main.zig` port was missing `--datafrag-size`/`-Z`, present in `srcC`). Added there
+first, then checked (per the audit's own framing: zzdds-examples' four `*/shape` ports are all
+independently-maintained copies of the same CLI surface) whether the same gap existed in
+`zig/shape`, `c/shape`, `cpp/shape`, `java/shape` — it did, in all four, so fixed all four the same
+session rather than leaving three of four ports behind.
+
+**Found in the process: `--periodic-announcement` has been a silent no-op in all five ports since
+before this session**, not just `dds-rtps`'s port. Every one of them tried to set it via
+`setenv("ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS", ...)` before creating the factory — but
+`src/config/resolve.zig`'s own module doc has explicitly disclaimed env-var-based config since
+"Config File Improvements" (#54): *"Env vars are deliberately not part of this at all... An
+application that wants env-driven tweaks can read them itself and mutate the resolved struct."*
+Nothing in `zzdds` has read `ZZDDS_PARTICIPANT_ANNOUNCEMENT_PERIOD_MS` (or any env var) for
+config purposes since then — confirmed via a real crash-free-but-silently-ineffective run before
+the fix, and a real crash-free-and-effective run after. Fixed everywhere by routing through the
+same real mechanism now used for `-Z` in each port (see below), replacing every dead `setenv`
+call site.
+
+**`dds-rtps`'s zig port and `zig/shape`** (pure-Zig, never cross the C ABI): a new
+`dds.ParticipantOptions{ fragment_size, announcement_period_ms }` (documented in `dds-rtps`'s
+`srcZig/dds.zig` vendor-agnostic contract) threaded into `createParticipant`, which builds a
+`ZZDDS.DomainParticipantConfig` and calls `create_participant_ex` directly — safe here since it's
+a pure-Zig call. `zig/shape`'s version additionally starts from
+`get_default_participant_config`'s result (not a bare `.{}`) so it correctly composes with its
+existing `--config` flag; `dds-rtps`'s port has no `--config` to compose with, so uses the simpler
+`.{}`-literal start (also required to stay compatible with the `v0.2.0-zig.0.16.0` zzdds tag
+`dds-rtps` pins, which predates `get_default_participant_config`/`set_default_participant_config`
+entirely — confirmed against that tag's own `idl/zzdds.idl`).
+
+**`c/shape`/`cpp/shape`/`java/shape`**: given the ABI bug above, none of these originally used
+`create_participant_ex` at all — each wrote a small generated TOML file (just the
+`[default_participant_config.rtps] fragment_size`/`[default_participant_config.participant]
+announcement_period_ms` keys actually needed) and loaded it via `zzdds_process_configure_from_file`
+(the same real API `c/shape`/`cpp/shape`'s pre-existing `--config` already used, and `java/shape`'s
+`--config` *should* have been using — see below), the only one of the three extension operations
+that takes a plain path string with no struct-crossing risk. `-Z`/`--periodic-announcement` and
+`--config` were mutually exclusive in these three ports as a result (documented in each `--help`,
+clear error if combined) since `zzdds_process_configure_from_file` can only run once per process
+and merging arbitrary user TOML with a generated override wasn't worth building for an example.
+
+**Update (2026-08-20) — simplified now that the ABI bug is fixed**: with the C-ABI mirror fix
+verified (see below), the temp-file workaround is gone from all three ports — they now call
+`create_participant_ex`/`get_default_participant_config` directly, exactly matching `zig/shape`'s
+own composition logic (start from the factory's already-resolved default, reflecting `--config` if
+any, then override just `fragment_size`/`announcement_period_ms`). `-Z`/`--periodic-announcement`
+and `--config` compose correctly in all five ports now, no more mutual-exclusivity restriction.
+Verified with a real built binary per port: all three print `Create topic:`/`Create writer for
+topic:` with `--config`+`-Z`+`--periodic-announcement` combined in one run, no crash, no
+`RETCODE_OUT_OF_RESOURCES` — re-confirmed against the real released `v0.3.7-zig.0.16.0` after
+`zzdds`'s pin bump, not just the local checkout used while this was being written. A stray
+`fdopen()` return-value check missing from the (now-deleted) temp-file code was also caught and
+fixed before deletion, for the record.
+
+**`java/shape` also got two independent fixes along the way**: its `--config` flag previously
+worked around a missing JNI binding by staging the chosen file as `./zzdds.toml` (backup/restore
+dance via a shutdown hook) since "no `zzdds_process_configure_from_file` JNI wrapper exists yet"
+per its own MVP-note comment — closed for real by adding
+`ZzddsRuntime.configureFromFile(String)` (`java_runtime/ZzddsRuntime.java`+
+`zzdds_java_runtime.c`, a thin wrapper around `zzdds_process_configure_from_file`, no struct
+crossing), which `--config` now also uses directly, deleting the staging workaround entirely.
+Separately, `java/shape/build.py`'s `javac` classpath was missing the generated `io/zzdds/ext`
+package (`hello_world`/`waitset`'s own `build.py` already include it) — harmless until any `shape`
+change needed an `io.zzdds.ext.*` type, which this one did; fixed to match its sibling ports.
+
+All five ports verified with a real built binary: `--help` text, an out-of-range `-Z` value
+correctly rejected, a real participant created successfully with `-Z`/`--periodic-announcement`
+set (individually and, where supported, together with `--config`), and the plain no-flags path
+unaffected. Cross-process wire-level fragmentation behavior (two real processes actually
+exchanging a `DATA_FRAG`-fragmented sample) could not be verified in this session's sandbox — UDP
+multicast SPDP discovery doesn't work here at all, confirmed as a pre-existing environment
+limitation via an identical baseline failure with no flags involved, not something introduced by
+this change.
+
+---
+
 ## Writer Liveliness Protocol (WLP) implemented (2026-08-19)
 
 `DomainParticipant.assert_liveliness()` / `DataWriter.assert_liveliness()` previously only

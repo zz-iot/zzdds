@@ -217,4 +217,34 @@ public final class ZzddsRuntime {
      * can produce). Returns an {@code io.zzdds.ext.DataWriterImpl}.
      */
     public static native Object asZzddsDataWriter(Object writer);
+
+    /**
+     * Resolves {@code path} as a zzdds TOML config file and installs it as
+     * the process-wide default participant config, entirely native-side —
+     * the real API this binding previously lacked (see {@code shape}'s own
+     * README history / {@code docs/design/shape-reference-app.md}'s MVP note
+     * for the {@code ./zzdds.toml}-staging workaround this replaces). Must be
+     * called before the first factory is created in this process. Mirrors
+     * {@code zzdds_c.h}'s {@code zzdds_process_configure_from_file} — the
+     * same function C/C++ call directly, just JNI-wrapped. Returns the
+     * {@code DDS_ReturnCode_t} value as an {@code int}.
+     */
+    public static native int configureFromFile(String path);
+
+    /**
+     * Narrows the plain {@code io.zzdds.dcps.Dcps.DDS.DomainParticipantFactory}
+     * returned by {@code createFactory()} to zzdds's own
+     * {@code io.zzdds.ext.Zzdds.zzdds.DomainParticipantFactory} extension view
+     * — e.g. to reach {@code create_participant_ex}/
+     * {@code set_default_participant_config}/{@code get_default_participant_config}.
+     * Same underlying native factory, just a different generated interface
+     * view (see {@code include/zzdds_c.h}'s
+     * {@code DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory}).
+     * {@code createFactory()} itself always boxes into the base
+     * {@code io.zzdds.dcps.DomainParticipantFactoryImpl} view (see its own doc
+     * comment in {@code zzdds_java_runtime.c}) since nothing needed the
+     * extension view at bootstrap time before this; call this narrowing
+     * function to get it. Returns an {@code io.zzdds.ext.DomainParticipantFactoryImpl}.
+     */
+    public static native Object asZzddsFactory(Object factory);
 }
