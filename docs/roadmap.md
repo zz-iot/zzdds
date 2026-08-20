@@ -79,6 +79,65 @@ valid Java class(es) for each (some, like `writer`, can legitimately be either t
 `ext` package view of the same entity) and touches the whole file's structure again; flagged as
 a follow-up, not folded into this pass.
 
+**Update (2026-08-20) — two more rounds, then the broader rollout done**: Greptile's next two
+review passes found (a) the same call chain still crashed on a *non-null* wrong-type
+argument — `zzdds_java_require_non_null` only checks for `NULL`; `zzdds_java_unbox` never
+checked whether its own `GetFieldID` lookup succeeded before calling `GetLongField` with the
+result, undefined behavior for any object with no `ptr_` field, and even a real `ptr_`-bearing
+object from a *different* entity type unboxed "successfully" into the wrong native pointer —
+and (b) once fixed with an interface-based `IsInstanceOf` check, that an app-defined class could
+still `implements Dcps.DDS.DomainParticipantFactory` with an arbitrary `ptr_`, since interfaces
+are open to any implementer, plus the new `static jclass` cache backing that check published
+across threads with no synchronization (unlike every other class cache in this file). Investigated
+whether `writer`/`reader` can legitimately be either the `dcps` or `ext` package view before
+broadening further: no — the generated per-topic `XxxDataWriter`/`XxxDataReader` wrapper
+constructors are compile-time typed to the plain `Dcps.DDS.DataWriter`/`DataReader` interface
+(`writer_iface`/`reader_iface` in zidl's `emitZzddsDataWriterFile`), so only the base `dcps`-package
+class is ever legitimately passed to the raw write/take functions; the `ext` view is only used for
+`set_listener_ex`, never write/take.
+
+Fixed all three, then finished the broadening: (1) `zzdds_java_unbox` now checks `GetFieldID`
+itself, closing the "no `ptr_` field" case at the root for every caller. (2) `zzdds_java_require_
+instance_of` now checks the concrete `*Impl` class (e.g. `io/zzdds/dcps/DomainParticipantFactoryImpl`,
+not the `Dcps.DDS.DomainParticipantFactory` interface it implements) via the existing, already
+mutex-protected `zzdds_java_class_cache`/`zzdds_java_get_or_cache_class` — reusing that
+infrastructure closed the race for free instead of needing a new lock. A new `zzdds_java_require_
+instance_of_any` variant (accepts a caller-supplied array of candidate classes) handles the one
+parameter that legitimately spans two concrete types: `take_w_condition`'s `condition` argument,
+which per spec accepts a `ReadCondition` or its `QueryCondition` subtype — two independent
+sibling Impl classes in Java, not one a subclass of the other, so a single-class check would wrongly
+reject one of them. (3) Rolled the (now race-free, concrete-class) check out to every remaining
+unboxed handle parameter: `participant` (`registerTypeSupport`), `writer` (the five write/
+register/lookup functions), `reader`/`reader_obj` (all eight take/read functions, six of them
+shared static helpers so one check covers two `JNIEXPORT` wrappers each), `condition_obj` (the
+two `_w_condition` functions, via the new "any of" variant), `waitset`/`guardcondition`
+(`destroyWaitSet`/`destroyGuardCondition` — null still a no-op, a wrong-type non-null value now
+rejected instead of silently no-op'd), and `cft` (`cftMatchSample` — null still means "no filter",
+non-null wrong-type now rejected). Deliberately left unchanged: `zzdds_java_waitset_attach_
+condition`/`zzdds_java_resolve_condition_handle`'s own existing type-dispatch cascade for `cond`
+(already spec-appropriate — `WaitSet.attach_condition` genuinely takes any `Condition`, and this
+code has its own delicate, separately-hardened history across three earlier rounds of Greptile
+review in PR #62; not part of the same `*_Raw` pattern, and riskier to touch than to leave alone)
+and `accessor`/`typeName`/`typeClass` (not zzdds entity handles at all — an app-supplied callback
+interface and a plain `String`/`Class<?>`, with no "wrong concrete type" to check).
+
+Explicitly **not** attempted, and documented as such directly in `zzdds_java_require_instance_of`'s
+own comment: validating that a correctly-typed handle's native pointer is still *live* (not already
+destroyed). That's a use-after-free class of problem structurally different from "wrong Java type,"
+would need a live-handle registry this project has nowhere else either (not in C, C++, or Zig), and
+is out of scope here.
+
+Verified for real, comprehensively: rebuilt and ran a standalone Java harness covering every one of
+the newly-hardened sites — a real, live entity handle of the *wrong* type (e.g. a genuine factory
+object passed to `writeRaw`/`takeRaw`/`registerTypeSupport`/`destroyWaitSet`/
+`destroyGuardCondition`/`cftMatchSample`) now throws `IllegalArgumentException` instead of
+undefined behavior, an app-defined class implementing the public interface with a bogus `ptr_` is
+now rejected the same way, `destroyWaitSet(null)`/`cftMatchSample(null, ...)` still behave exactly
+as before (silent no-op / "no filter"), and 16 threads hammering `asZzddsFactory` concurrently on
+first call (half with a real factory, half with a bogus app-defined one) completed without a
+crash. `zig build`/`zig build test` clean throughout; `participant-config` and `discovery`
+re-run end-to-end on Java afterward, both still pass.
+
 ---
 
 ## Examples cleanup list resolved — mostly already done, one real gap fixed (2026-08-20)

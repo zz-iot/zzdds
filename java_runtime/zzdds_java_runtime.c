@@ -125,40 +125,6 @@ static void *zzdds_java_require_unboxed(JNIEnv *env, jobject obj, const char *pa
     return p;
 }
 
-/* Narrower still than zzdds_java_require_unboxed: verifies `obj` (already
- * known non-null) is genuinely an instance of the interface named by
- * `iface_name`, not just *some* object with a `ptr_` field of the right
- * shape. Every zzdds entity wrapper class shares that same `private final
- * long ptr_` field declaration, so a caller passing the wrong entity's
- * wrapper (e.g. a DataReaderImpl where asZzddsDataWriter expects a
- * DataWriter) would unbox "successfully" into that entity's real native
- * pointer, just of the wrong type -- the exact type-confusion
- * zzdds_java_unbox's own GetFieldID guard can't catch on its own, since it
- * has no way to know which entity type a given call site actually wants.
- * Needed specifically by the two extension-view "narrowing" functions
- * below, which take a plain `Object` (see their own javadoc for why) and
- * feed it straight into a native downcast that assumes the right concrete
- * type. `*cache` is a caller-owned `static jclass` local, resolved and
- * cached the same redundant-safe way zzdds_java_get_field_from_cdr_ctx's
- * own class caches already are (see that function's doc comment) --
- * concurrent first calls harmlessly re-resolve the same interface; no
- * `(J)V` constructor lookup is possible here the way zzdds_java_class_cache
- * needs, since these are interfaces, not concrete boxed classes. Throws
- * IllegalArgumentException naming `param_name` and returns false on any
- * failure (class resolution or the instance check itself). Found via
- * Greptile PR #67 review, second round ("an object that is not a live
- * base factory wrapper"). */
-static bool zzdds_java_require_instance_of(JNIEnv *env, jobject obj, jclass *cache, const char *iface_name, const char *param_name) {
-    if (*cache == NULL) {
-        jclass local = (*env)->FindClass(env, iface_name);
-        if (local != NULL) *cache = (jclass)(*env)->NewGlobalRef(env, local);
-    }
-    if (*cache != NULL && (*env)->IsInstanceOf(env, obj, *cache)) return true;
-    jclass iae = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
-    if (iae != NULL) (*env)->ThrowNew(env, iae, param_name);
-    return false;
-}
-
 /* ── Lazily-cached (jclass, "(J)V" ctor jmethodID) pairs ─────────────────
  *
  * createFactory()/asZzddsDataWriter() each resolve their target class once
@@ -210,6 +176,67 @@ static bool zzdds_java_get_or_cache_class(JNIEnv *env, zzdds_java_class_cache *c
     }
     pthread_mutex_unlock(&zzdds_java_class_cache_mu);
     return true;
+}
+
+/* Narrower still than zzdds_java_require_unboxed: verifies `obj` (already
+ * known non-null) is genuinely an instance of `class_name`, not just *some*
+ * object with a `ptr_` field of the right shape. Every zzdds entity wrapper
+ * class shares that same `private final long ptr_` field declaration, so a
+ * caller passing the wrong entity's wrapper (e.g. a DataReaderImpl where
+ * asZzddsDataWriter expects a DataWriter) would unbox "successfully" into
+ * that entity's real native pointer, just of the wrong type -- the exact
+ * type-confusion zzdds_java_unbox's own GetFieldID guard can't catch on its
+ * own, since it has no way to know which entity type a given call site
+ * actually wants. Needed specifically by the two extension-view "narrowing"
+ * functions below, which take a plain `Object` (see their own javadoc for
+ * why) and feed it straight into a native downcast that assumes the right
+ * concrete type.
+ *
+ * Deliberately checks the concrete *Impl class (e.g.
+ * io/zzdds/dcps/DomainParticipantFactoryImpl), not the public
+ * Dcps.DDS.DomainParticipantFactory interface it implements: the interface
+ * is implementable by any application class, which could set an arbitrary
+ * `ptr_`-shaped field of its own and pass an IsInstanceOf-against-the-
+ * interface check while still not being one of this binding's own boxed
+ * handles. Checking the concrete class rules that out. It does NOT (and
+ * structurally cannot, short of a live-handle registry this project has
+ * nowhere else either) catch a *stale* handle -- a real, correctly-typed
+ * wrapper whose underlying native entity has since been destroyed; see
+ * docs/roadmap.md's matching entry for why that's out of scope here.
+ *
+ * Reuses zzdds_java_class_cache/zzdds_java_get_or_cache_class (both just
+ * above) rather than a standalone `static jclass` -- concrete classes have
+ * the `(J)V` constructor that mechanism needs, and its existing mutex is
+ * exactly the synchronized publication a bare, lock-free `static jclass`
+ * here would be missing (Greptile PR #67 review flagged both this and the
+ * interface-vs-concrete-class gap, in successive rounds). Throws
+ * IllegalArgumentException naming `param_name` and returns false on any
+ * failure (class resolution or the instance check itself). */
+static bool zzdds_java_require_instance_of(JNIEnv *env, jobject obj, zzdds_java_class_cache *cache, const char *class_name, const char *param_name) {
+    if (zzdds_java_get_or_cache_class(env, cache, class_name) && (*env)->IsInstanceOf(env, obj, cache->cls)) return true;
+    jclass iae = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+    if (iae != NULL) (*env)->ThrowNew(env, iae, param_name);
+    return false;
+}
+
+/* Same as zzdds_java_require_instance_of, but accepts `obj` if it matches
+ * ANY of `n` candidate concrete classes -- needed where a single JNI
+ * parameter legitimately accepts more than one concrete entity type.
+ * take_w_condition/take_next_instance_w_condition's `condition` argument is
+ * the one case of this in the file: per the OMG spec it accepts either a
+ * plain ReadCondition or its QueryCondition subtype, and — unlike the
+ * interface hierarchy (QueryCondition extends ReadCondition) — the two
+ * zzdds Impl classes are independent siblings, neither a Java subclass of
+ * the other, so a single zzdds_java_require_instance_of check against
+ * either one alone would wrongly reject the other. `caches`/`class_names`
+ * are parallel arrays of length `n`. */
+static bool zzdds_java_require_instance_of_any(JNIEnv *env, jobject obj, zzdds_java_class_cache *caches, const char *const *class_names, size_t n, const char *param_name) {
+    for (size_t i = 0; i < n; i++) {
+        if (zzdds_java_get_or_cache_class(env, &caches[i], class_names[i]) && (*env)->IsInstanceOf(env, obj, caches[i].cls)) return true;
+    }
+    jclass iae = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+    if (iae != NULL) (*env)->ThrowNew(env, iae, param_name);
+    return false;
 }
 
 /* ── Factory bootstrap ──────────────────────────────────────────────────
@@ -458,6 +485,9 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_createGuardConditio
  * Dcps.DDS.WaitSet/GuardCondition's generated interface). */
 JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyWaitSet(JNIEnv *env, jclass self_cls, jobject waitset) {
     (void)self_cls;
+    if (waitset == NULL) return; /* idempotent destroy -- see this file's own top-of-section comment */
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_instance_of(env, waitset, &type_check_cache, "io/zzdds/dcps/WaitSetImpl", "waitset")) return;
     DDS_WaitSet ws = (DDS_WaitSet)zzdds_java_unbox(env, waitset);
     if (ws == NULL) return;
     zzdds_destroy_waitset(ws);
@@ -465,6 +495,9 @@ JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyWaitSet(JNIEnv 
 
 JNIEXPORT void JNICALL Java_io_zzdds_runtime_ZzddsRuntime_destroyGuardCondition(JNIEnv *env, jclass self_cls, jobject guardcondition) {
     (void)self_cls;
+    if (guardcondition == NULL) return; /* idempotent destroy -- see this file's own top-of-section comment */
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_instance_of(env, guardcondition, &type_check_cache, "io/zzdds/dcps/GuardConditionImpl", "guardcondition")) return;
     DDS_GuardCondition gc = (DDS_GuardCondition)zzdds_java_unbox(env, guardcondition);
     if (gc == NULL) return;
     zzdds_destroy_guardcondition(gc);
@@ -626,8 +659,10 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     JNIEnv *env, jclass self_cls, jobject participant, jstring typeName, jclass typeClass)
 {
     (void)self_cls;
-    void *p = zzdds_java_require_unboxed(env, participant, "participant");
-    if (p == NULL) return -1;
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, participant, "participant")) return -1;
+    if (!zzdds_java_require_instance_of(env, participant, &type_check_cache, "io/zzdds/dcps/DomainParticipantImpl", "participant")) return -1;
+    void *p = zzdds_java_unbox(env, participant);
     if (!zzdds_java_require_non_null(env, (jobject)typeName, "typeName")) return -1;
     if (!zzdds_java_require_non_null(env, (jobject)typeClass, "typeClass")) return -1;
 
@@ -677,7 +712,10 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_writeRaw(
     JNIEnv *env, jclass self_cls, jobject writer, jint kind, jbyteArray keyHash, jlong handle, jbyteArray payload)
 {
     (void)self_cls;
-    void *w = zzdds_java_require_unboxed(env, writer, "writer");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return -1;
+    if (!zzdds_java_require_instance_of(env, writer, &type_check_cache, "io/zzdds/dcps/DataWriterImpl", "writer")) return -1;
+    void *w = zzdds_java_unbox(env, writer);
     if (w == NULL) return -1;
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -694,7 +732,10 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_writeRawWTimestamp(
     JNIEnv *env, jclass self_cls, jobject writer, jint kind, jbyteArray keyHash, jlong handle, jbyteArray payload, jint sec, jint nanosec)
 {
     (void)self_cls;
-    void *w = zzdds_java_require_unboxed(env, writer, "writer");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return -1;
+    if (!zzdds_java_require_instance_of(env, writer, &type_check_cache, "io/zzdds/dcps/DataWriterImpl", "writer")) return -1;
+    void *w = zzdds_java_unbox(env, writer);
     if (w == NULL) return -1;
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -712,7 +753,10 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerInstanceRaw(
     JNIEnv *env, jclass self_cls, jobject writer, jbyteArray keyHash)
 {
     (void)self_cls;
-    void *w = zzdds_java_require_unboxed(env, writer, "writer");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return 0;
+    if (!zzdds_java_require_instance_of(env, writer, &type_check_cache, "io/zzdds/dcps/DataWriterImpl", "writer")) return 0;
+    void *w = zzdds_java_unbox(env, writer);
     if (w == NULL) return 0;
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -723,7 +767,10 @@ JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueWrite
     JNIEnv *env, jclass self_cls, jobject writer, jlong handle)
 {
     (void)self_cls;
-    void *w = zzdds_java_require_unboxed(env, writer, "writer");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return NULL;
+    if (!zzdds_java_require_instance_of(env, writer, &type_check_cache, "io/zzdds/dcps/DataWriterImpl", "writer")) return NULL;
+    void *w = zzdds_java_unbox(env, writer);
     if (w == NULL) return NULL;
     uint8_t buf[4096];
     size_t len = 0;
@@ -737,7 +784,10 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceWriterR
     JNIEnv *env, jclass self_cls, jobject writer, jbyteArray keyHash)
 {
     (void)self_cls;
-    void *w = zzdds_java_require_unboxed(env, writer, "writer");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, writer, "writer")) return 0;
+    if (!zzdds_java_require_instance_of(env, writer, &type_check_cache, "io/zzdds/dcps/DataWriterImpl", "writer")) return 0;
+    void *w = zzdds_java_unbox(env, writer);
     if (w == NULL) return 0;
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -761,7 +811,10 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceWriterR
 static jbyteArray zzdds_java_take_or_read(
     JNIEnv *env, jobject reader_obj, jint max_size, jlongArray handle_out, jbooleanArray valid_out, jintArray state_out, int is_take)
 {
-    void *reader = zzdds_java_require_unboxed(env, reader_obj, "reader");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
+    if (!zzdds_java_require_instance_of(env, reader_obj, &type_check_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return NULL;
+    void *reader = zzdds_java_unbox(env, reader_obj);
     if (reader == NULL) return NULL;
     uint8_t *buf = malloc((size_t)max_size);
     if (buf == NULL) return NULL;
@@ -808,7 +861,10 @@ JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_readRaw(
 static jbyteArray zzdds_java_take_or_read_instance(
     JNIEnv *env, jobject reader_obj, jlong prev, jint max_size, jlongArray handle_out, jbooleanArray valid_out, jintArray state_out, int is_take)
 {
-    void *reader = zzdds_java_require_unboxed(env, reader_obj, "reader");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
+    if (!zzdds_java_require_instance_of(env, reader_obj, &type_check_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return NULL;
+    void *reader = zzdds_java_unbox(env, reader_obj);
     if (reader == NULL) return NULL;
     uint8_t *buf = malloc((size_t)max_size);
     if (buf == NULL) return NULL;
@@ -902,7 +958,10 @@ static jobjectArray zzdds_java_take_or_read_n(
     JNIEnv *env, jobject reader_obj, jint max, jint ss, jint vs, jint is_mask,
     jlongArray handles_out, jbooleanArray valids_out, int is_take)
 {
-    void *reader = zzdds_java_require_unboxed(env, reader_obj, "reader");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
+    if (!zzdds_java_require_instance_of(env, reader_obj, &type_check_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return NULL;
+    void *reader = zzdds_java_unbox(env, reader_obj);
     if (reader == NULL) return NULL;
     zzdds_raw_sample_array arr;
     int n = is_take
@@ -943,7 +1002,10 @@ static jobjectArray zzdds_java_take_or_read_n_instance(
     JNIEnv *env, jobject reader_obj, jlong instance_handle, jint max, jint ss, jint vs, jint is_mask,
     jlongArray handles_out, jbooleanArray valids_out, int is_take)
 {
-    void *reader = zzdds_java_require_unboxed(env, reader_obj, "reader");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
+    if (!zzdds_java_require_instance_of(env, reader_obj, &type_check_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return NULL;
+    void *reader = zzdds_java_unbox(env, reader_obj);
     if (reader == NULL) return NULL;
     zzdds_raw_sample_array arr;
     int n = is_take
@@ -976,9 +1038,16 @@ static jobjectArray zzdds_java_take_or_read_w_condition(
     JNIEnv *env, jobject reader_obj, jobject condition_obj, jint max,
     jlongArray handles_out, jbooleanArray valids_out, int is_take)
 {
-    void *reader = zzdds_java_require_unboxed(env, reader_obj, "reader");
+    static zzdds_java_class_cache reader_type_cache = {0};
+    static zzdds_java_class_cache condition_type_caches[2] = {{0}, {0}};
+    static const char *const condition_type_names[2] = {"io/zzdds/dcps/ReadConditionImpl", "io/zzdds/dcps/QueryConditionImpl"};
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
+    if (!zzdds_java_require_instance_of(env, reader_obj, &reader_type_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return NULL;
+    void *reader = zzdds_java_unbox(env, reader_obj);
     if (reader == NULL) return NULL;
-    void *condition = zzdds_java_require_unboxed(env, condition_obj, "condition");
+    if (!zzdds_java_require_non_null(env, condition_obj, "condition")) return NULL;
+    if (!zzdds_java_require_instance_of_any(env, condition_obj, condition_type_caches, condition_type_names, 2, "condition")) return NULL;
+    void *condition = zzdds_java_unbox(env, condition_obj);
     if (condition == NULL) return NULL;
     zzdds_raw_sample_array arr;
     int n = is_take
@@ -1011,9 +1080,16 @@ static jobjectArray zzdds_java_take_or_read_next_instance_w_condition(
     JNIEnv *env, jobject reader_obj, jobject condition_obj, jlong prev, jint max,
     jlongArray handles_out, jbooleanArray valids_out, int is_take)
 {
-    void *reader = zzdds_java_require_unboxed(env, reader_obj, "reader");
+    static zzdds_java_class_cache reader_type_cache = {0};
+    static zzdds_java_class_cache condition_type_caches[2] = {{0}, {0}};
+    static const char *const condition_type_names[2] = {"io/zzdds/dcps/ReadConditionImpl", "io/zzdds/dcps/QueryConditionImpl"};
+    if (!zzdds_java_require_non_null(env, reader_obj, "reader")) return NULL;
+    if (!zzdds_java_require_instance_of(env, reader_obj, &reader_type_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return NULL;
+    void *reader = zzdds_java_unbox(env, reader_obj);
     if (reader == NULL) return NULL;
-    void *condition = zzdds_java_require_unboxed(env, condition_obj, "condition");
+    if (!zzdds_java_require_non_null(env, condition_obj, "condition")) return NULL;
+    if (!zzdds_java_require_instance_of_any(env, condition_obj, condition_type_caches, condition_type_names, 2, "condition")) return NULL;
+    void *condition = zzdds_java_unbox(env, condition_obj);
     if (condition == NULL) return NULL;
     zzdds_raw_sample_array arr;
     int n = is_take
@@ -1048,7 +1124,10 @@ JNIEXPORT jbyteArray JNICALL Java_io_zzdds_runtime_ZzddsRuntime_getKeyValueReade
     JNIEnv *env, jclass self_cls, jobject reader, jlong handle)
 {
     (void)self_cls;
-    void *r = zzdds_java_require_unboxed(env, reader, "reader");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, reader, "reader")) return NULL;
+    if (!zzdds_java_require_instance_of(env, reader, &type_check_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return NULL;
+    void *r = zzdds_java_unbox(env, reader);
     if (r == NULL) return NULL;
     uint8_t buf[4096];
     size_t len = 0;
@@ -1062,7 +1141,10 @@ JNIEXPORT jlong JNICALL Java_io_zzdds_runtime_ZzddsRuntime_lookupInstanceReaderR
     JNIEnv *env, jclass self_cls, jobject reader, jbyteArray keyHash)
 {
     (void)self_cls;
-    void *r = zzdds_java_require_unboxed(env, reader, "reader");
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, reader, "reader")) return 0;
+    if (!zzdds_java_require_instance_of(env, reader, &type_check_cache, "io/zzdds/dcps/DataReaderImpl", "reader")) return 0;
+    void *r = zzdds_java_unbox(env, reader);
     if (r == NULL) return 0;
     jbyte hash_buf[16];
     (*env)->GetByteArrayRegion(env, keyHash, 0, 16, hash_buf);
@@ -1139,7 +1221,9 @@ JNIEXPORT jboolean JNICALL Java_io_zzdds_runtime_ZzddsRuntime_cftMatchSample(
     JNIEnv *env, jclass self_cls, jobject cft, jobject accessor)
 {
     (void)self_cls;
-    if (cft == NULL) return JNI_TRUE;
+    if (cft == NULL) return JNI_TRUE; /* "no content filter" -- see this file's own top-of-section comment */
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_instance_of(env, cft, &type_check_cache, "io/zzdds/dcps/ContentFilteredTopicImpl", "cft")) return JNI_FALSE;
     if (!zzdds_java_require_non_null(env, accessor, "accessor")) return JNI_FALSE;
     void *c = zzdds_java_unbox(env, cft);
 
@@ -1166,9 +1250,9 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsDataWriter(
     JNIEnv *env, jclass self_cls, jobject writer)
 {
     (void)self_cls;
-    static jclass iface_cache = NULL;
+    static zzdds_java_class_cache type_check_cache = {0};
     if (!zzdds_java_require_non_null(env, writer, "writer")) return NULL;
-    if (!zzdds_java_require_instance_of(env, writer, &iface_cache, "io/zzdds/dcps/Dcps$DDS$DataWriter", "writer")) return NULL;
+    if (!zzdds_java_require_instance_of(env, writer, &type_check_cache, "io/zzdds/dcps/DataWriterImpl", "writer")) return NULL;
     DDS_DataWriter w = (DDS_DataWriter)zzdds_java_require_unboxed(env, writer, "writer");
     if (w == NULL) return NULL;
     zzdds_DataWriter zw = DDS_DataWriter_as_zzdds_DataWriter(w);
@@ -1200,9 +1284,9 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsFactory(
     JNIEnv *env, jclass self_cls, jobject factory)
 {
     (void)self_cls;
-    static jclass iface_cache = NULL;
+    static zzdds_java_class_cache type_check_cache = {0};
     if (!zzdds_java_require_non_null(env, factory, "factory")) return NULL;
-    if (!zzdds_java_require_instance_of(env, factory, &iface_cache, "io/zzdds/dcps/Dcps$DDS$DomainParticipantFactory", "factory")) return NULL;
+    if (!zzdds_java_require_instance_of(env, factory, &type_check_cache, "io/zzdds/dcps/DomainParticipantFactoryImpl", "factory")) return NULL;
     DDS_DomainParticipantFactory f = (DDS_DomainParticipantFactory)zzdds_java_require_unboxed(env, factory, "factory");
     if (f == NULL) return NULL;
     zzdds_DomainParticipantFactory zf = DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory(f);
