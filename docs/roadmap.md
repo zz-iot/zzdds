@@ -38,6 +38,47 @@ in a bad state by the throw. Re-ran `zzdds-examples`' `participant-config` (exer
 Java after the change — still passes cleanly, confirming the new guards don't reject legitimate
 non-null calls.
 
+**Update (2026-08-20) — a second, distinct gap found on re-review**: Greptile's next pass on
+`asZzddsFactory` pointed out that a *non-null* but wrong-type argument was still unsafe —
+`zzdds_java_require_non_null` only checks for `NULL`, but `zzdds_java_unbox` itself never checked
+whether its `GetFieldID(cls, "ptr_", "J")` lookup actually succeeded before calling
+`GetLongField` with the result: an object with no `ptr_` field at all (some unrelated Java type)
+makes `GetFieldID` fail and leaves a pending `NoSuchFieldError`, and calling `GetLongField` with
+that invalid field ID is itself undefined behavior — a second, independent crash underneath the
+first one, present in `zzdds_java_unbox` for every one of its 21 callers, not just the two new
+functions. Worse: even an object that *does* have a `ptr_` field (any other zzdds entity
+wrapper — they all share that same field declaration) unboxes "successfully" into a real,
+valid-looking native pointer of the *wrong entity type*, which the C-ABI downcast then
+dereferences as if it were the right one.
+
+Fixed in two layers: (1) `zzdds_java_unbox` now checks `GetFieldID`'s result and clears/returns
+`NULL` instead of proceeding to `GetLongField`, closing the "no `ptr_` field at all" case for
+every caller — the null-tolerant ones included, which needed this protection just as much for a
+non-null-but-wrong-type argument. A new `zzdds_java_require_unboxed` helper (null-check +
+unbox + "throw `IllegalArgumentException` if unbox still came back empty") replaced the
+`require_non_null`-then-`unbox` two-step at every "required" call site from the first pass. (2)
+For the two extension-view "narrowing" functions specifically (`asZzddsFactory`/
+`asZzddsDataWriter`) — the ones a caller could plausibly hand *any* other real entity wrapper to
+by mistake, since they take a bare `Object` — added a `zzdds_java_require_instance_of` check
+against the expected `Dcps.DDS.DomainParticipantFactory`/`DataWriter` interface before
+unboxing, catching the "right shape, wrong entity type" case `GetFieldID` succeeding can't rule
+out on its own.
+
+Verified for real again: the same standalone Java harness, extended to pass a plain unrelated
+object (`"not a factory"`, `new Object()`) and — the specific scenario raised — a real, live
+`DomainParticipantFactory` object into `asZzddsDataWriter`, confirmed all three now throw
+`IllegalArgumentException` (previously: undefined behavior/crash territory) while a genuine
+`asZzddsFactory(<real factory>)` call still succeeds. `zig build`/`zig build test` clean; the
+`participant-config` example re-run end-to-end again afterward.
+
+Broadening the same `IsInstanceOf` type-check (not just the `GetFieldID`-safety fix, which now
+covers everything) to the other ~19 handle parameters in this file (`writer`/`reader`/
+`condition`/`participant`/`waitset`/`guardcondition` across the write/take/lookup family) is a
+further, separate expansion — deliberately not done here. It would need researching the exact
+valid Java class(es) for each (some, like `writer`, can legitimately be either the `dcps` or
+`ext` package view of the same entity) and touches the whole file's structure again; flagged as
+a follow-up, not folded into this pass.
+
 ---
 
 ## Examples cleanup list resolved — mostly already done, one real gap fixed (2026-08-20)
