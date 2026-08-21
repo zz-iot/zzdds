@@ -889,10 +889,27 @@ pub const DataWriterImpl = struct {
             return DDS.RETCODE_BAD_PARAMETER;
         for (guids.items) |guid| {
             if (guidToHandle(guid) == handle) {
+                // topic_name/type_name must be duped into fresh, caller-owned
+                // storage here, not aliased to self.topic_name/self.type_name
+                // directly -- see DomainParticipantImpl.vtGetDiscoveredTopicData's
+                // matching comment for why (this writer's own topic_name/type_name
+                // would otherwise get double-freed at teardown). Always
+                // c_allocator, decoupling this from self.alloc, matching
+                // factoryGetDefaultParticipantConfig's identical reasoning.
+                //
+                // Duped into locals first, and *data's prior content freed
+                // only once both dupes have succeeded -- see
+                // vtGetDiscoveredTopicData's matching comment for why.
+                const topic_name = std.heap.c_allocator.dupe(u8, self.topic_name) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+                const type_name = std.heap.c_allocator.dupe(u8, self.type_name) catch {
+                    std.heap.c_allocator.free(topic_name);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+                data.deinit(std.heap.c_allocator);
                 data.* = .{};
                 data.key = guidToBuiltinKey(guid);
-                data.topic_name = self.topic_name;
-                data.type_name = self.type_name;
+                data.topic_name = topic_name;
+                data.type_name = type_name;
                 return DDS.RETCODE_OK;
             }
         }

@@ -3786,14 +3786,38 @@ pub const DomainParticipantImpl = struct {
         defer self.mu.unlock();
         for (self.discovered_topics.items) |dt| {
             if (dt.handle != handle) continue;
-            // name/type_name are slices into heap-allocated strings owned by the
-            // DiscoveredTopic entry.  They are valid for the participant's lifetime
-            // as long as no undiscovery path frees them.  If topic undiscovery is
-            // ever added, these fields must be duped into caller-owned storage instead.
+            // name/type_name must be duped into fresh, caller-owned storage here,
+            // not aliased to dt.topic_name/dt.type_name directly: the C-ABI export
+            // of this call (DDS_DomainParticipant_get_discovered_topic_data) always
+            // frees whatever ends up in *data via std.heap.c_allocator (both the
+            // generated wrapper's own cleanup and TopicBuiltinTopicData_free on the
+            // caller side), and callers -- including this vtable's own pure-Zig
+            // callers, see zig/discovery -- deinit() the result the same way. If
+            // these fields aliased the DiscoveredTopic entry's storage instead,
+            // that free would double-free memory the participant's own
+            // discovered_topics list still owns and frees again at teardown.
+            // Always c_allocator, decoupling this from self.alloc, matching
+            // factoryGetDefaultParticipantConfig's identical reasoning.
+            //
+            // Duped into locals first, not directly into the struct literal
+            // below: a struct literal only commits once every field has been
+            // evaluated, so if the type_name dupe failed after the name dupe
+            // already succeeded, returning from inside the literal would both
+            // leak that first allocation and leave *data's old (about-to-be
+            // freed) content undisturbed but never actually freed. Freeing
+            // *data's prior content is deferred until both dupes have
+            // succeeded, for the same reason: an early OOM return must leave
+            // *data exactly as the caller last saw it, not half-freed.
+            const name = std.heap.c_allocator.dupe(u8, dt.topic_name) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            const type_name = std.heap.c_allocator.dupe(u8, dt.type_name) catch {
+                std.heap.c_allocator.free(name);
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+            data.deinit(std.heap.c_allocator);
             data.* = .{
                 .key = topicNameToKey(dt.topic_name),
-                .name = dt.topic_name,
-                .type_name = dt.type_name,
+                .name = name,
+                .type_name = type_name,
                 .reliability = qosReliability(dt.reliability_kind),
                 .durability = qosDurability(dt.durability_kind),
                 .liveliness = qosLiveliness(dt.liveliness_kind),

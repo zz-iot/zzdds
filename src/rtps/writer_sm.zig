@@ -550,10 +550,18 @@ pub const StatefulWriter = struct {
     /// otherwise know the target is gone.
     pub fn stopHeartbeat(self: *Self) void {
         self.hb_stopping.store(true, .release);
-        if (self.hb_thread) |t| {
-            t.join();
-            self.hb_thread = null;
-        }
+        // hb_thread itself is mu-guarded (addMatchedReader reads/writes it
+        // under mu too, at its own spawn site) -- read-and-clear it under
+        // mu, then join outside the lock. Joining while holding mu would
+        // risk deadlock: heartbeatThread's own loop briefly reacquires mu
+        // (via sendHeartbeat/checkProbeDeadlines/checkConnectionGenerations)
+        // between hb_stopping checks, so it needs mu free to ever notice
+        // hb_stopping and return.
+        self.mu.lock();
+        const maybe_thread = self.hb_thread;
+        self.hb_thread = null;
+        self.mu.unlock();
+        if (maybe_thread) |t| t.join();
     }
 
     pub fn deinit(self: *Self) void {
