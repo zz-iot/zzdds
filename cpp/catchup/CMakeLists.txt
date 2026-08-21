@@ -26,17 +26,17 @@ add_custom_command(
 )
 add_custom_target(generate_catchup_types DEPENDS "${GENERATED_DIR}/catchup_sample.hpp" "${GENERATED_DIR}/catchup_sample_cdr.cpp")
 
-add_library(dcps_impl STATIC
+add_library(catchup_dcps_impl STATIC
     "${ZZDDS_DCPS_IMPL_CPP}"
     "${ZZDDS_ZZDDS_IMPL_CPP}"
     "${GENERATED_DIR}/catchup_sample_cdr.cpp"
 )
-add_dependencies(dcps_impl generate_catchup_types)
-target_include_directories(dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+add_dependencies(catchup_dcps_impl generate_catchup_types)
+target_include_directories(catchup_dcps_impl PUBLIC "${GENERATED_DIR}")
+target_link_libraries(catchup_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(catchup_pub src/publisher.cpp)
-target_link_libraries(catchup_pub PRIVATE dcps_impl ZZDDS::zzdds)
+target_link_libraries(catchup_pub PRIVATE catchup_dcps_impl ZZDDS::zzdds)
 
 add_executable(catchup_sub src/subscriber.cpp)
-target_link_libraries(catchup_sub PRIVATE dcps_impl ZZDDS::zzdds)
+target_link_libraries(catchup_sub PRIVATE catchup_dcps_impl ZZDDS::zzdds)

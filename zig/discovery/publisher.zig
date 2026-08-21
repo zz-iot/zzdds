@@ -11,10 +11,12 @@
 //! minimal reliable write loop (3 samples) as hello_world/participant-config,
 //! to prove the participant/writer still work normally.
 //!
-//! `topic_data`/`subscription_data`'s string fields are *borrowed* slices
-//! owned by zzdds internally (valid for the entity's lifetime) -- unlike
-//! participant-config's `DomainParticipantConfig` round-trip, nothing here
-//! is caller-owned, so nothing is `.deinit()`'d.
+//! `topic_data`/`subscription_data` are fresh, caller-owned copies -- like
+//! participant-config's `DomainParticipantConfig` round-trip, each is
+//! `.deinit(std.heap.c_allocator)`'d after use (always c_allocator here,
+//! regardless of this process's own DebugAllocator: see
+//! `vtGetDiscoveredTopicData`'s comment in zzdds's `src/dcps/participant.zig`
+//! for why).
 //!
 //! Required stdout markers: "Create topic:", "Create writer for topic:",
 //! "Discovery OK (participant):", "on_reliable_reader_ready",
@@ -126,7 +128,15 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
         var found = false;
+        // Reused across every iteration below, not re-declared per handle:
+        // safe because get_discovered_topic_data() itself frees whatever
+        // topic_data already holds before writing the next result (see
+        // vtGetDiscoveredTopicData's comment in zzdds's
+        // src/dcps/participant.zig) -- a failed lookup (RETCODE_BAD_PARAMETER)
+        // leaves topic_data untouched, so this defer always cleans up
+        // exactly one live result, never more.
         var topic_data: DDS.TopicBuiltinTopicData = .{};
+        defer topic_data.deinit(std.heap.c_allocator);
         for (handles._buffer.?[0..handles._length]) |h| {
             if (dp.get_discovered_topic_data(&topic_data, h) != DDS.RETCODE_OK) continue;
             if (std.mem.eql(u8, topic_data.name, TOPIC_NAME)) {
@@ -199,6 +209,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
         var sub_data: DDS.SubscriptionBuiltinTopicData = .{};
+        defer sub_data.deinit(std.heap.c_allocator);
         if (dw.get_matched_subscription_data(&sub_data, handles._buffer.?[0]) != DDS.RETCODE_OK) {
             std.debug.print("FAIL: get_matched_subscription_data() failed\n", .{});
             std.process.exit(1);

@@ -8,9 +8,10 @@
 //! loop (3 samples) as hello_world/participant-config, to prove the reader
 //! still works normally.
 //!
-//! `publication_data`'s string fields are *borrowed* slices owned by zzdds
-//! internally (valid for the entity's lifetime) -- nothing here is
-//! caller-owned, so nothing is `.deinit()`'d.
+//! `publication_data` is a fresh, caller-owned copy, `.deinit(std.heap.
+//! c_allocator)`'d after use (always c_allocator, regardless of this
+//! process's own DebugAllocator: see `vtGetMatchedPubData`'s comment in
+//! zzdds's `src/dcps/reader.zig` for why).
 //!
 //! Required stdout markers: "Create topic:", "Create reader for topic:",
 //! "Discovery OK (reader):", "Subscriber: received count=", "Subscriber:
@@ -164,6 +165,7 @@ pub fn main(init: std.process.Init) !void {
         sleepNs(io, POLL_PERIOD_NS);
     }
     var pub_data: DDS.PublicationBuiltinTopicData = .{};
+    defer pub_data.deinit(std.heap.c_allocator);
     if (dr.get_matched_publication_data(&pub_data, pub_handles._buffer.?[0]) != DDS.RETCODE_OK) {
         std.debug.print("FAIL: get_matched_publication_data() failed\n", .{});
         std.process.exit(1);

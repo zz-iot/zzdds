@@ -12,5 +12,12 @@
 cmake_minimum_required(VERSION 3.14)
 project(zzdds_c_examples)
 
+add_subdirectory(catchup)
 add_subdirectory(custom-allocator)
+add_subdirectory(discovery)
+add_subdirectory(hello_world)
+add_subdirectory(participant-config)
+add_subdirectory(presence)
+add_subdirectory(registry)
 add_subdirectory(shape)
+add_subdirectory(waitset)

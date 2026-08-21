@@ -26,17 +26,17 @@ add_custom_command(
 )
 add_custom_target(generate_registry_types DEPENDS "${GENERATED_DIR}/registry_sample.hpp" "${GENERATED_DIR}/registry_sample_cdr.cpp")
 
-add_library(dcps_impl STATIC
+add_library(registry_dcps_impl STATIC
     "${ZZDDS_DCPS_IMPL_CPP}"
     "${ZZDDS_ZZDDS_IMPL_CPP}"
     "${GENERATED_DIR}/registry_sample_cdr.cpp"
 )
-add_dependencies(dcps_impl generate_registry_types)
-target_include_directories(dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+add_dependencies(registry_dcps_impl generate_registry_types)
+target_include_directories(registry_dcps_impl PUBLIC "${GENERATED_DIR}")
+target_link_libraries(registry_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(registry_pub src/publisher.cpp)
-target_link_libraries(registry_pub PRIVATE dcps_impl ZZDDS::zzdds)
+target_link_libraries(registry_pub PRIVATE registry_dcps_impl ZZDDS::zzdds)
 
 add_executable(registry_sub src/subscriber.cpp)
-target_link_libraries(registry_sub PRIVATE dcps_impl ZZDDS::zzdds)
+target_link_libraries(registry_sub PRIVATE registry_dcps_impl ZZDDS::zzdds)

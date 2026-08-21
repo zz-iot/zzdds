@@ -59,19 +59,19 @@ add_custom_target(generate_waitset_sample_types DEPENDS "${GENERATED_DIR}/waitse
 # zzdds's own pre-generated DCPS entity implementation, compiled directly by
 # consumers -- see cpp/hello_world/CMakeLists.txt's matching comment
 # ("three-artifact model": shared lib + these two generated .cpp files + headers).
-add_library(dcps_impl STATIC
+add_library(waitset_dcps_impl STATIC
     "${ZZDDS_DCPS_IMPL_CPP}"
     "${ZZDDS_ZZDDS_IMPL_CPP}"
     "${GENERATED_DIR}/waitset_sample_cdr.cpp"
 )
-add_dependencies(dcps_impl generate_waitset_sample_types)
-target_include_directories(dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+add_dependencies(waitset_dcps_impl generate_waitset_sample_types)
+target_include_directories(waitset_dcps_impl PUBLIC "${GENERATED_DIR}")
+target_link_libraries(waitset_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 find_package(Threads REQUIRED)
 
 add_executable(waitset_pub src/publisher.cpp)
-target_link_libraries(waitset_pub PRIVATE dcps_impl ZZDDS::zzdds Threads::Threads)
+target_link_libraries(waitset_pub PRIVATE waitset_dcps_impl ZZDDS::zzdds Threads::Threads)
 
 add_executable(waitset_sub src/subscriber.cpp)
-target_link_libraries(waitset_sub PRIVATE dcps_impl ZZDDS::zzdds Threads::Threads)
+target_link_libraries(waitset_sub PRIVATE waitset_dcps_impl ZZDDS::zzdds Threads::Threads)

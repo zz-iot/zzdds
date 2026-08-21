@@ -29,17 +29,17 @@ add_custom_target(generate_discovery_ping_types DEPENDS "${GENERATED_DIR}/discov
 # zzdds's own pre-generated DCPS entity implementation, compiled directly by
 # consumers -- see cpp/custom-allocator/CMakeLists.txt's matching comment
 # ("three-artifact model": shared lib + these two generated .cpp files + headers).
-add_library(dcps_impl STATIC
+add_library(discovery_dcps_impl STATIC
     "${ZZDDS_DCPS_IMPL_CPP}"
     "${ZZDDS_ZZDDS_IMPL_CPP}"
     "${GENERATED_DIR}/discovery_ping_cdr.cpp"
 )
-add_dependencies(dcps_impl generate_discovery_ping_types)
-target_include_directories(dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+add_dependencies(discovery_dcps_impl generate_discovery_ping_types)
+target_include_directories(discovery_dcps_impl PUBLIC "${GENERATED_DIR}")
+target_link_libraries(discovery_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(discovery_pub src/publisher.cpp)
-target_link_libraries(discovery_pub PRIVATE dcps_impl ZZDDS::zzdds)
+target_link_libraries(discovery_pub PRIVATE discovery_dcps_impl ZZDDS::zzdds)
 
 add_executable(discovery_sub src/subscriber.cpp)
-target_link_libraries(discovery_sub PRIVATE dcps_impl ZZDDS::zzdds)
+target_link_libraries(discovery_sub PRIVATE discovery_dcps_impl ZZDDS::zzdds)

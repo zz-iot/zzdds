@@ -36,14 +36,14 @@ add_custom_target(generate_sensor_types DEPENDS "${GENERATED_DIR}/sensor.hpp" "$
 # Topic, Publisher/Subscriber, DataWriter/DataReader, ...) -- compiled by
 # consumers directly, not baked into libzzdds.so (the three-artifact model:
 # shared lib + these two generated .cpp files + headers).
-add_library(dcps_impl STATIC
+add_library(custom_allocator_dcps_impl STATIC
     "${ZZDDS_DCPS_IMPL_CPP}"
     "${ZZDDS_ZZDDS_IMPL_CPP}"
     "${GENERATED_DIR}/sensor_cdr.cpp"
 )
-add_dependencies(dcps_impl generate_sensor_types)
-target_include_directories(dcps_impl PUBLIC "${GENERATED_DIR}")
-target_link_libraries(dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
+add_dependencies(custom_allocator_dcps_impl generate_sensor_types)
+target_include_directories(custom_allocator_dcps_impl PUBLIC "${GENERATED_DIR}")
+target_link_libraries(custom_allocator_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_library(static_pool_allocator STATIC src/static_pool_allocator.c)
 target_include_directories(static_pool_allocator PUBLIC src)
@@ -64,15 +64,15 @@ target_include_directories(noalloc_guard_client PUBLIC src)
 target_link_libraries(noalloc_guard_client PUBLIC ${CMAKE_DL_LIBS})
 
 add_executable(publisher src/publisher.cpp)
-target_link_libraries(publisher PRIVATE dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
+target_link_libraries(publisher PRIVATE custom_allocator_dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
 
 add_executable(subscriber src/subscriber.cpp)
-target_link_libraries(subscriber PRIVATE dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
+target_link_libraries(subscriber PRIVATE custom_allocator_dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
 
 # Narrow regression check for the zzdds_process_configure_from_file bootstrap
 # fix specifically -- see src/bootstrap_noalloc_check.cpp.
 add_executable(bootstrap_noalloc_check src/bootstrap_noalloc_check.cpp)
-target_link_libraries(bootstrap_noalloc_check PRIVATE dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
+target_link_libraries(bootstrap_noalloc_check PRIVATE custom_allocator_dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
 
 # publisher/subscriber both run with this directory as their cwd; zzdds's
 # ambient config resolution looks for "./zzdds.toml" the first time a factory

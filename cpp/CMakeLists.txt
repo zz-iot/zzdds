@@ -16,8 +16,15 @@
 cmake_minimum_required(VERSION 3.16)
 project(zzdds_cpp_examples)
 
+add_subdirectory(catchup)
 add_subdirectory(custom-allocator)
+add_subdirectory(discovery)
+add_subdirectory(hello_world)
+add_subdirectory(participant-config)
+add_subdirectory(presence)
+add_subdirectory(registry)
 add_subdirectory(shape)
+add_subdirectory(waitset)
 
 # opencv_zzdds additionally needs OpenCV, which isn't available on every
 # build machine (e.g. CI images without libopencv-dev). Probe for it here,
