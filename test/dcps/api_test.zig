@@ -431,6 +431,7 @@ test "DCPS: get_discovered_topic_data returns name and type_name for discovered 
     try testing.expectEqual(@as(u32, 1), handles._length);
 
     var data = DDS.TopicBuiltinTopicData{};
+    defer data.deinit(std.heap.c_allocator);
     try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles._buffer.?[0]));
     try testing.expectEqualStrings("DiscTopic", data.name);
     try testing.expectEqualStrings("DiscType", data.type_name);
@@ -510,6 +511,7 @@ test "DCPS: get_discovered_topics and get_discovered_topic_data work for locally
     try testing.expectEqual(@as(u32, 1), handles._length);
 
     var data = DDS.TopicBuiltinTopicData{};
+    defer data.deinit(std.heap.c_allocator);
     try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topic_data(dp.ptr, &data, handles._buffer.?[0]));
     try testing.expectEqualStrings("LocalTopic", data.name);
     try testing.expectEqualStrings("LocalType", data.type_name);

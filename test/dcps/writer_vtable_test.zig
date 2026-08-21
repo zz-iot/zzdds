@@ -573,6 +573,7 @@ test "get_matched_subscription_data: returns data for matched reader" {
     try testing.expectEqual(@as(u32, 1), handles._length);
 
     var data: DDS.SubscriptionBuiltinTopicData = .{};
+    defer data.deinit(std.heap.c_allocator);
     const rc = dw.vtable.get_matched_subscription_data(dw.ptr, &data, handles._buffer.?[0]);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqualStrings("WVTopic", data.topic_name);
