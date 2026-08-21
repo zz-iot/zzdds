@@ -896,11 +896,20 @@ pub const DataWriterImpl = struct {
                 // would otherwise get double-freed at teardown). Always
                 // c_allocator, decoupling this from self.alloc, matching
                 // factoryGetDefaultParticipantConfig's identical reasoning.
+                //
+                // Duped into locals first, and *data's prior content freed
+                // only once both dupes have succeeded -- see
+                // vtGetDiscoveredTopicData's matching comment for why.
+                const topic_name = std.heap.c_allocator.dupe(u8, self.topic_name) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+                const type_name = std.heap.c_allocator.dupe(u8, self.type_name) catch {
+                    std.heap.c_allocator.free(topic_name);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
                 data.deinit(std.heap.c_allocator);
                 data.* = .{};
                 data.key = guidToBuiltinKey(guid);
-                data.topic_name = std.heap.c_allocator.dupe(u8, self.topic_name) catch return DDS.RETCODE_OUT_OF_RESOURCES;
-                data.type_name = std.heap.c_allocator.dupe(u8, self.type_name) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+                data.topic_name = topic_name;
+                data.type_name = type_name;
                 return DDS.RETCODE_OK;
             }
         }

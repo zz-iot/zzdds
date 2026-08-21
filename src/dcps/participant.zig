@@ -3798,11 +3798,26 @@ pub const DomainParticipantImpl = struct {
             // discovered_topics list still owns and frees again at teardown.
             // Always c_allocator, decoupling this from self.alloc, matching
             // factoryGetDefaultParticipantConfig's identical reasoning.
+            //
+            // Duped into locals first, not directly into the struct literal
+            // below: a struct literal only commits once every field has been
+            // evaluated, so if the type_name dupe failed after the name dupe
+            // already succeeded, returning from inside the literal would both
+            // leak that first allocation and leave *data's old (about-to-be
+            // freed) content undisturbed but never actually freed. Freeing
+            // *data's prior content is deferred until both dupes have
+            // succeeded, for the same reason: an early OOM return must leave
+            // *data exactly as the caller last saw it, not half-freed.
+            const name = std.heap.c_allocator.dupe(u8, dt.topic_name) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+            const type_name = std.heap.c_allocator.dupe(u8, dt.type_name) catch {
+                std.heap.c_allocator.free(name);
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
             data.deinit(std.heap.c_allocator);
             data.* = .{
                 .key = topicNameToKey(dt.topic_name),
-                .name = std.heap.c_allocator.dupe(u8, dt.topic_name) catch return DDS.RETCODE_OUT_OF_RESOURCES,
-                .type_name = std.heap.c_allocator.dupe(u8, dt.type_name) catch return DDS.RETCODE_OUT_OF_RESOURCES,
+                .name = name,
+                .type_name = type_name,
                 .reliability = qosReliability(dt.reliability_kind),
                 .durability = qosDurability(dt.durability_kind),
                 .liveliness = qosLiveliness(dt.liveliness_kind),
