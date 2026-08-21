@@ -605,7 +605,12 @@ test "DataReader: get_matched_publication_data returns data for matched writer" 
     _ = dr_dds.vtable.get_matched_publications(dr_dds.ptr, &handles);
     try testing.expectEqual(@as(u32, 1), handles._length);
 
-    var data: DDS.PublicationBuiltinTopicData = undefined;
+    // Zero-initialized, matching the real calling convention every caller
+    // (C-ABI FromCAbi, zig/discovery) follows: vtGetMatchedPubData frees
+    // whatever is already in *data before writing fresh content, so passing
+    // undefined here would crash trying to free garbage.
+    var data: DDS.PublicationBuiltinTopicData = .{};
+    defer data.deinit(std.heap.c_allocator);
     const rc = dr_dds.vtable.get_matched_publication_data(dr_dds.ptr, &data, handles._buffer.?[0]);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
     try testing.expectEqualStrings("RdrPubTopic", data.topic_name);

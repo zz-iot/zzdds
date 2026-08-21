@@ -2688,10 +2688,18 @@ pub const DataReaderImpl = struct {
             return DDS.RETCODE_BAD_PARAMETER;
         for (guids.items) |guid| {
             if (writer_mod.guidToHandle(guid) == handle) {
+                // topic_name/type_name must be duped into fresh, caller-owned
+                // storage here, not aliased to topic_desc's own strings directly
+                // -- see DomainParticipantImpl.vtGetDiscoveredTopicData's matching
+                // comment for why (the topic description's own storage would
+                // otherwise get double-freed at teardown). Always c_allocator,
+                // decoupling this from self.alloc, matching
+                // factoryGetDefaultParticipantConfig's identical reasoning.
+                data.deinit(std.heap.c_allocator);
                 data.* = .{};
                 data.key = writer_mod.guidToBuiltinKey(guid);
-                data.topic_name = self.topic_desc.get_name();
-                data.type_name = self.topic_desc.get_type_name();
+                data.topic_name = std.heap.c_allocator.dupe(u8, self.topic_desc.get_name()) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+                data.type_name = std.heap.c_allocator.dupe(u8, self.topic_desc.get_type_name()) catch return DDS.RETCODE_OUT_OF_RESOURCES;
                 return DDS.RETCODE_OK;
             }
         }
