@@ -596,7 +596,7 @@ static void print_not_alive(const char *topic_name, const char *color, uint32_t 
 
 typedef struct {
     ShapeType v;
-    zzdds_sample_info i;
+    DDS_SampleInfo i;
 } ShapeSample;
 
 static int sample_cmp_by_handle(const void *a, const void *b) {
@@ -713,7 +713,7 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
                  * ordering, applied here via the sort. */
                 ShapeSample buf[MAX_SAMPLES_PER_READ];
                 ShapeType values[MAX_SAMPLES_PER_READ];
-                zzdds_sample_info infos[MAX_SAMPLES_PER_READ];
+                DDS_SampleInfo infos[MAX_SAMPLES_PER_READ];
                 memset(values, 0, sizeof(values));
                 memset(infos, 0, sizeof(infos));
                 int got = ShapeTypeDataReader_read_n(&typed_readers[ti], values, infos, MAX_SAMPLES_PER_READ,
@@ -729,7 +729,7 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
 
                 for (int k = 0; k < got; k++) {
                     ShapeType *value = &buf[k].v;
-                    zzdds_sample_info *info = &buf[k].i;
+                    DDS_SampleInfo *info = &buf[k].i;
 
                     if (!info->valid_data ||
                         info->instance_state == DDS_NOT_ALIVE_NO_WRITERS_INSTANCE_STATE ||
@@ -761,7 +761,7 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
                  * FIFO take() delivery order instead. */
                 for (;;) {
                     ShapeType value;
-                    zzdds_sample_info info;
+                    DDS_SampleInfo info;
                     memset(&value, 0, sizeof(value));
                     memset(&info, 0, sizeof(info));
                     uint8_t cdr_buf[512];

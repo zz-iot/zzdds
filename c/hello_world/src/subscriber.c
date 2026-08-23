@@ -39,7 +39,7 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
 
     for (;;) {
         HelloWorld value;
-        zzdds_sample_info info;
+        DDS_SampleInfo info;
         memset(&value, 0, sizeof(value));
         memset(&info, 0, sizeof(info));
         uint8_t buf[512];

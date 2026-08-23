@@ -4,7 +4,7 @@
 //! the example -- see ../README.md's "Findings" section for the exact error
 //! this is supposed to produce and why it matters. `keep_past_drop` below
 //! tries to smuggle a loaned sample's data slice out past the point where
-//! `LoanedSample::drop` (which calls `zzdds_return_loaned_raw`) runs --
+//! `LoanedSample::drop` (which calls `DDS_DataReader_return_loan_raw`) runs --
 //! exactly the "read the buffer after the loan was returned" bug this
 //! spike's whole design (`.data()` borrowing from `&self`, not from the
 //! outer `'a` reader lifetime) exists to make impossible, not just
@@ -28,10 +28,10 @@ fn keep_past_drop(reader: &DataReaderHandle) {
         // Drop impl) goes away at the closing brace below, before
         // `data_ref` is ever read.
         data_ref = loaned.data();
-    } // <- LoanedSample::drop runs here: zzdds_return_loaned_raw() fires for real
+    } // <- LoanedSample::drop runs here: DDS_DataReader_return_loan_raw() fires for real
 
     // If the line above had compiled, this would be a genuine
-    // use-after-return_loan -- reading through a pointer zzdds has already
+    // use-after-return_loan_raw -- reading through a pointer zzdds has already
     // told the CDR layer it's free to reuse or has already freed. It must
     // never be reachable to write in working code.
     println!("{:?}", data_ref);

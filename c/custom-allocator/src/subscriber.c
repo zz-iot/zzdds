@@ -138,7 +138,7 @@ int main(void) {
          * dispose/unregister-only sample (key data, no real payload) is
          * never misread as one with real data. */
         SensorSample out;
-        zzdds_sample_info info;
+        DDS_SampleInfo info;
         memset(&out, 0, sizeof(out));
         memset(&info, 0, sizeof(info));
         uint8_t buf[256];
@@ -156,7 +156,7 @@ int main(void) {
     int received_logs = 0;
     for (int elapsed_ms = 0; elapsed_ms < MAX_WAIT_SECONDS * 1000 && received_logs < EXPECTED_LOGS; elapsed_ms += 50) {
         SensorLog out;
-        zzdds_sample_info info;
+        DDS_SampleInfo info;
         memset(&out, 0, sizeof(out));
         memset(&info, 0, sizeof(info));
         uint8_t buf[512];

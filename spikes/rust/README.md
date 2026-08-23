@@ -2,20 +2,39 @@
 
 Not a Rust binding, not the `zig-ffi` backend. A throwaway probe answering
 one specific question before the binding design review commits to
-anything: does zzdds's existing `take_loaned`/`return_loan` C-ABI contract
-(a pointer valid until an explicit release call) map cleanly onto a real,
-borrow-checker-enforced Rust lifetime — the `zig-ffi` mode's whole value
-proposition — or does it need `unsafe` escape hatches that quietly defeat
-the point?
+anything: does zzdds's loan C-ABI contract (a pointer valid until an
+explicit release call) map cleanly onto a real, borrow-checker-enforced
+Rust lifetime — the `zig-ffi` mode's whole value proposition — or does it
+need `unsafe` escape hatches that quietly defeat the point?
 
-Deliberately tested against the **existing** loan API, which is a plain
-heap allocation today, not real zero-copy/SHMEM (see
-`zzdds/docs/roadmap.md`'s note on this, reachable via zidl's own roadmap
-"Binding design review" section). That's not a limitation of this spike —
-the lifetime/safety question is about the *contract shape*, which is
-identical regardless of what backs the pointer. Real zero-copy is a
-separate, larger zzdds-core question; this spike doesn't depend on it and
-isn't blocked by it.
+**Migration note**: originally probed against the old hand-written
+`zzdds_take_loaned_raw`/`zzdds_return_loaned_raw` C-ABI family
+(`zzdds/src/c_abi/bootstrap.zig`). That family has since been deleted,
+superseded by real `dcps.idl`-generated ops
+(`DDS_DataReader_take_raw`/`DDS_DataReader_return_loan_raw`,
+`DDS_DataWriter_write_raw`) generated uniformly across all four zidl
+backends — see `zzdds/docs/design/raw-loan-api.md`. This spike (`src/ffi.rs`,
+`src/loan.rs`, `src/main.rs`) has been migrated to the new ops; the "Findings"
+section below is preserved as the historical record of what the original
+probe found against the old API (finding 1's convention bug in particular —
+the old function-local return-code convention no longer exists, since the
+whole hand-written family it applied to is gone). One real shape change
+from the migration: `take_raw` is batch-oriented at the C ABI
+(`cdr_payloads`/`sample_infos` are always sequences, one
+independently-located descriptor per sample, never a single-sample-shaped
+op — see the design doc's zero-copy rationale) where the old
+`zzdds_take_loaned_raw` returned exactly one sample directly. `LoanedSample`
+now deals with a length-1 batch internally (`src/loan.rs`'s own doc comment
+has the detail) — the lifetime-safety question this spike exists to answer
+is unchanged, only the internal FFI shape got bigger.
+
+Deliberately tested against the loan API's current heap-allocated
+implementation, not real zero-copy/SHMEM (see `zzdds/docs/roadmap.md`'s note
+on this, reachable via zidl's own roadmap "Binding design review" section).
+That's not a limitation of this spike — the lifetime/safety question is
+about the *contract shape*, which is identical regardless of what backs the
+pointer. Real zero-copy is a separate, larger zzdds-core question; this
+spike doesn't depend on it and isn't blocked by it.
 
 No `bindgen`, no external crates — `src/ffi.rs` hand-declares the small
 slice of the C-ABI needed (`extern "C"` + `#[repr(C)]`), same spirit as the
@@ -38,8 +57,9 @@ cargo build --example escape_attempt       # MUST fail to compile -- see Finding
 ## What's here
 
 - **`src/loan.rs`** — the thing under test: `LoanedSample<'a>`, a
-  `MutexGuard`/`Ref`-shaped RAII guard around `zzdds_take_loaned_raw`/
-  `zzdds_return_loaned_raw`. Two deliberate design choices, not incidental:
+  `MutexGuard`/`Ref`-shaped RAII guard around `DDS_DataReader_take_raw`
+  (loan mode)/`DDS_DataReader_return_loan_raw`. Two deliberate design
+  choices, not incidental:
   `return_loan` happens in `Drop`, not a method the caller has to remember
   to call (stronger than C/C++/Java's manual contract — `Drop` still runs
   on an early return or unwind, where a forgotten call would leak); and
@@ -60,6 +80,14 @@ cargo build --example escape_attempt       # MUST fail to compile -- see Finding
   revisited later.
 
 ## Findings
+
+(Findings 1-2 below describe the original probe against the now-deleted
+`zzdds_take_loaned_raw`/`zzdds_return_loaned_raw` hand-written family --
+preserved as historical record per the migration note above. Finding 2's
+core result -- the loan contract maps cleanly onto Rust's borrow checker --
+was re-confirmed after the migration to the real generated `take_raw`/
+`return_loan_raw` ops: `cargo run` and `cargo build --example
+escape_attempt` both still behave exactly as described below.)
 
 **1. Real, successful loan cycle works end-to-end against the live C-ABI,
 first correction found by actually running it rather than reasoning about

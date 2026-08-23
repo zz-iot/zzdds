@@ -134,7 +134,7 @@ int main() {
         // defensively: it's zeroed first so a dispose/unregister-only sample
         // (key data, no real payload) is never misread as one with real data.
         SensorSampleDataReader::Sample sample;
-        sample.info = zzdds_sample_info{};
+        sample.info = DDS_SampleInfo{};
         uint8_t buf[256];
         size_t cdr_len = 0;
         int rc = typed_reader.take(sample, buf, sizeof(buf), &cdr_len);
@@ -152,7 +152,7 @@ int main() {
     for (int elapsed_ms = 0; elapsed_ms < MAX_WAIT_SECONDS * 1000 && received_logs < EXPECTED_LOGS;
          elapsed_ms += 50) {
         SensorLogDataReader::Sample sample;
-        sample.info = zzdds_sample_info{};
+        sample.info = DDS_SampleInfo{};
         uint8_t buf[512];
         size_t cdr_len = 0;
         int rc = log_reader.take(sample, buf, sizeof(buf), &cdr_len);

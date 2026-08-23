@@ -40,8 +40,8 @@ just trust a written conclusion indefinitely.
 - `haskell/` — hand-declared `foreign import ccall` probes: GHC RTS thread
   registration for a zzdds-internal callback thread, and `StablePtr`-based
   ctx lifetime.
-- `rust/` — does zzdds's existing `take_loaned`/`return_loan` loan contract
-  map onto a real borrow-checker-enforced Rust lifetime.
+- `rust/` — does zzdds's loan contract (`take_raw`/`read_raw` in loan mode,
+  `return_loan_raw`) map onto a real borrow-checker-enforced Rust lifetime.
 
 See each subdirectory's own `README.md` for its exact questions, findings,
 and how to build/run it.

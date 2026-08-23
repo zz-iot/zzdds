@@ -266,14 +266,14 @@ int main(int argc, char **argv) {
          * *label* from each sample's own already-deserialized `priority`
          * field rather than trusting which call it came from. */
         WaitsetSample high_values[EXPECTED_SAMPLES];
-        zzdds_sample_info high_infos[EXPECTED_SAMPLES];
+        DDS_SampleInfo high_infos[EXPECTED_SAMPLES];
         memset(high_values, 0, sizeof(high_values));
         memset(high_infos, 0, sizeof(high_infos));
         int n_high = WaitsetSampleDataReader_take_w_condition(
             &reader, DDS_QueryCondition_as_DDS_ReadCondition(qc_cond), high_values, high_infos, EXPECTED_SAMPLES);
 
         WaitsetSample low_values[EXPECTED_SAMPLES];
-        zzdds_sample_info low_infos[EXPECTED_SAMPLES];
+        DDS_SampleInfo low_infos[EXPECTED_SAMPLES];
         memset(low_values, 0, sizeof(low_values));
         memset(low_infos, 0, sizeof(low_infos));
         int n_low = WaitsetSampleDataReader_take_n(&reader, low_values, low_infos, EXPECTED_SAMPLES,

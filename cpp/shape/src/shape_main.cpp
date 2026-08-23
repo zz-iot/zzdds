@@ -604,7 +604,7 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
                  * --take-read still picks FIFO vs grouped-by-instance
                  * ordering, applied here via the sort. */
                 std::vector<::ShapeType> values(MAX_SAMPLES_PER_READ);
-                std::vector<zzdds_sample_info> infos(MAX_SAMPLES_PER_READ);
+                std::vector<DDS_SampleInfo> infos(MAX_SAMPLES_PER_READ);
                 int got = typed_readers[ti]->read_n(values.data(), infos.data(), MAX_SAMPLES_PER_READ,
                                                      ::DDS::NOT_READ_SAMPLE_STATE, ::DDS::ANY_VIEW_STATE, ::DDS::ANY_INSTANCE_STATE);
                 if (got < 0) got = 0;
@@ -619,7 +619,7 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
 
                 for (int idx : order) {
                     ::ShapeType &value = values[static_cast<size_t>(idx)];
-                    zzdds_sample_info &info = infos[static_cast<size_t>(idx)];
+                    DDS_SampleInfo &info = infos[static_cast<size_t>(idx)];
 
                     if (!info.valid_data ||
                         info.instance_state == ::DDS::NOT_ALIVE_NO_WRITERS_INSTANCE_STATE ||
@@ -651,7 +651,7 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
                  * FIFO take() delivery order instead. */
                 for (;;) {
                     ShapeTypeDataReader::Sample sample;
-                    sample.info = zzdds_sample_info{};
+                    sample.info = DDS_SampleInfo{};
                     uint8_t buf[512];
                     size_t cdr_len = 0;
 

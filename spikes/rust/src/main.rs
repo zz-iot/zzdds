@@ -85,17 +85,32 @@ fn main() {
         // matching still gets delivered once matching completes -- but
         // write repeatedly rather than betting the whole probe on getting
         // the initial discovery wait exactly right on any given machine.
+        let key_hash_seq = ffi::DDS_OctetSeq {
+            _maximum: 16,
+            _length: 16,
+            _buffer: key_hash.as_ptr() as *mut u8,
+            _release: false,
+        };
+        let source_timestamp = ffi::DDS_Time_t { sec: ffi::DDS_TIME_INVALID_SEC, nanosec: ffi::DDS_TIME_INVALID_NSEC };
+
         let loaned_opt = 'outer: loop {
             let mut wrote_any = false;
             for _ in 0..15 {
-                let rc = ffi::zzdds_write_raw(
+                let payload_seq = ffi::DDS_OctetSeq {
+                    _maximum: payload.len() as u32,
+                    _length: payload.len() as u32,
+                    _buffer: payload.as_mut_ptr(),
+                    _release: false,
+                };
+                let rc = ffi::DDS_DataWriter_write_raw(
                     writer,
-                    key_hash.as_ptr(),
+                    &key_hash_seq,
                     ffi::DDS_HANDLE_NIL,
-                    payload.as_ptr(),
-                    payload.len(),
+                    &payload_seq,
+                    ffi::DDS_WriteKind::ALIVE_WRITE_KIND,
+                    &source_timestamp,
                 );
-                assert_eq!(rc, ffi::DDS_RETCODE_OK, "zzdds_write_raw failed rc={}", rc);
+                assert_eq!(rc, ffi::DDS_RETCODE_OK, "DDS_DataWriter_write_raw failed rc={}", rc);
                 if !wrote_any {
                     println!("[main] wrote {} bytes (retrying until matched+delivered)", payload.len());
                     wrote_any = true;

@@ -270,13 +270,13 @@ int main(int argc, char **argv) {
         // sample's own already-deserialized `priority` field rather than
         // trusting which call it came from.
         std::vector<WaitsetSample> high_values(EXPECTED_SAMPLES);
-        std::vector<zzdds_sample_info> high_infos(EXPECTED_SAMPLES);
+        std::vector<DDS_SampleInfo> high_infos(EXPECTED_SAMPLES);
         int n_high = reader.take_w_condition(
             DDS_QueryCondition_as_DDS_ReadCondition(qc_cond->native_handle()),
             high_values.data(), high_infos.data(), EXPECTED_SAMPLES);
 
         std::vector<WaitsetSample> low_values(EXPECTED_SAMPLES);
-        std::vector<zzdds_sample_info> low_infos(EXPECTED_SAMPLES);
+        std::vector<DDS_SampleInfo> low_infos(EXPECTED_SAMPLES);
         int n_low = reader.take_n(low_values.data(), low_infos.data(), EXPECTED_SAMPLES,
                                    ::DDS::ANY_SAMPLE_STATE, ::DDS::ANY_VIEW_STATE, ::DDS::ANY_INSTANCE_STATE);
 
