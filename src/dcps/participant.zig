@@ -3473,6 +3473,27 @@ pub const DomainParticipantImpl = struct {
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
         const self = cast(ctx);
+        // Spec §2.2.2.2.1.18: PRECONDITION_NOT_MET propagates up from any
+        // contained entity's own outstanding preconditions -- check every
+        // subscriber (read-loans) and publisher (write-loans) before
+        // touching anything. Topics have no loan-related precondition, so
+        // that branch needs no check.
+        self.mu.lock();
+        for (self.subscribers.items) |s| {
+            const precondition = s.checkDeleteContainedPrecondition();
+            if (precondition != DDS.RETCODE_OK) {
+                self.mu.unlock();
+                return precondition;
+            }
+        }
+        for (self.publishers.items) |p| {
+            const precondition = p.checkDeleteContainedPrecondition();
+            if (precondition != DDS.RETCODE_OK) {
+                self.mu.unlock();
+                return precondition;
+            }
+        }
+        self.mu.unlock();
         // Take ownership of entity lists under the lock.
         var pubs: std.ArrayListUnmanaged(*publisher_mod.PublisherImpl) = undefined;
         var subs: std.ArrayListUnmanaged(*subscriber_mod.SubscriberImpl) = undefined;

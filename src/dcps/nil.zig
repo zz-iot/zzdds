@@ -4,17 +4,20 @@
 //! the generated vtable types (DDS.DomainParticipant, DDS.Publisher, etc.)
 //! use non-optional `ptr: *anyopaque`, we provide nil-object vtables that return
 //! RETCODE_ERROR for every method.  The nil entity's `ptr` points to
-//! `nil_storage`, a distinguishable sentinel address.
+//! `zidl_rt.NIL_PTR`, a distinguishable sentinel address shared with
+//! zidl_rt's own C-ABI entity-interface-param null handling (see that
+//! constant's doc comment) -- so a NULL passed for an optional entity
+//! in-param (e.g. dcps.idl's raw op family's `a_condition`) is recognized as
+//! nil by isNil() below too, not just entities this module itself hands out.
 //!
 //! Use `isNil(entity)` to check whether a returned entity is nil.
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const zidl_rt = @import("zidl_rt");
 
-/// Single-byte storage whose address serves as the nil-entity sentinel.
-pub var nil_storage: u8 = 0;
-pub const NIL_PTR: *anyopaque = @ptrCast(&nil_storage);
+pub const NIL_PTR: *anyopaque = zidl_rt.NIL_PTR;
 
 /// True if the entity's ptr is the nil sentinel.
 pub fn isNil(entity: anytype) bool {
@@ -608,6 +611,26 @@ var nil_datawriter_vtable = DDS.DataWriter.Vtable{
             return DDS.RETCODE_ERROR;
         }
     }.f,
+    .write_raw = struct {
+        fn f(_: *anyopaque, _: ?*const DDS.OctetSeq, _: DDS.InstanceHandle_t, _: ?*const DDS.OctetSeq, _: DDS.WriteKind, _: *const DDS.Time_t) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .loan_raw = struct {
+        fn f(_: *anyopaque, _: u32, _: ?*DDS.OctetSeq) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .publish_loan_raw = struct {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeq, _: ?*const DDS.OctetSeq, _: DDS.InstanceHandle_t, _: DDS.WriteKind) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .return_loan_raw = struct {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeq) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
     .deinit = nilDeinit,
     .get_c_abi_handle = nilDatawriterGetCAbiHandle,
     .as_Entity = nilAsEntity,
@@ -721,6 +744,31 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
     }.f,
     .get_matched_publication_data = struct {
         fn f(_: *anyopaque, _: *DDS.PublicationBuiltinTopicData, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .take_raw = struct {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq, _: DDS.InstanceHandle_t, _: DDS.ReadCondition, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: i32) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .read_raw = struct {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq, _: DDS.InstanceHandle_t, _: DDS.ReadCondition, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: i32) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .take_next_instance_raw = struct {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq, _: DDS.InstanceHandle_t, _: DDS.ReadCondition, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: i32) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .read_next_instance_raw = struct {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq, _: DDS.InstanceHandle_t, _: DDS.ReadCondition, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: i32) DDS.ReturnCode_t {
+            return DDS.RETCODE_ERROR;
+        }
+    }.f,
+    .return_loan_raw = struct {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,

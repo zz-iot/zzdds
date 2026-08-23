@@ -64,14 +64,6 @@ public final class ZzddsRuntime {
      */
     public static native int registerTypeSupport(Object participant, String typeName, Class<?> typeClass);
 
-    /** kind: 0 = write (alive), 1 = dispose, 2 = unregister (matches zzdds_write_kind). */
-    public static native int writeRaw(Object writer, int kind, byte[] keyHash, long handle, byte[] payload);
-
-    /** Same as {@link #writeRaw}, plus an explicit source timestamp
-     * (DDS_Time_t's sec/nanosec fields, passed separately since JNI can't
-     * marshal a C struct by value). */
-    public static native int writeRawWTimestamp(Object writer, int kind, byte[] keyHash, long handle, byte[] payload, int sec, int nanosec);
-
     /** Computes the deterministic instance handle for `keyHash` -- the raw
      * path to `register_instance`. zzdds's own instance registration has no
      * side effects beyond this computation (see zzdds_register_instance_raw). */
@@ -86,86 +78,6 @@ public final class ZzddsRuntime {
      * writer-side `lookup_instance`. Returns `DDS_HANDLE_NIL` (0) if no
      * alive write has been made for that key. */
     public static native long lookupInstanceWriterRaw(Object writer, byte[] keyHash);
-
-    /**
-     * Takes/reads one raw (still-encoded) sample. Returns null if none was
-     * available. `handleOut`/`validOut`/`stateOut` must be pre-allocated
-     * 1-element arrays; `maxSize` bounds the receive buffer (a sample larger
-     * than this is dropped — size generously for your topic). `stateOut[0]`
-     * is the sample's raw `SampleInfo.instance_state` bitmask value
-     * (`Dcps.DDS.ALIVE_INSTANCE_STATE`/`NOT_ALIVE_DISPOSED_INSTANCE_STATE`/
-     * `NOT_ALIVE_NO_WRITERS_INSTANCE_STATE`).
-     */
-    public static native byte[] takeRaw(Object reader, int maxSize, long[] handleOut, boolean[] validOut, int[] stateOut);
-
-    public static native byte[] readRaw(Object reader, int maxSize, long[] handleOut, boolean[] validOut, int[] stateOut);
-
-    /**
-     * Takes/reads the next sample of the instance identified by `prev`
-     * (`DDS_HANDLE_NIL`/`0` to start at the first instance), draining that
-     * instance before moving to the next — same semantics as C/C++'s
-     * `take_next_instance`/`read_next_instance`. Returns null if none was
-     * available. `handleOut`/`validOut`/`stateOut` must be pre-allocated
-     * 1-element arrays; `maxSize` bounds the receive buffer, same as
-     * {@link #takeRaw}.
-     */
-    public static native byte[] takeNextInstanceRaw(Object reader, long prev, int maxSize, long[] handleOut, boolean[] validOut, int[] stateOut);
-
-    public static native byte[] readNextInstanceRaw(Object reader, long prev, int maxSize, long[] handleOut, boolean[] validOut, int[] stateOut);
-
-    /**
-     * Batch take/read of up to `max` samples matching the given sample/view/
-     * instance state masks (e.g. {@code Dcps.DDS.ANY_SAMPLE_STATE.value}) —
-     * same semantics as C/C++'s `take_n`/`read_n`. `max` must be positive
-     * (unlike the underlying C ABI, which also accepts <= 0 for "everything
-     * currently available" — not exposed here, since `handlesOut`/
-     * `validsOut` must be sized by the caller *before* the call, which is
-     * only possible when `max` is a known, fixed bound).
-     *
-     * Returns a {@code byte[][]} of `N <= max` raw payloads (`N` is the true
-     * count — may be less than `max` if fewer samples were available).
-     * `handlesOut`/`validsOut` must be pre-allocated to length `max`; only
-     * their first `N` entries are meaningful, parallel to the returned
-     * array. Unlike {@link #takeRaw}, there is no per-sample buffer-size
-     * bound to pass: each sample's buffer is allocated by zzdds core,
-     * sized exactly to that sample's real length.
-     */
-    public static native byte[][] takeNRaw(Object reader, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
-
-    public static native byte[][] readNRaw(Object reader, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
-
-    /**
-     * Batch take/read restricted to one instance -- the raw path to
-     * `take_instance`/`read_instance`. Same masks/`handlesOut`/`validsOut`/
-     * return shape as {@link #takeNRaw}, scoped to `instanceHandle` (a real
-     * instance handle, not `DDS_HANDLE_NIL` -- there is no "no filter"
-     * sentinel here, unlike {@link #takeNRaw}).
-     */
-    public static native byte[][] takeNInstanceRaw(Object reader, long instanceHandle, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
-
-    public static native byte[][] readNInstanceRaw(Object reader, long instanceHandle, int max, int sampleStates, int viewStates, int instanceStates, long[] handlesOut, boolean[] validsOut);
-
-    /**
-     * Batch take/read restricted to a `ReadCondition` (or a `QueryCondition`
-     * upcast via its own generated `as_ReadCondition()`) -- the raw path to
-     * `take_w_condition`/`read_w_condition`. State masks (and, for a
-     * QueryCondition, the query filter) come from `condition` itself. Same
-     * `handlesOut`/`validsOut`/return shape as {@link #takeNRaw}.
-     */
-    public static native byte[][] takeWConditionRaw(Object reader, Object condition, int max, long[] handlesOut, boolean[] validsOut);
-
-    public static native byte[][] readWConditionRaw(Object reader, Object condition, int max, long[] handlesOut, boolean[] validsOut);
-
-    /**
-     * Batch take/read restricted to a `ReadCondition` AND scoped to the
-     * "next instance" after `prev` -- the raw path to
-     * `take_next_instance_w_condition`/`read_next_instance_w_condition`. Per
-     * spec, instance *selection* itself is restricted to instances with a
-     * matching sample, not just the next instance with any sample at all.
-     */
-    public static native byte[][] takeNextInstanceWConditionRaw(Object reader, Object condition, long prev, int max, long[] handlesOut, boolean[] validsOut);
-
-    public static native byte[][] readNextInstanceWConditionRaw(Object reader, Object condition, long prev, int max, long[] handlesOut, boolean[] validsOut);
 
     /** Returns the stored CDR payload for `handle`, or null if no alive
      * sample has arrived for that instance -- the raw path to the

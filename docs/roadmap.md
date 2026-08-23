@@ -5,6 +5,76 @@ see `docs/implementation_status.md`.
 
 ---
 
+## Raw / loaned DataReader & DataWriter API redesign — implemented (2026-08-22)
+
+Full design in `docs/design/raw-loan-api.md`. Triggered by an external ROS2 RMW
+integration attempt depending on `zzdds_take_loaned_raw()` as if it were real zero-copy —
+it isn't (heap-copies out of reader history, wraps the copy in a loan-shaped handle) —
+combined with the raw family being hand-written, C/C++-only, exactly the
+independently-authored-per-binding-signature shape that caused the `create_participant_ex`
+bug found via the participant-config/discovery examples.
+
+Decided: replace the entire hand-written raw family (`bootstrap.zig`'s `write_raw`,
+`take_one_raw`, `take_n_raw`, `take_loaned_raw`, etc. — full list in the design doc) with
+real `dcps.idl` operations, generated consistently across all four bindings, full batch
+support (read/take side only), and a write-side loan (`loan_raw`/`publish_loan_raw`/
+`return_loan_raw`) that didn't exist before in any form. No back-compat shim — full
+replacement.
+
+Two real, pre-existing bugs found and fixed along the way, independent of raw/loan itself:
+
+- `delete_contained_entities` has zero error propagation at any level
+  (`participant.zig`/`subscriber.zig`/`reader.zig` all hardcode `RETCODE_OK` regardless of
+  precondition state) — a real DDS 1.4 spec-compliance gap, not just a loan-teardown issue.
+- Three of four bindings' typed reader family (C, C++, Java — Zig is correct) carries an
+  incomplete 3-field `zzdds_sample_info`/`Sample` instead of the real 12-field spec
+  `SampleInfo` — missing `source_timestamp` and every generation/rank field, live in every
+  current C/C++/Java example today.
+
+Punch list, all landed (see design doc for full detail on each):
+
+- [x] Fixed `delete_contained_entities` cascading error propagation (participant → publisher/
+      subscriber/topic → reader/writer), via a synchronous check-then-teardown pass (fails
+      all-or-nothing with `PRECONDITION_NOT_MET` before any child is torn down, rather than
+      the async-completion status-aggregation originally sketched — `deinit()` completes via
+      `EntityQuiesce`, so there was nothing synchronous to aggregate from).
+- [x] Loan-outstanding tracking + `PRECONDITION_NOT_MET` fast-fail teardown, read (CAS-based
+      refcount pin table, `reader.zig`) and write (single-owner counter, `writer.zig`) side.
+- [x] Real `max_len == 0` loan branching wired into zidl's generated `take_raw`/`read_raw`
+      (and `take_next_instance_raw`/`read_next_instance_raw`, added for full parity with the
+      old raw family's instance/condition-filtered variants — the illustrative IDL sketch
+      above only showed the unfiltered case).
+- [x] `take_raw`/`read_raw`/`return_loan_raw` (read) and
+      `write_raw`/`loan_raw`/`publish_loan_raw`/`return_loan_raw` (write) added to
+      `dcps.idl`, generated across all 4 bindings (Zig, C, C++, Java).
+- [x] Batch read/take-loan with the non-contiguous, one-shared-pin-per-batch shape
+      (`sequence<OctetSeq>`, `reader.zig`'s `loan_table` keyed off the descriptor array's
+      pointer identity).
+- [x] DCPS-layer refcounted pin/retirement mechanism (`EntityQuiesce`-modeled), heap-backed;
+      pool/allocator seam still a single concrete (heap) implementation, as planned — no
+      config flag yet.
+- [x] Fixed the reduced-`SampleInfo` bug in C/C++'s typed reader codegen (Java's typed
+      wrapper reads `SampleInfo` fields off the base interface's own real 12-field struct
+      via the new ops, not a separate reduced shape).
+- [x] Added `zidl_cdr_writer`'s "counting" mode, wired into C's and C++'s generated
+      non-timestamped `write`/`dispose`/`unregister` (count-then-`loan_raw`, no
+      malloc/realloc). The `_w_timestamp` family stays on `write_raw` — `publish_loan_raw`
+      has no `source_timestamp` parameter, so only the "use now" path can loan.
+- [x] Java write-loan buffer exposure landed differently than originally scoped here: not a
+      new hand-written method in `zzdds_java_runtime.c`, but a `java.zig` codegen special
+      case (`isWriteLoanBufferOp`) generating a real `java.nio.ByteBuffer`-based
+      `loan_raw`/`publish_loan_raw`/`return_loan_raw` for the base `DataWriter` interface —
+      `zzdds_java_runtime.c` needed no changes at all. Found and fixed a real, previously
+      unexercised bug along the way: the *generic* per-op JNI marshaling this would otherwise
+      have used copies through a fresh native buffer on every call, losing the loaned
+      buffer's identity between `loan_raw()` and `publish_loan_raw()` — confirmed via a real
+      re-break to publish uninitialized memory as sample data, not just a resource leak.
+- [x] Migrated the one known direct consumer of the old raw functions,
+      `zzdds-examples/spikes/rust` (no external RMW code exists in this workspace to
+      migrate). `c/shape/shape_main.c` needed only a rebuild, as expected.
+
+---
+
 ## Hardened `zzdds_java_runtime.c`'s JNI boundary against null/invalid handle inputs (2026-08-20)
 
 Greptile's review of PR #67 (the `configureFromFile`/`asZzddsFactory` JNI wrappers added there)
@@ -159,8 +229,8 @@ single-process smoke run of both binaries past `registerTypeSupport` with no `FA
 
 ---
 
-## Real, live bug found, not yet fixed: `create_participant_ex`/`set_default_participant_config`/
-`get_default_participant_config`'s exported C-ABI symbols use the wrong struct layout for every
+## Real, live bug found and fixed: `create_participant_ex`/`set_default_participant_config`/
+`get_default_participant_config`'s exported C-ABI symbols used the wrong struct layout for every
 non-Zig-native caller (2026-08-20)
 
 Found while adding `-Z`/`--datafrag-size` to zzdds-examples' C/C++/Java `shape` ports (see the

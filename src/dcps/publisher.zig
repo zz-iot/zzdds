@@ -385,6 +385,10 @@ pub const PublisherImpl = struct {
         defer self.mu.unlock();
         for (self.writers.items, 0..) |w, i| {
             if (w.toDDSDataWriter().ptr == a_datawriter.ptr) {
+                // PRECONDITION_NOT_MET if the writer has outstanding
+                // write-loans -- check before touching anything.
+                const precondition = w.checkDeletePrecondition();
+                if (precondition != DDS.RETCODE_OK) return precondition;
                 _ = self.writers.swapRemove(i);
                 self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
                 w.deinit();
@@ -392,6 +396,20 @@ pub const PublisherImpl = struct {
             }
         }
         return DDS.RETCODE_BAD_PARAMETER;
+    }
+
+    /// Checks every writer's delete precondition without tearing anything
+    /// down -- shared by `vtDeleteContained` below and by
+    /// `participant.zig`'s own cascade, which needs an all-or-nothing check
+    /// across every publisher before any of them start tearing down.
+    pub fn checkDeleteContainedPrecondition(self: *Self) DDS.ReturnCode_t {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.writers.items) |w| {
+            const precondition = w.checkDeletePrecondition();
+            if (precondition != DDS.RETCODE_OK) return precondition;
+        }
+        return DDS.RETCODE_OK;
     }
 
     fn vtLookupDataWriter(ctx: *anyopaque, topic_name: [*:0]const u8) DDS.DataWriter {
@@ -409,6 +427,8 @@ pub const PublisherImpl = struct {
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
         const self = cast(ctx);
+        const precondition = self.checkDeleteContainedPrecondition();
+        if (precondition != DDS.RETCODE_OK) return precondition;
         self.mu.lock();
         defer self.mu.unlock();
         for (self.writers.items) |w| {

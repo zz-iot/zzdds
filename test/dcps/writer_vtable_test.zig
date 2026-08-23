@@ -641,3 +641,97 @@ test "DataWriter: get_qos returns independent clone — replacement does not dan
     try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
     got.deinit(alloc);
 }
+
+// ── Raw/loaned write ops (write_raw/loan_raw/publish_loan_raw/return_loan_raw) ─
+
+test "write_raw: valid key_hash + payload lands in the cache" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var key_hash_bytes = [_]u8{1} ** 16;
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    var payload_bytes = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const payload = DDS.OctetSeq{ ._buffer = &payload_bytes, ._length = 4, ._maximum = 4, ._release = false };
+
+    const before = dw_impl.proto_writer.cacheLen();
+    const rc = dw.vtable.write_raw(dw.ptr, &key_hash, DDS.HANDLE_NIL, &payload, .ALIVE_WRITE_KIND, &DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC });
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(before + 1, dw_impl.proto_writer.cacheLen());
+}
+
+test "write_raw: wrong-length key_hash is BAD_PARAMETER" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+
+    var short_bytes = [_]u8{1} ** 4;
+    const short_key_hash = DDS.OctetSeq{ ._buffer = &short_bytes, ._length = 4, ._maximum = 4, ._release = false };
+    var payload_bytes = [_]u8{0x01};
+    const payload = DDS.OctetSeq{ ._buffer = &payload_bytes, ._length = 1, ._maximum = 1, ._release = false };
+
+    const rc = dw.vtable.write_raw(dw.ptr, &short_key_hash, DDS.HANDLE_NIL, &payload, .ALIVE_WRITE_KIND, &DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC });
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
+}
+
+test "loan_raw + publish_loan_raw: round trip through the real vtable lands the loaned bytes in the cache" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expect(cdr_payload._buffer != null);
+    cdr_payload._buffer.?[0..4].* = .{ 0x01, 0x02, 0x03, 0x04 };
+
+    var key_hash_bytes = [_]u8{2} ** 16;
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+
+    const before = dw_impl.proto_writer.cacheLen();
+    const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(before + 1, dw_impl.proto_writer.cacheLen());
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    // publish_loan_raw must clear the sequence -- the caller no longer owns it.
+    try testing.expect(cdr_payload._buffer == null);
+}
+
+test "loan_raw + return_loan_raw: round trip through the real vtable publishes nothing" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 8, &cdr_payload));
+    try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
+
+    const before = dw_impl.proto_writer.cacheLen();
+    const rc = dw.vtable.return_loan_raw(dw.ptr, &cdr_payload);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(before, dw_impl.proto_writer.cacheLen());
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expect(cdr_payload._buffer == null);
+}
+
+test "loan_raw: an outstanding loan blocks delete_datawriter with PRECONDITION_NOT_MET" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 1, &cdr_payload));
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw));
+
+    // Resolve the loan, then teardown must succeed.
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.return_loan_raw(dw.ptr, &cdr_payload));
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw));
+}
