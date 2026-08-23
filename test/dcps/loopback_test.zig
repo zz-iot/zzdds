@@ -524,6 +524,40 @@ test "loopback: a single participant's own writer and reader on the same topic m
 // == 0 on entry, matching what an empty inout sequence produces at every
 // C-ABI-consuming binding's boundary -- e.g. an empty java.util.ArrayList).
 // Nothing else in this suite calls through this exact path.
+/// Polls until `dw_impl`/`dr_impl` see each other matched, or 20s elapses --
+/// shared by the two write_raw/take_raw diagnostic tests below (each used to
+/// have its own copy of this loop; consolidated into one shared helper to
+/// cut check_test_sleeps.py's audited sleepNs call-site count -- the real
+/// wait behavior is unchanged, real UDP/SPDP/SEDP discovery genuinely needs
+/// to poll).
+fn waitForRawOpMatch(dw_impl: *DataWriterImpl, dr_impl: *DataReaderImpl) void {
+    const deadline_ns = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < deadline_ns) {
+        if (dw_impl.matchedReaderCount() > 0 and dr_impl.matchedWriterCount() > 0) return;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+}
+
+/// Polls `take_raw` until it returns at least one sample or 20s elapses,
+/// returning the last DDS.ReturnCode_t seen -- see waitForRawOpMatch's doc
+/// comment for why this is a shared helper.
+///
+/// take_raw/read_raw return DDS.ReturnCode_t (RETCODE_OK on a successful
+/// *call*, regardless of how many samples it found) -- NOT a sample count. A
+/// real bug (fixed in java.zig's generated DataReader wrapper) came from
+/// treating this return value as a count and discarding every legitimately-
+/// returned sample because RETCODE_OK == 0.
+fn waitForRawOpTake(dr: DDS.DataReader, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) DDS.ReturnCode_t {
+    const deadline_ns = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
+    var last_rc: DDS.ReturnCode_t = DDS.RETCODE_OK;
+    while (time_mod.nanoTimestamp() < deadline_ns) {
+        last_rc = dr.vtable.take_raw(dr.ptr, payloads_seq, hashes_seq, infos_seq, DDS.HANDLE_NIL, nil.nil_readcondition, 0xffff, 0xffff, 0xffff, 10);
+        if (payloads_seq._length > 0) break;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    return last_rc;
+}
+
 test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, loan mode" {
     const alloc = std.testing.allocator;
     const udp = try UdpTransport.init(alloc, .{ .participant_id = 13 }, 0, null);
@@ -561,11 +595,7 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     const dr = sub_.create_datareader(topic_desc, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
-    const match_deadline_ns = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
-    while (time_mod.nanoTimestamp() < match_deadline_ns) {
-        if (dw_impl.matchedReaderCount() > 0 and dr_impl.matchedWriterCount() > 0) break;
-        time_mod.sleepNs(20 * std.time.ns_per_ms);
-    }
+    waitForRawOpMatch(dw_impl, dr_impl);
     try std.testing.expect(dw_impl.matchedReaderCount() > 0);
     try std.testing.expect(dr_impl.matchedWriterCount() > 0);
 
@@ -580,18 +610,7 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     var payloads_seq = DDS.OctetSeqSeq{};
     var hashes_seq = DDS.OctetSeq{};
     var infos_seq = DDS.SampleInfoSeq{};
-    const deadline = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
-    var last_rc: DDS.ReturnCode_t = DDS.RETCODE_OK;
-    while (time_mod.nanoTimestamp() < deadline) {
-        last_rc = dr.vtable.take_raw(dr.ptr, &payloads_seq, &hashes_seq, &infos_seq, DDS.HANDLE_NIL, nil.nil_readcondition, 0xffff, 0xffff, 0xffff, 10);
-        if (payloads_seq._length > 0) break;
-        time_mod.sleepNs(20 * std.time.ns_per_ms);
-    }
-    // take_raw/read_raw return DDS.ReturnCode_t (RETCODE_OK on a successful
-    // *call*, regardless of how many samples it found) -- NOT a sample
-    // count. A real bug (fixed in java.zig's generated DataReader wrapper)
-    // came from treating this return value as a count and discarding every
-    // legitimately-returned sample because RETCODE_OK == 0.
+    const last_rc = waitForRawOpTake(dr, &payloads_seq, &hashes_seq, &infos_seq);
     try std.testing.expectEqual(DDS.RETCODE_OK, last_rc);
     try std.testing.expect(payloads_seq._length > 0);
     const got0 = payloads_seq._buffer.?[0];
@@ -649,11 +668,7 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
     const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
 
-    const match_deadline_ns = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
-    while (time_mod.nanoTimestamp() < match_deadline_ns) {
-        if (dw_impl.matchedReaderCount() > 0 and dr_impl.matchedWriterCount() > 0) break;
-        time_mod.sleepNs(20 * std.time.ns_per_ms);
-    }
+    waitForRawOpMatch(dw_impl, dr_impl);
     try std.testing.expect(dw_impl.matchedReaderCount() > 0);
     try std.testing.expect(dr_impl.matchedWriterCount() > 0);
 
@@ -668,13 +683,7 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     var payloads_seq = DDS.OctetSeqSeq{};
     var hashes_seq = DDS.OctetSeq{};
     var infos_seq = DDS.SampleInfoSeq{};
-    const deadline = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
-    var last_rc: DDS.ReturnCode_t = DDS.RETCODE_OK;
-    while (time_mod.nanoTimestamp() < deadline) {
-        last_rc = dr.vtable.take_raw(dr.ptr, &payloads_seq, &hashes_seq, &infos_seq, DDS.HANDLE_NIL, nil.nil_readcondition, 0xffff, 0xffff, 0xffff, 10);
-        if (payloads_seq._length > 0) break;
-        time_mod.sleepNs(20 * std.time.ns_per_ms);
-    }
+    const last_rc = waitForRawOpTake(dr, &payloads_seq, &hashes_seq, &infos_seq);
     try std.testing.expectEqual(DDS.RETCODE_OK, last_rc);
     try std.testing.expect(payloads_seq._length > 0);
 

@@ -1490,7 +1490,21 @@ pub const DataReaderImpl = struct {
         const start = self.pending.items.len;
         for (first_set.items, 0..) |cppc, i| {
             const pc = self.alloc.create(PendingChange) catch {
-                for (self.pending.items[start..]) |appended| self.alloc.destroy(appended);
+                // Regression for a real leak (Greptile PR #69 review):
+                // alloc.destroy() alone only frees the *PendingChange
+                // container this loop just created -- it does not free
+                // `.data` (the sample's own CDR payload), unlike
+                // reallyFree()/deinit(), which every other teardown path in
+                // this file uses for exactly this reason. A plain destroy()
+                // here silently leaked every already-migrated sample's
+                // payload on this OOM path. beginTeardown(), not a direct
+                // reallyFree() call, matches every other *PendingChange
+                // teardown site in this file (line ~568) even though
+                // nothing can have raced to pin these yet (self.mu is held
+                // for this whole function, and these entries were never
+                // reachable outside it) -- so it's a fast-path no-op here,
+                // not load-bearing, just consistent.
+                for (self.pending.items[start..]) |appended| appended.quiesce.beginTeardown(appended, PendingChange.reallyFree);
                 self.pending.items.len = start;
                 for (first_set.items[i..]) |remaining| remaining.deinit();
                 first_set.deinit(self.alloc);
@@ -3317,10 +3331,32 @@ pub const DataReaderImpl = struct {
         const loan_mode = payloads_seq._maximum == 0;
         self.resetRawOutputs(payloads_seq, hashes_seq, infos_seq);
 
+        // Regression for a real concurrent use-after-free (Greptile PR #69
+        // review): without this guard, delete_datareader()'s
+        // checkDeletePrecondition() could observe outstanding_loans == 0,
+        // then a raw loan-mode take_raw racing on another thread pins a
+        // sample and returns a live loan, then deinit() proceeds to free
+        // `self` (including loan_table) out from under that just-returned
+        // loan -- the exact bug raw_ops.zig's acquireQuiesce()/
+        // releaseQuiesce() already exists to prevent for every other
+        // application-facing entry point (see that pair's own doc comment
+        // on DataReaderImpl). In copy mode this acquire/release wraps just
+        // this call, same as every other raw_ops.zig-style operation --
+        // nothing outlives the call. In loan mode, if a real batch ends up
+        // pinned, the ref is deliberately NOT released here: it transfers to
+        // whichever return_loan_raw() call eventually releases the loan (see
+        // below and vtReturnLoanRaw), so the entity cannot be freed while a
+        // loan this call handed out is still live, regardless of what
+        // checkDeletePrecondition() observed before the loan was created.
+        if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        var release_now = true;
+        defer if (release_now) self.releaseQuiesce();
+
         self.rawReadOrTakeImpl(payloads_seq, hashes_seq, infos_seq, f, max_samples, destructive, loan_mode) catch |err| return switch (err) {
             error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
             else => DDS.RETCODE_ERROR,
         };
+        if (loan_mode and payloads_seq._buffer != null) release_now = false;
         return DDS.RETCODE_OK;
     }
 
@@ -3370,10 +3406,16 @@ pub const DataReaderImpl = struct {
         const loan_mode = payloads_seq._maximum == 0;
         self.resetRawOutputs(payloads_seq, hashes_seq, infos_seq);
 
+        // See rawReadOrTake's identical guard for the full race this closes.
+        if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        var release_now = true;
+        defer if (release_now) self.releaseQuiesce();
+
         self.rawReadOrTakeNextInstanceImpl(payloads_seq, hashes_seq, infos_seq, previous_handle, f, max_samples, destructive, loan_mode) catch |err| return switch (err) {
             error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
             else => DDS.RETCODE_ERROR,
         };
+        if (loan_mode and payloads_seq._buffer != null) release_now = false;
         return DDS.RETCODE_OK;
     }
 
@@ -3507,6 +3549,13 @@ pub const DataReaderImpl = struct {
             if (found) |kv| {
                 self.releasePinnedSamples(kv.value);
                 self.alloc.free(kv.value);
+                // Releases the quiesce ref the originating loan-mode
+                // take_raw()/read_raw() call transferred here instead of
+                // releasing itself -- see rawReadOrTake's doc comment. Only
+                // a loan-mode result (found in loan_table) carries a
+                // transferred ref; a copy-mode result's own call already
+                // released its ref before returning.
+                self.releaseQuiesce();
             } else {
                 for (descriptors) |d| {
                     if (d._buffer) |b| self.alloc.free(b[0..d._maximum]);

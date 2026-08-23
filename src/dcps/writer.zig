@@ -1043,6 +1043,15 @@ pub const DataWriterImpl = struct {
         if (handle != DDS.HANDLE_NIL and handle != registerInstanceRaw(kh)) {
             return DDS.RETCODE_BAD_PARAMETER;
         }
+        // Regression for a real concurrent use-after-free (Greptile PR #69
+        // review): without this guard, delete_datawriter()'s
+        // checkDeletePrecondition() racing this call could free `self`
+        // mid-write. Symmetric within this one call -- unlike loan_raw
+        // below, a plain write_raw() never outlives its own call, matching
+        // every raw_ops.zig-style operation's existing acquire/release
+        // pattern on DataWriterImpl.
+        if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.releaseQuiesce();
         const data = if (payload._buffer) |b| b[0..payload._length] else &[_]u8{};
         _ = self.writeRaw(change_kind, rtpsTimestampFromRaw(source_timestamp), kh, kh, data) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
@@ -1055,7 +1064,18 @@ pub const DataWriterImpl = struct {
     fn vtLoanRaw(ctx: *anyopaque, size: u32, cdr_payload: ?*DDS.OctetSeq) DDS.ReturnCode_t {
         const self = cast(ctx);
         const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
-        const buf = self.loanForWrite(@intCast(size)) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // Same race as vtWriteRaw above, but a successful loan outlives this
+        // call (until publish_loan_raw()/return_loan_raw() resolves it) --
+        // the acquired ref is deliberately NOT released on the success path;
+        // it transfers to whichever of those two calls resolves the loan
+        // (see vtPublishLoanRaw/vtReturnLoanRaw), keeping the entity alive
+        // for the loan's whole lifetime regardless of what
+        // checkDeletePrecondition() observed before the loan was created.
+        if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        const buf = self.loanForWrite(@intCast(size)) catch {
+            self.releaseQuiesce();
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        };
         // _release = false deliberately: this buffer is owned by the
         // outstanding-loan accounting in loanForWrite/publishLoan/cancelLoan,
         // not by the generic OctetSeq.deinit()/_free() path -- a caller must
@@ -1087,6 +1107,11 @@ pub const DataWriterImpl = struct {
         if (seq._length > seq._maximum) return DDS.RETCODE_BAD_PARAMETER;
         const used_len: usize = seq._length;
         seq.* = .{}; // consumed either way -- see publishLoan's doc comment
+        // Releases the quiesce ref vtLoanRaw transferred here -- self is
+        // guaranteed alive up to this point regardless of a concurrent
+        // delete (that's the whole point of the transfer), so this can run
+        // unconditionally after publishLoan resolves, on every path.
+        defer self.releaseQuiesce();
         _ = self.publishLoan(change_kind, time_mod.RtpsTimestamp.now(), kh, kh, full_buf, used_len) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
             error.Timeout => DDS.RETCODE_TIMEOUT,
@@ -1101,6 +1126,9 @@ pub const DataWriterImpl = struct {
         const full_buf: []u8 = (seq._buffer orelse return DDS.RETCODE_BAD_PARAMETER)[0..seq._maximum];
         seq.* = .{};
         self.cancelLoan(full_buf);
+        // Releases the quiesce ref vtLoanRaw transferred here -- see
+        // vtPublishLoanRaw's identical comment.
+        self.releaseQuiesce();
         return DDS.RETCODE_OK;
     }
 
