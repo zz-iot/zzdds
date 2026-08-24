@@ -1111,3 +1111,147 @@ test "take_raw: loan mode sweeps an already-expired (LIFESPAN) sample instead of
     try testing.expectEqual(@as(u32, 0), payloads._length);
     try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
 }
+
+// ── kcov coverage sweep (2026-08-24): closing gaps 1-4 from the fresh
+// kcov-vs-PR-diff comparison, plus a few LIFESPAN-sweep call sites from the
+// medium-value item ─────────────────────────────────────────────────────────
+
+test "take_raw: proto_reader already tearing down (but not yet freed) fails cleanly with ALREADY_DELETED" {
+    // Coverage gap #1, read-side counterpart of writer_vtable_test.zig's
+    // identical test -- see that test's comment for the full technique
+    // (holds an extra quiesce ref on proto_reader first so
+    // destroy_proto_reader's beginTeardown() only sets the tearing-down bit
+    // without dropping the count to zero, so proto_reader stays genuinely
+    // allocated the whole time -- no undefined behavior). Hits
+    // src/dcps/reader.zig's `!self.proto_reader.quiesceAcquire()` branch in
+    // rawReadOrTake (~L3371-3373).
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
+
+    try testing.expect(dr.proto_reader.quiesceAcquire());
+    sub_impl.cbs.destroy_proto_reader(sub_impl.cbs.ctx, dr.instance_handle);
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+
+    dr.proto_reader.quiesceRelease();
+}
+
+test "take_next_instance_raw: proto_reader already tearing down (but not yet freed) fails cleanly with ALREADY_DELETED" {
+    // Coverage gap #1, rawReadOrTakeNextInstance's own copy of the same
+    // guard (src/dcps/reader.zig ~L3438-3440).
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
+
+    try testing.expect(dr.proto_reader.quiesceAcquire());
+    sub_impl.cbs.destroy_proto_reader(sub_impl.cbs.ctx, dr.instance_handle);
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+
+    dr.proto_reader.quiesceRelease();
+}
+
+test "take_raw: a_condition via the QueryCondition-thunk vtable (not the plain ReadCondition view) is resolved correctly" {
+    // Coverage gap #4: the earlier "a_condition accepts a real
+    // QueryCondition" test (above) calls `qc.vtable.as_ReadCondition(qc.ptr)`,
+    // which returns `qc.rc.toDDSReadCondition()` -- a view tagged with
+    // `ReadConditionImpl.vtable`, NOT `QueryConditionImpl.rc_thunk_vtable`.
+    // So that test actually exercises resolveRawFilter's plain-ReadCondition
+    // branch (src/dcps/reader.zig L3213), not the thunk branch (L3214-3216)
+    // its own comment claimed. `rc_thunk_vtable` is real production code --
+    // reached when a QueryCondition crosses the C-ABI boundary and gets
+    // unboxed directly as a ReadCondition (see QueryConditionImpl.views'
+    // `flat_vtable = &rc_thunk_vtable`) -- but nothing at the Zig level
+    // constructs it that way except a manual `DDS.ReadCondition` literal,
+    // which is what this test does instead.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    try pushInstance(dr, alloc, 1, &[_]u8{0x0A});
+
+    var empty_params = DDS.StringSeq{};
+    const qc = dr_dds.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", &empty_params);
+    try testing.expect(qc.ptr != nil.NIL_PTR);
+    defer qc.deinit();
+    const thunk_view = DDS.ReadCondition{ .ptr = qc.ptr, .vtable = &zzdds.dcps.QueryConditionImpl.rc_thunk_vtable };
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    // Explicit masks are ignored when a_condition is non-nil -- pass masks
+    // that would exclude everything, same proof as the existing test.
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, thunk_view, 0, 0, 0, -1));
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+}
+
+test "takeNextInstanceRaw: sweeps an already-expired (LIFESPAN) sample instead of returning it" {
+    // Medium-value item: one of 9 near-identical LIFESPAN-sweep call sites
+    // in reader.zig, only 1 of which (the raw-ops loan-mode path, tested
+    // above) was previously exercised. This covers takeNextInstanceRaw's
+    // own copy (src/dcps/reader.zig ~L1668-1671), the core method behind
+    // the typed API's single-sample take_next_instance.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushExpiredInstance(dr, alloc, 1, &[_]u8{0xE1});
+    try testing.expect(dr.takeNextInstanceRaw(DDS.HANDLE_NIL) == null);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
+
+test "readNextInstanceRaw: sweeps an already-expired (LIFESPAN) sample instead of returning it" {
+    // Medium-value item, readNextInstanceRaw's own copy
+    // (src/dcps/reader.zig ~L1723-1726) -- the non-destructive counterpart
+    // of the test above.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushExpiredInstance(dr, alloc, 1, &[_]u8{0xE2});
+    try testing.expect(dr.readNextInstanceRaw(DDS.HANDLE_NIL) == null);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
+
+test "takeFiltered: sweeps an already-expired (LIFESPAN) sample instead of returning it" {
+    // Medium-value item, takeFiltered's own copy
+    // (src/dcps/reader.zig ~L2333-2336) -- the core batch method behind the
+    // typed API's plain take()/take_w_condition() family.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushExpiredInstance(dr, alloc, 1, &[_]u8{0xE3});
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer out.deinit(alloc);
+    try dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
