@@ -204,9 +204,13 @@ test "support factory: generated create_participant_ex uses config defaults" {
 
 const TrackingCtx = struct {
     child: std.mem.Allocator,
-    alloc_calls: usize = 0,
-    resize_calls: usize = 0,
-    free_calls: usize = 0,
+    // Atomic: a real DomainParticipantImpl (RTPS receive threads, timer thread,
+    // etc.) allocates/frees through this same injected allocator concurrently
+    // with the main thread, so plain `usize += 1` here is a genuine data race
+    // (caught by ThreadSanitizer, not just theoretical).
+    alloc_calls: std.atomic.Value(usize) = .init(0),
+    resize_calls: std.atomic.Value(usize) = .init(0),
+    free_calls: std.atomic.Value(usize) = .init(0),
 };
 
 // The actual std.mem.Allocator <-> ZidlAllocator forwarding logic lives in
@@ -214,21 +218,21 @@ const TrackingCtx = struct {
 // the call counting this test needs, delegating everything else to it.
 fn trackAlloc(ctx: ?*anyopaque, len: usize, alignment: usize) callconv(.c) ?[*]u8 {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
-    self.alloc_calls += 1;
+    _ = self.alloc_calls.fetchAdd(1, .monotonic);
     const inner = allocator_adapter.fromAllocator(&self.child);
     return inner.alloc(inner.ctx, len, alignment);
 }
 
 fn trackResize(ctx: ?*anyopaque, ptr: ?[*]u8, old_len: usize, new_len: usize, alignment: usize) callconv(.c) bool {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
-    self.resize_calls += 1;
+    _ = self.resize_calls.fetchAdd(1, .monotonic);
     const inner = allocator_adapter.fromAllocator(&self.child);
     return inner.resize(inner.ctx, ptr, old_len, new_len, alignment);
 }
 
 fn trackFree(ctx: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callconv(.c) void {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
-    self.free_calls += 1;
+    _ = self.free_calls.fetchAdd(1, .monotonic);
     const inner = allocator_adapter.fromAllocator(&self.child);
     inner.free(inner.ctx, ptr, len, alignment);
 }
@@ -254,8 +258,8 @@ test "support factory: zzdds_create_factory_with_allocator routes every allocati
     const ext_factory = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
     // Bootstrapping the factory itself (FactoryOwner) already allocates.
-    try testing.expect(track.alloc_calls > 0);
-    const calls_after_bootstrap = track.alloc_calls;
+    try testing.expect(track.alloc_calls.load(.monotonic) > 0);
+    const calls_after_bootstrap = track.alloc_calls.load(.monotonic);
 
     // Creating a participant spins up a real UdpTransport + SpdpSedpDiscovery +
     // DomainParticipantFactoryImpl/DomainParticipantImpl stack (ParticipantStack.init)
@@ -265,11 +269,11 @@ test "support factory: zzdds_create_factory_with_allocator routes every allocati
     const qos = DDS.DomainParticipantQos{};
     const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
-    try testing.expect(track.alloc_calls > calls_after_bootstrap);
+    try testing.expect(track.alloc_calls.load(.monotonic) > calls_after_bootstrap);
 
     const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
     try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
-    try testing.expect(track.free_calls > 0);
+    try testing.expect(track.free_calls.load(.monotonic) > 0);
 }
 
 test "support factory: get_default_participant_config on a custom-allocator factory doesn't mismatch the caller's c_allocator-owned input" {
@@ -1289,19 +1293,19 @@ test "waitset: zzdds_create_waitset_with_allocator/zzdds_create_guardcondition_w
 
     const ws_boxed = extensions.zzdds_create_waitset_with_allocator(&c_alloc);
     const gc_boxed = extensions.zzdds_create_guardcondition_with_allocator(&c_alloc);
-    try testing.expect(track.alloc_calls > 0);
-    const calls_after_create = track.alloc_calls;
+    try testing.expect(track.alloc_calls.load(.monotonic) > 0);
+    const calls_after_create = track.alloc_calls.load(.monotonic);
 
     const ws = zidl_rt.unboxAs(DDS.WaitSet, ws_boxed);
     const gc = zidl_rt.unboxAsView(DDS.GuardCondition, gc_boxed);
     // Attaching grows WaitSet's `conditions` list — another allocation
     // through the same injected allocator, not a silent fallback.
     try testing.expectEqual(DDS.RETCODE_OK, ws.attach_condition(gc.vtable.as_Condition(gc.ptr)));
-    try testing.expect(track.alloc_calls > calls_after_create);
+    try testing.expect(track.alloc_calls.load(.monotonic) > calls_after_create);
 
     extensions.zzdds_destroy_waitset(ws_boxed);
     extensions.zzdds_destroy_guardcondition(gc_boxed);
-    try testing.expect(track.free_calls > 0);
+    try testing.expect(track.free_calls.load(.monotonic) > 0);
 }
 
 // ── Zig-native createWaitSet / createGuardCondition (raw_ops.zig) ───────────────

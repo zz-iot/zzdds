@@ -1072,7 +1072,31 @@ pub const DataWriterImpl = struct {
         // for the loan's whole lifetime regardless of what
         // checkDeletePrecondition() observed before the loan was created.
         if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        // Regression for a real, distinct race (Greptile PR #69 review,
+        // round 3): self.acquireQuiesce() above only keeps the DataWriterImpl
+        // struct itself alive -- it says nothing about self.proto_writer, a
+        // separately torn-down RTPS object (destroy_proto_writer, called
+        // from publisher.zig's deinit loop, is not gated by self's own
+        // quiesce state at all). Without this, a checkDeleteContainedPrecondition()
+        // check racing this call could observe zero outstanding loans, this
+        // loan then acquires successfully, and delete_publisher/
+        // delete_datawriter proceeds to destroy proto_writer while the loan
+        // is still outstanding -- publish_loan_raw() would then dereference
+        // a freed protocol writer. proto_writer already has its own
+        // EntityQuiesce (see protocol_adapters.zig's RtpsProtocolWriter,
+        // built for a different reason -- deferring add_matched_reader send
+        // I/O) whose deinit() already defers real teardown until this
+        // refcount hits zero; acquiring it here for the loan's whole
+        // lifetime (released alongside self's own ref in
+        // vtPublishLoanRaw/vtReturnLoanRaw) closes the race regardless of
+        // check timing, reusing already-tested machinery instead of adding
+        // new locking.
+        if (!self.proto_writer.quiesceAcquire()) {
+            self.releaseQuiesce();
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
         const buf = self.loanForWrite(@intCast(size)) catch {
+            self.proto_writer.quiesceRelease();
             self.releaseQuiesce();
             return DDS.RETCODE_OUT_OF_RESOURCES;
         };
@@ -1107,11 +1131,13 @@ pub const DataWriterImpl = struct {
         if (seq._length > seq._maximum) return DDS.RETCODE_BAD_PARAMETER;
         const used_len: usize = seq._length;
         seq.* = .{}; // consumed either way -- see publishLoan's doc comment
-        // Releases the quiesce ref vtLoanRaw transferred here -- self is
-        // guaranteed alive up to this point regardless of a concurrent
-        // delete (that's the whole point of the transfer), so this can run
-        // unconditionally after publishLoan resolves, on every path.
+        // Releases both quiesce refs vtLoanRaw transferred here -- self and
+        // proto_writer are both guaranteed alive up to this point regardless
+        // of a concurrent delete (that's the whole point of the transfer),
+        // so this can run unconditionally after publishLoan resolves, on
+        // every path.
         defer self.releaseQuiesce();
+        defer self.proto_writer.quiesceRelease();
         _ = self.publishLoan(change_kind, time_mod.RtpsTimestamp.now(), kh, kh, full_buf, used_len) catch |err| return switch (err) {
             error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
             error.Timeout => DDS.RETCODE_TIMEOUT,
@@ -1126,9 +1152,10 @@ pub const DataWriterImpl = struct {
         const full_buf: []u8 = (seq._buffer orelse return DDS.RETCODE_BAD_PARAMETER)[0..seq._maximum];
         seq.* = .{};
         self.cancelLoan(full_buf);
-        // Releases the quiesce ref vtLoanRaw transferred here -- see
+        // Releases both quiesce refs vtLoanRaw transferred here -- see
         // vtPublishLoanRaw's identical comment.
         self.releaseQuiesce();
+        self.proto_writer.quiesceRelease();
         return DDS.RETCODE_OK;
     }
 

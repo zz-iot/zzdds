@@ -3351,12 +3351,37 @@ pub const DataReaderImpl = struct {
         if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
         var release_now = true;
         defer if (release_now) self.releaseQuiesce();
+        // Regression for a real, distinct race (Greptile PR #69 review,
+        // round 3): self.acquireQuiesce() above only keeps the
+        // DataReaderImpl struct itself alive -- it says nothing about
+        // self.proto_reader, a separately torn-down RTPS object
+        // (destroy_proto_reader, called from subscriber.zig's deinit loop,
+        // is not gated by self's own quiesce state at all). Without this, a
+        // checkDeleteContainedPrecondition() check racing this call could
+        // observe zero outstanding loans, this loan then pins successfully,
+        // and delete_subscriber/delete_datareader proceeds to destroy
+        // proto_reader while the loan is still outstanding. proto_reader
+        // already has its own EntityQuiesce (see protocol_adapters.zig's
+        // RtpsProtocolReader, built for a different reason -- deferring
+        // add_matched_writer send I/O) whose deinit() already defers real
+        // teardown until this refcount hits zero; acquiring it here for the
+        // loan's whole lifetime (released alongside self's own ref in
+        // vtReturnLoanRaw) closes the race regardless of check timing.
+        // Symmetric with vtWriteRaw/vtLoanRaw's identical fix in writer.zig.
+        if (!self.proto_reader.quiesceAcquire()) {
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
+        var release_proto_now = true;
+        defer if (release_proto_now) self.proto_reader.quiesceRelease();
 
         self.rawReadOrTakeImpl(payloads_seq, hashes_seq, infos_seq, f, max_samples, destructive, loan_mode) catch |err| return switch (err) {
             error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
             else => DDS.RETCODE_ERROR,
         };
-        if (loan_mode and payloads_seq._buffer != null) release_now = false;
+        if (loan_mode and payloads_seq._buffer != null) {
+            release_now = false;
+            release_proto_now = false;
+        }
         return DDS.RETCODE_OK;
     }
 
@@ -3406,16 +3431,24 @@ pub const DataReaderImpl = struct {
         const loan_mode = payloads_seq._maximum == 0;
         self.resetRawOutputs(payloads_seq, hashes_seq, infos_seq);
 
-        // See rawReadOrTake's identical guard for the full race this closes.
+        // See rawReadOrTake's identical guards for the full race this closes.
         if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
         var release_now = true;
         defer if (release_now) self.releaseQuiesce();
+        if (!self.proto_reader.quiesceAcquire()) {
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
+        var release_proto_now = true;
+        defer if (release_proto_now) self.proto_reader.quiesceRelease();
 
         self.rawReadOrTakeNextInstanceImpl(payloads_seq, hashes_seq, infos_seq, previous_handle, f, max_samples, destructive, loan_mode) catch |err| return switch (err) {
             error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
             else => DDS.RETCODE_ERROR,
         };
-        if (loan_mode and payloads_seq._buffer != null) release_now = false;
+        if (loan_mode and payloads_seq._buffer != null) {
+            release_now = false;
+            release_proto_now = false;
+        }
         return DDS.RETCODE_OK;
     }
 
@@ -3558,13 +3591,14 @@ pub const DataReaderImpl = struct {
             if (found) |kv| {
                 self.releasePinnedSamples(kv.value);
                 self.alloc.free(kv.value);
-                // Releases the quiesce ref the originating loan-mode
+                // Releases both quiesce refs the originating loan-mode
                 // take_raw()/read_raw() call transferred here instead of
                 // releasing itself -- see rawReadOrTake's doc comment. Only
                 // a loan-mode result (found in loan_table) carries a
                 // transferred ref; a copy-mode result's own call already
-                // released its ref before returning.
+                // released both refs before returning.
                 self.releaseQuiesce();
+                self.proto_reader.quiesceRelease();
             } else {
                 for (descriptors) |d| {
                     if (d._buffer) |b| self.alloc.free(b[0..d._maximum]);

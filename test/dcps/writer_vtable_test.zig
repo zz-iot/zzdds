@@ -735,3 +735,54 @@ test "loan_raw: an outstanding loan blocks delete_datawriter with PRECONDITION_N
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.return_loan_raw(dw.ptr, &cdr_payload));
     try testing.expectEqual(DDS.RETCODE_OK, fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw));
 }
+
+test "loan_raw: outstanding loan defers real protocol-writer teardown until the loan resolves" {
+    // Regression for a real, distinct race (Greptile PR #69 review, round
+    // 3): checkDeleteContainedPrecondition() is a momentary read -- it
+    // observing zero outstanding loans doesn't mean a concurrent loan_raw()
+    // can't acquire one immediately after. Reproducing that exact timing
+    // race is inherently fragile (see this session's own notes on why a
+    // thread-spawn-latency-based test for a similar race wasn't safe to
+    // ship); this test instead directly proves the fix that actually closes
+    // it, independent of check timing: even when protocol-writer teardown
+    // proceeds with a loan already outstanding (simulated here by calling
+    // the *real* destroy_proto_writer callback directly, bypassing the
+    // precondition check entirely -- exactly what publisher.zig's own
+    // teardown loop calls, just out of its normal sequence), the real
+    // protocol writer's resources are not actually destroyed until the
+    // loan releases its transferred quiesce ref. Before the fix, this would
+    // segfault inside publish_loan_raw on a freed protocol writer.
+    //
+    // Calling the real callback (not proto_writer.deinit() directly)
+    // matters for test hygiene too: it correctly removes the writer's
+    // active_writers entry, so the fixture's own later teardown (which
+    // still calls destroy_proto_writer once more, from PublisherImpl's own
+    // deinit loop) finds nothing and safely no-ops instead of double-freeing
+    // the now-torn-down protocol writer.
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    cdr_payload._buffer.?[0..4].* = .{ 0xAA, 0xBB, 0xCC, 0xDD };
+
+    // Simulate the race having already gone the unsafe way: the protocol
+    // writer is destroyed (from the participant's perspective) while the
+    // loan above is still outstanding.
+    pub_impl.cbs.destroy_proto_writer(pub_impl.cbs.ctx, dw_impl.instance_handle);
+
+    // proto_writer's real resources are legitimately gone once
+    // publish_loan_raw resolves the transferred ref and real teardown
+    // finally runs, so there's nothing left to inspect on it afterward --
+    // the proof here is publish_loan_raw succeeding at all, not crashing on
+    // a use-after-free while it's still writing through the (correctly
+    // still-alive) protocol writer.
+    var key_hash_bytes = [_]u8{3} ** 16;
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+}
