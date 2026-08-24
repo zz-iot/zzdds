@@ -332,7 +332,6 @@ fn topicGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
 }
 
 pub const writer_vtable = ZZDDS.DataWriter.Vtable{
-    .write_serialized = writerWriteSerialized,
     .set_listener_ex = writerSetListenerEx,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = writerGetCAbiHandleZzdds,
@@ -1094,35 +1093,6 @@ fn topicAsTopicDescription(ctx: *anyopaque) DDS.TopicDescription {
     if (ctx == nil.NIL_PTR) return nil.nil_topic_description;
     const impl: *TopicImpl = @ptrCast(@alignCast(ctx));
     return impl.toTopicDescription();
-}
-
-fn writerWriteSerialized(
-    ctx: *anyopaque,
-    kind: ZZDDS.WriteKind,
-    key_hash: ?*const ZZDDS.OctetSeq,
-    cdr: ?*const ZZDDS.OctetSeq,
-) DDS.ReturnCode_t {
-    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
-    const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
-    const payload = octets(cdr) orelse return DDS.RETCODE_BAD_PARAMETER;
-    var hash = [_]u8{0} ** 16;
-    if (octets(key_hash)) |bytes| {
-        const n = @min(bytes.len, hash.len);
-        @memcpy(hash[0..n], bytes[0..n]);
-    } else if (key_hash != null) {
-        return DDS.RETCODE_BAD_PARAMETER;
-    }
-    const change_kind: history_mod.ChangeKind = switch (kind) {
-        .WRITE_ALIVE => .alive,
-        .WRITE_DISPOSE => .not_alive_disposed,
-        .WRITE_UNREGISTER => if (impl.qos.writer_data_lifecycle.autodispose_unregistered_instances)
-            .not_alive_disposed
-        else
-            .not_alive_unregistered,
-        _ => .alive,
-    };
-    _ = impl.writeRaw(change_kind, time_mod.RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, hash, payload) catch return DDS.RETCODE_ERROR;
-    return DDS.RETCODE_OK;
 }
 
 fn writerSetListenerEx(

@@ -397,6 +397,10 @@ pub const SubscriberImpl = struct {
         defer self.mu.unlock();
         for (self.readers.items, 0..) |r, i| {
             if (r.toDDSDataReader().ptr == a_datareader.ptr) {
+                // Spec §2.2.2.5.2.6: PRECONDITION_NOT_MET if the reader has
+                // outstanding loans -- check before touching anything.
+                const precondition = r.checkDeletePrecondition();
+                if (precondition != DDS.RETCODE_OK) return precondition;
                 _ = self.readers.swapRemove(i);
                 self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
                 r.deinit();
@@ -406,8 +410,24 @@ pub const SubscriberImpl = struct {
         return DDS.RETCODE_BAD_PARAMETER;
     }
 
+    /// Checks every reader's delete precondition without tearing anything
+    /// down -- shared by `vtDeleteContained` below and by
+    /// `participant.zig`'s own cascade, which needs an all-or-nothing check
+    /// across every subscriber before any of them start tearing down.
+    pub fn checkDeleteContainedPrecondition(self: *Self) DDS.ReturnCode_t {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.readers.items) |r| {
+            const precondition = r.checkDeletePrecondition();
+            if (precondition != DDS.RETCODE_OK) return precondition;
+        }
+        return DDS.RETCODE_OK;
+    }
+
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
         const self = cast(ctx);
+        const precondition = self.checkDeleteContainedPrecondition();
+        if (precondition != DDS.RETCODE_OK) return precondition;
         self.mu.lock();
         defer self.mu.unlock();
         for (self.readers.items) |r| {
@@ -746,14 +766,14 @@ pub const SubscriberImpl = struct {
                     // INSTANCE: group samples by instance handle so all samples of
                     // instance X are consecutive; break ties with group_seq_num.
                     .INSTANCE_PRESENTATION_QOS => std.mem.sort(
-                        reader_mod.PendingChange,
+                        *reader_mod.PendingChange,
                         r.pending.items,
                         {},
                         pendingInstanceLessThan,
                     ),
                     // TOPIC / GROUP: preserve publisher write order across instances.
                     else => std.mem.sort(
-                        reader_mod.PendingChange,
+                        *reader_mod.PendingChange,
                         r.pending.items,
                         {},
                         pendingLessThan,
@@ -805,13 +825,13 @@ pub const SubscriberImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn pendingLessThan(_: void, a: reader_mod.PendingChange, b: reader_mod.PendingChange) bool {
+    fn pendingLessThan(_: void, a: *reader_mod.PendingChange, b: *reader_mod.PendingChange) bool {
         const a_gsn = a.group_seq_num orelse std.math.maxInt(i64);
         const b_gsn = b.group_seq_num orelse std.math.maxInt(i64);
         return a_gsn < b_gsn;
     }
 
-    fn pendingInstanceLessThan(_: void, a: reader_mod.PendingChange, b: reader_mod.PendingChange) bool {
+    fn pendingInstanceLessThan(_: void, a: *reader_mod.PendingChange, b: *reader_mod.PendingChange) bool {
         if (a.info.instance_handle != b.info.instance_handle)
             return a.info.instance_handle < b.info.instance_handle;
         const a_gsn = a.group_seq_num orelse std.math.maxInt(i64);

@@ -167,6 +167,12 @@ fn drNoop22(_: *anyopaque, _: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
 fn drNoop23(_: *anyopaque, _: *DDS.PublicationBuiltinTopicData, _: DDS.InstanceHandle_t) DDS.ReturnCode_t {
     unreachable;
 }
+fn drNoop24(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq, _: DDS.InstanceHandle_t, _: DDS.ReadCondition, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: i32) DDS.ReturnCode_t {
+    unreachable;
+}
+fn drNoop25(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
+    unreachable;
+}
 fn drNoDeinit(_: *anyopaque) void {}
 fn drNoCAbiHandle(_: *anyopaque) *anyopaque {
     unreachable;
@@ -199,6 +205,11 @@ const stub_dr_vtable = DDS.DataReader.Vtable{
     .wait_for_historical_data = drNoop21,
     .get_matched_publications = drNoop22,
     .get_matched_publication_data = drNoop23,
+    .take_raw = drNoop24,
+    .read_raw = drNoop24,
+    .take_next_instance_raw = drNoop24,
+    .read_next_instance_raw = drNoop24,
+    .return_loan_raw = drNoop25,
     .deinit = drNoDeinit,
     .get_c_abi_handle = drNoCAbiHandle,
     .as_Entity = drNoAsEntity,

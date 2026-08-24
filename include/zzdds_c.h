@@ -20,46 +20,6 @@
 extern "C" {
 #endif
 
-typedef enum zzdds_write_kind {
-    ZZDDS_WRITE_ALIVE = 0,
-    ZZDDS_WRITE_DISPOSE = 1,
-    ZZDDS_WRITE_UNREGISTER = 2,
-} zzdds_write_kind;
-
-typedef struct zzdds_sample_info {
-    bool valid_data;
-    uint32_t instance_state;
-    DDS_InstanceHandle_t instance_handle;
-} zzdds_sample_info;
-
-typedef struct zzdds_loaned_sample {
-    const uint8_t *data;
-    size_t data_len;
-    void *owner;
-} zzdds_loaned_sample;
-
-typedef struct zzdds_raw_sample {
-    uint8_t *data;
-    size_t data_len;
-    zzdds_sample_info info;
-} zzdds_raw_sample;
-
-/* NOTE (pre-1.0 ABI): this struct's layout has grown before (adding the
- * _alloc_* fields below) and may grow again -- zzdds has no tagged 1.0
- * release and no known external consumers yet, so there is no compiled
- * caller anywhere linking an older layout of this struct to corrupt.
- * Layout stability is a 1.0 commitment, not a pre-1.0 one: rebuild against
- * the header you're linking. Once zzdds reaches 1.0 this struct's shape
- * must be frozen (or ownership tracked out-of-band instead of inline, e.g.
- * a pointer-keyed side table) rather than grown again in place. */
-typedef struct zzdds_raw_sample_array {
-    zzdds_raw_sample *samples;
-    size_t count;
-    size_t _alloc_capacity;     /* internal; do not modify */
-    void *_alloc_ctx;           /* internal; do not modify */
-    const void *_alloc_vtable;  /* internal; do not modify */
-} zzdds_raw_sample_array;
-
 typedef int (*zzdds_compute_key_hash_fn)(const uint8_t *payload, size_t len, uint8_t hash_out[16]);
 
 /* Discriminated field value used by get_field_from_cdr (below) and by
@@ -298,72 +258,7 @@ int zzdds_register_type_support_ctx(
     void (*ctx_deinit)(void *ctx)
 );
 
-/* handle: pass DDS_HANDLE_NIL to derive the instance automatically from
- * key_hash, or a handle previously returned by zzdds_register_instance_raw
- * (or a prior write) for that same key. Any other value returns
- * DDS_RETCODE_BAD_PARAMETER. */
-DDS_ReturnCode_t zzdds_write_raw(
-    DDS_DataWriter writer,
-    const uint8_t key_hash[16],
-    DDS_InstanceHandle_t handle,
-    const uint8_t *data,
-    size_t data_len
-);
-
-DDS_ReturnCode_t zzdds_write_raw_kind(
-    DDS_DataWriter writer,
-    zzdds_write_kind kind,
-    const uint8_t key_hash[16],
-    DDS_InstanceHandle_t handle,
-    const uint8_t *data,
-    size_t data_len
-);
-
-/* zzdds_take_one_raw/_instance/_loaned all return a plain DDS_ReturnCode_t
- * like every other zzdds C-ABI function: DDS_RETCODE_OK (a sample was
- * taken), DDS_RETCODE_NO_DATA (none available -- not an error), or another
- * DDS_RETCODE_* on a real error (DDS_RETCODE_BAD_PARAMETER for a null/
- * invalid reader handle, DDS_RETCODE_OUT_OF_RESOURCES for a destination
- * buffer too small to hold the sample or an allocation failure while
- * constructing a loan). Every generated <Type>DataReader_take()/
- * _take_next_instance()/_take_loaned() wrapper (C and C++) propagates this
- * value directly as its own return value. */
-DDS_ReturnCode_t zzdds_take_one_raw(
-    DDS_DataReader reader,
-    uint8_t *cdr_buf,
-    size_t buf_size,
-    size_t *cdr_len_out,
-    zzdds_sample_info *info_out
-);
-
-DDS_ReturnCode_t zzdds_take_one_raw_instance(
-    DDS_DataReader reader,
-    DDS_InstanceHandle_t prev_instance_handle,
-    uint8_t *cdr_buf,
-    size_t buf_size,
-    size_t *cdr_len_out,
-    zzdds_sample_info *info_out
-);
-
-DDS_ReturnCode_t zzdds_take_loaned_raw(
-    DDS_DataReader reader,
-    zzdds_loaned_sample *loan_out,
-    zzdds_sample_info *info_out
-);
-
-void zzdds_return_loaned_raw(DDS_DataReader reader, zzdds_loaned_sample *loan);
-
 DDS_InstanceHandle_t zzdds_register_instance_raw(DDS_DataWriter writer, const uint8_t key_hash[16]);
-
-DDS_ReturnCode_t zzdds_write_raw_w_timestamp(
-    DDS_DataWriter writer,
-    zzdds_write_kind kind,
-    const uint8_t key_hash[16],
-    DDS_InstanceHandle_t handle,
-    const uint8_t *data,
-    size_t data_len,
-    DDS_Time_t timestamp
-);
 
 int zzdds_get_key_value_writer(
     DDS_DataWriter writer,
@@ -374,98 +269,6 @@ int zzdds_get_key_value_writer(
 );
 
 DDS_InstanceHandle_t zzdds_lookup_instance_writer(DDS_DataWriter writer, const uint8_t key_hash[16]);
-
-/* Same DDS_ReturnCode_t convention as zzdds_take_one_raw/_instance/_loaned
- * above -- see that comment. */
-DDS_ReturnCode_t zzdds_read_one_raw(
-    DDS_DataReader reader,
-    uint8_t *cdr_buf,
-    size_t buf_size,
-    size_t *cdr_len_out,
-    zzdds_sample_info *info_out
-);
-
-DDS_ReturnCode_t zzdds_read_one_raw_instance(
-    DDS_DataReader reader,
-    DDS_InstanceHandle_t prev,
-    uint8_t *cdr_buf,
-    size_t buf_size,
-    size_t *cdr_len_out,
-    zzdds_sample_info *info_out
-);
-
-int zzdds_take_n_raw(
-    DDS_DataReader reader,
-    uint32_t ss,
-    uint32_t vs,
-    uint32_t is,
-    int max,
-    zzdds_raw_sample_array *out
-);
-
-int zzdds_read_n_raw(
-    DDS_DataReader reader,
-    uint32_t ss,
-    uint32_t vs,
-    uint32_t is,
-    int max,
-    zzdds_raw_sample_array *out
-);
-
-int zzdds_take_n_instance_raw(
-    DDS_DataReader reader,
-    DDS_InstanceHandle_t instance_handle,
-    uint32_t ss,
-    uint32_t vs,
-    uint32_t is,
-    int max,
-    zzdds_raw_sample_array *out
-);
-
-int zzdds_read_n_instance_raw(
-    DDS_DataReader reader,
-    DDS_InstanceHandle_t instance_handle,
-    uint32_t ss,
-    uint32_t vs,
-    uint32_t is,
-    int max,
-    zzdds_raw_sample_array *out
-);
-
-/* `condition` is a DDS_ReadCondition -- or a DDS_QueryCondition, upcast via
- * its own generated as_ReadCondition() -- from this same reader. State masks
- * (and, for a QueryCondition, the query filter) come from `condition` itself. */
-int zzdds_take_w_condition_raw(
-    DDS_DataReader reader,
-    DDS_ReadCondition condition,
-    int max,
-    zzdds_raw_sample_array *out
-);
-
-int zzdds_read_w_condition_raw(
-    DDS_DataReader reader,
-    DDS_ReadCondition condition,
-    int max,
-    zzdds_raw_sample_array *out
-);
-
-int zzdds_take_next_instance_w_condition_raw(
-    DDS_DataReader reader,
-    DDS_ReadCondition condition,
-    DDS_InstanceHandle_t prev,
-    int max,
-    zzdds_raw_sample_array *out
-);
-
-int zzdds_read_next_instance_w_condition_raw(
-    DDS_DataReader reader,
-    DDS_ReadCondition condition,
-    DDS_InstanceHandle_t prev,
-    int max,
-    zzdds_raw_sample_array *out
-);
-
-void zzdds_return_raw_samples(DDS_DataReader reader, zzdds_raw_sample_array *arr);
 
 int zzdds_get_key_value_reader(
     DDS_DataReader reader,

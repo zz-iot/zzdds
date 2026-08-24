@@ -18,6 +18,7 @@ const noop_security = zzdds.noop_security.noop_security_plugins;
 const mock_tr = zzdds.mock_transport;
 const iface = zzdds.discovery;
 const time_mod = zzdds.util.time;
+const history_mod = zzdds.rtps.history;
 
 const MockNetwork = mock_tr.MockNetwork;
 const MockTransport = mock_tr.MockTransport;
@@ -419,6 +420,204 @@ test "partition names: multiple writers with partitions — deinit via delete_pu
 
     // delete_publisher → delete_contained_entities → each writer removed from active_writers.
     _ = fx.dp.vtable.delete_publisher(fx.dp.ptr, publisher);
+}
+
+test "vtDeleteContained (Participant): all-or-nothing -- refuses and tears down nothing while a nested reader has an outstanding read-loan" {
+    var fx = try Fixture.init(42);
+    defer fx.deinit();
+
+    const topic = fx.dp.create_topic("LoanTopic", "T", .{}, null, 0);
+    const subscriber = fx.dp.create_subscriber(.{}, null, 0);
+    const topic_impl = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr)));
+    const td = topic_impl.toTopicDescription();
+    const dr = subscriber.create_datareader(td, .{}, null, 0);
+    const dr_impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    const data = try testing.allocator.dupe(u8, &.{0xEE});
+    const pc = try testing.allocator.create(zzdds.dcps.PendingChange);
+    pc.* = .{
+        .data = data,
+        .alloc = testing.allocator,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
+    };
+    try dr_impl.pending.append(testing.allocator, pc);
+
+    const pinned = try dr_impl.pinSamplesForLoan(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+    defer testing.allocator.free(pinned);
+    try testing.expectEqual(@as(usize, 1), pinned.len);
+
+    // Refused, all-or-nothing: nothing torn down at any level.
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.dp.vtable.delete_contained_entities(fx.dp.ptr));
+
+    dr_impl.releasePinnedSamples(pinned);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_contained_entities(fx.dp.ptr));
+}
+
+// ── Write-loan tests (Phase C) ──────────────────────────────────────────────
+
+const WL_KEY: [16]u8 = std.mem.zeroes([16]u8);
+const WL_IH: history_mod.InstanceHandle = history_mod.INSTANCE_HANDLE_NIL;
+
+fn wlMakeWriter(fx: *Fixture, name: [:0]const u8, qos: DDS.DataWriterQos) *zzdds.dcps.DataWriterImpl {
+    const topic = fx.dp.create_topic(name, "T", .{}, null, 0);
+    const publisher = fx.dp.create_publisher(.{}, null, 0);
+    const dw = publisher.create_datawriter(topic, qos, null, 0);
+    return @ptrCast(@alignCast(dw.ptr));
+}
+
+test "loanForWrite/publishLoan: round trip tracks outstanding_loans, frees buffer, and lands in the cache" {
+    var fx = try Fixture.init(50);
+    defer fx.deinit();
+    const dw_impl = wlMakeWriter(&fx, "WLTopicPublish", .{});
+
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    const buf = try dw_impl.loanForWrite(1);
+    try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
+    buf[0] = 0x42;
+
+    const before = dw_impl.proto_writer.cacheLen();
+    _ = try dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), WL_IH, WL_KEY, buf, buf.len);
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expectEqual(before + 1, dw_impl.proto_writer.cacheLen());
+}
+
+test "loanForWrite/cancelLoan: round trip tracks outstanding_loans, frees buffer, publishes nothing" {
+    var fx = try Fixture.init(51);
+    defer fx.deinit();
+    const dw_impl = wlMakeWriter(&fx, "WLTopicCancel", .{});
+
+    const buf = try dw_impl.loanForWrite(4);
+    try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
+    const before = dw_impl.proto_writer.cacheLen();
+    dw_impl.cancelLoan(buf);
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expectEqual(before, dw_impl.proto_writer.cacheLen());
+}
+
+test "publishLoan: a failed publish (RESOURCE_LIMITS) still fully releases the loan" {
+    var fx = try Fixture.init(52);
+    defer fx.deinit();
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.resource_limits.max_samples = 1;
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    const dw_impl = wlMakeWriter(&fx, "WLTopicFail", dw_qos);
+
+    // Fill the one available slot with a plain write so the cache is at its limit.
+    const PAYLOAD: [5]u8 = .{ 0x00, 0x01, 0x00, 0x00, 0x01 };
+    _ = try dw_impl.writeRaw(.alive, time_mod.RtpsTimestamp.now(), WL_IH, WL_KEY, &PAYLOAD);
+
+    const buf = try dw_impl.loanForWrite(1);
+    try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expectError(error.OutOfResources, dw_impl.publishLoan(.alive, time_mod.RtpsTimestamp.now(), WL_IH, WL_KEY, buf, buf.len));
+    // The loan is fully released despite the failure -- nothing left pending to retry.
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+}
+
+test "checkDeletePrecondition (DataWriter): PRECONDITION_NOT_MET while a loan is outstanding, OK once resolved" {
+    var fx = try Fixture.init(53);
+    defer fx.deinit();
+    const dw_impl = wlMakeWriter(&fx, "WLTopicPrecond", .{});
+
+    try testing.expectEqual(DDS.RETCODE_OK, dw_impl.checkDeletePrecondition());
+    const buf = try dw_impl.loanForWrite(1);
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, dw_impl.checkDeletePrecondition());
+    dw_impl.cancelLoan(buf);
+    try testing.expectEqual(DDS.RETCODE_OK, dw_impl.checkDeletePrecondition());
+}
+
+test "vtDeleteDataWriter/vtDeleteContained (Publisher): refuse while a writer has an outstanding write-loan, succeed once resolved" {
+    var fx = try Fixture.init(54);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("WLTopicPubDelete", "T", .{}, null, 0);
+    const publisher = fx.dp.create_publisher(.{}, null, 0);
+    const dw = publisher.create_datawriter(topic, .{}, null, 0);
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    const buf = try dw_impl.loanForWrite(1);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, publisher.vtable.delete_datawriter(publisher.ptr, dw));
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, publisher.vtable.delete_contained_entities(publisher.ptr));
+
+    dw_impl.cancelLoan(buf);
+    try testing.expectEqual(DDS.RETCODE_OK, publisher.vtable.delete_contained_entities(publisher.ptr));
+}
+
+test "vtDeletePublisher (Participant): refuses direct delete while a writer has an outstanding write-loan, succeeds once resolved" {
+    // Regression for a real bug (Greptile PR #69 follow-up): unlike
+    // delete_datawriter/delete_contained_entities (see the test above), the
+    // participant's own direct delete_publisher previously skipped the
+    // precondition check entirely and unconditionally destroyed every
+    // contained writer's protocol writer -- a caller that had already loaned
+    // a buffer via loan_raw() would then dereference a destroyed protocol
+    // writer on publish_loan_raw(), no concurrency required to hit it.
+    var fx = try Fixture.init(56);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("WLTopicDirectPubDelete", "T", .{}, null, 0);
+    const publisher = fx.dp.create_publisher(.{}, null, 0);
+    const dw = publisher.create_datawriter(topic, .{}, null, 0);
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    const buf = try dw_impl.loanForWrite(1);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.dp.vtable.delete_publisher(fx.dp.ptr, publisher));
+
+    dw_impl.cancelLoan(buf);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_publisher(fx.dp.ptr, publisher));
+}
+
+test "vtDeleteSubscriber (Participant): refuses direct delete while a reader has an outstanding read-loan, succeeds once resolved" {
+    // Read-side counterpart of the direct-delete_publisher fix above.
+    var fx = try Fixture.init(57);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("WLTopicDirectSubDelete", "T", .{}, null, 0);
+    const subscriber = fx.dp.create_subscriber(.{}, null, 0);
+    const topic_impl = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr)));
+    const dr = subscriber.create_datareader(topic_impl.toTopicDescription(), .{}, null, 0);
+    const dr_impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    const data = try testing.allocator.dupe(u8, &.{0xEE});
+    const pc = try testing.allocator.create(zzdds.dcps.PendingChange);
+    pc.* = .{
+        .data = data,
+        .alloc = testing.allocator,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
+    };
+    try dr_impl.pending.append(testing.allocator, pc);
+
+    const pinned = try dr_impl.pinSamplesForLoan(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+    defer testing.allocator.free(pinned);
+    try testing.expectEqual(@as(usize, 1), pinned.len);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.dp.vtable.delete_subscriber(fx.dp.ptr, subscriber));
+
+    dr_impl.releasePinnedSamples(pinned);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_subscriber(fx.dp.ptr, subscriber));
+}
+
+test "vtDeleteContained (Participant): all-or-nothing across both branches -- a writer's outstanding write-loan refuses even with all readers clean, and vice versa" {
+    var fx = try Fixture.init(55);
+    defer fx.deinit();
+
+    // Clean reader side.
+    const r_topic = fx.dp.create_topic("WLBothTopicR", "T", .{}, null, 0);
+    const subscriber = fx.dp.create_subscriber(.{}, null, 0);
+    const r_topic_impl = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(r_topic.ptr)));
+    _ = subscriber.create_datareader(r_topic_impl.toTopicDescription(), .{}, null, 0);
+
+    // Dirty writer side.
+    const w_topic = fx.dp.create_topic("WLBothTopicW", "T", .{}, null, 0);
+    const publisher = fx.dp.create_publisher(.{}, null, 0);
+    const dw = publisher.create_datawriter(w_topic, .{}, null, 0);
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const buf = try dw_impl.loanForWrite(1);
+
+    // A writer-side-only failure must still refuse, all-or-nothing, with the
+    // reader side entirely clean -- guards against the publisher check being
+    // accidentally short-circuited by (or short-circuiting) the subscriber check.
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.dp.vtable.delete_contained_entities(fx.dp.ptr));
+
+    dw_impl.cancelLoan(buf);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_contained_entities(fx.dp.ptr));
 }
 
 // ── Heap-QoS round-trip tests ─────────────────────────────────────────────────

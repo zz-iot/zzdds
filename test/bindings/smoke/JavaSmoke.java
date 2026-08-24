@@ -149,6 +149,39 @@ public class JavaSmoke {
         check(dpFromEntity == dpWriter, "get_entity() boxed the SAME identity-cached DomainParticipant, not a bare Entity");
         System.out.println("  StatusCondition.get_entity() most-derived box: OK");
 
+        // Regression coverage for the generic loan_raw/publish_loan_raw JNI
+        // bridge (java.zig's isWriteLoanBufferOp) that writer.write() above
+        // already exercises implicitly: a real, previously-unexercised bug
+        // in the generic per-op codegen lost the loaned native buffer's
+        // identity across the loan_raw()->publish_loan_raw() call pair
+        // (Java's normal List<Byte> marshaling copies through a *fresh*
+        // native buffer on every JNI boundary crossing), leaking both the
+        // buffer and the writer's outstanding-loan count permanently --
+        // confirmed by generating and reading the actual JNI bridge output
+        // before the fix existed. Fixed via java.nio.ByteBuffer
+        // (NewDirectByteBuffer/GetDirectBufferAddress correctly preserve
+        // that identity). dispose()'s key-only branch exercises writeViaLoan
+        // with keyOnly=true (a different toPayload() call than write()'s);
+        // delete_datawriter() succeeding afterward is the real regression
+        // check for the leak -- it would return PRECONDITION_NOT_MET forever
+        // if any prior loan_raw call's outstanding-loan count was never
+        // cleared.
+        check(writer.dispose(sample, 0L) == 0, "writer.dispose() rc == 0");
+        BindingSmokeStatusDataReader.Sample disposed = null;
+        for (int i = 0; i < 50 && disposed == null; i++) {
+            disposed = reader.take();
+            if (disposed == null) Thread.sleep(100);
+        }
+        check(disposed != null, "reader.take() returned the dispose sample");
+        check(!disposed.validData, "dispose sample has valid_data == false");
+        check(disposed.instanceState == Dcps.DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE.value,
+            "dispose sample instance_state == NOT_ALIVE_DISPOSED_INSTANCE_STATE");
+        System.out.println("  writer.dispose() via loan path: OK");
+
+        int deleteRc = publisher.delete_datawriter(rawWriter);
+        check(deleteRc == 0, "delete_datawriter() rc == 0 (would be PRECONDITION_NOT_MET if any loan_raw call above leaked its outstanding-loan count)");
+        System.out.println("  delete_datawriter() after loan-backed writes: OK (no outstanding-loan leak)");
+
         System.out.println("All Java binding smoke checks passed.");
     }
 }

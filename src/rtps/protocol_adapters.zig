@@ -424,8 +424,23 @@ pub const RtpsProtocolReader = struct {
         });
     }
 
+    /// `writer_match_cb` is written here (once, from `DataReaderImpl.init`, before
+    /// the reader is otherwise reachable) and read from `vtAddMatchedWriter`/
+    /// `vtRemoveMatchedWriter`, which run on the RTPS receive thread and can race
+    /// that initial write in practice — SEDP re-discovery of an already-known
+    /// remote writer can fire `addMatchedWriter` concurrently with a *different*
+    /// reader still being constructed on the same participant. Guard the field
+    /// with `self.reader.mu` (already the lock protecting `writer_proxies`, and
+    /// already taken by this same adapter in `vtMatchedWriterCount`/
+    /// `vtListMatchedWriters`) rather than adding a new lock. The callback itself
+    /// is snapshotted under the lock and invoked after unlocking, matching
+    /// `vtMatchedWriterCount`'s existing snapshot-then-release shape — never
+    /// held during arbitrary listener code, which avoids opening a new lock-order
+    /// dependency against `DataReaderImpl.mu` (taken inside the callback).
     fn vtSetWriterMatchCallback(ctx: *anyopaque, cb: protocol.WriterMatchCallback) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.reader.mu.lock();
+        defer self.reader.mu.unlock();
         self.writer_match_cb = cb;
     }
 
@@ -445,16 +460,22 @@ pub const RtpsProtocolReader = struct {
         // on_writer_matched first (DDS spec: subscription_matched precedes liveliness_changed),
         // then on_writer_alive — a newly matched writer is alive by definition.
         // Both fire only after addMatchedWriter succeeds so no callback leaks on OOM.
-        if (self.writer_match_cb) |cb| {
-            cb.on_writer_matched(cb.ctx, info);
-            if (cb.on_writer_alive) |f| f(cb.ctx, info.guid, .data);
+        self.reader.mu.lock();
+        const cb = self.writer_match_cb;
+        self.reader.mu.unlock();
+        if (cb) |c| {
+            c.on_writer_matched(c.ctx, info);
+            if (c.on_writer_alive) |f| f(c.ctx, info.guid, .data);
         }
     }
 
     fn vtRemoveMatchedWriter(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.reader.removeMatchedWriter(guid);
-        if (self.writer_match_cb) |cb| cb.on_writer_unmatched(cb.ctx, guid);
+        self.reader.mu.lock();
+        const cb = self.writer_match_cb;
+        self.reader.mu.unlock();
+        if (cb) |c| c.on_writer_unmatched(c.ctx, guid);
     }
 
     fn vtMatchedWriterCount(ctx: *anyopaque) usize {

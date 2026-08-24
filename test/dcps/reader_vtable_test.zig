@@ -15,6 +15,7 @@ const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const nil = zzdds.dcps;
 const noop_security = zzdds.noop_security.noop_security_plugins;
+const time_mod = zzdds.util.time;
 
 const testing = std.testing;
 
@@ -657,4 +658,600 @@ test "DataReader: get_qos returns independent clone — replacement does not dan
 
     try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
     got.deinit(testing.allocator);
+}
+
+// ── Raw/loaned read ops (take_raw/read_raw/return_loan_raw) ────────────────────
+
+test "take_raw: loan mode (max_len==0) is destructive, zero-copy, and outstanding_loans-tracked" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0xAA });
+    dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0xBB });
+    try testing.expectEqual(@as(usize, 2), dr.pending.items.len);
+
+    var payloads = DDS.OctetSeqSeq{}; // _maximum == 0 -> loan mode
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    const rc = dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+
+    try testing.expectEqual(@as(u32, 2), payloads._length);
+    try testing.expectEqual(false, payloads._release);
+    try testing.expectEqual(@as(u32, 32), hashes._length); // 2 * 16 bytes
+    try testing.expectEqual(@as(u32, 2), infos._length);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len); // destructive
+    try testing.expectEqual(@as(usize, 2), dr.outstanding_loans.load(.monotonic));
+
+    const buf0 = payloads._buffer.?[0];
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x00, 0x00, 0xAA }, buf0._buffer.?[0..buf0._length]);
+
+    const rc2 = dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos);
+    try testing.expectEqual(DDS.RETCODE_OK, rc2);
+    try testing.expectEqual(@as(usize, 0), dr.outstanding_loans.load(.monotonic));
+}
+
+test "read_raw: loan mode is non-destructive -- samples stay in pending, marked READ" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0xAA });
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    const rc = dr_dds.vtable.read_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len); // non-destructive
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE, dr.pending.items[0].info.sample_state);
+    try testing.expectEqual(@as(usize, 1), dr.outstanding_loans.load(.monotonic));
+
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+    try testing.expectEqual(@as(usize, 0), dr.outstanding_loans.load(.monotonic));
+    // Sample is still in pending -- releasing a loan doesn't retire it.
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+}
+
+test "take_raw: copy mode (max_len!=0) does not require return_loan_raw -- generic free is safe" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0xCC });
+
+    // A non-zero _maximum signals copy mode -- the actual value/buffer
+    // content is ignored (matches this codebase's existing convention for
+    // sequence-returning ops, e.g. vtGetMatchedSubs, which always allocates
+    // fresh rather than filling a caller-supplied buffer).
+    var payloads = DDS.OctetSeqSeq{ ._maximum = 1 };
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    const rc = dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+    try testing.expectEqual(@as(usize, 0), dr.outstanding_loans.load(.monotonic)); // not a loan
+
+    // return_loan_raw still works correctly on copy-mode output (finds no
+    // loan_table entry, falls back to freeing each descriptor directly).
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+}
+
+test "take_raw: an outstanding read-loan blocks delete_datareader with PRECONDITION_NOT_MET" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x01 });
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds));
+
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+    try testing.expectEqual(DDS.RETCODE_OK, fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds));
+}
+
+test "take_raw: outstanding read-loan defers real protocol-reader teardown until the loan resolves" {
+    // Regression for a real, distinct race (Greptile PR #69 review, round
+    // 3), read-side counterpart of writer_vtable_test.zig's identical
+    // fix/test -- see that test's comment for the full race description and
+    // why the underlying fix (acquiring proto_reader's own EntityQuiesce
+    // ref for the loan's whole lifetime, deferring real teardown) closes it
+    // regardless of checkDeleteContainedPrecondition()'s check timing.
+    //
+    // Unlike the write side, releasing a read loan (return_loan_raw) never
+    // itself touches proto_reader -- pinned samples live entirely in
+    // DataReaderImpl's own `pending` queue. So the proof here is different:
+    // matchedWriterCount() (which does call into proto_reader) must still
+    // work correctly after the simulated destroy below, while the loan is
+    // still outstanding -- proving proto_reader's real resources weren't
+    // actually destroyed yet, not just that release itself doesn't crash.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
+    dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x01 });
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+
+    // Simulate the race having already gone the unsafe way: the protocol
+    // reader is destroyed (from the participant's perspective) while the
+    // loan above is still outstanding.
+    sub_impl.cbs.destroy_proto_reader(sub_impl.cbs.ctx, dr.instance_handle);
+
+    // Before the fix, proto_reader's real resources would already be gone
+    // here, and this would use-after-free.
+    _ = dr.matchedWriterCount();
+
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+}
+
+test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterward" {
+    // Regression for a real, distinct bug (Greptile PR #69 review, round
+    // 4), read-side counterpart of writer_vtable_test.zig's identical
+    // fix/test -- see that test's comment for the full bug description AND
+    // an important caveat: this test does not reliably catch a regression
+    // back to the wrong release order via a crash (confirmed empirically on
+    // the write side this session; std.testing.allocator's small-object
+    // path doesn't unmap/poison a freed slot this size). The actual
+    // use-after-free-safety property is enforced by the explicit release
+    // order in vtReturnLoanRaw's source and its accompanying comment, not
+    // by this test's pass/fail -- this test exercises the real code path
+    // and pins down the ref-count mechanics via explicit assertions.
+    //
+    // Unlike the write side, this function also frees hashes_seq/infos_seq
+    // and the taken samples' own storage (all via self.alloc) before
+    // releasing any quiesce ref -- every one of those self.alloc reads
+    // would also have use-after-freed under the old (wrong) release order,
+    // not just the self.proto_reader read.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
+    dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x01 });
+
+    try testing.expectEqual(@as(usize, 1), dr.quiesce.state.load(.monotonic));
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(usize, 2), dr.quiesce.state.load(.monotonic));
+
+    // Simulate the race having already gone the unsafe way: a
+    // delete_datareader raced ahead of the loan above and completed anyway
+    // -- removing dr from the subscriber's own list, destroying its
+    // protocol reader, and calling deinit() directly, mirroring
+    // vtDeleteDataReader's real successful path minus the precondition
+    // check it would otherwise fail on. deinit() drops dr's baseline
+    // quiesce ref; the loan above still holds a transferred ref, so dr
+    // survives (EntityQuiesce defers physical teardown) until
+    // return_loan_raw resolves it.
+    sub_impl.mu.lock();
+    for (sub_impl.readers.items, 0..) |r, i| {
+        if (r == dr) {
+            _ = sub_impl.readers.swapRemove(i);
+            break;
+        }
+    }
+    sub_impl.mu.unlock();
+    sub_impl.cbs.destroy_proto_reader(sub_impl.cbs.ctx, dr.instance_handle);
+    dr.deinit();
+    // Tearing-down bit set (high bit) + refcount 1 (just the loan's ref) --
+    // confirms the precondition this test exists to exercise actually holds
+    // before return_loan_raw runs.
+    try testing.expectEqual(@as(usize, 0x8000000000000001), dr.quiesce.state.load(.monotonic));
+
+    // dr is now kept alive only by the loan's transferred quiesce ref --
+    // removed from sub_impl.readers above, so nothing else will touch it
+    // again (no `defer delete_datareader`). Returning the loan resolves
+    // that ref and frees dr for real: the proof here is this call
+    // succeeding without crashing.
+    const rc = dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+}
+
+const PendingChange = zzdds.dcps.PendingChange;
+
+/// Injects a sample for a specific instance_handle directly (pushCdr always
+/// uses a single zero key hash / instance -- these tests need >= 2 distinct
+/// instances, which nothing else in this file's fixtures can produce).
+fn pushInstance(dr: *DataReaderImpl, alloc: std.mem.Allocator, ih: DDS.InstanceHandle_t, data: []const u8) !void {
+    const pc = try alloc.create(PendingChange);
+    pc.* = .{
+        .data = try alloc.dupe(u8, data),
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = ih, .valid_data = true },
+    };
+    try dr.pending.append(alloc, pc);
+}
+
+/// Like pushInstance, but already expired (LIFESPAN QoS) -- expiry_ns is set
+/// to a timestamp already in the past, so any raw op's expiry-sweep check
+/// (`if (now_ns >= exp) ...`) fires the first time it runs, with no need to
+/// wait for real time to pass or configure a real writer's lifespan QoS.
+fn pushExpiredInstance(dr: *DataReaderImpl, alloc: std.mem.Allocator, ih: DDS.InstanceHandle_t, data: []const u8) !void {
+    const pc = try alloc.create(PendingChange);
+    pc.* = .{
+        .data = try alloc.dupe(u8, data),
+        .alloc = alloc,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = ih, .valid_data = true },
+        .expiry_ns = time_mod.nanoTimestamp() - std.time.ns_per_s,
+    };
+    try dr.pending.append(alloc, pc);
+}
+
+test "take_raw: instance_handle filters to exactly that instance" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushInstance(dr, alloc, 1, &[_]u8{0xA1});
+    try pushInstance(dr, alloc, 2, &[_]u8{0xB2});
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    const rc = dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, 2, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+    try testing.expectEqualSlices(u8, &.{0xB2}, payloads._buffer.?[0]._buffer.?[0..1]);
+    try testing.expectEqual(@as(i32, 2), infos._buffer.?[0].instance_handle);
+    // Instance 1's sample is untouched -- still in pending.
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+}
+
+test "take_next_instance_raw: cursor iteration visits each instance once, in handle order" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushInstance(dr, alloc, 5, &[_]u8{0x05});
+    try pushInstance(dr, alloc, 3, &[_]u8{0x03});
+
+    // First call (previous_handle = HANDLE_NIL): lowest handle, instance 3.
+    var payloads1 = DDS.OctetSeqSeq{};
+    var hashes1 = DDS.OctetSeq{};
+    var infos1 = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &payloads1, &hashes1, &infos1, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(u32, 1), payloads1._length);
+    try testing.expectEqual(@as(i32, 3), infos1._buffer.?[0].instance_handle);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads1, &hashes1, &infos1));
+
+    // Second call (previous_handle = 3): next instance after it, instance 5.
+    var payloads2 = DDS.OctetSeqSeq{};
+    var hashes2 = DDS.OctetSeq{};
+    var infos2 = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &payloads2, &hashes2, &infos2, 3, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(u32, 1), payloads2._length);
+    try testing.expectEqual(@as(i32, 5), infos2._buffer.?[0].instance_handle);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads2, &hashes2, &infos2));
+
+    // No more instances after 5.
+    var payloads3 = DDS.OctetSeqSeq{};
+    var hashes3 = DDS.OctetSeq{};
+    var infos3 = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &payloads3, &hashes3, &infos3, 5, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(u32, 0), payloads3._length);
+}
+
+// ── Coverage gap #1: read_next_instance_raw (never previously exercised in
+// either mode -- take_next_instance_raw's read-only sibling) ───────────────
+
+test "read_next_instance_raw: loan mode is non-destructive and advances the cursor, mirroring take_next_instance_raw" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushInstance(dr, alloc, 5, &[_]u8{0x05});
+    try pushInstance(dr, alloc, 3, &[_]u8{0x03});
+
+    var payloads1 = DDS.OctetSeqSeq{};
+    var hashes1 = DDS.OctetSeq{};
+    var infos1 = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.read_next_instance_raw(dr_dds.ptr, &payloads1, &hashes1, &infos1, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(u32, 1), payloads1._length);
+    try testing.expectEqual(@as(i32, 3), infos1._buffer.?[0].instance_handle);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads1, &hashes1, &infos1));
+    // Non-destructive: both samples remain in pending, just marked read.
+    try testing.expectEqual(@as(usize, 2), dr.pending.items.len);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE, dr.pending.items[1].info.sample_state);
+
+    // Cursor still advances past instance 3, same as take_next_instance_raw.
+    var payloads2 = DDS.OctetSeqSeq{};
+    var hashes2 = DDS.OctetSeq{};
+    var infos2 = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.read_next_instance_raw(dr_dds.ptr, &payloads2, &hashes2, &infos2, 3, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(u32, 1), payloads2._length);
+    try testing.expectEqual(@as(i32, 5), infos2._buffer.?[0].instance_handle);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads2, &hashes2, &infos2));
+}
+
+test "read_next_instance_raw: copy mode (max_len!=0) is non-destructive and independently owned" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushInstance(dr, alloc, 3, &[_]u8{0x03});
+
+    var descriptor_buf: [1]DDS.OctetSeq = undefined;
+    var payloads = DDS.OctetSeqSeq{ ._buffer = &descriptor_buf, ._length = 0, ._maximum = 1, ._release = false };
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.read_next_instance_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+    try testing.expectEqualSlices(u8, &.{0x03}, payloads._buffer.?[0]._buffer.?[0..1]);
+    // Non-destructive: sample remains in pending, marked read.
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE, dr.pending.items[0].info.sample_state);
+    // Copy mode: return_loan_raw still safely releases the independently-owned copy.
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+}
+
+// ── Coverage gap #2: read_raw copy mode (only take_raw's copy mode had a
+// test; readRaw's own call site inside rawReadOrTakeImpl never fired) ──────
+
+test "read_raw: copy mode (max_len!=0) is non-destructive and independently owned" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    try pushInstance(dr, alloc, 1, &[_]u8{0x07});
+
+    // A non-zero _maximum signals copy mode -- the actual caller-supplied
+    // buffer/value is ignored, matching take_raw's copy-mode test above
+    // (buildRawOutputFromTaken always allocates fresh regardless of mode).
+    var payloads = DDS.OctetSeqSeq{ ._maximum = 1 };
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.read_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+    try testing.expectEqualSlices(u8, &.{0x07}, payloads._buffer.?[0]._buffer.?[0..1]);
+    // Non-destructive: sample remains in pending, marked read.
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expectEqual(DDS.READ_SAMPLE_STATE, dr.pending.items[0].info.sample_state);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+}
+
+// ── Coverage gap #3: raw ops + a real QueryCondition (every existing raw-op
+// condition test used a plain ReadCondition; the QueryCondition-thunk branch
+// in resolveRawFilter never ran) ────────────────────────────────────────────
+
+test "take_raw: a_condition accepts a real QueryCondition (degrades to ReadCondition semantics with an empty expression)" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    try pushInstance(dr, alloc, 1, &[_]u8{0x09});
+
+    // Empty expression imposes no field constraints -- valid without a
+    // registered TypeSupport, and matches everything, same as a plain
+    // ReadCondition with ANY_*_STATE masks.
+    var empty_params = DDS.StringSeq{};
+    const qc = dr_dds.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", &empty_params);
+    try testing.expect(qc.ptr != nil.NIL_PTR);
+    defer qc.deinit();
+    const rc_view = qc.vtable.as_ReadCondition(qc.ptr);
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    // Explicit masks are ignored when a_condition is non-nil -- pass masks
+    // that would exclude everything, to prove the condition's own stored
+    // masks (not these) are what's actually applied.
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, rc_view, 0, 0, 0, -1));
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+    try testing.expectEqualSlices(u8, &.{0x09}, payloads._buffer.?[0]._buffer.?[0..1]);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+}
+
+// ── Coverage gap #4: LIFESPAN expiry sweep, never exercised for any of the
+// raw-op pin/take-for-loan functions (pinSamplesForLoan, takeSamplesForLoan,
+// pinNextInstanceForLoan, takeNextInstanceForLoan all duplicate this same
+// sweep, each independently untested) ───────────────────────────────────────
+
+test "take_raw: loan mode sweeps an already-expired (LIFESPAN) sample instead of returning it" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushExpiredInstance(dr, alloc, 1, &[_]u8{0xEE});
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    // Swept during the expiry pass, not returned as a real sample.
+    try testing.expectEqual(@as(u32, 0), payloads._length);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
+
+// ── kcov coverage sweep (2026-08-24): closing gaps 1-4 from the fresh
+// kcov-vs-PR-diff comparison, plus a few LIFESPAN-sweep call sites from the
+// medium-value item ─────────────────────────────────────────────────────────
+
+test "take_raw: proto_reader already tearing down (but not yet freed) fails cleanly with ALREADY_DELETED" {
+    // Coverage gap #1, read-side counterpart of writer_vtable_test.zig's
+    // identical test -- see that test's comment for the full technique
+    // (holds an extra quiesce ref on proto_reader first so
+    // destroy_proto_reader's beginTeardown() only sets the tearing-down bit
+    // without dropping the count to zero, so proto_reader stays genuinely
+    // allocated the whole time -- no undefined behavior). Hits
+    // src/dcps/reader.zig's `!self.proto_reader.quiesceAcquire()` branch in
+    // rawReadOrTake (~L3371-3373).
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
+
+    try testing.expect(dr.proto_reader.quiesceAcquire());
+    sub_impl.cbs.destroy_proto_reader(sub_impl.cbs.ctx, dr.instance_handle);
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+
+    dr.proto_reader.quiesceRelease();
+}
+
+test "take_next_instance_raw: proto_reader already tearing down (but not yet freed) fails cleanly with ALREADY_DELETED" {
+    // Coverage gap #1, rawReadOrTakeNextInstance's own copy of the same
+    // guard (src/dcps/reader.zig ~L3438-3440).
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
+
+    try testing.expect(dr.proto_reader.quiesceAcquire());
+    sub_impl.cbs.destroy_proto_reader(sub_impl.cbs.ctx, dr.instance_handle);
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+
+    dr.proto_reader.quiesceRelease();
+}
+
+test "take_raw: a_condition via the QueryCondition-thunk vtable (not the plain ReadCondition view) is resolved correctly" {
+    // Coverage gap #4: the earlier "a_condition accepts a real
+    // QueryCondition" test (above) calls `qc.vtable.as_ReadCondition(qc.ptr)`,
+    // which returns `qc.rc.toDDSReadCondition()` -- a view tagged with
+    // `ReadConditionImpl.vtable`, NOT `QueryConditionImpl.rc_thunk_vtable`.
+    // So that test actually exercises resolveRawFilter's plain-ReadCondition
+    // branch (src/dcps/reader.zig L3213), not the thunk branch (L3214-3216)
+    // its own comment claimed. `rc_thunk_vtable` is real production code --
+    // reached when a QueryCondition crosses the C-ABI boundary and gets
+    // unboxed directly as a ReadCondition (see QueryConditionImpl.views'
+    // `flat_vtable = &rc_thunk_vtable`) -- but nothing at the Zig level
+    // constructs it that way except a manual `DDS.ReadCondition` literal,
+    // which is what this test does instead.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    try pushInstance(dr, alloc, 1, &[_]u8{0x0A});
+
+    var empty_params = DDS.StringSeq{};
+    const qc = dr_dds.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "", &empty_params);
+    try testing.expect(qc.ptr != nil.NIL_PTR);
+    defer qc.deinit();
+    const thunk_view = DDS.ReadCondition{ .ptr = qc.ptr, .vtable = &zzdds.dcps.QueryConditionImpl.rc_thunk_vtable };
+
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    // Explicit masks are ignored when a_condition is non-nil -- pass masks
+    // that would exclude everything, same proof as the existing test.
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, thunk_view, 0, 0, 0, -1));
+    try testing.expectEqual(@as(u32, 1), payloads._length);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
+}
+
+test "takeNextInstanceRaw: sweeps an already-expired (LIFESPAN) sample instead of returning it" {
+    // Medium-value item: one of 9 near-identical LIFESPAN-sweep call sites
+    // in reader.zig, only 1 of which (the raw-ops loan-mode path, tested
+    // above) was previously exercised. This covers takeNextInstanceRaw's
+    // own copy (src/dcps/reader.zig ~L1668-1671), the core method behind
+    // the typed API's single-sample take_next_instance.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushExpiredInstance(dr, alloc, 1, &[_]u8{0xE1});
+    try testing.expect(dr.takeNextInstanceRaw(DDS.HANDLE_NIL) == null);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
+
+test "readNextInstanceRaw: sweeps an already-expired (LIFESPAN) sample instead of returning it" {
+    // Medium-value item, readNextInstanceRaw's own copy
+    // (src/dcps/reader.zig ~L1723-1726) -- the non-destructive counterpart
+    // of the test above.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushExpiredInstance(dr, alloc, 1, &[_]u8{0xE2});
+    try testing.expect(dr.readNextInstanceRaw(DDS.HANDLE_NIL) == null);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
+}
+
+test "takeFiltered: sweeps an already-expired (LIFESPAN) sample instead of returning it" {
+    // Medium-value item, takeFiltered's own copy
+    // (src/dcps/reader.zig ~L2333-2336) -- the core batch method behind the
+    // typed API's plain take()/take_w_condition() family.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+
+    try pushExpiredInstance(dr, alloc, 1, &[_]u8{0xE3});
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer out.deinit(alloc);
+    try dr.takeFiltered(&out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+    try testing.expectEqual(@as(usize, 0), dr.pending.items.len);
 }

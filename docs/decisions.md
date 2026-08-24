@@ -98,7 +98,13 @@ future optimization if per-sample CPU cost becomes measurable.
 **`DataReader.read()` semantics: copy first, loan upgrade path preserved.**
 `readRaw()` is non-destructive: marks samples `READ_SAMPLE_STATE` in-place, returns
 clones. The zero-copy loan upgrade path is preserved — no API changes needed when
-`loan()`/`return_loan()` are added.
+`loan()`/`return_loan()` are added. **Confirmed true**: the raw/loan API redesign
+(2026-08-22, `docs/design/raw-loan-api.md`) added real loan-mode read (`take_raw`/
+`read_raw` with `cdr_payloads._maximum == 0`, `return_loan_raw`) and a new write-loan
+(`loan_raw`/`publish_loan_raw`/`return_loan_raw`) as a genuinely separate pin/refcount
+mechanism (`reader.zig`'s `pinSamplesForLoan`/`takeSamplesForLoan`, `EntityQuiesce`-modeled)
+sitting alongside `readRaw`/`takeFiltered`'s existing copy semantics, exactly as predicted
+— `readRaw`'s own copy-returning behavior was untouched.
 
 **QoS incompatibility notification: listener callbacks and StatusCondition, both.**
 Per DDS spec §2.2.4. `on_offered_incompatible_qos` / `on_requested_incompatible_qos`

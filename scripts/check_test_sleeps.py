@@ -19,8 +19,13 @@ ALLOWLIST = {
     # sleep added with the same-participant self-matching regression test
     # (a real writer+reader on one participant, waiting for real SPDP/SEDP
     # discovery to complete before writing) -- same category as the other
-    # two, not a new one.
-    "test/dcps/loopback_test.zig": (3, "UDP loopback receive/discovery polling"),
+    # two, not a new one. Two more sleeps added with the generic
+    # DDS.DataWriter.write_raw/DDS.DataReader.take_raw diagnostic tests (real
+    # SPDP/SEDP match polling, real take_raw polling) -- both consolidated
+    # into one shared helper each (waitForRawOpMatch/waitForRawOpTake),
+    # called from both of that pair's tests, so this is 2 new call sites for
+    # 2 tests rather than 4.
+    "test/dcps/loopback_test.zig": (5, "UDP loopback receive/discovery polling"),
     # Real UDP loopback WLP tests: polling for SEDP match completion, and
     # polling get_liveliness_changed_status while the real background
     # checkTimers() thread (real wall-clock, not ManualClock -- WLP's

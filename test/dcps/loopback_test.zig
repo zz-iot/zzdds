@@ -517,3 +517,172 @@ test "loopback: a single participant's own writer and reader on the same topic m
     try std.testing.expectEqual(@as(usize, 1), received.len);
     try std.testing.expectEqualSlices(u8, p, received[0]);
 }
+
+// Exercises the *generic* DDS.DataWriter/DDS.DataReader vtable's write_raw/
+// take_raw ops end to end (real RTPS wire, not the internal writeRaw/takeRaw
+// helpers this file's other tests use) in loan mode (cdr_payloads._maximum
+// == 0 on entry, matching what an empty inout sequence produces at every
+// C-ABI-consuming binding's boundary -- e.g. an empty java.util.ArrayList).
+// Nothing else in this suite calls through this exact path.
+/// Polls until `dw_impl`/`dr_impl` see each other matched, or 20s elapses --
+/// shared by the two write_raw/take_raw diagnostic tests below (each used to
+/// have its own copy of this loop; consolidated into one shared helper to
+/// cut check_test_sleeps.py's audited sleepNs call-site count -- the real
+/// wait behavior is unchanged, real UDP/SPDP/SEDP discovery genuinely needs
+/// to poll).
+fn waitForRawOpMatch(dw_impl: *DataWriterImpl, dr_impl: *DataReaderImpl) void {
+    const deadline_ns = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < deadline_ns) {
+        if (dw_impl.matchedReaderCount() > 0 and dr_impl.matchedWriterCount() > 0) return;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+}
+
+/// Polls `take_raw` until it returns at least one sample or 20s elapses,
+/// returning the last DDS.ReturnCode_t seen -- see waitForRawOpMatch's doc
+/// comment for why this is a shared helper.
+///
+/// take_raw/read_raw return DDS.ReturnCode_t (RETCODE_OK on a successful
+/// *call*, regardless of how many samples it found) -- NOT a sample count. A
+/// real bug (fixed in java.zig's generated DataReader wrapper) came from
+/// treating this return value as a count and discarding every legitimately-
+/// returned sample because RETCODE_OK == 0.
+fn waitForRawOpTake(dr: DDS.DataReader, payloads_seq: *DDS.OctetSeqSeq, hashes_seq: *DDS.OctetSeq, infos_seq: *DDS.SampleInfoSeq) DDS.ReturnCode_t {
+    const deadline_ns = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
+    var last_rc: DDS.ReturnCode_t = DDS.RETCODE_OK;
+    while (time_mod.nanoTimestamp() < deadline_ns) {
+        last_rc = dr.vtable.take_raw(dr.ptr, payloads_seq, hashes_seq, infos_seq, DDS.HANDLE_NIL, nil.nil_readcondition, 0xffff, 0xffff, 0xffff, 10);
+        if (payloads_seq._length > 0) break;
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    return last_rc;
+}
+
+test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, loan mode" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 13 }, 0, null);
+    defer udp.deinit();
+    const disc = try SpdpSedpDiscovery.init(alloc, udp.transport(), 0, 1_000);
+    var factory = try DomainParticipantFactoryImpl.init(
+        alloc,
+        udp.transport(),
+        disc.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory.deinit();
+        disc.deinit();
+    }
+
+    const dpf = factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    const topic = dp.create_topic("RawOpDiagTopic", "RawOpDiagType", .{}, null, 0);
+    const dw = pub_.create_datawriter(topic, dw_qos, null, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    const sub_ = dp.create_subscriber(.{}, null, 0);
+    const topic_desc = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
+    const dr = sub_.create_datareader(topic_desc, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    waitForRawOpMatch(dw_impl, dr_impl);
+    try std.testing.expect(dw_impl.matchedReaderCount() > 0);
+    try std.testing.expect(dr_impl.matchedWriterCount() > 0);
+
+    var kh_buf = ZERO_KEY;
+    var key_hash_seq = DDS.OctetSeq{ ._maximum = 16, ._length = 16, ._buffer = &kh_buf, ._release = false };
+    var payload_buf = PAYLOAD_1;
+    var payload_seq = DDS.OctetSeq{ ._maximum = payload_buf.len, ._length = payload_buf.len, ._buffer = &payload_buf, ._release = false };
+    const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
+    const wrc = dw.vtable.write_raw(dw.ptr, &key_hash_seq, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts);
+    try std.testing.expectEqual(DDS.RETCODE_OK, wrc);
+
+    var payloads_seq = DDS.OctetSeqSeq{};
+    var hashes_seq = DDS.OctetSeq{};
+    var infos_seq = DDS.SampleInfoSeq{};
+    const last_rc = waitForRawOpTake(dr, &payloads_seq, &hashes_seq, &infos_seq);
+    try std.testing.expectEqual(DDS.RETCODE_OK, last_rc);
+    try std.testing.expect(payloads_seq._length > 0);
+    const got0 = payloads_seq._buffer.?[0];
+    try std.testing.expectEqualSlices(u8, &PAYLOAD_1, got0._buffer.?[0..got0._length]);
+
+    _ = dr.vtable.return_loan_raw(dr.ptr, &payloads_seq, &hashes_seq, &infos_seq);
+}
+
+// Same as above but with two distinct DomainParticipants (still same
+// process/transport-per-participant, real SEDP matching) -- closer to a
+// real two-process deployment than the single-participant self-loopback
+// variant above.
+test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, two participants" {
+    const alloc = std.testing.allocator;
+
+    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = 21 }, 0, null);
+    defer udp_w.deinit();
+    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), 0, 1_000);
+    var factory_w = try DomainParticipantFactoryImpl.init(alloc, udp_w.transport(), disc_w.toDiscovery(), noop_security, .spec_random, .{});
+    defer {
+        factory_w.deinit();
+        disc_w.deinit();
+    }
+    const dpf_w = factory_w.toDDSFactory();
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    defer _ = dpf_w.delete_participant(dp_w);
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic("RawOpDiag2Topic", "RawOpDiag2Type", .{}, null, 0);
+    const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = 22 }, 0, null);
+    defer udp_r.deinit();
+    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), 0, 1_000);
+    var factory_r = try DomainParticipantFactoryImpl.init(alloc, udp_r.transport(), disc_r.toDiscovery(), noop_security, .spec_random, .{});
+    defer {
+        factory_r.deinit();
+        disc_r.deinit();
+    }
+    const dpf_r = factory_r.toDDSFactory();
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    defer _ = dpf_r.delete_participant(dp_r);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic("RawOpDiag2Topic", "RawOpDiag2Type", .{}, null, 0);
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    waitForRawOpMatch(dw_impl, dr_impl);
+    try std.testing.expect(dw_impl.matchedReaderCount() > 0);
+    try std.testing.expect(dr_impl.matchedWriterCount() > 0);
+
+    var kh_buf = ZERO_KEY;
+    var key_hash_seq = DDS.OctetSeq{ ._maximum = 16, ._length = 16, ._buffer = &kh_buf, ._release = false };
+    var payload_buf = PAYLOAD_1;
+    var payload_seq = DDS.OctetSeq{ ._maximum = payload_buf.len, ._length = payload_buf.len, ._buffer = &payload_buf, ._release = false };
+    const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
+    const wrc = dw.vtable.write_raw(dw.ptr, &key_hash_seq, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts);
+    try std.testing.expectEqual(DDS.RETCODE_OK, wrc);
+
+    var payloads_seq = DDS.OctetSeqSeq{};
+    var hashes_seq = DDS.OctetSeq{};
+    var infos_seq = DDS.SampleInfoSeq{};
+    const last_rc = waitForRawOpTake(dr, &payloads_seq, &hashes_seq, &infos_seq);
+    try std.testing.expectEqual(DDS.RETCODE_OK, last_rc);
+    try std.testing.expect(payloads_seq._length > 0);
+
+    _ = dr.vtable.return_loan_raw(dr.ptr, &payloads_seq, &hashes_seq, &infos_seq);
+}

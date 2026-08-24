@@ -1,8 +1,11 @@
 //! Tests for the C-ABI bootstrap shim (src/c_abi/bootstrap.zig).
 //!
 //! - Factory lifecycle test: zzdds_create_factory + generated create/delete
-//! - Write/take tests: use IntraProcessDelivery for synchronous delivery so
-//!   no timing sensitivity; the write/take functions work on any DDS entity handle.
+//! - key-hash/instance-handle lookup tests: use IntraProcessDelivery for
+//!   synchronous delivery so no timing sensitivity; samples are written via
+//!   the real DDS.DataWriter.write_raw IDL op (see writeRawViaOp), not the
+//!   old hand-written bootstrap raw family (superseded -- see
+//!   bootstrap.zig's file-level doc comment).
 //! - topic_as_description: verified against the CFT TopicDescription vtable.
 
 const std = @import("std");
@@ -133,11 +136,12 @@ const Fixture = struct {
     /// Returns both the native fat-pointer structs (dw/dr -- for calling
     /// vtable methods directly, as some tests do) and their *boxed* C-ABI
     /// handle equivalents (dw_boxed/dr_boxed -- what a real C caller actually
-    /// has and must pass to bootstrap.zzdds_write_raw/zzdds_take_one_raw/etc;
-    /// zzdds_c.h's DDS_DataWriter/DDS_DataReader are opaque pointers, not the
-    /// native struct). Exercising the bootstrap functions with the native
-    /// structs directly previously masked a real C-ABI signature mismatch bug
-    /// (see bootstrap.zig's file-level doc comment).
+    /// has and must pass to bootstrap.zzdds_register_instance_raw/
+    /// zzdds_get_key_value_writer/etc; zzdds_c.h's DDS_DataWriter/
+    /// DDS_DataReader are opaque pointers, not the native struct).
+    /// Exercising the bootstrap functions with the native structs directly
+    /// previously masked a real C-ABI signature mismatch bug (see
+    /// bootstrap.zig's file-level doc comment).
     fn makeWriterReader(self: *Fixture) struct { dw: DDS.DataWriter, dr: DDS.DataReader, dw_boxed: *anyopaque, dr_boxed: *anyopaque } {
         const td = @as(*TopicImpl, @ptrCast(@alignCast(self.topic_r.ptr))).toTopicDescription();
         const dr = self.sub_r.create_datareader(td, .{}, null, 0);
@@ -200,9 +204,13 @@ test "support factory: generated create_participant_ex uses config defaults" {
 
 const TrackingCtx = struct {
     child: std.mem.Allocator,
-    alloc_calls: usize = 0,
-    resize_calls: usize = 0,
-    free_calls: usize = 0,
+    // Atomic: a real DomainParticipantImpl (RTPS receive threads, timer thread,
+    // etc.) allocates/frees through this same injected allocator concurrently
+    // with the main thread, so plain `usize += 1` here is a genuine data race
+    // (caught by ThreadSanitizer, not just theoretical).
+    alloc_calls: std.atomic.Value(usize) = .init(0),
+    resize_calls: std.atomic.Value(usize) = .init(0),
+    free_calls: std.atomic.Value(usize) = .init(0),
 };
 
 // The actual std.mem.Allocator <-> ZidlAllocator forwarding logic lives in
@@ -210,21 +218,21 @@ const TrackingCtx = struct {
 // the call counting this test needs, delegating everything else to it.
 fn trackAlloc(ctx: ?*anyopaque, len: usize, alignment: usize) callconv(.c) ?[*]u8 {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
-    self.alloc_calls += 1;
+    _ = self.alloc_calls.fetchAdd(1, .monotonic);
     const inner = allocator_adapter.fromAllocator(&self.child);
     return inner.alloc(inner.ctx, len, alignment);
 }
 
 fn trackResize(ctx: ?*anyopaque, ptr: ?[*]u8, old_len: usize, new_len: usize, alignment: usize) callconv(.c) bool {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
-    self.resize_calls += 1;
+    _ = self.resize_calls.fetchAdd(1, .monotonic);
     const inner = allocator_adapter.fromAllocator(&self.child);
     return inner.resize(inner.ctx, ptr, old_len, new_len, alignment);
 }
 
 fn trackFree(ctx: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callconv(.c) void {
     const self: *TrackingCtx = @ptrCast(@alignCast(ctx.?));
-    self.free_calls += 1;
+    _ = self.free_calls.fetchAdd(1, .monotonic);
     const inner = allocator_adapter.fromAllocator(&self.child);
     inner.free(inner.ctx, ptr, len, alignment);
 }
@@ -250,8 +258,8 @@ test "support factory: zzdds_create_factory_with_allocator routes every allocati
     const ext_factory = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
     // Bootstrapping the factory itself (FactoryOwner) already allocates.
-    try testing.expect(track.alloc_calls > 0);
-    const calls_after_bootstrap = track.alloc_calls;
+    try testing.expect(track.alloc_calls.load(.monotonic) > 0);
+    const calls_after_bootstrap = track.alloc_calls.load(.monotonic);
 
     // Creating a participant spins up a real UdpTransport + SpdpSedpDiscovery +
     // DomainParticipantFactoryImpl/DomainParticipantImpl stack (ParticipantStack.init)
@@ -261,11 +269,11 @@ test "support factory: zzdds_create_factory_with_allocator routes every allocati
     const qos = DDS.DomainParticipantQos{};
     const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
-    try testing.expect(track.alloc_calls > calls_after_bootstrap);
+    try testing.expect(track.alloc_calls.load(.monotonic) > calls_after_bootstrap);
 
     const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
     try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
-    try testing.expect(track.free_calls > 0);
+    try testing.expect(track.free_calls.load(.monotonic) > 0);
 }
 
 test "support factory: get_default_participant_config on a custom-allocator factory doesn't mismatch the caller's c_allocator-owned input" {
@@ -363,143 +371,6 @@ test "bootstrap: topic_as_description returns nil TopicDescription for a NULL to
     try testing.expectEqual(nil.NIL_PTR, td.ptr);
 }
 
-// ── write_raw + take_one_raw ──────────────────────────────────────────────────
-
-test "bootstrap: write_raw and take_one_raw return an error, not a crash, for NULL handles" {
-    // Same regression as the topic_as_description NULL test above, covering
-    // the write and take sides -- every zidl_rt.unboxAs call site in this
-    // file was affected by the same ordering bug.
-    const key_hash = std.mem.zeroes([16]u8);
-    const payload = [_]u8{0xAB};
-    try testing.expectEqual(@as(DDS.ReturnCode_t, 1), bootstrap.zzdds_write_raw(makeNullHandle(), &key_hash, DDS.HANDLE_NIL, &payload, payload.len));
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, bootstrap.zzdds_take_one_raw(makeNullHandle(), &buf, buf.len, &cdr_len, &info));
-}
-
-test "bootstrap: write_raw and take_one_raw round-trip" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    const rc = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    try testing.expectEqual(@as(DDS.ReturnCode_t, 0), rc);
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, n);
-    try testing.expectEqual(PAYLOAD.len, cdr_len);
-    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..cdr_len]);
-    try testing.expect(info.valid_data);
-}
-
-test "bootstrap: write_raw_kind dispose produces not-alive sample" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    const rc = bootstrap.zzdds_write_raw_kind(pair.dw_boxed, .dispose, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    try testing.expectEqual(@as(DDS.ReturnCode_t, 0), rc);
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, n);
-    try testing.expect(!info.valid_data);
-    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, info.instance_state);
-}
-
-test "bootstrap: take_loaned_raw and return_loaned_raw" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    var loan: bootstrap.CLoanedSample = undefined;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_loaned_raw(pair.dr_boxed, &loan, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, n);
-    try testing.expect(info.valid_data);
-    try testing.expectEqual(PAYLOAD.len, loan.data_len);
-    try testing.expectEqualSlices(u8, &PAYLOAD, loan.data.?[0..loan.data_len]);
-    try testing.expect(loan.owner != null);
-
-    bootstrap.zzdds_return_loaned_raw(pair.dr_boxed, &loan);
-    try testing.expectEqual(@as(usize, 0), loan.data_len);
-    try testing.expect(loan.data == null);
-    try testing.expect(loan.owner == null);
-}
-
-test "bootstrap: take_one_raw returns 0 when queue is empty" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_NO_DATA, n);
-}
-
-test "bootstrap: take_one_raw returns -1 when buffer too small" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    var tiny: [2]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &tiny, tiny.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, n);
-    // cdr_len_out must be set even on failure so the caller can retry with a larger buffer.
-    try testing.expectEqual(PAYLOAD.len, cdr_len);
-}
-
-// ── take_one_raw_instance ─────────────────────────────────────────────────────
-
-test "bootstrap: take_one_raw_instance round-trip" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw_instance(pair.dr_boxed, 0, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, n);
-    try testing.expectEqual(PAYLOAD.len, cdr_len);
-}
-
-test "bootstrap: take_one_raw_instance returns 0 when queue is empty" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw_instance(pair.dr_boxed, 0, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_NO_DATA, n);
-}
-
 // ── register_instance_raw ─────────────────────────────────────────────────────
 
 test "bootstrap: register_instance_raw returns deterministic handle" {
@@ -515,428 +386,20 @@ test "bootstrap: register_instance_raw returns deterministic handle" {
 
 // ── write_raw_w_timestamp ─────────────────────────────────────────────────────
 
-test "bootstrap: write_raw_w_timestamp round-trip" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    const ts = DDS.Time_t{ .sec = 42, .nanosec = 0 };
-    const rc = bootstrap.zzdds_write_raw_w_timestamp(pair.dw_boxed, .alive, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len, ts);
-    try testing.expectEqual(@as(DDS.ReturnCode_t, 0), rc);
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, n);
-    try testing.expectEqual(PAYLOAD.len, cdr_len);
-    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..cdr_len]);
-}
-
-// ── read_one_raw ──────────────────────────────────────────────────────────────
-
-test "bootstrap: read_one_raw non-destructive — sample stays in queue" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n1 = bootstrap.zzdds_read_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, n1);
-    try testing.expectEqual(PAYLOAD.len, cdr_len);
-    // Second read still returns the same sample.
-    const n2 = bootstrap.zzdds_read_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, n2);
-}
-
-test "bootstrap: read_one_raw returns 0 when queue is empty" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_read_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_NO_DATA, n);
-}
-
-// ── read_one_raw_instance ─────────────────────────────────────────────────────
-
-test "bootstrap: read_one_raw_instance round-trip" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_read_one_raw_instance(pair.dr_boxed, 0, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, n);
-    try testing.expectEqual(PAYLOAD.len, cdr_len);
-    try testing.expectEqualSlices(u8, &PAYLOAD, buf[0..cdr_len]);
-}
-
-test "bootstrap: read_one_raw_instance returns 0 when queue is empty" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const n = bootstrap.zzdds_read_one_raw_instance(pair.dr_boxed, 0, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_NO_DATA, n);
-}
-
-// ── take_n_raw / read_n_raw / return_raw_samples ──────────────────────────────
-
-test "bootstrap: take_n_raw returns all samples and return_raw_samples frees" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    // Use three different key hashes to get three distinct instances
-    // (default KEEP_LAST=1 QoS keeps one sample per instance).
-    var k1: [16]u8 = std.mem.zeroes([16]u8);
-    k1[0] = 1;
-    var k2: [16]u8 = std.mem.zeroes([16]u8);
-    k2[0] = 2;
-    var k3: [16]u8 = std.mem.zeroes([16]u8);
-    k3[0] = 3;
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k3, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr);
-    try testing.expectEqual(@as(c_int, 3), n);
-    try testing.expectEqual(@as(usize, 3), arr.count);
-    try testing.expect(arr.samples != null);
-    // Verify first sample payload.
-    const s0 = arr.samples.?[0];
-    try testing.expectEqual(PAYLOAD.len, s0.data_len);
-    try testing.expectEqualSlices(u8, &PAYLOAD, s0.data.?[0..s0.data_len]);
-
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-    try testing.expectEqual(@as(usize, 0), arr.count);
-    try testing.expect(arr.samples == null);
-
-    // Queue is now empty.
-    var arr2: bootstrap.CRawSampleArray = undefined;
-    const n2 = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr2);
-    try testing.expectEqual(@as(c_int, 0), n2);
-    try testing.expect(arr2.samples == null);
-}
-
-test "bootstrap: return_raw_samples frees via the array's own allocator, not whatever reader handle is passed" {
-    // Regression test for a real bug (Greptile PR #64 review): an earlier
-    // version of zzdds_return_raw_samples derived the freeing allocator by
-    // unboxing the `reader` parameter, which is unsound whenever that
-    // handle doesn't match (or no longer refers to a live) reader. Passing
-    // makeNullHandle() here exercises exactly that: if the free path still
-    // depended on `reader`, this would hit the isNullHandle/c_allocator
-    // fallback and free testing.allocator-backed memory with the wrong
-    // allocator -- testing.allocator's own leak/double-free detection would
-    // catch that. The array must instead free correctly using the
-    // allocator captured in CRawSampleArray itself at take time.
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 5, &arr);
-    try testing.expectEqual(@as(c_int, 1), n);
-
-    bootstrap.zzdds_return_raw_samples(makeNullHandle(), &arr);
-    try testing.expectEqual(@as(usize, 0), arr.count);
-    try testing.expect(arr.samples == null);
-}
-
-test "bootstrap: return_raw_samples falls back to c_allocator when the array carries no injected allocator" {
-    // Exercises the plain-c_allocator fallback branch in
-    // zzdds_return_raw_samples (arr._alloc_ctx == null) -- the path for an
-    // array that was never populated via zzdds_take_n_raw/zzdds_read_n_raw's
-    // allocator-injection machinery (both of those always set _alloc_ctx on
-    // success; this simulates a caller building a CRawSampleArray by hand).
-    // Backed by std.heap.c_allocator to match the allocator this fallback
-    // actually frees with -- a mismatched allocator here would abort/crash.
-    const c_alloc = std.heap.c_allocator;
-    const data = try c_alloc.alloc(u8, PAYLOAD.len);
-    @memcpy(data, &PAYLOAD);
-    const samples = try c_alloc.alloc(bootstrap.CRawSample, 1);
-    samples[0] = .{
-        .data = data.ptr,
-        .data_len = data.len,
-        .info = .{ .valid_data = true, .instance_state = 0, .instance_handle = DDS.HANDLE_NIL },
-    };
-
-    var arr: bootstrap.CRawSampleArray = .{
-        .samples = samples.ptr,
-        .count = 1,
-        ._alloc_capacity = 1,
-        ._alloc_ctx = null,
-        ._alloc_vtable = null,
-    };
-
-    bootstrap.zzdds_return_raw_samples(makeNullHandle(), &arr);
-    try testing.expectEqual(@as(usize, 0), arr.count);
-    try testing.expect(arr.samples == null);
-}
-
-test "bootstrap: take_n_raw returns 0 when queue is empty" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 10, &arr);
-    try testing.expectEqual(@as(c_int, 0), n);
-    try testing.expect(arr.samples == null);
-}
-
-test "bootstrap: read_n_raw is non-destructive" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var k1: [16]u8 = std.mem.zeroes([16]u8);
-    k1[0] = 1;
-    var k2: [16]u8 = std.mem.zeroes([16]u8);
-    k2[0] = 2;
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_read_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 10, &arr);
-    try testing.expectEqual(@as(c_int, 2), n);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-
-    // Samples still in queue — take should succeed.
-    var buf: [64]u8 = undefined;
-    var cdr_len: usize = 0;
-    var info: bootstrap.CSampleInfo = undefined;
-    const m = bootstrap.zzdds_take_one_raw(pair.dr_boxed, &buf, buf.len, &cdr_len, &info);
-    try testing.expectEqual(DDS.RETCODE_OK, m);
-}
-
-// ── take_n_instance_raw / read_n_instance_raw ──────────────────────────────────
-//
-// Additive siblings of take_n_raw/read_n_raw scoped to one instance -- the
-// raw path to what the OMG spec calls take_instance/read_instance.
-
-test "bootstrap: take_n_instance_raw restricts to one instance" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var k1: [16]u8 = std.mem.zeroes([16]u8);
-    k1[0] = 1;
-    var k2: [16]u8 = std.mem.zeroes([16]u8);
-    k2[0] = 2;
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    const ih1 = DataWriterImpl.registerInstanceRaw(k1);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_n_instance_raw(pair.dr_boxed, ih1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &arr);
-    try testing.expectEqual(@as(c_int, 1), n);
-    try testing.expectEqual(ih1, arr.samples.?[0].info.instance_handle);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-
-    // Instance 2's sample is still in queue.
-    var arr2: bootstrap.CRawSampleArray = undefined;
-    const n2 = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &arr2);
-    try testing.expectEqual(@as(c_int, 1), n2);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr2);
-}
-
-test "bootstrap: read_n_instance_raw is non-destructive" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var k1: [16]u8 = std.mem.zeroes([16]u8);
-    k1[0] = 1;
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    const ih1 = DataWriterImpl.registerInstanceRaw(k1);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_read_n_instance_raw(pair.dr_boxed, ih1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &arr);
-    try testing.expectEqual(@as(c_int, 1), n);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-
-    var arr2: bootstrap.CRawSampleArray = undefined;
-    const n2 = bootstrap.zzdds_take_n_instance_raw(pair.dr_boxed, ih1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &arr2);
-    try testing.expectEqual(@as(c_int, 1), n2);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr2);
-}
-
-// ── take_w_condition_raw / read_w_condition_raw ─────────────────────────────────
-//
-// The raw path to what the OMG spec calls take_w_condition/read_w_condition,
-// through a real boxed DDS_ReadCondition handle (as a real C caller has).
-
-test "bootstrap: take_w_condition_raw applies the condition's own state masks" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    const rc = pair.dr.create_readcondition(DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
-    defer _ = pair.dr.delete_readcondition(rc);
-    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_w_condition_raw(pair.dr_boxed, rc_boxed, -1, &arr);
-    try testing.expectEqual(@as(c_int, 1), n);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-
-    // A second call sees nothing left (the one NOT_READ sample was taken).
-    var arr2: bootstrap.CRawSampleArray = undefined;
-    const n2 = bootstrap.zzdds_take_w_condition_raw(pair.dr_boxed, rc_boxed, -1, &arr2);
-    try testing.expectEqual(@as(c_int, 0), n2);
-}
-
-test "bootstrap: take_w_condition_raw with a QueryCondition (via as_ReadCondition) applies its query filter" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-
-    const GetField = struct {
-        fn get(_: *anyopaque, payload: []const u8, field: []const u8, _: []u8) ?zzdds.dcps.filter.FilterValue {
-            if (!std.mem.eql(u8, field, "tag")) return null;
-            return .{ .int = payload[payload.len - 1] };
-        }
-        fn computeKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
-            return std.mem.zeroes([16]u8);
-        }
-    };
-    try testing.expect(zzdds.registerTypeSupport(fx.dp_r, "BootType", .{
-        .ctx = undefined,
-        .compute_key_hash = GetField.computeKeyHash,
-        .get_field = GetField.get,
-    }));
-    const pair = fx.makeWriterReader();
-
-    var payload_1 = PAYLOAD;
-    payload_1[4] = 1;
-    var payload_2 = PAYLOAD;
-    payload_2[4] = 2;
-    var k1: [16]u8 = std.mem.zeroes([16]u8);
-    k1[0] = 1;
-    var k2: [16]u8 = std.mem.zeroes([16]u8);
-    k2[0] = 2;
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &payload_1, payload_1.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &payload_2, payload_2.len);
-
-    var params = [_][*:0]const u8{"2"};
-    var params_seq = DDS.StringSeq{ ._buffer = &params, ._length = 1, ._maximum = 1, ._release = false };
-    const qc = pair.dr.create_querycondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, "tag = %0", &params_seq);
-    try testing.expect(qc.ptr != nil.NIL_PTR);
-    const rc = qc.vtable.as_ReadCondition(qc.ptr);
-    defer _ = pair.dr.delete_readcondition(rc);
-    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_w_condition_raw(pair.dr_boxed, rc_boxed, -1, &arr);
-    try testing.expectEqual(@as(c_int, 1), n);
-    try testing.expectEqual(@as(u8, 2), arr.samples.?[0].data.?[arr.samples.?[0].data_len - 1]);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-}
-
-test "bootstrap: take_w_condition_raw returns -1 for a NULL condition handle" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_w_condition_raw(pair.dr_boxed, makeNullHandle(), -1, &arr);
-    try testing.expectEqual(@as(c_int, -1), n);
-    try testing.expect(arr.samples == null);
-}
-
-// ── take_next_instance_w_condition_raw / read_next_instance_w_condition_raw ────
-
-test "bootstrap: take_next_instance_w_condition_raw skips a non-matching instance" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var k1: [16]u8 = std.mem.zeroes([16]u8);
-    k1[0] = 1;
-    var k2: [16]u8 = std.mem.zeroes([16]u8);
-    k2[0] = 2;
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    const ih1 = DataWriterImpl.registerInstanceRaw(k1);
-    const ih2 = DataWriterImpl.registerInstanceRaw(k2);
-    const excluded_ih = @min(ih1, ih2);
-
-    // Mark the lower-handle instance's sample READ, leaving the other NOT_READ.
-    var mark_read: bootstrap.CRawSampleArray = undefined;
-    const nr = bootstrap.zzdds_read_n_instance_raw(pair.dr_boxed, excluded_ih, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, &mark_read);
-    try testing.expectEqual(@as(c_int, 1), nr);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &mark_read);
-
-    const rc = pair.dr.create_readcondition(DDS.NOT_READ_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
-    defer _ = pair.dr.delete_readcondition(rc);
-    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_next_instance_w_condition_raw(pair.dr_boxed, rc_boxed, DDS.HANDLE_NIL, -1, &arr);
-    try testing.expectEqual(@as(c_int, 1), n);
-    // Must have selected the OTHER (still NOT_READ) instance, not simply the
-    // smallest handle -- that's the whole point of the _w_condition variant.
-    try testing.expect(arr.samples.?[0].info.instance_handle != excluded_ih);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-}
-
-test "bootstrap: read_next_instance_w_condition_raw is non-destructive" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    const rc = pair.dr.create_readcondition(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
-    defer _ = pair.dr.delete_readcondition(rc);
-    const rc_boxed = rc.vtable.get_c_abi_handle(rc.ptr);
-
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_read_next_instance_w_condition_raw(pair.dr_boxed, rc_boxed, DDS.HANDLE_NIL, -1, &arr);
-    try testing.expectEqual(@as(c_int, 1), n);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-
-    var arr2: bootstrap.CRawSampleArray = undefined;
-    const n2 = bootstrap.zzdds_take_next_instance_w_condition_raw(pair.dr_boxed, rc_boxed, DDS.HANDLE_NIL, -1, &arr2);
-    try testing.expectEqual(@as(c_int, 1), n2);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr2);
-}
-
 // ── get_key_value_writer / lookup_instance_writer ─────────────────────────────
+
+/// Writes `payload` for `key_hash` through the real `DDS.DataWriter.write_raw`
+/// IDL op (the replacement for the deleted `zzdds_write_raw` bootstrap
+/// export), using the fixture pair's unboxed `pair.dw` fat pointer.
+fn writeRawViaOp(dw: DDS.DataWriter, key_hash: [16]u8, payload: []const u8) void {
+    var kh = key_hash;
+    var key_hash_seq = DDS.OctetSeq{ ._maximum = 16, ._length = 16, ._buffer = &kh, ._release = false };
+    var pl_buf: [4096]u8 = undefined;
+    @memcpy(pl_buf[0..payload.len], payload);
+    var payload_seq = DDS.OctetSeq{ ._maximum = @intCast(payload.len), ._length = @intCast(payload.len), ._buffer = &pl_buf, ._release = false };
+    const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
+    _ = dw.vtable.write_raw(dw.ptr, &key_hash_seq, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts);
+}
 
 test "bootstrap: get_key_value_writer returns CDR payload after alive write" {
     const alloc = testing.allocator;
@@ -944,7 +407,7 @@ test "bootstrap: get_key_value_writer returns CDR payload after alive write" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
 
     const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
     var buf: [64]u8 = undefined;
@@ -989,7 +452,7 @@ test "bootstrap: get_key_value_reader returns CDR payload after receive" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
 
     const ih = bootstrap.zzdds_register_instance_raw(pair.dw_boxed, &KEY_HASH);
     var buf: [64]u8 = undefined;
@@ -1021,7 +484,7 @@ test "bootstrap: lookup_instance_reader returns handle for alive instance, 0 whe
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
 
     // Known alive instance returns its handle.
     const ih = bootstrap.zzdds_lookup_instance_reader(pair.dr_boxed, &KEY_HASH);
@@ -1170,7 +633,7 @@ test "extensions: take_serialized via ZZDDS DataReader vtable" {
     defer fx.deinit();
     const pair = fx.makeWriterReader();
 
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &KEY_HASH, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
+    writeRawViaOp(pair.dw, KEY_HASH, &PAYLOAD);
 
     const zdr = zidl_rt.unboxAsView(ZZDDS.DataReader, extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)));
     var sample: ZZDDS.SerializedSample = std.mem.zeroes(ZZDDS.SerializedSample);
@@ -1184,40 +647,6 @@ test "extensions: take_serialized via ZZDDS DataReader vtable" {
     // Queue is now empty.
     var sample2: ZZDDS.SerializedSample = std.mem.zeroes(ZZDDS.SerializedSample);
     try testing.expectEqual(DDS.RETCODE_NO_DATA, zdr.vtable.take_serialized(zdr.ptr, &sample2));
-}
-
-// ── nRawImpl max≤0: unbounded take ───────────────────────────────────────────
-//
-// max=0 and max=-1 both mean "take all available samples" (unlimited).
-// The implementation peeks with readRaw(-1) first to size the pre-allocation,
-// then calls takeFiltered with the peeked count.
-
-test "bootstrap: take_n_raw with max=0 takes all available samples" {
-    const alloc = testing.allocator;
-    var fx = try Fixture.init(alloc);
-    defer fx.deinit();
-    const pair = fx.makeWriterReader();
-
-    var k1 = std.mem.zeroes([16]u8);
-    k1[0] = 0xC1;
-    var k2 = std.mem.zeroes([16]u8);
-    k2[0] = 0xC2;
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k1, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-    _ = bootstrap.zzdds_write_raw(pair.dw_boxed, &k2, DDS.HANDLE_NIL, &PAYLOAD, PAYLOAD.len);
-
-    // max=0 means "unlimited" — takes all samples and returns their count.
-    var arr: bootstrap.CRawSampleArray = undefined;
-    const n = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 0, &arr);
-    try testing.expectEqual(@as(c_int, 2), n);
-    try testing.expectEqual(@as(usize, 2), arr.count);
-    try testing.expect(arr.samples != null);
-    bootstrap.zzdds_return_raw_samples(pair.dr_boxed, &arr);
-
-    // Queue is now empty.
-    var arr2: bootstrap.CRawSampleArray = undefined;
-    const n2 = bootstrap.zzdds_take_n_raw(pair.dr_boxed, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, 0, &arr2);
-    try testing.expectEqual(@as(c_int, 0), n2);
-    try testing.expect(arr2.samples == null);
 }
 
 // ── Config: stringSeqSlice null-buffer and null-element guards ────────────────
@@ -1864,19 +1293,19 @@ test "waitset: zzdds_create_waitset_with_allocator/zzdds_create_guardcondition_w
 
     const ws_boxed = extensions.zzdds_create_waitset_with_allocator(&c_alloc);
     const gc_boxed = extensions.zzdds_create_guardcondition_with_allocator(&c_alloc);
-    try testing.expect(track.alloc_calls > 0);
-    const calls_after_create = track.alloc_calls;
+    try testing.expect(track.alloc_calls.load(.monotonic) > 0);
+    const calls_after_create = track.alloc_calls.load(.monotonic);
 
     const ws = zidl_rt.unboxAs(DDS.WaitSet, ws_boxed);
     const gc = zidl_rt.unboxAsView(DDS.GuardCondition, gc_boxed);
     // Attaching grows WaitSet's `conditions` list — another allocation
     // through the same injected allocator, not a silent fallback.
     try testing.expectEqual(DDS.RETCODE_OK, ws.attach_condition(gc.vtable.as_Condition(gc.ptr)));
-    try testing.expect(track.alloc_calls > calls_after_create);
+    try testing.expect(track.alloc_calls.load(.monotonic) > calls_after_create);
 
     extensions.zzdds_destroy_waitset(ws_boxed);
     extensions.zzdds_destroy_guardcondition(gc_boxed);
-    try testing.expect(track.free_calls > 0);
+    try testing.expect(track.free_calls.load(.monotonic) > 0);
 }
 
 // ── Zig-native createWaitSet / createGuardCondition (raw_ops.zig) ───────────────

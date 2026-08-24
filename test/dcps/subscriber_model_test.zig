@@ -224,7 +224,10 @@ fn makePending(alloc: std.mem.Allocator, ch: ModelChange) !PendingChange {
 }
 
 fn addPending(alloc: std.mem.Allocator, dr: *DataReaderImpl, ch: ModelChange) !void {
-    try dr.pending.append(alloc, try makePending(alloc, ch));
+    const pc = try alloc.create(PendingChange);
+    errdefer alloc.destroy(pc);
+    pc.* = try makePending(alloc, ch);
+    try dr.pending.append(alloc, pc);
 }
 
 fn addCommitted(alloc: std.mem.Allocator, dr: *DataReaderImpl, changes: []const ModelChange) !void {
@@ -267,6 +270,52 @@ fn expectReaderMatchesModel(dr: *DataReaderImpl, model: *const ModelReader) !voi
         try testing.expectEqual(exp.group_seq_num, got.group_seq_num);
     }
     try testing.expectEqual(model.committed.items.len > 0, dr.coherent_committed_ready);
+}
+
+test "vtDeleteDataReader: refuses PRECONDITION_NOT_MET while the reader has an outstanding read-loan" {
+    const alloc = testing.allocator;
+    var h = try Harness.init(alloc, .{});
+    defer h.deinit();
+    const dr = try h.makeReader();
+    try addPending(alloc, dr, .{ .id = 'A', .instance = 1 });
+
+    const pinned = try dr.pinSamplesForLoan(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+    defer alloc.free(pinned);
+    try testing.expectEqual(@as(usize, 1), pinned.len);
+
+    const dds_sub = h.sub.toDDSSubscriber();
+    const dds_dr = dr.toDDSDataReader();
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, dds_sub.vtable.delete_datareader(dds_sub.ptr, dds_dr));
+    // Refused: still tracked, untouched.
+    try testing.expectEqual(@as(usize, 1), h.sub.readers.items.len);
+
+    dr.releasePinnedSamples(pinned);
+    try testing.expectEqual(DDS.RETCODE_OK, dds_sub.vtable.delete_datareader(dds_sub.ptr, dds_dr));
+    try testing.expectEqual(@as(usize, 0), h.sub.readers.items.len);
+}
+
+test "vtDeleteContained (Subscriber): all-or-nothing -- refuses and tears down nothing while any reader has an outstanding read-loan" {
+    const alloc = testing.allocator;
+    var h = try Harness.init(alloc, .{});
+    defer h.deinit();
+    const dr1 = try h.makeReader();
+    const dr2 = try h.makeReader();
+    try addPending(alloc, dr1, .{ .id = 'A', .instance = 1 });
+    try addPending(alloc, dr2, .{ .id = 'B', .instance = 1 });
+
+    // Only dr2 is loaned -- the check must still refuse the whole call and
+    // leave dr1 (which has no outstanding loan) untouched too.
+    const pinned = try dr2.pinSamplesForLoan(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+    defer alloc.free(pinned);
+    try testing.expectEqual(@as(usize, 1), pinned.len);
+
+    const dds_sub = h.sub.toDDSSubscriber();
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, dds_sub.vtable.delete_contained_entities(dds_sub.ptr));
+    try testing.expectEqual(@as(usize, 2), h.sub.readers.items.len);
+
+    dr2.releasePinnedSamples(pinned);
+    try testing.expectEqual(DDS.RETCODE_OK, dds_sub.vtable.delete_contained_entities(dds_sub.ptr));
+    try testing.expectEqual(@as(usize, 0), h.sub.readers.items.len);
 }
 
 test "subscriber model: begin_access exposes one committed coherent set per call" {

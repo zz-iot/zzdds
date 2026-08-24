@@ -89,6 +89,14 @@ pub const DataWriterImpl = struct {
     /// callback (RTPS heartbeat/receive, timer, discovery) racing
     /// `deinit()` — see entity_quiesce.zig.
     quiesce: EntityQuiesce = .{},
+    /// Count of currently-outstanding write-loans (see `loanForWrite`/
+    /// `publishLoan`/`cancelLoan`). Informational only -- feeds
+    /// `checkDeletePrecondition()`'s PRECONDITION_NOT_MET check, not itself
+    /// a gating mechanism. A write-loan is single-owner (unlike the read
+    /// side's multi-holder pin), so this is a plain counter, not a per-loan
+    /// refcount -- but it's still atomic since publish/cancel isn't
+    /// guaranteed to happen under any particular lock.
+    outstanding_loans: std.atomic.Value(usize) = .init(0),
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -310,6 +318,65 @@ pub const DataWriterImpl = struct {
         // this is unconditional.
         self.wlp_last_assert_ns.store(now_ns, .monotonic);
         return sn;
+    }
+
+    /// Borrow a writable buffer for the caller to serialize a sample into
+    /// directly, later resolved via `publishLoan` or `cancelLoan`.
+    /// Single-owner: one buffer, one caller, until resolved -- unlike the
+    /// read side's multi-holder pin, no refcount is needed here. Deferred
+    /// admission: no RESOURCE_LIMITS check here, matching plain `write()`
+    /// exactly -- `publishLoan` performs that check, since instance
+    /// identity (needed for `max_samples_per_instance`) isn't known until
+    /// then. See docs/design/raw-loan-api.md, "Write-side loan".
+    pub fn loanForWrite(self: *Self, size: usize) ![]u8 {
+        const buf = try self.alloc.alloc(u8, size);
+        _ = self.outstanding_loans.fetchAdd(1, .monotonic);
+        return buf;
+    }
+
+    /// Publish a previously-loaned buffer (from `loanForWrite`) as a sample,
+    /// then release the loan. Runs `writeRaw`'s existing RESOURCE_LIMITS
+    /// handling unchanged. The buffer is freed and the loan released
+    /// whether or not the publish succeeds -- a failed publish, like a
+    /// failed plain `write()`, leaves nothing pending to retry. `buf` must
+    /// be the exact buffer previously returned by `loanForWrite` on this
+    /// same writer (required for `alloc.free` to be valid) -- `used_len`
+    /// (`<= buf.len`, the caller-populated byte count) is what actually
+    /// gets published, distinct from `buf.len` (the loaned capacity), so a
+    /// caller that loaned more than it ended up serializing doesn't leak
+    /// unwritten trailing bytes onto the wire.
+    pub fn publishLoan(
+        self: *Self,
+        kind: history_mod.ChangeKind,
+        source_timestamp: history_mod.RtpsTimestamp,
+        instance_handle: history_mod.InstanceHandle,
+        key_hash: [16]u8,
+        buf: []u8,
+        used_len: usize,
+    ) !history_mod.SequenceNumber {
+        defer {
+            self.alloc.free(buf);
+            _ = self.outstanding_loans.fetchSub(1, .monotonic);
+        }
+        return self.writeRaw(kind, source_timestamp, instance_handle, key_hash, buf[0..used_len]);
+    }
+
+    /// Cancel a previously-loaned buffer (from `loanForWrite`) without
+    /// publishing it -- frees the buffer and releases the loan.
+    pub fn cancelLoan(self: *Self, buf: []u8) void {
+        self.alloc.free(buf);
+        _ = self.outstanding_loans.fetchSub(1, .monotonic);
+    }
+
+    /// PRECONDITION_NOT_MET if this writer has any outstanding write-loans.
+    /// Write-loans aren't DDS-spec-standardized (a zzdds extension, same
+    /// territory as ROS2 RMW's `rmw_publisher_loan`), but refusing teardown
+    /// with unresolved outstanding state mirrors the read side's
+    /// spec-mandated equivalent -- called by `delete_datawriter` and the
+    /// `delete_contained_entities` cascade before any teardown proceeds.
+    pub fn checkDeletePrecondition(self: *Self) DDS.ReturnCode_t {
+        if (self.outstanding_loans.load(.acquire) != 0) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        return DDS.RETCODE_OK;
     }
 
     /// Returns true when all RELIABLE matched readers have acked up to last_sn.
@@ -682,6 +749,10 @@ pub const DataWriterImpl = struct {
         .assert_liveliness = vtAssertLiveliness,
         .get_matched_subscriptions = vtGetMatchedSubs,
         .get_matched_subscription_data = vtGetMatchedSubData,
+        .write_raw = vtWriteRaw,
+        .loan_raw = vtLoanRaw,
+        .publish_loan_raw = vtPublishLoanRaw,
+        .return_loan_raw = vtReturnLoanRaw,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
         .as_Entity = vtAsEntity,
@@ -914,6 +985,184 @@ pub const DataWriterImpl = struct {
             }
         }
         return DDS.RETCODE_BAD_PARAMETER;
+    }
+
+    /// Maps the IDL `WriteKind` (a zzdds extension -- see dcps.idl) to the
+    /// core `history_mod.ChangeKind`, honoring autodispose_unregistered_instances
+    /// exactly like the old hand-written `zzdds_write_raw_kind` did. `WriteKind`
+    /// is a non-exhaustive generated enum (unknown wire values possible), hence
+    /// the `else` arm.
+    fn changeKindFromWriteKind(self: *Self, kind: DDS.WriteKind) ?history_mod.ChangeKind {
+        return switch (kind) {
+            .ALIVE_WRITE_KIND => .alive,
+            .DISPOSE_WRITE_KIND => .not_alive_disposed,
+            .UNREGISTER_WRITE_KIND => if (self.qos.writer_data_lifecycle.autodispose_unregistered_instances)
+                .not_alive_disposed
+            else
+                .not_alive_unregistered,
+            else => null,
+        };
+    }
+
+    /// Copies a 16-byte `OctetSeq` key hash into a fixed array, or null if
+    /// `seq` isn't exactly 16 bytes -- every raw write op below rejects a
+    /// wrong-length key hash with RETCODE_BAD_PARAMETER rather than silently
+    /// truncating or padding it.
+    fn keyHashFromOctetSeq(seq: *const DDS.OctetSeq) ?[16]u8 {
+        if (seq._length != 16) return null;
+        const b = seq._buffer orelse return null;
+        var out: [16]u8 = undefined;
+        @memcpy(&out, b[0..16]);
+        return out;
+    }
+
+    /// TIME_INVALID (DDS.TIME_INVALID_SEC/_NSEC) means "use the current
+    /// time" -- the raw path to plain write()/dispose()/unregister_instance();
+    /// any other value is used as given -- the raw path to
+    /// write_w_timestamp()/dispose_w_timestamp()/unregister_w_timestamp().
+    fn rtpsTimestampFromRaw(t: *const DDS.Time_t) time_mod.RtpsTimestamp {
+        if (t.sec == DDS.TIME_INVALID_SEC and t.nanosec == DDS.TIME_INVALID_NSEC) {
+            return time_mod.RtpsTimestamp.now();
+        }
+        return time_mod.RtpsTimestamp.fromTime(.{ .sec = t.sec, .nanosec = t.nanosec });
+    }
+
+    fn vtWriteRaw(
+        ctx: *anyopaque,
+        key_hash: ?*const DDS.OctetSeq,
+        handle: DDS.InstanceHandle_t,
+        cdr_payload: ?*const DDS.OctetSeq,
+        kind: DDS.WriteKind,
+        source_timestamp: *const DDS.Time_t,
+    ) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const kh_seq = key_hash orelse return DDS.RETCODE_BAD_PARAMETER;
+        const payload = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
+        const kh = keyHashFromOctetSeq(kh_seq) orelse return DDS.RETCODE_BAD_PARAMETER;
+        const change_kind = self.changeKindFromWriteKind(kind) orelse return DDS.RETCODE_BAD_PARAMETER;
+        if (handle != DDS.HANDLE_NIL and handle != registerInstanceRaw(kh)) {
+            return DDS.RETCODE_BAD_PARAMETER;
+        }
+        // Regression for a real concurrent use-after-free (Greptile PR #69
+        // review): without this guard, delete_datawriter()'s
+        // checkDeletePrecondition() racing this call could free `self`
+        // mid-write. Symmetric within this one call -- unlike loan_raw
+        // below, a plain write_raw() never outlives its own call, matching
+        // every raw_ops.zig-style operation's existing acquire/release
+        // pattern on DataWriterImpl.
+        if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        defer self.releaseQuiesce();
+        const data = if (payload._buffer) |b| b[0..payload._length] else &[_]u8{};
+        _ = self.writeRaw(change_kind, rtpsTimestampFromRaw(source_timestamp), kh, kh, data) catch |err| return switch (err) {
+            error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
+            error.Timeout => DDS.RETCODE_TIMEOUT,
+            else => DDS.RETCODE_ERROR,
+        };
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtLoanRaw(ctx: *anyopaque, size: u32, cdr_payload: ?*DDS.OctetSeq) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
+        // Same race as vtWriteRaw above, but a successful loan outlives this
+        // call (until publish_loan_raw()/return_loan_raw() resolves it) --
+        // the acquired ref is deliberately NOT released on the success path;
+        // it transfers to whichever of those two calls resolves the loan
+        // (see vtPublishLoanRaw/vtReturnLoanRaw), keeping the entity alive
+        // for the loan's whole lifetime regardless of what
+        // checkDeletePrecondition() observed before the loan was created.
+        if (!self.acquireQuiesce()) return DDS.RETCODE_ALREADY_DELETED;
+        // Regression for a real, distinct race (Greptile PR #69 review,
+        // round 3): self.acquireQuiesce() above only keeps the DataWriterImpl
+        // struct itself alive -- it says nothing about self.proto_writer, a
+        // separately torn-down RTPS object (destroy_proto_writer, called
+        // from publisher.zig's deinit loop, is not gated by self's own
+        // quiesce state at all). Without this, a checkDeleteContainedPrecondition()
+        // check racing this call could observe zero outstanding loans, this
+        // loan then acquires successfully, and delete_publisher/
+        // delete_datawriter proceeds to destroy proto_writer while the loan
+        // is still outstanding -- publish_loan_raw() would then dereference
+        // a freed protocol writer. proto_writer already has its own
+        // EntityQuiesce (see protocol_adapters.zig's RtpsProtocolWriter,
+        // built for a different reason -- deferring add_matched_reader send
+        // I/O) whose deinit() already defers real teardown until this
+        // refcount hits zero; acquiring it here for the loan's whole
+        // lifetime (released alongside self's own ref in
+        // vtPublishLoanRaw/vtReturnLoanRaw) closes the race regardless of
+        // check timing, reusing already-tested machinery instead of adding
+        // new locking.
+        if (!self.proto_writer.quiesceAcquire()) {
+            self.releaseQuiesce();
+            return DDS.RETCODE_ALREADY_DELETED;
+        }
+        const buf = self.loanForWrite(@intCast(size)) catch {
+            self.proto_writer.quiesceRelease();
+            self.releaseQuiesce();
+            return DDS.RETCODE_OUT_OF_RESOURCES;
+        };
+        // _release = false deliberately: this buffer is owned by the
+        // outstanding-loan accounting in loanForWrite/publishLoan/cancelLoan,
+        // not by the generic OctetSeq.deinit()/_free() path -- a caller must
+        // resolve it via publish_loan_raw/return_loan_raw, never a plain free.
+        seq.* = .{ ._buffer = buf.ptr, ._length = @intCast(buf.len), ._maximum = @intCast(buf.len), ._release = false };
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtPublishLoanRaw(
+        ctx: *anyopaque,
+        cdr_payload: ?*DDS.OctetSeq,
+        key_hash: ?*const DDS.OctetSeq,
+        handle: DDS.InstanceHandle_t,
+        kind: DDS.WriteKind,
+    ) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
+        const kh_seq = key_hash orelse return DDS.RETCODE_BAD_PARAMETER;
+        const kh = keyHashFromOctetSeq(kh_seq) orelse return DDS.RETCODE_BAD_PARAMETER;
+        const change_kind = self.changeKindFromWriteKind(kind) orelse return DDS.RETCODE_BAD_PARAMETER;
+        if (handle != DDS.HANDLE_NIL and handle != registerInstanceRaw(kh)) {
+            return DDS.RETCODE_BAD_PARAMETER;
+        }
+        // A null buffer means this isn't a value loan_raw() actually
+        // returned (an empty-but-real loan has a non-null, zero-length
+        // buffer from the allocator) -- reject rather than fabricate an
+        // empty slice to hand to publishLoan's alloc.free.
+        const full_buf: []u8 = (seq._buffer orelse return DDS.RETCODE_BAD_PARAMETER)[0..seq._maximum];
+        if (seq._length > seq._maximum) return DDS.RETCODE_BAD_PARAMETER;
+        const used_len: usize = seq._length;
+        seq.* = .{}; // consumed either way -- see publishLoan's doc comment
+        // Releases both quiesce refs vtLoanRaw transferred here -- self and
+        // proto_writer are both guaranteed alive up to this point regardless
+        // of a concurrent delete (that's the whole point of the transfer),
+        // so this can run unconditionally after publishLoan resolves, on
+        // every path.
+        defer self.releaseQuiesce();
+        defer self.proto_writer.quiesceRelease();
+        _ = self.publishLoan(change_kind, time_mod.RtpsTimestamp.now(), kh, kh, full_buf, used_len) catch |err| return switch (err) {
+            error.OutOfResources => DDS.RETCODE_OUT_OF_RESOURCES,
+            error.Timeout => DDS.RETCODE_TIMEOUT,
+            else => DDS.RETCODE_ERROR,
+        };
+        return DDS.RETCODE_OK;
+    }
+
+    fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payload: ?*DDS.OctetSeq) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
+        const full_buf: []u8 = (seq._buffer orelse return DDS.RETCODE_BAD_PARAMETER)[0..seq._maximum];
+        seq.* = .{};
+        self.cancelLoan(full_buf);
+        // Releases both quiesce refs vtLoanRaw transferred here -- see
+        // vtPublishLoanRaw's identical comment. Order matters (Greptile PR
+        // #69 review, round 4): proto_writer's ref must release FIRST,
+        // while self is still guaranteed alive, since self's own release
+        // can synchronously free self -- reading self.proto_writer
+        // afterward would be a use-after-free. vtPublishLoanRaw gets this
+        // right for free via LIFO `defer` ordering; this function has no
+        // defers, so the order must be explicit.
+        self.proto_writer.quiesceRelease();
+        self.releaseQuiesce();
+        return DDS.RETCODE_OK;
     }
 
     fn vtDeinit(ctx: *anyopaque) void {

@@ -641,3 +641,391 @@ test "DataWriter: get_qos returns independent clone — replacement does not dan
     try testing.expectEqual(@as(u32, 1), got.user_data.value._length);
     got.deinit(alloc);
 }
+
+// ── Raw/loaned write ops (write_raw/loan_raw/publish_loan_raw/return_loan_raw) ─
+
+test "write_raw: valid key_hash + payload lands in the cache" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var key_hash_bytes = [_]u8{1} ** 16;
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    var payload_bytes = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const payload = DDS.OctetSeq{ ._buffer = &payload_bytes, ._length = 4, ._maximum = 4, ._release = false };
+
+    const before = dw_impl.proto_writer.cacheLen();
+    const rc = dw.vtable.write_raw(dw.ptr, &key_hash, DDS.HANDLE_NIL, &payload, .ALIVE_WRITE_KIND, &DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC });
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(before + 1, dw_impl.proto_writer.cacheLen());
+}
+
+test "write_raw: wrong-length key_hash is BAD_PARAMETER" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+
+    var short_bytes = [_]u8{1} ** 4;
+    const short_key_hash = DDS.OctetSeq{ ._buffer = &short_bytes, ._length = 4, ._maximum = 4, ._release = false };
+    var payload_bytes = [_]u8{0x01};
+    const payload = DDS.OctetSeq{ ._buffer = &payload_bytes, ._length = 1, ._maximum = 1, ._release = false };
+
+    const rc = dw.vtable.write_raw(dw.ptr, &short_key_hash, DDS.HANDLE_NIL, &payload, .ALIVE_WRITE_KIND, &DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC });
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
+}
+
+test "loan_raw + publish_loan_raw: round trip through the real vtable lands the loaned bytes in the cache" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expect(cdr_payload._buffer != null);
+    cdr_payload._buffer.?[0..4].* = .{ 0x01, 0x02, 0x03, 0x04 };
+
+    var key_hash_bytes = [_]u8{2} ** 16;
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+
+    const before = dw_impl.proto_writer.cacheLen();
+    const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(before + 1, dw_impl.proto_writer.cacheLen());
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    // publish_loan_raw must clear the sequence -- the caller no longer owns it.
+    try testing.expect(cdr_payload._buffer == null);
+}
+
+test "loan_raw + return_loan_raw: round trip through the real vtable publishes nothing" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 8, &cdr_payload));
+    try testing.expectEqual(@as(usize, 1), dw_impl.outstanding_loans.load(.monotonic));
+
+    const before = dw_impl.proto_writer.cacheLen();
+    const rc = dw.vtable.return_loan_raw(dw.ptr, &cdr_payload);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(before, dw_impl.proto_writer.cacheLen());
+    try testing.expectEqual(@as(usize, 0), dw_impl.outstanding_loans.load(.monotonic));
+    try testing.expect(cdr_payload._buffer == null);
+}
+
+test "loan_raw: an outstanding loan blocks delete_datawriter with PRECONDITION_NOT_MET" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 1, &cdr_payload));
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw));
+
+    // Resolve the loan, then teardown must succeed.
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.return_loan_raw(dw.ptr, &cdr_payload));
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw));
+}
+
+test "loan_raw: outstanding loan defers real protocol-writer teardown until the loan resolves" {
+    // Regression for a real, distinct race (Greptile PR #69 review, round
+    // 3): checkDeleteContainedPrecondition() is a momentary read -- it
+    // observing zero outstanding loans doesn't mean a concurrent loan_raw()
+    // can't acquire one immediately after. Reproducing that exact timing
+    // race is inherently fragile (see this session's own notes on why a
+    // thread-spawn-latency-based test for a similar race wasn't safe to
+    // ship); this test instead directly proves the fix that actually closes
+    // it, independent of check timing: even when protocol-writer teardown
+    // proceeds with a loan already outstanding (simulated here by calling
+    // the *real* destroy_proto_writer callback directly, bypassing the
+    // precondition check entirely -- exactly what publisher.zig's own
+    // teardown loop calls, just out of its normal sequence), the real
+    // protocol writer's resources are not actually destroyed until the
+    // loan releases its transferred quiesce ref. Before the fix, this would
+    // segfault inside publish_loan_raw on a freed protocol writer.
+    //
+    // Calling the real callback (not proto_writer.deinit() directly)
+    // matters for test hygiene too: it correctly removes the writer's
+    // active_writers entry, so the fixture's own later teardown (which
+    // still calls destroy_proto_writer once more, from PublisherImpl's own
+    // deinit loop) finds nothing and safely no-ops instead of double-freeing
+    // the now-torn-down protocol writer.
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    cdr_payload._buffer.?[0..4].* = .{ 0xAA, 0xBB, 0xCC, 0xDD };
+
+    // Simulate the race having already gone the unsafe way: the protocol
+    // writer is destroyed (from the participant's perspective) while the
+    // loan above is still outstanding.
+    pub_impl.cbs.destroy_proto_writer(pub_impl.cbs.ctx, dw_impl.instance_handle);
+
+    // proto_writer's real resources are legitimately gone once
+    // publish_loan_raw resolves the transferred ref and real teardown
+    // finally runs, so there's nothing left to inspect on it afterward --
+    // the proof here is publish_loan_raw succeeding at all, not crashing on
+    // a use-after-free while it's still writing through the (correctly
+    // still-alive) protocol writer.
+    var key_hash_bytes = [_]u8{3} ** 16;
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+}
+
+test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterward" {
+    // Regression for a real, distinct bug (Greptile PR #69 review, round 4):
+    // vtReturnLoanRaw released self's own quiesce ref -- which can
+    // synchronously free self when it's the last outstanding ref -- BEFORE
+    // reading self.proto_writer to release its ref too, a genuine
+    // use-after-free. vtPublishLoanRaw already had the correct order for
+    // free via LIFO `defer`s; vtReturnLoanRaw has no defers, so the order
+    // had to be made explicit (proto_writer's ref released first, self's
+    // own ref released last).
+    //
+    // Caution for future readers: this test does NOT reliably catch a
+    // regression back to the wrong order via a crash. Confirmed by direct
+    // manual instrumentation this session (temporary prints in reallyDeinit
+    // and vtReturnLoanRaw, not kept): with the order deliberately broken,
+    // self.releaseQuiesce() does synchronously free `self` here (reallyDeinit
+    // fires) exactly as expected -- but the very next statement's read of
+    // the now-dangling self.proto_writer still succeeds and returns the
+    // correct pointer value, because std.testing.allocator's small-object
+    // path doesn't unmap or poison a freed slot this size, unlike the
+    // round-3 regression test's proto_writer object (whose crash comes from
+    // touching genuinely torn-down nested RTPS state -- sockets, freed
+    // internal containers -- not just a reused-but-intact struct field).
+    // This test still exercises the real "loan is the last outstanding
+    // ref, released via return_loan_raw" code path (untouched by any other
+    // test in this file) and pins down the ref-count mechanics below via
+    // explicit assertions; the actual use-after-free-safety property is
+    // enforced by the explicit release order in vtReturnLoanRaw's source
+    // and its accompanying comment, not by this test's pass/fail. Worth
+    // revisiting under ASan if this project ever gets an ASan test step.
+    //
+    // Reproduces the exact ref state the real race leaves behind: a loan
+    // outstanding, followed by a delete_datawriter that raced ahead of the
+    // loan and completed anyway. Simulated the same way as the round-3
+    // regression test above -- removing the writer from the publisher's own
+    // list, destroying its protocol writer, and calling deinit() directly,
+    // mirroring vtDeleteDataWriter's real successful path minus the
+    // precondition check it would otherwise fail on. deinit() drops the
+    // writer's baseline quiesce ref; since the loan below still holds a
+    // transferred ref, the writer survives (EntityQuiesce defers physical
+    // teardown) until return_loan_raw resolves it.
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(@as(usize, 1), dw_impl.quiesce.state.load(.monotonic));
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    try testing.expectEqual(@as(usize, 2), dw_impl.quiesce.state.load(.monotonic));
+
+    pub_impl.mu.lock();
+    for (pub_impl.writers.items, 0..) |w, i| {
+        if (w == dw_impl) {
+            _ = pub_impl.writers.swapRemove(i);
+            break;
+        }
+    }
+    pub_impl.mu.unlock();
+    pub_impl.cbs.destroy_proto_writer(pub_impl.cbs.ctx, dw_impl.instance_handle);
+    dw_impl.deinit();
+    // Tearing-down bit set (high bit) + refcount 1 (just the loan's ref) --
+    // confirms the precondition this test exists to exercise actually holds
+    // before return_loan_raw runs.
+    try testing.expectEqual(@as(usize, 0x8000000000000001), dw_impl.quiesce.state.load(.monotonic));
+
+    // dw_impl is now kept alive only by the loan's transferred quiesce ref
+    // -- removed from pub_impl.writers above, so nothing else will touch it
+    // again (no `defer delete_datawriter` for this dw). Returning the loan
+    // resolves that ref and frees dw_impl for real: the proof here is this
+    // call succeeding without crashing, not anything left to inspect on
+    // dw_impl afterward (it's legitimately gone).
+    const rc = dw.vtable.return_loan_raw(dw.ptr, &cdr_payload);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+}
+
+test "delete_publisher: a loan racing the TOCTOU window before the real deinit cascade is safe" {
+    // Regression matching Greptile PR #69 review's own sequence diagram for
+    // its round-5 restatement of the (already-fixed) round-3 finding: this
+    // exercises the exact parent-level shape it describes -- a real
+    // checkDeleteContainedPrecondition() call (observing zero loans),
+    // followed by a loan racing in during the gap before the real
+    // PublisherImpl.deinit() cascade runs (matching vtDeletePublisher's/
+    // participant.zig's vtDeleteContained's actual check-then-unlock-then-
+    // deinit shape -- neither holds a lock spanning both) -- rather than
+    // round-3's test, which simulates the destroy_proto_writer step
+    // directly without going through the parent's own real check+cascade
+    // code path at all.
+    //
+    // Greptile's restated concern: parent deletion "destroys the protocol
+    // endpoint" while a loan racing the check still needs it. This proves
+    // that's safe: destroy_proto_writer/w.deinit() (called from the real
+    // PublisherImpl.deinit() cascade below) only *defer* real teardown --
+    // acquiring the loan transferred both quiesce refs (entity + protocol,
+    // round-3's fix) before the cascade ran, so nothing is actually freed
+    // until the loan resolves, regardless of how tight the TOCTOU window is
+    // or how many layers up the deletion started.
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
+    const dp_impl: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(fx.dp.ptr));
+
+    // Step 1: the real precondition check, exactly as vtDeletePublisher
+    // calls it -- observes zero outstanding loans, passes.
+    try testing.expectEqual(DDS.RETCODE_OK, pub_impl.checkDeleteContainedPrecondition());
+
+    // Step 2: a loan races in during the window between the check above and
+    // the deinit cascade below -- exactly what Greptile's diagram depicts.
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+
+    // Step 3: the real parent-level teardown proceeds anyway, mirroring
+    // vtDeletePublisher exactly: remove from the participant's own list
+    // under its lock, then deinit outside the lock (vtDeletePublisher
+    // doesn't re-check the precondition either -- it already checked once
+    // above, and re-checking here wouldn't close the gap being tested).
+    dp_impl.mu.lock();
+    for (dp_impl.publishers.items, 0..) |p, i| {
+        if (p == pub_impl) {
+            _ = dp_impl.publishers.swapRemove(i);
+            break;
+        }
+    }
+    dp_impl.mu.unlock();
+    pub_impl.deinit();
+
+    // pub_impl (and its child writer's protocol writer, via
+    // destroy_proto_writer inside the deinit loop above) are now gone --
+    // but dw_impl survives, kept alive solely by the loan's transferred
+    // quiesce refs. Publishing the loan must still succeed: the proof this
+    // scenario is actually safe.
+    var key_hash_bytes = [_]u8{4} ** 16;
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+}
+
+// ── kcov coverage sweep (2026-08-24): closing gaps 1-4 from the fresh
+// kcov-vs-PR-diff comparison ─────────────────────────────────────────────────
+
+test "loan_raw: proto_writer already tearing down (but not yet freed) fails cleanly with ALREADY_DELETED" {
+    // Coverage gap #1: the `!self.proto_writer.quiesceAcquire()` failure
+    // branch in vtLoanRaw was untested -- this is the failure path of the
+    // round-3 fix itself (src/dcps/writer.zig ~L1094-1097).
+    //
+    // To hit it without relying on undefined behavior, this holds an EXTRA
+    // quiesce ref on proto_writer first (simulating some other legitimate
+    // concurrent operation already using it -- the same technique
+    // EntityQuiesce's own doc comment uses: "a background callback that
+    // acquired before teardown began"), so destroy_proto_writer's
+    // beginTeardown() only sets the tearing-down bit and drops the count
+    // from 2 to 1 -- proto_writer stays genuinely allocated (not freed)
+    // for the whole test, so quiesceAcquire()'s tearing-down-bit check is
+    // what rejects the loan, never a read of freed memory.
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
+
+    try testing.expect(dw_impl.proto_writer.quiesceAcquire());
+    pub_impl.cbs.destroy_proto_writer(pub_impl.cbs.ctx, dw_impl.instance_handle);
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_ALREADY_DELETED, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    try testing.expect(cdr_payload._buffer == null);
+
+    // Release the extra ref this test itself is holding -- proto_writer's
+    // real teardown finally runs here, safely (nothing else touches it
+    // afterward). Uses the same still-valid `ProtocolWriter` handle
+    // acquired above; the field on dw_impl hasn't changed.
+    dw_impl.proto_writer.quiesceRelease();
+}
+
+test "changeKindFromWriteKind: UNREGISTER_WRITE_KIND maps through autodispose_unregistered_instances" {
+    // Coverage gap #2 (src/dcps/writer.zig L999-1000): UNREGISTER_WRITE_KIND
+    // was never exercised by any write_raw test -- every existing one used
+    // ALIVE_WRITE_KIND or DISPOSE_WRITE_KIND. autodispose_unregistered_
+    // instances defaults to true, so a default-QoS writer's unregister maps
+    // to .not_alive_disposed (the branch this test hits); the `else`
+    // (.not_alive_unregistered, when the QoS is false) is a one-line mirror
+    // of the same ternary, not separately worth a second test.
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+
+    var key_hash_bytes = [_]u8{5} ** 16;
+    var key_hash_seq = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    var payload_buf = [_]u8{0x01};
+    var payload_seq = DDS.OctetSeq{ ._buffer = &payload_buf, ._length = payload_buf.len, ._maximum = payload_buf.len, ._release = false };
+    const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
+    const rc = dw.vtable.write_raw(dw.ptr, &key_hash_seq, DDS.HANDLE_NIL, &payload_seq, .UNREGISTER_WRITE_KIND, &ts);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+}
+
+test "write_raw: an explicit instance_handle that doesn't match the key hash is rejected" {
+    // Coverage gap #3 (src/dcps/writer.zig L1044): the
+    // `handle != HANDLE_NIL and handle != registerInstanceRaw(kh)`
+    // mismatch-rejection branch was untested -- every existing write_raw
+    // test passed HANDLE_NIL (which always skips this check).
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+
+    var key_hash_bytes = [_]u8{6} ** 16;
+    var key_hash_seq = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    var payload_buf = [_]u8{0x02};
+    var payload_seq = DDS.OctetSeq{ ._buffer = &payload_buf, ._length = payload_buf.len, ._maximum = payload_buf.len, ._release = false };
+    const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
+    const real_handle = DataWriterImpl.registerInstanceRaw(key_hash_bytes);
+    const wrong_handle = real_handle + 1;
+    const rc = dw.vtable.write_raw(dw.ptr, &key_hash_seq, wrong_handle, &payload_seq, .ALIVE_WRITE_KIND, &ts);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
+}
+
+test "publish_loan_raw: an explicit instance_handle that doesn't match the key hash is rejected" {
+    // Coverage gap #3, publish_loan_raw's own copy of the same check
+    // (src/dcps/writer.zig L1124).
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+
+    var key_hash_bytes = [_]u8{7} ** 16;
+    const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
+    const real_handle = DataWriterImpl.registerInstanceRaw(key_hash_bytes);
+    const wrong_handle = real_handle + 1;
+    const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, wrong_handle, .ALIVE_WRITE_KIND);
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, rc);
+
+    // publish_loan_raw rejected before consuming the loan -- return it
+    // properly so delete_datawriter (the deferred cleanup above) doesn't
+    // hit PRECONDITION_NOT_MET.
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.return_loan_raw(dw.ptr, &cdr_payload));
+}

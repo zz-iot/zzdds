@@ -23,12 +23,6 @@ module zzdds {
         DISCOVERY_BROKER
     };
 
-    enum WriteKind {
-        WRITE_ALIVE,
-        WRITE_DISPOSE,
-        WRITE_UNREGISTER
-    };
-
     struct DomainConfig {
         @default(0) unsigned long id;
     };
@@ -156,10 +150,11 @@ module zzdds {
     };
 
     @shared_c_abi_box interface DataWriter : DDS::DataWriter {
-        DDS::ReturnCode_t write_serialized(
-            in WriteKind kind,
-            in OctetSeq key_hash,
-            in OctetSeq cdr);
+        // write_serialized() was removed: DDS::DataWriter::write_raw() (see
+        // dcps.idl) supersedes it -- same underlying zzdds core, but correct
+        // per-instance KEEP_LAST trimming (write_serialized passed a NIL
+        // instance handle instead of the real key hash) and consistent with
+        // the raw/loaned API family. See docs/design/raw-loan-api.md.
         DDS::ReturnCode_t set_listener_ex(
             in DataWriterListenerEx a_listener,
             in DDS::StatusMask      mask);
