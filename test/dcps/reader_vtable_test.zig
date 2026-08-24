@@ -809,6 +809,72 @@ test "take_raw: outstanding read-loan defers real protocol-reader teardown until
     try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
 }
 
+test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterward" {
+    // Regression for a real, distinct bug (Greptile PR #69 review, round
+    // 4), read-side counterpart of writer_vtable_test.zig's identical
+    // fix/test -- see that test's comment for the full bug description AND
+    // an important caveat: this test does not reliably catch a regression
+    // back to the wrong release order via a crash (confirmed empirically on
+    // the write side this session; std.testing.allocator's small-object
+    // path doesn't unmap/poison a freed slot this size). The actual
+    // use-after-free-safety property is enforced by the explicit release
+    // order in vtReturnLoanRaw's source and its accompanying comment, not
+    // by this test's pass/fail -- this test exercises the real code path
+    // and pins down the ref-count mechanics via explicit assertions.
+    //
+    // Unlike the write side, this function also frees hashes_seq/infos_seq
+    // and the taken samples' own storage (all via self.alloc) before
+    // releasing any quiesce ref -- every one of those self.alloc reads
+    // would also have use-after-freed under the old (wrong) release order,
+    // not just the self.proto_reader read.
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dr_dds = fx.makeReader(nil.nil_dr_listener, 0);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
+    const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
+    dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x01 });
+
+    try testing.expectEqual(@as(usize, 1), dr.quiesce.state.load(.monotonic));
+    var payloads = DDS.OctetSeqSeq{};
+    var hashes = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
+    try testing.expectEqual(@as(usize, 2), dr.quiesce.state.load(.monotonic));
+
+    // Simulate the race having already gone the unsafe way: a
+    // delete_datareader raced ahead of the loan above and completed anyway
+    // -- removing dr from the subscriber's own list, destroying its
+    // protocol reader, and calling deinit() directly, mirroring
+    // vtDeleteDataReader's real successful path minus the precondition
+    // check it would otherwise fail on. deinit() drops dr's baseline
+    // quiesce ref; the loan above still holds a transferred ref, so dr
+    // survives (EntityQuiesce defers physical teardown) until
+    // return_loan_raw resolves it.
+    sub_impl.mu.lock();
+    for (sub_impl.readers.items, 0..) |r, i| {
+        if (r == dr) {
+            _ = sub_impl.readers.swapRemove(i);
+            break;
+        }
+    }
+    sub_impl.mu.unlock();
+    sub_impl.cbs.destroy_proto_reader(sub_impl.cbs.ctx, dr.instance_handle);
+    dr.deinit();
+    // Tearing-down bit set (high bit) + refcount 1 (just the loan's ref) --
+    // confirms the precondition this test exists to exercise actually holds
+    // before return_loan_raw runs.
+    try testing.expectEqual(@as(usize, 0x8000000000000001), dr.quiesce.state.load(.monotonic));
+
+    // dr is now kept alive only by the loan's transferred quiesce ref --
+    // removed from sub_impl.readers above, so nothing else will touch it
+    // again (no `defer delete_datareader`). Returning the loan resolves
+    // that ref and frees dr for real: the proof here is this call
+    // succeeding without crashing.
+    const rc = dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+}
+
 const PendingChange = zzdds.dcps.PendingChange;
 
 /// Injects a sample for a specific instance_handle directly (pushCdr always

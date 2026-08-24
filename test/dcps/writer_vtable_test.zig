@@ -786,3 +786,79 @@ test "loan_raw: outstanding loan defers real protocol-writer teardown until the 
     const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
 }
+
+test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterward" {
+    // Regression for a real, distinct bug (Greptile PR #69 review, round 4):
+    // vtReturnLoanRaw released self's own quiesce ref -- which can
+    // synchronously free self when it's the last outstanding ref -- BEFORE
+    // reading self.proto_writer to release its ref too, a genuine
+    // use-after-free. vtPublishLoanRaw already had the correct order for
+    // free via LIFO `defer`s; vtReturnLoanRaw has no defers, so the order
+    // had to be made explicit (proto_writer's ref released first, self's
+    // own ref released last).
+    //
+    // Caution for future readers: this test does NOT reliably catch a
+    // regression back to the wrong order via a crash. Confirmed by direct
+    // manual instrumentation this session (temporary prints in reallyDeinit
+    // and vtReturnLoanRaw, not kept): with the order deliberately broken,
+    // self.releaseQuiesce() does synchronously free `self` here (reallyDeinit
+    // fires) exactly as expected -- but the very next statement's read of
+    // the now-dangling self.proto_writer still succeeds and returns the
+    // correct pointer value, because std.testing.allocator's small-object
+    // path doesn't unmap or poison a freed slot this size, unlike the
+    // round-3 regression test's proto_writer object (whose crash comes from
+    // touching genuinely torn-down nested RTPS state -- sockets, freed
+    // internal containers -- not just a reused-but-intact struct field).
+    // This test still exercises the real "loan is the last outstanding
+    // ref, released via return_loan_raw" code path (untouched by any other
+    // test in this file) and pins down the ref-count mechanics below via
+    // explicit assertions; the actual use-after-free-safety property is
+    // enforced by the explicit release order in vtReturnLoanRaw's source
+    // and its accompanying comment, not by this test's pass/fail. Worth
+    // revisiting under ASan if this project ever gets an ASan test step.
+    //
+    // Reproduces the exact ref state the real race leaves behind: a loan
+    // outstanding, followed by a delete_datawriter that raced ahead of the
+    // loan and completed anyway. Simulated the same way as the round-3
+    // regression test above -- removing the writer from the publisher's own
+    // list, destroying its protocol writer, and calling deinit() directly,
+    // mirroring vtDeleteDataWriter's real successful path minus the
+    // precondition check it would otherwise fail on. deinit() drops the
+    // writer's baseline quiesce ref; since the loan below still holds a
+    // transferred ref, the writer survives (EntityQuiesce defers physical
+    // teardown) until return_loan_raw resolves it.
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
+
+    var cdr_payload = DDS.OctetSeq{};
+    try testing.expectEqual(@as(usize, 1), dw_impl.quiesce.state.load(.monotonic));
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    try testing.expectEqual(@as(usize, 2), dw_impl.quiesce.state.load(.monotonic));
+
+    pub_impl.mu.lock();
+    for (pub_impl.writers.items, 0..) |w, i| {
+        if (w == dw_impl) {
+            _ = pub_impl.writers.swapRemove(i);
+            break;
+        }
+    }
+    pub_impl.mu.unlock();
+    pub_impl.cbs.destroy_proto_writer(pub_impl.cbs.ctx, dw_impl.instance_handle);
+    dw_impl.deinit();
+    // Tearing-down bit set (high bit) + refcount 1 (just the loan's ref) --
+    // confirms the precondition this test exists to exercise actually holds
+    // before return_loan_raw runs.
+    try testing.expectEqual(@as(usize, 0x8000000000000001), dw_impl.quiesce.state.load(.monotonic));
+
+    // dw_impl is now kept alive only by the loan's transferred quiesce ref
+    // -- removed from pub_impl.writers above, so nothing else will touch it
+    // again (no `defer delete_datawriter` for this dw). Returning the loan
+    // resolves that ref and frees dw_impl for real: the proof here is this
+    // call succeeding without crashing, not anything left to inspect on
+    // dw_impl afterward (it's legitimately gone).
+    const rc = dw.vtable.return_loan_raw(dw.ptr, &cdr_payload);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+}

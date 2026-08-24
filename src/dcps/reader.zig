@@ -3580,6 +3580,14 @@ pub const DataReaderImpl = struct {
         const hashes_seq = key_hashes orelse return DDS.RETCODE_BAD_PARAMETER;
         const infos_seq = sample_infos orelse return DDS.RETCODE_BAD_PARAMETER;
 
+        // Whether this call must release the transferred quiesce refs (both
+        // self's own and proto_reader's -- see below). Deferred to the very
+        // end of the function, after every other `self.`-touching statement
+        // (Greptile PR #69 review, round 4): self's own release can
+        // synchronously free self, so nothing may read any `self.*` field
+        // -- not just self.proto_reader, but self.alloc too -- afterward.
+        var release_refs = false;
+
         if (payloads_seq._buffer) |descriptors_ptr| {
             const n = payloads_seq._maximum;
             const descriptors = descriptors_ptr[0..n];
@@ -3591,14 +3599,13 @@ pub const DataReaderImpl = struct {
             if (found) |kv| {
                 self.releasePinnedSamples(kv.value);
                 self.alloc.free(kv.value);
-                // Releases both quiesce refs the originating loan-mode
-                // take_raw()/read_raw() call transferred here instead of
-                // releasing itself -- see rawReadOrTake's doc comment. Only
-                // a loan-mode result (found in loan_table) carries a
-                // transferred ref; a copy-mode result's own call already
-                // released both refs before returning.
-                self.releaseQuiesce();
-                self.proto_reader.quiesceRelease();
+                // Only a loan-mode result (found in loan_table) carries the
+                // quiesce refs the originating loan-mode take_raw()/
+                // read_raw() call transferred here instead of releasing
+                // itself -- see rawReadOrTake's doc comment. A copy-mode
+                // result's own call already released both refs before
+                // returning.
+                release_refs = true;
             } else {
                 for (descriptors) |d| {
                     if (d._buffer) |b| self.alloc.free(b[0..d._maximum]);
@@ -3612,6 +3619,12 @@ pub const DataReaderImpl = struct {
         payloads_seq.* = .{};
         hashes_seq.* = .{};
         infos_seq.* = .{};
+        if (release_refs) {
+            // proto_reader's ref first, while self is still guaranteed
+            // alive; self's own ref last, since it may free self.
+            self.proto_reader.quiesceRelease();
+            self.releaseQuiesce();
+        }
         return DDS.RETCODE_OK;
     }
 

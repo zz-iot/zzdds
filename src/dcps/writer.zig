@@ -1153,9 +1153,15 @@ pub const DataWriterImpl = struct {
         seq.* = .{};
         self.cancelLoan(full_buf);
         // Releases both quiesce refs vtLoanRaw transferred here -- see
-        // vtPublishLoanRaw's identical comment.
-        self.releaseQuiesce();
+        // vtPublishLoanRaw's identical comment. Order matters (Greptile PR
+        // #69 review, round 4): proto_writer's ref must release FIRST,
+        // while self is still guaranteed alive, since self's own release
+        // can synchronously free self -- reading self.proto_writer
+        // afterward would be a use-after-free. vtPublishLoanRaw gets this
+        // right for free via LIFO `defer` ordering; this function has no
+        // defers, so the order must be explicit.
         self.proto_writer.quiesceRelease();
+        self.releaseQuiesce();
         return DDS.RETCODE_OK;
     }
 
