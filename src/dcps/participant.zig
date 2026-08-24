@@ -3221,22 +3221,34 @@ pub const DomainParticipantImpl = struct {
 
     fn vtDeletePublisher(ctx: *anyopaque, a_publisher: DDS.Publisher) DDS.ReturnCode_t {
         const self = cast(ctx);
-        var found: ?*publisher_mod.PublisherImpl = null;
         self.mu.lock();
-        for (self.publishers.items, 0..) |p, i| {
+        var found: ?*publisher_mod.PublisherImpl = null;
+        for (self.publishers.items) |p| {
             if (p.toDDSPublisher().ptr == a_publisher.ptr) {
-                _ = self.publishers.swapRemove(i);
                 found = p;
                 break;
             }
         }
         self.mu.unlock();
-        // Deinit outside lock: publisher.deinit() calls destroy_proto_writer which locks mu.
-        if (found) |p| {
-            p.deinit();
-            return DDS.RETCODE_OK;
+        const p = found orelse return DDS.RETCODE_BAD_PARAMETER;
+        // PRECONDITION_NOT_MET if any contained writer has outstanding
+        // write-loans -- delete_datawriter/delete_contained_entities already
+        // check this via checkDeleteContainedPrecondition(); direct
+        // delete_publisher previously didn't, letting it destroy a protocol
+        // writer a live loan still needed (Greptile PR #69 follow-up finding).
+        const precondition = p.checkDeleteContainedPrecondition();
+        if (precondition != DDS.RETCODE_OK) return precondition;
+        self.mu.lock();
+        for (self.publishers.items, 0..) |pp, i| {
+            if (pp == p) {
+                _ = self.publishers.swapRemove(i);
+                break;
+            }
         }
-        return DDS.RETCODE_BAD_PARAMETER;
+        self.mu.unlock();
+        // Deinit outside lock: publisher.deinit() calls destroy_proto_writer which locks mu.
+        p.deinit();
+        return DDS.RETCODE_OK;
     }
 
     fn vtCreateSubscriber(
@@ -3269,21 +3281,30 @@ pub const DomainParticipantImpl = struct {
 
     fn vtDeleteSubscriber(ctx: *anyopaque, a_subscriber: DDS.Subscriber) DDS.ReturnCode_t {
         const self = cast(ctx);
-        var found: ?*subscriber_mod.SubscriberImpl = null;
         self.mu.lock();
-        for (self.subscribers.items, 0..) |s, i| {
+        var found: ?*subscriber_mod.SubscriberImpl = null;
+        for (self.subscribers.items) |s| {
             if (s.toDDSSubscriber().ptr == a_subscriber.ptr) {
-                _ = self.subscribers.swapRemove(i);
                 found = s;
                 break;
             }
         }
         self.mu.unlock();
-        if (found) |s| {
-            s.deinit();
-            return DDS.RETCODE_OK;
+        const s = found orelse return DDS.RETCODE_BAD_PARAMETER;
+        // See vtDeletePublisher's identical guard -- same finding, read side.
+        const precondition = s.checkDeleteContainedPrecondition();
+        if (precondition != DDS.RETCODE_OK) return precondition;
+        self.mu.lock();
+        for (self.subscribers.items, 0..) |ss, i| {
+            if (ss == s) {
+                _ = self.subscribers.swapRemove(i);
+                break;
+            }
         }
-        return DDS.RETCODE_BAD_PARAMETER;
+        self.mu.unlock();
+        // Deinit outside lock: subscriber.deinit() calls destroy_proto_reader which locks mu.
+        s.deinit();
+        return DDS.RETCODE_OK;
     }
 
     fn vtGetBuiltinSubscriber(ctx: *anyopaque) DDS.Subscriber {

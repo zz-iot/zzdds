@@ -1162,16 +1162,18 @@ module DDS {
         // see docs/design/raw-loan-api.md. max_len == 0 on cdr_payloads (the
         // spec's own inout-collection convention) signals loan rather than
         // copy: the returned octet_seq entries borrow directly from reader
-        // history (no data copy) and must be released via return_loan_raw();
-        // a non-zero max_len signals copy mode, and the returned entries are
-        // independently owned (freeable via the ordinary generated _free()
-        // path, return_loan_raw() is also safe to call on them -- a no-op-
-        // equivalent single free either way). key_hashes is always copied
-        // regardless of mode (small, fixed-size -- not worth loaning): N
-        // 16-byte hashes back to back, one per returned sample. take_raw/
-        // take_next_instance_raw are destructive (samples removed from
-        // reader history); read_raw/read_next_instance_raw are not (samples
-        // remain, marked read).
+        // history (no data copy); a non-zero max_len signals copy mode, and
+        // the returned entries are independently owned copies. Regardless of
+        // mode, cdr_payloads/key_hashes/sample_infos must all be released via
+        // return_loan_raw() -- none of the three has an independent generic
+        // free path (a generic, entity-context-free free can never safely
+        // recover the allocator this reader actually used to produce them;
+        // return_loan_raw() has the reader itself in scope and always frees
+        // correctly). key_hashes is always copied regardless of mode (small,
+        // fixed-size -- not worth loaning): N 16-byte hashes back to back,
+        // one per returned sample. take_raw/take_next_instance_raw are
+        // destructive (samples removed from reader history); read_raw/
+        // read_next_instance_raw are not (samples remain, marked read).
         //
         // instance_handle (HANDLE_NIL = no filter) restricts to samples of
         // exactly that instance, the raw path to the typed API's
@@ -1237,11 +1239,14 @@ module DDS {
 
         // Release the result of a prior take_raw()/read_raw()/
         // take_next_instance_raw()/read_next_instance_raw() call --
-        // cdr_payloads/sample_infos must be the exact same values returned.
-        // Safe to call regardless of whether that call was loan-mode or
-        // copy-mode (see take_raw's doc comment above).
+        // cdr_payloads/key_hashes/sample_infos must be the exact same values
+        // returned. Safe to call regardless of whether that call was
+        // loan-mode or copy-mode (see take_raw's doc comment above). This is
+        // the *only* correct way to release any of the three -- see that
+        // same comment for why.
         ReturnCode_t return_loan_raw(
             inout OctetSeqSeq   cdr_payloads,
+            inout OctetSeq      key_hashes,
             inout SampleInfoSeq sample_infos);
     };
 

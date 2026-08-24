@@ -3464,6 +3464,13 @@ pub const DataReaderImpl = struct {
         }
         var descriptors: std.ArrayListUnmanaged(DDS.OctetSeq) = .empty;
         errdefer descriptors.deinit(self.alloc);
+        // key_hashes is allocated via self.alloc, same as descriptors/infos,
+        // and released exclusively through return_loan_raw (see that op's
+        // dcps.idl doc comment) -- not through a generic, entity-context-free
+        // {Type}_free. A generic free has no way to recover this specific
+        // reader's own allocator, which can genuinely differ per reader
+        // (zzdds_create_factory_with_allocator); return_loan_raw always has
+        // the reader itself in scope and so always frees correctly.
         var hashes: std.ArrayListUnmanaged(u8) = .empty;
         errdefer hashes.deinit(self.alloc);
         var infos: std.ArrayListUnmanaged(DDS.SampleInfo) = .empty;
@@ -3488,7 +3495,7 @@ pub const DataReaderImpl = struct {
         try self.loan_table.put(self.alloc, descriptors_owned.ptr, pcs);
 
         payloads_seq.* = .{ ._buffer = descriptors_owned.ptr, ._length = @intCast(descriptors_owned.len), ._maximum = @intCast(descriptors_owned.len), ._release = false };
-        hashes_seq.* = .{ ._buffer = hashes_owned.ptr, ._length = @intCast(hashes_owned.len), ._maximum = @intCast(hashes_owned.len), ._release = true };
+        hashes_seq.* = .{ ._buffer = hashes_owned.ptr, ._length = @intCast(hashes_owned.len), ._maximum = @intCast(hashes_owned.len), ._release = false };
         infos_seq.* = .{ ._buffer = infos_owned.ptr, ._length = @intCast(infos_owned.len), ._maximum = @intCast(infos_owned.len), ._release = true };
     }
 
@@ -3502,6 +3509,7 @@ pub const DataReaderImpl = struct {
         errdefer for (taken) |s| self.alloc.free(s.data);
         var descriptors: std.ArrayListUnmanaged(DDS.OctetSeq) = .empty;
         errdefer descriptors.deinit(self.alloc);
+        // See buildRawOutputFromPins's identical hashes allocator comment.
         var hashes: std.ArrayListUnmanaged(u8) = .empty;
         errdefer hashes.deinit(self.alloc);
         var infos: std.ArrayListUnmanaged(DDS.SampleInfo) = .empty;
@@ -3522,7 +3530,7 @@ pub const DataReaderImpl = struct {
         errdefer self.alloc.free(infos_owned);
 
         payloads_seq.* = .{ ._buffer = descriptors_owned.ptr, ._length = @intCast(descriptors_owned.len), ._maximum = @intCast(descriptors_owned.len), ._release = false };
-        hashes_seq.* = .{ ._buffer = hashes_owned.ptr, ._length = @intCast(hashes_owned.len), ._maximum = @intCast(hashes_owned.len), ._release = true };
+        hashes_seq.* = .{ ._buffer = hashes_owned.ptr, ._length = @intCast(hashes_owned.len), ._maximum = @intCast(hashes_owned.len), ._release = false };
         infos_seq.* = .{ ._buffer = infos_owned.ptr, ._length = @intCast(infos_owned.len), ._maximum = @intCast(infos_owned.len), ._release = true };
     }
 
@@ -3533,9 +3541,10 @@ pub const DataReaderImpl = struct {
     /// sample via PendingChange.reallyFree once its refcount hits zero, same
     /// as any other pin release); absent means copy-mode (each descriptor
     /// independently owns its own buffer, freed directly here).
-    fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payloads: ?*DDS.OctetSeqSeq, sample_infos: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
+    fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payloads: ?*DDS.OctetSeqSeq, key_hashes: ?*DDS.OctetSeq, sample_infos: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
         const self = cast(ctx);
         const payloads_seq = cdr_payloads orelse return DDS.RETCODE_BAD_PARAMETER;
+        const hashes_seq = key_hashes orelse return DDS.RETCODE_BAD_PARAMETER;
         const infos_seq = sample_infos orelse return DDS.RETCODE_BAD_PARAMETER;
 
         if (payloads_seq._buffer) |descriptors_ptr| {
@@ -3563,9 +3572,11 @@ pub const DataReaderImpl = struct {
             }
             self.alloc.free(descriptors);
         }
+        if (hashes_seq._buffer) |hb| self.alloc.free(hb[0..hashes_seq._maximum]);
         if (infos_seq._buffer) |ib| self.alloc.free(ib[0..infos_seq._maximum]);
 
         payloads_seq.* = .{};
+        hashes_seq.* = .{};
         infos_seq.* = .{};
         return DDS.RETCODE_OK;
     }

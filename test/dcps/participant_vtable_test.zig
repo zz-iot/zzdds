@@ -542,6 +542,58 @@ test "vtDeleteDataWriter/vtDeleteContained (Publisher): refuse while a writer ha
     try testing.expectEqual(DDS.RETCODE_OK, publisher.vtable.delete_contained_entities(publisher.ptr));
 }
 
+test "vtDeletePublisher (Participant): refuses direct delete while a writer has an outstanding write-loan, succeeds once resolved" {
+    // Regression for a real bug (Greptile PR #69 follow-up): unlike
+    // delete_datawriter/delete_contained_entities (see the test above), the
+    // participant's own direct delete_publisher previously skipped the
+    // precondition check entirely and unconditionally destroyed every
+    // contained writer's protocol writer -- a caller that had already loaned
+    // a buffer via loan_raw() would then dereference a destroyed protocol
+    // writer on publish_loan_raw(), no concurrency required to hit it.
+    var fx = try Fixture.init(56);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("WLTopicDirectPubDelete", "T", .{}, null, 0);
+    const publisher = fx.dp.create_publisher(.{}, null, 0);
+    const dw = publisher.create_datawriter(topic, .{}, null, 0);
+    const dw_impl: *zzdds.dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    const buf = try dw_impl.loanForWrite(1);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.dp.vtable.delete_publisher(fx.dp.ptr, publisher));
+
+    dw_impl.cancelLoan(buf);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_publisher(fx.dp.ptr, publisher));
+}
+
+test "vtDeleteSubscriber (Participant): refuses direct delete while a reader has an outstanding read-loan, succeeds once resolved" {
+    // Read-side counterpart of the direct-delete_publisher fix above.
+    var fx = try Fixture.init(57);
+    defer fx.deinit();
+    const topic = fx.dp.create_topic("WLTopicDirectSubDelete", "T", .{}, null, 0);
+    const subscriber = fx.dp.create_subscriber(.{}, null, 0);
+    const topic_impl = @as(*zzdds.dcps.TopicImpl, @ptrCast(@alignCast(topic.ptr)));
+    const dr = subscriber.create_datareader(topic_impl.toTopicDescription(), .{}, null, 0);
+    const dr_impl: *zzdds.dcps.DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    const data = try testing.allocator.dupe(u8, &.{0xEE});
+    const pc = try testing.allocator.create(zzdds.dcps.PendingChange);
+    pc.* = .{
+        .data = data,
+        .alloc = testing.allocator,
+        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
+    };
+    try dr_impl.pending.append(testing.allocator, pc);
+
+    const pinned = try dr_impl.pinSamplesForLoan(DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+    defer testing.allocator.free(pinned);
+    try testing.expectEqual(@as(usize, 1), pinned.len);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.dp.vtable.delete_subscriber(fx.dp.ptr, subscriber));
+
+    dr_impl.releasePinnedSamples(pinned);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.dp.vtable.delete_subscriber(fx.dp.ptr, subscriber));
+}
+
 test "vtDeleteContained (Participant): all-or-nothing across both branches -- a writer's outstanding write-loan refuses even with all readers clean, and vice versa" {
     var fx = try Fixture.init(55);
     defer fx.deinit();

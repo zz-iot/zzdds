@@ -170,7 +170,7 @@ fn drNoop23(_: *anyopaque, _: *DDS.PublicationBuiltinTopicData, _: DDS.InstanceH
 fn drNoop24(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq, _: DDS.InstanceHandle_t, _: DDS.ReadCondition, _: DDS.SampleStateMask, _: DDS.ViewStateMask, _: DDS.InstanceStateMask, _: i32) DDS.ReturnCode_t {
     unreachable;
 }
-fn drNoop25(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
+fn drNoop25(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
     unreachable;
 }
 fn drNoDeinit(_: *anyopaque) void {}

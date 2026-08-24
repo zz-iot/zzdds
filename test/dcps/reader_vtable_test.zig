@@ -689,10 +689,9 @@ test "take_raw: loan mode (max_len==0) is destructive, zero-copy, and outstandin
     const buf0 = payloads._buffer.?[0];
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x00, 0x00, 0xAA }, buf0._buffer.?[0..buf0._length]);
 
-    const rc2 = dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &infos);
+    const rc2 = dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos);
     try testing.expectEqual(DDS.RETCODE_OK, rc2);
     try testing.expectEqual(@as(usize, 0), dr.outstanding_loans.load(.monotonic));
-    alloc.free(hashes._buffer.?[0..hashes._maximum]);
 }
 
 test "read_raw: loan mode is non-destructive -- samples stay in pending, marked READ" {
@@ -716,11 +715,10 @@ test "read_raw: loan mode is non-destructive -- samples stay in pending, marked 
     try testing.expectEqual(DDS.READ_SAMPLE_STATE, dr.pending.items[0].info.sample_state);
     try testing.expectEqual(@as(usize, 1), dr.outstanding_loans.load(.monotonic));
 
-    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &infos));
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
     try testing.expectEqual(@as(usize, 0), dr.outstanding_loans.load(.monotonic));
     // Sample is still in pending -- releasing a loan doesn't retire it.
     try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
-    alloc.free(hashes._buffer.?[0..hashes._maximum]);
 }
 
 test "take_raw: copy mode (max_len!=0) does not require return_loan_raw -- generic free is safe" {
@@ -747,8 +745,7 @@ test "take_raw: copy mode (max_len!=0) does not require return_loan_raw -- gener
 
     // return_loan_raw still works correctly on copy-mode output (finds no
     // loan_table entry, falls back to freeing each descriptor directly).
-    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &infos));
-    alloc.free(hashes._buffer.?[0..hashes._maximum]);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
 }
 
 test "take_raw: an outstanding read-loan blocks delete_datareader with PRECONDITION_NOT_MET" {
@@ -766,8 +763,7 @@ test "take_raw: an outstanding read-loan blocks delete_datareader with PRECONDIT
 
     try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds));
 
-    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &infos));
-    alloc.free(hashes._buffer.?[0..hashes._maximum]);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
     try testing.expectEqual(DDS.RETCODE_OK, fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds));
 }
 
@@ -808,8 +804,7 @@ test "take_raw: instance_handle filters to exactly that instance" {
     // Instance 1's sample is untouched -- still in pending.
     try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
 
-    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &infos));
-    alloc.free(hashes._buffer.?[0..hashes._maximum]);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads, &hashes, &infos));
 }
 
 test "take_next_instance_raw: cursor iteration visits each instance once, in handle order" {
@@ -830,8 +825,7 @@ test "take_next_instance_raw: cursor iteration visits each instance once, in han
     try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &payloads1, &hashes1, &infos1, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
     try testing.expectEqual(@as(u32, 1), payloads1._length);
     try testing.expectEqual(@as(i32, 3), infos1._buffer.?[0].instance_handle);
-    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads1, &infos1));
-    alloc.free(hashes1._buffer.?[0..hashes1._maximum]);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads1, &hashes1, &infos1));
 
     // Second call (previous_handle = 3): next instance after it, instance 5.
     var payloads2 = DDS.OctetSeqSeq{};
@@ -840,8 +834,7 @@ test "take_next_instance_raw: cursor iteration visits each instance once, in han
     try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_next_instance_raw(dr_dds.ptr, &payloads2, &hashes2, &infos2, 3, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
     try testing.expectEqual(@as(u32, 1), payloads2._length);
     try testing.expectEqual(@as(i32, 5), infos2._buffer.?[0].instance_handle);
-    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads2, &infos2));
-    alloc.free(hashes2._buffer.?[0..hashes2._maximum]);
+    try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.return_loan_raw(dr_dds.ptr, &payloads2, &hashes2, &infos2));
 
     // No more instances after 5.
     var payloads3 = DDS.OctetSeqSeq{};

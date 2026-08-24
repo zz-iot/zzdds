@@ -768,7 +768,7 @@ var nil_datareader_vtable = DDS.DataReader.Vtable{
         }
     }.f,
     .return_loan_raw = struct {
-        fn f(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
+        fn f(_: *anyopaque, _: ?*DDS.OctetSeqSeq, _: ?*DDS.OctetSeq, _: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
             return DDS.RETCODE_ERROR;
         }
     }.f,

@@ -360,8 +360,8 @@ public:
     ) override {
         return dds_.read_next_instance_raw(cdr_payloads, key_hashes, sample_infos, previous_handle, std::move(a_condition), sample_states, view_states, instance_states, max_samples);
     }
-    ::DDS::ReturnCode_t return_loan_raw(::DDS::OctetSeqSeq& cdr_payloads, ::DDS::SampleInfoSeq& sample_infos) override {
-        return dds_.return_loan_raw(cdr_payloads, sample_infos);
+    ::DDS::ReturnCode_t return_loan_raw(::DDS::OctetSeqSeq& cdr_payloads, ::DDS::OctetSeq& key_hashes, ::DDS::SampleInfoSeq& sample_infos) override {
+        return dds_.return_loan_raw(cdr_payloads, key_hashes, sample_infos);
     }
 
     // See TopicSupport's matching comment.

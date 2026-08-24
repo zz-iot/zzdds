@@ -616,10 +616,7 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     const got0 = payloads_seq._buffer.?[0];
     try std.testing.expectEqualSlices(u8, &PAYLOAD_1, got0._buffer.?[0..got0._length]);
 
-    _ = dr.vtable.return_loan_raw(dr.ptr, &payloads_seq, &infos_seq);
-    if (hashes_seq._release) {
-        if (hashes_seq._buffer) |b| alloc.free(b[0..hashes_seq._maximum]);
-    }
+    _ = dr.vtable.return_loan_raw(dr.ptr, &payloads_seq, &hashes_seq, &infos_seq);
 }
 
 // Same as above but with two distinct DomainParticipants (still same
@@ -687,8 +684,5 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     try std.testing.expectEqual(DDS.RETCODE_OK, last_rc);
     try std.testing.expect(payloads_seq._length > 0);
 
-    _ = dr.vtable.return_loan_raw(dr.ptr, &payloads_seq, &infos_seq);
-    if (hashes_seq._release) {
-        if (hashes_seq._buffer) |b| alloc.free(b[0..hashes_seq._maximum]);
-    }
+    _ = dr.vtable.return_loan_raw(dr.ptr, &payloads_seq, &hashes_seq, &infos_seq);
 }
