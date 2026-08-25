@@ -37,6 +37,7 @@ fn zzddsFilterValueToZig(v: ZzddsFilterValue) ?filter_mod.FilterValue {
         0 => filter_mod.FilterValue{ .int = v.i },
         1 => filter_mod.FilterValue{ .float = v.f },
         2 => filter_mod.FilterValue{ .string = (v.s_ptr orelse return null)[0..v.s_len] },
+        3 => filter_mod.FilterValue{ .float32 = @floatCast(v.f) },
         else => null,
     };
 }

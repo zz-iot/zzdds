@@ -862,7 +862,7 @@ pub export fn DDS_TopicDescription_as_DDS_MultiTopic(base: *anyopaque) callconv(
 // FieldAccessor, translated to a C-callable extern struct/fn pointer pair.
 
 /// Discriminated value returned by a caller-supplied `ZzddsFieldGetFn`.
-/// kind: 0 = int (`i` valid), 1 = float (`f` valid), 2 = string (`s_ptr`/`s_len` valid).
+/// kind: 0 = int, 1 = float64, 2 = string, 3 = float32.
 /// A plain extern struct with one field per variant (rather than a real
 /// tagged union) sidesteps any C-ABI union-layout ambiguity across
 /// C/C++/JNI callers.
@@ -913,6 +913,7 @@ pub export fn zzdds_cft_match_sample(
                 0 => filter_mod.FilterValue{ .int = out.i },
                 1 => filter_mod.FilterValue{ .float = out.f },
                 2 => filter_mod.FilterValue{ .string = (out.s_ptr orelse return null)[0..out.s_len] },
+                3 => filter_mod.FilterValue{ .float32 = @floatCast(out.f) },
                 else => null,
             };
         }

@@ -12,6 +12,7 @@ const build_opts = @import("build_options");
 /// A value extracted from a data sample field or a filter literal.
 pub const FilterValue = union(enum) {
     int: i64,
+    float32: f32,
     float: f64,
     string: []const u8,
 };
@@ -534,6 +535,23 @@ fn compareValues(left: FilterValue, op: RelOp, right: FilterValue) EvalError!boo
         return matchLike(pattern, value);
     }
 
+    // Compare at the field's declared precision. Promoting an f32 field to
+    // f64 first makes values such as 3.14159f unequal to the decimal
+    // parameter "3.14159" even though DDS coercion should match them.
+    if (std.meta.activeTag(left) == .float32 or std.meta.activeTag(right) == .float32) {
+        const lf = asNumeric32(left) orelse return error.TypeMismatch;
+        const rf = asNumeric32(right) orelse return error.TypeMismatch;
+        return switch (op) {
+            .eq => lf == rf,
+            .ne => lf != rf,
+            .lt => lf < rf,
+            .le => lf <= rf,
+            .gt => lf > rf,
+            .ge => lf >= rf,
+            .like => unreachable,
+        };
+    }
+
     // Try numeric comparison first.
     if (asNumeric(left)) |lf| {
         if (asNumeric(right)) |rf| {
@@ -569,8 +587,18 @@ fn compareValues(left: FilterValue, op: RelOp, right: FilterValue) EvalError!boo
 fn asNumeric(v: FilterValue) ?f64 {
     return switch (v) {
         .int => |i| @floatFromInt(i),
+        .float32 => |f| @floatCast(f),
         .float => |f| f,
         .string => |s| std.fmt.parseFloat(f64, s) catch null,
+    };
+}
+
+fn asNumeric32(v: FilterValue) ?f32 {
+    return switch (v) {
+        .int => |i| @floatFromInt(i),
+        .float32 => |f| f,
+        .float => |f| @floatCast(f),
+        .string => |s| std.fmt.parseFloat(f32, s) catch null,
     };
 }
 

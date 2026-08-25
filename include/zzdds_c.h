@@ -24,7 +24,8 @@ typedef int (*zzdds_compute_key_hash_fn)(const uint8_t *payload, size_t len, uin
 
 /* Discriminated field value used by get_field_from_cdr (below) and by
  * zzdds_cft_match_sample (see its own section further down): kind 0 = int
- * (i valid), 1 = float (f valid), 2 = string (s_ptr/s_len valid). */
+ * (i valid), 1 = float64 (f valid), 2 = string (s_ptr/s_len valid),
+ * 3 = float32 (f valid). */
 typedef struct zzdds_filter_value {
     int kind;
     int64_t i;
