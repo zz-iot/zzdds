@@ -1385,8 +1385,8 @@ pub const DomainParticipantImpl = struct {
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataWriterQos,
-        handle: DDS.InstanceHandle_t,
         presentation: DDS.PresentationQosPolicy,
+        publication_handle: *DDS.InstanceHandle_t,
     ) anyerror!proto.ProtocolWriter {
         const self = cast(ctx);
 
@@ -1401,6 +1401,7 @@ pub const DomainParticipantImpl = struct {
                 .entity_kind = EntityKind.user_writer_with_key,
             },
         };
+        publication_handle.* = writer_mod.guidToHandle(guid);
 
         const cache_kind: history_mod.HistoryKind = if (qos.history.kind == .KEEP_ALL_HISTORY_QOS)
             .keep_all
@@ -1449,7 +1450,7 @@ pub const DomainParticipantImpl = struct {
             self.mu.lock();
             defer self.mu.unlock();
             try self.active_writers.put(self.alloc, entityIdKey(guid.entity_id), .{
-                .handle = handle,
+                .handle = publication_handle.*,
                 .guid = guid,
                 .proto = pw,
                 .topic_name = topic_name,
@@ -2976,7 +2977,6 @@ pub const DomainParticipantImpl = struct {
             .ctx = self,
             .create_proto_writer = pubCreateProtoWriter,
             .destroy_proto_writer = pubDestroyProtoWriter,
-            .next_handle = nextHandle,
             .register_incompat_qos = pubRegisterWriterIncompatQos,
             .register_matched_notify = pubRegisterWriterMatchedNotify,
             .announce_writer = pubAnnounceProtoWriter,

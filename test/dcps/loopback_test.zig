@@ -613,6 +613,11 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     const last_rc = waitForRawOpTake(dr, &payloads_seq, &hashes_seq, &infos_seq);
     try std.testing.expectEqual(DDS.RETCODE_OK, last_rc);
     try std.testing.expect(payloads_seq._length > 0);
+    try std.testing.expect(infos_seq._length > 0);
+    try std.testing.expectEqual(
+        dw.vtable.get_instance_handle(dw.ptr),
+        infos_seq._buffer.?[0].publication_handle,
+    );
     const got0 = payloads_seq._buffer.?[0];
     try std.testing.expectEqualSlices(u8, &PAYLOAD_1, got0._buffer.?[0..got0._length]);
 
