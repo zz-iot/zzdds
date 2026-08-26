@@ -292,6 +292,22 @@ on the spot: the C++ backend's shared entity identity-cache (`_familyCache`) had
 unconditionally. Both fixed the same way as everything else here: route through the
 registered allocator, never hardcode.
 
+That `ReleaseCtx` fix had a second, subtler bug of its own, caught by Greptile review on the
+resulting PR: it *routed through* the registered allocator correctly, but re-queried
+`std::pmr::get_default_resource()` independently at both allocation and free time rather than
+capturing which resource was actually used at allocation. A live attachment can span a
+`zidl::setCppAllocator()` reconfiguration (the default resource is process-wide and
+mutable), so the free could silently select a *different* resource than the one that
+allocated — this is the exact bug class `allocator-strategy.md`'s Phase 3 post-merge review
+already found and fixed once before, for `_getOrCreate`'s own `ZidlAllocatorResource`, for
+the identical reason. Fixed the same way: `ReleaseCtx` now stores the resource pointer
+captured at construction and reuses it unconditionally at destruction, never re-querying.
+Verified with a standalone program using two independent, pointer-bounds-checked tracking
+resources — attach under resource A, reconfigure the default to resource B, detach; confirmed
+the free correctly targets resource A regardless. Deliberately reverting the fix reproduces
+a real, caught cross-resource free (not a hypothetical): resource B's tracking check aborts
+on a pointer that was never allocated from its own buffer.
+
 ## Known limitations & future work
 
 - **The app-owned boxed buffer's allocator match is not structurally enforced** — see

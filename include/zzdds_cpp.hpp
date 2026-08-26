@@ -679,12 +679,18 @@ private:
     // the exact ctx it was handed.
     struct ReleaseCtx {
         std::shared_ptr<::DDS::Condition> cond;
+        // Captured at allocation time and reused, unconditionally, at free
+        // time -- see allocReleaseCtx/freeReleaseCtx's comment for why this
+        // field exists at all: std::pmr::get_default_resource() is a
+        // process-wide, reconfigurable value, not a fixed one.
+        std::pmr::memory_resource* resource;
         // Explicit constructor, not just the aggregate's implicit one:
         // std::pmr::polymorphic_allocator::construct forwards its arguments
         // to a real constructor call (`::new (p) ReleaseCtx(args...)`), which
-        // aggregate-brace-init (`ReleaseCtx{cond}`) doesn't satisfy on its
-        // own.
-        explicit ReleaseCtx(std::shared_ptr<::DDS::Condition> c) : cond(std::move(c)) {}
+        // aggregate-brace-init (`ReleaseCtx{cond, res}`) doesn't satisfy on
+        // its own.
+        explicit ReleaseCtx(std::shared_ptr<::DDS::Condition> c, std::pmr::memory_resource* res)
+            : cond(std::move(c)), resource(res) {}
     };
 
     // Routed through the pmr default resource (zidl::setCppAllocator), not
@@ -695,17 +701,35 @@ private:
     // the process. std::pmr::polymorphic_allocator has no new_object/
     // delete_object helper pre-C++20 (this codebase targets C++17), hence
     // the explicit allocate+construct / destroy+deallocate pairs.
+    //
+    // A live attachment can outlive a std::pmr default-resource
+    // reconfiguration (zidl::setCppAllocator called again with a different
+    // resource while this ReleaseCtx is still outstanding, e.g. attached to
+    // a long-lived WaitSet) -- if freeReleaseCtx re-read
+    // std::pmr::get_default_resource() at free time instead of reusing
+    // whatever allocReleaseCtx actually allocated with, it would deallocate
+    // through a *different* resource than the one that allocated, the same
+    // allocate/free-allocator-mismatch bug class this whole design exists to
+    // close (Greptile review, zzdds PR #70). This is also the exact bug
+    // allocator-strategy.md's Phase 3 post-merge review already found and
+    // fixed once, for _getOrCreate's own ZidlAllocatorResource: "read the
+    // active allocator from a shared mutable slot at both allocate- and
+    // deallocate-time" was wrong there for the identical reason -- fixed the
+    // same way here: bind to one resource, captured at construction, reused
+    // unconditionally at destruction, never re-queried.
     static ReleaseCtx* allocReleaseCtx(std::shared_ptr<::DDS::Condition> cond)
     {
-        std::pmr::polymorphic_allocator<ReleaseCtx> alloc(std::pmr::get_default_resource());
+        std::pmr::memory_resource* res = std::pmr::get_default_resource();
+        std::pmr::polymorphic_allocator<ReleaseCtx> alloc(res);
         ReleaseCtx* p = alloc.allocate(1);
-        alloc.construct(p, std::move(cond));
+        alloc.construct(p, std::move(cond), res);
         return p;
     }
 
     static void freeReleaseCtx(ReleaseCtx* p)
     {
-        std::pmr::polymorphic_allocator<ReleaseCtx> alloc(std::pmr::get_default_resource());
+        std::pmr::memory_resource* res = p->resource;
+        std::pmr::polymorphic_allocator<ReleaseCtx> alloc(res);
         alloc.destroy(p);
         alloc.deallocate(p, 1);
     }
