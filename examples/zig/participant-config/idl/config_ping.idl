@@ -1,0 +1,8 @@
+// zig/participant-config's wire type -- deliberately minimal (a bare
+// counter, keyless, single instance), matching hello_world's convention:
+// this example is about *participant/factory configuration*, not the data
+// type, so the type itself stays out of the way.
+@appendable
+struct ConfigPing {
+    int32 count;
+};

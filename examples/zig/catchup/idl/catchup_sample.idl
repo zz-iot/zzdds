@@ -1,0 +1,11 @@
+// zig/catchup's wire type -- deliberately minimal (a bare sequence number),
+// unkeyed, single instance, same shape as hello_world.idl -- the point of
+// this example is durability/timing, not the payload. See
+// docs/design/catchup-reference-app.md at the repo root for the full spec.
+// Byte-identical copy required in c/catchup, cpp/catchup, java/catchup once
+// those ports exist (same discipline hello_world.idl already follows
+// across bindings).
+@appendable
+struct HistoryEvent {
+    int32 seq_num;
+};

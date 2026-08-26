@@ -1,0 +1,11 @@
+// cpp/waitset's wire type -- byte-identical to
+// zig/waitset/idl/waitset_sample.idl. See
+// docs/design/waitset-reference-app.md at the repo root for the full spec.
+// `priority` exists purely so QueryCondition has something real to filter
+// on.
+@appendable
+struct WaitsetSample {
+    int32 count;
+    int32 priority;
+    string<256> message;
+};

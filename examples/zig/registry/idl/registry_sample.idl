@@ -1,0 +1,13 @@
+// zig/registry's wire type -- a keyed topic with a trivial payload, used to
+// demonstrate explicit instance lifecycle management (register_instance,
+// write_w_timestamp, dispose, unregister_instance_w_timestamp,
+// get_key_value, lookup_instance) rather than implicit registration-via-
+// write() only. See docs/design/registry-reference-app.md at the repo root
+// for the full spec. Byte-identical copy required in c/registry,
+// cpp/registry, java/registry once those ports exist (same discipline
+// hello_world.idl already follows across bindings).
+@appendable
+struct SensorReading {
+    @key int32 sensor_id;
+    int32 value;
+};

@@ -1,0 +1,12 @@
+# Isolates: non-default port_base/gain values, to verify the RTPS Section
+# 9.6.1.1 port formula is actually computed from config (not hardcoded), and
+# to let two independent zzdds-examples runs coexist on one machine without
+# colliding on the default 7400+ port range.
+#
+# Externally observable: with this file, domain 0 participant 0's metatraffic
+# unicast port is 20000 + 100*0 + 10*0 + 10 = 20010 (vs. the default 7410) --
+# checkable with `ss -uln` while a participant using this file is running.
+[default_participant_config.transport.udp]
+port_base = 20000
+domain_gain = 100
+participant_gain = 10

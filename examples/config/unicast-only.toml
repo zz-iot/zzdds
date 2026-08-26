@@ -1,0 +1,15 @@
+# Isolates: explicit unicast peers with no multicast, for reproducing "why
+# don't these two hosts discover each other" reports where multicast is
+# blocked or unavailable (common on cloud VPCs, some VPNs, and CI runners).
+# Each initial_peers entry is contacted directly at startup as an SPDP reader
+# locator, regardless of whether multicast discovery would otherwise work.
+#
+# Adjust the addresses/ports below to match your actual peers -- these
+# defaults assume two participants on localhost, domain 0, at the default
+# RTPS-formula metatraffic unicast ports for participant IDs 0 and 1
+# (7400 + 2*participant_id + 10 -- see zzdds/src/config/schema.zig's
+# rtpsPort()/metatrafficUnicastPort()).
+[default_participant_config.transport.udp]
+multicast_group_v4 = ""
+multicast_group_v6 = ""
+initial_peers = ["127.0.0.1:7410", "127.0.0.1:7412"]

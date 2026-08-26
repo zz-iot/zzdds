@@ -1,0 +1,18 @@
+.{
+    .name = .zzdds_examples_catchup_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x4006c4e87a47a5ea,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zzdds = .{
+            .path = "../../../zzdds",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "publisher.zig",
+        "subscriber.zig",
+        "idl",
+    },
+}

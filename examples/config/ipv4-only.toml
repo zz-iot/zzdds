@@ -1,0 +1,6 @@
+# Isolates: forcing IPv6 off entirely, so a participant using this file only
+# creates IPv4 UDP sockets/multicast (see zzdds/src/transport/udp.zig's
+# ipv4_enabled/ipv6_enabled gates). Point two shape instances at this file
+# to reproduce/verify an "IPv4-only network" scenario.
+[default_participant_config.transport.udp]
+ipv6_enabled = false

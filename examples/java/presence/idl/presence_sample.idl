@@ -1,0 +1,12 @@
+// zig/presence's wire type -- deliberately minimal (a bare sequence number),
+// unkeyed, single instance. The payload is incidental to this example; what
+// matters is the LIVELINESS QoS on the writer and the reader's
+// on_liveliness_changed transitions, not the data content. See
+// docs/design/presence-reference-app.md at the repo root for the full spec.
+// Byte-identical copy required in c/presence, cpp/presence, java/presence
+// once those ports exist (same discipline hello_world.idl already follows
+// across bindings).
+@appendable
+struct PresenceBeacon {
+    int32 seq_num;
+};

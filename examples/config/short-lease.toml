@@ -1,0 +1,7 @@
+# Isolates: a short participant lease/announcement period, for fast
+# liveliness-expiry testing without waiting out the 10s/3s defaults -- e.g.
+# kill one side and watch the other declare it NOT_ALIVE within ~2s instead
+# of ~10s (see zzdds/src/discovery/spdp.zig's lease-expiry handling).
+[default_participant_config.participant]
+lease_duration_ms = 2000
+announcement_period_ms = 500

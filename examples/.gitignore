@@ -1,0 +1,40 @@
+# Out-of-source CMake build directories (every C/C++ example builds into
+# its own build/ — see each example's README).
+build/
+
+# Stray in-source CMake artifacts, in case `cmake .` ever gets run from an
+# example's source root by mistake instead of its build/ directory.
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# zidl-generated sources (regenerated at build time by every example).
+zzdds-gen/
+generated/
+
+# Java build output.
+build/classes/
+*.class
+
+# java/shape's --config MVP: run.sh/ShapeMain.java stage the user's chosen
+# --config file here at run time (see java/shape/README.md) -- not a
+# committed example config like java/listener-pubsub/zzdds.toml.
+java/shape/zzdds.toml
+
+# Editor/OS cruft.
+*.swp
+.DS_Store
+
+# Python bytecode cache, and the per-run pub/sub logs interop/*.py smoke
+# tests write while a check is in flight.
+__pycache__/
+interop/.smoke-logs/
+
+# Cargo build output (spikes/rust) and the manually-built shim shared
+# library its README's Setup step produces (not a `cc`-crate build.rs
+# output, so cargo clean doesn't remove it -- same out-of-source spirit as
+# the CMake build/ ignore above, just Rust's own equivalent).
+target/
+*.so
