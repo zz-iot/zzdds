@@ -226,7 +226,8 @@ const BuiltinSubscriberState = struct {
         const noop_cbs = subscriber_mod.ParticipantCbs{
             .ctx = @ptrCast(participant),
             .create_proto_reader = struct {
-                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.InstanceHandle_t, _: DDS.PresentationQosPolicy, guid: *Guid) anyerror!proto.ProtocolReader {
+                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.PresentationQosPolicy, handle: *DDS.InstanceHandle_t, guid: *Guid) anyerror!proto.ProtocolReader {
+                    handle.* = DDS.HANDLE_NIL;
                     guid.* = std.mem.zeroes(Guid);
                     return noopProtocolReader();
                 }
@@ -234,7 +235,6 @@ const BuiltinSubscriberState = struct {
             .destroy_proto_reader = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t) void {}
             }.f,
-            .next_handle = DomainParticipantImpl.nextHandle,
             .register_incompat_qos = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i32) void) void {}
             }.f,
@@ -1563,8 +1563,8 @@ pub const DomainParticipantImpl = struct {
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataReaderQos,
-        handle: DDS.InstanceHandle_t,
         presentation: DDS.PresentationQosPolicy,
+        subscription_handle: *DDS.InstanceHandle_t,
         guid_out: *Guid,
     ) anyerror!proto.ProtocolReader {
         const self = cast(ctx);
@@ -1581,6 +1581,7 @@ pub const DomainParticipantImpl = struct {
             },
         };
         guid_out.* = guid;
+        subscription_handle.* = writer_mod.guidToHandle(guid);
 
         const r_cache_kind: history_mod.HistoryKind = if (qos.history.kind == .KEEP_ALL_HISTORY_QOS)
             .keep_all
@@ -1618,7 +1619,7 @@ pub const DomainParticipantImpl = struct {
             self.mu.lock();
             defer self.mu.unlock();
             try self.active_readers.put(self.alloc, entityIdKey(guid.entity_id), .{
-                .handle = handle,
+                .handle = subscription_handle.*,
                 .guid = guid,
                 .proto = pr,
                 .topic_name = topic_name,
@@ -3116,7 +3117,6 @@ pub const DomainParticipantImpl = struct {
             .ctx = self,
             .create_proto_reader = subCreateProtoReader,
             .destroy_proto_reader = subDestroyProtoReader,
-            .next_handle = nextHandle,
             .register_incompat_qos = subRegisterReaderIncompatQos,
             .register_matched_notify = subRegisterReaderMatchedNotify,
             .announce_reader = subAnnounceProtoReader,

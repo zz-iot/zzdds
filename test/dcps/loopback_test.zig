@@ -598,6 +598,17 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     waitForRawOpMatch(dw_impl, dr_impl);
     try std.testing.expect(dw_impl.matchedReaderCount() > 0);
     try std.testing.expect(dr_impl.matchedWriterCount() > 0);
+    var subscription_handles: DDS.InstanceHandleSeq = .{};
+    defer if (subscription_handles._buffer) |buffer| alloc.free(buffer[0..subscription_handles._maximum]);
+    try std.testing.expectEqual(
+        DDS.RETCODE_OK,
+        dw.vtable.get_matched_subscriptions(dw.ptr, &subscription_handles),
+    );
+    try std.testing.expectEqual(@as(u32, 1), subscription_handles._length);
+    try std.testing.expectEqual(
+        dr.vtable.get_instance_handle(dr.ptr),
+        subscription_handles._buffer.?[0],
+    );
 
     var kh_buf = ZERO_KEY;
     var key_hash_seq = DDS.OctetSeq{ ._maximum = 16, ._length = 16, ._buffer = &kh_buf, ._release = false };

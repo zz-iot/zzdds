@@ -33,16 +33,13 @@ pub const ParticipantCbs = struct {
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataReaderQos,
-        handle: DDS.InstanceHandle_t,
         presentation: DDS.PresentationQosPolicy,
+        subscription_handle: *DDS.InstanceHandle_t,
         guid: *proto.Guid,
     ) anyerror!proto.ProtocolReader,
 
     /// Tear down the ProtocolReader identified by handle.
     destroy_proto_reader: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t) void,
-
-    /// Assign a fresh unique InstanceHandle_t.
-    next_handle: *const fn (ctx: *anyopaque) DDS.InstanceHandle_t,
 
     /// Register an incompatible-QoS notification callback for a reader.
     /// Called once per DataReader after create_proto_reader succeeds.
@@ -301,18 +298,18 @@ pub const SubscriberImpl = struct {
         mask: DDS.StatusMask,
     ) DDS.DataReader {
         const self = cast(ctx);
-        const sub_handle = self.cbs.next_handle(self.cbs.ctx);
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
         const presentation = self.qos.presentation;
+        var subscription_handle = DDS.HANDLE_NIL;
         var guid: proto.Guid = undefined;
         const pr = self.cbs.create_proto_reader(
             self.cbs.ctx,
             topic_name,
             type_name,
             qos.*,
-            sub_handle,
             presentation,
+            &subscription_handle,
             &guid,
         ) catch return nil.nil_datareader;
         const dr = reader_mod.DataReaderImpl.init(
@@ -323,28 +320,28 @@ pub const SubscriberImpl = struct {
             qos.*,
             if (a_listener) |l| l.* else DDS.noop_DataReaderListener,
             mask,
-            sub_handle,
+            subscription_handle,
             guid,
             self.cbs.timer_clock,
         ) catch {
-            self.cbs.destroy_proto_reader(self.cbs.ctx, sub_handle);
+            self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
             return nil.nil_datareader;
         };
         self.cbs.register_incompat_qos(
             self.cbs.ctx,
-            sub_handle,
+            subscription_handle,
             dr,
             reader_mod.DataReaderImpl.notifyIncompatibleQos,
         );
         self.cbs.register_matched_notify(
             self.cbs.ctx,
-            sub_handle,
+            subscription_handle,
             dr,
             reader_mod.DataReaderImpl.notifySubscriptionMatched,
         );
         self.cbs.register_timer_notify(
             self.cbs.ctx,
-            sub_handle,
+            subscription_handle,
             dr,
             reader_mod.DataReaderImpl.checkTimersFn,
             reader_mod.DataReaderImpl.quiesceAcquireFn,
@@ -370,14 +367,14 @@ pub const SubscriberImpl = struct {
         // comment.
         self.cbs.register_get_field_refresh(
             self.cbs.ctx,
-            sub_handle,
+            subscription_handle,
             type_name,
             dr,
             reader_mod.DataReaderImpl.refreshGetFieldFn,
         );
         self.cbs.register_wlp_alive_notify(
             self.cbs.ctx,
-            sub_handle,
+            subscription_handle,
             dr,
             reader_mod.DataReaderImpl.onParticipantAliveCb,
         );
@@ -389,11 +386,11 @@ pub const SubscriberImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        self.cbs.announce_reader(self.cbs.ctx, sub_handle, pname_slice, presentation);
+        self.cbs.announce_reader(self.cbs.ctx, subscription_handle, pname_slice, presentation);
         self.mu.lock();
         self.readers.append(self.alloc, dr) catch {
             self.mu.unlock();
-            self.cbs.destroy_proto_reader(self.cbs.ctx, sub_handle);
+            self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
             dr.deinit();
             return nil.nil_datareader;
         };

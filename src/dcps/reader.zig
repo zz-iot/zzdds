@@ -428,6 +428,11 @@ pub const DataReaderImpl = struct {
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const OwnerEntry = struct { guid: Guid, strength: i32 };
+    /// A collision remains ambiguous for this reader's lifetime. Unmatching
+    /// either writer is not enough to clear it: an already-queued or loaned
+    /// SampleInfo may still carry the shared handle and originate from that
+    /// now-unmatched writer. Returning no GUID is safer than attributing such
+    /// a sample to whichever colliding writer happens to remain matched.
     const PublicationGuidEntry = struct { guid: Guid, collision: bool = false };
     const Self = @This();
 
