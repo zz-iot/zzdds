@@ -54,6 +54,9 @@ fn entNoDeinit(_: *anyopaque) void {}
 fn entNoCAbiHandle(_: *anyopaque) *anyopaque {
     unreachable;
 }
+fn entNoAllocator(_: *anyopaque) std.mem.Allocator {
+    unreachable;
+}
 
 const stub_entity_vtable = DDS.Entity.Vtable{
     .enable = entEnable,
@@ -62,6 +65,7 @@ const stub_entity_vtable = DDS.Entity.Vtable{
     .get_instance_handle = entGetIH,
     .deinit = entNoDeinit,
     .get_c_abi_handle = entNoCAbiHandle,
+    .get_allocator = entNoAllocator,
 };
 
 fn stubEntity() DDS.Entity {
@@ -177,6 +181,9 @@ fn drNoDeinit(_: *anyopaque) void {}
 fn drNoCAbiHandle(_: *anyopaque) *anyopaque {
     unreachable;
 }
+fn drNoAllocator(_: *anyopaque) std.mem.Allocator {
+    unreachable;
+}
 fn drNoAsEntity(_: *anyopaque) DDS.Entity {
     unreachable;
 }
@@ -212,6 +219,7 @@ const stub_dr_vtable = DDS.DataReader.Vtable{
     .return_loan_raw = drNoop25,
     .deinit = drNoDeinit,
     .get_c_abi_handle = drNoCAbiHandle,
+    .get_allocator = drNoAllocator,
     .as_Entity = drNoAsEntity,
 };
 

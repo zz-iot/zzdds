@@ -655,7 +655,7 @@ public:
     {
         if (!cond) return ::DDS::WaitSetImpl::attach_condition(cond);
         DDS_Condition h = resolve_handle(cond);
-        auto* ctx = new ReleaseCtx{std::move(cond)};
+        auto* ctx = allocReleaseCtx(std::move(cond));
         bool accepted = false;
         auto rc = zzdds_waitset_attach_condition_with_release(handle_, h, ctx, &release_trampoline, &accepted);
         if (rc != DDS_RETCODE_OK || !accepted) {
@@ -665,7 +665,7 @@ public:
             // release_ctx/release_fn is untouched, exactly as documented).
             // Either way, release_trampoline will never run for this ctx;
             // it's safe -- and necessary -- to destroy it here directly.
-            delete ctx;
+            freeReleaseCtx(ctx);
         }
         return rc;
     }
@@ -679,13 +679,42 @@ private:
     // the exact ctx it was handed.
     struct ReleaseCtx {
         std::shared_ptr<::DDS::Condition> cond;
+        // Explicit constructor, not just the aggregate's implicit one:
+        // std::pmr::polymorphic_allocator::construct forwards its arguments
+        // to a real constructor call (`::new (p) ReleaseCtx(args...)`), which
+        // aggregate-brace-init (`ReleaseCtx{cond}`) doesn't satisfy on its
+        // own.
+        explicit ReleaseCtx(std::shared_ptr<::DDS::Condition> c) : cond(std::move(c)) {}
     };
+
+    // Routed through the pmr default resource (zidl::setCppAllocator), not
+    // raw new/delete -- a real, confirmed gap found via a noalloc-guarded
+    // custom-allocator example (zzdds-examples' cpp/custom-allocator):
+    // this bookkeeping object was allocated via plain `new` unconditionally,
+    // regardless of any custom allocator configured for everything else in
+    // the process. std::pmr::polymorphic_allocator has no new_object/
+    // delete_object helper pre-C++20 (this codebase targets C++17), hence
+    // the explicit allocate+construct / destroy+deallocate pairs.
+    static ReleaseCtx* allocReleaseCtx(std::shared_ptr<::DDS::Condition> cond)
+    {
+        std::pmr::polymorphic_allocator<ReleaseCtx> alloc(std::pmr::get_default_resource());
+        ReleaseCtx* p = alloc.allocate(1);
+        alloc.construct(p, std::move(cond));
+        return p;
+    }
+
+    static void freeReleaseCtx(ReleaseCtx* p)
+    {
+        std::pmr::polymorphic_allocator<ReleaseCtx> alloc(std::pmr::get_default_resource());
+        alloc.destroy(p);
+        alloc.deallocate(p, 1);
+    }
 
     // Fires from inside zzdds, outside any zzdds-internal lock, on whichever
     // of the three ways an attachment ends.
     static void release_trampoline(void* ctx_raw)
     {
-        delete static_cast<ReleaseCtx*>(ctx_raw);
+        freeReleaseCtx(static_cast<ReleaseCtx*>(ctx_raw));
     }
 
     // Mirrors WaitSetImpl::attach_condition's own generated dynamic_cast

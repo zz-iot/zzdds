@@ -111,7 +111,17 @@ pub fn build(b: *std.Build) void {
     });
     // pub export fn callconv(.c) wrappers are only needed when building a C-ABI
     // binding; skip them for pure-Zig builds to avoid unused symbol overhead.
-    if (need_c_abi) gen_dcps.addArg("--zig-generate-c-api");
+    //
+    // --zig-generate-c-api-cdr-allocator: opt-in companion flag (default off
+    // in zidl, since plain --zig-generate-c-api must stay dependency-free for
+    // consumers that only link zidl_rt — see zidl PR #45's Greptile finding).
+    // zzdds always passes it alongside --zig-generate-c-api because it
+    // already links libzidl_cdr unconditionally in this same need_c_abi
+    // block (see zidl_cdr_lib below) for C/C++ CDR decode, so there's no
+    // added dependency cost here — only the correctness fix (generated
+    // frees route through the same registered allocator instead of a
+    // hardcoded default).
+    if (need_c_abi) gen_dcps.addArgs(&.{ "--zig-generate-c-api", "--zig-generate-c-api-cdr-allocator" });
     gen_dcps.addArg("-o");
     // addOutputDirectoryArg injects the cache-managed output path as the next arg.
     const gen_output_dir = gen_dcps.addOutputDirectoryArg(gen_dir);
@@ -144,7 +154,8 @@ pub fn build(b: *std.Build) void {
         "--no-typesupport",           "--no-typeobject-support",
         "--zig-generate-toml-config",
     });
-    if (need_c_abi) gen_zzdds_vendor.addArg("--zig-generate-c-api");
+    // See the matching comment on gen_dcps's --zig-generate-c-api above.
+    if (need_c_abi) gen_zzdds_vendor.addArgs(&.{ "--zig-generate-c-api", "--zig-generate-c-api-cdr-allocator" });
     gen_zzdds_vendor.addArg("-o");
     const gen_zzdds_output_dir = gen_zzdds_vendor.addOutputDirectoryArg("zzdds-generated-ext");
     gen_zzdds_vendor.addFileArg(b.path("idl/zzdds.idl"));

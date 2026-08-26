@@ -36,6 +36,7 @@ const noop_security = @import("../security/noop.zig").noop_security_plugins;
 const history_mod = @import("../rtps/history.zig");
 const time_mod = @import("../util/time.zig");
 const nil = @import("../dcps/nil.zig");
+const standalone_create = @import("../util/standalone_create.zig");
 
 const FactoryOwner = struct {
     alloc: std.mem.Allocator,
@@ -226,8 +227,15 @@ pub const factory_vtable = ZZDDS.DomainParticipantFactory.Vtable{
     .get_default_participant_config = factoryGetDefaultParticipantConfig,
     .deinit = factoryDeinit,
     .get_c_abi_handle = factoryGetCAbiHandleZzdds,
+    .get_allocator = factoryGetAllocator,
     .as_DomainParticipantFactory = factoryAsDdsFactory,
 };
+
+fn factoryGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+    if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
+    const owner: *FactoryOwner = @ptrCast(@alignCast(ctx));
+    return owner.alloc;
+}
 
 fn factoryAsDdsFactory(ctx: *anyopaque) DDS.DomainParticipantFactory {
     return .{ .ptr = ctx, .vtable = &dds_factory_vtable };
@@ -264,6 +272,7 @@ const dds_factory_vtable = DDS.DomainParticipantFactory.Vtable{
     .get_qos = factoryGetQos,
     .deinit = factoryDeinit,
     .get_c_abi_handle = factoryGetCAbiHandleDds,
+    .get_allocator = factoryGetAllocator,
 };
 
 // Same reasoning as nil_zzdds_fac_c_abi above, for the DDS.* view.
@@ -279,8 +288,15 @@ pub const participant_vtable = ZZDDS.DomainParticipant.Vtable{
     .register_type_support = participantRegisterTypeSupport,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = participantGetCAbiHandleZzdds,
+    .get_allocator = participantGetAllocator,
     .as_DomainParticipant = participantAsDds,
 };
+
+fn participantGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+    if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(ctx));
+    return impl.alloc;
+}
 
 fn participantAsDds(ctx: *anyopaque) DDS.DomainParticipant {
     if (ctx == nil.NIL_PTR) return nil.nil_participant;
@@ -307,8 +323,15 @@ pub const topic_vtable = ZZDDS.Topic.Vtable{
     .as_topic_description = topicAsTopicDescription,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = topicGetCAbiHandleZzdds,
+    .get_allocator = topicGetAllocator,
     .as_Topic = topicAsDds,
 };
+
+fn topicGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+    if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
+    const impl: *TopicImpl = @ptrCast(@alignCast(ctx));
+    return impl.alloc;
+}
 
 fn topicAsDds(ctx: *anyopaque) DDS.Topic {
     if (ctx == nil.NIL_PTR) return nil.nil_topic;
@@ -335,8 +358,15 @@ pub const writer_vtable = ZZDDS.DataWriter.Vtable{
     .set_listener_ex = writerSetListenerEx,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = writerGetCAbiHandleZzdds,
+    .get_allocator = writerGetAllocator,
     .as_DataWriter = writerAsDds,
 };
+
+fn writerGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+    if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
+    return impl.alloc;
+}
 
 fn writerAsDds(ctx: *anyopaque) DDS.DataWriter {
     if (ctx == nil.NIL_PTR) return nil.nil_datawriter;
@@ -364,8 +394,15 @@ pub const reader_vtable = ZZDDS.DataReader.Vtable{
     .take_next_instance_serialized = readerTakeNextInstanceSerialized,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = readerGetCAbiHandleZzdds,
+    .get_allocator = readerGetAllocator,
     .as_DataReader = readerAsDds,
 };
+
+fn readerGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+    if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    return impl.alloc;
+}
 
 fn readerAsDds(ctx: *anyopaque) DDS.DataReader {
     if (ctx == nil.NIL_PTR) return nil.nil_datareader;
@@ -431,23 +468,33 @@ pub export fn zzdds_create_waitset() callconv(.c) *anyopaque {
     return zzdds_create_waitset_with_allocator(null);
 }
 
+fn waitSetCtor(alloc: std.mem.Allocator) !DDS.WaitSet {
+    const ws = try WaitSetImpl.init(alloc);
+    return ws.toDDSWaitSet();
+}
+
 /// Same as zzdds_create_waitset, but every allocation the WaitSet itself
 /// makes (its `conditions` list) is routed through `allocator` instead of
 /// the default std.heap.c_allocator. Pass NULL for the default. `allocator`
 /// must outlive the WaitSet returned here — see ZidlAllocator's contract in
 /// zidl_allocator.h.
 pub export fn zzdds_create_waitset_with_allocator(allocator: ?*const zidl_rt.ZidlAllocator) callconv(.c) *anyopaque {
-    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
-    const ws = WaitSetImpl.init(alloc) catch |err| {
-        std.log.err("zzdds_create_waitset_with_allocator: {}", .{err});
-        return nil.nil_waitset.vtable.get_c_abi_handle(nil.nil_waitset.ptr);
-    };
-    const r = ws.toDDSWaitSet();
-    return r.vtable.get_c_abi_handle(r.ptr);
+    return standalone_create.createWithAllocator(
+        DDS.WaitSet,
+        allocator,
+        "zzdds_create_waitset_with_allocator",
+        waitSetCtor,
+        nil.nil_waitset,
+    );
 }
 
 pub export fn zzdds_create_guardcondition() callconv(.c) *anyopaque {
     return zzdds_create_guardcondition_with_allocator(null);
+}
+
+fn guardConditionCtor(alloc: std.mem.Allocator) !DDS.GuardCondition {
+    const gc = try GuardConditionImpl.init(alloc);
+    return gc.toDDSGuardCondition();
 }
 
 /// Same as zzdds_create_guardcondition, but the GuardCondition itself is
@@ -455,13 +502,13 @@ pub export fn zzdds_create_guardcondition() callconv(.c) *anyopaque {
 /// Pass NULL for the default. `allocator` must outlive the GuardCondition
 /// returned here — see ZidlAllocator's contract in zidl_allocator.h.
 pub export fn zzdds_create_guardcondition_with_allocator(allocator: ?*const zidl_rt.ZidlAllocator) callconv(.c) *anyopaque {
-    const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
-    const gc = GuardConditionImpl.init(alloc) catch |err| {
-        std.log.err("zzdds_create_guardcondition_with_allocator: {}", .{err});
-        return nil.nil_guardcondition.vtable.get_c_abi_handle(nil.nil_guardcondition.ptr);
-    };
-    const r = gc.toDDSGuardCondition();
-    return r.vtable.get_c_abi_handle(r.ptr);
+    return standalone_create.createWithAllocator(
+        DDS.GuardCondition,
+        allocator,
+        "zzdds_create_guardcondition_with_allocator",
+        guardConditionCtor,
+        nil.nil_guardcondition,
+    );
 }
 
 /// Mirrors zzdds_factory_is_nil -- lets a caller (e.g. the C++ binding's

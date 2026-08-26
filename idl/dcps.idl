@@ -273,7 +273,15 @@ module DDS {
 
     typedef sequence<Condition>     ConditionSeq;
 
-    interface WaitSet {
+    // @standalone: no factory operation creates this (per OMG spec, both
+    // WaitSet and GuardCondition are app-instantiated directly) -- the
+    // application constructs it standalone and owns its lifetime, so any
+    // release of a value it produces (e.g. wait()'s ConditionSeq) can never
+    // assume an owning entity is in scope. See
+    // zzdds/docs/design/generated-class-lifecycle-design.md's classification
+    // rule (Category 2). Inert today -- no codegen reads this yet; it's here
+    // so a future validation pass has something already in place to check.
+    @standalone interface WaitSet {
         ReturnCode_t wait(
             inout ConditionSeq  active_conditions,
             in Duration_t       timeout);
@@ -285,7 +293,8 @@ module DDS {
             inout ConditionSeq attached_conditions);
     };
 
-    @shared_c_abi_box interface GuardCondition : Condition {
+    // @standalone: see WaitSet's comment above -- same no-factory-op shape.
+    @shared_c_abi_box @standalone interface GuardCondition : Condition {
         ReturnCode_t set_trigger_value(
             in boolean value);
     };
