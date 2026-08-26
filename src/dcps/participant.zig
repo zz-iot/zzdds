@@ -226,14 +226,15 @@ const BuiltinSubscriberState = struct {
         const noop_cbs = subscriber_mod.ParticipantCbs{
             .ctx = @ptrCast(participant),
             .create_proto_reader = struct {
-                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.InstanceHandle_t, _: DDS.PresentationQosPolicy) anyerror!proto.ProtocolReader {
+                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.PresentationQosPolicy, handle: *DDS.InstanceHandle_t, guid: *Guid) anyerror!proto.ProtocolReader {
+                    handle.* = DDS.HANDLE_NIL;
+                    guid.* = std.mem.zeroes(Guid);
                     return noopProtocolReader();
                 }
             }.f,
             .destroy_proto_reader = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t) void {}
             }.f,
-            .next_handle = DomainParticipantImpl.nextHandle,
             .register_incompat_qos = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i32) void) void {}
             }.f,
@@ -290,6 +291,7 @@ const BuiltinSubscriberState = struct {
             nil.nil_dr_listener,
             0,
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
+            std.mem.zeroes(Guid),
             participant.timer_clock,
         );
         n_ok = 1;
@@ -302,6 +304,7 @@ const BuiltinSubscriberState = struct {
             nil.nil_dr_listener,
             0,
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
+            std.mem.zeroes(Guid),
             participant.timer_clock,
         );
         n_ok = 2;
@@ -314,6 +317,7 @@ const BuiltinSubscriberState = struct {
             nil.nil_dr_listener,
             0,
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
+            std.mem.zeroes(Guid),
             participant.timer_clock,
         );
         n_ok = 3;
@@ -326,6 +330,7 @@ const BuiltinSubscriberState = struct {
             nil.nil_dr_listener,
             0,
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
+            std.mem.zeroes(Guid),
             participant.timer_clock,
         );
         n_ok = 4;
@@ -420,9 +425,17 @@ fn pushBuiltinPublicationCdr(
         .liveliness = qosLiveliness(data.qos.liveliness_kind),
         .ownership = qosOwnership(data.qos.ownership_kind),
         .destination_order = qosDestOrder(data.qos.destination_order_kind),
+        .user_data = .{ .value = .{
+            ._maximum = @intCast(data.qos.user_data.len),
+            ._length = @intCast(data.qos.user_data.len),
+            ._buffer = @constCast(data.qos.user_data.ptr),
+            ._release = false,
+        } },
     };
     DDS.PublicationBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushCdr(buf.items);
+    var key_hash: [16]u8 = undefined;
+    @memcpy(&key_hash, std.mem.asBytes(&data.guid));
+    dr.pushBuiltinCdr(buf.items, key_hash, .alive);
 }
 
 fn pushBuiltinSubscriptionCdr(
@@ -444,9 +457,23 @@ fn pushBuiltinSubscriptionCdr(
         .liveliness = qosLiveliness(data.qos.liveliness_kind),
         .ownership = qosOwnership(data.qos.ownership_kind),
         .destination_order = qosDestOrder(data.qos.destination_order_kind),
+        .user_data = .{ .value = .{
+            ._maximum = @intCast(data.qos.user_data.len),
+            ._length = @intCast(data.qos.user_data.len),
+            ._buffer = @constCast(data.qos.user_data.ptr),
+            ._release = false,
+        } },
     };
     DDS.SubscriptionBuiltinTopicData.serialize(&w, v) catch return;
-    dr.pushCdr(buf.items);
+    var key_hash: [16]u8 = undefined;
+    @memcpy(&key_hash, std.mem.asBytes(&data.guid));
+    dr.pushBuiltinCdr(buf.items, key_hash, .alive);
+}
+
+fn pushBuiltinEndpointDisposed(dr: *reader_mod.DataReaderImpl, guid: Guid) void {
+    var key_hash: [16]u8 = undefined;
+    @memcpy(&key_hash, std.mem.asBytes(&guid));
+    dr.pushBuiltinCdr(&.{}, key_hash, .not_alive_disposed);
 }
 
 fn pushBuiltinTopicCdr(
@@ -603,6 +630,7 @@ const DiscoveredWriter = struct {
         alloc.free(self.topic_name);
         alloc.free(self.type_name);
         DomainParticipantImpl.freePartitionNames(alloc, self.qos.partition_names);
+        if (self.qos.user_data.len != 0) alloc.free(self.qos.user_data);
         alloc.free(self.unicast_locators);
         alloc.free(self.multicast_locators);
     }
@@ -622,6 +650,7 @@ const DiscoveredReader = struct {
         alloc.free(self.topic_name);
         alloc.free(self.type_name);
         DomainParticipantImpl.freePartitionNames(alloc, self.qos.partition_names);
+        if (self.qos.user_data.len != 0) alloc.free(self.qos.user_data);
         alloc.free(self.unicast_locators);
         alloc.free(self.multicast_locators);
     }
@@ -696,6 +725,33 @@ const ActiveReader = struct {
     refresh_get_field: ?RefreshGetField = null,
     wlp_alive: ?WlpAliveNotify = null,
 };
+
+fn cloneUserData(
+    alloc: std.mem.Allocator,
+    source: DDS.UserDataQosPolicy,
+) !DDS.UserDataQosPolicy {
+    var result = source;
+    const len = source.value._length;
+    if (len == 0) {
+        result.value = .{};
+        return result;
+    }
+    const buffer = try alloc.alloc(u8, len);
+    @memcpy(buffer, source.value._buffer.?[0..len]);
+    result.value = .{
+        ._maximum = len,
+        ._length = len,
+        ._buffer = buffer.ptr,
+        ._release = true,
+    };
+    return result;
+}
+
+fn freeUserData(alloc: std.mem.Allocator, value: DDS.UserDataQosPolicy) void {
+    if (value.value._release and value.value._buffer != null) {
+        alloc.free(value.value._buffer.?[0..value.value._maximum]);
+    }
+}
 
 // ── DomainParticipantImpl ────────────────────────────────────────────────────
 
@@ -1219,6 +1275,7 @@ pub const DomainParticipantImpl = struct {
             aw.proto.deinit();
             freePartitionNames(self.alloc, aw.partition_names);
             aw.qos.data_representation.value.deinit(self.alloc);
+            freeUserData(self.alloc, aw.qos.user_data);
         }
         self.active_writers.deinit(self.alloc);
         var rit = self.active_readers.valueIterator();
@@ -1226,6 +1283,7 @@ pub const DomainParticipantImpl = struct {
             ar.proto.deinit();
             freePartitionNames(self.alloc, ar.partition_names);
             ar.qos.data_representation.value.deinit(self.alloc);
+            freeUserData(self.alloc, ar.qos.user_data);
         }
         self.active_readers.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
@@ -1385,8 +1443,9 @@ pub const DomainParticipantImpl = struct {
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataWriterQos,
-        handle: DDS.InstanceHandle_t,
         presentation: DDS.PresentationQosPolicy,
+        publication_handle: *DDS.InstanceHandle_t,
+        guid_out: *Guid,
     ) anyerror!proto.ProtocolWriter {
         const self = cast(ctx);
 
@@ -1401,6 +1460,8 @@ pub const DomainParticipantImpl = struct {
                 .entity_kind = EntityKind.user_writer_with_key,
             },
         };
+        guid_out.* = guid;
+        publication_handle.* = writer_mod.guidToHandle(guid);
 
         const cache_kind: history_mod.HistoryKind = if (qos.history.kind == .KEEP_ALL_HISTORY_QOS)
             .keep_all
@@ -1444,12 +1505,15 @@ pub const DomainParticipantImpl = struct {
         // a real repro: -x 2 matching flakiness traced to exactly this.
         var owned_qos = qos;
         owned_qos.data_representation.value = try qos.data_representation.value.clone(self.alloc);
+        errdefer owned_qos.data_representation.value.deinit(self.alloc);
+        owned_qos.user_data = try cloneUserData(self.alloc, qos.user_data);
+        errdefer freeUserData(self.alloc, owned_qos.user_data);
 
         {
             self.mu.lock();
             defer self.mu.unlock();
             try self.active_writers.put(self.alloc, entityIdKey(guid.entity_id), .{
-                .handle = handle,
+                .handle = publication_handle.*,
                 .guid = guid,
                 .proto = pw,
                 .topic_name = topic_name,
@@ -1468,6 +1532,7 @@ pub const DomainParticipantImpl = struct {
         var found_proto: ?proto.ProtocolWriter = null;
         var found_parts: []const []const u8 = &.{};
         var found_repr: DDS.DataRepresentationIdSeq = .{};
+        var found_user_data: DDS.UserDataQosPolicy = .{};
 
         self.mu.lock();
         var writ = self.active_writers.valueIterator();
@@ -1477,6 +1542,7 @@ pub const DomainParticipantImpl = struct {
                 found_proto = aw.proto;
                 found_parts = aw.partition_names;
                 found_repr = aw.qos.data_representation.value;
+                found_user_data = aw.qos.user_data;
                 break;
             }
         }
@@ -1485,6 +1551,7 @@ pub const DomainParticipantImpl = struct {
 
         freePartitionNames(self.alloc, found_parts);
         found_repr.deinit(self.alloc);
+        freeUserData(self.alloc, found_user_data);
         if (found_guid) |g| self.discovery.retractWriter(g);
         if (found_proto) |p| p.deinit();
     }
@@ -1496,8 +1563,9 @@ pub const DomainParticipantImpl = struct {
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataReaderQos,
-        handle: DDS.InstanceHandle_t,
         presentation: DDS.PresentationQosPolicy,
+        subscription_handle: *DDS.InstanceHandle_t,
+        guid_out: *Guid,
     ) anyerror!proto.ProtocolReader {
         const self = cast(ctx);
 
@@ -1512,6 +1580,8 @@ pub const DomainParticipantImpl = struct {
                 .entity_kind = EntityKind.user_reader_with_key,
             },
         };
+        guid_out.* = guid;
+        subscription_handle.* = writer_mod.guidToHandle(guid);
 
         const r_cache_kind: history_mod.HistoryKind = if (qos.history.kind == .KEEP_ALL_HISTORY_QOS)
             .keep_all
@@ -1541,12 +1611,15 @@ pub const DomainParticipantImpl = struct {
         // dangling buffer.
         var owned_qos = qos;
         owned_qos.data_representation.value = try qos.data_representation.value.clone(self.alloc);
+        errdefer owned_qos.data_representation.value.deinit(self.alloc);
+        owned_qos.user_data = try cloneUserData(self.alloc, qos.user_data);
+        errdefer freeUserData(self.alloc, owned_qos.user_data);
 
         {
             self.mu.lock();
             defer self.mu.unlock();
             try self.active_readers.put(self.alloc, entityIdKey(guid.entity_id), .{
-                .handle = handle,
+                .handle = subscription_handle.*,
                 .guid = guid,
                 .proto = pr,
                 .topic_name = topic_name,
@@ -1570,6 +1643,7 @@ pub const DomainParticipantImpl = struct {
         var found_proto: ?proto.ProtocolReader = null;
         var found_parts: []const []const u8 = &.{};
         var found_repr: DDS.DataRepresentationIdSeq = .{};
+        var found_user_data: DDS.UserDataQosPolicy = .{};
 
         self.mu.lock();
         var rrit = self.active_readers.valueIterator();
@@ -1579,6 +1653,7 @@ pub const DomainParticipantImpl = struct {
                 found_proto = ar.proto;
                 found_parts = ar.partition_names;
                 found_repr = ar.qos.data_representation.value;
+                found_user_data = ar.qos.user_data;
                 break;
             }
         }
@@ -1587,6 +1662,7 @@ pub const DomainParticipantImpl = struct {
 
         freePartitionNames(self.alloc, found_parts);
         found_repr.deinit(self.alloc);
+        freeUserData(self.alloc, found_user_data);
         if (found_guid) |g| self.discovery.retractReader(g);
         if (found_proto) |p| p.deinit();
     }
@@ -1622,6 +1698,10 @@ pub const DomainParticipantImpl = struct {
             .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
             .coherent_access = presentation.coherent_access,
             .ordered_access = presentation.ordered_access,
+            .user_data = if (qos.user_data.value._buffer) |buffer|
+                buffer[0..qos.user_data.value._length]
+            else
+                &.{},
             .lifespan_sec = if (ls_zero_w) 0x7fff_ffff else qos.lifespan.duration.sec,
             .lifespan_nanosec = if (ls_zero_w) 0xffff_ffff else qos.lifespan.duration.nanosec,
         };
@@ -1650,6 +1730,10 @@ pub const DomainParticipantImpl = struct {
             .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
             .coherent_access = presentation.coherent_access,
             .ordered_access = presentation.ordered_access,
+            .user_data = if (qos.user_data.value._buffer) |buffer|
+                buffer[0..qos.user_data.value._length]
+            else
+                &.{},
         };
     }
 
@@ -2002,13 +2086,28 @@ pub const DomainParticipantImpl = struct {
 
     fn onParticipantLost(ctx: *anyopaque, guid: disc.Guid) void {
         const self = cast(ctx);
+        var lost_writers: std.ArrayListUnmanaged(Guid) = .empty;
+        defer lost_writers.deinit(self.alloc);
+        var lost_readers: std.ArrayListUnmanaged(Guid) = .empty;
+        defer lost_readers.deinit(self.alloc);
+        var publication_dr: ?*reader_mod.DataReaderImpl = null;
+        var subscription_dr: ?*reader_mod.DataReaderImpl = null;
         self.mu.lock();
-        defer self.mu.unlock();
         for (self.discovered_participants.items, 0..) |e, i| {
             if (e.guid.eql(guid)) {
                 _ = self.discovered_participants.swapRemove(i);
                 break;
             }
+        }
+        for (self.discovered_writers.items) |entry| {
+            if (entry.guid.prefix.eql(guid.prefix)) lost_writers.append(self.alloc, entry.guid) catch {};
+        }
+        for (self.discovered_readers.items) |entry| {
+            if (entry.guid.prefix.eql(guid.prefix)) lost_readers.append(self.alloc, entry.guid) catch {};
+        }
+        if (self.builtin_sub) |bs| {
+            publication_dr = bs.pub_dr;
+            subscription_dr = bs.sub_dr;
         }
         // Remove matched writers/readers belonging to this participant from all
         // local DataReaders so they can generate NOT_ALIVE_NO_WRITERS.
@@ -2049,6 +2148,11 @@ pub const DomainParticipantImpl = struct {
             }
         }
         removeDiscoveredEndpointsForPrefix(self, prefix);
+        self.mu.unlock();
+        if (publication_dr) |dr| for (lost_writers.items) |endpoint_guid|
+            pushBuiltinEndpointDisposed(dr, endpoint_guid);
+        if (subscription_dr) |dr| for (lost_readers.items) |endpoint_guid|
+            pushBuiltinEndpointDisposed(dr, endpoint_guid);
     }
 
     /// WLP (RTPS §8.4.13): a remote participant's ParticipantMessageData
@@ -2222,8 +2326,8 @@ pub const DomainParticipantImpl = struct {
 
     fn onWriterLost(ctx: *anyopaque, guid: disc.Guid) void {
         const self = cast(ctx);
+        var push_dr: ?*reader_mod.DataReaderImpl = null;
         self.mu.lock();
-        defer self.mu.unlock();
         const remote_handle = writer_mod.guidToHandle(guid);
         var ar_it2 = self.active_readers.valueIterator();
         while (ar_it2.next()) |ar| {
@@ -2235,6 +2339,9 @@ pub const DomainParticipantImpl = struct {
             }
         }
         removeDiscoveredWriter(self, guid);
+        if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
+        self.mu.unlock();
+        if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
     }
 
     /// Looks up the VendorId of a previously-discovered participant by GUID
@@ -2376,8 +2483,8 @@ pub const DomainParticipantImpl = struct {
 
     fn onReaderLost(ctx: *anyopaque, guid: disc.Guid) void {
         const self = cast(ctx);
+        var push_dr: ?*reader_mod.DataReaderImpl = null;
         self.mu.lock();
-        defer self.mu.unlock();
         const remote_handle = writer_mod.guidToHandle(guid);
         var aw_it2 = self.active_writers.valueIterator();
         while (aw_it2.next()) |aw| {
@@ -2389,6 +2496,9 @@ pub const DomainParticipantImpl = struct {
             }
         }
         removeDiscoveredReader(self, guid);
+        if (self.builtin_sub) |bs| push_dr = bs.sub_dr;
+        self.mu.unlock();
+        if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
     }
 
     // ── Discovered writer/reader registry (retroactive matching) ─────────────
@@ -2406,6 +2516,12 @@ pub const DomainParticipantImpl = struct {
         };
         var qos = data.qos;
         qos.partition_names = dupePartitionNames(alloc, data.qos.partition_names);
+        qos.user_data = if (data.qos.user_data.len == 0) &.{} else alloc.dupe(u8, data.qos.user_data) catch {
+            freePartitionNames(alloc, qos.partition_names);
+            alloc.free(tt);
+            alloc.free(tn);
+            return null;
+        };
         return .{
             .guid = data.guid,
             .topic_name = tn,
@@ -2424,6 +2540,12 @@ pub const DomainParticipantImpl = struct {
         };
         var qos = data.qos;
         qos.partition_names = dupePartitionNames(alloc, data.qos.partition_names);
+        qos.user_data = if (data.qos.user_data.len == 0) &.{} else alloc.dupe(u8, data.qos.user_data) catch {
+            freePartitionNames(alloc, qos.partition_names);
+            alloc.free(tt);
+            alloc.free(tn);
+            return null;
+        };
         return .{
             .guid = data.guid,
             .topic_name = tn,
@@ -2658,7 +2780,9 @@ pub const DomainParticipantImpl = struct {
             .qos = snap,
             .type_object = &.{},
             .type_info_cdr = type_info_cdr,
-        }) catch {};
+        }) catch |err| {
+            log_mod.dcps.warn("participant: failed to announce writer through SEDP: {s}", .{@errorName(err)});
+        };
     }
 
     const AnnounceMatchedWriterJob = struct {
@@ -2773,7 +2897,9 @@ pub const DomainParticipantImpl = struct {
             .type_name = ann.type_name,
             .qos = snap,
             .type_info_cdr = type_info_cdr,
-        }) catch {};
+        }) catch |err| {
+            log_mod.dcps.warn("participant: failed to announce reader through SEDP: {s}", .{@errorName(err)});
+        };
     }
 
     fn pubRegisterWriterIncompatQos(
@@ -2976,7 +3102,6 @@ pub const DomainParticipantImpl = struct {
             .ctx = self,
             .create_proto_writer = pubCreateProtoWriter,
             .destroy_proto_writer = pubDestroyProtoWriter,
-            .next_handle = nextHandle,
             .register_incompat_qos = pubRegisterWriterIncompatQos,
             .register_matched_notify = pubRegisterWriterMatchedNotify,
             .announce_writer = pubAnnounceProtoWriter,
@@ -2992,7 +3117,6 @@ pub const DomainParticipantImpl = struct {
             .ctx = self,
             .create_proto_reader = subCreateProtoReader,
             .destroy_proto_reader = subDestroyProtoReader,
-            .next_handle = nextHandle,
             .register_incompat_qos = subRegisterReaderIncompatQos,
             .register_matched_notify = subRegisterReaderMatchedNotify,
             .announce_reader = subAnnounceProtoReader,

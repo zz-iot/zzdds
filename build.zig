@@ -294,6 +294,13 @@ pub fn build(b: *std.Build) void {
     });
     zzdds_mod.addOptions("build_options", build_options);
     zzdds_mod.link_libc = true;
+    if (need_c_abi) {
+        zzdds_mod.addCSourceFile(.{
+            .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
+            .flags = &.{"-std=c99"},
+        });
+        zzdds_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+    }
     if (target.result.os.tag == .windows) {
         zzdds_mod.linkSystemLibrary("ws2_32", .{});
     }

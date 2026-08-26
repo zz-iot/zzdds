@@ -35,16 +35,14 @@ pub const ParticipantCbs = struct {
         topic_name: []const u8,
         type_name: []const u8,
         qos: DDS.DataWriterQos,
-        handle: DDS.InstanceHandle_t,
         presentation: DDS.PresentationQosPolicy,
+        publication_handle: *DDS.InstanceHandle_t,
+        guid: *proto.Guid,
     ) anyerror!proto.ProtocolWriter,
 
     /// Tear down the ProtocolWriter identified by handle.
     /// Called on delete_datawriter.
     destroy_proto_writer: *const fn (ctx: *anyopaque, handle: DDS.InstanceHandle_t) void,
-
-    /// Assign a fresh unique InstanceHandle_t (monotonically increasing counter).
-    next_handle: *const fn (ctx: *anyopaque) DDS.InstanceHandle_t,
 
     /// Register an incompatible-QoS notification callback for a writer.
     /// Called once per DataWriter after create_proto_writer succeeds.
@@ -303,17 +301,19 @@ pub const PublisherImpl = struct {
         mask: DDS.StatusMask,
     ) DDS.DataWriter {
         const self = cast(ctx);
-        const pub_handle = self.cbs.next_handle(self.cbs.ctx);
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
         const presentation = self.qos.presentation;
+        var publication_handle = DDS.HANDLE_NIL;
+        var guid: proto.Guid = undefined;
         const pw = self.cbs.create_proto_writer(
             self.cbs.ctx,
             topic_name,
             type_name,
             qos.*,
-            pub_handle,
             presentation,
+            &publication_handle,
+            &guid,
         ) catch return nil.nil_datawriter;
         const dw = writer_mod.DataWriterImpl.init(
             self.alloc,
@@ -323,27 +323,28 @@ pub const PublisherImpl = struct {
             qos.*,
             if (a_listener) |l| l.* else DDS.noop_DataWriterListener,
             mask,
-            pub_handle,
+            publication_handle,
+            guid,
             self.cbs.timer_clock,
         ) catch {
-            self.cbs.destroy_proto_writer(self.cbs.ctx, pub_handle);
+            self.cbs.destroy_proto_writer(self.cbs.ctx, publication_handle);
             return nil.nil_datawriter;
         };
         self.cbs.register_incompat_qos(
             self.cbs.ctx,
-            pub_handle,
+            publication_handle,
             dw,
             writer_mod.DataWriterImpl.notifyIncompatibleQos,
         );
         self.cbs.register_matched_notify(
             self.cbs.ctx,
-            pub_handle,
+            publication_handle,
             dw,
             writer_mod.DataWriterImpl.notifyPublicationMatched,
         );
         self.cbs.register_timer_notify(
             self.cbs.ctx,
-            pub_handle,
+            publication_handle,
             dw,
             writer_mod.DataWriterImpl.checkTimersFn,
             writer_mod.DataWriterImpl.quiesceAcquireFn,
@@ -351,13 +352,13 @@ pub const PublisherImpl = struct {
         );
         self.cbs.register_liveliness_assert(
             self.cbs.ctx,
-            pub_handle,
+            publication_handle,
             dw,
             writer_mod.DataWriterImpl.assertLivelinessFn,
         );
         self.cbs.register_liveliness_query(
             self.cbs.ctx,
-            pub_handle,
+            publication_handle,
             dw,
             writer_mod.DataWriterImpl.livelinessLastNsFn,
         );
@@ -373,11 +374,11 @@ pub const PublisherImpl = struct {
         if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
             s.* = std.mem.span(b[i]);
         };
-        self.cbs.announce_writer(self.cbs.ctx, pub_handle, self.instance_handle, pname_slice, presentation);
+        self.cbs.announce_writer(self.cbs.ctx, publication_handle, self.instance_handle, pname_slice, presentation);
         self.mu.lock();
         self.writers.append(self.alloc, dw) catch {
             self.mu.unlock();
-            self.cbs.destroy_proto_writer(self.cbs.ctx, pub_handle);
+            self.cbs.destroy_proto_writer(self.cbs.ctx, publication_handle);
             dw.deinit();
             return nil.nil_datawriter;
         };

@@ -70,7 +70,6 @@ const Harness = struct {
             .ctx = undefined,
             .create_proto_reader = createProtoReader,
             .destroy_proto_reader = destroyProtoReader,
-            .next_handle = nextHandle,
             .register_incompat_qos = registerIncompatQos,
             .register_matched_notify = registerMatchedNotify,
             .announce_reader = announceReader,
@@ -138,16 +137,14 @@ const Harness = struct {
         _: []const u8,
         _: []const u8,
         _: DDS.DataReaderQos,
-        _: DDS.InstanceHandle_t,
         _: DDS.PresentationQosPolicy,
+        _: *DDS.InstanceHandle_t,
+        _: *proto.Guid,
     ) anyerror!proto.ProtocolReader {
         return error.Unused;
     }
 
     fn destroyProtoReader(_: *anyopaque, _: DDS.InstanceHandle_t) void {}
-    fn nextHandle(_: *anyopaque) DDS.InstanceHandle_t {
-        return 0;
-    }
     fn registerIncompatQos(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i32) void) void {}
     fn registerMatchedNotify(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void) void {}
     fn announceReader(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const []const u8, _: DDS.PresentationQosPolicy) void {}

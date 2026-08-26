@@ -13,6 +13,10 @@ const std = @import("std");
 /// per-test. Library users who provide their own std_options override this entirely.
 pub const std_options: std.Options = .{
     .logFn = logFn,
+    // libzzdds is embedded in runtimes such as ASan that may already own the
+    // calling thread's alternate signal stack.  Replacing that stack from a
+    // shared library breaks the host runtime's thread-teardown bookkeeping.
+    .signal_stack_size = null,
 };
 
 fn logFn(

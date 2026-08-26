@@ -66,11 +66,13 @@ const SnapshotW = struct {
     guid: Guid,
     topic: []u8,
     typ: []u8,
+    user_data: []u8,
     qos: QosSnapshot,
     alloc: std.mem.Allocator,
     fn deinit(self: *@This()) void {
         self.alloc.free(self.topic);
         self.alloc.free(self.typ);
+        self.alloc.free(self.user_data);
     }
 };
 
@@ -78,11 +80,13 @@ const SnapshotR = struct {
     guid: Guid,
     topic: []u8,
     typ: []u8,
+    user_data: []u8,
     qos: QosSnapshot,
     alloc: std.mem.Allocator,
     fn deinit(self: *@This()) void {
         self.alloc.free(self.topic);
         self.alloc.free(self.typ);
+        self.alloc.free(self.user_data);
     }
 };
 
@@ -121,23 +125,31 @@ const Recorder = struct {
 
     fn onWriterDiscovered(ctx: *anyopaque, d: *const WriterData) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        const user_data = self.alloc.dupe(u8, d.qos.user_data) catch return;
+        var qos = d.qos;
+        qos.user_data = user_data;
         const s = SnapshotW{
             .alloc = self.alloc,
             .guid = d.guid,
             .topic = self.alloc.dupe(u8, d.topic_name) catch return,
             .typ = self.alloc.dupe(u8, d.type_name) catch return,
-            .qos = d.qos,
+            .user_data = user_data,
+            .qos = qos,
         };
         self.writers_found.append(self.alloc, s) catch {};
     }
     fn onReaderDiscovered(ctx: *anyopaque, d: *const ReaderData) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        const user_data = self.alloc.dupe(u8, d.qos.user_data) catch return;
+        var qos = d.qos;
+        qos.user_data = user_data;
         const s = SnapshotR{
             .alloc = self.alloc,
             .guid = d.guid,
             .topic = self.alloc.dupe(u8, d.topic_name) catch return,
             .typ = self.alloc.dupe(u8, d.type_name) catch return,
-            .qos = d.qos,
+            .user_data = user_data,
+            .qos = qos,
         };
         self.readers_found.append(self.alloc, s) catch {};
     }
@@ -335,6 +347,23 @@ test "SEDP: retractWriter fires on_writer_lost on remote" {
 
     try testing.expectEqual(@as(usize, 1), remote.rec.writers_lost.items.len);
     try testing.expect(remote.rec.writers_lost.items[0].eql(writer_guid));
+
+    const later_writer_guid = makeGuid(0x05, 0x11);
+    try local.sedp.announceWriter(&.{
+        .guid = later_writer_guid,
+        .participant_guid = makeGuid(0x05, 0x01),
+        .topic_name = "LaterT",
+        .type_name = "TT",
+        .qos = .{},
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+    var found_later_writer = false;
+    for (remote.rec.writers_found.items) |found| {
+        found_later_writer = found_later_writer or found.guid.eql(later_writer_guid);
+    }
+    try testing.expect(found_later_writer);
 }
 
 test "SEDP: retractReader fires on_reader_lost on remote" {
@@ -367,6 +396,22 @@ test "SEDP: retractReader fires on_reader_lost on remote" {
 
     try testing.expectEqual(@as(usize, 1), remote.rec.readers_lost.items.len);
     try testing.expect(remote.rec.readers_lost.items[0].eql(reader_guid));
+
+    const later_reader_guid = makeGuid(0x07, 0x21);
+    try local.sedp.announceReader(&.{
+        .guid = later_reader_guid,
+        .participant_guid = makeGuid(0x07, 0x01),
+        .topic_name = "LaterT",
+        .type_name = "TT",
+        .qos = .{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+    var found_later_reader = false;
+    for (remote.rec.readers_found.items) |found| {
+        found_later_reader = found_later_reader or found.guid.eql(later_reader_guid);
+    }
+    try testing.expect(found_later_reader);
 }
 
 // ── Tests: SPDP→SEDP combined flow ───────────────────────────────────────────
@@ -442,6 +487,33 @@ test "SEDP: WriterAnnouncement with non-default PRESENTATION round-trips correct
     try testing.expectEqual(@as(u8, 1), w.qos.presentation_access_scope);
     try testing.expectEqual(false, w.qos.coherent_access);
     try testing.expectEqual(true, w.qos.ordered_access);
+}
+
+test "SEDP: WriterAnnouncement USER_DATA round-trips as binary octets" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x31);
+    var remote = try Participant.init(net, 0x32);
+    defer local.deinit();
+    defer remote.deinit();
+    local.discoverPeer(0x32);
+    remote.discoverPeer(0x31);
+
+    const user_data = [_]u8{ 't', 'y', 'p', 'e', 0, 0xff };
+    try local.sedp.announceWriter(&.{
+        .guid = makeGuid(0x31, 0x10),
+        .participant_guid = makeGuid(0x31, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{ .user_data = &user_data },
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+    try testing.expectEqualSlices(u8, &user_data, remote.rec.writers_found.items[0].qos.user_data);
 }
 
 test "SEDP: ReaderAnnouncement with non-default PRESENTATION round-trips correctly" {

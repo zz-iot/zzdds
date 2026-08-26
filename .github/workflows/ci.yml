@@ -51,7 +51,7 @@ env:
   # Bump deliberately (its own small PR) when zzdds-examples gains something
   # this job should pick up. Override via the zzdds_examples_ref
   # workflow_dispatch input to test against a different commit/branch/tag.
-  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || 'c74d82da3daab68b9b2445545041092a2401e12c' }}
+  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || '0a83e833b8df1064d5629d19c6113711d7b822c9' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -822,6 +822,7 @@ jobs:
               'connext_dds',
               'eclipse_cyclone',
               'toc_coredx_dds',
+              'hdds',
           ]
 
           result = subprocess.run(

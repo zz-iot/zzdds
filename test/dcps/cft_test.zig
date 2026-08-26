@@ -292,6 +292,16 @@ test "eval: parameter substitution" {
     try testing.expect(!filter.eval(ast, mock.accessor(), &.{"99"}));
 }
 
+test "eval: float32 field coerces decimal parameter to field precision" {
+    const alloc = testing.allocator;
+    const ast = (try filter.parse(alloc, "value = %0")) orelse return error.NullAst;
+    defer filter.freeAst(alloc, ast);
+    const fields = [_]FieldEntry{.{ .name = "value", .value = .{ .float32 = 3.14159 } }};
+    const mock = MockAccessor{ .fields = &fields };
+    try testing.expect(filter.eval(ast, mock.accessor(), &.{"3.14159"}));
+    try testing.expect(!filter.eval(ast, mock.accessor(), &.{"3.14"}));
+}
+
 test "eval: LIKE wildcard matching" {
     const alloc = testing.allocator;
     const ast = (try filter.parse(alloc, "name LIKE 'foo%'")) orelse return error.NullAst;

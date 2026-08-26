@@ -11,6 +11,10 @@ module zzdds {
     typedef sequence<string> StringSeq;
     typedef sequence<octet>  OctetSeq;
 
+    struct RtpsGuid {
+        octet value[16];
+    };
+
     enum GuidStrategy {
         GUID_SPEC_RANDOM,
         GUID_HOST_BASED,
@@ -131,6 +135,7 @@ module zzdds {
     @shared_c_abi_box interface DomainParticipant : DDS::DomainParticipant {
         DDS::ReturnCode_t register_type_support(
             in string type_name);
+        DDS::ReturnCode_t get_rtps_guid(inout RtpsGuid result);
     };
 
     @shared_c_abi_box interface Topic : DDS::Topic {
@@ -158,9 +163,20 @@ module zzdds {
         DDS::ReturnCode_t set_listener_ex(
             in DataWriterListenerEx a_listener,
             in DDS::StatusMask      mask);
+        DDS::ReturnCode_t get_rtps_guid(inout RtpsGuid result);
+        // Expands a handle returned by get_matched_subscriptions().
+        DDS::ReturnCode_t get_matched_subscription_rtps_guid(
+            in DDS::InstanceHandle_t subscription_handle,
+            inout RtpsGuid result);
     };
 
     @shared_c_abi_box interface DataReader : DDS::DataReader {
+        DDS::ReturnCode_t get_rtps_guid(inout RtpsGuid result);
+        // Expands a publication handle from get_matched_publications() or
+        // SampleInfo. Associations needed by queued samples survive unmatching.
+        DDS::ReturnCode_t get_matched_publication_rtps_guid(
+            in DDS::InstanceHandle_t publication_handle,
+            inout RtpsGuid result);
         DDS::ReturnCode_t take_serialized(
             inout SerializedSample sample);
         DDS::ReturnCode_t take_next_instance_serialized(
