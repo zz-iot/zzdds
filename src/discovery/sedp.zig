@@ -110,6 +110,16 @@ fn writePartitionPid(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), names: [
     }
 }
 
+fn writeUserDataPid(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), value: []const u8) !void {
+    if (value.len == 0) return;
+    const payload_len = 4 + value.len;
+    const padded_len = (payload_len + 3) & ~@as(usize, 3);
+    try writePidHdr(alloc, buf, PidTable.USER_DATA, @intCast(padded_len));
+    try writeU32Le(alloc, buf, @intCast(value.len));
+    try buf.appendSlice(alloc, value);
+    try buf.appendNTimes(alloc, 0, padded_len - payload_len);
+}
+
 fn readU16LE(b: []const u8, le: bool) u16 {
     return std.mem.readInt(u16, b[0..2], if (le) .little else .big);
 }
@@ -253,7 +263,10 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
         while (p > 0) : (p -= 1) try buf.append(alloc, 0);
     }
 
+    try writeUserDataPid(alloc, &buf, ann.qos.user_data);
+
     // QoS policies.
+
     // RTPS wire reliability: 1=BEST_EFFORT, 2=RELIABLE (DDS API: 0/1 → add 1 on wire).
     // PID_RELIABILITY is 12 bytes: kind (4) + max_blocking_time Duration_t (8).
     try writePidHdr(alloc, &buf, PidTable.RELIABILITY, 12);
@@ -366,6 +379,8 @@ fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![
         while (p > 0) : (p -= 1) try buf.append(alloc, 0);
     }
 
+    try writeUserDataPid(alloc, &buf, ann.qos.user_data);
+
     // RTPS wire reliability: 1=BEST_EFFORT, 2=RELIABLE (DDS API: 0/1 → add 1 on wire).
     // PID_RELIABILITY is 12 bytes: kind (4) + max_blocking_time Duration_t (8).
     try writePidHdr(alloc, &buf, PidTable.RELIABILITY, 12);
@@ -436,6 +451,7 @@ const DecodedEndpoint = struct {
         self.alloc.free(self.multicast);
         for (self.partition_names) |name| self.alloc.free(name);
         self.alloc.free(self.partition_names);
+        if (self.qos.user_data.len != 0) self.alloc.free(self.qos.user_data);
     }
 };
 
@@ -449,11 +465,13 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
     var uc: std.ArrayList(Locator) = .empty;
     var mc: std.ArrayList(Locator) = .empty;
     var partitions: std.ArrayList([]u8) = .empty;
+    var user_data: []u8 = &.{};
     errdefer {
         uc.deinit(alloc);
         mc.deinit(alloc);
         for (partitions.items) |name| alloc.free(name);
         partitions.deinit(alloc);
+        if (user_data.len != 0) alloc.free(user_data);
     }
     // DDS spec defaults: DataWriter reliability = RELIABLE (1), DataReader = BEST_EFFORT (0).
     // Implementations may omit PID_RELIABILITY when it matches the default.
@@ -486,6 +504,15 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
             PidTable.TYPE_NAME => {
                 const s = readString(v, le);
                 typ = try alloc.dupe(u8, s);
+            },
+            PidTable.USER_DATA => {
+                if (v.len >= 4) {
+                    const count = readU32LE(v, le);
+                    if (count <= v.len - 4) {
+                        if (user_data.len != 0) alloc.free(user_data);
+                        user_data = try alloc.dupe(u8, v[4 .. 4 + count]);
+                    }
+                }
             },
             PidTable.UNICAST_LOCATOR => { // 0x002F — endpoint-specific unicast locator in SEDP
                 if (v.len >= 24) try uc.append(alloc, readLocator(v, le));
@@ -584,6 +611,7 @@ fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool
     const part_slice = try partitions.toOwnedSlice(alloc);
     // Point qos.partition_names into the owned slice (valid while DecodedEndpoint is alive).
     qos.partition_names = @ptrCast(part_slice);
+    qos.user_data = user_data;
 
     return DecodedEndpoint{
         .alloc = alloc,
@@ -1054,6 +1082,19 @@ pub const SedpEndpoints = struct {
                                             if (kh_bytes.len >= 16) keyHashToGuid(kh_bytes[0..16].*) else null
                                         else
                                             guidFromDisposalPayload(d.serialized_payload);
+                                        // The reliable builtin reader must also consume the
+                                        // disposal's sequence number.  Skipping its state machine
+                                        // leaves an artificial gap and blocks later announcements,
+                                        // even when the optional endpoint key could not be decoded.
+                                        if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
+                                            _ = pub_pair.tryHandle(sm, src_prefix);
+                                        } else if (wid.eql(EntityIds.sedp_builtin_subscriptions_writer)) {
+                                            _ = sub_pair.tryHandle(sm, src_prefix);
+                                        }
+                                        // Consuming a previously missing sequence can synchronously
+                                        // deliver buffered ALIVE changes.  Apply the loss notification
+                                        // afterwards so one of those older changes cannot resurrect
+                                        // the endpoint that this disposal removes.
                                         if (ep_guid) |g| {
                                             if (wid.eql(EntityIds.sedp_builtin_publications_writer)) {
                                                 if (self.callbacks) |cbs|
@@ -1115,7 +1156,10 @@ pub const SedpEndpoints = struct {
 
     fn handleEndpointChange(self: *Self, ch: *const CacheChange, is_writer: bool) void {
         if (ch.kind != .alive) return;
-        var ep = decodeEndpoint(self.alloc, ch.data, is_writer) catch return;
+        var ep = decodeEndpoint(self.alloc, ch.data, is_writer) catch |err| {
+            log.sedp.warn("sedp: failed to decode endpoint announcement: {s}", .{@errorName(err)});
+            return;
+        };
         defer ep.deinit();
 
         const cbs = self.callbacks orelse return;

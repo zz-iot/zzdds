@@ -838,6 +838,93 @@ test "extensions: DDS_ReadCondition_as_DDS_Condition with real ReadCondition" {
 
 // ── Extension serialized take via ZZDDS DataReader vtable ─────────────────────
 
+test "extensions: RTPS GUIDs identify participants and endpoints" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    const zdp = zidl_rt.unboxAsView(
+        ZZDDS.DomainParticipant,
+        extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(fx.dp_w.vtable.get_c_abi_handle(fx.dp_w.ptr)),
+    );
+    const zdp_reader = zidl_rt.unboxAsView(
+        ZZDDS.DomainParticipant,
+        extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(fx.dp_r.vtable.get_c_abi_handle(fx.dp_r.ptr)),
+    );
+    const zdw = zidl_rt.unboxAsView(
+        ZZDDS.DataWriter,
+        extensions.DDS_DataWriter_as_zzdds_DataWriter(pair.dw.vtable.get_c_abi_handle(pair.dw.ptr)),
+    );
+    const zdr = zidl_rt.unboxAsView(
+        ZZDDS.DataReader,
+        extensions.DDS_DataReader_as_zzdds_DataReader(pair.dr.vtable.get_c_abi_handle(pair.dr.ptr)),
+    );
+
+    var participant_guid: ZZDDS.RtpsGuid = undefined;
+    var reader_participant_guid: ZZDDS.RtpsGuid = undefined;
+    var writer_guid: ZZDDS.RtpsGuid = undefined;
+    var reader_guid: ZZDDS.RtpsGuid = undefined;
+    try testing.expectEqual(DDS.RETCODE_OK, zdp.vtable.get_rtps_guid(zdp.ptr, &participant_guid));
+    try testing.expectEqual(DDS.RETCODE_OK, zdp_reader.vtable.get_rtps_guid(zdp_reader.ptr, &reader_participant_guid));
+    try testing.expectEqual(DDS.RETCODE_OK, zdw.vtable.get_rtps_guid(zdw.ptr, &writer_guid));
+    try testing.expectEqual(DDS.RETCODE_OK, zdr.vtable.get_rtps_guid(zdr.ptr, &reader_guid));
+
+    // Every endpoint created by a participant shares its 12-byte GUID prefix,
+    // while its four-byte entity id is distinct.
+    try testing.expectEqualSlices(u8, participant_guid.value[0..12], writer_guid.value[0..12]);
+    try testing.expect(!std.mem.eql(u8, participant_guid.value[12..16], writer_guid.value[12..16]));
+    try testing.expectEqualSlices(u8, reader_participant_guid.value[0..12], reader_guid.value[0..12]);
+    try testing.expect(!std.mem.eql(u8, writer_guid.value[0..12], reader_guid.value[0..12]));
+
+    var subscription_handles: DDS.InstanceHandleSeq = .{};
+    defer if (subscription_handles._buffer) |buffer| alloc.free(buffer[0..subscription_handles._maximum]);
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dw.get_matched_subscriptions(&subscription_handles));
+    try testing.expectEqual(@as(u32, 1), subscription_handles._length);
+
+    // The symmetric writer operation expands a matched subscription handle.
+    const subscription_handle = subscription_handles._buffer.?[0];
+    var resolved_reader_guid: ZZDDS.RtpsGuid = undefined;
+    try testing.expectEqual(
+        DDS.RETCODE_OK,
+        zdw.vtable.get_matched_subscription_rtps_guid(zdw.ptr, subscription_handle, &resolved_reader_guid),
+    );
+    try testing.expectEqualSlices(u8, &reader_guid.value, &resolved_reader_guid.value);
+
+    var publication_handles: DDS.InstanceHandleSeq = .{};
+    defer if (publication_handles._buffer) |buffer| alloc.free(buffer[0..publication_handles._maximum]);
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dr.get_matched_publications(&publication_handles));
+    try testing.expectEqual(@as(u32, 1), publication_handles._length);
+
+    // The reader can expand SampleInfo.publication_handle's compact DDS handle
+    // back to the remote writer's full RTPS GUID.
+    const publication_handle = publication_handles._buffer.?[0];
+    var resolved_guid: ZZDDS.RtpsGuid = undefined;
+    try testing.expectEqual(
+        DDS.RETCODE_OK,
+        zdr.vtable.get_matched_publication_rtps_guid(zdr.ptr, publication_handle, &resolved_guid),
+    );
+    try testing.expectEqualSlices(u8, &writer_guid.value, &resolved_guid.value);
+
+    try testing.expectEqual(
+        DDS.RETCODE_BAD_PARAMETER,
+        zdw.vtable.get_matched_subscription_rtps_guid(zdw.ptr, DDS.HANDLE_NIL, &resolved_reader_guid),
+    );
+    try testing.expectEqual(
+        DDS.RETCODE_BAD_PARAMETER,
+        zdr.vtable.get_matched_publication_rtps_guid(zdr.ptr, DDS.HANDLE_NIL, &resolved_guid),
+    );
+
+    // Keep the association after unmatching: samples already queued in the
+    // reader can continue to carry this publication_handle.
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.delete_datawriter(pair.dw));
+    try testing.expectEqual(
+        DDS.RETCODE_OK,
+        zdr.vtable.get_matched_publication_rtps_guid(zdr.ptr, publication_handle, &resolved_guid),
+    );
+    try testing.expectEqualSlices(u8, &writer_guid.value, &resolved_guid.value);
+}
+
 test "extensions: take_serialized via ZZDDS DataReader vtable" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

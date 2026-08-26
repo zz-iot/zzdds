@@ -390,6 +390,38 @@ test "DCPS: DCPSTopic reader receives a sample when a topic is created" {
     try testing.expect(sample.data.len > 0);
 }
 
+test "DCPS: DCPSPublication reports endpoint identity and disposal" {
+    var h = try Harness.init(0x7A);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(0, .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    fireRemoteWriter(dp_impl, "RemoteTopic", "RemoteType");
+    const publication_dr = dp_impl.builtin_sub.?.pub_dr;
+    const alive = publication_dr.takeRaw() orelse return error.NoSample;
+    defer alloc.free(alive.data);
+    try testing.expect(alive.info.valid_data);
+    try testing.expectEqual(DDS.ALIVE_INSTANCE_STATE, alive.info.instance_state);
+    try testing.expect(alive.data.len > 0);
+
+    const guid = Guid{
+        .prefix = .{ .bytes = .{ 0xAA, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
+        .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
+    };
+    try testing.expectEqual(dcps.guidToHandle(guid), alive.info.instance_handle);
+
+    dp_impl.disc_callbacks.on_writer_lost(dp_impl.disc_callbacks.ctx, guid);
+    const disposed = publication_dr.takeRaw() orelse return error.NoSample;
+    defer alloc.free(disposed.data);
+    try testing.expect(!disposed.info.valid_data);
+    try testing.expectEqual(DDS.NOT_ALIVE_DISPOSED_INSTANCE_STATE, disposed.info.instance_state);
+    try testing.expectEqual(alive.info.instance_handle, disposed.info.instance_handle);
+}
+
 test "DCPS: get_discovered_topics returns handle for a SEDP-discovered writer's topic" {
     var h = try Harness.init(0x0B);
     defer h.deinit();

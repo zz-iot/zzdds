@@ -53,6 +53,9 @@ pub const QosSnapshot = struct {
     presentation_access_scope: u8 = 0,
     coherent_access: bool = false,
     ordered_access: bool = false,
+    // DDS USER_DATA bytes. Announcement snapshots borrow the QoS buffer;
+    // decoded/discovered endpoint containers retain an owned copy.
+    user_data: []const u8 = &.{},
     // LIFESPAN QoS (DataWriter only). DDS INFINITE = {0x7fffffff, 0xffffffff}.
     lifespan_sec: i32 = 0x7fff_ffff,
     lifespan_nanosec: u32 = 0xffff_ffff,

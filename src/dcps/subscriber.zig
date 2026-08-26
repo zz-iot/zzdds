@@ -35,6 +35,7 @@ pub const ParticipantCbs = struct {
         qos: DDS.DataReaderQos,
         handle: DDS.InstanceHandle_t,
         presentation: DDS.PresentationQosPolicy,
+        guid: *proto.Guid,
     ) anyerror!proto.ProtocolReader,
 
     /// Tear down the ProtocolReader identified by handle.
@@ -304,6 +305,7 @@ pub const SubscriberImpl = struct {
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
         const presentation = self.qos.presentation;
+        var guid: proto.Guid = undefined;
         const pr = self.cbs.create_proto_reader(
             self.cbs.ctx,
             topic_name,
@@ -311,6 +313,7 @@ pub const SubscriberImpl = struct {
             qos.*,
             sub_handle,
             presentation,
+            &guid,
         ) catch return nil.nil_datareader;
         const dr = reader_mod.DataReaderImpl.init(
             self.alloc,
@@ -321,6 +324,7 @@ pub const SubscriberImpl = struct {
             if (a_listener) |l| l.* else DDS.noop_DataReaderListener,
             mask,
             sub_handle,
+            guid,
             self.cbs.timer_clock,
         ) catch {
             self.cbs.destroy_proto_reader(self.cbs.ctx, sub_handle);

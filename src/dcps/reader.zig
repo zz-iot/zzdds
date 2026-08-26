@@ -232,6 +232,7 @@ pub const DataReaderImpl = struct {
     quiesce: EntityQuiesce = .{},
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
+    guid: proto.Guid = std.mem.zeroes(proto.Guid),
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
 
@@ -400,6 +401,11 @@ pub const DataReaderImpl = struct {
     /// when a writer disappears without an explicit unregister.
     writer_instances: std.AutoHashMapUnmanaged(Guid, std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void)) = .empty,
 
+    /// Stable publication-handle lookup for SampleInfo metadata. Associations
+    /// survive unmatching because already-queued samples can still reference
+    /// their originating writer. Guarded by `mu` and released with the reader.
+    publication_guids: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, PublicationGuidEntry) = .empty,
+
     // ── TIME_BASED_FILTER tracking ────────────────────────────────────────────
     // Guarded by `mu`. Per-instance: each instance independently tracks the
     // source timestamp of its last delivered sample.
@@ -422,6 +428,7 @@ pub const DataReaderImpl = struct {
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const OwnerEntry = struct { guid: Guid, strength: i32 };
+    const PublicationGuidEntry = struct { guid: Guid, collision: bool = false };
     const Self = @This();
 
     pub fn init(
@@ -433,6 +440,7 @@ pub const DataReaderImpl = struct {
         listener: DDS.DataReaderListener,
         mask: DDS.StatusMask,
         instance_handle: DDS.InstanceHandle_t,
+        guid: proto.Guid,
         timer_clock: time_mod.Clock,
     ) !*Self {
         const self = try alloc.create(Self);
@@ -445,6 +453,7 @@ pub const DataReaderImpl = struct {
             .listener_box = undefined,
             .listener_mask = mask,
             .instance_handle = instance_handle,
+            .guid = guid,
             .status_changes = 0,
             .status_cond = null,
             .data_notifiers = .empty,
@@ -594,6 +603,7 @@ pub const DataReaderImpl = struct {
             while (wi_it.next()) |inner| inner.deinit(self.alloc);
         }
         self.writer_instances.deinit(self.alloc);
+        self.publication_guids.deinit(self.alloc);
         {
             var si_it = self.seen_instances.valueIterator();
             while (si_it.next()) |entry| {
@@ -671,18 +681,29 @@ pub const DataReaderImpl = struct {
     /// Used by the built-in subscriber to push discovery-sourced samples.
     /// `cdr` is borrowed; it is copied internally.
     pub fn pushCdr(self: *Self, cdr: []const u8) void {
+        self.pushBuiltinCdr(cdr, std.mem.zeroes([16]u8), .alive);
+    }
+
+    /// Inject a keyed built-in-topic sample or lifecycle change directly.
+    /// `cdr` is copied for alive samples and ignored for non-alive changes.
+    pub fn pushBuiltinCdr(
+        self: *Self,
+        cdr: []const u8,
+        key_hash: [16]u8,
+        kind: history_mod.ChangeKind,
+    ) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        const copy = self.alloc.dupe(u8, cdr) catch return;
+        const copy = self.alloc.dupe(u8, if (kind == .alive) cdr else &.{}) catch return;
         self.mu.lock();
-        const ih = writer_mod.keyHashToHandle(std.mem.zeroes([16]u8));
-        const states = self.determineStatesLocked(ih, .alive);
+        const ih = writer_mod.keyHashToHandle(key_hash);
+        const states = self.determineStatesLocked(ih, kind);
         const info = DDS.SampleInfo{
             .sample_state = DDS.NOT_READ_SAMPLE_STATE,
             .view_state = states.view,
             .instance_state = states.instance_state,
             .instance_handle = ih,
-            .valid_data = true,
+            .valid_data = kind == .alive,
             .disposed_generation_count = states.disposed_generation_count,
             .no_writers_generation_count = states.no_writers_generation_count,
         };
@@ -697,7 +718,7 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             return;
         };
-        pc.* = .{ .data = copy, .alloc = self.alloc, .info = info };
+        pc.* = .{ .data = copy, .alloc = self.alloc, .info = info, .key_hash = key_hash };
         self.pending.append(self.alloc, pc) catch {
             self.mu.unlock();
             self.alloc.destroy(pc);
@@ -720,6 +741,27 @@ pub const DataReaderImpl = struct {
         const gop = self.writer_instances.getOrPut(self.alloc, guid) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         gop.value_ptr.put(self.alloc, ih, {}) catch {};
+    }
+
+    fn rememberPublicationGuidLocked(self: *Self, guid: Guid) void {
+        const handle = writer_mod.guidToHandle(guid);
+        const entry = self.publication_guids.getOrPut(self.alloc, handle) catch return;
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{ .guid = guid };
+        } else if (!entry.value_ptr.guid.eql(guid)) {
+            entry.value_ptr.collision = true;
+        }
+    }
+
+    pub fn resolvePublicationGuid(
+        self: *Self,
+        handle: DDS.InstanceHandle_t,
+    ) error{ NoData, HandleCollision }!Guid {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const entry = self.publication_guids.get(handle) orelse return error.NoData;
+        if (entry.collision) return error.HandleCollision;
+        return entry.guid;
     }
 
     /// Called from the RTPS receive thread when a new sample arrives.
@@ -1212,6 +1254,7 @@ pub const DataReaderImpl = struct {
         {
             self.mu.lock();
             defer self.mu.unlock();
+            self.rememberPublicationGuidLocked(info.guid);
             self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
             if (info.lifespan_ns > 0)
                 self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
@@ -1360,6 +1403,7 @@ pub const DataReaderImpl = struct {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
+        self.rememberPublicationGuidLocked(guid);
         _ = self.writer_strengths.remove(guid);
         _ = self.writer_lifespans.remove(guid);
         // Discard any in-progress coherent set from this writer.  If the writer

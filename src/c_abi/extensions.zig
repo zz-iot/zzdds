@@ -17,6 +17,7 @@ const DomainParticipantImpl = participant_mod.DomainParticipantImpl;
 const PublisherImpl = @import("../dcps/publisher.zig").PublisherImpl;
 const SubscriberImpl = @import("../dcps/subscriber.zig").SubscriberImpl;
 const DataWriterImpl = @import("../dcps/writer.zig").DataWriterImpl;
+const writer_mod = @import("../dcps/writer.zig");
 const reader_mod = @import("../dcps/reader.zig");
 const DataReaderImpl = reader_mod.DataReaderImpl;
 const topic_mod = @import("../dcps/topic.zig");
@@ -37,6 +38,7 @@ const history_mod = @import("../rtps/history.zig");
 const time_mod = @import("../util/time.zig");
 const nil = @import("../dcps/nil.zig");
 const standalone_create = @import("../util/standalone_create.zig");
+const proto = @import("../protocol/interface.zig");
 
 const FactoryOwner = struct {
     alloc: std.mem.Allocator,
@@ -286,6 +288,7 @@ fn factoryGetCAbiHandleDds(ctx: *anyopaque) *anyopaque {
 
 pub const participant_vtable = ZZDDS.DomainParticipant.Vtable{
     .register_type_support = participantRegisterTypeSupport,
+    .get_rtps_guid = participantGetRtpsGuid,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = participantGetCAbiHandleZzdds,
     .get_allocator = participantGetAllocator,
@@ -296,6 +299,17 @@ fn participantGetAllocator(ctx: *anyopaque) std.mem.Allocator {
     if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
     const impl: *DomainParticipantImpl = @ptrCast(@alignCast(ctx));
     return impl.alloc;
+}
+
+fn writeGuid(out: *ZZDDS.RtpsGuid, guid: proto.Guid) void {
+    @memcpy(&out.value, std.mem.asBytes(&guid));
+}
+
+fn participantGetRtpsGuid(ctx: *anyopaque, out: *ZZDDS.RtpsGuid) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const impl: *DomainParticipantImpl = @ptrCast(@alignCast(ctx));
+    writeGuid(out, impl.guid);
+    return DDS.RETCODE_OK;
 }
 
 fn participantAsDds(ctx: *anyopaque) DDS.DomainParticipant {
@@ -356,6 +370,8 @@ fn topicGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
 
 pub const writer_vtable = ZZDDS.DataWriter.Vtable{
     .set_listener_ex = writerSetListenerEx,
+    .get_rtps_guid = writerGetRtpsGuid,
+    .get_matched_subscription_rtps_guid = writerGetMatchedSubscriptionRtpsGuid,
     .deinit = borrowedDeinit,
     .get_c_abi_handle = writerGetCAbiHandleZzdds,
     .get_allocator = writerGetAllocator,
@@ -366,6 +382,40 @@ fn writerGetAllocator(ctx: *anyopaque) std.mem.Allocator {
     if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
     return impl.alloc;
+}
+
+fn writerGetRtpsGuid(ctx: *anyopaque, out: *ZZDDS.RtpsGuid) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const writer: *DataWriterImpl = @ptrCast(@alignCast(ctx));
+    writeGuid(out, writer.guid);
+    return DDS.RETCODE_OK;
+}
+
+fn writerGetMatchedSubscriptionRtpsGuid(
+    ctx: *anyopaque,
+    subscription_handle: DDS.InstanceHandle_t,
+    out: *ZZDDS.RtpsGuid,
+) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR or subscription_handle == DDS.HANDLE_NIL)
+        return DDS.RETCODE_BAD_PARAMETER;
+    const writer: *DataWriterImpl = @ptrCast(@alignCast(ctx));
+    var guids: std.ArrayListUnmanaged(proto.Guid) = .empty;
+    defer guids.deinit(writer.alloc);
+    writer.proto_writer.listMatchedReaders(writer.alloc, &guids) catch
+        return DDS.RETCODE_OUT_OF_RESOURCES;
+    var match: ?proto.Guid = null;
+    for (guids.items) |guid| {
+        if (writer_mod.guidToHandle(guid) != subscription_handle) continue;
+        if (match) |existing| {
+            if (!std.meta.eql(existing, guid)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        }
+        match = guid;
+    }
+    if (match) |guid| {
+        writeGuid(out, guid);
+        return DDS.RETCODE_OK;
+    }
+    return DDS.RETCODE_NO_DATA;
 }
 
 fn writerAsDds(ctx: *anyopaque) DDS.DataWriter {
@@ -390,6 +440,8 @@ fn writerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
 }
 
 pub const reader_vtable = ZZDDS.DataReader.Vtable{
+    .get_rtps_guid = readerGetRtpsGuid,
+    .get_matched_publication_rtps_guid = readerGetMatchedPublicationRtpsGuid,
     .take_serialized = readerTakeSerialized,
     .take_next_instance_serialized = readerTakeNextInstanceSerialized,
     .deinit = borrowedDeinit,
@@ -402,6 +454,29 @@ fn readerGetAllocator(ctx: *anyopaque) std.mem.Allocator {
     if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
     const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
     return impl.alloc;
+}
+
+fn readerGetRtpsGuid(ctx: *anyopaque, out: *ZZDDS.RtpsGuid) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const reader: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    writeGuid(out, reader.guid);
+    return DDS.RETCODE_OK;
+}
+
+fn readerGetMatchedPublicationRtpsGuid(
+    ctx: *anyopaque,
+    publication_handle: DDS.InstanceHandle_t,
+    out: *ZZDDS.RtpsGuid,
+) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR or publication_handle == DDS.HANDLE_NIL)
+        return DDS.RETCODE_BAD_PARAMETER;
+    const reader: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    const guid = reader.resolvePublicationGuid(publication_handle) catch |err| return switch (err) {
+        error.HandleCollision => DDS.RETCODE_PRECONDITION_NOT_MET,
+        error.NoData => DDS.RETCODE_NO_DATA,
+    };
+    writeGuid(out, guid);
+    return DDS.RETCODE_OK;
 }
 
 fn readerAsDds(ctx: *anyopaque) DDS.DataReader {

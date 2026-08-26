@@ -37,6 +37,7 @@ pub const ParticipantCbs = struct {
         qos: DDS.DataWriterQos,
         presentation: DDS.PresentationQosPolicy,
         publication_handle: *DDS.InstanceHandle_t,
+        guid: *proto.Guid,
     ) anyerror!proto.ProtocolWriter,
 
     /// Tear down the ProtocolWriter identified by handle.
@@ -304,6 +305,7 @@ pub const PublisherImpl = struct {
         const type_name = a_topic.get_type_name();
         const presentation = self.qos.presentation;
         var publication_handle = DDS.HANDLE_NIL;
+        var guid: proto.Guid = undefined;
         const pw = self.cbs.create_proto_writer(
             self.cbs.ctx,
             topic_name,
@@ -311,6 +313,7 @@ pub const PublisherImpl = struct {
             qos.*,
             presentation,
             &publication_handle,
+            &guid,
         ) catch return nil.nil_datawriter;
         const dw = writer_mod.DataWriterImpl.init(
             self.alloc,
@@ -321,6 +324,7 @@ pub const PublisherImpl = struct {
             if (a_listener) |l| l.* else DDS.noop_DataWriterListener,
             mask,
             publication_handle,
+            guid,
             self.cbs.timer_clock,
         ) catch {
             self.cbs.destroy_proto_writer(self.cbs.ctx, publication_handle);

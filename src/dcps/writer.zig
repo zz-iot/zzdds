@@ -99,6 +99,7 @@ pub const DataWriterImpl = struct {
     outstanding_loans: std.atomic.Value(usize) = .init(0),
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
+    guid: proto.Guid = std.mem.zeroes(proto.Guid),
     status_changes: DDS.StatusMask,
     status_cond: ?*waitset.StatusConditionImpl,
 
@@ -186,6 +187,7 @@ pub const DataWriterImpl = struct {
         listener: DDS.DataWriterListener,
         mask: DDS.StatusMask,
         instance_handle: DDS.InstanceHandle_t,
+        guid: proto.Guid,
         timer_clock: time_mod.Clock,
     ) !*Self {
         const now = timer_clock.nowNs();
@@ -201,6 +203,7 @@ pub const DataWriterImpl = struct {
             .listener_ex_box = undefined,
             .listener_mask = mask,
             .instance_handle = instance_handle,
+            .guid = guid,
             .status_changes = 0,
             .status_cond = null,
             .timer_clock = timer_clock,
@@ -1216,12 +1219,19 @@ pub fn guidToHandle(guid: Guid) DDS.InstanceHandle_t {
     return if (v == 0) 1 else v;
 }
 
-/// First 12 bytes of GUID (GuidPrefix) as a BuiltinTopicKey_t.
+/// Stable opaque built-in-topic key derived from the complete RTPS GUID.
+/// Endpoint keys must remain distinct for endpoints sharing one participant.
 pub fn guidToBuiltinKey(guid: Guid) DDS.BuiltinTopicKey_t {
-    const bytes = &guid.prefix.bytes;
-    return .{ .value = .{
-        @as(i32, @bitCast(@as(u32, bytes[0]) | @as(u32, bytes[1]) << 8 | @as(u32, bytes[2]) << 16 | @as(u32, bytes[3]) << 24)),
-        @as(i32, @bitCast(@as(u32, bytes[4]) | @as(u32, bytes[5]) << 8 | @as(u32, bytes[6]) << 16 | @as(u32, bytes[7]) << 24)),
-        @as(i32, @bitCast(@as(u32, bytes[8]) | @as(u32, bytes[9]) << 8 | @as(u32, bytes[10]) << 16 | @as(u32, bytes[11]) << 24)),
-    } };
+    const bytes = std.mem.asBytes(&guid);
+    const seeds = [3]u32{ 2166136261, 0x9e3779b9, 0x85ebca6b };
+    var values: [3]i32 = undefined;
+    for (&values, seeds) |*value, seed| {
+        var hash = seed;
+        for (bytes) |byte| {
+            hash ^= byte;
+            hash *%= 16777619;
+        }
+        value.* = @bitCast(hash);
+    }
+    return .{ .value = values };
 }
