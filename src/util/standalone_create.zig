@@ -37,7 +37,12 @@ pub fn createWithAllocator(
 ) *anyopaque {
     const alloc = if (allocator) |a| zidl_rt.toAllocator(a) else std.heap.c_allocator;
     const r = construct(alloc) catch |err| {
-        std.log.err(log_name ++ ": {}", .{err});
+        // .warn, not .err: this is an expected, recoverable degrade (fall
+        // back to the nil sentinel), not an unexpected internal error --
+        // Zig's test runner hard-fails any test that logs at .err regardless
+        // of std.testing.log_level, so .err here would make this path
+        // untestable.
+        std.log.warn(log_name ++ ": {}", .{err});
         return nil_value.vtable.get_c_abi_handle(nil_value.ptr);
     };
     return r.vtable.get_c_abi_handle(r.ptr);

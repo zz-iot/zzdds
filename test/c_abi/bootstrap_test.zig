@@ -330,6 +330,217 @@ test "support factory: get_default_participant_qos on a custom-allocator factory
     try testing.expectEqual(DDS.RETCODE_OK, factory.get_default_participant_qos(&qos));
 }
 
+// ── get_allocator ────────────────────────────────────────────────────────────
+//
+// Regression coverage for the `get_allocator` vtable slot added across every
+// entity interface (generated-class-lifecycle-design.md's "Allocator
+// resolution") -- previously zero tests anywhere in this suite called
+// `.vtable.get_allocator(...)` on anything, native or C-ABI-layer, real or
+// nil. Each of these tests exercises a *different* set of vtable literals
+// (native impl vtables via Fixture, extensions.zig's separate C-ABI-layer
+// vtables via zzdds_create_factory_with_allocator, nil singletons), since the
+// same-looking `get_allocator = xGetAllocator` addition was made
+// independently in each place, not generated from one shared site -- a typo
+// in any one of them (wrong impl type in the cast, wrong nil constant) would
+// compile fine and silently return the wrong allocator; only a real
+// assertion catches that class of mistake.
+
+test "get_allocator: native entity vtables return the allocator each entity was constructed with" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const pair = fx.makeWriterReader();
+
+    try testing.expectEqual(alloc, fx.dp_w.vtable.get_allocator(fx.dp_w.ptr));
+    try testing.expectEqual(alloc, fx.pub_w.vtable.get_allocator(fx.pub_w.ptr));
+    try testing.expectEqual(alloc, fx.topic_w.vtable.get_allocator(fx.topic_w.ptr));
+    try testing.expectEqual(alloc, fx.sub_r.vtable.get_allocator(fx.sub_r.ptr));
+    try testing.expectEqual(alloc, pair.dw.vtable.get_allocator(pair.dw.ptr));
+    try testing.expectEqual(alloc, pair.dr.vtable.get_allocator(pair.dr.ptr));
+}
+
+test "get_allocator: extensions-layer C-ABI vtables return the injected custom allocator, not a process-wide guess" {
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_rt.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+    // toAllocator is a pure, allocation-free function of its input pointer
+    // (see zidl_rt's own doc comment) -- calling it again here with the same
+    // &c_alloc reconstructs a byte-identical std.mem.Allocator to whatever
+    // extensions.zig built internally, making expectEqual a precise check,
+    // not an approximation.
+    const expected = zidl_rt.toAllocator(&c_alloc);
+
+    const ext_factory_boxed = extensions.zzdds_create_factory_with_allocator(&c_alloc);
+    defer extensions.zzdds_destroy_factory(ext_factory_boxed);
+    const ext_factory = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
+    try testing.expectEqual(expected, ext_factory.vtable.get_allocator(ext_factory.ptr));
+
+    const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
+    try testing.expectEqual(expected, factory.vtable.get_allocator(factory.ptr));
+
+    const cfg = ZZDDS.DomainParticipantConfig.default();
+    const qos = DDS.DomainParticipantQos{};
+    const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
+    defer _ = factory.delete_participant(dp);
+    try testing.expectEqual(expected, dp.vtable.get_allocator(dp.ptr));
+
+    const topic = dp.create_topic("GAllocTopic", "GAllocType", .{}, null, 0);
+    try testing.expectEqual(expected, topic.vtable.get_allocator(topic.ptr));
+
+    const pub_ent = dp.create_publisher(.{}, null, 0);
+    const dw = pub_ent.create_datawriter(topic, .{}, null, 0);
+    try testing.expectEqual(expected, dw.vtable.get_allocator(dw.ptr));
+
+    const sub_ent = dp.create_subscriber(.{}, null, 0);
+    const td = topic.vtable.as_TopicDescription(topic.ptr);
+    const dr = sub_ent.create_datareader(td, .{}, null, 0);
+    try testing.expectEqual(expected, dr.vtable.get_allocator(dr.ptr));
+
+    // The above all resolve through the *native* src/dcps/*.zig vtables
+    // (already covered by the native-entity test above) -- create_topic /
+    // create_datawriter / create_datareader / create_participant_ex all
+    // return plain DDS.* fat pointers per dcps.idl, never the ZZDDS.* wrapper
+    // types directly. Exercise extensions.zig's *own*, separately-defined
+    // participant_vtable / topic_vtable / writer_vtable / reader_vtable (each
+    // with its own get_allocator, e.g. participantGetAllocator at
+    // extensions.zig) via the DDS_X_as_zzdds_X checked-downcast path a real
+    // C caller would use to reach the ZZDDS namespace -- otherwise a typo'd
+    // get_allocator in any of those four vtable literals would compile fine
+    // and go completely unexercised by this suite.
+    const zdp_boxed = extensions.DDS_DomainParticipant_as_zzdds_DomainParticipant(dp.vtable.get_c_abi_handle(dp.ptr));
+    const zdp = zidl_rt.unboxAsView(ZZDDS.DomainParticipant, zdp_boxed);
+    try testing.expectEqual(expected, zdp.vtable.get_allocator(zdp.ptr));
+
+    const ztopic_boxed = extensions.DDS_Topic_as_zzdds_Topic(topic.vtable.get_c_abi_handle(topic.ptr));
+    const ztopic = zidl_rt.unboxAsView(ZZDDS.Topic, ztopic_boxed);
+    try testing.expectEqual(expected, ztopic.vtable.get_allocator(ztopic.ptr));
+
+    const zdw_boxed = extensions.DDS_DataWriter_as_zzdds_DataWriter(dw.vtable.get_c_abi_handle(dw.ptr));
+    const zdw = zidl_rt.unboxAsView(ZZDDS.DataWriter, zdw_boxed);
+    try testing.expectEqual(expected, zdw.vtable.get_allocator(zdw.ptr));
+
+    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr.vtable.get_c_abi_handle(dr.ptr));
+    const zdr = zidl_rt.unboxAsView(ZZDDS.DataReader, zdr_boxed);
+    try testing.expectEqual(expected, zdr.vtable.get_allocator(zdr.ptr));
+}
+
+test "get_allocator: every nil singleton returns the fixed nil allocator" {
+    const nd = zzdds.dcps;
+    inline for (.{
+        nd.nil_status_condition,
+        nd.nil_entity,
+        nd.nil_participant,
+        nd.nil_publisher,
+        nd.nil_subscriber,
+        nd.nil_datawriter,
+        nd.nil_datareader,
+        nd.nil_topic_description,
+        nd.nil_topic,
+        nd.nil_cft,
+        nd.nil_multitopic,
+        nd.nil_condition,
+        nd.nil_readcondition,
+        nd.nil_querycondition,
+        nd.nil_guardcondition,
+        nd.nil_waitset,
+        nd.nil_factory,
+    }) |nil_handle| {
+        // Every nil singleton is documented to deliberately share one fixed
+        // std.heap.c_allocator, not a real per-instance one (no real impl
+        // object exists to draw one from) -- see nil.zig's nilGetAllocator.
+        try testing.expectEqual(std.heap.c_allocator, nil_handle.vtable.get_allocator(nil_handle.ptr));
+    }
+}
+
+// ── @standalone types: WaitSet/GuardCondition create-with-allocator ───────────
+//
+// standalone_create.zig's createWithAllocator (queue item 2 of
+// generated-class-lifecycle-design.md) had zero test coverage anywhere in
+// this suite -- only ever exercised indirectly through the C-ABI functions,
+// verified this session solely via external, disposable C-program repros,
+// never by `zig build test`. These cover both its happy path (construct
+// succeeds, returns a real boxed handle routed through the given allocator)
+// and its error path (construct fails, falls back to the nil sentinel
+// instead of crashing) -- the two branches createWithAllocator actually has.
+
+fn alwaysFailAlloc(ctx: ?*anyopaque, len: usize, alignment: usize) callconv(.c) ?[*]u8 {
+    _ = ctx;
+    _ = len;
+    _ = alignment;
+    return null;
+}
+fn alwaysFailResize(ctx: ?*anyopaque, ptr: ?[*]u8, old_len: usize, new_len: usize, alignment: usize) callconv(.c) bool {
+    _ = ctx;
+    _ = ptr;
+    _ = old_len;
+    _ = new_len;
+    _ = alignment;
+    return false;
+}
+fn alwaysFailFree(ctx: ?*anyopaque, ptr: ?[*]u8, len: usize, alignment: usize) callconv(.c) void {
+    _ = ctx;
+    _ = ptr;
+    _ = len;
+    _ = alignment;
+}
+
+test "standalone_create: WaitSet/GuardCondition created via the allocator-taking constructors route through it, not a process default" {
+    var track = TrackingCtx{ .child = testing.allocator };
+    const c_alloc = zidl_rt.ZidlAllocator{
+        .ctx = &track,
+        .alloc = trackAlloc,
+        .resize = trackResize,
+        .free = trackFree,
+    };
+    const expected = zidl_rt.toAllocator(&c_alloc);
+
+    const ws_boxed = extensions.zzdds_create_waitset_with_allocator(&c_alloc);
+    defer extensions.zzdds_destroy_waitset(ws_boxed);
+    try testing.expect(!extensions.zzdds_waitset_is_nil(ws_boxed));
+    try testing.expect(track.alloc_calls.load(.monotonic) > 0);
+
+    const ws = zidl_rt.unboxAs(DDS.WaitSet, ws_boxed);
+    try testing.expectEqual(expected, ws.vtable.get_allocator(ws.ptr));
+
+    const gc_boxed = extensions.zzdds_create_guardcondition_with_allocator(&c_alloc);
+    defer extensions.zzdds_destroy_guardcondition(gc_boxed);
+    try testing.expect(!extensions.zzdds_guardcondition_is_nil(gc_boxed));
+
+    const gc = zidl_rt.unboxAsView(DDS.GuardCondition, gc_boxed);
+    try testing.expectEqual(expected, gc.vtable.get_allocator(gc.ptr));
+}
+
+test "standalone_create: construct failure falls back to the nil sentinel instead of crashing" {
+    // A ZidlAllocator whose alloc() always returns null -- construct()
+    // (WaitSetImpl.init/GuardConditionImpl.init) genuinely fails under this,
+    // exercising createWithAllocator's catch/log/nil-fallback branch for
+    // real, not simulated.
+    const failing_alloc = zidl_rt.ZidlAllocator{
+        .ctx = undefined,
+        .alloc = alwaysFailAlloc,
+        .resize = alwaysFailResize,
+        .free = alwaysFailFree,
+    };
+
+    // createWithAllocator logs a .warn on this path -- expected here, not a
+    // real error. Suppress the print so it doesn't read as test noise.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    const ws_boxed = extensions.zzdds_create_waitset_with_allocator(&failing_alloc);
+    defer extensions.zzdds_destroy_waitset(ws_boxed);
+    try testing.expect(extensions.zzdds_waitset_is_nil(ws_boxed));
+
+    const gc_boxed = extensions.zzdds_create_guardcondition_with_allocator(&failing_alloc);
+    defer extensions.zzdds_destroy_guardcondition(gc_boxed);
+    try testing.expect(extensions.zzdds_guardcondition_is_nil(gc_boxed));
+}
+
 fn DDS_DomainParticipantFactory_create_participant_for_test(
     factory: DDS.DomainParticipantFactory,
     domain_id: DDS.DomainId_t,
