@@ -2662,6 +2662,7 @@ pub const DataReaderImpl = struct {
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
     };
 
     // ── DDS.DataReader vtable ─────────────────────────────────────────────────
@@ -2697,6 +2698,7 @@ pub const DataReaderImpl = struct {
         .return_loan_raw = vtReturnLoanRaw,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
         .as_Entity = vtAsEntity,
     };
 
@@ -2717,6 +2719,10 @@ pub const DataReaderImpl = struct {
     fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
         return self.c_abi.get(self.alloc, ctx, &views);
+    }
+
+    fn vtGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+        return cast(ctx).alloc;
     }
 
     fn vtAsEntity(ctx: *anyopaque) DDS.Entity {

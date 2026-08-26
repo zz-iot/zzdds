@@ -126,6 +126,7 @@ pub const TopicImpl = struct {
         .get_inconsistent_topic_status = vtGetInconsistent,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
         .as_Entity = vtAsEntity,
         .as_TopicDescription = vtAsTopicDescription,
     };
@@ -154,6 +155,10 @@ pub const TopicImpl = struct {
     fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
         return self.c_abi.get(self.alloc, ctx, &views);
+    }
+
+    fn vtGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+        return cast(ctx).alloc;
     }
 
     fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
@@ -258,6 +263,7 @@ pub const TopicImpl = struct {
         .get_participant = vtGetParticipant,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandleTd,
+        .get_allocator = vtGetAllocator,
     };
 
     /// TopicDescription's own (secondary-base, independently-boxed)
@@ -284,6 +290,7 @@ pub const TopicImpl = struct {
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
     };
 
     fn getStatusFn(entity_ptr: *anyopaque) DDS.StatusMask {
@@ -420,6 +427,7 @@ pub const ContentFilteredTopicImpl = struct {
         .get_participant = tdGetParticipant,
         .deinit = tdDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
     };
 
     fn tdGetTypeName(ctx: *anyopaque) [*:0]const u8 {
@@ -450,6 +458,7 @@ pub const ContentFilteredTopicImpl = struct {
         .get_related_topic = cftGetRelated,
         .deinit = cftDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
         .as_TopicDescription = cftAsTopicDescription,
     };
 
@@ -464,6 +473,10 @@ pub const ContentFilteredTopicImpl = struct {
     fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
         return self.c_abi.get(self.alloc, ctx, &views);
+    }
+
+    fn vtGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+        return cast(ctx).alloc;
     }
 
     fn cftAsTopicDescription(ctx: *anyopaque) DDS.TopicDescription {

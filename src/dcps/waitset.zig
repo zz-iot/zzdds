@@ -339,11 +339,17 @@ pub const WaitSetImpl = struct {
         .get_conditions = vtGetConditions,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandleWaitSet,
+        .get_allocator = vtGetAllocatorWaitSet,
     };
 
     fn vtGetCAbiHandleWaitSet(ctx: *anyopaque) *anyopaque {
         const self: *Self = @ptrCast(@alignCast(ctx));
         return self.ws_c_abi.get(self.alloc, ctx, &vtable);
+    }
+
+    fn vtGetAllocatorWaitSet(ctx: *anyopaque) std.mem.Allocator {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.alloc;
     }
 
     /// Condvar-based wait: blocks until at least one attached condition is
@@ -807,6 +813,7 @@ pub const GuardConditionImpl = struct {
         .set_trigger_value = vtSetTrigger,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
         .as_Condition = vtAsConditionGuard,
     };
 
@@ -828,10 +835,15 @@ pub const GuardConditionImpl = struct {
         return self.c_abi.get(self.alloc, ctx, &views);
     }
 
+    fn vtGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+        return cast(ctx).alloc;
+    }
+
     pub const cond_vtable = DDS.Condition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
     };
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
@@ -1056,6 +1068,7 @@ pub const ReadConditionImpl = struct {
         .get_datareader = vtGetReader,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandleReadCondition,
+        .get_allocator = vtGetAllocatorRC,
         .as_Condition = vtAsConditionRead,
     };
 
@@ -1090,10 +1103,23 @@ pub const ReadConditionImpl = struct {
         return self.c_abi.get(self.alloc, ctx, &views);
     }
 
+    /// Same `owner_qc` redirect as `vtGetCAbiHandleReadCondition`/
+    /// `vtGetCAbiHandleCondition` -- when embedded in a QueryConditionImpl,
+    /// the allocator that matters is the owning QueryCondition's, not this
+    /// standalone struct's own (unused) field. Shared by both `vtable` and
+    /// `cond_vtable` below since the answer doesn't depend on which view was
+    /// called through, only on which concrete allocation this `ctx` lives in.
+    fn vtGetAllocatorRC(ctx: *anyopaque) std.mem.Allocator {
+        const self = cast(ctx);
+        if (self.owner_qc) |qc| return qc.alloc;
+        return self.alloc;
+    }
+
     pub const cond_vtable = DDS.Condition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandleCondition,
+        .get_allocator = vtGetAllocatorRC,
     };
 
     /// Same `owner_qc` redirect as `vtGetCAbiHandleReadCondition` above, for
@@ -1193,6 +1219,7 @@ pub const StatusConditionImpl = struct {
         .get_entity = vtGetEntity,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
         .as_Condition = vtAsConditionStatus,
     };
 
@@ -1212,10 +1239,15 @@ pub const StatusConditionImpl = struct {
         return self.c_abi.get(self.alloc, ctx, &views);
     }
 
+    fn vtGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+        return cast(ctx).alloc;
+    }
+
     pub const cond_vtable = DDS.Condition.Vtable{
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
     };
 
     fn vtGetTrigger(ctx: *anyopaque) bool {
@@ -1423,6 +1455,7 @@ pub const QueryConditionImpl = struct {
         .set_query_parameters = vtSetParams,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
         .as_ReadCondition = vtAsReadCondition,
     };
 
@@ -1470,6 +1503,7 @@ pub const QueryConditionImpl = struct {
         .get_datareader = vtGetReader,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
         .as_Condition = vtAsConditionThunk,
     };
 
@@ -1479,6 +1513,7 @@ pub const QueryConditionImpl = struct {
         .get_trigger_value = vtGetTrigger,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
     };
 
     fn vtAsConditionThunk(ctx: *anyopaque) DDS.Condition {
@@ -1491,6 +1526,12 @@ pub const QueryConditionImpl = struct {
     fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
         return self.c_abi.get(self.alloc, ctx, &views);
+    }
+
+    /// Shared by all three views' `get_allocator` slots, same reasoning as
+    /// `vtGetCAbiHandle` above.
+    fn vtGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+        return cast(ctx).alloc;
     }
 
     fn vtGetTrigger(ctx: *anyopaque) bool {

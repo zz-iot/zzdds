@@ -174,6 +174,11 @@ const BuiltinTopicDescImpl = struct {
                 return self.c_abi.get(self.alloc, ctx, &vtbl);
             }
         }.f,
+        .get_allocator = struct {
+            fn f(ctx: *anyopaque) std.mem.Allocator {
+                return cast(ctx).alloc;
+            }
+        }.f,
     };
 
     fn cast(ctx: *anyopaque) *@This() {
@@ -3098,6 +3103,7 @@ pub const DomainParticipantImpl = struct {
         .get_instance_handle = vtGetHandle,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
     };
 
     // ── DomainParticipant vtable ──────────────────────────────────────────────
@@ -3145,6 +3151,7 @@ pub const DomainParticipantImpl = struct {
         .get_current_time = vtGetCurrentTime,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandle,
+        .get_allocator = vtGetAllocator,
         .as_Entity = vtAsEntity,
     };
 
@@ -3164,6 +3171,10 @@ pub const DomainParticipantImpl = struct {
     fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
         const self = cast(ctx);
         return self.c_abi.get(self.alloc, ctx, &views);
+    }
+
+    fn vtGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+        return cast(ctx).alloc;
     }
 
     fn vtAsEntity(ctx: *anyopaque) DDS.Entity {

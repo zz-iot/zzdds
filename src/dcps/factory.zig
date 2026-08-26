@@ -111,11 +111,17 @@ pub const DomainParticipantFactoryImpl = struct {
         .get_qos = vtGetQos,
         .deinit = vtDeinit,
         .get_c_abi_handle = vtGetCAbiHandleFactory,
+        .get_allocator = vtGetAllocatorFactory,
     };
 
     fn vtGetCAbiHandleFactory(ctx: *anyopaque) *anyopaque {
         const self: *Self = @ptrCast(@alignCast(ctx));
         return self.fac_c_abi.get(self.alloc, ctx, &vtable);
+    }
+
+    fn vtGetAllocatorFactory(ctx: *anyopaque) std.mem.Allocator {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.alloc;
     }
 
     fn vtCreateParticipant(
