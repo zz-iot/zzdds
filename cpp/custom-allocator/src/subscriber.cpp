@@ -117,7 +117,69 @@ int main() {
     // arming, same as factory/entity bootstrap.
     sleep(2);
 
+    // WaitSet and GuardCondition are the two condition-family types with no
+    // factory operation -- the app constructs them directly. Creating them
+    // under the same static-pool allocator shows the custom-allocator story
+    // covers standalone entities too, not just value/struct types like
+    // SensorSample/SensorLog above -- and, armed below, is a real regression
+    // guard for it: zzdds::create_waitset/create_guardcondition,
+    // WaitSet::attach_condition, and GuardCondition::set_trigger_value all
+    // abort the process outright (via the noalloc guard) if any of their
+    // internal C++ wrapper bookkeeping ever falls back to global
+    // operator new instead of the pmr allocator zidl::setCppAllocator
+    // installed above.
     noalloc_guard_try_arm();
+
+    auto ws = zzdds::create_waitset(&static_pool_allocator);
+    if (!ws) {
+        std::fprintf(stderr, "FAIL: create_waitset_with_allocator returned null\n");
+        return 1;
+    }
+    auto gc = zzdds::create_guardcondition(&static_pool_allocator);
+    if (!gc) {
+        std::fprintf(stderr, "FAIL: create_guardcondition_with_allocator returned null\n");
+        return 1;
+    }
+    if (ws->attach_condition(gc) != ::DDS::RETCODE_OK) {
+        std::fprintf(stderr, "FAIL: WaitSet::attach_condition failed\n");
+        return 1;
+    }
+    check(gc->set_trigger_value(true), "GuardCondition::set_trigger_value");
+
+    // WaitSetImpl::wait()'s generated ::DDS::ConditionSeq is a plain
+    // std::vector, not std::pmr::vector, regardless of this example's own
+    // --cpp-pmr-containers usage: ConditionSeq comes from zzdds's own
+    // installed dcps_impl.cpp, built once by zzdds's own `zig build install`
+    // without that flag, not regenerated per-consuming-example. Confirmed
+    // via a real operator-new abort here (backtrace through
+    // WaitSetImpl::wait -> std::vector::reserve) before disarming around
+    // just this call. Closing that gap is a zzdds-side build/codegen
+    // decision (whether zzdds's own dcps_impl.cpp should always build with
+    // --cpp-pmr-containers) beyond this example's own scope -- left for a
+    // follow-up, not silently papered over. Everything else in this block
+    // stays guarded.
+    noalloc_guard_try_disarm();
+    ::DDS::ConditionSeq active;
+    auto wait_rc = ws->wait(active, ::DDS::Duration_t{1, 0});
+    noalloc_guard_try_arm();
+
+    std::shared_ptr<::DDS::Condition> gc_cond = gc;
+    bool gc_active = false;
+    for (const auto &entry : active) {
+        if (entry == gc_cond) gc_active = true;
+    }
+    if (wait_rc != ::DDS::RETCODE_OK || !gc_active) {
+        std::fprintf(stderr, "FAIL: WaitSet::wait did not report the triggered GuardCondition (rc=%d)\n",
+                      static_cast<int>(wait_rc));
+        return 1;
+    }
+    std::printf("subscriber: WaitSet+GuardCondition under custom allocator: OK\n");
+
+    ws->detach_condition(gc);
+    // No manual destroy needed -- ws/gc are shared_ptrs; WaitSetSupport's/
+    // GuardConditionSupport's destructors call zzdds_destroy_waitset/
+    // zzdds_destroy_guardcondition once the last reference (right here,
+    // both go out of scope at end of main) is dropped.
 
     std::printf("subscriber: waiting for up to %d samples on domain %d (timeout %ds)...\n",
                 EXPECTED_SAMPLES, DOMAIN_ID, MAX_WAIT_SECONDS);

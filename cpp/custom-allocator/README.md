@@ -31,6 +31,20 @@ Two sample types show two different allocation shapes:
   `zidl_cdr_set_allocator`, which only governs the CDR writer's own
   scratch-buffer growth). Both programs write/read both types in one run.
 
+The subscriber also creates a `WaitSet`+`GuardCondition` under the same
+allocator (`zzdds::create_waitset`/`create_guardcondition`) and exercises a
+real attach/trigger/`wait()` cycle — showing standalone entities (no factory
+operation creates these two types) are covered too, not just value/struct
+types like `SensorSample`/`SensorLog` above. One honest caveat, not papered
+over: `WaitSet::wait()`'s generated `::DDS::ConditionSeq` is a plain
+`std::vector`, not `std::pmr::vector` — it comes from zzdds's own installed
+`dcps_impl.cpp`, built once by zzdds's own `zig build install` without
+`--cpp-pmr-containers`, not regenerated per-consuming-example — so the
+noalloc guard is deliberately disarmed around just that one call (see the
+comment at its call site in `src/subscriber.cpp`). Everything else in this
+block, including `WaitSet`/`GuardCondition` creation and attachment
+themselves, stays guarded.
+
 ## Build and run
 
 ```sh

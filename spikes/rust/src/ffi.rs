@@ -32,6 +32,72 @@ pub const DDS_ANY_INSTANCE_STATE: DDS_InstanceStateMask = 65535;
 pub const DDS_TIME_INVALID_SEC: i32 = -1;
 pub const DDS_TIME_INVALID_NSEC: u32 = 4294967295;
 
+// ── Allocator-spike additions (queue item 5, generated-class-lifecycle-design.md) ──
+//
+// WaitSet/GuardCondition are opaque C-ABI handles, same shape as every other
+// entity in this file -- no new representation needed.
+pub type DDS_WaitSet = *mut c_void;
+pub type DDS_GuardCondition = *mut c_void;
+pub type DDS_Condition = *mut c_void;
+
+/// Mirrors `DDS_Duration_t_s` (dcps.h) -- a plain 2-field value struct, no
+/// hidden layout concerns.
+#[repr(C)]
+pub struct DDS_Duration_t {
+    pub sec: i32,
+    pub nanosec: u32,
+}
+
+/// Mirrors `DDS_Condition_seq` (dcps.h) -- same generic
+/// `{_maximum, _length, _buffer, _release}` shape as every other zzdds
+/// C-ABI sequence, element type `DDS_Condition` (an opaque handle, not a
+/// value type).
+#[repr(C)]
+pub struct DDS_ConditionSeq {
+    pub _maximum: u32,
+    pub _length: u32,
+    pub _buffer: *mut DDS_Condition,
+    pub _release: bool,
+}
+
+impl DDS_ConditionSeq {
+    pub fn empty() -> Self {
+        DDS_ConditionSeq { _maximum: 0, _length: 0, _buffer: std::ptr::null_mut(), _release: false }
+    }
+
+    /// Safe accessor over the raw buffer -- every element is a live
+    /// `DDS_Condition` handle for `0.._length` when this value was just
+    /// populated by a successful `DDS_WaitSet_wait()` call.
+    pub fn as_slice(&self) -> &[DDS_Condition] {
+        if self._buffer.is_null() || self._length == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self._buffer, self._length as usize) }
+        }
+    }
+}
+
+/// Mirrors `zidl_allocator.h`'s `ZidlAllocator` — the shared C
+/// allocator-vtable ABI zidl-generated code and zzdds's own C-ABI bootstrap
+/// both consume. `#[repr(C)]` + plain `extern "C" fn` pointers: fully
+/// expressible on *stable* Rust, no `#![feature(allocator_api)]` needed —
+/// this struct is FFI surface, not Rust's own per-object allocator trait
+/// machinery (see `spikes/rust/README.md`'s new "Allocator injection"
+/// section for why that distinction is the actual point of this spike).
+#[repr(C)]
+pub struct ZidlAllocator {
+    pub ctx: *mut c_void,
+    pub alloc: extern "C" fn(ctx: *mut c_void, len: usize, alignment: usize) -> *mut c_void,
+    pub resize: extern "C" fn(
+        ctx: *mut c_void,
+        ptr: *mut c_void,
+        old_len: usize,
+        new_len: usize,
+        alignment: usize,
+    ) -> bool,
+    pub free: extern "C" fn(ctx: *mut c_void, ptr: *mut c_void, len: usize, alignment: usize),
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum DDS_WriteKind {
@@ -225,4 +291,42 @@ unsafe extern "C" {
     pub fn spike_sizeof_writer_qos() -> usize;
     pub fn spike_sizeof_reader_qos() -> usize;
     pub fn spike_set_writer_reliable_keep_all(qos: *mut c_void);
+}
+
+unsafe extern "C" {
+    // ── Allocator-spike additions ──
+
+    pub fn zzdds_create_factory_with_allocator(
+        allocator: *const ZidlAllocator,
+    ) -> ZzddsDomainParticipantFactory;
+
+    pub fn zzdds_create_waitset_with_allocator(allocator: *const ZidlAllocator) -> DDS_WaitSet;
+    pub fn zzdds_waitset_is_nil(waitset: DDS_WaitSet) -> bool;
+    pub fn zzdds_destroy_waitset(waitset: DDS_WaitSet);
+
+    pub fn zzdds_create_guardcondition_with_allocator(
+        allocator: *const ZidlAllocator,
+    ) -> DDS_GuardCondition;
+    pub fn zzdds_guardcondition_is_nil(guardcondition: DDS_GuardCondition) -> bool;
+    pub fn zzdds_destroy_guardcondition(guardcondition: DDS_GuardCondition);
+
+    pub fn DDS_GuardCondition_set_trigger_value(self_: DDS_GuardCondition, value: bool) -> DDS_ReturnCode_t;
+    pub fn DDS_GuardCondition_as_DDS_Condition(child: DDS_GuardCondition) -> DDS_Condition;
+
+    pub fn DDS_WaitSet_attach_condition(self_: DDS_WaitSet, cond: DDS_Condition) -> DDS_ReturnCode_t;
+    pub fn DDS_WaitSet_detach_condition(self_: DDS_WaitSet, cond: DDS_Condition) -> DDS_ReturnCode_t;
+    pub fn DDS_WaitSet_wait(
+        self_: DDS_WaitSet,
+        active_conditions: *mut DDS_ConditionSeq,
+        timeout: *const DDS_Duration_t,
+    ) -> DDS_ReturnCode_t;
+    pub fn DDS_ConditionSeq_free(v: *mut DDS_ConditionSeq);
+
+    // static_pool_allocator.c (copied into this spike directory, same as
+    // spike_shim.c -- self-contained, not shared by path across spikes).
+    // Reused rather than reimplemented in Rust: the point of this spike is
+    // whether Rust can *consume* a ZidlAllocator across the C ABI, not
+    // whether Rust can implement one -- see README.md.
+    pub static static_pool_allocator: ZidlAllocator;
+    pub fn static_pool_allocator_reset();
 }

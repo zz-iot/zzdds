@@ -49,9 +49,10 @@ RELIABLE+KEEP_ALL on the writer QoS.
 ```sh
 cd zzdds && zig build -Dc-binding=true install
 cd ../zzdds-examples/spikes/rust
-gcc -shared -fPIC -I../../../zzdds/zig-out/include -o libspike_shim.so spike_shim.c
+gcc -shared -fPIC -I../../../zzdds/zig-out/include -o libspike_shim.so spike_shim.c static_pool_allocator.c
 cargo run                                  # real end-to-end loan, correct usage
 cargo build --example escape_attempt       # MUST fail to compile -- see Findings
+cargo run --example allocator_spike        # allocator-injection probe, see "Allocator injection" below
 ```
 
 ## What's here
@@ -78,6 +79,12 @@ cargo build --example escape_attempt       # MUST fail to compile -- see Finding
   dropped. Never run; only ever built, and only ever expected to fail —
   see the file's own doc comment before assuming this is a mistake if
   revisited later.
+- **`examples/allocator_spike.rs`** — the allocator-injection probe (added
+  later, see "Allocator injection" below): creates a factory, `WaitSet`, and
+  `GuardCondition` all under the same caller-supplied `ZidlAllocator`
+  (`static_pool_allocator.c`, copied in from `zzdds-examples/c/custom-
+  allocator/`, same self-contained-copy convention as `spike_shim.c`),
+  attaches/triggers/waits for the condition, and confirms it fired.
 
 ## Findings
 
@@ -159,6 +166,83 @@ The two real open items are narrower than "will this work at all":
   can change later without the Rust-side lifetime design needing to change
   with it.
 
+## Allocator injection
+
+A second, independent probe (`examples/allocator_spike.rs`), added later —
+does zzdds's `ZidlAllocator` C-ABI injection point (`allocator-strategy.md`,
+`docs/design/generated-class-lifecycle-design.md`) work from Rust, and what's
+the realistic ceiling for a real future Rust binding's create/destroy story,
+given Rust's *current stable* allocator ecosystem? The question this spike
+exists to answer, and the answer found:
+
+**The question has two genuinely different halves, and they get different
+answers.** "Can Rust *consume* a caller-supplied allocator across zzdds's
+C-ABI" and "can Rust's own standard collections (`Box<T>`, `Vec<T>`) be
+*generic* over that same allocator" sound like the same question but aren't
+— zzdds's injection point is a `#[repr(C)]` vtable struct crossing an FFI
+boundary; Rust's own per-object allocator support is a *language/stdlib*
+generic-parameter feature. They have independent stability stories.
+
+**1. Confirmed, real, end-to-end: Rust can consume `ZidlAllocator` today, on
+stable, with zero unstable features.** `ffi::ZidlAllocator` is a plain
+`#[repr(C)]` struct with `extern "C" fn` pointer fields — ordinary,
+always-been-stable Rust, ABI-identical to the C struct in `zidl_allocator.h`.
+`examples/allocator_spike.rs` reuses the existing `static_pool_allocator.c`
+(copied into this directory, not reimplemented in Rust — the question here
+is whether Rust can consume a `ZidlAllocator`, not whether it can author
+one), passes `&static_pool_allocator` to `zzdds_create_factory_with_allocator`
+/`zzdds_create_waitset_with_allocator`/`zzdds_create_guardcondition_with_allocator`,
+attaches the `GuardCondition` to the `WaitSet`, triggers it, and confirms a
+real `DDS_WaitSet_wait()` reports it fired — `cargo run --example
+allocator_spike` passes cleanly (`PASS`). **Proven, not just "ran without
+crashing"**: deliberately skipping `static_pool_allocator_reset()` (leaving
+the pool's free list genuinely empty) makes the very same run fail for real
+— `zzdds_create_factory_with_allocator: error.OutOfMemory`, factory returns
+nil — confirming the allocator is actually being consulted by zzdds's core,
+not silently bypassed to a process default. Reverting the skip restores the
+clean pass. Since `WaitSet`/`GuardCondition` specifically exercise this
+session's `get_allocator` vtable-accessor fix (`WaitSet::wait()`'s native
+temporary buffer, freed via the *entity's own* allocator rather than a
+process-wide guess), this run is also a second, independent, cross-language
+confirmation that fix holds — already verified in C/C++ via the
+`noalloc_guard` examples; this is the same claim from a third language.
+
+**2. Confirmed via a direct compiler check, not assumed: Rust's own
+*per-object* allocator generics (`Box<T, A>`/`Vec<T, A>`, `std::alloc::
+Allocator`) remain nightly-only.** This environment has stable Rust 1.85.0
+only (no `rustup`, no nightly toolchain available). A minimal snippet
+(`use std::alloc::Allocator; struct MyBox<T, A: Allocator> { .. }`) fails
+to compile on this stable toolchain with:
+  ```
+  error[E0658]: use of unstable library feature `allocator_api`
+   --> use std::alloc::Allocator;
+      = note: see issue #32838 <https://github.com/rust-lang/rust/issues/32838>
+  ```
+  Issue #32838 has been open since 2016 and is still unresolved as of this
+  toolchain. For contrast, confirmed separately that Rust's *other*,
+  *process-wide* allocator override — `#[global_allocator]`/`GlobalAlloc`
+  (what the old "Non-findings" bullet below used to name) — compiles and
+  runs fine on the same stable toolchain; it's simply a different mechanism
+  (one allocator for the whole process's `Vec`/`Box`/`String` ecosystem, not
+  a per-factory injection point), and not what zzdds's `ZidlAllocator`
+  contract needs or provides.
+
+**Bottom line, confirming the design doc's expected ceiling, not refuting
+it**: a real future Rust binding's standalone-entity create/destroy story
+(`WaitSet`/`GuardCondition`, and any future `@standalone`-annotated type)
+has a clean, idiomatic shape available *today*, on stable: an explicit
+`create_with_allocator(allocator: &ZidlAllocator) -> Self`-shaped
+constructor (exactly what this spike calls), paired with ordinary `Drop` for
+cleanup — the same "explicit factory function + caller-owned `Box`/`Drop`"
+shape `allocator-strategy.md`/the design doc's Decisions log already
+expected. What that ceiling rules out: Rust *binding-side* wrapper objects
+(an RAII guard analogous to `LoanedSample<'a>` above, or a hypothetical
+`WaitSet` wrapper struct) being *themselves* allocated through the injected
+`ZidlAllocator` via `Box<T, A>`-style generics — those stay on Rust's
+ordinary default allocator (or whatever `#[global_allocator]` is registered
+process-wide) until `allocator_api` stabilizes, which is a real, current,
+external constraint on the Rust ecosystem, not a zzdds/zidl design gap.
+
 ## Non-findings / not attempted
 
 - The contrasting "wrong lifetime, compiles anyway" version (`data()`
@@ -171,5 +255,10 @@ The two real open items are narrower than "will this work at all":
 - `pure` Rust mode (the non-`zig-ffi`, no-zzdds-dependency backend) is out
   of scope for this review entirely — it doesn't touch the C-ABI/interface
   questions this review is about.
-- Allocator-injection interaction with Rust's own allocator story
-  (`GlobalAlloc`, `no_std + alloc`) — not examined.
+- ~~Allocator-injection interaction with Rust's own allocator story
+  (`GlobalAlloc`, `no_std + alloc`) — not examined.~~ **Examined — see
+  "Allocator injection" above.** `GlobalAlloc`/`#[global_allocator]`
+  specifically wasn't needed or used: this probe's whole point is
+  *per-object* injection (a `ZidlAllocator*` passed to one factory), which
+  is a different mechanism than Rust's process-wide global allocator
+  override — see that section for why the two shouldn't be conflated.

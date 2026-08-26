@@ -17,6 +17,13 @@ Two sample types show two different allocation shapes:
   size-at-decode-time heap allocation, which is why `zidl_cdr_set_allocator`
   is also registered. Both programs write/read both types in one run.
 
+The subscriber also creates a `WaitSet`+`GuardCondition` under the same
+static-pool allocator (`zzdds_create_waitset_with_allocator`/
+`zzdds_create_guardcondition_with_allocator`) and exercises a real
+attach/trigger/`wait()` cycle — showing the custom-allocator story covers
+standalone entities (no factory operation creates these two types), not just
+value/struct types like `SensorSample`/`SensorLog` above.
+
 ## Build and run
 
 ```sh

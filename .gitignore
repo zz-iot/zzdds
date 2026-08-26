@@ -31,3 +31,10 @@ java/shape/zzdds.toml
 # tests write while a check is in flight.
 __pycache__/
 interop/.smoke-logs/
+
+# Cargo build output (spikes/rust) and the manually-built shim shared
+# library its README's Setup step produces (not a `cc`-crate build.rs
+# output, so cargo clean doesn't remove it -- same out-of-source spirit as
+# the CMake build/ ignore above, just Rust's own equivalent).
+target/
+*.so
