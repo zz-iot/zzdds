@@ -602,13 +602,13 @@ paper. Concerns, as invited:
    verified via unit tests plus a real, CI-tracked integration test proving struct-field
    allocation routes through `zidl::setCppAllocator`. Unlocks unbounded (and bounded) fields
    in idiomatic C++ under a caller-controlled allocator, opt-in since it's a source/ABI
-   break. Not yet in a tagged zidl release.
+   break. In a tagged zidl release as of `v0.3.11-zig.0.16.0`.
 6. Phase 5 — implement the missing `{Type}_free()` bodies (zidl) — **Done**, and wider in
    scope than originally described: also fixed two silent gaps found along the way
    (string-only structs and bounded-sequence-only structs got no `_free()` declared at all,
    not just "declared but bodyless"). Verified via unit tests, reviewed golden-fixture
-   diffs, and a real decode-then-free run proving exact alloc/free count matches. Not yet in
-   a tagged zidl release.
+   diffs, and a real decode-then-free run proving exact alloc/free count matches. In a
+   tagged zidl release as of `v0.3.11-zig.0.16.0`.
 7. Tier 2 (data-plane override) / Tier 3 (per-entity-kind override) — deferred, revisit
    only once Phase 1 ships and a real need for *separate* allocators (not just one
    configurable one) shows up.

@@ -87,8 +87,10 @@ it has instantiated. The field appears in `SPDPdiscoveredParticipantData.availab
 |  10 | BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_WRITER | P2P liveliness writer       |
 |  11 | BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_READER | P2P liveliness reader       |
 
-Zenzen DDS currently advertises bits 0-5 (`0x0000003F`). The P2P liveliness bits are
-defined in source but not set because the WLP endpoint is not instantiated.
+Zenzen DDS advertises bits 0-5 plus the two P2P liveliness bits 10-11 (`0x00000C3F`).
+The WLP endpoints are instantiated in `src/discovery/wlp.zig` (`WlpEndpoints`) and wired
+into `src/discovery/combined.zig` — see the Writer Liveliness Protocol section of
+`docs/roadmap.md`. The bitmask is built in `src/dcps/participant.zig` (`BUILTIN_ENDPOINTS`).
 
 ---
 

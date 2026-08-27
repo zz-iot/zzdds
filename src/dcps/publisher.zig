@@ -1,7 +1,9 @@
 //! PublisherImpl — DCPS Publisher implementation.
 //!
 //! A Publisher groups DataWriters under a common QoS policy and provides
-//! coherent-change semantics (deferred to a later phase).
+//! coherent-change semantics (begin/end_coherent_changes with a nesting
+//! counter and a two-phase end-of-coherent-set flush; see vtBeginCoherent /
+//! vtEndCoherent below).
 //!
 //! Entity lifecycle:
 //!   create_datawriter   → allocates DataWriterImpl + ProtocolWriter via participant cbs

@@ -6,8 +6,10 @@ zzdds client surfaces.
 ## Release Gates
 
 - Release zidl with `--generate-zzdds-wrappers` support for Zig, C, and C++.
+  *(done — shipped in `zidl v0.3.11-zig.0.16.0`.)*
 - Update `build.zig.zon` from the local `../zidl` path to the released zidl
   package URL/hash after that tag exists.
+  *(done — `build.zig.zon` pins `zidl v0.3.11-zig.0.16.0` by URL + hash.)*
 - Keep `idl/dcps.idl` normative and put zzdds-specific configuration and
   extension interfaces in `idl/zzdds.idl`.
 - Keep `include/zzdds_c.h` as a small support ABI for generated wrappers; prefer

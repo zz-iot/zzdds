@@ -1214,7 +1214,7 @@ manual elapsed-time tracking that fed them) and confirmed `on_offered_deadline_m
 `zig/shape` and dds-rtps's own zzdds `shape_main` port — plus re-verified the plain-match
 and CFT-filtering scenarios from the `setListenerEx` fix still pass unchanged.
 
-**Background thread usage — revisit holistically, not started.** Prompted directly by
+**Concurrency model — investigation + design task, not started.** Prompted directly by
 adding the DEADLINE/LIVELINESS timer thread above: that's the *tenth* `std.Thread.spawn`
 call site in zzdds, and — checked, not assumed — only five of the ten ever block on a
 socket (`UdpTransport` recv ×2, `TcpTransport` recv ×2, `TcpTransport` accept ×1). The
@@ -1233,14 +1233,25 @@ naturally per-object — heartbeat is lazily spawned only once a writer has a ma
 reader, SPDP timing is participant-specific — so consolidating *those* two is a separate,
 harder question, if it's worth doing at all.) Beyond consolidation: zzdds has never stated
 an overall concurrency strategy — one-thread-per-concern has just been the default every
-time a new periodic need came up. Worth deciding deliberately whether that stays the
-model, or whether some/all of this should move to Zig's `std.Io` async/evented
-abstractions instead (the same `Io` interface `zig/hello_world`'s portable sleep fix
-already uses) — and if so, whether that's an outright replacement or a configurable choice
-(thread-per-concern vs. a shared event loop) so different deployment targets (embedded/
-real-time vs. a normal server process) can pick what fits. Not scoped further than this;
-deciding the shape of that choice is the point of picking this up, not something to
-pre-decide here.
+time a new periodic need came up. The intended direction (to be validated by the design task, not pre-committed here): support
+**both** a direct-threading model and an evented model, user-selectable — build-time
+configuration is acceptable if a runtime switch proves impractical — so a normal server
+process and an embedded/real-time deployment can each pick what fits. The design must take
+in:
+
+- **RTOS and bare-metal embedded targets** — no OS threads, no `std.Io` event loop as it
+  exists for hosted targets; the evented path has to degrade to a single-threaded
+  `drive(timeout)`-style pump (see the "Single-threaded / embedded `drive(timeout)` API"
+  entry — that API is the embedded face of this same decision).
+- **Test strategy across build configurations** — correctness (ordering, liveliness,
+  teardown, no races) must be verified for every supported concurrency config, not just the
+  default; today's TSan lane assumes the threaded model. Decide how the suite parametrises
+  over the choice.
+- **Thread consolidation** as a sub-item — whether the periodic-tick threads
+  (DEADLINE/LIVELINESS, interface-change poll, wire-trace flush; possibly heartbeat and
+  SPDP) collapse onto one scheduler regardless of which concurrency model is selected.
+
+Output: a design doc; the roadmap keeps a one-paragraph pointer.
 
 **Resolved by the `v0.3.4-zig.0.16.0` pin bump (PR #59/#60).** At the time this was found,
 `zig build install -Dc-binding=true` (and therefore `-Dcpp-binding=true`/
@@ -1363,6 +1374,49 @@ after setting the flag can wait that long in the worst case. Negligible next to 
 multi-second issue above, but worth naming here so it isn't mistaken for a new mystery
 delay if someone's specifically hunting sub-100ms teardown latency later.
 
+**Keyed-instance handle without a wire key-hash — not started.** Without an inline
+`PID_KEY_HASH` on the sample or a registered `TypeSupport.compute_key_hash`, keyed samples
+all collapse to the NIL instance handle, so per-instance QoS (OWNERSHIP arbitration,
+KEEP_LAST-per-instance eviction, instance-state tracking) degrades to treating the topic as
+single-instance. The clean long-term fix is XTypes TypeLookup (below); a nearer-term option
+is to require `registerTypeSupport` for keyed topics and error rather than silently
+degrade. See `docs/implementation_status.md` "Known Limitations" and
+`docs/design/history-cache.md`.
+
+**Transport scatter-gather (`sendmsg`) — not started.** The `Transport` vtable has no
+vectored-send entry point; `MessageBuilder`'s iovec list is flattened into a single
+`[65536]u8` stack buffer at the transport boundary before every send. Adding a
+`writev`/`sendmsg`-style path (and a matching UDP/TCP implementation) removes that copy and
+the fixed size cap. See `docs/design/rtps-message-builder.md` and
+`docs/implementation_status.md`.
+
+**Single-threaded / embedded `drive(timeout)` API — not started.** Even a minimal
+two-participant setup runs several background threads (transport RX, SPDP, per-participant
+DEADLINE/LIVELINESS timer, per-writer heartbeat). An embedded target needs a
+`DomainParticipant.drive(timeout)` that pumps transport polling + `checkTimers()` from the
+caller's loop with no threads spawned. The design keeps this possible (non-blocking
+transport seams, explicit `checkTimers()`) but nothing implements it. Related to the
+"Background thread usage" holistic review above. See `docs/design/thread-model.md`.
+
+**Cross-binding DCPS API test-coverage buildout — not started.**
+`docs/design/dcps-api-coverage-audit.md` inventories the DCPS operations, statuses, and QoS
+behaviours with zero or unverified coverage across the four example bindings, and proposes
+two new test tiers on top of the existing Tier 1–4 model: an **Integration** tier
+(liveliness/status marshaling per binding, `enable()` semantics, late-joiner durability,
+ignore-* across processes, runtime CFT reconfiguration, coherent/ordered grouping
+atomicity, `_w_timestamp` propagation, `delete_contained_entities` across the C-ABI) and a
+**Stress** tier (reentrant-listener/entity-lifecycle churn, WaitSet/Condition churn under
+load, listener-fallback under load, many-participant SPDP/SEDP fan-in/out, rapid
+DataWriter/DataReader create/delete during SEDP matching). Harness is Python, reusing the
+examples' `_common.py` pattern. The audit doc is the working plan.
+
+**dds-rtps interop suite — upstream coverage gaps.** `docs/design/dds-rtps-interop-suite-audit.md`
+records areas the upstream OMG dds-rtps test suite doesn't exercise (RESOURCE_LIMITS,
+TRANSIENT/PERSISTENT durability behaviour, `--datafrag-size`, KEEP_LAST eviction, deadline
+re-arming, multi-topic, post-match ownership re-arbitration, BEST_EFFORT/MTU-boundary
+large data, XCDR1/2 content round-trip). These are gaps in the *upstream* suite, not zzdds
+work items — revisit only if we upstream fixes or need the coverage for our own validation.
+
 **Language bindings** — see `docs/language-bindings.md` for the distribution model
 (three-artifact structure, build flags, version coupling). Current status:
 
@@ -1461,6 +1515,28 @@ configuration surface yet, in zzdds itself or in the generated bindings.
 - **Tier 3 — per-entity-kind or per-topic overrides** (e.g. distinct pools for readers vs.
   writers). Explicitly deferred — plausible eventually as an optional override on top of
   Tier 1/2's default-from-parent, but not designed; don't build ahead of a real use case.
+
+**Investigation + design task — CDR-layer allocator scoping vs. the entity layer.** There
+is a real seam between two allocator layers that Tier 2/3 sit on top of, and it needs a
+decision before either is built:
+
+- The **entity layer** already takes per-entity allocators — `zzdds_create_factory_with_allocator`
+  and the `_with_allocator` entity constructors — so different participants/readers/writers
+  *can* use different allocators for their own impl structs and history-cache storage.
+- The **CDR layer** (`zidl-cdr`, used to decode string/sequence fields *inside* samples) is
+  a single **process-wide** global by an explicit zidl design decision (`zidl_cdr_set_allocator`;
+  see zidl roadmap "Known Gaps") — a decoded field is later freed by a generated
+  `{Type}_free()` with no per-call or per-entity context, so there is nowhere to record
+  "which allocator made this."
+
+The consequences to resolve: (1) Tier 2's "separate data-plane allocator" premise is only
+partly achievable while CDR-decoded field storage is process-wide; (2) the
+generated-class-lifecycle doc already documents a correctness hazard when an entity's
+`_with_allocator` allocator differs from the process-wide CDR one (alloc/free mismatch on
+sample field buffers). Options span: promote the CDR allocator to per-participant (a zidl
+API change), constrain entity allocators to always equal the process-wide CDR one
+(document + assert), or split "scratch/temp" from "owned sample field storage" so only the
+former is per-entity. Output should be a short design doc; roadmap keeps a pointer.
 
 **C++ generated binding allocator injection** — a separate, harder axis from the tiers
 above; full analysis (including a second, previously-untracked allocation surface found
@@ -2289,7 +2365,20 @@ there's no real audience being misdirected by leaving it up for now).
   deferred unless a use case needs stricter behavior.
 - **Platform-specific InterfaceMonitors** — `monitor/netlink.zig` (Linux) and
   `monitor/pf_route.zig` (macOS) deferred; polling monitor is sufficient.
-- **SHMEM transport** — deferred; UDP covers current use cases.
+- **True zero-copy / raw native-representation (POD) loans** — out of scope, not just
+  deferred. A loan path that hands the application a pointer to an unserialized,
+  fixed-layout native struct is fundamentally at odds with IDL as a platform-agnostic data
+  representation, and with the QoS, security, and RTPS wire assumptions the rest of the
+  stack is built on — close to an anti-feature for a real DDS implementation. Applications
+  that need that class of performance should use a mechanism that doesn't carry
+  representation-independence, QoS, or security. The existing **raw-byte loan** APIs
+  (`take_raw`/`read_raw`/`loan_raw` — the application serializes directly into, or reads
+  directly out of, an internal CDR buffer) stay and are the supported "avoid a copy" path.
+  Still open as possible future work, tracked separately: using SHMEM for the
+  **History Cache** (with RTPS/UDP scaffolding, as Connext does), and a **SHMEM transport**
+  alongside UDP/TCP. Neither implies zero *serialization*.
+- **SHMEM transport** — not in v1; UDP covers current use cases. Possible later, alongside
+  UDP/TCP (see the zero-copy note above for scope boundaries).
 - **Other protocol/discovery plugins** — QUIC, MQTT, custom hardware channels, and
   mDNS/DNS-SD are extension points only; no v1 implementation is planned.
 - **PKCS#11** — out of scope for v1; security plugin interface must not preclude it.
