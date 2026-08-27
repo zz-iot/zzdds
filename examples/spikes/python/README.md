@@ -1,7 +1,7 @@
 # spikes/python
 
 Not a Python binding. A throwaway probe answering two specific questions
-raised in zidl's `docs/roadmap.md` ("Binding design review: interfaces vs.
+raised in `zidl/docs/design/binding-c-abi-identity.md` (
 impls, inheritance, and C-ABI identity" and the "Other complications" list
 under it) *before* that review commits to a real Python backend design:
 
@@ -69,8 +69,7 @@ default relative zzdds checkout path; override with `ZZDDS_LIB`/
 
 - **`probe1_deadline_timer.py`** — creates one reader with a 1s DEADLINE
   period on a topic nobody writes to, and waits for zzdds's per-participant
-  timer thread (spawned unconditionally, ticks every 100ms — see zzdds's
-  own roadmap "DEADLINE/LIVELINESS QoS is now enforced automatically") to
+  timer thread (spawned unconditionally, ticks every 100ms — see `zzdds/CHANGELOG.md` (2026-08-06, DEADLINE/LIVELINESS auto-enforcement)) to
   fire `on_requested_deadline_missed` into Python repeatedly, entirely on
   its own. Cheapest possible "unknown native thread calls into Python"
   check — no writer, no data flow, no second process.
@@ -171,8 +170,7 @@ attached to it. Real ownership is: automatic and tied to the parent
 `ReadCondition`/`QueryCondition` (explicit `delete_readcondition()`, or
 implicit at reader teardown); and — the sharp case — tied to the
 *application itself* for `GuardCondition`, which has no owning factory at
-all. zzdds's own condition/`WaitSet` lifecycle fix (see zzdds's
-`docs/roadmap.md` "WaitSet / condition example") already guarantees the
+all. zzdds's own condition/`WaitSet` lifecycle fix (see `zzdds/CHANGELOG.md` (2026-08-09/10)) already guarantees the
 *memory-safety* half of this is handled: destroy a condition's true owner
 while it's still attached, with no explicit `detach_condition()` first, and
 `WakeupList.invalidateAll()`/`unregisterFromCondition()` (confirmed by

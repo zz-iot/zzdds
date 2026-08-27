@@ -27,7 +27,7 @@
  * own independent identity cache -- never the same C++ object as the
  * GuardConditionSupport/StatusConditionImpl this program already holds, even
  * though both refer to the same underlying condition (see zidl's
- * docs/roadmap.md "Binding design review: decision" for the raw-C-ABI-handle
+ * `zidl/docs/design/binding-c-abi-identity.md` for the raw-C-ABI-handle
  * fix, and its "shared-family _getOrCreate cache" follow-up for the
  * C++-wrapper-layer fix this specifically needed on top of that -- the raw
  * handle alone wasn't enough, since every condition subtype kept its own

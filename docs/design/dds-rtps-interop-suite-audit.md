@@ -25,9 +25,9 @@ this one.** `srcC` implements this (validated ≤65535 bytes, RTPS spec-referenc
 error message) — sets the DATA_FRAG fragment size directly, independent of payload size.
 zzdds's shape had `--additional-payload-size` for large payloads but no way to pin a
 specific fragment size, so it couldn't participate in any test case that targets a
-fragmentation boundary precisely rather than just "payload is large." See `docs/roadmap.md`'s
-"`-Z`/`--datafrag-size` rolled out to every `shape` port" entry for the full writeup,
-including two real bugs found along the way (a silently-broken `--periodic-announcement` in
+fragmentation boundary precisely rather than just "payload is large." See `CHANGELOG.md`
+(2026-08-20) for the full writeup, including two real bugs found along the way (a
+silently-broken `--periodic-announcement` in
 all five ports, and a serious C-ABI/Zig-native struct-layout mismatch in
 `create_participant_ex`/`get_default_participant_config`/`set_default_participant_config`
 affecting every non-Zig-native caller, not fixed yet). This directly unblocks item 5 below.

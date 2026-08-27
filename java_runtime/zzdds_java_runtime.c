@@ -24,8 +24,8 @@
  * box-identity cache itself -- otherwise WaitSet.wait()'s generic
  * zidl_java_box_DDS_Condition would still construct an unrelated second
  * object for the same handle, even with the shared cache in place on the
- * generated side. See zzdds's docs/roadmap.md and zidl's docs/roadmap.md
- * "Binding design review: decision" for the fuller writeup. */
+ * generated side. See zidl/docs/design/binding-c-abi-identity.md and
+ * zidl/CHANGELOG.md (v0.3.5) for the fuller writeup. */
 extern void _zidl_family_DDS_Condition_register_external(JNIEnv *env, void *handle, jobject obj);
 
 /* GetFieldID fails (leaving a pending NoSuchFieldError) for any object
@@ -66,8 +66,8 @@ static void *zzdds_java_unbox(JNIEnv *env, jobject obj) {
  * whole JVM down instead of a catchable Java exception. Found via Greptile
  * PR #67 review flagging it on the two new functions added there
  * (configureFromFile/asZzddsFactory), then generalized here to every call
- * site in this file with the same risk profile -- see docs/roadmap.md's
- * matching entry for the full audit. Deliberately NOT applied to the
+ * site in this file with the same risk profile -- see CHANGELOG.md
+ * (2026-08-20) for the full audit. Deliberately NOT applied to the
  * handful of call sites where null already has real, documented meaning:
  * destroyWaitSet/destroyGuardCondition's idempotent-destroy convention,
  * cftMatchSample's cft==NULL "no filter" convention, and
@@ -202,7 +202,7 @@ static bool zzdds_java_get_or_cache_class(JNIEnv *env, zzdds_java_class_cache *c
  * structurally cannot, short of a live-handle registry this project has
  * nowhere else either) catch a *stale* handle -- a real, correctly-typed
  * wrapper whose underlying native entity has since been destroyed; see
- * docs/roadmap.md's matching entry for why that's out of scope here.
+ * docs/roadmap.md's "Bindings" gap ("JNI: no stale-handle detection").
  *
  * Reuses zzdds_java_class_cache/zzdds_java_get_or_cache_class (both just
  * above) rather than a standalone `static jclass` -- concrete classes have
@@ -896,8 +896,8 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsDataWriter(
 
 /* Mirrors zzdds_c.h's zzdds_process_configure_from_file -- a plain string-in,
  * retcode-out call, so (unlike create_participant_ex/get_default_participant_
- * config's DomainParticipantConfig struct parameter -- see this project's own
- * roadmap for the ABI gap there) there is no struct-marshaling risk here. */
+ * config's DomainParticipantConfig struct parameter -- see CHANGELOG.md
+ * (2026-08-20) for the ABI gap there) there is no struct-marshaling risk here. */
 JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_configureFromFile(
     JNIEnv *env, jclass self_cls, jstring path)
 {

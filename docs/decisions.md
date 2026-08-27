@@ -2,7 +2,7 @@
 
 Stable decisions with rationale. These are invariants that new code should not
 inadvertently violate. For implementation status see `docs/implementation_status.md`;
-for future work see `docs/roadmap.md`.
+for future work see `docs/roadmap.md`; for the change history see `CHANGELOG.md`.
 
 ---
 
@@ -106,6 +106,17 @@ mechanism (`reader.zig`'s `pinSamplesForLoan`/`takeSamplesForLoan`, `EntityQuies
 sitting alongside `readRaw`/`takeFiltered`'s existing copy semantics, exactly as predicted
 — `readRaw`'s own copy-returning behavior was untouched.
 
+**Loans are raw *bytes*, not zero serialization (2026-08-27).** `take_raw`/`read_raw`/
+`loan_raw` let the application serialize directly into, or read directly out of, an internal
+CDR buffer — that saves the marshaling-boundary copy, and the bytes are still CDR. A loan
+that hands back a pointer to an unserialized, fixed-layout native struct (as ROS2 RMW's
+POD-only loan contract wants) is **out of scope**: it is fundamentally at odds with IDL as a
+platform-agnostic data representation, and with the QoS, security, and RTPS wire assumptions
+the rest of the stack relies on. Applications needing that class of performance should use a
+mechanism that doesn't carry representation-independence, QoS, or security. Using SHMEM for
+History Cache *storage* (still CDR) and a SHMEM transport alongside UDP/TCP remain possible
+future work; neither implies zero serialization. See `docs/design/raw-loan-api.md`.
+
 **QoS incompatibility notification: listener callbacks and StatusCondition, both.**
 Per DDS spec §2.2.4. `on_offered_incompatible_qos` / `on_requested_incompatible_qos`
 listeners are called; the corresponding `StatusCondition` is also set.
@@ -140,8 +151,8 @@ decision's own framing ("add a new listener interface/method", not "add a new st
 
 Implementing this required a zidl generator fix: cross-module `@callback interface`
 inheritance (a `zzdds.idl` callback interface inheriting a `dcps.idl` one via `import`) had
-never been exercised before and silently dropped the base's methods. See the zidl repo's
-`docs/roadmap.md` for the generator-side fix; it also uncovered that entity interfaces share
+never been exercised before and silently dropped the base's methods. See `zidl/CHANGELOG.md`
+and `zidl/docs/decisions.md` for the generator-side fix; it also uncovered that entity interfaces share
 the same flattening code, which would have required unrelated new work in
 `c_abi/extensions.zig` and hit an existing C++ backend limitation
 (`error.MultipleNativeHandleBases`) — the zidl fix is deliberately scoped to only fill

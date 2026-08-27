@@ -3,8 +3,7 @@
  *
  * This whole directory is a throwaway probe for the "foreign-thread calls
  * into the GIL" and "ctx pointer lifetime" questions recorded in zidl's
- * roadmap ("Binding design review: interfaces vs. impls, inheritance, and
- * C-ABI identity"), before that review commits to a real Python backend
+ * design doc (zidl/docs/design/binding-c-abi-identity.md), before that review commits to a real Python backend
  * design. See README.md in this directory for what each probe script is
  * actually checking and why.
  *

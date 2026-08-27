@@ -7,7 +7,7 @@ Creates a participant + a keyless topic + a subscriber + one DataReader with
 a 1-second DEADLINE period, on a topic nobody ever writes to. Nothing else
 happens. zzdds's per-participant timer thread (spawned unconditionally in
 DomainParticipantImpl.start(), ticking every 100ms, see zzdds's own
-docs/roadmap.md "DEADLINE/LIVELINESS QoS is now enforced automatically")
+`zzdds/CHANGELOG.md` (2026-08-06))
 fires DDS_DataReaderListener.on_requested_deadline_missed once per second,
 forever, entirely on its own -- no writer, no data flow, no second process.
 

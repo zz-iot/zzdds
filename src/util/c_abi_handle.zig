@@ -7,7 +7,7 @@
 //! identity-stable across repeated calls (e.g. `get_topic()` called twice
 //! returns the same handle) and prevents a widened-view accessor
 //! (`get_entity()`, `get_topicdescription()`) from leaking a fresh box on
-//! every call — see zidl's roadmap "Entity handle ABI: heap-boxing".
+//! every call — see `zidl/docs/design/binding-c-abi-identity.md`.
 //!
 //! A concrete impl that presents more than one distinct (ptr, vtable) view of
 //! itself — e.g. `TopicImpl` implements `Topic`, `Entity`, and

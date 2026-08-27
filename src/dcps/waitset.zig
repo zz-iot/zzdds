@@ -188,8 +188,8 @@ pub const WakeupList = struct {
 /// being destroyed while still attached) — mirroring `release_listener_data`'s
 /// contract (see `docs/decisions.md`) one level up: a binding that wants to
 /// know when it's safe to release its own keep-alive for an attached
-/// condition (a real gap with no existing hook — see zidl/docs/roadmap.md
-/// "Binding design review: decision") now has one. A plain `attach_condition()`
+/// condition (a real gap with no existing hook — see
+/// `zidl/docs/design/binding-c-abi-identity.md`) now has one. A plain `attach_condition()`
 /// call (the spec-mandated op) leaves both fields null; nothing fires for it
 /// — only `attachConditionWithRelease` populates them.
 pub const AttachedCondition = struct {
@@ -712,9 +712,9 @@ pub const GuardConditionImpl = struct {
     trigger: std.atomic.Value(bool),
     wakeups: WakeupList,
     /// One box for the whole object, shared across every interface view
-    /// (GuardCondition, Condition) — see `views` below and zidl/docs/roadmap.md
-    /// "Binding design review: decision" for why this replaces what used to be
-    /// two independently-cached, independently-addressed boxes.
+    /// (GuardCondition, Condition) — see `views` below and
+    /// `zidl/docs/design/binding-c-abi-identity.md` for why this replaces what
+    /// used to be two independently-cached, independently-addressed boxes.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
     /// Guards the *opposite* direction from WakeupHandle/quiesce above on
     /// WaitSetImpl: that mechanism protects a WaitSet from being freed while
@@ -930,7 +930,7 @@ pub const ReadConditionImpl = struct {
     owner_qc: ?*QueryConditionImpl = null,
     /// One box for the whole object, shared across every interface view
     /// (ReadCondition, Condition) — see `views` below and
-    /// zidl/docs/roadmap.md "Binding design review: decision". Unused (never
+    /// zidl/docs/design/binding-c-abi-identity.md. Unused (never
     /// populated) when `owner_qc != null`: an embedded `rc`'s own C-ABI
     /// identity is `owner_qc`'s box instead — see `vtGetCAbiHandleReadCondition`/
     /// `vtGetCAbiHandleCondition`'s `owner_qc` redirect below, which is what
@@ -1172,7 +1172,7 @@ pub const StatusConditionImpl = struct {
     wakeups: WakeupList,
     /// One box for the whole object, shared across every interface view
     /// (StatusCondition, Condition) — see `views` below and
-    /// zidl/docs/roadmap.md "Binding design review: decision".
+    /// zidl/docs/design/binding-c-abi-identity.md.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();
@@ -1465,8 +1465,8 @@ pub const QueryConditionImpl = struct {
     // native value's `.vtable` is `ReadConditionImpl.vtable` (NOT
     // `rc_thunk_vtable` below) — unchanged from before this file's C-ABI
     // identity fix, since native Zig-to-Zig dispatch through `&self.rc` was
-    // never the bug (see zidl/docs/roadmap.md "Binding design review:
-    // decision"; only C-ABI box *addresses* diverged). `rc_thunk_vtable` is
+    // never the bug (see `zidl/docs/design/binding-c-abi-identity.md`; only
+    // C-ABI box *addresses* diverged). `rc_thunk_vtable` is
     // reached only via `ReadConditionImpl.vtGetCAbiHandleReadCondition`'s own
     // `owner_qc` redirect, i.e. only when *boxing* for the C-ABI boundary.
     fn vtAsReadCondition(ctx: *anyopaque) DDS.ReadCondition {

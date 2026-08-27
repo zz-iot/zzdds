@@ -19,8 +19,8 @@
  * is `==`-comparable against what wait() returns for the same underlying
  * condition. Previously worked around here by calling each condition's own
  * get_trigger_value() directly instead, because that identity didn't hold
- * at the C-ABI level -- see zidl/docs/roadmap.md "Binding design review:
- * decision" for the bug and its fix.
+ * at the C-ABI level -- see zidl/docs/design/binding-c-abi-identity.md for
+ * the bug and its fix.
  *
  * After the run completes, delete_datawriter() is called WITHOUT first
  * detaching the writer's StatusCondition from the WaitSet -- deliberately,

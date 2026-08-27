@@ -3,8 +3,8 @@
 A pub/sub example built around zzdds's participant/factory-level
 configuration APIs — the knobs that sit outside standard DDS QoS entirely
 (transport selection, RTPS fragment size, SPDP timing, ...). Per
-`zzdds/docs/design/dcps-api-coverage-audit.md` and this project's own
-roadmap, `create_participant_ex`/`set_default_participant_config`/
+`zzdds/docs/design/dcps-api-coverage-audit.md` and `zzdds/CHANGELOG.md`
+(2026-08-20), `create_participant_ex`/`set_default_participant_config`/
 `get_default_participant_config` had **zero** cross-language exercise
 anywhere in this project before this example — every existing use of them
 (`zig/shape`, `dds-rtps`'s zzdds port) is a pure-Zig call that never
@@ -90,8 +90,8 @@ zidl's C-ABI mirror-struct fix shipped in zidl `v0.3.7-zig.0.16.0`
 against the real pinned release, not just a local checkout: the full
 3-sample pub/sub exchange passes end-to-end on `c`/`cpp`/`java`, not just
 the round-trip assertion in isolation. The fix and its verification are
-written up in `zzdds/docs/roadmap.md`. The account below of the original
-bug is kept for reference.
+written up in `zzdds/CHANGELOG.md` (2026-08-20). The account below of the
+original bug is kept for reference.
 
 Originally, the programmatic round-trip check crashed or failed on
 `c`/`cpp`/`java`; only `zig/participant-config` passed cleanly (a pure-Zig
@@ -124,7 +124,7 @@ across all three affected bindings, each failing a different way:
 Full root-cause writeup, the exact affected operations (these three, plus
 `get_discovered_topic_data`/`get_matched_publication_data`/
 `get_matched_subscription_data` — see the `discovery` example), and
-candidate fixes are in `zzdds/docs/roadmap.md`. **Deliberately not fixed as
+the fix are in `zzdds/CHANGELOG.md` (2026-08-20). **Deliberately not fixed as
 part of building this example** — the fix belongs in zidl's C-ABI codegen,
 not in application code, and this example's job was to prove the bug and
 give the eventual fix a concrete, cross-language regression test, not to
@@ -136,7 +136,7 @@ port/participant-id fields, reachable from `DomainParticipantConfig`) used
 the wrong method descriptor and crashed on a NULL `jmethodID` before ever
 reaching the bug above — fixed in zidl (`src/backend/java.zig`), with a
 regression test, released in the same `v0.3.7-zig.0.16.0` bundle as the
-fix above (see the roadmap entry for that fix specifically).
+fix above (see `zzdds/CHANGELOG.md`, 2026-08-20).
 
 ## Deliberately out of scope
 

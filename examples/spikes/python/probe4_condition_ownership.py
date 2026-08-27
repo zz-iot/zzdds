@@ -12,7 +12,7 @@ wrapper itself is garbage collected (the natural, RAII-shaped thing a binding
 author would likely write), attaching it to a WaitSet and then letting your
 only Python reference drop is completely legal per spec and silently
 undoes the attachment. zzdds's own condition/WaitSet lifecycle fix (see
-zzdds's docs/roadmap.md "WaitSet / condition example") already guarantees
+`zzdds/CHANGELOG.md` (2026-08-09/10)) already guarantees
 this can't dangle a pointer -- this probe isn't re-testing that. It's
 testing the layer above: given that guarantee, what does premature,
 GC-triggered destruction actually look like from the application's side?

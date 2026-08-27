@@ -20,8 +20,8 @@ struct types these operations return. `participant-config`'s own scope
 stopped at the `zzdds.idl` operations it happened to be exercising when it
 found the bug; this example exists to give the `dcps.idl` half — the three
 operations above — the same real, cross-language regression coverage,
-closing out the full affected-operation list from
-`zzdds/docs/roadmap.md`.
+closing out the full affected-operation list from `zzdds/CHANGELOG.md`
+(2026-08-20).
 
 ## The type
 
@@ -110,7 +110,7 @@ was borrowed or owned. So `c`/`cpp`/`java`'s ports **do** need to free what
 `get_matched_publication_data` write back (`DDS_TopicBuiltinTopicData_free`
 and friends) — see each port's own README/source for exactly where.
 
-## The bug this closes out (see `participant-config` and `zzdds/docs/roadmap.md` for the full writeup)
+## The bug this closes out (see `participant-config` and `zzdds/CHANGELOG.md`, 2026-08-20)
 
 `participant-config` found and zidl now fixes a C-ABI struct-layout
 mismatch with two independent halves: a `_toml_applied`-bookkeeping-field

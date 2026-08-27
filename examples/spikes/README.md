@@ -16,13 +16,13 @@ not a signal that a Python/Go/Haskell/Rust binding exists or is imminent.
 These aren't dead code. Several real, load-bearing engineering decisions
 trace directly back to a specific probe in this directory — the C-ABI
 cross-view identity bug that drove zidl's whole "Binding design review"
-(see `zidl/docs/roadmap.md`) was first caught here, and this session reused
+(see `zidl/docs/design/binding-c-abi-identity.md`) was first caught here, and this session reused
 the Rust spike directly to verify a retcode-convention fix rather than
 trusting the original finding from memory. Findings are written up in each
 spike's own `README.md`, and the decisions they fed are recorded in
-`zidl/docs/roadmap.md` and `zzdds/docs/roadmap.md` — search those for
-`spikes/python`, `spikes/go`, `spikes/haskell`, `spikes/rust`, or a probe's
-own flag names (e.g. `--vanish`/`--crash`) to find the specific decision a
+`zidl/docs/design/binding-c-abi-identity.md`, `zidl/docs/decisions.md`, and the
+two `CHANGELOG.md` files — see also each spike's own `README.md` for the
+probe-level detail (`--vanish`/`--crash` etc.) behind the specific decision a
 given finding informed.
 
 Kept as real, re-runnable code (not just prose) specifically because

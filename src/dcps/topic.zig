@@ -44,7 +44,7 @@ pub const TopicImpl = struct {
     inconsistent: DDS.InconsistentTopicStatus,
     // Topic's primary base is Entity (`Topic : Entity, TopicDescription` —
     // Entity listed first); TopicDescription is a *secondary* base and, per
-    // zidl/docs/roadmap.md "Binding design review: decision", can't share a
+    // zidl/docs/design/binding-c-abi-identity.md, can't share a
     // box with the primary chain — it keeps its own independent box
     // (`td_c_abi`/`td_views` below), permanently. `c_abi` is shared across
     // every view on the PRIMARY chain instead: Topic, Entity, and (see
@@ -331,7 +331,7 @@ pub const ContentFilteredTopicImpl = struct {
     parsed_expr: ?*filter_mod.AstNode,
     /// One box for the whole object, shared across both interface views
     /// (TopicDescription, ContentFilteredTopic) — see `views` below and
-    /// zidl/docs/roadmap.md "Binding design review: decision".
+    /// zidl/docs/design/binding-c-abi-identity.md.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();

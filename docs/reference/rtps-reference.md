@@ -67,7 +67,7 @@ p2p_builtin_participant_msg_reader:   { key={00,02,00}, kind=0xC7 }
 These entity IDs are defined in `src/rtps/guid.zig`. The `p2p_builtin_participant_message_writer/reader`
 endpoints implement the Writer Liveliness Protocol (§8.4.13) in `src/discovery/wlp.zig`
 (`WlpEndpoints`), wired into `src/discovery/combined.zig`'s `SpdpSedpDiscovery` alongside SPDP and
-SEDP -- see `docs/roadmap.md` for the rollout notes.
+SEDP -- see `CHANGELOG.md` (2026-08-19) for the rollout notes.
 
 ---
 
@@ -89,8 +89,8 @@ it has instantiated. The field appears in `SPDPdiscoveredParticipantData.availab
 
 Zenzen DDS advertises bits 0-5 plus the two P2P liveliness bits 10-11 (`0x00000C3F`).
 The WLP endpoints are instantiated in `src/discovery/wlp.zig` (`WlpEndpoints`) and wired
-into `src/discovery/combined.zig` — see the Writer Liveliness Protocol section of
-`docs/roadmap.md`. The bitmask is built in `src/dcps/participant.zig` (`BUILTIN_ENDPOINTS`).
+into `src/discovery/combined.zig` (see `CHANGELOG.md`, 2026-08-19). The bitmask is built in
+`src/dcps/participant.zig` (`BUILTIN_ENDPOINTS`).
 
 ---
 

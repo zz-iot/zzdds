@@ -9,7 +9,7 @@ kind of pub/sub flow, reached through `wait()` instead of callbacks.
 
 This is also the first example to exercise `WaitSet`/`GuardCondition`
 construction at all: before the work this example was built alongside, no
-binding had a way to construct either (see zzdds's `docs/roadmap.md`).
+binding had a way to construct either (see `zzdds/CHANGELOG.md`, 2026-08-09/10).
 
 ## The type
 
@@ -61,7 +61,7 @@ One `WaitSet`, four conditions attached at once:
   (what the OMG spec calls `take_w_condition`) on every binding — this
   example is what surfaced that the whole `_w_condition` family was missing
   from every binding's generated typed reader/writer, not just Zig's; see
-  zidl's roadmap for the full spec-completeness writeup that followed.
+  `zidl/CHANGELOG.md` (v0.3.0-v0.3.4) for the spec-completeness writeup.
 - `ReadCondition` (any sample/view/instance state) — everything the
   `QueryCondition` pass didn't take. `take_w_condition` and the plain
   filtered take that follows are two separate calls, each independently

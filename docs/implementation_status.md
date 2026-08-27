@@ -1,7 +1,8 @@
 # Zenzen DDS — Implementation Status
 
 Source-backed reference for what is and isn't implemented. See `docs/roadmap.md` for
-planned work. See `docs/decisions.md` for stable design decisions with rationale.
+planned work, `CHANGELOG.md` for the change history, and `docs/decisions.md` for stable
+design decisions with rationale.
 
 ---
 

@@ -143,8 +143,8 @@ pub const PublisherImpl = struct {
     group_seq_num_counter: i64,
 
     /// One box for the whole object, shared across every interface view
-    /// (Publisher, Entity) — see `views` below and zidl/docs/roadmap.md
-    /// "Binding design review: decision".
+    /// (Publisher, Entity) — see `views` below and
+    /// `zidl/docs/design/binding-c-abi-identity.md`.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();

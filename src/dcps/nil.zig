@@ -52,7 +52,7 @@ var nil_sc_vtable = DDS.StatusCondition.Vtable{
 };
 var nil_sc_c_abi: c_abi_handle.CachedCAbiHandle = .{};
 // `DDS.StatusCondition`/`.Condition` are `@shared_c_abi_box`-annotated (see
-// zidl/docs/roadmap.md "Binding design review: decision") -- `unboxAsView`
+// zidl/docs/design/binding-c-abi-identity.md) -- `unboxAsView`
 // expects every box for these types to hold a `CAbiViews` pointer, not a
 // bare flat `Vtable` pointer, including nil sentinels: a nil condition can
 // legitimately be boxed and passed where a C signature declares the base
@@ -886,7 +886,7 @@ pub const nil_topic = DDS.Topic{ .ptr = NIL_PTR, .vtable = &nil_topic_vtable };
 var nil_topic_c_abi: c_abi_handle.CachedCAbiHandle = .{};
 // Primary base only (Entity) -- TopicDescription is Topic's *secondary* base
 // and never shares a box, same rule as the real TopicImpl (see
-// zidl/docs/roadmap.md "Binding design review: decision").
+// zidl/docs/design/binding-c-abi-identity.md).
 const nil_topic_views = DDS.Topic.CAbiViews{
     .base = .{ .flat_vtable = &nil_entity_vtable },
     .flat_vtable = &nil_topic_vtable,
