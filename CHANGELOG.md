@@ -159,11 +159,17 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   themselves. Scoped to one thread per participant.
 - Fixed a standing Zig build-graph bug (unrelated to this work) found along the way.
 
-## dds-rtps interop validation (Phase 33) — complete
+## dds-rtps shape interop validation (Phase 33) — complete
 
-Self-interop CI job (48/48, gates release); zenzen↔zenzen 100%; FastDDS, OpenDDS, RTI
-Connext, Cyclone DDS all 48/48 bidirectional (Cyclone's two CFT cases are
-`SUB_UNSUPPORTED_FEATURE` in its own `shape_main` — a test-infra gap, not a wire issue).
+The OMG **dds-rtps shape** interop suite (48 cases): self-interop CI job 48/48 (gates
+release); zenzen↔zenzen 100%; FastDDS, OpenDDS, RTI Connext, Cyclone DDS all 48/48
+bidirectional (Cyclone's two CFT cases are `SUB_UNSUPPORTED_FEATURE` in its own
+`shape_main` — a test-infra gap, not a wire issue).
+
+This does **not** cover GROUP_PRESENTATION coherent-set interop, which uses a separate,
+larger suite — RTI Connext still has 5 open zzdds→Connext gaps there
+(`CoherentSets_8/10/11/12`, `OrderedAccess_8`); see `docs/implementation_status.md` and the
+roadmap's "DCPS / QoS" gaps.
 
 ## Earlier (through 2026-08-05)
 
