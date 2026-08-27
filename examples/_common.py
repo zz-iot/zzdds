@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared helpers for zzdds-examples' Python build/run/smoke-test scripts.
+"""Shared helpers for zzdds's examples/ Python build/run/smoke-test scripts.
 
 Common across interop/*.py, java/*.py, cpp/opencv_zzdds/smoke_test.py, and
 the top-level run_all.py: environment/path resolution, running a build
@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 
 
 def zzdds_zig_out() -> Path:
-    return Path(os.environ.get("ZZDDS_ZIG_OUT", str(REPO_ROOT.parent / "zzdds" / "zig-out")))
+    return Path(os.environ.get("ZZDDS_ZIG_OUT", str(REPO_ROOT.parent / "zig-out")))
 
 
 def run_env(zig_out: Path) -> dict:

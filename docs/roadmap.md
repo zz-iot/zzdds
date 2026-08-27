@@ -2242,6 +2242,34 @@ CI duration/PR-review-unit size if example jobs aren't gated tightly, and what h
 pass (repo restructuring, CI pipeline changes, any external links to the standalone repo)
 before executing — not a quick change.
 
+**Update (2026-08-26) — done.** Merged `zz-iot/zzdds-examples` into this repo at
+`examples/`, preserving full commit history via `git merge -s ours --no-commit
+--allow-unrelated-histories` + `git read-tree --prefix=examples/ -u` (the
+pre-merge commits are reachable in the object graph, though `git log --follow`
+on the new prefixed paths won't auto-traverse the merge boundary — a known
+limitation of this technique, not lost history; use `git log <old-tip> --
+<old-path>` to see it directly).
+
+`examples/` is deliberately absent from the root `build.zig.zon`'s `.paths`
+allowlist, so it's automatically excluded from the tarball a real consumer
+fetches via `zig build`/`zig fetch` — the original "don't force a
+single-binding consumer to build examples" goal falls out of how Zig's
+package manager already works here, no extra gating needed.
+
+Fixed up along with the merge: all 8 Zig examples' `build.zig.zon` `.path`
+dependency (`../../../zzdds` → `../../..`, now that zzdds is the parent repo
+instead of a sibling checkout); `examples/_common.py`'s `ZZDDS_ZIG_OUT`
+default; and `zzdds/.github/workflows/ci.yml`'s `examples`/`examples-tsan`
+jobs, which collapsed from two checkouts (+ a now-dead zidl sibling checkout
+these jobs had never dropped after zidl became a URL dependency) down to one,
+with `ZZDDS_EXAMPLES_REF` and its workflow_dispatch input removed entirely —
+there's nothing left to pin independently now that a core fix and the
+example that needed it can land as one commit.
+
+Deliberately left as-is: the standalone `zz-iot/zzdds-examples` GitHub repo
+itself (not archived or deleted this round — it has 0 stars/issues/PRs, so
+there's no real audience being misdirected by leaving it up for now).
+
 ---
 
 ## Deferred / Out of Scope for v1

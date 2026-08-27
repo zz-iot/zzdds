@@ -18,8 +18,8 @@ prerequisite is treated.
 Usage:
   ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.py [--strict]
 
-See ZZDDS_VERSION for the zzdds commit these examples are known to work
-against, if you need a baseline rather than testing your own local build.
+Defaults to ../zig-out (the zzdds repo this examples/ directory lives in)
+if ZZDDS_ZIG_OUT isn't set -- see _common.py's zzdds_zig_out().
 """
 from __future__ import annotations
 

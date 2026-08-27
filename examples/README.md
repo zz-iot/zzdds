@@ -49,19 +49,16 @@ easier to get right in Python than bash.
 `hello_world` and `shape` shared across all four language ports — see
 those before diving into a specific language's README.
 
-Every example builds against a local zzdds checkout — none of these are
-released/tagged against a specific zzdds version, or pinned via a git
-submodule. Point everything at whatever local `zig build ... install` tree
-you want to test. If you just want a known-good baseline rather than testing
-your own local zzdds, `ZZDDS_VERSION` names the zzdds commit these examples
-are last confirmed to fully pass against.
+Every example builds against the zzdds it lives inside — a core fix and the
+example that needed it land as one commit, so there's no separate version to
+track and nothing to pin against a specific zzdds release.
 
 Build zzdds first with whatever bindings you need — `run_all.py` (below)
 detects which of these you actually built and skips accordingly, so it's
 fine to only build what you're testing:
 
 ```sh
-cd /path/to/zzdds
+cd /path/to/zzdds  # repo root, one level up from examples/
 zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 ```
 
