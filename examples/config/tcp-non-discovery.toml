@@ -1,0 +1,13 @@
+# Isolates: transport.tcp.enabled gives this participant's user-data
+# (DataWriter/DataReader) traffic its own privately-owned TCP transport.
+# SPDP/SEDP discovery unconditionally stays on UDP regardless of this setting
+# -- there is no "TCP for discovery too" mode in zzdds (see
+# zzdds/src/dcps/participant.zig's transport/discovery_transport split). This
+# scenario is specifically "user-data over TCP, discovery still over UDP",
+# NOT "run fully over TCP" -- zzdds doesn't support the latter.
+#
+# bind_address must be a concrete, reachable address -- TCP cannot advertise
+# a wildcard address the way UDP can. Change it to match your own host/interface.
+[default_participant_config.transport.tcp]
+enabled = true
+bind_address = "127.0.0.1"

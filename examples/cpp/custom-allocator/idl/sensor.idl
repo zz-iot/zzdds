@@ -1,0 +1,28 @@
+// Milestone 1 sample type: deliberately fully bounded (no unbounded string or
+// sequence field). Compiled with --cpp-pmr-containers, the bounded string
+// still becomes std::pmr::string (zidl's C++ backend has no fixed-capacity
+// string type -- see zzdds's docs/design/allocator-strategy.md, "the C++
+// template problem"), so zero-heap here means "routed through the
+// caller-registered std::pmr allocator", not "no allocation call at all".
+struct SensorSample {
+    @key unsigned long sensor_id;
+    unsigned long long timestamp_ms;
+    double temperature_c;
+    string<32> label;
+};
+
+// Milestone 2 sample type: deliberately UNBOUNDED (an unbounded string and an
+// unbounded sequence), exercising the C++/pmr backend's decode-side allocator
+// story. Decoding an unbounded field means std::pmr::vector::resize()/
+// std::pmr::string assignment growing through whatever std::pmr::memory_resource
+// was current when the containing Sample was default-constructed --
+// zidl::setCppAllocator's std::pmr::set_default_resource registration, not
+// zidl_cdr_set_allocator (that one only governs the CDR writer's own
+// scratch-buffer growth here -- see README). A real heap-shaped allocation
+// sized at decode time, not compile time, which only a caller-registered
+// allocator can keep off libc malloc / global operator new.
+struct SensorLog {
+    @key unsigned long sensor_id;
+    string log_message;
+    sequence<double> readings;
+};

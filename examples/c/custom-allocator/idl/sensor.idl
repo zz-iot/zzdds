@@ -1,0 +1,20 @@
+// Milestone 1 sample type: deliberately fully bounded (no unbounded string or
+// sequence field) so the whole pub/sub exchange can run under a fixed-size
+// static-pool allocator with zero heap allocation after startup.
+struct SensorSample {
+    @key unsigned long sensor_id;
+    unsigned long long timestamp_ms;
+    double temperature_c;
+    string<32> label;
+};
+
+// Milestone 2 sample type: deliberately UNBOUNDED (an unbounded string and an
+// unbounded sequence), exercising Phase 2's zidl_cdr allocator injection
+// (zidl_cdr_set_allocator) on the decode path -- an unbounded field forces a
+// real heap-shaped allocation (sized at decode time, not compile time), which
+// only a caller-registered allocator can keep off libc malloc.
+struct SensorLog {
+    @key unsigned long sensor_id;
+    string log_message;
+    sequence<double> readings;
+};

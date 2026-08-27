@@ -19,11 +19,6 @@ on:
         required: false
         default: ''
         type: string
-      zzdds_examples_ref:
-        description: 'zz-iot/zzdds-examples commit/branch/tag to check out (default: pinned commit)'
-        required: false
-        default: ''
-        type: string
   schedule:
     # Weekly full-vendor interop sweep — Mondays 06:00 UTC
     - cron: '0 6 * * 1'
@@ -42,16 +37,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-a9f61ee' }}
-  # Pinned zz-iot/zzdds-examples commit for the examples-smoke-test job below.
-  # Deliberately a commit, not "main" — the examples job executes that repo's
-  # own scripts directly in this workflow's authenticated context, so a
-  # floating branch ref would let anyone who can push to zzdds-examples' main
-  # (or compromise it) run arbitrary code here the next time this job fires.
-  # Bump deliberately (its own small PR) when zzdds-examples gains something
-  # this job should pick up. Override via the zzdds_examples_ref
-  # workflow_dispatch input to test against a different commit/branch/tag.
-  ZZDDS_EXAMPLES_REF: ${{ inputs.zzdds_examples_ref || '0a83e833b8df1064d5629d19c6113711d7b822c9' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-95b6f62' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -218,22 +204,22 @@ jobs:
       # docs/design/ci-platform-coverage-expansion.md item 3 for the full
       # writeup and follow-up tracking.
 
-  # ── zzdds-examples smoke test ──────────────────────────────────────────────
+  # ── examples smoke test ──────────────────────────────────────────────────
   #
-  # Builds zzdds with every binding enabled, then runs zz-iot/zzdds-examples'
-  # own orchestrator (run_all.py) against that build — catches a PR breaking
-  # any of the C/C++/Java example apps, or their cross-binding-interop/opencv
+  # Builds zzdds with every binding enabled, then runs examples/'s own
+  # orchestrator (run_all.py) against that build — catches a PR breaking any
+  # of the C/C++/Java example apps, or their cross-binding-interop/opencv
   # smoke tests, independent of the dds-rtps interop coverage below.
   #
-  # --strict turns "zzdds-examples couldn't find a binding/dependency it
-  # needs" into a hard failure instead of a silent skip — appropriate here
-  # since every binding and OpenCV are deliberately installed in this job, so
-  # a skip would mean something regressed, not that the environment is just
+  # --strict turns "examples/ couldn't find a binding/dependency it needs"
+  # into a hard failure instead of a silent skip — appropriate here since
+  # every binding and OpenCV are deliberately installed in this job, so a
+  # skip would mean something regressed, not that the environment is just
   # missing an optional piece (see run_all.py's own default, unstrict
   # behavior for the latter case).
 
   examples:
-    name: zzdds-examples
+    name: examples
     needs: test-linux
     runs-on: ubuntu-latest
     # 30, not 20: the "Install OpenCV" step below (libopencv-dev, ~30
@@ -247,47 +233,6 @@ jobs:
     steps:
       - name: Check out zzdds
         uses: actions/checkout@v4
-        with:
-          path: zzdds
-          # Neither checkout in this job ever pushes; leaving no persisted
-          # token in either repo's git config means nothing zzdds-examples'
-          # own scripts run below could read one out of, even accidentally.
-          persist-credentials: false
-
-      - name: Check out zzdds-examples (${{ env.ZZDDS_EXAMPLES_REF }})
-        uses: actions/checkout@v4
-        with:
-          repository: zz-iot/zzdds-examples
-          ref: ${{ env.ZZDDS_EXAMPLES_REF }}
-          path: zzdds-examples
-          persist-credentials: false
-
-      - name: Resolve zidl ref from zzdds/build.zig.zon
-        # zig/shape's build.zig.zon depends on ../../../zidl (a sibling of
-        # zzdds-examples, i.e. $GITHUB_WORKSPACE/zidl) — without checking it
-        # out, its build fails outright since that path never exists
-        # otherwise. Deliberately read out of zzdds's OWN pinned .zidl.url
-        # here rather than a second independently-maintained ref: the whole
-        # point of this job is to build zig/shape against the exact zidl
-        # zzdds itself was just built with, so there is only one source of
-        # truth to bump (build.zig.zon) — not two that can drift apart.
-        id: zidl_ref
-        run: |
-          set -euo pipefail
-          TAG=$(grep -A2 '\.zidl = \.{' zzdds/build.zig.zon | grep -oP 'refs/tags/\K[^"]+(?=\.tar\.gz)')
-          if [ -z "$TAG" ]; then
-            echo "FAIL: could not parse a zidl tag out of zzdds/build.zig.zon's .zidl.url" >&2
-            exit 1
-          fi
-          echo "ref=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Check out zidl (${{ steps.zidl_ref.outputs.ref }})
-        uses: actions/checkout@v4
-        with:
-          repository: zz-iot/zidl
-          ref: ${{ steps.zidl_ref.outputs.ref }}
-          path: zidl
-          persist-credentials: false
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -300,7 +245,7 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Install Python (zzdds-examples' build/run/smoke-test scripts)
+      - name: Install Python (examples/'s build/run/smoke-test scripts)
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -311,22 +256,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends libopencv-dev
 
       - name: Build zzdds (all bindings)
-        working-directory: zzdds
         run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
-      - name: Run zzdds-examples (strict)
-        working-directory: zzdds-examples
-        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zzdds/zig-out" ./run_all.py --strict
+      - name: Run examples (strict)
+        working-directory: examples
+        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
 
-  # ── zzdds-examples: WaitSet + ThreadSanitizer ────────────────────────────
+  # ── examples: WaitSet + ThreadSanitizer ──────────────────────────────────
   #
   # Separate from the `examples` job above, which builds/runs ALL of
-  # zzdds-examples with a plain (non-TSAN) build. This job instead builds
+  # examples/ with a plain (non-TSAN) build. This job instead builds
   # zzdds with -Dsanitize-thread=true and runs specifically the zig/waitset
   # and cpp/waitset examples under TSAN -- the ones whose whole point is
   # exercising real concurrency (a watchdog thread and the main thread's
   # WaitSet.wait() loop both touching the same WaitSet/GuardCondition at
-  # once; see zzdds-examples' docs/design/waitset-reference-app.md).
+  # once; see examples/docs/design/waitset-reference-app.md).
   #
   # java/waitset is deliberately NOT run under TSAN here: JVM+TSAN is a
   # known-hard combination in general (see vendor-interop-tsan's own comment
@@ -337,7 +281,7 @@ jobs:
   # comment claims is done.
 
   examples-tsan:
-    name: zzdds-examples (TSAN)
+    name: examples (TSAN)
     needs: test-linux
     runs-on: ubuntu-latest
     # Was 20 for 3 examples (zig/c/cpp waitset); now 8 examples (+shape,
@@ -348,39 +292,6 @@ jobs:
     steps:
       - name: Check out zzdds
         uses: actions/checkout@v4
-        with:
-          path: zzdds
-          persist-credentials: false
-
-      - name: Check out zzdds-examples (${{ env.ZZDDS_EXAMPLES_REF }})
-        uses: actions/checkout@v4
-        with:
-          repository: zz-iot/zzdds-examples
-          ref: ${{ env.ZZDDS_EXAMPLES_REF }}
-          path: zzdds-examples
-          persist-credentials: false
-
-      # See the `examples` job above's identical step for why this reads
-      # zzdds's own pinned .zidl.url rather than a second, independently
-      # maintained ref.
-      - name: Resolve zidl ref from zzdds/build.zig.zon
-        id: zidl_ref
-        run: |
-          set -euo pipefail
-          TAG=$(grep -A2 '\.zidl = \.{' zzdds/build.zig.zon | grep -oP 'refs/tags/\K[^"]+(?=\.tar\.gz)')
-          if [ -z "$TAG" ]; then
-            echo "FAIL: could not parse a zidl tag out of zzdds/build.zig.zon's .zidl.url" >&2
-            exit 1
-          fi
-          echo "ref=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Check out zidl (${{ steps.zidl_ref.outputs.ref }})
-        uses: actions/checkout@v4
-        with:
-          repository: zz-iot/zidl
-          ref: ${{ steps.zidl_ref.outputs.ref }}
-          path: zidl
-          persist-credentials: false
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -400,19 +311,18 @@ jobs:
       # This lower-entropy sysctl alone was tried first and did NOT resolve
       # it (still crashed identically on the next CI run); the actual
       # per-process fix is disabling ASLR outright via `setarch -R`, applied
-      # to every TSAN pub/sub pair in run_tsan_pubsub_pair.py (zzdds-examples
-      # repo) -- kept here too since it's a legitimate, complementary
+      # to every TSAN pub/sub pair in run_tsan_pubsub_pair.py (examples/
+      # scripts/) -- kept here too since it's a legitimate, complementary
       # belt-and-suspenders measure for anything setarch's wrapping doesn't
       # cover (e.g. cmake's own build-time compiler probes).
       - name: Reduce ASLR entropy for TSan
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Build zzdds (C + C++ bindings, ThreadSanitizer)
-        working-directory: zzdds
         run: zig build -Dc-binding=true -Dcpp-binding=true -Dsanitize-thread=true install
 
       - name: Build zig/waitset (ThreadSanitizer)
-        working-directory: zzdds-examples/zig/waitset
+        working-directory: examples/zig/waitset
         run: zig build -Dsanitize-thread=true
 
       # Two distinct bugs were found and fixed here, both confirmed via
@@ -462,48 +372,48 @@ jobs:
 
       - name: Build cpp/waitset (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DWAITSET_SANITIZE_THREAD=ON \
-            -B zzdds-examples/cpp/waitset/build -S zzdds-examples/cpp/waitset
-          cmake --build zzdds-examples/cpp/waitset/build
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DWAITSET_SANITIZE_THREAD=ON \
+            -B examples/cpp/waitset/build -S examples/cpp/waitset
+          cmake --build examples/cpp/waitset/build
 
       - name: Build c/waitset (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DWAITSET_SANITIZE_THREAD=ON \
-            -B zzdds-examples/c/waitset/build -S zzdds-examples/c/waitset
-          cmake --build zzdds-examples/c/waitset/build
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zig-out" -DWAITSET_SANITIZE_THREAD=ON \
+            -B examples/c/waitset/build -S examples/c/waitset
+          cmake --build examples/c/waitset/build
 
       - name: Build zig/shape (ThreadSanitizer)
-        working-directory: zzdds-examples/zig/shape
+        working-directory: examples/zig/shape
         run: zig build -Dsanitize-thread=true
 
       - name: Build cpp/shape (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DSHAPE_SANITIZE_THREAD=ON \
-            -B zzdds-examples/cpp/shape/build -S zzdds-examples/cpp/shape
-          cmake --build zzdds-examples/cpp/shape/build
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DSHAPE_SANITIZE_THREAD=ON \
+            -B examples/cpp/shape/build -S examples/cpp/shape
+          cmake --build examples/cpp/shape/build
 
       - name: Build c/shape (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DSHAPE_SANITIZE_THREAD=ON \
-            -B zzdds-examples/c/shape/build -S zzdds-examples/c/shape
-          cmake --build zzdds-examples/c/shape/build
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zig-out" -DSHAPE_SANITIZE_THREAD=ON \
+            -B examples/c/shape/build -S examples/c/shape
+          cmake --build examples/c/shape/build
 
       - name: Build cpp/custom-allocator (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
-            -B zzdds-examples/cpp/custom-allocator/build -S zzdds-examples/cpp/custom-allocator
-          cmake --build zzdds-examples/cpp/custom-allocator/build
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zig-out" -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/zig-cc-wrappers/zigcxx" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
+            -B examples/cpp/custom-allocator/build -S examples/cpp/custom-allocator
+          cmake --build examples/cpp/custom-allocator/build
 
       - name: Build c/custom-allocator (ThreadSanitizer)
         run: |
-          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zzdds/zig-out" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
-            -B zzdds-examples/c/custom-allocator/build -S zzdds-examples/c/custom-allocator
-          cmake --build zzdds-examples/c/custom-allocator/build
+          cmake -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/zig-out" -DCUSTOM_ALLOCATOR_SANITIZE_THREAD=ON \
+            -B examples/c/custom-allocator/build -S examples/c/custom-allocator
+          cmake --build examples/c/custom-allocator/build
 
       # Shared run/verify logic (background subscriber, foreground publisher
       # with a timeout, check both exit codes AND a completion marker in
       # each log -- a wire/QoS mismatch or a hang can still exit 0 on one
-      # side) lives in zzdds-examples/scripts/run_tsan_pubsub_pair.py, not
+      # side) lives in examples/scripts/run_tsan_pubsub_pair.py, not
       # copy-pasted per step: this job went from 3 examples to 8, and the
       # hand-rolled ~15-20-line bash block per step doesn't scale past the
       # original 3. Python, not bash, per that script's own docstring --
@@ -513,9 +423,9 @@ jobs:
         env:
           TSAN_OPTIONS: abort_on_error=1
         run: |
-          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
-            --sub-cmd "zzdds-examples/zig/waitset/zig-out/bin/waitset_sub -d 30" \
-            --pub-cmd "zzdds-examples/zig/waitset/zig-out/bin/waitset_pub -d 30" \
+          python3 examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "examples/zig/waitset/zig-out/bin/waitset_sub -d 30" \
+            --pub-cmd "examples/zig/waitset/zig-out/bin/waitset_pub -d 30" \
             --sub-log /tmp/zig-ws-sub.log --pub-log /tmp/zig-ws-pub.log \
             --sub-marker "Subscriber: received all 10 samples." \
             --pub-marker "Publisher: done." --timeout 40
@@ -524,37 +434,37 @@ jobs:
         env:
           TSAN_OPTIONS: abort_on_error=1
         run: |
-          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
-            --sub-cmd "zzdds-examples/cpp/waitset/build/waitset_sub -d 31" \
-            --pub-cmd "zzdds-examples/cpp/waitset/build/waitset_pub -d 31" \
+          python3 examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "examples/cpp/waitset/build/waitset_sub -d 31" \
+            --pub-cmd "examples/cpp/waitset/build/waitset_pub -d 31" \
             --sub-log /tmp/cpp-ws-sub.log --pub-log /tmp/cpp-ws-pub.log \
             --sub-marker "Subscriber: received all 10 samples." \
             --pub-marker "Publisher: done." --timeout 40 \
-            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+            --ld-library-path "$GITHUB_WORKSPACE/zig-out/lib"
 
       - name: Run c/waitset under TSAN
         env:
           TSAN_OPTIONS: abort_on_error=1
         run: |
-          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
-            --sub-cmd "zzdds-examples/c/waitset/build/waitset_sub -d 32" \
-            --pub-cmd "zzdds-examples/c/waitset/build/waitset_pub -d 32" \
+          python3 examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "examples/c/waitset/build/waitset_sub -d 32" \
+            --pub-cmd "examples/c/waitset/build/waitset_pub -d 32" \
             --sub-log /tmp/c-ws-sub.log --pub-log /tmp/c-ws-pub.log \
             --sub-marker "Subscriber: received all 10 samples." \
             --pub-marker "Publisher: done." --timeout 40 \
-            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+            --ld-library-path "$GITHUB_WORKSPACE/zig-out/lib"
 
       # shape_main exits on its own after -i iterations (no external
       # duration/timeout needed the way waitset's -d flag provides); markers
-      # mirror zzdds-examples' own shape_cross_binding_smoke_test.py (a real
+      # mirror examples/'s own shape_cross_binding_smoke_test.py (a real
       # match + a real received-sample line, not just a clean exit).
       - name: Run zig/shape under TSAN
         env:
           TSAN_OPTIONS: abort_on_error=1
         run: |
-          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
-            --sub-cmd "zzdds-examples/zig/shape/zig-out/bin/shape_main -S -i 8 --read-period 300" \
-            --pub-cmd "zzdds-examples/zig/shape/zig-out/bin/shape_main -P -w -i 8 --write-period 300" \
+          python3 examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "examples/zig/shape/zig-out/bin/shape_main -S -i 8 --read-period 300" \
+            --pub-cmd "examples/zig/shape/zig-out/bin/shape_main -P -w -i 8 --write-period 300" \
             --sub-log /tmp/zig-shape-sub.log --pub-log /tmp/zig-shape-pub.log \
             --sub-marker "Square" --pub-marker "on_publication_matched()" --timeout 30
 
@@ -562,23 +472,23 @@ jobs:
         env:
           TSAN_OPTIONS: abort_on_error=1
         run: |
-          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
-            --sub-cmd "zzdds-examples/cpp/shape/build/shape_main -S -i 8 --read-period 300" \
-            --pub-cmd "zzdds-examples/cpp/shape/build/shape_main -P -w -i 8 --write-period 300" \
+          python3 examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "examples/cpp/shape/build/shape_main -S -i 8 --read-period 300" \
+            --pub-cmd "examples/cpp/shape/build/shape_main -P -w -i 8 --write-period 300" \
             --sub-log /tmp/cpp-shape-sub.log --pub-log /tmp/cpp-shape-pub.log \
             --sub-marker "Square" --pub-marker "on_publication_matched()" --timeout 30 \
-            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+            --ld-library-path "$GITHUB_WORKSPACE/zig-out/lib"
 
       - name: Run c/shape under TSAN
         env:
           TSAN_OPTIONS: abort_on_error=1
         run: |
-          python3 zzdds-examples/scripts/run_tsan_pubsub_pair.py \
-            --sub-cmd "zzdds-examples/c/shape/build/shape_main -S -i 8 --read-period 300" \
-            --pub-cmd "zzdds-examples/c/shape/build/shape_main -P -w -i 8 --write-period 300" \
+          python3 examples/scripts/run_tsan_pubsub_pair.py \
+            --sub-cmd "examples/c/shape/build/shape_main -S -i 8 --read-period 300" \
+            --pub-cmd "examples/c/shape/build/shape_main -P -w -i 8 --write-period 300" \
             --sub-log /tmp/c-shape-sub.log --pub-log /tmp/c-shape-pub.log \
             --sub-marker "Square" --pub-marker "on_publication_matched()" --timeout 30 \
-            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+            --ld-library-path "$GITHUB_WORKSPACE/zig-out/lib"
 
       # custom-allocator's publisher/subscriber take no CLI flags (hardcoded
       # sample/log counts and an internal poll-timeout of their own -- up to
@@ -588,24 +498,24 @@ jobs:
       - name: Run cpp/custom-allocator under TSAN
         env:
           TSAN_OPTIONS: abort_on_error=1
-        working-directory: zzdds-examples/cpp/custom-allocator/build
+        working-directory: examples/cpp/custom-allocator/build
         run: |
-          python3 "$GITHUB_WORKSPACE/zzdds-examples/scripts/run_tsan_pubsub_pair.py" \
+          python3 "$GITHUB_WORKSPACE/examples/scripts/run_tsan_pubsub_pair.py" \
             --sub-cmd "./subscriber" --pub-cmd "./publisher" \
             --sub-log /tmp/cpp-ca-sub.log --pub-log /tmp/cpp-ca-pub.log \
             --sub-marker "subscriber: done" --pub-marker "publisher: done" --timeout 60 \
-            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+            --ld-library-path "$GITHUB_WORKSPACE/zig-out/lib"
 
       - name: Run c/custom-allocator under TSAN
         env:
           TSAN_OPTIONS: abort_on_error=1
-        working-directory: zzdds-examples/c/custom-allocator/build
+        working-directory: examples/c/custom-allocator/build
         run: |
-          python3 "$GITHUB_WORKSPACE/zzdds-examples/scripts/run_tsan_pubsub_pair.py" \
+          python3 "$GITHUB_WORKSPACE/examples/scripts/run_tsan_pubsub_pair.py" \
             --sub-cmd "./subscriber" --pub-cmd "./publisher" \
             --sub-log /tmp/c-ca-sub.log --pub-log /tmp/c-ca-pub.log \
             --sub-marker "subscriber: done" --pub-marker "publisher: done" --timeout 60 \
-            --ld-library-path "$GITHUB_WORKSPACE/zzdds/zig-out/lib"
+            --ld-library-path "$GITHUB_WORKSPACE/zig-out/lib"
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
@@ -822,7 +732,6 @@ jobs:
               'connext_dds',
               'eclipse_cyclone',
               'toc_coredx_dds',
-              'hdds',
           ]
 
           result = subprocess.run(

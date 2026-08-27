@@ -1,0 +1,23 @@
+# Process-wide zzdds configuration. Picked up automatically the first time
+# any factory is created in this process (zzdds_create_factory()/
+# zzdds_create_factory_with_allocator()), as long as the app never calls
+# zzdds_process_configure() itself first -- see zzdds's
+# src/config/resolve.zig/process.zig. No code change needed in publisher.c/
+# subscriber.c to pick this up: CMake copies this file next to the built
+# binaries (see CMakeLists.txt), and both programs run with that as their cwd.
+#
+# [default_participant_config.transport.udp]
+# interface_poll_interval_ms = 0 is PollingMonitor's runtime sentinel for "no
+# periodic re-poll thread at all" -- without it, network-interface
+# re-enumeration mallocs via libc's getifaddrs() on every poll interval, with
+# no allocator hook. Needed here so the zero-allocation acceptance test below
+# can pass with a default zzdds build.
+[default_participant_config.transport.udp]
+interface_poll_interval_ms = 0
+
+# Also demonstrates an integer field outside the transport/UDP struct flowing
+# correctly end-to-end from this file, through zidl-generated applyToml, to a
+# functionally-observable effect: SPDP lease expiry (src/discovery/spdp.zig)
+# is computed directly from this value.
+[default_participant_config.participant]
+lease_duration_ms = 20000

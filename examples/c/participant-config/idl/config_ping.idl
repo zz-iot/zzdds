@@ -1,0 +1,10 @@
+// c/participant-config's wire type -- byte-identical to
+// zig/participant-config/idl/config_ping.idl. See
+// docs/design/participant-config-reference-app.md at the repo root for the
+// full spec. Deliberately minimal (a bare counter, keyless, single
+// instance): this example is about *participant/factory configuration*,
+// not the data type, so the type itself stays out of the way.
+@appendable
+struct ConfigPing {
+    int32 count;
+};

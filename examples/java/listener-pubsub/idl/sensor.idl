@@ -1,0 +1,8 @@
+// Simple bounded topic type for the Java pub/sub showcase.
+@final
+struct SensorSample {
+    @key unsigned long sensor_id;
+    unsigned long long timestamp_ms;
+    double temperature_c;
+    string<32> label;
+};
