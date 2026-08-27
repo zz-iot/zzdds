@@ -30,7 +30,7 @@
 // (ZzddsRuntime.createGuardCondition() calls it directly) for GuardCondition,
 // which -- like C++'s GuardConditionSupport -- constructs its Java object by
 // hand rather than through any generated box helper. See zidl's
-// docs/roadmap.md "Binding design review: decision" and its "Java backend:
+// `zidl/docs/design/binding-c-abi-identity.md` and its "Java backend:
 // native weak-global-ref box cache" follow-up for the fuller writeup.
 // Confirmed by testing directly against the fixed zzdds, not just reasoned
 // about.

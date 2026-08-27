@@ -143,8 +143,8 @@ pub const SubscriberImpl = struct {
     mu: Mutex,
 
     /// One box for the whole object, shared across every interface view
-    /// (Subscriber, Entity) — see `views` below and zidl/docs/roadmap.md
-    /// "Binding design review: decision".
+    /// (Subscriber, Entity) — see `views` below and
+    /// `zidl/docs/design/binding-c-abi-identity.md`.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();

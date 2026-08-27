@@ -30,7 +30,7 @@ is unchanged, only the internal FFI shape got bigger.
 
 Deliberately tested against the loan API's current heap-allocated
 implementation, not real zero-copy/SHMEM (see `zzdds/docs/roadmap.md`'s note
-on this, reachable via zidl's own roadmap "Binding design review" section).
+on this, see `zidl/docs/design/binding-c-abi-identity.md`).
 That's not a limitation of this spike — the lifetime/safety question is
 about the *contract shape*, which is identical regardless of what backs the
 pointer. Real zero-copy is a separate, larger zzdds-core question; this
@@ -112,7 +112,7 @@ standard `DDS_ReturnCode_t` convention); the review agreed and normalized
 `zzdds_take_loaned_raw` and its four siblings (`zzdds_take_one_raw`/
 `_instance`, `zzdds_read_one_raw`/`_instance`) to the standard
 `DDS_RETCODE_OK`/`DDS_RETCODE_NO_DATA`/`DDS_RETCODE_*` convention — see
-zidl's `docs/roadmap.md` "Binding design review: decision". This spike's
+zidl's `zidl/docs/design/binding-c-abi-identity.md`. This spike's
 own code (`src/loan.rs`) has been updated to match.
 
 **2. The core finding: the loan contract maps cleanly onto Rust's borrow
@@ -159,8 +159,7 @@ The two real open items are narrower than "will this work at all":
   hand-declaring this function's signature from the header alone, in any
   language, would make the same mistake this spike's first version did.
 - **Whether real zero-copy ever lands underneath this** is a separate,
-  larger zzdds-core question (see zidl's roadmap "Binding design review"
-  section) — this spike deliberately doesn't depend on it. The Rust-side
+  larger zzdds-core question (see zidl/docs/design/binding-c-abi-identity.md section) — this spike deliberately doesn't depend on it. The Rust-side
   design question this spike was built to answer is closed either way: the
   *contract* is soundly expressible in Rust today; *what backs the pointer*
   can change later without the Rust-side lifetime design needing to change

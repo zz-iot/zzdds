@@ -15,7 +15,7 @@
 //! After the run completes, delete_datawriter() is called WITHOUT first
 //! detaching the writer's StatusCondition from the WaitSet -- deliberately,
 //! to demonstrate that this is safe (see zzdds's own
-//! docs/roadmap.md "Planned" entry on condition/entity lifecycle safety):
+//! `zzdds/CHANGELOG.md` (2026-08-09/10, WaitSet / condition example)):
 //! before that fix, this would have left the WaitSet holding a dangling
 //! pointer.
 //!
@@ -47,7 +47,7 @@ fn sleepNs(io: std.Io, ns: u64) void {
 // zidl's Zig backend generates the `as_{Base}` vtable slot for these
 // synthetic base-interface upcasts but not a `pub fn as_{Base}(self)`
 // convenience wrapper on the struct itself (a real, minor codegen gap, not
-// specific to this example -- see zidl's roadmap "Zig backend" section for
+// specific to this example -- see `zidl/docs/design/binding-c-abi-identity.md` (as_{Base} for pure-Zig callers) for
 // the general as_{Base} design). Call through the vtable directly.
 fn statusAsCondition(sc: DDS.StatusCondition) DDS.Condition {
     return sc.vtable.as_Condition(sc.ptr);

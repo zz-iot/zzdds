@@ -11,7 +11,7 @@
 //!     high-priority half (5..9). Drained via the generated
 //!     `WaitsetSampleDataReader.take_w_condition` (what the OMG spec calls
 //!     `take_w_condition`, and part of the typed DataReader's implicit IDL
-//!     on every binding -- see zidl's roadmap for the fuller writeup on
+//!     on every binding -- see zidl/CHANGELOG.md (v0.3.0-v0.3.4) for the writeup on
 //!     closing this gap).
 //!   - ReadCondition (any sample/view/instance state) -- catches whatever
 //!     the QueryCondition pass didn't take (the low-priority half).

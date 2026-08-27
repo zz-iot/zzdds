@@ -77,8 +77,7 @@ audit's original 2026-08-14 snapshot) while working the "Examples" bucket below:
 consistent across all four `shape` ports (landed sometime in the presence/registry/catchup/
 waitset work since this audit was written). The one real remaining gap —
 `zig/waitset`'s publisher/subscriber ignoring `registerTypeSupport`'s return code, unlike
-every other example in the repo — is fixed; see `docs/roadmap.md`'s "Examples cleanup list
-resolved" entry.
+every other example in the repo — is fixed (see `CHANGELOG.md`, 2026-08-20).
 
 ---
 

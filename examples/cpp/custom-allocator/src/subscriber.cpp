@@ -191,8 +191,8 @@ int main() {
         // DDS_RETCODE_NO_DATA when the queue is empty -- no longer ambiguous
         // (used to collide: both empty-queue and a successfully-deserialized
         // sample returned 0, before zzdds_take_one_raw's own retcode
-        // convention was normalized -- see zidl's docs/roadmap.md "Binding
-        // design review: decision"). Still checking info.valid_data too,
+        // convention was normalized -- see
+        // zidl/docs/design/binding-c-abi-identity.md). Still checking info.valid_data too,
         // defensively: it's zeroed first so a dispose/unregister-only sample
         // (key data, no real payload) is never misread as one with real data.
         SensorSampleDataReader::Sample sample;

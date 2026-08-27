@@ -54,7 +54,7 @@ LD_LIBRARY_PATH=/path/to/zzdds/zig-out/lib ./build/waitset_pub -d 42
   every condition-family (and entity-family) sibling's cache into one shared
   per-family cache, plus registering `GuardCondition` into it on construction
   (it has no generated `_getOrCreate` of its own) — see zidl's
-  `docs/roadmap.md` "Binding design review: decision" and its
+  `zidl/docs/design/binding-c-abi-identity.md` and its
   "shared-family `_getOrCreate` cache" follow-up. Verified directly against
   the fixed zzdds (rebuilt, both binaries rerun clean, twice) before
   switching to the membership-based form here — including through

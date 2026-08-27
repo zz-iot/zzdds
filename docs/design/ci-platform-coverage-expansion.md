@@ -2,8 +2,8 @@
 
 ## Scope
 
-Implements the top 4 re-ranked items from `docs/roadmap.md`'s "CI / release platform
-coverage gaps" section (re-reviewed 2026-08-16). All four are chosen because none require
+Implements the top 4 re-ranked items from `docs/roadmap.md`'s "CI / Release Platform
+Coverage" section (re-reviewed 2026-08-16). All four are chosen because none require
 new external infrastructure (no vendor binaries for non-Linux, no code-signing, no release
 pipeline redesign) — they extend tooling and jobs that already exist and already work on
 Linux x86_64 to platforms `ci.yml`/`release.yml` already run bare `zig build test` on.

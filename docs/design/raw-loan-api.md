@@ -17,11 +17,13 @@ Two problems surfaced while adding the participant-config and discovery examples
 while investigating an external ROS2 RMW integration attempt built directly on
 `zzdds_take_loaned_raw`:
 
-1. **`zzdds_take_loaned_raw` is not zero-copy.** It heap-copies the sample out of reader
-   history and wraps that copy in a loan-shaped handle — a real API-honesty gap for any
-   caller assuming a real zero-copy/SHMEM path exists behind it. It doesn't yet, and
-   won't until a real SHMEM transport lands (currently deferred, wire-format scaffolding
-   only — see "Deferred / Out of Scope for v1" below).
+1. **`zzdds_take_loaned_raw` is a copy, and the name over-promises.** It heap-copies the
+   sample out of reader history and wraps that copy in a loan-shaped handle. That's fine
+   for what this API family *is* — a raw-**byte** loan that saves the caller a copy at the
+   marshaling boundary — but the "loaned" name invites a caller to expect zero
+   serialization / a native-struct pointer, which is explicitly **out of scope** (see
+   "Scope boundaries" below). The name and doc comments were tightened to say "raw-byte
+   buffer," not "zero-copy."
 2. **The raw family is hand-written per-binding.** Only C/C++ have it; Java and Zig
    don't. Hand-written, independently-authored per-binding signatures are exactly the
    root-cause shape of the `create_participant_ex` C-ABI struct-layout bug found via the
@@ -342,21 +344,32 @@ same underlying problem ("don't free while someone might still be touching it, t
 must observe this safely"), same proven CAS-acquire/tearing-down-flag pattern, already
 TSan-verified in this codebase.
 
-## Deferred / out of scope for this round
+## Scope boundaries
+
+**What this API is.** A *raw-byte* loan: the application serializes directly into, or reads
+directly out of, an internal CDR buffer, avoiding one copy. The bytes are still CDR; QoS,
+security, and RTPS wire behaviour are unchanged.
+
+### Out of scope — not a fit for a DDS implementation (decided 2026-08-27)
+
+- **True zero-copy meaning zero serialization** and a **raw native-representation (POD)
+  loan variant** (a fixed-layout native struct pointer, as ROS2 RMW's POD-only loan
+  contract wants). This is fundamentally at odds with IDL as a platform-agnostic data
+  representation and with the QoS / security / wire assumptions the rest of the stack
+  relies on — close to an anti-feature here. Applications needing that class of
+  performance should use a mechanism that doesn't carry representation-independence, QoS,
+  or security. The alignment courtesy-minimum above is just that — a courtesy, not a
+  foothold for this.
+
+### Deferred — possible future work, not committed
 
 - **Entity creation** (factories, `DomainParticipantFactory`) — separate follow-up.
-- **Eliminating the RTPS `HistoryCache` copy** (true end-to-end zero-copy) — needs the
-  DCPS layer to borrow-pin directly from the RTPS cache instead of duping; deliberately
-  deferred, see "Lifetime, isolation, and pool pressure" above.
-- **Real SHMEM transport** — already deferred project-wide ("SHMEM transport — deferred;
-  UDP covers current use cases"). This design's storage seam is built so a future SHMEM
-  pool can slot in underneath without an API break, but no SHMEM implementation work is
-  in this round.
-- **Raw-native-struct loan variant** (a POD-struct-shaped chunk, as ROS2 RMW's own loan
-  contract actually wants — RMW loaning is explicitly POD-only per its design doc, a
-  different representation than CDR-bytes-in-chunk). Not needed for this round's scope;
-  the alignment courtesy-minimum decision above keeps this option open for later without
-  revisiting the API.
+- **SHMEM for the RTPS `HistoryCache`** — using shared memory for cache *storage* (with
+  RTPS/UDP scaffolding, as Connext does) is still on the table; it does not imply zero
+  serialization. This design's storage seam is built so a SHMEM pool can slot in
+  underneath without an API break.
+- **A SHMEM transport** alongside UDP/TCP — not in v1; possible later. See the roadmap's
+  "Deferred / Out of Scope for v1" section for the scope boundary.
 - **Blocking teardown option** (wait-for-release instead of fail-fast) — plausible later
   addition (a bounded `max_blocking_time`-style config), not built now.
 

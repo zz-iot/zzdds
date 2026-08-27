@@ -53,7 +53,7 @@ const FactoryOwner = struct {
     /// One box for the whole object, shared across both interface views
     /// (ZZDDS.DomainParticipantFactory via `factory_vtable`,
     /// DDS.DomainParticipantFactory via `dds_factory_vtable`) — see `views`
-    /// below and zidl/docs/roadmap.md "Binding design review: decision".
+    /// below and zidl/docs/design/binding-c-abi-identity.md.
     /// NOT the same object as `DomainParticipantFactoryImpl` (factory.zig) —
     /// see that struct's own doc comment; `FactoryOwner` is the real,
     /// app-visible factory identity, `DomainParticipantFactoryImpl` is an
@@ -626,7 +626,7 @@ pub export fn zzdds_destroy_guardcondition(guardcondition: *anyopaque) callconv(
 /// before this: a binding wrapping an attached condition in something with
 /// its own lifetime tracking (e.g. a `std::shared_ptr`) previously had no
 /// way to learn "this condition just got detached/destroyed" — see
-/// zidl/docs/roadmap.md "Binding design review: decision".
+/// zidl/docs/design/binding-c-abi-identity.md.
 ///
 /// `release_ctx`/`release_fn` are ignored (as if this were a plain
 /// `attach_condition()` call) if `condition` is already attached to
@@ -715,8 +715,8 @@ pub export fn zzdds_process_configure_from_file(
 // by zidl directly from the IDL-declared inheritance (`interface Topic :
 // DDS::Topic` in zzdds.idl; `interface Topic : Entity, TopicDescription` in
 // dcps.idl) via the `as_{Base}` vtable slot / export mechanism — see the
-// `.as_*` fields wired into each concrete impl's vtable literal and zidl's
-// `docs/roadmap.md`. Only genuine *downcasts* (DDS_X_as_zzdds_X, going from
+// `.as_*` fields wired into each concrete impl's vtable literal and
+// `zidl/docs/design/binding-c-abi-identity.md`. Only genuine *downcasts* (DDS_X_as_zzdds_X, going from
 // a base handle down to a specific derived type) remain hand-written below —
 // IDL inheritance can't express "which concrete derived type is this," so
 // these still need a runtime vtable-identity check.

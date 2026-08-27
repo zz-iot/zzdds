@@ -56,7 +56,7 @@ is the only flag either class takes.
   (`ZzddsRuntime.createGuardCondition()`'s native implementation calls it
   directly, since — like C++'s `GuardConditionSupport` — it constructs its
   Java object by hand rather than through any generated box helper). See
-  zidl's `docs/roadmap.md` "Binding design review: decision" and its "Java
+  zidl's `zidl/docs/design/binding-c-abi-identity.md` and its "Java
   backend: native weak-global-ref box cache" follow-up for the fuller
   writeup. Verified directly against the fixed zzdds (rebuilt, both classes
   rerun clean, twice) before switching to the membership-based form here —

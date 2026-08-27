@@ -102,8 +102,7 @@ fresh box on every call.  See zidl's `docs/ecosystem.md` ("`--zig-generate-c-api
 C-ABI export layer") for the full design and rationale.
 
 **Cross-view identity:** for `@shared_c_abi_box`-annotated interfaces (every real DDS
-entity/condition type as of 2026-08-12 — see zidl/docs/roadmap.md "Binding design review:
-decision"), a concrete impl caches *one* box shared across every interface view it
+entity/condition type as of 2026-08-12 — see `zidl/docs/design/binding-c-abi-identity.md`), a concrete impl caches *one* box shared across every interface view it
 presents, not one box per view — so a `GuardCondition` handle and the `Condition` handle
 `WaitSet.wait()` later returns for that same object are the identical, `==`-comparable
 C-ABI address, not just each internally self-consistent. The box's payload for these

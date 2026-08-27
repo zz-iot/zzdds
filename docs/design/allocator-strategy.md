@@ -46,7 +46,7 @@ a fixed, one-time, tiny allocation (a handful of pointer-sized boxes, created on
 process, not per call) — not on any hot path, not scaling with entity/traffic count. Not
 worth solving; noted here so it isn't mistaken for a missed gap.
 
-**zidl's C CDR runtime — `ZidlCdrAllocator` (already tracked, `zidl/docs/roadmap.md`).**
+**zidl's C CDR runtime — `ZidlAllocator` (shipped, `zidl/CHANGELOG.md` v0.3.11; scope decision in `zidl/docs/decisions.md`).**
 `zidl_cdr_read_string` / `zidl_cdr_read_seq_*` (`packages/zidl-cdr`) call `malloc`
 directly when decoding an unbounded `string` or `sequence` field of a **user-defined
 topic type**. This is a separate code path from zzdds's own internal RTPS/discovery CDR
@@ -166,8 +166,8 @@ which doesn't hit them) with a real C++ compiler:
    `zidl/src/ir/builder.zig`), which made a real base (e.g. `DDS::DomainParticipant :
    Entity`) look base-less from a different file's generation pass. Fixed by preserving
    `.bases` specifically (still resetting everything else) plus making
-   `collectEntityBaseNames` walk the base chain transitively — see zidl's roadmap for
-   the full design writeup.
+   `collectEntityBaseNames` walk the base chain transitively — see `zidl/CHANGELOG.md`
+   (v0.3.11) for the full design writeup.
 2. **Listener trampoline wrapping the wrong class** — a cross-module `@callback
    interface` (`zzdds::DataWriterListenerEx : DDS::DataWriterListener`) flattens in
    operations whose entity parameter belongs to the *base's* module, but the trampoline
@@ -206,7 +206,7 @@ inline sequence-buffer allocation, and — found while doing this, not originall
 real (not just compiled) standalone C program: the actual generated `Sample_deserialize`
 (unbounded `string` + unbounded `sequence<long>`) decoded a real CDR payload through a
 custom allocator, 2 allocations/2 frees, both fields correct. Full design writeup and the
-process-wide-vs-per-reader tradeoff discussion is in zidl's own roadmap now — required the
+process-wide-vs-per-reader tradeoff discussion is in `zidl/docs/decisions.md` — required the
 moment a user-defined topic type has an unbounded `string` or `sequence` field, i.e.
 required for the C showcase app unless its sample type is deliberately kept fully bounded
 (see below).
@@ -254,8 +254,7 @@ handle value is reused or the process exits; only the allocation side was checke
 path.
 
 **Post-merge review fixes (Greptile, zidl PR #28)**: three real issues surfaced across review
-rounds, all fixed in zidl's `zidl_allocator_pmr.hpp` (see zidl's `docs/roadmap.md` for the
-full per-round writeup): (1) the original design read the active allocator from a shared
+rounds, all fixed in zidl's `zidl_allocator_pmr.hpp` (see `zidl/CHANGELOG.md`, v0.3.11): (1) the original design read the active allocator from a shared
 mutable slot at both allocate- and deallocate-time, so re-registering with a different
 `ZidlAllocator*` would silently redirect *outstanding* objects' frees to the new allocator —
 fixed by binding each `ZidlAllocatorResource` permanently to one allocator at construction
@@ -386,8 +385,7 @@ string-returning operation/attribute failed to *compile at all* under the flag. 
 routing all five construction sites through the same type-name helper the declarations
 already used; verified with new unit tests plus a real generated interface that now
 compiles and runs correctly (values correct, allocation routed through a registered
-`ZidlAllocator`) where it previously failed to compile — see zidl's `docs/roadmap.md` for
-the fuller writeup.
+`ZidlAllocator`) where it previously failed to compile — see `zidl/CHANGELOG.md` (v0.3.11).
 
 **Phase 5 — Implement the missing `{Type}_free()` function bodies (zidl repo, C backend).
 Done.** Added last, as a deliberate scope extension beyond the original Phase 0-4 plan: not
@@ -602,13 +600,13 @@ paper. Concerns, as invited:
    verified via unit tests plus a real, CI-tracked integration test proving struct-field
    allocation routes through `zidl::setCppAllocator`. Unlocks unbounded (and bounded) fields
    in idiomatic C++ under a caller-controlled allocator, opt-in since it's a source/ABI
-   break. Not yet in a tagged zidl release.
+   break. In a tagged zidl release as of `v0.3.11-zig.0.16.0`.
 6. Phase 5 — implement the missing `{Type}_free()` bodies (zidl) — **Done**, and wider in
    scope than originally described: also fixed two silent gaps found along the way
    (string-only structs and bounded-sequence-only structs got no `_free()` declared at all,
    not just "declared but bodyless"). Verified via unit tests, reviewed golden-fixture
-   diffs, and a real decode-then-free run proving exact alloc/free count matches. Not yet in
-   a tagged zidl release.
+   diffs, and a real decode-then-free run proving exact alloc/free count matches. In a
+   tagged zidl release as of `v0.3.11-zig.0.16.0`.
 7. Tier 2 (data-plane override) / Tier 3 (per-entity-kind override) — deferred, revisit
    only once Phase 1 ships and a real need for *separate* allocators (not just one
    configurable one) shows up.

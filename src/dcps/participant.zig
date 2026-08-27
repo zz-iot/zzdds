@@ -870,8 +870,8 @@ pub const DomainParticipantImpl = struct {
     /// writer_sm.zig's per-writer heartbeat thread and spdp.zig's
     /// per-participant announcement timer (thread lifetime strictly bounded
     /// by the owning object's own init/deinit, never reaching across
-    /// objects -- see docs/roadmap.md's "Background thread usage" entry for
-    /// why that matters here specifically).
+    /// objects -- see docs/roadmap.md's "Concurrency model" design-task entry
+    /// for why that matters here specifically).
     timer_thread: ?std.Thread = null,
     /// Set by timerThreadFn as its first action, read by deinit() to detect
     /// a self-join (see deinit()'s doc comment). 0 = not yet set; real
@@ -888,7 +888,7 @@ pub const DomainParticipantImpl = struct {
     /// One box for the whole object, shared across every interface view
     /// (DomainParticipant, Entity, and ZZDDS.DomainParticipant — see
     /// src/c_abi/extensions.zig) — see `views` below and
-    /// zidl/docs/roadmap.md "Binding design review: decision".
+    /// zidl/docs/design/binding-c-abi-identity.md.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();

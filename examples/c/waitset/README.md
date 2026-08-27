@@ -42,8 +42,8 @@ LD_LIBRARY_PATH=/path/to/zzdds/zig-out/lib ./build/waitset_pub -d 42
   to require branching on each condition's own `get_trigger_value()`
   directly instead, working around a real identity gap in `WaitSet.wait()`'s
   handling of boxed C-ABI handles (confirmed at the raw C-ABI level, not
-  specific to any one binding) — see zidl's `docs/roadmap.md` "Binding
-  design review: decision" for the bug and its fix (zidl/zzdds, 2026-08-12).
+  specific to any one binding) — see `zidl/docs/design/binding-c-abi-identity.md`
+  for the bug and its fix (zidl/zzdds, 2026-08-12).
   Verified directly against the fixed zzdds (rebuilt, both binaries rerun
   clean, twice) before switching to the membership-based form here —
   including through `qc_cond`'s two-level `QueryCondition` →

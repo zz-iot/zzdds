@@ -44,8 +44,7 @@ liveliness is scoped to this one DataWriter and asserted by this one
 DataWriter — `DataWriter.assert_liveliness()`, not
 `DomainParticipant.assert_liveliness()`. AUTOMATIC was rejected deliberately:
 zzdds's DEADLINE/LIVELINESS timer thread already drives AUTOMATIC liveliness
-without any app involvement at all (see `zzdds/docs/roadmap.md`'s
-"DEADLINE/LIVELINESS QoS is now enforced automatically" entry) — a
+without any app involvement at all (see `zzdds/CHANGELOG.md`, 2026-08-06) — a
 MANUAL_BY_TOPIC writer that deliberately stops writing *and* stops asserting
 is the only way to make "going offline" an app-driven, demonstrable action
 rather than something that just happens to the process regardless of what it

@@ -772,8 +772,8 @@ test "extensions: DDS_DataReader_as_zzdds and back round-trip" {
 
 test "extensions: DataReader's Entity, DataReader, and ZZDDS.DataReader views all share the SAME boxed C-ABI handle" {
     // Phase 2 regression for the same anchor bug Phase 1 fixed for the
-    // Condition family (zidl/docs/roadmap.md "Binding design review:
-    // decision") -- confirms the fix generalizes across a real 3-level
+    // Condition family (zidl/docs/design/binding-c-abi-identity.md) --
+    // confirms the fix generalizes across a real 3-level
     // chain (Entity <- DataReader <- ZZDDS.DataReader) and across the
     // dcps.idl/zzdds.idl module boundary, not just within one IDL file.
     const alloc = testing.allocator;
@@ -1354,8 +1354,9 @@ test "waitset: zzdds_create_waitset/zzdds_create_guardcondition round trip throu
 }
 
 test "waitset: WaitSet.wait() returns the SAME boxed C-ABI handle the app derived for its own GuardCondition, not a different one" {
-    // Regression for the anchor bug in zidl/docs/roadmap.md's "Binding
-    // design review: decision" (2026-08-12): before that fix, GuardCondition
+    // Regression for the anchor bug in
+    // zidl/docs/design/binding-c-abi-identity.md (2026-08-12): before that
+    // fix, GuardCondition
     // and Condition views of the same object boxed to two independently-
     // allocated EntityBox addresses (GuardConditionImpl.gc_c_abi vs
     // .cond_c_abi), so an app holding a GuardCondition handle it attached
@@ -1373,7 +1374,7 @@ test "waitset: WaitSet.wait() returns the SAME boxed C-ABI handle the app derive
     // `.vtable.get_c_abi_handle`), which is the actual mechanism under test
     // and is always available. attach_condition/wait themselves are called
     // as plain native vtable dispatch (never boxed, never broken -- see the
-    // roadmap section) so this test's own plumbing doesn't accidentally
+    // design doc) so this test's own plumbing doesn't accidentally
     // depend on the very fix it's meant to verify.
     const ws_boxed = extensions.zzdds_create_waitset();
     defer extensions.zzdds_destroy_waitset(ws_boxed);

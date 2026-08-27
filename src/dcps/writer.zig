@@ -172,8 +172,7 @@ pub const DataWriterImpl = struct {
 
     /// One box for the whole object, shared across every interface view
     /// (DataWriter, Entity, and ZZDDS.DataWriter — see src/c_abi/extensions.zig)
-    /// — see `views` below and zidl/docs/roadmap.md "Binding design review:
-    /// decision".
+    /// — see `views` below and `zidl/docs/design/binding-c-abi-identity.md`.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
     const Self = @This();

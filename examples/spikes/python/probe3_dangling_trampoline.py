@@ -9,8 +9,7 @@ release_listener_data(void *listener_data) field -- zzdds's own way of
 telling a binding "I'm done calling through this listener's function
 pointers, it's now safe to free whatever you were keeping alive on my
 behalf." zzdds's ListenerBox/EntityQuiesce refcounting (see zzdds's
-docs/roadmap.md "Entity quiesce decision" / "Listener release hook
-decision") makes sure that hook fires at the right time relative to
+`zzdds/docs/decisions.md` (listener-release hook / entity quiesce)) makes sure that hook fires at the right time relative to
 in-flight callback dispatch -- but that machinery protects the DDS
 *entity*'s lifetime (the reader/writer), not the *native function pointer's
 own backing memory*, which is an entirely different, Python/ctypes-side

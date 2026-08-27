@@ -1,5 +1,5 @@
 //! Regression coverage for condition/entity lifecycle safety around WaitSet
-//! attachment — see docs/roadmap.md's WaitSet/condition-example plan.
+//! attachment — see CHANGELOG.md (2026-08-09/10, WaitSet / condition example).
 //!
 //! Before this fix, StatusCondition/ReadCondition/QueryCondition were freed
 //! unconditionally by their owning entity/reader's teardown path with no

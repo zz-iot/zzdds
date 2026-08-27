@@ -590,7 +590,7 @@ namespace detail {
 // concrete sibling implementors — every WaitSet view really is a WaitSet).
 // GuardCondition is different: it's a real member of Condition's shared
 // C-ABI box family (see dcps.idl's `@shared_c_abi_box` annotations and
-// zidl's docs/roadmap.md "Binding design review: decision"), and
+// zidl/docs/design/binding-c-abi-identity.md), and
 // `WaitSet::wait()`/`get_conditions()` construct a generic `::DDS::Condition`
 // for every handle they return via `::DDS::ConditionImpl::_getOrCreate` — the
 // same shared per-family cache `StatusConditionImpl`/`ReadConditionImpl`/
@@ -630,10 +630,9 @@ public:
     // last shared_ptr right after attaching, relying on the WaitSet to keep
     // the condition alive the way wait()'s returned handles might suggest,
     // would otherwise be left holding a dangling wrapper the moment the
-    // underlying C-ABI entity is torn down. See zidl's docs/roadmap.md
-    // "Binding design review: decision" -> "WaitSet-attached-condition
-    // release hook" for the C-ABI side of this, and its own "Explicitly not
-    // done" note this closes for C++.
+    // underlying C-ABI entity is torn down. See
+    // zidl/docs/design/binding-c-abi-identity.md and zidl/CHANGELOG.md
+    // (v0.3.5, WaitSet-attached-condition release hook) for the C-ABI side.
     //
     // Deliberately does NOT pre-check "is this condition already attached"
     // against any bookkeeping of its own before deciding whether to
