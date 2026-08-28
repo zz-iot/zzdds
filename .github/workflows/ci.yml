@@ -37,7 +37,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-95b6f62' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-c052430' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -721,17 +721,23 @@ jobs:
           # prepared upstream). Re-promote once fixed on their end.
           #
           # toc_coredx_dds is promoted (2026-07-14): full suite is clean in one
-          # direction (105/105) and 103/105 in the other. The 2 failures
-          # (Test_CoherentSets_10/19) are a rare (~1/15 runs), spec-compliant
-          # flake — CoreDX sends all topics' coherent-set-completing data
-          # within microseconds of each other (confirmed via pcap), so the
-          # occasional single-poll-cycle lag is internal zzdds reader-dispatch
-          # jitter across independent per-topic StatefulReaders, not a wire or
-          # protocol bug. Tracked as a follow-up; not blocking.
+          # direction (105/105) and 103/105 in the other. The Test_CoherentSets
+          # flakes seen against it (and against connext under the sanitizer
+          # lanes) were run to ground 2026-08-28 — ~2,500 live runs, zero
+          # ordering/loss/tear faults in any direction or build. The cause is
+          # the dds-rtps harness's coherent_sets_w_instances asserting an exact
+          # per-poll-cycle sample count; fixed upstream in omg-dds/dds-rtps.
+          #
+          # zzdds is included so the pinned RELEASE binary runs against the
+          # freshly-built HEAD binary every CI run (both directions, in the
+          # normal + TSan + DebugAllocator lanes) — a standing "did HEAD regress
+          # vs the last published snapshot" signal, and sanitizer-lane coverage
+          # the released binary does not get in the omg-dds workflow.
           DEFAULT_PREFIXES = [
               'connext_dds',
               'eclipse_cyclone',
               'toc_coredx_dds',
+              'zzdds',
           ]
 
           result = subprocess.run(
@@ -768,13 +774,15 @@ jobs:
   #   dds-rtps/srcZig/zzdds/packages/zzdds -> ../../../../zzdds
   # which resolves to $GITHUB_WORKSPACE/zzdds — exactly our checkout path.
   #
-  # ubuntu-22.04: vendor prebuilt binaries require this image; use the same
-  # runner here so the zzdds binary we upload is glibc-compatible with it.
+  # ubuntu-24.04 matches omg-dds/dds-rtps's own interop workflow
+  # (1_run_interoperability_tests.yml runs on ubuntu-latest), so the pinned
+  # vendor release binaries are known to run there. If a vendor binary ever
+  # fails to exec on this image, that is the reason to pin the runner back.
 
   self-interop:
     name: self-interop (dds-rtps)
     needs: test-linux
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out zzdds
@@ -813,8 +821,13 @@ jobs:
         with:
           version: "0.16.0"
 
+      - name: Install Python (match omg-dds/dds-rtps interop workflow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+
       - name: Install Python dependencies
-        run: pip install pexpect junitparser
+        run: pip install --requirement dds-rtps/requirements.txt
 
       - name: Build shape_main (ReleaseSafe)
         working-directory: dds-rtps/srcZig/zzdds
@@ -848,7 +861,7 @@ jobs:
   self-interop-tsan:
     name: self-interop (dds-rtps) + TSAN
     needs: test-linux
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out zzdds
@@ -881,8 +894,13 @@ jobs:
         with:
           version: "0.16.0"
 
+      - name: Install Python (match omg-dds/dds-rtps interop workflow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+
       - name: Install Python dependencies
-        run: pip install pexpect junitparser
+        run: pip install --requirement dds-rtps/requirements.txt
 
       - name: Build shape_main (Debug + ThreadSanitizer)
         working-directory: dds-rtps/srcZig/zzdds
@@ -934,7 +952,7 @@ jobs:
   vendor-interop-normal:
     name: "${{ matrix.vendor.name }} / ${{ matrix.direction }}"
     needs: [setup-matrix, self-interop]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -956,8 +974,13 @@ jobs:
           path: dds-rtps
           persist-credentials: false
 
+      - name: Install Python (match omg-dds/dds-rtps interop workflow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+
       - name: Install Python dependencies
-        run: pip install pexpect junitparser
+        run: pip install --requirement dds-rtps/requirements.txt
 
       - name: Download zzdds binary
         uses: actions/download-artifact@v4
@@ -1015,7 +1038,7 @@ jobs:
   vendor-interop-tsan:
     name: "TSan: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
     needs: [setup-matrix, self-interop-tsan]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -1037,8 +1060,13 @@ jobs:
           path: dds-rtps
           persist-credentials: false
 
+      - name: Install Python (match omg-dds/dds-rtps interop workflow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+
       - name: Install Python dependencies
-        run: pip install pexpect junitparser
+        run: pip install --requirement dds-rtps/requirements.txt
 
       - name: Download zzdds binary (TSan)
         uses: actions/download-artifact@v4
@@ -1103,7 +1131,7 @@ jobs:
   self-interop-debug-allocator:
     name: self-interop (dds-rtps) + DebugAllocator
     needs: test-linux
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out zzdds
@@ -1136,8 +1164,13 @@ jobs:
         with:
           version: "0.16.0"
 
+      - name: Install Python (match omg-dds/dds-rtps interop workflow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+
       - name: Install Python dependencies
-        run: pip install pexpect junitparser
+        run: pip install --requirement dds-rtps/requirements.txt
 
       - name: Build shape_main (Debug + DebugAllocator)
         working-directory: dds-rtps/srcZig/zzdds
@@ -1171,7 +1204,7 @@ jobs:
   vendor-interop-debug-allocator:
     name: "DebugAllocator: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
     needs: [setup-matrix, self-interop-debug-allocator]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -1193,8 +1226,13 @@ jobs:
           path: dds-rtps
           persist-credentials: false
 
+      - name: Install Python (match omg-dds/dds-rtps interop workflow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+
       - name: Install Python dependencies
-        run: pip install pexpect junitparser
+        run: pip install --requirement dds-rtps/requirements.txt
 
       - name: Download zzdds binary (DebugAllocator)
         uses: actions/download-artifact@v4

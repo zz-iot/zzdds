@@ -161,12 +161,17 @@ bases exactly as before (unexercised, matching today's shipped behavior).
 
 **GROUP_PRESENTATION coherent sets: implement to spec.**
 The zzdds implementation emits `PID_COHERENT_SET` (0x0056), `PID_GROUP_SEQ_NUM` (0x0064),
-and `PID_GROUP_COHERENT_SET` (0x0063) inline QoS per RTPS 2.5 §9.6.3.7. Five test cases
-currently fail in the zzdds→Connext direction (`CoherentSets_8/10/11/12`,
-`OrderedAccess_8`); the Connext→zzdds direction is 89/89. The interop gap is under
-investigation — vendor binaries in CI may not reflect the latest implementation. No
-wire-format changes are planned until the root cause is confirmed; deviating from the
-spec to chase a binary snapshot would risk breaking other vendor interop.
+and `PID_GROUP_COHERENT_SET` (0x0063) inline QoS per RTPS 2.5 §9.6.3.7. The recurring
+`dds-rtps` `CoherentSets_10/11/12/19/20/21` CI failures were investigated end to end
+(2026-08-28, ~2,500 live runs + ~2,300 trace replays across CoreDX/Connext/self, both
+directions, ReleaseSafe/TSan/DebugAllocator): **no zzdds defect.** Every failure is the
+harness's `coherent_sets_w_instances` asserting a per-poll-cycle sample count (exactly 36),
+which depends on the phase alignment of two unsynchronised sleep loops rather than the
+coherent_access contract. The shipped `zzdds-0.2.0` binary flakes identically. Fixed by a
+`coherent_sets_w_instances` rewrite (asserts per-instance ordering, no loss/dup, and
+atomic per-instance coherent-set delivery over the whole run) PR'd to `omg-dds/dds-rtps` —
+same spirit as their `95b6f62` "Added tolerance to the ordered_access test". No zzdds
+wire-format change was needed. `CoherentSets_8` passes.
 
 **Listener hierarchy fallback (DDS 1.4 §2.2.4.1.5): reader/writer own listener first,
 then Subscriber/Publisher, then DomainParticipant — every level's `listener_mask`

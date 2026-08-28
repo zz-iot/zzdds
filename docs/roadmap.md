@@ -98,9 +98,10 @@ Forward-looking only: known gaps, planned features, and open design questions.
   for the `_w_condition` family is a separate, not-yet-done retrofit (`idl/dcps.idl:1114`).
 - **`@standalone` interface annotation is inert** — placed so a future validation pass has
   something to check; no codegen reads it (`idl/dcps.idl:283`).
-- **RTI Connext: 5 open interop gaps** in the zzdds→Connext direction for GROUP_PRESENTATION
-  (`CoherentSets_8/10/11/12`, `OrderedAccess_8`). Root cause under investigation; no
-  wire-format changes until it's confirmed. See `decisions.md`.
+- **`dds-rtps` `CoherentSets_1x/2x` flakiness is a test-harness issue, not zzdds** —
+  `coherent_sets_w_instances` asserted a poll-timing coincidence (exactly 36 samples per
+  read cycle). ~2,500 runs found no ordering/loss/tear faults in any direction or build.
+  Fix PR'd to `omg-dds/dds-rtps`. See `implementation_status.md` / `decisions.md`.
 
 ### Bindings
 
