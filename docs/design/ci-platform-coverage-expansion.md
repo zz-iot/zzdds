@@ -55,6 +55,9 @@ platform-conditional).
 plausible new finding is a genuinely platform-specific allocator interaction, which is the
 point.
 
+**Outcome (PR #65, 2026-08-18): landed on all three platforms** — the
+`DebugAllocator lane` step is in `ci.yml`'s `test-other` job, no platform-specific findings.
+
 ## Item 2 — C/C++/Java bindings on the 3-platform matrix
 
 **Change:** extend `test-other` to also build+run the binding smoke tests, mirroring
@@ -211,6 +214,19 @@ specific panic message, or relying on `unreachable` being reached deterministica
 wiring it into CI, specifically to find any such test and either fix it (make the assertion
 `Debug`/`ReleaseSafe`-only, or rewrite it to not depend on safety-check panics) rather than
 discover it as a confusing CI failure.
+
+**Outcome — `ReleaseFast` landed (PR #65, 2026-08-18):** the `release-fast` step is in
+`run_deterministic_matrix.py` (covering Linux x86_64 via `test-linux`) and a
+`Test (ReleaseFast)` step is in `release.yml`'s `test` job on all four platforms. No
+safety-panic-dependent tests were found; the suite passes clean.
+
+**Outcome — `ReleaseSmall` NOT landed (2026-08-28):** `zig build test -Doptimize=ReleaseSmall`
+produces 37 `panic: incorrect alignment` crashes, all in `bootstrap_test` and
+`typesupport_test`, all through `zidl-rt`'s `entity_box.zig` `unboxAsView`
+(`@alignCast(box.vtable)`) — the C-ABI shared-box / WaitSet / TypeSupport paths. `Debug`,
+`ReleaseSafe`, and `ReleaseFast` are all clean, so this is a real latent alignment bug
+surfaced only by ReleaseSmall's layout, not a test-depends-on-a-safety-panic issue. Left
+un-wired pending root-cause; tracked in `roadmap.md`'s CI section.
 
 ## Cross-cutting implementation notes
 
