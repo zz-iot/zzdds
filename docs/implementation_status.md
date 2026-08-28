@@ -159,11 +159,21 @@ The constant is present but not yet serialized in SEDP announcements; when GROUP
 is added, confirm that peers expect `0x002D` (not the historical `0x0056` used by some older
 implementations).
 
-**RTI Connext GROUP_PRESENTATION interop gaps (zzdds→Connext).** Five test cases fail in
-the zzdds→Connext direction: `CoherentSets_8`, `OrderedAccess_8`, `CoherentSets_10/11/12`.
-These scenarios involve GROUP_PRESENTATION coherent sets. The root cause is under
-investigation — the vendor binary in CI may predate any relevant updates to their shape_main
-implementation. The Connext→zzdds direction passes 89/89.
+**`dds-rtps` `CoherentSets_10/11/12/19/20/21` flakiness — traced to the test harness,
+not zzdds.** These six tests use `coherent_sets_w_instances`, whose original body asserted
+that *exactly* 36 samples arrive between consecutive `Reading coherent sets` lines — a
+property of the phase alignment between the subscriber's `take()` period and the
+publisher's write period, not of the coherent_access contract. A ~2,500-run campaign
+(2026-08-28) against CoreDX / Connext / self, in both directions, across ReleaseSafe /
+ThreadSanitizer / DebugAllocator builds, found **zero** ordering, loss, duplication, or
+coherent-set-tear faults; every failure was the per-poll-cycle count assertion. It is
+direction-specific (vendor publishes, zzdds subscribes), worst against CoreDX (round-robins
+instances) and under the slower sanitizer builds, and the shipped `zzdds-0.2.0` binary
+flakes the same way. Fix: a `coherent_sets_w_instances` rewrite that asserts the real
+invariants (per-instance ordering, no loss/dup, per-instance coherent-set atomic delivery)
+over the whole run — PR'd to `omg-dds/dds-rtps`. `CoherentSets_8` (pure GROUP_PRESENTATION
+compatibility) currently passes. `OrderedAccess_8` was not re-examined in this campaign;
+RTI added timing tolerance to `ordered_access_w_instances` upstream in Aug 2026 (`95b6f62`).
 
 **SPDP liveness probe fires directed HBs on SEDP reliable channels.** When SPDP silence
 exceeds `min(3 × observed_interval, 5 s)`, the SPDP layer triggers a directed non-final
