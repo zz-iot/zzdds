@@ -302,6 +302,14 @@ jobs:
                    zig-out/lib/pkgconfig/zzdds.pc zig-out/lib/cmake/ZZDDS/zzdds-config.cmake; do
             [ -f "$f" ] || { echo "::error::missing $f"; fail=1; }
           done
+          # The bundle is renamed and extracted elsewhere, so zzdds.pc must be
+          # relocatable (prefix derived from ${pcfiledir}) rather than carrying
+          # a baked-in absolute build path.
+          if ! grep -qE '^prefix=\$\{pcfiledir\}' zig-out/lib/pkgconfig/zzdds.pc; then
+            echo "::error::zzdds.pc prefix= is not \${pcfiledir}-relative — bundle would not be relocatable"
+            grep '^prefix=' zig-out/lib/pkgconfig/zzdds.pc
+            fail=1
+          fi
           [ "$fail" -eq 0 ]
 
       - name: Package
@@ -400,9 +408,11 @@ jobs:
           \`\`\`
 
           ## Prebuilt C/C++ library bundles
-          \`zzdds-<version>-<platform>.tar.gz\` below each unpack to an install
-          prefix (\`include/\`, \`lib/\` with pkgconfig + CMake package files).
-          Point \`PKG_CONFIG_PATH\` or \`CMAKE_PREFIX_PATH\` at the unpacked dir." \
+          \`zzdds-<version>-<platform>.tar.gz\` below each unpack to a
+          relocatable install prefix (\`include/\`, \`lib/\` with pkg-config +
+          CMake package files). Point \`CMAKE_PREFIX_PATH\` at the unpacked
+          directory, or \`PKG_CONFIG_PATH\` at its \`lib/pkgconfig\`
+          subdirectory." \
             dist/*.tar.gz
 
       - name: Bump to post-release dev version

@@ -346,13 +346,19 @@ Audit of `build.zig` options, `scripts/run_deterministic_matrix.py`, `ci.yml`, a
   drift). Revisit when Zig bundles a newer LLVM. Trail:
   `zz-dev/macos-tsan-crash-investigation.md`. (TSan on Windows: Clang/LLVM has no supported
   target. Extending `examples-tsan` to macOS is a separate follow-up.)
-- **`ReleaseSmall` gate** — attempted 2026-08-28, **not viable yet**. `zig build test
-  -Doptimize=ReleaseSmall` produces 37 `panic: incorrect alignment` crashes, all in
-  `bootstrap_test` and `typesupport_test`, all through `zidl-rt`'s
-  `entity_box.zig` `unboxAsView` (`@alignCast(box.vtable)`) on the C-ABI shared-box /
-  WaitSet / TypeSupport paths. `Debug`, `ReleaseSafe`, and `ReleaseFast` are all clean — so
-  this is a real latent alignment bug surfaced only by ReleaseSmall's layout, not a
-  test-depends-on-a-safety-panic issue. Root-cause before gating on ReleaseSmall.
+- **`ReleaseSmall` gate — blocked on an upstream Zig codegen bug (root-caused 2026-08-29).**
+  `zig build test -Doptimize=ReleaseSmall` produces 37 `panic: incorrect alignment` crashes
+  (in `bootstrap_test` / `typesupport_test`, via `zidl-rt`'s `entity_box.zig` `unboxAsView`
+  `@alignCast(box.vtable)`). Root cause: **Zig 0.16.0's self-hosted x86_64 backend, only at
+  `-OReleaseSmall`, emits read-only global constants with no alignment** — `&SomeImpl.views`
+  (an `extern struct` `CAbiViews`, `@alignOf` 8) and every `*_vtable` global land at odd
+  addresses, packed byte-to-byte in `.rodata`. `unboxAsView`'s `@alignCast` correctly traps
+  it. Not a zzdds or zidl defect. Minimal repro (deterministic, ~10 lines): a bare
+  `const val: u32 = …` preceded by a 1-byte `const` lands 1-mod-4 under
+  `-OReleaseSmall -fno-llvm -fno-lld`; fine under `-OReleaseFast`, fine with the LLVM
+  backend, fine under Debug/ReleaseSafe. Full trail + repro in
+  `zz-dev/releasesmall-misaligned-rodata-investigation.md`. Next: file against `ziglang/zig`;
+  a ReleaseSmall CI lane would need `.use_llvm = true` (like `emit-tests-llvm`) until fixed.
 
 ### Still open, ranked
 

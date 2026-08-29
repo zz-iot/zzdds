@@ -220,13 +220,18 @@ discover it as a confusing CI failure.
 `Test (ReleaseFast)` step is in `release.yml`'s `test` job on all four platforms. No
 safety-panic-dependent tests were found; the suite passes clean.
 
-**Outcome — `ReleaseSmall` NOT landed (2026-08-28):** `zig build test -Doptimize=ReleaseSmall`
-produces 37 `panic: incorrect alignment` crashes, all in `bootstrap_test` and
-`typesupport_test`, all through `zidl-rt`'s `entity_box.zig` `unboxAsView`
-(`@alignCast(box.vtable)`) — the C-ABI shared-box / WaitSet / TypeSupport paths. `Debug`,
-`ReleaseSafe`, and `ReleaseFast` are all clean, so this is a real latent alignment bug
-surfaced only by ReleaseSmall's layout, not a test-depends-on-a-safety-panic issue. Left
-un-wired pending root-cause; tracked in `roadmap.md`'s CI section.
+**Outcome — `ReleaseSmall` NOT landed; root-caused to an upstream Zig bug (2026-08-29):**
+`zig build test -Doptimize=ReleaseSmall` produces 37 `panic: incorrect alignment` crashes
+(`bootstrap_test` / `typesupport_test`, via `zidl-rt`'s `entity_box.zig` `unboxAsView`
+`@alignCast(box.vtable)`). Traced to **Zig 0.16.0's self-hosted x86_64 backend emitting
+read-only global constants with no alignment, only at `-OReleaseSmall`**: `&SomeImpl.views`
+(an `extern struct` with `@alignOf` 8) and every `*_vtable` global land at odd addresses,
+byte-packed in `.rodata`; `unboxAsView`'s `@alignCast` correctly traps it. Not a zzdds/zidl
+defect — reproduces in ~10 lines with a bare `const val: u32` (`-OReleaseSmall -fno-llvm
+-fno-lld` → 1-mod-4; `-OReleaseFast`, the LLVM backend, and Debug/ReleaseSafe all fine).
+Full trail + minimal repro: `zz-dev/releasesmall-misaligned-rodata-investigation.md`.
+Follow-ups: (1) file against `ziglang/zig`; (2) a ReleaseSmall lane, if wanted before the
+fix lands, must force `.use_llvm = true` (as `emit-tests-llvm` already does for Valgrind).
 
 ## Cross-cutting implementation notes
 
