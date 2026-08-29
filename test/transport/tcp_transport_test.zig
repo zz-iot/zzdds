@@ -766,21 +766,30 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
         for (server.all_connections.items) |co| _ = std.c.shutdown(co.fd, 2); // SHUT_RDWR
         server.conn_mu.unlock();
     }
-    // Give the kernel a moment to actually process and propagate the
-    // shutdown before testing behavior that depends on it having happened.
-    // This is the well-known TCP characteristic where the first send() after
-    // a remote RST can still succeed locally (the RST hasn't been processed
-    // by the local stack yet) — the failure only surfaces on a later send or
-    // read. CI showed this isn't just a theoretical race: it reproduced on
-    // both Windows and (previously-passing) macOS once the send followed the
-    // shutdown closely enough, so this is a real cross-platform TCP settling
-    // delay to account for, not a platform-specific quirk.
-    sleepMs(100);
+    // The transport detects a dead connection lazily, on the next write
+    // failure — there's no disconnect event for a send-only connection. After
+    // shutdown() the local stack may not have processed the peer's FIN yet,
+    // and the first post-shutdown send() can still succeed on the doomed
+    // socket (the well-known "first send after a remote RST succeeds locally"
+    // characteristic — CI has hit this on Windows and macOS). A fixed sleep
+    // here is a guess at that settling time; under a slow/loaded runner
+    // (ARM64 + DebugAllocator) it loses the race and generation stays 1.
+    // Instead, drive the reconnect until the new TcpConnection is observed:
+    // the first send() that lands after the FIN is processed triggers the
+    // redial, earlier ones are harmless no-ops on the still-"live" socket.
+    {
+        const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+        while (time_mod.nanoTimestamp() < deadline) {
+            ct.send(&dest, "second") catch {};
+            if (ct.connectionGeneration(&dest) == 2) break;
+            sleepMs(20);
+        } else return error.ReconnectNeverObserved;
+    }
 
-    // Reconnect: generation becomes 2.
-    try ct.send(&dest, "second");
-    latch.waitFor(3);
+    // Reconnect happened: generation is 2, and the byte reached the server
+    // over the new connection.
     try testing.expectEqual(@as(u32, 2), ct.connectionGeneration(&dest));
+    latch.waitFor(3);
 }
 
 // ── IPv6 loopback send + receive ──────────────────────────────────────────────

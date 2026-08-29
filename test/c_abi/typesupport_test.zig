@@ -4,6 +4,7 @@
 //! compute_key_hash function pointer into the Zig TypeSupport infrastructure.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
@@ -87,7 +88,7 @@ const Fixture = struct {
             .{},
         );
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const dp_boxed = try zidl_rt.boxEntity(alloc, dp.ptr, &DomainParticipantImpl.views);
         return .{ .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .dp_boxed = dp_boxed, .alloc = alloc };
     }

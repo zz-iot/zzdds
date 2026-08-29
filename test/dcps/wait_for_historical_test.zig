@@ -5,6 +5,7 @@
 //! background threads are needed.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -147,7 +148,7 @@ test "wait_for_historical_data: VOLATILE returns OK immediately" {
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
@@ -170,7 +171,7 @@ test "wait_for_historical_data: TRANSIENT_LOCAL with no matched writers returns 
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
@@ -207,7 +208,7 @@ test "wait_for_historical_data: non-zero max_wait with no matched writer times o
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
@@ -241,7 +242,7 @@ test "wait_for_historical_data: matches and delivers *during* the wait, not befo
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
@@ -298,7 +299,7 @@ test "wait_for_historical_data: times out before first HEARTBEAT from transient-
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -329,7 +330,7 @@ test "wait_for_historical_data: returns OK after first HB with empty history (la
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -363,7 +364,7 @@ test "wait_for_historical_data: returns OK after history fully delivered (data b
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -410,7 +411,7 @@ test "wait_for_historical_data: returns OK once pending data fills history floor
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));

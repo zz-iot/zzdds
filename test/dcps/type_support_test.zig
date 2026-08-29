@@ -8,6 +8,7 @@
 //! the CDR payloads and correctly applies ownership per-instance.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
@@ -103,7 +104,7 @@ const Fixture = struct {
             .{},
         );
         errdefer factory_a.deinit();
-        const dp_a = factory_a.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_a = factory_a.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_a = dp_a.create_publisher(.{}, null, 0);
         const topic_a = dp_a.create_topic("TSTopic", "TSType", .{}, null, 0);
 
@@ -120,7 +121,7 @@ const Fixture = struct {
             .{},
         );
         errdefer factory_b.deinit();
-        const dp_b = factory_b.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_b = factory_b.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_b = dp_b.create_publisher(.{}, null, 0);
         const topic_b = dp_b.create_topic("TSTopic", "TSType", .{}, null, 0);
 
@@ -137,7 +138,7 @@ const Fixture = struct {
             .{},
         );
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub_r = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("TSTopic", "TSType", .{}, null, 0);
 

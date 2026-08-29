@@ -9,6 +9,7 @@
 //! and all four notification fire paths.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -87,7 +88,7 @@ const SingleFixture = struct {
             .{},
         );
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_ = dp.create_publisher(.{}, null, 0);
         const topic = dp.create_topic("WriterTopic", "WriterType", .{}, null, 0);
         return .{
@@ -151,7 +152,7 @@ const TwoPartyFixture = struct {
             .{},
         );
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_ = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("WVTopic", "WVType", .{}, null, 0);
 
@@ -168,7 +169,7 @@ const TwoPartyFixture = struct {
             .{},
         );
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub_ = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("WVTopic", "WVType", .{}, null, 0);
 

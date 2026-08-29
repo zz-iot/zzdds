@@ -5,6 +5,7 @@
 //! set/get_qos, deinit-via-vtable.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -93,10 +94,10 @@ test "lookup_participant: returns participant for matching domain_id" {
     var h = try Harness.init(1);
     defer h.deinit();
     const f = h.factory.toDDSFactory();
-    const dp = f.create_participant(7, .{}, null, 0);
+    const dp = f.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = f.vtable.delete_participant(f.ptr, dp);
 
-    const found = f.vtable.lookup_participant(f.ptr, 7);
+    const found = f.vtable.lookup_participant(f.ptr, test_domain.get());
     try testing.expect(found.ptr == dp.ptr);
 }
 
@@ -104,7 +105,7 @@ test "lookup_participant: returns nil for unknown domain_id" {
     var h = try Harness.init(2);
     defer h.deinit();
     const f = h.factory.toDDSFactory();
-    const dp = f.create_participant(7, .{}, null, 0);
+    const dp = f.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = f.vtable.delete_participant(f.ptr, dp);
 
     const found = f.vtable.lookup_participant(f.ptr, 99);

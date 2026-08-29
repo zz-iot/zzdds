@@ -4,6 +4,7 @@
 //! sockets or background threads are needed.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -176,7 +177,7 @@ test "ignore_participant: removes from discovered cache" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -212,7 +213,7 @@ test "ignore_participant: blocks future announcements from same prefix" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -242,7 +243,7 @@ test "ignore_participant: bad handle returns RETCODE_BAD_PARAMETER" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const rc = dp.vtable.ignore_participant(dp.ptr, 0x7FFF_FFFF);
@@ -254,7 +255,7 @@ test "ignore_participant: writer from ignored prefix not matched" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -292,7 +293,7 @@ test "ignore_participant: reader from ignored prefix not matched to writer" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -329,7 +330,7 @@ test "ignore_topic: bad handle returns BAD_PARAMETER" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, dp.vtable.ignore_topic(dp.ptr, 0x7FFF_FFFF));
@@ -340,7 +341,7 @@ test "ignore_topic: writer for ignored topic not matched to reader" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -369,7 +370,7 @@ test "ignore_topic: reader for ignored topic not matched to writer" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -393,7 +394,7 @@ test "ignore_publication: ignored writer not matched to reader" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -429,7 +430,7 @@ test "ignore_subscription: ignored reader not matched to writer" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -460,7 +461,7 @@ test "ignore_publication/subscription: duplicate call is idempotent" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_publication(dp.ptr, 42));

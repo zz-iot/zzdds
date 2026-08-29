@@ -6,6 +6,7 @@
 //! for fully deterministic timer control.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -96,7 +97,7 @@ const Fixture = struct {
         );
         errdefer factory_w.deinit();
         const dpf_w = factory_w.toDDSFactory();
-        const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+        const dp_w = dpf_w.create_participant(test_domain.get(), .{}, null, 0);
         const pub_w = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("QosTopic", "QosType", .{}, null, 0);
 
@@ -114,7 +115,7 @@ const Fixture = struct {
         );
         errdefer factory_r.deinit();
         const dpf_r = factory_r.toDDSFactory();
-        const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+        const dp_r = dpf_r.create_participant(test_domain.get(), .{}, null, 0);
         const sub_r = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("QosTopic", "QosType", .{}, null, 0);
 
@@ -328,7 +329,7 @@ const OwnershipFixture = struct {
             .{},
         );
         errdefer factory_a.deinit();
-        const dp_a = factory_a.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_a = factory_a.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_a = dp_a.create_publisher(.{}, null, 0);
         const topic_a = dp_a.create_topic("OwnTopic", "OwnType", .{}, null, 0);
 
@@ -345,7 +346,7 @@ const OwnershipFixture = struct {
             .{},
         );
         errdefer factory_b.deinit();
-        const dp_b = factory_b.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_b = factory_b.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_b = dp_b.create_publisher(.{}, null, 0);
         const topic_b = dp_b.create_topic("OwnTopic", "OwnType", .{}, null, 0);
 
@@ -362,7 +363,7 @@ const OwnershipFixture = struct {
             .{},
         );
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub_r = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("OwnTopic", "OwnType", .{}, null, 0);
 
@@ -881,7 +882,7 @@ const TimerFixture = struct {
         errdefer factory.deinit();
         try factory.clock_registry.register("manual", clock);
         const dpf = factory.toDDSFactory();
-        const dp = dpf.create_participant(0, .{}, null, 0);
+        const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
         const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
         const pub_ = dp.create_publisher(.{}, null, 0);
         const sub_ = dp.create_subscriber(.{}, null, 0);
@@ -1424,7 +1425,7 @@ const TwoPartyTimerFixture = struct {
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_w.deinit();
         try factory_w.clock_registry.register("manual", clock);
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_ = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("LiveTopic", "LiveType", .{}, null, 0);
 
@@ -1435,7 +1436,7 @@ const TwoPartyTimerFixture = struct {
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, config);
         errdefer factory_r.deinit();
         try factory_r.clock_registry.register("manual", clock);
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
         const sub_ = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("LiveTopic", "LiveType", .{}, null, 0);

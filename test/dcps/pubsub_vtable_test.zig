@@ -7,6 +7,7 @@
 //! get_participant, set/get_default_*_qos, copy_from_topic_qos, deinit.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -94,7 +95,7 @@ const Harness = struct {
 test "Publisher: enable returns RETCODE_OK" {
     var h = try Harness.init(0x20);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -104,7 +105,7 @@ test "Publisher: enable returns RETCODE_OK" {
 test "Publisher: get_statuscondition and get_status_changes" {
     var h = try Harness.init(0x21);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -124,7 +125,7 @@ test "Publisher: lookup_datawriter found and not-found" {
     var h = try Harness.init(0x22);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -146,7 +147,7 @@ test "Publisher: delete_contained_entities clears all writers" {
     var h = try Harness.init(0x23);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -161,7 +162,7 @@ test "Publisher: delete_datawriter returns BAD_PARAMETER for unknown writer" {
     var h = try Harness.init(0x24);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -172,7 +173,7 @@ test "Publisher: delete_datawriter returns BAD_PARAMETER for unknown writer" {
 test "Publisher: set_qos / get_qos round-trip" {
     var h = try Harness.init(0x25);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -192,7 +193,7 @@ test "Publisher: set_qos / get_qos round-trip" {
 test "Publisher: set_listener / get_listener round-trip" {
     var h = try Harness.init(0x26);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -205,7 +206,7 @@ test "Publisher: set_listener / get_listener round-trip" {
 test "Publisher: suspend/resume/begin/end return OK" {
     var h = try Harness.init(0x27);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -221,7 +222,7 @@ test "Publisher: wait_for_acknowledgments with BEST_EFFORT writer returns OK" {
     var h = try Harness.init(0x28);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -240,7 +241,7 @@ test "Publisher: wait_for_acknowledgments with infinite timeout and no writers" 
     var h = try Harness.init(0x29);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -255,7 +256,7 @@ test "Publisher: wait_for_acknowledgments with infinite timeout and no writers" 
 test "Publisher: get_participant returns the owning DomainParticipant" {
     var h = try Harness.init(0x2A);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -268,7 +269,7 @@ test "Publisher: get_participant returns the owning DomainParticipant" {
 test "Publisher: set/get_default_datawriter_qos round-trip" {
     var h = try Harness.init(0x2B);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -286,7 +287,7 @@ test "Publisher: set/get_default_datawriter_qos round-trip" {
 test "Publisher: copy_from_topic_qos copies relevant fields" {
     var h = try Harness.init(0x2C);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -305,7 +306,7 @@ test "Publisher: copy_from_topic_qos copies relevant fields" {
 test "Subscriber: enable, get_statuscondition, get_status_changes, get_instance_handle" {
     var h = try Harness.init(0x30);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -328,7 +329,7 @@ test "Subscriber: lookup_datareader found and not-found" {
     var h = try Harness.init(0x31);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -349,7 +350,7 @@ test "Subscriber: delete_contained_entities" {
     var h = try Harness.init(0x32);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -363,7 +364,7 @@ test "Subscriber: delete_contained_entities" {
 test "Subscriber: delete_datareader returns BAD_PARAMETER for unknown reader" {
     var h = try Harness.init(0x33);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -374,7 +375,7 @@ test "Subscriber: delete_datareader returns BAD_PARAMETER for unknown reader" {
 test "Subscriber: get_datareaders with empty subscriber returns empty list" {
     var h = try Harness.init(0x34);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -393,7 +394,7 @@ test "Subscriber: notify_datareaders fires listener for readers with DATA_AVAILA
     var h = try Harness.init(0x35);
     defer h.deinit();
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -410,7 +411,7 @@ test "Subscriber: notify_datareaders fires listener for readers with DATA_AVAILA
 test "Subscriber: notify_datareaders with no readers returns OK" {
     var h = try Harness.init(0x36);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -422,7 +423,7 @@ test "Subscriber: notify_datareaders with no readers returns OK" {
 test "Subscriber: set_qos / get_qos round-trip" {
     var h = try Harness.init(0x37);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -439,7 +440,7 @@ test "Subscriber: set_qos / get_qos round-trip" {
 test "Subscriber: set_listener / get_listener round-trip" {
     var h = try Harness.init(0x38);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -452,7 +453,7 @@ test "Subscriber: set_listener / get_listener round-trip" {
 test "Subscriber: begin_access / end_access return RETCODE_OK" {
     var h = try Harness.init(0x39);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -465,7 +466,7 @@ test "Subscriber: begin_access / end_access return RETCODE_OK" {
 test "Subscriber: get_participant returns the owning DomainParticipant" {
     var h = try Harness.init(0x3A);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -478,7 +479,7 @@ test "Subscriber: get_participant returns the owning DomainParticipant" {
 test "Subscriber: set/get_default_datareader_qos round-trip" {
     var h = try Harness.init(0x3B);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -495,7 +496,7 @@ test "Subscriber: set/get_default_datareader_qos round-trip" {
 test "Subscriber: copy_from_topic_qos copies relevant fields" {
     var h = try Harness.init(0x3C);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const sub = dp.create_subscriber(.{}, null, 0);
@@ -514,7 +515,7 @@ test "Subscriber: copy_from_topic_qos copies relevant fields" {
 test "Publisher: set_qos with partition names — clone survives replacement" {
     var h = try Harness.init(0xB0);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
     const pub_ = dp.create_publisher(.{}, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -538,7 +539,7 @@ test "Publisher: set_qos with partition names — clone survives replacement" {
 test "Publisher: get_qos returns independent clone — replacement does not dangle" {
     var h = try Harness.init(0xB1);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
     const pub_ = dp.create_publisher(.{}, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -561,7 +562,7 @@ test "Publisher: get_qos returns independent clone — replacement does not dang
 test "Publisher: set_default_datawriter_qos with user_data — clone survives replacement" {
     var h = try Harness.init(0xB2);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
     const pub_ = dp.create_publisher(.{}, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -585,7 +586,7 @@ test "Publisher: set_default_datawriter_qos with user_data — clone survives re
 test "Subscriber: set_qos with partition names — clone survives replacement" {
     var h = try Harness.init(0xB3);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
     const sub = dp.create_subscriber(.{}, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);
@@ -609,7 +610,7 @@ test "Subscriber: set_qos with partition names — clone survives replacement" {
 test "Subscriber: set_default_datareader_qos with user_data — clone survives replacement" {
     var h = try Harness.init(0xB4);
     defer h.deinit();
-    const dp = h.factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
     const sub = dp.create_subscriber(.{}, null, 0);
     defer _ = dp.vtable.delete_contained_entities(dp.ptr);

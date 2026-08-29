@@ -9,6 +9,7 @@
 //! - topic_as_description: verified against the CFT TopicDescription vtable.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
@@ -87,7 +88,7 @@ const Fixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_w = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("BootTopic", "BootType", .{}, null, 0);
 
@@ -97,7 +98,7 @@ const Fixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub_r = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("BootTopic", "BootType", .{}, null, 0);
 
@@ -173,7 +174,7 @@ test "support factory: generated create_participant and delete_participant" {
     const ext_factory = zidl_rt.unboxAsView(ZZDDS.DomainParticipantFactory, ext_factory_boxed);
 
     const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
-    const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, 0, null);
+    const dp = DDS_DomainParticipantFactory_create_participant_for_test(factory, test_domain.get(), null);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
     try testing.expectEqual(DDS.RETCODE_OK, factory.delete_participant(dp));
 }
@@ -185,7 +186,7 @@ test "support factory: generated create_participant_ex uses config defaults" {
 
     const cfg = ZZDDS.DomainParticipantConfig.default();
     const qos = DDS.DomainParticipantQos{};
-    const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
+    const dp = ext_factory.create_participant_ex(test_domain.get(), qos, null, 0, cfg);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
 
     const factory = ext_factory.vtable.as_DomainParticipantFactory(ext_factory.ptr);
@@ -267,7 +268,7 @@ test "support factory: zzdds_create_factory_with_allocator routes every allocati
     // allocator, not silently fall back to std.heap.c_allocator.
     const cfg = ZZDDS.DomainParticipantConfig.default();
     const qos = DDS.DomainParticipantQos{};
-    const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
+    const dp = ext_factory.create_participant_ex(test_domain.get(), qos, null, 0, cfg);
     try testing.expect(dp.ptr != zzdds.dcps.NIL_PTR);
     try testing.expect(track.alloc_calls.load(.monotonic) > calls_after_bootstrap);
 
@@ -384,7 +385,7 @@ test "get_allocator: extensions-layer C-ABI vtables return the injected custom a
 
     const cfg = ZZDDS.DomainParticipantConfig.default();
     const qos = DDS.DomainParticipantQos{};
-    const dp = ext_factory.create_participant_ex(0, qos, null, 0, cfg);
+    const dp = ext_factory.create_participant_ex(test_domain.get(), qos, null, 0, cfg);
     defer _ = factory.delete_participant(dp);
     try testing.expectEqual(expected, dp.vtable.get_allocator(dp.ptr));
 

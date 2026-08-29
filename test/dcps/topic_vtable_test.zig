@@ -1,6 +1,7 @@
 //! Tests for TopicImpl and ContentFilteredTopicImpl vtable methods.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -30,7 +31,7 @@ const Fixture = struct {
         errdefer d.deinit();
         const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), d.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         return .{ .alloc = alloc, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp };
     }
 

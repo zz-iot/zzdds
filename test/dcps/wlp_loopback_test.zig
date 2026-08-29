@@ -13,6 +13,7 @@
 //! lenient (e.g. an accidentally-infinite lease).
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -71,14 +72,14 @@ fn setupMatchedPairEx(
     liveliness: DDS.LivelinessQosPolicy,
     reader_reliability: DDS.ReliabilityQosPolicyKind,
 ) !Pair {
-    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = w_pid }, 0, null);
+    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = w_pid }, test_domain.get(), null);
     errdefer udp_w.deinit();
-    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), 0, 1_000);
+    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), test_domain.get(), 1_000);
     errdefer disc_w.deinit();
     const factory_w = try DomainParticipantFactoryImpl.init(alloc, udp_w.transport(), disc_w.toDiscovery(), noop_security, .spec_random, .{});
     errdefer factory_w.deinit();
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    const dp_w = dpf_w.create_participant(test_domain.get(), .{}, null, 0);
     errdefer _ = dpf_w.delete_participant(dp_w);
 
     const pub_w = dp_w.create_publisher(.{}, null, 0);
@@ -88,14 +89,14 @@ fn setupMatchedPairEx(
     dw_qos.liveliness = liveliness;
     const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
 
-    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = r_pid }, 0, null);
+    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = r_pid }, test_domain.get(), null);
     errdefer udp_r.deinit();
-    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), 0, 1_000);
+    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), test_domain.get(), 1_000);
     errdefer disc_r.deinit();
     const factory_r = try DomainParticipantFactoryImpl.init(alloc, udp_r.transport(), disc_r.toDiscovery(), noop_security, .spec_random, .{});
     errdefer factory_r.deinit();
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    const dp_r = dpf_r.create_participant(test_domain.get(), .{}, null, 0);
     errdefer _ = dpf_r.delete_participant(dp_r);
 
     const sub_r = dp_r.create_subscriber(.{}, null, 0);
