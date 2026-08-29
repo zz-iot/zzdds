@@ -111,6 +111,42 @@ jobs:
       - name: Test (ReleaseFast)
         run: zig build test -Doptimize=ReleaseFast
 
+      # Binding smoke tests, mirroring ci.yml's test-other job: the release
+      # gate previously ran only `zig build test` (+ReleaseFast +TSan) and
+      # never built a single binding, so a PR breaking the C/C++/Java
+      # generated bindings could still cut a release. `test-bindings` is
+      # pure Zig-build-system (zig cc / zig c++, no external CMake), so it
+      # runs on every platform; Java/JNI on Windows stays deferred (see
+      # ci.yml's test-other for the full CFG-hypothesis writeup).
+      - name: Install JDK (java-binding needs jni.h, not just a JRE)
+        if: runner.os != 'Windows'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: C/C++/Java binding smoke tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
+
+      - name: C/C++ binding smoke tests (Windows -- Java deferred, see ci.yml)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
+
+      # build.zig downgrades missing JDK/JNI headers or javac to a
+      # std.log.warn + skip rather than a build failure -- without this
+      # check a broken setup-java wiring would silently pass instead of
+      # actually testing the Java binding.
+      - name: Verify no binding was silently skipped
+        shell: bash
+        run: |
+          if grep -qE "jni\.h not found|javac not found" "$RUNNER_TEMP/binding-smoke.log"; then
+            echo "::error::A binding was silently skipped instead of tested — see build.zig's std.log.warn fallbacks"
+            exit 1
+          fi
+
       # ThreadSanitizer (Clang/LLVM) has no real Windows support. macOS is
       # deliberately NOT included here either, despite being TSan-capable in
       # principle -- see ci.yml's test-other job for why: even the minimal
@@ -142,7 +178,7 @@ jobs:
     needs: [prepare, test]
     runs-on: ubuntu-latest
     env:
-      INTEROP_RTPS_REF: zenzen-a9f61ee
+      INTEROP_RTPS_REF: zenzen-c052430
 
     steps:
       - name: Check out zzdds
@@ -179,8 +215,13 @@ jobs:
         with:
           version: ${{ needs.prepare.outputs.zig_version }}
 
+      - name: Install Python (match omg-dds/dds-rtps interop workflow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+
       - name: Install Python dependencies
-        run: pip install pexpect junitparser
+        run: pip install --requirement dds-rtps/requirements.txt
 
       - name: Build shape_main (ReleaseSafe)
         working-directory: dds-rtps/srcZig/zzdds
@@ -204,10 +245,92 @@ jobs:
           name: release-interop-results
           path: /tmp/interop-results.xml
 
+  # ── Prebuilt C/C++ library bundles ───────────────────────────────────────
+  #
+  # release.yml previously published only a git tag + a `zig fetch` URL --
+  # nothing for C/C++ consumers who don't build from source. This job builds
+  # the install tree (dynamic libzzdds + static libzidl_cdr + headers +
+  # pkgconfig + CMake package files) on each release platform and uploads it
+  # as a per-platform tarball; `publish` attaches them to the GitHub release.
+  #
+  # The *functional* smoke test of these libraries is the `test` job's
+  # `test-bindings` step, which compiles and runs real C/C++/Java programs
+  # against a freshly built libzzdds on every platform -- this job only has
+  # to confirm the install tree is complete before packaging it.
+  package-libs:
+    name: package-libs (${{ matrix.name }})
+    needs: [prepare, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: macos-arm64
+            os: macos-latest
+          - name: windows-x86_64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ needs.prepare.outputs.zig_version }}
+
+      - name: Build install tree (C + C++ bindings)
+        run: zig build -Dc-binding=true -Dcpp-binding=true install
+
+      - name: Verify install tree is complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          # Dynamic libzzdds -- extension and directory differ per platform
+          # (.dll lands in bin/ on Windows, since Zig's InstallArtifact
+          # treats a .dll as isDll()).
+          if ! ls zig-out/lib/libzzdds.so zig-out/lib/libzzdds.dylib \
+                  zig-out/bin/zzdds.dll zig-out/lib/zzdds.dll 2>/dev/null | grep -q .; then
+            echo "::error::no dynamic libzzdds found under zig-out/"
+            fail=1
+          fi
+          for f in zig-out/include/dcps.h zig-out/include/zzdds.h zig-out/include/zidl_cdr.h \
+                   zig-out/lib/pkgconfig/zzdds.pc zig-out/lib/cmake/ZZDDS/zzdds-config.cmake; do
+            [ -f "$f" ] || { echo "::error::missing $f"; fail=1; }
+          done
+          # The bundle is renamed and extracted elsewhere, so zzdds.pc must be
+          # relocatable (prefix derived from ${pcfiledir}) rather than carrying
+          # a baked-in absolute build path.
+          if ! grep -qE '^prefix=\$\{pcfiledir\}' zig-out/lib/pkgconfig/zzdds.pc; then
+            echo "::error::zzdds.pc prefix= is not \${pcfiledir}-relative — bundle would not be relocatable"
+            grep '^prefix=' zig-out/lib/pkgconfig/zzdds.pc
+            fail=1
+          fi
+          [ "$fail" -eq 0 ]
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="zzdds-${{ needs.prepare.outputs.full_version }}-${{ matrix.name }}"
+          mv zig-out "$dir"
+          tar -czf "${dir}.tar.gz" "$dir"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbundle-${{ matrix.name }}
+          path: "*.tar.gz"
+          retention-days: 7
+
   # ── Version bump, tag, and GitHub release ─────────────────────────────────
   publish:
     name: Publish
-    needs: [prepare, self-interop]
+    needs: [prepare, self-interop, package-libs]
     runs-on: ubuntu-latest
     if: ${{ !inputs.dry_run }}
     permissions:
@@ -216,6 +339,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Download prebuilt library bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libbundle-*
+          path: dist
+          merge-multiple: true
 
       - name: Bump version in build.zig.zon
         env:
@@ -275,7 +405,15 @@ jobs:
           ## Using zzdds as a Zig package
           \`\`\`
           zig fetch --save https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz
-          \`\`\`"
+          \`\`\`
+
+          ## Prebuilt C/C++ library bundles
+          \`zzdds-<version>-<platform>.tar.gz\` below each unpack to a
+          relocatable install prefix (\`include/\`, \`lib/\` with pkg-config +
+          CMake package files). Point \`CMAKE_PREFIX_PATH\` at the unpacked
+          directory, or \`PKG_CONFIG_PATH\` at its \`lib/pkgconfig\`
+          subdirectory." \
+            dist/*.tar.gz
 
       - name: Bump to post-release dev version
         env:

@@ -55,6 +55,9 @@ platform-conditional).
 plausible new finding is a genuinely platform-specific allocator interaction, which is the
 point.
 
+**Outcome (PR #65, 2026-08-18): landed on all three platforms** — the
+`DebugAllocator lane` step is in `ci.yml`'s `test-other` job, no platform-specific findings.
+
 ## Item 2 — C/C++/Java bindings on the 3-platform matrix
 
 **Change:** extend `test-other` to also build+run the binding smoke tests, mirroring
@@ -211,6 +214,24 @@ specific panic message, or relying on `unreachable` being reached deterministica
 wiring it into CI, specifically to find any such test and either fix it (make the assertion
 `Debug`/`ReleaseSafe`-only, or rewrite it to not depend on safety-check panics) rather than
 discover it as a confusing CI failure.
+
+**Outcome — `ReleaseFast` landed (PR #65, 2026-08-18):** the `release-fast` step is in
+`run_deterministic_matrix.py` (covering Linux x86_64 via `test-linux`) and a
+`Test (ReleaseFast)` step is in `release.yml`'s `test` job on all four platforms. No
+safety-panic-dependent tests were found; the suite passes clean.
+
+**Outcome — `ReleaseSmall` NOT landed; root-caused to an upstream Zig bug (2026-08-29):**
+`zig build test -Doptimize=ReleaseSmall` produces 37 `panic: incorrect alignment` crashes
+(`bootstrap_test` / `typesupport_test`, via `zidl-rt`'s `entity_box.zig` `unboxAsView`
+`@alignCast(box.vtable)`). Traced to **Zig 0.16.0's self-hosted x86_64 backend emitting
+read-only global constants with no alignment, only at `-OReleaseSmall`**: `&SomeImpl.views`
+(an `extern struct` with `@alignOf` 8) and every `*_vtable` global land at odd addresses,
+byte-packed in `.rodata`; `unboxAsView`'s `@alignCast` correctly traps it. Not a zzdds/zidl
+defect — reproduces in ~10 lines with a bare `const val: u32` (`-OReleaseSmall -fno-llvm
+-fno-lld` → 1-mod-4; `-OReleaseFast`, the LLVM backend, and Debug/ReleaseSafe all fine).
+Full trail + minimal repro: `zz-dev/releasesmall-misaligned-rodata-investigation.md`.
+Follow-ups: (1) file against `ziglang/zig`; (2) a ReleaseSmall lane, if wanted before the
+fix lands, must force `.use_llvm = true` (as `emit-tests-llvm` already does for Valgrind).
 
 ## Cross-cutting implementation notes
 

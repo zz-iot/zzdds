@@ -177,8 +177,7 @@ Forward-looking only: known gaps, planned features, and open design questions.
   participant-config); the `wait_for_historical_data`-should-time-out negative case
   (catchup); `assert_liveliness()` + AUTOMATIC/MANUAL_BY_PARTICIPANT + `on_liveliness_lost`
   (presence); `*_w_timestamp` symmetry + batch instance ops (registry); Java's
-  `instance_state` on the batch-take family; the `c`/`cpp`/`java` waitset ports don't exist
-  yet.
+  `instance_state` on the batch-take family.
 - **Non-goal (recorded, not planned):** a spec-conformance harness, network simulation
   (ns-3 / CORE), and formal verification / safety certification (DO-178C, IEC 61508, ISO
   26262) — long-term concerns, not built. `design/testing-strategy.md`.
@@ -315,38 +314,61 @@ and shape are open — see `zidl/docs/roadmap.md` "Plugin architecture".
 ## CI / Release Platform Coverage
 
 Audit of `build.zig` options, `scripts/run_deterministic_matrix.py`, `ci.yml`, and
-`release.yml` against the platform/build-type matrix they exercise (re-reviewed 2026-08-16).
-Ranked, lowest-effort first:
+`release.yml` against the platform/build-type matrix they exercise. Original ranking
+2026-08-16; progress notes below from PR #65 (2026-08-18) and the 2026-08-28 CI pass.
 
-1. **Extend the DebugAllocator lane** to `test-other`'s Linux ARM64 / macOS / Windows matrix
-   (a one-line copy of `test-linux`'s `-Ddebug-allocator=true` step). Lowest effort;
-   suggested first move.
-2. **Java/JNI binding smoke test on Windows** — deferred, not achieved. `java.exe` exits
-   code 9 with no crash file at the first JNI call; leading hypothesis is a Control Flow
-   Guard mismatch between `jvm.dll` and the zig-cc-built zzdds DLLs. Needs WinDbg on real
-   Windows hardware. Investigation trail: `zz-dev/windows-jni-crash-investigation.md`.
-3. **TSan lane on macOS ARM64** — deferred. Even `test-tsan-self-check` segfaults before app
-   code; likely an upstream Zig/LLVM `libtsan` gap (`pthread_introspection_hook_install`
-   private-API drift). Revisit when Zig bundles a newer LLVM. Trail:
-   `zz-dev/macos-tsan-crash-investigation.md`. (TSan on Windows: Clang/LLVM has no supported
-   target. Extending `examples-tsan` to macOS is a separate follow-up.)
-4. **`ReleaseFast` is never built or run** anywhere (CI or `release.yml`); `ReleaseSmall`
-   likewise. Run locally first to find tests that depend on a safety-check panic.
-5. **Real vendor/self RTPS interop** (Connext / Cyclone / CoreDX / self) runs only on Linux
+### Landed
+
+- **DebugAllocator lane on `test-other`** (PR #65) — `zig build test -Ddebug-allocator=true`
+  now runs on Linux ARM64, macOS ARM64, and Windows x86_64, additive to `test-linux`'s
+  existing step.
+- **`ReleaseFast` built and tested** (PR #65) — `run_deterministic_matrix.py` gained a
+  `release-fast` step (so `test-linux` covers it on Linux x86_64) and `release.yml`'s `test`
+  job runs `zig build test -Doptimize=ReleaseFast` on all four platforms.
+- **C/C++ binding smoke tests everywhere** (PR #65 for `ci.yml`; 2026-08-28 for `release.yml`)
+  — `zig build test-bindings -Dc-binding -Dcpp-binding` runs on all `test-other` /
+  `release.yml` `test` platforms (Java added on Linux ARM64 + macOS; Java-on-Windows
+  deferred, see below).
+- **Prebuilt library bundles** (2026-08-28) — `release.yml`'s new `package-libs` job builds
+  the C/C++ install tree (dynamic `libzzdds` + static `libzidl_cdr` + headers + pkgconfig +
+  CMake package files) on each of the four release platforms, verifies completeness, and
+  uploads a per-platform tarball that `publish` attaches to the GitHub release. Functional
+  coverage of the bundled libraries is the `test` job's `test-bindings` step.
+
+### Deferred (investigation trails exist)
+
+- **Java/JNI binding smoke test on Windows** — `java.exe` exits code 9 with no crash file at
+  the first JNI call; leading hypothesis is a Control Flow Guard mismatch between `jvm.dll`
+  and the zig-cc-built zzdds DLLs. Needs WinDbg on real Windows hardware. Trail:
+  `zz-dev/windows-jni-crash-investigation.md`.
+- **TSan lane on macOS ARM64** — even `test-tsan-self-check` segfaults before app code;
+  likely an upstream Zig/LLVM `libtsan` gap (`pthread_introspection_hook_install` private-API
+  drift). Revisit when Zig bundles a newer LLVM. Trail:
+  `zz-dev/macos-tsan-crash-investigation.md`. (TSan on Windows: Clang/LLVM has no supported
+  target. Extending `examples-tsan` to macOS is a separate follow-up.)
+- **`ReleaseSmall` gate — blocked on an upstream Zig codegen bug (root-caused 2026-08-29).**
+  `zig build test -Doptimize=ReleaseSmall` produces 37 `panic: incorrect alignment` crashes
+  (in `bootstrap_test` / `typesupport_test`, via `zidl-rt`'s `entity_box.zig` `unboxAsView`
+  `@alignCast(box.vtable)`). Root cause: **Zig 0.16.0's self-hosted x86_64 backend, only at
+  `-OReleaseSmall`, emits read-only global constants with no alignment** — `&SomeImpl.views`
+  (an `extern struct` `CAbiViews`, `@alignOf` 8) and every `*_vtable` global land at odd
+  addresses, packed byte-to-byte in `.rodata`. `unboxAsView`'s `@alignCast` correctly traps
+  it. Not a zzdds or zidl defect. Minimal repro (deterministic, ~10 lines): a bare
+  `const val: u32 = …` preceded by a 1-byte `const` lands 1-mod-4 under
+  `-OReleaseSmall -fno-llvm -fno-lld`; fine under `-OReleaseFast`, fine with the LLVM
+  backend, fine under Debug/ReleaseSafe. Full trail + repro in
+  `zz-dev/releasesmall-misaligned-rodata-investigation.md`. Next: file against `ziglang/zig`;
+  a ReleaseSmall CI lane would need `.use_llvm = true` (like `emit-tests-llvm`) until fixed.
+
+### Still open, ranked
+
+1. **Real vendor/self RTPS interop** (Connext / Cyclone / CoreDX / self) runs only on Linux
    x86_64 — no wire / discovery / CDR coverage on Windows, macOS, or ARM64.
-6. **No Intel macOS coverage** — `macos-latest` is Apple Silicon only.
-7. **`release.yml` never builds a binding** — the release gate only requires a Linux x86_64
-   ReleaseSafe self-interop pass.
-8. **No musl / static Linux target** — always glibc, always the native triple; `-Dtarget`
+2. **No Intel macOS coverage** — `macos-latest` is Apple Silicon only.
+3. **No musl / static Linux target** — always glibc, always the native triple; `-Dtarget`
    is never actually cross-compiled.
-9. **No prebuilt release binaries** — `release.yml` publishes only a tag, changelog, and
-   `zig fetch` URL; no compiled `libzzdds.{so,dll,dylib}` is built, uploaded, or
-   smoke-tested.
-10. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
-    non-Linux memory bug motivates revisiting.
-
-The `test-other` job's 20-minute CI timeout needs re-budgeting once it also runs
-DebugAllocator + bindings (+ JDK) + conditional TSan.
+4. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
+   non-Linux memory bug motivates revisiting.
 
 ---
 

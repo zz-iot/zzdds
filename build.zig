@@ -717,9 +717,14 @@ pub fn build(b: *std.Build) void {
         }
 
         // Generate and install lib/pkgconfig/zzdds.pc.
-        // The prefix is baked in at install time (matches --prefix, defaulting to zig-out/).
+        // prefix is derived at pkg-config time from ${pcfiledir} (the directory
+        // holding this .pc file, i.e. <prefix>/lib/pkgconfig), so the install
+        // tree stays relocatable — it can be renamed, moved, or extracted from
+        // a release bundle without the header/library paths going stale. This
+        // matches the CMake package config below, which does the same via
+        // get_filename_component.
         const pc_content = b.fmt(
-            \\prefix={s}
+            \\prefix=${{pcfiledir}}/../..
             \\libdir=${{prefix}}/lib
             \\includedir=${{prefix}}/include
             \\
@@ -729,7 +734,7 @@ pub fn build(b: *std.Build) void {
             \\Libs: -L${{libdir}} -lzzdds -lzidl_cdr
             \\Cflags: -I${{includedir}}
             \\
-        , .{ b.install_prefix, zzdds_version });
+        , .{zzdds_version});
         const pc_wf = b.addWriteFiles();
         const pc_lp = pc_wf.add("zzdds.pc", pc_content);
         const install_pc = b.addInstallFileWithDir(pc_lp, .{ .custom = "lib/pkgconfig" }, "zzdds.pc");

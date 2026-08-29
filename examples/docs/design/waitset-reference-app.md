@@ -98,5 +98,6 @@ interface struct itself, unlike every other generated operation. Both
 Worth fixing in zidl at some point — tracked as a small follow-up, not
 blocking here.
 
-See each language's own README for build and run instructions once that
-port exists; today only `zig/waitset` exists.
+See each language's own README for build and run instructions. All four
+ports (`zig`, `c`, `cpp`, `java`) exist; `zig`, `cpp`, and `c` are
+additionally built and run under ThreadSanitizer in CI (`examples-tsan`).
