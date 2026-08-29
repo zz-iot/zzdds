@@ -517,6 +517,59 @@ jobs:
             --sub-marker "subscriber: done" --pub-marker "publisher: done" --timeout 60 \
             --ld-library-path "$GITHUB_WORKSPACE/zig-out/lib"
 
+  # ── Stress tests ─────────────────────────────────────────────────────────
+  #
+  # stress-tests/ -- concurrency- and lifecycle-under-load tests, OpenDDS
+  # EntityLifecycleStress-shaped. Deliberately outside `zig build test`
+  # (wall-clock, real UDP, non-deterministic). Mirrors the `examples` job:
+  # build zzdds native + -Ddebug-allocator, then run_all.py --strict with
+  # CI-sized parameters. run_all.py's own xfail list keeps a currently-known
+  # zzdds bug (see stress-tests/README.md "Findings") from reddening the gate
+  # while still exercising it. The nightly `schedule` trigger runs a heavier
+  # matrix below.
+  stress:
+    name: stress
+    needs: test-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # setarch -R (disable ASLR) is applied per-process by _common.LiveProcess
+      # for the TSan lane; this lowers the shadow-map-incompatible entropy for
+      # anything that slips through (build-time compiler probes etc.).
+      - name: Reduce ASLR entropy (for the TSan churn lane)
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Build zzdds (native, DebugAllocator)
+        run: zig build -Ddebug-allocator=true install
+
+      - name: Run stress suite (strict)
+        run: stress-tests/run_all.py --strict
+
+      - name: lifecycle_churn/reentrant under ThreadSanitizer
+        working-directory: stress-tests/zig/lifecycle_churn
+        run: ./run.py --scenario reentrant --threads 4 --iterations 25 --tsan --timeout 300
+
+      # Weekly full-vendor sweep trigger only: heavier, longer, + --large.
+      - name: Nightly heavy matrix
+        if: github.event_name == 'schedule'
+        working-directory: stress-tests/zig/entity_lifecycle_stress
+        run: |
+          ./run.py --publishers 12 --subscribers 12 --samples 750 --churn --timeout 300
+          ./run.py --publishers 6 --subscribers 6 --large --churn --timeout 300
+
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
   # Builds all test binaries to zig-out/tests/, runs each through kcov

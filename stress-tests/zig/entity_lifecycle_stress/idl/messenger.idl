@@ -1,0 +1,13 @@
+// Port of OpenDDS/tests/DCPS/ConsolidatedMessengerIdl/Messenger.idl, used by
+// the EntityLifecycleStress port. `subject_id` is the key (OpenDDS marks it
+// via `#pragma DCPS_DATA_KEY "Messenger::Message subject_id"`; the IDL4 form
+// is `@key`). Bounded strings so the type has a fixed max size — the stress
+// harness cares about entity churn, not payload variety.
+@appendable
+struct Message {
+    string<64>   from;
+    string<64>   subject;
+    @key int32   subject_id;
+    string<4096> text;
+    int32        count;
+};

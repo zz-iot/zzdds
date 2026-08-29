@@ -62,3 +62,4 @@ test/interop/interop-artifacts-*.tar.gz
 *~
 .idea/
 .vscode/
+__pycache__/

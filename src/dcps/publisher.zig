@@ -20,6 +20,7 @@ const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
+const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const participant_mod = @import("participant.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
@@ -147,6 +148,14 @@ pub const PublisherImpl = struct {
     /// `zidl/docs/design/binding-c-abi-identity.md`.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
+    /// Deferred teardown, like DataWriterImpl's. A DataWriterImpl holds a
+    /// reference on its parent PublisherImpl for its whole (possibly
+    /// quiesce-deferred) lifetime, so `dispatchWriterFallback` -- reached
+    /// from a writer's discovery-driven `notifyPublicationMatched` after
+    /// `participant.mu` is released -- can never read a freed PublisherImpl
+    /// even if `delete_publisher` races it (DDS 1.4 listener-fallback chain).
+    quiesce: EntityQuiesce = .{},
+
     const Self = @This();
 
     pub fn init(
@@ -190,15 +199,41 @@ pub const PublisherImpl = struct {
         return self;
     }
 
+    /// Drops this publisher's own quiesce reference; `reallyDeinit` runs
+    /// immediately unless a child DataWriterImpl (or an in-flight fallback
+    /// dispatch) still holds one, in which case that release runs it.
     pub fn deinit(self: *Self) void {
-        self.listener_box.releaseRef(self.alloc);
-        if (self.status_cond) |sc| sc.deinit();
-        self.c_abi.free(self.alloc);
-        // Destroy all remaining DataWriters.
+        // Tear owned DataWriters down synchronously first: each w.deinit()
+        // drops the lifetime ref it holds on us (writer.zig init), so by
+        // beginTeardown the only refs left are our own "alive" one and any
+        // still-in-flight fallback dispatch -- which is exactly what should
+        // keep us alive past this call.
         for (self.writers.items) |w| {
             self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
             w.deinit();
         }
+        self.writers.clearRetainingCapacity();
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    /// `*anyopaque` variants for the DataWriterImpl lifetime-ref and
+    /// participant.zig's fallback path (see DataWriterImpl.quiesceAcquireFn).
+    pub fn quiesceAcquireFn(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+    pub fn quiesceReleaseFn(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.listener_box.releaseRef(self.alloc);
+        if (self.status_cond) |sc| sc.deinit();
+        self.c_abi.free(self.alloc);
+        // Owned DataWriters were torn down synchronously in deinit(); the list
+        // is empty here.
         self.writers.deinit(self.alloc);
         self.qos.deinit(self.alloc);
         self.default_dw_qos.deinit(self.alloc);
@@ -515,6 +550,11 @@ pub const PublisherImpl = struct {
     /// `deinit()`, including this one if it were mid-fallback, has
     /// returned).
     pub fn dispatchWriterFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
+        // A child DataWriterImpl holds a lifetime ref (see `quiesce`), so
+        // reaching here means the struct is live; acquire keeps it so
+        // across the callback and refuses once teardown has begun.
+        if (!self.quiesce.acquire()) return false;
+        defer self.quiesce.release(self, reallyDeinit);
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
         if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
