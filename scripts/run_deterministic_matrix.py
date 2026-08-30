@@ -3,9 +3,14 @@
 
 This is a convenience wrapper around the checks that are useful before pushing:
 formatting, sleep guardrails, Debug tests, feature-minimal tests, ReleaseSafe
-tests, ReleaseFast tests, and fuzz harness compile-checks.  ThreadSanitizer is
-available as an opt-in because it is slower and can be noisy on some local
-systems.
+tests, ReleaseFast tests, ReleaseSmall tests, and fuzz harness compile-checks.
+ThreadSanitizer is available as an opt-in because it is slower and can be noisy
+on some local systems.
+
+The ReleaseSmall step runs via `zig build test-release-small`, which forces the
+LLVM backend: Zig 0.16's self-hosted x86_64 backend mis-aligns read-only globals
+at -OReleaseSmall (see that step's comment in build.zig). Drop back to a plain
+`zig build test -Doptimize=ReleaseSmall` step at the Zig 0.17 bump.
 """
 
 from __future__ import annotations
@@ -49,6 +54,7 @@ def parse_args() -> argparse.Namespace:
             "feature-minimal",
             "release-safe",
             "release-fast",
+            "release-small",
             "fuzz",
             "tsan-self-check",
             "tsan",
@@ -67,6 +73,10 @@ def steps(zig: str, include_tsan: bool) -> list[Step]:
         Step("feature-minimal", [zig, "build", "test", "-Dipv6=false", "-Dinterface-monitor=false"]),
         Step("release-safe", [zig, "build", "test", "-Doptimize=ReleaseSafe"]),
         Step("release-fast", [zig, "build", "test", "-Doptimize=ReleaseFast"]),
+        # LLVM backend forced by the `test-release-small` step itself -- see its
+        # build.zig comment. Switch to `["test", "-Doptimize=ReleaseSmall"]` at
+        # the Zig 0.17 bump.
+        Step("release-small", [zig, "build", "test-release-small", "-Doptimize=ReleaseSmall"]),
         Step("fuzz", [zig, "build", "test-fuzz"]),
     ]
     if include_tsan:

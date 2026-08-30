@@ -220,18 +220,29 @@ discover it as a confusing CI failure.
 `Test (ReleaseFast)` step is in `release.yml`'s `test` job on all four platforms. No
 safety-panic-dependent tests were found; the suite passes clean.
 
-**Outcome — `ReleaseSmall` NOT landed; root-caused to an upstream Zig bug (2026-08-29):**
-`zig build test -Doptimize=ReleaseSmall` produces 37 `panic: incorrect alignment` crashes
-(`bootstrap_test` / `typesupport_test`, via `zidl-rt`'s `entity_box.zig` `unboxAsView`
-`@alignCast(box.vtable)`). Traced to **Zig 0.16.0's self-hosted x86_64 backend emitting
-read-only global constants with no alignment, only at `-OReleaseSmall`**: `&SomeImpl.views`
-(an `extern struct` with `@alignOf` 8) and every `*_vtable` global land at odd addresses,
-byte-packed in `.rodata`; `unboxAsView`'s `@alignCast` correctly traps it. Not a zzdds/zidl
-defect — reproduces in ~10 lines with a bare `const val: u32` (`-OReleaseSmall -fno-llvm
--fno-lld` → 1-mod-4; `-OReleaseFast`, the LLVM backend, and Debug/ReleaseSafe all fine).
-Full trail + minimal repro: `zz-dev/releasesmall-misaligned-rodata-investigation.md`.
-Follow-ups: (1) file against `ziglang/zig`; (2) a ReleaseSmall lane, if wanted before the
-fix lands, must force `.use_llvm = true` (as `emit-tests-llvm` already does for Valgrind).
+**Outcome — `ReleaseSmall` landed 2026-08-29 via an LLVM-backend workaround (upstream bug
+root-caused + confirmed fixed on Zig master).** First finding: `zig build test
+-Doptimize=ReleaseSmall` produced 37 `panic: incorrect alignment` crashes (`bootstrap_test`
+/ `typesupport_test`, via `zidl-rt`'s `entity_box.zig` `unboxAsView` `@alignCast(box.vtable)`).
+Root cause: **Zig 0.16.0's self-hosted x86_64 backend emits read-only global constants with
+no alignment, only at `-OReleaseSmall`** — `&SomeImpl.views` (an `extern struct` with
+`@alignOf` 8) and every `*_vtable` global land at odd `.rodata` addresses; `@alignCast`
+correctly traps it. Not a zzdds/zidl defect — reproduces in ~10 lines with a bare
+`const val: u32` (`-OReleaseSmall -fno-llvm -fno-lld` → 1-mod-4; `-OReleaseFast`, the LLVM
+backend, and Debug/ReleaseSafe all fine). **Fixed on `zig-0.17.0-dev.1902+896bd9e15`**;
+still broken on 0.16.0 (the pinned toolchain and latest stable, tagged 2026-04-13; no
+matching upstream issue, nothing to file). Full trail + repro:
+`zz-dev/releasesmall-misaligned-rodata-investigation.md`.
+
+**What landed:** a new `zig build test-release-small` step (`build.zig`) that runs the whole
+unit suite at `-OReleaseSmall` **on the LLVM backend** — it reuses the baseline-CPU /
+`.use_llvm = true` module graph the `emit-tests-llvm` step already builds, and adds
+`b.addRunArtifact` for each test binary. Wired into `run_deterministic_matrix.py` as the
+`release-small` step (so `ci.yml`'s `test-linux` runs it) and into `release.yml`'s `test`
+job as `Test (ReleaseSmall, LLVM backend)`, gated to `ubuntu-latest` (the workaround path is
+Linux-exercised only). **At the Zig 0.17 bump:** delete `test-release-small` + its run-deps,
+replace the matrix/release.yml entries with a plain `zig build test -Doptimize=ReleaseSmall`
+on the normal self-hosted backend, and broaden the `release.yml` step to the whole matrix.
 
 ## Cross-cutting implementation notes
 

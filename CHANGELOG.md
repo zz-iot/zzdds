@@ -8,6 +8,31 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-08-29
+
+- **CI flake fix — unique DDS domain per test binary.** `zig build test` runs the ~29
+  participant-creating test binaries as parallel Run steps; they all stood up participants
+  on domain 0 and contended for the same fixed RTPS ports (SPDP multicast 7400, metatraffic
+  unicast), so on slow runners (ARM64, DebugAllocator/TSan lanes) the loser hit
+  `error.BindFailed`, discovery stalled, and a loopback test timed out. `build.zig` now
+  gives each test binary's Run step a distinct `ZZDDS_TEST_DOMAIN_BASE` (per-lane counter,
+  see `addTestRun`); the new `test/support/domain.zig` reads it, and every DCPS/C-ABI test's
+  `create_participant` (plus `loopback_test` / `wlp_loopback_test`'s hand-wired
+  `UdpTransport.init` / `SpdpSedpDiscovery.init`) uses `test_domain.get()`. Distinct domains
+  map to disjoint port sets (250-port stride). `mock_loopback_test` is unchanged (it never
+  binds a real socket).
+- **CI flake fix — `tcp_transport_test` reconnect race.** "connectionGeneration increments
+  on reconnect" replaced a fixed `sleepMs(100)` (a guess at how long the local TCP stack
+  takes to process a peer FIN) with a poll-until-observed loop: drive the reconnecting
+  `send()` until a new `TcpConnection` is seen, or a 5 s deadline. Same invariant asserted,
+  no magic constant.
+- **`ReleaseSmall` CI lane.** New `zig build test-release-small` runs the unit suite at
+  `-OReleaseSmall`, wired into `run_deterministic_matrix.py` and `release.yml` (Linux
+  x86_64). It forces the LLVM backend to work around a Zig 0.16 self-hosted-x86_64 codegen
+  bug — read-only globals emitted without alignment at `-OReleaseSmall` — that is fixed on
+  Zig 0.17 master; switch back to the plain self-hosted backend at the 0.17 bump. See
+  `docs/design/ci-platform-coverage-expansion.md`.
+
 ## 2026-08-26
 
 - **`zzdds-examples` folded into `examples/`.** The standalone `zz-iot/zzdds-examples` repo

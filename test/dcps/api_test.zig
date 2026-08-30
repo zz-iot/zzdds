@@ -8,6 +8,7 @@
 //! threads are needed.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -110,7 +111,7 @@ test "DCPS: create_participant / delete_participant" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     // ptr is *anyopaque; verify it's not the null address
     try testing.expect(@intFromPtr(dp.ptr) != 0);
 
@@ -123,7 +124,7 @@ test "DCPS: delete_participant with outstanding children fails" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     // Create a publisher without deleting it.
     _ = dp.create_publisher(.{}, null, 0);
 
@@ -143,7 +144,7 @@ test "DCPS: create/delete Publisher and Subscriber" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -161,7 +162,7 @@ test "DCPS: create/delete Topic" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const topic = dp.create_topic(
@@ -184,7 +185,7 @@ test "DCPS: create/delete DataWriter and DataReader" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -211,7 +212,7 @@ test "DCPS: delete_contained_entities removes all children" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
     const sub_ = dp.create_subscriber(.{}, null, 0);
@@ -321,7 +322,7 @@ test "DCPS: get_statuscondition on participant returns bound condition" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const sc = dp.vtable.get_statuscondition(dp.ptr);
@@ -335,7 +336,7 @@ test "DCPS: get_statuscondition on DataWriter returns non-null condition" {
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
@@ -374,7 +375,7 @@ test "DCPS: DCPSTopic reader receives a sample when a topic is created" {
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const bs_sub = dp.vtable.get_builtin_subscriber(dp.ptr);
@@ -396,7 +397,7 @@ test "DCPS: DCPSPublication reports endpoint identity and disposal" {
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
@@ -428,7 +429,7 @@ test "DCPS: get_discovered_topics returns handle for a SEDP-discovered writer's 
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -449,7 +450,7 @@ test "DCPS: get_discovered_topic_data returns name and type_name for discovered 
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -478,7 +479,7 @@ test "DCPS: get_discovered_topics deduplicates same topic from multiple writers"
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
@@ -499,7 +500,7 @@ test "DCPS: contains_entity returns true for participant, topic, publisher, writ
     defer h.deinit();
 
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     const dp_handle = dp.vtable.get_instance_handle(dp.ptr);
@@ -529,7 +530,7 @@ test "DCPS: get_discovered_topics and get_discovered_topic_data work for locally
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     _ = dp.create_topic("LocalTopic", "LocalType", .{}, null, 0);
@@ -555,7 +556,7 @@ test "DCPS: SEDP announcement for a locally-created topic does not produce a dup
 
     const alloc = testing.allocator;
     const dpf = h.factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     _ = dp.create_topic("DupTopic", "DupType", .{}, null, 0);

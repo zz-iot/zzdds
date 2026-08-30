@@ -334,6 +334,15 @@ Audit of `build.zig` options, `scripts/run_deterministic_matrix.py`, `ci.yml`, a
   CMake package files) on each of the four release platforms, verifies completeness, and
   uploads a per-platform tarball that `publish` attaches to the GitHub release. Functional
   coverage of the bundled libraries is the `test` job's `test-bindings` step.
+- **`ReleaseSmall` lane** (2026-08-29) — new `zig build test-release-small` step runs the
+  whole unit suite at `-OReleaseSmall`, wired into `run_deterministic_matrix.py` (so
+  `ci.yml`'s `test-linux` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
+  The step **forces the LLVM backend** to sidestep a Zig 0.16 self-hosted-x86_64 codegen bug
+  (misaligned read-only globals at `-OReleaseSmall` — see the Deferred note below and the
+  step's `build.zig` comment). **At the Zig 0.17 bump: delete `test-release-small` and
+  replace it with a plain `zig build test -Doptimize=ReleaseSmall` step on the normal
+  self-hosted backend, broadened to the whole `release.yml` matrix** — the bug is fixed on
+  0.17.
 
 ### Deferred (investigation trails exist)
 
@@ -346,19 +355,16 @@ Audit of `build.zig` options, `scripts/run_deterministic_matrix.py`, `ci.yml`, a
   drift). Revisit when Zig bundles a newer LLVM. Trail:
   `zz-dev/macos-tsan-crash-investigation.md`. (TSan on Windows: Clang/LLVM has no supported
   target. Extending `examples-tsan` to macOS is a separate follow-up.)
-- **`ReleaseSmall` gate — blocked on an upstream Zig codegen bug (root-caused 2026-08-29).**
-  `zig build test -Doptimize=ReleaseSmall` produces 37 `panic: incorrect alignment` crashes
-  (in `bootstrap_test` / `typesupport_test`, via `zidl-rt`'s `entity_box.zig` `unboxAsView`
-  `@alignCast(box.vtable)`). Root cause: **Zig 0.16.0's self-hosted x86_64 backend, only at
-  `-OReleaseSmall`, emits read-only global constants with no alignment** — `&SomeImpl.views`
-  (an `extern struct` `CAbiViews`, `@alignOf` 8) and every `*_vtable` global land at odd
-  addresses, packed byte-to-byte in `.rodata`. `unboxAsView`'s `@alignCast` correctly traps
-  it. Not a zzdds or zidl defect. Minimal repro (deterministic, ~10 lines): a bare
-  `const val: u32 = …` preceded by a 1-byte `const` lands 1-mod-4 under
-  `-OReleaseSmall -fno-llvm -fno-lld`; fine under `-OReleaseFast`, fine with the LLVM
-  backend, fine under Debug/ReleaseSafe. Full trail + repro in
-  `zz-dev/releasesmall-misaligned-rodata-investigation.md`. Next: file against `ziglang/zig`;
-  a ReleaseSmall CI lane would need `.use_llvm = true` (like `emit-tests-llvm`) until fixed.
+- **Self-hosted `-OReleaseSmall` on Zig 0.16 — upstream codegen bug, worked around above.**
+  Zig 0.16.0's self-hosted x86_64 backend, *only* at `-OReleaseSmall`, emits read-only
+  global constants with no alignment: `&SomeImpl.views` (an `extern struct` `CAbiViews`,
+  `@alignOf` 8) and every `*_vtable` global land at odd `.rodata` addresses, and `zidl-rt`'s
+  `@alignCast(box.vtable)` traps it (`panic: incorrect alignment`, ~37 C-ABI tests).
+  `-OReleaseFast`, the LLVM backend, and Debug/ReleaseSafe are all fine. Not a zzdds/zidl
+  defect; **fixed on `zig-0.17.0-dev.1902`**, not in any stable release (0.16.0, tagged
+  2026-04-13, is latest; no matching upstream issue found). The `ReleaseSmall` lane
+  (see *Landed*) sidesteps it by forcing the LLVM backend until the 0.17 bump. Minimal repro
+  + full trail: `zz-dev/releasesmall-misaligned-rodata-investigation.md`.
 
 ### Still open, ranked
 

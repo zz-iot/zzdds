@@ -3,6 +3,7 @@
 //! Uses IntraProcessDelivery (synchronous, no pump) for deterministic delivery.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -61,7 +62,7 @@ const Fixture = struct {
         );
         errdefer factory_w.deinit();
         const dpf_w = factory_w.toDDSFactory();
-        const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+        const dp_w = dpf_w.create_participant(test_domain.get(), .{}, null, 0);
         const pub_w = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("RTTopic", "RTType", .{}, null, 0);
 
@@ -79,7 +80,7 @@ const Fixture = struct {
         );
         errdefer factory_r.deinit();
         const dpf_r = factory_r.toDDSFactory();
-        const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+        const dp_r = dpf_r.create_participant(test_domain.get(), .{}, null, 0);
         const sub_r = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("RTTopic", "RTType", .{}, null, 0);
 

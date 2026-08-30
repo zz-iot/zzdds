@@ -5,6 +5,7 @@
 //! partition-name ownership lifecycle through DataWriter/DataReader creation.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -83,7 +84,7 @@ const Fixture = struct {
             .{},
         );
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         return .{ .net = net, .transport = t, .factory = factory, .dp = dp };
     }
 
@@ -230,7 +231,7 @@ test "registerTypeSupport: deinit on participant teardown calls entry deinit" {
     );
     defer factory.deinit();
 
-    const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+    const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
 
     var deinit_called = false;
@@ -761,7 +762,7 @@ test "createParticipantWithConfig: TCP enabled with empty bind_address fails cle
     // concrete address configured for the TCP data transport to advertise.
 
     const qos = DDS.DomainParticipantQos{};
-    const dp = factory.createParticipantWithConfig(0, &qos, null, 0, config);
+    const dp = factory.createParticipantWithConfig(test_domain.get(), &qos, null, 0, config);
     defer {
         if (dp.ptr != nil.NIL_PTR) _ = factory.toDDSFactory().delete_participant(dp);
     }
@@ -793,7 +794,7 @@ test "createParticipantWithConfig: TCP enabled with a concrete bind_address succ
     config.transport.tcp.bind_address = "127.0.0.1";
 
     const qos = DDS.DomainParticipantQos{};
-    const dp = factory.createParticipantWithConfig(0, &qos, null, 0, config);
+    const dp = factory.createParticipantWithConfig(test_domain.get(), &qos, null, 0, config);
     defer {
         if (dp.ptr != nil.NIL_PTR) _ = factory.toDDSFactory().delete_participant(dp);
     }
@@ -841,7 +842,7 @@ test "createParticipantWithConfig: config.qos seeds default_topic_qos" {
     };
 
     const qos = DDS.DomainParticipantQos{};
-    const dp = factory.createParticipantWithConfig(0, &qos, null, 0, config);
+    const dp = factory.createParticipantWithConfig(test_domain.get(), &qos, null, 0, config);
     defer {
         if (dp.ptr != nil.NIL_PTR) _ = factory.toDDSFactory().delete_participant(dp);
     }
@@ -880,7 +881,7 @@ test "createParticipantWithConfig: config.qos seeds Publisher's default_datawrit
     };
 
     const qos = DDS.DomainParticipantQos{};
-    const dp = factory.createParticipantWithConfig(0, &qos, null, 0, config);
+    const dp = factory.createParticipantWithConfig(test_domain.get(), &qos, null, 0, config);
     defer {
         if (dp.ptr != nil.NIL_PTR) _ = factory.toDDSFactory().delete_participant(dp);
     }
@@ -971,7 +972,7 @@ test "deinit: reentrant delete_participant from a timer-driven listener does not
     );
     defer factory.deinit();
     const dpf = factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     try testing.expect(dp.ptr != nil.NIL_PTR);
 
     const pub_ = dp.create_publisher(.{}, null, 0);

@@ -11,6 +11,7 @@
 //! data port.  MemoryTransport.send() is synchronous, so assertions are immediate.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const testing = std.testing;
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
@@ -287,7 +288,7 @@ const Fixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const dp_w_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_w.ptr));
 
         const t_r = try delivery.newTransport();
@@ -296,7 +297,7 @@ const Fixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const dp_r_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp_r.ptr));
 
         const sub_r = dp_r.create_subscriber(.{}, null, 0);

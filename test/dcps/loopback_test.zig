@@ -5,6 +5,7 @@
 //! No external dependencies; runs under `zig build test`.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -72,9 +73,9 @@ fn runLoopback(
     // immediately releases it) and both claim pid=0, causing a unicast port clash.
     // Each test uses distinct pids so that sequential tests never re-bind ports
     // that were just released by the previous test (avoids Windows port-reuse races).
-    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = w_pid }, 0, null);
+    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = w_pid }, test_domain.get(), null);
     defer udp_w.deinit();
-    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), 0, 1_000);
+    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), test_domain.get(), 1_000);
     var factory_w = try DomainParticipantFactoryImpl.init(
         alloc,
         udp_w.transport(),
@@ -89,7 +90,7 @@ fn runLoopback(
     }
 
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    const dp_w = dpf_w.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
     const pub_w = dp_w.create_publisher(.{}, null, 0);
@@ -133,9 +134,9 @@ fn runLoopback(
     }
 
     // ── Reader participant ────────────────────────────────────────────────────
-    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = r_pid }, 0, null);
+    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = r_pid }, test_domain.get(), null);
     defer udp_r.deinit();
-    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), 0, 1_000);
+    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), test_domain.get(), 1_000);
     var factory_r = try DomainParticipantFactoryImpl.init(
         alloc,
         udp_r.transport(),
@@ -150,7 +151,7 @@ fn runLoopback(
     }
 
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    const dp_r = dpf_r.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
     const sub_r = dp_r.create_subscriber(.{}, null, 0);
@@ -347,9 +348,9 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
 
-    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = 8 }, 0, null);
+    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = 8 }, test_domain.get(), null);
     defer udp_w.deinit();
-    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), 0, 1_000);
+    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), test_domain.get(), 1_000);
     var factory_w = try DomainParticipantFactoryImpl.init(
         alloc,
         udp_w.transport(),
@@ -364,7 +365,7 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     }
 
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    const dp_w = dpf_w.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
     const pub_w = dp_w.create_publisher(.{}, null, 0);
@@ -378,9 +379,9 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
-    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = 9 }, 0, null);
+    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = 9 }, test_domain.get(), null);
     defer udp_r.deinit();
-    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), 0, 1_000);
+    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), test_domain.get(), 1_000);
     var factory_r = try DomainParticipantFactoryImpl.init(
         alloc,
         udp_r.transport(),
@@ -395,7 +396,7 @@ test "loopback: incompatible QoS — best_effort writer vs reliable reader" {
     }
 
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    const dp_r = dpf_r.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
     const sub_r = dp_r.create_subscriber(.{}, null, 0);
@@ -459,9 +460,9 @@ test "loopback: a single participant's own writer and reader on the same topic m
     // participant itself, reusing the exact same proxy-wiring path already
     // proven correct for remote participants (the other tests in this file).
     const alloc = std.testing.allocator;
-    const udp = try UdpTransport.init(alloc, .{ .participant_id = 12 }, 0, null);
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 12 }, test_domain.get(), null);
     defer udp.deinit();
-    const disc = try SpdpSedpDiscovery.init(alloc, udp.transport(), 0, 1_000);
+    const disc = try SpdpSedpDiscovery.init(alloc, udp.transport(), test_domain.get(), 1_000);
     var factory = try DomainParticipantFactoryImpl.init(
         alloc,
         udp.transport(),
@@ -476,7 +477,7 @@ test "loopback: a single participant's own writer and reader on the same topic m
     }
 
     const dpf = factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     var dw_qos = DDS.DataWriterQos{};
@@ -560,9 +561,9 @@ fn waitForRawOpTake(dr: DDS.DataReader, payloads_seq: *DDS.OctetSeqSeq, hashes_s
 
 test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, loan mode" {
     const alloc = std.testing.allocator;
-    const udp = try UdpTransport.init(alloc, .{ .participant_id = 13 }, 0, null);
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 13 }, test_domain.get(), null);
     defer udp.deinit();
-    const disc = try SpdpSedpDiscovery.init(alloc, udp.transport(), 0, 1_000);
+    const disc = try SpdpSedpDiscovery.init(alloc, udp.transport(), test_domain.get(), 1_000);
     var factory = try DomainParticipantFactoryImpl.init(
         alloc,
         udp.transport(),
@@ -577,7 +578,7 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     }
 
     const dpf = factory.toDDSFactory();
-    const dp = dpf.create_participant(0, .{}, null, 0);
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf.delete_participant(dp);
 
     var dw_qos = DDS.DataWriterQos{};
@@ -642,16 +643,16 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
 test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, two participants" {
     const alloc = std.testing.allocator;
 
-    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = 21 }, 0, null);
+    const udp_w = try UdpTransport.init(alloc, .{ .participant_id = 21 }, test_domain.get(), null);
     defer udp_w.deinit();
-    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), 0, 1_000);
+    const disc_w = try SpdpSedpDiscovery.init(alloc, udp_w.transport(), test_domain.get(), 1_000);
     var factory_w = try DomainParticipantFactoryImpl.init(alloc, udp_w.transport(), disc_w.toDiscovery(), noop_security, .spec_random, .{});
     defer {
         factory_w.deinit();
         disc_w.deinit();
     }
     const dpf_w = factory_w.toDDSFactory();
-    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    const dp_w = dpf_w.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf_w.delete_participant(dp_w);
 
     var dw_qos = DDS.DataWriterQos{};
@@ -661,16 +662,16 @@ test "loopback: DDS.DataWriter.write_raw / DDS.DataReader.take_raw generic ops, 
     const dw = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
-    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = 22 }, 0, null);
+    const udp_r = try UdpTransport.init(alloc, .{ .participant_id = 22 }, test_domain.get(), null);
     defer udp_r.deinit();
-    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), 0, 1_000);
+    const disc_r = try SpdpSedpDiscovery.init(alloc, udp_r.transport(), test_domain.get(), 1_000);
     var factory_r = try DomainParticipantFactoryImpl.init(alloc, udp_r.transport(), disc_r.toDiscovery(), noop_security, .spec_random, .{});
     defer {
         factory_r.deinit();
         disc_r.deinit();
     }
     const dpf_r = factory_r.toDDSFactory();
-    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    const dp_r = dpf_r.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = dpf_r.delete_participant(dp_r);
 
     var dr_qos = DDS.DataReaderQos{};

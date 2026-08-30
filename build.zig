@@ -1,6 +1,21 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Run a test binary, giving it a unique DDS domain via `ZZDDS_TEST_DOMAIN_BASE`.
+///
+/// `zig build test` runs test binaries as parallel build-graph steps; the
+/// participant-creating ones would otherwise all bind domain-0 RTPS ports
+/// (SPDP multicast 7400, …) and race for them — a real CI flake, worst on the
+/// slow ARM64 / DebugAllocator / TSan lanes. `next` is a per-lane counter
+/// (each `zig build <step>` runs one lane's binaries at once); domains stay in
+/// `1..232` (`7400 + 250*domain < 65536`). See `test/support/domain.zig`.
+fn addTestRun(b: *std.Build, t: *std.Build.Step.Compile, next: *u32) *std.Build.Step.Run {
+    const r = b.addRunArtifact(t);
+    r.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", b.fmt("{d}", .{next.*}));
+    next.* += 1;
+    return r;
+}
+
 /// Directories containing `jni.h`/`jni_md.h` for the JDK backing `java_path`
 /// (the `java` executable's own path, e.g. from `b.findProgram`). Resolves
 /// symlink chains (PATH/update-alternatives-style) back to a real
@@ -1121,6 +1136,13 @@ pub fn build(b: *std.Build) void {
 
     // ── Unit tests ────────────────────────────────────────────────────────────
 
+    // Shared by every DCPS test module (see `addTestRun` / test/support/domain.zig).
+    // link_libc: it reads its env var via std.c.getenv.
+    const test_domain_mod = b.createModule(.{
+        .root_source_file = b.path("test/support/domain.zig"),
+        .link_libc = true,
+    });
+
     const test_step = b.step("test", "Run Zenzen DDS tests");
 
     // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
@@ -1293,6 +1315,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/participant_vtable_test.zig",
         "test/dcps/writer_vtable_test.zig",
     };
+    var dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -1303,11 +1326,12 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "zzdds", .module = zzdds_mod },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
                     .{ .name = "zidl_rt", .module = zidl_rt_mod },
+                    .{ .name = "test_domain", .module = test_domain_mod },
                 },
             }),
         });
         t.root_module.link_libc = true;
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        test_step.dependOn(&addTestRun(b, t, &dcps_test_domain).step);
         emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
@@ -1398,6 +1422,27 @@ pub fn build(b: *std.Build) void {
 
     const emit_tests_llvm_step = b.step("emit-tests-llvm", "Build test binaries (LLVM backend, baseline CPU) for external DWARF-reading tools like Valgrind");
 
+    // `zig build test-release-small -Doptimize=ReleaseSmall` — run the whole
+    // unit suite at ReleaseSmall. It reuses the LLVM-backend / baseline-CPU
+    // module graph above (the same `.use_llvm = true` artifacts emit-tests-llvm
+    // installs) rather than the normal self-hosted `test` step, purely to dodge
+    // an upstream Zig bug: Zig 0.16.0's self-hosted x86_64 backend, *only* at
+    // -OReleaseSmall, emits read-only global constants (vtable structs,
+    // `CAbiViews` values) with no alignment -- `&SomeImpl.views` lands at an odd
+    // address and `zidl_rt`'s `@alignCast(box.vtable)` traps it (`panic:
+    // incorrect alignment`), crashing ~37 C-ABI tests. The LLVM backend aligns
+    // rodata correctly in every mode; Debug/ReleaseSafe/ReleaseFast on the
+    // self-hosted backend are also fine -- ReleaseSmall is the only broken cell.
+    // The bug is fixed on Zig master (0.17.0-dev.1902+); it is not in any stable
+    // release (0.16.0, tagged 2026-04-13, is latest). Minimal repro + full trail:
+    // `zz-dev/releasesmall-misaligned-rodata-investigation.md`.
+    //
+    // AT THE ZIG 0.17 BUMP: delete this step and its run-artifact deps below,
+    // and add a plain `release-small` entry to scripts/run_deterministic_matrix.py
+    // and release.yml, mirroring `release-fast` (`zig build test
+    // -Doptimize=ReleaseSmall` on the normal self-hosted backend).
+    const test_release_small_step = b.step("test-release-small", "Run the unit suite at ReleaseSmall (LLVM backend -- see comment: works around a Zig 0.16 self-hosted-backend rodata-alignment bug)");
+
     const zzdds_tests_llvm = b.addTest(.{
         .name = "zzdds_lib",
         .root_module = zzdds_mod_llvm_safe,
@@ -1406,6 +1451,7 @@ pub fn build(b: *std.Build) void {
     emit_tests_llvm_step.dependOn(&b.addInstallArtifact(zzdds_tests_llvm, .{
         .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
     }).step);
+    test_release_small_step.dependOn(&b.addRunArtifact(zzdds_tests_llvm).step);
 
     for (fuzz_test_files) |src| {
         const t = b.addTest(.{
@@ -1423,6 +1469,7 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
+        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (transport_test_files) |src| {
@@ -1441,6 +1488,7 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
+        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (discovery_test_files) |src| {
@@ -1459,6 +1507,7 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
+        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (rtps_test_files) |src| {
@@ -1477,8 +1526,10 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
+        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
+    var rs_dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -1490,6 +1541,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
                     .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+                    .{ .name = "test_domain", .module = test_domain_mod },
                 },
             }),
         });
@@ -1497,6 +1549,7 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
+        test_release_small_step.dependOn(&addTestRun(b, t, &rs_dcps_test_domain).step);
     }
 
     // ── TSan test step ────────────────────────────────────────────────────────
@@ -1582,6 +1635,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // DCPS tests (TSan) — WaitSet thread test, loopback
+    var tsan_dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src),
@@ -1591,10 +1645,11 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zzdds", .module = zzdds_mod_tsan },
                 .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
                 .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
+                .{ .name = "test_domain", .module = test_domain_mod },
             },
         }), .use_llvm = true });
         t.root_module.link_libc = true;
-        tsan_step.dependOn(&b.addRunArtifact(t).step);
+        tsan_step.dependOn(&addTestRun(b, t, &tsan_dcps_test_domain).step);
     }
 
     // `zig build test-tsan-self-check` — regression guard proving TSan

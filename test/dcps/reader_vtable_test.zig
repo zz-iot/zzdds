@@ -6,6 +6,7 @@
 //! matchedWriterCount, and matched-publication queries.
 
 const std = @import("std");
+const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
 
@@ -73,7 +74,7 @@ const SingleFixture = struct {
         errdefer d.deinit();
         const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), d.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory.deinit();
-        const dp = factory.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp = factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub = dp.create_subscriber(.{}, null, 0);
         const topic = dp.create_topic("RdrVtTopic", "RdrVtType", .{}, null, 0);
         return .{ .alloc = alloc, .delivery = delivery, .t = t, .d = d, .factory = factory, .dp = dp, .sub = sub, .topic = topic };
@@ -127,7 +128,7 @@ const TwoPartyFixture = struct {
         errdefer d_w.deinit();
         const factory_w = try DomainParticipantFactoryImpl.init(alloc, t_w.transport(), d_w.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_w.deinit();
-        const dp_w = factory_w.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_w = factory_w.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const pub_w = dp_w.create_publisher(.{}, null, 0);
         const topic_w = dp_w.create_topic("RdrPubTopic", "RdrPubType", .{}, null, 0);
 
@@ -137,7 +138,7 @@ const TwoPartyFixture = struct {
         errdefer d_r.deinit();
         const factory_r = try DomainParticipantFactoryImpl.init(alloc, t_r.transport(), d_r.toDiscovery(), noop_security, .spec_random, .{});
         errdefer factory_r.deinit();
-        const dp_r = factory_r.toDDSFactory().create_participant(0, .{}, null, 0);
+        const dp_r = factory_r.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
         const sub_r = dp_r.create_subscriber(.{}, null, 0);
         const topic_r = dp_r.create_topic("RdrPubTopic", "RdrPubType", .{}, null, 0);
         return .{
