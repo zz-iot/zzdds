@@ -8,8 +8,16 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
+    // Zig 0.16's self-hosted backend silently no-ops sanitize_thread without
+    // this (confirmed upstream in zzdds's build.zig).
+    const use_llvm: ?bool = if (sanitize_thread) true else null;
 
-    const zzdds_dep = b.dependency("zzdds", .{ .target = target, .optimize = optimize });
+    const zzdds_dep = b.dependency("zzdds", .{
+        .target = target,
+        .optimize = optimize,
+        .@"sanitize-thread" = sanitize_thread,
+    });
     const zzdds_mod = zzdds_dep.module("zzdds");
     const zzdds_gen = zzdds_dep.module("zzdds_generated");
     const zzdds_ext_gen = zzdds_dep.module("zzdds_ext_generated");
@@ -29,6 +37,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = gen_dir.path(b, "messenger.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
         .imports = &.{
             .{ .name = "zidl_rt", .module = zidl_rt_mod },
             .{ .name = "zzdds", .module = zzdds_mod },
@@ -37,10 +46,12 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "elc_stress",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
             .imports = &.{
                 .{ .name = "zzdds", .module = zzdds_mod },
                 .{ .name = "zzdds_generated", .module = zzdds_gen },
