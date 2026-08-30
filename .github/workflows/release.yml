@@ -37,7 +37,7 @@ jobs:
           echo "Tag will be: ${TAG}"
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ steps.ver.outputs.zig_version }}
 
@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ needs.prepare.outputs.zig_version }}
 
@@ -211,7 +211,7 @@ jobs:
           (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ needs.prepare.outputs.zig_version }}
 
@@ -278,7 +278,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ needs.prepare.outputs.zig_version }}
 
