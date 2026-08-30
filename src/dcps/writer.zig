@@ -66,6 +66,9 @@ pub const DataWriterImpl = struct {
     type_name: []const u8, // borrowed from TopicImpl
     topic: DDS.Topic,
     publisher: DDS.Publisher,
+    /// Whether init() took a lifetime quiesce ref on `publisher` (false for
+    /// hand-built impls in tests that skip init()).
+    parent_pinned: bool = false,
     proto_writer: proto.ProtocolWriter,
     qos: DDS.DataWriterQos,
     // Unified listener storage: both the base OMG `set_listener()` and the
@@ -222,6 +225,12 @@ pub const DataWriterImpl = struct {
             getStatusFn,
         );
         self.status_cond = sc;
+        // Hold a quiesce reference on the parent PublisherImpl for this
+        // writer's whole lifetime (dropped in reallyDeinit). Keeps
+        // publisher.zig's `dispatchWriterFallback` -- reached from this
+        // writer's discovery-driven `notifyPublicationMatched` -- from
+        // ever touching a PublisherImpl freed by a racing delete_publisher.
+        self.parent_pinned = !nil.isNil(publisher) and publisher_mod.PublisherImpl.quiesceAcquireFn(publisher.ptr);
         return self;
     }
 
@@ -257,7 +266,13 @@ pub const DataWriterImpl = struct {
         self.key_registry.deinit(self.alloc);
         // NOTE: proto_writer lifecycle is owned by the participant (via
         // pubDestroyProtoWriter callback), not by DataWriterImpl.
+        const pinned = self.parent_pinned;
+        const publisher = self.publisher;
         self.alloc.destroy(self);
+        // Drop the parent-publisher lifetime ref taken in init(). After
+        // destroy(self) so a reentrant PublisherImpl.reallyDeinit (if this
+        // was its last ref) never sees this half-freed writer.
+        if (pinned) publisher_mod.PublisherImpl.quiesceReleaseFn(publisher.ptr);
     }
 
     /// Write a pre-serialized CDR payload (4-byte encap header + CDR bytes).

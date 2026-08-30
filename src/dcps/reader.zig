@@ -219,6 +219,8 @@ pub const DataReaderImpl = struct {
     alloc: std.mem.Allocator,
     topic_desc: DDS.TopicDescription,
     subscriber: DDS.Subscriber,
+    /// See DataWriterImpl.parent_pinned.
+    parent_pinned: bool = false,
     proto_reader: proto.ProtocolReader,
     qos: DDS.DataReaderQos,
     listener_box: *ListenerBox(DDS.DataReaderListener),
@@ -498,6 +500,11 @@ pub const DataReaderImpl = struct {
             getStatusFn,
         );
         self.status_cond = sc;
+        // Lifetime ref on the parent SubscriberImpl (dropped in
+        // reallyDeinit): keeps subscriber.zig's `dispatchReaderFallback`
+        // from touching a SubscriberImpl freed by a racing
+        // delete_subscriber. See DataWriterImpl.init's mirror.
+        self.parent_pinned = !nil.isNil(subscriber) and subscriber_mod.SubscriberImpl.quiesceAcquireFn(subscriber.ptr);
         return self;
     }
 
@@ -618,8 +625,10 @@ pub const DataReaderImpl = struct {
         self.qos.deinit(self.alloc);
         // NOTE: proto_reader lifecycle is owned by the participant (via
         // subDestroyProtoReader callback), not by DataReaderImpl.
-        // The participant's destroy_proto_reader callback frees it.
+        const pinned = self.parent_pinned;
+        const subscriber = self.subscriber;
         self.alloc.destroy(self);
+        if (pinned) subscriber_mod.SubscriberImpl.quiesceReleaseFn(subscriber.ptr);
     }
 
     /// Determine view_state and instance_state for an incoming change.

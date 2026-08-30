@@ -19,6 +19,7 @@ const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
+const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const participant_mod = @import("participant.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
@@ -147,6 +148,13 @@ pub const SubscriberImpl = struct {
     /// `zidl/docs/design/binding-c-abi-identity.md`.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
+    /// Deferred teardown, mirroring PublisherImpl: a DataReaderImpl holds a
+    /// lifetime reference on its parent SubscriberImpl so
+    /// `dispatchReaderFallback` -- reached from a reader's discovery-driven
+    /// `notifySubscriptionMatched` after `participant.mu` is released --
+    /// never reads a SubscriberImpl freed by a racing delete_subscriber.
+    quiesce: EntityQuiesce = .{},
+
     const Self = @This();
 
     pub fn init(
@@ -188,13 +196,33 @@ pub const SubscriberImpl = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.listener_box.releaseRef(self.alloc);
-        if (self.status_cond) |sc| sc.deinit();
-        self.c_abi.free(self.alloc);
+        // Tear owned DataReaders down synchronously first (see PublisherImpl's
+        // matching comment): each r.deinit() drops the lifetime ref it holds
+        // on us, so by beginTeardown only our "alive" ref and any in-flight
+        // fallback dispatch remain.
         for (self.readers.items) |r| {
             self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
             r.deinit();
         }
+        self.readers.clearRetainingCapacity();
+        self.quiesce.beginTeardown(self, reallyDeinit);
+    }
+
+    pub fn quiesceAcquireFn(ctx: *anyopaque) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.quiesce.acquire();
+    }
+    pub fn quiesceReleaseFn(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
+    }
+
+    fn reallyDeinit(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.listener_box.releaseRef(self.alloc);
+        if (self.status_cond) |sc| sc.deinit();
+        self.c_abi.free(self.alloc);
+        // Owned DataReaders were torn down synchronously in deinit(); empty here.
         self.readers.deinit(self.alloc);
         self.qos.deinit(self.alloc);
         self.default_dr_qos.deinit(self.alloc);
@@ -569,6 +597,8 @@ pub const SubscriberImpl = struct {
     /// parent is guaranteed alive for the whole of this call — the same
     /// reasoning applies symmetrically here.
     pub fn dispatchReaderFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
+        if (!self.quiesce.acquire()) return false;
+        defer self.quiesce.release(self, reallyDeinit);
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
         if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;

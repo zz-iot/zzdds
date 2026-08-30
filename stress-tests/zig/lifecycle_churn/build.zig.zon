@@ -1,0 +1,21 @@
+.{
+    .name = .zzdds_stress_lifecycle_churn,
+    .version = "0.0.0",
+    .fingerprint = 0x9c76ed15fdbdc3e3,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Point at the zzdds repo root (this app lives at
+        // stress-tests/zig/lifecycle_churn within it). No direct
+        // dependency on zidl -- build.zig gets the zidl executable and
+        // zidl_rt module through zzdds. See examples/zig/hello_world.
+        .zzdds = .{
+            .path = "../../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "idl",
+    },
+}

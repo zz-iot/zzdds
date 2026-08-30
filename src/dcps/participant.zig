@@ -536,6 +536,28 @@ const IncompatQosNotify = struct {
 const MatchedNotify = struct {
     ctx: *anyopaque,
     notify: *const fn (ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void,
+    /// `ctx` is a `*DataReaderImpl` when true, a `*DataWriterImpl` when false —
+    /// needed to reach the right `EntityQuiesce` from `onReaderDiscovered` /
+    /// `onWriterDiscovered`, which release `participant.mu` before firing
+    /// `notify` and so must pin the target entity themselves (a raw `ctx` is
+    /// otherwise free to dangle in that window — see `entity_quiesce.zig`).
+    is_reader: bool,
+
+    /// Call while holding `participant.mu` (so `ctx` is provably still live);
+    /// hold the reference until after `notify` returns, then `quiesceRelease`.
+    /// False = the target entity is tearing down; skip the notify entirely.
+    fn quiesceAcquire(self: MatchedNotify) bool {
+        return if (self.is_reader)
+            reader_mod.DataReaderImpl.quiesceAcquireFn(self.ctx)
+        else
+            writer_mod.DataWriterImpl.quiesceAcquireFn(self.ctx);
+    }
+    fn quiesceRelease(self: MatchedNotify) void {
+        if (self.is_reader)
+            reader_mod.DataReaderImpl.quiesceReleaseFn(self.ctx)
+        else
+            writer_mod.DataWriterImpl.quiesceReleaseFn(self.ctx);
+    }
 };
 
 /// Callback registered by DataWriterImpl / DataReaderImpl so that the participant
@@ -2215,6 +2237,7 @@ pub const DomainParticipantImpl = struct {
         proto: proto.ProtocolReader,
         info: proto.MatchedWriterInfo,
         notify: ?MatchedNotify,
+        notify_quiesced: bool = false,
     };
 
     fn onWriterDiscovered(ctx: *anyopaque, data: *const disc.WriterData) void {
@@ -2270,7 +2293,11 @@ pub const DomainParticipantImpl = struct {
             // races it; see protocol/interface.zig's quiesce_acquire doc.
             if (!ar.proto.quiesceAcquire()) continue;
             const info = buildMatchedWriterInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
-            jobs.append(self.alloc, .{ .proto = ar.proto, .info = info, .notify = ar.matched_notify }) catch ar.proto.quiesceRelease();
+            const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
+            jobs.append(self.alloc, .{ .proto = ar.proto, .info = info, .notify = ar.matched_notify, .notify_quiesced = nq }) catch {
+                ar.proto.quiesceRelease();
+                if (nq) ar.matched_notify.?.quiesceRelease();
+            };
         }
         upsertDiscoveredWriter(self, data);
         if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
@@ -2308,7 +2335,10 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
         for (jobs.items) |job| {
             job.proto.addMatchedWriter(&job.info) catch {};
-            if (job.notify) |cb| cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+            if (job.notify) |cb| if (job.notify_quiesced) {
+                cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+                cb.quiesceRelease();
+            };
             job.proto.quiesceRelease();
         }
         if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data);
@@ -2379,6 +2409,7 @@ pub const DomainParticipantImpl = struct {
         proto: proto.ProtocolWriter,
         info: proto.MatchedReaderInfo,
         notify: ?MatchedNotify,
+        notify_quiesced: bool = false,
     };
 
     fn onReaderDiscovered(ctx: *anyopaque, data: *const disc.ReaderData) void {
@@ -2427,7 +2458,11 @@ pub const DomainParticipantImpl = struct {
             // until after self.mu is released below.
             if (!aw.proto.quiesceAcquire()) continue;
             const info = self.buildMatchedReaderInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
-            jobs.append(self.alloc, .{ .proto = aw.proto, .info = info, .notify = aw.matched_notify }) catch aw.proto.quiesceRelease();
+            const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
+            jobs.append(self.alloc, .{ .proto = aw.proto, .info = info, .notify = aw.matched_notify, .notify_quiesced = nq }) catch {
+                aw.proto.quiesceRelease();
+                if (nq) aw.matched_notify.?.quiesceRelease();
+            };
         }
         upsertDiscoveredReader(self, data);
         if (self.builtin_sub) |bs| push_dr = bs.sub_dr;
@@ -2465,7 +2500,10 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
         for (jobs.items) |job| {
             job.proto.addMatchedReader(&job.info) catch {};
-            if (job.notify) |cb| cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+            if (job.notify) |cb| if (job.notify_quiesced) {
+                cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+                cb.quiesceRelease();
+            };
             job.proto.quiesceRelease();
         }
         if (push_dr) |dr| pushBuiltinSubscriptionCdr(self.alloc, dr, data);
@@ -2660,6 +2698,7 @@ pub const DomainParticipantImpl = struct {
         proto: proto.ProtocolWriter,
         info: proto.MatchedReaderInfo,
         notify: ?MatchedNotify,
+        notify_quiesced: bool = false,
         remote_guid: Guid,
         unicast_locs: []const Locator,
         multicast_locs: []const Locator,
@@ -2721,15 +2760,18 @@ pub const DomainParticipantImpl = struct {
                         const uloc = dupeLocators(self.alloc, dr.unicast_locators);
                         const mloc = dupeLocators(self.alloc, dr.multicast_locators);
                         const info = self.buildMatchedReaderInfo(dr.guid, dr.qos, uloc, mloc);
+                        const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
                         jobs.append(self.alloc, .{
                             .proto = aw.proto,
                             .info = info,
                             .notify = aw.matched_notify,
+                            .notify_quiesced = nq,
                             .remote_guid = dr.guid,
                             .unicast_locs = uloc,
                             .multicast_locs = mloc,
                         }) catch {
                             aw.proto.quiesceRelease();
+                            if (nq) aw.matched_notify.?.quiesceRelease();
                             self.alloc.free(uloc);
                             self.alloc.free(mloc);
                         };
@@ -2740,7 +2782,10 @@ pub const DomainParticipantImpl = struct {
         }
         for (jobs.items) |job| {
             job.proto.addMatchedReader(&job.info) catch {};
-            if (job.notify) |cb| cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+            if (job.notify) |cb| if (job.notify_quiesced) {
+                cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+                cb.quiesceRelease();
+            };
             job.proto.quiesceRelease();
             self.alloc.free(job.unicast_locs);
             self.alloc.free(job.multicast_locs);
@@ -2789,6 +2834,7 @@ pub const DomainParticipantImpl = struct {
         proto: proto.ProtocolReader,
         info: proto.MatchedWriterInfo,
         notify: ?MatchedNotify,
+        notify_quiesced: bool = false,
         remote_guid: Guid,
         unicast_locs: []const Locator,
         multicast_locs: []const Locator,
@@ -2859,15 +2905,18 @@ pub const DomainParticipantImpl = struct {
                         const uloc = dupeLocators(self.alloc, dw.unicast_locators);
                         const mloc = dupeLocators(self.alloc, dw.multicast_locators);
                         const info = buildMatchedWriterInfo(dw.guid, dw.qos, uloc, mloc);
+                        const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
                         jobs.append(self.alloc, .{
                             .proto = ar.proto,
                             .info = info,
                             .notify = ar.matched_notify,
+                            .notify_quiesced = nq,
                             .remote_guid = dw.guid,
                             .unicast_locs = uloc,
                             .multicast_locs = mloc,
                         }) catch {
                             ar.proto.quiesceRelease();
+                            if (nq) ar.matched_notify.?.quiesceRelease();
                             self.alloc.free(uloc);
                             self.alloc.free(mloc);
                         };
@@ -2878,7 +2927,10 @@ pub const DomainParticipantImpl = struct {
         }
         for (jobs.items) |job| {
             job.proto.addMatchedWriter(&job.info) catch {};
-            if (job.notify) |cb| cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+            if (job.notify) |cb| if (job.notify_quiesced) {
+                cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+                cb.quiesceRelease();
+            };
             job.proto.quiesceRelease();
             self.alloc.free(job.unicast_locs);
             self.alloc.free(job.multicast_locs);
@@ -2932,7 +2984,7 @@ pub const DomainParticipantImpl = struct {
         var aw_it5 = self.active_writers.valueIterator();
         while (aw_it5.next()) |aw| {
             if (aw.handle == handle) {
-                aw.matched_notify = .{ .ctx = notify_ctx, .notify = notify_fn };
+                aw.matched_notify = .{ .ctx = notify_ctx, .notify = notify_fn, .is_reader = false };
                 break;
             }
         }
@@ -2968,7 +3020,7 @@ pub const DomainParticipantImpl = struct {
         var ar_it5 = self.active_readers.valueIterator();
         while (ar_it5.next()) |ar| {
             if (ar.handle == handle) {
-                ar.matched_notify = .{ .ctx = notify_ctx, .notify = notify_fn };
+                ar.matched_notify = .{ .ctx = notify_ctx, .notify = notify_fn, .is_reader = true };
                 break;
             }
         }
