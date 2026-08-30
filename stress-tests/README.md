@@ -144,8 +144,13 @@ memory. `entity_quiesce.zig`'s own doc spells out why: it "can't protect a `ctx`
 that was already dangling before `acquire()`" — that has to come from whatever hands the
 callback its `ctx`, and the discovery path handed it a raw pointer with `mu` released.
 
-**Fix, two parts** (`src/dcps/{participant,writer,reader,publisher,subscriber}.zig`,
-regression `test/dcps/lifecycle_churn_test.zig`):
+The `entities` scenario itself is the regression — it is gating in the `stress` CI job
+(built with `-Ddebug-allocator`), and reproduces in ~10 s locally. It stays out of
+`zig build test`: reproducing this race needs real UDP, a real receive thread, and two
+racing teardown threads — inherently non-deterministic, the opposite of that suite's
+`ManualClock` / mock-transport contract.
+
+**Fix, two parts** (`src/dcps/{participant,writer,reader,publisher,subscriber}.zig`):
 
 1. `MatchedNotify` gained `is_reader` + `quiesceAcquire`/`quiesceRelease`. The four
    discovery-notify sites (`onReaderDiscovered`, `onWriterDiscovered`, the two

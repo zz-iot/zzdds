@@ -1292,7 +1292,6 @@ pub fn build(b: *std.Build) void {
         "test/dcps/factory_vtable_test.zig",
         "test/dcps/participant_vtable_test.zig",
         "test/dcps/writer_vtable_test.zig",
-        "test/dcps/lifecycle_churn_test.zig",
     };
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
