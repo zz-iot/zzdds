@@ -71,11 +71,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - **Release prep — GitHub-release notes now come from `CHANGELOG.md`.** `release.yml`'s
   `publish` job built its release body from raw `git log --pretty=%s` subjects. It now
   quotes the `CHANGELOG.md` sections added since the previous release tag —
-  `scripts/extract_changelog.py` diffs the current section headings against `CHANGELOG.md`
-  as of that tag (so two releases on the same calendar day are handled: a plain date cutoff
-  would drop the second), falling back to the leading date-headed run when the tag predates
-  the file, and to raw commit subjects only if that yields nothing. Always appends a
-  `compare` link to the full commit log.
+  `scripts/extract_changelog.py` emits the leading run of sections whose heading is not
+  present in `CHANGELOG.md` as of that tag (whole-heading, not date, comparison), falling
+  back to the leading date-headed run when the tag predates the file, and to raw commit
+  subjects only if that yields nothing. Always appends a `compare` link. Two releases on
+  the *same calendar day* under one `## <date>` heading aren't distinguished — the second
+  gets the git-log fallback (fine for a hotfix; the notes are hand-editable).
 - **Decision recorded — pre-1.0 has no stability guarantee.** `docs/decisions.md` gains a
   "Versioning / Releases" section: any release may break the Zig API, the C ABI, the
   QoS/config schema, or the bundle layout, with no deprecation cycle; the C ABI stays in

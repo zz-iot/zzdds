@@ -7,17 +7,23 @@ section-headed log, the release notes quote *it* instead.
 
 CHANGELOG.md is a sequence of `## <heading>` sections, newest first. The slice
 for a release is "every section added since the previous release tag". Given
-`--prev-ref <tag>`, this compares the current CHANGELOG against the CHANGELOG as
-it stood at that tag: it emits the leading run of sections whose headings are
-new, and if there are none (two releases the same day, so the newest `## <date>`
-heading already existed) it emits that section's heading plus only the body
-lines added since. A plain date cutoff would drop the second same-day release.
+`--prev-ref <tag>`, this emits the leading run of sections whose heading is not
+present in CHANGELOG.md as it stood at that tag. Comparing whole headings (not
+dates) means a section dated the same day as the previous tag is still emitted
+as long as its heading text is new.
 
 If the previous tag predates CHANGELOG.md (or `--prev-ref` is omitted / not a
 resolvable ref), it falls back to emitting the leading run of date-headed
 sections (`## 2026-09-02`, or a range `## 2026-08-09 - 2026-08-10`), stopping at
 the first heading with no date -- correct for the first release cut under the
 dated-entry scheme.
+
+Two releases on the *same calendar day* that both write under one `## <date>`
+heading are not distinguishable here: the second finds its heading already
+present and emits nothing, so the caller falls back to a git-log body for it
+(fine for a same-day hotfix; the maintainer can hand-edit the release notes).
+Splitting bullets out of a shared dated section by line was tried and dropped --
+line-level diffing of prose fragments the entries.
 
 Exit status:
   0  one or more sections printed
@@ -70,30 +76,14 @@ def changelog_at_ref(ref: str, changelog: Path) -> str | None:
 
 
 def slice_by_prev_headings(sections: list[tuple[str, list[str]]], prev_text: str) -> list[str]:
-    prev_sections = split_sections(prev_text)
-    prev_headings = {h for h, _ in prev_sections}
+    prev_headings = {h for h, _ in split_sections(prev_text)}
     out: list[str] = []
     for heading, body in sections:
         if heading in prev_headings:
             break
         out.append(heading)
         out.extend(body)
-    if out:
-        return out
-
-    # Nothing under a brand-new heading. Handles two releases on the same day:
-    # the newest section's heading (e.g. "## 2026-09-02") already existed at the
-    # previous tag, but bullets were appended to it afterwards. Emit just the
-    # body lines that are new since then.
-    if sections:
-        heading, body = sections[0]
-        prev_body = next((b for h, b in prev_sections if h == heading), None)
-        if prev_body is not None:
-            prev_set = set(prev_body)
-            new_lines = [ln for ln in body if ln not in prev_set]
-            if any(ln.strip() for ln in new_lines):
-                return [heading, *new_lines]
-    return []
+    return out
 
 
 def slice_by_dated_run(sections: list[tuple[str, list[str]]]) -> list[str]:
