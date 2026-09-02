@@ -48,7 +48,7 @@ For each API found, classified as:
 | Rejection/loss | `on_sample_rejected`/`on_sample_lost`, `get_sample_rejected_status`/`get_sample_lost_status` — neither listener nor polling form, anywhere |
 | Historical data | `wait_for_historical_data` — confirmed zero across every harness |
 | Timestamped/explicit instance ops | `register_instance` (explicit), `register_instance_w_timestamp`, `write_w_timestamp`, `dispose_w_timestamp`, `unregister_instance_w_timestamp` |
-| Instance introspection | `get_key_value`, `lookup_instance` |
+| Instance introspection | `lookup_instance`; `get_key_value` now exercised by the stress `instance` scenario, which found it returns the wrong key for non-leading-key types (zidl codegen, all backends — see below) |
 | Loans | `return_loan_raw`, any loaned-read (`take_raw`/`read_raw` in loan mode) or write-loan (`loan_raw`/`publish_loan_raw`) path — no `zzdds-examples` port exercises these yet (internal test-suite coverage exists, see the loan-lifecycle entry below) |
 | Entity admin, post-creation | `set_qos`/`get_qos` round-trip, `get_listener` read-back, `enable()`, `get_status_changes()`, `contains_entity()` |
 | Discovery/ignore | `ignore_participant`/`ignore_topic`/`ignore_publication`/`ignore_subscription`, `get_discovered_participants`/`get_discovered_topics` + `_data` variants |
@@ -128,8 +128,10 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   needs 2 real processes to mean anything.
 - **`set_expression_parameters` at runtime** (CFT dynamic reconfiguration) — does
   changing parameters without recreating the CFT actually re-filter subsequent samples?
-  Real spec-mandated behavior, currently fully untested, and CFT has an established bug
-  history in this project (missing null-checks found in this same audit).
+  Real spec-mandated behavior; the *behavioural* question is still untested (the
+  stress-tier `cft` scenario now covers its *concurrency safety* and fixed a UAF there).
+  CFT has an established bug history in this project (missing null-checks found in this
+  same audit).
 - **Coherent/ordered access grouping correctness** — build a real coherent set across
   multiple writers, verify atomic delivery. High value given past CoherentSets
   flakiness investigations.
@@ -156,23 +158,32 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   project has repeatedly found real bugs specifically in teardown-cascade edge cases.
 
 ### → Stress tests (new, in-repo)
-- **Generalized reentrant-listener/entity-lifecycle churn** — the existing
-  `participant_vtable_test` "reentrant delete_participant from a timer-driven listener"
-  unit test is a single hand-built scenario; a stress test hammers this pattern with many
-  concurrent writers/readers/waitsets/listeners simultaneously creating/deleting/firing.
-- **WaitSet/Condition churn under load** — many threads attaching/detaching conditions to
-  a shared WaitSet while `wait()` is blocked elsewhere, concurrent GuardCondition
-  set/reset — directly exercises the `CachedCAbiHandle`/`EntityQuiesce` machinery under
-  real pressure, not just narrow unit tests.
-- **Listener-fallback chain under load** — concurrent reader/subscriber/participant
-  deletion racing concurrent `set_listener()` replacement and event delivery (this
-  project's most recent feature, see `docs/decisions.md` "Listener hierarchy fallback").
-- **Many-writer/many-reader fan-in/fan-out discovery** — SPDP/SEDP under N participants
-  joining/leaving concurrently, matching OpenDDS Bench's discovery/fan-in/fan-out
-  scenario shapes at a small scale (targeted tests, not a full framework, to start).
-- **Rapid DataWriter/DataReader create/delete during active SEDP matching** — plausible
-  source of use-after-free/leak bugs; matches OpenDDS `EntityLifecycleStress` directly
-  in spirit.
+Landed in `stress-tests/` (`lifecycle_churn` scenarios + `entity_lifecycle_stress`):
+- ~~**Generalized reentrant-listener/entity-lifecycle churn**~~ — `--scenario reentrant`.
+- ~~**WaitSet/Condition churn under load**~~ — `--scenario waitset` (threads
+  attach/detach ReadConditions/QueryConditions on a shared WaitSet while a waiter is in
+  `wait()` and a waker flips a GuardCondition; includes delete-while-attached).
+- ~~**Listener-fallback chain under load**~~ — `--scenario listener` (participant +
+  publisher + subscriber listeners; per-iteration `set_listener` swaps incl. `null`
+  racing entity teardown and event delivery). Found the unsynchronised `listener_mask`
+  race, now fixed + TSan-gated.
+- ~~**Rapid DataWriter/DataReader create/delete during active SEDP matching**~~ —
+  `--scenario entities`. Found the discovery-driven listener-dispatch UAF, now fixed.
+- **Runtime `set_expression_parameters` reconfiguration** — `--scenario cft`. Found a
+  UAF between the reconfigure and receive-thread filter eval, now fixed + TSan-gated.
+- ~~**Many-writer/many-reader fan-in/fan-out discovery**~~ + ~~**participant-churning
+  fallback**~~ — `--scenario participants` (N threads each churning a whole participant on
+  one shared domain, listeners at every level, W/R mix for fan-in/fan-out). Clean.
+- ~~**`instance` churn**~~ — `--scenario instance`. Clean for the instance-map /
+  reader-tracking / register-dispose-unregister paths, but surfaced two pre-existing bugs
+  it deliberately doesn't gate on: `get_key_value` parses the stored *full* sample with the
+  *key-only* deserializer in all four zidl backends (wrong key for any type whose key
+  member isn't first — see `stress-tests/README.md`), and concurrent `write()` on one
+  `DataWriter` is unsynchronised (`writeRaw` takes no lock). Each needs its own PR.
+
+Still open:
+- A scenario that churns the reader-side WaitSet/condition graph *and* the participant at
+  once (the closest current pair is `waitset` + `participants` run separately).
 
 ### Not prioritized / low value
 - Condition introspection getters (`get_query_expression`, `get_sample_state_mask`, etc.)

@@ -562,6 +562,16 @@ jobs:
         working-directory: stress-tests/zig/lifecycle_churn
         run: ./run.py --scenario reentrant --threads 4 --iterations 25 --tsan --timeout 300
 
+      # listener + cft each surfaced a real data race that now has a fix
+      # (see stress-tests/README.md "Findings"); a TSan lane pins them.
+      - name: lifecycle_churn/listener under ThreadSanitizer
+        working-directory: stress-tests/zig/lifecycle_churn
+        run: ./run.py --scenario listener --threads 4 --duration 20 --tsan --timeout 300
+
+      - name: lifecycle_churn/cft under ThreadSanitizer
+        working-directory: stress-tests/zig/lifecycle_churn
+        run: ./run.py --scenario cft --threads 6 --duration 20 --tsan --timeout 300
+
       # Weekly full-vendor sweep trigger only: heavier, longer, + --large.
       - name: Nightly heavy matrix
         if: github.event_name == 'schedule'

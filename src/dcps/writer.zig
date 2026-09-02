@@ -100,6 +100,14 @@ pub const DataWriterImpl = struct {
     /// refcount -- but it's still atomic since publish/cancel isn't
     /// guaranteed to happen under any particular lock.
     outstanding_loans: std.atomic.Value(usize) = .init(0),
+    /// Set once at init, then only via `vtSetListener`/`setListenerEx`.
+    /// A discovery- or timer-thread dispatch can read it (in
+    /// `dispatchListener`) concurrently with an application `set_listener`
+    /// on another thread, so every *runtime* read/write goes through
+    /// `@atomicLoad`/`@atomicStore` (`.monotonic` -- the box it gates is
+    /// separately synchronised by `listener_mu` + the ListenerBox
+    /// refcount). Struct-literal initialisers touch it single-threaded,
+    /// before publication, and stay plain.
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     guid: proto.Guid = std.mem.zeroes(proto.Guid),
@@ -107,7 +115,12 @@ pub const DataWriterImpl = struct {
     status_cond: ?*waitset.StatusConditionImpl,
 
     /// Sequence number of the most recently written sample; 0 = nothing written.
-    last_sn: proto.SequenceNumber = 0,
+    /// `writeRaw` (application thread, possibly several -- concurrent `write()`
+    /// on one DataWriter is spec-legal) publishes it; `wait_for_acknowledgments`
+    /// and `waitForAcks` read it from other threads. Plain `.monotonic` --
+    /// there is no ordering dependency on other writer state, only tearing to
+    /// avoid.
+    last_sn: std.atomic.Value(proto.SequenceNumber) = .init(0),
 
     /// Cumulative count of incompatible-QoS events. incompat_total_change/
     /// incompat_last_policy are now guarded by `mu` (see its doc comment --
@@ -172,6 +185,17 @@ pub const DataWriterImpl = struct {
     /// Maps instance_handle → last alive CDR payload for get_key_value support.
     /// Populated on the first alive write per instance; never overwritten.
     key_registry: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, []u8) = .empty,
+    /// Guards `key_registry` only. `writeRaw` mutates it (insert-only) from
+    /// the application thread(s) -- concurrent `write()` on one DataWriter is
+    /// spec-legal, and the RTPS layer (`proto_writer`) is already internally
+    /// locked, so this map plus `last_sn` were the last unsynchronised writer
+    /// state on the hot path (found by the stress `instance` scenario under
+    /// TSan: a `HashMapUnmanaged` grow racing a concurrent insert). A
+    /// dedicated leaf mutex, not `mu` -- `mu`'s contract is "plain counter
+    /// reads/writes, never held across a callback", and `writeRaw` takes no
+    /// other lock. Entries are inserted once and never replaced, so a `[]u8`
+    /// value handed out by `getKeyValueRaw` stays valid after unlock.
+    key_registry_mu: Mutex = .{},
 
     /// One box for the whole object, shared across every interface view
     /// (DataWriter, Entity, and ZZDDS.DataWriter — see src/c_abi/extensions.zig)
@@ -308,9 +332,11 @@ pub const DataWriterImpl = struct {
         }
 
         const sn = try self.proto_writer.write(kind, source_timestamp, instance_handle, key_hash, data);
-        self.last_sn = sn;
+        self.last_sn.store(sn, .monotonic);
         if (kind == .alive) {
             const ih = keyHashToHandle(key_hash);
+            self.key_registry_mu.lock();
+            defer self.key_registry_mu.unlock();
             if (!self.key_registry.contains(ih)) {
                 const stored = self.alloc.dupe(u8, data) catch null;
                 if (stored) |s| {
@@ -398,7 +424,7 @@ pub const DataWriterImpl = struct {
 
     /// Returns true when all RELIABLE matched readers have acked up to last_sn.
     pub fn allAcked(self: *Self) bool {
-        return self.proto_writer.allAcked(self.last_sn);
+        return self.proto_writer.allAcked(self.last_sn.load(.monotonic));
     }
 
     pub fn matchedReaderCount(self: *Self) usize {
@@ -413,8 +439,13 @@ pub const DataWriterImpl = struct {
 
     /// Return the stored CDR payload for the given instance handle, or null if
     /// no alive write has been made for this instance.
-    /// The returned slice is valid until the next write to this writer.
+    /// The returned slice stays valid for the life of the writer: entries are
+    /// inserted once and never replaced (see `key_registry_mu`). The lock only
+    /// guards against a concurrent `writeRaw` insert reallocating the map's
+    /// index while we look up.
     pub fn getKeyValueRaw(self: *Self, handle: DDS.InstanceHandle_t) ?[]u8 {
+        self.key_registry_mu.lock();
+        defer self.key_registry_mu.unlock();
         return self.key_registry.get(handle);
     }
 
@@ -606,7 +637,7 @@ pub const DataWriterImpl = struct {
     /// Backs `zzdds::DataWriter::set_listener_ex` (see src/c_abi/extensions.zig).
     pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataWriterListenerEx, mask: DDS.StatusMask) void {
         self.swapListenerEx(listener_ex);
-        self.listener_mask = mask;
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
     }
 
     /// Installs `new_listener_ex`, releasing whatever it replaces. Safe
@@ -652,7 +683,8 @@ pub const DataWriterImpl = struct {
     fn dispatchListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: *anyopaque, args: anytype) bool {
         const box = self.acquireListenerEx();
         defer box.releaseRef(self.alloc);
-        if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        if (listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args)) return true;
         if (nil.isNil(self.publisher)) return false;
         const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
         return pub_.dispatchWriterFallback(field, bit, handle, args);
@@ -841,7 +873,7 @@ pub const DataWriterImpl = struct {
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataWriterListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
         self.swapListenerEx(listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener));
-        self.listener_mask = mask;
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         return DDS.RETCODE_OK;
     }
 
@@ -863,7 +895,8 @@ pub const DataWriterImpl = struct {
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
         const self = cast(ctx);
         if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return DDS.RETCODE_OK;
-        if (self.last_sn == 0) return DDS.RETCODE_OK;
+        const last_sn = self.last_sn.load(.monotonic);
+        if (last_sn == 0) return DDS.RETCODE_OK;
         const deadline_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
             timeout.nanosec == DDS.DURATION_INFINITE_NSEC)
             null
@@ -873,7 +906,7 @@ pub const DataWriterImpl = struct {
                 @as(i64, timeout.sec) * std.time.ns_per_s +
                 @as(i64, @intCast(timeout.nanosec));
         };
-        return if (self.proto_writer.waitAllAcked(self.last_sn, deadline_ns))
+        return if (self.proto_writer.waitAllAcked(last_sn, deadline_ns))
             DDS.RETCODE_OK
         else
             DDS.RETCODE_TIMEOUT;

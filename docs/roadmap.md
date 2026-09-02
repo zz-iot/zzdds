@@ -89,6 +89,53 @@ Forward-looking only: known gaps, planned features, and open design questions.
   long-term fix is XTypes TypeLookup (below); a nearer-term option is to require
   `registerTypeSupport` for keyed topics and error rather than silently degrade. See
   `implementation_status.md` "Known Limitations" and `design/history-cache.md`.
+  - *Mitigated for zzdds→zzdds:* a writer whose `TypeSupport.has_key` is set now emits an
+    inline `PID_KEY_HASH` on **every** sample (RTPS §8.7.9), including a zero-valued key —
+    previously suppressed as all-zeros — so the subscriber routes by the wire hash and
+    never reconstructs one from the payload. `resolveKeyHash` also now honours a *present*
+    all-zero `PID_KEY_HASH` instead of treating it as "recompute". Residual: a non-zzdds
+    peer that omits the inline hash for an alive keyed sample still falls to
+    `key_hash_fn`; see the selective-CDR-parse follow-ups below.
+- **`key_hash_fn` reconstructs a non-leading `@key` incorrectly** — `resolveKeyHash`'s
+  fallback (`TypeSupport.compute_key_hash`, whose contract is "full CDR wire payload in,
+  16-byte hash out") is served by zidl's generated `computeKeyHashFromCdr`, which runs the
+  **key-only** deserializer and so only reads a leading, contiguous key correctly. A
+  non-leading `@key` member (e.g. `Message.subject_id`, member 3) is misread. The
+  zzdds→zzdds case is fixed (keyed writers now always send inline `PID_KEY_HASH`, so the
+  fallback isn't reached); the remaining case is a non-zzdds peer that omits the inline
+  hash for an alive keyed sample. Fix: route the fallback through
+  `deserialize_selected(KEY_FIELD_MASK)` on a full payload while keeping the key-only path
+  for genuine DISPOSE/UNREGISTER payloads (distinguish via the DATA submessage K flag).
+  The selective parser is available (zidl v0.3.12, pinned), but wiring `key_hash_fn` onto
+  it needs a `TypeSupport.compute_key_hash` signature change (`is_key_only: bool`) + C-ABI
+  mirror + a further zidl release.
+
+### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
+
+zidl v0.3.12 adds a mask-driven selective parser (`deserialize_selected(want)` /
+`KEY_FIELD_MASK` / `field_index`, `skipPrimitives` fast path) across all four backends, and
+rewires `get_key_value` and `get_field_from_cdr` onto it. Three refinements
+were deliberately left out of that change; none is a regression (each is a new capability
+or an optimisation on an already-improved path):
+
+- **Batched one-pass multi-field filter reads** — a CFT/QueryCondition referencing N fields
+  currently does N `deserialize_selected` walks (one per field reference). Resolve the
+  filter AST's whole referenced-field set to one `FieldMask` at condition-creation and do a
+  single walk per sample. Needs a `filter_mod` `FieldAccessor` API change (pull API → cache
+  the parse, or pre-resolve fields in `eval`). Impact of deferring: a redundant struct walk
+  per extra referenced field per sample — pure CPU, proportional to filter complexity × rate.
+- **Nested field paths (`a.b.c`) in filter expressions** — the DDS filter grammar (DDS 1.4
+  Annex A) allows dotted member navigation and `[n]` subscripts; zzdds only supports
+  top-level simple members (always has — `get_field_from_cdr` / `classifyFilterFieldKind`).
+  Needs grammar/parser/AST/evaluator changes in `filter_mod` plus a `Spec`-tree form of
+  `deserialize_selected` for selective descent (the `u64` mask primitive was built to
+  accept this later without rework). ~1 day with full-decode of wanted nested structs,
+  ~2 days fully selective. Impact of deferring: a nested field reference silently never
+  matches (unknown field → `eval` passes the sample) — a pre-existing gap.
+- **`computeKeyHashFromCdr` full-payload path** — see the `key_hash_fn` bullet above. The
+  zzdds→zzdds mitigation has landed; routing the fallback itself through
+  `deserialize_selected` (for non-zzdds peers) still needs the `compute_key_hash`
+  signature change + a further zidl release.
 - **`on_inconsistent_topic` and `on_data_on_readers` have zero firing sites** — the
   underlying status detection is not wired up.
 - **`SampleInfo` `sample_rank` / `generation_rank` / `absolute_generation_rank`** stay at
@@ -227,11 +274,22 @@ model:
   replay; `ignore_*` across two processes; runtime `set_expression_parameters` CFT
   reconfiguration; coherent/ordered grouping atomicity across multiple writers;
   `_w_timestamp` source-timestamp propagation; `delete_contained_entities` across the C-ABI.
-- **Stress tier** — reentrant-listener / entity-lifecycle churn; WaitSet/Condition churn
-  under load; listener-fallback chain under load; many-participant SPDP/SEDP fan-in/out;
-  rapid DataWriter/DataReader create/delete during SEDP matching. Plus a loaned-read example
-  (loan lifecycle has zero C/C++ coverage today — nothing stops a C/C++ caller reading a
-  returned loan).
+- **Stress tier** — landed in `stress-tests/` as seven `lifecycle_churn` scenarios
+  (`reentrant`, `entities`, `waitset`, `listener`, `cft`, `participants`, `instance`) plus
+  the `entity_lifecycle_stress` multi-process port. Found + fixed three concurrency bugs
+  (discovery/teardown UAF, unsynchronised `listener_mask`, CFT param UAF) and
+  unsynchronised concurrent single-writer `write()`. The `instance` scenario also surfaced
+  two key-hash correctness bugs: (1) `get_key_value` decoding a full stored sample with the
+  key-only deserializer (zidl codegen, all four backends) — fixed in zidl via the
+  selective-parse family; landed here with the zidl v0.3.12 pin, the scenario now asserts
+  the returned key value; (2) `resolveKeyHash` misroute
+  for a zero-valued key — mitigated (keyed writers now always send inline `PID_KEY_HASH`;
+  present all-zero hash honoured), with the `key_hash_fn` full-payload path itself tracked
+  as a selective-parse follow-up. See `stress-tests/README.md`. Remaining stress ideas: a
+  scenario that also churns the reader-side WaitSet/condition graph under participant
+  churn; a Bench-style discovery-latency measurement (explicitly out of scope for this
+  tier). Plus a loaned-read example (loan lifecycle has zero C/C++ coverage today —
+  nothing stops a C/C++ caller reading a returned loan).
 
 Harness is Python, reusing the examples' `_common.py` pattern.
 

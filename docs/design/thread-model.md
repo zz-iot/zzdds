@@ -25,6 +25,13 @@ would invert locks held by the receive path.
 
 `WaitSet.wait()` blocks only the calling thread.
 
+Concurrent `DataWriter.write()` (and the `dispose`/`unregister_instance`/`write_raw`
+family) from multiple application threads on a *single* writer is safe: the RTPS
+`StatefulWriter`/`StatelessWriter` layer is internally locked, and `DataWriterImpl`'s own
+per-write state (`last_sn`, the `get_key_value` key registry) is guarded
+(`src/dcps/writer.zig` — atomic `last_sn`, `key_registry_mu`). Ordering between concurrent
+writes is not defined — they interleave — but no write is lost or corrupted.
+
 ## Single-Threaded Direction
 
 An embedded/single-threaded API such as `DomainParticipant.drive(timeout)` is not

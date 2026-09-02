@@ -96,6 +96,10 @@ pub const RtpsProtocolWriter = struct {
         self.writer.setLifespan(ls);
     }
 
+    pub fn setKeyed(self: *Self, keyed: bool) void {
+        self.writer.setKeyed(keyed);
+    }
+
     pub fn toProtocolWriter(self: *Self) ProtocolWriter {
         return .{ .ctx = self, .vtable = &vtable };
     }
