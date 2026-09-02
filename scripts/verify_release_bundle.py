@@ -27,10 +27,12 @@ Steps:
      compiles, links and runs `test/release-bundle/consumer.c`.
 
 `--configure-only` stops after step 4's `cmake` *configure* of the small
-consumer (no compiler, no run, no examples). Used on Windows, where the
-CMake/compiler example build path is not yet covered (same deferral as
-`ci.yml`'s Windows Java binding) -- it still exercises the generated
-`zzdds-config.cmake` and the bundled `zidl.exe`.
+consumer (no compiler, no run, no examples). It is a local-debugging aid for a
+host without a usable C/C++ toolchain; `release.yml` does not use it. In
+particular it is NOT run on Windows -- the generated `zzdds-config.cmake` /
+`zzdds.pc` are POSIX-shaped today (search `lib/` for the shared lib, no
+`IMPORTED_IMPLIB`, `bin/zidl` not `bin/zidl.exe`), so `find_package(ZZDDS)`
+does not configure there yet (tracked in `docs/roadmap.md`).
 """
 
 from __future__ import annotations
@@ -246,7 +248,9 @@ def main() -> int:
     ap.add_argument("--examples-dir", type=Path, default=REPO_ROOT / "examples",
                     help="path to the folded-in examples/ tree (default: <repo>/examples)")
     ap.add_argument("--configure-only", action="store_true",
-                    help="stop after cmake-configuring the small consumer (no compiler / no run / no examples)")
+                    help="stop after cmake-configuring the small consumer (no compiler / no run / "
+                         "no examples). Local-debugging aid for a host without a C/C++ toolchain; "
+                         "not used by release.yml, and not usable on Windows yet (see module docstring)")
     ap.add_argument("--skip-example-run", action="store_true",
                     help="build examples/{c,cpp}/hello_world against the bundle but do not run the "
                          "pub/sub pair (link coverage only; use where live UDP DDS discovery is flaky, "
