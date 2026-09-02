@@ -43,6 +43,54 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `TypeSupport.compute_key_hash` signature change (`is_key_only: bool`) rippling to the
   C ABI mirror and a further zidl release, so it is a follow-up beyond the v0.3.12 bump.
   Tracked in `docs/roadmap.md` "Selective CDR parse — deferred follow-ups".
+- **Release prep — prebuilt-bundle consume check.** `release.yml`'s `package-libs` job used
+  to verify only the *contents* of the install tree it built, in place. It now also extracts
+  the finished per-platform tarball into an unrelated directory and drives a real downstream
+  consume of it (`scripts/verify_release_bundle.py` + committed fixtures under
+  `test/release-bundle/`): structural completeness, pkg-config / CMake-package
+  relocatability (no baked-in absolute build path), the bundled `bin/zidl` runs, and
+  `find_package(ZZDDS)` + `pkg-config` build `examples/{c,cpp}/hello_world` and a minimal
+  consumer against the *relocated* prefix — on Linux the hello_world pair also exchanges its
+  10 samples. This is the consumption path `rmw_zzdds` (and any C/C++ CMake consumer) takes;
+  the in-tree `test-bindings` step never exercised a moved prefix. Linux: full; macOS:
+  `--skip-example-run` (skips only the live-UDP pair run — `cmake_consumer` still links and
+  runs against `libzzdds.dylib`). Windows keeps the structural check only: the generated
+  `zzdds-config.cmake` / `zzdds.pc` are POSIX-shaped (search `lib/` for the shared lib, no
+  `IMPORTED_IMPLIB`, `bin/zidl` not `bin/zidl.exe`), so `find_package(ZZDDS)` can't configure
+  a bundle there yet — tracked in `docs/roadmap.md` "CI / Release Platform Coverage".
+- **Release prep — musl / static Linux target lane.** `-Dtarget` was never actually
+  cross-compiled anywhere in CI. New `zig build test -Dtarget=x86_64-linux-musl` step in
+  `run_deterministic_matrix.py` (so `ci.yml`'s `test-linux` covers it) and `release.yml`'s
+  `test` job (Linux x86_64 only). A `-linux-musl` binary is statically linked and runs
+  natively on the glibc runner, so this executes the full suite (1076/1076), proving zzdds
+  is musl-clean for Alpine / static-binary / container consumers. In
+  `run_deterministic_matrix.py` the step is gated to x86_64-Linux hosts (elsewhere the
+  cross-built binaries can't run, and Zig would silently skip them); CI's `ubuntu-latest`
+  runs it unconditionally. `aarch64-linux-musl` (needs qemu) and a static-archive `libzzdds`
+  bundle variant remain deferred — `docs/roadmap.md` "CI / Release Platform Coverage".
+- **Release prep — GitHub-release notes now come from `CHANGELOG.md`.** `release.yml`'s
+  `publish` job built its release body from raw `git log --pretty=%s` subjects. It now
+  quotes the `CHANGELOG.md` sections added since the previous release tag —
+  `scripts/extract_changelog.py` emits the leading run of sections whose heading is not
+  present in `CHANGELOG.md` as of that tag (whole-heading, not date, comparison), falling
+  back to the leading date-headed run when the tag predates the file, and to raw commit
+  subjects only if that yields nothing. Always appends a `compare` link. Two releases on
+  the *same calendar day* under one `## <date>` heading aren't distinguished — the second
+  gets the git-log fallback (fine for a hotfix; the notes are hand-editable).
+- **Decision recorded — pre-1.0 has no stability guarantee.** `docs/decisions.md` gains a
+  "Versioning / Releases" section: any release may break the Zig API, the C ABI, the
+  QoS/config schema, or the bundle layout, with no deprecation cycle; the C ABI stays in
+  flux until zzdds and Zig mature toward a distant 1.0; `--runtime-version <N>` stays
+  unimplemented until there is a tier worth pinning. Consumers pin an exact
+  `vX.Y.Z-zig.A.B.C` tag / bundle; downstream middleware (e.g. `rmw_zzdds`) owns its own
+  version mapping and absorbs zzdds churn behind its own boundary. `release.yml`'s release
+  notes now carry a matching "Stability" section.
+- **Fix — the installed `zzdds.pc` / `zzdds-config.cmake` version now tracks `build.zig.zon`.**
+  `build.zig` carried a second, hand-maintained `zzdds_version` string (stuck at
+  `0.1.1-zig.0.16.0-dev`) that stamped the `Version:` field of the generated pkg-config and
+  CMake package files — so a consumer's `pkg-config --modversion zzdds` reported a version
+  two minors behind the actual package. It now reads `@import("build.zig.zon").version`, the
+  same field `release.yml` bumps at tag time.
 
 ## 2026-08-30
 

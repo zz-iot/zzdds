@@ -121,6 +121,19 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: zig build test-release-small -Doptimize=ReleaseSmall
 
+      # musl / fully-static Linux target. `-Dtarget` was never actually
+      # cross-compiled anywhere in CI before -- every lane built the native
+      # glibc triple. A `-linux-musl` target links a static musl libc, and
+      # such a binary runs natively on this glibc x86_64 runner, so this is
+      # real execution coverage (1076/1076 tests), not just a build check.
+      # Proves zzdds is musl-clean for Alpine / static-binary / container
+      # consumers. aarch64-linux-musl would need qemu to run and is deferred;
+      # a static-archive libzzdds bundle variant is a separate follow-up
+      # (see docs/roadmap.md "CI / Release Platform Coverage").
+      - name: Test (musl static, x86_64-linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: zig build test -Dtarget=x86_64-linux-musl
+
       # Binding smoke tests, mirroring ci.yml's test-other job: the release
       # gate previously ran only `zig build test` (+ReleaseFast +TSan) and
       # never built a single binding, so a PR breaking the C/C++/Java
@@ -263,10 +276,22 @@ jobs:
   # pkgconfig + CMake package files) on each release platform and uploads it
   # as a per-platform tarball; `publish` attaches them to the GitHub release.
   #
-  # The *functional* smoke test of these libraries is the `test` job's
-  # `test-bindings` step, which compiles and runs real C/C++/Java programs
-  # against a freshly built libzzdds on every platform -- this job only has
-  # to confirm the install tree is complete before packaging it.
+  # Beyond confirming the tree is complete, this job (Linux + macOS) also
+  # extracts the finished tarball into an unrelated directory and drives a real
+  # downstream consume of it -- `find_package(ZZDDS)` + pkg-config, building
+  # examples/{c,cpp}/hello_world and a minimal consumer against the *relocated*
+  # prefix (scripts/verify_release_bundle.py). That catches broken CMake
+  # package files / pkg-config relocatability / rpath|install-name that the
+  # `test` job's in-tree `test-bindings` step (which points CMAKE_PREFIX_PATH
+  # straight at the live zig-out) cannot see.
+  #
+  # Windows gets the structural check only: the generated zzdds-config.cmake /
+  # zzdds.pc are POSIX-shaped today (search `lib/` for the shared lib, no
+  # IMPORTED_IMPLIB, `bin/zidl` not `bin/zidl.exe`), so `find_package(ZZDDS)`
+  # can't configure there yet. Making the generated package Windows-correct is
+  # tracked in docs/roadmap.md "CI / Release Platform Coverage"; until then the
+  # Windows tarball ships as-is (its libraries are still functionally covered by
+  # the `test` job's `test-bindings` step).
   package-libs:
     name: package-libs (${{ matrix.name }})
     needs: [prepare, test]
@@ -330,6 +355,29 @@ jobs:
           mv zig-out "$dir"
           tar -czf "${dir}.tar.gz" "$dir"
 
+      - name: Install Python (for verify_release_bundle.py)
+        if: runner.os != 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Extract the tarball we just made into an unrelated directory and prove a
+      # downstream project can consume it from there. Linux: full path --
+      # find_package + pkg-config, build examples/{c,cpp}/hello_world, run a
+      # pub/sub pair. macOS: same but --skip-example-run (the hello_world pair
+      # needs live UDP discovery, flaky on hosted macOS; cmake_consumer still
+      # links + runs against libzzdds.dylib, so install-name relocatability is
+      # still covered). Windows is skipped -- see the job-header comment.
+      - name: Verify prebuilt bundle is consumable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="zzdds-${{ needs.prepare.outputs.full_version }}-${{ matrix.name }}.tar.gz"
+          args=""
+          [ "${{ runner.os }}" = "macOS" ] && args="--skip-example-run"
+          python3 scripts/verify_release_bundle.py --bundle "$tarball" $args
+
       - name: Upload bundle
         uses: actions/upload-artifact@v4
         with:
@@ -380,21 +428,51 @@ jobs:
           git tag "${TAG}"
           git push origin "${TAG}"
 
+      # Release notes body: prefer the curated, date-headed CHANGELOG.md
+      # sections written since the previous release; fall back to raw commit
+      # subjects only if that yields nothing (e.g. CHANGELOG not updated).
+      # Either way, append a compare link to the full commit log.
       - name: Generate changelog
         id: changelog
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            LOG=$(git log "${PREV_TAG}..HEAD~1" --pretty=format:"- %s" --no-merges)
-          else
-            LOG=$(git log HEAD~1 --pretty=format:"- %s" --no-merges)
+
+          BODY=""
+          SOURCE=""
+          # extract_changelog.py emits the CHANGELOG.md sections added since
+          # PREV_TAG (by heading-set diff against CHANGELOG.md as of that tag;
+          # falls back to the leading date-headed run if the tag predates the
+          # file). An empty PREV_TAG is passed through and lands on that same
+          # fallback.
+          if SLICE=$(python3 scripts/extract_changelog.py --changelog CHANGELOG.md --prev-ref "$PREV_TAG"); then
+            # Demote CHANGELOG's own "## <date>" headings so they nest under
+            # the "## Changelog" heading in the release-notes template.
+            BODY=$(printf '%s\n' "$SLICE" | sed 's/^## /### /')
+            SOURCE="CHANGELOG.md since ${PREV_TAG:-<repo start>}"
           fi
+
+          if [ -z "$BODY" ]; then
+            if [ -n "$PREV_TAG" ]; then
+              BODY=$(git log "${PREV_TAG}..HEAD~1" --pretty=format:"- %s" --no-merges)
+            else
+              BODY=$(git log HEAD~1 --pretty=format:"- %s" --no-merges)
+            fi
+            SOURCE="git log (CHANGELOG.md had no dated sections since the last release)"
+          fi
+
+          if [ -n "$PREV_TAG" ]; then
+            BODY="${BODY}
+
+          **Full commit log:** https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+          fi
+
+          echo "Release-notes body sourced from: ${SOURCE}"
           {
-            echo "log<<EOF"
-            echo "$LOG"
-            echo "EOF"
+            echo "log<<CHANGELOG_EOF"
+            echo "$BODY"
+            echo "CHANGELOG_EOF"
           } >> $GITHUB_OUTPUT
 
       - name: Create GitHub release
@@ -406,8 +484,14 @@ jobs:
         run: |
           gh release create "${TAG}" \
             --title "${TAG}" \
-            --notes "## Changes
+            --notes "## Changelog
           ${CHANGELOG}
+
+          ## Stability
+          Pre-1.0: **any release may break source and ABI compatibility** — the Zig API, the
+          C ABI, the QoS/config schema, and the bundle layout are all still in flux (see
+          \`docs/decisions.md\` → Versioning / Releases). Pin this exact tag / bundle; do not
+          track a branch or a version range.
 
           ## Zig compatibility
           Built with and requires Zig \`${ZIG_VERSION}\`.

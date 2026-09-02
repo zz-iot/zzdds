@@ -165,8 +165,10 @@ or an optimisation on an already-improved path):
   machinery works, but backends do not all generate a real `get_field_from_cdr` callback,
   so CFT/QueryCondition without a registered `TypeSupport.get_field` accessor passes all
   samples through (`raw_ops.zig:637`; see `decisions.md`).
-- **`--runtime-version <N>`** zidl flag for API-tier pinning is not implemented; relevant
-  once the first stable API tier is declared.
+- **`--runtime-version <N>`** zidl flag for API-tier pinning is not implemented, and
+  deliberately stays that way pre-1.0 — there is no stable API tier to pin and declaring one
+  is not a near-term goal (`decisions.md` → Versioning / Releases). Consumers pin an exact
+  release instead.
 - **Idiomatic Zig binding** — a future generated `dcps_zig.zig` (closure-based listeners,
   slice-friendly QoS builders) is not built; Zig callers use the native fat-pointer vtable
   directly. `language-bindings.md`.
@@ -373,7 +375,9 @@ and shape are open — see `zidl/docs/roadmap.md` "Plugin architecture".
 
 Audit of `build.zig` options, `scripts/run_deterministic_matrix.py`, `ci.yml`, and
 `release.yml` against the platform/build-type matrix they exercise. Original ranking
-2026-08-16; progress notes below from PR #65 (2026-08-18) and the 2026-08-28 CI pass.
+2026-08-16; progress notes below from PR #65 (2026-08-18), the 2026-08-28 CI pass, and the
+2026-09-02 release-prep pass (musl lane + prebuilt-bundle consume check + CHANGELOG-sourced
+release notes).
 
 ### Landed
 
@@ -392,6 +396,26 @@ Audit of `build.zig` options, `scripts/run_deterministic_matrix.py`, `ci.yml`, a
   CMake package files) on each of the four release platforms, verifies completeness, and
   uploads a per-platform tarball that `publish` attaches to the GitHub release. Functional
   coverage of the bundled libraries is the `test` job's `test-bindings` step.
+- **Prebuilt-bundle consume check** (2026-09-02) — `package-libs` now also extracts the
+  finished tarball into an unrelated directory and drives a real downstream consume of it via
+  `scripts/verify_release_bundle.py`: `find_package(ZZDDS)` + pkg-config resolve from the
+  *relocated* prefix, the bundled `bin/zidl` runs, and `examples/{c,cpp}/hello_world` + a
+  minimal consumer compile, link and (Linux) exchange samples against it. Catches broken
+  CMake package files / pkg-config relocatability / rpath|install-name that the in-tree
+  `test-bindings` step (CMAKE_PREFIX_PATH pointed straight at the live `zig-out`) can't see.
+  Linux runs the full path; macOS skips only the live-UDP hello_world pair run
+  (`--skip-example-run`). Windows gets the structural check only — the generated
+  `zzdds-config.cmake` / `zzdds.pc` are POSIX-shaped, so `find_package(ZZDDS)` can't
+  configure there yet (see "Still open" below).
+- **musl / static Linux target lane** (2026-09-02) — `zig build test -Dtarget=x86_64-linux-musl`
+  now runs in `run_deterministic_matrix.py` (so `ci.yml`'s `test-linux` covers it) and
+  `release.yml`'s `test` job (Linux x86_64 only). A `-linux-musl` binary is statically linked
+  and runs natively on the glibc runner, so this is full-suite execution coverage
+  (1076/1076), not just a build check — closes "`-Dtarget` is never actually cross-compiled".
+- **Release notes sourced from `CHANGELOG.md`** (2026-09-02) — `release.yml`'s `publish` job
+  builds the GitHub-release body from the curated, date-headed `CHANGELOG.md` sections
+  written since the previous release tag (`scripts/extract_changelog.py`), falling back to
+  raw commit subjects only if that yields nothing, and always appending a `compare` link.
 - **`ReleaseSmall` lane** (2026-08-29) — new `zig build test-release-small` step runs the
   whole unit suite at `-OReleaseSmall`, wired into `run_deterministic_matrix.py` (so
   `ci.yml`'s `test-linux` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
@@ -429,9 +453,19 @@ Audit of `build.zig` options, `scripts/run_deterministic_matrix.py`, `ci.yml`, a
 1. **Real vendor/self RTPS interop** (Connext / Cyclone / CoreDX / self) runs only on Linux
    x86_64 — no wire / discovery / CDR coverage on Windows, macOS, or ARM64.
 2. **No Intel macOS coverage** — `macos-latest` is Apple Silicon only.
-3. **No musl / static Linux target** — always glibc, always the native triple; `-Dtarget`
-   is never actually cross-compiled.
-4. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
+3. **musl coverage is x86_64-only, and there is no static-`libzzdds` bundle** — the new lane
+   (see *Landed*) cross-builds and runs `x86_64-linux-musl`; `aarch64-linux-musl` would need
+   qemu to execute. Separately, `build.zig` still only builds `libzzdds` as a shared library
+   (`.linkage = .dynamic`, no `-Dlinkage` option), so there's no static-archive/musl variant
+   in `package-libs`' bundle set — deferred until a concrete consumer asks for one.
+4. **The generated CMake/pkg-config package is POSIX-only** — `build.zig`'s
+   `zzdds-config.cmake` searches `lib/` for the shared library (the Windows DLL installs to
+   `bin/`), sets no `IMPORTED_IMPLIB` for the import lib, and hard-codes `bin/zidl` (not
+   `bin/zidl.exe`); `zzdds.pc` is likewise `-l`-style. So a Windows consumer can't
+   `find_package(ZZDDS)` a bundle yet — `package-libs` ships the Windows tarball with the
+   structural check only, and `verify_release_bundle.py` is not run there. Fix: platform-aware
+   generation in `build.zig` + turn the Windows arm of the consume check back on.
+5. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
    non-Linux memory bug motivates revisiting.
 
 ---
