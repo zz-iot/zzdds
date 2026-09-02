@@ -1,6 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Single source of truth for the package version. Everything that stamps a
+/// version (the installed `zzdds.pc` and `zzdds-config.cmake` below) reads it
+/// from here so it can never drift from the published package. `release.yml`
+/// bumps `.version` in `build.zig.zon` at tag time.
+const zzdds_version = @import("build.zig.zon").version;
+
 /// Run a test binary, giving it a unique DDS domain via `ZZDDS_TEST_DOMAIN_BASE`.
 ///
 /// `zig build test` runs test binaries as parallel build-graph steps; the
@@ -48,8 +54,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
     const debug_allocator = b.option(bool, "debug-allocator", "Route the default (allocator=NULL) factory allocation path through std.heap.DebugAllocator instead of std.heap.c_allocator, for fast attributable double-free/UAF diagnostics") orelse false;
-
-    const zzdds_version = "0.1.1-zig.0.16.0-dev";
 
     // ── Dependencies ──────────────────────────────────────────────────────────
 

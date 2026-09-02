@@ -315,3 +315,25 @@ Wireshark correlation and deterministic tests. Both paths embed `ZZDDS_VENDOR_ID
 `-Dipv4`, `-Dipv6`, `-Dinterface-monitor`, `-Dwire-trace`, `-Dguid-filter`,
 `-Dxtypes`, `-Dcontent-subscription-profile`. Dead-code elimination removes unused
 paths at compile time — no runtime overhead, no `#ifdef`-style branching at call sites.
+
+---
+
+## Versioning / Releases
+
+**Pre-1.0: no source- or ABI-compatibility guarantee across releases.**
+Any release may change the Zig API, the C ABI (`zzdds_c.h` + the zidl-generated C/C++
+surface), the QoS/config schema, or the prebuilt-bundle layout — without a deprecation
+cycle. The C ABI in particular is expected to stay in flux until both zzdds and Zig itself
+mature toward a 1.0, which is a long way off. `--runtime-version <N>` (see
+`language-bindings.md`) is deliberately unimplemented until there is a stable tier to pin;
+there isn't one yet, and declaring one is not a near-term goal.
+
+**Consumers pin an exact release.** A tag is `vX.Y.Z-zig.A.B.C` (package version + the
+exact Zig toolchain it was built with — enforced in `release.yml`). Pin the exact tag for
+`zig fetch`, or the exact per-platform bundle tarball for C/C++ / CMake consumers. Do not
+track a branch or a version range.
+
+**Downstream middleware owns its own compatibility mapping.** A consumer that re-exports
+zzdds through its own stable-ish surface (e.g. an `rmw_zzdds`) is responsible for pinning a
+specific zzdds release, carrying its own version/build metadata, and absorbing zzdds ABI
+churn behind its own boundary — not for expecting zzdds to hold an interface for it.

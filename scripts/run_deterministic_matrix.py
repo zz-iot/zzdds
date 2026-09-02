@@ -3,9 +3,9 @@
 
 This is a convenience wrapper around the checks that are useful before pushing:
 formatting, sleep guardrails, Debug tests, feature-minimal tests, ReleaseSafe
-tests, ReleaseFast tests, ReleaseSmall tests, and fuzz harness compile-checks.
-ThreadSanitizer is available as an opt-in because it is slower and can be noisy
-on some local systems.
+tests, ReleaseFast tests, ReleaseSmall tests, a musl static-target cross-build,
+and fuzz harness compile-checks. ThreadSanitizer is available as an opt-in
+because it is slower and can be noisy on some local systems.
 
 The ReleaseSmall step runs via `zig build test-release-small`, which forces the
 LLVM backend: Zig 0.16's self-hosted x86_64 backend mis-aligns read-only globals
@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
             "release-safe",
             "release-fast",
             "release-small",
+            "musl",
             "fuzz",
             "tsan-self-check",
             "tsan",
@@ -77,6 +78,13 @@ def steps(zig: str, include_tsan: bool) -> list[Step]:
         # build.zig comment. Switch to `["test", "-Doptimize=ReleaseSmall"]` at
         # the Zig 0.17 bump.
         Step("release-small", [zig, "build", "test-release-small", "-Doptimize=ReleaseSmall"]),
+        # musl / fully-static Linux target. `-Dtarget` is otherwise never
+        # cross-compiled in the matrix. A `-linux-musl` binary is statically
+        # linked and runs natively on a glibc x86_64 host, so this executes
+        # the full suite (not just a build check) and proves zzdds is
+        # musl-clean for Alpine / static-binary consumers. Host-arch only;
+        # aarch64-linux-musl would need qemu.
+        Step("musl", [zig, "build", "test", "-Dtarget=x86_64-linux-musl"]),
         Step("fuzz", [zig, "build", "test-fuzz"]),
     ]
     if include_tsan:
