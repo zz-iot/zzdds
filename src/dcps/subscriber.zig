@@ -132,6 +132,12 @@ pub const SubscriberImpl = struct {
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
+    /// See `writer.zig`'s matching field. Read from discovery/timer
+    /// threads in `dispatchReaderFallback` and (cross-entity, for the
+    /// reader's and participant's masks too) in
+    /// `resolveDataAvailableFallback`, concurrently with an application
+    /// `set_listener`; all runtime reads/writes are
+    /// `@atomicLoad`/`@atomicStore` `.monotonic`. Initialisers stay plain.
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -551,7 +557,7 @@ pub const SubscriberImpl = struct {
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.SubscriberListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_SubscriberListener);
-        self.listener_mask = mask;
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         return DDS.RETCODE_OK;
     }
 
@@ -601,7 +607,8 @@ pub const SubscriberImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
-        if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        if (listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args)) return true;
         if (nil.isNil(self.participant)) return false;
         const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
         return p.dispatchFallback(field, bit, handle, args);
@@ -649,13 +656,13 @@ pub const SubscriberImpl = struct {
     /// `dispatchWriterFallback` doc comment).
     fn resolveDataAvailableFallback(self: *Self, r: *reader_mod.DataReaderImpl) DataAvailableResolution {
         const rbox = r.acquireListener();
-        if (listener_fallback.peek("on_data_available", r.listener_mask, DDS.DATA_AVAILABLE_STATUS, rbox.listener)) |cb| {
+        if (listener_fallback.peek("on_data_available", @atomicLoad(DDS.StatusMask, &r.listener_mask, .monotonic), DDS.DATA_AVAILABLE_STATUS, rbox.listener)) |cb| {
             return .{ .cb = cb, .listener_data = rbox.listener.listener_data, .owner = .{ .reader = .{ .box = rbox, .alloc = r.alloc } } };
         }
         rbox.releaseRef(r.alloc);
 
         const sbox = self.acquireListener();
-        if (listener_fallback.peek("on_data_available", self.listener_mask, DDS.DATA_AVAILABLE_STATUS, sbox.listener)) |cb| {
+        if (listener_fallback.peek("on_data_available", @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic), DDS.DATA_AVAILABLE_STATUS, sbox.listener)) |cb| {
             return .{ .cb = cb, .listener_data = sbox.listener.listener_data, .owner = .{ .subscriber = .{ .box = sbox, .alloc = self.alloc } } };
         }
         sbox.releaseRef(self.alloc);
@@ -663,7 +670,7 @@ pub const SubscriberImpl = struct {
         if (nil.isNil(self.participant)) return .{ .cb = null, .listener_data = null, .owner = .none };
         const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
         const pbox = p.acquireListener();
-        if (listener_fallback.peek("on_data_available", p.listener_mask, DDS.DATA_AVAILABLE_STATUS, pbox.listener)) |cb| {
+        if (listener_fallback.peek("on_data_available", @atomicLoad(DDS.StatusMask, &p.listener_mask, .monotonic), DDS.DATA_AVAILABLE_STATUS, pbox.listener)) |cb| {
             return .{ .cb = cb, .listener_data = pbox.listener.listener_data, .owner = .{ .participant = .{ .box = pbox, .alloc = p.alloc } } };
         }
         pbox.releaseRef(p.alloc);

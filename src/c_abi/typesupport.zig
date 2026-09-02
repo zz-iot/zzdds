@@ -144,6 +144,9 @@ pub export fn zzdds_register_type_support(
     if (!impl.registerTypeSupport(name, TypeSupport{
         .ctx = adapter,
         .compute_key_hash = CTypeSupportAdapter.computeKeyHash,
+        // Per this entry point's contract, a keyed type passes its generated
+        // `<Type>_compute_key_hash_from_cdr`; a keyless type passes NULL.
+        .has_key = compute_key_hash_fn != null,
         .get_field = if (get_field_fn != null) CTypeSupportAdapter.getField else null,
         .deinit = CTypeSupportAdapter.deinitAdapter,
     })) {
@@ -259,6 +262,7 @@ pub export fn zzdds_register_type_support_ctx(
     if (!impl.registerTypeSupport(name, TypeSupport{
         .ctx = adapter,
         .compute_key_hash = CtxTypeSupportAdapter.computeKeyHash,
+        .has_key = compute_key_hash_fn != null,
         .get_field = if (get_field_fn != null) CtxTypeSupportAdapter.getField else null,
         .deinit = CtxTypeSupportAdapter.deinitAdapter,
     })) {

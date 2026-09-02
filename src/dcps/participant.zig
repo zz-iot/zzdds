@@ -691,6 +691,14 @@ pub const TypeSupport = struct {
     /// `payload` includes the 4-byte encapsulation header (as received from
     /// the wire).  Return `zeroes([16]u8)` for keyless types.
     compute_key_hash: *const fn (ctx: *anyopaque, payload: []const u8) [16]u8,
+    /// True when the type has one or more `@key` members. Consulted by
+    /// `pubCreateProtoWriter` so a keyed writer emits inline `PID_KEY_HASH` on
+    /// every sample (RTPS §8.7.9), including a zero-valued key — otherwise a
+    /// subscriber would have to reconstruct the per-instance hash from the
+    /// payload (see `resolveKeyHash`). Must be registered before the writer is
+    /// created to take effect, same ordering constraint as `key_hash_fn` on
+    /// readers. Defaults false; keyless types may leave it unset.
+    has_key: bool = false,
     /// Optional: extract a named field value from a raw CDR payload.
     /// Used to evaluate ContentFilteredTopic expressions at delivery time.
     /// null = CFT evaluation deferred to the typed DataReader layer.
@@ -786,6 +794,10 @@ pub const DomainParticipantImpl = struct {
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
+    /// See `writer.zig`'s matching field: `dispatchFallback` (the bottom
+    /// of the s2.2.4.1.5 chain, run from discovery/timer threads) reads it
+    /// while an application `set_listener` may write it, so both use
+    /// `@atomicLoad`/`@atomicStore` `.monotonic`; initialisers stay plain.
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -1514,6 +1526,18 @@ pub const DomainParticipantImpl = struct {
             .nanosec = qos.lifespan.duration.nanosec,
         }));
 
+        // Keyed writers must send inline PID_KEY_HASH on every sample so the
+        // subscriber never reconstructs a per-instance hash from the payload
+        // (RTPS §8.7.9; see resolveKeyHash). Requires the type's TypeSupport to
+        // be registered before this writer is created — the same ordering
+        // constraint readers already have for key_hash_fn.
+        {
+            self.mu.lock();
+            const is_keyed = if (self.type_support_registry.get(type_name)) |ts| ts.has_key else false;
+            self.mu.unlock();
+            adapter.setKeyed(is_keyed);
+        }
+
         const pw = adapter.toProtocolWriter();
 
         // qos.data_representation.value._buffer, as received here, borrows
@@ -1800,7 +1824,11 @@ pub const DomainParticipantImpl = struct {
         return .alive;
     }
 
-    fn decodeKeyHash(iq: ?submsg_mod.InlineQos) [16]u8 {
+    /// Decode the inline `PID_KEY_HASH` (RTPS §9.6.4.8), if the writer sent one.
+    /// Returns `null` when the parameter is absent (or malformed) — distinct from
+    /// a *present* all-zero hash, which `resolveKeyHash` must honour verbatim
+    /// rather than treating as "recompute from payload".
+    fn decodeKeyHash(iq: ?submsg_mod.InlineQos) ?[16]u8 {
         if (iq) |q| {
             if (q.get(.key_hash)) |kh| {
                 if (kh.len >= 16) {
@@ -1810,7 +1838,7 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
-        return std.mem.zeroes([16]u8);
+        return null;
     }
 
     fn decodeCoherentSetSn(iq: ?submsg_mod.InlineQos, little_endian: bool) ?history_mod.SequenceNumber {
@@ -1870,10 +1898,29 @@ pub const DomainParticipantImpl = struct {
         return null;
     }
 
-    fn resolveKeyHash(kh: [16]u8, ar: *ActiveReader, payload: []const u8) [16]u8 {
-        if (!std.mem.eql(u8, &kh, &std.mem.zeroes([16]u8))) return kh;
+    /// Resolve the effective 16-byte key hash for a received change.
+    ///
+    /// A *present* inline `PID_KEY_HASH` (`maybe_kh != null`) always wins — even
+    /// if it is all-zeros. An all-zero hash is a legitimate value (a zero-valued
+    /// key, or a keyless topic), distinct from the parameter being *absent*;
+    /// treating "present, all-zero" as "recompute" (the old behaviour) discarded
+    /// a hash the writer deliberately sent. This is the common path: RTPS §8.7.9
+    /// says a keyed writer SHOULD send it, and zzdds's own writer does whenever
+    /// the computed hash is non-zero.
+    ///
+    /// With no inline hash we fall back to the type's `key_hash_fn`
+    /// (`TypeSupport.compute_key_hash`), whose contract is "full CDR wire
+    /// payload in, 16-byte hash out". NOTE: zidl's *generated*
+    /// `computeKeyHashFromCdr` currently honours that contract only for a
+    /// leading, contiguous key — it runs the key-only deserializer, so a
+    /// non-leading `@key` member is misread. That is tracked as the
+    /// selective-parse `key_hash_fn` rework (see `docs/roadmap.md` and the
+    /// v0.3.12 pin-bump follow-up); it is a zidl-side fix, not fixable here
+    /// without breaking contract-conforming hand-written TypeSupports.
+    fn resolveKeyHash(maybe_kh: ?[16]u8, ar: *ActiveReader, payload: []const u8) [16]u8 {
+        if (maybe_kh) |kh| return kh;
         if (ar.key_hash_fn) |f| return f(ar.key_hash_ctx, payload);
-        return kh;
+        return std.mem.zeroes([16]u8);
     }
 
     fn dispatchDirectedWrite(
@@ -1883,7 +1930,7 @@ pub const DomainParticipantImpl = struct {
         writer_guid: Guid,
         sn: anytype,
         ts: time_mod.RtpsTimestamp,
-        key_hash: [16]u8,
+        key_hash: ?[16]u8,
         payload: []const u8,
         kind: history_mod.ChangeKind,
         coherent_set_sn: ?history_mod.SequenceNumber,
@@ -3745,7 +3792,7 @@ pub const DomainParticipantImpl = struct {
     ) DDS.ReturnCode_t {
         const self = cast(ctx);
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_DomainParticipantListener);
-        self.listener_mask = mask;
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         return DDS.RETCODE_OK;
     }
 
@@ -3800,7 +3847,8 @@ pub const DomainParticipantImpl = struct {
     pub fn dispatchFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
-        return listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args);
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        return listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args);
     }
 
     fn vtIgnoreParticipant(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {

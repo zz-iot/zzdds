@@ -217,6 +217,12 @@ fn exclusiveDrQos() DDS.DataReaderQos {
     return q;
 }
 
+fn keepAllDrQos() DDS.DataReaderQos {
+    var q = DDS.DataReaderQos{};
+    q.history.kind = .KEEP_ALL_HISTORY_QOS;
+    return q;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "TypeSupport: registerTypeSupport stores callback" {
@@ -334,4 +340,71 @@ test "TypeSupport: non-nil inline key_hash takes precedence over TypeSupport" {
 
     // 0xBB (A, from inline) ≠ 0xAA (B, from TypeSupport) → two instances.
     try testing.expectEqual(@as(usize, 2), pendingCount(dr));
+}
+
+test "TypeSupport: has_key writer sends inline PID_KEY_HASH for a zero-valued key, bypassing key_hash_fn" {
+    // A keyed writer (TypeSupport.has_key = true) must put an inline
+    // PID_KEY_HASH on every alive sample per RTPS §8.7.9 — including when the
+    // hash is all-zeros (a zero-valued key). The subscriber then routes by that
+    // *present* hash and never calls key_hash_fn to reconstruct one from the
+    // payload (which, for a non-leading @key, would misread it).
+    //
+    // Here both writers emit a zero key hash for different payloads. testKeyHash
+    // (reads payload[4]) *would* derive distinct hashes 0xAA / 0xBB if it were
+    // consulted — but it must NOT be, because the wire now carries an explicit
+    // all-zero PID_KEY_HASH. So both samples land on one instance.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // has_key must be registered on the *writer* participants, before the
+    // writers are created, for pubCreateProtoWriter to mark them keyed.
+    inline for (.{ fx.dp_a, fx.dp_b, fx.dp_r }) |dp| {
+        _ = fx.dpImpl(dp).registerTypeSupport("TSType", .{
+            .ctx = undefined,
+            .compute_key_hash = testKeyHash,
+            .has_key = true,
+        });
+    }
+
+    const dw_a = fx.makeWriterA(.{});
+    const dw_b = fx.makeWriterB(.{});
+    const dr = fx.makeReader(keepAllDrQos());
+
+    try writeNilKey(dw_a, &PAYLOAD_A); // payload[4] = 0xAA — ignored
+    try writeNilKey(dw_b, &PAYLOAD_B); // payload[4] = 0xBB — ignored
+
+    // Both carry an inline all-zero key hash → same instance → both retained
+    // (KEEP_ALL) under one instance handle.
+    try testing.expectEqual(@as(usize, 2), pendingCount(dr));
+    dr.mu.lock();
+    const ih0 = dr.pending.items[0].info.instance_handle;
+    const ih1 = dr.pending.items[1].info.instance_handle;
+    dr.mu.unlock();
+    try testing.expectEqual(ih0, ih1);
+}
+
+test "TypeSupport: without has_key, a zero-valued key still falls back to key_hash_fn (unchanged)" {
+    // Control: same inputs as above but has_key defaults false. The writer omits
+    // the inline hash for an all-zero key, so the reader reconstructs distinct
+    // hashes via key_hash_fn (testKeyHash → 0xAA / 0xBB) → two instances.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{ .ctx = undefined, .compute_key_hash = testKeyHash });
+
+    const dw_a = fx.makeWriterA(.{});
+    const dw_b = fx.makeWriterB(.{});
+    const dr = fx.makeReader(keepAllDrQos());
+
+    try writeNilKey(dw_a, &PAYLOAD_A);
+    try writeNilKey(dw_b, &PAYLOAD_B);
+
+    try testing.expectEqual(@as(usize, 2), pendingCount(dr));
+    dr.mu.lock();
+    const ih0 = dr.pending.items[0].info.instance_handle;
+    const ih1 = dr.pending.items[1].info.instance_handle;
+    dr.mu.unlock();
+    try testing.expect(ih0 != ih1);
 }

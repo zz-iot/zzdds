@@ -49,6 +49,17 @@ fn statusInfoFromKind(kind: ChangeKind) ?u32 {
     };
 }
 
+/// The inline `PID_KEY_HASH` value to place on a DATA / DATA_FRAG (fragment 1),
+/// or `null` to omit the parameter. A keyed writer always sends it — RTPS §8.7.9
+/// SHOULD, and it spares the subscriber from reconstructing a per-instance hash
+/// from the payload — even when the hash is all-zeros (a zero-valued key). A
+/// non-keyed writer only ever carries a non-zero hash (from a built-in endpoint
+/// keyed on its GUID); a plain keyless user topic omits it.
+fn inlineKeyHash(keyed: bool, kh: [16]u8) ?[16]u8 {
+    if (keyed or !std.mem.eql(u8, &kh, &std.mem.zeroes([16]u8))) return kh;
+    return null;
+}
+
 // ── Message send helper ───────────────────────────────────────────────────────
 
 /// Maximum flat buffer size for a single send. Each DATA_FRAG fragment is
@@ -446,6 +457,14 @@ pub const StatefulWriter = struct {
     /// via SEDP writer announcement) — some readers only apply lifespan-based expiry
     /// to samples that carry it inline. null = no lifespan configured.
     lifespan: ?time_mod.RtpsDuration,
+    /// True when this writer's topic type is keyed. Keyed writers emit inline
+    /// PID_KEY_HASH on *every* DATA/DATA_FRAG (RTPS §8.7.9 SHOULD) — including
+    /// when the hash is all-zeros (a zero-valued key), so a subscriber never has
+    /// to reconstruct a per-instance hash from the payload. Non-keyed writers
+    /// leave it false and only ever send a non-zero hash (they never have one).
+    /// Set once at creation via `setKeyed`, before any reader match; read
+    /// without the lock, like `guid`.
+    keyed: bool,
 
     const Self = @This();
 
@@ -489,8 +508,15 @@ pub const StatefulWriter = struct {
             .protocol_ready_fn = null,
             .protocol_ready_ctx = null,
             .lifespan = null,
+            .keyed = false,
         };
         return self;
+    }
+
+    /// Mark this writer's topic type as keyed. Call once, right after `init`,
+    /// before any reader proxy is added.
+    pub fn setKeyed(self: *Self, keyed: bool) void {
+        self.keyed = keyed;
     }
 
     pub fn setLifespan(self: *Self, ls: ?time_mod.RtpsDuration) void {
@@ -870,10 +896,7 @@ pub const StatefulWriter = struct {
                     .reader_entity_id = rp.guid.entity_id,
                     .writer_entity_id = self.guid.entity_id,
                     .writer_sn = ch.sequence_number,
-                    .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
-                        ch.key_hash
-                    else
-                        null,
+                    .key_hash = inlineKeyHash(self.keyed, ch.key_hash),
                     .is_key = ch.kind != .alive,
                     .status_info = statusInfoFromKind(ch.kind),
                     .lifespan = if (ch.kind == .alive) self.lifespan else null,
@@ -1013,6 +1036,7 @@ pub const StatefulWriter = struct {
         const self_guid = self.guid;
         const self_lifespan = self.lifespan;
         const self_transport = self.transport;
+        const self_keyed = self.keyed;
 
         self.mu.unlock();
         defer self.mu.lock();
@@ -1026,10 +1050,7 @@ pub const StatefulWriter = struct {
                 .reader_entity_id = rp_guid.entity_id,
                 .writer_entity_id = self_guid.entity_id,
                 .writer_sn = c.sn,
-                .key_hash = if (!std.mem.eql(u8, &c.key_hash, &std.mem.zeroes([16]u8)))
-                    c.key_hash
-                else
-                    null,
+                .key_hash = inlineKeyHash(self_keyed, c.key_hash),
                 .is_key = c.kind != .alive,
                 .status_info = statusInfoFromKind(c.kind),
                 .lifespan = if (c.kind == .alive) self_lifespan else null,
@@ -1478,10 +1499,7 @@ pub const StatefulWriter = struct {
                             .reader_entity_id = proxy.guid.entity_id,
                             .writer_entity_id = w.guid.entity_id,
                             .writer_sn = ch.sequence_number,
-                            .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
-                                ch.key_hash
-                            else
-                                null,
+                            .key_hash = inlineKeyHash(w.keyed, ch.key_hash),
                             .is_key = ch.kind != .alive,
                             .status_info = statusInfoFromKind(ch.kind),
                             .coherent_set_sn = ch.coherent_set_sn,
@@ -1737,6 +1755,7 @@ pub const StatefulWriter = struct {
             const self_guid = self.guid;
             const self_lifespan = self.lifespan;
             const self_transport = self.transport;
+            const self_keyed = self.keyed;
 
             self.mu.unlock();
 
@@ -1749,10 +1768,7 @@ pub const StatefulWriter = struct {
                     .reader_entity_id = s.guid.entity_id,
                     .writer_entity_id = self_guid.entity_id,
                     .writer_sn = ch_sn,
-                    .key_hash = if (!std.mem.eql(u8, &ch_key_hash, &std.mem.zeroes([16]u8)))
-                        ch_key_hash
-                    else
-                        null,
+                    .key_hash = inlineKeyHash(self_keyed, ch_key_hash),
                     .is_key = ch_kind != .alive,
                     .status_info = statusInfoFromKind(ch_kind),
                     .coherent_set_sn = ch_coherent_set_sn,
@@ -1888,10 +1904,7 @@ pub const StatefulWriter = struct {
                 .fragments_in_submessage = 1,
                 .fragment_size = @intCast(frag_size),
                 .data_size = data_size,
-                .key_hash = if (frag_num == 1 and !std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
-                    ch.key_hash
-                else
-                    null,
+                .key_hash = if (frag_num == 1) inlineKeyHash(self.keyed, ch.key_hash) else null,
                 .status_info = if (frag_num == 1) statusInfoFromKind(ch.kind) else null,
                 .coherent_set_sn = if (frag_num == 1) ch.coherent_set_sn else null,
                 .group_seq_num = if (frag_num == 1) ch.group_seq_num else null,
@@ -1940,10 +1953,7 @@ pub const StatefulWriter = struct {
                 .fragments_in_submessage = 1,
                 .fragment_size = @intCast(frag_size),
                 .data_size = @intCast(ch.data.len),
-                .key_hash = if (!std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
-                    ch.key_hash
-                else
-                    null,
+                .key_hash = inlineKeyHash(self.keyed, ch.key_hash),
                 .status_info = statusInfoFromKind(ch.kind),
                 .coherent_set_sn = ch.coherent_set_sn,
                 .group_seq_num = ch.group_seq_num,
@@ -2013,10 +2023,7 @@ pub const StatefulWriter = struct {
                     .fragments_in_submessage = 1,
                     .fragment_size = @intCast(frag_size),
                     .data_size = data_size,
-                    .key_hash = if (frag_num == 1 and !std.mem.eql(u8, &ch.key_hash, &std.mem.zeroes([16]u8)))
-                        ch.key_hash
-                    else
-                        null,
+                    .key_hash = if (frag_num == 1) inlineKeyHash(self.keyed, ch.key_hash) else null,
                     .status_info = if (frag_num == 1) statusInfoFromKind(ch.kind) else null,
                     .coherent_set_sn = if (frag_num == 1) ch.coherent_set_sn else null,
                     .group_seq_num = if (frag_num == 1) ch.group_seq_num else null,

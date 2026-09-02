@@ -47,6 +47,36 @@ APPS: list[tuple[str, Path, list[str], bool]] = [
         ["--scenario", "entities", "--threads", "8", "--duration", "8"],
         False,
     ),
+    (
+        "lifecycle_churn/waitset",
+        SCRIPT_DIR / "zig" / "lifecycle_churn" / "run.py",
+        ["--scenario", "waitset", "--threads", "8", "--duration", "8"],
+        False,
+    ),
+    (
+        "lifecycle_churn/listener",
+        SCRIPT_DIR / "zig" / "lifecycle_churn" / "run.py",
+        ["--scenario", "listener", "--threads", "8", "--duration", "8"],
+        False,
+    ),
+    (
+        "lifecycle_churn/cft",
+        SCRIPT_DIR / "zig" / "lifecycle_churn" / "run.py",
+        ["--scenario", "cft", "--threads", "10", "--duration", "8"],
+        False,
+    ),
+    (
+        "lifecycle_churn/participants",
+        SCRIPT_DIR / "zig" / "lifecycle_churn" / "run.py",
+        ["--scenario", "participants", "--threads", "8", "--duration", "8"],
+        False,
+    ),
+    (
+        "lifecycle_churn/instance",
+        SCRIPT_DIR / "zig" / "lifecycle_churn" / "run.py",
+        ["--scenario", "instance", "--threads", "8", "--duration", "8"],
+        False,
+    ),
 ]
 
 

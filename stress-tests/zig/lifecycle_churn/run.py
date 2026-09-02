@@ -22,6 +22,7 @@ APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR.parents[2] / "examples"))
 import _common  # noqa: E402
 
+SCENARIOS = ["entities", "reentrant", "waitset", "listener", "cft", "participants", "instance"]
 SUMMARY_RE = re.compile(r"^SUMMARY: OK scenario=(\w+) ops=(\d+)", re.M)
 BAD = ("FAIL:", "panic", "Segmentation fault", "General protection",
        "ThreadSanitizer", "data race", "leaked")
@@ -40,7 +41,7 @@ def build(tsan: bool) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", required=True, choices=["entities", "reentrant"])
+    ap.add_argument("--scenario", required=True, choices=SCENARIOS)
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--iterations", type=int, default=40)
     ap.add_argument("--duration", type=int, default=8)

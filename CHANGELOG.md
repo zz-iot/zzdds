@@ -8,6 +8,88 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-02
+
+- **Pinned `zidl` v0.3.12-zig.0.16.0** (`build.zig.zon`) — the selective-parse family
+  (`deserialize_selected` / `KEY_FIELD_MASK` / `skipPrimitives`) that rewires
+  `get_key_value` and `get_field_from_cdr` off the key-only deserializer. The
+  `lifecycle_churn` `instance` scenario now **asserts** `get_key_value`'s returned
+  `subject_id` (non-leading `@key`) on both the writer and reader sides — it was
+  call-only-not-asserted while the fix was unreleased. Verified: 8 threads × 6 s, plus
+  ThreadSanitizer, clean; full stress suite green.
+- **Fix — keyed writers now always send inline `PID_KEY_HASH`; a present all-zero hash is
+  honoured.** Two connected key-hash bugs the `instance` stress scenario exposed for a
+  zero-valued key (`subject_id == 0`):
+  1. `writer_sm.zig` suppressed the inline `PID_KEY_HASH` parameter whenever the computed
+     hash was all-zero bytes — indistinguishable from "keyless topic" but also true for a
+     legitimate zero key. A subscriber then had to reconstruct the per-instance hash from
+     the payload.
+  2. `resolveKeyHash` treated a *received* all-zero hash as "absent, recompute" rather
+     than as the value the writer sent.
+  Now: `TypeSupport` gains `has_key`; `pubCreateProtoWriter` marks the RTPS `StatefulWriter`
+  keyed (via new `setKeyed` / adapter passthrough); a keyed writer emits `PID_KEY_HASH` on
+  every DATA/DATA_FRAG including an all-zero key (`writer_sm.zig` `inlineKeyHash` helper).
+  `decodeKeyHash` returns `?[16]u8` and `resolveKeyHash` returns a *present* hash verbatim,
+  even all-zero. The C-ABI `zzdds_register_type_support{,_ctx}` infer `has_key` from a
+  non-NULL `compute_key_hash_fn` (per their documented contract); Zig-native callers set it
+  explicitly (stress harness updated). Regression: `test/dcps/type_support_test.zig` — a
+  keyed writer's zero-key sample routes by the wire hash and bypasses `key_hash_fn`, with a
+  control test showing the unchanged non-`has_key` fallback. Verified by re-breaking.
+- **Known follow-up.** `TypeSupport.compute_key_hash`'s contract is "full CDR payload in,
+  hash out", but zidl's generated `computeKeyHashFromCdr` runs the key-only deserializer,
+  so a non-`has_key` fallback still misreads a non-leading `@key` from a non-zzdds peer that
+  omits the inline hash. Completion — route the fallback through
+  `deserialize_selected(KEY_FIELD_MASK)` on a full payload, K-flag-gated — needs a
+  `TypeSupport.compute_key_hash` signature change (`is_key_only: bool`) rippling to the
+  C ABI mirror and a further zidl release, so it is a follow-up beyond the v0.3.12 bump.
+  Tracked in `docs/roadmap.md` "Selective CDR parse — deferred follow-ups".
+
+## 2026-08-30
+
+- **Stress tests — five new `lifecycle_churn` churn scenarios.** On top of
+  `entities`/`reentrant`: `waitset` (threads attach/detach Read/QueryConditions on a
+  shared WaitSet while a waiter is in `wait()` and a waker flips a GuardCondition;
+  includes a deliberate delete-while-attached), `listener` (participant + publisher +
+  subscriber listeners installed; per-iteration `set_listener` swaps incl. `null` racing
+  entity teardown and event delivery), `cft` (a shared long-lived ContentFilteredTopic
+  hammered with `set_expression_parameters` while its reader is drained, alongside
+  unique-name CFT + reader lifecycle churn), `participants` (N threads each churning a
+  whole participant on one shared domain, listeners at every level, writer/reader
+  fan-in/fan-out — the participant level of the §2.2.4.1.5 fallback under teardown), and
+  `instance` (per-thread writer; `register_instance` / `write` / `dispose` /
+  `unregister_instance` / `get_key_value` / `lookup_instance` churn with a shared reader
+  fan-in). All gating in the `stress` CI job; `listener` and `cft` also run under
+  ThreadSanitizer. See `stress-tests/README.md`. The `instance` scenario surfaced two
+  pre-existing bugs: the concurrent-`write()` race (next entry, fixed here) and
+  `get_key_value` decoding the wrong key for a non-leading `@key` member — fixed in zidl
+  (a *selective-parse family*: `deserialize_selected(KEY_FIELD_MASK)` decodes just the
+  `@key` members and skips the rest, all four backends), landing here with the zidl
+  v0.3.12 `build.zig.zon` bump; the scenario's `get_key_value` value assertion is staged
+  for that PR (`zz-dev/zidl-v0.3.12-pin-bump-followups.md`).
+- **Fix — concurrent `write()` on a single `DataWriter` was unsynchronised.**
+  `DataWriterImpl.writeRaw` updated `last_sn` and the `get_key_value` key registry (a
+  `HashMapUnmanaged`) with no lock, so two application threads calling `write()` /
+  `dispose()` / `unregister_instance()` on the same writer — spec-legal — raced on the
+  map's grow/insert and could abort on its `SafetyLock` (found by `instance` under
+  ThreadSanitizer). The RTPS layer under `proto_writer` was already internally locked; now
+  `last_sn` is a `std.atomic.Value` and the key registry is guarded by a dedicated
+  `key_registry_mu`. `docs/design/thread-model.md` documents the guarantee. Regression:
+  `test/dcps/writer_vtable_test.zig` — 6 threads × 40 keyed `write_raw` calls on one
+  writer plus a concurrent `getKeyValueRaw` poller; also runs in the `test-tsan` lane.
+- **Fix — unsynchronised `listener_mask` (data race).** `listener_mask` was a plain
+  `u32` written unlocked by `set_listener` and read unlocked by the discovery/timer
+  dispatch path (`listener_mu` only ever covered the `ListenerBox` swap beside it).
+  Every *runtime* access in `src/dcps/{writer,reader,publisher,subscriber,participant,
+  topic}.zig` is now `@atomicLoad`/`@atomicStore` `.monotonic`; struct-literal
+  initialisers stay plain. Found by the `listener` scenario under TSan.
+- **Fix — CFT `set_expression_parameters` use-after-free.** `ContentFilteredTopicImpl`
+  had no synchronisation on `expr_params`: `set_expression_parameters` frees the old
+  parameter strings + backing array and swaps in the new list while the receive thread's
+  `matchSample` is mid-`filter_mod.eval` holding those strings by reference (SEGV in
+  `parseFloat`). New `params_lock: Mutex` on the impl, held across `matchSample`'s eval
+  and around the swap in `set_expression_parameters` / the read in
+  `get_expression_parameters`. Found by the `cft` scenario (~40% repro at 12 threads).
+
 ## 2026-08-29
 
 - **CI flake fix — unique DDS domain per test binary.** `zig build test` runs the ~29

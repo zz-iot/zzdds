@@ -37,6 +37,12 @@ pub const TopicImpl = struct {
     /// locked mutator, confirmed via TSan there; TopicImpl had no
     /// general-purpose mutex at all before this).
     mu: Mutex = .{},
+    /// No topic-listener dispatch path reads this today, but it is the same
+    /// concept as the writer/reader/publisher/subscriber/participant
+    /// `listener_mask` (all made `@atomicStore`/`@atomicLoad` `.monotonic`
+    /// after a stress-test TSan finding) -- kept atomic here too so a
+    /// future `on_inconsistent_topic` fallback path can't reintroduce the
+    /// race. Initialisers stay plain.
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -212,7 +218,7 @@ pub const TopicImpl = struct {
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.TopicListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_TopicListener);
-        self.listener_mask = mask;
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         return DDS.RETCODE_OK;
     }
 
@@ -323,6 +329,18 @@ pub const ContentFilteredTopicImpl = struct {
     name: [:0]u8, // owned, null-terminated for C API
     filter_expr: [:0]u8, // owned, null-terminated for C API
     expr_params: std.ArrayListUnmanaged([]u8), // owned copies
+    /// Guards `expr_params` only. `set_expression_parameters` runs on an
+    /// application thread and frees + replaces the whole list; `matchSample`
+    /// runs on the RTPS receive thread that delivers a sample to a reader
+    /// built on this CFT and reads the list by reference for the duration of
+    /// `filter_mod.eval`. Without this, a concurrent reconfigure frees the
+    /// strings mid-evaluation (found by the `lifecycle_churn --scenario cft`
+    /// stress test: SEGV in `parseFloat` on a freed parameter). Evaluation
+    /// for one CFT is already serialised by the single receive thread, so a
+    /// plain mutex (vs. an rwlock) costs nothing in practice; only the rare
+    /// reconfigure writer ever blocks. `filter_expr`/`parsed_expr` are set
+    /// once at init and need no guard.
+    params_lock: Mutex = .{},
     related: DDS.Topic,
     participant: DDS.DomainParticipant,
     /// Parsed AST of `filter_expr`; null when expression is empty or the
@@ -396,9 +414,13 @@ pub const ContentFilteredTopicImpl = struct {
     /// Returns true if the sample passes the filter (should be delivered).
     /// An empty expression or disabled profile always returns true.
     pub fn matchSample(
-        self: *const Self,
+        self: *Self,
         accessor: filter_mod.FieldAccessor,
     ) bool {
+        // Held across the whole eval: the AST holds `params_slice` entries
+        // by reference (see `params_lock`).
+        self.params_lock.lock();
+        defer self.params_lock.unlock();
         const params_slice: []const []const u8 = @ptrCast(self.expr_params.items);
         return filter_mod.eval(self.parsed_expr, accessor, params_slice);
     }
@@ -490,6 +512,8 @@ pub const ContentFilteredTopicImpl = struct {
     fn cftGetParams(ctx: *anyopaque, out: ?*DDS.StringSeq) DDS.ReturnCode_t {
         const seq = out orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
+        self.params_lock.lock();
+        defer self.params_lock.unlock();
         if (seq._release) {
             if (seq._buffer) |b| {
                 for (b[0..seq._length]) |s| self.alloc.free(std.mem.span(s));
@@ -519,6 +543,8 @@ pub const ContentFilteredTopicImpl = struct {
         // Build into a temporary list first so the old params survive any OOM.
         var tmp: std.ArrayListUnmanaged([]u8) = .empty;
         const seq = params orelse {
+            self.params_lock.lock();
+            defer self.params_lock.unlock();
             for (self.expr_params.items) |p| self.alloc.free(p);
             self.expr_params.clearRetainingCapacity();
             return DDS.RETCODE_OK;
@@ -538,7 +564,10 @@ pub const ContentFilteredTopicImpl = struct {
                 };
             }
         }
-        // All copies succeeded — swap in and free old.
+        // All copies succeeded — swap in and free old under the exclusive
+        // lock so no receive thread is mid-eval on the outgoing strings.
+        self.params_lock.lock();
+        defer self.params_lock.unlock();
         for (self.expr_params.items) |p| self.alloc.free(p);
         self.expr_params.deinit(self.alloc);
         self.expr_params = tmp;

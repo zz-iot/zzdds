@@ -119,6 +119,10 @@ pub const PublisherImpl = struct {
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
+    /// See `writer.zig`'s matching field: `dispatchWriterFallback` (called
+    /// from a discovery/timer thread) reads it while an application
+    /// `set_listener` may be writing it, so both go through
+    /// `@atomicLoad`/`@atomicStore` `.monotonic`; initialisers stay plain.
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     status_changes: DDS.StatusMask,
@@ -500,7 +504,7 @@ pub const PublisherImpl = struct {
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.PublisherListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_PublisherListener);
-        self.listener_mask = mask;
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
         return DDS.RETCODE_OK;
     }
 
@@ -557,7 +561,8 @@ pub const PublisherImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
-        if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        if (listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args)) return true;
         if (nil.isNil(self.participant)) return false;
         const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
         return p.dispatchFallback(field, bit, handle, args);

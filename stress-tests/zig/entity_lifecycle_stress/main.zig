@@ -193,6 +193,7 @@ fn commonSetup(
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .has_key = gen.Message.has_key,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);

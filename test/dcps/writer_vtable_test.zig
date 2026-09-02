@@ -1030,3 +1030,83 @@ test "publish_loan_raw: an explicit instance_handle that doesn't match the key h
     // hit PRECONDITION_NOT_MET.
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.return_loan_raw(dw.ptr, &cdr_payload));
 }
+
+// ── Regression: concurrent write() on one DataWriter ──────────────────────────
+
+test "concurrent write_raw on one DataWriter keeps key_registry and last_sn consistent" {
+    // Regression for the stress `instance` scenario finding: DataWriterImpl.writeRaw
+    // mutated `key_registry` (a HashMapUnmanaged) and `last_sn` with no lock, so
+    // concurrent write() on one DataWriter -- spec-legal -- raced on the map's
+    // grow/insert (TSan) and could abort on its SafetyLock. Now guarded by
+    // `key_registry_mu` + an atomic `last_sn` (the RTPS layer under `proto_writer`
+    // was already internally locked). Consistency check here; the data-race half
+    // is caught by the `-Dsanitize-thread` lane running this same file.
+    const N_THREADS = 6;
+    const PER_THREAD = 40; // 240 distinct keys -> several map grows
+
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    const dw = fx.makeWriter(.{}, null, 0);
+    defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
+    const impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    const Writer = struct {
+        dw: DDS.DataWriter,
+        tid: u32,
+        fn run(c: @This()) void {
+            var payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0 };
+            var i: u32 = 0;
+            while (i < PER_THREAD) : (i += 1) {
+                var kh = std.mem.zeroes([16]u8);
+                std.mem.writeInt(u32, kh[0..4], c.tid, .little);
+                std.mem.writeInt(u32, kh[4..8], i, .little);
+                var kh_seq = DDS.OctetSeq{ ._buffer = &kh, ._length = 16, ._maximum = 16, ._release = false };
+                std.mem.writeInt(u32, payload[4..8], c.tid *% 1000 +% i, .little);
+                var pl_seq = DDS.OctetSeq{ ._buffer = &payload, ._length = payload.len, ._maximum = payload.len, ._release = false };
+                const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
+                _ = c.dw.vtable.write_raw(c.dw.ptr, &kh_seq, DDS.HANDLE_NIL, &pl_seq, .ALIVE_WRITE_KIND, &ts);
+            }
+        }
+    };
+
+    // Reader thread: the HashMap.get vs grow half of the race.
+    var stop = std.atomic.Value(bool).init(false);
+    const Poller = struct {
+        impl: *DataWriterImpl,
+        stop: *std.atomic.Value(bool),
+        fn run(c: @This()) void {
+            while (!c.stop.load(.acquire)) {
+                const kh = std.mem.zeroes([16]u8);
+                _ = c.impl.getKeyValueRaw(DataWriterImpl.registerInstanceRaw(kh));
+            }
+        }
+    };
+
+    var threads: [N_THREADS]std.Thread = undefined;
+    const poller = try std.Thread.spawn(.{}, Poller.run, .{Poller{ .impl = impl, .stop = &stop }});
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Writer.run, .{Writer{ .dw = dw, .tid = @intCast(i) }});
+    }
+    for (threads) |t| t.join();
+    stop.store(true, .release);
+    poller.join();
+
+    // Every distinct key must have landed.
+    var found: usize = 0;
+    var tid: u32 = 0;
+    while (tid < N_THREADS) : (tid += 1) {
+        var i: u32 = 0;
+        while (i < PER_THREAD) : (i += 1) {
+            var kh = std.mem.zeroes([16]u8);
+            std.mem.writeInt(u32, kh[0..4], tid, .little);
+            std.mem.writeInt(u32, kh[4..8], i, .little);
+            if (impl.getKeyValueRaw(DataWriterImpl.registerInstanceRaw(kh)) != null) found += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, N_THREADS * PER_THREAD), found);
+
+    // proto_writer hands out sequential SNs under its own lock; last_sn just has
+    // to be a real one that was written (no tearing), 1..=total.
+    const last = impl.last_sn.load(.monotonic);
+    try testing.expect(last >= 1 and last <= @as(i64, N_THREADS * PER_THREAD));
+}

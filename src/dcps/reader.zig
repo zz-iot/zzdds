@@ -232,6 +232,11 @@ pub const DataReaderImpl = struct {
     /// callback (RTPS receive, timer, discovery) racing `deinit()` — see
     /// entity_quiesce.zig.
     quiesce: EntityQuiesce = .{},
+    /// See the matching field in `writer.zig`: runtime reads (in
+    /// `dispatchListener`, and cross-entity in `subscriber.zig`'s
+    /// `on_data_available` fan-out) and writes (`vtSetListener`) go
+    /// through `@atomicLoad`/`@atomicStore` `.monotonic`; struct-literal
+    /// initialisers stay plain.
     listener_mask: DDS.StatusMask,
     instance_handle: DDS.InstanceHandle_t,
     guid: proto.Guid = std.mem.zeroes(proto.Guid),
@@ -2958,7 +2963,7 @@ pub const DataReaderImpl = struct {
     fn vtSetListener(ctx: *anyopaque, a_listener: ?*const DDS.DataReaderListener, mask: DDS.StatusMask) DDS.ReturnCode_t {
         const self = cast(ctx);
         self.swapListener(if (a_listener) |l| l.* else DDS.noop_DataReaderListener);
-        self.listener_mask = mask;
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
 
         // DDS status conditions/listeners are level-triggered, not
         // edge-triggered: enabling a listener for a status that's *already*
@@ -3045,7 +3050,8 @@ pub const DataReaderImpl = struct {
     pub fn dispatchListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: *anyopaque, args: anytype) bool {
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
-        if (listener_fallback.tryDispatch(field, self.listener_mask, bit, box.listener, handle, args)) return true;
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        if (listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args)) return true;
         if (nil.isNil(self.subscriber)) return false;
         const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
         return sub.dispatchReaderFallback(field, bit, handle, args);
