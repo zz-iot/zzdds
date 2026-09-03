@@ -16,5 +16,8 @@
         "src",
         "idl",
         "test",
+        // build.zig runs scripts/fix_macos_dylib_exports.sh during a macOS
+        // `-Dc-binding` install, so it must travel with the package.
+        "scripts",
     },
 }

@@ -104,6 +104,19 @@ def check_structure(prefix: Path) -> None:
     if not any((prefix / rel).is_file() for rel in shared):
         fail("bundle has no dynamic libzzdds (looked for: " + ", ".join(shared) + ")")
 
+    # Zig 0.16 incorrectly puts its Mach-O linker-synthesized ___dso_handle in
+    # a dylib's export trie. Apple ld-prime may then bind a C++ consumer's
+    # image-local reference to the dylib and fail with "target
+    # '___dso_handle' does not have address". The macOS packaging workaround
+    # must keep that implementation symbol private.
+    dylib = prefix / "lib/libzzdds.dylib"
+    if sys.platform == "darwin" and dylib.is_file():
+        proc = run(["nm", "-gjU", str(dylib)], capture=True, timeout=60)
+        if proc.returncode != 0:
+            fail(f"could not inspect exports from {dylib}:\n{proc.stdout}")
+        if "___dso_handle" in proc.stdout.splitlines():
+            fail("lib/libzzdds.dylib incorrectly exports ___dso_handle")
+
     log("structure: all required files present")
 
 
@@ -257,11 +270,8 @@ def main() -> int:
                          "pub/sub pair (link coverage only; use where live UDP DDS discovery is flaky, "
                          "e.g. hosted macOS runners -- cmake_consumer still runs and loads libzzdds)")
     ap.add_argument("--example-langs", default="c,cpp",
-                    help="comma-separated hello_world ports to build against the bundle (default "
-                         "'c,cpp'). Pass 'c' on macOS: the C++ three-artifact model doesn't link "
-                         "with Apple clang++/ld against the Zig-built dylib yet -- dcps_impl.cpp.o "
-                         "hits a `___dso_handle` fixup error (deployment-target skew / ld-prime). "
-                         "Tracked in docs/roadmap.md.")
+                    help="comma-separated hello_world ports to build against the bundle "
+                         "(default 'c,cpp'; the useful narrower value is 'c').")
     ap.add_argument("--work", type=Path, default=None, help="working directory (default: a fresh temp dir)")
     ap.add_argument("--keep", action="store_true", help="do not delete the working directory on exit")
     ap.add_argument("--domain-base", type=int, default=58,

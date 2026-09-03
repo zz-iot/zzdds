@@ -10,7 +10,7 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-09-03
 
-- **Release workflow — first real run shook out two `package-libs` bugs.** That job
+- **Release workflow — first real run shook out three `package-libs` bugs.** That job
   (`release.yml`-only, never exercised by `ci.yml`) had shipped unrun since 2026-08-28.
   1. **`Verify install tree is complete` false negative.** The dynamic-lib probe was
      `if ! ls <4 candidate paths> 2>/dev/null | grep -q .` under `set -o pipefail`; on any
@@ -28,14 +28,20 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
      is unchanged. Fixes a local `zig build install` on macOS and a macOS bundle
      cross-compiled from another host, not just the release runner. (ziglang/zig#1981;
      Linux `ar` output is fine.)
-  3. **C++ bundle consumption on macOS scoped to a known gap.** With (2) fixed, the C path
-     is fully green on macOS-arm64 (`cmake_consumer` + `c/hello_world` link against the
-     Zig-built `libzzdds.dylib`), but the C++ three-artifact model isn't: Apple `clang++`
-     + `ld` on the bundled `src/dcps_impl.cpp` fail with `ld: fixup error … '___dso_handle'
-     does not have address` plus an `LC_BUILD_VERSION` skew warning. `zig c++` links it
-     fine (so `test-bindings` is green). `verify_release_bundle.py` gained `--example-langs`
-     and `release.yml` runs `--example-langs c` on macOS. Tracked in `docs/roadmap.md`
-     "Still open" — this is not on the `rmw_zzdds` (C) path.
+  3. **macOS dylib not linkable by Apple ld-prime C++ consumers.** Zig 0.16 publishes its
+     Mach-O linker-synthesized `___dso_handle` in `libzzdds.dylib`'s export trie. When a
+     C++ consumer registers a destructible static with `__cxa_atexit`, Apple ld 1267 binds
+     the reference to that dylib export and fails with `target '___dso_handle' does not
+     have address`. `zig c++`/LLD do not, so `test-bindings` was green; the new
+     prebuilt-bundle consume check building `examples/cpp/hello_world` with Apple clang++
+     caught it. The macOS install step now post-processes the dylib
+     (`scripts/fix_macos_dylib_exports.sh`) to filter only that private runtime symbol
+     from its export trie (`strip -s` with the kept-symbol list; `strip -R` alone leaves
+     `LC_DYLD_EXPORTS_TRIE` untouched); the raw compile artifact is unchanged for Zig's
+     in-tree links. macOS builds also now default to Zig 0.16's supported deployment floor
+     (13.0) instead of stamping the build host's current OS version (which produced an
+     `LC_BUILD_VERSION` skew warning). `verify_release_bundle.py` gained a `check_structure`
+     guard that fails if the dylib re-exports `___dso_handle`. (ziglang/zig#24370.)
 - **Convention — dry-run `release.yml` before merging any change to it.** Documented in the
   workflow header and `docs/binding-release-plan.md`: run it from the PR branch with
   `dry_run: true` (skips `publish`) and confirm `test`, `self-interop`, and all four

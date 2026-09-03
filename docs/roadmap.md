@@ -416,6 +416,15 @@ release notes).
   builds the GitHub-release body from the curated, date-headed `CHANGELOG.md` sections
   written since the previous release tag (`scripts/extract_changelog.py`), falling back to
   raw commit subjects only if that yields nothing, and always appending a `compare` link.
+- **macOS bundle links with the Apple toolchain** (2026-09-03) — the prebuilt-bundle consume
+  check building `examples/{c,cpp}/hello_world` with Apple clang/clang++ shook out two macOS
+  packaging defects, both worked around in `build.zig` (details in `CHANGELOG.md`): the
+  static `libzidl_cdr.a` re-packed with `zig ar --format=darwin` for `ld64` 8-byte
+  alignment (ziglang/zig#1981), and `libzzdds.dylib`'s export trie post-processed to drop a
+  spuriously-exported `___dso_handle` that broke Apple ld-prime C++ consumers
+  (`scripts/fix_macos_dylib_exports.sh`; ziglang/zig#24370). macOS builds also default to a
+  13.0 deployment floor instead of the build host's OS version. **Both workarounds are
+  upstream Zig bugs — revisit deleting them at a Zig bump.**
 - **`ReleaseSmall` lane** (2026-08-29) — new `zig build test-release-small` step runs the
   whole unit suite at `-OReleaseSmall`, wired into `run_deterministic_matrix.py` (so
   `ci.yml`'s `test-linux` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
@@ -465,18 +474,7 @@ release notes).
    `find_package(ZZDDS)` a bundle yet — `package-libs` ships the Windows tarball with the
    structural check only, and `verify_release_bundle.py` is not run there. Fix: platform-aware
    generation in `build.zig` + turn the Windows arm of the consume check back on.
-5. **C++ bundle consumption on macOS with Apple clang++ is unverified** — the C path works
-   (`cmake_consumer` + `c/hello_world` link against the Zig-built `libzzdds.dylib` on
-   macOS-arm64), but the C++ *three-artifact* model does not: Apple `clang++` compiling the
-   bundled `src/dcps_impl.cpp` and Apple `ld` linking it against the dylib fails with
-   `ld: fixup error (kind=arm64_adrp_lo12) … 'zidl_cdr'/dcps_impl.cpp.o … '___dso_handle'
-   does not have address`, alongside a `LC_BUILD_VERSION` skew warning (the dylib is stamped
-   with the runner's full OS version, the consumer builds for the SDK default). `zig c++`
-   links it fine, so `test-bindings` is green. `verify_release_bundle.py` runs
-   `--example-langs c` on macOS. Likely fixes to try on a real macOS box: a pinned
-   `CMAKE_OSX_DEPLOYMENT_TARGET` / matching `-mmacosx-version-min`, `-Wl,-ld_classic` or
-   `-Wl,-no_fixup_chains`, or stamping the dylib with a lower min-version in `build.zig`.
-6. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
+5. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
    non-Linux memory bug motivates revisiting.
 
 ---
