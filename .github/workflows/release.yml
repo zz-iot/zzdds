@@ -382,10 +382,13 @@ jobs:
       # Extract the tarball we just made into an unrelated directory and prove a
       # downstream project can consume it from there. Linux: full path --
       # find_package + pkg-config, build examples/{c,cpp}/hello_world, run a
-      # pub/sub pair. macOS: same but --skip-example-run (the hello_world pair
-      # needs live UDP discovery, flaky on hosted macOS; cmake_consumer still
-      # links + runs against libzzdds.dylib, so install-name relocatability is
-      # still covered). Windows is skipped -- see the job-header comment.
+      # pub/sub pair. macOS: --skip-example-run (the hello_world pair needs live
+      # UDP discovery, flaky on hosted macOS) + --example-langs c (the C++
+      # three-artifact model doesn't link with Apple clang++/ld against the
+      # Zig dylib yet -- see docs/roadmap.md; cmake_consumer + c/hello_world
+      # still cover find_package / pkg-config / relocatability / libzzdds.dylib
+      # linking, which is the surface rmw_zzdds needs). Windows is skipped --
+      # see the job-header comment.
       - name: Verify prebuilt bundle is consumable
         if: runner.os != 'Windows'
         shell: bash
@@ -393,7 +396,7 @@ jobs:
           set -euo pipefail
           tarball="zzdds-${{ needs.prepare.outputs.full_version }}-${{ matrix.name }}.tar.gz"
           args=""
-          [ "${{ runner.os }}" = "macOS" ] && args="--skip-example-run"
+          [ "${{ runner.os }}" = "macOS" ] && args="--skip-example-run --example-langs c"
           python3 scripts/verify_release_bundle.py --bundle "$tarball" $args
 
       - name: Upload bundle

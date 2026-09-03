@@ -465,7 +465,18 @@ release notes).
    `find_package(ZZDDS)` a bundle yet — `package-libs` ships the Windows tarball with the
    structural check only, and `verify_release_bundle.py` is not run there. Fix: platform-aware
    generation in `build.zig` + turn the Windows arm of the consume check back on.
-5. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
+5. **C++ bundle consumption on macOS with Apple clang++ is unverified** — the C path works
+   (`cmake_consumer` + `c/hello_world` link against the Zig-built `libzzdds.dylib` on
+   macOS-arm64), but the C++ *three-artifact* model does not: Apple `clang++` compiling the
+   bundled `src/dcps_impl.cpp` and Apple `ld` linking it against the dylib fails with
+   `ld: fixup error (kind=arm64_adrp_lo12) … 'zidl_cdr'/dcps_impl.cpp.o … '___dso_handle'
+   does not have address`, alongside a `LC_BUILD_VERSION` skew warning (the dylib is stamped
+   with the runner's full OS version, the consumer builds for the SDK default). `zig c++`
+   links it fine, so `test-bindings` is green. `verify_release_bundle.py` runs
+   `--example-langs c` on macOS. Likely fixes to try on a real macOS box: a pinned
+   `CMAKE_OSX_DEPLOYMENT_TARGET` / matching `-mmacosx-version-min`, `-Wl,-ld_classic` or
+   `-Wl,-no_fixup_chains`, or stamping the dylib with a lower min-version in `build.zig`.
+6. **Valgrind has no viable non-Linux equivalent** — treat as Linux-only unless a specific
    non-Linux memory bug motivates revisiting.
 
 ---

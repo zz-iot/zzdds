@@ -28,6 +28,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
      is unchanged. Fixes a local `zig build install` on macOS and a macOS bundle
      cross-compiled from another host, not just the release runner. (ziglang/zig#1981;
      Linux `ar` output is fine.)
+  3. **C++ bundle consumption on macOS scoped to a known gap.** With (2) fixed, the C path
+     is fully green on macOS-arm64 (`cmake_consumer` + `c/hello_world` link against the
+     Zig-built `libzzdds.dylib`), but the C++ three-artifact model isn't: Apple `clang++`
+     + `ld` on the bundled `src/dcps_impl.cpp` fail with `ld: fixup error … '___dso_handle'
+     does not have address` plus an `LC_BUILD_VERSION` skew warning. `zig c++` links it
+     fine (so `test-bindings` is green). `verify_release_bundle.py` gained `--example-langs`
+     and `release.yml` runs `--example-langs c` on macOS. Tracked in `docs/roadmap.md`
+     "Still open" — this is not on the `rmw_zzdds` (C) path.
 - **Convention — dry-run `release.yml` before merging any change to it.** Documented in the
   workflow header and `docs/binding-release-plan.md`: run it from the PR branch with
   `dry_run: true` (skips `publish`) and confirm `test`, `self-interop`, and all four

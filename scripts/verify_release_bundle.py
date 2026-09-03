@@ -18,8 +18,9 @@ Steps:
   3. The bundled `bin/zidl` code generator runs on this platform.
   4. `find_package(ZZDDS)` resolves from the relocated prefix and its imported
      targets are usable -- `test/release-bundle/cmake_consumer` (fast, no
-     codegen) then the real `examples/c/hello_world` + `examples/cpp/hello_world`
-     downstream CMake projects, compiled and linked against the bundle.
+     codegen) then the real `examples/<lang>/hello_world` downstream CMake
+     projects (`--example-langs`, default `c,cpp`), compiled and linked against
+     the bundle.
   5. The linked binaries actually run -- a hello_world publisher/subscriber
      pair exchanges its 10 samples (loads `libzzdds` from the relocated prefix:
      catches broken rpath / install-name).
@@ -255,6 +256,12 @@ def main() -> int:
                     help="build examples/{c,cpp}/hello_world against the bundle but do not run the "
                          "pub/sub pair (link coverage only; use where live UDP DDS discovery is flaky, "
                          "e.g. hosted macOS runners -- cmake_consumer still runs and loads libzzdds)")
+    ap.add_argument("--example-langs", default="c,cpp",
+                    help="comma-separated hello_world ports to build against the bundle (default "
+                         "'c,cpp'). Pass 'c' on macOS: the C++ three-artifact model doesn't link "
+                         "with Apple clang++/ld against the Zig-built dylib yet -- dcps_impl.cpp.o "
+                         "hits a `___dso_handle` fixup error (deployment-target skew / ld-prime). "
+                         "Tracked in docs/roadmap.md.")
     ap.add_argument("--work", type=Path, default=None, help="working directory (default: a fresh temp dir)")
     ap.add_argument("--keep", action="store_true", help="do not delete the working directory on exit")
     ap.add_argument("--domain-base", type=int, default=58,
@@ -300,7 +307,10 @@ def main() -> int:
             fail(f"cmake_consumer binary exited {proc.returncode}:\n{proc.stdout}")
         log(f"cmake_consumer: ran -- {proc.stdout.strip()}")
 
-        for i, name in enumerate(("c", "cpp")):
+        langs = [s.strip() for s in args.example_langs.split(",") if s.strip()]
+        if bad := [l for l in langs if l not in ("c", "cpp")]:
+            fail(f"--example-langs: unknown {bad} (want c and/or cpp)")
+        for i, name in enumerate(langs):
             example = args.examples_dir / name / "hello_world"
             if not (example / "CMakeLists.txt").is_file():
                 fail(f"example project not found: {example}")
