@@ -50,7 +50,17 @@ fn findJniIncludeDir(b: *std.Build, java_path: []const u8) ?JniIncludeDirs {
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // A native macOS target otherwise inherits the build host's current OS
+    // version (for example 26.6.2), making release dylibs unusable to consumers
+    // targeting an older supported macOS. Zig 0.16 itself requires macOS 13,
+    // so use that as the default deployment floor unless the caller supplied
+    // an explicit minimum in -Dtarget.
+    var target_query = b.standardTargetOptionsQueryOnly(.{});
+    const initially_resolved_target = b.resolveTargetQuery(target_query);
+    if (initially_resolved_target.result.os.tag == .macos and target_query.os_version_min == null) {
+        target_query.os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } };
+    }
+    const target = b.resolveTargetQuery(target_query);
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
     const debug_allocator = b.option(bool, "debug-allocator", "Route the default (allocator=NULL) factory allocation path through std.heap.DebugAllocator instead of std.heap.c_allocator, for fast attributable double-free/UAF diagnostics") orelse false;
@@ -495,7 +505,30 @@ pub fn build(b: *std.Build) void {
             // without this, and was caught immediately with it.
             .use_llvm = if (sanitize_thread) true else null,
         });
-        b.installArtifact(zidl_cdr_lib);
+
+        // Install libzidl_cdr.a. On macOS the archive that `Step.Compile`'s
+        // own (GNU-format) archiver writes has member offsets Apple's ld64
+        // rejects -- "64-bit mach-o member 'zidl_cdr.o' not 8-byte aligned".
+        // zig cc / LLD tolerate it (so linking it into libzzdds and the
+        // binding smoke tests below is fine), but a downstream C/C++ consumer
+        // building against the installed tree with Apple clang/ld cannot link
+        // it. Re-pack the same object with the `zig ar` subcommand, whose
+        // Darwin-format output is 8-byte aligned. Works when cross-compiling a
+        // macOS bundle from a non-macOS host too. See ziglang/zig#1981.
+        if (target.result.os.tag == .macos) {
+            const zidl_cdr_obj = b.addObject(.{
+                .name = "zidl_cdr",
+                .root_module = zidl_cdr_mod,
+                .use_llvm = if (sanitize_thread) true else null,
+            });
+            const repack = b.addSystemCommand(&.{ b.graph.zig_exe, "ar", "-rcs", "--format=darwin" });
+            const fixed_a = repack.addOutputFileArg("libzidl_cdr.a");
+            repack.addArtifactArg(zidl_cdr_obj);
+            const install_fixed_a = b.addInstallFileWithDir(fixed_a, .lib, "libzidl_cdr.a");
+            b.getInstallStep().dependOn(&install_fixed_a.step);
+        } else {
+            b.installArtifact(zidl_cdr_lib);
+        }
 
         // Build libzzdds as a shared library exposing the C ABI surface.
         const zzdds_lib = b.addLibrary(.{
@@ -548,10 +581,25 @@ pub fn build(b: *std.Build) void {
         zzdds_lib.root_module.addIncludePath(b.path("include"));
         zzdds_lib.root_module.linkLibrary(zidl_cdr_lib);
 
-        const install_zzdds_lib = b.addInstallArtifact(zzdds_lib, .{});
-        b.getInstallStep().dependOn(&install_zzdds_lib.step);
+        const install_zzdds_lib_step: *std.Build.Step = if (target.result.os.tag == .macos) blk: {
+            // Zig 0.16 incorrectly publishes the Mach-O linker-synthesized
+            // ___dso_handle in a dylib's export trie. An Apple-clang C++
+            // consumer with a destructible static then fails in ld-prime with
+            // "target '___dso_handle' does not have address". Restrict the
+            // installed dylib to its existing exports minus that private
+            // runtime symbol. Keep the compile artifact unchanged for Zig's
+            // own in-tree linking.
+            const fix_exports = b.addSystemCommand(&.{
+                "sh",
+                b.pathFromRoot("scripts/fix_macos_dylib_exports.sh"),
+            });
+            fix_exports.addArtifactArg(zzdds_lib);
+            const fixed_dylib = fix_exports.addOutputFileArg("libzzdds.dylib");
+            break :blk &b.addInstallFileWithDir(fixed_dylib, .lib, "libzzdds.dylib").step;
+        } else &b.addInstallArtifact(zzdds_lib, .{}).step;
+        b.getInstallStep().dependOn(install_zzdds_lib_step);
         zzdds_lib_for_reuse = zzdds_lib;
-        zzdds_lib_install_step = &install_zzdds_lib.step;
+        zzdds_lib_install_step = install_zzdds_lib_step;
 
         const gen_smoke_c = b.addRunArtifact(zidl_exe);
         gen_smoke_c.addArgs(&.{ "-b", "c", "--generate-zzdds-wrappers", "-o" });

@@ -416,6 +416,15 @@ release notes).
   builds the GitHub-release body from the curated, date-headed `CHANGELOG.md` sections
   written since the previous release tag (`scripts/extract_changelog.py`), falling back to
   raw commit subjects only if that yields nothing, and always appending a `compare` link.
+- **macOS bundle links with the Apple toolchain** (2026-09-03) — the prebuilt-bundle consume
+  check building `examples/{c,cpp}/hello_world` with Apple clang/clang++ shook out two macOS
+  packaging defects, both worked around in `build.zig` (details in `CHANGELOG.md`): the
+  static `libzidl_cdr.a` re-packed with `zig ar --format=darwin` for `ld64` 8-byte
+  alignment (ziglang/zig#1981), and `libzzdds.dylib`'s export trie post-processed to drop a
+  spuriously-exported `___dso_handle` that broke Apple ld-prime C++ consumers
+  (`scripts/fix_macos_dylib_exports.sh`; ziglang/zig#24370). macOS builds also default to a
+  13.0 deployment floor instead of the build host's OS version. **Both workarounds are
+  upstream Zig bugs — revisit deleting them at a Zig bump.**
 - **`ReleaseSmall` lane** (2026-08-29) — new `zig build test-release-small` step runs the
   whole unit suite at `-OReleaseSmall`, wired into `run_deterministic_matrix.py` (so
   `ci.yml`'s `test-linux` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
