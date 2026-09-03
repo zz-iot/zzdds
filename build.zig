@@ -495,7 +495,30 @@ pub fn build(b: *std.Build) void {
             // without this, and was caught immediately with it.
             .use_llvm = if (sanitize_thread) true else null,
         });
-        b.installArtifact(zidl_cdr_lib);
+
+        // Install libzidl_cdr.a. On macOS the archive that `Step.Compile`'s
+        // own (GNU-format) archiver writes has member offsets Apple's ld64
+        // rejects -- "64-bit mach-o member 'zidl_cdr.o' not 8-byte aligned".
+        // zig cc / LLD tolerate it (so linking it into libzzdds and the
+        // binding smoke tests below is fine), but a downstream C/C++ consumer
+        // building against the installed tree with Apple clang/ld cannot link
+        // it. Re-pack the same object with the `zig ar` subcommand, whose
+        // Darwin-format output is 8-byte aligned. Works when cross-compiling a
+        // macOS bundle from a non-macOS host too. See ziglang/zig#1981.
+        if (target.result.os.tag == .macos) {
+            const zidl_cdr_obj = b.addObject(.{
+                .name = "zidl_cdr",
+                .root_module = zidl_cdr_mod,
+                .use_llvm = if (sanitize_thread) true else null,
+            });
+            const repack = b.addSystemCommand(&.{ b.graph.zig_exe, "ar", "-rcs", "--format=darwin" });
+            const fixed_a = repack.addOutputFileArg("libzidl_cdr.a");
+            repack.addArtifactArg(zidl_cdr_obj);
+            const install_fixed_a = b.addInstallFileWithDir(fixed_a, .lib, "libzidl_cdr.a");
+            b.getInstallStep().dependOn(&install_fixed_a.step);
+        } else {
+            b.installArtifact(zidl_cdr_lib);
+        }
 
         // Build libzzdds as a shared library exposing the C ABI surface.
         const zzdds_lib = b.addLibrary(.{

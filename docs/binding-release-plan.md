@@ -16,6 +16,12 @@ zzdds client surfaces.
   generated DDS/zzdds IDL bindings as the user-facing API.
 - Gate release candidates with `zig build test` and
   `zig build test-bindings -Dc-binding=true -Dcpp-binding=true`.
+- Before merging any PR that modifies `.github/workflows/release.yml`, run the
+  `Release` workflow from that PR's branch with `dry_run: true` and confirm
+  `test`, `self-interop`, and all four `package-libs` legs pass. `publish` is
+  skipped on a dry run. Much of `package-libs` (the install-tree checks, the
+  prebuilt-bundle consume check) runs *only* in `release.yml`, so ordinary CI
+  never exercises it.
 
 ## Current Smoke Surface
 

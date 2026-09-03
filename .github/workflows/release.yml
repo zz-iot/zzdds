@@ -1,5 +1,14 @@
 name: Release
 
+# CONVENTION: before merging any PR that touches this file, run this workflow
+# once from the PR's branch with `dry_run: true` (Actions -> Release -> Run
+# workflow -> pick the branch) and confirm `test`, `self-interop`, and all four
+# `package-libs` legs go green. `publish` is skipped on a dry run, so nothing is
+# tagged or released. Several `package-libs` steps only ever execute in this
+# workflow (never in `ci.yml`), so a plain PR check does not exercise them --
+# the v0.3.0 attempt failed on a shell bug in `package-libs` that had shipped
+# unrun for a week.
+
 on:
   workflow_dispatch:
     inputs:
