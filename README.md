@@ -8,8 +8,13 @@ A Zig implementation of the DDS specification (v1.4) and RTPS 2.5 wire interoper
 
 - Full DDS v1.4 DCPS compliance (formal/15-04-10)
 - RTPS 2.5 wire interoperability
-- Pluggable transport, discovery, and security — RTPS/UDP and SPDP/SEDP default; DDS-Security v1.2 planned
-- Language bindings for C, C++, Java (the formal specs for IDL mappings), and others via `zidl --generate-interfaces`
+- Pluggable transport, discovery, and security
+  - RTPS/UDP and SPDP/SEDP default
+  - DDS-Security v1.2 planned
+- Language bindings for:
+  - C, C++, Java (the formal specs for IDL mappings)
+  - C#, Python, Rust, Haskell (planned)
+  - and others via `zidl --generate-interfaces`
 - Configuration: built-in defaults or a TOML config file, returned as a plain struct you can mutate directly
 
 ## Build
