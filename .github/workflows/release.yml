@@ -317,22 +317,31 @@ jobs:
         with:
           version: ${{ needs.prepare.outputs.zig_version }}
 
+      # --summary all leaves a full step tree in the log -- cheap, and it made
+      # the "verify" false-negative below (a shell bug, not a build bug)
+      # obvious once package-libs finally ran for real.
       - name: Build install tree (C + C++ bindings)
-        run: zig build -Dc-binding=true -Dcpp-binding=true install
+        run: zig build -Dc-binding=true -Dcpp-binding=true install --summary all
 
       - name: Verify install tree is complete
         shell: bash
         run: |
           set -euo pipefail
           fail=0
-          # Dynamic libzzdds -- extension and directory differ per platform
-          # (.dll lands in bin/ on Windows, since Zig's InstallArtifact
-          # treats a .dll as isDll()).
-          if ! ls zig-out/lib/libzzdds.so zig-out/lib/libzzdds.dylib \
-                  zig-out/bin/zzdds.dll zig-out/lib/zzdds.dll 2>/dev/null | grep -q .; then
-            echo "::error::no dynamic libzzdds found under zig-out/"
-            fail=1
-          fi
+          # Dynamic libzzdds -- name/dir differ per platform (.so / .dylib, and
+          # a .dll lands in bin/ on Windows since Zig's InstallArtifact treats
+          # it as isDll()). Probe each candidate with `test -f`, NOT
+          # `ls a b c d | grep`: under `set -o pipefail` a partial `ls` (some
+          # operands absent -> exit 2) wins over grep's success, so `if ! ls
+          # ... | grep -q .` inverted to a bogus "not found" even with the
+          # library sitting right there -- which is exactly how the first
+          # real release run "failed" on all four platforms.
+          shlib=
+          for cand in zig-out/lib/libzzdds.so zig-out/lib/libzzdds.dylib \
+                      zig-out/bin/zzdds.dll zig-out/lib/zzdds.dll; do
+            if [ -f "$cand" ]; then shlib="$cand"; break; fi
+          done
+          [ -n "$shlib" ] || { echo "::error::no dynamic libzzdds found under zig-out/"; fail=1; }
           for f in zig-out/include/dcps.h zig-out/include/zzdds.h zig-out/include/zidl_cdr.h \
                    zig-out/lib/pkgconfig/zzdds.pc zig-out/lib/cmake/ZZDDS/zzdds-config.cmake; do
             [ -f "$f" ] || { echo "::error::missing $f"; fail=1; }
