@@ -226,7 +226,7 @@ jobs:
     needs: test-linux
     permissions:
       contents: read
-    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@c922472d782deb7d1bb2028a68f37ac0963939bb
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@b47c7887ea7896929169b6e793e6da8859eb9471
     with:
       mode: zzdds-pr
       zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
