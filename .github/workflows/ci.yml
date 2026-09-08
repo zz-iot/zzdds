@@ -218,15 +218,16 @@ jobs:
   # is this line, not an env var.
   #
   # rmw_zzdds requires a full ROS 2 Rolling toolchain (its workflow runs in a
-  # pinned `ros:rolling` container), so this job takes ~20 min — hence
-  # `needs: test-linux` and a single gating leg here, not the full matrix that
-  # rmw_zzdds runs on its own PRs / schedule.
+  # pinned `ros:rolling` container) and, since rmw_zzdds@09aa654, also runs the
+  # upstream `test_rmw_implementation` conformance suites against rmw_zzdds_cpp,
+  # so this job takes ~35–45 min — hence `needs: test-linux` and a single gating
+  # leg here, not the full matrix that rmw_zzdds runs on its own PRs / schedule.
   rmw-zzdds:
     name: rmw_zzdds
     needs: test-linux
     permissions:
       contents: read
-    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@b47c7887ea7896929169b6e793e6da8859eb9471
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@09aa6544f010189fafb667650160c1e858cc266e
     with:
       mode: zzdds-pr
       zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
