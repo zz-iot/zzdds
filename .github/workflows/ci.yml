@@ -204,6 +204,34 @@ jobs:
       # docs/design/ci-platform-coverage-expansion.md item 3 for the full
       # writeup and follow-up tracking.
 
+  # ── rmw_zzdds regression gate ────────────────────────────────────────────
+  #
+  # Builds zz-iot/rmw_zzdds (the experimental ROS 2 middleware backed by zzdds)
+  # against *this* commit and runs its test suite, so a change here that breaks
+  # the RMW consumer is caught in the zzdds PR. All the logic lives in
+  # rmw_zzdds's own ci/build_and_test.py; this just invokes its reusable
+  # workflow with mode=zzdds-pr and the commit under test.
+  #
+  # rmw_zzdds has no releases yet, so the `uses:` ref is a pinned commit hash.
+  # Bump it deliberately (Dependabot's github-actions ecosystem will also open
+  # PRs for it) — a `${{ }}` expression is not allowed in `uses:`, so the pin
+  # is this line, not an env var.
+  #
+  # rmw_zzdds requires a full ROS 2 Rolling toolchain (its workflow runs in a
+  # pinned `ros:rolling` container), so this job takes ~20 min — hence
+  # `needs: test-linux` and a single gating leg here, not the full matrix that
+  # rmw_zzdds runs on its own PRs / schedule.
+  rmw-zzdds:
+    name: rmw_zzdds
+    needs: test-linux
+    permissions:
+      contents: read
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@b47c7887ea7896929169b6e793e6da8859eb9471
+    with:
+      mode: zzdds-pr
+      zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      zzdds_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
   # ── examples smoke test ──────────────────────────────────────────────────
   #
   # Builds zzdds with every binding enabled, then runs examples/'s own
