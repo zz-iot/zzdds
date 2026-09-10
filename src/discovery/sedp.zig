@@ -208,7 +208,7 @@ fn writeLivelinessPid(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), qos: Qo
 
 // ── DiscoveredWriterData encoding ─────────────────────────────────────────────
 
-fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![]u8 {
+pub fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
     try buf.appendSlice(alloc, &PLCDR_LE_ENCAP);
@@ -342,7 +342,7 @@ fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![
 
 // ── DiscoveredReaderData encoding ─────────────────────────────────────────────
 
-fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![]u8 {
+pub fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
     try buf.appendSlice(alloc, &PLCDR_LE_ENCAP);
@@ -1321,7 +1321,7 @@ fn keyHashToGuid(kh: [16]u8) Guid {
 
 /// Encode a minimal PL-CDR disposal payload: PLCDR_LE_ENCAP + PID_ENDPOINT_GUID + PID_SENTINEL.
 /// Used as the serialized_payload of NOT_ALIVE_DISPOSED DATA messages.
-fn encodeEndpointDisposalPayload(alloc: std.mem.Allocator, guid: Guid) ![]u8 {
+pub fn encodeEndpointDisposalPayload(alloc: std.mem.Allocator, guid: Guid) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
     try buf.appendSlice(alloc, &PLCDR_LE_ENCAP);

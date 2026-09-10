@@ -1286,6 +1286,7 @@ pub fn build(b: *std.Build) void {
         "test/discovery/spdp_lease_test.zig",
         "test/discovery/sedp_test.zig",
         "test/discovery/discovery_interface_test.zig",
+        "test/discovery/wire_golden_test.zig",
     };
     for (discovery_test_files) |src| {
         const t = b.addTest(.{
