@@ -811,6 +811,11 @@ pub const SedpEndpoints = struct {
                 return;
             };
             defer ep.deinit();
+            // A writer keeping the DDS default (RELIABLE) MAY omit PID_RELIABILITY
+            // (RTPS §8.5.4.2). The generated decoder leaves `reliability.kind` at
+            // 0 (an invalid wire value); re-seed the spec default so QoS matching
+            // doesn't read it as BEST_EFFORT.
+            if (ep.data.reliability.kind == 0) ep.data.reliability.kind = 2;
             const g = guidFromBytes(&ep.data.writerGuid);
             var eff = self.resolveEffectiveLocators(g.prefix, ep.unicast, ep.multicast);
             defer eff.deinit(self.alloc);
@@ -837,6 +842,10 @@ pub const SedpEndpoints = struct {
                 return;
             };
             defer ep.deinit();
+            // Reader default is BEST_EFFORT; a reader that keeps it MAY omit
+            // PID_RELIABILITY (RTPS §8.5.4.3). Re-seed so 0 (invalid) isn't
+            // read as "weaker than BEST_EFFORT".
+            if (ep.data.reliability.kind == 0) ep.data.reliability.kind = 1;
             const g = guidFromBytes(&ep.data.readerGuid);
             var eff = self.resolveEffectiveLocators(g.prefix, ep.unicast, ep.multicast);
             defer eff.deinit(self.alloc);

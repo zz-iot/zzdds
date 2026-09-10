@@ -26,6 +26,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `PID_DATA_REPRESENTATION [2]` (matching the real `reprFromQos` path, not the old golden
   capture); `PID_TYPE_INFORMATION` is replayed after `PID_PARTITION` rather than before.
 - SPDP encode/decode is unchanged (hand-rolled — it carries no QoS).
+- SEDP decode re-seeds `RELIABILITY` after decode when a peer omits `PID_RELIABILITY` for
+  its spec default (Connext does this for a default-RELIABLE writer): the generated decoder
+  leaves `kind == 0` (invalid), which QoS matching would read as weaker than BEST_EFFORT.
+  Writer branch seeds `0 → RELIABLE`, reader branch `0 → BEST_EFFORT` (RTPS 2.5
+  §8.5.4.2/§8.5.4.3). The old hand parser applied RTPS defaults inline.
 - zidl pin → `v0.3.14-zig.0.16.0` (fixes `@optional` sequence / array codegen the SEDP
   structs rely on).
 

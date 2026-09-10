@@ -480,6 +480,18 @@ Scoped down by the spike: no big-endian reader work (§S4), no `raw_encoded` fie
   adapter (§3.5) must set the member null at the default — this logic is preserved from
   `writerQosSnapshot`, not lost, but it is the most error-prone part of the byte-exactness
   goal. The golden fixtures (§7 PR B step 3) are the guard.
+* **Decode-side spec defaults for omitted PIDs.** The mirror of the point above: a foreign
+  peer omits a policy PID when it keeps the spec default (Connext omits `PID_RELIABILITY`
+  for its default-RELIABLE writer). The generated `deserializeFromPlCdr` leaves the
+  non-`@optional` `reliability` member zero-initialised (`kind == 0`, an invalid wire
+  value), which `checkDiscovered` would read as *weaker than BEST_EFFORT* → spurious
+  `INCOMPATIBLE_QOS`. The old hand parser seeded RTPS defaults as it went; the generated
+  decoder does not. `sedp.zig` `handleEndpointChange` re-seeds `reliability.kind` after
+  decode — `0 → 2` (RELIABLE) on the writer branch, `0 → 1` (BEST_EFFORT) on the reader
+  branch, per RTPS 2.5 §8.5.4.2/§8.5.4.3. Other omitted policies (durability, ownership,
+  destination-order, history) already decode to `0`, which is their spec-default ordinal,
+  so they need no re-seed. Caught by the live interop gate, not the golden fixtures (those
+  drive zzdds's own always-emitting encoder).
 * **RTPS vs DDS `Duration_t`** (§3.2) appears anywhere a duration crosses the adapter — 4
   fields per endpoint, `{sec, nanosec}` → `{sec, fraction}`, INFINITE sentinel on both
   sides. The reason the discovery structs can't just embed `DDS::*QosPolicy` (§S1).

@@ -164,7 +164,9 @@ pub fn checkDiscovered(
 
     // DATA_REPRESENTATION: writer offers a single representation; reader accepts
     // exactly its configured representation (strict equality — matches the
-    // single-element PID_DATA_REPRESENTATION zzdds emits).
+    // single-element PID_DATA_REPRESENTATION zzdds emits). A peer that omits
+    // PID_DATA_REPRESENTATION decodes with an empty sequence, which `firstRepr`
+    // reports as XCDR1 (0) — the classic default assumed by DDS-XTypes §7.6.3.
     if (firstRepr(w.dataRepresentation) != firstRepr(r.dataRepresentation))
         return .{ .incompatible = .data_representation };
 
