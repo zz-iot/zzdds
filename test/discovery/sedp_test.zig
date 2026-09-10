@@ -109,15 +109,30 @@ const SnapshotW = struct {
     topic: []u8,
     typ: []u8,
     user_data: []u8,
+    partitions: [][]u8, // owned deep copy of WriterData.partition_names
     qos: dwire.DiscoveredWriterData, // owned clone
     alloc: std.mem.Allocator,
     fn deinit(self: *@This()) void {
         self.alloc.free(self.topic);
         self.alloc.free(self.typ);
         self.alloc.free(self.user_data);
+        for (self.partitions) |p| self.alloc.free(p);
+        self.alloc.free(self.partitions);
         self.qos.deinit(self.alloc);
     }
 };
+
+fn dupePartitions(alloc: std.mem.Allocator, names: []const []const u8) ![][]u8 {
+    const out = try alloc.alloc([]u8, names.len);
+    errdefer alloc.free(out);
+    var done: usize = 0;
+    errdefer for (out[0..done]) |p| alloc.free(p);
+    for (names, 0..) |nm, i| {
+        out[i] = try alloc.dupe(u8, nm);
+        done = i + 1;
+    }
+    return out;
+}
 
 const SnapshotR = struct {
     guid: Guid,
@@ -171,12 +186,14 @@ const Recorder = struct {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         const user_data = self.alloc.dupe(u8, iface.discUserData(d.qos)) catch return;
         const qos = d.qos.clone(self.alloc) catch return;
+        const parts = dupePartitions(self.alloc, d.partition_names) catch return;
         const s = SnapshotW{
             .alloc = self.alloc,
             .guid = d.guid,
             .topic = self.alloc.dupe(u8, d.topic_name) catch return,
             .typ = self.alloc.dupe(u8, d.type_name) catch return,
             .user_data = user_data,
+            .partitions = parts,
             .qos = qos,
         };
         self.writers_found.append(self.alloc, s) catch {};
@@ -696,4 +713,38 @@ test "SEDP: WriterAnnouncement with lifespan and deadline QoS round-trips correc
     try testing.expectEqual(@as(u32, 500_000_000), wireDur(found.qos.lifespan).nanosec);
     try testing.expectEqual(@as(i32, 5), wireDur(found.qos.deadline).sec);
     try testing.expectEqual(@as(u32, 0), wireDur(found.qos.deadline).nanosec);
+}
+
+test "SEDP: a writer with >32 PARTITION names delivers all of them (no truncation)" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x19);
+    var remote = try Participant.init(net, 0x1A);
+    defer local.deinit();
+    defer remote.deinit();
+
+    local.discoverPeer(0x1A);
+    remote.discoverPeer(0x19);
+
+    var names: [40][]const u8 = undefined;
+    var storage: [40][16]u8 = undefined;
+    for (0..40) |i| names[i] = std.fmt.bufPrint(&storage[i], "partition-{d}", .{i}) catch unreachable;
+
+    try local.sedp.announceWriter(&.{
+        .guid = makeGuid(0x19, 0x10),
+        .participant_guid = makeGuid(0x19, 0x01),
+        .topic_name = "T",
+        .type_name = "TT",
+        .qos = .{},
+        .partition_names = &names,
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+    const got = remote.rec.writers_found.items[0].partitions;
+    try testing.expectEqual(@as(usize, 40), got.len);
+    for (0..40) |i| try testing.expectEqualStrings(names[i], got[i]);
 }

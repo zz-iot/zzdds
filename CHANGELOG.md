@@ -31,6 +31,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   leaves `kind == 0` (invalid), which QoS matching would read as weaker than BEST_EFFORT.
   Writer branch seeds `0 → RELIABLE`, reader branch `0 → BEST_EFFORT` (RTPS 2.5
   §8.5.4.2/§8.5.4.3). The old hand parser applied RTPS defaults inline.
+- SEDP decode: PARTITION names are no longer capped at 32 per endpoint (the IDL type is an
+  unbounded `sequence<string>`; the fixed decode buffer silently dropped the rest and broke
+  matching for endpoints with many partitions) — `partitionNamesOwned` now sizes to the
+  actual count. The legacy `PID_PARTITION` (`0x0035`) hand-parse reads its sequence count
+  and string lengths with the payload's byte order instead of assuming little-endian, so a
+  big-endian peer's legacy partitions decode correctly.
 - zidl pin → `v0.3.14-zig.0.16.0` (fixes `@optional` sequence / array codegen the SEDP
   structs rely on).
 

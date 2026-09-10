@@ -200,6 +200,11 @@ fn DecodedEndpoint(comptime T: type) type {
         data: T, // owned via T.deinit
         unicast: []Locator, // owned
         multicast: []Locator, // owned
+        /// Byte order of the payload's encapsulation header. Retained-unknown
+        /// parameter values (`data.unknown_params[*].bytes`) are stored verbatim,
+        /// so any hand-parse of one (e.g. the legacy PID_PARTITION) must read it
+        /// with this endianness rather than assuming LE.
+        little_endian: bool,
         alloc: std.mem.Allocator,
 
         fn deinit(self: *Self2) void {
@@ -237,32 +242,68 @@ fn decodeEndpointT(comptime T: type, alloc: std.mem.Allocator, payload: []const 
     const uc = try wireLocatorsOwned(alloc, data.unicastLocatorList);
     errdefer alloc.free(uc);
     const mc = try wireLocatorsOwned(alloc, data.multicastLocatorList);
-    return .{ .data = data, .unicast = uc, .multicast = mc, .alloc = alloc };
+    return .{
+        .data = data,
+        .unicast = uc,
+        .multicast = mc,
+        .little_endian = r.byte_order == .little,
+        .alloc = alloc,
+    };
 }
 
-/// PID_PARTITION_LEGACY (0x0035): the generated switch keys on `@id` 0x0029, so
-/// a peer that sends partition as the legacy PID lands it in `unknown_params`.
-/// Parse it as a CDR `sequence<string>` (LE — every zzdds/DDS peer emits
-/// PL_CDR_LE) into `buf`, returning borrowed slices into the RawParam bytes
-/// (valid while the decoded struct lives). Returns `null` when absent.
-fn legacyPartitionNames(unknown: []const zidl_rt.RawParam, buf: [][]const u8) ?[]const []const u8 {
+/// PARTITION names for a decoded endpoint, never truncated: the legacy
+/// PID_PARTITION (`0x0035`) sequence when the peer sent that, otherwise the
+/// declared `partition` member. The returned slice array is heap-owned by
+/// `alloc` (caller frees); the name bytes stay borrowed from the decoded struct
+/// / its RawParams and are valid while it lives. `&.{}` when no partition data
+/// is present (and never heap-allocated in that case).
+fn partitionNamesOwned(
+    alloc: std.mem.Allocator,
+    unknown: []const zidl_rt.RawParam,
+    declared: anytype,
+    little_endian: bool,
+) error{OutOfMemory}![]const []const u8 {
+    // The generated switch keys on `@id` 0x0029, so a peer that sends partition
+    // as the legacy PID lands it in `unknown_params`. It wins when present, even
+    // if it decodes to zero names (matches the old `orelse` precedence).
     for (unknown) |rp| {
-        if (rp.pid != PidTable.PARTITION_LEGACY) continue;
-        const v = rp.bytes;
-        if (v.len < 4) return &.{};
-        const count = readU32LE(v, true);
-        var off: usize = 4;
-        var i: usize = 0;
-        while (i < count and i < buf.len and off + 4 <= v.len) : (i += 1) {
-            const slen = readU32LE(v[off..], true);
-            off += 4;
-            if (slen == 0 or off + slen > v.len) break;
-            buf[i] = v[off .. off + slen - 1]; // strip NUL
-            off = (off + slen + 3) & ~@as(usize, 3);
-        }
-        return buf[0..i];
+        if (rp.pid == PidTable.PARTITION_LEGACY)
+            return legacyPartitionSeq(alloc, rp.bytes, little_endian);
     }
-    return null;
+    const s = declared orelse return &.{};
+    const b = s._buffer orelse return &.{};
+    const n: usize = s._length;
+    if (n == 0) return &.{};
+    const out = try alloc.alloc([]const u8, n);
+    for (0..n) |i| out[i] = std.mem.span(b[i]);
+    return out;
+}
+
+/// Parse a retained legacy-PID_PARTITION value as a CDR `sequence<string>` with
+/// the payload's byte order (`le`). Retained param bytes are stored verbatim, so
+/// a big-endian peer's sequence count and string lengths are big-endian too.
+fn legacyPartitionSeq(
+    alloc: std.mem.Allocator,
+    v: []const u8,
+    le: bool,
+) error{OutOfMemory}![]const []const u8 {
+    if (v.len < 4) return &.{};
+    const count = readU32LE(v, le);
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(alloc);
+    // Hint capacity by what the buffer can actually hold (>= 4 bytes of length
+    // prefix per element) so a bogus count can't drive a huge up-front alloc.
+    try list.ensureTotalCapacity(alloc, @min(@as(usize, count), (v.len -| 4) / 4));
+    var off: usize = 4;
+    var i: usize = 0;
+    while (i < count and off + 4 <= v.len) : (i += 1) {
+        const slen = readU32LE(v[off..], le);
+        off += 4;
+        if (slen == 0 or off + slen > v.len) break;
+        try list.append(alloc, v[off .. off + slen - 1]); // strip NUL
+        off = (off + slen + 3) & ~@as(usize, 3);
+    }
+    return list.toOwnedSlice(alloc);
 }
 
 /// The PID_TYPE_INFORMATION (0x0075) blob out of `unknown_params`, borrowed.
@@ -820,9 +861,11 @@ pub const SedpEndpoints = struct {
             var eff = self.resolveEffectiveLocators(g.prefix, ep.unicast, ep.multicast);
             defer eff.deinit(self.alloc);
             if (!eff.reachable) return;
-            var pn_buf: [32][]const u8 = undefined;
-            const pnames = legacyPartitionNames(ep.data.unknown_params, &pn_buf) orelse
-                iface.partitionNames(ep.data.partition, &pn_buf);
+            const pnames = partitionNamesOwned(self.alloc, ep.data.unknown_params, ep.data.partition, ep.little_endian) catch |err| {
+                log.sedp.warn("sedp: writer partition-name decode failed: {s}", .{@errorName(err)});
+                return;
+            };
+            defer if (pnames.len > 0) self.alloc.free(pnames);
             const wd = WriterData{
                 .guid = g,
                 .participant_guid = .{ .prefix = g.prefix, .entity_id = EntityIds.participant },
@@ -850,9 +893,11 @@ pub const SedpEndpoints = struct {
             var eff = self.resolveEffectiveLocators(g.prefix, ep.unicast, ep.multicast);
             defer eff.deinit(self.alloc);
             if (!eff.reachable) return;
-            var pn_buf: [32][]const u8 = undefined;
-            const pnames = legacyPartitionNames(ep.data.unknown_params, &pn_buf) orelse
-                iface.partitionNames(ep.data.partition, &pn_buf);
+            const pnames = partitionNamesOwned(self.alloc, ep.data.unknown_params, ep.data.partition, ep.little_endian) catch |err| {
+                log.sedp.warn("sedp: reader partition-name decode failed: {s}", .{@errorName(err)});
+                return;
+            };
+            defer if (pnames.len > 0) self.alloc.free(pnames);
             const rd = ReaderData{
                 .guid = g,
                 .participant_guid = .{ .prefix = g.prefix, .entity_id = EntityIds.participant },
@@ -999,4 +1044,87 @@ fn keyHashToGuid(kh: [16]u8) Guid {
 /// Used as the serialized_payload of NOT_ALIVE_DISPOSED DATA messages.
 pub fn encodeEndpointDisposalPayload(alloc: std.mem.Allocator, guid: Guid) ![]u8 {
     return emitPlCdr(Disc.EndpointDisposal, alloc, .{ .endpointGuid = guidBytes(guid) });
+}
+
+// ── Tests: legacy PID_PARTITION (0x0035) hand-parse ──────────────────────────
+
+const testing = std.testing;
+
+/// Emit a CDR `sequence<string>` value (no encap header — this is a retained
+/// parameter's *value* bytes) with the given byte order. String lengths include
+/// the NUL, elements padded to 4 — matches what a real peer's PL_CDR carries.
+fn emitStringSeqValue(alloc: std.mem.Allocator, names: []const []const u8, le: bool) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    var lp: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lp, @intCast(names.len), if (le) .little else .big);
+    try buf.appendSlice(alloc, &lp);
+    for (names) |nm| {
+        std.mem.writeInt(u32, &lp, @intCast(nm.len + 1), if (le) .little else .big);
+        try buf.appendSlice(alloc, &lp);
+        try buf.appendSlice(alloc, nm);
+        try buf.append(alloc, 0);
+        while (buf.items.len % 4 != 0) try buf.append(alloc, 0);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+test "legacyPartitionSeq: round-trips >32 names, both endiannesses, no truncation" {
+    const a = testing.allocator;
+    var names: [40][]const u8 = undefined;
+    var storage: [40][12]u8 = undefined;
+    for (0..40) |i| {
+        names[i] = std.fmt.bufPrint(&storage[i], "part-{d}", .{i}) catch unreachable;
+    }
+    for ([_]bool{ true, false }) |le| {
+        const v = try emitStringSeqValue(a, &names, le);
+        defer a.free(v);
+        const got = try legacyPartitionSeq(a, v, le);
+        defer a.free(got);
+        try testing.expectEqual(@as(usize, 40), got.len);
+        for (0..40) |i| try testing.expectEqualStrings(names[i], got[i]);
+    }
+}
+
+test "legacyPartitionSeq: wrong endianness / truncated tail degrade safely" {
+    const a = testing.allocator;
+    const names = [_][]const u8{ "alpha", "beta" };
+    const v_le = try emitStringSeqValue(a, &names, true);
+    defer a.free(v_le);
+
+    // Read LE bytes as BE: the count becomes huge; the loop is bounded by the
+    // buffer and the allocation is capped, so it just yields nothing (or stops).
+    const misread = try legacyPartitionSeq(a, v_le, false);
+    defer a.free(misread);
+    try testing.expect(misread.len < names.len);
+
+    // Truncated mid-string: parse what's whole ("alpha"), stop cleanly before
+    // the second element's bytes run out.
+    const cut = try legacyPartitionSeq(a, v_le[0 .. v_le.len - 8], true);
+    defer a.free(cut);
+    try testing.expectEqual(@as(usize, 1), cut.len);
+    try testing.expectEqualStrings("alpha", cut[0]);
+
+    // Empty / too-short value.
+    const none = try legacyPartitionSeq(a, &.{}, true);
+    defer a.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "partitionNamesOwned: legacy 0x0035 wins over declared member and is not truncated" {
+    const a = testing.allocator;
+    var names: [40][]const u8 = undefined;
+    var storage: [40][12]u8 = undefined;
+    for (0..40) |i| names[i] = std.fmt.bufPrint(&storage[i], "p{d}", .{i}) catch unreachable;
+
+    const v = try emitStringSeqValue(a, &names, true);
+    defer a.free(v);
+    const unknown = [_]zidl_rt.RawParam{.{ .pid = PidTable.PARTITION_LEGACY, .bytes = v }};
+
+    // declared member absent → legacy path (and legacy wins even when present).
+    const NoDeclared = @as(@FieldType(Disc.DiscoveredWriterData, "partition"), null);
+    const got = try partitionNamesOwned(a, &unknown, NoDeclared, true);
+    defer a.free(got);
+    try testing.expectEqual(@as(usize, 40), got.len);
+    try testing.expectEqualStrings("p39", got[39]);
 }

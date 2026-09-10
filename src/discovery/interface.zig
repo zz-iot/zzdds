@@ -72,20 +72,6 @@ pub fn discUserData(q: anytype) []const u8 {
     return b[0..u._length];
 }
 
-/// Read a `DiscoveredReaderData` / `DiscoveredWriterData` `partition` sequence
-/// (`?[*][*:0]const u8`) into a caller-provided buffer of slices. Returns the
-/// used prefix. The generated struct stores NUL-terminated strings; callers
-/// that want `[]const []const u8` (e.g. `qos_match.checkPartition`) go through
-/// this. `sedp.zig` also fills `WriterData.partition_names` this way so match
-/// sites need not re-parse.
-pub fn partitionNames(opt_seq: anytype, buf: [][]const u8) []const []const u8 {
-    const s = opt_seq orelse return &.{};
-    const b = s._buffer orelse return &.{};
-    const n = @min(@as(usize, s._length), buf.len);
-    for (0..n) |i| buf[i] = std.mem.span(b[i]);
-    return buf[0..n];
-}
-
 /// Information about the local participant broadcast to remote peers.
 pub const ParticipantAnnouncement = struct {
     guid: Guid,
@@ -206,8 +192,10 @@ pub const WriterData = struct {
     /// The decoded RTPS wire QoS, borrowed for the callback's duration.
     /// `unknown_params` retains every unrecognised PID verbatim (lossless).
     qos: *const DiscoveredWriterData,
-    /// PARTITION names, parsed from `qos.partition` into a call-lifetime view
-    /// so match sites need not re-walk the sequence.
+    /// PARTITION names for this writer — the legacy PID_PARTITION (0x0035)
+    /// sequence when the peer sent that, else the decoded `qos.partition`
+    /// member. Materialised by `sedp.zig` so match sites need not re-walk the
+    /// sequence; borrowed for the callback's duration (the consumer deep-copies).
     partition_names: []const []const u8 = &.{},
     /// Unicast locators for direct writer → reader messaging.
     unicast_locators: []const Locator,

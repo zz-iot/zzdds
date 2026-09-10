@@ -500,6 +500,18 @@ Scoped down by the spike: no big-endian reader work (§S4), no `raw_encoded` fie
   do not fix it here.
 * **XTypes / Security blobs** (`PID_TYPE_INFORMATION`, future secure-discovery PIDs) now
   round-trip through retention with no code — a positive, and a fixture case.
+* **PARTITION decode edges.** Two things a hand-parse of the decoded struct must get
+  right. (1) A peer that sends `PID_PARTITION` as the legacy PID `0x0035` lands it in
+  `unknown_params` (the generated switch keys on `@id` `0x0029`). `sedp.zig`
+  `legacyPartitionSeq` parses that retained value as a CDR `sequence<string>` — and must
+  read its sequence count and string lengths with the **payload's byte order**, since
+  retained param bytes are stored verbatim and `CdrReader` accepts `PL_CDR_BE` too
+  (`DecodedEndpoint.little_endian` carries it). (2) `partition` is an unbounded
+  `sequence<string>`; materialising it (declared member or legacy) into a fixed stack
+  buffer silently drops names past the cap and breaks matching for an endpoint that
+  advertises many partitions. `partitionNamesOwned` heap-allocates to the actual count
+  (freed after the callback; the consumer deep-copies). Both are `sedp_test.zig` /
+  in-file `sedp.zig` regression cases.
 * **`@pl_retain_unknown` touches `deinit`/`clone` codegen.** The retained-slice field means
   structs that were previously cleanup-free now need a generated `deinit` — verify the
   backend's `structNeedsCleanup` path picks that up and that `clone` deep-copies
