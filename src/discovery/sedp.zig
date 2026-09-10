@@ -109,7 +109,7 @@ fn emitPlCdr(comptime T: type, alloc: std.mem.Allocator, value: T) ![]u8 {
 pub fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![]u8 {
     var out = adapter.writerDiscoveredData(ann.qos, ann.presentation);
     out.writerGuid = guidBytes(ann.guid);
-    if (ann.group_guid) |gg| out.groupGuid = .{ .value = guidBytes(gg) };
+    if (ann.group_guid) |gg| out.groupGuid = guidBytes(gg);
     out.topicName = ann.topic_name;
     out.typeName = ann.type_name;
 
@@ -191,10 +191,9 @@ pub fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement
 
 /// Decoded remote endpoint: owns the generated wire struct — whose
 /// `unknown_params` retains every unrecognised PID verbatim — plus the
-/// transport-typed per-endpoint locator slices (rare; parsed out of
-/// `unknown_params` since `DiscoveredWriterData` / `DiscoveredReaderData` carry
-/// no locator members — zzdds never emits them and a `@optional @pl_repeated`
-/// member's generated `deinit`/`clone` is currently miscompiled).
+/// transport-typed per-endpoint locator slices converted from its
+/// `unicastLocatorList` / `multicastLocatorList` members (rare; zzdds never
+/// emits per-endpoint locators, but a remote peer may).
 fn DecodedEndpoint(comptime T: type) type {
     return struct {
         const Self2 = @This();
@@ -211,26 +210,17 @@ fn DecodedEndpoint(comptime T: type) type {
     };
 }
 
-/// Collect every 24-byte `Locator_t` carried under `pid` in `unknown_params`
-/// (RTPS repeated-parameter encoding: one PID entry per locator).
-fn locatorsFromUnknown(alloc: std.mem.Allocator, unknown: []const zidl_rt.RawParam, pid: u16) ![]Locator {
-    var n: usize = 0;
-    for (unknown) |rp| {
-        if (rp.pid == pid and rp.bytes.len >= 24) n += 1;
-    }
+/// Convert a decoded `@pl_repeated sequence<Locator_t>` member to owned
+/// transport `Locator`s.
+fn wireLocatorsOwned(alloc: std.mem.Allocator, opt_seq: anytype) ![]Locator {
+    const s = opt_seq orelse return alloc.alloc(Locator, 0);
+    const b = s._buffer orelse return alloc.alloc(Locator, 0);
+    const n: usize = s._length;
     const out = try alloc.alloc(Locator, n);
     errdefer alloc.free(out);
-    var i: usize = 0;
-    for (unknown) |rp| {
-        if (rp.pid != pid or rp.bytes.len < 24) continue;
-        const v = rp.bytes;
-        const lw = LocatorWire{
-            .kind = @bitCast(readU32LE(v[0..], true)),
-            .port = readU32LE(v[4..], true),
-            .address = v[8..24].*,
-        };
+    for (0..n) |i| {
+        const lw = LocatorWire{ .kind = b[i].kind, .port = b[i].port_number, .address = b[i].address };
         out[i] = lw.toLocator();
-        i += 1;
     }
     return out;
 }
@@ -244,9 +234,9 @@ fn decodeEndpointT(comptime T: type, alloc: std.mem.Allocator, payload: []const 
     // misaligned length — matches the old hand parser's leniency. The native
     // path never uses `.strict` (reserved for a broker's ingress validation).
     try T.deserializeFromPlCdr(&data, &r, alloc, .lenient);
-    const uc = try locatorsFromUnknown(alloc, data.unknown_params, PidTable.UNICAST_LOCATOR);
+    const uc = try wireLocatorsOwned(alloc, data.unicastLocatorList);
     errdefer alloc.free(uc);
-    const mc = try locatorsFromUnknown(alloc, data.unknown_params, PidTable.MULTICAST_LOCATOR);
+    const mc = try wireLocatorsOwned(alloc, data.multicastLocatorList);
     return .{ .data = data, .unicast = uc, .multicast = mc, .alloc = alloc };
 }
 

@@ -10,15 +10,13 @@ Implementation notes (2026-09-10):
   `qos_match.checkWriterReader`/`checkPresentation` are deleted; matching is
   `qos_match.checkDiscovered` over the RTPS structs.
 - SPDP encode/decode remain hand-rolled (no QoS; broker-retention swap deferred).
-- `PID_TYPE_INFORMATION` (opaque blob) and per-endpoint `PID_UNICAST_LOCATOR` /
-  `PID_MULTICAST_LOCATOR` are carried via `unknown_params`, not declared members.
-- Two zidl Zig-backend `@optional` codegen bugs surfaced when the codec was first
-  *called* (it was previously built-but-unused): `@optional octet[N]` (array dim lost)
-  and `@optional sequence<>` (decode type mismatch + non-unwrapping deinit/clone).
-  Worked around with a `@final struct Guid16` wrapper and by making `userData`/`partition`
-  non-optional (empty PID emitted on default QoS — spec-legal). Restore `@optional` after
-  the upstream fix. See `docs/roadmap.md` → Discovery / RTPS / transport.
-- Three spec-legal wire deltas from the pre-codec hand encoders, documented in
+- `PID_TYPE_INFORMATION` (an opaque blob, no CDR length prefix) is the one parameter with
+  no declared member — the SEDP writer wrapper injects it via `unknown_params`.
+- Two zidl Zig-backend `@optional` codegen bugs surfaced when the codec was first *called*
+  (it was previously built-but-unused): `@optional octet[N]` (array dimension lost) and
+  `@optional sequence<>` (decode type mismatch + non-unwrapping `deinit`/`clone`). Fixed in
+  zidl v0.3.14; `rtps_discovery.idl` uses the plain `@optional` forms.
+- Two spec-legal wire deltas from the pre-codec hand encoders, documented in
   `test/discovery/wire_golden_test.zig` and `docs/decisions.md`; the live interop suite is
   the gate.
 

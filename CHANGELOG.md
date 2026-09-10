@@ -24,10 +24,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - **Wire deltas** (all spec-legal; `test/discovery/wire_golden_test.zig` is the contract,
   validated against the live interop suite): a default writer/reader now advertises
   `PID_DATA_REPRESENTATION [2]` (matching the real `reprFromQos` path, not the old golden
-  capture); an empty `PID_USER_DATA` / `PID_PARTITION` is emitted where nothing was before
-  (a zidl `@optional sequence<>` codegen limitation — see `docs/roadmap.md`);
-  `PID_TYPE_INFORMATION` is replayed after `PID_PARTITION` rather than before.
+  capture); `PID_TYPE_INFORMATION` is replayed after `PID_PARTITION` rather than before.
 - SPDP encode/decode is unchanged (hand-rolled — it carries no QoS).
+- zidl pin → `v0.3.14-zig.0.16.0` (fixes `@optional` sequence / array codegen the SEDP
+  structs rely on).
 
 ## 2026-09-03
 

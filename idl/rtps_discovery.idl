@@ -27,8 +27,8 @@
 // `unknown_params: []zidl_rt.RawParam`, replayed verbatim by serializePlCdr
 // before the sentinel. This is how the discovery codec stays lossless for a
 // broker relay (docs/design/discovery-broker.md) and how the SEDP writer
-// encode path re-injects PID_TYPE_INFORMATION / PID_PARTITION in wire order
-// (see src/discovery/sedp.zig): those two are NOT declared members here.
+// encode path re-injects PID_TYPE_INFORMATION (an opaque blob) in wire order
+// (see src/discovery/sedp.zig): it is the one PL_CDR parameter with no member.
 
 // ── Primitive wire types (inline; no include) ─────────────────────────────
 
@@ -46,21 +46,6 @@
     unsigned long port_number;
     octet         address[16];
 };
-
-// A 16-byte GUID (prefix[12] + entityId[4]) as an @optional member. A bare
-// `@optional octet x[16]` member currently loses its array dimension in the
-// zidl Zig backend's field type, so the wrapper struct is required.
-@final struct Guid16 { octet value[16]; };
-
-// NOTE: `userData` and `partition` are declared as NON-optional sequences (not
-// `@optional`). The zidl Zig PL_CDR backend currently miscompiles an
-// `@optional sequence<...>` member on both the decode path (`out.x = <local
-// anon extern>` type mismatch) and the generated `deinit`/`clone` (calls
-// `.deinit`/`.clone` on the `?` without unwrapping). A non-optional sequence
-// is always emitted — an empty `PID_USER_DATA` / `PID_PARTITION` (`[u32 0]`)
-// where the hand encoder emitted nothing. That is spec-legal (an empty
-// sequence; peers treat an empty PARTITION list as the default `[""]`), and is
-// validated by the live interop suite. Fix upstream, then restore `@optional`.
 
 // RTPS Duration_t (§9.3.2.3): time = seconds + fraction/2^32.  Used for ALL
 // Duration values in SPDP/SEDP ParameterLists (there is no "direct nanoseconds"
@@ -129,10 +114,12 @@ struct SPDPdiscoveredParticipantData {
 @mutable @pl_retain_unknown
 struct DiscoveredWriterData {
     @id(0x005A)           octet             writerGuid[16];     // PID_ENDPOINT_GUID
-    @id(0x0052) @optional Guid16            groupGuid;          // PID_GROUP_GUID (GROUP publisher only)
+    @id(0x0052) @optional octet            groupGuid[16];      // PID_GROUP_GUID (GROUP publisher only)
     @id(0x0005)           string            topicName;
     @id(0x0007)           string            typeName;
-    @id(0x002C)           sequence<octet>   userData;           // always emitted (empty seq when unset)
+    @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;   // decode only; zzdds never emits per-endpoint locators
+    @id(0x0030) @optional @pl_repeated sequence<Locator_t> multicastLocatorList; // decode only
+    @id(0x002C) @optional sequence<octet>   userData;           // omitted when empty
     @id(0x001A)           ReliabilityWire   reliability;
     @id(0x001D)           unsigned long     durabilityKind;
     @id(0x0021) @optional PresentationWire  presentation;       // omitted at spec default
@@ -145,7 +132,7 @@ struct DiscoveredWriterData {
     @id(0x0040)           HistoryWire       history;
     @id(0x002B) @optional Duration_t        lifespan;           // omitted when INFINITE
     @id(0x0073)           sequence<short>   dataRepresentation; // always a 1-element seq ([0]=XCDR1, [2]=XCDR2)
-    @id(0x0029)           sequence<string>  partition;          // PID_PARTITION; always emitted (empty seq when unset)
+    @id(0x0029) @optional sequence<string>  partition;          // PID_PARTITION; omitted when empty
 };
 
 // ── DiscoveredReaderData (§8.5.4.3, §9.6.2.3) ───────────────────────────────
@@ -163,7 +150,9 @@ struct DiscoveredReaderData {
     @id(0x005A)           octet             readerGuid[16];     // PID_ENDPOINT_GUID
     @id(0x0005)           string            topicName;
     @id(0x0007)           string            typeName;
-    @id(0x002C)           sequence<octet>   userData;           // always emitted (empty seq when unset)
+    @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;   // decode only
+    @id(0x0030) @optional @pl_repeated sequence<Locator_t> multicastLocatorList; // decode only
+    @id(0x002C) @optional sequence<octet>   userData;           // omitted when empty
     @id(0x001A)           ReliabilityWire   reliability;
     @id(0x001D)           unsigned long     durabilityKind;
     @id(0x001F)           unsigned long     ownershipKind;
@@ -173,7 +162,7 @@ struct DiscoveredReaderData {
     @id(0x0023) @optional Duration_t        deadline;           // omitted when INFINITE
     @id(0x0027) @optional Duration_t        latencyBudget;      // decode only; never emitted
     @id(0x001B) @optional LivelinessWire    liveliness;         // omitted at AUTOMATIC + INFINITE
-    @id(0x0029)           sequence<string>  partition;          // PID_PARTITION; always emitted (empty seq when unset)
+    @id(0x0029) @optional sequence<string>  partition;          // PID_PARTITION; omitted when empty
 };
 
 // ── EndpointDisposal ───────────────────────────────────────────────────────

@@ -67,8 +67,9 @@ pub fn discDestOrderKind(q: anytype) u8 {
 }
 /// USER_DATA bytes, borrowed from the struct; empty when absent.
 pub fn discUserData(q: anytype) []const u8 {
-    const b = q.userData._buffer orelse return &.{};
-    return b[0..q.userData._length];
+    const u = q.userData orelse return &.{};
+    const b = u._buffer orelse return &.{};
+    return b[0..u._length];
 }
 
 /// Read a `DiscoveredReaderData` / `DiscoveredWriterData` `partition` sequence
@@ -77,9 +78,10 @@ pub fn discUserData(q: anytype) []const u8 {
 /// that want `[]const []const u8` (e.g. `qos_match.checkPartition`) go through
 /// this. `sedp.zig` also fills `WriterData.partition_names` this way so match
 /// sites need not re-parse.
-pub fn partitionNames(seq: anytype, buf: [][]const u8) []const []const u8 {
-    const b = seq._buffer orelse return &.{};
-    const n = @min(@as(usize, seq._length), buf.len);
+pub fn partitionNames(opt_seq: anytype, buf: [][]const u8) []const []const u8 {
+    const s = opt_seq orelse return &.{};
+    const b = s._buffer orelse return &.{};
+    const n = @min(@as(usize, s._length), buf.len);
     for (0..n) |i| buf[i] = std.mem.span(b[i]);
     return buf[0..n];
 }

@@ -60,19 +60,17 @@ to/from the wire structs; the old flat `disc.QosSnapshot`, `writerQosSnapshot` /
 (`qos_match.checkDiscovered`) runs directly on the RTPS structs. The native decode path
 uses `.lenient` mode (skip/retain unknowns, tolerate a truncated tail); `.strict` is
 reserved for a broker's ingress validation. SPDP encode/decode remains hand-rolled for now
-(it carries no QoS). `PID_TYPE_INFORMATION` (an opaque XTypes blob, no CDR length prefix)
-and per-endpoint `PID_UNICAST_LOCATOR` / `PID_MULTICAST_LOCATOR` are not declared members —
-the SEDP wrapper injects/extracts them via `unknown_params`.
+(it carries no QoS). `PID_TYPE_INFORMATION` (an opaque XTypes blob with no CDR length
+prefix — zidl has no raw-bytes member type) is the one parameter with no declared member:
+the SEDP writer wrapper injects it via `unknown_params` (replayed before the sentinel) and
+the decode wrapper reads it back out.
 
 **Wire deltas from the pre-codec hand encoders (all spec-legal; `test/discovery/wire_golden_test.zig`
 is the contract, live interop is the gate):** (1) a default writer/reader now emits
 `PID_DATA_REPRESENTATION [2]` (XCDR2 acceptance) — the real announce path always ran
-`reprFromQos`; the old golden capture had `[0]` only because it bypassed it. (2) An empty
-`PID_USER_DATA` / `PID_PARTITION` (`[u32 0]`) is emitted where the hand encoder emitted
-nothing — a zidl `@optional sequence<>` codegen limitation forces those members
-non-optional; restore `@optional` once fixed upstream. (3) `PID_TYPE_INFORMATION` is
-replayed after `PID_PARTITION` rather than before (PL_CDR parameter order is not
-significant, RTPS §9.6.2.1).
+`reprFromQos`; the old golden capture had `[0]` only because it bypassed it. (2)
+`PID_TYPE_INFORMATION` is replayed after `PID_PARTITION` rather than before (PL_CDR
+parameter order is not significant, RTPS §9.6.2.1).
 
 **BEST_EFFORT late-join replay is a TRANSIENT_LOCAL courtesy, not reliability.**
 For TRANSIENT_LOCAL writers, `StatefulWriter` replays the current writer cache to a newly

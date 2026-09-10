@@ -86,7 +86,14 @@ fn reprSeq(comptime FT: type, xcdr2: bool) FT {
     };
 }
 
-fn octetSeq(comptime FT: type, bytes: []const u8) FT {
+fn OptChild(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+}
+
+fn octetSeq(comptime FT: type, bytes: []const u8) OptChild(FT) {
     return .{
         ._maximum = @intCast(bytes.len),
         ._length = @intCast(bytes.len),
@@ -138,7 +145,7 @@ pub fn writerDiscoveredData(
             .max_blocking_time = .{ .seconds = 0, .fraction = 0 },
         },
         .durabilityKind = @intFromEnum(qos.durability.kind),
-        .userData = if (ud.len > 0) octetSeq(@FieldType(wire.DiscoveredWriterData, "userData"), ud) else .{},
+        .userData = if (ud.len > 0) octetSeq(@FieldType(wire.DiscoveredWriterData, "userData"), ud) else null,
         .presentation = presentationWire(presentation),
         .deadline = if (durUnset(qos.deadline.period.sec, qos.deadline.period.nanosec))
             null
@@ -194,7 +201,7 @@ pub fn readerDiscoveredData(
         // MATCH ONLY: `encodeReaderData` nulls this before serialize so the
         // reader wire is unchanged (readers historically never emit it).
         .destinationOrder = @intFromEnum(qos.destination_order.kind),
-        .userData = if (ud.len > 0) octetSeq(@FieldType(wire.DiscoveredReaderData, "userData"), ud) else .{},
+        .userData = if (ud.len > 0) octetSeq(@FieldType(wire.DiscoveredReaderData, "userData"), ud) else null,
         .presentation = presentationWire(presentation),
         .deadline = if (durUnset(qos.deadline.period.sec, qos.deadline.period.nanosec))
             null
