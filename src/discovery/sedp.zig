@@ -12,17 +12,21 @@
 //! matching is performed via dcps/qos_match.zig, and the appropriate discovery callback
 //! fires (on_writer_discovered / on_reader_discovered).
 //!
-//! PL-CDR encoding is hand-written (no dependency on zidl-generated code here).
+//! PL-CDR encode/decode goes through the zidl-generated codec in
+//! `idl/rtps_discovery.idl` (imported as `Disc`); QoS is mapped to/from the
+//! wire structs by `qos_adapter.zig`.
 
 const std = @import("std");
 const log = @import("../log.zig");
 const trace = @import("../trace.zig");
 const iface = @import("interface.zig");
+const adapter = @import("qos_adapter.zig");
 const tr_iface = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const pid_mod = @import("../rtps/pid.zig");
-const qos_mod = @import("../qos/policy.zig");
 const qm_mod = @import("../dcps/qos_match.zig");
+const zidl_rt = @import("zidl_rt");
+const Disc = @import("zzdds_disc_generated");
 const writer_sm_mod = @import("../rtps/writer_sm.zig");
 const reader_sm_mod = @import("../rtps/reader_sm.zig");
 const builtin_endpoint_mod = @import("builtin_endpoint.zig");
@@ -55,574 +59,228 @@ const WriterAnnouncement = iface.WriterAnnouncement;
 const ReaderAnnouncement = iface.ReaderAnnouncement;
 const WriterData = iface.WriterData;
 const ReaderData = iface.ReaderData;
-const QosSnapshot = iface.QosSnapshot;
 const PidTable = pid_mod.PidTable;
 const BuiltinEndpointSet = pid_mod.BuiltinEndpointSet;
 const BuiltinPair = builtin_endpoint_mod.BuiltinPair;
 
 const PLCDR_LE_ENCAP: [4]u8 = .{ 0x00, 0x03, 0x00, 0x00 };
 
-// ── Helpers for PL-CDR I/O ────────────────────────────────────────────────────
-
-fn writePidHdr(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), pid: u16, length: u16) !void {
-    var hdr: [4]u8 = undefined;
-    std.mem.writeInt(u16, hdr[0..2], pid, .little);
-    std.mem.writeInt(u16, hdr[2..4], length, .little);
-    try buf.appendSlice(alloc, &hdr);
-}
-fn writeU32Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: u32) !void {
-    var b: [4]u8 = undefined;
-    std.mem.writeInt(u32, &b, v, .little);
-    try buf.appendSlice(alloc, &b);
-}
-fn writeI32Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: i32) !void {
-    try writeU32Le(alloc, buf, @bitCast(v));
-}
-fn writeI16Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: i16) !void {
-    var b: [2]u8 = undefined;
-    std.mem.writeInt(i16, &b, v, .little);
-    try buf.appendSlice(alloc, &b);
-}
-fn writeLocator(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), loc: Locator) !void {
-    const w = loc.toRtpsWire();
-    try writeI32Le(alloc, buf, w.kind);
-    try writeU32Le(alloc, buf, w.port);
-    try buf.appendSlice(alloc, &w.address);
-}
-
-fn writePartitionPid(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), names: []const []const u8) !void {
-    // Compute payload size: seq_len(4) + sum of (len_field(4) + padded_data) per name.
-    var payload: usize = 4; // sequence length field
-    for (names) |name| {
-        const slen: usize = name.len + 1; // +1 for null terminator
-        payload += 4 + ((slen + 3) & ~@as(usize, 3));
-    }
-    try writePidHdr(alloc, buf, PidTable.PARTITION, @intCast(payload));
-    try writeU32Le(alloc, buf, @intCast(names.len));
-    for (names) |name| {
-        const slen: u32 = @intCast(name.len + 1);
-        try writeU32Le(alloc, buf, slen);
-        try buf.appendSlice(alloc, name);
-        try buf.append(alloc, 0); // null terminator
-        const padded: usize = (slen + 3) & ~@as(usize, 3);
-        var p: usize = padded - slen;
-        while (p > 0) : (p -= 1) try buf.append(alloc, 0);
-    }
-}
-
-fn writeUserDataPid(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), value: []const u8) !void {
-    if (value.len == 0) return;
-    const payload_len = 4 + value.len;
-    const padded_len = (payload_len + 3) & ~@as(usize, 3);
-    try writePidHdr(alloc, buf, PidTable.USER_DATA, @intCast(padded_len));
-    try writeU32Le(alloc, buf, @intCast(value.len));
-    try buf.appendSlice(alloc, value);
-    try buf.appendNTimes(alloc, 0, padded_len - payload_len);
-}
+// ── PL-CDR I/O helpers (decode side; encode goes through the generated codec) ─
 
 fn readU16LE(b: []const u8, le: bool) u16 {
     return std.mem.readInt(u16, b[0..2], if (le) .little else .big);
 }
-fn readI16LE(b: []const u8, le: bool) i16 {
-    return @bitCast(readU16LE(b, le));
-}
 fn readU32LE(b: []const u8, le: bool) u32 {
     return std.mem.readInt(u32, b[0..4], if (le) .little else .big);
 }
-fn readI32LE(b: []const u8, le: bool) i32 {
-    return @bitCast(readU32LE(b, le));
-}
-fn readLocator(b: []const u8, le: bool) Locator {
-    const kind = readI32LE(b[0..], le);
-    const port = readU32LE(b[4..], le);
-    var addr: [16]u8 = undefined;
-    @memcpy(&addr, b[8..24]);
-    const wire = LocatorWire{ .kind = kind, .port = port, .address = addr };
-    return wire.toLocator();
-}
-fn readString(b: []const u8, le: bool) []const u8 {
-    if (b.len < 4) return "";
-    const slen = readU32LE(b[0..], le);
-    if (slen == 0 or b.len < 4 + slen) return "";
-    const end = 4 + slen - 1; // strip null
-    return b[4..end];
-}
-// RTPS 2.5 §9.3.2.3: Duration_t is {seconds: long, fraction: unsigned long},
-// with time = seconds + fraction/2^32, for ALL types appearing within
-// submessages or Built-in Topic Data (i.e. SEDP/SPDP ParameterLists use the
-// same wire Duration_t as inline QoS — there is no separate "direct
-// nanoseconds" encoding).
-fn readDeadlineDuration(b: []const u8, le: bool) time_mod.Duration {
-    if (b.len < 8) return time_mod.Duration.infinite;
-    const rd = time_mod.RtpsDuration{ .seconds = readI32LE(b[0..], le), .fraction = readU32LE(b[4..], le) };
-    if (rd.isInfinite()) return time_mod.Duration.infinite;
-    return rd.toDuration();
+
+/// Build the 16-byte on-wire GUID (prefix[12] + entityId[4]) from a `Guid`.
+fn guidBytes(g: Guid) [16]u8 {
+    var b: [16]u8 = undefined;
+    @memcpy(b[0..12], &g.prefix.bytes);
+    b[12] = g.entity_id.entity_key[0];
+    b[13] = g.entity_id.entity_key[1];
+    b[14] = g.entity_id.entity_key[2];
+    b[15] = g.entity_id.entity_kind;
+    return b;
 }
 
-fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
-    try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
+/// Parse a 16-byte on-wire GUID back into a `Guid`.
+fn guidFromBytes(b: []const u8) Guid {
+    return .{
+        .prefix = .{ .bytes = b[0..12].* },
+        .entity_id = .{ .entity_key = b[12..15].*, .entity_kind = b[15] },
+    };
 }
 
-fn snapshotDeadlineDuration(qos: QosSnapshot) time_mod.Duration {
-    return .{ .sec = qos.deadline_sec, .nanosec = qos.deadline_nanosec };
-}
-
-fn snapshotLivelinessDuration(qos: QosSnapshot) time_mod.Duration {
-    return .{ .sec = qos.liveliness_lease_sec, .nanosec = qos.liveliness_lease_nanosec };
-}
-
-/// PID_LIVELINESS (RTPS 2.5 §9.6.3.7, 0x001b): kind(u32, 4 bytes) +
-/// lease_duration(RtpsDuration, 8 bytes) = 12 bytes total.
-///
-/// Only emitted when non-default (AUTOMATIC + INFINITE) -- same "omit a PID
-/// that equals the spec default" convention PID_DEADLINE/PID_LIFESPAN already
-/// use above, not a workaround for a real cross-vendor incompatibility:
-/// `writeRtpsDuration` already encodes DDS Duration_t's INFINITE sentinel as
-/// RTPS's own spec-defined DURATION_INFINITE (seconds=0x7fffffff,
-/// fraction=0xffffffff, RTPS 2.5 §9.3.2) via `RtpsDuration.fromDuration`'s
-/// existing `isInfinite()` special case -- exactly what Cyclone DDS sends,
-/// and what OpenDDS's own spec-compliance flag (used in OpenDDS's own interop
-/// test suite, not its default for backwards-compatibility reasons) expects.
-/// There is no real incompatibility to avoid here.
-///
-/// This PID used to be omitted *unconditionally*, meaning any non-default
-/// LIVELINESS (a kind other than AUTOMATIC, or a finite lease) was silently
-/// invisible to a remote peer regardless of configuration -- `checkSnapshots`
-/// always saw AUTOMATIC+INFINITE for the remote side, so `on_liveliness_changed`/
-/// `on_liveliness_lost` could never fire for a real cross-process peer under
-/// any QoS configuration, and RxO liveliness-kind compatibility was evaluated
-/// against a value that was never what the remote peer actually configured.
-/// The decode side (`PidTable.LIVELINESS` in the switch below) was already
-/// fully implemented and correct -- only the encode side omitted it. Found
-/// building zzdds-examples' `presence` example (first real end-to-end
-/// cross-process exercise of a non-default LIVELINESS QoS in this project).
-fn writeLivelinessPid(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), qos: QosSnapshot) !void {
-    const is_default = qos.liveliness_kind == 0 and
-        qos.liveliness_lease_sec == 0x7fff_ffff and
-        qos.liveliness_lease_nanosec == 0xffff_ffff;
-    if (is_default) return;
-    try writePidHdr(alloc, buf, PidTable.LIVELINESS, 12);
-    try writeU32Le(alloc, buf, qos.liveliness_kind);
-    try writeRtpsDuration(alloc, buf, snapshotLivelinessDuration(qos));
+/// Serialize a `Disc.*` PL_CDR struct to a heap slice (encap header + params +
+/// sentinel), owned by the caller.
+fn emitPlCdr(comptime T: type, alloc: std.mem.Allocator, value: T) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    var w = zidl_rt.PlCdrWriter.init(&buf, alloc);
+    try w.writeEncapHeader();
+    try T.serializePlCdr(&w, value);
+    return buf.toOwnedSlice(alloc);
 }
 
 // ── DiscoveredWriterData encoding ─────────────────────────────────────────────
 
 pub fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    try buf.appendSlice(alloc, &PLCDR_LE_ENCAP);
+    var out = adapter.writerDiscoveredData(ann.qos, ann.presentation);
+    out.writerGuid = guidBytes(ann.guid);
+    if (ann.group_guid) |gg| out.groupGuid = .{ .value = guidBytes(gg) };
+    out.topicName = ann.topic_name;
+    out.typeName = ann.type_name;
 
-    // PID_ENDPOINT_GUID (0x005A): 16 bytes
-    try writePidHdr(alloc, &buf, PidTable.ENDPOINT_GUID, 16);
-    try buf.appendSlice(alloc, &ann.guid.prefix.bytes);
-    try buf.appendSlice(alloc, &[_]u8{
-        ann.guid.entity_id.entity_key[0],
-        ann.guid.entity_id.entity_key[1],
-        ann.guid.entity_id.entity_key[2],
-        ann.guid.entity_id.entity_kind,
-    });
-
-    // PID_GROUP_GUID (0x0052): 16 bytes — publisher group GUID for GROUP coherent sets.
-    // Required so that Connext GROUP subscribers can associate writers into the same
-    // coherent group (publisherKey in PublicationBuiltinTopicData).
-    if (ann.group_guid) |gg| {
-        try writePidHdr(alloc, &buf, PidTable.GROUP_GUID, 16);
-        try buf.appendSlice(alloc, &gg.prefix.bytes);
-        try buf.appendSlice(alloc, &[_]u8{
-            gg.entity_id.entity_key[0],
-            gg.entity_id.entity_key[1],
-            gg.entity_id.entity_key[2],
-            gg.entity_id.entity_kind,
-        });
+    // PID_PARTITION: NUL-terminate the names for the generated seq<string>.
+    var part_ptrs: std.ArrayList([*:0]const u8) = .empty;
+    defer {
+        for (part_ptrs.items) |p| alloc.free(std.mem.span(p));
+        part_ptrs.deinit(alloc);
+    }
+    if (ann.partition_names.len > 0) {
+        for (ann.partition_names) |name| {
+            const z = try alloc.dupeZ(u8, name);
+            part_ptrs.append(alloc, z.ptr) catch |e| {
+                alloc.free(z);
+                return e;
+            };
+        }
+        out.partition = .{
+            ._maximum = @intCast(part_ptrs.items.len),
+            ._length = @intCast(part_ptrs.items.len),
+            ._buffer = part_ptrs.items.ptr,
+            ._release = false,
+        };
     }
 
-    // PID_TOPIC_NAME (0x0005)
-    {
-        const slen: u32 = @intCast(ann.topic_name.len + 1);
-        const total: u32 = 4 + slen;
-        const padded: u16 = @intCast((total + 3) & ~@as(u32, 3));
-        try writePidHdr(alloc, &buf, PidTable.TOPIC_NAME, padded);
-        try writeU32Le(alloc, &buf, slen);
-        try buf.appendSlice(alloc, ann.topic_name);
-        try buf.append(alloc, 0);
-        var p: usize = padded - total;
-        while (p > 0) : (p -= 1) try buf.append(alloc, 0);
-    }
-
-    // PID_TYPE_NAME (0x0007)
-    {
-        const slen: u32 = @intCast(ann.type_name.len + 1);
-        const total: u32 = 4 + slen;
-        const padded: u16 = @intCast((total + 3) & ~@as(u32, 3));
-        try writePidHdr(alloc, &buf, PidTable.TYPE_NAME, padded);
-        try writeU32Le(alloc, &buf, slen);
-        try buf.appendSlice(alloc, ann.type_name);
-        try buf.append(alloc, 0);
-        var p: usize = padded - total;
-        while (p > 0) : (p -= 1) try buf.append(alloc, 0);
-    }
-
-    try writeUserDataPid(alloc, &buf, ann.qos.user_data);
-
-    // QoS policies.
-
-    // RTPS wire reliability: 1=BEST_EFFORT, 2=RELIABLE (DDS API: 0/1 → add 1 on wire).
-    // PID_RELIABILITY is 12 bytes: kind (4) + max_blocking_time Duration_t (8).
-    try writePidHdr(alloc, &buf, PidTable.RELIABILITY, 12);
-    try writeU32Le(alloc, &buf, @as(u32, ann.qos.reliability_kind) + 1);
-    try writeRtpsDuration(alloc, &buf, time_mod.Duration.zero); // max_blocking_time
-    try writePidHdr(alloc, &buf, PidTable.DURABILITY, 4);
-    try writeU32Le(alloc, &buf, ann.qos.durability_kind);
-    // PID_PRESENTATION: access_scope(u32) + coherent_access(u8) + ordered_access(u8) + pad(2) = 8 bytes.
-    // Only emit when non-default (any field non-zero) to avoid breaking peers that don't parse it.
-    if (ann.qos.presentation_access_scope != 0 or ann.qos.coherent_access or ann.qos.ordered_access) {
-        try writePidHdr(alloc, &buf, PidTable.PRESENTATION, 8);
-        try writeU32Le(alloc, &buf, ann.qos.presentation_access_scope);
-        try buf.append(alloc, @intFromBool(ann.qos.coherent_access));
-        try buf.append(alloc, @intFromBool(ann.qos.ordered_access));
-        try buf.appendSlice(alloc, &[_]u8{ 0, 0 }); // padding
-    }
-    // PID_DEADLINE: only emitted when not INFINITE; omitting INFINITE avoids
-    // encoding differences between implementations.
-    if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0xffff_ffff) {
-        try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
-    }
-    try writeLivelinessPid(alloc, &buf, ann.qos);
-    try writePidHdr(alloc, &buf, PidTable.OWNERSHIP, 4);
-    try writeU32Le(alloc, &buf, ann.qos.ownership_kind);
-    if (ann.qos.ownership_kind != 0) {
-        try writePidHdr(alloc, &buf, PidTable.OWNERSHIP_STRENGTH, 4);
-        try writeI32Le(alloc, &buf, ann.qos.ownership_strength);
-    }
-    try writePidHdr(alloc, &buf, PidTable.DESTINATION_ORDER, 4);
-    try writeU32Le(alloc, &buf, ann.qos.destination_order_kind);
-    try writePidHdr(alloc, &buf, PidTable.HISTORY, 8);
-    try writeU32Le(alloc, &buf, ann.qos.history_kind);
-    try writeI32Le(alloc, &buf, ann.qos.history_depth);
-    // PID_LIFESPAN: only emitted when not INFINITE (same pattern as DEADLINE).
-    if (ann.qos.lifespan_sec != 0x7fff_ffff or ann.qos.lifespan_nanosec != 0xffff_ffff) {
-        try writePidHdr(alloc, &buf, PidTable.LIFESPAN, 8);
-        try writeRtpsDuration(alloc, &buf, .{ .sec = ann.qos.lifespan_sec, .nanosec = ann.qos.lifespan_nanosec });
-    }
-
-    // PID_DATA_REPRESENTATION: seq_len(4) + value(2) + pad(2) = 8 bytes.
-    // Advertise a single representation matching the writer's QoS so that
-    // remote readers using the intersection rule (Cyclone 11, DustDDS) can
-    // correctly determine compatibility.
-    {
-        const repr: i16 = if (ann.qos.data_representation == 2) 2 else 0; // XCDR2=2, XCDR1=0
-        try writePidHdr(alloc, &buf, PidTable.DATA_REPRESENTATION, 8);
-        try writeU32Le(alloc, &buf, 1); // sequence length: 1 element
-        try writeI16Le(alloc, &buf, repr);
-        try writeI16Le(alloc, &buf, 0); // pad to 4-byte boundary
-    }
-
-    // PID_TYPE_INFORMATION (0x0075): CDR2-encoded XTypes TypeInformation blob.
-    // Only emitted when the enable_xtypes build option is set; advertising this
-    // PID without a functioning TypeLookup service causes OpenDDS to stall
-    // endpoint matching waiting for a GET_TYPES response that never arrives.
+    // PID_TYPE_INFORMATION: opaque XTypes blob, injected via unknown_params
+    // (no declared member — see idl/rtps_discovery.idl). Only when XTypes is
+    // built in AND a blob is available (advertising it without a TypeLookup
+    // service stalls OpenDDS endpoint matching).
+    var uparams: [1]zidl_rt.RawParam = undefined;
+    var un: usize = 0;
     if (build_opts.xtypes and ann.type_info_cdr.len > 0) {
-        const tlen: u16 = @intCast((ann.type_info_cdr.len + 3) & ~@as(usize, 3));
-        try writePidHdr(alloc, &buf, PidTable.TYPE_INFORMATION, tlen);
-        try buf.appendSlice(alloc, ann.type_info_cdr);
-        var pad: usize = tlen - ann.type_info_cdr.len;
-        while (pad > 0) : (pad -= 1) try buf.append(alloc, 0);
+        uparams[0] = .{ .pid = 0x0075, .bytes = @constCast(ann.type_info_cdr) };
+        un = 1;
     }
+    out.unknown_params = uparams[0..un];
 
-    // PID_PARTITION (0x0029): CDR sequence<string>. Omitted when default (empty list).
-    if (ann.qos.partition_names.len > 0) {
-        try writePartitionPid(alloc, &buf, ann.qos.partition_names);
-    }
-
-    try buf.appendSlice(alloc, &[_]u8{ 0x01, 0x00, 0x00, 0x00 }); // SENTINEL
-    return buf.toOwnedSlice(alloc);
+    return emitPlCdr(Disc.DiscoveredWriterData, alloc, out);
 }
 
 // ── DiscoveredReaderData encoding ─────────────────────────────────────────────
 
 pub fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    try buf.appendSlice(alloc, &PLCDR_LE_ENCAP);
+    var out = adapter.readerDiscoveredData(ann.qos, ann.presentation);
+    out.readerGuid = guidBytes(ann.guid);
+    out.topicName = ann.topic_name;
+    out.typeName = ann.type_name;
+    // Readers have historically never advertised PID_DESTINATION_ORDER; the
+    // adapter fills it for local QoS matching only. Keep it off the wire.
+    out.destinationOrder = null;
 
-    try writePidHdr(alloc, &buf, PidTable.ENDPOINT_GUID, 16);
-    try buf.appendSlice(alloc, &ann.guid.prefix.bytes);
-    try buf.appendSlice(alloc, &[_]u8{
-        ann.guid.entity_id.entity_key[0],
-        ann.guid.entity_id.entity_key[1],
-        ann.guid.entity_id.entity_key[2],
-        ann.guid.entity_id.entity_kind,
-    });
-
-    {
-        const slen: u32 = @intCast(ann.topic_name.len + 1);
-        const total: u32 = 4 + slen;
-        const padded: u16 = @intCast((total + 3) & ~@as(u32, 3));
-        try writePidHdr(alloc, &buf, PidTable.TOPIC_NAME, padded);
-        try writeU32Le(alloc, &buf, slen);
-        try buf.appendSlice(alloc, ann.topic_name);
-        try buf.append(alloc, 0);
-        var p: usize = padded - total;
-        while (p > 0) : (p -= 1) try buf.append(alloc, 0);
+    var part_ptrs: std.ArrayList([*:0]const u8) = .empty;
+    defer {
+        for (part_ptrs.items) |p| alloc.free(std.mem.span(p));
+        part_ptrs.deinit(alloc);
     }
-    {
-        const slen: u32 = @intCast(ann.type_name.len + 1);
-        const total: u32 = 4 + slen;
-        const padded: u16 = @intCast((total + 3) & ~@as(u32, 3));
-        try writePidHdr(alloc, &buf, PidTable.TYPE_NAME, padded);
-        try writeU32Le(alloc, &buf, slen);
-        try buf.appendSlice(alloc, ann.type_name);
-        try buf.append(alloc, 0);
-        var p: usize = padded - total;
-        while (p > 0) : (p -= 1) try buf.append(alloc, 0);
+    if (ann.partition_names.len > 0) {
+        for (ann.partition_names) |name| {
+            const z = try alloc.dupeZ(u8, name);
+            part_ptrs.append(alloc, z.ptr) catch |e| {
+                alloc.free(z);
+                return e;
+            };
+        }
+        out.partition = .{
+            ._maximum = @intCast(part_ptrs.items.len),
+            ._length = @intCast(part_ptrs.items.len),
+            ._buffer = part_ptrs.items.ptr,
+            ._release = false,
+        };
     }
 
-    try writeUserDataPid(alloc, &buf, ann.qos.user_data);
-
-    // RTPS wire reliability: 1=BEST_EFFORT, 2=RELIABLE (DDS API: 0/1 → add 1 on wire).
-    // PID_RELIABILITY is 12 bytes: kind (4) + max_blocking_time Duration_t (8).
-    try writePidHdr(alloc, &buf, PidTable.RELIABILITY, 12);
-    try writeU32Le(alloc, &buf, @as(u32, ann.qos.reliability_kind) + 1);
-    try writeRtpsDuration(alloc, &buf, time_mod.Duration.zero); // max_blocking_time
-    try writePidHdr(alloc, &buf, PidTable.DURABILITY, 4);
-    try writeU32Le(alloc, &buf, ann.qos.durability_kind);
-    try writePidHdr(alloc, &buf, PidTable.OWNERSHIP, 4);
-    try writeU32Le(alloc, &buf, ann.qos.ownership_kind);
-    // PID_PRESENTATION: access_scope(u32) + coherent_access(u8) + ordered_access(u8) + pad(2) = 8 bytes.
-    if (ann.qos.presentation_access_scope != 0 or ann.qos.coherent_access or ann.qos.ordered_access) {
-        try writePidHdr(alloc, &buf, PidTable.PRESENTATION, 8);
-        try writeU32Le(alloc, &buf, ann.qos.presentation_access_scope);
-        try buf.append(alloc, @intFromBool(ann.qos.coherent_access));
-        try buf.append(alloc, @intFromBool(ann.qos.ordered_access));
-        try buf.appendSlice(alloc, &[_]u8{ 0, 0 }); // padding
-    }
-
-    // PID_DATA_REPRESENTATION: emit exactly the configured representation so that
-    // remote writers can detect incompatible data_representation QoS.
-    // Sequence layout: seq_len(4) + i16 + pad(2) = 8 bytes.
-    {
-        const repr: i16 = if (ann.qos.data_representation == 2) 2 else 0; // XCDR2=2, XCDR1=0
-        try writePidHdr(alloc, &buf, PidTable.DATA_REPRESENTATION, 8);
-        try writeU32Le(alloc, &buf, 1); // sequence length: 1 element
-        try writeI16Le(alloc, &buf, repr);
-        try writeI16Le(alloc, &buf, 0); // pad to 4-byte boundary
-    }
-
-    // PID_DEADLINE: only emitted when not INFINITE; omitting INFINITE avoids
-    // encoding differences between implementations.
-    if (ann.qos.deadline_sec != 0x7fff_ffff or ann.qos.deadline_nanosec != 0xffff_ffff) {
-        try writePidHdr(alloc, &buf, PidTable.DEADLINE, 8);
-        try writeRtpsDuration(alloc, &buf, snapshotDeadlineDuration(ann.qos));
-    }
-    try writeLivelinessPid(alloc, &buf, ann.qos);
-
-    // PID_TYPE_INFORMATION is omitted from reader announcements: when present,
-    // OpenDDS 3.x initiates a TypeLookup round-trip to the remote reader, which
-    // we don't implement.  Cyclone falls back to type-name matching when the
-    // remote reader has no TypeInformation, so S2 still passes.
-
-    // PID_PARTITION (0x0029): CDR sequence<string>. Omitted when default (empty list).
-    if (ann.qos.partition_names.len > 0) {
-        try writePartitionPid(alloc, &buf, ann.qos.partition_names);
-    }
-
-    try buf.appendSlice(alloc, &[_]u8{ 0x01, 0x00, 0x00, 0x00 });
-    return buf.toOwnedSlice(alloc);
+    // Readers deliberately never emit PID_TYPE_INFORMATION (OpenDDS TypeLookup
+    // round-trip stall — see the git history of this comment).
+    return emitPlCdr(Disc.DiscoveredReaderData, alloc, out);
 }
 
-// ── Decode helpers ────────────────────────────────────────────────────────────
+// ── Decode ──────────────────────────────────────────────────────────────────
 
-const DecodedEndpoint = struct {
-    guid: Guid,
-    topic_name: []u8, // owned
-    type_name: []u8, // owned
-    unicast: []Locator, // owned
-    multicast: []Locator, // owned
-    partition_names: [][]u8, // owned: each string individually allocated
-    qos: QosSnapshot,
-    alloc: std.mem.Allocator,
+/// Decoded remote endpoint: owns the generated wire struct — whose
+/// `unknown_params` retains every unrecognised PID verbatim — plus the
+/// transport-typed per-endpoint locator slices (rare; parsed out of
+/// `unknown_params` since `DiscoveredWriterData` / `DiscoveredReaderData` carry
+/// no locator members — zzdds never emits them and a `@optional @pl_repeated`
+/// member's generated `deinit`/`clone` is currently miscompiled).
+fn DecodedEndpoint(comptime T: type) type {
+    return struct {
+        const Self2 = @This();
+        data: T, // owned via T.deinit
+        unicast: []Locator, // owned
+        multicast: []Locator, // owned
+        alloc: std.mem.Allocator,
 
-    fn deinit(self: *DecodedEndpoint) void {
-        self.alloc.free(self.topic_name);
-        self.alloc.free(self.type_name);
-        self.alloc.free(self.unicast);
-        self.alloc.free(self.multicast);
-        for (self.partition_names) |name| self.alloc.free(name);
-        self.alloc.free(self.partition_names);
-        if (self.qos.user_data.len != 0) self.alloc.free(self.qos.user_data);
-    }
-};
-
-fn decodeEndpoint(alloc: std.mem.Allocator, payload: []const u8, is_writer: bool) !DecodedEndpoint {
-    if (payload.len < 4) return error.TooShort;
-    const le = (payload[1] & 0x01) != 0;
-
-    var guid = Guid.unknown;
-    var topic: []u8 = &.{};
-    var typ: []u8 = &.{};
-    var uc: std.ArrayList(Locator) = .empty;
-    var mc: std.ArrayList(Locator) = .empty;
-    var partitions: std.ArrayList([]u8) = .empty;
-    var user_data: []u8 = &.{};
-    errdefer {
-        uc.deinit(alloc);
-        mc.deinit(alloc);
-        for (partitions.items) |name| alloc.free(name);
-        partitions.deinit(alloc);
-        if (user_data.len != 0) alloc.free(user_data);
-    }
-    // DDS spec defaults: DataWriter reliability = RELIABLE (1), DataReader = BEST_EFFORT (0).
-    // Implementations may omit PID_RELIABILITY when it matches the default.
-    var qos = QosSnapshot{ .reliability_kind = if (is_writer) 1 else 0 };
-
-    var pos: usize = 4;
-    while (pos + 4 <= payload.len) {
-        const pid = readU16LE(payload[pos..], le);
-        const len = readU16LE(payload[pos + 2 ..], le);
-        pos += 4;
-        if (pid == PidTable.SENTINEL) break;
-        if (pos + len > payload.len) break;
-        const v = payload[pos .. pos + len];
-        pos += len;
-
-        switch (pid) {
-            PidTable.ENDPOINT_GUID => {
-                if (v.len >= 16) {
-                    @memcpy(&guid.prefix.bytes, v[0..12]);
-                    guid.entity_id = .{
-                        .entity_key = v[12..15].*,
-                        .entity_kind = v[15],
-                    };
-                }
-            },
-            PidTable.TOPIC_NAME => {
-                const s = readString(v, le);
-                topic = try alloc.dupe(u8, s);
-            },
-            PidTable.TYPE_NAME => {
-                const s = readString(v, le);
-                typ = try alloc.dupe(u8, s);
-            },
-            PidTable.USER_DATA => {
-                if (v.len >= 4) {
-                    const count = readU32LE(v, le);
-                    if (count <= v.len - 4) {
-                        if (user_data.len != 0) alloc.free(user_data);
-                        user_data = try alloc.dupe(u8, v[4 .. 4 + count]);
-                    }
-                }
-            },
-            PidTable.UNICAST_LOCATOR => { // 0x002F — endpoint-specific unicast locator in SEDP
-                if (v.len >= 24) try uc.append(alloc, readLocator(v, le));
-            },
-            PidTable.MULTICAST_LOCATOR => { // 0x0030
-                if (v.len >= 24) try mc.append(alloc, readLocator(v, le));
-            },
-            PidTable.RELIABILITY => {
-                // Wire: 1=BEST_EFFORT, 2=RELIABLE. Internal: 0=BEST_EFFORT, 1=RELIABLE.
-                if (v.len >= 4) {
-                    const wire = readU32LE(v, le);
-                    qos.reliability_kind = if (wire >= 1) @intCast(wire - 1) else 0;
-                }
-            },
-            PidTable.DURABILITY => {
-                if (v.len >= 4) qos.durability_kind = @intCast(readU32LE(v, le));
-            },
-            PidTable.LIVELINESS => {
-                if (v.len >= 4) qos.liveliness_kind = @intCast(readU32LE(v, le));
-                if (v.len >= 12) {
-                    const dur = readDeadlineDuration(v[4..], le);
-                    qos.liveliness_lease_sec = dur.sec;
-                    qos.liveliness_lease_nanosec = dur.nanosec;
-                }
-            },
-            PidTable.DEADLINE => {
-                if (v.len >= 8) {
-                    const dur = readDeadlineDuration(v, le);
-                    qos.deadline_sec = dur.sec;
-                    qos.deadline_nanosec = dur.nanosec;
-                }
-            },
-            PidTable.OWNERSHIP => {
-                if (v.len >= 4) qos.ownership_kind = @intCast(readU32LE(v, le));
-            },
-            PidTable.OWNERSHIP_STRENGTH => {
-                if (v.len >= 4) qos.ownership_strength = readI32LE(v, le);
-            },
-            PidTable.HISTORY => {
-                if (v.len >= 8) {
-                    qos.history_kind = @intCast(readU32LE(v[0..], le));
-                    qos.history_depth = readI32LE(v[4..], le);
-                }
-            },
-            PidTable.DESTINATION_ORDER => {
-                if (v.len >= 4) qos.destination_order_kind = @intCast(readU32LE(v, le));
-            },
-            PidTable.PRESENTATION => {
-                // access_scope(u32) + coherent_access(u8) + ordered_access(u8) = 6 bytes minimum
-                if (v.len >= 6) {
-                    qos.presentation_access_scope = @intCast(@min(readU32LE(v, le), 2));
-                    qos.coherent_access = v[4] != 0;
-                    qos.ordered_access = v[5] != 0;
-                }
-            },
-            PidTable.DATA_REPRESENTATION => {
-                // seq_len (4) + first id (2) — only the first value matters for matching
-                if (v.len >= 6) {
-                    const seq_len = readU32LE(v, le);
-                    if (seq_len >= 1) {
-                        const id = readI16LE(v[4..], le);
-                        // Map wire value: 0=XCDR1, 2=XCDR2. Store as 1/2.
-                        qos.data_representation = if (id == 2) 2 else 1;
-                    }
-                }
-            },
-            PidTable.LIFESPAN => {
-                if (v.len >= 8) {
-                    const dur = readDeadlineDuration(v, le);
-                    qos.lifespan_sec = dur.sec;
-                    qos.lifespan_nanosec = dur.nanosec;
-                }
-            },
-            PidTable.PARTITION, PidTable.PARTITION_LEGACY => {
-                // CDR sequence<string>: seq_len(4) + N × (str_len(4) + chars + null + pad)
-                if (v.len >= 4) {
-                    const count = readU32LE(v, le);
-                    var off: usize = 4;
-                    var i: u32 = 0;
-                    while (i < count and off + 4 <= v.len) : (i += 1) {
-                        const slen = readU32LE(v[off..], le);
-                        off += 4;
-                        if (slen == 0 or off + slen > v.len) break;
-                        const s = v[off .. off + slen - 1]; // strip null terminator
-                        try partitions.append(alloc, try alloc.dupe(u8, s));
-                        // Advance to the next 4-byte aligned boundary after the string data.
-                        const end = off + slen;
-                        off = (end + 3) & ~@as(usize, 3);
-                    }
-                }
-            },
-            else => {},
+        fn deinit(self: *Self2) void {
+            self.data.deinit(self.alloc);
+            self.alloc.free(self.unicast);
+            self.alloc.free(self.multicast);
         }
-    }
-
-    const part_slice = try partitions.toOwnedSlice(alloc);
-    // Point qos.partition_names into the owned slice (valid while DecodedEndpoint is alive).
-    qos.partition_names = @ptrCast(part_slice);
-    qos.user_data = user_data;
-
-    return DecodedEndpoint{
-        .alloc = alloc,
-        .guid = guid,
-        .topic_name = topic,
-        .type_name = typ,
-        .unicast = try uc.toOwnedSlice(alloc),
-        .multicast = try mc.toOwnedSlice(alloc),
-        .partition_names = part_slice,
-        .qos = qos,
     };
+}
+
+/// Collect every 24-byte `Locator_t` carried under `pid` in `unknown_params`
+/// (RTPS repeated-parameter encoding: one PID entry per locator).
+fn locatorsFromUnknown(alloc: std.mem.Allocator, unknown: []const zidl_rt.RawParam, pid: u16) ![]Locator {
+    var n: usize = 0;
+    for (unknown) |rp| {
+        if (rp.pid == pid and rp.bytes.len >= 24) n += 1;
+    }
+    const out = try alloc.alloc(Locator, n);
+    errdefer alloc.free(out);
+    var i: usize = 0;
+    for (unknown) |rp| {
+        if (rp.pid != pid or rp.bytes.len < 24) continue;
+        const v = rp.bytes;
+        const lw = LocatorWire{
+            .kind = @bitCast(readU32LE(v[0..], true)),
+            .port = readU32LE(v[4..], true),
+            .address = v[8..24].*,
+        };
+        out[i] = lw.toLocator();
+        i += 1;
+    }
+    return out;
+}
+
+fn decodeEndpointT(comptime T: type, alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoint(T) {
+    if (payload.len < 4) return error.TooShort;
+    var r = try zidl_rt.CdrReader.init(payload);
+    var data: T = .{};
+    errdefer data.deinit(alloc);
+    // `.lenient`: skip/retain unknowns, tolerate a truncated tail, round a
+    // misaligned length — matches the old hand parser's leniency. The native
+    // path never uses `.strict` (reserved for a broker's ingress validation).
+    try T.deserializeFromPlCdr(&data, &r, alloc, .lenient);
+    const uc = try locatorsFromUnknown(alloc, data.unknown_params, PidTable.UNICAST_LOCATOR);
+    errdefer alloc.free(uc);
+    const mc = try locatorsFromUnknown(alloc, data.unknown_params, PidTable.MULTICAST_LOCATOR);
+    return .{ .data = data, .unicast = uc, .multicast = mc, .alloc = alloc };
+}
+
+/// PID_PARTITION_LEGACY (0x0035): the generated switch keys on `@id` 0x0029, so
+/// a peer that sends partition as the legacy PID lands it in `unknown_params`.
+/// Parse it as a CDR `sequence<string>` (LE — every zzdds/DDS peer emits
+/// PL_CDR_LE) into `buf`, returning borrowed slices into the RawParam bytes
+/// (valid while the decoded struct lives). Returns `null` when absent.
+fn legacyPartitionNames(unknown: []const zidl_rt.RawParam, buf: [][]const u8) ?[]const []const u8 {
+    for (unknown) |rp| {
+        if (rp.pid != PidTable.PARTITION_LEGACY) continue;
+        const v = rp.bytes;
+        if (v.len < 4) return &.{};
+        const count = readU32LE(v, true);
+        var off: usize = 4;
+        var i: usize = 0;
+        while (i < count and i < buf.len and off + 4 <= v.len) : (i += 1) {
+            const slen = readU32LE(v[off..], true);
+            off += 4;
+            if (slen == 0 or off + slen > v.len) break;
+            buf[i] = v[off .. off + slen - 1]; // strip NUL
+            off = (off + slen + 3) & ~@as(usize, 3);
+        }
+        return buf[0..i];
+    }
+    return null;
+}
+
+/// The PID_TYPE_INFORMATION (0x0075) blob out of `unknown_params`, borrowed.
+fn typeInfoBlob(unknown: []const zidl_rt.RawParam) []const u8 {
+    for (unknown) |rp| {
+        if (rp.pid == 0x0075) return rp.bytes;
+    }
+    return &.{};
 }
 
 // ── SedpEndpoints ─────────────────────────────────────────────────────────────
@@ -1156,103 +814,122 @@ pub const SedpEndpoints = struct {
 
     fn handleEndpointChange(self: *Self, ch: *const CacheChange, is_writer: bool) void {
         if (ch.kind != .alive) return;
-        var ep = decodeEndpoint(self.alloc, ch.data, is_writer) catch |err| {
-            log.sedp.warn("sedp: failed to decode endpoint announcement: {s}", .{@errorName(err)});
-            return;
-        };
-        defer ep.deinit();
-
         const cbs = self.callbacks orelse return;
-
-        // RTPS spec: if endpoint data omits explicit locators, fall back to the
-        // participant's default unicast/multicast locators (from SPDP).
-        // Take a local copy under participant_locs_mu so the SPDP thread can
-        // safely mutate the map while we use the locators below.
-        //
-        // Read the *_for_data variants specifically: these are what's actually
-        // reachable by this participant's user-data transport (equal to the
-        // plain unicast/multicast fields when no data_reachable override is
-        // configured — see filterKnownParticipantLocators / onParticipantDiscovered).
-        var pl_uc_copy: ?[]Locator = null;
-        var pl_mc_copy: ?[]Locator = null;
-        self.participant_locs_mu.lock();
-        if (self.participant_locs.get(ep.guid.prefix)) |pl| {
-            pl_uc_copy = self.alloc.dupe(Locator, pl.unicast_for_data) catch null;
-            pl_mc_copy = self.alloc.dupe(Locator, pl.multicast_for_data) catch null;
-        }
-        self.participant_locs_mu.unlock();
-        defer if (pl_uc_copy) |s| self.alloc.free(s);
-        defer if (pl_mc_copy) |s| self.alloc.free(s);
-
-        // Explicit per-endpoint locators (rare — zzdds never sets these locally;
-        // only a remote peer's own PID_UNICAST_LOCATOR/PID_MULTICAST_LOCATOR
-        // would populate ep.unicast/ep.multicast). Filtered the same way: via
-        // the data-transport check when configured, else via discovery
-        // reachability (identical to today's behavior).
-        const ep_uc = if (self.data_reachable) |dr|
-            iface.filterReachableLocatorsForData(self.alloc, ep.unicast, dr)
-        else
-            self.filterReachableLocators(ep.unicast, "endpoint unicast");
-        defer self.alloc.free(ep_uc);
-        const ep_mc = if (self.data_reachable) |dr|
-            iface.filterReachableLocatorsForData(self.alloc, ep.multicast, dr)
-        else
-            self.filterReachableLocators(ep.multicast, "endpoint multicast");
-        defer self.alloc.free(ep_mc);
-
-        const eff_uc: []const Locator = if (ep_uc.len > 0)
-            ep_uc
-        else if (pl_uc_copy) |s|
-            s
-        else
-            ep_uc;
-
-        const eff_mc: []const Locator = if (ep_mc.len > 0)
-            ep_mc
-        else if (pl_mc_copy) |s|
-            s
-        else
-            ep_mc;
-
-        // A data-transport override is configured and neither the endpoint's own
-        // locators nor its participant's default locators are reachable by it:
-        // this pair cannot actually exchange data. Treat it the same as a QoS
-        // incompatibility — no match — rather than firing a matched-callback
-        // that can never deliver anything. Gated on data_reachable so the
-        // default (no override, discovery transport == data transport) path is
-        // completely unchanged.
-        if (self.data_reachable != null and eff_uc.len == 0 and eff_mc.len == 0) return;
-
         if (is_writer) {
+            var ep = decodeEndpointT(Disc.DiscoveredWriterData, self.alloc, ch.data) catch |err| {
+                log.sedp.warn("sedp: failed to decode writer announcement: {s}", .{@errorName(err)});
+                return;
+            };
+            defer ep.deinit();
+            const g = guidFromBytes(&ep.data.writerGuid);
+            var eff = self.resolveEffectiveLocators(g.prefix, ep.unicast, ep.multicast);
+            defer eff.deinit(self.alloc);
+            if (!eff.reachable) return;
+            var pn_buf: [32][]const u8 = undefined;
+            const pnames = legacyPartitionNames(ep.data.unknown_params, &pn_buf) orelse
+                iface.partitionNames(ep.data.partition, &pn_buf);
             const wd = WriterData{
-                .guid = ep.guid,
-                .participant_guid = .{
-                    .prefix = ep.guid.prefix,
-                    .entity_id = EntityIds.participant,
-                },
-                .topic_name = ep.topic_name,
-                .type_name = ep.type_name,
-                .qos = ep.qos,
-                .unicast_locators = eff_uc,
-                .multicast_locators = eff_mc,
-                .type_object = &.{},
+                .guid = g,
+                .participant_guid = .{ .prefix = g.prefix, .entity_id = EntityIds.participant },
+                .topic_name = ep.data.topicName,
+                .type_name = ep.data.typeName,
+                .qos = &ep.data,
+                .partition_names = pnames,
+                .unicast_locators = eff.uc,
+                .multicast_locators = eff.mc,
+                .type_object = typeInfoBlob(ep.data.unknown_params),
+                .raw_parameter_list = ch.data,
             };
             cbs.on_writer_discovered(cbs.ctx, &wd);
         } else {
+            var ep = decodeEndpointT(Disc.DiscoveredReaderData, self.alloc, ch.data) catch |err| {
+                log.sedp.warn("sedp: failed to decode reader announcement: {s}", .{@errorName(err)});
+                return;
+            };
+            defer ep.deinit();
+            const g = guidFromBytes(&ep.data.readerGuid);
+            var eff = self.resolveEffectiveLocators(g.prefix, ep.unicast, ep.multicast);
+            defer eff.deinit(self.alloc);
+            if (!eff.reachable) return;
+            var pn_buf: [32][]const u8 = undefined;
+            const pnames = legacyPartitionNames(ep.data.unknown_params, &pn_buf) orelse
+                iface.partitionNames(ep.data.partition, &pn_buf);
             const rd = ReaderData{
-                .guid = ep.guid,
-                .participant_guid = .{
-                    .prefix = ep.guid.prefix,
-                    .entity_id = EntityIds.participant,
-                },
-                .topic_name = ep.topic_name,
-                .type_name = ep.type_name,
-                .qos = ep.qos,
-                .unicast_locators = eff_uc,
-                .multicast_locators = eff_mc,
+                .guid = g,
+                .participant_guid = .{ .prefix = g.prefix, .entity_id = EntityIds.participant },
+                .topic_name = ep.data.topicName,
+                .type_name = ep.data.typeName,
+                .qos = &ep.data,
+                .partition_names = pnames,
+                .unicast_locators = eff.uc,
+                .multicast_locators = eff.mc,
+                .raw_parameter_list = ch.data,
             };
             cbs.on_reader_discovered(cbs.ctx, &rd);
         }
+    }
+
+    const EffectiveLocators = struct {
+        uc: []Locator, // owned
+        mc: []Locator, // owned
+        reachable: bool,
+
+        fn deinit(self: *EffectiveLocators, alloc: std.mem.Allocator) void {
+            alloc.free(self.uc);
+            alloc.free(self.mc);
+        }
+    };
+
+    /// RTPS spec: when endpoint data omits explicit locators, fall back to the
+    /// discovering participant's default unicast/multicast locators (from SPDP).
+    /// `ep_uc` / `ep_mc` are the endpoint's own PID_*_LOCATOR values (rare —
+    /// zzdds never emits per-endpoint locators locally). Returns owned slices;
+    /// `reachable` is false only when a data-transport override is configured
+    /// and nothing reachable was found (treat as a QoS-incompatible non-match).
+    fn resolveEffectiveLocators(
+        self: *Self,
+        prefix: GuidPrefix,
+        ep_uc_raw: []const Locator,
+        ep_mc_raw: []const Locator,
+    ) EffectiveLocators {
+        // Snapshot the participant's default locators under the lock so the SPDP
+        // thread can mutate the map concurrently. Read the *_for_data variants
+        // (== the plain fields unless a data_reachable override is configured).
+        var pl_uc: ?[]Locator = null;
+        var pl_mc: ?[]Locator = null;
+        self.participant_locs_mu.lock();
+        if (self.participant_locs.get(prefix)) |pl| {
+            pl_uc = self.alloc.dupe(Locator, pl.unicast_for_data) catch null;
+            pl_mc = self.alloc.dupe(Locator, pl.multicast_for_data) catch null;
+        }
+        self.participant_locs_mu.unlock();
+        defer if (pl_uc) |s| self.alloc.free(s);
+        defer if (pl_mc) |s| self.alloc.free(s);
+
+        var uc = if (self.data_reachable) |dr|
+            iface.filterReachableLocatorsForData(self.alloc, ep_uc_raw, dr)
+        else
+            self.filterReachableLocators(ep_uc_raw, "endpoint unicast");
+        var mc = if (self.data_reachable) |dr|
+            iface.filterReachableLocatorsForData(self.alloc, ep_mc_raw, dr)
+        else
+            self.filterReachableLocators(ep_mc_raw, "endpoint multicast");
+
+        if (uc.len == 0) {
+            if (pl_uc) |s| {
+                self.alloc.free(uc);
+                uc = self.alloc.dupe(Locator, s) catch &.{};
+            }
+        }
+        if (mc.len == 0) {
+            if (pl_mc) |s| {
+                self.alloc.free(mc);
+                mc = self.alloc.dupe(Locator, s) catch &.{};
+            }
+        }
+
+        const reachable = !(self.data_reachable != null and uc.len == 0 and mc.len == 0);
+        return .{ .uc = uc, .mc = mc, .reachable = reachable };
     }
 
     fn filterReachableLocators(self: *Self, locators: []const Locator, context: []const u8) []Locator {
@@ -1322,38 +999,5 @@ fn keyHashToGuid(kh: [16]u8) Guid {
 /// Encode a minimal PL-CDR disposal payload: PLCDR_LE_ENCAP + PID_ENDPOINT_GUID + PID_SENTINEL.
 /// Used as the serialized_payload of NOT_ALIVE_DISPOSED DATA messages.
 pub fn encodeEndpointDisposalPayload(alloc: std.mem.Allocator, guid: Guid) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    try buf.appendSlice(alloc, &PLCDR_LE_ENCAP);
-    try writePidHdr(alloc, &buf, PidTable.ENDPOINT_GUID, 16);
-    try buf.appendSlice(alloc, &guid.prefix.bytes);
-    try buf.appendSlice(alloc, &[_]u8{
-        guid.entity_id.entity_key[0],
-        guid.entity_id.entity_key[1],
-        guid.entity_id.entity_key[2],
-        guid.entity_id.entity_kind,
-    });
-    try writePidHdr(alloc, &buf, PidTable.SENTINEL, 0);
-    return buf.toOwnedSlice(alloc);
-}
-
-test "readDeadlineDuration preserves explicit zero QoS duration" {
-    const bytes = [_]u8{0} ** 8;
-    try std.testing.expectEqual(time_mod.Duration.zero, readDeadlineDuration(&bytes, true));
-}
-
-test "readDeadlineDuration recognizes DDS infinite sentinel" {
-    // DDS Duration_t INFINITE = {sec=0x7fffffff, nanosec=0xffffffff}
-    const bytes = [_]u8{ 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff };
-    try std.testing.expect(readDeadlineDuration(&bytes, true).isInfinite());
-}
-
-test "readDeadlineDuration reads sub-second RTPS wire Duration_t" {
-    // RTPS 2.5 §9.3.2.3: 250ms on the wire is {seconds=0, fraction=0.25 * 2^32}.
-    var bytes: [8]u8 = undefined;
-    std.mem.writeInt(i32, bytes[0..4], 0, .little);
-    std.mem.writeInt(u32, bytes[4..8], 0x4000_0000, .little); // 0.25 * 2^32
-    const dur = readDeadlineDuration(&bytes, true);
-    try std.testing.expectEqual(@as(i32, 0), dur.sec);
-    try std.testing.expectEqual(@as(u32, 250_000_000), dur.nanosec);
+    return emitPlCdr(Disc.EndpointDisposal, alloc, .{ .endpointGuid = guidBytes(guid) });
 }

@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const disc_iface = @import("interface.zig");
+const disc_adapter = @import("qos_adapter.zig");
 const mutex_mod = @import("../util/mutex.zig");
 const header_mod = @import("../rtps/message/header.zig");
 
@@ -131,11 +132,13 @@ pub const DiscoveryBus = struct {
             new_callbacks.on_participant_discovered(new_callbacks.ctx, &pd);
 
             for (snap.writers[0..snap.writer_count]) |w| {
-                const wd = makeWriterData(&w, snap.data_locators);
+                var wq = disc_adapter.writerDiscoveredData(w.qos, w.presentation);
+                const wd = makeWriterData(&w, &wq, snap.data_locators);
                 new_callbacks.on_writer_discovered(new_callbacks.ctx, &wd);
             }
             for (snap.readers[0..snap.reader_count]) |r| {
-                const rd = makeReaderData(&r, snap.data_locators);
+                var rq = disc_adapter.readerDiscoveredData(r.qos, r.presentation);
+                const rd = makeReaderData(&r, &rq, snap.data_locators);
                 new_callbacks.on_reader_discovered(new_callbacks.ctx, &rd);
             }
         }
@@ -253,7 +256,8 @@ pub const DiscoveryBus = struct {
         snap_count = filtered;
 
         // Tell other participants about this new writer.
-        const wd = makeWriterData(info, writer_data_locs);
+        var wq = disc_adapter.writerDiscoveredData(info.qos, info.presentation);
+        const wd = makeWriterData(info, &wq, writer_data_locs);
         for (snapshots[0..snap_count]) |snap| {
             snap.callbacks.on_writer_discovered(snap.callbacks.ctx, &wd);
         }
@@ -262,7 +266,8 @@ pub const DiscoveryBus = struct {
         if (own_callbacks) |cb| {
             for (snapshots[0..snap_count]) |snap| {
                 for (snap.readers[0..snap.reader_count]) |r| {
-                    const rd = makeReaderData(&r, snap.data_locators);
+                    var rq = disc_adapter.readerDiscoveredData(r.qos, r.presentation);
+                    const rd = makeReaderData(&r, &rq, snap.data_locators);
                     cb.on_reader_discovered(cb.ctx, &rd);
                 }
             }
@@ -349,13 +354,15 @@ pub const DiscoveryBus = struct {
         if (own_callbacks) |cb| {
             for (snapshots[0..snap_count]) |snap| {
                 for (snap.writers[0..snap.writer_count]) |w| {
-                    const wd = makeWriterData(&w, snap.data_locators);
+                    var wq = disc_adapter.writerDiscoveredData(w.qos, w.presentation);
+                    const wd = makeWriterData(&w, &wq, snap.data_locators);
                     cb.on_writer_discovered(cb.ctx, &wd);
                 }
             }
         }
         // Tell other participants about this new reader.
-        const rd = makeReaderData(info, reader_data_locs);
+        var rq = disc_adapter.readerDiscoveredData(info.qos, info.presentation);
+        const rd = makeReaderData(info, &rq, reader_data_locs);
         for (snapshots[0..snap_count]) |snap| {
             snap.callbacks.on_reader_discovered(snap.callbacks.ctx, &rd);
         }
@@ -435,26 +442,36 @@ pub const DiscoveryBus = struct {
     };
 };
 
-fn makeWriterData(ann: *const WriterAnnouncement, data_locs: []const Locator) WriterData {
+fn makeWriterData(
+    ann: *const WriterAnnouncement,
+    qos: *const disc_iface.DiscoveredWriterData,
+    data_locs: []const Locator,
+) WriterData {
     return .{
         .guid = ann.guid,
         .participant_guid = ann.participant_guid,
         .topic_name = ann.topic_name,
         .type_name = ann.type_name,
-        .qos = ann.qos,
+        .qos = qos,
+        .partition_names = ann.partition_names,
         .unicast_locators = data_locs,
         .multicast_locators = &.{},
         .type_object = ann.type_object,
     };
 }
 
-fn makeReaderData(ann: *const ReaderAnnouncement, data_locs: []const Locator) ReaderData {
+fn makeReaderData(
+    ann: *const ReaderAnnouncement,
+    qos: *const disc_iface.DiscoveredReaderData,
+    data_locs: []const Locator,
+) ReaderData {
     return .{
         .guid = ann.guid,
         .participant_guid = ann.participant_guid,
         .topic_name = ann.topic_name,
         .type_name = ann.type_name,
-        .qos = ann.qos,
+        .qos = qos,
+        .partition_names = ann.partition_names,
         .unicast_locators = data_locs,
         .multicast_locators = &.{},
     };

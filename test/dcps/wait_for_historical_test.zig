@@ -117,16 +117,19 @@ const Harness = struct {
             .prefix = prefix,
             .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
         };
+        var repr = [_]i16{2}; // XCDR2 — matches reader's expected value
+        var q = iface.DiscoveredWriterData{
+            .reliability = .{ .kind = reliability_kind + 1, .max_blocking_time = .{} },
+            .durabilityKind = durability_kind,
+            .history = .{ .kind = 0, .depth = 1 },
+            .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &repr, ._release = false },
+        };
         const data = iface.WriterData{
             .guid = writer_guid,
             .participant_guid = Guid{ .prefix = prefix, .entity_id = EntityIds.participant },
             .topic_name = topic,
             .type_name = "TestType",
-            .qos = .{
-                .durability_kind = durability_kind,
-                .reliability_kind = reliability_kind,
-                .data_representation = 2, // XCDR2 — matches reader's expected value
-            },
+            .qos = &q,
             .unicast_locators = &.{},
             .multicast_locators = &.{},
             .type_object = &.{},

@@ -8,6 +8,27 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-10
+
+- **SEDP discovery codec is now zidl-generated** from `idl/rtps_discovery.idl`
+  (`--zig-pl-cdr`, `@pl_retain_unknown` — every unrecognised PID round-trips losslessly,
+  the groundwork for a discovery-broker relay). The hand-rolled `sedp.zig` encoders/parsers
+  are gone; `discovery/qos_adapter.zig` maps the typed `DDS.DataWriterQos` /
+  `DataReaderQos` (+ Publisher/Subscriber `PresentationQosPolicy`) to/from the wire structs.
+- **Removed:** the flat `disc.QosSnapshot`, `participant.zig`'s `writerQosSnapshot` /
+  `readerQosSnapshot` / `reprFromQos`, and `src/qos/policy.zig` + `qos_match.checkWriterReader`
+  / `checkPresentation` (all orphaned). QoS matching is now `qos_match.checkDiscovered`,
+  operating directly on the RTPS discovery wire structs. Discovery callbacks carry
+  `qos: *const Discovered{Writer,Reader}Data` (borrowed) plus a `raw_parameter_list` for a
+  future broker.
+- **Wire deltas** (all spec-legal; `test/discovery/wire_golden_test.zig` is the contract,
+  validated against the live interop suite): a default writer/reader now advertises
+  `PID_DATA_REPRESENTATION [2]` (matching the real `reprFromQos` path, not the old golden
+  capture); an empty `PID_USER_DATA` / `PID_PARTITION` is emitted where nothing was before
+  (a zidl `@optional sequence<>` codegen limitation — see `docs/roadmap.md`);
+  `PID_TYPE_INFORMATION` is replayed after `PID_PARTITION` rather than before.
+- SPDP encode/decode is unchanged (hand-rolled — it carries no QoS).
+
 ## 2026-09-03
 
 - **Release workflow — first real run shook out three `package-libs` bugs.** That job

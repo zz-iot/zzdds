@@ -12,6 +12,9 @@ const zzdds = @import("zzdds");
 const sedp_mod = zzdds.sedp_discovery;
 const iface = zzdds.discovery;
 const mock_tr = zzdds.mock_transport;
+const DDS = zzdds.DDS;
+const dwire = zzdds.disc_wire;
+const rtps_time = zzdds.util.time;
 
 const SedpEndpoints = sedp_mod.SedpEndpoints;
 const MockNetwork = mock_tr.MockNetwork;
@@ -26,7 +29,6 @@ const WriterAnnouncement = iface.WriterAnnouncement;
 const ReaderAnnouncement = iface.ReaderAnnouncement;
 const WriterData = iface.WriterData;
 const ReaderData = iface.ReaderData;
-const QosSnapshot = iface.QosSnapshot;
 
 // RTPS §8.5.4.2 BuiltinEndpointSet flags (DISC subset).
 const BES_PUB_ANNOUNCER: u32 = 0x00000004;
@@ -51,6 +53,46 @@ fn makeGuid(p: u8, eid_key: u8) Guid {
 
 const ALL_SEDP_ENDPOINTS: u32 = BES_PUB_ANNOUNCER | BES_PUB_DETECTOR | BES_SUB_ANNOUNCER | BES_SUB_DETECTOR;
 
+// ── QoS builders / readers for the typed discovery model ─────────────────────
+
+fn dwq(reliable: bool, durability: u8) DDS.DataWriterQos {
+    return .{
+        .reliability = .{ .kind = if (reliable) .RELIABLE_RELIABILITY_QOS else .BEST_EFFORT_RELIABILITY_QOS, .max_blocking_time = .{} },
+        .durability = .{ .kind = @enumFromInt(durability) },
+    };
+}
+fn drq(reliable: bool, durability: u8) DDS.DataReaderQos {
+    return .{
+        .reliability = .{ .kind = if (reliable) .RELIABLE_RELIABILITY_QOS else .BEST_EFFORT_RELIABILITY_QOS, .max_blocking_time = .{} },
+        .durability = .{ .kind = @enumFromInt(durability) },
+    };
+}
+fn pres(scope: u32, coherent: bool, ordered: bool) DDS.PresentationQosPolicy {
+    return .{ .access_scope = @enumFromInt(scope), .coherent_access = coherent, .ordered_access = ordered };
+}
+fn udPolicy(bytes: []const u8) DDS.UserDataQosPolicy {
+    return .{ .value = .{ ._maximum = @intCast(bytes.len), ._length = @intCast(bytes.len), ._buffer = @constCast(bytes.ptr), ._release = false } };
+}
+fn relK(q: anytype) u8 {
+    return iface.discReliabilityKind(q);
+}
+fn durK(q: anytype) u8 {
+    return @intCast(q.durabilityKind);
+}
+fn presScope(q: anytype) u8 {
+    return if (q.presentation) |x| @intCast(x.access_scope) else 0;
+}
+fn presCoh(q: anytype) bool {
+    return if (q.presentation) |x| x.coherent_access else false;
+}
+fn presOrd(q: anytype) bool {
+    return if (q.presentation) |x| x.ordered_access else false;
+}
+fn wireDur(od: ?dwire.Duration_t) rtps_time.Duration {
+    const d = od orelse return rtps_time.Duration.infinite;
+    return (rtps_time.RtpsDuration{ .seconds = d.seconds, .fraction = d.fraction }).toDuration();
+}
+
 // Per-participant locator port allocation: each participant gets a unique port
 // derived from its prefix byte so MockNetwork routing is unambiguous.
 fn metaPort(p: u8) u16 {
@@ -67,12 +109,13 @@ const SnapshotW = struct {
     topic: []u8,
     typ: []u8,
     user_data: []u8,
-    qos: QosSnapshot,
+    qos: dwire.DiscoveredWriterData, // owned clone
     alloc: std.mem.Allocator,
     fn deinit(self: *@This()) void {
         self.alloc.free(self.topic);
         self.alloc.free(self.typ);
         self.alloc.free(self.user_data);
+        self.qos.deinit(self.alloc);
     }
 };
 
@@ -81,12 +124,13 @@ const SnapshotR = struct {
     topic: []u8,
     typ: []u8,
     user_data: []u8,
-    qos: QosSnapshot,
+    qos: dwire.DiscoveredReaderData, // owned clone
     alloc: std.mem.Allocator,
     fn deinit(self: *@This()) void {
         self.alloc.free(self.topic);
         self.alloc.free(self.typ);
         self.alloc.free(self.user_data);
+        self.qos.deinit(self.alloc);
     }
 };
 
@@ -125,9 +169,8 @@ const Recorder = struct {
 
     fn onWriterDiscovered(ctx: *anyopaque, d: *const WriterData) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
-        const user_data = self.alloc.dupe(u8, d.qos.user_data) catch return;
-        var qos = d.qos;
-        qos.user_data = user_data;
+        const user_data = self.alloc.dupe(u8, iface.discUserData(d.qos)) catch return;
+        const qos = d.qos.clone(self.alloc) catch return;
         const s = SnapshotW{
             .alloc = self.alloc,
             .guid = d.guid,
@@ -140,9 +183,8 @@ const Recorder = struct {
     }
     fn onReaderDiscovered(ctx: *anyopaque, d: *const ReaderData) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
-        const user_data = self.alloc.dupe(u8, d.qos.user_data) catch return;
-        var qos = d.qos;
-        qos.user_data = user_data;
+        const user_data = self.alloc.dupe(u8, iface.discUserData(d.qos)) catch return;
+        const qos = d.qos.clone(self.alloc) catch return;
         const s = SnapshotR{
             .alloc = self.alloc,
             .guid = d.guid,
@@ -268,7 +310,7 @@ test "SEDP: WriterAnnouncement encode/decode round-trip" {
         .participant_guid = makeGuid(0x01, 0x01),
         .topic_name = "HelloWorldTopic",
         .type_name = "HelloWorld",
-        .qos = .{ .reliability_kind = 1, .durability_kind = 0 },
+        .qos = dwq(true, 0),
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
@@ -279,7 +321,7 @@ test "SEDP: WriterAnnouncement encode/decode round-trip" {
     try testing.expect(found.guid.eql(writer_guid));
     try testing.expectEqualStrings("HelloWorldTopic", found.topic);
     try testing.expectEqualStrings("HelloWorld", found.typ);
-    try testing.expectEqual(@as(u8, 1), found.qos.reliability_kind);
+    try testing.expectEqual(@as(u8, 1), relK(&found.qos));
 }
 
 test "SEDP: ReaderAnnouncement encode/decode round-trip" {
@@ -300,7 +342,7 @@ test "SEDP: ReaderAnnouncement encode/decode round-trip" {
         .participant_guid = makeGuid(0x03, 0x01),
         .topic_name = "SensorData",
         .type_name = "Sensor",
-        .qos = .{ .reliability_kind = 0, .durability_kind = 1 },
+        .qos = drq(false, 1),
         .type_info_cdr = &.{},
     });
     net.deliverAll();
@@ -310,8 +352,8 @@ test "SEDP: ReaderAnnouncement encode/decode round-trip" {
     try testing.expect(found.guid.eql(reader_guid));
     try testing.expectEqualStrings("SensorData", found.topic);
     try testing.expectEqualStrings("Sensor", found.typ);
-    try testing.expectEqual(@as(u8, 0), found.qos.reliability_kind);
-    try testing.expectEqual(@as(u8, 1), found.qos.durability_kind);
+    try testing.expectEqual(@as(u8, 0), relK(&found.qos));
+    try testing.expectEqual(@as(u8, 1), durK(&found.qos));
 }
 
 // ── Tests: endpoint retraction ────────────────────────────────────────────────
@@ -472,11 +514,8 @@ test "SEDP: WriterAnnouncement with non-default PRESENTATION round-trips correct
         .participant_guid = makeGuid(0x11, 0x01),
         .topic_name = "T",
         .type_name = "TT",
-        .qos = .{
-            .presentation_access_scope = 1, // TOPIC
-            .coherent_access = false,
-            .ordered_access = true,
-        },
+        .qos = .{},
+        .presentation = pres(1, false, true), // TOPIC
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
@@ -484,9 +523,9 @@ test "SEDP: WriterAnnouncement with non-default PRESENTATION round-trips correct
 
     try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
     const w = &remote.rec.writers_found.items[0];
-    try testing.expectEqual(@as(u8, 1), w.qos.presentation_access_scope);
-    try testing.expectEqual(false, w.qos.coherent_access);
-    try testing.expectEqual(true, w.qos.ordered_access);
+    try testing.expectEqual(@as(u8, 1), presScope(&w.qos));
+    try testing.expectEqual(false, presCoh(&w.qos));
+    try testing.expectEqual(true, presOrd(&w.qos));
 }
 
 test "SEDP: WriterAnnouncement USER_DATA round-trips as binary octets" {
@@ -506,14 +545,14 @@ test "SEDP: WriterAnnouncement USER_DATA round-trips as binary octets" {
         .participant_guid = makeGuid(0x31, 0x01),
         .topic_name = "T",
         .type_name = "TT",
-        .qos = .{ .user_data = &user_data },
+        .qos = .{ .user_data = udPolicy(&user_data) },
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
     net.deliverAll();
 
     try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
-    try testing.expectEqualSlices(u8, &user_data, remote.rec.writers_found.items[0].qos.user_data);
+    try testing.expectEqualSlices(u8, &user_data, remote.rec.writers_found.items[0].user_data);
 }
 
 test "SEDP: ReaderAnnouncement with non-default PRESENTATION round-trips correctly" {
@@ -533,20 +572,17 @@ test "SEDP: ReaderAnnouncement with non-default PRESENTATION round-trips correct
         .participant_guid = makeGuid(0x13, 0x01),
         .topic_name = "T",
         .type_name = "TT",
-        .qos = .{
-            .presentation_access_scope = 2, // GROUP
-            .coherent_access = true,
-            .ordered_access = true,
-        },
+        .qos = .{},
+        .presentation = pres(2, true, true), // GROUP
         .type_info_cdr = &.{},
     });
     net.deliverAll();
 
     try testing.expectEqual(@as(usize, 1), remote.rec.readers_found.items.len);
     const r = &remote.rec.readers_found.items[0];
-    try testing.expectEqual(@as(u8, 2), r.qos.presentation_access_scope);
-    try testing.expectEqual(true, r.qos.coherent_access);
-    try testing.expectEqual(true, r.qos.ordered_access);
+    try testing.expectEqual(@as(u8, 2), presScope(&r.qos));
+    try testing.expectEqual(true, presCoh(&r.qos));
+    try testing.expectEqual(true, presOrd(&r.qos));
 }
 
 test "SEDP: second onParticipantDiscovered replaces proxy without adding a duplicate" {
@@ -615,7 +651,8 @@ test "SEDP: WriterAnnouncement with group_guid encodes and delivers without erro
         .group_guid = makeGuid(0x15, 0x01), // publisher participant GUID as group GUID
         .topic_name = "GroupTopic",
         .type_name = "GroupType",
-        .qos = .{ .coherent_access = true, .presentation_access_scope = 2 },
+        .qos = .{},
+        .presentation = pres(2, true, false),
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
@@ -645,10 +682,8 @@ test "SEDP: WriterAnnouncement with lifespan and deadline QoS round-trips correc
         .topic_name = "T",
         .type_name = "TT",
         .qos = .{
-            .lifespan_sec = 10,
-            .lifespan_nanosec = 500_000_000,
-            .deadline_sec = 5,
-            .deadline_nanosec = 0,
+            .lifespan = .{ .duration = .{ .sec = 10, .nanosec = 500_000_000 } },
+            .deadline = .{ .period = .{ .sec = 5, .nanosec = 0 } },
         },
         .type_object = &.{},
         .type_info_cdr = &.{},
@@ -657,8 +692,8 @@ test "SEDP: WriterAnnouncement with lifespan and deadline QoS round-trips correc
 
     try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
     const found = &remote.rec.writers_found.items[0];
-    try testing.expectEqual(@as(i32, 10), found.qos.lifespan_sec);
-    try testing.expectEqual(@as(u32, 500_000_000), found.qos.lifespan_nanosec);
-    try testing.expectEqual(@as(i32, 5), found.qos.deadline_sec);
-    try testing.expectEqual(@as(u32, 0), found.qos.deadline_nanosec);
+    try testing.expectEqual(@as(i32, 10), wireDur(found.qos.lifespan).sec);
+    try testing.expectEqual(@as(u32, 500_000_000), wireDur(found.qos.lifespan).nanosec);
+    try testing.expectEqual(@as(i32, 5), wireDur(found.qos.deadline).sec);
+    try testing.expectEqual(@as(u32, 0), wireDur(found.qos.deadline).nanosec);
 }

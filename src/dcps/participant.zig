@@ -44,6 +44,7 @@ const time_mod = @import("../util/time.zig");
 const header_mod = @import("../rtps/message/header.zig");
 const build_opts = @import("build_options");
 const qm_mod = @import("qos_match.zig");
+const disc_adapter = @import("../discovery/qos_adapter.zig");
 const reader_mod = @import("reader.zig");
 const writer_mod = @import("writer.zig");
 const zidl_rt = @import("zidl_rt");
@@ -420,16 +421,19 @@ fn pushBuiltinPublicationCdr(
         .participant_key = writer_mod.guidToBuiltinKey(data.participant_guid),
         .topic_name = data.topic_name,
         .type_name = data.type_name,
-        .reliability = qosReliability(data.qos.reliability_kind),
-        .durability = qosDurability(data.qos.durability_kind),
-        .liveliness = qosLiveliness(data.qos.liveliness_kind),
-        .ownership = qosOwnership(data.qos.ownership_kind),
-        .destination_order = qosDestOrder(data.qos.destination_order_kind),
-        .user_data = .{ .value = .{
-            ._maximum = @intCast(data.qos.user_data.len),
-            ._length = @intCast(data.qos.user_data.len),
-            ._buffer = @constCast(data.qos.user_data.ptr),
-            ._release = false,
+        .reliability = qosReliability(disc.discReliabilityKind(data.qos)),
+        .durability = qosDurability(disc.discDurabilityKind(data.qos)),
+        .liveliness = qosLiveliness(disc.discLivelinessKind(data.qos)),
+        .ownership = qosOwnership(disc.discOwnershipKind(data.qos)),
+        .destination_order = qosDestOrder(disc.discDestOrderKind(data.qos)),
+        .user_data = .{ .value = blk: {
+            const _ud = disc.discUserData(data.qos);
+            break :blk .{
+                ._maximum = @intCast(_ud.len),
+                ._length = @intCast(_ud.len),
+                ._buffer = @constCast(_ud.ptr),
+                ._release = false,
+            };
         } },
     };
     DDS.PublicationBuiltinTopicData.serialize(&w, v) catch return;
@@ -452,16 +456,19 @@ fn pushBuiltinSubscriptionCdr(
         .participant_key = writer_mod.guidToBuiltinKey(data.participant_guid),
         .topic_name = data.topic_name,
         .type_name = data.type_name,
-        .reliability = qosReliability(data.qos.reliability_kind),
-        .durability = qosDurability(data.qos.durability_kind),
-        .liveliness = qosLiveliness(data.qos.liveliness_kind),
-        .ownership = qosOwnership(data.qos.ownership_kind),
-        .destination_order = qosDestOrder(data.qos.destination_order_kind),
-        .user_data = .{ .value = .{
-            ._maximum = @intCast(data.qos.user_data.len),
-            ._length = @intCast(data.qos.user_data.len),
-            ._buffer = @constCast(data.qos.user_data.ptr),
-            ._release = false,
+        .reliability = qosReliability(disc.discReliabilityKind(data.qos)),
+        .durability = qosDurability(disc.discDurabilityKind(data.qos)),
+        .liveliness = qosLiveliness(disc.discLivelinessKind(data.qos)),
+        .ownership = qosOwnership(disc.discOwnershipKind(data.qos)),
+        .destination_order = qosDestOrder(disc.discDestOrderKind(data.qos)),
+        .user_data = .{ .value = blk: {
+            const _ud = disc.discUserData(data.qos);
+            break :blk .{
+                ._maximum = @intCast(_ud.len),
+                ._length = @intCast(_ud.len),
+                ._buffer = @constCast(_ud.ptr),
+                ._release = false,
+            };
         } },
     };
     DDS.SubscriptionBuiltinTopicData.serialize(&w, v) catch return;
@@ -644,15 +651,21 @@ const DiscoveredWriter = struct {
     guid: Guid,
     topic_name: []const u8, // owned
     type_name: []const u8, // owned
-    qos: disc.QosSnapshot, // qos.partition_names owned via dupePartitionNames
+    /// Deep-cloned decoded wire QoS (retains unknown PIDs). Owned; freed with
+    /// its generated `deinit`.
+    qos: disc.DiscoveredWriterData,
+    /// PARTITION names, owned copies (`dupePartitionNames`). `qos.partition`
+    /// also holds them but as `[*:0]` pointers into the clone; this flat view
+    /// is what `qm_mod.checkPartition` wants.
+    partition_names: []const []const u8, // owned
     unicast_locators: []const Locator, // owned
     multicast_locators: []const Locator, // owned
 
-    fn deinit(self: DiscoveredWriter, alloc: std.mem.Allocator) void {
+    fn deinit(self: *DiscoveredWriter, alloc: std.mem.Allocator) void {
         alloc.free(self.topic_name);
         alloc.free(self.type_name);
-        DomainParticipantImpl.freePartitionNames(alloc, self.qos.partition_names);
-        if (self.qos.user_data.len != 0) alloc.free(self.qos.user_data);
+        DomainParticipantImpl.freePartitionNames(alloc, self.partition_names);
+        self.qos.deinit(alloc);
         alloc.free(self.unicast_locators);
         alloc.free(self.multicast_locators);
     }
@@ -664,15 +677,16 @@ const DiscoveredReader = struct {
     guid: Guid,
     topic_name: []const u8, // owned
     type_name: []const u8, // owned
-    qos: disc.QosSnapshot, // qos.partition_names owned via dupePartitionNames
+    qos: disc.DiscoveredReaderData, // owned (generated deinit)
+    partition_names: []const []const u8, // owned
     unicast_locators: []const Locator, // owned
     multicast_locators: []const Locator, // owned
 
-    fn deinit(self: DiscoveredReader, alloc: std.mem.Allocator) void {
+    fn deinit(self: *DiscoveredReader, alloc: std.mem.Allocator) void {
         alloc.free(self.topic_name);
         alloc.free(self.type_name);
-        DomainParticipantImpl.freePartitionNames(alloc, self.qos.partition_names);
-        if (self.qos.user_data.len != 0) alloc.free(self.qos.user_data);
+        DomainParticipantImpl.freePartitionNames(alloc, self.partition_names);
+        self.qos.deinit(alloc);
         alloc.free(self.unicast_locators);
         alloc.free(self.multicast_locators);
     }
@@ -1331,9 +1345,9 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(dt.type_name);
         }
         self.discovered_topics.deinit(self.alloc);
-        for (self.discovered_writers.items) |dw| dw.deinit(self.alloc);
+        for (self.discovered_writers.items) |*dw| dw.deinit(self.alloc);
         self.discovered_writers.deinit(self.alloc);
-        for (self.discovered_readers.items) |dr| dr.deinit(self.alloc);
+        for (self.discovered_readers.items) |*dr| dr.deinit(self.alloc);
         self.discovered_readers.deinit(self.alloc);
 
         self.qos.deinit(self.alloc);
@@ -1519,7 +1533,7 @@ pub const DomainParticipantImpl = struct {
         errdefer adapter.deinit();
         adapter.setTracer(self.tracer);
         // {0,0} from codegen means unset → infinite (no lifespan enforcement),
-        // matching the convention used by writerQosSnapshot for SEDP announcement.
+        // matching the convention used by discovery/qos_adapter.zig for SEDP announcement.
         const ls_zero = qos.lifespan.duration.sec == 0 and qos.lifespan.duration.nanosec == 0;
         adapter.setLifespan(if (ls_zero) null else time_mod.RtpsDuration.fromDuration(.{
             .sec = qos.lifespan.duration.sec,
@@ -1546,7 +1560,7 @@ pub const DomainParticipantImpl = struct {
         // through a chain of stack-local copies that get destroyed once this
         // whole call returns -- see ActiveWriter.qos's doc comment). Clone it
         // the same way dupePartitionNames already does for partition_names,
-        // or writerQosSnapshot() re-reads this later (at match time, against
+        // or discovery/qos_adapter.zig re-reads this later (at match time, against
         // a newly-discovered remote reader) and gets garbage -- confirmed via
         // a real repro: -x 2 matching flakiness traced to exactly this.
         var owned_qos = qos;
@@ -1653,7 +1667,7 @@ pub const DomainParticipantImpl = struct {
 
         // See pubCreateProtoWriter's matching comment: qos.data_representation
         // .value must be cloned into zzdds-owned storage before being stashed
-        // in ActiveReader, or a later readerQosSnapshot() call reads a
+        // in ActiveReader, or a later discovery/qos_adapter.zig call reads a
         // dangling buffer.
         var owned_qos = qos;
         owned_qos.data_representation.value = try qos.data_representation.value.clone(self.alloc);
@@ -1711,90 +1725,6 @@ pub const DomainParticipantImpl = struct {
         freeUserData(self.alloc, found_user_data);
         if (found_guid) |g| self.discovery.retractReader(g);
         if (found_proto) |p| p.deinit();
-    }
-
-    // ── QoS → discovery snapshot conversion ──────────────────────────────────
-
-    fn writerQosSnapshot(qos: DDS.DataWriterQos, presentation: DDS.PresentationQosPolicy) disc.QosSnapshot {
-        const keep_last = qos.history.kind != .KEEP_ALL_HISTORY_QOS;
-        // DDS spec: deadline default is DURATION_INFINITE; {0,0} from codegen means unset → treat as infinite.
-        const dl_zero_w = qos.deadline.period.sec == 0 and qos.deadline.period.nanosec == 0;
-        // Liveliness lease: {0,0} from codegen means unset → treat as infinite.
-        const ll_zero_w = qos.liveliness.lease_duration.sec == 0 and qos.liveliness.lease_duration.nanosec == 0;
-        // Lifespan: {0,0} from codegen means unset → treat as infinite.
-        const ls_zero_w = qos.lifespan.duration.sec == 0 and qos.lifespan.duration.nanosec == 0;
-        return .{
-            .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
-            .durability_kind = @as(u8, @truncate(@intFromEnum(qos.durability.kind))),
-            .history_kind = if (qos.history.kind == .KEEP_ALL_HISTORY_QOS) @as(u8, 1) else 0,
-            // DDS spec: KEEP_LAST depth must be >= 1; default 0 from codegen → clamp to 1.
-            .history_depth = if (keep_last and qos.history.depth < 1) 1 else qos.history.depth,
-            .liveliness_kind = @as(u8, @truncate(@intFromEnum(qos.liveliness.kind))),
-            .liveliness_lease_sec = if (ll_zero_w) 0x7fff_ffff else qos.liveliness.lease_duration.sec,
-            .liveliness_lease_nanosec = if (ll_zero_w) 0xffff_ffff else qos.liveliness.lease_duration.nanosec,
-            .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
-            .ownership_strength = qos.ownership_strength.value,
-            .destination_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
-            .data_representation = if (comptime build_opts.xtypes)
-                reprFromQos(if (qos.data_representation.value._buffer) |b| b[0..qos.data_representation.value._length] else &.{})
-            else
-                1,
-            .deadline_sec = if (dl_zero_w) 0x7fff_ffff else qos.deadline.period.sec,
-            .deadline_nanosec = if (dl_zero_w) 0xffff_ffff else qos.deadline.period.nanosec,
-            .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
-            .coherent_access = presentation.coherent_access,
-            .ordered_access = presentation.ordered_access,
-            .user_data = if (qos.user_data.value._buffer) |buffer|
-                buffer[0..qos.user_data.value._length]
-            else
-                &.{},
-            .lifespan_sec = if (ls_zero_w) 0x7fff_ffff else qos.lifespan.duration.sec,
-            .lifespan_nanosec = if (ls_zero_w) 0xffff_ffff else qos.lifespan.duration.nanosec,
-        };
-    }
-
-    fn readerQosSnapshot(qos: DDS.DataReaderQos, presentation: DDS.PresentationQosPolicy) disc.QosSnapshot {
-        const keep_last = qos.history.kind != .KEEP_ALL_HISTORY_QOS;
-        // DDS spec: deadline default is DURATION_INFINITE; {0,0} from codegen means unset → treat as infinite.
-        const dl_zero_r = qos.deadline.period.sec == 0 and qos.deadline.period.nanosec == 0;
-        return .{
-            .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
-            .durability_kind = @as(u8, @truncate(@intFromEnum(qos.durability.kind))),
-            .history_kind = if (qos.history.kind == .KEEP_ALL_HISTORY_QOS) @as(u8, 1) else 0,
-            // DDS spec: KEEP_LAST depth must be >= 1; default 0 from codegen → clamp to 1.
-            .history_depth = if (keep_last and qos.history.depth < 1) 1 else qos.history.depth,
-            .liveliness_kind = @as(u8, @truncate(@intFromEnum(qos.liveliness.kind))),
-            .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
-            .destination_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
-            .data_representation = if (comptime build_opts.xtypes)
-                reprFromQos(if (qos.data_representation.value._buffer) |b| b[0..qos.data_representation.value._length] else &.{})
-            else
-                2, // Advertise XCDR2 acceptance so XCDR2-capable writers (OpenDDS) match.
-            // zzdds stores raw CDR bytes and interop programs parse both XCDR1/2.
-            .deadline_sec = if (dl_zero_r) 0x7fff_ffff else qos.deadline.period.sec,
-            .deadline_nanosec = if (dl_zero_r) 0xffff_ffff else qos.deadline.period.nanosec,
-            .presentation_access_scope = @as(u8, @intCast(@intFromEnum(presentation.access_scope))),
-            .coherent_access = presentation.coherent_access,
-            .ordered_access = presentation.ordered_access,
-            .user_data = if (qos.user_data.value._buffer) |buffer|
-                buffer[0..qos.user_data.value._length]
-            else
-                &.{},
-        };
-    }
-
-    /// Map DDS-XTypes DataRepresentationId_t sequence to QosSnapshot encoding.
-    /// QosSnapshot uses 1=XCDR1, 2=XCDR2. Wire values: XCDR1=0, XCDR2=2.
-    /// Empty sequence (generated default) → XCDR1.
-    fn reprFromQos(ids: []const i16) u16 {
-        // Empty sequence = default; per XTypes §7.6.3.1.1 this means the implementation
-        // accepts all representations it supports.  zzdds stores raw CDR bytes so it
-        // can receive XCDR2 payloads, so advertise XCDR2 acceptance for the common case.
-        if (ids.len == 0) return 2;
-        for (ids) |id| {
-            if (id == 2) return 2; // XCDR2_DATA_REPRESENTATION
-        }
-        return 1; // explicit XCDR1-only list
     }
 
     // ── User data receive dispatcher ──────────────────────────────────────────
@@ -2249,34 +2179,36 @@ pub const DomainParticipantImpl = struct {
         for (due.items) |cb| cb.notify_fn(cb.ctx, prefix, kind);
     }
 
+    /// RTPS wire `Duration_t` → nanoseconds; 0 for INFINITE / absent (the
+    /// callers treat 0 as "no expiry tracking").
+    fn wireDurExpiryNs(od: ?disc.wire.Duration_t) i64 {
+        const d = od orelse return 0;
+        const rd = time_mod.RtpsDuration{ .seconds = d.seconds, .fraction = d.fraction };
+        if (rd.isInfinite()) return 0;
+        const dd = rd.toDuration();
+        return @as(i64, dd.sec) * std.time.ns_per_s + @as(i64, dd.nanosec);
+    }
+
     fn buildMatchedWriterInfo(
         guid: Guid,
-        qos: disc.QosSnapshot,
+        qos: *const disc.DiscoveredWriterData,
         unicast_locators: []const Locator,
         multicast_locators: []const Locator,
     ) proto.MatchedWriterInfo {
-        const ll_sec = qos.liveliness_lease_sec;
-        const ll_ns = qos.liveliness_lease_nanosec;
-        const lease_ns: i64 = if (ll_sec == 0x7fff_ffff)
-            0 // infinite — no expiry tracking
-        else
-            @as(i64, ll_sec) * std.time.ns_per_s + @as(i64, ll_ns);
-        const ls_sec = qos.lifespan_sec;
-        const ls_ns = qos.lifespan_nanosec;
-        const lifespan_ns: i64 = if (ls_sec == 0x7fff_ffff)
-            0 // infinite — no expiry
-        else
-            @as(i64, ls_sec) * std.time.ns_per_s + @as(i64, ls_ns);
+        const lease_ns: i64 = if (qos.liveliness) |l| wireDurExpiryNs(l.lease_duration) else 0;
+        const lifespan_ns: i64 = wireDurExpiryNs(qos.lifespan);
+        // Wire reliability is 1-based: 2 = RELIABLE.
+        const reliable = qos.reliability.kind >= 2;
         return .{
             .guid = guid,
             .unicast_locators = unicast_locators,
             .multicast_locators = multicast_locators,
-            .reliability = if (qos.reliability_kind == 1) .reliable else .best_effort,
-            .ownership_strength = qos.ownership_strength,
+            .reliability = if (reliable) .reliable else .best_effort,
+            .ownership_strength = qos.ownershipStrength orelse 0,
             .liveliness_lease_ns = lease_ns,
-            .liveliness_kind = qos.liveliness_kind,
+            .liveliness_kind = if (qos.liveliness) |l| @intCast(l.kind) else 0,
             .lifespan_ns = lifespan_ns,
-            .history_expected = qos.durability_kind > 0 and qos.reliability_kind == 1,
+            .history_expected = qos.durabilityKind > 0 and reliable,
         };
     }
 
@@ -2316,17 +2248,14 @@ pub const DomainParticipantImpl = struct {
         while (ar_it.next()) |ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, ar.type_name, data.type_name)) continue;
-            const local_snap = readerQosSnapshot(ar.qos, ar.presentation);
-            const result = qm_mod.checkSnapshots(data.qos, local_snap);
+            const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
+            const result = qm_mod.checkDiscovered(data.qos, &local_rd);
             if (!result.isCompatible()) {
                 if (ar.incompat_qos) |cb|
                     cb.notify(cb.ctx, @as(i32, @intCast(@intFromEnum(result.incompatible))));
                 continue;
             }
-            const part_result = qm_mod.checkPartition(
-                .{ .name = data.qos.partition_names },
-                .{ .name = ar.partition_names },
-            );
+            const part_result = qm_mod.checkPartition(data.partition_names, ar.partition_names);
             if (!part_result.isCompatible()) continue;
             // Defer the actual addMatchedWriter (and its initial ACKNACK/
             // replay send) until after self.mu is released below: it
@@ -2365,11 +2294,11 @@ pub const DomainParticipantImpl = struct {
                 .topic_name = tn,
                 .type_name = tt,
                 .handle = topicToHandle(data.topic_name, data.type_name),
-                .reliability_kind = data.qos.reliability_kind,
-                .durability_kind = data.qos.durability_kind,
-                .liveliness_kind = data.qos.liveliness_kind,
-                .ownership_kind = data.qos.ownership_kind,
-                .dest_order_kind = data.qos.destination_order_kind,
+                .reliability_kind = disc.discReliabilityKind(data.qos),
+                .durability_kind = disc.discDurabilityKind(data.qos),
+                .liveliness_kind = disc.discLivelinessKind(data.qos),
+                .ownership_kind = disc.discOwnershipKind(data.qos),
+                .dest_order_kind = disc.discDestOrderKind(data.qos),
             };
             self.discovered_topics.append(self.alloc, dt) catch {
                 self.alloc.free(tn);
@@ -2433,7 +2362,7 @@ pub const DomainParticipantImpl = struct {
     fn buildMatchedReaderInfo(
         self: *Self,
         guid: Guid,
-        qos: disc.QosSnapshot,
+        qos: *const disc.DiscoveredReaderData,
         unicast_locators: []const Locator,
         multicast_locators: []const Locator,
     ) proto.MatchedReaderInfo {
@@ -2446,8 +2375,8 @@ pub const DomainParticipantImpl = struct {
             .unicast_locators = unicast_locators,
             .multicast_locators = multicast_locators,
             .expects_inline_qos = false,
-            .reliability = if (qos.reliability_kind == 1) .reliable else .best_effort,
-            .durability_kind = qos.durability_kind,
+            .reliability = if (qos.reliability.kind >= 2) .reliable else .best_effort,
+            .durability_kind = @intCast(qos.durabilityKind),
             .needs_pid_coherent_set_marker = needs_marker,
         };
     }
@@ -2488,17 +2417,14 @@ pub const DomainParticipantImpl = struct {
         while (aw_it.next()) |aw| {
             if (!std.mem.eql(u8, aw.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, aw.type_name, data.type_name)) continue;
-            const local_snap = writerQosSnapshot(aw.qos, aw.presentation);
-            const result = qm_mod.checkSnapshots(local_snap, data.qos);
+            const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
+            const result = qm_mod.checkDiscovered(&local_wd, data.qos);
             if (!result.isCompatible()) {
                 if (aw.incompat_qos) |cb|
                     cb.notify(cb.ctx, @as(i32, @intCast(@intFromEnum(result.incompatible))));
                 continue;
             }
-            const part_result = qm_mod.checkPartition(
-                .{ .name = aw.partition_names },
-                .{ .name = data.qos.partition_names },
-            );
+            const part_result = qm_mod.checkPartition(aw.partition_names, data.partition_names);
             if (!part_result.isCompatible()) continue;
             // See onWriterDiscovered's matching comment: defer the actual
             // addMatchedReader (and its initial HEARTBEAT/replay send)
@@ -2530,11 +2456,11 @@ pub const DomainParticipantImpl = struct {
                 .topic_name = tn,
                 .type_name = tt,
                 .handle = topicToHandle(data.topic_name, data.type_name),
-                .reliability_kind = data.qos.reliability_kind,
-                .durability_kind = data.qos.durability_kind,
-                .liveliness_kind = data.qos.liveliness_kind,
-                .ownership_kind = data.qos.ownership_kind,
-                .dest_order_kind = data.qos.destination_order_kind,
+                .reliability_kind = disc.discReliabilityKind(data.qos),
+                .durability_kind = disc.discDurabilityKind(data.qos),
+                .liveliness_kind = disc.discLivelinessKind(data.qos),
+                .ownership_kind = disc.discOwnershipKind(data.qos),
+                .dest_order_kind = disc.discDestOrderKind(data.qos),
             };
             self.discovered_topics.append(self.alloc, dt) catch {
                 self.alloc.free(tn);
@@ -2599,19 +2525,18 @@ pub const DomainParticipantImpl = struct {
             alloc.free(tn);
             return null;
         };
-        var qos = data.qos;
-        qos.partition_names = dupePartitionNames(alloc, data.qos.partition_names);
-        qos.user_data = if (data.qos.user_data.len == 0) &.{} else alloc.dupe(u8, data.qos.user_data) catch {
-            freePartitionNames(alloc, qos.partition_names);
+        const qos = data.qos.clone(alloc) catch {
             alloc.free(tt);
             alloc.free(tn);
             return null;
         };
+        const pn = dupePartitionNames(alloc, data.partition_names);
         return .{
             .guid = data.guid,
             .topic_name = tn,
             .type_name = tt,
             .qos = qos,
+            .partition_names = pn,
             .unicast_locators = dupeLocators(alloc, data.unicast_locators),
             .multicast_locators = dupeLocators(alloc, data.multicast_locators),
         };
@@ -2623,19 +2548,18 @@ pub const DomainParticipantImpl = struct {
             alloc.free(tn);
             return null;
         };
-        var qos = data.qos;
-        qos.partition_names = dupePartitionNames(alloc, data.qos.partition_names);
-        qos.user_data = if (data.qos.user_data.len == 0) &.{} else alloc.dupe(u8, data.qos.user_data) catch {
-            freePartitionNames(alloc, qos.partition_names);
+        const qos = data.qos.clone(alloc) catch {
             alloc.free(tt);
             alloc.free(tn);
             return null;
         };
+        const pn = dupePartitionNames(alloc, data.partition_names);
         return .{
             .guid = data.guid,
             .topic_name = tn,
             .type_name = tt,
             .qos = qos,
+            .partition_names = pn,
             .unicast_locators = dupeLocators(alloc, data.unicast_locators),
             .multicast_locators = dupeLocators(alloc, data.multicast_locators),
         };
@@ -2683,7 +2607,7 @@ pub const DomainParticipantImpl = struct {
 
     /// Must be called with self.mu held.
     fn removeDiscoveredWriter(self: *Self, guid: Guid) void {
-        for (self.discovered_writers.items, 0..) |dw, i| {
+        for (self.discovered_writers.items, 0..) |*dw, i| {
             if (dw.guid.eql(guid)) {
                 dw.deinit(self.alloc);
                 _ = self.discovered_writers.swapRemove(i);
@@ -2694,7 +2618,7 @@ pub const DomainParticipantImpl = struct {
 
     /// Must be called with self.mu held.
     fn removeDiscoveredReader(self: *Self, guid: Guid) void {
-        for (self.discovered_readers.items, 0..) |dr, i| {
+        for (self.discovered_readers.items, 0..) |*dr, i| {
             if (dr.guid.eql(guid)) {
                 dr.deinit(self.alloc);
                 _ = self.discovered_readers.swapRemove(i);
@@ -2785,16 +2709,13 @@ pub const DomainParticipantImpl = struct {
                     // presentation QoS) — onReaderDiscovered only scans writers
                     // that already exist at the moment a reader is discovered, so
                     // without this a reader discovered first would never be matched.
-                    const local_snap = writerQosSnapshot(aw.qos, aw.presentation);
-                    for (self.discovered_readers.items) |dr| {
+                    const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
+                    for (self.discovered_readers.items) |*dr| {
                         if (!std.mem.eql(u8, dr.topic_name, aw.topic_name)) continue;
                         if (!std.mem.eql(u8, dr.type_name, aw.type_name)) continue;
-                        const result = qm_mod.checkSnapshots(local_snap, dr.qos);
+                        const result = qm_mod.checkDiscovered(&local_wd, &dr.qos);
                         if (!result.isCompatible()) continue;
-                        const part_result = qm_mod.checkPartition(
-                            .{ .name = aw.partition_names },
-                            .{ .name = dr.qos.partition_names },
-                        );
+                        const part_result = qm_mod.checkPartition(aw.partition_names, dr.partition_names);
                         if (!part_result.isCompatible()) continue;
                         // See onWriterDiscovered's matching comment: defer the
                         // actual addMatchedReader send until after self.mu is
@@ -2806,7 +2727,7 @@ pub const DomainParticipantImpl = struct {
                         if (!aw.proto.quiesceAcquire()) continue;
                         const uloc = dupeLocators(self.alloc, dr.unicast_locators);
                         const mloc = dupeLocators(self.alloc, dr.multicast_locators);
-                        const info = self.buildMatchedReaderInfo(dr.guid, dr.qos, uloc, mloc);
+                        const info = self.buildMatchedReaderInfo(dr.guid, &dr.qos, uloc, mloc);
                         const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
                         jobs.append(self.alloc, .{
                             .proto = aw.proto,
@@ -2861,15 +2782,15 @@ pub const DomainParticipantImpl = struct {
             };
         } else null;
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
-        var snap = writerQosSnapshot(ann.qos, ann.presentation);
-        snap.partition_names = owned_names;
         self.discovery.announceWriter(&disc.WriterAnnouncement{
             .guid = ann.guid,
             .participant_guid = self.guid,
             .group_guid = group_guid,
             .topic_name = ann.topic_name,
             .type_name = ann.type_name,
-            .qos = snap,
+            .qos = ann.qos,
+            .presentation = ann.presentation,
+            .partition_names = owned_names,
             .type_object = &.{},
             .type_info_cdr = type_info_cdr,
         }) catch |err| {
@@ -2920,11 +2841,11 @@ pub const DomainParticipantImpl = struct {
                     // presentation QoS) — onWriterDiscovered only scans readers
                     // that already exist at the moment a writer is discovered, so
                     // without this a writer discovered first would never be matched.
-                    const local_snap = readerQosSnapshot(ar.qos, ar.presentation);
-                    for (self.discovered_writers.items) |dw| {
+                    const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
+                    for (self.discovered_writers.items) |*dw| {
                         if (!std.mem.eql(u8, dw.topic_name, ar.topic_name)) continue;
                         if (!std.mem.eql(u8, dw.type_name, ar.type_name)) continue;
-                        const result = qm_mod.checkSnapshots(dw.qos, local_snap);
+                        const result = qm_mod.checkDiscovered(&dw.qos, &local_rd);
                         if (!result.isCompatible()) {
                             // Mirrors onWriterDiscovered's live-discovery path below --
                             // without this, a writer whose (incompatible) SEDP
@@ -2939,10 +2860,7 @@ pub const DomainParticipantImpl = struct {
                                 cb.notify(cb.ctx, @as(i32, @intCast(@intFromEnum(result.incompatible))));
                             continue;
                         }
-                        const part_result = qm_mod.checkPartition(
-                            .{ .name = dw.qos.partition_names },
-                            .{ .name = ar.partition_names },
-                        );
+                        const part_result = qm_mod.checkPartition(dw.partition_names, ar.partition_names);
                         if (!part_result.isCompatible()) continue;
                         // See onWriterDiscovered's matching comment: defer the
                         // actual addMatchedWriter send until after self.mu is
@@ -2951,7 +2869,7 @@ pub const DomainParticipantImpl = struct {
                         if (!ar.proto.quiesceAcquire()) continue;
                         const uloc = dupeLocators(self.alloc, dw.unicast_locators);
                         const mloc = dupeLocators(self.alloc, dw.multicast_locators);
-                        const info = buildMatchedWriterInfo(dw.guid, dw.qos, uloc, mloc);
+                        const info = buildMatchedWriterInfo(dw.guid, &dw.qos, uloc, mloc);
                         const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
                         jobs.append(self.alloc, .{
                             .proto = ar.proto,
@@ -2987,14 +2905,14 @@ pub const DomainParticipantImpl = struct {
             return;
         };
         const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
-        var snap = readerQosSnapshot(ann.qos, ann.presentation);
-        snap.partition_names = owned_names;
         self.discovery.announceReader(&disc.ReaderAnnouncement{
             .guid = ann.guid,
             .participant_guid = self.guid,
             .topic_name = ann.topic_name,
             .type_name = ann.type_name,
-            .qos = snap,
+            .qos = ann.qos,
+            .presentation = ann.presentation,
+            .partition_names = owned_names,
             .type_info_cdr = type_info_cdr,
         }) catch |err| {
             log_mod.dcps.warn("participant: failed to announce reader through SEDP: {s}", .{@errorName(err)});

@@ -128,12 +128,16 @@ const Harness = struct {
             .prefix = prefix,
             .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
         };
+        var q = iface.DiscoveredWriterData{
+            .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+            .history = .{ .kind = 0, .depth = 1 },
+        };
         const data = iface.WriterData{
             .guid = writer_guid,
             .participant_guid = Guid{ .prefix = prefix, .entity_id = EntityIds.participant },
             .topic_name = topic,
             .type_name = type_name,
-            .qos = .{ .reliability_kind = 1 },
+            .qos = &q,
             .unicast_locators = &.{},
             .multicast_locators = &.{},
             .type_object = &.{},
@@ -153,12 +157,15 @@ const Harness = struct {
             .prefix = prefix,
             .entity_id = .{ .entity_key = .{ 0, 0, 4 }, .entity_kind = 0x07 },
         };
+        var q = iface.DiscoveredReaderData{
+            .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+        };
         const data = iface.ReaderData{
             .guid = reader_guid,
             .participant_guid = Guid{ .prefix = prefix, .entity_id = EntityIds.participant },
             .topic_name = topic,
             .type_name = type_name,
-            .qos = .{ .reliability_kind = 1 },
+            .qos = &q,
             .unicast_locators = &.{},
             .multicast_locators = &.{},
         };

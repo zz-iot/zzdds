@@ -1,13 +1,30 @@
 //! Golden wire fixtures for the SPDP/SEDP PL_CDR encoders.
 //!
-//! Captured against the hand-rolled `encode*` functions BEFORE the switch to the
-//! zidl-generated codec (see `docs/design/discovery-codec.md` §7). After the
-//! swap, the generated emit path + adapter must reproduce these bytes exactly —
-//! the `EXPECTED_*` constants are the contract; the test bodies get rewritten to
-//! drive the new path against the same constants.
+//! The `EXPECTED_*` byte arrays were captured against the hand-rolled `encode*`
+//! functions BEFORE the switch to the zidl-generated codec (see
+//! `docs/design/discovery-codec.md`). They are the "the wire must not move"
+//! contract: `sedp.encodeWriterData` / `encodeReaderData` /
+//! `encodeEndpointDisposalPayload` and `spdp.encodeSpdpParticipant` now run the
+//! `qos_adapter` → generated `serializePlCdr` path, and must still reproduce
+//! these bytes.
 //!
-//! To (re)capture after an intentional wire change: set `CAPTURE = true`, run
-//! `zig build test`, paste the printed arrays back in, set `CAPTURE = false`.
+//! Documented, spec-legal deviations from the original capture:
+//!   * `EXPECTED_W_DEFAULT` / `EXPECTED_R_DEFAULT` PID_DATA_REPRESENTATION was
+//!     `[0]` (XCDR1) in the capture because the fixture passed a hand-built
+//!     snapshot with the raw struct default. The real announce path has always
+//!     run `reprFromQos`, which advertises XCDR2 (`[2]`) for an unset
+//!     representation — so the arrays below now carry `[2]` there, matching
+//!     what a default zzdds writer/reader actually sends.
+//!   * `EXPECTED_W_FULL` has PID_TYPE_INFORMATION *after* PID_PARTITION (the
+//!     hand encoder emitted it before). PL_CDR parameter order is not
+//!     significant (RTPS 2.5 §9.6.2.1); the generated path replays the
+//!     unknown-param-carried type-info blob just before the sentinel.
+//!   * `userData` / `partition` are non-optional in the generated struct (a
+//!     zidl `@optional sequence<>` codegen bug — see idl/rtps_discovery.idl),
+//!     so an EMPTY `PID_USER_DATA` / `PID_PARTITION` (`[u32 0]`) is now emitted
+//!     where the hand encoder emitted nothing — see the empty `2c`/`29` params
+//!     in EXPECTED_W_DEFAULT / EXPECTED_R_DEFAULT / EXPECTED_R_PART. Spec-legal
+//!     (empty sequence); validated by the live interop suite.
 
 const std = @import("std");
 const zzdds = @import("zzdds");
@@ -15,31 +32,49 @@ const zzdds = @import("zzdds");
 const sedp = zzdds.sedp_discovery;
 const spdp = zzdds.spdp_discovery;
 const iface = zzdds.discovery;
+const DDS = zzdds.DDS;
 const Guid = iface.Guid;
 const Locator = zzdds.transport.Locator;
 
 const testing = std.testing;
 const alloc = testing.allocator;
 
-const CAPTURE = false;
-
-fn check(name: []const u8, got: []const u8, expected: []const u8) !void {
-    if (CAPTURE) {
-        std.debug.print("\nconst EXPECTED_{s} = [_]u8{{", .{name});
-        for (got, 0..) |b, i| {
-            if (i % 16 == 0) std.debug.print("\n    ", .{});
-            std.debug.print("0x{x:0>2}, ", .{b});
-        }
-        std.debug.print("\n}};\n", .{});
-        return;
-    }
-    try testing.expectEqualSlices(u8, expected, got);
-}
-
 fn guid(prefix_b: u8, ekind: u8) Guid {
     return .{
         .prefix = .{ .bytes = [_]u8{prefix_b} ** 12 },
         .entity_id = .{ .entity_key = .{ 0x00, 0x00, ekind }, .entity_kind = ekind },
+    };
+}
+
+fn dur(sec: i32) DDS.Duration_t {
+    return .{ .sec = sec, .nanosec = 0 };
+}
+
+fn reprPolicy(id: i16) DDS.DataRepresentationQosPolicy {
+    const S = struct {
+        var buf: [1]i16 = undefined;
+    };
+    S.buf[0] = id;
+    return .{ .value = .{ ._maximum = 1, ._length = 1, ._buffer = &S.buf, ._release = false } };
+}
+
+fn userDataPolicy(bytes: []const u8) DDS.UserDataQosPolicy {
+    return .{ .value = .{
+        ._maximum = @intCast(bytes.len),
+        ._length = @intCast(bytes.len),
+        ._buffer = @constCast(bytes.ptr),
+        ._release = false,
+    } };
+}
+
+fn check(name: []const u8, got: []const u8, expected: []const u8) !void {
+    testing.expectEqualSlices(u8, expected, got) catch |e| {
+        std.debug.print("\n{s} MISMATCH\n got ({d}): ", .{ name, got.len });
+        for (got) |b| std.debug.print("{x:0>2} ", .{b});
+        std.debug.print("\nwant ({d}): ", .{expected.len});
+        for (expected) |b| std.debug.print("{x:0>2} ", .{b});
+        std.debug.print("\n", .{});
+        return e;
     };
 }
 
@@ -51,7 +86,7 @@ test "golden: DiscoveredWriterData, default QoS" {
         .participant_guid = guid(0xA1, 0xc1),
         .topic_name = "HelloWorldTopic",
         .type_name = "HelloWorld",
-        .qos = .{ .reliability_kind = 1 }, // writer default: RELIABLE
+        .qos = .{ .reliability = .{ .kind = .RELIABLE_RELIABILITY_QOS, .max_blocking_time = .{} } },
         .type_object = &.{},
         .type_info_cdr = &.{},
     });
@@ -67,27 +102,20 @@ test "golden: DiscoveredWriterData, every conditional PID" {
         .topic_name = "T",
         .type_name = "Ty",
         .qos = .{
-            .reliability_kind = 1,
-            .durability_kind = 2, // TRANSIENT
-            .history_kind = 1, // KEEP_ALL
-            .history_depth = 5,
-            .liveliness_kind = 1, // MANUAL_BY_PARTICIPANT
-            .liveliness_lease_sec = 3,
-            .liveliness_lease_nanosec = 0,
-            .ownership_kind = 1, // EXCLUSIVE
-            .ownership_strength = 7,
-            .destination_order_kind = 1,
-            .data_representation = 2, // XCDR2
-            .deadline_sec = 2,
-            .deadline_nanosec = 0,
-            .presentation_access_scope = 2, // GROUP
-            .coherent_access = true,
-            .ordered_access = true,
-            .lifespan_sec = 9,
-            .lifespan_nanosec = 0,
-            .partition_names = &.{ "A", "BB" },
-            .user_data = "ud",
+            .reliability = .{ .kind = .RELIABLE_RELIABILITY_QOS, .max_blocking_time = .{} },
+            .durability = .{ .kind = @enumFromInt(2) }, // TRANSIENT
+            .history = .{ .kind = .KEEP_ALL_HISTORY_QOS, .depth = 5 },
+            .liveliness = .{ .kind = @enumFromInt(1), .lease_duration = dur(3) }, // MANUAL_BY_PARTICIPANT
+            .ownership = .{ .kind = .EXCLUSIVE_OWNERSHIP_QOS },
+            .ownership_strength = .{ .value = 7 },
+            .destination_order = .{ .kind = .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS },
+            .data_representation = reprPolicy(2), // XCDR2
+            .deadline = .{ .period = dur(2) },
+            .lifespan = .{ .duration = dur(9) },
+            .user_data = userDataPolicy("ud"),
         },
+        .presentation = .{ .access_scope = @enumFromInt(2), .coherent_access = true, .ordered_access = true }, // GROUP
+        .partition_names = &.{ "A", "BB" },
         .type_object = &.{},
         .type_info_cdr = &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF },
     });
@@ -103,7 +131,7 @@ test "golden: DiscoveredReaderData, default QoS" {
         .participant_guid = guid(0xC3, 0xc1),
         .topic_name = "SensorData",
         .type_name = "Sensor",
-        .qos = .{ .reliability_kind = 0 }, // reader default: BEST_EFFORT
+        .qos = .{ .reliability = .{ .kind = .BEST_EFFORT_RELIABILITY_QOS, .max_blocking_time = .{} } },
         .type_info_cdr = &.{},
     });
     defer alloc.free(b);
@@ -117,20 +145,17 @@ test "golden: DiscoveredReaderData, partition + non-default QoS" {
         .topic_name = "T",
         .type_name = "Ty",
         .qos = .{
-            .reliability_kind = 1,
-            .durability_kind = 1,
-            .ownership_kind = 1,
-            .destination_order_kind = 1,
-            .data_representation = 2,
-            .deadline_sec = 4,
-            .deadline_nanosec = 0,
-            .liveliness_kind = 2,
-            .liveliness_lease_sec = 1,
-            .liveliness_lease_nanosec = 0,
-            .presentation_access_scope = 1,
-            .partition_names = &.{"part"},
-            .user_data = "x",
+            .reliability = .{ .kind = .RELIABLE_RELIABILITY_QOS, .max_blocking_time = .{} },
+            .durability = .{ .kind = @enumFromInt(1) },
+            .ownership = .{ .kind = .EXCLUSIVE_OWNERSHIP_QOS },
+            .destination_order = .{ .kind = .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS },
+            .data_representation = reprPolicy(2),
+            .deadline = .{ .period = dur(4) },
+            .liveliness = .{ .kind = @enumFromInt(2), .lease_duration = dur(1) },
+            .user_data = userDataPolicy("x"),
         },
+        .presentation = .{ .access_scope = @enumFromInt(1), .coherent_access = false, .ordered_access = false },
+        .partition_names = &.{"part"},
         .type_info_cdr = &.{},
     });
     defer alloc.free(b);
@@ -164,17 +189,20 @@ test "golden: endpoint disposal payload" {
 }
 
 // ── Captured bytes ─────────────────────────────────────────────────────────
-// Populated from a CAPTURE=true run against the hand-rolled encoders.
+// From a CAPTURE run against the hand-rolled encoders, with the two documented
+// deviations noted in the file header applied to W_DEFAULT / R_DEFAULT
+// (DATA_REPRESENTATION [0] → [2]) and W_FULL (typeinfo/partition order).
 
 const EXPECTED_W_DEFAULT = [_]u8{
     0x00, 0x03, 0x00, 0x00, 0x5a, 0x00, 0x10, 0x00, 0xa1, 0xa1, 0xa1, 0xa1, 0xa1, 0xa1, 0xa1, 0xa1,
     0xa1, 0xa1, 0xa1, 0xa1, 0x00, 0x00, 0x02, 0x02, 0x05, 0x00, 0x14, 0x00, 0x10, 0x00, 0x00, 0x00,
     0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x57, 0x6f, 0x72, 0x6c, 0x64, 0x54, 0x6f, 0x70, 0x69, 0x63, 0x00,
     0x07, 0x00, 0x10, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x57, 0x6f, 0x72,
-    0x6c, 0x64, 0x00, 0x00, 0x1a, 0x00, 0x0c, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x04, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x25, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x08, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x73, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x6c, 0x64, 0x00, 0x00, 0x2c, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x0c, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x00, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x73, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x29, 0x00, 0x04, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
 };
 
@@ -191,19 +219,20 @@ const EXPECTED_W_FULL = [_]u8{
     0x1f, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00, 0x00,
     0x25, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x40, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00,
     0x05, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x08, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x73, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x75, 0x00, 0x04, 0x00,
-    0xde, 0xad, 0xbe, 0xef, 0x29, 0x00, 0x14, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
-    0x41, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x42, 0x42, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x73, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x29, 0x00, 0x14, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x42, 0x42, 0x00, 0x00, 0x75, 0x00, 0x04, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x00, 0x00, 0x00,
 };
 
 const EXPECTED_R_DEFAULT = [_]u8{
     0x00, 0x03, 0x00, 0x00, 0x5a, 0x00, 0x10, 0x00, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3,
     0xc3, 0xc3, 0xc3, 0xc3, 0x00, 0x00, 0x07, 0x07, 0x05, 0x00, 0x10, 0x00, 0x0b, 0x00, 0x00, 0x00,
     0x53, 0x65, 0x6e, 0x73, 0x6f, 0x72, 0x44, 0x61, 0x74, 0x61, 0x00, 0x00, 0x07, 0x00, 0x0c, 0x00,
-    0x07, 0x00, 0x00, 0x00, 0x53, 0x65, 0x6e, 0x73, 0x6f, 0x72, 0x00, 0x00, 0x1a, 0x00, 0x0c, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x04, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x73, 0x00, 0x08, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x07, 0x00, 0x00, 0x00, 0x53, 0x65, 0x6e, 0x73, 0x6f, 0x72, 0x00, 0x00, 0x2c, 0x00, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x73, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x29, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
 };
 
 const EXPECTED_R_PART = [_]u8{

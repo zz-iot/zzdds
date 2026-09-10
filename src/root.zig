@@ -37,8 +37,13 @@ pub const memory_transport = @import("transport/memory.zig");
 pub const lossy_transport = @import("transport/lossy.zig");
 pub const monitor_polling = @import("transport/monitor/polling.zig");
 pub const discovery = @import("discovery/interface.zig");
+/// zidl-generated PL_CDR codec for SPDP/SEDP discovery data (idl/rtps_discovery.idl).
+pub const disc_wire = @import("zzdds_disc_generated");
+/// zidl runtime (CDR reader/writer, PL_CDR helpers) — re-exported for tests.
+pub const zidl_rt = @import("zidl_rt");
 pub const spdp_discovery = @import("discovery/spdp.zig");
 pub const sedp_discovery = @import("discovery/sedp.zig");
+pub const disc_qos_adapter = @import("discovery/qos_adapter.zig");
 pub const wlp_discovery = @import("discovery/wlp.zig");
 pub const combined_discovery = @import("discovery/combined.zig");
 pub const direct_discovery = @import("discovery/direct.zig");
@@ -52,7 +57,6 @@ pub const resolve_config = @import("config/resolve.zig");
 pub const process_config = @import("config/process.zig");
 pub const factory = @import("factory.zig");
 pub const rtps = @import("rtps/root.zig");
-pub const qos = @import("qos/policy.zig");
 pub const dcps = @import("dcps/root.zig");
 pub const c_abi = @import("c_abi/root.zig");
 
@@ -153,7 +157,6 @@ test {
     _ = @import("util/mutex.zig");
     _ = @import("util/listener_box.zig");
     _ = @import("util/entity_quiesce.zig");
-    _ = @import("qos/policy.zig");
     _ = @import("dcps/qos_match.zig");
     _ = @import("dcps/nil.zig");
     _ = @import("dcps/topic.zig");
@@ -167,6 +170,7 @@ test {
     _ = @import("rtps/protocol_adapters.zig");
     _ = @import("discovery/spdp.zig");
     _ = @import("discovery/sedp.zig");
+    _ = @import("discovery/qos_adapter.zig");
     _ = @import("discovery/wlp.zig");
     _ = @import("discovery/combined.zig");
     _ = @import("discovery/direct.zig");

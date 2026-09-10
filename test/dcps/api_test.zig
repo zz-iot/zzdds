@@ -356,12 +356,17 @@ test "DCPS: get_statuscondition on DataWriter returns non-null condition" {
 
 fn fireRemoteWriter(dp_impl: *DomainParticipantImpl, topic: []const u8, type_name: []const u8) void {
     const pfx = GuidPrefix{ .bytes = .{ 0xAA, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    var q = iface.DiscoveredWriterData{
+        .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+        .durabilityKind = 1,
+        .history = .{ .kind = 0, .depth = 1 },
+    };
     const data = iface.WriterData{
         .guid = .{ .prefix = pfx, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 } },
         .participant_guid = .{ .prefix = pfx, .entity_id = EntityIds.participant },
         .topic_name = topic,
         .type_name = type_name,
-        .qos = .{ .reliability_kind = 1, .durability_kind = 1 },
+        .qos = &q,
         .unicast_locators = &.{},
         .multicast_locators = &.{},
         .type_object = &.{},

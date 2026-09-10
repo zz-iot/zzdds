@@ -49,6 +49,31 @@ decode wire durations as `RtpsDuration`, then convert to DDS `Duration` before l
 or QoS logic. Omitted `PID_DEADLINE` means DDS default infinite; explicit `{0,0}` means
 RTPS `DURATION_ZERO` and is not normalized to infinite.
 
+**SEDP discovery codec is zidl-generated from `idl/rtps_discovery.idl`.**
+The hand-rolled SEDP PL_CDR encoders/parsers were replaced by the codec zidl emits for
+`DiscoveredWriterData` / `DiscoveredReaderData` / `EndpointDisposal` (`--zig-pl-cdr`,
+`@pl_retain_unknown` so every unrecognised PID round-trips losslessly — the groundwork
+for a discovery broker relay). `discovery/qos_adapter.zig` maps the typed
+`DDS.DataWriterQos` / `DataReaderQos` (+ Publisher/Subscriber `PresentationQosPolicy`)
+to/from the wire structs; the old flat `disc.QosSnapshot`, `writerQosSnapshot` /
+`readerQosSnapshot`, and `src/qos/policy.zig` + `checkWriterReader` are gone. QoS matching
+(`qos_match.checkDiscovered`) runs directly on the RTPS structs. The native decode path
+uses `.lenient` mode (skip/retain unknowns, tolerate a truncated tail); `.strict` is
+reserved for a broker's ingress validation. SPDP encode/decode remains hand-rolled for now
+(it carries no QoS). `PID_TYPE_INFORMATION` (an opaque XTypes blob, no CDR length prefix)
+and per-endpoint `PID_UNICAST_LOCATOR` / `PID_MULTICAST_LOCATOR` are not declared members —
+the SEDP wrapper injects/extracts them via `unknown_params`.
+
+**Wire deltas from the pre-codec hand encoders (all spec-legal; `test/discovery/wire_golden_test.zig`
+is the contract, live interop is the gate):** (1) a default writer/reader now emits
+`PID_DATA_REPRESENTATION [2]` (XCDR2 acceptance) — the real announce path always ran
+`reprFromQos`; the old golden capture had `[0]` only because it bypassed it. (2) An empty
+`PID_USER_DATA` / `PID_PARTITION` (`[u32 0]`) is emitted where the hand encoder emitted
+nothing — a zidl `@optional sequence<>` codegen limitation forces those members
+non-optional; restore `@optional` once fixed upstream. (3) `PID_TYPE_INFORMATION` is
+replayed after `PID_PARTITION` rather than before (PL_CDR parameter order is not
+significant, RTPS §9.6.2.1).
+
 **BEST_EFFORT late-join replay is a TRANSIENT_LOCAL courtesy, not reliability.**
 For TRANSIENT_LOCAL writers, `StatefulWriter` replays the current writer cache to a newly
 matched BEST_EFFORT reader. This covers late joiners and in-process discovery races, but it

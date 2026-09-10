@@ -10,12 +10,17 @@
 //!   - A writer is compatible with a reader iff every checked policy satisfies
 //!     the reader's requirement.
 //!
-//! `checkPresentation` and `checkPartition` check Publisher/Subscriber-level
-//! policies, which DataWriter/DataReader don't carry directly.
+//! `checkDiscovered` compares two decoded RTPS discovery wire structs (the
+//! output of `discovery/qos_adapter.zig` for the local endpoint, and the
+//! `deserializeFromPlCdr` result for the remote one). `checkPartition` checks
+//! the Publisher/Subscriber-level PARTITION policy, which the endpoint structs
+//! don't carry.
 
 const std = @import("std");
-const qos = @import("../qos/policy.zig");
 const disc = @import("../discovery/interface.zig");
+const time = @import("../util/time.zig");
+
+const wire = disc.wire;
 
 // ── Policy IDs ────────────────────────────────────────────────────────────────
 
@@ -60,165 +65,122 @@ pub const MatchResult = union(enum) {
     }
 };
 
-// ── DataWriter / DataReader matching ──────────────────────────────────────────
+// ── Discovery wire-struct matching ────────────────────────────────────────────
 
-/// Check DataWriter vs DataReader QoS compatibility (DDS v1.4 §2.2.3 Table 2-3).
-///
-/// Returns `compatible` if the writer's offered QoS satisfies the reader's
-/// requested QoS, or `incompatible` carrying the first violating policy ID.
-///
-/// Policies checked (endpoint level):
-///   DURABILITY, DEADLINE, LATENCY_BUDGET, OWNERSHIP, LIVELINESS,
-///   RELIABILITY, DESTINATION_ORDER.
-///
-/// PRESENTATION (access_scope, coherent/ordered access) is Publisher/Subscriber-
-/// level and is not checked here; use `checkPresentation` directly, or rely on
-/// `checkSnapshots` which embeds PRESENTATION fields from the discovery snapshot.
-/// PARTITION is also Publisher/Subscriber-level; use `checkPartition` separately.
-pub fn checkWriterReader(
-    offered: *const qos.DataWriterQos,
-    requested: *const qos.DataReaderQos,
-) MatchResult {
-    // DURABILITY: offered.kind >= requested.kind
-    // (persistent > transient > transient_local > volatile — enum values match this order)
-    if (@intFromEnum(offered.durability.kind) < @intFromEnum(requested.durability.kind))
-        return .{ .incompatible = .durability };
-
-    // DEADLINE: offered.period <= requested.period
-    // Writer guarantees to produce a sample at least as often as the period;
-    // a shorter (stricter) period is a better offer.
-    if (offered.deadline.period.order(requested.deadline.period) == .gt)
-        return .{ .incompatible = .deadline };
-
-    // LATENCY_BUDGET: offered.duration <= requested.duration
-    // Advisory; still reported as incompatible when violated per spec.
-    if (offered.latency_budget.duration.order(requested.latency_budget.duration) == .gt)
-        return .{ .incompatible = .latency_budget };
-
-    // OWNERSHIP: must be the same kind (shared or exclusive)
-    if (offered.ownership.kind != requested.ownership.kind)
-        return .{ .incompatible = .ownership };
-
-    // LIVELINESS: offered.kind >= requested.kind
-    //             AND offered.lease_duration <= requested.lease_duration
-    // (manual_by_topic > manual_by_participant > automatic — enum values match)
-    if (@intFromEnum(offered.liveliness.kind) < @intFromEnum(requested.liveliness.kind))
-        return .{ .incompatible = .liveliness };
-    if (offered.liveliness.lease_duration.order(requested.liveliness.lease_duration) == .gt)
-        return .{ .incompatible = .liveliness };
-
-    // RELIABILITY: offered.kind >= requested.kind
-    // (reliable=2 > best_effort=1 — enum values match)
-    if (@intFromEnum(offered.reliability.kind) < @intFromEnum(requested.reliability.kind))
-        return .{ .incompatible = .reliability };
-
-    // DESTINATION_ORDER: offered.kind >= requested.kind
-    // (by_source_timestamp=1 > by_reception_timestamp=0 — enum values match)
-    if (@intFromEnum(offered.destination_order.kind) < @intFromEnum(requested.destination_order.kind))
-        return .{ .incompatible = .destination_order };
-
-    return .compatible;
+/// RTPS wire `Duration_t` in nanoseconds, or `null` for DURATION_INFINITE.
+fn rtpsDurNs(d: wire.Duration_t) ?i64 {
+    const rd = time.RtpsDuration{ .seconds = d.seconds, .fraction = d.fraction };
+    if (rd.isInfinite()) return null;
+    const dd = rd.toDuration();
+    return @as(i64, dd.sec) * std.time.ns_per_s + @as(i64, dd.nanosec);
 }
 
-// ── QosSnapshot matching ──────────────────────────────────────────────────────
+/// An absent `@optional Duration_t` member means "unset" → INFINITE.
+fn optDurNs(od: ?wire.Duration_t) ?i64 {
+    const d = od orelse return null;
+    return rtpsDurNs(d);
+}
 
-/// Compare two QosSnapshots for writer-reader compatibility.
+fn livKind(l: anytype) u32 {
+    return if (l) |v| v.kind else 0; // absent → AUTOMATIC
+}
+
+fn livLeaseNs(l: anytype) ?i64 {
+    const v = l orelse return null; // absent → INFINITE
+    return rtpsDurNs(v.lease_duration);
+}
+
+/// First advertised DataRepresentationId (0 = XCDR1, 2 = XCDR2); the single
+/// element zzdds emits. Empty sequence → 0.
+fn firstRepr(seq: anytype) i16 {
+    const b = seq._buffer orelse return 0;
+    if (seq._length == 0) return 0;
+    return b[0];
+}
+
+fn presScope(p: anytype) u32 {
+    return if (p) |v| v.access_scope else 0;
+}
+fn presCoherent(p: anytype) bool {
+    return if (p) |v| v.coherent_access else false;
+}
+fn presOrdered(p: anytype) bool {
+    return if (p) |v| v.ordered_access else false;
+}
+
+/// Check a discovered/local DataWriter's offered QoS against a discovered/local
+/// DataReader's requested QoS (DDS v1.4 §2.2.3 Table 2-3), operating directly on
+/// the RTPS discovery wire structs.
 ///
-/// Covers the policies captured in QosSnapshot: DURABILITY, OWNERSHIP,
-/// LIVELINESS (kind and lease_duration), RELIABILITY, DESTINATION_ORDER,
-/// DEADLINE, DATA_REPRESENTATION, and PRESENTATION (access_scope,
-/// coherent_access, ordered_access).
-///
-/// LATENCY_BUDGET is not present in QosSnapshot and is treated as always
-/// mutually compatible (spec default). LIVELINESS.lease_duration *is*
-/// present and checked below -- see PID_LIVELINESS's own encode-side comment
-/// in `discovery/sedp.zig` for why it wasn't previously (the PID used to be
-/// omitted from the wire entirely, not merely absent from this struct).
-pub fn checkSnapshots(offered: disc.QosSnapshot, requested: disc.QosSnapshot) MatchResult {
-    // DURABILITY: offered.kind >= requested.kind (higher ordinal = stronger guarantee)
-    if (offered.durability_kind < requested.durability_kind)
+/// Covers DURABILITY, OWNERSHIP, LIVELINESS (kind + lease_duration),
+/// RELIABILITY, DESTINATION_ORDER, DEADLINE, DATA_REPRESENTATION, and
+/// PRESENTATION (access_scope + coherent/ordered access, carried on the
+/// endpoint structs by the adapter). LATENCY_BUDGET is treated as always
+/// mutually compatible (spec default). PARTITION is Publisher/Subscriber-level —
+/// use `checkPartition`.
+pub fn checkDiscovered(
+    w: *const wire.DiscoveredWriterData,
+    r: *const wire.DiscoveredReaderData,
+) MatchResult {
+    // DURABILITY: offered.kind >= requested.kind (higher ordinal = stronger).
+    if (w.durabilityKind < r.durabilityKind)
         return .{ .incompatible = .durability };
 
-    // OWNERSHIP: must be the same kind
-    if (offered.ownership_kind != requested.ownership_kind)
+    // OWNERSHIP: must be the same kind.
+    if (w.ownershipKind != r.ownershipKind)
         return .{ .incompatible = .ownership };
 
-    // LIVELINESS kind: offered.kind >= requested.kind
-    if (offered.liveliness_kind < requested.liveliness_kind)
+    // LIVELINESS kind: offered.kind >= requested.kind.
+    if (livKind(w.liveliness) < livKind(r.liveliness))
         return .{ .incompatible = .liveliness };
 
-    // LIVELINESS lease_duration: offered.lease <= requested.lease (infinite = largest possible value)
+    // LIVELINESS lease_duration: offered <= requested (INFINITE = largest).
     {
-        const off_inf = offered.liveliness_lease_sec == 0x7fff_ffff and offered.liveliness_lease_nanosec == 0xffff_ffff;
-        const req_inf = requested.liveliness_lease_sec == 0x7fff_ffff and requested.liveliness_lease_nanosec == 0xffff_ffff;
-        if (!req_inf) { // finite reader lease — writer must also be finite and <=
-            if (off_inf) return .{ .incompatible = .liveliness };
-            const off_ns: i64 = @as(i64, offered.liveliness_lease_sec) * std.time.ns_per_s + @as(i64, offered.liveliness_lease_nanosec);
-            const req_ns: i64 = @as(i64, requested.liveliness_lease_sec) * std.time.ns_per_s + @as(i64, requested.liveliness_lease_nanosec);
-            if (off_ns > req_ns) return .{ .incompatible = .liveliness };
+        const req = livLeaseNs(r.liveliness);
+        if (req) |rn| {
+            const off = livLeaseNs(w.liveliness) orelse return .{ .incompatible = .liveliness };
+            if (off > rn) return .{ .incompatible = .liveliness };
         }
     }
 
-    // RELIABILITY: 0=best_effort, 1=reliable; offered >= requested
-    if (offered.reliability_kind < requested.reliability_kind)
+    // RELIABILITY: offered.kind >= requested.kind (wire values are 1-based:
+    // 1 = BEST_EFFORT, 2 = RELIABLE; the ordering is the same as the DDS API).
+    if (w.reliability.kind < r.reliability.kind)
         return .{ .incompatible = .reliability };
 
-    // DESTINATION_ORDER: offered.kind >= requested.kind
-    if (offered.destination_order_kind < requested.destination_order_kind)
+    // DESTINATION_ORDER: offered.kind >= requested.kind. Writers always carry
+    // it; readers only for local matching (see qos_adapter) — absent → 0.
+    if (w.destinationOrder < (r.destinationOrder orelse 0))
         return .{ .incompatible = .destination_order };
 
-    // DEADLINE: offered.period <= requested.period (infinite = largest possible value)
+    // DEADLINE: offered.period <= requested.period (INFINITE = largest).
     {
-        const off_inf = offered.deadline_sec == 0x7fff_ffff and offered.deadline_nanosec == 0xffff_ffff;
-        const req_inf = requested.deadline_sec == 0x7fff_ffff and requested.deadline_nanosec == 0xffff_ffff;
-        if (!req_inf) { // finite reader deadline — writer must also be finite and <=
-            if (off_inf) return .{ .incompatible = .deadline };
-            const off_ns: i64 = @as(i64, offered.deadline_sec) * std.time.ns_per_s + @as(i64, offered.deadline_nanosec);
-            const req_ns: i64 = @as(i64, requested.deadline_sec) * std.time.ns_per_s + @as(i64, requested.deadline_nanosec);
-            if (off_ns > req_ns) return .{ .incompatible = .deadline };
+        const req = optDurNs(r.deadline);
+        if (req) |rn| {
+            const off = optDurNs(w.deadline) orelse return .{ .incompatible = .deadline };
+            if (off > rn) return .{ .incompatible = .deadline };
         }
     }
 
-    // DATA_REPRESENTATION: writer offers a single representation; reader accepts exactly
-    // its configured representation.  Strict equality reflects the explicit -x flag
-    // semantics in shape_main and the single-element PID_DATA_REPRESENTATION we emit.
-    if (offered.data_representation != requested.data_representation)
+    // DATA_REPRESENTATION: writer offers a single representation; reader accepts
+    // exactly its configured representation (strict equality — matches the
+    // single-element PID_DATA_REPRESENTATION zzdds emits).
+    if (firstRepr(w.dataRepresentation) != firstRepr(r.dataRepresentation))
         return .{ .incompatible = .data_representation };
 
-    // PRESENTATION: publisher's access_scope must be >= subscriber's (instance=0 <
-    // topic=1 < group=2); coherent/ordered access requested by the subscriber must
-    // be offered by the publisher.  We compare raw integers to avoid @enumFromInt
-    // relying on a [0,2] invariant that the type system cannot enforce on a u8 field.
-    if (offered.presentation_access_scope < requested.presentation_access_scope)
+    // PRESENTATION: publisher access_scope >= subscriber's; coherent/ordered
+    // access the subscriber requests must be offered by the publisher.
+    if (presScope(w.presentation) < presScope(r.presentation))
         return .{ .incompatible = .presentation };
-    if (requested.coherent_access and !offered.coherent_access)
+    if (presCoherent(r.presentation) and !presCoherent(w.presentation))
         return .{ .incompatible = .presentation };
-    if (requested.ordered_access and !offered.ordered_access)
+    if (presOrdered(r.presentation) and !presOrdered(w.presentation))
         return .{ .incompatible = .presentation };
 
     return .compatible;
 }
 
 // ── Publisher / Subscriber level matching ─────────────────────────────────────
-
-/// Check Publisher vs Subscriber PRESENTATION QoS compatibility (§2.2.3.6).
-///
-/// Rules:
-///   - offered.access_scope >= requested.access_scope (group > topic > instance)
-///   - if requested.coherent_access then offered.coherent_access must be true
-///   - if requested.ordered_access  then offered.ordered_access  must be true
-pub fn checkPresentation(
-    offered: qos.Presentation,
-    requested: qos.Presentation,
-) MatchResult {
-    if (@intFromEnum(offered.access_scope) < @intFromEnum(requested.access_scope))
-        return .{ .incompatible = .presentation };
-    if (requested.coherent_access and !offered.coherent_access)
-        return .{ .incompatible = .presentation };
-    if (requested.ordered_access and !offered.ordered_access)
-        return .{ .incompatible = .presentation };
-    return .compatible;
-}
 
 /// Check Publisher vs Subscriber PARTITION QoS compatibility (§2.2.3.16).
 ///
@@ -228,14 +190,13 @@ pub fn checkPresentation(
 /// (`*` = any sequence, `?` = any single character); either side may carry
 /// the wildcard — matching is symmetric.
 pub fn checkPartition(
-    offered: qos.Partition,
-    requested: qos.Partition,
+    offered: []const []const u8,
+    requested: []const []const u8,
 ) MatchResult {
-    // An empty partition list is equivalent to [""] per spec.
     const pub_names: []const []const u8 =
-        if (offered.name.len == 0) &[_][]const u8{""} else offered.name;
+        if (offered.len == 0) &[_][]const u8{""} else offered;
     const sub_names: []const []const u8 =
-        if (requested.name.len == 0) &[_][]const u8{""} else requested.name;
+        if (requested.len == 0) &[_][]const u8{""} else requested;
 
     for (pub_names) |pn| {
         for (sub_names) |sn| {
@@ -258,8 +219,6 @@ fn partitionNamesMatch(a: []const u8, b: []const u8) bool {
 fn fnmatch(pattern: []const u8, name: []const u8) bool {
     var pi: usize = 0; // index into pattern
     var ni: usize = 0; // index into name
-    // Backtrack state: position in pattern after last '*', and name position
-    // at that time (sentinel: star_pi == pattern.len means no star seen yet).
     var star_pi: usize = pattern.len;
     var star_ni: usize = 0;
 
@@ -269,10 +228,9 @@ fn fnmatch(pattern: []const u8, name: []const u8) bool {
             ni += 1;
         } else if (pi < pattern.len and pattern[pi] == '*') {
             star_pi = pi;
-            star_ni = ni; // let '*' match zero chars first
+            star_ni = ni;
             pi += 1;
         } else if (star_pi < pattern.len) {
-            // Backtrack: let the last '*' consume one more name char.
             star_ni += 1;
             ni = star_ni;
             pi = star_pi + 1;
@@ -280,296 +238,154 @@ fn fnmatch(pattern: []const u8, name: []const u8) bool {
             return false;
         }
     }
-    // Consume any trailing '*' in the pattern.
     while (pi < pattern.len and pattern[pi] == '*') pi += 1;
     return pi == pattern.len;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-test "compatible defaults: reliable writer, best_effort reader" {
-    const w = qos.DataWriterQos{};
-    const r = qos.DataReaderQos{};
-    try std.testing.expect(checkWriterReader(&w, &r).isCompatible());
+const testing = std.testing;
+
+const REL = wire.ReliabilityWire{ .kind = 2, .max_blocking_time = .{} };
+const BE = wire.ReliabilityWire{ .kind = 1, .max_blocking_time = .{} };
+const INF = wire.Duration_t{ .seconds = 0x7fff_ffff, .fraction = 0xffff_ffff };
+
+fn dsecs(n: i32) wire.Duration_t {
+    return .{ .seconds = n, .fraction = 0 };
 }
 
-test "durability: volatile writer, transient_local reader → incompatible" {
-    const w = qos.DataWriterQos{ .durability = .{ .kind = .volatile_ } };
-    const r = qos.DataReaderQos{ .durability = .{ .kind = .transient_local } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .durability }, res);
+test "checkDiscovered: matching defaults → compatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .history = .{ .kind = 0, .depth = 1 } };
+    const r = wire.DiscoveredReaderData{ .reliability = REL };
+    try testing.expect(checkDiscovered(&w, &r).isCompatible());
 }
 
-test "durability: persistent writer, volatile reader → compatible" {
-    const w = qos.DataWriterQos{ .durability = .{ .kind = .persistent } };
-    const r = qos.DataReaderQos{ .durability = .{ .kind = .volatile_ } };
-    try std.testing.expect(checkWriterReader(&w, &r).isCompatible());
+test "checkDiscovered: reliable writer, best_effort reader → compatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL };
+    const r = wire.DiscoveredReaderData{ .reliability = BE };
+    try testing.expect(checkDiscovered(&w, &r).isCompatible());
 }
 
-test "deadline: writer period longer than reader requirement → incompatible" {
-    const w = qos.DataWriterQos{ .deadline = .{ .period = .{ .sec = 10, .nanosec = 0 } } };
-    const r = qos.DataReaderQos{ .deadline = .{ .period = .{ .sec = 1, .nanosec = 0 } } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .deadline }, res);
+test "checkDiscovered: best_effort writer, reliable reader → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = BE };
+    const r = wire.DiscoveredReaderData{ .reliability = REL };
+    try testing.expectEqual(MatchResult{ .incompatible = .reliability }, checkDiscovered(&w, &r));
 }
 
-test "deadline: writer period equal to reader requirement → compatible" {
-    const p = qos.Deadline{ .period = .{ .sec = 5, .nanosec = 0 } };
-    const w = qos.DataWriterQos{ .deadline = p };
-    const r = qos.DataReaderQos{ .deadline = p };
-    try std.testing.expect(checkWriterReader(&w, &r).isCompatible());
+test "checkDiscovered: volatile writer, transient_local reader → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .durabilityKind = 0 };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .durabilityKind = 1 };
+    try testing.expectEqual(MatchResult{ .incompatible = .durability }, checkDiscovered(&w, &r));
 }
 
-test "deadline: writer infinite period, reader finite → incompatible" {
-    const Duration = @import("../util/time.zig").Duration;
-    const w = qos.DataWriterQos{ .deadline = .{ .period = Duration.infinite } };
-    const r = qos.DataReaderQos{ .deadline = .{ .period = .{ .sec = 1, .nanosec = 0 } } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .deadline }, res);
+test "checkDiscovered: transient writer, volatile reader → compatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .durabilityKind = 2 };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .durabilityKind = 0 };
+    try testing.expect(checkDiscovered(&w, &r).isCompatible());
 }
 
-test "latency_budget: writer larger than reader → incompatible" {
-    const w = qos.DataWriterQos{ .latency_budget = .{ .duration = .{ .sec = 1, .nanosec = 0 } } };
-    const r = qos.DataReaderQos{ .latency_budget = .{ .duration = .{ .sec = 0, .nanosec = 100 } } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .latency_budget }, res);
+test "checkDiscovered: ownership mismatch → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .ownershipKind = 0 };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .ownershipKind = 1 };
+    try testing.expectEqual(MatchResult{ .incompatible = .ownership }, checkDiscovered(&w, &r));
 }
 
-test "ownership: shared vs exclusive → incompatible" {
-    const w = qos.DataWriterQos{ .ownership = .{ .kind = .shared } };
-    const r = qos.DataReaderQos{ .ownership = .{ .kind = .exclusive } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .ownership }, res);
+test "checkDiscovered: liveliness writer weaker → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .liveliness = .{ .kind = 2, .lease_duration = INF } };
+    try testing.expectEqual(MatchResult{ .incompatible = .liveliness }, checkDiscovered(&w, &r));
 }
 
-test "ownership: same kind → compatible" {
-    const w = qos.DataWriterQos{ .ownership = .{ .kind = .exclusive } };
-    const r = qos.DataReaderQos{ .ownership = .{ .kind = .exclusive } };
-    try std.testing.expect(checkWriterReader(&w, &r).isCompatible());
+test "checkDiscovered: liveliness writer lease longer than reader → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .liveliness = .{ .kind = 0, .lease_duration = dsecs(10) } };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .liveliness = .{ .kind = 0, .lease_duration = dsecs(1) } };
+    try testing.expectEqual(MatchResult{ .incompatible = .liveliness }, checkDiscovered(&w, &r));
 }
 
-test "liveliness: writer kind weaker than reader → incompatible" {
-    const w = qos.DataWriterQos{ .liveliness = .{ .kind = .automatic, .lease_duration = @import("../util/time.zig").Duration.infinite } };
-    const r = qos.DataReaderQos{ .liveliness = .{ .kind = .manual_by_topic, .lease_duration = @import("../util/time.zig").Duration.infinite } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .liveliness }, res);
+test "checkDiscovered: destination_order mismatch → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .destinationOrder = 0 };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .destinationOrder = 1 };
+    try testing.expectEqual(MatchResult{ .incompatible = .destination_order }, checkDiscovered(&w, &r));
 }
 
-test "liveliness: same kind, writer lease longer than reader → incompatible" {
-    const w = qos.DataWriterQos{ .liveliness = .{ .kind = .automatic, .lease_duration = .{ .sec = 10, .nanosec = 0 } } };
-    const r = qos.DataReaderQos{ .liveliness = .{ .kind = .automatic, .lease_duration = .{ .sec = 1, .nanosec = 0 } } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .liveliness }, res);
+test "checkDiscovered: reader without destination_order → compatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .destinationOrder = 1 };
+    const r = wire.DiscoveredReaderData{ .reliability = REL };
+    try testing.expect(checkDiscovered(&w, &r).isCompatible());
 }
 
-test "liveliness: manual_by_topic writer, automatic reader → compatible" {
-    const inf = @import("../util/time.zig").Duration.infinite;
-    const w = qos.DataWriterQos{ .liveliness = .{ .kind = .manual_by_topic, .lease_duration = inf } };
-    const r = qos.DataReaderQos{ .liveliness = .{ .kind = .automatic, .lease_duration = inf } };
-    try std.testing.expect(checkWriterReader(&w, &r).isCompatible());
+test "checkDiscovered: deadline writer slower than reader → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .deadline = dsecs(10) };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .deadline = dsecs(1) };
+    try testing.expectEqual(MatchResult{ .incompatible = .deadline }, checkDiscovered(&w, &r));
 }
 
-test "reliability: best_effort writer, reliable reader → incompatible" {
-    const w = qos.DataWriterQos{ .reliability = .{ .kind = .best_effort, .max_blocking_time = @import("../util/time.zig").Duration.zero } };
-    const r = qos.DataReaderQos{ .reliability = .{ .kind = .reliable, .max_blocking_time = @import("../util/time.zig").Duration.zero } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .reliability }, res);
+test "checkDiscovered: writer infinite deadline, reader finite → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .deadline = dsecs(1) };
+    try testing.expectEqual(MatchResult{ .incompatible = .deadline }, checkDiscovered(&w, &r));
 }
 
-test "destination_order: by_reception writer, by_source reader → incompatible" {
-    const w = qos.DataWriterQos{ .destination_order = .{ .kind = .by_reception_timestamp } };
-    const r = qos.DataReaderQos{ .destination_order = .{ .kind = .by_source_timestamp } };
-    const res = checkWriterReader(&w, &r);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .destination_order }, res);
+test "checkDiscovered: data_representation mismatch → incompatible" {
+    var w_ids = [_]i16{2};
+    var r_ids = [_]i16{0};
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &w_ids, ._release = false } };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &r_ids, ._release = false } };
+    try testing.expectEqual(MatchResult{ .incompatible = .data_representation }, checkDiscovered(&w, &r));
 }
 
-test "presentation: publisher scope weaker → incompatible" {
-    const offered = qos.Presentation{ .access_scope = .instance };
-    const requested = qos.Presentation{ .access_scope = .topic };
-    const res = checkPresentation(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .presentation }, res);
+test "checkDiscovered: presentation scope weaker → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .presentation = .{ .access_scope = 1, .coherent_access = false, .ordered_access = false } };
+    try testing.expectEqual(MatchResult{ .incompatible = .presentation }, checkDiscovered(&w, &r));
 }
 
-test "presentation: pub scope >= sub scope → compatible" {
-    const offered = qos.Presentation{ .access_scope = .group };
-    const requested = qos.Presentation{ .access_scope = .topic };
-    try std.testing.expect(checkPresentation(offered, requested).isCompatible());
+test "checkDiscovered: presentation ordered requested not offered → incompatible" {
+    const w = wire.DiscoveredWriterData{ .reliability = REL, .presentation = .{ .access_scope = 1, .coherent_access = false, .ordered_access = false } };
+    const r = wire.DiscoveredReaderData{ .reliability = REL, .presentation = .{ .access_scope = 1, .coherent_access = false, .ordered_access = true } };
+    try testing.expectEqual(MatchResult{ .incompatible = .presentation }, checkDiscovered(&w, &r));
 }
 
-test "presentation: coherent_access requested but not offered → incompatible" {
-    const offered = qos.Presentation{ .access_scope = .topic, .coherent_access = false };
-    const requested = qos.Presentation{ .access_scope = .topic, .coherent_access = true };
-    const res = checkPresentation(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .presentation }, res);
+test "checkPartition: both default (empty) → compatible" {
+    try testing.expect(checkPartition(&.{}, &.{}).isCompatible());
 }
-
-test "presentation: ordered_access requested but not offered → incompatible" {
-    const offered = qos.Presentation{ .access_scope = .topic, .ordered_access = false };
-    const requested = qos.Presentation{ .access_scope = .topic, .ordered_access = true };
-    const res = checkPresentation(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .presentation }, res);
+test "checkPartition: matching names → compatible" {
+    try testing.expect(checkPartition(&.{"sensors"}, &.{"sensors"}).isCompatible());
 }
-
-test "partition: both default (empty) → compatible" {
-    const offered = qos.Partition{};
-    const requested = qos.Partition{};
-    try std.testing.expect(checkPartition(offered, requested).isCompatible());
+test "checkPartition: no name in common → incompatible" {
+    try testing.expectEqual(MatchResult{ .incompatible = .partition }, checkPartition(&.{"sensors"}, &.{"actuators"}));
 }
-
-test "partition: matching names → compatible" {
-    const pub_parts = [_][]const u8{"sensors"};
-    const sub_parts = [_][]const u8{"sensors"};
-    const offered = qos.Partition{ .name = &pub_parts };
-    const requested = qos.Partition{ .name = &sub_parts };
-    try std.testing.expect(checkPartition(offered, requested).isCompatible());
+test "checkPartition: wildcard on publisher side matches subscriber" {
+    try testing.expect(checkPartition(&.{"sensor*"}, &.{"sensors/temperature"}).isCompatible());
 }
-
-test "partition: no name in common → incompatible" {
-    const pub_parts = [_][]const u8{"sensors"};
-    const sub_parts = [_][]const u8{"actuators"};
-    const offered = qos.Partition{ .name = &pub_parts };
-    const requested = qos.Partition{ .name = &sub_parts };
-    const res = checkPartition(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .partition }, res);
+test "checkPartition: wildcard on subscriber side matches publisher" {
+    try testing.expect(checkPartition(&.{"sensors/temperature"}, &.{"sensors/*"}).isCompatible());
 }
-
-test "partition: wildcard on publisher side matches subscriber" {
-    const pub_parts = [_][]const u8{"sensor*"};
-    const sub_parts = [_][]const u8{"sensors/temperature"};
-    const offered = qos.Partition{ .name = &pub_parts };
-    const requested = qos.Partition{ .name = &sub_parts };
-    try std.testing.expect(checkPartition(offered, requested).isCompatible());
+test "checkPartition: publisher empty (default) vs named subscriber → incompatible" {
+    try testing.expectEqual(MatchResult{ .incompatible = .partition }, checkPartition(&.{}, &.{"sensors"}));
 }
-
-test "partition: wildcard on subscriber side matches publisher" {
-    const pub_parts = [_][]const u8{"sensors/temperature"};
-    const sub_parts = [_][]const u8{"sensors/*"};
-    const offered = qos.Partition{ .name = &pub_parts };
-    const requested = qos.Partition{ .name = &sub_parts };
-    try std.testing.expect(checkPartition(offered, requested).isCompatible());
-}
-
-test "partition: publisher empty (default) vs named subscriber → incompatible" {
-    const sub_parts = [_][]const u8{"sensors"};
-    const offered = qos.Partition{};
-    const requested = qos.Partition{ .name = &sub_parts };
-    const res = checkPartition(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .partition }, res);
-}
-
-// fnmatch unit tests
 
 test "fnmatch: exact match" {
-    try std.testing.expect(fnmatch("hello", "hello"));
+    try testing.expect(fnmatch("hello", "hello"));
 }
-
 test "fnmatch: star matches everything" {
-    try std.testing.expect(fnmatch("*", "anything"));
-    try std.testing.expect(fnmatch("*", ""));
+    try testing.expect(fnmatch("*", "anything"));
+    try testing.expect(fnmatch("*", ""));
 }
-
 test "fnmatch: star at end" {
-    try std.testing.expect(fnmatch("foo*", "foobar"));
-    try std.testing.expect(!fnmatch("foo*", "barfoo"));
+    try testing.expect(fnmatch("foo*", "foobar"));
+    try testing.expect(!fnmatch("foo*", "barfoo"));
 }
-
 test "fnmatch: star in middle" {
-    try std.testing.expect(fnmatch("f*r", "foobar"));
-    try std.testing.expect(!fnmatch("f*r", "foobaz"));
+    try testing.expect(fnmatch("f*r", "foobar"));
+    try testing.expect(!fnmatch("f*r", "foobaz"));
 }
-
 test "fnmatch: question mark" {
-    try std.testing.expect(fnmatch("fo?", "foo"));
-    try std.testing.expect(fnmatch("fo?", "fob"));
-    try std.testing.expect(!fnmatch("fo?", "fo"));
-    try std.testing.expect(!fnmatch("fo?", "fooo"));
+    try testing.expect(fnmatch("fo?", "foo"));
+    try testing.expect(!fnmatch("fo?", "fo"));
+    try testing.expect(!fnmatch("fo?", "fooo"));
 }
-
 test "fnmatch: multiple wildcards" {
-    try std.testing.expect(fnmatch("*/*", "a/b"));
-    try std.testing.expect(fnmatch("*/*", "sensors/temp"));
-    try std.testing.expect(!fnmatch("*/*", "noslash"));
-}
-
-test "fnmatch: no match" {
-    try std.testing.expect(!fnmatch("abc", "abd"));
-    try std.testing.expect(!fnmatch("abc", "ab"));
-    try std.testing.expect(!fnmatch("abc", "abcd"));
-}
-
-// ── checkSnapshots tests ──────────────────────────────────────────────────────
-
-test "checkSnapshots: matching defaults → compatible" {
-    const snap = disc.QosSnapshot{};
-    try std.testing.expect(checkSnapshots(snap, snap).isCompatible());
-}
-
-test "checkSnapshots: reliable writer, best_effort reader → compatible" {
-    const offered = disc.QosSnapshot{ .reliability_kind = 1 };
-    const requested = disc.QosSnapshot{ .reliability_kind = 0 };
-    try std.testing.expect(checkSnapshots(offered, requested).isCompatible());
-}
-
-test "checkSnapshots: best_effort writer, reliable reader → incompatible" {
-    const offered = disc.QosSnapshot{ .reliability_kind = 0 };
-    const requested = disc.QosSnapshot{ .reliability_kind = 1 };
-    const res = checkSnapshots(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .reliability }, res);
-}
-
-test "checkSnapshots: volatile writer, transient_local reader → incompatible" {
-    const offered = disc.QosSnapshot{ .durability_kind = 0 };
-    const requested = disc.QosSnapshot{ .durability_kind = 1 };
-    const res = checkSnapshots(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .durability }, res);
-}
-
-test "checkSnapshots: transient writer, volatile reader → compatible" {
-    const offered = disc.QosSnapshot{ .durability_kind = 2 };
-    const requested = disc.QosSnapshot{ .durability_kind = 0 };
-    try std.testing.expect(checkSnapshots(offered, requested).isCompatible());
-}
-
-test "checkSnapshots: ownership mismatch → incompatible" {
-    const offered = disc.QosSnapshot{ .ownership_kind = 0 }; // shared
-    const requested = disc.QosSnapshot{ .ownership_kind = 1 }; // exclusive
-    const res = checkSnapshots(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .ownership }, res);
-}
-
-test "checkSnapshots: liveliness writer weaker → incompatible" {
-    const offered = disc.QosSnapshot{ .liveliness_kind = 0 }; // automatic
-    const requested = disc.QosSnapshot{ .liveliness_kind = 2 }; // manual_by_topic
-    const res = checkSnapshots(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .liveliness }, res);
-}
-
-test "checkSnapshots: destination_order mismatch → incompatible" {
-    const offered = disc.QosSnapshot{ .destination_order_kind = 0 };
-    const requested = disc.QosSnapshot{ .destination_order_kind = 1 };
-    const res = checkSnapshots(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .destination_order }, res);
-}
-
-test "checkSnapshots: PRESENTATION scope weaker → incompatible" {
-    const offered = disc.QosSnapshot{ .presentation_access_scope = 0 }; // instance
-    const requested = disc.QosSnapshot{ .presentation_access_scope = 1 }; // topic
-    const res = checkSnapshots(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .presentation }, res);
-}
-
-test "checkSnapshots: PRESENTATION ordered_access requested but not offered → incompatible" {
-    const offered = disc.QosSnapshot{ .presentation_access_scope = 1, .ordered_access = false };
-    const requested = disc.QosSnapshot{ .presentation_access_scope = 1, .ordered_access = true };
-    const res = checkSnapshots(offered, requested);
-    try std.testing.expectEqual(MatchResult{ .incompatible = .presentation }, res);
-}
-
-test "checkSnapshots: PRESENTATION compatible when scope and flags match" {
-    const snap = disc.QosSnapshot{
-        .presentation_access_scope = 1, // topic
-        .coherent_access = true,
-        .ordered_access = true,
-    };
-    try std.testing.expect(checkSnapshots(snap, snap).isCompatible());
+    try testing.expect(fnmatch("*/*", "a/b"));
+    try testing.expect(!fnmatch("*/*", "noslash"));
 }
