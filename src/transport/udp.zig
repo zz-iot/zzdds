@@ -77,6 +77,7 @@ pub const IfAddr = iface.IfAddr;
 pub const Transport = iface.Transport;
 pub const ReceiveHandler = iface.ReceiveHandler;
 pub const LocatorChangeHandler = iface.LocatorChangeHandler;
+pub const Channel = iface.Channel;
 pub const InterfaceMonitor = iface.InterfaceMonitor;
 const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
@@ -222,6 +223,25 @@ const SocketEntry = struct {
     // and if recvThread were acquiring mu to look up port_entries, it would
     // block indefinitely.
     handler: ReceiveHandler,
+    /// Guards `closed` + the actual close() syscall against a concurrent
+    /// sendOnChannel — mirrors TcpConnection.send_mu, adapted to UDP's
+    /// simpler (no byte-stream framing) protocol: sendOnChannel only needs
+    /// this lock to avoid writing to `fd` after it's been closed and the
+    /// number possibly reused by the OS for an unrelated socket, not to
+    /// serialize datagram writes against each other (sendto() is already
+    /// atomic per-call at the OS level). Never acquired from recvThread.
+    send_mu: mutex_mod.Mutex = .{},
+    /// True once this entry's fd has been closed. Mirrors TcpConnection.fd_open
+    /// (inverted sense) — checked by sendOnChannel before writing, and by
+    /// Channel holders indirectly via the error.ChannelClosed it produces.
+    /// Guarded by send_mu. Set exactly once, by whichever teardown path
+    /// (stop() via unlisten, or the interface-loss graveyard move) reaches
+    /// this entry first.
+    closed: bool = false,
+    /// Staleness generation for Channel identity, stamped once at creation —
+    /// same purpose as TcpConnection.generation. See
+    /// docs/design/transport-channel.md §4.3.
+    generation: u32 = 0,
 
     /// Signal the recv thread to stop, without waiting for it to exit. Safe to
     /// call on any number of sockets before joining any of them — letting every
@@ -231,12 +251,19 @@ const SocketEntry = struct {
         self.stopping.store(true, .release);
     }
 
-    /// Wait for the recv thread to exit (already signaled via `requestStop`)
-    /// and close the socket. Call `requestStop` on every socket being torn down
-    /// first; see that method's comment.
+    /// Wait for the recv thread to exit (already signaled via `requestStop`),
+    /// close the socket, and mark it closed. Call `requestStop` on every
+    /// socket being torn down first; see that method's comment. Does NOT
+    /// notify on_channel_closed — that only fires when the entry actually
+    /// moves to the graveyard (see UdpTransport.retireSocketLocked), not on
+    /// every stop() (e.g. a plain vtUnlisten with no channel ever handed out
+    /// still calls stop(), where notifying would be meaningless).
     fn joinAndClose(self: *SocketEntry) void {
         self.thread.join();
+        self.send_mu.lock();
+        defer self.send_mu.unlock();
         socketClose(self.fd);
+        self.closed = true;
     }
 
     fn stop(self: *SocketEntry) void {
@@ -317,7 +344,7 @@ const PortEntry = struct {
         return self.handlers.items.len == 0;
     }
 
-    fn dispatch(ctx: *anyopaque, buf: []const u8, src: Locator) void {
+    fn dispatch(ctx: *anyopaque, buf: []const u8, src: Locator, channel: Channel) void {
         const self: *PortEntry = @ptrCast(@alignCast(ctx));
         // Snapshot handler list under mu so we can call without holding mu.
         var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
@@ -331,11 +358,29 @@ const PortEntry = struct {
                 count += 1;
             }
         }
-        for (snap[0..count]) |h| h.on_receive(h.ctx, buf, src);
+        for (snap[0..count]) |h| h.on_receive(h.ctx, buf, src, channel);
+    }
+
+    /// Notify every registered handler's on_channel_closed, if set. Same
+    /// snapshot-then-call shape as dispatch.
+    fn dispatchChannelClosed(ctx: *anyopaque, channel: Channel) void {
+        const self: *PortEntry = @ptrCast(@alignCast(ctx));
+        var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
+        var count: usize = 0;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            std.debug.assert(self.handlers.items.len <= snap.len);
+            for (self.handlers.items) |h| {
+                snap[count] = h;
+                count += 1;
+            }
+        }
+        for (snap[0..count]) |h| if (h.on_channel_closed) |cb| cb(h.ctx, channel);
     }
 
     fn asHandler(self: *PortEntry) ReceiveHandler {
-        return .{ .ctx = self, .on_receive = PortEntry.dispatch };
+        return .{ .ctx = self, .on_receive = PortEntry.dispatch, .on_channel_closed = PortEntry.dispatchChannelClosed };
     }
 };
 
@@ -355,6 +400,20 @@ pub const UdpTransport = struct {
     mu: mutex_mod.Mutex,
     port_entries: std.AutoHashMapUnmanaged(u32, *PortEntry),
     sockets: std.ArrayListUnmanaged(*SocketEntry),
+    /// Closed SocketEntry structs, retained (not freed) until UdpTransport
+    /// deinit — mirrors TcpTransport.all_connections' "graveyard" shape so a
+    /// Channel.token pointer stays safe to dereference for the transport's
+    /// whole lifetime instead of dangling across an interface flap. See
+    /// docs/design/transport-channel.md §4.3.
+    dead_sockets: std.ArrayListUnmanaged(*SocketEntry),
+    /// Monotonic counter stamped into SocketEntry.generation at creation.
+    /// Transport-wide rather than per-(port,addr_kind,bound_ip) slot: a
+    /// Channel is only ever compared against the exact SocketEntry its token
+    /// (a pointer) identifies, so collisions across different slots are
+    /// harmless — only two entries created for the *same* slot could ever be
+    /// compared against each other via a stale Channel, and a single
+    /// transport-wide counter still guarantees those differ. Guarded by `mu`.
+    next_socket_generation: u32,
     mc_states: std.ArrayListUnmanaged(MulticastState),
     locators_cache: std.ArrayListUnmanaged(Locator),
     active_ifaces: std.ArrayListUnmanaged(IfAddr),
@@ -436,6 +495,8 @@ pub const UdpTransport = struct {
             .mu = .{},
             .port_entries = .empty,
             .sockets = .empty,
+            .dead_sockets = .empty,
+            .next_socket_generation = 0,
             .mc_states = .empty,
             .locators_cache = .empty,
             .active_ifaces = .empty,
@@ -545,6 +606,11 @@ pub const UdpTransport = struct {
             self.alloc.destroy(s);
         }
         self.sockets.deinit(self.alloc);
+
+        // Graveyard: already stopped/closed when they were moved here (see
+        // retireSocketLocked); just free the allocations now.
+        for (self.dead_sockets.items) |s| self.alloc.destroy(s);
+        self.dead_sockets.deinit(self.alloc);
 
         for (self.mc_states.items) |*ms| ms.deinit(self.alloc);
         self.mc_states.deinit(self.alloc);
@@ -657,6 +723,7 @@ pub const UdpTransport = struct {
         errdefer if (fd_needs_close) socketClose(fd);
         const entry = try self.alloc.create(SocketEntry);
         errdefer self.alloc.destroy(entry);
+        self.next_socket_generation +%= 1;
         entry.* = .{
             .fd = fd,
             .port = port,
@@ -667,11 +734,31 @@ pub const UdpTransport = struct {
             .thread = undefined,
             .transport = self,
             .handler = handler,
+            .generation = self.next_socket_generation,
         };
         entry.thread = try std.Thread.spawn(.{}, recvThread, .{entry});
         fd_needs_close = false;
         errdefer entry.stop();
         try self.sockets.append(self.alloc, entry);
+    }
+
+    /// Stop, close, and notify on_channel_closed for `s`, then move it into
+    /// `dead_sockets` (retained until UdpTransport.close(), mirroring
+    /// TcpTransport.all_connections) instead of freeing it — a Channel.token
+    /// pointer into `s` must stay safe to dereference for the transport's
+    /// whole lifetime. Caller must hold `mu`, must have already called
+    /// `s.requestStop()`, and must not touch `s` again after this returns.
+    fn retireSocketLocked(self: *Self, s: *SocketEntry) void {
+        s.joinAndClose(); // joins the recv thread, closes the fd, sets s.closed
+        const channel = Channel{ .token = @intFromPtr(s), .generation = s.generation };
+        if (s.handler.on_channel_closed) |cb| cb(s.handler.ctx, channel);
+        self.dead_sockets.append(self.alloc, s) catch {
+            // OOM growing dead_sockets: leak s rather than free it. Freeing
+            // here would reopen exactly the UAF this graveyard exists to
+            // prevent (a Channel.token pointer into s could still be held).
+            // A handful of leaked, already-closed SocketEntry structs under
+            // sustained OOM is the lesser failure.
+        };
     }
 
     fn removeUnicastSockets(self: *Self, ip: [16]u8, port: u32) void {
@@ -686,9 +773,8 @@ pub const UdpTransport = struct {
             i -= 1;
             const s = self.sockets.items[i];
             if (s.kind == .unicast and s.port == port and std.mem.eql(u8, &s.bound_ip, &ip)) {
-                s.joinAndClose();
-                self.alloc.destroy(s);
                 _ = self.sockets.swapRemove(i);
+                self.retireSocketLocked(s);
             }
         }
     }
@@ -699,6 +785,7 @@ pub const UdpTransport = struct {
         }
         const fd = try createMulticastSocket(addr_kind, @intCast(port), self.config.recv_buffer_size);
         const entry = try self.alloc.create(SocketEntry);
+        self.next_socket_generation +%= 1;
         entry.* = .{
             .fd = fd,
             .port = port,
@@ -709,6 +796,7 @@ pub const UdpTransport = struct {
             .thread = undefined,
             .transport = self,
             .handler = handler,
+            .generation = self.next_socket_generation,
         };
         entry.thread = try std.Thread.spawn(.{}, recvThread, .{entry});
         try self.sockets.append(self.alloc, entry);
@@ -729,9 +817,8 @@ pub const UdpTransport = struct {
             i -= 1;
             const s = self.sockets.items[i];
             if (s.port == port) {
-                s.joinAndClose();
-                self.alloc.destroy(s);
                 _ = self.sockets.swapRemove(i);
+                self.retireSocketLocked(s);
             }
         }
     }
@@ -979,6 +1066,47 @@ pub const UdpTransport = struct {
                 } else {
                     try sendUdp6(u.addr, u.port, data);
                 }
+            },
+            else => return error.UnsupportedLocatorKind,
+        }
+    }
+
+    /// Send on the exact local socket `channel` identifies, to `locator`,
+    /// instead of vtSend's shared send_fd_v4/v6. Because `entry.fd` is the
+    /// socket actually bound to the interface a prior datagram arrived on,
+    /// the OS naturally uses that interface's address as the outgoing
+    /// source — this is how return-routability (reply from the contacted
+    /// service address) is satisfied, with no extra bookkeeping. `channel`
+    /// pins the local socket; unlike TCP, one UDP socket serves many peers,
+    /// so `locator` (the actual destination) is still required.
+    fn vtSendOnChannel(ctx: *anyopaque, channel: Channel, loc: *const Locator, data: []const u8) anyerror!void {
+        _ = ctx;
+        if (channel.isNone()) return error.ChannelClosed;
+        const entry: *SocketEntry = @ptrFromInt(channel.token);
+        if (entry.generation != channel.generation) return error.ChannelClosed;
+
+        entry.send_mu.lock();
+        defer entry.send_mu.unlock();
+        if (entry.closed) return error.ChannelClosed;
+
+        switch (loc.*) {
+            .udp_v4 => |u| {
+                const dest = posix.sockaddr.in{
+                    .family = posix.AF.INET,
+                    .port = std.mem.nativeToBig(u16, u.port),
+                    .addr = @bitCast(u.addr),
+                };
+                try socketSendTo(entry.fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
+            },
+            .udp_v6 => |u| {
+                const dest = posix.sockaddr.in6{
+                    .family = posix.AF.INET6,
+                    .port = std.mem.nativeToBig(u16, u.port),
+                    .flowinfo = 0,
+                    .addr = u.addr,
+                    .scope_id = 0,
+                };
+                try socketSendTo(entry.fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in6));
             },
             else => return error.UnsupportedLocatorKind,
         }
@@ -1271,6 +1399,7 @@ const udp_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = true },
     .can_reach = UdpTransport.vtCanReach,
     .send = UdpTransport.vtSend,
+    .send_on_channel = UdpTransport.vtSendOnChannel,
     .listen = UdpTransport.vtListen,
     .join_multicast = UdpTransport.vtJoinMulticast,
     .leave_multicast = UdpTransport.vtLeaveMulticast,
@@ -1331,7 +1460,8 @@ fn recvThread(entry: *SocketEntry) void {
         };
 
         const src_loc = sockaddrToLocator(@ptrCast(&src_store));
-        entry.handler.on_receive(entry.handler.ctx, buf[0..n], src_loc);
+        const channel = Channel{ .token = @intFromPtr(entry), .generation = entry.generation };
+        entry.handler.on_receive(entry.handler.ctx, buf[0..n], src_loc, channel);
     }
 }
 
@@ -1640,7 +1770,7 @@ test "fan-out port dispatch delivers to all registered handlers" {
 
     const Counter = struct {
         n: *std.atomic.Value(usize),
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: Channel) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             _ = self.n.fetchAdd(1, .monotonic);
         }
@@ -1694,7 +1824,7 @@ test "two participants share one UdpTransport; independent teardown" {
 
     const Counter = struct {
         n: *std.atomic.Value(usize),
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: Channel) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             _ = self.n.fetchAdd(1, .monotonic);
         }
@@ -1756,7 +1886,7 @@ test "non-wildcard bind still receives loopback traffic" {
     var count: std.atomic.Value(usize) = .init(0);
     const Counter = struct {
         n: *std.atomic.Value(usize),
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: Channel) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             _ = self.n.fetchAdd(1, .monotonic);
         }
@@ -1812,7 +1942,7 @@ test "vtListen promotes reserved meta fd on first listen" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try t.listen(&loc, h);
@@ -1872,7 +2002,7 @@ test "vtListen reserved meta fd also serves advertised IPv6 locators" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try t.listen(&loc, h);
@@ -1949,7 +2079,7 @@ test "deinit stops active socket threads" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try t.listen(&loc, h);
@@ -2005,7 +2135,7 @@ test "vtListen returns UnsupportedLocatorKind for non-UDP locator" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try std.testing.expectError(error.UnsupportedLocatorKind, t.listen(&loc, h));
@@ -2047,7 +2177,7 @@ test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
 
@@ -2156,7 +2286,7 @@ test "hasWildcardSocket returns correct value" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try t.listen(&loc, h);

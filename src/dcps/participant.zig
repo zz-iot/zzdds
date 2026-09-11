@@ -1897,7 +1897,7 @@ pub const DomainParticipantImpl = struct {
     //
     // Lock order: participant.mu → StatefulReader.mu (correct order).
 
-    fn userDataOnReceive(ctx: *anyopaque, raw: []const u8, _: Locator) void {
+    fn userDataOnReceive(ctx: *anyopaque, raw: []const u8, _: Locator, _: transport_if.Channel) void {
         const self = cast(ctx);
 
         var it = parser_mod.MessageIterator.init(raw) catch return;

@@ -305,12 +305,12 @@ test "LossyTransport: pass-through methods delegate to inner" {
     const t = lossy.transport();
 
     const dummy_rx = struct {
-        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
     };
     var rx_ctx: u8 = 0;
     const handler = ReceiveHandler{ .ctx = &rx_ctx, .on_receive = dummy_rx.f };
     // Exercise the callback itself (RecordingCtx.vtListen is a no-op stub).
-    handler.on_receive(handler.ctx, &.{}, dummy_locator);
+    handler.on_receive(handler.ctx, &.{}, dummy_locator, iface.Channel.none);
 
     _ = t.canReach(&dummy_locator);
     try t.listen(&dummy_locator, handler);

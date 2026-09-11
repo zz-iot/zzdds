@@ -494,9 +494,71 @@ release notes).
 - **Retroactive unmatching for ignored publications/subscriptions** — the ignore APIs
   filter future discovery callbacks; ignoring an already-discovered endpoint is a permitted
   no-op. Actively removing existing RTPS proxies is deferred unless a use case needs it.
-- **Platform-specific InterfaceMonitors** — `monitor/netlink.zig` (Linux),
-  `monitor/pf_route.zig` (macOS/BSD), `monitor/windows.zig` (NotifyIpInterfaceChange) —
-  deferred; the polling monitor is sufficient.
+- **Make `InterfaceMonitor` a real, complete thing for zzdds** — three related gaps, bundled
+  as one future initiative rather than three scattered items, because they share a root
+  cause (only the polling backend exists, item 1 below) and a natural landing order (backends
+  first, then the two consumers that would actually benefit from them):
+  1. **Platform-specific backends** — `monitor/netlink.zig` (Linux), `monitor/pf_route.zig`
+     (macOS/BSD), `monitor/windows.zig` (NotifyIpInterfaceChange) — deferred; the polling
+     monitor is sufficient today. `InterfaceMonitor.Vtable` itself (`interface.zig:350`,
+     `start`/`stop`/`enumerate`/`deinit`) needs no change — a backend is a drop-in `ctx`+
+     `vtable` pair, exactly like `PollingMonitor` is today. Contract any of the three must
+     satisfy: (a) **deliver, don't just detect** — `on_change(cb.ctx)` fires from the
+     backend's own detection thread promptly after the underlying kernel event (netlink
+     `RTM_NEWADDR`/`RTM_DELADDR`, PF_ROUTE `RTM_NEWADDR`/`RTM_DELADDR`, Windows
+     `MibAddressInstanceChange`), not batched behind an arbitrary delay — a small, bounded
+     coalescing window (10-50ms) to absorb a burst of near-simultaneous address changes is
+     fine, since it's a fixed, documented latency floor, categorically different from
+     polling's unbounded-until-next-tick latency; (b) **fall back to `PollingMonitor` on init
+     failure, don't fail hard** — `polling.zig`'s own doc comment already states the intent
+     ("the polling monitor is still available as a fallback and for testing", `:7`-`:9`); a
+     permission failure opening a netlink/PF_ROUTE socket (e.g. a locked-down container) or an
+     unsupported OS version must transparently construct a `PollingMonitor` instead of failing
+     transport construction; (c) **`enumerate()` stays the single source of truth** — a
+     backend may internally track structured per-address add/remove events, but must still
+     answer `enumerate()` with a full, current snapshot on demand (as
+     `PollingMonitor.vtEnumerate`, `:325`, does today), so every consumer's diff logic
+     re-derives added/removed sets from two `enumerate()` snapshots rather than trusting a
+     backend to hand over pre-diffed events — keeps reconciliation logic (and its bugs, its
+     tests) in one place per consumer regardless of backend.
+  2. **TCP gains topology awareness.** `design/transport-channel.md` revision 0.2 (superseded
+     by 0.3, kept in git history) worked out a concrete design, deliberately not carried into
+     the shipped spec or the transport-channel PR: `TcpConfig` has no keepalive, connect
+     timeout, or write deadline (`config/schema.zig` `TcpConfig`, `:70`-`:86`), so a TCP
+     connection whose local interface disappears is invisible until the OS's own unbounded
+     passive failure detection eventually fires (commonly tens of minutes on Linux with
+     default `tcp_retries2` and no keepalive). `TcpTransport.vtSetLocatorChangeHandler`
+     (`tcp.zig:723`) already stores a `locator_change_handler` that is silently never
+     invoked — grepped, zero `.on_change(` call sites in the file — dead plumbing this work
+     would complete rather than invent. The worked-out approach: give `TcpTransport` its own
+     `InterfaceMonitor` (optional-injection, mirroring `UdpTransport.init`'s existing `mon:
+     ?InterfaceMonitor` parameter, `udp.zig:492`-`503`); track each connection's concrete
+     local address via `getsockname()` (already used at `tcp.zig:661`,`:667` for a different
+     purpose) right after `connect()`/`accept()` succeeds; on a topology event, fire
+     `locator_change_handler` when the listen address itself is affected and proactively
+     shut down any connection whose local address just disappeared, instead of waiting on the
+     OS. The transport-channel work (`design/transport-channel.md` §5) built the API this
+     should fire through — `ReceiveHandler.on_channel_closed` — so landing this needs no
+     further Channel-side API change; it only needs to call the existing connection-close
+     path (`closeConnFdOnce`) at the right moment.
+  3. **Shared `InterfaceMonitor` instance across a participant's transports.** Once (2) gives
+     TCP its own monitor, having UDP and TCP each own an independent instance (two polling
+     threads, or eventually two netlink sockets, doing redundant work) is correct but
+     wasteful. Sharing one instance is blocked on the same constructor-chain plumbing noted
+     in (2)'s design: reaching UDP's concrete monitor from where TCP is constructed
+     (`participant.zig`'s `owned_tcp_transport`, built inside `DomainParticipantImpl.init`)
+     needs a new parameter threaded through `DomainParticipantFactoryImpl.init` and
+     `DomainParticipantImpl.init`, rippling through at least the six call sites in
+     `raw_ops.zig`/`c_abi/extensions.zig` that construct a factory directly. Do this at the
+     same time as (2), not before it — no reason to duplicate the monitor for even one
+     release cycle if the constructor plumbing is being touched anyway.
+
+  None of the three is required for or blocked by the transport-channel work
+  (`design/transport-channel.md`) — that spec ships `Channel`/`sendOnChannel` for both
+  transports and `on_channel_closed` firing from paths that already exist today (TCP natural
+  connection death; UDP's existing, pre-existing interface-monitor-driven socket teardown).
+  This item is what makes TCP's own local-interface-loss detection prompt, which today it
+  is not — deliberately out of scope for that PR, deliberately tracked here instead.
 - **True zero-copy (zero serialization) / raw native-representation (POD) loans** — out of
   scope, not just deferred. A loan that hands the application a pointer to an unserialized,
   fixed-layout native struct is fundamentally at odds with IDL as a platform-agnostic data

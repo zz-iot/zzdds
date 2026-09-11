@@ -379,13 +379,50 @@ pub const InterfaceMonitor = struct {
     }
 };
 
+// ── Channel ───────────────────────────────────────────────────────────────────
+
+/// A handle to the specific local socket/connection a message arrived on, or
+/// was previously observed on. Meaningless outside the Transport instance
+/// that produced it — never compared across transports, never put on the
+/// wire, never persisted past that Transport's close().
+///
+/// See docs/design/transport-channel.md §4.1 for the full design.
+pub const Channel = struct {
+    /// Opaque, transport-private identity.
+    ///   TCP: @intFromPtr(*TcpConnection) for the connection this arrived on
+    ///        (accepted or dialed — both are valid targets for a reply).
+    ///   UDP: @intFromPtr(*SocketEntry) for the socket this arrived on.
+    token: u64,
+    /// Staleness generation, transport-assigned. Distinct from
+    /// Transport.connectionGeneration(), which is keyed by Locator ("has
+    /// this peer's connection been re-established") — this is keyed by
+    /// Channel identity ("is this specific handle still the same underlying
+    /// connection/socket, or has the slot been torn down and possibly
+    /// reused").
+    generation: u32,
+
+    pub const none: Channel = .{ .token = 0, .generation = 0 };
+    pub fn isNone(self: Channel) bool {
+        return self.token == 0;
+    }
+};
+
 // ── Transport callbacks ───────────────────────────────────────────────────────
 
 /// Callback invoked by the transport on each received datagram.
 pub const ReceiveHandler = struct {
     ctx: *anyopaque,
     /// Called from the transport's receive thread. Must not block.
-    on_receive: *const fn (ctx: *anyopaque, data: []const u8, src: Locator) void,
+    /// `channel` is Channel.none for a transport with no channel concept
+    /// (memory, mock, lossy) or for any receive path that doesn't populate
+    /// one.
+    on_receive: *const fn (ctx: *anyopaque, data: []const u8, src: Locator, channel: Channel) void,
+    /// Called from the transport's receive/monitor thread — same "must not
+    /// block" contract as on_receive — when a channel this handler was ever
+    /// handed (via on_receive) transitions to closed. Optional: leave null
+    /// to ignore. Never called with Channel.none. See
+    /// docs/design/transport-channel.md §5.
+    on_channel_closed: ?*const fn (ctx: *anyopaque, channel: Channel) void = null,
 };
 
 /// Callback invoked when the transport's set of reachable unicast locators changes
@@ -417,6 +454,21 @@ pub const Transport = struct {
 
         /// Send `data` to `locator`. Non-blocking for small datagrams; may block briefly.
         send: *const fn (ctx: *anyopaque, locator: *const Locator, data: []const u8) anyerror!void,
+
+        /// Send `data` on the specific local socket/connection identified by
+        /// `channel`, to `locator`, bypassing normal locator->connection
+        /// resolution (LocatorSelector, dial-or-reuse, source-socket
+        /// selection).
+        ///   TCP: `channel` must identify the connection; `locator` is not
+        ///   consulted to choose a route — a TCP channel already has
+        ///   exactly one peer.
+        ///   UDP: `channel` pins the local socket (and therefore the
+        ///   reply's source address/interface); `locator` is the actual
+        ///   destination, since one UDP socket serves many peers.
+        /// Returns error.ChannelClosed if the channel is stale. Null (the
+        /// default) means this transport has no channel concept (memory,
+        /// mock, lossy).
+        send_on_channel: ?*const fn (ctx: *anyopaque, channel: Channel, locator: *const Locator, data: []const u8) anyerror!void = null,
 
         /// Bind a receive callback to the port given by `locator`.
         /// Creates one socket per active interface address. The same handler is
@@ -469,6 +521,12 @@ pub const Transport = struct {
     }
     pub fn send(self: Transport, locator: *const Locator, data: []const u8) anyerror!void {
         return self.vtable.send(self.ctx, locator, data);
+    }
+    /// Returns error.ChannelUnsupported if this transport has no channel
+    /// concept (send_on_channel is null).
+    pub fn sendOnChannel(self: Transport, channel: Channel, locator: *const Locator, data: []const u8) anyerror!void {
+        if (self.vtable.send_on_channel) |f| return f(self.ctx, channel, locator, data);
+        return error.ChannelUnsupported;
     }
     pub fn listen(self: Transport, locator: *const Locator, handler: ReceiveHandler) anyerror!void {
         return self.vtable.listen(self.ctx, locator, handler);

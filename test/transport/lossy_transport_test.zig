@@ -80,7 +80,7 @@ const StubCtx = struct {
 
 const dummy_loc = Locator{ .udp_v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 1234 } };
 const dummy_handler = ReceiveHandler{ .ctx = @ptrFromInt(1), .on_receive = struct {
-    fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+    fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
 }.f };
 
 // ── DropFirst ─────────────────────────────────────────────────────────────────

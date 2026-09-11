@@ -738,9 +738,10 @@ pub const SedpEndpoints = struct {
 
     // ── Transport receive callback ────────────────────────────────────────────
 
-    fn onReceive(ctx: *anyopaque, data: []const u8, from: Locator) void {
+    fn onReceive(ctx: *anyopaque, data: []const u8, from: Locator, channel: tr_iface.Channel) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         _ = from;
+        _ = channel;
         var pub_pair = self.pubPair();
         var sub_pair = self.subPair();
         var it = parser_mod.MessageIterator.init(data) catch return;

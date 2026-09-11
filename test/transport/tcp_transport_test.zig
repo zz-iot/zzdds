@@ -45,7 +45,7 @@ const Latch = struct {
 /// only care about delivery count, not payload.
 const LatchCounter = struct {
     latch: *Latch,
-    fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+    fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.latch.post();
     }
@@ -138,7 +138,7 @@ test "tcp transport: loopback send and receive" {
         alloc: std.mem.Allocator,
         latch: *Latch,
 
-        fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator) void {
+        fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator, _: iface.Channel) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.alloc.free(self.buf.*);
             self.buf.* = self.alloc.dupe(u8, data) catch &.{};
@@ -313,7 +313,7 @@ test "tcp transport: vtListen rejects non-TCP locator" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
         }.f,
     };
     try testing.expectError(error.UnsupportedLocator, t.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, 7400), h));
@@ -338,7 +338,7 @@ test "tcp transport: unicastLocators before and after listen" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
         }.f,
     };
     const listen_loc = Locator.tcp4(.{ 127, 0, 0, 1 }, 0);
@@ -361,7 +361,7 @@ test "tcp transport: unlisten last handler stops listener" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
         }.f,
     };
 
@@ -448,7 +448,7 @@ test "tcp transport: vtListen PortConflict rolls back handler" {
     var sentinel_a: u8 = 0;
     var sentinel_b: u8 = 0;
     const noop = struct {
-        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
     }.f;
     const ha = iface.ReceiveHandler{ .ctx = &sentinel_a, .on_receive = noop };
     const hb = iface.ReceiveHandler{ .ctx = &sentinel_b, .on_receive = noop };
@@ -477,7 +477,7 @@ test "tcp transport: vtListen rejects different address family on active listene
     var sentinel_a: u8 = 0;
     var sentinel_b: u8 = 0;
     const noop = struct {
-        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
     }.f;
     const ha = iface.ReceiveHandler{ .ctx = &sentinel_a, .on_receive = noop };
     const hb = iface.ReceiveHandler{ .ctx = &sentinel_b, .on_receive = noop };
@@ -498,7 +498,7 @@ test "tcp transport: vtListen rejects more than 64 handlers" {
 
     var ctxs: [65]u8 = undefined;
     const noop = struct {
-        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
     }.f;
 
     var loc = Locator.tcp4(.{ 127, 0, 0, 1 }, 0);
@@ -580,7 +580,7 @@ test "tcp transport: vtListen BindFailed rolls back registered handler (IPv4)" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
         }.f,
     };
     const loc = Locator.tcp4(.{ 192, 0, 2, 1 }, 0);
@@ -604,7 +604,7 @@ test "tcp transport: vtListen BindFailed rolls back registered handler (IPv6)" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
         }.f,
     };
     var doc6 = std.mem.zeroes([16]u8);
@@ -640,7 +640,7 @@ test "tcp transport: IPv6 listen with empty bind_address advertises locator addr
     const port = listenAndGetPortV6(st, (ReceiveHandler{
         .ctx = @as(*anyopaque, @ptrCast(&lo6)),
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
         }.f,
     }), alloc) catch |err| switch (err) {
         error.BindFailed => return, // IPv6 not available on this host
@@ -666,7 +666,7 @@ test "tcp transport: empty bind_address rejects wildcard advertise locator" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
         }.f,
     };
     try testing.expectError(error.WildcardAdvertiseAddress, t.listen(&Locator.tcp4(.{ 0, 0, 0, 0 }, 0), h));
@@ -814,7 +814,7 @@ test "tcp transport: IPv6 loopback send and receive" {
         alloc: std.mem.Allocator,
         latch: *Latch,
 
-        fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator) void {
+        fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator, _: iface.Channel) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.alloc.free(self.buf.*);
             self.buf.* = self.alloc.dupe(u8, data) catch &.{};
