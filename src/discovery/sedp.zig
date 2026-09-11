@@ -1049,6 +1049,7 @@ pub fn encodeEndpointDisposalPayload(alloc: std.mem.Allocator, guid: Guid) ![]u8
 // ── Tests: legacy PID_PARTITION (0x0035) hand-parse ──────────────────────────
 
 const testing = std.testing;
+const mock_tr = @import("../transport/mock.zig");
 
 /// Emit a CDR `sequence<string>` value (no encap header — this is a retained
 /// parameter's *value* bytes) with the given byte order. String lengths include
@@ -1127,4 +1128,182 @@ test "partitionNamesOwned: legacy 0x0035 wins over declared member and is not tr
     defer a.free(got);
     try testing.expectEqual(@as(usize, 40), got.len);
     try testing.expectEqualStrings("p39", got[39]);
+}
+
+test "decodeEndpointT: RTI Connext's vendor PID 0x8021 does not alias PID_PRESENTATION" {
+    // Regression test for the live-interop failure this PR's zidl v0.3.15 pin
+    // fixes (Greptile, PR review): a real Connext writer announcement carries
+    // vendor PID 0x8021 (bit 0x8000 set, a compressed TypeObject blob) whose
+    // low 15 bits — 0x0021 — collide with PID_PRESENTATION. zidl < v0.3.15's
+    // generated switch masked with `& 0x3FFF` before checking the vendor bit,
+    // so this payload decoded the blob as `{u32; bool; bool}` and failed with
+    // `error.InvalidBool`, dropping every Connext (and TOC CoreDX) endpoint.
+    // This exercises the real generated codec through zzdds's own decode path
+    // — if a future zidl (or IDL) change reopens the aliasing, this fails.
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    var w = zidl_rt.PlCdrWriter.init(&buf, a);
+    try w.writeEncapHeader();
+    {
+        const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);
+        for (0..16) |_| try w.writeU8(0x11);
+        try w.patchPlParam(h);
+    }
+    {
+        const h = try w.reservePlParam(0x0005); // PID_TOPIC_NAME
+        try w.writeString("Square");
+        try w.patchPlParam(h);
+    }
+    {
+        const h = try w.reservePlParam(0x0007); // PID_TYPE_NAME
+        try w.writeString("ShapeType");
+        try w.patchPlParam(h);
+    }
+    // Bytes chosen so a `{u32 access_scope; bool; bool}` misparse would hit
+    // `error.InvalidBool` (0x03 is not 0/1) exactly as the real capture did.
+    try w.writeRawParam(0x8021, &.{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00 });
+    try w.writePlSentinel();
+
+    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, buf.items);
+    defer ep.deinit();
+    try testing.expectEqualStrings("Square", ep.data.topicName);
+    try testing.expectEqualStrings("ShapeType", ep.data.typeName);
+    try testing.expect(ep.data.presentation == null); // vendor blob dropped, not misparsed
+    try testing.expectEqual(@as(usize, 1), ep.data.unknown_params.len);
+    try testing.expectEqual(@as(u16, 0x8021), ep.data.unknown_params[0].pid);
+}
+
+/// Raw wire bytes for a `Locator_t {i32 kind; u32 port; u8 address[16]}` (LE,
+/// no CDR length prefix — @pl_repeated occurrences carry the fixed-size value
+/// directly).
+fn locatorBytes(kind: i32, port: u32, ipv4: [4]u8) [24]u8 {
+    var b: [24]u8 = std.mem.zeroes([24]u8);
+    std.mem.writeInt(i32, b[0..4], kind, .little);
+    std.mem.writeInt(u32, b[4..8], port, .little);
+    @memcpy(b[20..24], &ipv4);
+    return b;
+}
+
+test "decodeEndpointT: a peer's PID_UNICAST_LOCATOR/PID_MULTICAST_LOCATOR entries decode to real transport Locators" {
+    // zzdds's own encoder never emits per-endpoint locators (SEDP relies on
+    // the SPDP participant defaults instead — see resolveEffectiveLocators),
+    // so this is the only path that exercises the wire Locator_t → transport
+    // Locator conversion (wireLocatorsOwned) against real interop traffic.
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    var w = zidl_rt.PlCdrWriter.init(&buf, a);
+    try w.writeEncapHeader();
+    {
+        const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);
+        for (0..16) |_| try w.writeU8(0x22);
+        try w.patchPlParam(h);
+    }
+    const uc1 = locatorBytes(tr_iface.LocatorKind.udp_v4, 7412, .{ 192, 168, 1, 10 });
+    const uc2 = locatorBytes(tr_iface.LocatorKind.udp_v4, 7413, .{ 192, 168, 1, 11 });
+    const mc1 = locatorBytes(tr_iface.LocatorKind.udp_v4, 7400, .{ 239, 255, 0, 1 });
+    try w.writeRawParam(PidTable.UNICAST_LOCATOR, &uc1);
+    try w.writeRawParam(PidTable.UNICAST_LOCATOR, &uc2); // @pl_repeated: 2nd occurrence appends
+    try w.writeRawParam(PidTable.MULTICAST_LOCATOR, &mc1);
+    try w.writePlSentinel();
+
+    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, buf.items);
+    defer ep.deinit();
+    try testing.expectEqual(@as(usize, 2), ep.unicast.len);
+    try testing.expectEqual(Locator{ .udp_v4 = .{ .addr = .{ 192, 168, 1, 10 }, .port = 7412 } }, ep.unicast[0]);
+    try testing.expectEqual(Locator{ .udp_v4 = .{ .addr = .{ 192, 168, 1, 11 }, .port = 7413 } }, ep.unicast[1]);
+    try testing.expectEqual(@as(usize, 1), ep.multicast.len);
+    try testing.expectEqual(Locator{ .udp_v4 = .{ .addr = .{ 239, 255, 0, 1 }, .port = 7400 } }, ep.multicast[0]);
+}
+
+test "decodeEndpointT / typeInfoBlob: a decoded PID_TYPE_INFORMATION blob round-trips" {
+    // Encode-side injection (encodeWriterData) is covered elsewhere; nothing
+    // exercised decoding one back out via typeInfoBlob until now.
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    var w = zidl_rt.PlCdrWriter.init(&buf, a);
+    try w.writeEncapHeader();
+    {
+        const h = try w.reservePlParam(PidTable.ENDPOINT_GUID);
+        for (0..16) |_| try w.writeU8(0x33);
+        try w.patchPlParam(h);
+    }
+    const blob = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    try w.writeRawParam(0x0075, &blob); // PID_TYPE_INFORMATION
+    try w.writePlSentinel();
+
+    var ep = try decodeEndpointT(Disc.DiscoveredWriterData, a, buf.items);
+    defer ep.deinit();
+    try testing.expectEqualSlices(u8, &blob, typeInfoBlob(ep.data.unknown_params));
+}
+
+test "handleEndpointChange: a too-short payload is dropped, not delivered to the callback" {
+    // Covers the `catch |err| { log.sedp.warn(...); return; }` branches for
+    // both the writer and reader decode paths — nothing previously drove a
+    // malformed payload through the real SedpEndpoints callback wiring (only
+    // decodeEndpointT itself, directly, in the tests above).
+    const a = testing.allocator;
+    const net = try mock_tr.MockNetwork.init(a);
+    defer net.deinit();
+    const t = try mock_tr.MockTransport.init(a, net, &.{});
+    defer t.deinit();
+
+    const sedp = try SedpEndpoints.init(a, t.transport());
+    defer sedp.deinit();
+
+    const Ctx = struct {
+        fired: bool = false,
+        fn onParticipant(_: *anyopaque, _: *const ParticipantData) void {}
+        fn onParticipantLost(_: *anyopaque, _: Guid) void {}
+        fn onWriter(ctx: *anyopaque, _: *const WriterData) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired = true;
+        }
+        fn onWriterLost(_: *anyopaque, _: Guid) void {}
+        fn onReader(ctx: *anyopaque, _: *const ReaderData) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired = true;
+        }
+        fn onReaderLost(_: *anyopaque, _: Guid) void {}
+        fn onWlpAlive(_: *anyopaque, _: GuidPrefix, _: u8) void {}
+    };
+    var ctx = Ctx{};
+    const cbs = Callbacks{
+        .ctx = &ctx,
+        .on_participant_discovered = Ctx.onParticipant,
+        .on_participant_lost = Ctx.onParticipantLost,
+        .on_writer_discovered = Ctx.onWriter,
+        .on_writer_lost = Ctx.onWriterLost,
+        .on_reader_discovered = Ctx.onReader,
+        .on_reader_lost = Ctx.onReaderLost,
+        .on_wlp_alive = Ctx.onWlpAlive,
+    };
+    const ann = ParticipantAnnouncement{
+        .guid = .{ .prefix = GuidPrefix.unknown, .entity_id = EntityIds.participant },
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &.{},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 30_000,
+        .builtin_endpoint_set = 0,
+    };
+    try sedp.start(&ann, &cbs);
+
+    const bad = CacheChange{
+        .kind = .alive,
+        .writer_guid = .{ .prefix = GuidPrefix.unknown, .entity_id = EntityIds.participant },
+        .sequence_number = 1,
+        .source_timestamp = RtpsTimestamp.now(),
+        .instance_handle = std.mem.zeroes(history_mod.InstanceHandle),
+        .key_hash = std.mem.zeroes([16]u8),
+        .data = &[_]u8{ 0x00, 0x03 }, // shorter than the 4-byte encap header
+    };
+    sedp.handleEndpointChange(&bad, true);
+    try testing.expect(!ctx.fired);
+    sedp.handleEndpointChange(&bad, false);
+    try testing.expect(!ctx.fired);
 }

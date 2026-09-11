@@ -11,6 +11,18 @@
 //!
 //! libFuzzer: build with `clang -fsanitize=fuzzer,address`, run against
 //!   test/fuzz/corpus/plcdr/
+//!
+//! Corpus seed `connext-vendor-pid-0x8021-presentation-alias.plcdr`:
+//!   Source: live interop against a real RTI Connext 7.7.0 writer (PR #83 CI).
+//!   Observed: vendor PID 0x8021 (bit 0x8000 set, a compressed TypeObject blob)
+//!     aliased PID_PRESENTATION (0x0021) under the pre-v0.3.15 zidl PL_CDR
+//!     switch's `& 0x3FFF` masking, so decode failed with `error.InvalidBool`.
+//!   Expected: decodes cleanly (zidl >= v0.3.15) with `presentation == null`;
+//!     the deterministic assertion lives in `sedp.zig`'s
+//!     "RTI Connext's vendor PID 0x8021 does not alias PID_PRESENTATION" test
+//!     (synthetic payload) — this corpus entry is the real captured bytes, for
+//!     fuzzing coverage and crash-regression only (this harness only asserts
+//!     no panic/OOB, not where the vendor bytes land).
 
 const std = @import("std");
 const zzdds = @import("zzdds");
