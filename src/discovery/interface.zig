@@ -21,45 +21,56 @@ const header_mod = @import("../rtps/message/header.zig");
 const Locator = transport.Locator;
 const Transport = transport.Transport;
 
+/// Typed DDS QoS (from dcps.idl codegen) and the RTPS discovery wire structs
+/// (from idl/rtps_discovery.idl). The discovery plugin interface is expressed
+/// directly in these — the old flat `QosSnapshot` is gone.
+pub const DDS = @import("zzdds_generated").DDS;
+pub const wire = @import("zzdds_disc_generated");
+
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
 pub const EntityId = guid_mod.EntityId;
 pub const EntityIds = guid_mod.EntityIds;
 pub const VendorId = header_mod.VendorId;
 
-/// QoS snapshot passed to discovery for matching and advertisement.
-/// Fields are kept as raw i32/u32 to avoid a circular dependency on qos.zig
-/// during the early build phases. Will be replaced by typed QoS once that
-/// module exists.
-pub const QosSnapshot = struct {
-    reliability_kind: u8 = 0, // 0=best_effort, 1=reliable
-    durability_kind: u8 = 0, // 0=volatile, 1=transient_local, 2=transient, 3=persistent
-    history_kind: u8 = 0, // 0=keep_last, 1=keep_all
-    history_depth: i32 = 1,
-    liveliness_kind: u8 = 0, // 0=automatic, 1=manual_by_participant, 2=manual_by_topic
-    liveliness_lease_sec: i32 = 0x7fff_ffff, // default = infinite
-    liveliness_lease_nanosec: u32 = 0xffff_ffff,
-    ownership_kind: u8 = 0, // 0=shared, 1=exclusive
-    ownership_strength: i32 = 0, // only meaningful when ownership_kind=exclusive
-    destination_order_kind: u8 = 0, // 0=by_reception_timestamp, 1=by_source_timestamp
-    data_representation: u16 = 1, // 1=XCDR1, 2=XCDR2
-    // DDS INFINITE = {sec=0x7fffffff, nanosec=0xffffffff}; default means "no deadline constraint".
-    deadline_sec: i32 = 0x7fff_ffff,
-    deadline_nanosec: u32 = 0xffff_ffff,
-    // Publisher/Subscriber partition names. Empty = default partition ("").
-    // Points into memory owned by the source (DecodedEndpoint or ActiveWriter/Reader).
-    partition_names: []const []const u8 = &.{},
-    // PRESENTATION QoS (Publisher/Subscriber level): 0=instance, 1=topic, 2=group
-    presentation_access_scope: u8 = 0,
-    coherent_access: bool = false,
-    ordered_access: bool = false,
-    // DDS USER_DATA bytes. Announcement snapshots borrow the QoS buffer;
-    // decoded/discovered endpoint containers retain an owned copy.
-    user_data: []const u8 = &.{},
-    // LIFESPAN QoS (DataWriter only). DDS INFINITE = {0x7fffffff, 0xffffffff}.
-    lifespan_sec: i32 = 0x7fff_ffff,
-    lifespan_nanosec: u32 = 0xffff_ffff,
-};
+/// Convenience aliases for the generated discovery wire structs.
+pub const DiscoveredWriterData = wire.DiscoveredWriterData;
+pub const DiscoveredReaderData = wire.DiscoveredReaderData;
+
+// ── Field accessors over the generated Discovered{Writer,Reader}Data structs ──
+// Both structs share these member names/shapes; the helpers are generic so
+// call sites (participant.zig, qos_match.zig) need not branch W vs R or repeat
+// the wire-encoding conventions (reliability is 1-based on the wire; several
+// QoS members are @optional and absent => the DDS spec default).
+
+/// Internal reliability kind: 0 = BEST_EFFORT, 1 = RELIABLE (wire is 1-based).
+pub fn discReliabilityKind(q: anytype) u8 {
+    return if (q.reliability.kind >= 2) 1 else 0;
+}
+pub fn discDurabilityKind(q: anytype) u8 {
+    return @intCast(q.durabilityKind);
+}
+/// Liveliness kind ordinal; absent => AUTOMATIC (0).
+pub fn discLivelinessKind(q: anytype) u8 {
+    return if (q.liveliness) |l| @intCast(l.kind) else 0;
+}
+pub fn discOwnershipKind(q: anytype) u8 {
+    return @intCast(q.ownershipKind);
+}
+/// Destination-order kind; absent (readers, off the wire) => BY_RECEPTION (0).
+pub fn discDestOrderKind(q: anytype) u8 {
+    const d = q.destinationOrder;
+    return switch (@typeInfo(@TypeOf(d))) {
+        .optional => @intCast(d orelse 0),
+        else => @intCast(d),
+    };
+}
+/// USER_DATA bytes, borrowed from the struct; empty when absent.
+pub fn discUserData(q: anytype) []const u8 {
+    const u = q.userData orelse return &.{};
+    const b = u._buffer orelse return &.{};
+    return b[0..u._length];
+}
 
 /// Information about the local participant broadcast to remote peers.
 pub const ParticipantAnnouncement = struct {
@@ -113,7 +124,15 @@ pub const WriterAnnouncement = struct {
     group_guid: ?Guid = null,
     topic_name: []const u8,
     type_name: []const u8,
-    qos: QosSnapshot,
+    /// The writer's DataWriter QoS. SEDP runs it through `qos_adapter` to build
+    /// the wire struct.
+    qos: DDS.DataWriterQos,
+    /// The parent Publisher's PRESENTATION QoS (Publisher-level, not on the
+    /// DataWriter QoS).
+    presentation: DDS.PresentationQosPolicy = .{},
+    /// The parent Publisher's PARTITION names. Empty = default partition ("").
+    /// Borrowed for the duration of the `announce_writer` call.
+    partition_names: []const []const u8 = &.{},
     /// TypeObject bytes (zidl-generated), or empty slice if not available.
     type_object: []const u8,
     /// CDR-encoded XTypes TypeInformation blob (PID_TYPE_INFORMATION = 0x0075).
@@ -127,7 +146,9 @@ pub const ReaderAnnouncement = struct {
     participant_guid: Guid,
     topic_name: []const u8,
     type_name: []const u8,
-    qos: QosSnapshot,
+    qos: DDS.DataReaderQos,
+    presentation: DDS.PresentationQosPolicy = .{},
+    partition_names: []const []const u8 = &.{},
     /// CDR-encoded XTypes TypeInformation blob (PID_TYPE_INFORMATION = 0x0075).
     /// Empty slice if not available; SEDP will omit the PID in that case.
     type_info_cdr: []const u8,
@@ -155,6 +176,11 @@ pub const ParticipantData = struct {
     /// participant's SPDP announcement. Used to work around known per-vendor
     /// RTPS wire-format quirks (see header_mod.needsPidCoherentSetMarker).
     vendor_id: VendorId,
+    /// Raw PL_CDR parameter list (encap header + params + sentinel) exactly as
+    /// received. Borrowed for the callback's duration only. Left empty by the
+    /// default SPDP/SEDP path — a broker discovery plugin that persists
+    /// participant records owns that lifetime decision (design doc §6).
+    raw_parameter_list: []const u8 = &.{},
 };
 
 /// Data about a discovered remote DataWriter.
@@ -163,12 +189,22 @@ pub const WriterData = struct {
     participant_guid: Guid,
     topic_name: []const u8,
     type_name: []const u8,
-    qos: QosSnapshot,
+    /// The decoded RTPS wire QoS, borrowed for the callback's duration.
+    /// `unknown_params` retains every unrecognised PID verbatim (lossless).
+    qos: *const DiscoveredWriterData,
+    /// PARTITION names for this writer — the legacy PID_PARTITION (0x0035)
+    /// sequence when the peer sent that, else the decoded `qos.partition`
+    /// member. Materialised by `sedp.zig` so match sites need not re-walk the
+    /// sequence; borrowed for the callback's duration (the consumer deep-copies).
+    partition_names: []const []const u8 = &.{},
     /// Unicast locators for direct writer → reader messaging.
     unicast_locators: []const Locator,
     multicast_locators: []const Locator,
-    /// Remote TypeObject bytes (may be empty).
-    type_object: []const u8,
+    /// Remote XTypes TypeInformation blob (PID_TYPE_INFORMATION), may be empty.
+    type_object: []const u8 = &.{},
+    /// Raw PL_CDR parameter list as received; borrowed for the callback's
+    /// duration only. Empty unless populated by the plugin.
+    raw_parameter_list: []const u8 = &.{},
 };
 
 /// Data about a discovered remote DataReader.
@@ -177,9 +213,12 @@ pub const ReaderData = struct {
     participant_guid: Guid,
     topic_name: []const u8,
     type_name: []const u8,
-    qos: QosSnapshot,
+    qos: *const DiscoveredReaderData,
+    partition_names: []const []const u8 = &.{},
     unicast_locators: []const Locator,
     multicast_locators: []const Locator,
+    type_object: []const u8 = &.{},
+    raw_parameter_list: []const u8 = &.{},
 };
 
 /// Callbacks delivered to the DCPS/RTPS layer when discovery events occur.

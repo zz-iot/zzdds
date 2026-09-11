@@ -835,7 +835,7 @@ pub const SpdpEndpoints = struct {
 
 /// Encode SPDPdiscoveredParticipantData as PL-CDR little-endian.
 /// Returns a heap-allocated slice owned by the caller.
-fn encodeSpdpParticipant(alloc: std.mem.Allocator, ann: *const ParticipantAnnouncement) ![]u8 {
+pub fn encodeSpdpParticipant(alloc: std.mem.Allocator, ann: *const ParticipantAnnouncement) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
 

@@ -1,32 +1,44 @@
 // Derived IDL for RTPS 2.5 built-in discovery ParameterList data.
 //
-// Source: RTPS 2.5 §8.5 / §9.3.2 / §9.6.2 / Tables 9.18-9.19.
+// Source: RTPS 2.5 §8.5 / §9.3.2 / §9.6.2 / Tables 9.14-9.19.
 // This is not copied normative IDL. It expresses the spec's ParameterList
 // mapping using zidl @id annotations so generated code can read/write PL_CDR.
+//
+// ── This file is DERIVED, not normative ────────────────────────────────────
+// The authoritative contract for the SPDP/SEDP wire format is the byte-exact
+// golden fixtures in test/discovery/wire_golden_test.zig, captured against the
+// hand-rolled encoders that these generated codecs replaced. Member
+// DECLARATION ORDER below == generated PL_CDR emission order (serializePlCdr
+// walks members in order, skipping null @optional members), so it is derived
+// from those golden bytes. See docs/design/discovery-codec.md.
 //
 // ── Wire encoding note ──────────────────────────────────────────────────────
 // These types are serialized using PL_CDR (Parameter List CDR) as described
 // in RTPS 2.5 §9.6.2.  The @id annotations carry the PID values from
-// Table 9.14.
+// Table 9.14 (numeric constants also live in src/rtps/pid.zig PidTable).
 //
-// RTPS uses *repeated parameters* for list-valued fields: one PID entry is
-// written per element, all sharing the same PID value.  The @pl_repeated
-// annotation instructs the zidl Zig backend to emit this encoding:
+// RTPS uses *repeated parameters* for list-valued locator fields: one PID
+// entry is written per element, all sharing the same PID value.  The
+// @pl_repeated annotation instructs the zidl Zig backend to emit that:
 //   serialize:   one (pid, len, value) triplet per sequence element
 //   deserialize: accumulate each occurrence into the sequence
 //
-// ── PID constant index ──────────────────────────────────────────────────────
-// Numeric PID values are defined in src/rtps/pid.zig (PidTable).
+// @pl_retain_unknown keeps any parameter the switch does not recognise in
+// `unknown_params: []zidl_rt.RawParam`, replayed verbatim by serializePlCdr
+// before the sentinel. This is how the discovery codec stays lossless for a
+// broker relay (docs/design/discovery-broker.md) and how the SEDP writer
+// encode path re-injects PID_TYPE_INFORMATION (an opaque blob) in wire order
+// (see src/discovery/sedp.zig): it is the one PL_CDR parameter with no member.
 
 // ── Primitive wire types (inline; no include) ─────────────────────────────
 
-// RTPS ProtocolVersion_t (§8.3.3.1)
+// RTPS ProtocolVersion_t (§8.3.3.1) — 2 bytes on the wire, PID len 4.
 @final struct ProtocolVersion_t { octet major; octet minor; };
 
-// RTPS VendorId_t (§8.3.3.2)
+// RTPS VendorId_t (§8.3.3.2) — 2 bytes on the wire, PID len 4.
 @final struct VendorId_t { octet vendorId[2]; };
 
-// RTPS Locator_t (§9.3.2 Table 9.19)
+// RTPS Locator_t (§9.3.2 Table 9.19) — 24 bytes.
 // Note: the RTPS field is named "port" but that is a reserved IDL 4.2 keyword;
 // renamed to port_number here.  Wire layout is unchanged (4-byte unsigned long).
 @final struct Locator_t {
@@ -35,70 +47,133 @@
     octet         address[16];
 };
 
-// RTPS Duration_t (§9.3.2): fraction is in units of 1/2^32 seconds.
+// RTPS Duration_t (§9.3.2.3): time = seconds + fraction/2^32.  Used for ALL
+// Duration values in SPDP/SEDP ParameterLists (there is no "direct nanoseconds"
+// encoding in Built-in Topic Data). DDS Duration_t{sec,nanosec} <-> this is a
+// conversion the adapter performs (util/time.zig RtpsDuration).
 @final struct Duration_t { long seconds; unsigned long fraction; };
+
+// ── QoS-policy wire helper structs ────────────────────────────────────────
+// Bespoke RTPS wire shapes for the multi-field QoS PIDs. Each is @final so its
+// nested .serialize runs plain XCDR1 to fill the PID value (the @mutable outer
+// struct's serializePlCdr reserves the (pid,len) header around it).
+
+// PID_RELIABILITY (0x001A): kind is 1-based on the wire (1=BEST_EFFORT,
+// 2=RELIABLE; DDS API kind + 1). 12 bytes.
+@final struct ReliabilityWire { unsigned long kind; Duration_t max_blocking_time; };
+
+// PID_PRESENTATION (0x0021): 6 bytes -> PID len 8 (2 pad).
+@final struct PresentationWire { unsigned long access_scope; boolean coherent_access; boolean ordered_access; };
+
+// PID_LIVELINESS (0x001B): kind ordinal (0=AUTOMATIC, 1=MANUAL_BY_PARTICIPANT,
+// 2=MANUAL_BY_TOPIC) + lease_duration. 12 bytes.
+@final struct LivelinessWire { unsigned long kind; Duration_t lease_duration; };
+
+// PID_HISTORY (0x0040): kind (0=KEEP_LAST, 1=KEEP_ALL) + depth. 8 bytes.
+@final struct HistoryWire { unsigned long kind; long depth; };
 
 // ── SPDPdiscoveredParticipantData (§8.5.3.2, §9.6.2.1) ─────────────────────
 //
 // Carried in DATA submessages on the SPDP built-in endpoints.
+// Declaration order == golden EXPECTED_SPDP emission order.
 
-@mutable
+@mutable @pl_retain_unknown
 struct SPDPdiscoveredParticipantData {
-    @id(0x0015) @optional ProtocolVersion_t  protocolVersion;
-    @id(0x0016) @optional VendorId_t         vendorId;
-    @id(0x0050)           octet              guidPrefix[12];  // PID_PARTICIPANT_GUID
-    @id(0x0058)           unsigned long      builtinEndpointSet;
-    @id(0x0077) @optional unsigned long      builtinEndpointQos;
-    @id(0x0002) @optional Duration_t         leaseDuration;
+    @id(0x0015)           ProtocolVersion_t protocolVersion;   // always emitted ({2,5})
+    @id(0x0016)           VendorId_t        vendorId;          // always emitted
+    @id(0x0050)           octet             participantGuid[16]; // prefix[12] + entityId[4]
+    @id(0x0058)           unsigned long     builtinEndpointSet;
+    @id(0x0002)           Duration_t        leaseDuration;     // always emitted
     @id(0x0032) @optional @pl_repeated sequence<Locator_t> metatrafficUnicastLocatorList;
     @id(0x0033) @optional @pl_repeated sequence<Locator_t> metatrafficMulticastLocatorList;
-    @id(0x002F) @optional @pl_repeated sequence<Locator_t> defaultUnicastLocatorList;
+    @id(0x0031) @optional @pl_repeated sequence<Locator_t> defaultUnicastLocatorList; // PID_DEFAULT_UNICAST_LOCATOR
     @id(0x0048) @optional @pl_repeated sequence<Locator_t> defaultMulticastLocatorList;
-    @id(0x002C) @optional sequence<octet>   userData;
-    @id(0x0062) @optional string            participantName; // PID_ENTITY_NAME
+    @id(0x0077) @optional unsigned long   builtinEndpointQos;  // decode only; never emitted
+    @id(0x002C) @optional sequence<octet> userData;     // decode only; never emitted
+    @id(0x0062) @optional string          participantName;     // PID_ENTITY_NAME
 };
 
 // ── DiscoveredWriterData (§8.5.4.2, §9.6.2.2) ───────────────────────────────
 //
 // SEDP publications topic: describes a DataWriter endpoint.
+// Declaration order == golden EXPECTED_W_FULL emission order.
+//
+// PID_TYPE_INFORMATION (0x0075) is NOT declared here: it is an opaque XTypes
+// blob with no CDR length prefix (zidl has no raw-bytes member type). The
+// sedp.zig encode wrapper appends it via unknown_params (replayed just before
+// the sentinel); the decode wrapper reads it back out of unknown_params. The
+// hand encoder emitted PID_TYPE_INFORMATION *before* PID_PARTITION; the
+// generated path emits it *after* (unknown_params replay is last). PL_CDR
+// parameter order is not significant (RTPS 2.5 §9.6.2.1 / §7.4.2), so this is
+// a spec-legal reorder — see EXPECTED_W_FULL in wire_golden_test.zig and the
+// live interop suite.
+//
+// PID_PARTITION_LEGACY (0x0035) lands in unknown_params on decode and is
+// mapped into `partition` by the decode wrapper (step 9).
 
-@mutable
+@mutable @pl_retain_unknown
 struct DiscoveredWriterData {
-    @id(0x005A)           octet         writerGuid[16];       // PID_ENDPOINT_GUID
-    @id(0x0005)           string        topicName;
-    @id(0x0007)           string        typeName;
-    @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;
-    @id(0x0030) @optional @pl_repeated sequence<Locator_t> multicastLocatorList;
-    @id(0x001A) @optional unsigned long reliabilityKind;      // 0=best_effort 1=reliable
-    @id(0x001D) @optional unsigned long durabilityKind;
-    @id(0x001B) @optional unsigned long livelinessKind;
-    @id(0x001F) @optional unsigned long ownershipKind;
-    @id(0x0006) @optional long          ownershipStrength;
-    @id(0x0023) @optional Duration_t    deadline;
-    @id(0x0027) @optional Duration_t    latencyBudget;
-    @id(0x0025) @optional unsigned long destinationOrder;
-    @id(0x0043) @optional boolean       expectsInlineQos;
-    @id(0x0075) @optional sequence<octet> typeInformation;    // XTypes TypeInformation
+    @id(0x005A)           octet             writerGuid[16];     // PID_ENDPOINT_GUID
+    @id(0x0052) @optional octet            groupGuid[16];      // PID_GROUP_GUID (GROUP publisher only)
+    @id(0x0005)           string            topicName;
+    @id(0x0007)           string            typeName;
+    @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;   // decode only; zzdds never emits per-endpoint locators
+    @id(0x0030) @optional @pl_repeated sequence<Locator_t> multicastLocatorList; // decode only
+    @id(0x002C) @optional sequence<octet>   userData;           // omitted when empty
+    @id(0x001A)           ReliabilityWire   reliability;
+    @id(0x001D)           unsigned long     durabilityKind;
+    @id(0x0021) @optional PresentationWire  presentation;       // omitted at spec default
+    @id(0x0023) @optional Duration_t        deadline;           // omitted when INFINITE
+    @id(0x0027) @optional Duration_t        latencyBudget;      // decode only; never emitted
+    @id(0x001B) @optional LivelinessWire    liveliness;         // omitted at AUTOMATIC + INFINITE
+    @id(0x001F)           unsigned long     ownershipKind;
+    @id(0x0006) @optional long             ownershipStrength;   // omitted when ownershipKind == SHARED
+    @id(0x0025)           unsigned long     destinationOrder;
+    @id(0x0040)           HistoryWire       history;
+    @id(0x002B) @optional Duration_t        lifespan;           // omitted when INFINITE
+    @id(0x0073)           sequence<short>   dataRepresentation; // always a 1-element seq ([0]=XCDR1, [2]=XCDR2)
+    @id(0x0029) @optional sequence<string>  partition;          // PID_PARTITION; omitted when empty
 };
 
 // ── DiscoveredReaderData (§8.5.4.3, §9.6.2.3) ───────────────────────────────
 //
 // SEDP subscriptions topic: describes a DataReader endpoint.
+// Declaration order == golden EXPECTED_R_PART emission order.
+//
+// Readers never emit PID_TYPE_INFORMATION (OpenDDS TypeLookup stall — see
+// encodeReaderData). PID_PARTITION (0x0029) IS a declared member here (it is
+// the last parameter, so no wire-order conflict). PID_PARTITION_LEGACY
+// (0x0035) still lands in unknown_params and is rescued by the decode wrapper.
 
-@mutable
+@mutable @pl_retain_unknown
 struct DiscoveredReaderData {
-    @id(0x005A)           octet         readerGuid[16];       // PID_ENDPOINT_GUID
-    @id(0x0005)           string        topicName;
-    @id(0x0007)           string        typeName;
-    @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;
-    @id(0x0030) @optional @pl_repeated sequence<Locator_t> multicastLocatorList;
-    @id(0x001A) @optional unsigned long reliabilityKind;
-    @id(0x001D) @optional unsigned long durabilityKind;
-    @id(0x001B) @optional unsigned long livelinessKind;
-    @id(0x001F) @optional unsigned long ownershipKind;
-    @id(0x0023) @optional Duration_t    deadline;
-    @id(0x0027) @optional Duration_t    latencyBudget;
-    @id(0x0025) @optional unsigned long destinationOrder;
-    @id(0x0035) @optional sequence<string> partition;         // PID_PARTITION
-    @id(0x0075) @optional sequence<octet> typeInformation;
+    @id(0x005A)           octet             readerGuid[16];     // PID_ENDPOINT_GUID
+    @id(0x0005)           string            topicName;
+    @id(0x0007)           string            typeName;
+    @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;   // decode only
+    @id(0x0030) @optional @pl_repeated sequence<Locator_t> multicastLocatorList; // decode only
+    @id(0x002C) @optional sequence<octet>   userData;           // omitted when empty
+    @id(0x001A)           ReliabilityWire   reliability;
+    @id(0x001D)           unsigned long     durabilityKind;
+    @id(0x001F)           unsigned long     ownershipKind;
+    @id(0x0025) @optional unsigned long     destinationOrder;   // MATCH ONLY — readers never emit PID_DESTINATION_ORDER; sedp.zig nulls it before serialize
+    @id(0x0021) @optional PresentationWire  presentation;       // omitted at spec default
+    @id(0x0073)           sequence<short>   dataRepresentation; // always a 1-element seq
+    @id(0x0023) @optional Duration_t        deadline;           // omitted when INFINITE
+    @id(0x0027) @optional Duration_t        latencyBudget;      // decode only; never emitted
+    @id(0x001B) @optional LivelinessWire    liveliness;         // omitted at AUTOMATIC + INFINITE
+    @id(0x0029) @optional sequence<string>  partition;          // PID_PARTITION; omitted when empty
+};
+
+// ── EndpointDisposal ───────────────────────────────────────────────────────
+//
+// serialized_payload of a NOT_ALIVE_DISPOSED SEDP DATA (when PID_KEY_HASH is
+// absent from inline_qos). Golden EXPECTED_DISPOSE.
+
+// Not @pl_retain_unknown: an all-POD @mutable struct is generated as an
+// `extern struct`, which cannot hold the `unknown_params` slice. A disposal
+// payload carries nothing worth retaining anyway.
+@mutable
+struct EndpointDisposal {
+    @id(0x005A) octet endpointGuid[16]; // PID_ENDPOINT_GUID (prefix[12] + entityId[4])
 };

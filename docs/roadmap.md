@@ -26,6 +26,9 @@ Forward-looking only: known gaps, planned features, and open design questions.
   schema reserve `static` and `broker` discovery kinds, but only SPDP/SEDP and direct
   in-process discovery are implemented. Either implement static-config loading + broker
   client support, or remove the advertised config surface, before v1.
+- **SEDP uses the zidl-generated PL_CDR codec** (`idl/rtps_discovery.idl`, `--zig-pl-cdr`,
+  `@pl_retain_unknown`); SPDP encode/decode is still hand-rolled. Swap SPDP too for
+  retention consistency once a broker relay needs lossless SPDP round-trips.
 - **MTU-aware fragment sizing** — `rtps.fragment_size` is a static config value. Add an
   interface-MTU / path-MTU aware default (accounting for IP / UDP / RTPS / future security
   overhead) while keeping the explicit override for deterministic tests.

@@ -356,17 +356,64 @@ test "DCPS: get_statuscondition on DataWriter returns non-null condition" {
 
 fn fireRemoteWriter(dp_impl: *DomainParticipantImpl, topic: []const u8, type_name: []const u8) void {
     const pfx = GuidPrefix{ .bytes = .{ 0xAA, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    var q = iface.DiscoveredWriterData{
+        .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+        .durabilityKind = 1,
+        .history = .{ .kind = 0, .depth = 1 },
+    };
     const data = iface.WriterData{
         .guid = .{ .prefix = pfx, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 } },
         .participant_guid = .{ .prefix = pfx, .entity_id = EntityIds.participant },
         .topic_name = topic,
         .type_name = type_name,
-        .qos = .{ .reliability_kind = 1, .durability_kind = 1 },
+        .qos = &q,
         .unicast_locators = &.{},
         .multicast_locators = &.{},
         .type_object = &.{},
     };
     dp_impl.disc_callbacks.on_writer_discovered(dp_impl.disc_callbacks.ctx, &data);
+}
+
+fn fireRemoteReader(dp_impl: *DomainParticipantImpl, topic: []const u8, type_name: []const u8) void {
+    const pfx = GuidPrefix{ .bytes = .{ 0xCC, 0xDD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    var q = iface.DiscoveredReaderData{
+        .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+    };
+    const data = iface.ReaderData{
+        .guid = .{ .prefix = pfx, .entity_id = .{ .entity_key = .{ 0, 0, 4 }, .entity_kind = 0x07 } },
+        .participant_guid = .{ .prefix = pfx, .entity_id = EntityIds.participant },
+        .topic_name = topic,
+        .type_name = type_name,
+        .qos = &q,
+        .unicast_locators = &.{},
+        .multicast_locators = &.{},
+    };
+    dp_impl.disc_callbacks.on_reader_discovered(dp_impl.disc_callbacks.ctx, &data);
+}
+
+test "DCPS: get_discovered_topics returns handle for a SEDP-discovered reader's topic" {
+    // Mirrors the writer-side test above, but the topic is *first* established
+    // by a discovered reader — covers onReaderDiscovered's own "register
+    // newly-seen topic" path (participant.zig), which the writer-first test
+    // above never reaches.
+    var h = try Harness.init(0x10);
+    defer h.deinit();
+
+    const alloc = testing.allocator;
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+    fireRemoteReader(dp_impl, "RemoteReaderTopic", "RemoteReaderType");
+
+    var handles = DDS.InstanceHandleSeq{};
+    defer if (handles._release) {
+        if (handles._buffer) |b| alloc.free(b[0..handles._length]);
+    };
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.get_discovered_topics(dp.ptr, &handles));
+    try testing.expectEqual(@as(u32, 1), handles._length);
+    try testing.expect(handles._buffer.?[0] != 0);
 }
 
 test "DCPS: DCPSTopic reader receives a sample when a topic is created" {

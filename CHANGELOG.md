@@ -8,6 +8,50 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-11
+
+- zidl pin → `v0.3.15-zig.0.16.0`. Fixes a PL_CDR decode bug the discovery codec swap
+  (2026-09-10) exposed against real vendor traffic: the generated
+  `deserializeFromPlCdr` switch dispatched on `pid & 0x3FFF`, but RTPS 2.5 §9.6.4.2.1
+  reserves bit `0x8000` for vendor-specific PIDs whose low 15 bits are the vendor's own
+  private numbering. RTI Connext's vendor PID `0x8021` (a compressed TypeObject blob)
+  aliased `PID_PRESENTATION` (`0x0021`), so zzdds failed to decode any Connext (and TOC
+  CoreDX) SPDP/SEDP announcement — a live-interop-only regression the golden fixtures and
+  self-interop suite couldn't see, since zzdds's own encoder never emits vendor PIDs. No
+  zzdds source change needed; the fix is entirely upstream (zidl PR #50).
+
+## 2026-09-10
+
+- **SEDP discovery codec is now zidl-generated** from `idl/rtps_discovery.idl`
+  (`--zig-pl-cdr`, `@pl_retain_unknown` — every unrecognised PID round-trips losslessly,
+  the groundwork for a discovery-broker relay). The hand-rolled `sedp.zig` encoders/parsers
+  are gone; `discovery/qos_adapter.zig` maps the typed `DDS.DataWriterQos` /
+  `DataReaderQos` (+ Publisher/Subscriber `PresentationQosPolicy`) to/from the wire structs.
+- **Removed:** the flat `disc.QosSnapshot`, `participant.zig`'s `writerQosSnapshot` /
+  `readerQosSnapshot` / `reprFromQos`, and `src/qos/policy.zig` + `qos_match.checkWriterReader`
+  / `checkPresentation` (all orphaned). QoS matching is now `qos_match.checkDiscovered`,
+  operating directly on the RTPS discovery wire structs. Discovery callbacks carry
+  `qos: *const Discovered{Writer,Reader}Data` (borrowed) plus a `raw_parameter_list` for a
+  future broker.
+- **Wire deltas** (all spec-legal; `test/discovery/wire_golden_test.zig` is the contract,
+  validated against the live interop suite): a default writer/reader now advertises
+  `PID_DATA_REPRESENTATION [2]` (matching the real `reprFromQos` path, not the old golden
+  capture); `PID_TYPE_INFORMATION` is replayed after `PID_PARTITION` rather than before.
+- SPDP encode/decode is unchanged (hand-rolled — it carries no QoS).
+- SEDP decode re-seeds `RELIABILITY` after decode when a peer omits `PID_RELIABILITY` for
+  its spec default (Connext does this for a default-RELIABLE writer): the generated decoder
+  leaves `kind == 0` (invalid), which QoS matching would read as weaker than BEST_EFFORT.
+  Writer branch seeds `0 → RELIABLE`, reader branch `0 → BEST_EFFORT` (RTPS 2.5
+  §8.5.4.2/§8.5.4.3). The old hand parser applied RTPS defaults inline.
+- SEDP decode: PARTITION names are no longer capped at 32 per endpoint (the IDL type is an
+  unbounded `sequence<string>`; the fixed decode buffer silently dropped the rest and broke
+  matching for endpoints with many partitions) — `partitionNamesOwned` now sizes to the
+  actual count. The legacy `PID_PARTITION` (`0x0035`) hand-parse reads its sequence count
+  and string lengths with the payload's byte order instead of assuming little-endian, so a
+  big-endian peer's legacy partitions decode correctly.
+- zidl pin → `v0.3.14-zig.0.16.0` (fixes `@optional` sequence / array codegen the SEDP
+  structs rely on).
+
 ## 2026-09-03
 
 - **Release workflow — first real run shook out three `package-libs` bugs.** That job

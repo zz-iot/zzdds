@@ -1217,6 +1217,7 @@ pub fn build(b: *std.Build) void {
     const fuzz_test_files = [_][]const u8{
         "test/fuzz/fuzz_rtps_parser.zig",
         "test/fuzz/fuzz_plcdr.zig",
+        "test/fuzz/fuzz_disc_codec.zig",
     };
     for (fuzz_test_files) |src| {
         const t = b.addTest(.{
@@ -1286,6 +1287,7 @@ pub fn build(b: *std.Build) void {
         "test/discovery/spdp_lease_test.zig",
         "test/discovery/sedp_test.zig",
         "test/discovery/discovery_interface_test.zig",
+        "test/discovery/wire_golden_test.zig",
     };
     for (discovery_test_files) |src| {
         const t = b.addTest(.{
