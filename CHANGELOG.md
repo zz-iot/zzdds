@@ -8,6 +8,18 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-11
+
+- zidl pin → `v0.3.15-zig.0.16.0`. Fixes a PL_CDR decode bug the discovery codec swap
+  (2026-09-10) exposed against real vendor traffic: the generated
+  `deserializeFromPlCdr` switch dispatched on `pid & 0x3FFF`, but RTPS 2.5 §9.6.4.2.1
+  reserves bit `0x8000` for vendor-specific PIDs whose low 15 bits are the vendor's own
+  private numbering. RTI Connext's vendor PID `0x8021` (a compressed TypeObject blob)
+  aliased `PID_PRESENTATION` (`0x0021`), so zzdds failed to decode any Connext (and TOC
+  CoreDX) SPDP/SEDP announcement — a live-interop-only regression the golden fixtures and
+  self-interop suite couldn't see, since zzdds's own encoder never emits vendor PIDs. No
+  zzdds source change needed; the fix is entirely upstream (zidl PR #50).
+
 ## 2026-09-10
 
 - **SEDP discovery codec is now zidl-generated** from `idl/rtps_discovery.idl`
