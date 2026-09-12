@@ -277,14 +277,35 @@ pub const TcpConnection = struct {
     generation: u32,
 };
 
-/// Close `conn.fd` exactly once. Safe to call from both recvLoop and deinit.
+/// Shut down and close `conn.fd` exactly once. Safe to call from recvLoop,
+/// vtSend's redial-on-failure path, ensureConnection's error paths, and
+/// deinit. shutdown() before close() interrupts a thread currently blocked
+/// in recv() on this fd (POSIX §2.9.7; same on Windows) — harmless to call
+/// on a connection whose own recv thread is the caller (recvLoop's
+/// self-close) or whose fd is already closed (shutdown on a bad fd is a
+/// silently-ignored error, not a crash).
+///
 /// The winning caller also notifies any ReceiveHandler.on_channel_closed
-/// registrant — this is the single choke point both natural death (recvLoop)
-/// and forced teardown (deinit) already funnel through, so it is the one
-/// place a Channel's closure needs to be announced from.
+/// registrant — this is the single choke point every death path (natural
+/// death, forced teardown) funnels through, so it is the one place a
+/// Channel's closure needs to be announced from.
+///
+/// The close is serialized against vtSendOnChannel via send_mu: without
+/// this, vtSendOnChannel's re-check of fd_open under send_mu is meaningless,
+/// since closeConnFdOnce could still close (and the OS could reuse) the fd
+/// between that check and the actual writeAll calls. Released before the
+/// on_channel_closed notification, not held across it — a handler's
+/// callback re-entering vtSendOnChannel on this same connection must not
+/// deadlock against this function still holding the lock.
 fn closeConnFdOnce(conn: *TcpConnection) void {
-    if (conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
+    conn.send_mu.lock();
+    const won = conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null;
+    if (won) {
+        socketShutdown(conn.fd, SHUT_RDWR);
         socketClose(conn.fd);
+    }
+    conn.send_mu.unlock();
+    if (won) {
         conn.owner.dispatchChannelClosed(.{ .token = @intFromPtr(conn), .generation = conn.generation });
     }
 }
@@ -367,18 +388,21 @@ pub const TcpTransport = struct {
         // shutdown() before close() is required to interrupt threads currently
         // blocked in accept() or recv() on these fds. A bare close() leaves
         // blocked threads running indefinitely (per POSIX §2.9.7; same on
-        // Windows with Winsock).
+        // Windows with Winsock). Signal every connection's fd here, up front,
+        // so the join loop below costs one bounded wait per thread rather
+        // than N sequential ones — the actual close (and, with it, the
+        // on_channel_closed notification) is deferred to that same loop,
+        // after conn_mu is released: closeConnFdOnce must not be called
+        // while conn_mu is held, since a handler's on_channel_closed
+        // callback re-entering a transport operation that needs conn_mu
+        // (listen/unlisten/send) would deadlock against it.
         var accept_thread: ?std.Thread = null;
         {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
             accept_thread = self.closeListenerLocked();
             for (self.all_connections.items) |conn| {
-                // Only shutdown+close if recvLoop hasn't already closed the fd.
-                if (conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
-                    socketShutdown(conn.fd, SHUT_RDWR);
-                    socketClose(conn.fd);
-                }
+                if (conn.fd_open.load(.acquire)) socketShutdown(conn.fd, SHUT_RDWR);
             }
         }
 
@@ -386,8 +410,14 @@ pub const TcpTransport = struct {
 
         // Join recv threads then free. Recv threads may call removeConnection
         // (acquires conn_mu) after their fd is closed — conn_mu is released
-        // above so those calls can complete before we join.
+        // above so those calls can complete before we join. accept_thread is
+        // already joined, so all_connections is stable (no concurrent
+        // appends) — safe to iterate without conn_mu here.
         for (self.all_connections.items) |conn| {
+            // Idempotent with recvLoop's own closeConnFdOnce call (CAS-guarded);
+            // this is what actually closes + notifies for a connection recvLoop
+            // hasn't already torn down itself.
+            closeConnFdOnce(conn);
             if (conn.thread_started) conn.recv_thread.join();
             self.alloc.destroy(conn);
         }
@@ -683,10 +713,12 @@ pub const TcpTransport = struct {
         conn.send_mu.lock();
         defer conn.send_mu.unlock();
         // Re-check under send_mu: fd_open could have flipped between the
-        // lock-free check above and acquiring the lock (closeConnFdOnce
-        // doesn't take send_mu), and a closed fd must never be written to —
-        // on POSIX the fd number can already have been reused by the OS for
-        // an unrelated socket by the time this runs.
+        // lock-free check above and acquiring the lock. This check is what
+        // makes the lock meaningful — closeConnFdOnce also takes send_mu
+        // around its close, so from here on a close cannot interleave with
+        // the writes below, and a closed fd is never written to (on POSIX
+        // the fd number can otherwise be reused by the OS for an unrelated
+        // socket).
         if (!conn.fd_open.load(.acquire)) return error.ChannelClosed;
         try writeAll(conn.fd, &len_buf);
         try writeAll(conn.fd, data);

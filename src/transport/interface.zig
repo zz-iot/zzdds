@@ -418,9 +418,18 @@ pub const ReceiveHandler = struct {
     /// one.
     on_receive: *const fn (ctx: *anyopaque, data: []const u8, src: Locator, channel: Channel) void,
     /// Called from the transport's receive/monitor thread — same "must not
-    /// block" contract as on_receive — when a channel this handler was ever
-    /// handed (via on_receive) transitions to closed. Optional: leave null
-    /// to ignore. Never called with Channel.none. See
+    /// block" contract as on_receive — when a channel on this handler's
+    /// port/connection closes. Optional: leave null to ignore. Never called
+    /// with Channel.none.
+    ///
+    /// Fan-out matches on_receive's: every handler currently registered on
+    /// the same port (UDP) or connection (TCP) is notified, not only
+    /// handlers that specifically observed this channel via on_receive — a
+    /// handler that registers after a channel's last on_receive but before
+    /// that channel closes will still be notified of a channel it was never
+    /// handed. Callers that need precise per-channel recipient tracking
+    /// must do it themselves (e.g. record token+generation from on_receive
+    /// and ignore an on_channel_closed for one never seen). See
     /// docs/design/transport-channel.md §5.
     on_channel_closed: ?*const fn (ctx: *anyopaque, channel: Channel) void = null,
 };

@@ -15,8 +15,8 @@ Fell out of the `discovery-broker.md` review (`discovery-broker-review.md` §2, 
 do now, independent of whether the broker ships — sibling to `discovery-codec.md`, which has
 since landed (SEDP path, zzdds `c86934e`). This spec re-inspects the transport source
 directly (zzdds `c86934e`, main) rather than trusting the handoff note's line numbers, and
-resolves every open question the handoff left for "the spec step." Not yet planned into
-PRs or implemented.
+resolves every open question the handoff left for "the spec step." Implemented on branch
+`transport-channel`, zzdds PR #84.
 
 ### 0.1 What changed in revision 0.2
 
@@ -374,9 +374,17 @@ pub const ReceiveHandler = struct {
     /// mock, lossy) or for any receive path that doesn't populate one.
     on_receive: *const fn (ctx: *anyopaque, data: []const u8, src: Locator, channel: Channel) void,
     /// Called from the transport's receive/monitor thread — same "must not
-    /// block" contract as on_receive — when a channel this handler was ever
-    /// handed (via on_receive) transitions to closed. Optional: leave null to
-    /// ignore. See §5. Never called with Channel.none.
+    /// block" contract as on_receive — when a channel on this handler's
+    /// port/connection closes. Optional: leave null to ignore. Never called
+    /// with Channel.none.
+    ///
+    /// Fan-out matches on_receive's: every handler currently registered on
+    /// the same port (UDP) or connection (TCP) is notified, not only
+    /// handlers that specifically observed this channel via on_receive — a
+    /// handler that registers after a channel's last on_receive but before
+    /// that channel closes will still be notified of a channel it was never
+    /// handed. Callers needing precise per-channel recipient tracking must
+    /// do it themselves. See §5.
     on_channel_closed: ?*const fn (ctx: *anyopaque, channel: Channel) void = null,
 };
 ```
@@ -581,6 +589,19 @@ complete thing for zzdds" for all three, together.
 
 ## 9. Risks and watch-items
 
+* **`on_channel_closed` fan-out is "every handler currently registered on the port/
+  connection," not "only handlers that actually received this channel."** Found in PR #84
+  review (Greptile): a handler that registers on a shared port after a channel's last
+  `on_receive` but before that channel closes is still notified of a channel it was never
+  handed. Building precise per-channel recipient tracking (a per-channel set of handler
+  `ctx` pointers, updated on every dispatch, pruned on unregister) was considered and
+  rejected as disproportionate to the actual risk: `on_receive` already has the identical
+  broadcast-to-everyone-currently-registered semantics (no consumer of this codebase relies
+  on per-handler receive filtering today), and nothing in the tree consumes
+  `on_channel_closed` yet to be broken by it. Resolution: the contract in §4.5/`interface.zig`
+  is corrected to state the real, broadcast behavior plainly rather than promise scoped
+  delivery the implementation doesn't provide. A future real consumer that needs scoped
+  delivery must track token+generation itself and ignore closures for channels it never saw.
 * **UDP `SocketEntry` graveyard is unbounded by live-socket count.** §4.3 trades
   individually-freed sockets for retention until `UdpTransport.close()`. A long-running
   process on a host with frequent interface churn (laptop suspend/resume, container network

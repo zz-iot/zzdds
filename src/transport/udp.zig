@@ -300,6 +300,11 @@ const McSendIfaces = struct {
 
 // ── Port entry (fan-out dispatch) ─────────────────────────────────────────────
 
+/// A closed channel's notification, captured while a lock is held and fired
+/// once it's released — see retireSocketLocked's and firePendingClosures'
+/// doc comments for why.
+const PendingClosure = struct { handler: ReceiveHandler, channel: Channel };
+
 /// One PortEntry exists per listened port. Multiple ReceiveHandlers can register
 /// on the same port (e.g. two participants sharing a transport). Each incoming
 /// datagram is dispatched to all registered handlers.
@@ -361,26 +366,27 @@ const PortEntry = struct {
         for (snap[0..count]) |h| h.on_receive(h.ctx, buf, src, channel);
     }
 
-    /// Notify every registered handler's on_channel_closed, if set. Same
-    /// snapshot-then-call shape as dispatch.
-    fn dispatchChannelClosed(ctx: *anyopaque, channel: Channel) void {
-        const self: *PortEntry = @ptrCast(@alignCast(ctx));
-        var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
-        var count: usize = 0;
-        {
-            self.mu.lock();
-            defer self.mu.unlock();
-            std.debug.assert(self.handlers.items.len <= snap.len);
-            for (self.handlers.items) |h| {
-                snap[count] = h;
-                count += 1;
-            }
+    /// Append {handler, channel} for every currently-registered real handler
+    /// into `pending`, under `mu`. Used by retireSocketLocked to capture
+    /// on_channel_closed recipients at a point where this PortEntry is
+    /// guaranteed alive and consistent, *without* leaving `pending` holding
+    /// any reference back to this PortEntry: a stored pointer to it would
+    /// not be safe to use later, since a different, concurrent caller (e.g.
+    /// vtUnlisten racing an onIfaceChange teardown on the same port) can
+    /// deinit this PortEntry before some other caller's captured pending
+    /// notification gets a chance to fire — decoupling the notification
+    /// from this PortEntry's lifetime avoids that use-after-free outright,
+    /// rather than trying to order every caller's teardown around it.
+    fn appendClosureRecipientsInto(self: *PortEntry, pending: *std.ArrayListUnmanaged(PendingClosure), alloc: std.mem.Allocator, channel: Channel) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.handlers.items) |h| {
+            pending.append(alloc, .{ .handler = h, .channel = channel }) catch {};
         }
-        for (snap[0..count]) |h| if (h.on_channel_closed) |cb| cb(h.ctx, channel);
     }
 
     fn asHandler(self: *PortEntry) ReceiveHandler {
-        return .{ .ctx = self, .on_receive = PortEntry.dispatch, .on_channel_closed = PortEntry.dispatchChannelClosed };
+        return .{ .ctx = self, .on_receive = PortEntry.dispatch };
     }
 };
 
@@ -742,16 +748,46 @@ pub const UdpTransport = struct {
         try self.sockets.append(self.alloc, entry);
     }
 
-    /// Stop, close, and notify on_channel_closed for `s`, then move it into
-    /// `dead_sockets` (retained until UdpTransport.close(), mirroring
-    /// TcpTransport.all_connections) instead of freeing it — a Channel.token
-    /// pointer into `s` must stay safe to dereference for the transport's
-    /// whole lifetime. Caller must hold `mu`, must have already called
-    /// `s.requestStop()`, and must not touch `s` again after this returns.
-    fn retireSocketLocked(self: *Self, s: *SocketEntry) void {
+    /// Fire every collected on_channel_closed notification. Callers must
+    /// call this only after releasing `mu` — never from inside a locked
+    /// region (see retireSocketLocked).
+    fn firePendingClosures(pending: *std.ArrayListUnmanaged(PendingClosure), alloc: std.mem.Allocator) void {
+        defer pending.deinit(alloc);
+        for (pending.items) |p| if (p.handler.on_channel_closed) |cb| cb(p.handler.ctx, p.channel);
+    }
+
+    /// Stop and close `s`, then move it into `dead_sockets` (retained until
+    /// UdpTransport.close(), mirroring TcpTransport.all_connections) instead
+    /// of freeing it — a Channel.token pointer into `s` must stay safe to
+    /// dereference for the transport's whole lifetime.
+    ///
+    /// Appends on_channel_closed's real recipients to `pending` rather than
+    /// firing directly, for two independent reasons:
+    ///   1. This function runs while the caller holds `mu` (required, since
+    ///      it touches `dead_sockets`), and firing an application callback
+    ///      here would let a handler that re-enters a transport operation
+    ///      needing `mu` (listen/unlisten/leaveMulticast/unicastLocators)
+    ///      deadlock against this same call stack.
+    ///   2. `s.handler` is a PortEntry.asHandler() proxy — appending it
+    ///      verbatim (rather than resolving it to the real, currently-
+    ///      registered handlers now) would leave `pending` holding a
+    ///      pointer through that PortEntry, which a *different*, concurrent
+    ///      caller (e.g. vtUnlisten racing this very teardown on the same
+    ///      port) could deinit before this caller's `pending` gets a chance
+    ///      to fire — a use-after-free. Resolving now, via
+    ///      appendClosureRecipientsInto (itself PortEntry.mu-protected),
+    ///      decouples the notification from that PortEntry's lifetime.
+    /// The caller must drain `pending` via firePendingClosures after
+    /// releasing `mu`.
+    ///
+    /// Caller must hold `mu` and must have already called `s.requestStop()`,
+    /// and must not touch `s` again after this returns.
+    fn retireSocketLocked(self: *Self, s: *SocketEntry, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
         s.joinAndClose(); // joins the recv thread, closes the fd, sets s.closed
         const channel = Channel{ .token = @intFromPtr(s), .generation = s.generation };
-        if (s.handler.on_channel_closed) |cb| cb(s.handler.ctx, channel);
+        if (self.port_entries.get(s.port)) |pe| {
+            pe.appendClosureRecipientsInto(pending, self.alloc, channel);
+        }
         self.dead_sockets.append(self.alloc, s) catch {
             // OOM growing dead_sockets: leak s rather than free it. Freeing
             // here would reopen exactly the UAF this graveyard exists to
@@ -761,7 +797,7 @@ pub const UdpTransport = struct {
         };
     }
 
-    fn removeUnicastSockets(self: *Self, ip: [16]u8, port: u32) void {
+    fn removeUnicastSockets(self: *Self, ip: [16]u8, port: u32, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
         // Signal before joining (see SocketEntry.requestStop) — same rationale
         // as removeSockets, kept consistent even though this usually matches
         // at most one socket.
@@ -774,7 +810,7 @@ pub const UdpTransport = struct {
             const s = self.sockets.items[i];
             if (s.kind == .unicast and s.port == port and std.mem.eql(u8, &s.bound_ip, &ip)) {
                 _ = self.sockets.swapRemove(i);
-                self.retireSocketLocked(s);
+                self.retireSocketLocked(s, pending);
             }
         }
     }
@@ -803,7 +839,7 @@ pub const UdpTransport = struct {
         return entry;
     }
 
-    fn removeSockets(self: *Self, port: u32) void {
+    fn removeSockets(self: *Self, port: u32, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
         // Signal every matching socket's recv thread before joining any of
         // them (see SocketEntry.requestStop) so tearing down a port with N
         // bound sockets (one per active interface, plus the explicit loopback
@@ -818,7 +854,7 @@ pub const UdpTransport = struct {
             const s = self.sockets.items[i];
             if (s.port == port) {
                 _ = self.sockets.swapRemove(i);
-                self.retireSocketLocked(s);
+                self.retireSocketLocked(s, pending);
             }
         }
     }
@@ -907,51 +943,61 @@ pub const UdpTransport = struct {
         self.monitor.enumerate(&new_ifaces, self.alloc) catch return;
         applyInterfaceFilter(self.alloc, &new_ifaces, &self.config) catch {};
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        // Collected under `mu` below, fired after it's released — see
+        // retireSocketLocked's doc comment for why this can't fire inline.
+        // Deferred here (rather than a trailing call after the locked block)
+        // so it still fires — after mu is unlocked, since that defer runs
+        // first, LIFO — on every early-return path below, present or future.
+        var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+        defer firePendingClosures(&pending, self.alloc);
 
-        const added = diffAdded(self.alloc, &self.active_ifaces, &new_ifaces) catch return;
-        defer {
-            var tmp = added;
-            tmp.deinit(self.alloc);
-        }
-        const removed = diffAdded(self.alloc, &new_ifaces, &self.active_ifaces) catch return;
-        defer {
-            var tmp = removed;
-            tmp.deinit(self.alloc);
-        }
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
 
-        for (added.items) |ia| {
-            if (ia.kind == LocatorKind.udp_v4 and !self.config.ipv4_enabled) continue;
-            if (ia.kind == LocatorKind.udp_v6 and !self.config.ipv6_enabled) continue;
-            var it = self.port_entries.iterator();
-            while (it.next()) |kv| {
-                // Skip ports served by a wildcard socket — they receive on 0.0.0.0
-                // and don't need (or want) per-interface duplicates.
-                if (self.hasWildcardSocket(kv.key_ptr.*)) continue;
-                self.addUnicastSocket(ia, kv.key_ptr.*, kv.value_ptr.*.asHandler()) catch {};
+            const added = diffAdded(self.alloc, &self.active_ifaces, &new_ifaces) catch return;
+            defer {
+                var tmp = added;
+                tmp.deinit(self.alloc);
             }
-            for (self.mc_states.items) |*ms| {
-                joinOnIface(self, ms, &ia) catch {};
+            const removed = diffAdded(self.alloc, &new_ifaces, &self.active_ifaces) catch return;
+            defer {
+                var tmp = removed;
+                tmp.deinit(self.alloc);
             }
+
+            for (added.items) |ia| {
+                if (ia.kind == LocatorKind.udp_v4 and !self.config.ipv4_enabled) continue;
+                if (ia.kind == LocatorKind.udp_v6 and !self.config.ipv6_enabled) continue;
+                var it = self.port_entries.iterator();
+                while (it.next()) |kv| {
+                    // Skip ports served by a wildcard socket — they receive on 0.0.0.0
+                    // and don't need (or want) per-interface duplicates.
+                    if (self.hasWildcardSocket(kv.key_ptr.*)) continue;
+                    self.addUnicastSocket(ia, kv.key_ptr.*, kv.value_ptr.*.asHandler()) catch {};
+                }
+                for (self.mc_states.items) |*ms| {
+                    joinOnIface(self, ms, &ia) catch {};
+                }
+            }
+
+            for (removed.items) |ia| {
+                for (self.mc_states.items) |*ms| {
+                    dropOnIface(self, ms, &ia);
+                }
+                var it = self.port_entries.iterator();
+                while (it.next()) |kv| {
+                    self.removeUnicastSockets(ia.ip, kv.key_ptr.*, &pending);
+                }
+            }
+
+            self.active_ifaces.deinit(self.alloc);
+            self.active_ifaces = new_ifaces;
+            self.rebuildLocatorsLocked() catch {};
+            self.publishMcSendIfacesLocked();
+
+            if (self.locator_change_handler) |h| h.on_change(h.ctx);
         }
-
-        for (removed.items) |ia| {
-            for (self.mc_states.items) |*ms| {
-                dropOnIface(self, ms, &ia);
-            }
-            var it = self.port_entries.iterator();
-            while (it.next()) |kv| {
-                self.removeUnicastSockets(ia.ip, kv.key_ptr.*);
-            }
-        }
-
-        self.active_ifaces.deinit(self.alloc);
-        self.active_ifaces = new_ifaces;
-        self.rebuildLocatorsLocked() catch {};
-        self.publishMcSendIfacesLocked();
-
-        if (self.locator_change_handler) |h| h.on_change(h.ctx);
     }
 
     // ── Reservation helpers ───────────────────────────────────────────────────
@@ -1313,35 +1359,44 @@ pub const UdpTransport = struct {
 
     fn vtLeaveMulticast(ctx: *anyopaque, group: *const Locator) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.mu.lock();
-        defer self.mu.unlock();
-        var i: usize = self.mc_states.items.len;
-        while (i > 0) {
-            i -= 1;
-            const ms = &self.mc_states.items[i];
-            if (!ms.group.eql(group.*)) continue;
-            const grp_port = ms.port();
-            switch (ms.group) {
-                .udp_v4 => |g| {
-                    for (ms.v4_ifaces.items) |ip| {
-                        dropMcV4(self.sockets.items, grp_port, g.addr, ip) catch {};
-                    }
-                },
-                else => {},
+        // Collected under `mu` below, fired after it's released — see
+        // retireSocketLocked's doc comment for why this can't fire inline.
+        // Deferred here (rather than a trailing call after the locked block)
+        // so it still fires — after mu is unlocked, since that defer runs
+        // first, LIFO — on every early-return path below, present or future.
+        var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+        defer firePendingClosures(&pending, self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            var i: usize = self.mc_states.items.len;
+            while (i > 0) {
+                i -= 1;
+                const ms = &self.mc_states.items[i];
+                if (!ms.group.eql(group.*)) continue;
+                const grp_port = ms.port();
+                switch (ms.group) {
+                    .udp_v4 => |g| {
+                        for (ms.v4_ifaces.items) |ip| {
+                            dropMcV4(self.sockets.items, grp_port, g.addr, ip) catch {};
+                        }
+                    },
+                    else => {},
+                }
+                ms.deinit(self.alloc);
+                _ = self.mc_states.swapRemove(i);
             }
-            ms.deinit(self.alloc);
-            _ = self.mc_states.swapRemove(i);
+            const grp_port: u32 = switch (group.*) {
+                .udp_v4 => |u| u.port,
+                .udp_v6 => |u| u.port,
+                else => return,
+            };
+            const still_needed = for (self.mc_states.items) |ms| {
+                if (ms.port() == grp_port) break true;
+            } else false;
+            if (!still_needed) self.removeSockets(grp_port, &pending);
+            self.publishMcSendIfacesLocked();
         }
-        const grp_port: u32 = switch (group.*) {
-            .udp_v4 => |u| u.port,
-            .udp_v6 => |u| u.port,
-            else => return,
-        };
-        const still_needed = for (self.mc_states.items) |ms| {
-            if (ms.port() == grp_port) break true;
-        } else false;
-        if (!still_needed) self.removeSockets(grp_port);
-        self.publishMcSendIfacesLocked();
     }
 
     fn vtUnlisten(ctx: *anyopaque, locator: *const Locator, handler: ReceiveHandler) void {
@@ -1351,25 +1406,38 @@ pub const UdpTransport = struct {
             .udp_v6 => |u| u.port,
             else => return,
         };
-        self.mu.lock();
-        defer self.mu.unlock();
-        const pe = self.port_entries.get(port) orelse return;
-        const empty = pe.removeHandler(handler.ctx);
-        if (!empty) return;
-        // Last handler deregistered — tear down all sockets for this port.
-        self.removeSockets(port);
-        var i: usize = self.mc_states.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.mc_states.items[i].port() == port) {
-                self.mc_states.items[i].deinit(self.alloc);
-                _ = self.mc_states.swapRemove(i);
+        // Collected under `mu` below, fired after it's released — see
+        // retireSocketLocked's doc comment for why this can't fire inline.
+        // Deferred here (rather than a trailing call after the locked block)
+        // so it still fires — after mu is unlocked, since that defer runs
+        // first, LIFO — on every early-return path below, present or future.
+        // Safe to fire after pe.deinit() below (unlike a naive "store the
+        // PortEntry proxy handler" approach would be): retireSocketLocked
+        // resolves `pending` to the real recipients up front, under `mu`,
+        // decoupled from this PortEntry's own lifetime — see its comment.
+        var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+        defer firePendingClosures(&pending, self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const pe = self.port_entries.get(port) orelse return;
+            const empty = pe.removeHandler(handler.ctx);
+            if (!empty) return;
+            // Last handler deregistered — tear down all sockets for this port.
+            self.removeSockets(port, &pending);
+            var i: usize = self.mc_states.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (self.mc_states.items[i].port() == port) {
+                    self.mc_states.items[i].deinit(self.alloc);
+                    _ = self.mc_states.swapRemove(i);
+                }
             }
+            pe.deinit();
+            _ = self.port_entries.remove(port);
+            self.rebuildLocatorsLocked() catch {};
+            self.publishMcSendIfacesLocked();
         }
-        pe.deinit();
-        _ = self.port_entries.remove(port);
-        self.rebuildLocatorsLocked() catch {};
-        self.publishMcSendIfacesLocked();
     }
 
     fn vtUnicastLocators(ctx: *anyopaque, out: *std.ArrayListUnmanaged(Locator), alloc: std.mem.Allocator) anyerror!void {

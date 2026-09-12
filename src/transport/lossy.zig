@@ -142,6 +142,23 @@ pub const LossyTransport = struct {
         return self.inner.vtable.send(self.inner.ctx, loc, data);
     }
 
+    /// Forwards to the inner transport's sendOnChannel under the same drop
+    /// policy and counters as vtSend — "all other vtable calls pass through
+    /// unchanged" (this file's own doc comment) applies to channel sends
+    /// too. Transport.sendOnChannel already returns error.ChannelUnsupported
+    /// when the inner transport has no channel concept, so this needs no
+    /// special case for that.
+    fn vtSendOnChannel(ctx: *anyopaque, channel: iface.Channel, loc: *const Locator, data: []const u8) anyerror!void {
+        const self: *LossyTransport = @ptrCast(@alignCast(ctx));
+        const seq = self.send_seq.fetchAdd(1, .monotonic) + 1; // 1-indexed
+        if (self.policy.should_drop(self.policy.ctx, loc, data, seq)) {
+            _ = self.dropped.fetchAdd(1, .monotonic);
+            return;
+        }
+        _ = self.sent.fetchAdd(1, .monotonic);
+        return self.inner.sendOnChannel(channel, loc, data);
+    }
+
     fn vtListen(ctx: *anyopaque, loc: *const Locator, h: ReceiveHandler) anyerror!void {
         const self: *LossyTransport = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.listen(self.inner.ctx, loc, h);
@@ -186,6 +203,7 @@ const lossy_vtable = Transport.Vtable{
     .capabilities = .{},
     .can_reach = LossyTransport.vtCanReach,
     .send = LossyTransport.vtSend,
+    .send_on_channel = LossyTransport.vtSendOnChannel,
     .listen = LossyTransport.vtListen,
     .join_multicast = LossyTransport.vtJoinMulticast,
     .leave_multicast = LossyTransport.vtLeaveMulticast,
