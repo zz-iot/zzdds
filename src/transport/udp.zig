@@ -2767,7 +2767,19 @@ test "sendOnChannel replies from the exact socket a datagram arrived on (IPv6)" 
     // udp_v6 branch was never exercised — every other sendOnChannel test
     // sets ipv6_enabled = false. Otherwise identical to the IPv4 version
     // above.
+    //
+    // Probe IPv6 availability first and skip otherwise (PR #84 review):
+    // without this, a host where IPv6 socket creation fails still lets
+    // UdpTransport.init succeed (vtListen only logs a warning — see its own
+    // "wildcard v6 socket" catch arm), leaving no v6 socket in
+    // client.sockets and crashing the `unreachable` below instead of
+    // failing gracefully. Matches the existing guard on "vtListen reserved
+    // meta fd also serves advertised IPv6 locators" above.
     const alloc = std.testing.allocator;
+    {
+        const probe = createUnicastSocket(LocatorKind.udp_v6, std.mem.zeroes([16]u8), 0, 0) catch return;
+        socketClose(probe);
+    }
 
     const server = try UdpTransport.init(alloc, .{
         .participant_id = 156,
