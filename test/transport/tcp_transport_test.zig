@@ -54,6 +54,49 @@ const LatchCounter = struct {
     }
 };
 
+/// Captures the Channel and src Locator from the first on_receive call, and
+/// posts to a Latch. Used by sendOnChannel tests that need to reply on the
+/// exact channel a message arrived on.
+const ChannelCapture = struct {
+    latch: Latch = .{},
+    channel: iface.Channel = iface.Channel.none,
+    src: Locator = .invalid,
+
+    fn onRecv(ctx: *anyopaque, _: []const u8, src: Locator, channel: iface.Channel) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.channel = channel;
+        self.src = src;
+        self.latch.post();
+    }
+    fn handler(self: *@This()) ReceiveHandler {
+        return .{ .ctx = self, .on_receive = onRecv };
+    }
+};
+
+/// Like ChannelCapture, but also captures on_channel_closed.
+const ChannelLifecycle = struct {
+    recv_latch: Latch = .{},
+    closed_latch: Latch = .{},
+    channel: iface.Channel = iface.Channel.none,
+    closed_channel: iface.Channel = iface.Channel.none,
+    src: Locator = .invalid,
+
+    fn onRecv(ctx: *anyopaque, _: []const u8, src: Locator, channel: iface.Channel) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.channel = channel;
+        self.src = src;
+        self.recv_latch.post();
+    }
+    fn onClosed(ctx: *anyopaque, channel: iface.Channel) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.closed_channel = channel;
+        self.closed_latch.post();
+    }
+    fn handler(self: *@This()) ReceiveHandler {
+        return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+    }
+};
+
 /// Listen on port 0 (IPv4 loopback), return the OS-assigned port.
 fn listenAndGetPort(t: iface.Transport, h: ReceiveHandler, alloc: std.mem.Allocator) !u16 {
     const loc = Locator.tcp4(.{ 127, 0, 0, 1 }, 0);
@@ -859,4 +902,165 @@ test "tcp transport: IPv6 loopback send and receive" {
     try testing.expectEqualSlices(u8, "Hello IPv6 TCP", received);
 
     alloc.free(received);
+}
+
+// ── sendOnChannel: exact-connection replies ───────────────────────────────────
+
+test "tcp transport: sendOnChannel replies on the exact accepted connection" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    const st = server.transport();
+
+    var capture = ChannelCapture{};
+    const port = try listenAndGetPort(st, capture.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), capture.handler());
+
+    sleepMs(20);
+
+    const client = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer client.deinit();
+    const ct = client.transport();
+
+    // TCP's handler list is transport-wide, not per-connection (see the
+    // file's own top comment): the client needs at least one registered
+    // handler to receive the server's reply on the connection it dialed,
+    // even though that handler's own listen port is otherwise unrelated.
+    var reply_capture = ChannelCapture{};
+    const client_port = try listenAndGetPort(ct, reply_capture.handler(), alloc);
+    defer ct.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, client_port), reply_capture.handler());
+
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+    try ct.send(&dest, "ping");
+    capture.latch.waitFor(1);
+
+    try testing.expect(!capture.channel.isNone());
+
+    // Reply on the exact channel "ping" arrived on, rather than dialing
+    // the client's advertised locator (which vtSend would do, and which a
+    // NATed peer might not even be reachable at).
+    try st.sendOnChannel(capture.channel, &capture.src, "pong");
+    reply_capture.latch.waitFor(1);
+
+    try testing.expect(!reply_capture.channel.isNone());
+}
+
+test "tcp transport: sendOnChannel returns ChannelClosed for Channel.none" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
+    try testing.expectError(error.ChannelClosed, t.sendOnChannel(iface.Channel.none, &dest, "x"));
+}
+
+test "tcp transport: sendOnChannel returns ChannelClosed for a stale generation" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    const st = server.transport();
+
+    var capture = ChannelCapture{};
+    const port = try listenAndGetPort(st, capture.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), capture.handler());
+
+    sleepMs(20);
+
+    const client = try TcpTransport.init(alloc, .{});
+    defer client.deinit();
+    const ct = client.transport();
+
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+    try ct.send(&dest, "ping");
+    capture.latch.waitFor(1);
+
+    // Same connection (same token), wrong generation — must not silently
+    // treat it as current.
+    var stale = capture.channel;
+    stale.generation +%= 1;
+    try testing.expectError(error.ChannelClosed, st.sendOnChannel(stale, &capture.src, "x"));
+}
+
+test "tcp transport: sendOnChannel returns ChannelClosed after the connection closes, and on_channel_closed fires" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    const st = server.transport();
+
+    var lifecycle = ChannelLifecycle{};
+    const port = try listenAndGetPort(st, lifecycle.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), lifecycle.handler());
+
+    sleepMs(20);
+
+    const client = try TcpTransport.init(alloc, .{});
+    const ct = client.transport();
+
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+    try ct.send(&dest, "ping");
+    lifecycle.recv_latch.waitFor(1);
+    try testing.expect(!lifecycle.channel.isNone());
+
+    // Peer-initiated close (the actual scenario closeConnFdOnce's fd_open
+    // CAS + send_mu serialization exists for): the server's recvLoop
+    // observes it, closes its side, and must notify on_channel_closed
+    // before this test ever calls sendOnChannel.
+    client.deinit();
+    lifecycle.closed_latch.waitFor(1);
+    try testing.expectEqual(lifecycle.channel.token, lifecycle.closed_channel.token);
+    try testing.expectEqual(lifecycle.channel.generation, lifecycle.closed_channel.generation);
+
+    try testing.expectError(error.ChannelClosed, st.sendOnChannel(lifecycle.channel, &lifecycle.src, "too late"));
+}
+
+test "tcp transport: deinit fires on_channel_closed for every still-open channel" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    const st = server.transport();
+
+    var lifecycle = ChannelLifecycle{};
+    const port = try listenAndGetPort(st, lifecycle.handler(), alloc);
+
+    sleepMs(20);
+
+    const client = try TcpTransport.init(alloc, .{});
+    defer client.deinit();
+    const ct = client.transport();
+
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+    try ct.send(&dest, "ping");
+    lifecycle.recv_latch.waitFor(1);
+
+    // Tear down the server transport itself (not the peer) — deinit must
+    // route the still-open accepted connection through the same
+    // closeConnFdOnce path natural death uses, rather than a separate close
+    // routine that silently skips the notification.
+    server.deinit();
+    lifecycle.closed_latch.waitFor(1);
+    try testing.expectEqual(lifecycle.channel.token, lifecycle.closed_channel.token);
+}
+
+test "tcp transport: sendOnChannel rejects empty message" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
+    try testing.expectError(error.EmptyMessage, t.sendOnChannel(iface.Channel.none, &dest, &.{}));
+}
+
+test "tcp transport: sendOnChannel rejects message larger than MAX_MSG_LEN" {
+    const alloc = testing.allocator;
+    const tcp = try TcpTransport.init(alloc, .{});
+    defer tcp.deinit();
+    const t = tcp.transport();
+
+    const ptr: [*]const u8 = @ptrFromInt(0x1000);
+    const huge: []const u8 = ptr[0 .. 4 * 1024 * 1024 + 1];
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, 1);
+    try testing.expectError(error.MessageTooLarge, t.sendOnChannel(iface.Channel.none, &dest, huge));
 }

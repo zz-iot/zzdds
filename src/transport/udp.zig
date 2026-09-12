@@ -2423,3 +2423,270 @@ test "init with interface IPv4 address filter runs applyInterfaceFilter" {
     }, 0, null);
     defer udp.deinit();
 }
+
+// ── sendOnChannel: exact-socket replies ───────────────────────────────────────
+
+/// Captures the Channel and src Locator from the first on_receive call.
+/// token doubles as a "have we been called yet" flag (a real Channel's
+/// token, a heap pointer, is never exactly 0) — publishing it last, with
+/// .release, after src/generation are written, and reading it first, with
+/// .acquire, makes those plain fields safe to read cross-thread too (the
+/// standard "publish via one flag" pattern this file's own tests rely on
+/// elsewhere: see "fan-out port dispatch"'s comment on why a plain usize
+/// counter here would be a genuine TSan-visible race).
+const ChannelCapture = struct {
+    token: std.atomic.Value(u64) = .init(0),
+    generation: u32 = 0,
+    src: Locator = .invalid,
+
+    fn onRecv(ctx: *anyopaque, _: []const u8, src: Locator, ch: Channel) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.src = src;
+        self.generation = ch.generation;
+        self.token.store(ch.token, .release);
+    }
+    fn handler(self: *@This()) ReceiveHandler {
+        return .{ .ctx = self, .on_receive = onRecv };
+    }
+    fn isSet(self: *const @This()) bool {
+        return self.token.load(.acquire) != 0;
+    }
+    fn channel(self: *const @This()) Channel {
+        return .{ .token = self.token.load(.acquire), .generation = self.generation };
+    }
+};
+
+test "sendOnChannel replies from the exact socket a datagram arrived on" {
+    const alloc = std.testing.allocator;
+
+    const server = try UdpTransport.init(alloc, .{
+        .participant_id = 168,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer server.deinit();
+    const st = server.transport();
+
+    const client = try UdpTransport.init(alloc, .{
+        .participant_id = 167,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer client.deinit();
+    const ct = client.transport();
+
+    // meta unicast port, domain 0: 7400 + 2*pid + 10.
+    const server_port: u16 = 7400 + 2 * 168 + 10; // 7746
+    const client_port: u16 = 7400 + 2 * 167 + 10; // 7744
+
+    var server_capture = ChannelCapture{};
+    try st.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, server_port), server_capture.handler());
+    defer st.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, server_port), server_capture.handler());
+
+    // The client must itself be listening on client_port to receive the
+    // server's reply there.
+    var client_capture = ChannelCapture{};
+    try ct.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, client_port), client_capture.handler());
+    defer ct.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, client_port), client_capture.handler());
+
+    // vtSend deliberately does NOT originate from a listening socket —
+    // send_fd_v4 is a separate, never-promoted ephemeral socket (see its
+    // own doc comment: "Option B never promotes send_fd to a bound
+    // socket"). So the initial "ping" is sent directly from the client's
+    // listening socket's own fd (white-box) instead of via ct.send() —
+    // exactly matching the real scenario this feature targets: a reply
+    // must land back on a socket that is actually receiving, not on
+    // whatever ephemeral port an ordinary send happened to use.
+    const client_fd = blk: {
+        client.mu.lock();
+        defer client.mu.unlock();
+        for (client.sockets.items) |s| {
+            if (s.kind == .unicast and s.port == client_port) break :blk s.fd;
+        }
+        unreachable;
+    };
+    const server_addr = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, server_port),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    try socketSendTo(client_fd, "ping", @ptrCast(&server_addr), @sizeOf(posix.sockaddr.in));
+    sleepMs(100);
+    try std.testing.expect(server_capture.isSet());
+
+    // Reply on the exact channel "ping" arrived on, rather than vtSend's
+    // shared send_fd_v4/v6 — this is the feature under test.
+    try st.sendOnChannel(server_capture.channel(), &server_capture.src, "pong");
+    sleepMs(100);
+    try std.testing.expect(client_capture.isSet());
+}
+
+test "udp transport: sendOnChannel returns ChannelClosed for Channel.none" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 166, .ipv6_enabled = false }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+    const dest = Locator.udp4(.{ 127, 0, 0, 1 }, 7400);
+    try std.testing.expectError(error.ChannelClosed, t.sendOnChannel(Channel.none, &dest, "x"));
+}
+
+test "udp transport: sendOnChannel returns ChannelClosed for a stale generation" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 165,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 165 + 10;
+    var capture = ChannelCapture{};
+    try t.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, port), capture.handler());
+    defer t.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, port), capture.handler());
+
+    const self_loc = Locator.udp4(.{ 127, 0, 0, 1 }, port);
+    try t.send(&self_loc, "ping");
+    sleepMs(100);
+    try std.testing.expect(capture.isSet());
+
+    // Same socket (same token), wrong generation — must not silently treat
+    // it as current.
+    var stale = capture.channel();
+    stale.generation +%= 1;
+    try std.testing.expectError(error.ChannelClosed, t.sendOnChannel(stale, &capture.src, "x"));
+}
+
+test "udp transport: sendOnChannel returns ChannelClosed after the socket is retired" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 164,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 164 + 10;
+    var capture = ChannelCapture{};
+    try t.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, port), capture.handler());
+
+    const self_loc = Locator.udp4(.{ 127, 0, 0, 1 }, port);
+    try t.send(&self_loc, "ping");
+    sleepMs(100);
+    try std.testing.expect(capture.isSet());
+    const channel = capture.channel();
+
+    // Last handler leaves -> socket retired into the graveyard. The
+    // Channel.token pointer stays safe to dereference (retained, not
+    // freed — see docs/design/transport-channel.md §4.3) but must now
+    // report closed rather than silently succeeding or crashing.
+    t.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, port), capture.handler());
+
+    try std.testing.expectError(error.ChannelClosed, t.sendOnChannel(channel, &self_loc, "too late"));
+}
+
+test "udp transport: vtUnlisten last handler leaving fires no on_channel_closed and does not crash" {
+    // Regression test (PR #84 review): retireSocketLocked used to store a
+    // handle back to the owning PortEntry rather than resolving to its real
+    // recipients up front — a use-after-free once vtUnlisten went on to
+    // free that same PortEntry before the deferred notification fired.
+    // Nobody is left to notify by construction on this exact path (the
+    // departing handler was the only one registered), so the assertion
+    // here is "zero closures fired, no crash".
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 163,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 163 + 10;
+    var closed_count: std.atomic.Value(usize) = .init(0);
+    const Handler = struct {
+        n: *std.atomic.Value(usize),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .n = &closed_count };
+
+    try t.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, port), h.handler());
+    t.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, port), h.handler());
+
+    try std.testing.expectEqual(@as(usize, 0), closed_count.load(.monotonic));
+}
+
+test "removeUnicastSockets: on_channel_closed reaches real recipients even when the owning PortEntry is freed before firing" {
+    // Direct test of retireSocketLocked's capture mechanism (PR #84
+    // review): pending must resolve to the real, currently-registered
+    // recipients up front, decoupled from the owning PortEntry's lifetime —
+    // not store a handle back to that PortEntry, which a different,
+    // concurrent caller could free before this caller's deferred
+    // notification fires. Proven directly here by freeing the PortEntry
+    // *between* capture and fire.
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 162,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+
+    const port: u32 = 7400 + 2 * 162 + 10;
+    var closed_count: std.atomic.Value(usize) = .init(0);
+    const Handler = struct {
+        n: *std.atomic.Value(usize),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .n = &closed_count };
+
+    // A real PortEntry with a real registrant, constructed directly rather
+    // than via listen() — this test targets retireSocketLocked's capture
+    // mechanism specifically, not the public listen/unlisten API (that's
+    // the test above).
+    const pe = try PortEntry.init(alloc);
+    try pe.addHandler(h.handler());
+    udp.mu.lock();
+    try udp.port_entries.put(alloc, port, pe);
+    udp.mu.unlock();
+
+    // A real, working socket standing in for "one bound to an interface
+    // that's about to disappear" — bound to real loopback so the fd is
+    // genuine, but *recorded* under a fake bound_ip (TEST-NET-3, RFC 5737:
+    // guaranteed to never be a real local interface) so this test doesn't
+    // depend on actually bringing down a real interface.
+    const loopback_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 };
+    const fake_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 203, 0, 113, 77 };
+    const fd = try createUnicastSocket(LocatorKind.udp_v4, loopback_ip, 0, 0);
+    udp.mu.lock();
+    try udp.addUnicastSocketFromFd(fd, LocatorKind.udp_v4, fake_ip, port, pe.asHandler());
+    udp.mu.unlock();
+
+    var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+    udp.mu.lock();
+    udp.removeUnicastSockets(fake_ip, port, &pending);
+    // Free the PortEntry *before* firing pending — exactly the ordering
+    // that use-after-freed when pending stored a proxy back to the
+    // PortEntry instead of resolving to its real recipients up front.
+    pe.deinit();
+    _ = udp.port_entries.remove(port);
+    udp.mu.unlock();
+    UdpTransport.firePendingClosures(&pending, alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), closed_count.load(.monotonic));
+}
