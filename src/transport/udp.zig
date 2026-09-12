@@ -18,6 +18,7 @@ const build_opts = @import("build_options");
 const posix = std.posix;
 const log = @import("../log.zig");
 const mutex_mod = @import("../util/mutex.zig");
+const condvar_mod = @import("../util/condvar.zig");
 const time_mod = @import("../util/time.zig");
 
 // std.posix.IP and std.posix.IPV6 are void on macOS in Zig 0.16.0 (std.c.IP
@@ -302,8 +303,11 @@ const McSendIfaces = struct {
 
 /// A closed channel's notification, captured while a lock is held and fired
 /// once it's released — see retireSocketLocked's and firePendingClosures'
-/// doc comments for why.
-const PendingClosure = struct { handler: ReceiveHandler, channel: Channel };
+/// doc comments for why. `owner` is the PortEntry the recipient was
+/// captured from — used only to call markDelivered() after firing, to
+/// unblock a concurrent unlisten() that may be waiting on it (see
+/// PortEntry.pending_closures).
+const PendingClosure = struct { handler: ReceiveHandler, channel: Channel, owner: *PortEntry };
 
 /// One PortEntry exists per listened port. Multiple ReceiveHandlers can register
 /// on the same port (e.g. two participants sharing a transport). Each incoming
@@ -315,6 +319,18 @@ const PortEntry = struct {
     mu: mutex_mod.Mutex,
     handlers: std.ArrayListUnmanaged(ReceiveHandler),
     alloc: std.mem.Allocator,
+    /// Number of on_channel_closed notifications captured from this
+    /// PortEntry's handler list (via appendClosureRecipientsInto) that have
+    /// not yet been delivered (markDelivered() not yet called for them).
+    /// unlisten() must wait for this to reach zero — via
+    /// waitPendingClosuresDrained() — before returning: otherwise the
+    /// caller could free a handler's ctx believing unlisten's "blocks until
+    /// no in-flight callbacks remain" contract already covers
+    /// on_channel_closed, while a snapshot taken just before this unlisten
+    /// call (by a different, concurrent retirement) still references it.
+    /// Guarded by mu; signaled via pending_cond.
+    pending_closures: usize = 0,
+    pending_cond: condvar_mod.Condvar = .{},
 
     fn init(alloc: std.mem.Allocator) !*PortEntry {
         const pe = try alloc.create(PortEntry);
@@ -323,6 +339,11 @@ const PortEntry = struct {
     }
 
     fn deinit(self: *PortEntry) void {
+        // Must only be called once waitPendingClosuresDrained() has
+        // returned — see its doc comment. A nonzero count here means some
+        // caller freed this PortEntry without waiting, reopening the
+        // use-after-free this mechanism exists to prevent.
+        std.debug.assert(self.pending_closures == 0);
         const alloc = self.alloc;
         self.handlers.deinit(alloc);
         alloc.destroy(self);
@@ -337,6 +358,14 @@ const PortEntry = struct {
 
     /// Remove the handler whose ctx matches `ctx`.
     /// Returns true if the list is now empty.
+    ///
+    /// Does NOT wait for in-flight closure notifications referencing this
+    /// handler to drain — that must happen separately, via
+    /// waitPendingClosuresDrained(), called *without* holding
+    /// UdpTransport.mu (unlike this function, which vtUnlisten calls while
+    /// holding it): delivering a closure may invoke an application callback
+    /// that legitimately needs UdpTransport.mu, which would deadlock
+    /// against a caller still holding it here.
     fn removeHandler(self: *PortEntry, ctx: *anyopaque) bool {
         self.mu.lock();
         defer self.mu.unlock();
@@ -366,23 +395,46 @@ const PortEntry = struct {
         for (snap[0..count]) |h| h.on_receive(h.ctx, buf, src, channel);
     }
 
-    /// Append {handler, channel} for every currently-registered real handler
-    /// into `pending`, under `mu`. Used by retireSocketLocked to capture
-    /// on_channel_closed recipients at a point where this PortEntry is
-    /// guaranteed alive and consistent, *without* leaving `pending` holding
-    /// any reference back to this PortEntry: a stored pointer to it would
-    /// not be safe to use later, since a different, concurrent caller (e.g.
-    /// vtUnlisten racing an onIfaceChange teardown on the same port) can
-    /// deinit this PortEntry before some other caller's captured pending
-    /// notification gets a chance to fire — decoupling the notification
-    /// from this PortEntry's lifetime avoids that use-after-free outright,
-    /// rather than trying to order every caller's teardown around it.
+    /// Append {handler, channel, owner} for every currently-registered real
+    /// handler into `pending`, under `mu`, and bump pending_closures by the
+    /// same count. Used by retireSocketLocked to capture on_channel_closed
+    /// recipients at a point where this PortEntry is guaranteed alive and
+    /// consistent, *without* leaving `pending` holding a bare reference
+    /// back to this PortEntry that some other caller's teardown could
+    /// invalidate — `owner` is only ever used to call markDelivered(),
+    /// which every caller of appendClosureRecipientsInto is required to
+    /// keep alive for (see waitPendingClosuresDrained()).
     fn appendClosureRecipientsInto(self: *PortEntry, pending: *std.ArrayListUnmanaged(PendingClosure), alloc: std.mem.Allocator, channel: Channel) void {
         self.mu.lock();
         defer self.mu.unlock();
         for (self.handlers.items) |h| {
-            pending.append(alloc, .{ .handler = h, .channel = channel }) catch {};
+            pending.append(alloc, .{ .handler = h, .channel = channel, .owner = self }) catch continue;
+            self.pending_closures += 1;
         }
+    }
+
+    /// Called once per PendingClosure after its callback has been invoked —
+    /// see firePendingClosures. Unblocks a concurrent
+    /// waitPendingClosuresDrained() call once every closure captured before
+    /// it was called has been delivered.
+    fn markDelivered(self: *PortEntry) void {
+        self.mu.lock();
+        std.debug.assert(self.pending_closures > 0);
+        self.pending_closures -= 1;
+        self.mu.unlock();
+        self.pending_cond.broadcast();
+    }
+
+    /// Block until every on_channel_closed notification already captured
+    /// from this PortEntry's handler list has been delivered (see
+    /// pending_closures). Must be called *without* holding UdpTransport.mu
+    /// — see removeHandler's doc comment for why. In the common case
+    /// (nothing racing this call) pending_closures is already zero and this
+    /// returns immediately.
+    fn waitPendingClosuresDrained(self: *PortEntry) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (self.pending_closures > 0) self.pending_cond.wait(&self.mu);
     }
 
     fn asHandler(self: *PortEntry) ReceiveHandler {
@@ -748,12 +800,17 @@ pub const UdpTransport = struct {
         try self.sockets.append(self.alloc, entry);
     }
 
-    /// Fire every collected on_channel_closed notification. Callers must
-    /// call this only after releasing `mu` — never from inside a locked
-    /// region (see retireSocketLocked).
+    /// Fire every collected on_channel_closed notification, then mark each
+    /// one delivered on its owning PortEntry (unblocking any concurrent
+    /// waitPendingClosuresDrained() call — see PortEntry.pending_closures).
+    /// Callers must call this only after releasing `mu` — never from inside
+    /// a locked region (see retireSocketLocked).
     fn firePendingClosures(pending: *std.ArrayListUnmanaged(PendingClosure), alloc: std.mem.Allocator) void {
         defer pending.deinit(alloc);
-        for (pending.items) |p| if (p.handler.on_channel_closed) |cb| cb(p.handler.ctx, p.channel);
+        for (pending.items) |p| {
+            if (p.handler.on_channel_closed) |cb| cb(p.handler.ctx, p.channel);
+            p.owner.markDelivered();
+        }
     }
 
     /// Stop and close `s`, then move it into `dead_sockets` (retained until
@@ -1408,35 +1465,52 @@ pub const UdpTransport = struct {
         };
         // Collected under `mu` below, fired after it's released — see
         // retireSocketLocked's doc comment for why this can't fire inline.
-        // Deferred here (rather than a trailing call after the locked block)
-        // so it still fires — after mu is unlocked, since that defer runs
-        // first, LIFO — on every early-return path below, present or future.
-        // Safe to fire after pe.deinit() below (unlike a naive "store the
-        // PortEntry proxy handler" approach would be): retireSocketLocked
-        // resolves `pending` to the real recipients up front, under `mu`,
-        // decoupled from this PortEntry's own lifetime — see its comment.
         var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
         defer firePendingClosures(&pending, self.alloc);
+
+        // Set below (inside the locked block) whenever a handler was
+        // actually removed, so the wait/deinit step after the block can run
+        // for every return path without an early `return` inside the block
+        // skipping it (a `return` there exits this whole function).
+        var removed_from: ?*PortEntry = null;
+        var fully_empty = false;
         {
             self.mu.lock();
             defer self.mu.unlock();
             const pe = self.port_entries.get(port) orelse return;
             const empty = pe.removeHandler(handler.ctx);
-            if (!empty) return;
-            // Last handler deregistered — tear down all sockets for this port.
-            self.removeSockets(port, &pending);
-            var i: usize = self.mc_states.items.len;
-            while (i > 0) {
-                i -= 1;
-                if (self.mc_states.items[i].port() == port) {
-                    self.mc_states.items[i].deinit(self.alloc);
-                    _ = self.mc_states.swapRemove(i);
+            removed_from = pe;
+            fully_empty = empty;
+            if (empty) {
+                // Last handler deregistered — tear down all sockets for this port.
+                self.removeSockets(port, &pending);
+                var i: usize = self.mc_states.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.mc_states.items[i].port() == port) {
+                        self.mc_states.items[i].deinit(self.alloc);
+                        _ = self.mc_states.swapRemove(i);
+                    }
                 }
+                _ = self.port_entries.remove(port);
+                self.rebuildLocatorsLocked() catch {};
+                self.publishMcSendIfacesLocked();
             }
-            pe.deinit();
-            _ = self.port_entries.remove(port);
-            self.rebuildLocatorsLocked() catch {};
-            self.publishMcSendIfacesLocked();
+        }
+
+        // Outside `mu`: wait for any on_channel_closed notification a
+        // *different*, concurrent caller already captured from this port's
+        // handler list (which may include the handler just removed above)
+        // to finish delivering, before this function returns — the caller
+        // may free `handler.ctx` the instant unlisten() returns (PR #84
+        // review), and that must not race a capture taken before this call
+        // but not yet delivered. Not done while `mu` is held: delivery may
+        // invoke an application callback that legitimately needs it, which
+        // would deadlock against this call still holding it. In the common,
+        // non-racing case this returns immediately (nothing pending).
+        if (removed_from) |pe| {
+            pe.waitPendingClosuresDrained();
+            if (fully_empty) pe.deinit();
         }
     }
 
@@ -2624,14 +2698,82 @@ test "udp transport: vtUnlisten last handler leaving fires no on_channel_closed 
     try std.testing.expectEqual(@as(usize, 0), closed_count.load(.monotonic));
 }
 
-test "removeUnicastSockets: on_channel_closed reaches real recipients even when the owning PortEntry is freed before firing" {
+test "udp transport: vtUnlisten blocks until a concurrently-captured closure notification is delivered" {
+    // Regression test (PR #84 review, round 3): appendClosureRecipientsInto
+    // snapshots a handler's ctx while capturing a pending closure, but the
+    // callback fires later, outside any lock. If vtUnlisten for that same
+    // handler could return in the meantime, the caller would be free to
+    // destroy `ctx` before the stale snapshot's callback runs — a
+    // use-after-free. vtUnlisten must block (via
+    // PortEntry.pending_closures / waitPendingClosuresDrained) until any
+    // such in-flight capture has actually been delivered.
+    //
+    // This is deterministic, not timing-flaky: with the fix,
+    // waitPendingClosuresDrained() cannot return before markDelivered() is
+    // called, no matter how long delivery takes — the delay below just
+    // makes the failure mode obvious if the fix regresses (unlisten
+    // returning immediately, well before delivery, rather than only after).
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 161,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 161 + 10;
+    var delivered: std.atomic.Value(bool) = .init(false);
+    const Handler = struct {
+        flag: *std.atomic.Value(bool),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.flag.store(true, .release);
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .flag = &delivered };
+
+    const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+    try t.listen(&listen_loc, h.handler());
+
+    // Simulate "a concurrent retirement already captured this handler" —
+    // exactly what retireSocketLocked does during a real socket teardown,
+    // invoked directly here rather than via one.
+    const pe = blk: {
+        udp.mu.lock();
+        defer udp.mu.unlock();
+        break :blk udp.port_entries.get(port).?;
+    };
+    var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+    pe.appendClosureRecipientsInto(&pending, alloc, Channel.none);
+
+    // Deliver it on a delay, from another thread.
+    const Deliverer = struct {
+        fn run(p: *std.ArrayListUnmanaged(PendingClosure), a: std.mem.Allocator) void {
+            sleepMs(100);
+            UdpTransport.firePendingClosures(p, a);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Deliverer.run, .{ &pending, alloc });
+    defer th.join();
+
+    // Must not return before the delayed delivery above actually runs.
+    t.unlisten(&listen_loc, h.handler());
+
+    try std.testing.expect(delivered.load(.acquire));
+}
+
+test "removeUnicastSockets: on_channel_closed reaches real recipients, not a PortEntry proxy" {
     // Direct test of retireSocketLocked's capture mechanism (PR #84
     // review): pending must resolve to the real, currently-registered
-    // recipients up front, decoupled from the owning PortEntry's lifetime —
-    // not store a handle back to that PortEntry, which a different,
-    // concurrent caller could free before this caller's deferred
-    // notification fires. Proven directly here by freeing the PortEntry
-    // *between* capture and fire.
+    // recipients up front, not store a bare handle back to the owning
+    // PortEntry — deinit() now asserts pending_closures == 0, so freeing it
+    // before every captured closure has actually been delivered is a bug
+    // this test would catch, not a scenario it needs to survive.
     const alloc = std.testing.allocator;
     const udp = try UdpTransport.init(alloc, .{
         .participant_id = 162,
@@ -2680,13 +2822,13 @@ test "removeUnicastSockets: on_channel_closed reaches real recipients even when 
     var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
     udp.mu.lock();
     udp.removeUnicastSockets(fake_ip, port, &pending);
-    // Free the PortEntry *before* firing pending — exactly the ordering
-    // that use-after-freed when pending stored a proxy back to the
-    // PortEntry instead of resolving to its real recipients up front.
-    pe.deinit();
     _ = udp.port_entries.remove(port);
     udp.mu.unlock();
-    UdpTransport.firePendingClosures(&pending, alloc);
 
+    // Fire before freeing pe — required now (deinit asserts
+    // pending_closures == 0); this is also the actual ordering every real
+    // caller (onIfaceChange, vtLeaveMulticast, vtUnlisten) already follows.
+    UdpTransport.firePendingClosures(&pending, alloc);
     try std.testing.expectEqual(@as(usize, 1), closed_count.load(.monotonic));
+    pe.deinit();
 }
