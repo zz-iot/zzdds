@@ -309,6 +309,88 @@ const McSendIfaces = struct {
 /// PortEntry.pending_closures).
 const PendingClosure = struct { handler: ReceiveHandler, channel: Channel, owner: *PortEntry };
 
+/// One stack frame per firePendingClosures call active on this thread's call
+/// stack — pushed on entry, popped on return (see firePendingClosures). Lets
+/// a reentrant call (an on_channel_closed callback that itself calls
+/// unlisten(), possibly for its own handler) see and act on the batch(es)
+/// this same thread is already in the middle of delivering, via
+/// drain_stack below. Never touched by any other thread: each thread has
+/// its own threadlocal stack, and a frame is only ever live on the stack of
+/// the thread that pushed it.
+const DrainFrame = struct {
+    /// The batch this frame is draining. Entries still in here have not
+    /// started delivering yet.
+    pending: *std.ArrayListUnmanaged(PendingClosure),
+    /// The entry (if any) whose callback is currently executing for this
+    /// frame — removed from `pending` before its callback is invoked (see
+    /// firePendingClosures), so it must be tracked separately for
+    /// selfDebtForPortEntry to still count it.
+    current: ?PendingClosure,
+    prev: ?*DrainFrame,
+};
+
+/// Head of the current thread's stack of in-progress firePendingClosures
+/// calls. See DrainFrame, cancelQueuedClosuresForCtx, selfDebtForPortEntry.
+threadlocal var drain_stack: ?*DrainFrame = null;
+
+/// Remove, without invoking their callback, every not-yet-started closure
+/// entry (in any frame on this thread's drain_stack) whose handler is
+/// `ctx`, marking each delivered so PortEntry.pending_closures / a
+/// concurrent waitPendingClosuresDrained() stay consistent.
+///
+/// Called by vtUnlisten right after removing `ctx` from its PortEntry.
+/// Necessary in the reentrant case — `ctx`'s own on_channel_closed callback
+/// calling unlisten() on itself — because selfDebtForPortEntry lets that
+/// unlisten() return without waiting for entries this same thread already
+/// queued for later delivery; if one of those leftover entries still
+/// targeted `ctx`, the caller would be free to destroy `ctx` before this
+/// thread's outer firePendingClosures loop got back around to firing it —
+/// a use-after-free. Cancelling them here instead is safe and correct:
+/// once unlisten(ctx) is returning, no further on_channel_closed(ctx, ...)
+/// call may legitimately happen, by the same contract that makes waiting
+/// necessary in the first place.
+fn cancelQueuedClosuresForCtx(ctx: *anyopaque) void {
+    var frame = drain_stack;
+    while (frame) |f| : (frame = f.prev) {
+        var i: usize = f.pending.items.len;
+        while (i > 0) {
+            i -= 1;
+            const p = f.pending.items[i];
+            if (p.handler.ctx == ctx) {
+                _ = f.pending.swapRemove(i);
+                p.owner.markDelivered();
+            }
+        }
+    }
+}
+
+/// Count how many not-yet-delivered PendingClosure entries owned by `pe`
+/// this thread is itself responsible for eventually delivering — either
+/// mid-callback right now, or still queued in a batch this thread is
+/// draining further up its own call stack.
+///
+/// vtUnlisten passes this to PortEntry.waitPendingClosuresDrained() as the
+/// count to wait *down to* instead of zero. Excluding it is what prevents
+/// the reentrant self-deadlock a plain "wait for zero" would hit: a
+/// not-yet-delivered entry that only this same thread can ever deliver
+/// (because delivering it requires returning up through the very call
+/// stack this thread is currently blocked in) can never resolve by waiting
+/// — the thread would be waiting on itself. Entries owned by *other*
+/// threads' batches are unaffected and still block the wait normally.
+fn selfDebtForPortEntry(pe: *PortEntry) usize {
+    var debt: usize = 0;
+    var frame = drain_stack;
+    while (frame) |f| : (frame = f.prev) {
+        if (f.current) |cur| {
+            if (cur.owner == pe) debt += 1;
+        }
+        for (f.pending.items) |p| {
+            if (p.owner == pe) debt += 1;
+        }
+    }
+    return debt;
+}
+
 /// One PortEntry exists per listened port. Multiple ReceiveHandlers can register
 /// on the same port (e.g. two participants sharing a transport). Each incoming
 /// datagram is dispatched to all registered handlers.
@@ -331,6 +413,21 @@ const PortEntry = struct {
     /// Guarded by mu; signaled via pending_cond.
     pending_closures: usize = 0,
     pending_cond: condvar_mod.Condvar = .{},
+    /// Set by vtUnlisten when the last handler just left but
+    /// pending_closures hasn't reached zero yet because the remaining
+    /// count is entirely this same thread's own self_debt (see
+    /// selfDebtForPortEntry) — i.e. entries this very thread is still
+    /// mid-delivering or has yet to reach in its own outer
+    /// firePendingClosures loop. vtUnlisten cannot free this PortEntry
+    /// itself in that case: those entries' `owner` still points at it, and
+    /// markDelivered() will dereference `owner` once each finishes
+    /// delivering (possibly after vtUnlisten has already returned to a
+    /// caller who may destroy handler.ctx, but never after this PortEntry
+    /// itself, which nothing outside markDelivered/waitPendingClosuresDrained
+    /// touches once removed from port_entries). markDelivered() checks this
+    /// flag and performs the deinit itself once its own decrement brings
+    /// pending_closures to zero. Guarded by mu.
+    pending_deinit: bool = false,
 
     fn init(alloc: std.mem.Allocator) !*PortEntry {
         const pe = try alloc.create(PortEntry);
@@ -339,10 +436,11 @@ const PortEntry = struct {
     }
 
     fn deinit(self: *PortEntry) void {
-        // Must only be called once waitPendingClosuresDrained() has
-        // returned — see its doc comment. A nonzero count here means some
-        // caller freed this PortEntry without waiting, reopening the
-        // use-after-free this mechanism exists to prevent.
+        // Must only be called once pending_closures has actually reached
+        // zero (either observed directly, or via markDelivered's
+        // pending_deinit handoff — see its doc comment). A nonzero count
+        // here means some caller freed this PortEntry too early, reopening
+        // the use-after-free this mechanism exists to prevent.
         std.debug.assert(self.pending_closures == 0);
         const alloc = self.alloc;
         self.handlers.deinit(alloc);
@@ -416,25 +514,31 @@ const PortEntry = struct {
     /// Called once per PendingClosure after its callback has been invoked —
     /// see firePendingClosures. Unblocks a concurrent
     /// waitPendingClosuresDrained() call once every closure captured before
-    /// it was called has been delivered.
+    /// it was called has been delivered. If this decrement is the one that
+    /// brings pending_closures to zero *and* vtUnlisten already left this
+    /// PortEntry marked for deinit (see pending_deinit) — because it left
+    /// the wait early on account of exactly this thread's own remaining
+    /// self_debt — this call performs that deferred deinit itself.
     fn markDelivered(self: *PortEntry) void {
         self.mu.lock();
         std.debug.assert(self.pending_closures > 0);
         self.pending_closures -= 1;
+        const finish_deinit = self.pending_closures == 0 and self.pending_deinit;
         self.mu.unlock();
         self.pending_cond.broadcast();
+        if (finish_deinit) self.deinit();
     }
 
-    /// Block until every on_channel_closed notification already captured
-    /// from this PortEntry's handler list has been delivered (see
-    /// pending_closures). Must be called *without* holding UdpTransport.mu
-    /// — see removeHandler's doc comment for why. In the common case
-    /// (nothing racing this call) pending_closures is already zero and this
-    /// returns immediately.
-    fn waitPendingClosuresDrained(self: *PortEntry) void {
+    /// Block until pending_closures has dropped to `self_debt` (ordinarily
+    /// 0 — see selfDebtForPortEntry for when it isn't). Must be called
+    /// *without* holding UdpTransport.mu — see removeHandler's doc comment
+    /// for why. In the common case (nothing racing this call, and no
+    /// reentrancy) pending_closures is already zero and this returns
+    /// immediately.
+    fn waitPendingClosuresDrained(self: *PortEntry, self_debt: usize) void {
         self.mu.lock();
         defer self.mu.unlock();
-        while (self.pending_closures > 0) self.pending_cond.wait(&self.mu);
+        while (self.pending_closures > self_debt) self.pending_cond.wait(&self.mu);
     }
 
     fn asHandler(self: *PortEntry) ReceiveHandler {
@@ -805,12 +909,27 @@ pub const UdpTransport = struct {
     /// waitPendingClosuresDrained() call — see PortEntry.pending_closures).
     /// Callers must call this only after releasing `mu` — never from inside
     /// a locked region (see retireSocketLocked).
+    ///
+    /// Pushes a DrainFrame onto this thread's drain_stack for the duration,
+    /// and removes each entry from `pending` immediately before invoking
+    /// its callback (rather than iterating `pending.items` directly) so
+    /// that a callback which reentrantly calls unlisten() — possibly for
+    /// its own handler — sees an accurate view of what this thread still
+    /// has left to deliver, via cancelQueuedClosuresForCtx and
+    /// selfDebtForPortEntry.
     fn firePendingClosures(pending: *std.ArrayListUnmanaged(PendingClosure), alloc: std.mem.Allocator) void {
-        defer pending.deinit(alloc);
-        for (pending.items) |p| {
+        var frame = DrainFrame{ .pending = pending, .current = null, .prev = drain_stack };
+        drain_stack = &frame;
+        defer drain_stack = frame.prev;
+
+        while (pending.items.len > 0) {
+            const p = pending.orderedRemove(0);
+            frame.current = p;
             if (p.handler.on_channel_closed) |cb| cb(p.handler.ctx, p.channel);
+            frame.current = null;
             p.owner.markDelivered();
         }
+        pending.deinit(alloc);
     }
 
     /// Stop and close `s`, then move it into `dead_sockets` (retained until
@@ -1508,9 +1627,40 @@ pub const UdpTransport = struct {
         // invoke an application callback that legitimately needs it, which
         // would deadlock against this call still holding it. In the common,
         // non-racing case this returns immediately (nothing pending).
+        //
+        // Two extra steps handle unlisten() being called reentrantly from
+        // inside an on_channel_closed callback (PR #84 review, round 4) —
+        // e.g. a handler unregisters itself upon being told its channel
+        // closed:
+        //   - cancelQueuedClosuresForCtx drops any *other*, not-yet-fired
+        //     notification this same thread already queued for
+        //     handler.ctx, so it can never fire on freed memory once this
+        //     call returns and the caller destroys handler.ctx.
+        //   - selfDebtForPortEntry excludes this thread's own
+        //     currently-in-flight and still-queued entries from the wait
+        //     below — waiting for them would be waiting on this same
+        //     thread's own later progress, which can only happen after
+        //     this call returns, i.e. never.
+        //
+        // Because of that same self_debt, pending_closures may still be
+        // nonzero (equal to self_debt) once the wait returns — freeing `pe`
+        // here regardless (as the pre-round-4 code did) would leave those
+        // still-owned entries' `owner` pointer dangling once this thread's
+        // own outer firePendingClosures loop got back around to delivering
+        // them. Free `pe` now only if it's actually drained; otherwise hand
+        // the deinit off to whichever markDelivered() call brings it to
+        // zero (see PortEntry.pending_deinit).
         if (removed_from) |pe| {
-            pe.waitPendingClosuresDrained();
-            if (fully_empty) pe.deinit();
+            cancelQueuedClosuresForCtx(handler.ctx);
+            const self_debt = selfDebtForPortEntry(pe);
+            pe.waitPendingClosuresDrained(self_debt);
+            if (fully_empty) {
+                pe.mu.lock();
+                const drained = pe.pending_closures == 0;
+                if (!drained) pe.pending_deinit = true;
+                pe.mu.unlock();
+                if (drained) pe.deinit();
+            }
         }
     }
 
@@ -2831,4 +2981,75 @@ test "removeUnicastSockets: on_channel_closed reaches real recipients, not a Por
     UdpTransport.firePendingClosures(&pending, alloc);
     try std.testing.expectEqual(@as(usize, 1), closed_count.load(.monotonic));
     pe.deinit();
+}
+
+test "udp transport: on_channel_closed callback may unlisten its own handler without deadlocking" {
+    // Regression test (PR #84 review, round 4): waitPendingClosuresDrained
+    // used to wait for pending_closures to reach plain zero. When a
+    // handler's own on_channel_closed callback reacted by calling
+    // unlisten() on itself, that wait counted the very callback invoking
+    // it — markDelivered() for that entry only runs once the callback
+    // returns, so the callback waited forever on its own completion.
+    //
+    // Runs the reentrant call on a spawned thread and polls with a bounded
+    // timeout rather than a plain join(): on a regression this hangs
+    // forever, and a plain join() would hang the whole test binary instead
+    // of just failing this one test.
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 160,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u32 = 7400 + 2 * 160 + 10;
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+
+    var closed_count: std.atomic.Value(usize) = .init(0);
+    const Handler = struct {
+        transport: Transport,
+        loc: Locator,
+        n: *std.atomic.Value(usize),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+            // Reentrant: this handler unregisters itself in direct response
+            // to being told its own channel closed.
+            self.transport.unlisten(&self.loc, self.handler());
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .transport = t, .loc = loc, .n = &closed_count };
+    try t.listen(&loc, h.handler());
+
+    // Simulate a socket retiring (as a real interface flap would, via
+    // retireSocketLocked) while h remains registered, so the closure
+    // notification below is *not* the one vtUnlisten's own removeHandler
+    // would have already excluded — h only leaves the handler list once
+    // its reentrant unlisten() call, triggered by delivery, runs.
+    var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+    udp.mu.lock();
+    udp.removeUnicastSockets(std.mem.zeroes([16]u8), port, &pending);
+    udp.mu.unlock();
+
+    var fired: std.atomic.Value(bool) = .init(false);
+    const Runner = struct {
+        fn run(p: *std.ArrayListUnmanaged(PendingClosure), a: std.mem.Allocator, done: *std.atomic.Value(bool)) void {
+            UdpTransport.firePendingClosures(p, a);
+            done.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Runner.run, .{ &pending, alloc, &fired });
+
+    var waited_ms: usize = 0;
+    while (!fired.load(.acquire) and waited_ms < 5000) : (waited_ms += 10) sleepMs(10);
+    try std.testing.expect(fired.load(.acquire));
+    th.join();
+
+    try std.testing.expectEqual(@as(usize, 1), closed_count.load(.monotonic));
 }
