@@ -20,6 +20,7 @@ const testing = std.testing;
 
 const StubCtx = struct {
     sends: usize = 0,
+    send_on_channels: usize = 0,
     listens: usize = 0,
     unlistens: usize = 0,
     joins: usize = 0,
@@ -33,6 +34,9 @@ const StubCtx = struct {
     }
     fn vtSend(ctx: *anyopaque, _: *const Locator, _: []const u8) anyerror!void {
         cast(ctx).sends += 1;
+    }
+    fn vtSendOnChannel(ctx: *anyopaque, _: iface.Channel, _: *const Locator, _: []const u8) anyerror!void {
+        cast(ctx).send_on_channels += 1;
     }
     fn vtListen(ctx: *anyopaque, _: *const Locator, _: ReceiveHandler) anyerror!void {
         cast(ctx).listens += 1;
@@ -60,6 +64,8 @@ const StubCtx = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
+    // No send_on_channel: represents a transport with no channel concept
+    // (memory, mock — and the point of the "unsupported inner" tests below).
     const vtable = Transport.Vtable{
         .capabilities = .{},
         .can_reach = vtCanReach,
@@ -73,14 +79,34 @@ const StubCtx = struct {
         .close = vtClose,
     };
 
+    // Same as `vtable` but with channel support, for tests of the forwarding
+    // path itself (as opposed to the "inner has no channel concept" path).
+    const vtable_with_channels = Transport.Vtable{
+        .capabilities = .{},
+        .can_reach = vtCanReach,
+        .send = vtSend,
+        .send_on_channel = vtSendOnChannel,
+        .listen = vtListen,
+        .join_multicast = vtJoinMulticast,
+        .leave_multicast = vtLeaveMulticast,
+        .unlisten = vtUnlisten,
+        .unicast_locators = vtUnicastLocators,
+        .set_locator_change_handler = vtSetLocatorChangeHandler,
+        .close = vtClose,
+    };
+
     pub fn transport(self: *StubCtx) Transport {
         return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    pub fn transportWithChannels(self: *StubCtx) Transport {
+        return .{ .ctx = self, .vtable = &vtable_with_channels };
     }
 };
 
 const dummy_loc = Locator{ .udp_v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 1234 } };
 const dummy_handler = ReceiveHandler{ .ctx = @ptrFromInt(1), .on_receive = struct {
-    fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+    fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
 }.f };
 
 // ── DropFirst ─────────────────────────────────────────────────────────────────
@@ -155,4 +181,52 @@ test "LossyTransport: pass-through vtable methods reach inner transport" {
     // close passes through.
     t.close();
     try testing.expectEqual(@as(usize, 1), stub.closes);
+}
+
+// ── sendOnChannel ─────────────────────────────────────────────────────────────
+
+const dummy_channel = iface.Channel{ .token = 0xdead_beef, .generation = 1 };
+
+test "LossyTransport: sendOnChannel forwards to inner under the same drop policy" {
+    var stub = StubCtx{};
+    var policy = DropEveryNth.init(2);
+    const lossy = try LossyTransport.init(testing.allocator, stub.transportWithChannels(), policy.packetPolicy());
+    defer lossy.deinit(testing.allocator);
+    const t = lossy.transport();
+
+    // seq 1 forward, 2 drop, 3 forward, 4 drop.
+    for (0..4) |_| try t.sendOnChannel(dummy_channel, &dummy_loc, &[_]u8{0xCC});
+
+    try testing.expectEqual(@as(usize, 2), stub.send_on_channels);
+    try testing.expectEqual(@as(u64, 2), lossy.dropped.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), lossy.sent.load(.monotonic));
+    // vtSend (the non-channel path) must be untouched by channel sends.
+    try testing.expectEqual(@as(usize, 0), stub.sends);
+}
+
+test "LossyTransport: sendOnChannel returns ChannelUnsupported consistently, independent of loss sequence" {
+    // Regression test for PR #84 review: checking the drop policy before
+    // checking inner support made whether the caller saw
+    // error.ChannelUnsupported depend on the loss sequence — a dropped
+    // attempt silently "succeeded" (never reaching the inner transport to
+    // fail) while a forwarded one correctly failed. Both must now fail the
+    // same way, and neither may consume a sequence number or touch the
+    // drop/sent/dropped counters.
+    var stub = StubCtx{};
+    var policy = DropEveryNth.init(2);
+    const lossy = try LossyTransport.init(testing.allocator, stub.transport(), policy.packetPolicy());
+    defer lossy.deinit(testing.allocator);
+    const t = lossy.transport();
+
+    // Every one of these would alternate drop/forward under the policy above
+    // if support were checked after applying it — all four must instead
+    // fail identically, before the policy is ever consulted.
+    for (0..4) |_| {
+        try testing.expectError(error.ChannelUnsupported, t.sendOnChannel(dummy_channel, &dummy_loc, &[_]u8{0xDD}));
+    }
+
+    try testing.expectEqual(@as(u64, 0), lossy.send_seq.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), lossy.dropped.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), lossy.sent.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), stub.send_on_channels);
 }

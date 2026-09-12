@@ -36,6 +36,7 @@ pub const LocatorKind = iface.LocatorKind;
 pub const Transport = iface.Transport;
 pub const ReceiveHandler = iface.ReceiveHandler;
 pub const LocatorChangeHandler = iface.LocatorChangeHandler;
+pub const Channel = iface.Channel;
 const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -266,12 +267,46 @@ pub const TcpConnection = struct {
     recv_thread: std.Thread,
     thread_started: bool,
     owner: *TcpTransport,
+    /// Snapshot of TcpTransport.connection_generations' value for `remote` at
+    /// the moment this connection was registered. Stamped once, at creation;
+    /// copied (not re-read) into every Channel this connection hands out via
+    /// dispatchToHandlers, so a Channel's generation identifies *this specific
+    /// connection object*, not "whatever the current generation for `remote`
+    /// happens to be" (which could have moved on to a newer reconnect by the
+    /// time a caller checks). See docs/design/transport-channel.md §4.2.
+    generation: u32,
 };
 
-/// Close `conn.fd` exactly once. Safe to call from both recvLoop and deinit.
+/// Shut down and close `conn.fd` exactly once. Safe to call from recvLoop,
+/// vtSend's redial-on-failure path, ensureConnection's error paths, and
+/// deinit. shutdown() before close() interrupts a thread currently blocked
+/// in recv() on this fd (POSIX §2.9.7; same on Windows) — harmless to call
+/// on a connection whose own recv thread is the caller (recvLoop's
+/// self-close) or whose fd is already closed (shutdown on a bad fd is a
+/// silently-ignored error, not a crash).
+///
+/// The winning caller also notifies any ReceiveHandler.on_channel_closed
+/// registrant — this is the single choke point every death path (natural
+/// death, forced teardown) funnels through, so it is the one place a
+/// Channel's closure needs to be announced from.
+///
+/// The close is serialized against vtSendOnChannel via send_mu: without
+/// this, vtSendOnChannel's re-check of fd_open under send_mu is meaningless,
+/// since closeConnFdOnce could still close (and the OS could reuse) the fd
+/// between that check and the actual writeAll calls. Released before the
+/// on_channel_closed notification, not held across it — a handler's
+/// callback re-entering vtSendOnChannel on this same connection must not
+/// deadlock against this function still holding the lock.
 fn closeConnFdOnce(conn: *TcpConnection) void {
-    if (conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
+    conn.send_mu.lock();
+    const won = conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null;
+    if (won) {
+        socketShutdown(conn.fd, SHUT_RDWR);
         socketClose(conn.fd);
+    }
+    conn.send_mu.unlock();
+    if (won) {
+        conn.owner.dispatchChannelClosed(.{ .token = @intFromPtr(conn), .generation = conn.generation });
     }
 }
 
@@ -353,18 +388,21 @@ pub const TcpTransport = struct {
         // shutdown() before close() is required to interrupt threads currently
         // blocked in accept() or recv() on these fds. A bare close() leaves
         // blocked threads running indefinitely (per POSIX §2.9.7; same on
-        // Windows with Winsock).
+        // Windows with Winsock). Signal every connection's fd here, up front,
+        // so the join loop below costs one bounded wait per thread rather
+        // than N sequential ones — the actual close (and, with it, the
+        // on_channel_closed notification) is deferred to that same loop,
+        // after conn_mu is released: closeConnFdOnce must not be called
+        // while conn_mu is held, since a handler's on_channel_closed
+        // callback re-entering a transport operation that needs conn_mu
+        // (listen/unlisten/send) would deadlock against it.
         var accept_thread: ?std.Thread = null;
         {
             self.conn_mu.lock();
             defer self.conn_mu.unlock();
             accept_thread = self.closeListenerLocked();
             for (self.all_connections.items) |conn| {
-                // Only shutdown+close if recvLoop hasn't already closed the fd.
-                if (conn.fd_open.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
-                    socketShutdown(conn.fd, SHUT_RDWR);
-                    socketClose(conn.fd);
-                }
+                if (conn.fd_open.load(.acquire)) socketShutdown(conn.fd, SHUT_RDWR);
             }
         }
 
@@ -372,8 +410,14 @@ pub const TcpTransport = struct {
 
         // Join recv threads then free. Recv threads may call removeConnection
         // (acquires conn_mu) after their fd is closed — conn_mu is released
-        // above so those calls can complete before we join.
+        // above so those calls can complete before we join. accept_thread is
+        // already joined, so all_connections is stable (no concurrent
+        // appends) — safe to iterate without conn_mu here.
         for (self.all_connections.items) |conn| {
+            // Idempotent with recvLoop's own closeConnFdOnce call (CAS-guarded);
+            // this is what actually closes + notifies for a connection recvLoop
+            // hasn't already torn down itself.
+            closeConnFdOnce(conn);
             if (conn.thread_started) conn.recv_thread.join();
             self.alloc.destroy(conn);
         }
@@ -385,14 +429,16 @@ pub const TcpTransport = struct {
         self.alloc.destroy(self);
     }
 
-    /// Record that a new (first or reconnected) connection now exists for `key`.
-    /// Caller must hold conn_mu. OOM is silently ignored — worst case a
-    /// reconnect isn't detected and the writer falls back to its normal
-    /// heartbeat-driven resync timing (RELIABLE) or just doesn't replay
-    /// (BEST_EFFORT, same as today), not a correctness break.
-    fn bumpGenerationLocked(self: *Self, key: RemoteKey) void {
-        const gop = self.connection_generations.getOrPut(self.alloc, key) catch return;
+    /// Record that a new (first or reconnected) connection now exists for `key`,
+    /// and return the new generation value. Caller must hold conn_mu. OOM is
+    /// silently ignored (returns 0) — worst case a reconnect isn't detected
+    /// and the writer falls back to its normal heartbeat-driven resync timing
+    /// (RELIABLE) or just doesn't replay (BEST_EFFORT, same as today), not a
+    /// correctness break.
+    fn bumpGenerationLocked(self: *Self, key: RemoteKey) u32 {
+        const gop = self.connection_generations.getOrPut(self.alloc, key) catch return 0;
         gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* +% 1 else 1;
+        return gop.value_ptr.*;
     }
 
     pub fn transport(self: *Self) Transport {
@@ -401,7 +447,7 @@ pub const TcpTransport = struct {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    fn dispatchToHandlers(self: *Self, data: []const u8, src: Locator) void {
+    fn dispatchToHandlers(self: *Self, data: []const u8, src: Locator, channel: Channel) void {
         var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
         var count: usize = 0;
         {
@@ -413,7 +459,25 @@ pub const TcpTransport = struct {
                 count += 1;
             }
         }
-        for (snap[0..count]) |h| h.on_receive(h.ctx, data, src);
+        for (snap[0..count]) |h| h.on_receive(h.ctx, data, src, channel);
+    }
+
+    /// Notify every registered handler's on_channel_closed, if set, that
+    /// `channel` has closed. Same snapshot-then-call shape as
+    /// dispatchToHandlers, for the same lock-discipline reasons.
+    fn dispatchChannelClosed(self: *Self, channel: Channel) void {
+        var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
+        var count: usize = 0;
+        {
+            self.handler_mu.lock();
+            defer self.handler_mu.unlock();
+            std.debug.assert(self.handlers.items.len <= snap.len);
+            for (self.handlers.items) |h| {
+                snap[count] = h;
+                count += 1;
+            }
+        }
+        for (snap[0..count]) |h| if (h.on_channel_closed) |cb| cb(h.ctx, channel);
     }
 
     fn removeHandlerFromListLocked(self: *Self, handler: ReceiveHandler) void {
@@ -489,6 +553,22 @@ pub const TcpTransport = struct {
         // Slow path: dial without holding conn_mu.
         const new_conn = try dialConnection(self.alloc, key);
         new_conn.owner = self;
+
+        // Stamp the generation before spawning the recv thread — same
+        // ordering requirement as acceptLoop (see its comment). Bumping here,
+        // before knowing whether this dial wins or loses the TOCTOU race
+        // below, is deliberate: connection_generations is already documented
+        // as monotonic and not required to correspond 1:1 to surviving
+        // connections (bumpGenerationLocked's own doc comment), so a spurious
+        // extra bump from a losing racer is harmless — it still leaves every
+        // live TcpConnection object with its own distinct generation, which
+        // is all Channel identity needs.
+        {
+            self.conn_mu.lock();
+            defer self.conn_mu.unlock();
+            new_conn.generation = self.bumpGenerationLocked(key);
+        }
+
         new_conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{new_conn}) catch |err| {
             socketClose(new_conn.fd);
             self.alloc.destroy(new_conn);
@@ -535,7 +615,8 @@ pub const TcpTransport = struct {
             self.alloc.destroy(new_conn);
             return err;
         };
-        self.bumpGenerationLocked(key);
+        // Generation already stamped on new_conn before the recv thread was
+        // spawned, above — nothing left to do here.
         self.conn_mu.unlock();
         return new_conn;
     }
@@ -601,6 +682,46 @@ pub const TcpTransport = struct {
         defer new_conn.send_mu.unlock();
         try writeAll(new_conn.fd, &len_buf);
         try writeAll(new_conn.fd, data);
+    }
+
+    /// Send on the exact connection `channel` identifies, bypassing
+    /// ensureConnection's dial-or-reuse resolution entirely. Unlike vtSend,
+    /// never redials on failure — a stale/closed channel is the caller's own
+    /// state transition to handle, not something to paper over by silently
+    /// reconnecting to a different socket than the one explicitly asked for.
+    fn vtSendOnChannel(ctx: *anyopaque, channel: Channel, locator: *const Locator, data: []const u8) anyerror!void {
+        _ = ctx;
+        if (data.len == 0) return error.EmptyMessage;
+        if (data.len > MAX_MSG_LEN) return error.MessageTooLarge;
+        if (channel.isNone()) return error.ChannelClosed;
+
+        const conn: *TcpConnection = @ptrFromInt(channel.token);
+        if (conn.generation != channel.generation) return error.ChannelClosed;
+        if (!conn.fd_open.load(.acquire)) return error.ChannelClosed;
+
+        // A TCP channel already has exactly one peer; locator is accepted
+        // for signature uniformity with UDP (§4.4) but not consulted to pick
+        // a route. Debug-only: catches a caller passing the wrong locator
+        // back alongside a channel, which would silently do the right thing
+        // here but signals a bug in the caller.
+        if (locatorToRemoteKey(locator)) |want| {
+            std.debug.assert(std.meta.eql(want, conn.remote));
+        }
+
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
+        conn.send_mu.lock();
+        defer conn.send_mu.unlock();
+        // Re-check under send_mu: fd_open could have flipped between the
+        // lock-free check above and acquiring the lock. This check is what
+        // makes the lock meaningful — closeConnFdOnce also takes send_mu
+        // around its close, so from here on a close cannot interleave with
+        // the writes below, and a closed fd is never written to (on POSIX
+        // the fd number can otherwise be reused by the OS for an unrelated
+        // socket).
+        if (!conn.fd_open.load(.acquire)) return error.ChannelClosed;
+        try writeAll(conn.fd, &len_buf);
+        try writeAll(conn.fd, data);
     }
 
     fn vtListen(ctx: *anyopaque, locator: *const Locator, handler: ReceiveHandler) anyerror!void {
@@ -747,6 +868,7 @@ const tcp_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = false },
     .can_reach = TcpTransport.vtCanReach,
     .send = TcpTransport.vtSend,
+    .send_on_channel = TcpTransport.vtSendOnChannel,
     .listen = TcpTransport.vtListen,
     .join_multicast = TcpTransport.vtJoinMulticast,
     .leave_multicast = TcpTransport.vtLeaveMulticast,
@@ -855,7 +977,19 @@ fn acceptLoop(self: *TcpTransport) void {
             .recv_thread = undefined,
             .thread_started = false,
             .owner = self,
+            .generation = undefined, // set below, before the recv thread can dispatch anything
         };
+
+        // Stamp the generation before spawning the recv thread: dispatchToHandlers
+        // reads conn.generation to build every Channel it hands out, so it must be
+        // set before any data can possibly be dispatched, not after (a message
+        // could arrive and be dispatched before this function reaches the insert
+        // below otherwise).
+        {
+            self.conn_mu.lock();
+            defer self.conn_mu.unlock();
+            conn.generation = self.bumpGenerationLocked(remote);
+        }
 
         conn.recv_thread = std.Thread.spawn(.{}, recvLoop, .{conn}) catch {
             socketClose(conn_fd);
@@ -882,7 +1016,6 @@ fn acceptLoop(self: *TcpTransport) void {
             self.alloc.destroy(conn);
             continue;
         };
-        self.bumpGenerationLocked(remote);
         self.conn_mu.unlock();
     }
 }
@@ -935,7 +1068,8 @@ fn recvLoop(conn: *TcpConnection) void {
         readExact(conn.fd, buf) catch break :outer;
 
         const src = remoteKeyToLocator(&conn.remote);
-        conn.owner.dispatchToHandlers(buf, src);
+        const channel = Channel{ .token = @intFromPtr(conn), .generation = conn.generation };
+        conn.owner.dispatchToHandlers(buf, src, channel);
     }
 
     conn.owner.removeConnection(conn);
@@ -1054,6 +1188,7 @@ fn dialConnection(alloc: std.mem.Allocator, key: RemoteKey) !*TcpConnection {
         .recv_thread = undefined,
         .thread_started = false,
         .owner = undefined,
+        .generation = undefined, // set by the caller right after bumpGenerationLocked
     };
     return conn;
 }

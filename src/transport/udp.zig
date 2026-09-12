@@ -18,6 +18,7 @@ const build_opts = @import("build_options");
 const posix = std.posix;
 const log = @import("../log.zig");
 const mutex_mod = @import("../util/mutex.zig");
+const condvar_mod = @import("../util/condvar.zig");
 const time_mod = @import("../util/time.zig");
 
 // std.posix.IP and std.posix.IPV6 are void on macOS in Zig 0.16.0 (std.c.IP
@@ -77,6 +78,7 @@ pub const IfAddr = iface.IfAddr;
 pub const Transport = iface.Transport;
 pub const ReceiveHandler = iface.ReceiveHandler;
 pub const LocatorChangeHandler = iface.LocatorChangeHandler;
+pub const Channel = iface.Channel;
 pub const InterfaceMonitor = iface.InterfaceMonitor;
 const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
@@ -222,6 +224,25 @@ const SocketEntry = struct {
     // and if recvThread were acquiring mu to look up port_entries, it would
     // block indefinitely.
     handler: ReceiveHandler,
+    /// Guards `closed` + the actual close() syscall against a concurrent
+    /// sendOnChannel — mirrors TcpConnection.send_mu, adapted to UDP's
+    /// simpler (no byte-stream framing) protocol: sendOnChannel only needs
+    /// this lock to avoid writing to `fd` after it's been closed and the
+    /// number possibly reused by the OS for an unrelated socket, not to
+    /// serialize datagram writes against each other (sendto() is already
+    /// atomic per-call at the OS level). Never acquired from recvThread.
+    send_mu: mutex_mod.Mutex = .{},
+    /// True once this entry's fd has been closed. Mirrors TcpConnection.fd_open
+    /// (inverted sense) — checked by sendOnChannel before writing, and by
+    /// Channel holders indirectly via the error.ChannelClosed it produces.
+    /// Guarded by send_mu. Set exactly once, by whichever teardown path
+    /// (stop() via unlisten, or the interface-loss graveyard move) reaches
+    /// this entry first.
+    closed: bool = false,
+    /// Staleness generation for Channel identity, stamped once at creation —
+    /// same purpose as TcpConnection.generation. See
+    /// docs/design/transport-channel.md §4.3.
+    generation: u32 = 0,
 
     /// Signal the recv thread to stop, without waiting for it to exit. Safe to
     /// call on any number of sockets before joining any of them — letting every
@@ -231,12 +252,19 @@ const SocketEntry = struct {
         self.stopping.store(true, .release);
     }
 
-    /// Wait for the recv thread to exit (already signaled via `requestStop`)
-    /// and close the socket. Call `requestStop` on every socket being torn down
-    /// first; see that method's comment.
+    /// Wait for the recv thread to exit (already signaled via `requestStop`),
+    /// close the socket, and mark it closed. Call `requestStop` on every
+    /// socket being torn down first; see that method's comment. Does NOT
+    /// notify on_channel_closed — that only fires when the entry actually
+    /// moves to the graveyard (see UdpTransport.retireSocketLocked), not on
+    /// every stop() (e.g. a plain vtUnlisten with no channel ever handed out
+    /// still calls stop(), where notifying would be meaningless).
     fn joinAndClose(self: *SocketEntry) void {
         self.thread.join();
+        self.send_mu.lock();
+        defer self.send_mu.unlock();
         socketClose(self.fd);
+        self.closed = true;
     }
 
     fn stop(self: *SocketEntry) void {
@@ -273,6 +301,104 @@ const McSendIfaces = struct {
 
 // ── Port entry (fan-out dispatch) ─────────────────────────────────────────────
 
+/// A closed channel's notification, captured while a lock is held and fired
+/// once it's released — see retireSocketLocked's and firePendingClosures'
+/// doc comments for why. `owner` is the PortEntry the recipient was
+/// captured from — used only to call markDelivered() after firing, to
+/// unblock a concurrent unlisten() that may be waiting on it (see
+/// PortEntry.pending_closures).
+const PendingClosure = struct { handler: ReceiveHandler, channel: Channel, owner: *PortEntry };
+
+/// One stack frame per firePendingClosures call active on this thread's call
+/// stack — pushed on entry, popped on return (see firePendingClosures). Lets
+/// a reentrant call (an on_channel_closed callback that itself calls
+/// unlisten(), possibly for its own handler) see and act on the batch(es)
+/// this same thread is already in the middle of delivering, via
+/// drain_stack below. Never touched by any other thread: each thread has
+/// its own threadlocal stack, and a frame is only ever live on the stack of
+/// the thread that pushed it.
+const DrainFrame = struct {
+    /// The batch this frame is draining. Entries still in here have not
+    /// started delivering yet.
+    pending: *std.ArrayListUnmanaged(PendingClosure),
+    /// The entry (if any) whose callback is currently executing for this
+    /// frame — removed from `pending` before its callback is invoked (see
+    /// firePendingClosures), so it must be tracked separately for
+    /// selfDebtForPortEntry to still count it.
+    current: ?PendingClosure,
+    prev: ?*DrainFrame,
+};
+
+/// Head of the current thread's stack of in-progress firePendingClosures
+/// calls. See DrainFrame, cancelQueuedClosuresForCtx, selfDebtForPortEntry.
+threadlocal var drain_stack: ?*DrainFrame = null;
+
+/// Remove, without invoking their callback, every not-yet-started closure
+/// entry (in any frame on this thread's drain_stack) that was captured
+/// *from `pe`* for handler `ctx`, marking each delivered so
+/// PortEntry.pending_closures / a concurrent waitPendingClosuresDrained()
+/// stay consistent.
+///
+/// Called by vtUnlisten right after removing `ctx` from `pe`. Necessary in
+/// the reentrant case — `ctx`'s own on_channel_closed callback calling
+/// unlisten() on itself — because selfDebtForPortEntry lets that unlisten()
+/// return without waiting for entries this same thread already queued for
+/// later delivery; if one of those leftover entries still targeted `ctx`,
+/// the caller would be free to destroy `ctx` before this thread's outer
+/// firePendingClosures loop got back around to firing it — a
+/// use-after-free. Cancelling them here instead is safe and correct: once
+/// unlisten(ctx) on `pe` is returning, no further on_channel_closed(ctx,
+/// ...) call sourced from `pe` may legitimately happen, by the same
+/// contract that makes waiting necessary in the first place.
+///
+/// Scoped to `pe` (not just `ctx`) because the same handler ctx can be
+/// registered on more than one port (e.g. a participant's meta and
+/// user-data ports sharing one handler) — matching by ctx alone would also
+/// cancel a still-valid queued notification for a *different*,
+/// still-active registration of the same handler on another port (PR #84
+/// review, round 5).
+fn cancelQueuedClosuresForCtx(pe: *PortEntry, ctx: *anyopaque) void {
+    var frame = drain_stack;
+    while (frame) |f| : (frame = f.prev) {
+        var i: usize = f.pending.items.len;
+        while (i > 0) {
+            i -= 1;
+            const p = f.pending.items[i];
+            if (p.owner == pe and p.handler.ctx == ctx) {
+                _ = f.pending.swapRemove(i);
+                p.owner.markDelivered();
+            }
+        }
+    }
+}
+
+/// Count how many not-yet-delivered PendingClosure entries owned by `pe`
+/// this thread is itself responsible for eventually delivering — either
+/// mid-callback right now, or still queued in a batch this thread is
+/// draining further up its own call stack.
+///
+/// vtUnlisten passes this to PortEntry.waitPendingClosuresDrained() as the
+/// count to wait *down to* instead of zero. Excluding it is what prevents
+/// the reentrant self-deadlock a plain "wait for zero" would hit: a
+/// not-yet-delivered entry that only this same thread can ever deliver
+/// (because delivering it requires returning up through the very call
+/// stack this thread is currently blocked in) can never resolve by waiting
+/// — the thread would be waiting on itself. Entries owned by *other*
+/// threads' batches are unaffected and still block the wait normally.
+fn selfDebtForPortEntry(pe: *PortEntry) usize {
+    var debt: usize = 0;
+    var frame = drain_stack;
+    while (frame) |f| : (frame = f.prev) {
+        if (f.current) |cur| {
+            if (cur.owner == pe) debt += 1;
+        }
+        for (f.pending.items) |p| {
+            if (p.owner == pe) debt += 1;
+        }
+    }
+    return debt;
+}
+
 /// One PortEntry exists per listened port. Multiple ReceiveHandlers can register
 /// on the same port (e.g. two participants sharing a transport). Each incoming
 /// datagram is dispatched to all registered handlers.
@@ -283,6 +409,18 @@ const PortEntry = struct {
     mu: mutex_mod.Mutex,
     handlers: std.ArrayListUnmanaged(ReceiveHandler),
     alloc: std.mem.Allocator,
+    /// Number of on_channel_closed notifications captured from this
+    /// PortEntry's handler list (via appendClosureRecipientsInto) that have
+    /// not yet been delivered (markDelivered() not yet called for them).
+    /// unlisten() must wait for this to reach zero — via
+    /// waitPendingClosuresDrained() — before returning: otherwise the
+    /// caller could free a handler's ctx believing unlisten's "blocks until
+    /// no in-flight callbacks remain" contract already covers
+    /// on_channel_closed, while a snapshot taken just before this unlisten
+    /// call (by a different, concurrent retirement) still references it.
+    /// Guarded by mu; signaled via pending_cond.
+    pending_closures: usize = 0,
+    pending_cond: condvar_mod.Condvar = .{},
 
     fn init(alloc: std.mem.Allocator) !*PortEntry {
         const pe = try alloc.create(PortEntry);
@@ -290,7 +428,24 @@ const PortEntry = struct {
         return pe;
     }
 
+    /// Only ever called at UdpTransport-wide teardown (deinit), once for
+    /// every PortEntry that ever existed — including ones vtUnlisten
+    /// retired earlier into UdpTransport.dead_port_entries rather than
+    /// freeing directly. See dead_port_entries' doc comment for why a
+    /// PortEntry is never freed while the transport that owns it is still
+    /// alive: doing so here would be safe (nothing references a
+    /// long-dead PortEntry by the time the whole transport is torn down),
+    /// but doing it any earlier, while a concurrent unlisten() call might
+    /// still be inside pending_cond.wait() for *this* PortEntry, is not —
+    /// a woken waiter reacquires `mu` internally before returning, and
+    /// freeing the memory backing that mutex out from under it is
+    /// undefined behavior (PR #84 review, round 5).
     fn deinit(self: *PortEntry) void {
+        // A nonzero count here means some caller captured a closure
+        // (appendClosureRecipientsInto) but it was never delivered or
+        // cancelled — by transport teardown time that should be
+        // impossible (every recv/accept thread has already stopped).
+        std.debug.assert(self.pending_closures == 0);
         const alloc = self.alloc;
         self.handlers.deinit(alloc);
         alloc.destroy(self);
@@ -305,6 +460,14 @@ const PortEntry = struct {
 
     /// Remove the handler whose ctx matches `ctx`.
     /// Returns true if the list is now empty.
+    ///
+    /// Does NOT wait for in-flight closure notifications referencing this
+    /// handler to drain — that must happen separately, via
+    /// waitPendingClosuresDrained(), called *without* holding
+    /// UdpTransport.mu (unlike this function, which vtUnlisten calls while
+    /// holding it): delivering a closure may invoke an application callback
+    /// that legitimately needs UdpTransport.mu, which would deadlock
+    /// against a caller still holding it here.
     fn removeHandler(self: *PortEntry, ctx: *anyopaque) bool {
         self.mu.lock();
         defer self.mu.unlock();
@@ -317,7 +480,7 @@ const PortEntry = struct {
         return self.handlers.items.len == 0;
     }
 
-    fn dispatch(ctx: *anyopaque, buf: []const u8, src: Locator) void {
+    fn dispatch(ctx: *anyopaque, buf: []const u8, src: Locator, channel: Channel) void {
         const self: *PortEntry = @ptrCast(@alignCast(ctx));
         // Snapshot handler list under mu so we can call without holding mu.
         var snap: [MAX_RECEIVE_HANDLERS]ReceiveHandler = undefined;
@@ -331,7 +494,53 @@ const PortEntry = struct {
                 count += 1;
             }
         }
-        for (snap[0..count]) |h| h.on_receive(h.ctx, buf, src);
+        for (snap[0..count]) |h| h.on_receive(h.ctx, buf, src, channel);
+    }
+
+    /// Append {handler, channel, owner} for every currently-registered real
+    /// handler into `pending`, under `mu`, and bump pending_closures by the
+    /// same count. Used by retireSocketLocked to capture on_channel_closed
+    /// recipients at a point where this PortEntry is guaranteed alive and
+    /// consistent, *without* leaving `pending` holding a bare reference
+    /// back to this PortEntry that some other caller's teardown could
+    /// invalidate — `owner` is only ever used to call markDelivered(),
+    /// which every caller of appendClosureRecipientsInto is required to
+    /// keep alive for (see waitPendingClosuresDrained()).
+    fn appendClosureRecipientsInto(self: *PortEntry, pending: *std.ArrayListUnmanaged(PendingClosure), alloc: std.mem.Allocator, channel: Channel) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.handlers.items) |h| {
+            pending.append(alloc, .{ .handler = h, .channel = channel, .owner = self }) catch continue;
+            self.pending_closures += 1;
+        }
+    }
+
+    /// Called once per PendingClosure after its callback has been invoked —
+    /// see firePendingClosures. Unblocks a concurrent
+    /// waitPendingClosuresDrained() call once every closure captured before
+    /// it was called has been delivered. Deliberately does *not* free `self`
+    /// even if this brings pending_closures to zero on an already-empty
+    /// PortEntry — see dead_port_entries' doc comment for why that would be
+    /// unsafe here, and PortEntry.deinit's for where freeing actually
+    /// happens instead.
+    fn markDelivered(self: *PortEntry) void {
+        self.mu.lock();
+        std.debug.assert(self.pending_closures > 0);
+        self.pending_closures -= 1;
+        self.mu.unlock();
+        self.pending_cond.broadcast();
+    }
+
+    /// Block until pending_closures has dropped to `self_debt` (ordinarily
+    /// 0 — see selfDebtForPortEntry for when it isn't). Must be called
+    /// *without* holding UdpTransport.mu — see removeHandler's doc comment
+    /// for why. In the common case (nothing racing this call, and no
+    /// reentrancy) pending_closures is already zero and this returns
+    /// immediately.
+    fn waitPendingClosuresDrained(self: *PortEntry, self_debt: usize) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (self.pending_closures > self_debt) self.pending_cond.wait(&self.mu);
     }
 
     fn asHandler(self: *PortEntry) ReceiveHandler {
@@ -355,6 +564,30 @@ pub const UdpTransport = struct {
     mu: mutex_mod.Mutex,
     port_entries: std.AutoHashMapUnmanaged(u32, *PortEntry),
     sockets: std.ArrayListUnmanaged(*SocketEntry),
+    /// Closed SocketEntry structs, retained (not freed) until UdpTransport
+    /// deinit — mirrors TcpTransport.all_connections' "graveyard" shape so a
+    /// Channel.token pointer stays safe to dereference for the transport's
+    /// whole lifetime instead of dangling across an interface flap. See
+    /// docs/design/transport-channel.md §4.3.
+    dead_sockets: std.ArrayListUnmanaged(*SocketEntry),
+    /// PortEntry structs whose last handler has unregistered (vtUnlisten),
+    /// retained (not freed) until UdpTransport deinit — same graveyard
+    /// shape and reason as dead_sockets, but for a different hazard: a
+    /// PortEntry embeds the mutex/condvar (mu, pending_cond) that a
+    /// *different*, concurrent unlisten() call on the same port may still
+    /// be inside pending_cond.wait() for when this one finds the list
+    /// empty. Freeing it immediately would risk that waiter reacquiring a
+    /// destroyed mutex once woken — undefined behavior (PR #84 review,
+    /// round 5). Guarded by `mu`.
+    dead_port_entries: std.ArrayListUnmanaged(*PortEntry),
+    /// Monotonic counter stamped into SocketEntry.generation at creation.
+    /// Transport-wide rather than per-(port,addr_kind,bound_ip) slot: a
+    /// Channel is only ever compared against the exact SocketEntry its token
+    /// (a pointer) identifies, so collisions across different slots are
+    /// harmless — only two entries created for the *same* slot could ever be
+    /// compared against each other via a stale Channel, and a single
+    /// transport-wide counter still guarantees those differ. Guarded by `mu`.
+    next_socket_generation: u32,
     mc_states: std.ArrayListUnmanaged(MulticastState),
     locators_cache: std.ArrayListUnmanaged(Locator),
     active_ifaces: std.ArrayListUnmanaged(IfAddr),
@@ -436,6 +669,9 @@ pub const UdpTransport = struct {
             .mu = .{},
             .port_entries = .empty,
             .sockets = .empty,
+            .dead_sockets = .empty,
+            .dead_port_entries = .empty,
+            .next_socket_generation = 0,
             .mc_states = .empty,
             .locators_cache = .empty,
             .active_ifaces = .empty,
@@ -546,6 +782,11 @@ pub const UdpTransport = struct {
         }
         self.sockets.deinit(self.alloc);
 
+        // Graveyard: already stopped/closed when they were moved here (see
+        // retireSocketLocked); just free the allocations now.
+        for (self.dead_sockets.items) |s| self.alloc.destroy(s);
+        self.dead_sockets.deinit(self.alloc);
+
         for (self.mc_states.items) |*ms| ms.deinit(self.alloc);
         self.mc_states.deinit(self.alloc);
 
@@ -562,6 +803,11 @@ pub const UdpTransport = struct {
         var pe_it = self.port_entries.valueIterator();
         while (pe_it.next()) |pe_ptr| pe_ptr.*.deinit();
         self.port_entries.deinit(self.alloc);
+
+        // Graveyard: see dead_port_entries' doc comment for why these
+        // weren't freed when their last handler unregistered.
+        for (self.dead_port_entries.items) |pe| pe.deinit();
+        self.dead_port_entries.deinit(self.alloc);
         self.locators_cache.deinit(self.alloc);
         self.active_ifaces.deinit(self.alloc);
         // Free the owned copy of the interfaces filter (deep-copied in init).
@@ -657,6 +903,7 @@ pub const UdpTransport = struct {
         errdefer if (fd_needs_close) socketClose(fd);
         const entry = try self.alloc.create(SocketEntry);
         errdefer self.alloc.destroy(entry);
+        self.next_socket_generation +%= 1;
         entry.* = .{
             .fd = fd,
             .port = port,
@@ -667,6 +914,7 @@ pub const UdpTransport = struct {
             .thread = undefined,
             .transport = self,
             .handler = handler,
+            .generation = self.next_socket_generation,
         };
         entry.thread = try std.Thread.spawn(.{}, recvThread, .{entry});
         fd_needs_close = false;
@@ -674,7 +922,76 @@ pub const UdpTransport = struct {
         try self.sockets.append(self.alloc, entry);
     }
 
-    fn removeUnicastSockets(self: *Self, ip: [16]u8, port: u32) void {
+    /// Fire every collected on_channel_closed notification, then mark each
+    /// one delivered on its owning PortEntry (unblocking any concurrent
+    /// waitPendingClosuresDrained() call — see PortEntry.pending_closures).
+    /// Callers must call this only after releasing `mu` — never from inside
+    /// a locked region (see retireSocketLocked).
+    ///
+    /// Pushes a DrainFrame onto this thread's drain_stack for the duration,
+    /// and removes each entry from `pending` immediately before invoking
+    /// its callback (rather than iterating `pending.items` directly) so
+    /// that a callback which reentrantly calls unlisten() — possibly for
+    /// its own handler — sees an accurate view of what this thread still
+    /// has left to deliver, via cancelQueuedClosuresForCtx and
+    /// selfDebtForPortEntry.
+    fn firePendingClosures(pending: *std.ArrayListUnmanaged(PendingClosure), alloc: std.mem.Allocator) void {
+        var frame = DrainFrame{ .pending = pending, .current = null, .prev = drain_stack };
+        drain_stack = &frame;
+        defer drain_stack = frame.prev;
+
+        while (pending.items.len > 0) {
+            const p = pending.orderedRemove(0);
+            frame.current = p;
+            if (p.handler.on_channel_closed) |cb| cb(p.handler.ctx, p.channel);
+            frame.current = null;
+            p.owner.markDelivered();
+        }
+        pending.deinit(alloc);
+    }
+
+    /// Stop and close `s`, then move it into `dead_sockets` (retained until
+    /// UdpTransport.close(), mirroring TcpTransport.all_connections) instead
+    /// of freeing it — a Channel.token pointer into `s` must stay safe to
+    /// dereference for the transport's whole lifetime.
+    ///
+    /// Appends on_channel_closed's real recipients to `pending` rather than
+    /// firing directly, for two independent reasons:
+    ///   1. This function runs while the caller holds `mu` (required, since
+    ///      it touches `dead_sockets`), and firing an application callback
+    ///      here would let a handler that re-enters a transport operation
+    ///      needing `mu` (listen/unlisten/leaveMulticast/unicastLocators)
+    ///      deadlock against this same call stack.
+    ///   2. `s.handler` is a PortEntry.asHandler() proxy — appending it
+    ///      verbatim (rather than resolving it to the real, currently-
+    ///      registered handlers now) would leave `pending` holding a
+    ///      pointer through that PortEntry, which a *different*, concurrent
+    ///      caller (e.g. vtUnlisten racing this very teardown on the same
+    ///      port) could deinit before this caller's `pending` gets a chance
+    ///      to fire — a use-after-free. Resolving now, via
+    ///      appendClosureRecipientsInto (itself PortEntry.mu-protected),
+    ///      decouples the notification from that PortEntry's lifetime.
+    /// The caller must drain `pending` via firePendingClosures after
+    /// releasing `mu`.
+    ///
+    /// Caller must hold `mu` and must have already called `s.requestStop()`,
+    /// and must not touch `s` again after this returns.
+    fn retireSocketLocked(self: *Self, s: *SocketEntry, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
+        s.joinAndClose(); // joins the recv thread, closes the fd, sets s.closed
+        const channel = Channel{ .token = @intFromPtr(s), .generation = s.generation };
+        if (self.port_entries.get(s.port)) |pe| {
+            pe.appendClosureRecipientsInto(pending, self.alloc, channel);
+        }
+        self.dead_sockets.append(self.alloc, s) catch {
+            // OOM growing dead_sockets: leak s rather than free it. Freeing
+            // here would reopen exactly the UAF this graveyard exists to
+            // prevent (a Channel.token pointer into s could still be held).
+            // A handful of leaked, already-closed SocketEntry structs under
+            // sustained OOM is the lesser failure.
+        };
+    }
+
+    fn removeUnicastSockets(self: *Self, ip: [16]u8, port: u32, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
         // Signal before joining (see SocketEntry.requestStop) — same rationale
         // as removeSockets, kept consistent even though this usually matches
         // at most one socket.
@@ -686,9 +1003,8 @@ pub const UdpTransport = struct {
             i -= 1;
             const s = self.sockets.items[i];
             if (s.kind == .unicast and s.port == port and std.mem.eql(u8, &s.bound_ip, &ip)) {
-                s.joinAndClose();
-                self.alloc.destroy(s);
                 _ = self.sockets.swapRemove(i);
+                self.retireSocketLocked(s, pending);
             }
         }
     }
@@ -699,6 +1015,7 @@ pub const UdpTransport = struct {
         }
         const fd = try createMulticastSocket(addr_kind, @intCast(port), self.config.recv_buffer_size);
         const entry = try self.alloc.create(SocketEntry);
+        self.next_socket_generation +%= 1;
         entry.* = .{
             .fd = fd,
             .port = port,
@@ -709,13 +1026,14 @@ pub const UdpTransport = struct {
             .thread = undefined,
             .transport = self,
             .handler = handler,
+            .generation = self.next_socket_generation,
         };
         entry.thread = try std.Thread.spawn(.{}, recvThread, .{entry});
         try self.sockets.append(self.alloc, entry);
         return entry;
     }
 
-    fn removeSockets(self: *Self, port: u32) void {
+    fn removeSockets(self: *Self, port: u32, pending: *std.ArrayListUnmanaged(PendingClosure)) void {
         // Signal every matching socket's recv thread before joining any of
         // them (see SocketEntry.requestStop) so tearing down a port with N
         // bound sockets (one per active interface, plus the explicit loopback
@@ -729,9 +1047,8 @@ pub const UdpTransport = struct {
             i -= 1;
             const s = self.sockets.items[i];
             if (s.port == port) {
-                s.joinAndClose();
-                self.alloc.destroy(s);
                 _ = self.sockets.swapRemove(i);
+                self.retireSocketLocked(s, pending);
             }
         }
     }
@@ -820,51 +1137,61 @@ pub const UdpTransport = struct {
         self.monitor.enumerate(&new_ifaces, self.alloc) catch return;
         applyInterfaceFilter(self.alloc, &new_ifaces, &self.config) catch {};
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        // Collected under `mu` below, fired after it's released — see
+        // retireSocketLocked's doc comment for why this can't fire inline.
+        // Deferred here (rather than a trailing call after the locked block)
+        // so it still fires — after mu is unlocked, since that defer runs
+        // first, LIFO — on every early-return path below, present or future.
+        var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+        defer firePendingClosures(&pending, self.alloc);
 
-        const added = diffAdded(self.alloc, &self.active_ifaces, &new_ifaces) catch return;
-        defer {
-            var tmp = added;
-            tmp.deinit(self.alloc);
-        }
-        const removed = diffAdded(self.alloc, &new_ifaces, &self.active_ifaces) catch return;
-        defer {
-            var tmp = removed;
-            tmp.deinit(self.alloc);
-        }
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
 
-        for (added.items) |ia| {
-            if (ia.kind == LocatorKind.udp_v4 and !self.config.ipv4_enabled) continue;
-            if (ia.kind == LocatorKind.udp_v6 and !self.config.ipv6_enabled) continue;
-            var it = self.port_entries.iterator();
-            while (it.next()) |kv| {
-                // Skip ports served by a wildcard socket — they receive on 0.0.0.0
-                // and don't need (or want) per-interface duplicates.
-                if (self.hasWildcardSocket(kv.key_ptr.*)) continue;
-                self.addUnicastSocket(ia, kv.key_ptr.*, kv.value_ptr.*.asHandler()) catch {};
+            const added = diffAdded(self.alloc, &self.active_ifaces, &new_ifaces) catch return;
+            defer {
+                var tmp = added;
+                tmp.deinit(self.alloc);
             }
-            for (self.mc_states.items) |*ms| {
-                joinOnIface(self, ms, &ia) catch {};
+            const removed = diffAdded(self.alloc, &new_ifaces, &self.active_ifaces) catch return;
+            defer {
+                var tmp = removed;
+                tmp.deinit(self.alloc);
             }
+
+            for (added.items) |ia| {
+                if (ia.kind == LocatorKind.udp_v4 and !self.config.ipv4_enabled) continue;
+                if (ia.kind == LocatorKind.udp_v6 and !self.config.ipv6_enabled) continue;
+                var it = self.port_entries.iterator();
+                while (it.next()) |kv| {
+                    // Skip ports served by a wildcard socket — they receive on 0.0.0.0
+                    // and don't need (or want) per-interface duplicates.
+                    if (self.hasWildcardSocket(kv.key_ptr.*)) continue;
+                    self.addUnicastSocket(ia, kv.key_ptr.*, kv.value_ptr.*.asHandler()) catch {};
+                }
+                for (self.mc_states.items) |*ms| {
+                    joinOnIface(self, ms, &ia) catch {};
+                }
+            }
+
+            for (removed.items) |ia| {
+                for (self.mc_states.items) |*ms| {
+                    dropOnIface(self, ms, &ia);
+                }
+                var it = self.port_entries.iterator();
+                while (it.next()) |kv| {
+                    self.removeUnicastSockets(ia.ip, kv.key_ptr.*, &pending);
+                }
+            }
+
+            self.active_ifaces.deinit(self.alloc);
+            self.active_ifaces = new_ifaces;
+            self.rebuildLocatorsLocked() catch {};
+            self.publishMcSendIfacesLocked();
+
+            if (self.locator_change_handler) |h| h.on_change(h.ctx);
         }
-
-        for (removed.items) |ia| {
-            for (self.mc_states.items) |*ms| {
-                dropOnIface(self, ms, &ia);
-            }
-            var it = self.port_entries.iterator();
-            while (it.next()) |kv| {
-                self.removeUnicastSockets(ia.ip, kv.key_ptr.*);
-            }
-        }
-
-        self.active_ifaces.deinit(self.alloc);
-        self.active_ifaces = new_ifaces;
-        self.rebuildLocatorsLocked() catch {};
-        self.publishMcSendIfacesLocked();
-
-        if (self.locator_change_handler) |h| h.on_change(h.ctx);
     }
 
     // ── Reservation helpers ───────────────────────────────────────────────────
@@ -979,6 +1306,47 @@ pub const UdpTransport = struct {
                 } else {
                     try sendUdp6(u.addr, u.port, data);
                 }
+            },
+            else => return error.UnsupportedLocatorKind,
+        }
+    }
+
+    /// Send on the exact local socket `channel` identifies, to `locator`,
+    /// instead of vtSend's shared send_fd_v4/v6. Because `entry.fd` is the
+    /// socket actually bound to the interface a prior datagram arrived on,
+    /// the OS naturally uses that interface's address as the outgoing
+    /// source — this is how return-routability (reply from the contacted
+    /// service address) is satisfied, with no extra bookkeeping. `channel`
+    /// pins the local socket; unlike TCP, one UDP socket serves many peers,
+    /// so `locator` (the actual destination) is still required.
+    fn vtSendOnChannel(ctx: *anyopaque, channel: Channel, loc: *const Locator, data: []const u8) anyerror!void {
+        _ = ctx;
+        if (channel.isNone()) return error.ChannelClosed;
+        const entry: *SocketEntry = @ptrFromInt(channel.token);
+        if (entry.generation != channel.generation) return error.ChannelClosed;
+
+        entry.send_mu.lock();
+        defer entry.send_mu.unlock();
+        if (entry.closed) return error.ChannelClosed;
+
+        switch (loc.*) {
+            .udp_v4 => |u| {
+                const dest = posix.sockaddr.in{
+                    .family = posix.AF.INET,
+                    .port = std.mem.nativeToBig(u16, u.port),
+                    .addr = @bitCast(u.addr),
+                };
+                try socketSendTo(entry.fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
+            },
+            .udp_v6 => |u| {
+                const dest = posix.sockaddr.in6{
+                    .family = posix.AF.INET6,
+                    .port = std.mem.nativeToBig(u16, u.port),
+                    .flowinfo = 0,
+                    .addr = u.addr,
+                    .scope_id = 0,
+                };
+                try socketSendTo(entry.fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in6));
             },
             else => return error.UnsupportedLocatorKind,
         }
@@ -1185,35 +1553,44 @@ pub const UdpTransport = struct {
 
     fn vtLeaveMulticast(ctx: *anyopaque, group: *const Locator) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.mu.lock();
-        defer self.mu.unlock();
-        var i: usize = self.mc_states.items.len;
-        while (i > 0) {
-            i -= 1;
-            const ms = &self.mc_states.items[i];
-            if (!ms.group.eql(group.*)) continue;
-            const grp_port = ms.port();
-            switch (ms.group) {
-                .udp_v4 => |g| {
-                    for (ms.v4_ifaces.items) |ip| {
-                        dropMcV4(self.sockets.items, grp_port, g.addr, ip) catch {};
-                    }
-                },
-                else => {},
+        // Collected under `mu` below, fired after it's released — see
+        // retireSocketLocked's doc comment for why this can't fire inline.
+        // Deferred here (rather than a trailing call after the locked block)
+        // so it still fires — after mu is unlocked, since that defer runs
+        // first, LIFO — on every early-return path below, present or future.
+        var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+        defer firePendingClosures(&pending, self.alloc);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            var i: usize = self.mc_states.items.len;
+            while (i > 0) {
+                i -= 1;
+                const ms = &self.mc_states.items[i];
+                if (!ms.group.eql(group.*)) continue;
+                const grp_port = ms.port();
+                switch (ms.group) {
+                    .udp_v4 => |g| {
+                        for (ms.v4_ifaces.items) |ip| {
+                            dropMcV4(self.sockets.items, grp_port, g.addr, ip) catch {};
+                        }
+                    },
+                    else => {},
+                }
+                ms.deinit(self.alloc);
+                _ = self.mc_states.swapRemove(i);
             }
-            ms.deinit(self.alloc);
-            _ = self.mc_states.swapRemove(i);
+            const grp_port: u32 = switch (group.*) {
+                .udp_v4 => |u| u.port,
+                .udp_v6 => |u| u.port,
+                else => return,
+            };
+            const still_needed = for (self.mc_states.items) |ms| {
+                if (ms.port() == grp_port) break true;
+            } else false;
+            if (!still_needed) self.removeSockets(grp_port, &pending);
+            self.publishMcSendIfacesLocked();
         }
-        const grp_port: u32 = switch (group.*) {
-            .udp_v4 => |u| u.port,
-            .udp_v6 => |u| u.port,
-            else => return,
-        };
-        const still_needed = for (self.mc_states.items) |ms| {
-            if (ms.port() == grp_port) break true;
-        } else false;
-        if (!still_needed) self.removeSockets(grp_port);
-        self.publishMcSendIfacesLocked();
     }
 
     fn vtUnlisten(ctx: *anyopaque, locator: *const Locator, handler: ReceiveHandler) void {
@@ -1223,25 +1600,85 @@ pub const UdpTransport = struct {
             .udp_v6 => |u| u.port,
             else => return,
         };
-        self.mu.lock();
-        defer self.mu.unlock();
-        const pe = self.port_entries.get(port) orelse return;
-        const empty = pe.removeHandler(handler.ctx);
-        if (!empty) return;
-        // Last handler deregistered — tear down all sockets for this port.
-        self.removeSockets(port);
-        var i: usize = self.mc_states.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.mc_states.items[i].port() == port) {
-                self.mc_states.items[i].deinit(self.alloc);
-                _ = self.mc_states.swapRemove(i);
+        // Collected under `mu` below, fired after it's released — see
+        // retireSocketLocked's doc comment for why this can't fire inline.
+        var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+        defer firePendingClosures(&pending, self.alloc);
+
+        // Set below (inside the locked block) whenever a handler was
+        // actually removed, so the wait/deinit step after the block can run
+        // for every return path without an early `return` inside the block
+        // skipping it (a `return` there exits this whole function).
+        var removed_from: ?*PortEntry = null;
+        var fully_empty = false;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const pe = self.port_entries.get(port) orelse return;
+            const empty = pe.removeHandler(handler.ctx);
+            removed_from = pe;
+            fully_empty = empty;
+            if (empty) {
+                // Last handler deregistered — tear down all sockets for this port.
+                self.removeSockets(port, &pending);
+                var i: usize = self.mc_states.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.mc_states.items[i].port() == port) {
+                        self.mc_states.items[i].deinit(self.alloc);
+                        _ = self.mc_states.swapRemove(i);
+                    }
+                }
+                _ = self.port_entries.remove(port);
+                self.rebuildLocatorsLocked() catch {};
+                self.publishMcSendIfacesLocked();
             }
         }
-        pe.deinit();
-        _ = self.port_entries.remove(port);
-        self.rebuildLocatorsLocked() catch {};
-        self.publishMcSendIfacesLocked();
+
+        // Outside `mu`: wait for any on_channel_closed notification a
+        // *different*, concurrent caller already captured from this port's
+        // handler list (which may include the handler just removed above)
+        // to finish delivering, before this function returns — the caller
+        // may free `handler.ctx` the instant unlisten() returns (PR #84
+        // review), and that must not race a capture taken before this call
+        // but not yet delivered. Not done while `mu` is held: delivery may
+        // invoke an application callback that legitimately needs it, which
+        // would deadlock against this call still holding it. In the common,
+        // non-racing case this returns immediately (nothing pending).
+        //
+        // Two extra steps handle unlisten() being called reentrantly from
+        // inside an on_channel_closed callback (PR #84 review, round 4) —
+        // e.g. a handler unregisters itself upon being told its channel
+        // closed:
+        //   - cancelQueuedClosuresForCtx drops any *other*, not-yet-fired
+        //     notification this same thread already queued from `pe` for
+        //     handler.ctx, so it can never fire on freed memory once this
+        //     call returns and the caller destroys handler.ctx.
+        //   - selfDebtForPortEntry excludes this thread's own
+        //     currently-in-flight and still-queued entries from the wait
+        //     below — waiting for them would be waiting on this same
+        //     thread's own later progress, which can only happen after
+        //     this call returns, i.e. never.
+        //
+        // Because of that same self_debt, pending_closures may still be
+        // nonzero once the wait returns. That's fine: `pe` itself is never
+        // freed here — see dead_port_entries' doc comment — so there's
+        // nothing unsafe about markDelivered() dereferencing it later, no
+        // matter how much later "later" turns out to be.
+        if (removed_from) |pe| {
+            cancelQueuedClosuresForCtx(pe, handler.ctx);
+            const self_debt = selfDebtForPortEntry(pe);
+            pe.waitPendingClosuresDrained(self_debt);
+            if (fully_empty) {
+                self.mu.lock();
+                self.dead_port_entries.append(self.alloc, pe) catch {
+                    // OOM: leak pe rather than free memory a concurrent
+                    // unlisten() on this same port might still be inside
+                    // pending_cond.wait() for (see dead_port_entries).
+                };
+                self.mu.unlock();
+            }
+        }
     }
 
     fn vtUnicastLocators(ctx: *anyopaque, out: *std.ArrayListUnmanaged(Locator), alloc: std.mem.Allocator) anyerror!void {
@@ -1271,6 +1708,7 @@ const udp_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = true },
     .can_reach = UdpTransport.vtCanReach,
     .send = UdpTransport.vtSend,
+    .send_on_channel = UdpTransport.vtSendOnChannel,
     .listen = UdpTransport.vtListen,
     .join_multicast = UdpTransport.vtJoinMulticast,
     .leave_multicast = UdpTransport.vtLeaveMulticast,
@@ -1331,7 +1769,8 @@ fn recvThread(entry: *SocketEntry) void {
         };
 
         const src_loc = sockaddrToLocator(@ptrCast(&src_store));
-        entry.handler.on_receive(entry.handler.ctx, buf[0..n], src_loc);
+        const channel = Channel{ .token = @intFromPtr(entry), .generation = entry.generation };
+        entry.handler.on_receive(entry.handler.ctx, buf[0..n], src_loc, channel);
     }
 }
 
@@ -1640,7 +2079,7 @@ test "fan-out port dispatch delivers to all registered handlers" {
 
     const Counter = struct {
         n: *std.atomic.Value(usize),
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: Channel) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             _ = self.n.fetchAdd(1, .monotonic);
         }
@@ -1694,7 +2133,7 @@ test "two participants share one UdpTransport; independent teardown" {
 
     const Counter = struct {
         n: *std.atomic.Value(usize),
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: Channel) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             _ = self.n.fetchAdd(1, .monotonic);
         }
@@ -1756,7 +2195,7 @@ test "non-wildcard bind still receives loopback traffic" {
     var count: std.atomic.Value(usize) = .init(0);
     const Counter = struct {
         n: *std.atomic.Value(usize),
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: Channel) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             _ = self.n.fetchAdd(1, .monotonic);
         }
@@ -1812,7 +2251,7 @@ test "vtListen promotes reserved meta fd on first listen" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try t.listen(&loc, h);
@@ -1872,7 +2311,7 @@ test "vtListen reserved meta fd also serves advertised IPv6 locators" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try t.listen(&loc, h);
@@ -1949,7 +2388,7 @@ test "deinit stops active socket threads" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try t.listen(&loc, h);
@@ -2005,7 +2444,7 @@ test "vtListen returns UnsupportedLocatorKind for non-UDP locator" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try std.testing.expectError(error.UnsupportedLocatorKind, t.listen(&loc, h));
@@ -2047,7 +2486,7 @@ test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
 
@@ -2156,7 +2595,7 @@ test "hasWildcardSocket returns correct value" {
     const h = ReceiveHandler{
         .ctx = &sentinel,
         .on_receive = struct {
-            fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+            fn f(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
         }.f,
     };
     try t.listen(&loc, h);
@@ -2224,4 +2663,641 @@ test "init with interface IPv4 address filter runs applyInterfaceFilter" {
         .interfaces = &filter,
     }, 0, null);
     defer udp.deinit();
+}
+
+// ── sendOnChannel: exact-socket replies ───────────────────────────────────────
+
+/// Captures the Channel and src Locator from the first on_receive call.
+/// token doubles as a "have we been called yet" flag (a real Channel's
+/// token, a heap pointer, is never exactly 0) — publishing it last, with
+/// .release, after src/generation are written, and reading it first, with
+/// .acquire, makes those plain fields safe to read cross-thread too (the
+/// standard "publish via one flag" pattern this file's own tests rely on
+/// elsewhere: see "fan-out port dispatch"'s comment on why a plain usize
+/// counter here would be a genuine TSan-visible race).
+const ChannelCapture = struct {
+    token: std.atomic.Value(u64) = .init(0),
+    generation: u32 = 0,
+    src: Locator = .invalid,
+
+    fn onRecv(ctx: *anyopaque, _: []const u8, src: Locator, ch: Channel) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.src = src;
+        self.generation = ch.generation;
+        self.token.store(ch.token, .release);
+    }
+    fn handler(self: *@This()) ReceiveHandler {
+        return .{ .ctx = self, .on_receive = onRecv };
+    }
+    fn isSet(self: *const @This()) bool {
+        return self.token.load(.acquire) != 0;
+    }
+    fn channel(self: *const @This()) Channel {
+        return .{ .token = self.token.load(.acquire), .generation = self.generation };
+    }
+};
+
+test "sendOnChannel replies from the exact socket a datagram arrived on" {
+    const alloc = std.testing.allocator;
+
+    const server = try UdpTransport.init(alloc, .{
+        .participant_id = 168,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer server.deinit();
+    const st = server.transport();
+
+    const client = try UdpTransport.init(alloc, .{
+        .participant_id = 167,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer client.deinit();
+    const ct = client.transport();
+
+    // meta unicast port, domain 0: 7400 + 2*pid + 10.
+    const server_port: u16 = 7400 + 2 * 168 + 10; // 7746
+    const client_port: u16 = 7400 + 2 * 167 + 10; // 7744
+
+    var server_capture = ChannelCapture{};
+    try st.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, server_port), server_capture.handler());
+    defer st.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, server_port), server_capture.handler());
+
+    // The client must itself be listening on client_port to receive the
+    // server's reply there.
+    var client_capture = ChannelCapture{};
+    try ct.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, client_port), client_capture.handler());
+    defer ct.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, client_port), client_capture.handler());
+
+    // vtSend deliberately does NOT originate from a listening socket —
+    // send_fd_v4 is a separate, never-promoted ephemeral socket (see its
+    // own doc comment: "Option B never promotes send_fd to a bound
+    // socket"). So the initial "ping" is sent directly from the client's
+    // listening socket's own fd (white-box) instead of via ct.send() —
+    // exactly matching the real scenario this feature targets: a reply
+    // must land back on a socket that is actually receiving, not on
+    // whatever ephemeral port an ordinary send happened to use.
+    const client_fd = blk: {
+        client.mu.lock();
+        defer client.mu.unlock();
+        for (client.sockets.items) |s| {
+            if (s.kind == .unicast and s.port == client_port) break :blk s.fd;
+        }
+        unreachable;
+    };
+    const server_addr = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, server_port),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    try socketSendTo(client_fd, "ping", @ptrCast(&server_addr), @sizeOf(posix.sockaddr.in));
+    sleepMs(100);
+    try std.testing.expect(server_capture.isSet());
+
+    // Reply on the exact channel "ping" arrived on, rather than vtSend's
+    // shared send_fd_v4/v6 — this is the feature under test.
+    try st.sendOnChannel(server_capture.channel(), &server_capture.src, "pong");
+    sleepMs(100);
+    try std.testing.expect(client_capture.isSet());
+}
+
+test "sendOnChannel replies from the exact socket a datagram arrived on (IPv6)" {
+    // Regression coverage (kcov cross-reference, PR #84): vtSendOnChannel's
+    // udp_v6 branch was never exercised — every other sendOnChannel test
+    // sets ipv6_enabled = false. Otherwise identical to the IPv4 version
+    // above.
+    //
+    // Probe IPv6 availability first and skip otherwise (PR #84 review):
+    // without this, a host where IPv6 socket creation fails still lets
+    // UdpTransport.init succeed (vtListen only logs a warning — see its own
+    // "wildcard v6 socket" catch arm), leaving no v6 socket in
+    // client.sockets and crashing the `unreachable` below instead of
+    // failing gracefully. Matches the existing guard on "vtListen reserved
+    // meta fd also serves advertised IPv6 locators" above.
+    const alloc = std.testing.allocator;
+    {
+        const probe = createUnicastSocket(LocatorKind.udp_v6, std.mem.zeroes([16]u8), 0, 0) catch return;
+        socketClose(probe);
+    }
+
+    const server = try UdpTransport.init(alloc, .{
+        .participant_id = 156,
+        .bind_wildcard = true,
+        .ipv4_enabled = false,
+    }, 0, null);
+    defer server.deinit();
+    const st = server.transport();
+
+    const client = try UdpTransport.init(alloc, .{
+        .participant_id = 155,
+        .bind_wildcard = true,
+        .ipv4_enabled = false,
+    }, 0, null);
+    defer client.deinit();
+    const ct = client.transport();
+
+    const server_port: u16 = 7400 + 2 * 156 + 10;
+    const client_port: u16 = 7400 + 2 * 155 + 10;
+    const loopback6: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+    var server_capture = ChannelCapture{};
+    try st.listen(&Locator.udp6(std.mem.zeroes([16]u8), server_port), server_capture.handler());
+    defer st.unlisten(&Locator.udp6(std.mem.zeroes([16]u8), server_port), server_capture.handler());
+
+    var client_capture = ChannelCapture{};
+    try ct.listen(&Locator.udp6(std.mem.zeroes([16]u8), client_port), client_capture.handler());
+    defer ct.unlisten(&Locator.udp6(std.mem.zeroes([16]u8), client_port), client_capture.handler());
+
+    // Send "ping" directly from the client's listening socket's own fd —
+    // see the IPv4 test above for why (send_fd_v6 is never promoted to a
+    // bound socket).
+    const client_fd = blk: {
+        client.mu.lock();
+        defer client.mu.unlock();
+        for (client.sockets.items) |s| {
+            if (s.kind == .unicast and s.port == client_port) break :blk s.fd;
+        }
+        unreachable;
+    };
+    const server_addr = posix.sockaddr.in6{
+        .family = posix.AF.INET6,
+        .port = std.mem.nativeToBig(u16, server_port),
+        .flowinfo = 0,
+        .addr = loopback6,
+        .scope_id = 0,
+    };
+    try socketSendTo(client_fd, "ping", @ptrCast(&server_addr), @sizeOf(posix.sockaddr.in6));
+    sleepMs(100);
+    try std.testing.expect(server_capture.isSet());
+
+    try st.sendOnChannel(server_capture.channel(), &server_capture.src, "pong");
+    sleepMs(100);
+    try std.testing.expect(client_capture.isSet());
+}
+
+test "udp transport: sendOnChannel returns ChannelClosed for Channel.none" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 166, .ipv6_enabled = false }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+    const dest = Locator.udp4(.{ 127, 0, 0, 1 }, 7400);
+    try std.testing.expectError(error.ChannelClosed, t.sendOnChannel(Channel.none, &dest, "x"));
+}
+
+test "udp transport: sendOnChannel returns ChannelClosed for a stale generation" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 165,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 165 + 10;
+    var capture = ChannelCapture{};
+    try t.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, port), capture.handler());
+    defer t.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, port), capture.handler());
+
+    const self_loc = Locator.udp4(.{ 127, 0, 0, 1 }, port);
+    try t.send(&self_loc, "ping");
+    sleepMs(100);
+    try std.testing.expect(capture.isSet());
+
+    // Same socket (same token), wrong generation — must not silently treat
+    // it as current.
+    var stale = capture.channel();
+    stale.generation +%= 1;
+    try std.testing.expectError(error.ChannelClosed, t.sendOnChannel(stale, &capture.src, "x"));
+}
+
+test "udp transport: sendOnChannel returns ChannelClosed after the socket is retired" {
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 164,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 164 + 10;
+    var capture = ChannelCapture{};
+    try t.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, port), capture.handler());
+
+    const self_loc = Locator.udp4(.{ 127, 0, 0, 1 }, port);
+    try t.send(&self_loc, "ping");
+    sleepMs(100);
+    try std.testing.expect(capture.isSet());
+    const channel = capture.channel();
+
+    // Last handler leaves -> socket retired into the graveyard. The
+    // Channel.token pointer stays safe to dereference (retained, not
+    // freed — see docs/design/transport-channel.md §4.3) but must now
+    // report closed rather than silently succeeding or crashing.
+    t.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, port), capture.handler());
+
+    try std.testing.expectError(error.ChannelClosed, t.sendOnChannel(channel, &self_loc, "too late"));
+}
+
+test "udp transport: vtUnlisten last handler leaving fires no on_channel_closed and does not crash" {
+    // Regression test (PR #84 review): retireSocketLocked used to store a
+    // handle back to the owning PortEntry rather than resolving to its real
+    // recipients up front — a use-after-free once vtUnlisten went on to
+    // free that same PortEntry before the deferred notification fired.
+    // Nobody is left to notify by construction on this exact path (the
+    // departing handler was the only one registered), so the assertion
+    // here is "zero closures fired, no crash".
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 163,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 163 + 10;
+    var closed_count: std.atomic.Value(usize) = .init(0);
+    const Handler = struct {
+        n: *std.atomic.Value(usize),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .n = &closed_count };
+
+    try t.listen(&Locator.udp4(.{ 0, 0, 0, 0 }, port), h.handler());
+    t.unlisten(&Locator.udp4(.{ 0, 0, 0, 0 }, port), h.handler());
+
+    try std.testing.expectEqual(@as(usize, 0), closed_count.load(.monotonic));
+}
+
+test "udp transport: vtUnlisten blocks until a concurrently-captured closure notification is delivered" {
+    // Regression test (PR #84 review, round 3): appendClosureRecipientsInto
+    // snapshots a handler's ctx while capturing a pending closure, but the
+    // callback fires later, outside any lock. If vtUnlisten for that same
+    // handler could return in the meantime, the caller would be free to
+    // destroy `ctx` before the stale snapshot's callback runs — a
+    // use-after-free. vtUnlisten must block (via
+    // PortEntry.pending_closures / waitPendingClosuresDrained) until any
+    // such in-flight capture has actually been delivered.
+    //
+    // This is deterministic, not timing-flaky: with the fix,
+    // waitPendingClosuresDrained() cannot return before markDelivered() is
+    // called, no matter how long delivery takes — the delay below just
+    // makes the failure mode obvious if the fix regresses (unlisten
+    // returning immediately, well before delivery, rather than only after).
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 161,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u16 = 7400 + 2 * 161 + 10;
+    var delivered: std.atomic.Value(bool) = .init(false);
+    const Handler = struct {
+        flag: *std.atomic.Value(bool),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.flag.store(true, .release);
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .flag = &delivered };
+
+    const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+    try t.listen(&listen_loc, h.handler());
+
+    // Simulate "a concurrent retirement already captured this handler" —
+    // exactly what retireSocketLocked does during a real socket teardown,
+    // invoked directly here rather than via one.
+    const pe = blk: {
+        udp.mu.lock();
+        defer udp.mu.unlock();
+        break :blk udp.port_entries.get(port).?;
+    };
+    var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+    pe.appendClosureRecipientsInto(&pending, alloc, Channel.none);
+
+    // Deliver it on a delay, from another thread.
+    const Deliverer = struct {
+        fn run(p: *std.ArrayListUnmanaged(PendingClosure), a: std.mem.Allocator) void {
+            sleepMs(100);
+            UdpTransport.firePendingClosures(p, a);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Deliverer.run, .{ &pending, alloc });
+    defer th.join();
+
+    // Must not return before the delayed delivery above actually runs.
+    t.unlisten(&listen_loc, h.handler());
+
+    try std.testing.expect(delivered.load(.acquire));
+}
+
+test "removeUnicastSockets: on_channel_closed reaches real recipients, not a PortEntry proxy" {
+    // Direct test of retireSocketLocked's capture mechanism (PR #84
+    // review): pending must resolve to the real, currently-registered
+    // recipients up front, not store a bare handle back to the owning
+    // PortEntry — deinit() now asserts pending_closures == 0, so freeing it
+    // before every captured closure has actually been delivered is a bug
+    // this test would catch, not a scenario it needs to survive.
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 162,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+
+    const port: u32 = 7400 + 2 * 162 + 10;
+    var closed_count: std.atomic.Value(usize) = .init(0);
+    const Handler = struct {
+        n: *std.atomic.Value(usize),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .n = &closed_count };
+
+    // A real PortEntry with a real registrant, constructed directly rather
+    // than via listen() — this test targets retireSocketLocked's capture
+    // mechanism specifically, not the public listen/unlisten API (that's
+    // the test above).
+    const pe = try PortEntry.init(alloc);
+    try pe.addHandler(h.handler());
+    udp.mu.lock();
+    try udp.port_entries.put(alloc, port, pe);
+    udp.mu.unlock();
+
+    // A real, working socket standing in for "one bound to an interface
+    // that's about to disappear" — bound to real loopback so the fd is
+    // genuine, but *recorded* under a fake bound_ip (TEST-NET-3, RFC 5737:
+    // guaranteed to never be a real local interface) so this test doesn't
+    // depend on actually bringing down a real interface.
+    const loopback_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 };
+    const fake_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 203, 0, 113, 77 };
+    const fd = try createUnicastSocket(LocatorKind.udp_v4, loopback_ip, 0, 0);
+    udp.mu.lock();
+    try udp.addUnicastSocketFromFd(fd, LocatorKind.udp_v4, fake_ip, port, pe.asHandler());
+    udp.mu.unlock();
+
+    var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+    udp.mu.lock();
+    udp.removeUnicastSockets(fake_ip, port, &pending);
+    _ = udp.port_entries.remove(port);
+    udp.mu.unlock();
+
+    // Fire before freeing pe — required now (deinit asserts
+    // pending_closures == 0); this is also the actual ordering every real
+    // caller (onIfaceChange, vtLeaveMulticast, vtUnlisten) already follows.
+    UdpTransport.firePendingClosures(&pending, alloc);
+    try std.testing.expectEqual(@as(usize, 1), closed_count.load(.monotonic));
+    pe.deinit();
+}
+
+test "udp transport: on_channel_closed callback may unlisten its own handler without deadlocking" {
+    // Regression test (PR #84 review, round 4): waitPendingClosuresDrained
+    // used to wait for pending_closures to reach plain zero. When a
+    // handler's own on_channel_closed callback reacted by calling
+    // unlisten() on itself, that wait counted the very callback invoking
+    // it — markDelivered() for that entry only runs once the callback
+    // returns, so the callback waited forever on its own completion.
+    //
+    // Runs the reentrant call on a spawned thread and polls with a bounded
+    // timeout rather than a plain join(): on a regression this hangs
+    // forever, and a plain join() would hang the whole test binary instead
+    // of just failing this one test.
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 160,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u32 = 7400 + 2 * 160 + 10;
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+
+    var closed_count: std.atomic.Value(usize) = .init(0);
+    const Handler = struct {
+        transport: Transport,
+        loc: Locator,
+        n: *std.atomic.Value(usize),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+            // Reentrant: this handler unregisters itself in direct response
+            // to being told its own channel closed.
+            self.transport.unlisten(&self.loc, self.handler());
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .transport = t, .loc = loc, .n = &closed_count };
+    try t.listen(&loc, h.handler());
+
+    // Simulate a socket retiring (as a real interface flap would, via
+    // retireSocketLocked) while h remains registered, so the closure
+    // notification below is *not* the one vtUnlisten's own removeHandler
+    // would have already excluded — h only leaves the handler list once
+    // its reentrant unlisten() call, triggered by delivery, runs.
+    var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+    udp.mu.lock();
+    udp.removeUnicastSockets(std.mem.zeroes([16]u8), port, &pending);
+    udp.mu.unlock();
+
+    var fired: std.atomic.Value(bool) = .init(false);
+    const Runner = struct {
+        fn run(p: *std.ArrayListUnmanaged(PendingClosure), a: std.mem.Allocator, done: *std.atomic.Value(bool)) void {
+            UdpTransport.firePendingClosures(p, a);
+            done.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Runner.run, .{ &pending, alloc, &fired });
+
+    var waited_ms: usize = 0;
+    while (!fired.load(.acquire) and waited_ms < 5000) : (waited_ms += 10) sleepMs(10);
+    try std.testing.expect(fired.load(.acquire));
+    th.join();
+
+    try std.testing.expectEqual(@as(usize, 1), closed_count.load(.monotonic));
+}
+
+test "udp transport: reentrant unlisten on one port does not cancel a pending closure on another port" {
+    // Regression test (PR #84 review, round 5): cancelQueuedClosuresForCtx
+    // used to match only by handler ctx, not by which PortEntry a queued
+    // closure was captured from. A handler registered on two ports at once
+    // (e.g. a participant's meta and user-data ports sharing one handler)
+    // that reacts to one port's channel closing by unregistering from
+    // *that* port would also silently cancel a still-pending, still-valid
+    // closure notification already queued for its other, still-active
+    // registration.
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 159,
+        .bind_wildcard = true,
+        .ipv6_enabled = false,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port_a: u32 = 7400 + 2 * 159 + 10;
+    const port_b: u32 = 7400 + 2 * 159 + 12;
+    const loc_a = Locator.udp4(.{ 0, 0, 0, 0 }, port_a);
+    const loc_b = Locator.udp4(.{ 0, 0, 0, 0 }, port_b);
+
+    var closed_count: std.atomic.Value(usize) = .init(0);
+    const Handler = struct {
+        transport: Transport,
+        loc_a: Locator,
+        n: *std.atomic.Value(usize),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+            // Reentrant, and scoped to port A only — the registration on
+            // port B is untouched and must still receive its own,
+            // independently-queued notification.
+            self.transport.unlisten(&self.loc_a, self.handler());
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .transport = t, .loc_a = loc_a, .n = &closed_count };
+    try t.listen(&loc_a, h.handler());
+    try t.listen(&loc_b, h.handler());
+    defer t.unlisten(&loc_b, h.handler());
+
+    // Simulate both ports' sockets retiring in one batch (as a multi-port
+    // onIfaceChange pass would), while h remains registered on both —
+    // producing two pending entries for the same ctx, owned by two
+    // different PortEntry instances.
+    var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+    udp.mu.lock();
+    udp.removeUnicastSockets(std.mem.zeroes([16]u8), port_a, &pending);
+    udp.removeUnicastSockets(std.mem.zeroes([16]u8), port_b, &pending);
+    udp.mu.unlock();
+
+    var fired: std.atomic.Value(bool) = .init(false);
+    const Runner = struct {
+        fn run(p: *std.ArrayListUnmanaged(PendingClosure), a: std.mem.Allocator, done: *std.atomic.Value(bool)) void {
+            UdpTransport.firePendingClosures(p, a);
+            done.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Runner.run, .{ &pending, alloc, &fired });
+
+    var waited_ms: usize = 0;
+    while (!fired.load(.acquire) and waited_ms < 5000) : (waited_ms += 10) sleepMs(10);
+    try std.testing.expect(fired.load(.acquire));
+    th.join();
+
+    // Both closures must have fired — port B's must survive port A's
+    // reentrant, self-scoped cancellation.
+    try std.testing.expectEqual(@as(usize, 2), closed_count.load(.monotonic));
+}
+
+test "udp transport: reentrant unlisten cancels a still-queued duplicate closure on the same port" {
+    // Regression coverage (kcov cross-reference, PR #84): every existing
+    // reentrant-unlisten test left cancelQueuedClosuresForCtx nothing to
+    // actually cancel — either the only captured entry was already the
+    // in-flight one (nothing left in `pending`), or the other queued entry
+    // belonged to a different port (the round-5 cross-port test, which
+    // deliberately proves that one *isn't* touched). The branch where
+    // cancellation actually removes a same-port, same-handler entry —
+    // which is what stops a second, stale on_channel_closed from firing on
+    // a ctx the caller is now free to destroy — was never exercised.
+    //
+    // A single UDP port bound wildcard on both address families yields two
+    // SocketEntry objects under one PortEntry; retiring both together (as
+    // an interface flap tearing down a whole port would) queues two
+    // closure entries for the same handler on the same port in one batch.
+    const alloc = std.testing.allocator;
+    const udp = try UdpTransport.init(alloc, .{
+        .participant_id = 158,
+        .bind_wildcard = true,
+    }, 0, null);
+    defer udp.deinit();
+    const t = udp.transport();
+
+    const port: u32 = 7400 + 2 * 158 + 10;
+    const loc = Locator.udp4(.{ 0, 0, 0, 0 }, port);
+
+    var closed_count: std.atomic.Value(usize) = .init(0);
+    const Handler = struct {
+        transport: Transport,
+        loc: Locator,
+        n: *std.atomic.Value(usize),
+        fn onRecv(_: *anyopaque, _: []const u8, _: Locator, _: Channel) void {}
+        fn onClosed(ctx: *anyopaque, _: Channel) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.n.fetchAdd(1, .monotonic);
+            self.transport.unlisten(&self.loc, self.handler());
+        }
+        fn handler(self: *@This()) ReceiveHandler {
+            return .{ .ctx = self, .on_receive = onRecv, .on_channel_closed = onClosed };
+        }
+    };
+    var h = Handler{ .transport = t, .loc = loc, .n = &closed_count };
+    try t.listen(&loc, h.handler());
+
+    // Confirm the setup actually produced two sockets on this one port
+    // before relying on it below.
+    {
+        udp.mu.lock();
+        defer udp.mu.unlock();
+        var n: usize = 0;
+        for (udp.sockets.items) |s| {
+            if (s.port == port) n += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), n);
+    }
+
+    var pending: std.ArrayListUnmanaged(PendingClosure) = .empty;
+    udp.mu.lock();
+    udp.removeSockets(port, &pending);
+    udp.mu.unlock();
+    try std.testing.expectEqual(@as(usize, 2), pending.items.len);
+
+    var fired: std.atomic.Value(bool) = .init(false);
+    const Runner = struct {
+        fn run(p: *std.ArrayListUnmanaged(PendingClosure), a: std.mem.Allocator, done: *std.atomic.Value(bool)) void {
+            UdpTransport.firePendingClosures(p, a);
+            done.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Runner.run, .{ &pending, alloc, &fired });
+
+    var waited_ms: usize = 0;
+    while (!fired.load(.acquire) and waited_ms < 5000) : (waited_ms += 10) sleepMs(10);
+    try std.testing.expect(fired.load(.acquire));
+    th.join();
+
+    // Only the first (in-flight) closure fired — the second, still-queued
+    // one for the same now-unregistered handler was cancelled, not
+    // delivered.
+    try std.testing.expectEqual(@as(usize, 1), closed_count.load(.monotonic));
 }

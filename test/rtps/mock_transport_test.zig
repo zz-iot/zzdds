@@ -70,7 +70,7 @@ const ReaderDispatch = struct {
         return .{ .ctx = self, .on_receive = recv };
     }
 
-    fn recv(ctx: *anyopaque, data: []const u8, _: Locator) void {
+    fn recv(ctx: *anyopaque, data: []const u8, _: Locator, _: zzdds.transport.Channel) void {
         const self: *ReaderDispatch = @ptrCast(@alignCast(ctx));
         var params: [32]InlineQosParam = undefined;
         var it = MessageIterator.init(data) catch return;
@@ -113,7 +113,7 @@ const WriterDispatch = struct {
         return .{ .ctx = self, .on_receive = recv };
     }
 
-    fn recv(ctx: *anyopaque, data: []const u8, _: Locator) void {
+    fn recv(ctx: *anyopaque, data: []const u8, _: Locator, _: zzdds.transport.Channel) void {
         const self: *WriterDispatch = @ptrCast(@alignCast(ctx));
         var params: [32]InlineQosParam = undefined;
         var it = MessageIterator.init(data) catch return;

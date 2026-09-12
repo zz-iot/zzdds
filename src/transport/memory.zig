@@ -151,7 +151,7 @@ pub const MemoryTransport = struct {
                     break :blk self.unicast_locs.items[0];
                 break :blk .invalid;
             };
-            h.on_receive(h.ctx, data, src);
+            h.on_receive(h.ctx, data, src, iface.Channel.none);
         }
     }
 
@@ -274,7 +274,7 @@ test "send delivers synchronously to registered handler" {
             return .{ .ctx = self, .on_receive = onRecv };
         }
 
-        fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator) void {
+        fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator, _: iface.Channel) void {
             const s: *@This() = @ptrCast(@alignCast(ctx));
             s.count.* += 1;
             s.len.* = @min(data.len, s.buf.len);
@@ -315,7 +315,7 @@ test "unlisten stops delivery" {
         fn handler(self: *@This()) ReceiveHandler {
             return .{ .ctx = self, .on_receive = f };
         }
-        fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+        fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {
             const s: *@This() = @ptrCast(@alignCast(ctx));
             s.n.* += 1;
         }

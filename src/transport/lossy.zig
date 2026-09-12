@@ -142,6 +142,30 @@ pub const LossyTransport = struct {
         return self.inner.vtable.send(self.inner.ctx, loc, data);
     }
 
+    /// Forwards to the inner transport's sendOnChannel under the same drop
+    /// policy and counters as vtSend — "all other vtable calls pass through
+    /// unchanged" (this file's own doc comment) applies to channel sends
+    /// too.
+    ///
+    /// Support is checked first, before touching send_seq or the drop
+    /// policy at all: checking after would make whether the caller sees
+    /// error.ChannelUnsupported depend on the loss sequence — a dropped
+    /// attempt would silently "succeed" (never reaching the inner transport
+    /// to fail), while a forwarded one would correctly fail, so the same
+    /// unsupported inner transport would appear to support channels on some
+    /// calls and not others (PR #84 review).
+    fn vtSendOnChannel(ctx: *anyopaque, channel: iface.Channel, loc: *const Locator, data: []const u8) anyerror!void {
+        const self: *LossyTransport = @ptrCast(@alignCast(ctx));
+        if (self.inner.vtable.send_on_channel == null) return error.ChannelUnsupported;
+        const seq = self.send_seq.fetchAdd(1, .monotonic) + 1; // 1-indexed
+        if (self.policy.should_drop(self.policy.ctx, loc, data, seq)) {
+            _ = self.dropped.fetchAdd(1, .monotonic);
+            return;
+        }
+        _ = self.sent.fetchAdd(1, .monotonic);
+        return self.inner.sendOnChannel(channel, loc, data);
+    }
+
     fn vtListen(ctx: *anyopaque, loc: *const Locator, h: ReceiveHandler) anyerror!void {
         const self: *LossyTransport = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.listen(self.inner.ctx, loc, h);
@@ -186,6 +210,7 @@ const lossy_vtable = Transport.Vtable{
     .capabilities = .{},
     .can_reach = LossyTransport.vtCanReach,
     .send = LossyTransport.vtSend,
+    .send_on_channel = LossyTransport.vtSendOnChannel,
     .listen = LossyTransport.vtListen,
     .join_multicast = LossyTransport.vtJoinMulticast,
     .leave_multicast = LossyTransport.vtLeaveMulticast,
@@ -305,12 +330,12 @@ test "LossyTransport: pass-through methods delegate to inner" {
     const t = lossy.transport();
 
     const dummy_rx = struct {
-        fn f(_: *anyopaque, _: []const u8, _: Locator) void {}
+        fn f(_: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {}
     };
     var rx_ctx: u8 = 0;
     const handler = ReceiveHandler{ .ctx = &rx_ctx, .on_receive = dummy_rx.f };
     // Exercise the callback itself (RecordingCtx.vtListen is a no-op stub).
-    handler.on_receive(handler.ctx, &.{}, dummy_locator);
+    handler.on_receive(handler.ctx, &.{}, dummy_locator, iface.Channel.none);
 
     _ = t.canReach(&dummy_locator);
     try t.listen(&dummy_locator, handler);

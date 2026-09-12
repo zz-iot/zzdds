@@ -208,7 +208,7 @@ pub const MockTransport = struct {
                 defer self.mu.unlock();
                 break :blk self.handlers.get(pkt.dest_port);
             };
-            if (h) |handler| handler.on_receive(handler.ctx, pkt.data, pkt.src);
+            if (h) |handler| handler.on_receive(handler.ctx, pkt.data, pkt.src, iface.Channel.none);
         }
     }
 
@@ -374,7 +374,7 @@ const Counter = struct {
         return .{ .ctx = self, .on_receive = onRecv };
     }
 
-    fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator) void {
+    fn onRecv(ctx: *anyopaque, data: []const u8, _: Locator, _: iface.Channel) void {
         const self: *Counter = @ptrCast(@alignCast(ctx));
         self.count += 1;
         self.last_n = @min(data.len, self.last.len);
@@ -560,7 +560,7 @@ test "snapshot semantics: packets from this deliver() don't arrive until next" {
     const reply_handler = ReceiveHandler{
         .ctx = &reply_ctx,
         .on_receive = struct {
-            fn f(ctx: *anyopaque, _: []const u8, _: Locator) void {
+            fn f(ctx: *anyopaque, _: []const u8, _: Locator, _: iface.Channel) void {
                 const rc: *ReplyCtx = @ptrCast(@alignCast(ctx));
                 rc.transport.send(&rc.dest, "reply") catch {};
             }
