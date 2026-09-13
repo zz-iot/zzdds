@@ -1,7 +1,7 @@
 # Generated discovery codec — IDL-defined RTPS ParameterList types, typed QoS end to end
 
-Status: IMPLEMENTED for SEDP, revision 0.3, 2026-09-10 (spec written 2026-09-09). MUST /
-SHOULD / MAY express requirements of the change, not additional OMG requirements.
+Status: IMPLEMENTED for SEDP and SPDP, revision 0.4, 2026-09-13 (spec written 2026-09-09).
+MUST / SHOULD / MAY express requirements of the change, not additional OMG requirements.
 
 Implementation notes (2026-09-10):
 - SEDP encode/decode go through the generated codec (`idl/rtps_discovery.idl` →
@@ -9,9 +9,24 @@ Implementation notes (2026-09-10):
   `disc.QosSnapshot`, `writerQosSnapshot`/`readerQosSnapshot`, `src/qos/policy.zig`, and
   `qos_match.checkWriterReader`/`checkPresentation` are deleted; matching is
   `qos_match.checkDiscovered` over the RTPS structs.
-- SPDP encode/decode remain hand-rolled (no QoS; broker-retention swap deferred).
 - `PID_TYPE_INFORMATION` (an opaque blob, no CDR length prefix) is the one parameter with
   no declared member — the SEDP writer wrapper injects it via `unknown_params`.
+
+Implementation notes (2026-09-13) — SPDP swap:
+- `SPDPdiscoveredParticipantData` now goes through the same generated codec. SPDP carries
+  no QoS, so `spdp.zig` builds the wire struct directly (no `qos_adapter.zig` involvement);
+  `discovery/wire_codec.zig` is new, holding the GUID-bytes / PL_CDR-framing /
+  `Locator_t`-sequence helpers now shared by both SPDP and SEDP (previously duplicated in
+  `sedp.zig`).
+- `participantGuid` and `leaseDuration` were made `@optional` in the IDL purely for the
+  decode side (a peer may legally omit either PID); zzdds's own encoder always fills both,
+  so the wire is unaffected. Decode falls back to the RTPS message header's `guid_prefix`
+  and a 10s lease default respectively — matching the pre-codec parser's behaviour, and
+  covered by the existing `test/fuzz/fuzz_plcdr.zig` corpus (unchanged, all passing).
+- Byte-exact parity with the pre-codec hand encoder verified via the existing
+  `EXPECTED_SPDP` golden fixture in `test/discovery/wire_golden_test.zig` — no wire deltas
+  for SPDP (unlike SEDP's two documented deltas below, which predate this change and are
+  unaffected by it).
 - Two zidl Zig-backend `@optional` codegen bugs surfaced when the codec was first *called*
   (it was previously built-but-unused): `@optional octet[N]` (array dimension lost) and
   `@optional sequence<>` (decode type mismatch + non-unwrapping `deinit`/`clone`). Fixed in

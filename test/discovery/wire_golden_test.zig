@@ -4,9 +4,10 @@
 //! functions BEFORE the switch to the zidl-generated codec (see
 //! `docs/design/discovery-codec.md`). They are the "the wire must not move"
 //! contract: `sedp.encodeWriterData` / `encodeReaderData` /
-//! `encodeEndpointDisposalPayload` and `spdp.encodeSpdpParticipant` now run the
-//! `qos_adapter` → generated `serializePlCdr` path, and must still reproduce
-//! these bytes.
+//! `encodeEndpointDisposalPayload` (via `qos_adapter` → generated
+//! `serializePlCdr`) and `spdp.encodeSpdpParticipant` (built directly against
+//! the generated `Disc.SPDPdiscoveredParticipantData` — SPDP carries no QoS,
+//! so there is no adapter step) must still reproduce these bytes.
 //!
 //! Documented, spec-legal deviations from the original capture:
 //!   * `EXPECTED_W_DEFAULT` / `EXPECTED_R_DEFAULT` PID_DATA_REPRESENTATION was
@@ -172,6 +173,51 @@ test "golden: SPDPdiscoveredParticipantData" {
     });
     defer alloc.free(b);
     try check("SPDP", b, &EXPECTED_SPDP);
+}
+
+test "SPDP decode round-trips locators, name, lease, and builtin endpoint set" {
+    const ann_guid = guid(0xE5, 0xc1);
+    const b = try spdp.encodeSpdpParticipant(alloc, &.{
+        .guid = ann_guid,
+        .domain_id = 0,
+        .name = "node1",
+        .metatraffic_unicast_locators = &[_]Locator{Locator.udp4(.{ 10, 0, 0, 1 }, 7410)},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &[_]Locator{Locator.udp4(.{ 10, 0, 0, 1 }, 7411)},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 10_000,
+        .builtin_endpoint_set = 0x0000_0c3f,
+    });
+    defer alloc.free(b);
+
+    var kp = try spdp.decodeSpdpParticipant(alloc, ann_guid.prefix, 7, b, .{ .bytes = .{ 0x01, 0x02 } });
+    defer kp.deinit();
+
+    try testing.expectEqual(ann_guid.prefix, kp.data.guid.prefix);
+    try testing.expectEqual(@as(u32, 7), kp.data.domain_id);
+    try testing.expectEqualStrings("node1", kp.data.name);
+    try testing.expectEqual(@as(u32, 10_000), kp.data.lease_duration_ms);
+    try testing.expectEqual(@as(u32, 0x0000_0c3f), kp.data.builtin_endpoint_set);
+    try testing.expectEqual(@as(usize, 1), kp.data.metatraffic_unicast_locators.len);
+    try testing.expectEqual(@as(usize, 0), kp.data.metatraffic_multicast_locators.len);
+    try testing.expectEqual(@as(usize, 1), kp.data.default_unicast_locators.len);
+    try testing.expectEqual(@as(usize, 0), kp.data.default_multicast_locators.len);
+    try testing.expectEqual(Locator.udp4(.{ 10, 0, 0, 1 }, 7410), kp.data.metatraffic_unicast_locators[0]);
+    try testing.expectEqual(Locator.udp4(.{ 10, 0, 0, 1 }, 7411), kp.data.default_unicast_locators[0]);
+}
+
+test "SPDP decode falls back to the RTPS header guid_prefix and a 10s lease when a peer omits both PIDs" {
+    // encap header + sentinel only — matches test/fuzz/fuzz_plcdr.zig's
+    // "encap header + sentinel only" corpus case, exercised here for the
+    // @optional participantGuid/leaseDuration fallback specifically.
+    const payload = [_]u8{ 0x00, 0x03, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
+    const fallback_prefix = guid(0x7A, 0x00).prefix;
+
+    var kp = try spdp.decodeSpdpParticipant(alloc, fallback_prefix, 0, &payload, .{ .bytes = .{ 0x00, 0x00 } });
+    defer kp.deinit();
+
+    try testing.expectEqual(fallback_prefix, kp.data.guid.prefix);
+    try testing.expectEqual(@as(u32, 10_000), kp.data.lease_duration_ms);
 }
 
 // ── Disposal ───────────────────────────────────────────────────────────────

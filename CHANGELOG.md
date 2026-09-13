@@ -8,6 +8,33 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-13
+
+- **SPDP discovery codec is now zidl-generated too**, completing the SEDP swap
+  (2026-09-10): `SPDPdiscoveredParticipantData` goes through the same generated
+  `idl/rtps_discovery.idl` codec (`--zig-pl-cdr`, `@pl_retain_unknown` — every
+  unrecognised PID round-trips losslessly), closing the last gap toward lossless
+  discovery retention for a future broker relay. The hand-rolled `spdp.zig`
+  encoder/parser are gone.
+- **New `discovery/wire_codec.zig`** — GUID <-> wire-byte conversion, PL_CDR framing, and
+  `Locator_t` sequence conversion in both directions, factored out of `sedp.zig` (which
+  had its own private copies) so SPDP and SEDP share one implementation.
+- `SPDPdiscoveredParticipantData.participantGuid` / `.leaseDuration` are now `@optional`
+  in the IDL, purely for the decode side (a peer may omit either PID); decode falls back
+  to the RTPS message header's `guid_prefix` and a 10s lease default, matching the
+  pre-codec parser exactly. zzdds's own encoder always fills both, so the wire is
+  unaffected — verified byte-exact against the existing `EXPECTED_SPDP` golden fixture in
+  `test/discovery/wire_golden_test.zig`, no wire deltas (unlike SEDP's two).
+- No behavior change to `test/fuzz/fuzz_plcdr.zig`'s corpus or invariants (still 13/13);
+  the generated `.lenient` decode is memory-safe on arbitrary input, same guarantee the
+  hand parser gave.
+- zidl pin → `v0.3.16-zig.0.16.0` (`build.zig.zon`). That release's changes are all on the
+  generated-union `deinit()`/`deserializeInto` safety path (three Greptile-review rounds on
+  zidl PR #51 — discriminant-before-payload, `@mutable`-loop payload/discriminant staleness,
+  and an owning-default-discriminant early-failure case); zzdds's own discovery IDL (SPDP,
+  SEDP, `EndpointDisposal`) declares no unions, so no zzdds source change was needed. Full
+  suite re-verified against the new pin: `zig build test` 1094/1094, `test-tsan` clean.
+
 ## 2026-09-11
 
 - zidl pin → `v0.3.15-zig.0.16.0`. Fixes a PL_CDR decode bug the discovery codec swap

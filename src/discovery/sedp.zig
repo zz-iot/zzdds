@@ -21,6 +21,7 @@ const log = @import("../log.zig");
 const trace = @import("../trace.zig");
 const iface = @import("interface.zig");
 const adapter = @import("qos_adapter.zig");
+const wire_codec = @import("wire_codec.zig");
 const tr_iface = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const pid_mod = @import("../rtps/pid.zig");
@@ -74,35 +75,11 @@ fn readU32LE(b: []const u8, le: bool) u32 {
     return std.mem.readInt(u32, b[0..4], if (le) .little else .big);
 }
 
-/// Build the 16-byte on-wire GUID (prefix[12] + entityId[4]) from a `Guid`.
-fn guidBytes(g: Guid) [16]u8 {
-    var b: [16]u8 = undefined;
-    @memcpy(b[0..12], &g.prefix.bytes);
-    b[12] = g.entity_id.entity_key[0];
-    b[13] = g.entity_id.entity_key[1];
-    b[14] = g.entity_id.entity_key[2];
-    b[15] = g.entity_id.entity_kind;
-    return b;
-}
-
-/// Parse a 16-byte on-wire GUID back into a `Guid`.
-fn guidFromBytes(b: []const u8) Guid {
-    return .{
-        .prefix = .{ .bytes = b[0..12].* },
-        .entity_id = .{ .entity_key = b[12..15].*, .entity_kind = b[15] },
-    };
-}
-
-/// Serialize a `Disc.*` PL_CDR struct to a heap slice (encap header + params +
-/// sentinel), owned by the caller.
-fn emitPlCdr(comptime T: type, alloc: std.mem.Allocator, value: T) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    var w = zidl_rt.PlCdrWriter.init(&buf, alloc);
-    try w.writeEncapHeader();
-    try T.serializePlCdr(&w, value);
-    return buf.toOwnedSlice(alloc);
-}
+// GUID <-> wire bytes, PL_CDR framing, and Locator_t sequence conversion are
+// shared with spdp.zig — see wire_codec.zig.
+const guidBytes = wire_codec.guidBytes;
+const guidFromBytes = wire_codec.guidFromBytes;
+const emitPlCdr = wire_codec.emitPlCdr;
 
 // ── DiscoveredWriterData encoding ─────────────────────────────────────────────
 
@@ -215,20 +192,7 @@ fn DecodedEndpoint(comptime T: type) type {
     };
 }
 
-/// Convert a decoded `@pl_repeated sequence<Locator_t>` member to owned
-/// transport `Locator`s.
-fn wireLocatorsOwned(alloc: std.mem.Allocator, opt_seq: anytype) ![]Locator {
-    const s = opt_seq orelse return alloc.alloc(Locator, 0);
-    const b = s._buffer orelse return alloc.alloc(Locator, 0);
-    const n: usize = s._length;
-    const out = try alloc.alloc(Locator, n);
-    errdefer alloc.free(out);
-    for (0..n) |i| {
-        const lw = LocatorWire{ .kind = b[i].kind, .port = b[i].port_number, .address = b[i].address };
-        out[i] = lw.toLocator();
-    }
-    return out;
-}
+const wireLocatorsOwned = wire_codec.wireLocatorsOwned;
 
 fn decodeEndpointT(comptime T: type, alloc: std.mem.Allocator, payload: []const u8) !DecodedEndpoint(T) {
     if (payload.len < 4) return error.TooShort;
