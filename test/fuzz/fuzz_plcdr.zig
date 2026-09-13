@@ -76,6 +76,22 @@ const PID_LEASE_10S = [_]u8{
     0x00, 0x00, 0x00, 0x00, // fraction=0
 };
 
+// PID_PARTICIPANT_LEASE_DURATION (0x0002), length=8, 5 seconds (little-endian)
+// -- a different value from PID_LEASE_10S, for the "last value wins" test.
+const PID_LEASE_5S = [_]u8{
+    0x02, 0x00, 0x08, 0x00,
+    0x05, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
+
+// PID_PARTICIPANT_LEASE_DURATION (0x0002), length=8, 10 seconds -- BIG-ENDIAN
+// (matches PID_LEASE_10S's value, every field byte-swapped).
+const PID_LEASE_10S_BE = [_]u8{
+    0x00, 0x02, 0x00, 0x08, // PID + length, BE
+    0x00, 0x00, 0x00, 0x0A, // seconds=10 BE
+    0x00, 0x00, 0x00, 0x00, // fraction=0
+};
+
 // PID_BUILTIN_ENDPOINT_SET (0x0058), length=4
 const PID_BES = [_]u8{
     0x58, 0x00, 0x04, 0x00,
@@ -122,9 +138,13 @@ test "full SPDP payload: GUID + lease + BES + sentinel" {
     kp.deinit();
 }
 
-test "big-endian encapsulation: parsed without crash" {
-    const payload = BE_ENCAP ++ SENTINEL;
-    fuzzOne(&payload);
+test "big-endian encapsulation: decodes the field correctly, not just without crashing" {
+    const payload = BE_ENCAP ++ PID_LEASE_10S_BE ++ SENTINEL;
+    var buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload, .{ .bytes = .{ 0x00, 0x00 } });
+    kp.deinit();
+    try std.testing.expectEqual(@as(u32, 10_000), kp.data.lease_duration_ms);
 }
 
 test "PID length exceeds remaining bytes: loop breaks safely" {
@@ -150,9 +170,17 @@ test "unknown PID: ignored without crash" {
     fuzzOne(&payload);
 }
 
-test "repeated known PIDs: last value wins, no crash" {
-    const payload = LE_ENCAP ++ PID_LEASE_10S ++ PID_LEASE_10S ++ SENTINEL;
-    fuzzOne(&payload);
+test "repeated known PIDs: last value wins" {
+    // Two DIFFERING occurrences of PID_PARTICIPANT_LEASE_DURATION (10s, then
+    // 5s) -- asserting the decoded value is the LAST one actually proves
+    // "last wins", unlike two identical occurrences (which pass even if the
+    // codec kept the first).
+    const payload = LE_ENCAP ++ PID_LEASE_10S ++ PID_LEASE_5S ++ SENTINEL;
+    var buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var kp = try spdp_mod.decodeSpdpParticipant(fba.allocator(), FAKE_PREFIX, 0, &payload, .{ .bytes = .{ 0x00, 0x00 } });
+    kp.deinit();
+    try std.testing.expectEqual(@as(u32, 5_000), kp.data.lease_duration_ms);
 }
 
 test "all-zeros payload: no crash" {

@@ -25,9 +25,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   pre-codec parser exactly. zzdds's own encoder always fills both, so the wire is
   unaffected — verified byte-exact against the existing `EXPECTED_SPDP` golden fixture in
   `test/discovery/wire_golden_test.zig`, no wire deltas (unlike SEDP's two).
-- No behavior change to `test/fuzz/fuzz_plcdr.zig`'s corpus or invariants (still 13/13);
-  the generated `.lenient` decode is memory-safe on arbitrary input, same guarantee the
-  hand parser gave.
+- `test/fuzz/fuzz_plcdr.zig`'s big-endian and repeated-known-PID tests now assert the
+  actually-decoded values, not just that decode doesn't crash — caught by Greptile review
+  on PR #85: both would have passed even if the codec swap silently mis-decoded BE fields
+  or kept the *first* occurrence of a repeated PID instead of the last. The repeated-PID
+  case in particular needed two *differing* values (10s then 5s) to prove "last wins" at
+  all — two identical occurrences pass regardless of which one "won".
 - zidl pin → `v0.3.16-zig.0.16.0` (`build.zig.zon`). That release's changes are all on the
   generated-union `deinit()`/`deserializeInto` safety path (three Greptile-review rounds on
   zidl PR #51 — discriminant-before-payload, `@mutable`-loop payload/discriminant staleness,
