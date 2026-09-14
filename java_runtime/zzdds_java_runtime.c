@@ -551,32 +551,54 @@ typedef struct {
     jmethodID get_field_mid;
 } zzdds_java_ts_ctx;
 
-static int zzdds_java_compute_key_hash_ctx(void *ctx_v, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
-    zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
+/* Shared implementation for zzdds_java_compute_key_hash_ctx and
+ * zzdds_java_compute_key_hash_key_only_ctx below -- they differ only in
+ * which jmethodID they call. Runs on zzdds's own long-lived native receive
+ * thread, not entered via a JNI call from Java, so there is no enclosing
+ * native-method frame to auto-release local references when this returns:
+ * every jbyteArray created or returned here must be explicitly deleted on
+ * every path, or repeated lifecycle traffic (e.g. DISPOSE/UNREGISTER changes
+ * with no inline key hash) accumulates local references without bound for
+ * the life of the thread. Also guards the two other ways a misbehaving or
+ * exception-throwing Java method could corrupt the caller: a pending
+ * exception left on `env` (fatal to every subsequent JNI call on this thread
+ * if not cleared) and a returned array shorter than the 16 bytes
+ * GetByteArrayRegion is about to read.
+ */
+static int zzdds_java_compute_key_hash_impl(zzdds_java_ts_ctx *ctx, jmethodID mid, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
     JNIEnv *env = zzdds_java_get_env();
     if (env == NULL) return -1;
     jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
+    if (arr == NULL) {
+        /* OOM: NewByteArray leaves an exception pending. */
+        (*env)->ExceptionClear(env);
+        return -1;
+    }
     (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte *)payload);
-    jbyteArray hash = (jbyteArray)(*env)->CallStaticObjectMethod(env, ctx->cls, ctx->mid, arr);
+    jbyteArray hash = (jbyteArray)(*env)->CallStaticObjectMethod(env, ctx->cls, mid, arr);
+    (*env)->DeleteLocalRef(env, arr);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return -1;
+    }
     if (hash == NULL) return -1;
-    (*env)->GetByteArrayRegion(env, hash, 0, 16, (jbyte *)hash_out);
-    return 0;
+    int rc = (*env)->GetArrayLength(env, hash) >= 16 ? 0 : -1;
+    if (rc == 0) (*env)->GetByteArrayRegion(env, hash, 0, 16, (jbyte *)hash_out);
+    (*env)->DeleteLocalRef(env, hash);
+    return rc;
 }
 
-/* Trampoline for the compute_key_hash_key_only_fn slot (zzdds_c.h) -- same
- * shape as zzdds_java_compute_key_hash_ctx above, calling
+static int zzdds_java_compute_key_hash_ctx(void *ctx_v, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
+    zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
+    return zzdds_java_compute_key_hash_impl(ctx, ctx->mid, payload, len, hash_out);
+}
+
+/* Trampoline for the compute_key_hash_key_only_fn slot (zzdds_c.h) -- calls
  * computeKeyHashFromCdrKeyOnly instead of computeKeyHashFromCdr. Only
  * installed when key_only_mid resolved (see registerTypeSupport below). */
 static int zzdds_java_compute_key_hash_key_only_ctx(void *ctx_v, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
     zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
-    JNIEnv *env = zzdds_java_get_env();
-    if (env == NULL) return -1;
-    jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
-    (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte *)payload);
-    jbyteArray hash = (jbyteArray)(*env)->CallStaticObjectMethod(env, ctx->cls, ctx->key_only_mid, arr);
-    if (hash == NULL) return -1;
-    (*env)->GetByteArrayRegion(env, hash, 0, 16, (jbyte *)hash_out);
-    return 0;
+    return zzdds_java_compute_key_hash_impl(ctx, ctx->key_only_mid, payload, len, hash_out);
 }
 
 /* Trampoline for zzdds_get_field_from_cdr_ctx_fn (zzdds_c.h) -- calls the
