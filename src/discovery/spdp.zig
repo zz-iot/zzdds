@@ -345,6 +345,14 @@ pub const SpdpEndpoints = struct {
             1, // keep_last 1: always the latest announcement
             EntityIds.spdp_builtin_participant_reader,
         );
+        // Owned by this function until published to `self.writer` below; any
+        // `try` between here and the publish (or after it, e.g. the timer
+        // thread spawn) that returns an error before ownership has
+        // transferred must not leak `new_writer`. Once published, `self`'s
+        // own teardown path (`deinit()`) owns it instead, so the errdefer
+        // must not also free it then — hence the `writer_published` guard.
+        var writer_published = false;
+        errdefer if (!writer_published) new_writer.deinit();
         new_writer.setTracer(self.tracer);
 
         // Encode the participant announcement to PL-CDR.
@@ -378,6 +386,7 @@ pub const SpdpEndpoints = struct {
         self.mu.lock();
         self.writer = new_writer;
         self.mu.unlock();
+        writer_published = true;
 
         // Listen on SPDP multicast port and join the multicast group.
         const listen_locator = Locator.udp4(.{ 0, 0, 0, 0 }, self.spdp_multicast_port);
