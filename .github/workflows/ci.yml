@@ -609,6 +609,24 @@ jobs:
           ./run.py --publishers 12 --subscribers 12 --samples 750 --churn --timeout 300
           ./run.py --publishers 6 --subscribers 6 --large --churn --timeout 300
 
+      # Every stress-tests/ log (build.log + each scenario's run log) lands
+      # under one of these two tempfile.mkdtemp() prefixes, whether the run
+      # passed or failed — see _common.mktemp_logdir. Without this, a failure
+      # is only "log contains 'ThreadSanitizer'" with a runner-local path
+      # that's gone once the job ends; this makes the actual report (or any
+      # other captured failure) inspectable after the fact. Placed last so it
+      # also catches the (schedule-only) nightly heavy matrix's logs above.
+      - name: Upload stress logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-logs
+          path: |
+            /tmp/elc-stress*/**
+            /tmp/churn-stress*/**
+          if-no-files-found: ignore
+          retention-days: 7
+
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
   # Builds all test binaries to zig-out/tests/, runs each through kcov

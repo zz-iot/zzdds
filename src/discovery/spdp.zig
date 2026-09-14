@@ -18,6 +18,7 @@ const std = @import("std");
 const log = @import("../log.zig");
 const trace = @import("../trace.zig");
 const iface = @import("interface.zig");
+const wire_codec = @import("wire_codec.zig");
 const tr_iface = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const pid_mod = @import("../rtps/pid.zig");
@@ -29,6 +30,8 @@ const mutex_mod = @import("../util/mutex.zig");
 const time_mod = @import("../util/time.zig");
 const sn_mod = @import("../rtps/sequence_number.zig");
 const header_mod = @import("../rtps/message/header.zig");
+const zidl_rt = @import("zidl_rt");
+const Disc = @import("zzdds_disc_generated");
 
 const Transport = tr_iface.Transport;
 const Locator = tr_iface.Locator;
@@ -49,11 +52,7 @@ const Callbacks = iface.Callbacks;
 const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 const ParticipantData = iface.ParticipantData;
 const Discovery = iface.Discovery;
-const PidTable = pid_mod.PidTable;
 const BuiltinEndpointSet = pid_mod.BuiltinEndpointSet;
-
-// PL_CDR_LE encapsulation identifier (RTPS §10.2, PL_CDR little-endian)
-const PLCDR_LE_ENCAP: [4]u8 = .{ 0x00, 0x03, 0x00, 0x00 };
 
 /// Floor for genuine SPDP re-announcement intervals fed into the EMA in
 /// processSpdpPayload. Real-world SPDP periods are seconds, never sub-100ms;
@@ -833,94 +832,68 @@ pub const SpdpEndpoints = struct {
 };
 
 // ── PL-CDR serialization ──────────────────────────────────────────────────────
+//
+// Goes through the zidl-generated `Disc.SPDPdiscoveredParticipantData` codec
+// (`idl/rtps_discovery.idl`, `--zig-pl-cdr`, `@pl_retain_unknown`) instead of a
+// hand-rolled parser — see docs/design/discovery-codec.md. `participantGuid`
+// and `leaseDuration` are `@optional` in the IDL purely for the decode side
+// (a peer may omit them); zzdds's own encoder always fills both.
 
 /// Encode SPDPdiscoveredParticipantData as PL-CDR little-endian.
 /// Returns a heap-allocated slice owned by the caller.
 pub fn encodeSpdpParticipant(alloc: std.mem.Allocator, ann: *const ParticipantAnnouncement) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-
-    // Encapsulation header
-    try buf.appendSlice(alloc, &PLCDR_LE_ENCAP);
-
-    // PID_PROTOCOL_VERSION (0x0015): major=2, minor=5 + 2 pad bytes → len=4
-    try writePidHdr(alloc, &buf, PidTable.PROTOCOL_VERSION, 4);
-    try buf.appendSlice(alloc, &[_]u8{ 2, 5, 0, 0 });
-
-    // PID_VENDORID (0x0016): 2 bytes + 2 pad → len=4
-    try writePidHdr(alloc, &buf, PidTable.VENDORID, 4);
-    try buf.appendSlice(alloc, &pid_mod.ZZDDS_VENDOR_ID);
-    try buf.appendSlice(alloc, &[_]u8{ 0, 0 });
-
-    // PID_PARTICIPANT_GUID (0x0050): 16 bytes (prefix[12] + entity_id[4])
-    try writePidHdr(alloc, &buf, PidTable.PARTICIPANT_GUID, 16);
-    try buf.appendSlice(alloc, &ann.guid.prefix.bytes);
-    try buf.appendSlice(alloc, &[_]u8{
-        EntityIds.participant.entity_key[0],
-        EntityIds.participant.entity_key[1],
-        EntityIds.participant.entity_key[2],
-        EntityIds.participant.entity_kind,
-    });
-
-    // PID_BUILTIN_ENDPOINT_SET (0x0058): u32
-    try writePidHdr(alloc, &buf, PidTable.BUILTIN_ENDPOINT_SET, 4);
-    try writeU32Le(alloc, &buf, ann.builtin_endpoint_set);
-
-    // PID_PARTICIPANT_LEASE_DURATION (0x0002): RTPS Duration_t (seconds + fraction) = 8 bytes
-    try writePidHdr(alloc, &buf, PidTable.PARTICIPANT_LEASE_DURATION, 8);
-    const lease = time_mod.Duration{
+    const lease = time_mod.RtpsDuration.fromDuration(.{
         .sec = @intCast(ann.lease_duration_ms / 1000),
         .nanosec = (ann.lease_duration_ms % 1000) * 1_000_000,
+    });
+
+    var out: Disc.SPDPdiscoveredParticipantData = .{
+        .protocolVersion = .{ .major = 2, .minor = 5 },
+        .vendorId = .{ .vendorId = pid_mod.ZZDDS_VENDOR_ID },
+        // RTPS §9.3.1.5: a participant's GUID entity_id is always the
+        // well-known "participant" value — not whatever `ann.guid.entity_id`
+        // holds (defensively ignored, same as the previous hand encoder).
+        .participantGuid = wire_codec.guidBytes(.{ .prefix = ann.guid.prefix, .entity_id = EntityIds.participant }),
+        .builtinEndpointSet = ann.builtin_endpoint_set,
+        .leaseDuration = .{ .seconds = lease.seconds, .fraction = lease.fraction },
     };
-    try writeRtpsDuration(alloc, &buf, lease);
+    if (ann.name.len > 0) out.participantName = ann.name;
 
-    // Metatraffic unicast locators (one PID entry per locator)
-    for (ann.metatraffic_unicast_locators) |loc| {
-        try writePidHdr(alloc, &buf, PidTable.METATRAFFIC_UNICAST_LOCATOR, 24);
-        try writeLocator(alloc, &buf, loc);
-    }
+    const meta_uc = try wire_codec.ownedDiscLocatorSeq(alloc, ann.metatraffic_unicast_locators);
+    defer alloc.free(meta_uc);
+    const meta_mc = try wire_codec.ownedDiscLocatorSeq(alloc, ann.metatraffic_multicast_locators);
+    defer alloc.free(meta_mc);
+    const def_uc = try wire_codec.ownedDiscLocatorSeq(alloc, ann.default_unicast_locators);
+    defer alloc.free(def_uc);
+    const def_mc = try wire_codec.ownedDiscLocatorSeq(alloc, ann.default_multicast_locators);
+    defer alloc.free(def_mc);
 
-    // Metatraffic multicast locators
-    for (ann.metatraffic_multicast_locators) |loc| {
-        try writePidHdr(alloc, &buf, PidTable.METATRAFFIC_MULTICAST_LOCATOR, 24);
-        try writeLocator(alloc, &buf, loc);
-    }
+    out.metatrafficUnicastLocatorList = wire_codec.discLocatorSeqField(
+        @FieldType(Disc.SPDPdiscoveredParticipantData, "metatrafficUnicastLocatorList"),
+        meta_uc,
+    );
+    out.metatrafficMulticastLocatorList = wire_codec.discLocatorSeqField(
+        @FieldType(Disc.SPDPdiscoveredParticipantData, "metatrafficMulticastLocatorList"),
+        meta_mc,
+    );
+    out.defaultUnicastLocatorList = wire_codec.discLocatorSeqField(
+        @FieldType(Disc.SPDPdiscoveredParticipantData, "defaultUnicastLocatorList"),
+        def_uc,
+    );
+    out.defaultMulticastLocatorList = wire_codec.discLocatorSeqField(
+        @FieldType(Disc.SPDPdiscoveredParticipantData, "defaultMulticastLocatorList"),
+        def_mc,
+    );
 
-    // Default unicast locators
-    for (ann.default_unicast_locators) |loc| {
-        try writePidHdr(alloc, &buf, PidTable.DEFAULT_UNICAST_LOCATOR, 24);
-        try writeLocator(alloc, &buf, loc);
-    }
-
-    // Default multicast locators
-    for (ann.default_multicast_locators) |loc| {
-        try writePidHdr(alloc, &buf, PidTable.DEFAULT_MULTICAST_LOCATOR, 24);
-        try writeLocator(alloc, &buf, loc);
-    }
-
-    // PID_ENTITY_NAME (participant name) if non-empty
-    if (ann.name.len > 0) {
-        const str_len: u32 = @intCast(ann.name.len + 1); // including null
-        const total = 4 + str_len; // length field + content
-        const padded: u16 = @intCast((total + 3) & ~@as(u32, 3));
-        try writePidHdr(alloc, &buf, PidTable.ENTITY_NAME, padded);
-        try writeU32Le(alloc, &buf, str_len);
-        try buf.appendSlice(alloc, ann.name);
-        try buf.append(alloc, 0); // null terminator
-        var p: usize = padded - total;
-        while (p > 0) : (p -= 1) try buf.append(alloc, 0);
-    }
-
-    // PID_SENTINEL
-    try buf.appendSlice(alloc, &[_]u8{ 0x01, 0x00, 0x00, 0x00 });
-
-    return buf.toOwnedSlice(alloc);
+    return wire_codec.emitPlCdr(Disc.SPDPdiscoveredParticipantData, alloc, out);
 }
 
 // ── PL-CDR deserialization ────────────────────────────────────────────────────
 
-/// Decode SPDPdiscoveredParticipantData from a PL-CDR payload (including 4-byte encap header).
-/// All slices in the returned KnownParticipant are heap-allocated; caller owns them.
+/// Decode SPDPdiscoveredParticipantData from a PL-CDR payload (including
+/// 4-byte encap header). `.lenient` matches the old hand parser's tolerance
+/// for a truncated tail or a missing sentinel. All slices in the returned
+/// KnownParticipant are heap-allocated; caller owns them.
 pub fn decodeSpdpParticipant(
     alloc: std.mem.Allocator,
     guid_prefix: GuidPrefix,
@@ -929,80 +902,38 @@ pub fn decodeSpdpParticipant(
     vendor_id: header_mod.VendorId,
 ) !KnownParticipant {
     if (payload.len < 4) return error.TooShort;
-    const le = (payload[1] & 0x01) != 0;
+    var r = try zidl_rt.CdrReader.init(payload);
+    var data: Disc.SPDPdiscoveredParticipantData = .{};
+    defer data.deinit(alloc);
+    try Disc.SPDPdiscoveredParticipantData.deserializeFromPlCdr(&data, &r, alloc, .lenient);
 
-    var meta_uc: std.ArrayList(Locator) = .empty;
-    var meta_mc: std.ArrayList(Locator) = .empty;
-    var data_uc: std.ArrayList(Locator) = .empty;
-    var data_mc: std.ArrayList(Locator) = .empty;
-    errdefer {
-        meta_uc.deinit(alloc);
-        meta_mc.deinit(alloc);
-        data_uc.deinit(alloc);
-        data_mc.deinit(alloc);
-    }
+    const decoded_prefix = if (data.participantGuid) |g|
+        wire_codec.guidFromBytes(&g).prefix
+    else
+        guid_prefix;
 
-    var lease_ms: u32 = 10_000;
-    var builtin_eps: u32 = 0;
-    var name: []u8 = &.{};
-    var decoded_prefix = guid_prefix; // override if PID_PARTICIPANT_GUID present
+    const lease_ms: u32 = if (data.leaseDuration) |ld| blk: {
+        const lease = (time_mod.RtpsDuration{ .seconds = ld.seconds, .fraction = ld.fraction }).toDuration();
+        if (lease.isInfinite()) break :blk std.math.maxInt(u32);
+        const ns = lease.toNs() orelse break :blk std.math.maxInt(u32);
+        if (ns <= 0) break :blk 0;
+        break :blk @intCast(@min(@as(i64, std.math.maxInt(u32)), @divTrunc(ns, std.time.ns_per_ms)));
+    } else 10_000;
 
-    var pos: usize = 4;
-    while (pos + 4 <= payload.len) {
-        const pid = readU16LE(payload[pos..], le);
-        const len = readU16LE(payload[pos + 2 ..], le);
-        pos += 4;
-        if (pid == PidTable.SENTINEL) break;
-        if (pos + len > payload.len) break;
-        const v = payload[pos .. pos + len];
-        pos += len;
+    const name: []u8 = if (data.participantName) |n| try alloc.dupe(u8, n) else &.{};
+    errdefer alloc.free(name);
 
-        switch (pid) {
-            PidTable.PARTICIPANT_GUID => {
-                if (v.len >= 12) @memcpy(&decoded_prefix.bytes, v[0..12]);
-            },
-            PidTable.PARTICIPANT_LEASE_DURATION => {
-                if (v.len >= 8) {
-                    const lease = readRtpsDuration(v, le).toDuration();
-                    lease_ms = if (lease.isInfinite()) std.math.maxInt(u32) else blk: {
-                        const ns = lease.toNs() orelse break :blk std.math.maxInt(u32);
-                        if (ns <= 0) break :blk 0;
-                        break :blk @intCast(@min(@as(i64, std.math.maxInt(u32)), @divTrunc(ns, std.time.ns_per_ms)));
-                    };
-                }
-            },
-            PidTable.BUILTIN_ENDPOINT_SET => {
-                if (v.len >= 4) builtin_eps = readU32LE(v[0..], le);
-            },
-            PidTable.METATRAFFIC_UNICAST_LOCATOR => {
-                if (v.len >= 24) try meta_uc.append(alloc, readLocator(v, le));
-            },
-            PidTable.METATRAFFIC_MULTICAST_LOCATOR => {
-                if (v.len >= 24) try meta_mc.append(alloc, readLocator(v, le));
-            },
-            PidTable.DEFAULT_UNICAST_LOCATOR => {
-                if (v.len >= 24) try data_uc.append(alloc, readLocator(v, le));
-            },
-            PidTable.DEFAULT_MULTICAST_LOCATOR => {
-                if (v.len >= 24) try data_mc.append(alloc, readLocator(v, le));
-            },
-            PidTable.ENTITY_NAME => {
-                if (v.len >= 4) {
-                    const slen = readU32LE(v[0..], le);
-                    if (slen > 0 and v.len >= 4 + slen) {
-                        const raw = v[4 .. 4 + slen - 1]; // strip null
-                        name = try alloc.dupe(u8, raw);
-                    }
-                }
-            },
-            else => {
-                log.spdp.debug("spdp: unknown pid=0x{x:0>4} len={d}", .{ pid, len });
-            },
-        }
-    }
+    const meta_uc = try wire_codec.wireLocatorsOwned(alloc, data.metatrafficUnicastLocatorList);
+    errdefer alloc.free(meta_uc);
+    const meta_mc = try wire_codec.wireLocatorsOwned(alloc, data.metatrafficMulticastLocatorList);
+    errdefer alloc.free(meta_mc);
+    const data_uc = try wire_codec.wireLocatorsOwned(alloc, data.defaultUnicastLocatorList);
+    errdefer alloc.free(data_uc);
+    const data_mc = try wire_codec.wireLocatorsOwned(alloc, data.defaultMulticastLocatorList);
+    errdefer alloc.free(data_mc);
 
-    log.spdp.debug("spdp: decoded data_uc={d} data_mc={d}", .{ data_uc.items.len, data_mc.items.len });
-    for (data_uc.items) |loc| log.spdp.debug("spdp:   data_unicast_locator={any}", .{loc});
+    log.spdp.debug("spdp: decoded data_uc={d} data_mc={d}", .{ data_uc.len, data_mc.len });
+    for (data_uc) |loc| log.spdp.debug("spdp:   data_unicast_locator={any}", .{loc});
 
     return KnownParticipant{
         .alloc = alloc,
@@ -1019,63 +950,15 @@ pub fn decodeSpdpParticipant(
             },
             .domain_id = domain_id,
             .name = name,
-            .metatraffic_unicast_locators = try meta_uc.toOwnedSlice(alloc),
-            .metatraffic_multicast_locators = try meta_mc.toOwnedSlice(alloc),
-            .default_unicast_locators = try data_uc.toOwnedSlice(alloc),
-            .default_multicast_locators = try data_mc.toOwnedSlice(alloc),
+            .metatraffic_unicast_locators = meta_uc,
+            .metatraffic_multicast_locators = meta_mc,
+            .default_unicast_locators = data_uc,
+            .default_multicast_locators = data_mc,
             .lease_duration_ms = lease_ms,
-            .builtin_endpoint_set = builtin_eps,
+            .builtin_endpoint_set = data.builtinEndpointSet,
             .vendor_id = vendor_id,
         },
     };
-}
-
-// ── PL-CDR write helpers ──────────────────────────────────────────────────────
-
-fn writePidHdr(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), pid: u16, length: u16) !void {
-    var hdr: [4]u8 = undefined;
-    std.mem.writeInt(u16, hdr[0..2], pid, .little);
-    std.mem.writeInt(u16, hdr[2..4], length, .little);
-    try buf.appendSlice(alloc, &hdr);
-}
-
-fn writeU32Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: u32) !void {
-    var b: [4]u8 = undefined;
-    std.mem.writeInt(u32, &b, v, .little);
-    try buf.appendSlice(alloc, &b);
-}
-
-fn writeI32Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: i32) !void {
-    try writeU32Le(alloc, buf, @bitCast(v));
-}
-
-fn writeLocator(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), loc: Locator) !void {
-    const w = loc.toRtpsWire();
-    try writeI32Le(alloc, buf, w.kind);
-    try writeU32Le(alloc, buf, w.port);
-    try buf.appendSlice(alloc, &w.address);
-}
-
-fn writeRtpsDuration(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), duration: time_mod.Duration) !void {
-    try time_mod.RtpsDuration.fromDuration(duration).appendLE(alloc, buf);
-}
-
-// ── PL-CDR read helpers ───────────────────────────────────────────────────────
-
-fn readU16LE(buf: []const u8, le: bool) u16 {
-    return std.mem.readInt(u16, buf[0..2], if (le) .little else .big);
-}
-
-fn readU32LE(buf: []const u8, le: bool) u32 {
-    return std.mem.readInt(u32, buf[0..4], if (le) .little else .big);
-}
-
-fn readI32LE(buf: []const u8, le: bool) i32 {
-    return @bitCast(readU32LE(buf, le));
-}
-
-fn readRtpsDuration(buf: []const u8, le: bool) time_mod.RtpsDuration {
-    return .{ .seconds = readI32LE(buf[0..], le), .fraction = readU32LE(buf[4..], le) };
 }
 
 /// Parse "a.b.c.d:port" into a UDP4 Locator. Returns null on any parse failure.
@@ -1092,13 +975,4 @@ fn parseLocatorStr(s: []const u8) ?Locator {
     }
     if (i != 4) return null;
     return Locator.udp4(addr, port);
-}
-
-fn readLocator(buf: []const u8, le: bool) Locator {
-    const kind = readI32LE(buf[0..], le);
-    const port = readU32LE(buf[4..], le);
-    var addr: [16]u8 = undefined;
-    @memcpy(&addr, buf[8..24]);
-    const wire = LocatorWire{ .kind = kind, .port = port, .address = addr };
-    return wire.toLocator();
 }

@@ -49,21 +49,31 @@ decode wire durations as `RtpsDuration`, then convert to DDS `Duration` before l
 or QoS logic. Omitted `PID_DEADLINE` means DDS default infinite; explicit `{0,0}` means
 RTPS `DURATION_ZERO` and is not normalized to infinite.
 
-**SEDP discovery codec is zidl-generated from `idl/rtps_discovery.idl`.**
-The hand-rolled SEDP PL_CDR encoders/parsers were replaced by the codec zidl emits for
-`DiscoveredWriterData` / `DiscoveredReaderData` / `EndpointDisposal` (`--zig-pl-cdr`,
-`@pl_retain_unknown` so every unrecognised PID round-trips losslessly — the groundwork
-for a discovery broker relay). `discovery/qos_adapter.zig` maps the typed
-`DDS.DataWriterQos` / `DataReaderQos` (+ Publisher/Subscriber `PresentationQosPolicy`)
-to/from the wire structs; the old flat `disc.QosSnapshot`, `writerQosSnapshot` /
-`readerQosSnapshot`, and `src/qos/policy.zig` + `checkWriterReader` are gone. QoS matching
-(`qos_match.checkDiscovered`) runs directly on the RTPS structs. The native decode path
-uses `.lenient` mode (skip/retain unknowns, tolerate a truncated tail); `.strict` is
-reserved for a broker's ingress validation. SPDP encode/decode remains hand-rolled for now
-(it carries no QoS). `PID_TYPE_INFORMATION` (an opaque XTypes blob with no CDR length
-prefix — zidl has no raw-bytes member type) is the one parameter with no declared member:
-the SEDP writer wrapper injects it via `unknown_params` (replayed before the sentinel) and
-the decode wrapper reads it back out.
+**SPDP and SEDP discovery codecs are both zidl-generated from `idl/rtps_discovery.idl`.**
+The hand-rolled SPDP/SEDP PL_CDR encoders/parsers were replaced by the codec zidl emits for
+`SPDPdiscoveredParticipantData` / `DiscoveredWriterData` / `DiscoveredReaderData` /
+`EndpointDisposal` (`--zig-pl-cdr`, `@pl_retain_unknown` so every unrecognised PID
+round-trips losslessly — the groundwork for a discovery broker relay). `discovery/qos_adapter.zig`
+maps the typed `DDS.DataWriterQos` / `DataReaderQos` (+ Publisher/Subscriber
+`PresentationQosPolicy`) to/from the SEDP wire structs; the old flat `disc.QosSnapshot`,
+`writerQosSnapshot` / `readerQosSnapshot`, and `src/qos/policy.zig` + `checkWriterReader`
+are gone. QoS matching (`qos_match.checkDiscovered`) runs directly on the RTPS structs.
+SPDP has no QoS to adapt, so `spdp.zig` builds its `Disc.SPDPdiscoveredParticipantData`
+directly; `discovery/wire_codec.zig` holds the small GUID / PL_CDR-framing / `Locator_t`
+sequence helpers shared by both SPDP and SEDP. The native decode path uses `.lenient` mode
+(skip/retain unknowns, tolerate a truncated tail); `.strict` is reserved for a broker's
+ingress validation. `PID_TYPE_INFORMATION` (an opaque XTypes blob with no CDR length
+prefix — zidl has no raw-bytes member type) is the one SEDP parameter with no declared
+member: the SEDP writer wrapper injects it via `unknown_params` (replayed before the
+sentinel) and the decode wrapper reads it back out.
+
+**`SPDPdiscoveredParticipantData.participantGuid` / `.leaseDuration` are `@optional` in the
+IDL purely for the decode side** (a peer may omit either PID; decode falls back to the RTPS
+message header's `guid_prefix` and a 10s default respectively, matching the pre-codec
+parser). zzdds's own encoder always fills both — the wire is unaffected. A participant
+GUID's entity_id is always the well-known "participant" value (RTPS §9.3.1.5), regardless
+of whatever `ParticipantAnnouncement.guid.entity_id` happens to hold — `encodeSpdpParticipant`
+overrides it explicitly, same as the pre-codec encoder did.
 
 **Wire deltas from the pre-codec hand encoders (all spec-legal; `test/discovery/wire_golden_test.zig`
 is the contract, live interop is the gate):** (1) a default writer/reader now emits
