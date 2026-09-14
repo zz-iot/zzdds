@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
     /* Unlike hello_world, this registration's get_field callback actually
      * matters here -- the QueryCondition's "priority > %0" expression needs
      * field-level access to evaluate. */
-    if (zzdds_register_type_support(dp, "WaitsetSample", WaitsetSample_compute_key_hash_from_cdr, WaitsetSample_get_field_from_cdr) != DDS_RETCODE_OK) {
+    if (WaitsetSampleTypeSupport_register(dp, "WaitsetSample") != DDS_RETCODE_OK) {
         fprintf(stderr, "FAIL: register_type_support failed\n");
         return 1;
     }

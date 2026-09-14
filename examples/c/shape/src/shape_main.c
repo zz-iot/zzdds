@@ -1075,7 +1075,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (zzdds_register_type_support(dp, "ShapeType", ShapeType_compute_key_hash_from_cdr, ShapeType_get_field_from_cdr) != DDS_RETCODE_OK) {
+    if (ShapeTypeTypeSupport_register(dp, "ShapeType") != DDS_RETCODE_OK) {
         fprintf(stderr, "registerTypeSupport() failed\n");
         zzdds_destroy_factory(factory);
         return 1;

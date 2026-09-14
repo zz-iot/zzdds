@@ -215,6 +215,18 @@ zzdds_DataReader DDS_DataReader_as_zzdds_DataReader(DDS_DataReader reader);
 DDS_TopicDescription zzdds_topic_as_description(DDS_Topic topic);
 
 /**
+ * @param compute_key_hash_fn  Computes the key hash from a complete ALIVE
+ *                       sample's raw CDR bytes -- generated as
+ *                       `<Type>_compute_key_hash_from_cdr`. NULL for keyless
+ *                       types.
+ * @param compute_key_hash_key_only_fn
+ *                       Computes the key hash from a genuine key-only CDR
+ *                       payload (RTPS DISPOSE/UNREGISTER) -- generated as
+ *                       `<Type>_compute_key_hash_from_cdr_key_only`. NULL for
+ *                       keyless types, or to accept a safe zero-hash
+ *                       fallback for that case (a peer that omits the inline
+ *                       PID_KEY_HASH on a DISPOSE/UNREGISTER sample gets an
+ *                       incomplete rather than a wrong instance handle).
  * @param get_field_fn  Optional (NULL if the type has no fields a
  *                       ContentFilteredTopic expression could reference).
  *                       When set, a DataReader created against a CFT for
@@ -229,6 +241,7 @@ int zzdds_register_type_support(
     DDS_DomainParticipant participant,
     const char *type_name,
     zzdds_compute_key_hash_fn compute_key_hash_fn,
+    zzdds_compute_key_hash_fn compute_key_hash_key_only_fn,
     zzdds_get_field_from_cdr_fn get_field_fn
 );
 
@@ -241,19 +254,21 @@ int zzdds_register_type_support(
 typedef int (*zzdds_compute_key_hash_ctx_fn)(void *ctx, const uint8_t *payload, size_t len, uint8_t hash_out[16]);
 
 /**
- * Same as zzdds_register_type_support, but compute_key_hash_fn/get_field_fn
- * additionally receive ctx on every call (the SAME ctx for both -- one
- * shared per-registration context, not two). ctx_deinit (may be NULL) is
- * called exactly once when this registration is replaced (a later call for
- * the same type_name) or when participant is destroyed — same reclaim path
- * as the non-ctx variant's internal adapter, just exposed to the caller's
- * own ctx here. get_field_fn is optional (NULL if the type has no
- * filterable fields), same as zzdds_register_type_support's.
+ * Same as zzdds_register_type_support, but compute_key_hash_fn/
+ * compute_key_hash_key_only_fn/get_field_fn additionally receive ctx on
+ * every call (the SAME ctx for all three -- one shared per-registration
+ * context, not several). ctx_deinit (may be NULL) is called exactly once
+ * when this registration is replaced (a later call for the same type_name)
+ * or when participant is destroyed — same reclaim path as the non-ctx
+ * variant's internal adapter, just exposed to the caller's own ctx here.
+ * compute_key_hash_key_only_fn and get_field_fn are each independently
+ * optional (NULL is fine for either), same as zzdds_register_type_support's.
  */
 int zzdds_register_type_support_ctx(
     DDS_DomainParticipant participant,
     const char *type_name,
     zzdds_compute_key_hash_ctx_fn compute_key_hash_fn,
+    zzdds_compute_key_hash_ctx_fn compute_key_hash_key_only_fn,
     zzdds_get_field_from_cdr_ctx_fn get_field_fn,
     void *ctx,
     void (*ctx_deinit)(void *ctx)

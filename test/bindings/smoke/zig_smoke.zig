@@ -12,7 +12,7 @@ pub fn main() !void {
         .label = try zidl_rt.BoundedArray(u8, 32).fromSlice("zig-smoke"),
     };
 
-    const expected_hash = smoke.BindingSmokeStatus.computeKeyHash(sample);
+    const expected_hash = smoke.BindingSmokeStatus.computeKeyHash(&sample);
     const writer = smoke.BindingSmokeStatusDataWriter.init(1, std.heap.page_allocator);
     try writer.write(sample, 0);
 

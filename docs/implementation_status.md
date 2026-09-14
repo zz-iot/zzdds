@@ -131,10 +131,13 @@ when a sample arrives without an inline-QoS key hash. Applications must call
 **Keyed-instance fallback for per-instance QoS/history.** `TIME_BASED_FILTER`, ownership,
 SampleInfo state, and `KEEP_LAST` all operate per resolved instance handle. Key hash
 resolution on the receive path follows: inline `PID_KEY_HASH` QoS (standard behavior of
-real DDS peers) → registered `TypeSupport.compute_key_hash` → all-zeros (NIL). If neither
-wire key-hash nor TypeSupport is available, keyed samples collapse to one fallback
-instance. The clean long-term answer for that fallback is XTypes TypeLookup, which would
-allow key field layout to be discovered from wire metadata without pre-registration.
+real DDS peers) → registered `TypeSupport` fallback, picked by change kind (`compute_key_hash`
+for a complete ALIVE sample, `compute_key_hash_key_only` for DISPOSE/UNREGISTER's genuine
+key-only payload — see `resolveKeyHash` in `src/dcps/participant.zig`) → all-zeros (NIL) if
+that kind's function wasn't registered. If neither wire key-hash nor TypeSupport is
+available, keyed samples collapse to one fallback instance. The clean long-term answer for
+that fallback is XTypes TypeLookup, which would allow key field layout to be discovered
+from wire metadata without pre-registration.
 
 **Transport scatter-gather not fully zero-copy.** The iovec list is assembled without
 copying but is flattened to a `[65536]u8` stack buffer at the `Transport.send()` boundary.

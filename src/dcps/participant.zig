@@ -701,10 +701,24 @@ pub const TypeSupport = struct {
     /// Follows the same convention as Transport and Security plugin vtables.
     /// Zig-native implementations that need no state may pass `undefined`.
     ctx: *anyopaque,
-    /// Compute the 16-byte DDS key hash from a CDR-encoded payload.
-    /// `payload` includes the 4-byte encapsulation header (as received from
-    /// the wire).  Return `zeroes([16]u8)` for keyless types.
+    /// Compute the 16-byte DDS key hash from a **complete ALIVE sample's**
+    /// CDR-encoded payload. `payload` includes the 4-byte encapsulation
+    /// header (as received from the wire). Return `zeroes([16]u8)` for
+    /// keyless types. See `resolveKeyHash`: this is the fallback used when a
+    /// received ALIVE change carries no inline `PID_KEY_HASH`.
     compute_key_hash: *const fn (ctx: *anyopaque, payload: []const u8) [16]u8,
+    /// Compute the 16-byte DDS key hash from a **genuine key-only** payload
+    /// (RTPS DISPOSE/UNREGISTER: nothing but the `@key` members, back to
+    /// back — not a full sample). Optional: `resolveKeyHash` falls back to
+    /// `zeroes([16]u8)` rather than misapplying `compute_key_hash` (which
+    /// expects a full sample and would misread a key-only one) when a
+    /// registration leaves this unset — see zidl's
+    /// `computeKeyHashFromCdrKeyOnly`/`_compute_key_hash_from_cdr_key_only`.
+    /// Wired end to end: the native Zig path (a caller passes this field
+    /// directly) and the C-ABI surface the C/C++/Java bindings register
+    /// through (`zzdds_register_type_support`/`_ctx`'s
+    /// `compute_key_hash_key_only_fn` parameter, `c_abi/typesupport.zig`).
+    compute_key_hash_key_only: ?*const fn (ctx: *anyopaque, payload: []const u8) [16]u8 = null,
     /// True when the type has one or more `@key` members. Consulted by
     /// `pubCreateProtoWriter` so a keyed writer emits inline `PID_KEY_HASH` on
     /// every sample (RTPS §8.7.9), including a zero-valued key — otherwise a
@@ -766,6 +780,7 @@ const ActiveReader = struct {
     timer_check: ?TimerNotify = null,
     key_hash_ctx: *anyopaque = undefined,
     key_hash_fn: ?*const fn (*anyopaque, []const u8) [16]u8 = null,
+    key_hash_only_fn: ?*const fn (*anyopaque, []const u8) [16]u8 = null,
     refresh_get_field: ?RefreshGetField = null,
     wlp_alive: ?WlpAliveNotify = null,
 };
@@ -1418,6 +1433,7 @@ pub const DomainParticipantImpl = struct {
                 if (std.mem.eql(u8, ar.type_name, type_name)) {
                     ar.key_hash_ctx = ts.ctx;
                     ar.key_hash_fn = ts.compute_key_hash;
+                    ar.key_hash_only_fn = ts.compute_key_hash_key_only;
                     // Also refresh whatever the reader itself cached at
                     // creation time (get_field_fn, and cft_filter.get_field_fn
                     // if it was created against a ContentFilteredTopic) --
@@ -1691,6 +1707,10 @@ pub const DomainParticipantImpl = struct {
                     ts.compute_key_hash
                 else
                     null,
+                .key_hash_only_fn = if (self.type_support_registry.get(type_name)) |ts|
+                    ts.compute_key_hash_key_only
+                else
+                    null,
             });
         }
 
@@ -1838,18 +1858,34 @@ pub const DomainParticipantImpl = struct {
     /// says a keyed writer SHOULD send it, and zzdds's own writer does whenever
     /// the computed hash is non-zero.
     ///
-    /// With no inline hash we fall back to the type's `key_hash_fn`
-    /// (`TypeSupport.compute_key_hash`), whose contract is "full CDR wire
-    /// payload in, 16-byte hash out". NOTE: zidl's *generated*
-    /// `computeKeyHashFromCdr` currently honours that contract only for a
-    /// leading, contiguous key — it runs the key-only deserializer, so a
-    /// non-leading `@key` member is misread. That is tracked as the
-    /// selective-parse `key_hash_fn` rework (see `docs/roadmap.md` and the
-    /// v0.3.12 pin-bump follow-up); it is a zidl-side fix, not fixable here
-    /// without breaking contract-conforming hand-written TypeSupports.
-    fn resolveKeyHash(maybe_kh: ?[16]u8, ar: *ActiveReader, payload: []const u8) [16]u8 {
+    /// With no inline hash we fall back to the type's `key_hash_fn`/
+    /// `key_hash_only_fn` (`TypeSupport.compute_key_hash`/
+    /// `compute_key_hash_key_only`), picked by `kind`: an ALIVE change's
+    /// `payload` is a complete sample (`key_hash_fn`, backed by zidl's
+    /// `computeKeyHashFromCdr` — `deserializeSelected`-based, so a
+    /// non-leading `@key` member is read correctly regardless of what
+    /// precedes it); a DISPOSE/UNREGISTER change's `payload` is a genuine
+    /// key-only wire payload per RTPS §8.7.9's K-flag convention
+    /// (`key_hash_only_fn`, backed by `computeKeyHashFromCdrKeyOnly`) —
+    /// calling the ALIVE-shaped function on that would misread it (missing
+    /// non-key member bytes to "skip"), not just misread a non-leading key.
+    ///
+    /// `key_hash_only_fn` is optional: a `TypeSupport` registered without it
+    /// falls back to `zeroes([16]u8)` rather than risk that misread — a
+    /// known, deliberately incomplete instance handle for that registration
+    /// rather than a confidently wrong non-zero one. This stays reachable in
+    /// practice, independent of binding: a hand-written `TypeSupport`, or a
+    /// generated class predating `computeKeyHashFromCdrKeyOnly`
+    /// (Java resolves it by reflection and tolerates it being absent), or a
+    /// keyless type (no key-only payload ever needs one), all leave it null
+    /// legitimately.
+    fn resolveKeyHash(maybe_kh: ?[16]u8, ar: *ActiveReader, payload: []const u8, kind: history_mod.ChangeKind) [16]u8 {
         if (maybe_kh) |kh| return kh;
-        if (ar.key_hash_fn) |f| return f(ar.key_hash_ctx, payload);
+        if (kind == .alive) {
+            if (ar.key_hash_fn) |f| return f(ar.key_hash_ctx, payload);
+        } else if (ar.key_hash_only_fn) |f| {
+            return f(ar.key_hash_ctx, payload);
+        }
         return std.mem.zeroes([16]u8);
     }
 
@@ -1885,7 +1921,7 @@ pub const DomainParticipantImpl = struct {
             };
             const rkey = entityIdKey(eid);
             if (self.active_readers.getPtr(rkey)) |ar| {
-                const kh = resolveKeyHash(key_hash, ar, payload);
+                const kh = resolveKeyHash(key_hash, ar, payload, kind);
                 ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
             }
         }
@@ -1943,13 +1979,13 @@ pub const DomainParticipantImpl = struct {
                     if (d.reader_entity_id.eql(EntityIds.unknown)) {
                         var fan_it = self.active_readers.valueIterator();
                         while (fan_it.next()) |ar| {
-                            const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
+                            const kh = resolveKeyHash(key_hash, ar, d.serialized_payload, kind);
                             ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
                         }
                     } else {
                         const rkey = entityIdKey(d.reader_entity_id);
                         if (self.active_readers.getPtr(rkey)) |ar| {
-                            const kh = resolveKeyHash(key_hash, ar, d.serialized_payload);
+                            const kh = resolveKeyHash(key_hash, ar, d.serialized_payload, kind);
                             ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
                         }
                     }
