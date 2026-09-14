@@ -110,6 +110,14 @@ pub const SpdpEndpoints = struct {
     domain_id: u32,
 
     // RTPS state machines
+    //
+    // `writer` starts null and is published exactly once, in `start()`, under
+    // `mu`. Every other read/write of this field must also go under `mu` (a
+    // snapshot-then-release pattern — never call into the writer itself while
+    // holding `mu`, per the lock-order note on `processSpdpPayload`) even
+    // though the pointer itself never changes after publication: without that,
+    // the initial publish and a concurrent early read (e.g. from the receive
+    // thread right after `transport.listen()` is wired up) race per TSan.
     writer: ?*StatelessWriter,
     reader: StatelessReader,
 
@@ -203,7 +211,14 @@ pub const SpdpEndpoints = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.writer) |w| w.deinit();
+        // No other thread should still be touching `self` by this point
+        // (callers must `stop()`, which joins the timer thread and unlistens
+        // the receive callback, before `deinit()`), but the lock is cheap and
+        // keeps every access to `self.writer` uniformly guarded.
+        self.mu.lock();
+        const w_opt = self.writer;
+        self.mu.unlock();
+        if (w_opt) |w| w.deinit();
         if (self.local_payload) |p| self.alloc.free(p);
         var it = self.known.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit();
@@ -311,26 +326,33 @@ pub const SpdpEndpoints = struct {
         else
             7400;
 
-        // Build the StatelessWriter for the SPDP participant writer.
+        // Build the StatelessWriter for the SPDP participant writer. Built up
+        // fully through a local (`new_writer`) and only published to the
+        // shared `self.writer` field (under `self.mu`) once it's ready to
+        // receive traffic — `self.transport.listen()` below is the point
+        // where another thread first gets a chance to read `self.writer`
+        // (via `onReceive` -> `processSpdpPayload`), and that read is also
+        // taken under `self.mu` (see there), so this publish establishes the
+        // happens-before relationship TSan otherwise flags as a race.
         const writer_guid = Guid{
             .prefix = local.guid.prefix,
             .entity_id = EntityIds.spdp_builtin_participant_writer,
         };
-        self.writer = try StatelessWriter.init(
+        const new_writer = try StatelessWriter.init(
             self.alloc,
             writer_guid,
             self.transport,
             1, // keep_last 1: always the latest announcement
             EntityIds.spdp_builtin_participant_reader,
         );
-        self.writer.?.setTracer(self.tracer);
+        new_writer.setTracer(self.tracer);
 
         // Encode the participant announcement to PL-CDR.
         const payload = try encodeSpdpParticipant(self.alloc, local);
         self.local_payload = payload;
 
         // Store the announcement in the writer cache (SN = 1).
-        _ = try self.writer.?.write(
+        _ = try new_writer.write(
             .alive,
             RtpsTimestamp.now(),
             history_mod.INSTANCE_HANDLE_NIL,
@@ -340,18 +362,22 @@ pub const SpdpEndpoints = struct {
 
         // Register all multicast locators as reader-locators on the SPDP writer.
         for (local.metatraffic_multicast_locators) |loc| {
-            try self.writer.?.addReaderLocator(.{ .locator = loc });
+            try new_writer.addReaderLocator(.{ .locator = loc });
         }
 
         // Register initial_peers as unicast reader-locators so SPDP announcements
         // are sent directly to each configured peer at startup.
         for (local.initial_peers) |peer_str| {
             if (parseLocatorStr(peer_str)) |loc| {
-                self.writer.?.addReaderLocator(.{ .locator = loc }) catch {};
+                new_writer.addReaderLocator(.{ .locator = loc }) catch {};
             } else {
                 log.spdp.warn("spdp: ignoring unparseable initial_peer '{s}'", .{peer_str});
             }
         }
+
+        self.mu.lock();
+        self.writer = new_writer;
+        self.mu.unlock();
 
         // Listen on SPDP multicast port and join the multicast group.
         const listen_locator = Locator.udp4(.{ 0, 0, 0, 0 }, self.spdp_multicast_port);
@@ -369,7 +395,7 @@ pub const SpdpEndpoints = struct {
         // Send an immediate announcement before spawning the timer thread, so
         // there's no window where the timer's first cycle could race this send
         // and both end up transmitting the same SN.
-        self.writer.?.sendAll();
+        new_writer.sendAll();
 
         // Spawn the timer thread.
         self.shutdown.store(false, .release);
@@ -385,7 +411,10 @@ pub const SpdpEndpoints = struct {
     /// a peer's own SPDP dedup logic could (reasonably) mistake for redundant
     /// delivery of one announcement rather than a genuine new one.
     fn reannounce(self: *Self) void {
-        const w = self.writer orelse return;
+        self.mu.lock();
+        const w_opt = self.writer;
+        self.mu.unlock();
+        const w = w_opt orelse return;
         const payload = self.local_payload orelse return;
         _ = w.write(
             .alive,
@@ -494,8 +523,11 @@ pub const SpdpEndpoints = struct {
         vendor_id: header_mod.VendorId,
     ) void {
         // Ignore our own announcements.
-        if (self.writer) |w| {
-            if (w.guid.prefix.eql(guid_prefix)) return;
+        self.mu.lock();
+        const own_writer_guid_prefix = if (self.writer) |w| w.guid.prefix else null;
+        self.mu.unlock();
+        if (own_writer_guid_prefix) |p| {
+            if (p.eql(guid_prefix)) return;
         }
 
         log.spdp.debug("spdp: received from {x}", .{guid_prefix.bytes});
@@ -629,7 +661,10 @@ pub const SpdpEndpoints = struct {
         }
         if (retransmit_locators.len > 0) {
             defer self.alloc.free(retransmit_locators);
-            if (self.writer) |w| {
+            self.mu.lock();
+            const w_opt = self.writer;
+            self.mu.unlock();
+            if (w_opt) |w| {
                 for (retransmit_locators) |loc| w.sendToLocator(loc);
             }
         }
