@@ -1,7 +1,8 @@
 //! Tests for the C-ABI TypeSupport registration shim.
 //!
 //! Verifies that zzdds_register_type_support correctly bridges a C-style
-//! compute_key_hash function pointer into the Zig TypeSupport infrastructure.
+//! compute_key_hash/compute_key_hash_key_only function pointer into the Zig
+//! TypeSupport infrastructure.
 
 const std = @import("std");
 const test_domain = @import("test_domain");
@@ -47,6 +48,21 @@ fn stubComputeKeyHashFromCdr(
     hash_out.*[1] = payload[5];
     hash_out.*[2] = payload[6];
     hash_out.*[3] = payload[7];
+    return 0;
+}
+
+// Distinguishable from stubComputeKeyHashFromCdr above by construction (a
+// constant tag in hash[15], never written by the full-payload stub) -- proves
+// which of the two slots a given call actually reached.
+fn stubComputeKeyHashFromCdrKeyOnly(
+    payload: [*]const u8,
+    len: usize,
+    hash_out: *[16]u8,
+) callconv(.c) c_int {
+    hash_out.* = std.mem.zeroes([16]u8);
+    if (len < 5) return -1;
+    hash_out.*[0] = payload[4];
+    hash_out.*[15] = 0xC0;
     return 0;
 }
 
@@ -118,6 +134,7 @@ test "c_abi TypeSupport: zzdds_register_type_support wires compute_key_hash" {
         "TestType",
         stubComputeKeyHashFromCdr,
         null,
+        null,
     );
     try testing.expectEqual(@as(c_int, 0), rc);
 
@@ -138,6 +155,65 @@ test "c_abi TypeSupport: zzdds_register_type_support wires compute_key_hash" {
     try testing.expectEqualSlices(u8, &std.mem.zeroes([12]u8), hash[4..]);
 }
 
+test "c_abi TypeSupport: zzdds_register_type_support wires compute_key_hash_key_only separately from compute_key_hash" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const rc = c_abi_ts.zzdds_register_type_support(
+        fx.dp_boxed,
+        "KeyOnlyType",
+        stubComputeKeyHashFromCdr,
+        stubComputeKeyHashFromCdrKeyOnly,
+        null,
+    );
+    try testing.expectEqual(@as(c_int, 0), rc);
+
+    const ts = fx.impl().type_support_registry.get("KeyOnlyType");
+    try testing.expect(ts != null);
+    try testing.expect(ts.?.compute_key_hash_key_only != null);
+
+    // A genuine key-only payload: no 4-byte encap header, just the key byte
+    // at offset 4 the way stubComputeKeyHashFromCdrKeyOnly reads it (this
+    // test only needs to prove which stub got called, not a real CDR shape).
+    const payload = [_]u8{ 0, 0, 0, 0, 0x2A };
+    const full_hash = ts.?.compute_key_hash(ts.?.ctx, &payload);
+    const key_only_hash = ts.?.compute_key_hash_key_only.?(ts.?.ctx, &payload);
+
+    // stubComputeKeyHashFromCdrKeyOnly requires len >= 5; the full-payload
+    // stub requires len >= 8, so it returns a zeroed hash for this payload --
+    // itself already proof the two are wired to different functions, and the
+    // 0xC0 tag confirms which one actually ran.
+    try testing.expectEqualSlices(u8, &std.mem.zeroes([16]u8), &full_hash);
+    try testing.expectEqual(@as(u8, 0x2A), key_only_hash[0]);
+    try testing.expectEqual(@as(u8, 0xC0), key_only_hash[15]);
+}
+
+test "c_abi TypeSupport: NULL compute_key_hash_key_only_fn falls back to zero hash" {
+    // TypeSupport.compute_key_hash_key_only itself is always the adapter
+    // method here (same pattern as the required .compute_key_hash field
+    // above it) -- it's the *C function pointer* that's null, and the
+    // adapter checks that internally and returns a zero hash, same outcome
+    // as resolveKeyHash's own "unset" fallback in dcps/participant.zig.
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const rc = c_abi_ts.zzdds_register_type_support(
+        fx.dp_boxed,
+        "NoKeyOnlyType",
+        stubComputeKeyHashFromCdr,
+        null,
+        null,
+    );
+    try testing.expectEqual(@as(c_int, 0), rc);
+
+    const ts = fx.impl().type_support_registry.get("NoKeyOnlyType");
+    try testing.expect(ts != null);
+    try testing.expect(ts.?.compute_key_hash_key_only != null);
+    const payload = [_]u8{ 0, 0, 0, 0, 0x2A };
+    const hash = ts.?.compute_key_hash_key_only.?(ts.?.ctx, &payload);
+    try testing.expectEqualSlices(u8, &std.mem.zeroes([16]u8), &hash);
+}
+
 test "c_abi TypeSupport: NULL participant handle returns error instead of crashing" {
     // Regression test: zidl_rt.unboxAs dereferences its argument
     // unconditionally, so a literal NULL passed by a C caller (a normal,
@@ -148,6 +224,7 @@ test "c_abi TypeSupport: NULL participant handle returns error instead of crashi
         makeNullHandle(),
         "TestType",
         stubComputeKeyHashFromCdr,
+        null,
         null,
     );
     try testing.expectEqual(@as(c_int, -1), rc);
@@ -185,6 +262,7 @@ test "c_abi TypeSupport: zzdds_register_type_support_ctx forwards ctx to every c
         "CtxType",
         stubComputeKeyHashCtx,
         null,
+        null,
         &tag,
         null,
     );
@@ -196,6 +274,41 @@ test "c_abi TypeSupport: zzdds_register_type_support_ctx forwards ctx to every c
     const hash = ts.?.compute_key_hash(ts.?.ctx, &payload);
     try testing.expectEqual(@as(u8, 0xAB), hash[0]);
     try testing.expectEqual(@as(u8, 0x42), hash[1]);
+}
+
+test "c_abi TypeSupport: zzdds_register_type_support_ctx wires compute_key_hash_key_only_fn separately, same ctx" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+
+    var tag: u8 = 0xAB;
+    const rc = c_abi_ts.zzdds_register_type_support_ctx(
+        fx.dp_boxed,
+        "CtxKeyOnlyType",
+        stubComputeKeyHashCtx,
+        stubComputeKeyHashCtx,
+        null,
+        &tag,
+        null,
+    );
+    try testing.expectEqual(@as(c_int, 0), rc);
+
+    const ts = fx.impl().type_support_registry.get("CtxKeyOnlyType");
+    try testing.expect(ts != null);
+    try testing.expect(ts.?.compute_key_hash_key_only != null);
+
+    // Same stub in both slots (it's ctx-only, no separate "key-only" shape
+    // needed to prove the point) but a *different* payload byte per call --
+    // proves compute_key_hash_key_only_fn is a real, independently-invoked
+    // second call, not silently aliasing compute_key_hash_fn, while still
+    // seeing the *same* ctx (tag) both times.
+    const payload_a = [_]u8{0x11};
+    const payload_b = [_]u8{0x22};
+    const hash_a = ts.?.compute_key_hash(ts.?.ctx, &payload_a);
+    const hash_b = ts.?.compute_key_hash_key_only.?(ts.?.ctx, &payload_b);
+    try testing.expectEqual(@as(u8, 0xAB), hash_a[0]);
+    try testing.expectEqual(@as(u8, 0x11), hash_a[1]);
+    try testing.expectEqual(@as(u8, 0xAB), hash_b[0]);
+    try testing.expectEqual(@as(u8, 0x22), hash_b[1]);
 }
 
 test "c_abi TypeSupport: ctx_deinit fires on replace and on participant deinit" {
@@ -210,6 +323,7 @@ test "c_abi TypeSupport: ctx_deinit fires on replace and on participant deinit" 
             "ReplacedType",
             stubComputeKeyHashCtx,
             null,
+            null,
             &tag,
             stubCtxDeinit,
         ));
@@ -222,6 +336,7 @@ test "c_abi TypeSupport: ctx_deinit fires on replace and on participant deinit" 
             fx.dp_boxed,
             "ReplacedType",
             stubComputeKeyHashCtx,
+            null,
             null,
             &tag,
             stubCtxDeinit,
@@ -240,6 +355,7 @@ test "c_abi TypeSupport: ctx_deinit variant NULL participant handle returns erro
         "TestType",
         stubComputeKeyHashCtx,
         null,
+        null,
         &tag,
         null,
     );
@@ -253,6 +369,7 @@ test "c_abi TypeSupport: NULL compute_key_hash registers zeroed-hash fallback" {
     const rc = c_abi_ts.zzdds_register_type_support(
         fx.dp_boxed,
         "KeylessType",
+        null,
         null,
         null,
     );
@@ -311,6 +428,7 @@ test "c_abi TypeSupport: zzdds_register_type_support wires get_field_from_cdr" {
         fx.dp_boxed,
         "FilterableType",
         stubComputeKeyHashFromCdr,
+        null,
         stubGetFieldFromCdr,
     );
     try testing.expectEqual(@as(c_int, 0), rc);
@@ -345,6 +463,7 @@ test "c_abi TypeSupport: NULL get_field_from_cdr leaves TypeSupport.get_field un
         fx.dp_boxed,
         "NoFilterType",
         stubComputeKeyHashFromCdr,
+        null,
         null,
     );
     try testing.expectEqual(@as(c_int, 0), rc);

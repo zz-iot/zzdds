@@ -37,6 +37,16 @@ fn writeNilKey(dw: *DataWriterImpl, payload: []const u8) !void {
     );
 }
 
+fn writeNilKeyKind(dw: *DataWriterImpl, kind: history_mod.ChangeKind, payload: []const u8) !void {
+    _ = try dw.writeRaw(
+        kind,
+        RtpsTimestamp.now(),
+        history_mod.INSTANCE_HANDLE_NIL,
+        std.mem.zeroes([16]u8),
+        payload,
+    );
+}
+
 fn pendingCount(dr: *DataReaderImpl) usize {
     dr.mu.lock();
     defer dr.mu.unlock();
@@ -407,4 +417,99 @@ test "TypeSupport: without has_key, a zero-valued key still falls back to key_ha
     const ih1 = dr.pending.items[1].info.instance_handle;
     dr.mu.unlock();
     try testing.expect(ih0 != ih1);
+}
+
+/// Constant, payload-independent hash -- the only thing this proves is
+/// *which* function `resolveKeyHash` picked, not what it does with the bytes
+/// (that's zidl's job, covered on zidl's own side).
+fn aliveTag(_: *anyopaque, _: []const u8) [16]u8 {
+    var h = std.mem.zeroes([16]u8);
+    h[0] = 0xA1;
+    return h;
+}
+fn keyOnlyTag(_: *anyopaque, _: []const u8) [16]u8 {
+    var h = std.mem.zeroes([16]u8);
+    h[0] = 0xC0;
+    return h;
+}
+
+test "TypeSupport: resolveKeyHash calls compute_key_hash for ALIVE, compute_key_hash_key_only for DISPOSE/UNREGISTER" {
+    // A non-zzdds peer that omits the inline PID_KEY_HASH sends a *complete*
+    // payload for an ALIVE change but a *key-only* one for DISPOSE/UNREGISTER
+    // (RTPS §8.7.9's K-flag convention) -- resolveKeyHash must call the
+    // matching one of the two registered functions, not the same one for
+    // both (see zidl's computeKeyHashFromCdr vs computeKeyHashFromCdrKeyOnly:
+    // feeding a key-only payload to the full-payload decoder misreads it).
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{
+        .ctx = undefined,
+        .compute_key_hash = aliveTag,
+        .compute_key_hash_key_only = keyOnlyTag,
+    });
+
+    const dw_a = fx.makeWriterA(.{});
+    const dr = fx.makeReader(keepAllDrQos());
+
+    try writeNilKeyKind(dw_a, .alive, &PAYLOAD_A);
+    try writeNilKeyKind(dw_a, .not_alive_disposed, &PAYLOAD_A);
+    try writeNilKeyKind(dw_a, .not_alive_unregistered, &PAYLOAD_A);
+
+    try testing.expectEqual(@as(usize, 3), pendingCount(dr));
+    dr.mu.lock();
+    const ih_alive = dr.pending.items[0].info.instance_handle;
+    const ih_disposed = dr.pending.items[1].info.instance_handle;
+    const ih_unregistered = dr.pending.items[2].info.instance_handle;
+    dr.mu.unlock();
+
+    // aliveTag (0xA1) vs keyOnlyTag (0xC0) resolve to different instances --
+    // wrong dispatch (e.g. both calling aliveTag) would collapse these to one.
+    try testing.expect(ih_alive != ih_disposed);
+    // Both non-alive kinds go through compute_key_hash_key_only, so they
+    // land on the *same* instance as each other.
+    try testing.expectEqual(ih_disposed, ih_unregistered);
+}
+
+test "TypeSupport: DISPOSE/UNREGISTER falls back to zero hash, not compute_key_hash, when compute_key_hash_key_only is unregistered" {
+    // A TypeSupport that only sets compute_key_hash (the common case today --
+    // no binding threads compute_key_hash_key_only through the C-ABI yet)
+    // must not let resolveKeyHash reach for compute_key_hash on a key-only
+    // payload: that function assumes a complete sample and would misread it.
+    // The safe fallback is a known zero hash, not a confidently wrong one.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    _ = fx.dpImpl(fx.dp_r).registerTypeSupport("TSType", .{
+        .ctx = undefined,
+        .compute_key_hash = aliveTag,
+    });
+
+    const dw_a = fx.makeWriterA(.{});
+    const dr = fx.makeReader(keepAllDrQos());
+
+    // Two different payloads, both disposed with no inline hash. If the
+    // fallback wrongly called aliveTag (payload-independent, always 0xA1)
+    // they'd still collapse to one instance -- so also prove aliveTag really
+    // is reachable and payload-shape-independent by using it correctly on an
+    // ALIVE write to the same key space in the same test.
+    try writeNilKeyKind(dw_a, .not_alive_disposed, &PAYLOAD_A);
+    try writeNilKeyKind(dw_a, .not_alive_disposed, &PAYLOAD_B);
+    try writeNilKeyKind(dw_a, .alive, &PAYLOAD_A);
+
+    try testing.expectEqual(@as(usize, 3), pendingCount(dr));
+    dr.mu.lock();
+    const ih_disposed_a = dr.pending.items[0].info.instance_handle;
+    const ih_disposed_b = dr.pending.items[1].info.instance_handle;
+    const ih_alive = dr.pending.items[2].info.instance_handle;
+    dr.mu.unlock();
+
+    // Both dispose writes resolve to the zero-hash instance regardless of
+    // payload -- the safe fallback, not aliveTag's constant 0xA1.
+    try testing.expectEqual(ih_disposed_a, ih_disposed_b);
+    // The ALIVE write does reach aliveTag, and the zero-hash fallback used by
+    // the dispose writes is a different instance from aliveTag's hash.
+    try testing.expect(ih_alive != ih_disposed_a);
 }

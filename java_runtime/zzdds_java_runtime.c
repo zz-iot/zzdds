@@ -534,6 +534,14 @@ static JNIEnv *zzdds_java_get_env(void) {
 typedef struct {
     jclass cls;    /* global ref */
     jmethodID mid;
+    /* Optional: resolved from the type's own generated
+     * `computeKeyHashFromCdrKeyOnly` static method (see java.zig's
+     * `Generator.emitStructSerializeFns`). NULL if the class has no such
+     * method (e.g. a hand-written TypeSupport class predating this contract)
+     * -- resolveKeyHash's DISPOSE/UNREGISTER fallback just uses a safe zero
+     * hash for that type instead, same as any other binding's TypeSupport
+     * with a NULL compute_key_hash_key_only_fn. */
+    jmethodID key_only_mid;
     /* Optional: resolved from the type's own generated `getFieldFromCdr`
      * static method (see java.zig's `Generator.emitGetFieldFromCdr`). NULL
      * if the class has no such method (e.g. a hand-written TypeSupport
@@ -543,16 +551,54 @@ typedef struct {
     jmethodID get_field_mid;
 } zzdds_java_ts_ctx;
 
-static int zzdds_java_compute_key_hash_ctx(void *ctx_v, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
-    zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
+/* Shared implementation for zzdds_java_compute_key_hash_ctx and
+ * zzdds_java_compute_key_hash_key_only_ctx below -- they differ only in
+ * which jmethodID they call. Runs on zzdds's own long-lived native receive
+ * thread, not entered via a JNI call from Java, so there is no enclosing
+ * native-method frame to auto-release local references when this returns:
+ * every jbyteArray created or returned here must be explicitly deleted on
+ * every path, or repeated lifecycle traffic (e.g. DISPOSE/UNREGISTER changes
+ * with no inline key hash) accumulates local references without bound for
+ * the life of the thread. Also guards the two other ways a misbehaving or
+ * exception-throwing Java method could corrupt the caller: a pending
+ * exception left on `env` (fatal to every subsequent JNI call on this thread
+ * if not cleared) and a returned array shorter than the 16 bytes
+ * GetByteArrayRegion is about to read.
+ */
+static int zzdds_java_compute_key_hash_impl(zzdds_java_ts_ctx *ctx, jmethodID mid, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
     JNIEnv *env = zzdds_java_get_env();
     if (env == NULL) return -1;
     jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
+    if (arr == NULL) {
+        /* OOM: NewByteArray leaves an exception pending. */
+        (*env)->ExceptionClear(env);
+        return -1;
+    }
     (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte *)payload);
-    jbyteArray hash = (jbyteArray)(*env)->CallStaticObjectMethod(env, ctx->cls, ctx->mid, arr);
+    jbyteArray hash = (jbyteArray)(*env)->CallStaticObjectMethod(env, ctx->cls, mid, arr);
+    (*env)->DeleteLocalRef(env, arr);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return -1;
+    }
     if (hash == NULL) return -1;
-    (*env)->GetByteArrayRegion(env, hash, 0, 16, (jbyte *)hash_out);
-    return 0;
+    int rc = (*env)->GetArrayLength(env, hash) >= 16 ? 0 : -1;
+    if (rc == 0) (*env)->GetByteArrayRegion(env, hash, 0, 16, (jbyte *)hash_out);
+    (*env)->DeleteLocalRef(env, hash);
+    return rc;
+}
+
+static int zzdds_java_compute_key_hash_ctx(void *ctx_v, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
+    zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
+    return zzdds_java_compute_key_hash_impl(ctx, ctx->mid, payload, len, hash_out);
+}
+
+/* Trampoline for the compute_key_hash_key_only_fn slot (zzdds_c.h) -- calls
+ * computeKeyHashFromCdrKeyOnly instead of computeKeyHashFromCdr. Only
+ * installed when key_only_mid resolved (see registerTypeSupport below). */
+static int zzdds_java_compute_key_hash_key_only_ctx(void *ctx_v, const uint8_t *payload, size_t len, uint8_t hash_out[16]) {
+    zzdds_java_ts_ctx *ctx = (zzdds_java_ts_ctx *)ctx_v;
+    return zzdds_java_compute_key_hash_impl(ctx, ctx->key_only_mid, payload, len, hash_out);
 }
 
 /* Trampoline for zzdds_get_field_from_cdr_ctx_fn (zzdds_c.h) -- calls the
@@ -681,18 +727,21 @@ JNIEXPORT jint JNICALL Java_io_zzdds_runtime_ZzddsRuntime_registerTypeSupport(
     }
     /* Optional (see zzdds_java_ts_ctx's doc comment) -- clear the pending
      * NoSuchMethodError rather than letting it propagate, unlike mid above. */
+    ctx->key_only_mid = (*env)->GetStaticMethodID(env, typeClass, "computeKeyHashFromCdrKeyOnly", "([B)[B");
+    if (ctx->key_only_mid == NULL) (*env)->ExceptionClear(env);
     ctx->get_field_mid = (*env)->GetStaticMethodID(env, typeClass, "getFieldFromCdr", "([BLjava/lang/String;)Ljava/lang/Object;");
     if (ctx->get_field_mid == NULL) (*env)->ExceptionClear(env);
 
     const char *type_name_c = (*env)->GetStringUTFChars(env, typeName, NULL);
-    /* Only wire the get_field trampoline in when the class actually has a
-     * getFieldFromCdr to call -- passing it unconditionally would still
-     * behave correctly (the trampoline itself checks get_field_mid and
-     * returns false, which zzdds's filter evaluator treats the same as "no
-     * get_field": pass every sample through), but skips a pointless
-     * per-field JNI round trip for a class that will never resolve one. */
+    /* Only wire each optional trampoline in when the class actually has the
+     * matching method to call -- passing it unconditionally would still
+     * behave correctly (each trampoline checks its own mid and reports "no
+     * value", which resolveKeyHash/zzdds's filter evaluator both already
+     * treat as a safe default), but skips a pointless JNI round trip for a
+     * class that will never resolve one. */
+    zzdds_compute_key_hash_ctx_fn key_only_fn = ctx->key_only_mid != NULL ? zzdds_java_compute_key_hash_key_only_ctx : NULL;
     zzdds_get_field_from_cdr_ctx_fn get_field_fn = ctx->get_field_mid != NULL ? zzdds_java_get_field_from_cdr_ctx : NULL;
-    int rc = zzdds_register_type_support_ctx(p, type_name_c, zzdds_java_compute_key_hash_ctx, get_field_fn, ctx, zzdds_java_ts_ctx_deinit);
+    int rc = zzdds_register_type_support_ctx(p, type_name_c, zzdds_java_compute_key_hash_ctx, key_only_fn, get_field_fn, ctx, zzdds_java_ts_ctx_deinit);
     (*env)->ReleaseStringUTFChars(env, typeName, type_name_c);
 
     if (rc != 0) {

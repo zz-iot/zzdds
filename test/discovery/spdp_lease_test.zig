@@ -750,3 +750,56 @@ test "SPDP: SEDP-traffic-seen heuristic does not retransmit on same-SN duplicate
     spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
     try testing.expectEqual(@as(usize, 1), peer_mt.queueLen());
 }
+
+// ── Regression: start() must not leak the writer on partial-init failure ──
+//
+// Greptile review (PR #86): the self.writer-publish race fix (see spdp.zig's
+// `start()`) restructured writer setup to build a local `new_writer` and only
+// publish it to `self.writer` (under `self.mu`) once fully configured. That
+// left a gap: if a `try` between `StatelessWriter.init` and the publish
+// fails (encodeSpdpParticipant, the initial cache write, or a reader-locator
+// registration are all allocation points), `new_writer` was already
+// allocated but never reachable from `self.writer` and never freed. Fixed
+// with an ownership-transfer `errdefer` (`writer_published` guard). This
+// test forces the allocation immediately after the writer's own `create`
+// (i.e. the first allocation start() makes on its behalf, inside
+// encodeSpdpParticipant) to fail, and relies on `testing.allocator`'s
+// leak detection to catch a regression.
+test "SPDP: start() does not leak the writer when a later allocation fails" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+
+    const local = ParticipantAnnouncement{
+        .guid = .{ .prefix = prefix(0x03), .entity_id = iface.EntityIds.participant },
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &.{},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 10_000,
+        .builtin_endpoint_set = 0,
+    };
+
+    // alloc_index 0 is StatelessWriter.init's own `alloc.create(Self)` (its
+    // HistoryCache/reader_locators fields don't allocate until first used) --
+    // that must succeed so `new_writer` exists and this test actually
+    // exercises the post-creation failure path. alloc_index 1 is the next
+    // allocation start() makes (inside encodeSpdpParticipant), which must
+    // fail and trigger the errdefer.
+    var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    spdp.alloc = fa.allocator();
+    defer spdp.alloc = alloc;
+
+    try testing.expectError(error.OutOfMemory, spdp.start(&local, &c));
+}

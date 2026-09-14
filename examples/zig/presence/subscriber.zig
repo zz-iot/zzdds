@@ -131,6 +131,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "PresenceBeacon", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = presence_gen.PresenceBeacon.computeKeyHashFromCdr,
+        .compute_key_hash_key_only = presence_gen.PresenceBeacon.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);

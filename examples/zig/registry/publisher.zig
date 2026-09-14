@@ -91,6 +91,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "SensorReading", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = registry_gen.SensorReading.computeKeyHashFromCdr,
+        .compute_key_hash_key_only = registry_gen.SensorReading.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);

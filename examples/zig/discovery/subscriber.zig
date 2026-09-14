@@ -114,6 +114,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, TOPIC_NAME, .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = ping_gen.DiscoveryPing.computeKeyHashFromCdr,
+        .compute_key_hash_key_only = ping_gen.DiscoveryPing.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});
         std.process.exit(1);

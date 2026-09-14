@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (zzdds_register_type_support(dp, "PresenceBeacon", PresenceBeacon_compute_key_hash_from_cdr, PresenceBeacon_get_field_from_cdr) != DDS_RETCODE_OK) {
+    if (PresenceBeaconTypeSupport_register(dp, "PresenceBeacon") != DDS_RETCODE_OK) {
         fprintf(stderr, "FAIL: register_type_support failed\n");
         return 1;
     }

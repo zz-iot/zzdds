@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (zzdds_register_type_support(dp, "HistoryEvent", HistoryEvent_compute_key_hash_from_cdr, HistoryEvent_get_field_from_cdr) != DDS_RETCODE_OK) {
+    if (HistoryEventTypeSupport_register(dp, "HistoryEvent") != DDS_RETCODE_OK) {
         fprintf(stderr, "FAIL: register_type_support failed\n");
         return 1;
     }

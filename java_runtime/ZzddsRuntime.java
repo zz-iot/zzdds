@@ -43,22 +43,33 @@ public final class ZzddsRuntime {
     /**
      * Registers `typeClass`'s TypeSupport with zzdds under `typeName`.
      * `typeClass` must declare a `static byte[] computeKeyHashFromCdr(byte[])`
-     * method (zidl generates this on every topic struct, keyed or keyless).
+     * method (zidl generates this on every topic struct, keyed or keyless) —
+     * used to derive an instance handle for a received complete ALIVE sample
+     * that carries no inline key hash.
      *
-     * `typeClass` may additionally declare a
-     * `static Object getFieldFromCdr(byte[] payload, String field)` method
-     * (zidl generates this on every topic struct too) — when present, a
-     * `DataReader` created against a `ContentFilteredTopic` for this type
-     * filters automatically, at the reader layer, with no app-side
-     * re-checking. Returns `null` for an unknown field, a boxed
-     * `Long`/`Double` for an int-like/float-like field, or a `String` for a
-     * string-like one. Optional: a `typeClass` without one still registers
-     * fine, it just gets no automatic CFT filtering (every sample passes
-     * through unfiltered, the same as any other binding's TypeSupport with
-     * a NULL get_field callback).
+     * `typeClass` may additionally declare:
+     *
+     * - `static byte[] computeKeyHashFromCdrKeyOnly(byte[])` (zidl generates
+     *   this alongside `computeKeyHashFromCdr`) — the same fallback, but for
+     *   a received DISPOSE/UNREGISTER sample, whose payload is a genuine
+     *   key-only CDR encoding (RTPS §8.7.9's K-flag convention), not a
+     *   complete sample. Optional: without it, that case falls back to a
+     *   safe zero hash instead (an incomplete instance handle for that type,
+     *   not a wrong one — `computeKeyHashFromCdr` assumes a complete sample
+     *   and would misread a key-only payload).
+     * - `static Object getFieldFromCdr(byte[] payload, String field)` method
+     *   (zidl generates this on every topic struct too) — when present, a
+     *   `DataReader` created against a `ContentFilteredTopic` for this type
+     *   filters automatically, at the reader layer, with no app-side
+     *   re-checking. Returns `null` for an unknown field, a boxed
+     *   `Long`/`Double` for an int-like/float-like field, or a `String` for a
+     *   string-like one. Optional: a `typeClass` without one still registers
+     *   fine, it just gets no automatic CFT filtering (every sample passes
+     *   through unfiltered, the same as any other binding's TypeSupport with
+     *   a NULL get_field callback).
      *
      * Backed by `zzdds_register_type_support_ctx` (see `zzdds_c.h`), which
-     * forwards a per-registration native context to both callbacks —
+     * forwards a per-registration native context to all three callbacks —
      * unbounded (no fixed slot count) and reclaimed automatically when this
      * registration is replaced or `participant` is destroyed.
      */

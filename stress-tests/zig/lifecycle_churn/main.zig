@@ -232,6 +232,7 @@ fn runEntities(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
     })) {
         fail("registerTypeSupport");
@@ -471,6 +472,7 @@ fn runWaitset(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
         .get_field = gen.Message.getFieldFromCdr,
     })) {
@@ -661,6 +663,7 @@ fn runListener(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
     })) {
         fail("registerTypeSupport");
@@ -826,6 +829,7 @@ fn runCft(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
         .get_field = gen.Message.getFieldFromCdr,
     })) {
@@ -956,6 +960,7 @@ fn participantsThread(ctx: ParticipantsCtx) void {
         if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
             .ctx = @ptrCast(&g_ts_alloc),
             .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+            .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
             .has_key = gen.Message.has_key,
         })) {
             fail("participants: registerTypeSupport");
@@ -1177,6 +1182,7 @@ fn runInstance(io: std.Io, cfg: Config) !void {
     if (!zzdds.registerTypeSupport(dp, TYPE_NAME, .{
         .ctx = @ptrCast(&g_ts_alloc),
         .compute_key_hash = gen.Message.computeKeyHashFromCdr,
+        .compute_key_hash_key_only = gen.Message.computeKeyHashFromCdrKeyOnly,
         .has_key = gen.Message.has_key,
     })) {
         fail("registerTypeSupport");

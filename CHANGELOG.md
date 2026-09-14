@@ -8,6 +8,79 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-14
+
+- **`resolveKeyHash`'s fallback now dispatches on change kind, not one shared function for
+  both ALIVE and DISPOSE/UNREGISTER.** Found via the `instance` stress scenario
+  (`stress-tests/README.md`): a non-zzdds peer that omits the inline `PID_KEY_HASH` sends a
+  *complete* payload for an ALIVE change but a *key-only* one for DISPOSE/UNREGISTER (RTPS
+  §8.7.9's K-flag convention) — calling the same reconstruction function for both misreads
+  one of the two shapes. This depends on zidl splitting `computeKeyHashFromCdr` into a
+  full-payload-safe default and a `computeKeyHashFromCdrKeyOnly` sibling (zidl PR, same
+  date) — the unsuffixed name changing meaning is a drop-in swap for the ALIVE case (no
+  zzdds source change needed there), but the DISPOSE/UNREGISTER case needs its own callback.
+  - `TypeSupport` gained an optional `compute_key_hash_key_only` field alongside the
+    existing `compute_key_hash` (now documented as the ALIVE/full-payload one).
+    `ActiveReader` gained a matching `key_hash_only_fn`, set alongside `key_hash_fn` at
+    reader-creation and TypeSupport-replacement-refresh time.
+  - `resolveKeyHash` now takes the change's `kind` (already in scope at all three call
+    sites) and picks `key_hash_fn` for `.alive`, `key_hash_only_fn` otherwise. When a
+    registration leaves the new field unset, it falls back to `zeroes([16]u8)` rather than
+    risk calling the ALIVE-shaped function on a key-only payload — a known incomplete
+    instance handle for that registration instead of a confidently wrong one.
+  - The C-ABI surface the C/C++/Java bindings register through
+    (`zzdds_register_type_support`/`_ctx`) now also carries the key-only function pointer —
+    see the entry directly below. Every one of zzdds's own `examples/`/`stress-tests/`
+    registrations passes it.
+  - Regression: `test/dcps/type_support_test.zig` — two new tests, one proving the kind-based
+    dispatch (distinct constant-hash functions per kind, asserted via resulting instance
+    handles), one proving the zero-hash fallback when `compute_key_hash_key_only` is
+    unregistered. Both verified to actually fail against the pre-fix dispatch (reverted
+    locally and re-run) before landing.
+  - zidl pin → `v0.3.17-zig.0.16.0` (`build.zig.zon`), the tagged release containing the
+    `computeKeyHashFromCdr` split (zidl PR #52). Developed and verified against a `.path`
+    override of the unreleased branch; re-verified against the real tag once it landed.
+
+- **`zzdds_register_type_support`/`_ctx` (the C-ABI TypeSupport registration surface the
+  C/C++/Java bindings all funnel through) gained a `compute_key_hash_key_only_fn`
+  parameter**, closing the gap the entry above left open. Both entry points now take it as
+  a new argument (inserted right after `compute_key_hash_fn`) and thread it into the new
+  `TypeSupport.compute_key_hash_key_only` field via `c_abi/typesupport.zig`'s two adapters
+  (`CTypeSupportAdapter`/`CtxTypeSupportAdapter`), each gaining a matching
+  `computeKeyHashKeyOnly` method. `include/zzdds_c.h` updated to match.
+  - **zidl side**: the C and C++ backends' generated `{Type}TypeSupport_register(...)`
+    wrapper now passes `{Type}_compute_key_hash_from_cdr_key_only` too — a C++ consumer
+    (which always goes through that generated wrapper) needed no source change at all.
+  - **Java/JNI**: `zzdds_java_runtime.c`'s `registerTypeSupport` now also resolves
+    `computeKeyHashFromCdrKeyOnly` via `GetStaticMethodID` (optional — cleared like
+    `getFieldFromCdr`'s lookup if the class predates this contract) and wires a new
+    `zzdds_java_compute_key_hash_key_only_ctx` trampoline. Java examples needed no source
+    change either (reflection-based).
+  - **C examples**: unlike C++ (which always calls the generated
+    `{Type}TypeSupport::register_type(dp)` wrapper), every one of these called
+    `zzdds_register_type_support` directly, naming the generated key-hash/get-field
+    functions explicitly — an unexplained asymmetry with no documented rationale, and
+    exactly the fragility that made this a mandatory 19-file fix instead of a no-op. Fixed
+    at the root instead of just patched: all 19 call sites across `examples/c/*/src/*.c`
+    now call the generated `{Type}TypeSupport_register(dp, type_name)` wrapper too (which
+    the C backend already generated, unused, alongside C++'s), matching C++'s pattern and
+    insulating the examples from any future C-ABI signature change the way C++ already was.
+  - **Native Zig registrations**: `examples/zig/*/{publisher,subscriber}.zig` (15 files) and
+    `stress-tests/zig/{entity_lifecycle_stress,lifecycle_churn}/main.zig` (7 call sites)
+    now all pass `.compute_key_hash_key_only = {Type}.computeKeyHashFromCdrKeyOnly` too.
+  - Regression: `test/c_abi/typesupport_test.zig` — new tests for both entry points proving
+    `compute_key_hash_key_only_fn` is wired to a real, independently-callable second slot
+    (not aliased to `compute_key_hash_fn`) and that a `NULL` value falls back to a zero hash
+    rather than leaving the field genuinely unset (it's the same "always wire the adapter
+    method, let the method check its own null" pattern the pre-existing, required
+    `compute_key_hash_fn` slot already used).
+  - Verified end to end against the real generated+compiled artifacts, not just unit tests,
+    re-run after the C-examples wrapper switch above: `examples/c/hello_world`,
+    `custom-allocator`, and `discovery` all built via CMake against a real
+    `zig build install` tree, `hello_world` actually run (publisher/subscriber exchanged all
+    10 samples); every `examples/zig/*` and `stress-tests/zig/*` binary built standalone;
+    `lifecycle_churn --scenario instance` run for real (`SUMMARY: OK`); TSan clean.
+
 ## 2026-09-13
 
 - **SPDP discovery codec is now zidl-generated too**, completing the SEDP swap

@@ -93,22 +93,17 @@ Forward-looking only: known gaps, planned features, and open design questions.
     inline `PID_KEY_HASH` on **every** sample (RTPS §8.7.9), including a zero-valued key —
     previously suppressed as all-zeros — so the subscriber routes by the wire hash and
     never reconstructs one from the payload. `resolveKeyHash` also now honours a *present*
-    all-zero `PID_KEY_HASH` instead of treating it as "recompute". Residual: a non-zzdds
-    peer that omits the inline hash for an alive keyed sample still falls to
-    `key_hash_fn`; see the selective-CDR-parse follow-ups below.
-- **`key_hash_fn` reconstructs a non-leading `@key` incorrectly** — `resolveKeyHash`'s
-  fallback (`TypeSupport.compute_key_hash`, whose contract is "full CDR wire payload in,
-  16-byte hash out") is served by zidl's generated `computeKeyHashFromCdr`, which runs the
-  **key-only** deserializer and so only reads a leading, contiguous key correctly. A
-  non-leading `@key` member (e.g. `Message.subject_id`, member 3) is misread. The
-  zzdds→zzdds case is fixed (keyed writers now always send inline `PID_KEY_HASH`, so the
-  fallback isn't reached); the remaining case is a non-zzdds peer that omits the inline
-  hash for an alive keyed sample. Fix: route the fallback through
-  `deserialize_selected(KEY_FIELD_MASK)` on a full payload while keeping the key-only path
-  for genuine DISPOSE/UNREGISTER payloads (distinguish via the DATA submessage K flag).
-  The selective parser is available (zidl v0.3.12, pinned), but wiring `key_hash_fn` onto
-  it needs a `TypeSupport.compute_key_hash` signature change (`is_key_only: bool`) + C-ABI
-  mirror + a further zidl release.
+    all-zero `PID_KEY_HASH` instead of treating it as "recompute".
+  - *Fixed for a non-zzdds peer omitting the inline hash* (2026-09-14, zidl pin →
+    `v0.3.17`): `resolveKeyHash` now dispatches on change kind — `TypeSupport.compute_key_hash`
+    (zidl's `computeKeyHashFromCdr`, `deserializeSelected(KEY_FIELD_MASK)`-based, reads a
+    non-leading `@key` correctly) for ALIVE, `TypeSupport.compute_key_hash_key_only` (zidl's
+    `computeKeyHashFromCdrKeyOnly`) for DISPOSE/UNREGISTER's genuine key-only payload. Wired
+    end to end: the C-ABI surface every binding registers through
+    (`zzdds_register_type_support`/`_ctx`) carries the new function pointer, the C/C++ zidl
+    backends' generated registration wrapper passes it, Java's JNI bridge resolves it by
+    reflection, and every one of zzdds's own `examples/`/`stress-tests/` registrations
+    passes it — see `CHANGELOG.md` 2026-09-14. Closed; not a gap anymore.
 
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
@@ -132,10 +127,6 @@ or an optimisation on an already-improved path):
   accept this later without rework). ~1 day with full-decode of wanted nested structs,
   ~2 days fully selective. Impact of deferring: a nested field reference silently never
   matches (unknown field → `eval` passes the sample) — a pre-existing gap.
-- **`computeKeyHashFromCdr` full-payload path** — see the `key_hash_fn` bullet above. The
-  zzdds→zzdds mitigation has landed; routing the fallback itself through
-  `deserialize_selected` (for non-zzdds peers) still needs the `compute_key_hash`
-  signature change + a further zidl release.
 - **`on_inconsistent_topic` and `on_data_on_readers` have zero firing sites** — the
   underlying status detection is not wired up.
 - **`SampleInfo` `sample_rank` / `generation_rank` / `absolute_generation_rank`** stay at
@@ -286,8 +277,9 @@ model:
   selective-parse family; landed here with the zidl v0.3.12 pin, the scenario now asserts
   the returned key value; (2) `resolveKeyHash` misroute
   for a zero-valued key — mitigated (keyed writers now always send inline `PID_KEY_HASH`;
-  present all-zero hash honoured), with the `key_hash_fn` full-payload path itself tracked
-  as a selective-parse follow-up. See `stress-tests/README.md`. Remaining stress ideas: a
+  present all-zero hash honoured), with the full-payload path itself fixed 2026-09-14 (see
+  "Keyed-instance handle without a wire key-hash" above). See `stress-tests/README.md`.
+  Remaining stress ideas: a
   scenario that also churns the reader-side WaitSet/condition graph under participant
   churn; a Bench-style discovery-latency measurement (explicitly out of scope for this
   tier). Plus a loaned-read example (loan lifecycle has zero C/C++ coverage today —
