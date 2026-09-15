@@ -210,7 +210,7 @@ jobs:
     needs: [prepare, test]
     runs-on: ubuntu-latest
     env:
-      INTEROP_RTPS_REF: zenzen-41bc178
+      INTEROP_RTPS_REF: zenzen-d51969c
 
     steps:
       - name: Check out zzdds
