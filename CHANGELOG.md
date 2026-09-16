@@ -8,6 +8,46 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-16
+
+- **`userDataOnReceive` also listens on the metatraffic unicast port, fixing a
+  zzdds-as-publisher regression against hdds (Durability/OrderedAccess, ACKNACK-gated
+  tests).** Found via the `zz-iot/dds-rtps` interop matrix (0.2.0 vs. 0.3.1 comparison,
+  2026-09-15): a writer/reader with no explicit SEDP locator inherits the participant's
+  `default_unicast_locator`, distinct from `metatraffic_unicast_locator` per RTPS §8.5.4 —
+  zzdds correctly advertises both as separate ports (confirmed on the wire), but hdds's
+  reader unconditionally routes ACKNACK/HEARTBEAT/GAP to `metatraffic_unicast_locator`
+  regardless of entity kind (confirmed directly against hdds's own source,
+  `hdds-team/hdds:crates/hdds/src/dds/reader/heartbeat.rs`'s `resolve_metatraffic_dest`,
+  tagged `v219` — added to work around an unrelated FastDDS quirk, applied too broadly).
+  `src/discovery/sedp.zig`'s `onReceive`, the sole listener on the metatraffic port, only
+  recognizes builtin SPDP/SEDP/WLP entities, so the misdirected traffic was silently
+  dropped — the writer's `suppress_live_data` durability-replay gate only ever clears
+  inside `handleAckNack`, which was never reached, so no live data was ever sent.
+  - Fix: `participant.zig`'s `start()` now also registers `userDataOnReceive` on the
+    metatraffic port (when it's a genuinely different port from the dedicated data-listen
+    port), as a second fan-out handler via `Transport.listen()`'s existing
+    reuse-`PortEntry`-via-`addHandler` path. `sedp.zig` is untouched — SEDP still only
+    knows about builtin entities, `userDataOnReceive` still only knows about
+    `active_writers`/`active_readers`; the two dispatchers stay fully decoupled, they just
+    both now see metatraffic-port traffic.
+  - Corrected two comments asserting the wrong reason WLP shares SEDP's listener instead
+    of opening its own (`src/discovery/wlp.zig`, `docs/roadmap.md`) — `vtListen`'s
+    reuse-existing-`PortEntry` path has existed since the initial commit; it was never a
+    transport limitation.
+  - `hdds` promoted into `ci.yml`'s gated default vendor matrix so a regression on either
+    side gets caught automatically going forward.
+  - Verified against the actual regression set (`Test_Durability_{5,9,10,13,14,15,17}`,
+    `Test_OrderedAccess_{11..17}`, all previously failing 100% reproducibly against hdds,
+    now passing) plus zzdds-self, connext, and coredx sanity checks (no change in
+    behavior — the new listener only ever matters for a peer that sends to the wrong
+    port).
+  - Longer-term direction (not this change): `docs/design/rtps-submessage-routing.md`
+    proposes routing decoded submessages by entity ID instead of registering more
+    listeners — would make this whole class of "peer sent to an unexpected port" issue
+    structurally impossible, at the cost of a real `ReceiveHandler` contract change.
+    Deliberately deferred; not scheduled.
+
 ## 2026-09-14
 
 - **`resolveKeyHash`'s fallback now dispatches on change kind, not one shared function for

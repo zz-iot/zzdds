@@ -50,10 +50,23 @@ Forward-looking only: known gaps, planned features, and open design questions.
   `BEST_EFFORT_PARTICIPANT_MESSAGE_DATA_READER` in `builtinEndpointQos`, is not implemented.
   (AUTOMATIC's `lease/3`-floored-at-100ms send period is a deliberate simplification, not a
   gap.)
-- **One downstream listener per port** — SPDP's single `sedp_ctx` slot is fanned out to
-  SEDP + WLP via a shim, and WLP shares SEDP's metatraffic unicast listener rather than
-  opening its own. A deliberate workaround for a transport that can't bind two independent
-  listeners to one port.
+- **SPDP's single downstream slot** — SPDP's single `sedp_ctx` slot is fanned out to SEDP +
+  WLP via a shim (`combined.zig`'s `DiscoveredFanout`). Still current. WLP itself sharing
+  SEDP's metatraffic unicast listener rather than opening its own is *not* a transport
+  limitation, though — `vtListen` has supported a second `listen()` call sharing one
+  `PortEntry` via `addHandler` since the initial commit (see
+  `docs/design/rtps-submessage-routing.md` §6; `participant.zig`'s `userDataOnReceive`
+  does exactly this for the same port as of 2026-09-16). WLP is a reasonable candidate to
+  migrate onto a plain second `listen()` call, decoupling it from SEDP's internals — small,
+  low-risk, not yet done.
+- **Entity-ID-based RTPS submessage routing** — today, every handler registered on a port
+  independently re-parses the full raw message and filters for entity IDs it owns
+  (`sedp.zig`'s `onReceive`, `participant.zig`'s `userDataOnReceive`). A single shared
+  parse, routing each decoded submessage to the one handler responsible for its entity ID
+  (builtin vs. user, cheaply classified from the entity kind's own bit pattern — see the
+  doc), would remove the redundant parsing and make which physical port a peer sends to
+  irrelevant. Bigger than it looks: changes `ReceiveHandler`'s contract everywhere it's
+  implemented. Not scheduled. `design/rtps-submessage-routing.md`.
 - **Lock-order-cycle fix (unlock-before-send) not applied everywhere** — `sendAckNackLocked`
   / `handleHeartbeat`'s proxy-loop path (`reader_sm.zig`) and fragmented-change sends
   (`sendFragsToProxyLocked`, `writer_sm.zig`) still send under lock. Out of scope for the

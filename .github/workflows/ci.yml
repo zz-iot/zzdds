@@ -843,9 +843,22 @@ jobs:
           # normal + TSan + DebugAllocator lanes) — a standing "did HEAD regress
           # vs the last published snapshot" signal, and sanitizer-lane coverage
           # the released binary does not get in the omg-dds workflow.
+          #
+          # hdds is promoted (2026-09-16): the 0.2.0->0.3.1 zzdds-as-publisher
+          # regression (Durability/OrderedAccess, all ACKNACK-gated) was
+          # root-caused to hdds unconditionally routing ACKNACK/HEARTBEAT/GAP
+          # to the remote participant's metatraffic_unicast_locator rather
+          # than default_unicast_locator for non-builtin writers/readers
+          # (confirmed against hdds-team/hdds's own source,
+          # crates/hdds/src/dds/reader/heartbeat.rs's resolve_metatraffic_dest,
+          # tagged v219). Fixed on zzdds's side by also listening for
+          # userDataOnReceive traffic on the metatraffic port (participant.zig
+          # start()); see docs/design/rtps-submessage-routing.md §6. Gated so a
+          # future regression on either side gets caught automatically.
           DEFAULT_PREFIXES = [
               'connext_dds',
               'eclipse_cyclone',
+              'hdds',
               'toc_coredx_dds',
               'zzdds',
           ]

@@ -915,6 +915,13 @@ pub const DomainParticipantImpl = struct {
     /// 0 = not yet listening (before start()).  Used by deinit() to unlisten.
     data_listen_port: u16,
 
+    /// Metatraffic port userDataOnReceive was *also* registered on as a
+    /// robustness fallback (see start()), if any. 0 = not registered there
+    /// (TCP, or meta_port == data_listen_port already). Used by deinit() to
+    /// unlisten -- must mirror start()'s registration exactly, or a packet
+    /// arriving after teardown calls userDataOnReceive with a freed `self`.
+    meta_userdata_listen_port: u16,
+
     /// Wire tracer applied to all user-plane protocol adapters (zero-size when disabled).
     tracer: trace_mod.Tracer,
 
@@ -1036,6 +1043,7 @@ pub const DomainParticipantImpl = struct {
                 .on_wlp_alive = wlpAliveFromDiscovery,
             },
             .data_listen_port = 0,
+            .meta_userdata_listen_port = 0,
             .tracer = tracer,
             .timer_clock = timer_clock,
             .mu = .{},
@@ -1202,6 +1210,69 @@ pub const DomainParticipantImpl = struct {
             });
         }
 
+        // Also register userDataOnReceive on the metatraffic unicast port,
+        // when it's a genuinely different port from the data-listen port
+        // above (skip for TCP -- no shared-port concept there, and no
+        // meta_locators to derive a port from).
+        //
+        // RTPS §8.5.4 gives a writer/reader with no explicit SEDP locator a
+        // participant-level fallback: metatraffic_unicast_locator_list for
+        // builtin SPDP/SEDP endpoints, default_unicast_locator_list for
+        // everything else. zzdds advertises these correctly as distinct
+        // locators (confirmed on the wire), but at least one real peer
+        // (hdds, confirmed from its own source: resolve_metatraffic_dest in
+        // dds/reader/heartbeat.rs) sends ACKNACK/HEARTBEAT/GAP for *any*
+        // writer/reader -- builtin or not -- to metatraffic_unicast_locator
+        // unconditionally. SEDP's onReceive (src/discovery/sedp.zig) only
+        // recognizes builtin SPDP/SEDP/WLP entities, so without this,
+        // protocol traffic for a user writer/reader that lands here is
+        // silently dropped and reliable delivery stalls forever.
+        //
+        // This is deliberately a second transport-level listener, not a
+        // callback threaded through SEDP: vtListen already supports two
+        // listen() calls sharing one PortEntry via addHandler (see its own
+        // doc comment) -- the same mechanism used internally for wildcard +
+        // loopback sockets sharing a port. userDataOnReceive runs completely
+        // unmodified and keeps deciding for itself, by entity ID, what it
+        // owns; SEDP is untouched and still only knows about builtin
+        // entities. The metatraffic port simply gets a second listener, the
+        // same as any other locally-owned port would.
+        if (!self.config.transport.tcp.enabled) {
+            var meta_port: u16 = 0;
+            for (meta_locators.items) |loc| {
+                switch (loc) {
+                    .udp_v4 => |u| {
+                        meta_port = u.port;
+                        break;
+                    },
+                    else => {},
+                }
+            }
+            if (meta_port != 0 and meta_port != self.data_listen_port) {
+                const meta_listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, meta_port);
+                // Best-effort: this is a robustness addition (see the comment
+                // above), not a hard requirement. UdpTransport supports a
+                // second listen() call sharing one PortEntry via addHandler,
+                // but MockTransport/MemoryTransport (test-only, used for fast
+                // in-process integration tests) don't -- they return
+                // error.PortAlreadyListening for any second listen() on a
+                // port, since SEDP already listens on the metatraffic port
+                // by this point. Failing participant start() over a transport
+                // not supporting an extra safety net would be worse than not
+                // having the safety net; just skip it.
+                if (self.discovery_transport.listen(&meta_listen_loc, transport_if.ReceiveHandler{
+                    .ctx = self,
+                    .on_receive = userDataOnReceive,
+                })) |_| {
+                    // Only record success: deinit() unlistens iff this is
+                    // nonzero, and must mirror exactly what got registered.
+                    self.meta_userdata_listen_port = meta_port;
+                } else |err| {
+                    log_mod.dcps.debug("participant: could not also listen for user-data traffic on the metatraffic port ({s}) -- continuing without this fallback", .{@errorName(err)});
+                }
+            }
+        }
+
         // Last step, deliberately: no thread exists yet at this point, so a
         // spawn failure here needs no stop/join cleanup of its own. Without
         // this thread, DEADLINE/LIVELINESS enforcement never fires with
@@ -1283,6 +1354,18 @@ pub const DomainParticipantImpl = struct {
         if (self.data_listen_port != 0) {
             const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
             self.transport.unlisten(&loc, transport_if.ReceiveHandler{
+                .ctx = self,
+                .on_receive = userDataOnReceive,
+            });
+        }
+        // Mirror start()'s metatraffic-port fallback registration, if any --
+        // otherwise a packet arriving on that port after this point calls
+        // userDataOnReceive with a freed `self` (SEDP's own registration on
+        // the same PortEntry is unaffected; self.discovery.stop() above
+        // handles that side).
+        if (self.meta_userdata_listen_port != 0) {
+            const meta_loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.meta_userdata_listen_port);
+            self.discovery_transport.unlisten(&meta_loc, transport_if.ReceiveHandler{
                 .ctx = self,
                 .on_receive = userDataOnReceive,
             });

@@ -186,8 +186,14 @@ pub const WlpEndpoints = struct {
 
         // WLP does not open its own transport listener -- it shares SEDP's
         // metatraffic unicast listener (see tryHandleFromSedp / combined.zig's
-        // setWlpDispatch wiring), since the transport does not support two
-        // independent listeners bound to the same port.
+        // setWlpDispatch wiring). Not a transport limitation: vtListen has
+        // supported a second listen() call sharing one PortEntry via
+        // addHandler since the initial commit (participant.zig's
+        // userDataOnReceive now does exactly that for the same port -- see
+        // its start() wiring and docs/design/rtps-submessage-routing.md §6).
+        // WLP predates that being noticed and is a reasonable candidate to
+        // migrate onto a plain second listen() call, decoupling it from
+        // SEDP's internals, but that's a separate, low-risk follow-up.
     }
 
     pub fn stop(self: *Self) void {
