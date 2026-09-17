@@ -230,15 +230,15 @@ public:
     ) override {
         return dds_.write_raw(std::move(key_hash), handle, std::move(cdr_payload), kind, source_timestamp);
     }
-    ::DDS::ReturnCode_t loan_raw(uint32_t size, ::DDS::OctetSeq& cdr_payload) override {
+    ::DDS::ReturnCode_t loan_raw(uint32_t size, DDS_OctetSeq& cdr_payload) override {
         return dds_.loan_raw(size, cdr_payload);
     }
     ::DDS::ReturnCode_t publish_loan_raw(
-        ::DDS::OctetSeq& cdr_payload, ::DDS::OctetSeq key_hash, ::DDS::InstanceHandle_t handle, ::DDS::WriteKind kind
+        DDS_OctetSeq& cdr_payload, ::DDS::OctetSeq key_hash, ::DDS::InstanceHandle_t handle, ::DDS::WriteKind kind
     ) override {
         return dds_.publish_loan_raw(cdr_payload, std::move(key_hash), handle, kind);
     }
-    ::DDS::ReturnCode_t return_loan_raw(::DDS::OctetSeq& cdr_payload) override {
+    ::DDS::ReturnCode_t return_loan_raw(DDS_OctetSeq& cdr_payload) override {
         return dds_.return_loan_raw(cdr_payload);
     }
 
@@ -329,7 +329,7 @@ public:
         return dds_.get_matched_publication_data(publication_data, publication_handle);
     }
     ::DDS::ReturnCode_t take_raw(
-        ::DDS::OctetSeqSeq& cdr_payloads, ::DDS::OctetSeq& key_hashes, ::DDS::SampleInfoSeq& sample_infos,
+        DDS_OctetSeqSeq& cdr_payloads, DDS_OctetSeq& key_hashes, DDS_SampleInfoSeq& sample_infos,
         ::DDS::InstanceHandle_t instance_handle, std::shared_ptr<::DDS::ReadCondition> a_condition,
         ::DDS::SampleStateMask sample_states, ::DDS::ViewStateMask view_states, ::DDS::InstanceStateMask instance_states,
         int32_t max_samples
@@ -337,7 +337,7 @@ public:
         return dds_.take_raw(cdr_payloads, key_hashes, sample_infos, instance_handle, std::move(a_condition), sample_states, view_states, instance_states, max_samples);
     }
     ::DDS::ReturnCode_t read_raw(
-        ::DDS::OctetSeqSeq& cdr_payloads, ::DDS::OctetSeq& key_hashes, ::DDS::SampleInfoSeq& sample_infos,
+        DDS_OctetSeqSeq& cdr_payloads, DDS_OctetSeq& key_hashes, DDS_SampleInfoSeq& sample_infos,
         ::DDS::InstanceHandle_t instance_handle, std::shared_ptr<::DDS::ReadCondition> a_condition,
         ::DDS::SampleStateMask sample_states, ::DDS::ViewStateMask view_states, ::DDS::InstanceStateMask instance_states,
         int32_t max_samples
@@ -345,7 +345,7 @@ public:
         return dds_.read_raw(cdr_payloads, key_hashes, sample_infos, instance_handle, std::move(a_condition), sample_states, view_states, instance_states, max_samples);
     }
     ::DDS::ReturnCode_t take_next_instance_raw(
-        ::DDS::OctetSeqSeq& cdr_payloads, ::DDS::OctetSeq& key_hashes, ::DDS::SampleInfoSeq& sample_infos,
+        DDS_OctetSeqSeq& cdr_payloads, DDS_OctetSeq& key_hashes, DDS_SampleInfoSeq& sample_infos,
         ::DDS::InstanceHandle_t previous_handle, std::shared_ptr<::DDS::ReadCondition> a_condition,
         ::DDS::SampleStateMask sample_states, ::DDS::ViewStateMask view_states, ::DDS::InstanceStateMask instance_states,
         int32_t max_samples
@@ -353,14 +353,14 @@ public:
         return dds_.take_next_instance_raw(cdr_payloads, key_hashes, sample_infos, previous_handle, std::move(a_condition), sample_states, view_states, instance_states, max_samples);
     }
     ::DDS::ReturnCode_t read_next_instance_raw(
-        ::DDS::OctetSeqSeq& cdr_payloads, ::DDS::OctetSeq& key_hashes, ::DDS::SampleInfoSeq& sample_infos,
+        DDS_OctetSeqSeq& cdr_payloads, DDS_OctetSeq& key_hashes, DDS_SampleInfoSeq& sample_infos,
         ::DDS::InstanceHandle_t previous_handle, std::shared_ptr<::DDS::ReadCondition> a_condition,
         ::DDS::SampleStateMask sample_states, ::DDS::ViewStateMask view_states, ::DDS::InstanceStateMask instance_states,
         int32_t max_samples
     ) override {
         return dds_.read_next_instance_raw(cdr_payloads, key_hashes, sample_infos, previous_handle, std::move(a_condition), sample_states, view_states, instance_states, max_samples);
     }
-    ::DDS::ReturnCode_t return_loan_raw(::DDS::OctetSeqSeq& cdr_payloads, ::DDS::OctetSeq& key_hashes, ::DDS::SampleInfoSeq& sample_infos) override {
+    ::DDS::ReturnCode_t return_loan_raw(DDS_OctetSeqSeq& cdr_payloads, DDS_OctetSeq& key_hashes, DDS_SampleInfoSeq& sample_infos) override {
         return dds_.return_loan_raw(cdr_payloads, key_hashes, sample_infos);
     }
 
