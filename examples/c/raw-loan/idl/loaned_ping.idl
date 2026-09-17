@@ -1,0 +1,13 @@
+// zig/raw-loan's wire type -- deliberately minimal (a bare sequence number),
+// unkeyed, single instance, same discipline as hello_world/presence. The
+// payload is incidental; what matters is that the publisher/subscriber
+// bypass TypeSupport marshaling entirely and go through the raw/loaned
+// DataWriter/DataReader operations (loan_raw/publish_loan_raw/take_raw/
+// return_loan_raw) directly. See docs/design/raw-loan-reference-app.md at
+// the repo root for the full spec. Byte-identical copy required in
+// c/raw-loan, cpp/raw-loan, java/raw-loan once those ports exist (same
+// discipline hello_world.idl already follows across bindings).
+@appendable
+struct LoanedPing {
+    int32 seq_num;
+};

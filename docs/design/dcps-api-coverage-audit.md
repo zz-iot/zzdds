@@ -1,8 +1,13 @@
 # DCPS API Coverage Audit (2026-08-14)
 
+Living doc, updated as gaps close — see entries below marked with a later date.
+References to `examples/` mean this repo's `examples/` tree; the standalone
+`zz-iot/zzdds-examples` repo it originally referred to was folded in on 2026-08-26
+(`CHANGELOG.md`) and is not otherwise referenced by name below.
+
 Cross-process/cross-binding DCPS API coverage, audited across every harness that runs
 zzdds as a real separate process against another DDS application: the dds-rtps vendor
-matrix, zzdds-examples' 12 per-binding example ports, and zzdds-examples' `interop/`
+matrix, `examples/`'s 12 per-binding example ports, and its `interop/`
 cross-binding smoke scripts. Does **not** cover zzdds's own Zig-native unit test suite
 (`zig build test`) — see `docs/testing.md`/`docs/design/testing-strategy.md` Tier 1/2 for
 that. The distinction matters: an API can be well-covered at the Zig-native unit-test
@@ -17,9 +22,9 @@ Four parallel surveys:
 - `dds-rtps/srcZig/shape_main.zig` — the only zzdds-authored dds-rtps entry (srcC/srcCxx/srcRs
   are other vendors' own native implementations). Cross-checked against
   `test_suite_functions.py`'s `pexpect`-based content matching.
-- `zzdds-examples/{zig,c}/{hello_world,shape,waitset}` — internal (in-app) assertions.
-- `zzdds-examples/{cpp,java}/{hello_world,shape,waitset}` — same.
-- `zzdds-examples/interop/*.py` — what the cross-binding orchestration scripts assert,
+- `examples/{zig,c}/{hello_world,shape,waitset}` — internal (in-app) assertions.
+- `examples/{cpp,java}/{hello_world,shape,waitset}` — same.
+- `examples/interop/*.py` — what the cross-binding orchestration scripts assert,
   independent of what the binaries do internally.
 
 For each API found, classified as:
@@ -44,12 +49,12 @@ For each API found, classified as:
 
 | Category | APIs |
 |---|---|
-| Liveliness | LIVELINESS QoS variation, `assert_liveliness`, `on_liveliness_lost`/`on_liveliness_changed`, `get_liveliness_lost_status`/`get_liveliness_changed_status` |
+| Liveliness (narrowed 2026-09-17 — see below) | `on_liveliness_lost`, `get_liveliness_lost_status`/`get_liveliness_changed_status` (as a getter, not just the listener), AUTOMATIC/MANUAL_BY_PARTICIPANT kinds, `DomainParticipant.assert_liveliness()`. `assert_liveliness()`, `on_liveliness_changed`, and MANUAL_BY_TOPIC are now covered by the `presence` example (all 4 bindings) — see "Examples" bucket below |
 | Rejection/loss | `on_sample_rejected`/`on_sample_lost`, `get_sample_rejected_status`/`get_sample_lost_status` — neither listener nor polling form, anywhere |
 | Historical data | `wait_for_historical_data` — confirmed zero across every harness |
 | Timestamped/explicit instance ops | `register_instance` (explicit), `register_instance_w_timestamp`, `write_w_timestamp`, `dispose_w_timestamp`, `unregister_instance_w_timestamp` |
 | Instance introspection | `lookup_instance`; `get_key_value` now exercised by the stress `instance` scenario, which found it returns the wrong key for non-leading-key types (zidl codegen, all backends — see below) |
-| Loans | `return_loan_raw`, any loaned-read (`take_raw`/`read_raw` in loan mode) or write-loan (`loan_raw`/`publish_loan_raw`) path — no `zzdds-examples` port exercises these yet (internal test-suite coverage exists, see the loan-lifecycle entry below) |
+| Loans | `return_loan_raw`, any loaned-read (`take_raw`/`read_raw` in loan mode) or write-loan (`loan_raw`/`publish_loan_raw`) path — no `examples/` port exercises these yet (internal test-suite coverage exists, see the loan-lifecycle entry below) |
 | Entity admin, post-creation | `set_qos`/`get_qos` round-trip, `get_listener` read-back, `enable()`, `get_status_changes()`, `contains_entity()` |
 | Discovery/ignore | `ignore_participant`/`ignore_topic`/`ignore_publication`/`ignore_subscription`, `get_discovered_participants`/`get_discovered_topics` + `_data` variants |
 | Misc participant ops | `find_topic`, `MultiTopic` (unimplemented in zzdds core — expected), `suspend_publications`/`resume_publications`, `notify_datareaders`, `get_current_time`, `get_domain_id`, `copy_from_topic_qos` |
@@ -97,27 +102,44 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   within one instance or an out-of-bounds x/y/shapesize, re-confirmed 2026-08-20.
 - ~~`WaitSet.get_conditions()` — trivial one-line addition to `waitset`.~~ Done — all four
   `waitset` subscribers call it and assert exactly 4 conditions, re-confirmed 2026-08-20.
-- New small example: **liveliness** (MANUAL_BY_TOPIC/PARTICIPANT + `assert_liveliness()`
-  + `on_liveliness_lost`/`changed`) — a genuine common real-world DDS pattern
-  (watchdog-style liveliness), worth showing across all 4 bindings.
-- New small example: **loaned read** (`take_raw`/`read_raw` in loan mode —
-  `cdr_payloads._maximum == 0` on entry — plus `return_loan_raw`) — distinct usage
-  pattern. Stale as of the 2026-08-22 raw/loan API redesign: the old hand-written
-  `take_loaned`/`return_loan` family (and its non-standard retcode convention, `1`=success
-  rather than the usual `RETCODE_OK`=0) is gone — `bootstrap.zig` deleted, replaced by real
-  `dcps.idl` ops using the standard convention throughout. No zzdds-examples port
-  demonstrates the new loan-mode ops yet; `zzdds-examples/spikes/rust` and this project's
-  own `writer_vtable_test.zig`/`reader_vtable_test.zig`/`JavaSmoke.java` do (see the
-  "Integration tests" loan-lifecycle entry below), but none of those are a `zzdds-examples`
-  port in the sense this table means.
+- ~~New small example: **liveliness**~~ — **Done**, as the `presence` example
+  (`examples/{zig,c,cpp,java}/presence`, `examples/docs/design/presence-reference-app.md`):
+  MANUAL_BY_TOPIC + `assert_liveliness()` + `on_liveliness_changed`, cross-process across
+  all 4 bindings and all 8 same/cross-binding pairs
+  (`interop/presence_cross_binding_smoke_test.py`). Found and fixed 4 real bugs, including
+  a wire-level one (`PID_LIVELINESS` was never encoded on the wire at all). Deliberately
+  left out to keep it one scenario: `on_liveliness_lost`/`get_liveliness_lost_status`,
+  AUTOMATIC/MANUAL_BY_PARTICIPANT kinds, `DomainParticipant.assert_liveliness()` — still a
+  real gap, small enough it could be a second small example or folded into the Integration
+  tier instead (see below).
+- New small example: **loaned read/write** (`take_raw`/`read_raw` in loan mode —
+  `cdr_payloads._maximum == 0` on entry — plus `return_loan_raw`; and the write side,
+  `loan_raw`/`publish_loan_raw`/`return_loan_raw`) — distinct usage pattern. The old
+  hand-written `take_loaned`/`return_loan` family (and its non-standard retcode
+  convention, `1`=success rather than the usual `RETCODE_OK`=0) is long gone —
+  `bootstrap.zig` deleted 2026-08-22, replaced by real `dcps.idl` ops, generated
+  uniformly across **all four bindings** (C, C++, Java, Zig — not C/C++-only), standard
+  retcode convention throughout. Re-verified 2026-09-17: still true, nothing has
+  regressed it since. No example port in *any* binding demonstrates the new loan-mode ops
+  yet; `examples/spikes/rust` and this project's own
+  `writer_vtable_test.zig`/`reader_vtable_test.zig`/`JavaSmoke.java` do (see the
+  "Integration tests" loan-lifecycle entry below), but none of those is an `examples/`
+  port in the sense this table means, and C/C++ have zero exercise even at that level.
+  Given the API's stability across all 4 bindings for a month now, this is a strong
+  candidate to build `presence`-style: cross-binding from the start, not per-language.
 - Extend `shape` or `hello_world` publisher to use explicit `register_instance` +
   `get_key_value`/`lookup_instance` once, instead of implicit registration only.
 - Extend an example with `get_discovered_participants`/`get_discovered_topics` — genuinely
   demo-able ("list what's on the network"), not just a correctness check.
 
 ### → Integration tests (new, in-repo)
-- **Liveliness through each binding's listener/status marshaling** — Zig-native already
-  unit-tests this; the gap is binding correctness.
+- ~~**Liveliness through each binding's listener/status marshaling**~~ — substantially
+  closed by the `presence` example (see "Examples" bucket above), which turned out to
+  *be* a real binding-correctness/integration test in everything but name: cross-process,
+  all 4 bindings, hard pass/fail assertion (must observe ONLINE→OFFLINE→ONLINE in order),
+  and it found 4 real bugs. Remaining narrower slice — `on_liveliness_lost` +
+  AUTOMATIC/MANUAL_BY_PARTICIPANT — could go here instead of a new example, since it's a
+  terminal/negative-case scenario (no recovery) rather than a demo-friendly one.
 - **SAMPLE_REJECTED/SAMPLE_LOST through each binding** — same reasoning.
 - **`enable()` / `autoenable_created_entities=false`** — create disabled, verify no
   discovery/matching occurs, call `enable()`, verify matching now proceeds. Currently
@@ -144,7 +166,7 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   + `PRECONDITION_NOT_MET` teardown-blocking (deliberately re-broken and restored) but are
   Zig-native, out of this audit's scope by its own definition. `JavaSmoke.java`
   (dispose-via-loan + `delete_datawriter` succeeding afterward) **is** in scope — real JNI
-  marshaling, a genuine gap closed. `zzdds-examples/spikes/rust` covers a real,
+  marshaling, a genuine gap closed. `examples/spikes/rust` covers a real,
   compiler-enforced double-return rejection (`LoanedSample`'s `Drop` impl makes an explicit
   second `return_loan_raw` call unreachable in safe Rust, verified by
   `examples/escape_attempt.rs`'s expected `E0597`), but it's a throwaway spike, not one of

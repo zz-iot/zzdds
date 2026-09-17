@@ -275,11 +275,18 @@ DCPS operations, statuses, and QoS behaviours with zero or unverified coverage a
 four example bindings, and proposes two new test tiers on top of the existing Tier 1–4
 model:
 
-- **Integration tier** — liveliness / status marshaling per binding; SAMPLE_REJECTED /
-  SAMPLE_LOST; `enable()` / `autoenable_created_entities=false`; late-joiner durability
-  replay; `ignore_*` across two processes; runtime `set_expression_parameters` CFT
-  reconfiguration; coherent/ordered grouping atomicity across multiple writers;
-  `_w_timestamp` source-timestamp propagation; `delete_contained_entities` across the C-ABI.
+- **Integration tier** — SAMPLE_REJECTED / SAMPLE_LOST; `enable()` /
+  `autoenable_created_entities=false`; late-joiner durability replay; `ignore_*` across two
+  processes; runtime `set_expression_parameters` CFT reconfiguration; coherent/ordered
+  grouping atomicity across multiple writers; `_w_timestamp` source-timestamp propagation;
+  `delete_contained_entities` across the C-ABI. Liveliness/status marshaling per binding
+  is now substantially covered by the `presence` example (see "Reference-app" note above
+  under Testing) — cross-process, all 4 bindings + 8 same/cross-binding pairs, found and
+  fixed 4 real bugs including a wire-level one (`PID_LIVELINESS` never encoded). Remaining
+  narrower gap, not yet covered anywhere: `on_liveliness_lost`/`get_liveliness_lost_status`
+  and the AUTOMATIC/MANUAL_BY_PARTICIPANT kinds — deliberately left out of `presence` to
+  keep it a single-scenario example (`examples/docs/design/presence-reference-app.md`,
+  "Deliberately out of scope").
 - **Stress tier** — landed in `stress-tests/` as seven `lifecycle_churn` scenarios
   (`reentrant`, `entities`, `waitset`, `listener`, `cft`, `participants`, `instance`) plus
   the `entity_lifecycle_stress` multi-process port. Found + fixed three concurrency bugs
@@ -295,8 +302,14 @@ model:
   Remaining stress ideas: a
   scenario that also churns the reader-side WaitSet/condition graph under participant
   churn; a Bench-style discovery-latency measurement (explicitly out of scope for this
-  tier). Plus a loaned-read example (loan lifecycle has zero C/C++ coverage today —
-  nothing stops a C/C++ caller reading a returned loan).
+  tier). Plus a loaned-read/write example — the raw/loan API has been real, IDL-generated
+  `dcps.idl` operations across **all four** bindings since the 2026-08-22 redesign (not a
+  C/C++-only hand-written family anymore; see `design/raw-loan-api.md`), and is
+  unit/smoke-tested internally (`writer_vtable_test.zig`/`reader_vtable_test.zig`,
+  `JavaSmoke.java`), but **no `examples/` port in any of the 4 bindings** demonstrates
+  `take_raw`/`read_raw`/`loan_raw`/`publish_loan_raw` yet — C/C++ have zero exercise even
+  internally (nothing stops a C/C++ caller reading a buffer after returning the loan). A
+  genuine candidate for a `presence`-style example built cross-binding from the start.
 
 Harness is Python, reusing the examples' `_common.py` pattern.
 
