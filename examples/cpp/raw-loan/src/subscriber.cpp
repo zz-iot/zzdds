@@ -70,14 +70,19 @@ public:
                 }
                 std::printf("Subscriber: received (loan) sequence=%d\n", value.seq_num);
                 state_->expected_next++;
-                if (state_->expected_next == SAMPLE_COUNT) {
-                    state_->all_received.store(true);
-                }
             }
 
             if (reader->return_loan_raw(payloads, hashes, infos) != ::DDS::RETCODE_OK) {
                 std::fprintf(stderr, "FAIL: return_loan_raw() failed\n");
                 std::exit(1);
+            }
+
+            // Signal completion only after the loan is actually returned --
+            // otherwise main() could race ahead and call delete_datareader()
+            // while this loan is still outstanding, failing with
+            // PRECONDITION_NOT_MET.
+            if (state_->expected_next == SAMPLE_COUNT) {
+                state_->all_received.store(true);
             }
         }
     }

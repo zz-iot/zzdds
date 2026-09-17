@@ -74,14 +74,19 @@ public class Subscriber {
                 }
                 System.out.println("Subscriber: received (loan) sequence=" + value.get_seq_num());
                 expectedNext++;
-                if (expectedNext == SAMPLE_COUNT) {
-                    allReceived.set(true);
-                }
             }
 
             if (reader.return_loan_raw(loan) != Dcps.DDS.RETCODE_OK.value) {
                 System.err.println("FAIL: return_loan_raw() failed");
                 System.exit(1);
+            }
+
+            // Signal completion only after the loan is actually returned --
+            // otherwise main() could race ahead and call delete_datareader()
+            // while this loan is still outstanding, failing with
+            // PRECONDITION_NOT_MET.
+            if (expectedNext == SAMPLE_COUNT) {
+                allReceived.set(true);
             }
         }
     }

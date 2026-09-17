@@ -2,7 +2,7 @@
 
 Raw/loaned `DataWriter`/`DataReader` reference app, talking to zzdds's native
 Zig API directly. See
-[`docs/design/raw-loan-reference-app.md`](../../docs/design/raw-loan-reference-app.md)
+[`docs/design/raw-loan-reference-app.md`](../../../docs/design/raw-loan-reference-app.md)
 at the repo root for what this example demonstrates and why (`loan_raw`/
 `publish_loan_raw`/`return_loan_raw` on the write side, `take_raw` in loan
 mode + `return_loan_raw` on the read side, bypassing `TypeSupport`

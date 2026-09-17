@@ -83,14 +83,19 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
             }
             printf("Subscriber: received (loan) sequence=%d\n", value.seq_num);
             state->expected_next++;
-            if (state->expected_next == SAMPLE_COUNT) {
-                atomic_store(&state->all_received, true);
-            }
         }
 
         if (DDS_DataReader_return_loan_raw(the_reader, &payloads, &hashes, &infos) != DDS_RETCODE_OK) {
             fprintf(stderr, "FAIL: return_loan_raw() failed\n");
             exit(1);
+        }
+
+        /* Signal completion only after the loan is actually returned --
+         * otherwise main() could race ahead and call delete_datareader()
+         * while this loan is still outstanding, failing with
+         * PRECONDITION_NOT_MET. */
+        if (state->expected_next == SAMPLE_COUNT) {
+            atomic_store(&state->all_received, true);
         }
     }
 }

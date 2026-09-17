@@ -159,19 +159,14 @@ the start.
   this backend either, same documented gap, same reason.
 - **All four bindings now have a working, cross-verified raw-loan example**
   (zig↔c, zig↔cpp, c↔cpp, java↔zig all spot-checked both directions).
-- Cross-binding interop smoke test (`interop/raw_loan_cross_binding_smoke_test.py`):
-  not yet built as a formal script — every pair has been spot-checked ad
-  hoc above, but there's no permanent, repeatable harness yet (the pattern
-  `presence_cross_binding_smoke_test.py` established: build all 4 ports,
-  run a representative subset of same/cross-binding pairs, assert on real
-  completion markers).
+- Cross-binding interop smoke test (`examples/interop/raw_loan_cross_binding_smoke_test.py`):
+  built and wired into `examples/run_all.py`. It builds all 4 ports, runs
+  8 same- and cross-binding pairs, and checks both processes' completion
+  markers.
 
-**zidl pin note:** the fix is verified against a local zidl checkout, not
-yet a tagged release. `zzdds/build.zig.zon`'s `.zidl` dependency is
-currently pointed at `.path = "../zidl"` (a local, uncommitted edit) for
-this verification — reverting to a real tagged/hashed pin (and un-reverting
-zig-out to match) needs a real zidl release first, same as every other
-zidl-pin-bump entry in `zzdds/CHANGELOG.md`.
+**zidl pin note:** `build.zig.zon` pins the tagged and hashed
+`v0.3.18-zig.0.16.0` release containing the required C++ and Java backend
+fixes.
 
 ## A real bug found building the C++ port
 

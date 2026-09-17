@@ -1,7 +1,7 @@
 # java/raw-loan
 
 Java port of `zig/raw-loan` — see
-[`docs/design/raw-loan-reference-app.md`](../../docs/design/raw-loan-reference-app.md)
+[`docs/design/raw-loan-reference-app.md`](../../../docs/design/raw-loan-reference-app.md)
 at the repo root for what this example demonstrates and why
 (`loan_raw`/`publish_loan_raw`/`return_loan_raw` on the write side,
 `take_raw` in loan mode + `return_loan_raw` on the read side, bypassing

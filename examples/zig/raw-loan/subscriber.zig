@@ -87,14 +87,19 @@ fn onDataAvailable(state: *State, dr: DDS.DataReader) void {
             }
             std.debug.print("Subscriber: received (loan) sequence={d}\n", .{value.seq_num});
             state.expected_next += 1;
-            if (state.expected_next == SAMPLE_COUNT) {
-                state.all_received.store(true, .release);
-            }
         }
 
         if (dr.return_loan_raw(&payloads, &hashes, &infos) != DDS.RETCODE_OK) {
             std.debug.print("FAIL: return_loan_raw() failed\n", .{});
             std.process.exit(1);
+        }
+
+        // Signal completion only after the loan is actually returned --
+        // otherwise main() could race ahead and call delete_datareader()
+        // while this loan is still outstanding, failing with
+        // PRECONDITION_NOT_MET.
+        if (state.expected_next == SAMPLE_COUNT) {
+            state.all_received.store(true, .release);
         }
     }
 }
