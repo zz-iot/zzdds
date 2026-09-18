@@ -1343,17 +1343,33 @@ test "mock_loopback: on_reliable_writer_ready callback can safely re-enter a par
     // turns a potential regression into a clean test failure instead of a
     // hung CI job -- same discipline as participant_vtable_test.zig's
     // "deinit: reentrant delete_participant from a timer-driven listener"
-    // test.
+    // test. Deliberately NOT detached: on the success path below we join it
+    // before returning, so it can never still be inside net.deliverAll()
+    // touching net/dp_r/dp_w while this function's defers start tearing
+    // them down (a real use-after-free race a detached thread would risk --
+    // observing state.done doesn't mean the worker's own call stack has
+    // unwound out of deliverAll() yet).
     const thread = try std.Thread.spawn(.{}, driveUntilDone, .{ net, &state });
-    thread.detach();
 
     const deadline = time_mod.nanoTimestamp() + 6 * std.time.ns_per_s;
     while (!state.done.load(.acquire)) {
         if (time_mod.nanoTimestamp() >= deadline) {
-            try std.testing.expect(false); // timed out: self-deadlock, the fix regressed
-            return;
+            // Do not return normally here: on a real regression the worker
+            // is presumably wedged forever inside the self-deadlock this
+            // test exists to catch (a hung mutex, not merely slow), so
+            // thread.join() would hang this whole test binary, and letting
+            // this function's defers run while that thread might still be
+            // mid-call into net/participant state would risk a UAF instead
+            // of a clean failure. @panic skips defers/teardown entirely and
+            // gives an unambiguous signal; other test binaries in the
+            // matrix are separate processes and are unaffected.
+            @panic("on_reliable_writer_ready reentrant callback deadlocked: participant.mu held during dispatch (fix regressed)");
         }
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
+    // Bounded, not a hang risk: the worker checks state.done right after its
+    // own net.deliverAll() + a single 20ms sleep, so it exits its loop and
+    // returns within that same window once state.done is true.
+    thread.join();
     try std.testing.expect(state.reentrant_ok.load(.acquire));
 }
