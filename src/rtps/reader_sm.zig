@@ -392,13 +392,19 @@ pub const StatefulReader = struct {
     }
 
     /// Register a callback that fires when a writer proxy's protocol-ready
-    /// state transitions. Must be called before any writer proxies are
-    /// added. Mirrors StatefulWriter.setProtocolReadyCallback.
+    /// state transitions. Safe to call concurrently with a live receive
+    /// thread already dispatching into this reader (addMatchedWriter/
+    /// handleHeartbeat/removeMatchedWriter capture protocol_ready_fn/ctx
+    /// under self.mu before firing -- see their comments); no ordering
+    /// requirement relative to when writer proxies are added. Mirrors
+    /// StatefulWriter.setProtocolReadyCallback.
     pub fn setProtocolReadyCallback(
         self: *Self,
         ctx: *anyopaque,
         fn_ptr: *const fn (*anyopaque, Guid, bool) void,
     ) void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.protocol_ready_fn = fn_ptr;
         self.protocol_ready_ctx = ctx;
     }
@@ -439,7 +445,10 @@ pub const StatefulReader = struct {
                 return;
             }
         }
-        try self.writer_proxies.append(self.alloc, proxy);
+        self.writer_proxies.append(self.alloc, proxy) catch |err| {
+            self.mu.unlock();
+            return err;
+        };
         self.ever_matched_writer = true;
         const new_wp = &self.writer_proxies.items[self.writer_proxies.items.len - 1];
 
@@ -485,10 +494,16 @@ pub const StatefulReader = struct {
         // trigger that compensates for the race between writer-side replay and
         // reader-side proxy setup.
         self.sendAckNackUnlocked(new_wp, 0, false);
+        // Captured under the lock, not re-read from self after unlocking --
+        // setProtocolReadyCallback can run concurrently from another thread
+        // (it takes the same lock), so self.protocol_ready_fn/ctx are only
+        // well-defined to read while self.mu is held.
+        const ready_fn = self.protocol_ready_fn;
+        const ready_ctx = self.protocol_ready_ctx;
         self.mu.unlock();
 
         if (newly_ready_guid) |guid| {
-            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, true);
+            if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
     }
 
@@ -504,6 +519,9 @@ pub const StatefulReader = struct {
                 _ = self.writer_proxies.swapRemove(i);
             }
         }
+        // See addMatchedWriter's matching comment: capture under the lock.
+        const ready_fn = self.protocol_ready_fn;
+        const ready_ctx = self.protocol_ready_ctx;
         self.mu.unlock();
 
         // Fired after self.mu is released (never while holding it) -- mirrors
@@ -512,7 +530,7 @@ pub const StatefulReader = struct {
         // told is ready has gone away, rather than staying convinced it's
         // still ready indefinitely.
         if (was_ready) {
-            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, false);
+            if (ready_fn) |f| f(ready_ctx.?, guid, false);
         }
     }
 
@@ -1034,10 +1052,13 @@ pub const StatefulReader = struct {
             }
         }
 
+        // See addMatchedWriter's matching comment: capture under the lock.
+        const ready_fn = self.protocol_ready_fn;
+        const ready_ctx = self.protocol_ready_ctx;
         self.mu.unlock();
 
         if (newly_ready_guid) |guid| {
-            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, true);
+            if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
     }
 

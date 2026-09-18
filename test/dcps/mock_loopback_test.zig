@@ -1242,3 +1242,118 @@ test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, 
     // on_subscription_matched alone does not wait for.
     try std.testing.expect(state.matched_seq.? < state.ready_seq.?);
 }
+
+// ── on_reliable_writer_ready: participant.mu must not be held during it ──────
+
+const ReentrancyState = struct {
+    dp_r: DDS.DomainParticipant,
+    fired: std.atomic.Value(bool) = .init(false),
+    reentrant_ok: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+fn onWriterReadyReentrant(_: DDS.InstanceHandle_t, is_ready: bool, ld: ?*anyopaque) callconv(.c) void {
+    if (!is_ready) return;
+    const state: *ReentrancyState = @ptrCast(@alignCast(ld.?));
+    if (state.fired.swap(true, .acq_rel)) return; // one-shot
+    // Reentrantly call back into a participant API that needs
+    // DomainParticipantImpl.mu (lookup_topicdescription: self.mu.lock() ...
+    // defer self.mu.unlock()). If the dispatch path that led here still
+    // holds that lock (the bug Greptile found in PR #90), this self-deadlocks
+    // -- the calling thread trying to re-lock a mutex it already holds.
+    _ = state.dp_r.vtable.lookup_topicdescription(state.dp_r.ptr, "ReentrancyProbe");
+    state.reentrant_ok.store(true, .release);
+    state.done.store(true, .release);
+}
+
+fn driveUntilDone(net: *MockNetwork, state: *ReentrancyState) void {
+    const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (!state.done.load(.acquire) and time_mod.nanoTimestamp() < deadline) {
+        net.deliverAll();
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+}
+
+test "mock_loopback: on_reliable_writer_ready callback can safely re-enter a participant API (participant.mu not held)" {
+    const alloc = std.testing.allocator;
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mock_r = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_R, PORT_META_R)});
+    defer mock_r.deinit();
+    const disc_r = try SpdpSedpDiscovery.init(alloc, mock_r.transport(), 0, 100);
+    var factory_r = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_r.transport(),
+        disc_r.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_r.deinit();
+        disc_r.deinit();
+    }
+    const dpf_r = factory_r.toDDSFactory();
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    defer _ = dpf_r.delete_participant(dp_r);
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic("MockTopic", "MockType", .{}, null, 0);
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
+    defer mock_w.deinit();
+    const disc_w = try SpdpSedpDiscovery.init(alloc, mock_w.transport(), 0, 100);
+    var factory_w = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_w.transport(),
+        disc_w.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_w.deinit();
+        disc_w.deinit();
+    }
+    const dpf_w = factory_w.toDDSFactory();
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    defer _ = dpf_w.delete_participant(dp_w);
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic("MockTopic", "MockType", .{}, null, 0);
+    _ = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
+
+    var state = ReentrancyState{ .dp_r = dp_r };
+    dr_impl.setListenerEx(.{
+        .listener_data = &state,
+        .on_reliable_writer_ready = onWriterReadyReentrant,
+    }, DDS.STATUS_MASK_ALL);
+
+    // Drive discovery on a background thread rather than this one: the
+    // callback's reentrant call runs synchronously inside net.deliverAll(),
+    // so if the fix regresses, this call itself never returns. Running it
+    // here and bounding completion with a deadline on the *main* thread
+    // turns a potential regression into a clean test failure instead of a
+    // hung CI job -- same discipline as participant_vtable_test.zig's
+    // "deinit: reentrant delete_participant from a timer-driven listener"
+    // test.
+    const thread = try std.Thread.spawn(.{}, driveUntilDone, .{ net, &state });
+    thread.detach();
+
+    const deadline = time_mod.nanoTimestamp() + 6 * std.time.ns_per_s;
+    while (!state.done.load(.acquire)) {
+        if (time_mod.nanoTimestamp() >= deadline) {
+            try std.testing.expect(false); // timed out: self-deadlock, the fix regressed
+            return;
+        }
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(state.reentrant_ok.load(.acquire));
+}
