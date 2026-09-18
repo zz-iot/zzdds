@@ -1129,11 +1129,18 @@ pub const StatefulWriter = struct {
         if (locs.len == 0) return;
         self.hb_count += 1;
         const first_sn = hb_first_sn;
-        // Guard: RTPS requires first_sn <= last_sn (except the empty-cache
-        // convention first=1, last=0).  A capped last_sn combined with
-        // KEEP_LAST eviction can push cache_first past last_sn — skip the HB
-        // rather than send a malformed submessage.
-        if (last_sn > 0 and first_sn > last_sn) return;
+        // Guard: RTPS requires first_sn <= last_sn + 1 (§8.3.7.5.3; matches
+        // reader_sm.zig's own handleHeartbeat validity check) -- first_sn ==
+        // last_sn + 1 is the *legal* empty-offer range ("nothing new for
+        // you, but I'm alive"), not a malformed submessage. A capped last_sn
+        // combined with KEEP_LAST eviction can still push cache_first more
+        // than one past last_sn — skip the HB only in that genuinely
+        // malformed case. Previously used `first_sn > last_sn`, which
+        // silently dropped the legal empty-offer heartbeat for any freshly
+        // matched non-replaying reader proxy whose start_sn sat exactly at
+        // the cache's current frontier -- see
+        // docs/design/discovery-association-race-testing.md.
+        if (last_sn > 0 and first_sn > last_sn + 1) return;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
@@ -1298,10 +1305,13 @@ pub const StatefulWriter = struct {
                 @as(SequenceNumber, 1)
             else
                 @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
-            // RTPS requires first_sn <= last_sn (except the empty-cache first=1,last=0
-            // convention).  The coherent cap can push last_sn below the proxy's start_sn
-            // — skip rather than send a malformed submessage.
-            if (last_sn > 0 and first_sn > last_sn) continue;
+            // RTPS requires first_sn <= last_sn + 1 (§8.3.7.5.3) -- first_sn ==
+            // last_sn + 1 is the legal empty-offer range, not malformed; see
+            // sendHeartbeatToProxyLockedWithLastSnAndFirstSn's matching
+            // comment. The coherent cap can still push last_sn more than one
+            // below the proxy's start_sn — skip only that genuinely
+            // malformed case.
+            if (last_sn > 0 and first_sn > last_sn + 1) continue;
             var b = MessageBuilder.init(&scratch, self.guid.prefix);
             b.addInfoDst(rp.guid.prefix);
             // When KEEP_LAST eviction has moved the cache floor above the reader's
@@ -1847,7 +1857,10 @@ pub const StatefulWriter = struct {
     ) void {
         if (locs.len == 0) return;
         const hb_first_sn = hbFirstSn(cache_first, last_sn, rp_start_sn, null);
-        if (last_sn > 0 and hb_first_sn > last_sn) return;
+        // See sendHeartbeatToProxyLockedWithLastSnAndFirstSn's matching
+        // comment: first_sn == last_sn + 1 is the legal empty-offer range,
+        // not malformed.
+        if (last_sn > 0 and hb_first_sn > last_sn + 1) return;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(rp_guid.prefix);

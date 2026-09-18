@@ -22,6 +22,7 @@ const submsg_mod = @import("../rtps/message/submessage.zig");
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
+pub const EntityId = guid_mod.EntityId;
 pub const ChangeKind = history_mod.ChangeKind;
 pub const InstanceHandle = history_mod.InstanceHandle;
 pub const RtpsTimestamp = history_mod.RtpsTimestamp;
@@ -471,10 +472,15 @@ pub const ProtocolReader = struct {
 
         /// Called by the participant's RTPS message dispatcher when a HEARTBEAT
         /// submessage arrives. Triggers ACKNACK if the reader has gaps or the
-        /// heartbeat is non-final.
+        /// heartbeat is non-final. `reader_id` is the submessage's own
+        /// readerId (RTPS §8.3.7.5) -- ENTITYID_UNKNOWN for a wildcard
+        /// heartbeat, or a specific reader's entity ID when the writer
+        /// targeted it -- used to drive the reader-side protocol-ready
+        /// signal (on_reliable_writer_ready).
         handle_heartbeat: *const fn (
             ctx: *anyopaque,
             writer_guid: Guid,
+            reader_id: EntityId,
             first_sn: SequenceNumber,
             last_sn: SequenceNumber,
             count: i32,
@@ -541,6 +547,12 @@ pub const ProtocolReader = struct {
         /// Pairs with a successful quiesce_acquire(). Defaults to a noop to
         /// match quiesce_acquire's default.
         quiesce_release: *const fn (ctx: *anyopaque) void = defaultQuiesceRelease,
+
+        /// Register a callback that fires when a matched writer proxy's
+        /// protocol-ready state transitions -- the reader-side counterpart
+        /// of ProtocolWriter.set_protocol_ready_callback. Must be called
+        /// before any writer proxies are added.
+        set_protocol_ready_callback: *const fn (ctx: *anyopaque, cb: ProtocolReadyCallback) void,
     };
 
     pub fn setDataCallback(self: ProtocolReader, cb: DataCallback) void {
@@ -600,13 +612,14 @@ pub const ProtocolReader = struct {
     pub fn handleHeartbeat(
         self: ProtocolReader,
         writer_guid: Guid,
+        reader_id: EntityId,
         first_sn: SequenceNumber,
         last_sn: SequenceNumber,
         count: i32,
         final: bool,
         liveliness: bool,
     ) void {
-        self.vtable.handle_heartbeat(self.ctx, writer_guid, first_sn, last_sn, count, final, liveliness);
+        self.vtable.handle_heartbeat(self.ctx, writer_guid, reader_id, first_sn, last_sn, count, final, liveliness);
     }
 
     pub fn handleDataFrag(
@@ -655,5 +668,9 @@ pub const ProtocolReader = struct {
 
     pub fn quiesceRelease(self: ProtocolReader) void {
         self.vtable.quiesce_release(self.ctx);
+    }
+
+    pub fn setProtocolReadyCallback(self: ProtocolReader, cb: ProtocolReadyCallback) void {
+        self.vtable.set_protocol_ready_callback(self.ctx, cb);
     }
 };

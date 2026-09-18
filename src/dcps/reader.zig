@@ -34,6 +34,40 @@ const extensions_mod = @import("../c_abi/extensions.zig");
 const Guid = proto.Guid;
 const GuidPrefix = proto.GuidPrefix;
 
+/// Build the unified listener representation from a plain `set_listener()`
+/// (base OMG API) call, with the extension callback unset. Mirrors
+/// writer.zig's identical widen/narrow scheme for DataWriterListenerEx.
+fn listenerExFromBase(l: DDS.DataReaderListener) ZZDDS.DataReaderListenerEx {
+    return .{
+        .listener_data = l.listener_data,
+        .release_listener_data = l.release_listener_data,
+        .on_requested_deadline_missed = l.on_requested_deadline_missed,
+        .on_requested_incompatible_qos = l.on_requested_incompatible_qos,
+        .on_sample_rejected = l.on_sample_rejected,
+        .on_liveliness_changed = l.on_liveliness_changed,
+        .on_data_available = l.on_data_available,
+        .on_subscription_matched = l.on_subscription_matched,
+        .on_sample_lost = l.on_sample_lost,
+        .on_reliable_writer_ready = null,
+    };
+}
+
+/// Narrow the unified listener representation back to the base OMG type for
+/// `get_listener()` — drops the extension callback.
+fn baseFromListenerEx(l: ZZDDS.DataReaderListenerEx) DDS.DataReaderListener {
+    return .{
+        .listener_data = l.listener_data,
+        .release_listener_data = l.release_listener_data,
+        .on_requested_deadline_missed = l.on_requested_deadline_missed,
+        .on_requested_incompatible_qos = l.on_requested_incompatible_qos,
+        .on_sample_rejected = l.on_sample_rejected,
+        .on_liveliness_changed = l.on_liveliness_changed,
+        .on_data_available = l.on_data_available,
+        .on_subscription_matched = l.on_subscription_matched,
+        .on_sample_lost = l.on_sample_lost,
+    };
+}
+
 /// CFT filter state held on the DataReaderImpl.
 /// Non-null only when the reader was created from a ContentFilteredTopic and a
 /// get_field function is available for this type.
@@ -223,8 +257,12 @@ pub const DataReaderImpl = struct {
     parent_pinned: bool = false,
     proto_reader: proto.ProtocolReader,
     qos: DDS.DataReaderQos,
-    listener_box: *ListenerBox(DDS.DataReaderListener),
-    /// Guards `listener_box` swaps/acquires only — never held across a
+    // Unified listener storage: both the base OMG `set_listener()` and the
+    // zzdds `set_listener_ex()` extension populate this same representation
+    // (see listenerExFromBase/baseFromListenerEx) so on_reliable_writer_ready
+    // and the standard callbacks are always dispatched from one place.
+    listener_ex_box: *ListenerBox(ZZDDS.DataReaderListenerEx),
+    /// Guards `listener_ex_box` swaps/acquires only — never held across a
     /// dispatch or any other call, so it can never participate in a
     /// deadlock with `mu` or any other lock (see listener_box.zig).
     listener_mu: Mutex = .{},
@@ -461,7 +499,7 @@ pub const DataReaderImpl = struct {
             .subscriber = subscriber,
             .proto_reader = proto_reader,
             .qos = .{},
-            .listener_box = undefined,
+            .listener_ex_box = undefined,
             .listener_mask = mask,
             .instance_handle = instance_handle,
             .guid = guid,
@@ -479,8 +517,8 @@ pub const DataReaderImpl = struct {
             .seen_instances = .empty,
         };
         errdefer alloc.destroy(self);
-        self.listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, listener);
-        errdefer alloc.destroy(self.listener_box);
+        self.listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(listener));
+        errdefer alloc.destroy(self.listener_ex_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
         // Register delivery callback with the RTPS layer.
@@ -546,7 +584,7 @@ pub const DataReaderImpl = struct {
 
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.listener_box.releaseRef(self.alloc);
+        self.listener_ex_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
         // Tear down any ReadCondition/QueryCondition the app never explicitly
@@ -2997,21 +3035,33 @@ pub const DataReaderImpl = struct {
         const self = cast(ctx);
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
-        return self.listener_box.listener;
+        return baseFromListenerEx(self.listener_ex_box.listener);
     }
 
-    /// Installs `new_listener`, releasing whatever it replaces. Safe against
-    /// a concurrently in-flight dispatch acquired via `acquireListener` (see
-    /// listener_box.zig) — the entity's own "installed" reference is what
-    /// gets dropped here; an in-flight dispatch's own extra reference keeps
-    /// the old box (and its native context) alive until that dispatch
-    /// finishes and releases it.
+    /// Installs `new_listener` (widened from the base OMG type — the
+    /// extension callback is unset), releasing whatever it replaces. Safe
+    /// against a concurrently in-flight dispatch acquired via
+    /// `acquireListener` (see listener_box.zig) — the entity's own
+    /// "installed" reference is what gets dropped here; an in-flight
+    /// dispatch's own extra reference keeps the old box (and its native
+    /// context) alive until that dispatch finishes and releases it.
     fn swapListener(self: *Self, new_listener: DDS.DataReaderListener) void {
-        const new_box = ListenerBox(DDS.DataReaderListener).create(self.alloc, new_listener) catch
+        self.swapListenerEx(listenerExFromBase(new_listener));
+    }
+
+    /// Backs `zzdds::DataReader::set_listener_ex` (see
+    /// src/c_abi/extensions.zig).
+    pub fn setListenerEx(self: *Self, listener_ex: ZZDDS.DataReaderListenerEx, mask: DDS.StatusMask) void {
+        self.swapListenerEx(listener_ex);
+        @atomicStore(DDS.StatusMask, &self.listener_mask, mask, .monotonic);
+    }
+
+    fn swapListenerEx(self: *Self, new_listener_ex: ZZDDS.DataReaderListenerEx) void {
+        const new_box = ListenerBox(ZZDDS.DataReaderListenerEx).create(self.alloc, new_listener_ex) catch
             @panic("zzdds: out of memory boxing listener");
         self.listener_mu.lock();
-        const old_box = self.listener_box;
-        self.listener_box = new_box;
+        const old_box = self.listener_ex_box;
+        self.listener_ex_box = new_box;
         self.listener_mu.unlock();
         old_box.releaseRef(self.alloc);
     }
@@ -3021,10 +3071,27 @@ pub const DataReaderImpl = struct {
     /// done (see listener_box.zig). `pub`: also used by `subscriber.zig`'s
     /// coherent-access batch dispatch, which snapshots multiple readers'
     /// listeners under `subscriber.mu` before firing any of them.
-    pub fn acquireListener(self: *Self) *ListenerBox(DDS.DataReaderListener) {
+    pub fn acquireListener(self: *Self) *ListenerBox(ZZDDS.DataReaderListenerEx) {
         self.listener_mu.lock();
         defer self.listener_mu.unlock();
-        return self.listener_box.acquireLocked();
+        return self.listener_ex_box.acquireLocked();
+    }
+
+    /// Registered directly on the ProtocolReader (see subscriber.zig's
+    /// create_datareader) — this signal is purely RTPS-internal (a HEARTBEAT
+    /// whose readerId names this reader, or immediate at match for
+    /// BEST_EFFORT) and needs no SEDP/participant bookkeeping, unlike
+    /// notifySubscriptionMatched. Not a DDS.StatusMask status: no counters,
+    /// no StatusCondition wakeup — this is a vendor extension callback only.
+    pub fn notifyWriterProtocolReady(ctx: *anyopaque, writer_guid: Guid, ready: bool) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
+        const box = self.acquireListener();
+        defer box.releaseRef(self.alloc);
+        if (box.listener.on_reliable_writer_ready) |cb| {
+            cb(writer_mod.guidToHandle(writer_guid), ready, box.listener.listener_data);
+        }
     }
 
     /// Dispatches `field` (a `DDS.DataReaderListener` callback) if this
@@ -3736,7 +3803,7 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -3770,7 +3837,7 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
-        dr.listener_box.releaseRef(alloc);
+        dr.listener_ex_box.releaseRef(alloc);
     }
 
     const writer_guid = @import("../rtps/guid.zig").Guid{
@@ -3836,7 +3903,7 @@ test "coherent WIP: CS transition discards incomplete previous WIP" {
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -3870,7 +3937,7 @@ test "coherent WIP: CS transition discards incomplete previous WIP" {
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
-        dr.listener_box.releaseRef(alloc);
+        dr.listener_ex_box.releaseRef(alloc);
         dr.coherent_writer_guids.deinit(alloc);
         var wit = dr.writer_instances.valueIterator();
         while (wit.next()) |v| v.deinit(alloc);
@@ -3923,7 +3990,7 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -3964,7 +4031,7 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
-        dr.listener_box.releaseRef(alloc);
+        dr.listener_ex_box.releaseRef(alloc);
         dr.coherent_writer_guids.deinit(alloc);
         var wit = dr.writer_instances.valueIterator();
         while (wit.next()) |v| v.deinit(alloc);
@@ -4015,7 +4082,7 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -4041,7 +4108,7 @@ test "takeRaw: expired LIFESPAN sample is silently discarded" {
             while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
         }
         dr.seen_instances.deinit(alloc);
-        dr.listener_box.releaseRef(alloc);
+        dr.listener_ex_box.releaseRef(alloc);
     }
 
     const d = try alloc.dupe(u8, &.{0xAA});
@@ -4065,7 +4132,7 @@ fn mkTestReaderForGenerationTests(alloc: std.mem.Allocator, clock: *time_test.Ma
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener) catch unreachable,
+        .listener_ex_box = ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)) catch unreachable,
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -4093,7 +4160,7 @@ fn deinitTestReader(dr: *DataReaderImpl, alloc: std.mem.Allocator) void {
         while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
     }
     dr.seen_instances.deinit(alloc);
-    dr.listener_box.releaseRef(alloc);
+    dr.listener_ex_box.releaseRef(alloc);
 }
 
 test "determineStatesLocked: disposed_generation_count increments only on resurrection from DISPOSED" {
@@ -4395,7 +4462,7 @@ test "vtCreateReadCondition: a condition tracked while deinit() is racing is sti
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -4480,7 +4547,7 @@ test "vtDeleteReadCondition: winning the race removes the condition before reall
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -4562,7 +4629,7 @@ test "vtCreateReadCondition: refuses to create once reader teardown has started"
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -4609,7 +4676,7 @@ test "vtDeleteReadCondition: backs off entirely once reader teardown has started
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,
@@ -4682,7 +4749,7 @@ test "ReadConditionImpl.deinit: a direct call (bypassing delete_readcondition) a
         .subscriber = nil.nil_subscriber,
         .proto_reader = undefined,
         .qos = .{},
-        .listener_box = try ListenerBox(DDS.DataReaderListener).create(alloc, nil.nil_dr_listener),
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
         .listener_mask = 0,
         .instance_handle = 1,
         .status_changes = 0,

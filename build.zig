@@ -202,6 +202,7 @@ pub fn build(b: *std.Build) void {
         \\const Generated = @import("zzdds_generated").DDS;
         \\
         \\pub const DataReader = Generated.DataReader;
+        \\pub const DataReaderListener = Generated.DataReaderListener;
         \\pub const DataWriter = Generated.DataWriter;
         \\pub const DataWriterListener = Generated.DataWriterListener;
         \\pub const DomainId_t = Generated.DomainId_t;
@@ -215,15 +216,21 @@ pub fn build(b: *std.Build) void {
         \\pub const HistoryQosPolicyKind = Generated.HistoryQosPolicyKind;
         \\pub const HistoryQosPolicyKind_fromString = Generated.HistoryQosPolicyKind_fromString;
         \\pub const InstanceHandle_t = Generated.InstanceHandle_t;
+        \\pub const LivelinessChangedStatus = Generated.LivelinessChangedStatus;
         \\pub const LivelinessLostStatus = Generated.LivelinessLostStatus;
         \\pub const OfferedDeadlineMissedStatus = Generated.OfferedDeadlineMissedStatus;
         \\pub const OfferedIncompatibleQosStatus = Generated.OfferedIncompatibleQosStatus;
         \\pub const PublicationMatchedStatus = Generated.PublicationMatchedStatus;
         \\pub const ReliabilityQosPolicyKind = Generated.ReliabilityQosPolicyKind;
         \\pub const ReliabilityQosPolicyKind_fromString = Generated.ReliabilityQosPolicyKind_fromString;
+        \\pub const RequestedDeadlineMissedStatus = Generated.RequestedDeadlineMissedStatus;
+        \\pub const RequestedIncompatibleQosStatus = Generated.RequestedIncompatibleQosStatus;
         \\pub const ReturnCode_t = Generated.ReturnCode_t;
+        \\pub const SampleLostStatus = Generated.SampleLostStatus;
+        \\pub const SampleRejectedStatus = Generated.SampleRejectedStatus;
         \\pub const StatusCondition = Generated.StatusCondition;
         \\pub const StatusMask = Generated.StatusMask;
+        \\pub const SubscriptionMatchedStatus = Generated.SubscriptionMatchedStatus;
         \\pub const Topic = Generated.Topic;
         \\pub const TopicDescription = Generated.TopicDescription;
         \\
@@ -1195,6 +1202,20 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // Shared discovery/association race-test infrastructure (see
+    // docs/design/discovery-association-race-testing.md). Available to every
+    // DCPS test module alongside test_domain, same pattern.
+    const sample_sequence_mod = b.createModule(.{
+        .root_source_file = b.path("test/support/sample_sequence.zig"),
+    });
+    const mock_dcps_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("test/support/mock_dcps_fixture.zig"),
+        .imports = &.{
+            .{ .name = "zzdds", .module = zzdds_mod },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+        },
+    });
+
     const test_step = b.step("test", "Run Zenzen DDS tests");
 
     // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
@@ -1368,6 +1389,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/factory_vtable_test.zig",
         "test/dcps/participant_vtable_test.zig",
         "test/dcps/writer_vtable_test.zig",
+        "test/dcps/discovery_race_test.zig",
     };
     var dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
@@ -1381,6 +1403,8 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
                     .{ .name = "zidl_rt", .module = zidl_rt_mod },
                     .{ .name = "test_domain", .module = test_domain_mod },
+                    .{ .name = "sample_sequence", .module = sample_sequence_mod },
+                    .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod },
                 },
             }),
         });
@@ -1583,6 +1607,14 @@ pub fn build(b: *std.Build) void {
         test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
+    const mock_dcps_fixture_mod_llvm_safe = b.createModule(.{
+        .root_source_file = b.path("test/support/mock_dcps_fixture.zig"),
+        .imports = &.{
+            .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+        },
+    });
+
     var rs_dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
@@ -1596,6 +1628,8 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
                     .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
                     .{ .name = "test_domain", .module = test_domain_mod },
+                    .{ .name = "sample_sequence", .module = sample_sequence_mod },
+                    .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod_llvm_safe },
                 },
             }),
         });
@@ -1689,6 +1723,13 @@ pub fn build(b: *std.Build) void {
     }
 
     // DCPS tests (TSan) — WaitSet thread test, loopback
+    const mock_dcps_fixture_mod_tsan = b.createModule(.{
+        .root_source_file = b.path("test/support/mock_dcps_fixture.zig"),
+        .imports = &.{
+            .{ .name = "zzdds", .module = zzdds_mod_tsan },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
+        },
+    });
     var tsan_dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
@@ -1700,6 +1741,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
                 .{ .name = "zidl_rt", .module = zidl_rt_mod_tsan },
                 .{ .name = "test_domain", .module = test_domain_mod },
+                .{ .name = "sample_sequence", .module = sample_sequence_mod },
+                .{ .name = "mock_dcps_fixture", .module = mock_dcps_fixture_mod_tsan },
             },
         }), .use_llvm = true });
         t.root_module.link_libc = true;

@@ -415,7 +415,13 @@ pub const RtpsProtocolReader = struct {
         .deinit = vtDeinit,
         .quiesce_acquire = vtQuiesceAcquire,
         .quiesce_release = vtQuiesceRelease,
+        .set_protocol_ready_callback = vtSetProtocolReadyCallback,
     };
+
+    fn vtSetProtocolReadyCallback(ctx: *anyopaque, cb: protocol.ProtocolReadyCallback) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.reader.setProtocolReadyCallback(cb.ctx, cb.on_ready);
+    }
 
     fn vtSetDataCallback(ctx: *anyopaque, cb: protocol.DataCallback) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -544,6 +550,7 @@ pub const RtpsProtocolReader = struct {
     fn vtHandleHeartbeat(
         ctx: *anyopaque,
         writer_guid: Guid,
+        reader_id: EntityId,
         first_sn: history_mod.SequenceNumber,
         last_sn: history_mod.SequenceNumber,
         count: i32,
@@ -576,7 +583,7 @@ pub const RtpsProtocolReader = struct {
                 if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid, if (liveliness) .manual_heartbeat else .heartbeat);
             }
         }
-        self.reader.handleHeartbeat(writer_guid, first_sn, last_sn, count, final);
+        self.reader.handleHeartbeat(writer_guid, reader_id, first_sn, last_sn, count, final);
     }
 
     fn vtHandleDataFrag(

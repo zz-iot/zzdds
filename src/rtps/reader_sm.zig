@@ -194,6 +194,16 @@ pub const WriterProxy = struct {
     /// Each entry accumulates DATA_FRAG payloads until complete, then delivers
     /// the assembled change through the normal handleData path.
     reassembly: std.AutoHashMapUnmanaged(SequenceNumber, ReassemblyEntry),
+    /// True once this proxy has completed the reader-side readiness signal
+    /// (or, for BEST_EFFORT proxies, immediately at match -- no handshake
+    /// exists). Sticky: never cleared by a later stale/duplicate HEARTBEAT.
+    /// Drives the `on_reliable_writer_ready` extended listener callback --
+    /// the reader-side counterpart of ReaderProxy.protocol_ready
+    /// (writer_sm.zig). Set true when a HEARTBEAT's readerId names this
+    /// reader specifically (RTPS §8.3.7.5), never on a wildcard
+    /// ENTITYID_UNKNOWN heartbeat, which proves nothing about per-reader
+    /// registration.
+    protocol_ready: bool = false,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -313,6 +323,10 @@ pub const StatefulReader = struct {
     /// false on unmatch. See hasMatchedWriters()'s own doc comment for why
     /// this needs to be "ever", not "currently".
     ever_matched_writer: bool = false,
+    /// Callback fired when a writer proxy's protocol-ready state
+    /// transitions. Mirrors StatefulWriter's identical field.
+    protocol_ready_fn: ?*const fn (*anyopaque, Guid, bool) void = null,
+    protocol_ready_ctx: ?*anyopaque = null,
 
     const Self = @This();
     const MAX_UNMATCHED_BUFFER: usize = 64;
@@ -377,6 +391,18 @@ pub const StatefulReader = struct {
         self.callback = cb;
     }
 
+    /// Register a callback that fires when a writer proxy's protocol-ready
+    /// state transitions. Must be called before any writer proxies are
+    /// added. Mirrors StatefulWriter.setProtocolReadyCallback.
+    pub fn setProtocolReadyCallback(
+        self: *Self,
+        ctx: *anyopaque,
+        fn_ptr: *const fn (*anyopaque, Guid, bool) void,
+    ) void {
+        self.protocol_ready_fn = fn_ptr;
+        self.protocol_ready_ctx = ctx;
+    }
+
     /// Add a matched writer. For new writers, sends an initial non-final AckNack
     /// to solicit available data (RTPS §8.4.10.3): RELIABLE writers respond by
     /// retransmitting missing cached changes, and TRANSIENT_LOCAL BEST_EFFORT
@@ -389,10 +415,10 @@ pub const StatefulReader = struct {
     /// presenting the same participant twice).
     pub fn addMatchedWriter(self: *Self, proxy: WriterProxy) !void {
         self.mu.lock();
-        defer self.mu.unlock();
         for (self.writer_proxies.items) |*wp| {
             if (wp.guid.eql(proxy.guid)) {
-                // Lease refresh: update locators/metadata, preserve sequence state.
+                // Lease refresh: update locators/metadata, preserve sequence state
+                // (including protocol_ready -- an already-ready proxy stays ready).
                 // proxy.selected_locators was already computed against
                 // proxy.unicast_locators/multicast_locators by WriterProxy.init,
                 // so it moves alongside them rather than being recomputed here.
@@ -409,12 +435,27 @@ pub const StatefulReader = struct {
                 discarded.multicast_locators = .empty;
                 discarded.selected_locators = .empty;
                 discarded.deinit(self.alloc);
+                self.mu.unlock();
                 return;
             }
         }
         try self.writer_proxies.append(self.alloc, proxy);
         self.ever_matched_writer = true;
         const new_wp = &self.writer_proxies.items[self.writer_proxies.items.len - 1];
+
+        // BEST_EFFORT proxies have no AckNack/Heartbeat handshake (RTPS
+        // §8.4.15) to prove targeted delivery, so there's nothing to wait
+        // for -- ready immediately. Mirrors StatefulWriter.addMatchedReader's
+        // identical BEST_EFFORT branch for on_reliable_reader_ready. Fired
+        // after self.mu is released below (never while holding it).
+        const newly_ready_guid: ?Guid = blk: {
+            if (!new_wp.reliable) {
+                new_wp.protocol_ready = true;
+                break :blk new_wp.guid;
+            }
+            break :blk null;
+        };
+
         // Replay any DATA that arrived in the window between first receiving data
         // from this writer and the writer proxy being established (SEDP race).
         // deliverChangeLocked makes its own copy, so we free our buffered copy afterward.
@@ -444,18 +485,34 @@ pub const StatefulReader = struct {
         // trigger that compensates for the race between writer-side replay and
         // reader-side proxy setup.
         self.sendAckNackUnlocked(new_wp, 0, false);
+        self.mu.unlock();
+
+        if (newly_ready_guid) |guid| {
+            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, true);
+        }
     }
 
     pub fn removeMatchedWriter(self: *Self, guid: Guid) void {
         self.mu.lock();
-        defer self.mu.unlock();
+        var was_ready = false;
         var i: usize = self.writer_proxies.items.len;
         while (i > 0) {
             i -= 1;
             if (self.writer_proxies.items[i].guid.eql(guid)) {
+                was_ready = was_ready or self.writer_proxies.items[i].protocol_ready;
                 self.writer_proxies.items[i].deinit(self.alloc);
                 _ = self.writer_proxies.swapRemove(i);
             }
+        }
+        self.mu.unlock();
+
+        // Fired after self.mu is released (never while holding it) -- mirrors
+        // StatefulWriter.removeMatchedReader's identical pattern. Lets an
+        // application using on_reliable_writer_ready know a writer it was
+        // told is ready has gone away, rather than staying convinced it's
+        // still ready indefinitely.
+        if (was_ready) {
+            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, false);
         }
     }
 
@@ -875,6 +932,7 @@ pub const StatefulReader = struct {
     pub fn handleHeartbeat(
         self: *Self,
         writer_guid: Guid,
+        reader_id: EntityId,
         first_sn: SequenceNumber,
         last_sn: SequenceNumber,
         count: i32,
@@ -886,7 +944,12 @@ pub const StatefulReader = struct {
         if (first_sn <= 0 or last_sn < first_sn - 1) return;
 
         self.mu.lock();
-        defer self.mu.unlock();
+
+        // Fired after self.mu is released below (never while holding it) --
+        // unlike the internal cb.on_heartbeat callback further down, this
+        // reaches arbitrary user listener code via DataReaderImpl.
+        // notifyWriterProtocolReady, which must never run under this lock.
+        var newly_ready_guid: ?Guid = null;
 
         for (self.writer_proxies.items) |*wp| {
             if (!wp.guid.eql(writer_guid)) continue;
@@ -905,6 +968,18 @@ pub const StatefulReader = struct {
             }
             const is_first_hb = wp.last_hb_count == null;
             wp.last_hb_count = count;
+
+            // reader_id names this reader specifically (RTPS §8.3.7.5): the
+            // writer could only construct that if it already has a
+            // ReaderProxy for us, so this is retroactive proof
+            // addMatchedReader has already run on the writer's side. A
+            // wildcard ENTITYID_UNKNOWN heartbeat proves nothing about
+            // per-reader registration and must not trigger this -- see
+            // docs/design/discovery-association-race-testing.md.
+            if (!wp.protocol_ready and reader_id.eql(self.guid.entity_id)) {
+                wp.protocol_ready = true;
+                newly_ready_guid = wp.guid;
+            }
 
             // On the first HEARTBEAT from a transient-local writer, record last_sn as
             // the floor: the reader needs to receive every SN up to that point before
@@ -957,6 +1032,12 @@ pub const StatefulReader = struct {
             if (!final or has_missing) {
                 self.sendAckNackLocked(wp, last_sn, !has_missing);
             }
+        }
+
+        self.mu.unlock();
+
+        if (newly_ready_guid) |guid| {
+            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, true);
         }
     }
 
@@ -1568,7 +1649,7 @@ test "StatefulReader pending_unmatched: out-of-order replay delivered by heartbe
     // Empty HEARTBEAT (first_sn=30, last_sn=29): writer history starts at SN=30,
     // so SNs 1-29 never existed.  Virtual GAP fill advances cumAck to 29 →
     // deliverPendingLocked delivers the buffered SN=30.
-    reader.handleHeartbeat(writer_guid, 30, 29, 1, true);
+    reader.handleHeartbeat(writer_guid, guid_mod.EntityIds.unknown, 30, 29, 1, true);
     try testing.expectEqual(@as(usize, 1), delivered);
 }
 
@@ -1614,7 +1695,7 @@ test "StatefulReader pending_unmatched: GUID cap drops 33rd unmatched writer" {
     const first_guid = makeGuid(0, 0xC2);
     const proxy0 = try WriterProxy.init(testing.allocator, first_guid, &.{}, &.{}, true);
     try reader.addMatchedWriter(proxy0);
-    reader.handleHeartbeat(first_guid, 1, 1, 1, true);
+    reader.handleHeartbeat(first_guid, guid_mod.EntityIds.unknown, 1, 1, 1, true);
     try testing.expectEqual(@as(usize, 1), delivered);
 }
 
@@ -1671,7 +1752,7 @@ test "StatefulReader pending_unmatched_reassembly: outer entry removed after ass
     // Match the 32nd writer and confirm its change is delivered.
     const proxy32 = try WriterProxy.init(testing.allocator, extra_guid, &.{}, &.{}, true);
     try reader.addMatchedWriter(proxy32);
-    reader.handleHeartbeat(extra_guid, 1, 1, 1, true);
+    reader.handleHeartbeat(extra_guid, guid_mod.EntityIds.unknown, 1, 1, 1, true);
     try testing.expectEqual(@as(usize, 1), delivered);
 }
 
@@ -1724,12 +1805,12 @@ test "StatefulReader pending_unmatched: GUID cap is shared across DATA and DATA_
     // Neither extra GUID delivered after matching.
     const proxy_data = try WriterProxy.init(testing.allocator, extra_data_guid, &.{}, &.{}, true);
     try reader.addMatchedWriter(proxy_data);
-    reader.handleHeartbeat(extra_data_guid, 1, 1, 1, true);
+    reader.handleHeartbeat(extra_data_guid, guid_mod.EntityIds.unknown, 1, 1, 1, true);
     try testing.expectEqual(@as(usize, 0), delivered);
 
     const proxy_frag = try WriterProxy.init(testing.allocator, extra_frag_guid, &.{}, &.{}, true);
     try reader.addMatchedWriter(proxy_frag);
-    reader.handleHeartbeat(extra_frag_guid, 1, 1, 1, true);
+    reader.handleHeartbeat(extra_frag_guid, guid_mod.EntityIds.unknown, 1, 1, 1, true);
     try testing.expectEqual(@as(usize, 0), delivered);
 }
 
@@ -1787,7 +1868,7 @@ test "StatefulReader pending_unmatched: GUID cap counts unique GUIDs across both
 
     const proxy32 = try WriterProxy.init(testing.allocator, guid32, &.{}, &.{}, true);
     try reader.addMatchedWriter(proxy32);
-    reader.handleHeartbeat(guid32, 1, 1, 1, true);
+    reader.handleHeartbeat(guid32, guid_mod.EntityIds.unknown, 1, 1, 1, true);
     try testing.expectEqual(@as(usize, 1), delivered);
 }
 

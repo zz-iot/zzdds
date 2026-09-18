@@ -106,7 +106,7 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber, _: ?i64) void {}
     }.f,
     .handle_heartbeat = struct {
-        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool, _: bool) void {}
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.EntityId, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool, _: bool) void {}
     }.f,
     .handle_data_frag = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.RtpsTimestamp, _: proto.DataFragSubmessage) void {}
@@ -134,6 +134,9 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
     }.f,
     .deinit = struct {
         fn f(_: *anyopaque) void {}
+    }.f,
+    .set_protocol_ready_callback = struct {
+        fn f(_: *anyopaque, _: proto.ProtocolReadyCallback) void {}
     }.f,
 };
 
@@ -2082,12 +2085,12 @@ pub const DomainParticipantImpl = struct {
                     if (hb.reader_entity_id.eql(EntityIds.unknown)) {
                         var fan_it = self.active_readers.valueIterator();
                         while (fan_it.next()) |ar| {
-                            ar.proto.handleHeartbeat(writer_guid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal(), hb.isLiveliness());
+                            ar.proto.handleHeartbeat(writer_guid, hb.reader_entity_id, hb.first_sn, hb.last_sn, hb.count, hb.isFinal(), hb.isLiveliness());
                         }
                     } else {
                         const rkey = entityIdKey(hb.reader_entity_id);
                         if (self.active_readers.getPtr(rkey)) |ar| {
-                            ar.proto.handleHeartbeat(writer_guid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal(), hb.isLiveliness());
+                            ar.proto.handleHeartbeat(writer_guid, hb.reader_entity_id, hb.first_sn, hb.last_sn, hb.count, hb.isFinal(), hb.isLiveliness());
                         }
                     }
                     self.mu.unlock();

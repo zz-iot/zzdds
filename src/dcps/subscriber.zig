@@ -23,6 +23,7 @@ const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const participant_mod = @import("participant.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
+const ZZDDS = @import("zzdds_ext_generated").zzdds;
 
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 pub const ParticipantCbs = struct {
@@ -412,6 +413,12 @@ pub const SubscriberImpl = struct {
             dr,
             reader_mod.DataReaderImpl.onParticipantAliveCb,
         );
+        // Direct ProtocolReader registration (not routed through
+        // ParticipantCbs like the callbacks above): this signal is purely
+        // RTPS-internal (a targeted HEARTBEAT's readerId, or immediate at
+        // match for BEST_EFFORT), unlike notifySubscriptionMatched which
+        // needs SEDP bookkeeping in the participant's active_readers map.
+        pr.setProtocolReadyCallback(.{ .ctx = dr, .on_ready = reader_mod.DataReaderImpl.notifyWriterProtocolReady });
         // Convert partition name StringSeq (C extern struct) to []const []const u8 for announce_reader.
         const pname_seq = &self.qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
@@ -626,7 +633,7 @@ pub const SubscriberImpl = struct {
         listener_data: ?*anyopaque,
         owner: union(enum) {
             none,
-            reader: struct { box: *ListenerBox(DDS.DataReaderListener), alloc: std.mem.Allocator },
+            reader: struct { box: *ListenerBox(ZZDDS.DataReaderListenerEx), alloc: std.mem.Allocator },
             subscriber: struct { box: *ListenerBox(DDS.SubscriberListener), alloc: std.mem.Allocator },
             participant: struct { box: *ListenerBox(DDS.DomainParticipantListener), alloc: std.mem.Allocator },
         },
