@@ -150,6 +150,15 @@ pub const ProtocolWriter = struct {
         /// SEDP removed a previously matched remote reader.
         remove_matched_reader: *const fn (ctx: *anyopaque, guid: Guid) void,
 
+        /// Like remove_matched_reader, but performs the removal immediately
+        /// and returns the resulting on_reliable_reader_ready(false)
+        /// transition instead of firing it -- for callers (e.g.
+        /// DomainParticipantImpl.onParticipantLost) that need the removal
+        /// itself kept serialized with their own external lock while still
+        /// firing the callback only after releasing it. See
+        /// StatefulWriter.removeMatchedReaderDeferred's doc comment for why.
+        remove_matched_reader_deferred: *const fn (ctx: *anyopaque, guid: Guid) ?ProtocolReadyCallback,
+
         /// Return the number of currently matched reader proxies.
         matched_reader_count: *const fn (ctx: *anyopaque) usize,
 
@@ -288,6 +297,10 @@ pub const ProtocolWriter = struct {
 
     pub fn removeMatchedReader(self: ProtocolWriter, guid: Guid) void {
         self.vtable.remove_matched_reader(self.ctx, guid);
+    }
+
+    pub fn removeMatchedReaderDeferred(self: ProtocolWriter, guid: Guid) ?ProtocolReadyCallback {
+        return self.vtable.remove_matched_reader_deferred(self.ctx, guid);
     }
 
     pub fn matchedReaderCount(self: ProtocolWriter) usize {
@@ -442,6 +455,15 @@ pub const ProtocolReader = struct {
         /// SEDP removed a previously matched remote writer.
         remove_matched_writer: *const fn (ctx: *anyopaque, guid: Guid) void,
 
+        /// Like remove_matched_writer, but performs the removal immediately
+        /// and returns the resulting on_reliable_writer_ready(false)
+        /// transition instead of firing it -- for callers (e.g.
+        /// DomainParticipantImpl.onWriterLost/onParticipantLost) that need
+        /// the removal itself kept serialized with their own external lock
+        /// while still firing the callback only after releasing it. See
+        /// StatefulReader.removeMatchedWriterDeferred's doc comment for why.
+        remove_matched_writer_deferred: *const fn (ctx: *anyopaque, guid: Guid) ?ProtocolReadyCallback,
+
         /// Return the number of currently matched writer proxies.
         matched_writer_count: *const fn (ctx: *anyopaque) usize,
 
@@ -569,6 +591,10 @@ pub const ProtocolReader = struct {
 
     pub fn removeMatchedWriter(self: ProtocolReader, guid: Guid) void {
         self.vtable.remove_matched_writer(self.ctx, guid);
+    }
+
+    pub fn removeMatchedWriterDeferred(self: ProtocolReader, guid: Guid) ?ProtocolReadyCallback {
+        return self.vtable.remove_matched_writer_deferred(self.ctx, guid);
     }
 
     pub fn matchedWriterCount(self: ProtocolReader) usize {

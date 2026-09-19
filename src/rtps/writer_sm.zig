@@ -1210,8 +1210,26 @@ pub const StatefulWriter = struct {
         }
     }
 
-    pub fn removeMatchedReader(self: *Self, guid: Guid) void {
+    /// A pending on_reliable_reader_ready(false) transition, returned instead
+    /// of fired immediately -- see removeMatchedReaderDeferred.
+    pub const DeferredReady = struct {
+        fn_ptr: *const fn (*anyopaque, Guid, bool) void,
+        ctx: *anyopaque,
+    };
+
+    /// Like removeMatchedReader, but performs the removal immediately (under
+    /// self.mu, as normal) and returns the resulting ready=false transition
+    /// instead of firing it -- for callers that need this removal kept
+    /// serialized with their OWN external lock (e.g.
+    /// DomainParticipantImpl.mu in onParticipantLost: without this, a
+    /// concurrent rediscovery could re-add the same reader between that lock
+    /// being released and a deferred plain removeMatchedReader call actually
+    /// running, and the stale removal would wrongly undo the fresh match)
+    /// while still firing the callback only once that external lock is
+    /// released. Caller must fire the returned transition itself.
+    pub fn removeMatchedReaderDeferred(self: *Self, guid: Guid) ?DeferredReady {
         self.mu.lock();
+        defer self.mu.unlock();
         var was_ready = false;
         var i: usize = self.reader_proxies.items.len;
         while (i > 0) {
@@ -1225,14 +1243,13 @@ pub const StatefulWriter = struct {
         // Wake any thread blocked in waitAllAcked: removing a reliable reader
         // may satisfy the all-acked condition even without an explicit ACKNACK.
         self.ack_cond.broadcast();
-        // See addMatchedReader's matching comment: capture under the lock.
-        const ready_fn = self.protocol_ready_fn;
-        const ready_ctx = self.protocol_ready_ctx;
-        self.mu.unlock();
+        if (!was_ready) return null;
+        const f = self.protocol_ready_fn orelse return null;
+        return .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
+    }
 
-        if (was_ready) {
-            if (ready_fn) |f| f(ready_ctx.?, guid, false);
-        }
+    pub fn removeMatchedReader(self: *Self, guid: Guid) void {
+        if (self.removeMatchedReaderDeferred(guid)) |d| d.fn_ptr(d.ctx, guid, false);
     }
 
     /// Store a new change and send it immediately to all matched readers.

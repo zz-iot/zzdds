@@ -94,6 +94,11 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
     .remove_matched_writer = struct {
         fn f(_: *anyopaque, _: proto.Guid) void {}
     }.f,
+    .remove_matched_writer_deferred = struct {
+        fn f(_: *anyopaque, _: proto.Guid) ?proto.ProtocolReadyCallback {
+            return null;
+        }
+    }.f,
     .matched_writer_count = struct {
         fn f(_: *anyopaque) usize {
             return 0;
@@ -2220,17 +2225,11 @@ pub const DomainParticipantImpl = struct {
         if (push_dr) |dr| pushBuiltinParticipantCdr(self.alloc, dr, data);
     }
 
-    const ParticipantLostReaderJob = struct {
-        proto: proto.ProtocolReader,
+    const ParticipantLostFire = struct {
+        guid: Guid,
+        ready_cb: ?proto.ProtocolReadyCallback,
         notify: ?MatchedNotify,
         notify_quiesced: bool = false,
-        guids: std.ArrayListUnmanaged(Guid),
-    };
-    const ParticipantLostWriterJob = struct {
-        proto: proto.ProtocolWriter,
-        notify: ?MatchedNotify,
-        notify_quiesced: bool = false,
-        guids: std.ArrayListUnmanaged(Guid),
     };
 
     fn onParticipantLost(ctx: *anyopaque, guid: disc.Guid) void {
@@ -2260,96 +2259,76 @@ pub const DomainParticipantImpl = struct {
         }
         // Remove matched writers/readers belonging to this participant from all
         // local DataReaders so they can generate NOT_ALIVE_NO_WRITERS, and the
-        // symmetric sweep for local DataWriters. Both removeMatchedWriter and
-        // removeMatchedReader can fire a readiness/matched-notify callback
-        // that reaches arbitrary application listener code, so -- same as
-        // onWriterLost -- collect quiesce-protected jobs (with the matching
-        // remote GUIDs, ownership transferred out of the per-entity list
-        // rather than freed here) under self.mu, then dispatch after
-        // unlocking. Uses the GUID prefix as the membership key (all
-        // endpoints of a participant share its prefix).
+        // symmetric sweep for local DataWriters. The protocol-level match
+        // removal itself must stay serialized under self.mu -- otherwise a
+        // concurrent rediscovery of one of these same endpoints (a fresh
+        // SEDP announcement processed on another thread) could re-add the
+        // match in the window between releasing this lock and a deferred
+        // removal call actually running, and the stale removal would
+        // wrongly undo the fresh match (PR #90 review). So remove
+        // immediately via removeMatchedWriterDeferred/
+        // removeMatchedReaderDeferred (still under the lock, exactly like
+        // the pre-restructuring code did), and only defer the resulting
+        // callbacks -- which reach arbitrary application listener code and
+        // must not fire while self.mu is held -- to after unlocking. Uses
+        // the GUID prefix as the membership key (all endpoints of a
+        // participant share its prefix).
         const prefix = guid.prefix;
-        var reader_jobs: std.ArrayListUnmanaged(ParticipantLostReaderJob) = .empty;
-        defer reader_jobs.deinit(self.alloc);
+        var reader_fires: std.ArrayListUnmanaged(ParticipantLostFire) = .empty;
+        defer reader_fires.deinit(self.alloc);
         var ar_it = self.active_readers.valueIterator();
         while (ar_it.next()) |ar| {
-            var guids: std.ArrayListUnmanaged(Guid) = .empty;
-            ar.proto.listMatchedWriters(self.alloc, &guids) catch continue;
-            var i: usize = guids.items.len;
-            while (i > 0) {
-                i -= 1;
-                if (!guids.items[i].prefix.eql(prefix)) _ = guids.swapRemove(i);
+            var w_guids: std.ArrayListUnmanaged(Guid) = .empty;
+            defer w_guids.deinit(self.alloc);
+            ar.proto.listMatchedWriters(self.alloc, &w_guids) catch continue;
+            for (w_guids.items) |w_guid| {
+                if (!w_guid.prefix.eql(prefix)) continue;
+                const before = ar.proto.matchedWriterCount();
+                const ready_cb = ar.proto.removeMatchedWriterDeferred(w_guid);
+                const matched_changed = ar.proto.matchedWriterCount() < before;
+                if (ready_cb == null and !matched_changed) continue;
+                const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
+                const nq = if (notify) |cb| cb.quiesceAcquire() else false;
+                reader_fires.append(self.alloc, .{ .guid = w_guid, .ready_cb = ready_cb, .notify = notify, .notify_quiesced = nq }) catch {
+                    if (nq) notify.?.quiesceRelease();
+                };
             }
-            if (guids.items.len == 0) {
-                guids.deinit(self.alloc);
-                continue;
-            }
-            if (!ar.proto.quiesceAcquire()) {
-                guids.deinit(self.alloc);
-                continue;
-            }
-            const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
-            reader_jobs.append(self.alloc, .{ .proto = ar.proto, .notify = ar.matched_notify, .notify_quiesced = nq, .guids = guids }) catch {
-                ar.proto.quiesceRelease();
-                if (nq) ar.matched_notify.?.quiesceRelease();
-                guids.deinit(self.alloc);
-            };
         }
         // Symmetric sweep: remove matched readers belonging to this participant
         // from all local DataWriters so they can generate on_publication_matched
         // (count decreasing) / update matched-subscription state.
-        var writer_jobs: std.ArrayListUnmanaged(ParticipantLostWriterJob) = .empty;
-        defer writer_jobs.deinit(self.alloc);
+        var writer_fires: std.ArrayListUnmanaged(ParticipantLostFire) = .empty;
+        defer writer_fires.deinit(self.alloc);
         var aw_it = self.active_writers.valueIterator();
         while (aw_it.next()) |aw| {
             var r_guids: std.ArrayListUnmanaged(Guid) = .empty;
+            defer r_guids.deinit(self.alloc);
             aw.proto.listMatchedReaders(self.alloc, &r_guids) catch continue;
-            var j: usize = r_guids.items.len;
-            while (j > 0) {
-                j -= 1;
-                if (!r_guids.items[j].prefix.eql(prefix)) _ = r_guids.swapRemove(j);
+            for (r_guids.items) |r_guid| {
+                if (!r_guid.prefix.eql(prefix)) continue;
+                const before = aw.proto.matchedReaderCount();
+                const ready_cb = aw.proto.removeMatchedReaderDeferred(r_guid);
+                const matched_changed = aw.proto.matchedReaderCount() < before;
+                if (ready_cb == null and !matched_changed) continue;
+                const notify: ?MatchedNotify = if (matched_changed) aw.matched_notify else null;
+                const nq = if (notify) |cb| cb.quiesceAcquire() else false;
+                writer_fires.append(self.alloc, .{ .guid = r_guid, .ready_cb = ready_cb, .notify = notify, .notify_quiesced = nq }) catch {
+                    if (nq) notify.?.quiesceRelease();
+                };
             }
-            if (r_guids.items.len == 0) {
-                r_guids.deinit(self.alloc);
-                continue;
-            }
-            if (!aw.proto.quiesceAcquire()) {
-                r_guids.deinit(self.alloc);
-                continue;
-            }
-            const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
-            writer_jobs.append(self.alloc, .{ .proto = aw.proto, .notify = aw.matched_notify, .notify_quiesced = nq, .guids = r_guids }) catch {
-                aw.proto.quiesceRelease();
-                if (nq) aw.matched_notify.?.quiesceRelease();
-                r_guids.deinit(self.alloc);
-            };
         }
         removeDiscoveredEndpointsForPrefix(self, prefix);
         self.mu.unlock();
 
-        for (reader_jobs.items) |*job| {
-            defer job.guids.deinit(self.alloc);
-            for (job.guids.items) |w_guid| {
-                const before = job.proto.matchedWriterCount();
-                job.proto.removeMatchedWriter(w_guid);
-                if (job.proto.matchedWriterCount() < before) {
-                    if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(w_guid), false);
-                }
-            }
-            if (job.notify_quiesced) job.notify.?.quiesceRelease();
-            job.proto.quiesceRelease();
+        for (reader_fires.items) |fire| {
+            if (fire.ready_cb) |cb| cb.on_ready(cb.ctx, fire.guid, false);
+            if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(fire.guid), false);
+            if (fire.notify_quiesced) fire.notify.?.quiesceRelease();
         }
-        for (writer_jobs.items) |*job| {
-            defer job.guids.deinit(self.alloc);
-            for (job.guids.items) |r_guid| {
-                const before = job.proto.matchedReaderCount();
-                job.proto.removeMatchedReader(r_guid);
-                if (job.proto.matchedReaderCount() < before) {
-                    if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(r_guid), false);
-                }
-            }
-            if (job.notify_quiesced) job.notify.?.quiesceRelease();
-            job.proto.quiesceRelease();
+        for (writer_fires.items) |fire| {
+            if (fire.ready_cb) |cb| cb.on_ready(cb.ctx, fire.guid, false);
+            if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(fire.guid), false);
+            if (fire.notify_quiesced) fire.notify.?.quiesceRelease();
         }
         if (publication_dr) |dr| for (lost_writers.items) |endpoint_guid|
             pushBuiltinEndpointDisposed(dr, endpoint_guid);
@@ -2534,7 +2513,7 @@ pub const DomainParticipantImpl = struct {
     }
 
     const RemovedWriterJob = struct {
-        proto: proto.ProtocolReader,
+        ready_cb: ?proto.ProtocolReadyCallback,
         notify: ?MatchedNotify,
         notify_quiesced: bool = false,
     };
@@ -2542,20 +2521,30 @@ pub const DomainParticipantImpl = struct {
     fn onWriterLost(ctx: *anyopaque, guid: disc.Guid) void {
         const self = cast(ctx);
         var push_dr: ?*reader_mod.DataReaderImpl = null;
-        // removeMatchedWriter can fire on_reliable_writer_ready(false), which
-        // reaches arbitrary application listener code -- must not run while
-        // self.mu is held. Same quiesce-protected job-list pattern as
-        // onWriterDiscovered/onReaderDiscovered.
+        // The protocol-level match removal itself must stay serialized
+        // under self.mu -- otherwise a concurrent rediscovery of this same
+        // writer (a fresh SEDP announcement processed on another thread)
+        // could re-add the match in the window between releasing this lock
+        // and a deferred removal call actually running, and the stale
+        // removal would wrongly undo the fresh match (PR #90 review). So
+        // remove immediately via removeMatchedWriterDeferred (still under
+        // the lock, exactly like the pre-restructuring code did), and only
+        // defer the resulting callbacks -- which reach arbitrary
+        // application listener code and must not fire while self.mu is
+        // held -- to after unlocking.
         var jobs: std.ArrayListUnmanaged(RemovedWriterJob) = .empty;
         defer jobs.deinit(self.alloc);
         self.mu.lock();
         var ar_it2 = self.active_readers.valueIterator();
         while (ar_it2.next()) |ar| {
-            if (!ar.proto.quiesceAcquire()) continue;
-            const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
-            jobs.append(self.alloc, .{ .proto = ar.proto, .notify = ar.matched_notify, .notify_quiesced = nq }) catch {
-                ar.proto.quiesceRelease();
-                if (nq) ar.matched_notify.?.quiesceRelease();
+            const before = ar.proto.matchedWriterCount();
+            const ready_cb = ar.proto.removeMatchedWriterDeferred(guid);
+            const matched_changed = ar.proto.matchedWriterCount() < before;
+            if (ready_cb == null and !matched_changed) continue;
+            const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
+            const nq = if (notify) |cb| cb.quiesceAcquire() else false;
+            jobs.append(self.alloc, .{ .ready_cb = ready_cb, .notify = notify, .notify_quiesced = nq }) catch {
+                if (nq) notify.?.quiesceRelease();
             };
         }
         removeDiscoveredWriter(self, guid);
@@ -2564,13 +2553,9 @@ pub const DomainParticipantImpl = struct {
 
         const remote_handle = writer_mod.guidToHandle(guid);
         for (jobs.items) |job| {
-            const before = job.proto.matchedWriterCount();
-            job.proto.removeMatchedWriter(guid);
-            if (job.proto.matchedWriterCount() < before) {
-                if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
-            }
+            if (job.ready_cb) |cb| cb.on_ready(cb.ctx, guid, false);
+            if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
             if (job.notify_quiesced) job.notify.?.quiesceRelease();
-            job.proto.quiesceRelease();
         }
         if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
     }

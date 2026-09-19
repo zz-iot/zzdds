@@ -507,8 +507,26 @@ pub const StatefulReader = struct {
         }
     }
 
-    pub fn removeMatchedWriter(self: *Self, guid: Guid) void {
+    /// A pending on_reliable_writer_ready(false) transition, returned instead
+    /// of fired immediately -- see removeMatchedWriterDeferred.
+    pub const DeferredReady = struct {
+        fn_ptr: *const fn (*anyopaque, Guid, bool) void,
+        ctx: *anyopaque,
+    };
+
+    /// Like removeMatchedWriter, but performs the removal immediately (under
+    /// self.mu, as normal) and returns the resulting ready=false transition
+    /// instead of firing it -- for callers that need this removal kept
+    /// serialized with their OWN external lock (e.g.
+    /// DomainParticipantImpl.mu in onWriterLost/onParticipantLost: without
+    /// this, a concurrent rediscovery could re-add the same writer between
+    /// that lock being released and a deferred plain removeMatchedWriter
+    /// call actually running, and the stale removal would wrongly undo the
+    /// fresh match) while still firing the callback only once that external
+    /// lock is released. Caller must fire the returned transition itself.
+    pub fn removeMatchedWriterDeferred(self: *Self, guid: Guid) ?DeferredReady {
         self.mu.lock();
+        defer self.mu.unlock();
         var was_ready = false;
         var i: usize = self.writer_proxies.items.len;
         while (i > 0) {
@@ -519,19 +537,18 @@ pub const StatefulReader = struct {
                 _ = self.writer_proxies.swapRemove(i);
             }
         }
-        // See addMatchedWriter's matching comment: capture under the lock.
-        const ready_fn = self.protocol_ready_fn;
-        const ready_ctx = self.protocol_ready_ctx;
-        self.mu.unlock();
+        if (!was_ready) return null;
+        const f = self.protocol_ready_fn orelse return null;
+        return .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
+    }
 
+    pub fn removeMatchedWriter(self: *Self, guid: Guid) void {
         // Fired after self.mu is released (never while holding it) -- mirrors
         // StatefulWriter.removeMatchedReader's identical pattern. Lets an
         // application using on_reliable_writer_ready know a writer it was
         // told is ready has gone away, rather than staying convinced it's
         // still ready indefinitely.
-        if (was_ready) {
-            if (ready_fn) |f| f(ready_ctx.?, guid, false);
-        }
+        if (self.removeMatchedWriterDeferred(guid)) |d| d.fn_ptr(d.ctx, guid, false);
     }
 
     /// Returns true if the given GUID is currently in the writer proxy list.

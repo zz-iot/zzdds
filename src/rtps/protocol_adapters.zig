@@ -108,6 +108,7 @@ pub const RtpsProtocolWriter = struct {
         .write = vtWrite,
         .add_matched_reader = vtAddMatchedReader,
         .remove_matched_reader = vtRemoveMatchedReader,
+        .remove_matched_reader_deferred = vtRemoveMatchedReaderDeferred,
         .matched_reader_count = vtMatchedReaderCount,
         .list_matched_readers = vtListMatchedReaders,
         .handle_ack_nack = vtHandleAckNack,
@@ -173,6 +174,12 @@ pub const RtpsProtocolWriter = struct {
     fn vtRemoveMatchedReader(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.writer.removeMatchedReader(guid);
+    }
+
+    fn vtRemoveMatchedReaderDeferred(ctx: *anyopaque, guid: Guid) ?protocol.ProtocolReadyCallback {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const d = self.writer.removeMatchedReaderDeferred(guid) orelse return null;
+        return .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
     }
 
     fn vtMatchedReaderCount(ctx: *anyopaque) usize {
@@ -403,6 +410,7 @@ pub const RtpsProtocolReader = struct {
         .set_writer_match_callback = vtSetWriterMatchCallback,
         .add_matched_writer = vtAddMatchedWriter,
         .remove_matched_writer = vtRemoveMatchedWriter,
+        .remove_matched_writer_deferred = vtRemoveMatchedWriterDeferred,
         .matched_writer_count = vtMatchedWriterCount,
         .list_matched_writers = vtListMatchedWriters,
         .handle_incoming_change = vtHandleIncomingChange,
@@ -486,6 +494,23 @@ pub const RtpsProtocolReader = struct {
         const cb = self.writer_match_cb;
         self.reader.mu.unlock();
         if (cb) |c| c.on_writer_unmatched(c.ctx, guid);
+    }
+
+    fn vtRemoveMatchedWriterDeferred(ctx: *anyopaque, guid: Guid) ?protocol.ProtocolReadyCallback {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const deferred = self.reader.removeMatchedWriterDeferred(guid);
+        // Unlike on_reliable_writer_ready (deferred above -- reaches
+        // arbitrary application listener code), on_writer_unmatched is pure
+        // DataReaderImpl-internal bookkeeping (see onWriterUnmatchedCb: its
+        // own quiesce/lock, no user callback, never touches
+        // DomainParticipantImpl.mu) -- safe to fire immediately regardless
+        // of what external lock the caller holds.
+        self.reader.mu.lock();
+        const cb = self.writer_match_cb;
+        self.reader.mu.unlock();
+        if (cb) |c| c.on_writer_unmatched(c.ctx, guid);
+        const d = deferred orelse return null;
+        return .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
     }
 
     fn vtMatchedWriterCount(ctx: *anyopaque) usize {
