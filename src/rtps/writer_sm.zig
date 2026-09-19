@@ -541,12 +541,18 @@ pub const StatefulWriter = struct {
     }
 
     /// Register a callback that fires when a reader proxy's protocol-ready
-    /// state transitions. Must be called before any reader proxies are added.
+    /// state transitions. Safe to call concurrently with a live receive
+    /// thread already dispatching into this writer (addMatchedReader/
+    /// handleAckNack/removeMatchedReader capture protocol_ready_fn/ctx under
+    /// self.mu before firing -- see their comments); no ordering requirement
+    /// relative to when reader proxies are added.
     pub fn setProtocolReadyCallback(
         self: *Self,
         ctx: *anyopaque,
         fn_ptr: *const fn (*anyopaque, Guid, bool) void,
     ) void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.protocol_ready_fn = fn_ptr;
         self.protocol_ready_ctx = ctx;
     }
@@ -733,10 +739,16 @@ pub const StatefulWriter = struct {
         if (self.hb_thread == null) {
             self.hb_thread = std.Thread.spawn(.{}, heartbeatThread, .{self}) catch null;
         }
+        // Captured under the lock, not re-read from self after unlocking --
+        // setProtocolReadyCallback can run concurrently from another thread
+        // (it takes the same lock), so self.protocol_ready_fn/ctx are only
+        // well-defined to read while self.mu is held.
+        const ready_fn = self.protocol_ready_fn;
+        const ready_ctx = self.protocol_ready_ctx;
         self.mu.unlock();
 
         if (newly_ready_guid) |guid| {
-            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, true);
+            if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
     }
 
@@ -1129,11 +1141,18 @@ pub const StatefulWriter = struct {
         if (locs.len == 0) return;
         self.hb_count += 1;
         const first_sn = hb_first_sn;
-        // Guard: RTPS requires first_sn <= last_sn (except the empty-cache
-        // convention first=1, last=0).  A capped last_sn combined with
-        // KEEP_LAST eviction can push cache_first past last_sn — skip the HB
-        // rather than send a malformed submessage.
-        if (last_sn > 0 and first_sn > last_sn) return;
+        // Guard: RTPS requires first_sn <= last_sn + 1 (§8.3.7.5.3; matches
+        // reader_sm.zig's own handleHeartbeat validity check) -- first_sn ==
+        // last_sn + 1 is the *legal* empty-offer range ("nothing new for
+        // you, but I'm alive"), not a malformed submessage. A capped last_sn
+        // combined with KEEP_LAST eviction can still push cache_first more
+        // than one past last_sn — skip the HB only in that genuinely
+        // malformed case. Previously used `first_sn > last_sn`, which
+        // silently dropped the legal empty-offer heartbeat for any freshly
+        // matched non-replaying reader proxy whose start_sn sat exactly at
+        // the cache's current frontier -- see
+        // docs/design/discovery-association-race-testing.md.
+        if (last_sn > 0 and first_sn > last_sn + 1) return;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
@@ -1191,8 +1210,26 @@ pub const StatefulWriter = struct {
         }
     }
 
-    pub fn removeMatchedReader(self: *Self, guid: Guid) void {
+    /// A pending on_reliable_reader_ready(false) transition, returned instead
+    /// of fired immediately -- see removeMatchedReaderDeferred.
+    pub const DeferredReady = struct {
+        fn_ptr: *const fn (*anyopaque, Guid, bool) void,
+        ctx: *anyopaque,
+    };
+
+    /// Like removeMatchedReader, but performs the removal immediately (under
+    /// self.mu, as normal) and returns the resulting ready=false transition
+    /// instead of firing it -- for callers that need this removal kept
+    /// serialized with their OWN external lock (e.g.
+    /// DomainParticipantImpl.mu in onParticipantLost: without this, a
+    /// concurrent rediscovery could re-add the same reader between that lock
+    /// being released and a deferred plain removeMatchedReader call actually
+    /// running, and the stale removal would wrongly undo the fresh match)
+    /// while still firing the callback only once that external lock is
+    /// released. Caller must fire the returned transition itself.
+    pub fn removeMatchedReaderDeferred(self: *Self, guid: Guid) ?DeferredReady {
         self.mu.lock();
+        defer self.mu.unlock();
         var was_ready = false;
         var i: usize = self.reader_proxies.items.len;
         while (i > 0) {
@@ -1206,11 +1243,13 @@ pub const StatefulWriter = struct {
         // Wake any thread blocked in waitAllAcked: removing a reliable reader
         // may satisfy the all-acked condition even without an explicit ACKNACK.
         self.ack_cond.broadcast();
-        self.mu.unlock();
+        if (!was_ready) return null;
+        const f = self.protocol_ready_fn orelse return null;
+        return .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
+    }
 
-        if (was_ready) {
-            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, false);
-        }
+    pub fn removeMatchedReader(self: *Self, guid: Guid) void {
+        if (self.removeMatchedReaderDeferred(guid)) |d| d.fn_ptr(d.ctx, guid, false);
     }
 
     /// Store a new change and send it immediately to all matched readers.
@@ -1298,10 +1337,13 @@ pub const StatefulWriter = struct {
                 @as(SequenceNumber, 1)
             else
                 @max(if (cache_first == 0) 1 else cache_first, rp.start_sn);
-            // RTPS requires first_sn <= last_sn (except the empty-cache first=1,last=0
-            // convention).  The coherent cap can push last_sn below the proxy's start_sn
-            // — skip rather than send a malformed submessage.
-            if (last_sn > 0 and first_sn > last_sn) continue;
+            // RTPS requires first_sn <= last_sn + 1 (§8.3.7.5.3) -- first_sn ==
+            // last_sn + 1 is the legal empty-offer range, not malformed; see
+            // sendHeartbeatToProxyLockedWithLastSnAndFirstSn's matching
+            // comment. The coherent cap can still push last_sn more than one
+            // below the proxy's start_sn — skip only that genuinely
+            // malformed case.
+            if (last_sn > 0 and first_sn > last_sn + 1) continue;
             var b = MessageBuilder.init(&scratch, self.guid.prefix);
             b.addInfoDst(rp.guid.prefix);
             // When KEEP_LAST eviction has moved the cache floor above the reader's
@@ -1612,13 +1654,16 @@ pub const StatefulWriter = struct {
             break; // GUIDs are unique; no need to scan further
         }
 
+        // See addMatchedReader's matching comment: capture under the lock.
+        const ready_fn = self.protocol_ready_fn;
+        const ready_ctx = self.protocol_ready_ctx;
         self.mu.unlock();
 
         if (probe_cleared) |prefix| {
             if (self.probe_result_fn) |f| f(self.probe_result_ctx.?, prefix, true);
         }
         if (newly_ready_guid) |guid| {
-            if (self.protocol_ready_fn) |f| f(self.protocol_ready_ctx.?, guid, true);
+            if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
     }
 
@@ -1847,7 +1892,10 @@ pub const StatefulWriter = struct {
     ) void {
         if (locs.len == 0) return;
         const hb_first_sn = hbFirstSn(cache_first, last_sn, rp_start_sn, null);
-        if (last_sn > 0 and hb_first_sn > last_sn) return;
+        // See sendHeartbeatToProxyLockedWithLastSnAndFirstSn's matching
+        // comment: first_sn == last_sn + 1 is the legal empty-offer range,
+        // not malformed.
+        if (last_sn > 0 and hb_first_sn > last_sn + 1) return;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(rp_guid.prefix);

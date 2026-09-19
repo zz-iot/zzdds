@@ -440,6 +440,7 @@ fn writerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
 }
 
 pub const reader_vtable = ZZDDS.DataReader.Vtable{
+    .set_listener_ex = readerSetListenerEx,
     .get_rtps_guid = readerGetRtpsGuid,
     .get_matched_publication_rtps_guid = readerGetMatchedPublicationRtpsGuid,
     .take_serialized = readerTakeSerialized,
@@ -1226,6 +1227,17 @@ fn writerSetListenerEx(
     if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
     const impl: *DataWriterImpl = @ptrCast(@alignCast(ctx));
     impl.setListenerEx(if (a_listener) |l| l.* else ZZDDS.noop_DataWriterListenerEx, mask);
+    return DDS.RETCODE_OK;
+}
+
+fn readerSetListenerEx(
+    ctx: *anyopaque,
+    a_listener: ?*const ZZDDS.DataReaderListenerEx,
+    mask: DDS.StatusMask,
+) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const impl: *DataReaderImpl = @ptrCast(@alignCast(ctx));
+    impl.setListenerEx(if (a_listener) |l| l.* else ZZDDS.noop_DataReaderListenerEx, mask);
     return DDS.RETCODE_OK;
 }
 

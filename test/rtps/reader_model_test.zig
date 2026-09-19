@@ -318,7 +318,7 @@ fn runReaderScript(alloc: std.mem.Allocator, ops: []const ReaderScriptOp) !void 
             },
             .heartbeat3 => {
                 rec.reset();
-                reader.handleHeartbeat(WRITER_GUID, 1, 3, hb_count, false);
+                reader.handleHeartbeat(WRITER_GUID, rtps.EntityIds.unknown, 1, 3, hb_count, false);
                 const accepted = try model.heartbeat(alloc, 1, hb_count);
                 try testing.expectEqual(@as(usize, if (accepted) 1 else 0), countAckNacks(&rec));
                 try expectDelivered(&model, &col);
@@ -351,7 +351,7 @@ test "reader model: out-of-order data then virtual gap delivers contiguous pendi
     try model.gap(alloc, 3, gap_list);
     try expectDelivered(&model, &col);
 
-    reader.handleHeartbeat(WRITER_GUID, 2, 4, 1, false);
+    reader.handleHeartbeat(WRITER_GUID, rtps.EntityIds.unknown, 2, 4, 1, false);
     _ = try model.heartbeat(alloc, 2, 1);
     try expectDelivered(&model, &col);
     try testing.expectEqual(@as(usize, 1), countAckNacks(&rec));
@@ -393,7 +393,7 @@ test "reader model: heartbeat virtual gap reports sample lost and unblocks pendi
     try model.data(alloc, 3);
     try expectDelivered(&model, &col);
 
-    reader.handleHeartbeat(WRITER_GUID, 3, 3, 1, true);
+    reader.handleHeartbeat(WRITER_GUID, rtps.EntityIds.unknown, 3, 3, 1, true);
     try testing.expect(try model.heartbeat(alloc, 3, 1));
     try expectDelivered(&model, &col);
     try testing.expectEqual(@as(i32, 2), col.lost_count);
@@ -409,16 +409,16 @@ test "reader model: duplicate and stale heartbeats do not send new AckNacks" {
     var model = ReaderModel{};
     defer model.deinit(alloc);
 
-    reader.handleHeartbeat(WRITER_GUID, 1, 3, 5, false);
+    reader.handleHeartbeat(WRITER_GUID, rtps.EntityIds.unknown, 1, 3, 5, false);
     try testing.expect(try model.heartbeat(alloc, 1, 5));
     try testing.expectEqual(@as(usize, 1), countAckNacks(&rec));
 
     rec.reset();
-    reader.handleHeartbeat(WRITER_GUID, 1, 3, 5, false);
+    reader.handleHeartbeat(WRITER_GUID, rtps.EntityIds.unknown, 1, 3, 5, false);
     try testing.expect(!(try model.heartbeat(alloc, 1, 5)));
     try testing.expectEqual(@as(usize, 0), countAckNacks(&rec));
 
-    reader.handleHeartbeat(WRITER_GUID, 1, 3, 4, false);
+    reader.handleHeartbeat(WRITER_GUID, rtps.EntityIds.unknown, 1, 3, 4, false);
     try testing.expect(!(try model.heartbeat(alloc, 1, 4)));
     try testing.expectEqual(@as(usize, 0), countAckNacks(&rec));
 }
@@ -436,12 +436,12 @@ test "reader model: heartbeat count rollover is accepted once" {
     reader.writer_proxies.items[0].last_hb_count = std.math.maxInt(i32);
     model.last_hb_count = std.math.maxInt(i32);
 
-    reader.handleHeartbeat(WRITER_GUID, 1, 3, std.math.minInt(i32), false);
+    reader.handleHeartbeat(WRITER_GUID, rtps.EntityIds.unknown, 1, 3, std.math.minInt(i32), false);
     try testing.expect(try model.heartbeat(alloc, 1, std.math.minInt(i32)));
     try testing.expectEqual(@as(usize, 1), countAckNacks(&rec));
 
     rec.reset();
-    reader.handleHeartbeat(WRITER_GUID, 1, 3, std.math.minInt(i32), false);
+    reader.handleHeartbeat(WRITER_GUID, rtps.EntityIds.unknown, 1, 3, std.math.minInt(i32), false);
     try testing.expect(!(try model.heartbeat(alloc, 1, std.math.minInt(i32))));
     try testing.expectEqual(@as(usize, 0), countAckNacks(&rec));
 }

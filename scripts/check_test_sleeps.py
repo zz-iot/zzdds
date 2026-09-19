@@ -41,7 +41,32 @@ ALLOWLIST = {
     # intervals. 15th sleep added with the writer-discovered-before-reader
     # retroactive-match regression test (polling discovered_writers via real
     # SPDP/SEDP timer-thread announcements) -- same category as the rest.
-    "test/dcps/mock_loopback_test.zig": (15, "SPDP timer-thread discovery polling"),
+    # 16th sleep added with the on_reliable_writer_ready full-stack test
+    # (test_service_round_trip.zig's zzdds-side counterpart): same
+    # net.deliverAll()-in-a-loop SPDP/SEDP polling pattern as every other
+    # test in this file, not a new category. 17th/18th added with the
+    # reentrancy regression test for the participant.mu-held-during-callback
+    # bug (PR #90 Greptile review): one in its background-thread discovery
+    # driver (same net.deliverAll()-in-a-loop pattern), one in the main
+    # thread's bounded wait for that thread to finish -- a real background
+    # thread is required here (the callback's reentrant call runs
+    # synchronously inside net.deliverAll(), so driving discovery on the
+    # test's own thread would hang it forever if the fix ever regresses).
+    # 19th/20th added with the onParticipantLost coverage test (kcov showed
+    # 0% on that whole sweep): same match-then-wait polling pattern as the
+    # on_reliable_writer_ready test above, plus a second wait for the
+    # reader's own checkLeases() to notice the (deliberately shortened)
+    # remote lease expiring after the writer participant is deleted.
+    "test/dcps/mock_loopback_test.zig": (20, "SPDP timer-thread discovery polling"),
+    # Same MockNetwork/MockTransport-with-real-SPDP-timer-thread pattern as
+    # mock_loopback_test.zig above -- see that file's own rationale. This
+    # file's 5 sleeps, across its two full-stack scenarios: the baseline
+    # write-after-match test has 2 (a match-wait polling loop, a
+    # data-delivery polling loop); the genuinely-late-VOLATILE-joiner guard
+    # has 3 (an added fixed 5-round idle-settle loop before the reader is
+    # created, so the "late" join is genuinely late rather than a timing
+    # artifact, plus its own match-wait and data-delivery polling loops).
+    "test/dcps/discovery_race_test.zig": (5, "SPDP timer-thread discovery polling"),
     # API and WaitSet tests intentionally wake waits from another thread.
     "test/dcps/api_test.zig": (1, "threaded WaitSet wakeup"),
     "test/dcps/waitset_test.zig": (1, "threaded WaitSet wakeup"),

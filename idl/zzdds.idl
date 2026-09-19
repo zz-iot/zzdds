@@ -154,6 +154,20 @@ module zzdds {
             in boolean               is_ready);
     };
 
+    // Reader-side counterpart of DataWriterListenerEx.on_reliable_reader_ready:
+    // fires once this reader has observed proof that a matched RELIABLE
+    // writer has actually registered it (a HEARTBEAT whose readerId names
+    // this reader specifically -- RTPS §8.3.7.5's readerId field, not a
+    // zzdds-only mechanism, though not every vendor's writer targets
+    // heartbeats per-reader), or immediately at match for BEST_EFFORT
+    // (which has no such handshake). See docs/design/
+    // discovery-association-race-testing.md.
+    @callback interface DataReaderListenerEx : DDS::DataReaderListener {
+        void on_reliable_writer_ready(
+            in DDS::InstanceHandle_t writer_handle,
+            in boolean               is_ready);
+    };
+
     @shared_c_abi_box interface DataWriter : DDS::DataWriter {
         // write_serialized() was removed: DDS::DataWriter::write_raw() (see
         // dcps.idl) supersedes it -- same underlying zzdds core, but correct
@@ -171,6 +185,9 @@ module zzdds {
     };
 
     @shared_c_abi_box interface DataReader : DDS::DataReader {
+        DDS::ReturnCode_t set_listener_ex(
+            in DataReaderListenerEx a_listener,
+            in DDS::StatusMask      mask);
         DDS::ReturnCode_t get_rtps_guid(inout RtpsGuid result);
         // Expands a publication handle from get_matched_publications() or
         // SampleInfo. Associations needed by queued samples survive unmatching.

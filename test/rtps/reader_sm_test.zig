@@ -203,7 +203,7 @@ test "handleHeartbeat: non-final with missing SNs generates AckNack bitmap" {
     rec.reset();
 
     // Non-final heartbeat claiming writer has SNs 1..3.
-    r.handleHeartbeat(writer_guid, 1, 3, 1, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, 1, false);
 
     const an = findAckNack(&rec) orelse return error.NoAckNackFound;
     // base = highest_received + 1 = 2; bitmap should NACK SNs 2 and 3.
@@ -240,7 +240,7 @@ test "handleHeartbeat: non-final with all SNs received → AckNack with empty bi
     }
     rec.reset();
 
-    r.handleHeartbeat(writer_guid, 1, 3, 1, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, 1, false);
 
     // Non-final always sends AckNack; but bitmap is empty (pure ACK).
     const an = findAckNack(&rec) orelse return error.NoAckNackFound;
@@ -274,7 +274,7 @@ test "handleHeartbeat: final + all SNs received → no AckNack sent" {
     rec.reset();
 
     // Final heartbeat: reader need not reply if no missing SNs.
-    r.handleHeartbeat(writer_guid, 1, 3, 1, true);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, 1, true);
 
     try testing.expectEqual(@as(usize, 0), rec.n);
 }
@@ -292,7 +292,7 @@ test "handleHeartbeat: unknown writer GUID is ignored" {
     defer r.deinit();
 
     rec.reset(); // clear initial AckNack from addMatchedWriter setup
-    r.handleHeartbeat(unknown_guid, 1, 3, 1, false);
+    r.handleHeartbeat(unknown_guid, rtps.EntityIds.unknown, 1, 3, 1, false);
 
     try testing.expectEqual(@as(usize, 0), rec.n);
 }
@@ -309,16 +309,16 @@ test "handleHeartbeat: duplicate count suppressed" {
     defer r.deinit();
 
     // First heartbeat with count=5 → accepted, AckNack sent.
-    r.handleHeartbeat(writer_guid, 1, 3, 5, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, 5, false);
     try testing.expect(rec.n > 0);
 
     // Same count=5 again → duplicate, suppressed.
     rec.reset();
-    r.handleHeartbeat(writer_guid, 1, 3, 5, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, 5, false);
     try testing.expectEqual(@as(usize, 0), rec.n);
 
     // Stale count=3 → also rejected.
-    r.handleHeartbeat(writer_guid, 1, 3, 3, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, 3, false);
     try testing.expectEqual(@as(usize, 0), rec.n);
 }
 
@@ -337,7 +337,7 @@ test "handleHeartbeat: Count_t rollover INT32_MAX → INT32_MIN accepted" {
     r.writer_proxies.items[0].last_hb_count = std.math.maxInt(i32);
 
     // Next heartbeat at INT32_MIN — the rollover should be accepted.
-    r.handleHeartbeat(writer_guid, 1, 3, std.math.minInt(i32), false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, std.math.minInt(i32), false);
     try testing.expect(rec.n > 0);
 }
 
@@ -355,12 +355,12 @@ test "handleHeartbeat: re-delivery after rollover rejected as duplicate" {
     r.writer_proxies.items[0].last_hb_count = std.math.maxInt(i32);
 
     // Rollover: accepted.
-    r.handleHeartbeat(writer_guid, 1, 3, std.math.minInt(i32), false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, std.math.minInt(i32), false);
     try testing.expect(rec.n > 0);
 
     // Same count again: rejected as duplicate.
     rec.reset();
-    r.handleHeartbeat(writer_guid, 1, 3, std.math.minInt(i32), false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 3, std.math.minInt(i32), false);
     try testing.expectEqual(@as(usize, 0), rec.n);
 }
 
@@ -539,7 +539,7 @@ test "handleData + handleHeartbeat: out-of-order DATA → NACK bitmap identifies
     rec.reset();
 
     // Heartbeat says writer has up to SN 2; reader NACKs SN 1, ACKs SN 2.
-    r.handleHeartbeat(writer_guid, 1, 2, 1, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 2, 1, false);
 
     const an = findAckNack(&rec) orelse return error.NoAckNackFound;
     try testing.expectEqual(@as(SequenceNumber, 1), an.reader_sn_state.base);
@@ -747,7 +747,7 @@ test "effectiveLocators: dual-stack writer proxy collapses to a single family" {
     try r.addMatchedWriter(wp);
     rec.reset();
 
-    r.handleHeartbeat(writer_guid, 1, 0, 1, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 0, 1, false);
 
     const v4_sends = countSendsToPort(&rec, 7520);
     const v6_sends = countSendsToV6Port(&rec, 7521);
@@ -768,7 +768,7 @@ test "effectiveLocators: loopback preferred over public at same family (reader s
     try r.addMatchedWriter(wp);
     rec.reset();
 
-    r.handleHeartbeat(writer_guid, 1, 0, 1, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 0, 1, false);
 
     try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7522));
     try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7523));
@@ -786,7 +786,7 @@ test "effectiveLocators: unicast-over-multicast preference unchanged when only m
     try r.addMatchedWriter(wp);
     rec.reset();
 
-    r.handleHeartbeat(writer_guid, 1, 0, 1, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 0, 1, false);
 
     try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7524));
 }
@@ -805,7 +805,7 @@ test "addMatchedWriter: lease refresh recomputes cached selection when locators 
     const wp1 = try WriterProxy.init(testing.allocator, writer_guid, &.{loc_pub}, &.{}, true);
     try r.addMatchedWriter(wp1);
     rec.reset();
-    r.handleHeartbeat(writer_guid, 1, 0, 1, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 0, 1, false);
     try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7525));
     try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7526));
     rec.reset();
@@ -814,7 +814,7 @@ test "addMatchedWriter: lease refresh recomputes cached selection when locators 
     // switch to it, not keep serving the stale public-only selection.
     const wp2 = try WriterProxy.init(testing.allocator, writer_guid, &.{ loc_pub, loc_lo }, &.{}, true);
     try r.addMatchedWriter(wp2);
-    r.handleHeartbeat(writer_guid, 1, 0, 2, false);
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 0, 2, false);
     try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7525));
     try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7526));
 }
@@ -859,4 +859,184 @@ test "addMatchedWriter: a non-UnsupportedLocatorKind send error is logged and sw
     // Must not propagate the transport's send failure to the caller.
     try r.addMatchedWriter(wp);
     try testing.expectEqual(@as(usize, 0), rec.n);
+}
+
+// ── Protocol-ready readiness (on_reliable_writer_ready) ──────────────────────
+
+const ProtocolReadyResult = struct {
+    guid: ?Guid = null,
+    ready: ?bool = null,
+    calls: usize = 0,
+    fn callback(ctx: *anyopaque, g: Guid, r: bool) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.guid = g;
+        self.ready = r;
+        self.calls += 1;
+    }
+};
+
+test "protocol_ready: RELIABLE proxy is not ready at match time" {
+    const reader_guid = makeGuid(0x70, READER_EID);
+    const writer_guid = makeGuid(0x71, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7600);
+
+    var rec: Recording = .{};
+    const r = try makeReader(&rec, reader_guid, writer_guid, writer_loc);
+    defer r.deinit();
+
+    r.mu.lock();
+    const ready = for (r.writer_proxies.items) |wp| {
+        if (wp.guid.eql(writer_guid)) break wp.protocol_ready;
+    } else true;
+    r.mu.unlock();
+    try testing.expect(!ready);
+}
+
+test "protocol_ready: RELIABLE proxy becomes ready when a HEARTBEAT names this reader's readerId, fires once" {
+    const reader_guid = makeGuid(0x72, READER_EID);
+    const writer_guid = makeGuid(0x73, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7601);
+    // Distinct entity KIND from READER_EID (not just a different prefix --
+    // handleHeartbeat's readerId match is by entity_id alone, and a GUID's
+    // prefix plays no part in it).
+    const other_entity_id = rtps.EntityIds.sedp_builtin_subscriptions_reader;
+
+    var rec: Recording = .{};
+    const r = try makeReader(&rec, reader_guid, writer_guid, writer_loc);
+    defer r.deinit();
+
+    var pr = ProtocolReadyResult{};
+    r.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    // Wildcard (ENTITYID_UNKNOWN) heartbeat proves nothing about per-reader
+    // registration -- must not fire.
+    r.handleHeartbeat(writer_guid, rtps.EntityIds.unknown, 1, 0, 1, false);
+    try testing.expectEqual(@as(usize, 0), pr.calls);
+
+    // Heartbeat targeted at a different reader must not fire either.
+    r.handleHeartbeat(writer_guid, other_entity_id, 1, 0, 2, false);
+    try testing.expectEqual(@as(usize, 0), pr.calls);
+
+    // Heartbeat targeted at this reader specifically fires readiness exactly once.
+    r.handleHeartbeat(writer_guid, reader_guid.entity_id, 1, 0, 3, false);
+    try testing.expectEqual(@as(usize, 1), pr.calls);
+    try testing.expect(pr.ready == true);
+    try testing.expect(pr.guid.?.eql(writer_guid));
+
+    // A later targeted heartbeat must not refire (sticky).
+    r.handleHeartbeat(writer_guid, reader_guid.entity_id, 1, 0, 4, false);
+    try testing.expectEqual(@as(usize, 1), pr.calls);
+}
+
+test "protocol_ready: BEST_EFFORT proxy fires ready immediately at match" {
+    const alloc = testing.allocator;
+    const reader_guid = makeGuid(0x75, READER_EID);
+    const writer_guid = makeGuid(0x76, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7602);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(alloc, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    var pr = ProtocolReadyResult{};
+    r.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    // reliable=false: BEST_EFFORT writers send no targeted-readerId handshake
+    // to wait for, so the proxy must become ready immediately at match.
+    const wp = try WriterProxy.init(alloc, writer_guid, &.{writer_loc}, &.{}, false);
+    try r.addMatchedWriter(wp);
+
+    try testing.expectEqual(@as(usize, 1), pr.calls);
+    try testing.expect(pr.ready == true);
+    try testing.expect(pr.guid.?.eql(writer_guid));
+}
+
+test "protocol_ready: removing a ready proxy fires ready=false" {
+    const reader_guid = makeGuid(0x77, READER_EID);
+    const writer_guid = makeGuid(0x78, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7603);
+
+    var rec: Recording = .{};
+    const r = try makeReader(&rec, reader_guid, writer_guid, writer_loc);
+    defer r.deinit();
+
+    var pr = ProtocolReadyResult{};
+    r.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    r.handleHeartbeat(writer_guid, reader_guid.entity_id, 1, 0, 1, false);
+    try testing.expect(pr.ready == true);
+
+    r.removeMatchedWriter(writer_guid);
+    try testing.expectEqual(@as(usize, 2), pr.calls);
+    try testing.expect(pr.ready == false);
+    try testing.expect(pr.guid.?.eql(writer_guid));
+}
+
+test "protocol_ready: removing a never-ready proxy does not fire" {
+    const reader_guid = makeGuid(0x79, READER_EID);
+    const writer_guid = makeGuid(0x7a, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7604);
+
+    var rec: Recording = .{};
+    const r = try makeReader(&rec, reader_guid, writer_guid, writer_loc);
+    defer r.deinit();
+
+    var pr = ProtocolReadyResult{};
+    r.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    r.removeMatchedWriter(writer_guid);
+    try testing.expectEqual(@as(usize, 0), pr.calls);
+}
+
+// ── addMatchedWriter: append-failure lock release (PR #90 review) ───────────
+
+fn tryLockFromAnotherThread(r: *StatefulReader, result: *bool) void {
+    result.* = r.mu.tryLock();
+    if (result.*) r.mu.unlock();
+}
+
+test "addMatchedWriter: proxy-list append OOM releases self.mu instead of leaking it held" {
+    // Regression test for Greptile PR #90 review (round 1): an earlier
+    // version used `try self.writer_proxies.append(...)` directly inside
+    // addMatchedWriter, which on allocation failure returned the error
+    // without releasing self.mu first -- self.mu stayed locked forever, and
+    // every later operation needing it (data, heartbeat, unmatch, teardown)
+    // would deadlock. Checked from a second thread, not this one: calling
+    // tryLock() (or lock()) again from the *same* thread that may still
+    // hold a non-recursive mutex is undefined behavior (confirmed --
+    // manually reverting this fix to verify the test produced a confusing
+    // assert-failure crash in a later mu.deinit(), not a clean signal, when
+    // tried same-thread). A different thread's tryLock() against a mutex
+    // still held elsewhere is well-defined POSIX behavior and fails fast
+    // instead of hanging.
+    const alloc = testing.allocator;
+    const reader_guid = makeGuid(0x7b, READER_EID);
+    const writer_guid = makeGuid(0x7c, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7607);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(alloc, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    // Constructed with the real allocator -- addMatchedWriter never takes
+    // ownership on this failure path, so this must be deinited manually.
+    var wp = try WriterProxy.init(alloc, writer_guid, &.{writer_loc}, &.{}, true);
+
+    // Force the very next allocation through r.alloc (writer_proxies.append
+    // growing from empty) to fail.
+    var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    r.alloc = fa.allocator();
+    defer r.alloc = alloc;
+
+    try testing.expectError(error.OutOfMemory, r.addMatchedWriter(wp));
+    wp.deinit(alloc);
+
+    // The core assertion: a regression here must fail fast (this thread
+    // joins and asserts immediately), not hang this test.
+    var lock_acquired = false;
+    const t = try std.Thread.spawn(.{}, tryLockFromAnotherThread, .{ r, &lock_acquired });
+    t.join();
+    try testing.expect(lock_acquired);
+
+    try testing.expect(!r.isWriterMatched(writer_guid));
 }

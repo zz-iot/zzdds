@@ -836,12 +836,19 @@ test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterwa
     const sub_impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(fx.sub.ptr));
     dr.pushCdr(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x01 });
 
-    try testing.expectEqual(@as(usize, 1), dr.quiesce.state.load(.monotonic));
+    // Baseline is 2, not 1: on_reliable_writer_ready's registration
+    // (subscriber.zig's create_datareader) holds its own permanent quiesce
+    // pin on dr for as long as the proto is alive, released only when the
+    // proto's own reallyDeinit runs below (destroy_proto_reader) -- see
+    // protocol/interface.zig's ProtocolReadyCallback doc comment. That
+    // release happens before this test's own final assertions, so only
+    // this baseline and the post-take count need the +1 adjustment.
+    try testing.expectEqual(@as(usize, 2), dr.quiesce.state.load(.monotonic));
     var payloads = DDS.OctetSeqSeq{};
     var hashes = DDS.OctetSeq{};
     var infos = DDS.SampleInfoSeq{};
     try testing.expectEqual(DDS.RETCODE_OK, dr_dds.vtable.take_raw(dr_dds.ptr, &payloads, &hashes, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1));
-    try testing.expectEqual(@as(usize, 2), dr.quiesce.state.load(.monotonic));
+    try testing.expectEqual(@as(usize, 3), dr.quiesce.state.load(.monotonic));
 
     // Simulate the race having already gone the unsafe way: a
     // delete_datareader raced ahead of the loan above and completed anyway
@@ -862,10 +869,15 @@ test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterwa
     sub_impl.mu.unlock();
     sub_impl.cbs.destroy_proto_reader(sub_impl.cbs.ctx, dr.instance_handle);
     dr.deinit();
-    // Tearing-down bit set (high bit) + refcount 1 (just the loan's ref) --
-    // confirms the precondition this test exists to exercise actually holds
-    // before return_loan_raw runs.
-    try testing.expectEqual(@as(usize, 0x8000000000000001), dr.quiesce.state.load(.monotonic));
+    // Tearing-down bit set (high bit) + refcount 2, not 1: the loan's ref,
+    // plus on_reliable_writer_ready's pin (still held -- test 40 above
+    // established that an outstanding loan defers the *proto's* own real
+    // teardown until return_loan_raw runs, and this pin is released from
+    // exactly that proto teardown, not from dr.deinit() above; see
+    // protocol/interface.zig's ProtocolReadyCallback doc comment). This
+    // confirms the precondition this test exists to exercise actually
+    // holds before return_loan_raw runs.
+    try testing.expectEqual(@as(usize, 0x8000000000000002), dr.quiesce.state.load(.monotonic));
 
     // dr is now kept alive only by the loan's transferred quiesce ref --
     // removed from sub_impl.readers above, so nothing else will touch it

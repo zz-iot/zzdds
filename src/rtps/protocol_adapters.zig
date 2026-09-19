@@ -49,6 +49,14 @@ pub const RtpsProtocolWriter = struct {
     /// protocol/interface.zig's Vtable and util/entity_quiesce.zig.
     quiesce: EntityQuiesce = .{},
 
+    /// Set by `vtSetProtocolReadyCallback` when the registered callback's
+    /// `ctx` (the owning DataWriterImpl) supplies quiesce hooks -- pins
+    /// `ctx` alive until `reallyDeinit` below, so a receive-thread dispatch
+    /// that resolved this adapter (protected by `quiesce` above) can also
+    /// safely resolve `ctx` even after participant.mu has been released.
+    /// See protocol/interface.zig's ProtocolReadyCallback doc comment.
+    ready_pin: ?struct { ctx: *anyopaque, release: *const fn (*anyopaque) void } = null,
+
     const Self = @This();
 
     pub fn init(
@@ -75,6 +83,7 @@ pub const RtpsProtocolWriter = struct {
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.writer.deinit();
+        if (self.ready_pin) |pin| pin.release(pin.ctx);
         self.alloc.destroy(self);
     }
 
@@ -108,6 +117,7 @@ pub const RtpsProtocolWriter = struct {
         .write = vtWrite,
         .add_matched_reader = vtAddMatchedReader,
         .remove_matched_reader = vtRemoveMatchedReader,
+        .remove_matched_reader_deferred = vtRemoveMatchedReaderDeferred,
         .matched_reader_count = vtMatchedReaderCount,
         .list_matched_readers = vtListMatchedReaders,
         .handle_ack_nack = vtHandleAckNack,
@@ -173,6 +183,12 @@ pub const RtpsProtocolWriter = struct {
     fn vtRemoveMatchedReader(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.writer.removeMatchedReader(guid);
+    }
+
+    fn vtRemoveMatchedReaderDeferred(ctx: *anyopaque, guid: Guid) ?protocol.ProtocolReadyCallback {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const d = self.writer.removeMatchedReaderDeferred(guid) orelse return null;
+        return .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
     }
 
     fn vtMatchedReaderCount(ctx: *anyopaque) usize {
@@ -335,6 +351,9 @@ pub const RtpsProtocolWriter = struct {
 
     fn vtSetProtocolReadyCallback(ctx: *anyopaque, cb: protocol.ProtocolReadyCallback) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (cb.quiesce_acquire) |acquire| {
+            if (acquire(cb.ctx)) self.ready_pin = .{ .ctx = cb.ctx, .release = cb.quiesce_release.? };
+        }
         self.writer.setProtocolReadyCallback(cb.ctx, cb.on_ready);
     }
 };
@@ -352,6 +371,9 @@ pub const RtpsProtocolReader = struct {
     /// add_matched_writer's initial send -- see quiesce_acquire/release on
     /// protocol/interface.zig's Vtable and util/entity_quiesce.zig.
     quiesce: EntityQuiesce = .{},
+
+    /// See RtpsProtocolWriter's matching field's doc comment.
+    ready_pin: ?struct { ctx: *anyopaque, release: *const fn (*anyopaque) void } = null,
 
     const Self = @This();
 
@@ -377,6 +399,7 @@ pub const RtpsProtocolReader = struct {
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.reader.deinit();
+        if (self.ready_pin) |pin| pin.release(pin.ctx);
         self.alloc.destroy(self);
     }
 
@@ -403,6 +426,7 @@ pub const RtpsProtocolReader = struct {
         .set_writer_match_callback = vtSetWriterMatchCallback,
         .add_matched_writer = vtAddMatchedWriter,
         .remove_matched_writer = vtRemoveMatchedWriter,
+        .remove_matched_writer_deferred = vtRemoveMatchedWriterDeferred,
         .matched_writer_count = vtMatchedWriterCount,
         .list_matched_writers = vtListMatchedWriters,
         .handle_incoming_change = vtHandleIncomingChange,
@@ -415,7 +439,16 @@ pub const RtpsProtocolReader = struct {
         .deinit = vtDeinit,
         .quiesce_acquire = vtQuiesceAcquire,
         .quiesce_release = vtQuiesceRelease,
+        .set_protocol_ready_callback = vtSetProtocolReadyCallback,
     };
+
+    fn vtSetProtocolReadyCallback(ctx: *anyopaque, cb: protocol.ProtocolReadyCallback) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (cb.quiesce_acquire) |acquire| {
+            if (acquire(cb.ctx)) self.ready_pin = .{ .ctx = cb.ctx, .release = cb.quiesce_release.? };
+        }
+        self.reader.setProtocolReadyCallback(cb.ctx, cb.on_ready);
+    }
 
     fn vtSetDataCallback(ctx: *anyopaque, cb: protocol.DataCallback) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -482,6 +515,27 @@ pub const RtpsProtocolReader = struct {
         if (cb) |c| c.on_writer_unmatched(c.ctx, guid);
     }
 
+    fn vtRemoveMatchedWriterDeferred(ctx: *anyopaque, guid: Guid) protocol.DeferredUnmatchCallbacks {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const deferred = self.reader.removeMatchedWriterDeferred(guid);
+        // on_writer_unmatched (onWriterUnmatchedCb) can itself synthesize a
+        // NOT_ALIVE_NO_WRITERS sample and dispatch on_data_available to
+        // arbitrary application listener code (confirmed: PR #90 review) --
+        // just as unsafe to fire under an external lock as
+        // on_reliable_writer_ready, so this returns both instead of firing
+        // either.
+        self.reader.mu.lock();
+        const cb = self.writer_match_cb;
+        self.reader.mu.unlock();
+        var result: protocol.DeferredUnmatchCallbacks = .{};
+        if (deferred) |d| result.ready = .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
+        if (cb) |c| {
+            result.unmatched_ctx = c.ctx;
+            result.unmatched_fn = c.on_writer_unmatched;
+        }
+        return result;
+    }
+
     fn vtMatchedWriterCount(ctx: *anyopaque) usize {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.reader.mu.lock();
@@ -544,6 +598,7 @@ pub const RtpsProtocolReader = struct {
     fn vtHandleHeartbeat(
         ctx: *anyopaque,
         writer_guid: Guid,
+        reader_id: EntityId,
         first_sn: history_mod.SequenceNumber,
         last_sn: history_mod.SequenceNumber,
         count: i32,
@@ -576,7 +631,7 @@ pub const RtpsProtocolReader = struct {
                 if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid, if (liveliness) .manual_heartbeat else .heartbeat);
             }
         }
-        self.reader.handleHeartbeat(writer_guid, first_sn, last_sn, count, final);
+        self.reader.handleHeartbeat(writer_guid, reader_id, first_sn, last_sn, count, final);
     }
 
     fn vtHandleDataFrag(

@@ -840,6 +840,65 @@ test "protocol_ready: removing a never-ready proxy does not fire" {
     try testing.expectEqual(@as(usize, 0), pr.calls);
 }
 
+test "protocol_ready: a second RELIABLE proxy added after the first is already ready gets its own initial heartbeat and becomes ready" {
+    // Reproduces a real rmw_zzdds scenario (two service clients matching the
+    // same response writer, added sequentially, with real writes to the
+    // first proxy in between) that showed the second proxy's
+    // on_reliable_writer_ready never firing within a 10s deadline.
+    const alloc = testing.allocator;
+    const writer_guid = makeGuid(0x6a, WRITER_EID);
+    const reader_a_guid = makeGuid(0x6b, READER_EID);
+    const reader_b_guid = makeGuid(0x6c, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7605);
+    const loc_b = Locator.udp4(.{ 127, 0, 0, 1 }, 7606);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        alloc,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    var pr = ProtocolReadyResult{};
+    w.setProtocolReadyCallback(&pr, ProtocolReadyResult.callback);
+
+    // Reader A matches, writer writes data for it, A ACKNACKs and becomes ready --
+    // mirrors client A's full round trip completing before client B exists.
+    const rp_a = try ReaderProxy.init(alloc, reader_a_guid, &.{loc_a}, &.{}, false, true);
+    try w.addMatchedReader(rp_a);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    const nack_a = SequenceNumberSet{ .base = 2, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_a_guid, 1, nack_a, 1, true);
+    try testing.expectEqual(@as(usize, 1), pr.calls);
+    try testing.expect(pr.ready == true);
+    try testing.expect(pr.guid.?.eql(reader_a_guid));
+    rec.reset();
+
+    // Reader B matches afterward -- must get its own initial targeted
+    // Heartbeat (addMatchedReader's sendInitialHeartbeatUnlocked), just like
+    // A did when it was the only proxy.
+    const rp_b = try ReaderProxy.init(alloc, reader_b_guid, &.{loc_b}, &.{}, false, true);
+    try w.addMatchedReader(rp_b);
+
+    const hb = findHeartbeat(&rec);
+    try testing.expect(hb != null);
+    try testing.expect(hb.?.reader_entity_id.eql(reader_b_guid.entity_id));
+    try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7606));
+
+    // B ACKNACKs and must become ready too, independently of A.
+    const nack_b = SequenceNumberSet{ .base = 2, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_b_guid, 1, nack_b, 1, true);
+    try testing.expectEqual(@as(usize, 2), pr.calls);
+    try testing.expect(pr.ready == true);
+    try testing.expect(pr.guid.?.eql(reader_b_guid));
+}
+
 // ── Coherent HB cap ───────────────────────────────────────────────────────────
 
 test "sendHeartbeat: coherent_active caps last_sn to last_flushed_sn" {
@@ -1114,6 +1173,89 @@ test "addMatchedReader: lease refresh recomputes cached selection when locators 
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
     try testing.expectEqual(@as(usize, 0), countSendsToPort(&rec, 7509));
     try testing.expectEqual(@as(usize, 1), countSendsToPort(&rec, 7510));
+}
+
+// ── addMatchedReader: discovery/write race (docs/design/discovery-association-race-testing.md) ──
+
+test "addMatchedReader: a write made before the proxy is registered is correctly excluded for a VOLATILE reader" {
+    // Investigated 2026-09-18 via an rmw_zzdds CI flake, initially suspected
+    // as a zzdds writer_sm.zig bug: an application can observe a reader as
+    // "matched" (via a signal on the *reader's own* side, asymmetric with
+    // this writer's addMatchedReader processing) and write before this
+    // writer has actually processed that reader's SEDP subscription-data.
+    //
+    // Working through the fix surfaced that this is *not* a bug: VOLATILE
+    // durability's only principled floor is "whatever the writer itself
+    // knows at the moment it processes the match" -- there is no other
+    // authoritative reference point available to the writer (a reader's own
+    // SEDP-announcement INFO_TS is a per-message timestamp, RTPS §8.3.3, not
+    // an entity-creation time -- it doesn't answer "when did this reader
+    // legitimately start existing"). So start_sn = self.cache.next_sn at
+    // addMatchedReader-time is correct, if nondeterministically timed
+    // relative to an application's own (asymmetric) readiness signal.
+    //
+    // The real fix for the motivating bug is a *reader-side* signal
+    // (`on_reliable_writer_ready`, see reader_sm_test.zig) that lets an
+    // application wait for proof the writer has actually registered it
+    // before writing/requesting, rather than trying to make the writer
+    // guess retroactively. See docs/design/discovery-association-race-testing.md.
+    const writer_guid = makeGuid(0x80, WRITER_EID);
+    const reader_guid = makeGuid(0x81, READER_EID);
+    const loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7530);
+
+    var rec: Recording = .{};
+    // replay_on_match=false (VOLATILE): matches the real bug's QoS shape
+    // (ROS2's rmw_qos_profile_services_default).
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_last,
+        1,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    const sn = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "race-sample");
+
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+
+    var sns_buf: [8]SequenceNumber = undefined;
+    const sent = collectDataSNsSorted(&rec, &sns_buf);
+    // Correct: the sample written before this proxy existed is never sent
+    // to it -- VOLATILE readers are not entitled to pre-match data.
+    try testing.expect(std.mem.indexOfScalar(SequenceNumber, sent, sn) == null);
+}
+
+test "addMatchedReader: a write made after the proxy is registered is always delivered (baseline)" {
+    const writer_guid = makeGuid(0x82, WRITER_EID);
+    const reader_guid = makeGuid(0x83, READER_EID);
+    const loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7531);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_last,
+        1,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+
+    const sn = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "baseline-sample");
+
+    var sns_buf: [8]SequenceNumber = undefined;
+    const sent = collectDataSNsSorted(&rec, &sns_buf);
+    try testing.expect(std.mem.indexOfScalar(SequenceNumber, sent, sn) != null);
 }
 
 test "checkConnectionGenerations: replays to a proxy whose connection generation changed" {

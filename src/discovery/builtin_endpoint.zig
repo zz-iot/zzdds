@@ -142,7 +142,7 @@ pub const BuiltinPair = struct {
                 if (!hb.writer_entity_id.eql(self.writer_entity_id)) return false;
                 if (self.reader) |r| {
                     const wguid = Guid{ .prefix = src_prefix, .entity_id = self.writer_entity_id };
-                    r.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                    r.handleHeartbeat(wguid, hb.reader_entity_id, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
                 }
                 return true;
             },

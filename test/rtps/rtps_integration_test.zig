@@ -99,7 +99,7 @@ const ReaderDispatch = struct {
             },
             .heartbeat => |hb| {
                 const wguid = Guid{ .prefix = src, .entity_id = hb.writer_entity_id };
-                self.reader.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                self.reader.handleHeartbeat(wguid, hb.reader_entity_id, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
             },
             else => {},
         };
@@ -670,7 +670,7 @@ test "loss_nack_drop_two: two NACKs dropped; periodic HB re-triggers recovery" {
 
     // Simulate writer periodic heartbeat #2 directly on the reader.
     // DropFirst(2) is exhausted so NACK-3 is forwarded into mt_w.
-    reader.handleHeartbeat(W1_GUID, 1, 3, 3, false);
+    reader.handleHeartbeat(W1_GUID, EntityIds.unknown, 1, 3, 3, false);
 
     // Round 3: NACK-3 → bitmap loop sends DATA(1,2,3) + trailing HB(c=3) capped at floor=3.
     net.deliverAll();
@@ -1050,7 +1050,7 @@ test "dispose_survives_nack_replay: not_alive_disposed replayed with correct STA
                 },
                 .heartbeat => |hb| {
                     const wguid = Guid{ .prefix = src, .entity_id = hb.writer_entity_id };
-                    self.reader.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                    self.reader.handleHeartbeat(wguid, hb.reader_entity_id, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
                 },
                 else => {},
             };

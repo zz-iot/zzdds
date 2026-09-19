@@ -273,8 +273,8 @@ public:
           dds_(handle)
     {}
 
-    // take_serialized()/take_next_instance_serialized() are already
-    // implemented by DataReaderImpl (base).
+    // take_serialized()/take_next_instance_serialized()/set_listener_ex()
+    // are already implemented by DataReaderImpl (base).
 
     ::DDS::ReturnCode_t enable() override { return dds_.enable(); }
     std::shared_ptr<::DDS::StatusCondition> get_statuscondition() override { return dds_.get_statuscondition(); }

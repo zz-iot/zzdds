@@ -835,9 +835,16 @@ test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterwa
     const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_.ptr));
 
     var cdr_payload = DDS.OctetSeq{};
-    try testing.expectEqual(@as(usize, 1), dw_impl.quiesce.state.load(.monotonic));
-    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    // Baseline is 2, not 1: on_reliable_reader_ready's registration
+    // (publisher.zig's create_datawriter) holds its own permanent quiesce
+    // pin on dw_impl for as long as the proto is alive, released only when
+    // the proto's own reallyDeinit runs below (destroy_proto_writer) --
+    // see protocol/interface.zig's ProtocolReadyCallback doc comment. That
+    // release happens before this test's own final assertions, so only
+    // this baseline and the post-loan count need the +1 adjustment.
     try testing.expectEqual(@as(usize, 2), dw_impl.quiesce.state.load(.monotonic));
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
+    try testing.expectEqual(@as(usize, 3), dw_impl.quiesce.state.load(.monotonic));
 
     pub_impl.mu.lock();
     for (pub_impl.writers.items, 0..) |w, i| {
@@ -849,10 +856,15 @@ test "return_loan_raw: releasing the last quiesce ref doesn't touch self afterwa
     pub_impl.mu.unlock();
     pub_impl.cbs.destroy_proto_writer(pub_impl.cbs.ctx, dw_impl.instance_handle);
     dw_impl.deinit();
-    // Tearing-down bit set (high bit) + refcount 1 (just the loan's ref) --
-    // confirms the precondition this test exists to exercise actually holds
-    // before return_loan_raw runs.
-    try testing.expectEqual(@as(usize, 0x8000000000000001), dw_impl.quiesce.state.load(.monotonic));
+    // Tearing-down bit set (high bit) + refcount 2, not 1: the loan's ref,
+    // plus on_reliable_reader_ready's pin (still held -- an outstanding
+    // loan defers the *proto's* own real teardown until return_loan_raw
+    // runs, and this pin is released from exactly that proto teardown,
+    // not from dw_impl.deinit() above; see protocol/interface.zig's
+    // ProtocolReadyCallback doc comment). This confirms the precondition
+    // this test exists to exercise actually holds before return_loan_raw
+    // runs.
+    try testing.expectEqual(@as(usize, 0x8000000000000002), dw_impl.quiesce.state.load(.monotonic));
 
     // dw_impl is now kept alive only by the loan's transferred quiesce ref
     // -- removed from pub_impl.writers above, so nothing else will touch it

@@ -251,6 +251,34 @@ payload/submessage protection (per-reader session keys); mitigation is shared go
 multicast-group keys. A pooled encryption scratch buffer in `MessageBuilder` is part of the
 planned path. Security-handshake interop testing follows when the plugin exists.
 
+### Discovery/association race testing — resolved via `on_reliable_writer_ready`
+
+[`design/discovery-association-race-testing.md`](design/discovery-association-race-testing.md)
+— **resolved 2026-09-18.** Found via a real bug (during rmw_zzdds CI flake
+investigation) that first looked like a `StatefulWriter.addMatchedReader` correctness
+defect (a newly-matched VOLATILE reader's `start_sn` set from the writer's own cache
+position at match time, silently excluding a sample the application wrote right after
+seeing itself "matched" from the reader side alone, before the writer's own asymmetric
+discovery caught up). Working through the fix design concluded this is actually correct
+VOLATILE-durability behavior — no `start_sn` fix exists or is needed. The real fix:
+`DataReaderListenerEx.on_reliable_writer_ready`, a new reader-side extended-listener
+callback (symmetric to the existing writer-side `on_reliable_reader_ready`) that fires
+once a matched RELIABLE writer has been observed to actually register this reader (a
+HEARTBEAT whose RTPS §8.3.7.5 `readerId` names it specifically, real wire behavior
+already sent by `StatefulWriter`; immediately at match for BEST_EFFORT). Landed in
+zzdds core (IDL, `reader_sm.zig`, `protocol/interface.zig`,
+`rtps/protocol_adapters.zig`, `dcps/participant.zig`, `dcps/reader.zig`,
+`dcps/subscriber.zig`, `c_abi/extensions.zig`), full test coverage
+(`test/rtps/reader_sm_test.zig`, `test/dcps/mock_loopback_test.zig`), `zig build test`
+and `test-tsan` both clean, C/C++/Java bindings all build clean. **Deferred, separate
+follow-on:** `rmw_zzdds`'s `rmw_service_server_is_available()` actually registering and
+consuming this new listener in place of its current
+`rmw_subscription_count_matched_publishers` check — needs a zzdds release first. The
+test-infrastructure proposals in the design doc (scenario matrix, shared verification
+utility, `MockNetwork`-based pinned-order tests) remain useful groundwork for the
+broader discovery/association race space independent of the superseded `start_sn`
+framing.
+
 ### DDS-XTypes v1.3 + TypeLookup
 
 TypeObject / TypeIdentifier / TypeMapping, for type-safe cross-vendor type discovery. There

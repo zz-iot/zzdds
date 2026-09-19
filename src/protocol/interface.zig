@@ -22,6 +22,7 @@ const submsg_mod = @import("../rtps/message/submessage.zig");
 
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
+pub const EntityId = guid_mod.EntityId;
 pub const ChangeKind = history_mod.ChangeKind;
 pub const InstanceHandle = history_mod.InstanceHandle;
 pub const RtpsTimestamp = history_mod.RtpsTimestamp;
@@ -121,6 +122,47 @@ pub const DataCallback = struct {
 pub const ProtocolReadyCallback = struct {
     ctx: *anyopaque,
     on_ready: *const fn (ctx: *anyopaque, guid: Guid, ready: bool) void,
+
+    /// Only meaningful on the value passed to `set_protocol_ready_callback`
+    /// (a stale copy of these two also rides along on the value later
+    /// returned from `remove_matched_*_deferred`, but nothing reads them
+    /// there). Lets the adapter (RtpsProtocolReader/RtpsProtocolWriter in
+    /// rtps/protocol_adapters.zig) pin `ctx` alive for as long as the
+    /// adapter's own object is alive, releasing the pin only from the
+    /// adapter's own quiesce-protected `reallyDeinit`.
+    ///
+    /// Needed because a raw `ctx` handed to a background-thread callback
+    /// has no lifetime guarantee of its own once the caller stops holding
+    /// participant.mu across the *entire* dispatch that might fire
+    /// `on_ready` -- true for handleHeartbeat's direct on_reliable_writer_
+    /// ready fire and for participant.zig's onWriterLost/onParticipantLost
+    /// deferred fires (all release participant.mu before calling
+    /// `on_ready`, since it can reach arbitrary application listener
+    /// code), but NOT for handleAckNack's on_reliable_reader_ready fire
+    /// (participant.mu stays held for that whole dispatch), so writer-side
+    /// registration setting these is a belt-and-braces strengthening, not
+    /// a fix for a reachable bug there today. See entity_quiesce.zig's
+    /// module doc and the "Deferred callback is discarded"-shaped bug this
+    /// closes (a genuine heap-use-after-free: a background receive thread
+    /// resolves `ctx` from a proto object whose own quiesce is correctly
+    /// held, but `ctx` itself -- a separate DataReaderImpl/DataWriterImpl
+    /// object -- has no relationship to that quiesce and can be freed by
+    /// a concurrent delete_datareader/delete_datawriter regardless).
+    quiesce_acquire: ?*const fn (ctx: *anyopaque) bool = null,
+    quiesce_release: ?*const fn (ctx: *anyopaque) void = null,
+};
+
+/// Bundle of callbacks pending from a *_matched_*_deferred removal call,
+/// none of them fired yet -- both can reach arbitrary application listener
+/// code (on_reliable_writer_ready/on_reliable_reader_ready, and
+/// on_writer_unmatched/on_reader_unmatched can themselves synthesize a
+/// NOT_ALIVE_NO_WRITERS/NO_READERS sample and dispatch on_data_available),
+/// so the caller must fire both only after releasing whatever external lock
+/// (e.g. DomainParticipantImpl.mu) protects the removal itself.
+pub const DeferredUnmatchCallbacks = struct {
+    ready: ?ProtocolReadyCallback = null,
+    unmatched_ctx: ?*anyopaque = null,
+    unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
 };
 
 // ── ProtocolWriter ────────────────────────────────────────────────────────────
@@ -148,6 +190,15 @@ pub const ProtocolWriter = struct {
 
         /// SEDP removed a previously matched remote reader.
         remove_matched_reader: *const fn (ctx: *anyopaque, guid: Guid) void,
+
+        /// Like remove_matched_reader, but performs the removal immediately
+        /// and returns the resulting on_reliable_reader_ready(false)
+        /// transition instead of firing it -- for callers (e.g.
+        /// DomainParticipantImpl.onParticipantLost) that need the removal
+        /// itself kept serialized with their own external lock while still
+        /// firing the callback only after releasing it. See
+        /// StatefulWriter.removeMatchedReaderDeferred's doc comment for why.
+        remove_matched_reader_deferred: *const fn (ctx: *anyopaque, guid: Guid) ?ProtocolReadyCallback,
 
         /// Return the number of currently matched reader proxies.
         matched_reader_count: *const fn (ctx: *anyopaque) usize,
@@ -287,6 +338,10 @@ pub const ProtocolWriter = struct {
 
     pub fn removeMatchedReader(self: ProtocolWriter, guid: Guid) void {
         self.vtable.remove_matched_reader(self.ctx, guid);
+    }
+
+    pub fn removeMatchedReaderDeferred(self: ProtocolWriter, guid: Guid) ?ProtocolReadyCallback {
+        return self.vtable.remove_matched_reader_deferred(self.ctx, guid);
     }
 
     pub fn matchedReaderCount(self: ProtocolWriter) usize {
@@ -441,6 +496,18 @@ pub const ProtocolReader = struct {
         /// SEDP removed a previously matched remote writer.
         remove_matched_writer: *const fn (ctx: *anyopaque, guid: Guid) void,
 
+        /// Like remove_matched_writer, but performs the removal immediately
+        /// and returns the resulting callbacks (on_reliable_writer_ready
+        /// AND on_writer_unmatched -- the latter can itself synthesize a
+        /// NOT_ALIVE_NO_WRITERS sample and dispatch on_data_available, so it
+        /// is just as unsafe to fire under an external lock) instead of
+        /// firing them -- for callers (e.g.
+        /// DomainParticipantImpl.onWriterLost/onParticipantLost) that need
+        /// the removal itself kept serialized with their own external lock
+        /// while still firing both callbacks only after releasing it. See
+        /// StatefulReader.removeMatchedWriterDeferred's doc comment for why.
+        remove_matched_writer_deferred: *const fn (ctx: *anyopaque, guid: Guid) DeferredUnmatchCallbacks,
+
         /// Return the number of currently matched writer proxies.
         matched_writer_count: *const fn (ctx: *anyopaque) usize,
 
@@ -471,10 +538,15 @@ pub const ProtocolReader = struct {
 
         /// Called by the participant's RTPS message dispatcher when a HEARTBEAT
         /// submessage arrives. Triggers ACKNACK if the reader has gaps or the
-        /// heartbeat is non-final.
+        /// heartbeat is non-final. `reader_id` is the submessage's own
+        /// readerId (RTPS §8.3.7.5) -- ENTITYID_UNKNOWN for a wildcard
+        /// heartbeat, or a specific reader's entity ID when the writer
+        /// targeted it -- used to drive the reader-side protocol-ready
+        /// signal (on_reliable_writer_ready).
         handle_heartbeat: *const fn (
             ctx: *anyopaque,
             writer_guid: Guid,
+            reader_id: EntityId,
             first_sn: SequenceNumber,
             last_sn: SequenceNumber,
             count: i32,
@@ -541,6 +613,12 @@ pub const ProtocolReader = struct {
         /// Pairs with a successful quiesce_acquire(). Defaults to a noop to
         /// match quiesce_acquire's default.
         quiesce_release: *const fn (ctx: *anyopaque) void = defaultQuiesceRelease,
+
+        /// Register a callback that fires when a matched writer proxy's
+        /// protocol-ready state transitions -- the reader-side counterpart
+        /// of ProtocolWriter.set_protocol_ready_callback. Must be called
+        /// before any writer proxies are added.
+        set_protocol_ready_callback: *const fn (ctx: *anyopaque, cb: ProtocolReadyCallback) void,
     };
 
     pub fn setDataCallback(self: ProtocolReader, cb: DataCallback) void {
@@ -557,6 +635,10 @@ pub const ProtocolReader = struct {
 
     pub fn removeMatchedWriter(self: ProtocolReader, guid: Guid) void {
         self.vtable.remove_matched_writer(self.ctx, guid);
+    }
+
+    pub fn removeMatchedWriterDeferred(self: ProtocolReader, guid: Guid) DeferredUnmatchCallbacks {
+        return self.vtable.remove_matched_writer_deferred(self.ctx, guid);
     }
 
     pub fn matchedWriterCount(self: ProtocolReader) usize {
@@ -600,13 +682,14 @@ pub const ProtocolReader = struct {
     pub fn handleHeartbeat(
         self: ProtocolReader,
         writer_guid: Guid,
+        reader_id: EntityId,
         first_sn: SequenceNumber,
         last_sn: SequenceNumber,
         count: i32,
         final: bool,
         liveliness: bool,
     ) void {
-        self.vtable.handle_heartbeat(self.ctx, writer_guid, first_sn, last_sn, count, final, liveliness);
+        self.vtable.handle_heartbeat(self.ctx, writer_guid, reader_id, first_sn, last_sn, count, final, liveliness);
     }
 
     pub fn handleDataFrag(
@@ -655,5 +738,9 @@ pub const ProtocolReader = struct {
 
     pub fn quiesceRelease(self: ProtocolReader) void {
         self.vtable.quiesce_release(self.ctx);
+    }
+
+    pub fn setProtocolReadyCallback(self: ProtocolReader, cb: ProtocolReadyCallback) void {
+        self.vtable.set_protocol_ready_callback(self.ctx, cb);
     }
 };

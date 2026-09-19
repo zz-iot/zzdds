@@ -89,7 +89,7 @@ const ReaderDispatch = struct {
             },
             .heartbeat => |hb| {
                 const wguid = Guid{ .prefix = src, .entity_id = hb.writer_entity_id };
-                self.reader.handleHeartbeat(wguid, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
+                self.reader.handleHeartbeat(wguid, hb.reader_entity_id, hb.first_sn, hb.last_sn, hb.count, hb.isFinal());
             },
             .heartbeat_frag => |hbf| {
                 const wguid = Guid{ .prefix = src, .entity_id = hbf.writer_entity_id };
