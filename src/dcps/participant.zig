@@ -2287,13 +2287,29 @@ pub const DomainParticipantImpl = struct {
         // the GUID prefix as the membership key (all endpoints of a
         // participant share its prefix).
         const prefix = guid.prefix;
+        // Gates removeDiscoveredEndpointsForPrefix and the lost_writers/
+        // lost_readers disposal firing below: if any reader's or writer's
+        // sweep couldn't run (listing failed, or its capacity reservation
+        // failed), that entity's protocol match was NOT removed, so
+        // discovery state must be preserved too -- otherwise discovery
+        // would forget this participant's endpoints while local readers/
+        // writers keep stale matched entries with no later loss event
+        // guaranteed to clean them up (this is a one-shot event: SPDP has
+        // already permanently forgotten the participant by the time this
+        // fires). Reporting a not-actually-removed endpoint as disposed
+        // via the built-in topic would be equally inconsistent (Greptile
+        // review).
+        var all_swept = true;
         var reader_fires: std.ArrayListUnmanaged(ParticipantLostFire) = .empty;
         defer reader_fires.deinit(self.alloc);
         var ar_it = self.active_readers.valueIterator();
         while (ar_it.next()) |ar| {
             var w_guids: std.ArrayListUnmanaged(Guid) = .empty;
             defer w_guids.deinit(self.alloc);
-            ar.proto.listMatchedWriters(self.alloc, &w_guids) catch continue;
+            ar.proto.listMatchedWriters(self.alloc, &w_guids) catch {
+                all_swept = false;
+                continue;
+            };
             // Reserve capacity for this reader's worst case (every matched
             // writer, not just ones matching prefix) *before* mutating
             // anything below: removeMatchedWriterDeferred's removal is not
@@ -2302,7 +2318,10 @@ pub const DomainParticipantImpl = struct {
             // that's already gone (Greptile review). If we can't even
             // guarantee that for this one reader, skip it entirely rather
             // than partially mutate with no way to notify.
-            if (reader_fires.ensureUnusedCapacity(self.alloc, w_guids.items.len)) |_| {} else |_| continue;
+            if (reader_fires.ensureUnusedCapacity(self.alloc, w_guids.items.len)) |_| {} else |_| {
+                all_swept = false;
+                continue;
+            }
             for (w_guids.items) |w_guid| {
                 if (!w_guid.prefix.eql(prefix)) continue;
                 const before = ar.proto.matchedWriterCount();
@@ -2333,9 +2352,15 @@ pub const DomainParticipantImpl = struct {
         while (aw_it.next()) |aw| {
             var r_guids: std.ArrayListUnmanaged(Guid) = .empty;
             defer r_guids.deinit(self.alloc);
-            aw.proto.listMatchedReaders(self.alloc, &r_guids) catch continue;
+            aw.proto.listMatchedReaders(self.alloc, &r_guids) catch {
+                all_swept = false;
+                continue;
+            };
             // See the reader-sweep's matching comment above.
-            if (writer_fires.ensureUnusedCapacity(self.alloc, r_guids.items.len)) |_| {} else |_| continue;
+            if (writer_fires.ensureUnusedCapacity(self.alloc, r_guids.items.len)) |_| {} else |_| {
+                all_swept = false;
+                continue;
+            }
             for (r_guids.items) |r_guid| {
                 if (!r_guid.prefix.eql(prefix)) continue;
                 const before = aw.proto.matchedReaderCount();
@@ -2355,7 +2380,7 @@ pub const DomainParticipantImpl = struct {
                 });
             }
         }
-        removeDiscoveredEndpointsForPrefix(self, prefix);
+        if (all_swept) removeDiscoveredEndpointsForPrefix(self, prefix);
         self.mu.unlock();
 
         for (reader_fires.items) |fire| {
@@ -2371,10 +2396,12 @@ pub const DomainParticipantImpl = struct {
             if (fire.notify_quiesced) fire.notify.?.quiesceRelease();
             if (fire.writer_proto_quiesced) |p| p.quiesceRelease();
         }
-        if (publication_dr) |dr| for (lost_writers.items) |endpoint_guid|
-            pushBuiltinEndpointDisposed(dr, endpoint_guid);
-        if (subscription_dr) |dr| for (lost_readers.items) |endpoint_guid|
-            pushBuiltinEndpointDisposed(dr, endpoint_guid);
+        if (all_swept) {
+            if (publication_dr) |dr| for (lost_writers.items) |endpoint_guid|
+                pushBuiltinEndpointDisposed(dr, endpoint_guid);
+            if (subscription_dr) |dr| for (lost_readers.items) |endpoint_guid|
+                pushBuiltinEndpointDisposed(dr, endpoint_guid);
+        }
     }
 
     /// WLP (RTPS §8.4.13): a remote participant's ParticipantMessageData
@@ -2603,7 +2630,14 @@ pub const DomainParticipantImpl = struct {
         // reservation failure itself, skip the whole sweep rather than
         // partially mutate with no way to notify -- consistent with this
         // function's other OOM-tolerance fallbacks.
-        if (jobs.ensureTotalCapacityPrecise(self.alloc, self.active_readers.count())) |_| {
+        //
+        // `swept` additionally gates removeDiscoveredWriter/
+        // pushBuiltinEndpointDisposed below: if the reservation failed, no
+        // reader's protocol match was actually removed, so discovery
+        // state must stay as-is too -- otherwise discovery would forget
+        // this writer while every local reader keeps a stale matched-
+        // writer entry that nothing will ever clean up (Greptile review).
+        const swept = if (jobs.ensureTotalCapacityPrecise(self.alloc, self.active_readers.count())) |_| blk: {
             var ar_it2 = self.active_readers.valueIterator();
             while (ar_it2.next()) |ar| {
                 const before = ar.proto.matchedWriterCount();
@@ -2628,8 +2662,9 @@ pub const DomainParticipantImpl = struct {
                     .proto_quiesced = if (pq) ar.proto else null,
                 });
             }
-        } else |_| {}
-        removeDiscoveredWriter(self, guid);
+            break :blk true;
+        } else |_| false;
+        if (swept) removeDiscoveredWriter(self, guid);
         if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
         self.mu.unlock();
 
@@ -2641,7 +2676,7 @@ pub const DomainParticipantImpl = struct {
             if (job.notify_quiesced) job.notify.?.quiesceRelease();
             if (job.proto_quiesced) |p| p.quiesceRelease();
         }
-        if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
+        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
     }
 
     /// Looks up the VendorId of a previously-discovered participant by GUID
