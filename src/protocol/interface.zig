@@ -122,6 +122,34 @@ pub const DataCallback = struct {
 pub const ProtocolReadyCallback = struct {
     ctx: *anyopaque,
     on_ready: *const fn (ctx: *anyopaque, guid: Guid, ready: bool) void,
+
+    /// Only meaningful on the value passed to `set_protocol_ready_callback`
+    /// (a stale copy of these two also rides along on the value later
+    /// returned from `remove_matched_*_deferred`, but nothing reads them
+    /// there). Lets the adapter (RtpsProtocolReader/RtpsProtocolWriter in
+    /// rtps/protocol_adapters.zig) pin `ctx` alive for as long as the
+    /// adapter's own object is alive, releasing the pin only from the
+    /// adapter's own quiesce-protected `reallyDeinit`.
+    ///
+    /// Needed because a raw `ctx` handed to a background-thread callback
+    /// has no lifetime guarantee of its own once the caller stops holding
+    /// participant.mu across the *entire* dispatch that might fire
+    /// `on_ready` -- true for handleHeartbeat's direct on_reliable_writer_
+    /// ready fire and for participant.zig's onWriterLost/onParticipantLost
+    /// deferred fires (all release participant.mu before calling
+    /// `on_ready`, since it can reach arbitrary application listener
+    /// code), but NOT for handleAckNack's on_reliable_reader_ready fire
+    /// (participant.mu stays held for that whole dispatch), so writer-side
+    /// registration setting these is a belt-and-braces strengthening, not
+    /// a fix for a reachable bug there today. See entity_quiesce.zig's
+    /// module doc and the "Deferred callback is discarded"-shaped bug this
+    /// closes (a genuine heap-use-after-free: a background receive thread
+    /// resolves `ctx` from a proto object whose own quiesce is correctly
+    /// held, but `ctx` itself -- a separate DataReaderImpl/DataWriterImpl
+    /// object -- has no relationship to that quiesce and can be freed by
+    /// a concurrent delete_datareader/delete_datawriter regardless).
+    quiesce_acquire: ?*const fn (ctx: *anyopaque) bool = null,
+    quiesce_release: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 /// Bundle of callbacks pending from a *_matched_*_deferred removal call,

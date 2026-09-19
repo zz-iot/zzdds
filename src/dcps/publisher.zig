@@ -407,7 +407,20 @@ pub const PublisherImpl = struct {
         // like the callbacks above): this signal is purely RTPS-internal
         // (AckNack/Heartbeat correlation), unlike matched_notify which needs
         // SEDP bookkeeping in the participant's active_writers map.
-        pw.setProtocolReadyCallback(.{ .ctx = dw, .on_ready = writer_mod.DataWriterImpl.notifyReaderProtocolReady });
+        pw.setProtocolReadyCallback(.{
+            .ctx = dw,
+            .on_ready = writer_mod.DataWriterImpl.notifyReaderProtocolReady,
+            // Belt-and-braces, not a fix for a reachable bug here today:
+            // handleAckNack's own direct fire keeps participant.mu held
+            // for its whole dispatch, so `dw` can't be concurrently freed
+            // there. But onParticipantLost's writer-sweep resolves `dw`
+            // from this same registration *after* releasing participant.mu
+            // (see participant.zig's ParticipantLostFire firing loop), so
+            // `dw` needs the same pin the reader side needs for real. See
+            // protocol/interface.zig's ProtocolReadyCallback doc comment.
+            .quiesce_acquire = writer_mod.DataWriterImpl.quiesceAcquireFn,
+            .quiesce_release = writer_mod.DataWriterImpl.quiesceReleaseFn,
+        });
         const pname_seq = &self.qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
         var pname_buf: [64][]const u8 = undefined;

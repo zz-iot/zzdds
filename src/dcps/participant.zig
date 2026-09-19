@@ -2234,6 +2234,15 @@ pub const DomainParticipantImpl = struct {
         // doc comment. Always null for the writer-sweep (reader removal) side.
         unmatched_ctx: ?*anyopaque = null,
         unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
+        // Exactly one of these two is set (matching which sweep produced
+        // this entry), held from collection (under self.mu) through firing
+        // (after self.mu is released) so `ready_cb`/`unmatched_fn`'s ctx --
+        // pinned to its owning proto's lifetime via ready_pin, see
+        // protocol/interface.zig's ProtocolReadyCallback doc comment --
+        // can't be freed out from under this loop. See RemovedWriterJob.
+        // proto_quiesced's matching comment in onWriterLost.
+        reader_proto_quiesced: ?proto.ProtocolReader = null,
+        writer_proto_quiesced: ?proto.ProtocolWriter = null,
     };
 
     fn onParticipantLost(ctx: *anyopaque, guid: disc.Guid) void {
@@ -2285,6 +2294,15 @@ pub const DomainParticipantImpl = struct {
             var w_guids: std.ArrayListUnmanaged(Guid) = .empty;
             defer w_guids.deinit(self.alloc);
             ar.proto.listMatchedWriters(self.alloc, &w_guids) catch continue;
+            // Reserve capacity for this reader's worst case (every matched
+            // writer, not just ones matching prefix) *before* mutating
+            // anything below: removeMatchedWriterDeferred's removal is not
+            // reversible, so an append failing partway through would
+            // silently discard an already-decided callback for a match
+            // that's already gone (Greptile review). If we can't even
+            // guarantee that for this one reader, skip it entirely rather
+            // than partially mutate with no way to notify.
+            if (reader_fires.ensureUnusedCapacity(self.alloc, w_guids.items.len)) |_| {} else |_| continue;
             for (w_guids.items) |w_guid| {
                 if (!w_guid.prefix.eql(prefix)) continue;
                 const before = ar.proto.matchedWriterCount();
@@ -2293,16 +2311,17 @@ pub const DomainParticipantImpl = struct {
                 if (deferred.ready == null and deferred.unmatched_fn == null and !matched_changed) continue;
                 const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
                 const nq = if (notify) |cb| cb.quiesceAcquire() else false;
-                reader_fires.append(self.alloc, .{
+                // See RemovedWriterJob.proto_quiesced's comment in onWriterLost.
+                const pq = ar.proto.quiesceAcquire();
+                reader_fires.appendAssumeCapacity(.{
                     .guid = w_guid,
                     .ready_cb = deferred.ready,
                     .notify = notify,
                     .notify_quiesced = nq,
                     .unmatched_ctx = deferred.unmatched_ctx,
                     .unmatched_fn = deferred.unmatched_fn,
-                }) catch {
-                    if (nq) notify.?.quiesceRelease();
-                };
+                    .reader_proto_quiesced = if (pq) ar.proto else null,
+                });
             }
         }
         // Symmetric sweep: remove matched readers belonging to this participant
@@ -2315,6 +2334,8 @@ pub const DomainParticipantImpl = struct {
             var r_guids: std.ArrayListUnmanaged(Guid) = .empty;
             defer r_guids.deinit(self.alloc);
             aw.proto.listMatchedReaders(self.alloc, &r_guids) catch continue;
+            // See the reader-sweep's matching comment above.
+            if (writer_fires.ensureUnusedCapacity(self.alloc, r_guids.items.len)) |_| {} else |_| continue;
             for (r_guids.items) |r_guid| {
                 if (!r_guid.prefix.eql(prefix)) continue;
                 const before = aw.proto.matchedReaderCount();
@@ -2323,9 +2344,15 @@ pub const DomainParticipantImpl = struct {
                 if (ready_cb == null and !matched_changed) continue;
                 const notify: ?MatchedNotify = if (matched_changed) aw.matched_notify else null;
                 const nq = if (notify) |cb| cb.quiesceAcquire() else false;
-                writer_fires.append(self.alloc, .{ .guid = r_guid, .ready_cb = ready_cb, .notify = notify, .notify_quiesced = nq }) catch {
-                    if (nq) notify.?.quiesceRelease();
-                };
+                // See RemovedWriterJob.proto_quiesced's comment in onWriterLost.
+                const pq = aw.proto.quiesceAcquire();
+                writer_fires.appendAssumeCapacity(.{
+                    .guid = r_guid,
+                    .ready_cb = ready_cb,
+                    .notify = notify,
+                    .notify_quiesced = nq,
+                    .writer_proto_quiesced = if (pq) aw.proto else null,
+                });
             }
         }
         removeDiscoveredEndpointsForPrefix(self, prefix);
@@ -2336,11 +2363,13 @@ pub const DomainParticipantImpl = struct {
             if (fire.unmatched_fn) |f| f(fire.unmatched_ctx.?, fire.guid);
             if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(fire.guid), false);
             if (fire.notify_quiesced) fire.notify.?.quiesceRelease();
+            if (fire.reader_proto_quiesced) |p| p.quiesceRelease();
         }
         for (writer_fires.items) |fire| {
             if (fire.ready_cb) |cb| cb.on_ready(cb.ctx, fire.guid, false);
             if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(fire.guid), false);
             if (fire.notify_quiesced) fire.notify.?.quiesceRelease();
+            if (fire.writer_proto_quiesced) |p| p.quiesceRelease();
         }
         if (publication_dr) |dr| for (lost_writers.items) |endpoint_guid|
             pushBuiltinEndpointDisposed(dr, endpoint_guid);
@@ -2530,6 +2559,20 @@ pub const DomainParticipantImpl = struct {
         notify_quiesced: bool = false,
         unmatched_ctx: ?*anyopaque = null,
         unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
+        /// Held from collection (still under self.mu, so `ar.proto` -- and,
+        /// via its `ready_pin`, the DataReaderImpl `ready_cb`/`unmatched_fn`
+        /// resolve into -- are both provably alive) through firing below
+        /// (after self.mu is released, since firing can reach arbitrary
+        /// application listener code). Only set when `ready_cb` or
+        /// `unmatched_fn` is non-null; `notify`'s own DataReaderImpl/
+        /// DataWriterImpl target is pinned separately via
+        /// MatchedNotify.quiesceAcquire/notify_quiesced above. Mirrors
+        /// onWriterDiscovered's existing `job.proto`/`quiesceRelease`
+        /// pattern -- see protocol/interface.zig's ProtocolReadyCallback
+        /// doc comment for why this is needed at all (a real
+        /// heap-use-after-free, caught by TSan in the "listener" stress
+        /// scenario).
+        proto_quiesced: ?proto.ProtocolReader = null,
     };
 
     fn onWriterLost(ctx: *anyopaque, guid: disc.Guid) void {
@@ -2549,24 +2592,43 @@ pub const DomainParticipantImpl = struct {
         var jobs: std.ArrayListUnmanaged(RemovedWriterJob) = .empty;
         defer jobs.deinit(self.alloc);
         self.mu.lock();
-        var ar_it2 = self.active_readers.valueIterator();
-        while (ar_it2.next()) |ar| {
-            const before = ar.proto.matchedWriterCount();
-            const deferred = ar.proto.removeMatchedWriterDeferred(guid);
-            const matched_changed = ar.proto.matchedWriterCount() < before;
-            if (deferred.ready == null and deferred.unmatched_fn == null and !matched_changed) continue;
-            const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
-            const nq = if (notify) |cb| cb.quiesceAcquire() else false;
-            jobs.append(self.alloc, .{
-                .ready_cb = deferred.ready,
-                .notify = notify,
-                .notify_quiesced = nq,
-                .unmatched_ctx = deferred.unmatched_ctx,
-                .unmatched_fn = deferred.unmatched_fn,
-            }) catch {
-                if (nq) notify.?.quiesceRelease();
-            };
-        }
+        // Reserve capacity for every possible job *before* mutating any
+        // state below: removeMatchedWriterDeferred's removal is not
+        // reversible, so an append failing partway through the loop would
+        // silently discard an already-decided callback for a match that's
+        // already gone (Greptile review) -- with capacity reserved
+        // upfront, appendAssumeCapacity below cannot fail. Bounded by
+        // active_readers.count() (every reader, not just ones matching
+        // this guid, so always sufficient). On the (extremely unlikely)
+        // reservation failure itself, skip the whole sweep rather than
+        // partially mutate with no way to notify -- consistent with this
+        // function's other OOM-tolerance fallbacks.
+        if (jobs.ensureTotalCapacityPrecise(self.alloc, self.active_readers.count())) |_| {
+            var ar_it2 = self.active_readers.valueIterator();
+            while (ar_it2.next()) |ar| {
+                const before = ar.proto.matchedWriterCount();
+                const deferred = ar.proto.removeMatchedWriterDeferred(guid);
+                const matched_changed = ar.proto.matchedWriterCount() < before;
+                if (deferred.ready == null and deferred.unmatched_fn == null and !matched_changed) continue;
+                const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
+                const nq = if (notify) |cb| cb.quiesceAcquire() else false;
+                // ar.proto is provably still alive and not yet tearing
+                // down here (its removal from active_readers requires
+                // self.mu, which this thread holds), so this can't fail
+                // in practice; still handled defensively rather than
+                // asserted -- see RemovedWriterJob.proto_quiesced's doc
+                // comment for why this is needed at all.
+                const pq = ar.proto.quiesceAcquire();
+                jobs.appendAssumeCapacity(.{
+                    .ready_cb = deferred.ready,
+                    .notify = notify,
+                    .notify_quiesced = nq,
+                    .unmatched_ctx = deferred.unmatched_ctx,
+                    .unmatched_fn = deferred.unmatched_fn,
+                    .proto_quiesced = if (pq) ar.proto else null,
+                });
+            }
+        } else |_| {}
         removeDiscoveredWriter(self, guid);
         if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
         self.mu.unlock();
@@ -2577,6 +2639,7 @@ pub const DomainParticipantImpl = struct {
             if (job.unmatched_fn) |f| f(job.unmatched_ctx.?, guid);
             if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
             if (job.notify_quiesced) job.notify.?.quiesceRelease();
+            if (job.proto_quiesced) |p| p.quiesceRelease();
         }
         if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
     }

@@ -49,6 +49,14 @@ pub const RtpsProtocolWriter = struct {
     /// protocol/interface.zig's Vtable and util/entity_quiesce.zig.
     quiesce: EntityQuiesce = .{},
 
+    /// Set by `vtSetProtocolReadyCallback` when the registered callback's
+    /// `ctx` (the owning DataWriterImpl) supplies quiesce hooks -- pins
+    /// `ctx` alive until `reallyDeinit` below, so a receive-thread dispatch
+    /// that resolved this adapter (protected by `quiesce` above) can also
+    /// safely resolve `ctx` even after participant.mu has been released.
+    /// See protocol/interface.zig's ProtocolReadyCallback doc comment.
+    ready_pin: ?struct { ctx: *anyopaque, release: *const fn (*anyopaque) void } = null,
+
     const Self = @This();
 
     pub fn init(
@@ -75,6 +83,7 @@ pub const RtpsProtocolWriter = struct {
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.writer.deinit();
+        if (self.ready_pin) |pin| pin.release(pin.ctx);
         self.alloc.destroy(self);
     }
 
@@ -342,6 +351,9 @@ pub const RtpsProtocolWriter = struct {
 
     fn vtSetProtocolReadyCallback(ctx: *anyopaque, cb: protocol.ProtocolReadyCallback) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (cb.quiesce_acquire) |acquire| {
+            if (acquire(cb.ctx)) self.ready_pin = .{ .ctx = cb.ctx, .release = cb.quiesce_release.? };
+        }
         self.writer.setProtocolReadyCallback(cb.ctx, cb.on_ready);
     }
 };
@@ -359,6 +371,9 @@ pub const RtpsProtocolReader = struct {
     /// add_matched_writer's initial send -- see quiesce_acquire/release on
     /// protocol/interface.zig's Vtable and util/entity_quiesce.zig.
     quiesce: EntityQuiesce = .{},
+
+    /// See RtpsProtocolWriter's matching field's doc comment.
+    ready_pin: ?struct { ctx: *anyopaque, release: *const fn (*anyopaque) void } = null,
 
     const Self = @This();
 
@@ -384,6 +399,7 @@ pub const RtpsProtocolReader = struct {
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.reader.deinit();
+        if (self.ready_pin) |pin| pin.release(pin.ctx);
         self.alloc.destroy(self);
     }
 
@@ -428,6 +444,9 @@ pub const RtpsProtocolReader = struct {
 
     fn vtSetProtocolReadyCallback(ctx: *anyopaque, cb: protocol.ProtocolReadyCallback) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (cb.quiesce_acquire) |acquire| {
+            if (acquire(cb.ctx)) self.ready_pin = .{ .ctx = cb.ctx, .release = cb.quiesce_release.? };
+        }
         self.reader.setProtocolReadyCallback(cb.ctx, cb.on_ready);
     }
 

@@ -418,7 +418,19 @@ pub const SubscriberImpl = struct {
         // RTPS-internal (a targeted HEARTBEAT's readerId, or immediate at
         // match for BEST_EFFORT), unlike notifySubscriptionMatched which
         // needs SEDP bookkeeping in the participant's active_readers map.
-        pr.setProtocolReadyCallback(.{ .ctx = dr, .on_ready = reader_mod.DataReaderImpl.notifyWriterProtocolReady });
+        pr.setProtocolReadyCallback(.{
+            .ctx = dr,
+            .on_ready = reader_mod.DataReaderImpl.notifyWriterProtocolReady,
+            // Pins `dr` alive until the proto's own quiesce-protected
+            // teardown actually completes -- handleHeartbeat's direct fire
+            // and participant.zig's onWriterLost/onParticipantLost
+            // deferred fires all resolve `dr` from this proto after
+            // releasing participant.mu, so `dr`'s own lifetime otherwise
+            // has no relationship to the proto's (see
+            // protocol/interface.zig's ProtocolReadyCallback doc comment).
+            .quiesce_acquire = reader_mod.DataReaderImpl.quiesceAcquireFn,
+            .quiesce_release = reader_mod.DataReaderImpl.quiesceReleaseFn,
+        });
         // Convert partition name StringSeq (C extern struct) to []const []const u8 for announce_reader.
         const pname_seq = &self.qos.partition.name;
         const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
