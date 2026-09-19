@@ -27,6 +27,7 @@ const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
+const config_mod = zzdds.config;
 const nil = zzdds.dcps;
 const RtpsTimestamp = zzdds.util.time.RtpsTimestamp;
 const history_mod = zzdds.rtps.history;
@@ -1139,12 +1140,19 @@ test "mock_loopback: on_reliable_reader_ready fires after AckNack handshake, str
 // ── on_reliable_writer_ready extended listener ────────────────────────────────
 
 const WriterReadyState = struct {
+    // seq/matched_calls/matched_seq are only ever touched same-thread (both
+    // driven synchronously by net.deliverAll() in the first test below).
+    // ready_calls/last_ready are also read from the onParticipantLost test's
+    // main thread while written from the *reader participant's own real
+    // SPDP timer thread* (checkLeases -> onParticipantLost, a genuine
+    // background thread, unlike the net.deliverAll()-driven callbacks
+    // everywhere else in this file) -- confirmed by TSan, hence atomic.
     seq: usize = 0,
     matched_calls: usize = 0,
     matched_seq: ?usize = null,
-    ready_calls: usize = 0,
+    ready_calls: std.atomic.Value(usize) = .init(0),
     ready_seq: ?usize = null,
-    last_ready: bool = false,
+    last_ready: std.atomic.Value(bool) = .init(false),
 };
 
 fn onSubMatchedForReadyTest(_: *anyopaque, _: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
@@ -1157,8 +1165,11 @@ fn onSubMatchedForReadyTest(_: *anyopaque, _: *const DDS.SubscriptionMatchedStat
 fn onWriterReadyForReadyTest(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaque) callconv(.c) void {
     const state: *WriterReadyState = @ptrCast(@alignCast(ld.?));
     state.seq += 1;
-    state.ready_calls += 1;
-    state.last_ready = ready;
+    // release: publishes this function's preceding plain writes (seq,
+    // ready_seq) to whatever thread later observes ready_calls via a
+    // matching acquire load -- see WriterReadyState's doc comment.
+    state.last_ready.store(ready, .release);
+    _ = state.ready_calls.fetchAdd(1, .release);
     if (state.ready_seq == null) state.ready_seq = state.seq;
 }
 
@@ -1228,14 +1239,14 @@ test "mock_loopback: on_reliable_writer_ready fires after a targeted heartbeat, 
     // Drive discovery + the writer's Heartbeat cycle until both callbacks
     // have fired (or timeout).
     const deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
-    while ((state.matched_calls == 0 or state.ready_calls == 0) and time_mod.nanoTimestamp() < deadline) {
+    while ((state.matched_calls == 0 or state.ready_calls.load(.acquire) == 0) and time_mod.nanoTimestamp() < deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
     }
 
     try std.testing.expect(state.matched_calls > 0);
-    try std.testing.expectEqual(@as(usize, 1), state.ready_calls);
-    try std.testing.expect(state.last_ready == true);
+    try std.testing.expectEqual(@as(usize, 1), state.ready_calls.load(.acquire));
+    try std.testing.expect(state.last_ready.load(.acquire) == true);
     // The protocol-ready signal must never fire before (or in the same
     // "tick" as) the discovery-time match -- it requires a real targeted
     // Heartbeat naming this reader on top of SEDP matching, which
@@ -1372,4 +1383,111 @@ test "mock_loopback: on_reliable_writer_ready callback can safely re-enter a par
     // returns within that same window once state.done is true.
     thread.join();
     try std.testing.expect(state.reentrant_ok.load(.acquire));
+}
+
+// ── onParticipantLost: matched-endpoint sweep (PR #90 review) ────────────────
+
+test "mock_loopback: onParticipantLost fires on_reliable_writer_ready(false) when the remote participant's lease expires" {
+    // Exercises DomainParticipantImpl.onParticipantLost's matched-endpoint
+    // sweep end-to-end -- previously untested (0% coverage on that whole
+    // code path per kcov): removeMatchedWriterDeferred/
+    // removeMatchedReaderDeferred actually running, and the resulting
+    // on_reliable_writer_ready/matched_notify callbacks correctly firing
+    // after participant.mu is released, not just the mechanism in
+    // isolation (see the reentrancy test above, and reader_sm_test.zig's
+    // unit-level protocol_ready coverage).
+    const alloc = std.testing.allocator;
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mock_r = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_R, PORT_META_R)});
+    defer mock_r.deinit();
+    const disc_r = try SpdpSedpDiscovery.init(alloc, mock_r.transport(), 0, 100);
+    var factory_r = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_r.transport(),
+        disc_r.toDiscovery(),
+        noop_security,
+        .spec_random,
+        .{},
+    );
+    defer {
+        factory_r.deinit();
+        disc_r.deinit();
+    }
+    const dpf_r = factory_r.toDDSFactory();
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    defer _ = dpf_r.delete_participant(dp_r);
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic("MockTopic", "MockType", .{}, null, 0);
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
+    defer mock_w.deinit();
+    const disc_w = try SpdpSedpDiscovery.init(alloc, mock_w.transport(), 0, 100);
+    // Short lease so the reader's own checkLeases() notices W's silence
+    // (after W is deleted below) within this test's bounded polling window,
+    // instead of waiting out the 10s default.
+    const cfg_w = config_mod.Config{ .participant = .{ .lease_duration_ms = 250 } };
+    var factory_w = try DomainParticipantFactoryImpl.init(
+        alloc,
+        mock_w.transport(),
+        disc_w.toDiscovery(),
+        noop_security,
+        .spec_random,
+        cfg_w,
+    );
+    var factory_w_alive = true;
+    defer if (factory_w_alive) {
+        factory_w.deinit();
+        disc_w.deinit();
+    };
+    const dpf_w = factory_w.toDDSFactory();
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic("MockTopic", "MockType", .{}, null, 0);
+    _ = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
+
+    var state = WriterReadyState{};
+    dr_impl.setListenerEx(.{
+        .listener_data = &state,
+        .on_subscription_matched = onSubMatchedForReadyTest,
+        .on_reliable_writer_ready = onWriterReadyForReadyTest,
+    }, DDS.STATUS_MASK_ALL);
+
+    // Drive discovery + the writer's Heartbeat cycle until matched AND ready.
+    const match_deadline = time_mod.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while ((state.matched_calls == 0 or state.ready_calls.load(.acquire) == 0) and time_mod.nanoTimestamp() < match_deadline) {
+        net.deliverAll();
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.ready_calls.load(.acquire));
+    try std.testing.expect(state.last_ready.load(.acquire) == true);
+
+    // Delete the writer-side participant (its timer thread stops, so it
+    // goes silent from the reader's perspective -- zzdds has no explicit
+    // SPDP BYE/dispose-on-delete, so this is indistinguishable from a crash
+    // or network partition, same as the real case onParticipantLost exists
+    // for) and stop driving its factory/discovery afterward.
+    _ = dpf_w.delete_participant(dp_w);
+    factory_w.deinit();
+    disc_w.deinit();
+    factory_w_alive = false;
+
+    // Wait for the reader's own SPDP checkLeases() to notice the expired
+    // lease and fire onParticipantLost's sweep.
+    const lost_deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (state.ready_calls.load(.acquire) < 2 and time_mod.nanoTimestamp() < lost_deadline) {
+        net.deliverAll();
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.ready_calls.load(.acquire));
+    try std.testing.expect(state.last_ready.load(.acquire) == false);
 }

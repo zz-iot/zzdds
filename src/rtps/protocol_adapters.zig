@@ -496,21 +496,25 @@ pub const RtpsProtocolReader = struct {
         if (cb) |c| c.on_writer_unmatched(c.ctx, guid);
     }
 
-    fn vtRemoveMatchedWriterDeferred(ctx: *anyopaque, guid: Guid) ?protocol.ProtocolReadyCallback {
+    fn vtRemoveMatchedWriterDeferred(ctx: *anyopaque, guid: Guid) protocol.DeferredUnmatchCallbacks {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const deferred = self.reader.removeMatchedWriterDeferred(guid);
-        // Unlike on_reliable_writer_ready (deferred above -- reaches
-        // arbitrary application listener code), on_writer_unmatched is pure
-        // DataReaderImpl-internal bookkeeping (see onWriterUnmatchedCb: its
-        // own quiesce/lock, no user callback, never touches
-        // DomainParticipantImpl.mu) -- safe to fire immediately regardless
-        // of what external lock the caller holds.
+        // on_writer_unmatched (onWriterUnmatchedCb) can itself synthesize a
+        // NOT_ALIVE_NO_WRITERS sample and dispatch on_data_available to
+        // arbitrary application listener code (confirmed: PR #90 review) --
+        // just as unsafe to fire under an external lock as
+        // on_reliable_writer_ready, so this returns both instead of firing
+        // either.
         self.reader.mu.lock();
         const cb = self.writer_match_cb;
         self.reader.mu.unlock();
-        if (cb) |c| c.on_writer_unmatched(c.ctx, guid);
-        const d = deferred orelse return null;
-        return .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
+        var result: protocol.DeferredUnmatchCallbacks = .{};
+        if (deferred) |d| result.ready = .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
+        if (cb) |c| {
+            result.unmatched_ctx = c.ctx;
+            result.unmatched_fn = c.on_writer_unmatched;
+        }
+        return result;
     }
 
     fn vtMatchedWriterCount(ctx: *anyopaque) usize {

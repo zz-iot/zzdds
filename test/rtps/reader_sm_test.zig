@@ -987,3 +987,56 @@ test "protocol_ready: removing a never-ready proxy does not fire" {
     r.removeMatchedWriter(writer_guid);
     try testing.expectEqual(@as(usize, 0), pr.calls);
 }
+
+// ── addMatchedWriter: append-failure lock release (PR #90 review) ───────────
+
+fn tryLockFromAnotherThread(r: *StatefulReader, result: *bool) void {
+    result.* = r.mu.tryLock();
+    if (result.*) r.mu.unlock();
+}
+
+test "addMatchedWriter: proxy-list append OOM releases self.mu instead of leaking it held" {
+    // Regression test for Greptile PR #90 review (round 1): an earlier
+    // version used `try self.writer_proxies.append(...)` directly inside
+    // addMatchedWriter, which on allocation failure returned the error
+    // without releasing self.mu first -- self.mu stayed locked forever, and
+    // every later operation needing it (data, heartbeat, unmatch, teardown)
+    // would deadlock. Checked from a second thread, not this one: calling
+    // tryLock() (or lock()) again from the *same* thread that may still
+    // hold a non-recursive mutex is undefined behavior (confirmed --
+    // manually reverting this fix to verify the test produced a confusing
+    // assert-failure crash in a later mu.deinit(), not a clean signal, when
+    // tried same-thread). A different thread's tryLock() against a mutex
+    // still held elsewhere is well-defined POSIX behavior and fails fast
+    // instead of hanging.
+    const alloc = testing.allocator;
+    const reader_guid = makeGuid(0x7b, READER_EID);
+    const writer_guid = makeGuid(0x7c, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7607);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(alloc, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    // Constructed with the real allocator -- addMatchedWriter never takes
+    // ownership on this failure path, so this must be deinited manually.
+    var wp = try WriterProxy.init(alloc, writer_guid, &.{writer_loc}, &.{}, true);
+
+    // Force the very next allocation through r.alloc (writer_proxies.append
+    // growing from empty) to fail.
+    var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    r.alloc = fa.allocator();
+    defer r.alloc = alloc;
+
+    try testing.expectError(error.OutOfMemory, r.addMatchedWriter(wp));
+    wp.deinit(alloc);
+
+    // The core assertion: a regression here must fail fast (this thread
+    // joins and asserts immediately), not hang this test.
+    var lock_acquired = false;
+    const t = try std.Thread.spawn(.{}, tryLockFromAnotherThread, .{ r, &lock_acquired });
+    t.join();
+    try testing.expect(lock_acquired);
+
+    try testing.expect(!r.isWriterMatched(writer_guid));
+}

@@ -124,6 +124,19 @@ pub const ProtocolReadyCallback = struct {
     on_ready: *const fn (ctx: *anyopaque, guid: Guid, ready: bool) void,
 };
 
+/// Bundle of callbacks pending from a *_matched_*_deferred removal call,
+/// none of them fired yet -- both can reach arbitrary application listener
+/// code (on_reliable_writer_ready/on_reliable_reader_ready, and
+/// on_writer_unmatched/on_reader_unmatched can themselves synthesize a
+/// NOT_ALIVE_NO_WRITERS/NO_READERS sample and dispatch on_data_available),
+/// so the caller must fire both only after releasing whatever external lock
+/// (e.g. DomainParticipantImpl.mu) protects the removal itself.
+pub const DeferredUnmatchCallbacks = struct {
+    ready: ?ProtocolReadyCallback = null,
+    unmatched_ctx: ?*anyopaque = null,
+    unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
+};
+
 // ── ProtocolWriter ────────────────────────────────────────────────────────────
 
 /// Write-side protocol abstraction. DCPS DataWriter holds one of these.
@@ -456,13 +469,16 @@ pub const ProtocolReader = struct {
         remove_matched_writer: *const fn (ctx: *anyopaque, guid: Guid) void,
 
         /// Like remove_matched_writer, but performs the removal immediately
-        /// and returns the resulting on_reliable_writer_ready(false)
-        /// transition instead of firing it -- for callers (e.g.
+        /// and returns the resulting callbacks (on_reliable_writer_ready
+        /// AND on_writer_unmatched -- the latter can itself synthesize a
+        /// NOT_ALIVE_NO_WRITERS sample and dispatch on_data_available, so it
+        /// is just as unsafe to fire under an external lock) instead of
+        /// firing them -- for callers (e.g.
         /// DomainParticipantImpl.onWriterLost/onParticipantLost) that need
         /// the removal itself kept serialized with their own external lock
-        /// while still firing the callback only after releasing it. See
+        /// while still firing both callbacks only after releasing it. See
         /// StatefulReader.removeMatchedWriterDeferred's doc comment for why.
-        remove_matched_writer_deferred: *const fn (ctx: *anyopaque, guid: Guid) ?ProtocolReadyCallback,
+        remove_matched_writer_deferred: *const fn (ctx: *anyopaque, guid: Guid) DeferredUnmatchCallbacks,
 
         /// Return the number of currently matched writer proxies.
         matched_writer_count: *const fn (ctx: *anyopaque) usize,
@@ -593,7 +609,7 @@ pub const ProtocolReader = struct {
         self.vtable.remove_matched_writer(self.ctx, guid);
     }
 
-    pub fn removeMatchedWriterDeferred(self: ProtocolReader, guid: Guid) ?ProtocolReadyCallback {
+    pub fn removeMatchedWriterDeferred(self: ProtocolReader, guid: Guid) DeferredUnmatchCallbacks {
         return self.vtable.remove_matched_writer_deferred(self.ctx, guid);
     }
 

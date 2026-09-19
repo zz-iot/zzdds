@@ -95,8 +95,8 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: proto.Guid) void {}
     }.f,
     .remove_matched_writer_deferred = struct {
-        fn f(_: *anyopaque, _: proto.Guid) ?proto.ProtocolReadyCallback {
-            return null;
+        fn f(_: *anyopaque, _: proto.Guid) proto.DeferredUnmatchCallbacks {
+            return .{};
         }
     }.f,
     .matched_writer_count = struct {
@@ -2230,6 +2230,10 @@ pub const DomainParticipantImpl = struct {
         ready_cb: ?proto.ProtocolReadyCallback,
         notify: ?MatchedNotify,
         notify_quiesced: bool = false,
+        // Reader-sweep (writer removal) only -- see removeMatchedWriterDeferred's
+        // doc comment. Always null for the writer-sweep (reader removal) side.
+        unmatched_ctx: ?*anyopaque = null,
+        unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
     };
 
     fn onParticipantLost(ctx: *anyopaque, guid: disc.Guid) void {
@@ -2284,12 +2288,19 @@ pub const DomainParticipantImpl = struct {
             for (w_guids.items) |w_guid| {
                 if (!w_guid.prefix.eql(prefix)) continue;
                 const before = ar.proto.matchedWriterCount();
-                const ready_cb = ar.proto.removeMatchedWriterDeferred(w_guid);
+                const deferred = ar.proto.removeMatchedWriterDeferred(w_guid);
                 const matched_changed = ar.proto.matchedWriterCount() < before;
-                if (ready_cb == null and !matched_changed) continue;
+                if (deferred.ready == null and deferred.unmatched_fn == null and !matched_changed) continue;
                 const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
                 const nq = if (notify) |cb| cb.quiesceAcquire() else false;
-                reader_fires.append(self.alloc, .{ .guid = w_guid, .ready_cb = ready_cb, .notify = notify, .notify_quiesced = nq }) catch {
+                reader_fires.append(self.alloc, .{
+                    .guid = w_guid,
+                    .ready_cb = deferred.ready,
+                    .notify = notify,
+                    .notify_quiesced = nq,
+                    .unmatched_ctx = deferred.unmatched_ctx,
+                    .unmatched_fn = deferred.unmatched_fn,
+                }) catch {
                     if (nq) notify.?.quiesceRelease();
                 };
             }
@@ -2322,6 +2333,7 @@ pub const DomainParticipantImpl = struct {
 
         for (reader_fires.items) |fire| {
             if (fire.ready_cb) |cb| cb.on_ready(cb.ctx, fire.guid, false);
+            if (fire.unmatched_fn) |f| f(fire.unmatched_ctx.?, fire.guid);
             if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(fire.guid), false);
             if (fire.notify_quiesced) fire.notify.?.quiesceRelease();
         }
@@ -2516,6 +2528,8 @@ pub const DomainParticipantImpl = struct {
         ready_cb: ?proto.ProtocolReadyCallback,
         notify: ?MatchedNotify,
         notify_quiesced: bool = false,
+        unmatched_ctx: ?*anyopaque = null,
+        unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
     };
 
     fn onWriterLost(ctx: *anyopaque, guid: disc.Guid) void {
@@ -2538,12 +2552,18 @@ pub const DomainParticipantImpl = struct {
         var ar_it2 = self.active_readers.valueIterator();
         while (ar_it2.next()) |ar| {
             const before = ar.proto.matchedWriterCount();
-            const ready_cb = ar.proto.removeMatchedWriterDeferred(guid);
+            const deferred = ar.proto.removeMatchedWriterDeferred(guid);
             const matched_changed = ar.proto.matchedWriterCount() < before;
-            if (ready_cb == null and !matched_changed) continue;
+            if (deferred.ready == null and deferred.unmatched_fn == null and !matched_changed) continue;
             const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
             const nq = if (notify) |cb| cb.quiesceAcquire() else false;
-            jobs.append(self.alloc, .{ .ready_cb = ready_cb, .notify = notify, .notify_quiesced = nq }) catch {
+            jobs.append(self.alloc, .{
+                .ready_cb = deferred.ready,
+                .notify = notify,
+                .notify_quiesced = nq,
+                .unmatched_ctx = deferred.unmatched_ctx,
+                .unmatched_fn = deferred.unmatched_fn,
+            }) catch {
                 if (nq) notify.?.quiesceRelease();
             };
         }
@@ -2554,6 +2574,7 @@ pub const DomainParticipantImpl = struct {
         const remote_handle = writer_mod.guidToHandle(guid);
         for (jobs.items) |job| {
             if (job.ready_cb) |cb| cb.on_ready(cb.ctx, guid, false);
+            if (job.unmatched_fn) |f| f(job.unmatched_ctx.?, guid);
             if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
             if (job.notify_quiesced) job.notify.?.quiesceRelease();
         }

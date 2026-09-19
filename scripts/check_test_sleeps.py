@@ -52,7 +52,12 @@ ALLOWLIST = {
     # thread is required here (the callback's reentrant call runs
     # synchronously inside net.deliverAll(), so driving discovery on the
     # test's own thread would hang it forever if the fix ever regresses).
-    "test/dcps/mock_loopback_test.zig": (18, "SPDP timer-thread discovery polling"),
+    # 19th/20th added with the onParticipantLost coverage test (kcov showed
+    # 0% on that whole sweep): same match-then-wait polling pattern as the
+    # on_reliable_writer_ready test above, plus a second wait for the
+    # reader's own checkLeases() to notice the (deliberately shortened)
+    # remote lease expiring after the writer participant is deleted.
+    "test/dcps/mock_loopback_test.zig": (20, "SPDP timer-thread discovery polling"),
     # Same MockNetwork/MockTransport-with-real-SPDP-timer-thread pattern as
     # mock_loopback_test.zig above -- see that file's own rationale. This
     # file's 5 sleeps, across its two full-stack scenarios: the baseline

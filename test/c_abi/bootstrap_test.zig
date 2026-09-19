@@ -1678,3 +1678,52 @@ test "entities: get_c_abi_handle boxes every remaining real entity and Entity vi
     _ = pair.dr.vtable.get_c_abi_handle(pair.dr.ptr);
     _ = pair.dr.vtable.as_Entity(pair.dr.ptr).vtable.get_c_abi_handle(pair.dr.vtable.as_Entity(pair.dr.ptr).ptr);
 }
+
+const ReadyState = struct {
+    calls: usize = 0,
+    last_ready: bool = false,
+};
+
+fn onReadyCb(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaque) callconv(.c) void {
+    const state: *ReadyState = @ptrCast(@alignCast(ld.?));
+    state.calls += 1;
+    state.last_ready = ready;
+}
+
+test "readerSetListenerEx: real C-ABI set_listener_ex delegates to DataReaderImpl.setListenerEx" {
+    // kcov showed 0% coverage on readerSetListenerEx (extensions.zig) --
+    // every existing on_reliable_writer_ready test calls
+    // DataReaderImpl.setListenerEx directly at the Zig level, never through
+    // this actual C-ABI entry point (zzdds_DataReader_set_listener_ex), the
+    // one a real C/C++/Java caller uses. Mirrors "get_allocator:
+    // extensions-layer C-ABI vtables..." above: reach extensions.zig's own
+    // ZZDDS.DataReader.Vtable via the DDS_DataReader_as_zzdds_DataReader
+    // checked-downcast path a real caller would use, not the native fat
+    // pointer directly.
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // Install the listener on the reader *before* the writer exists --
+    // default QoS is BEST_EFFORT, so on_reliable_writer_ready fires
+    // immediately at match (no heartbeat handshake to wait for), and
+    // IntraProcessDelivery matches synchronously inside create_datawriter
+    // itself: deterministic, no polling needed.
+    const td = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
+    const dr = fx.sub_r.create_datareader(td, .{}, null, 0);
+
+    const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr.vtable.get_c_abi_handle(dr.ptr));
+    const zdr = zidl_rt.unboxAsView(ZZDDS.DataReader, zdr_boxed);
+
+    var state = ReadyState{};
+    const listener = ZZDDS.DataReaderListenerEx{
+        .listener_data = &state,
+        .on_reliable_writer_ready = onReadyCb,
+    };
+    try testing.expectEqual(DDS.RETCODE_OK, zdr.vtable.set_listener_ex(zdr.ptr, &listener, DDS.STATUS_MASK_ALL));
+
+    _ = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+
+    try testing.expectEqual(@as(usize, 1), state.calls);
+    try testing.expect(state.last_ready == true);
+}
