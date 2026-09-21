@@ -3759,7 +3759,13 @@ pub const DomainParticipantImpl = struct {
         // Publisher's own enable() state comes from the PARTICIPANT's
         // entity_factory QoS -- distinct from this Publisher's own
         // qos.entity_factory, which instead governs its future DataWriters.
-        p.enabled.store(self.qos.entity_factory.autoenable_created_entities, .release);
+        // Also gated on THIS participant's own current enabled state (Greptile
+        // PR #91 finding): autoenable_created_entities=true is "auto-call
+        // enable() on creation," and enable() can never succeed while the
+        // parent isn't enabled (see vtEnable's PRECONDITION_NOT_MET check) --
+        // a disabled participant with the (spec-default) true QoS must not
+        // silently produce an already-enabled child.
+        p.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         self.mu.lock();
         self.publishers.append(self.alloc, p) catch {
             self.mu.unlock();
@@ -3826,8 +3832,9 @@ pub const DomainParticipantImpl = struct {
             mask,
             handle,
         ) catch return nil.nil_subscriber;
-        // See vtCreatePublisher's identical comment.
-        s.enabled.store(self.qos.entity_factory.autoenable_created_entities, .release);
+        // See vtCreatePublisher's identical comment (including the
+        // participant-enabled gate, PR #91 Greptile finding).
+        s.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         self.mu.lock();
         self.subscribers.append(self.alloc, s) catch {
             self.mu.unlock();
@@ -3906,7 +3913,9 @@ pub const DomainParticipantImpl = struct {
             mask,
             handle,
         ) catch return nil.nil_topic;
-        t.enabled.store(self.qos.entity_factory.autoenable_created_entities, .release);
+        // Gated on the participant's own enabled state too -- see
+        // vtCreatePublisher's identical comment (PR #91 Greptile finding).
+        t.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         self.mu.lock();
         self.topics.append(self.alloc, t) catch {
             self.mu.unlock();

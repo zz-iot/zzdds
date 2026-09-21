@@ -183,15 +183,28 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        int n_pos_taken = PositionDataReader_take_n(&position_reader, position_values, position_infos,
-                                                      GROUP_COUNT, DDS_ANY_SAMPLE_STATE, DDS_ANY_VIEW_STATE, DDS_ANY_INSTANCE_STATE);
+        /* Bound each take_n by the REMAINING space in the cumulative
+         * position_order/velocity_order arrays (fixed at GROUP_COUNT), not
+         * GROUP_COUNT itself -- n_position/n_velocity accumulate across many
+         * wait/take cycles, so a single take_n returning close to GROUP_COUNT
+         * new samples while some were already buffered from an earlier cycle
+         * would otherwise write past the end of these stack arrays (found via
+         * PR #91 Greptile review). */
+        int pos_capacity = GROUP_COUNT - n_position;
+        int n_pos_taken = pos_capacity > 0
+            ? PositionDataReader_take_n(&position_reader, position_values, position_infos,
+                                         pos_capacity, DDS_ANY_SAMPLE_STATE, DDS_ANY_VIEW_STATE, DDS_ANY_INSTANCE_STATE)
+            : 0;
         for (int i = 0; i < n_pos_taken; i++) {
             if (!position_infos[i].valid_data) continue;
             position_order[n_position++] = position_values[i].group_id;
         }
 
-        int n_vel_taken = VelocityDataReader_take_n(&velocity_reader, velocity_values, velocity_infos,
-                                                      GROUP_COUNT, DDS_ANY_SAMPLE_STATE, DDS_ANY_VIEW_STATE, DDS_ANY_INSTANCE_STATE);
+        int vel_capacity = GROUP_COUNT - n_velocity;
+        int n_vel_taken = vel_capacity > 0
+            ? VelocityDataReader_take_n(&velocity_reader, velocity_values, velocity_infos,
+                                         vel_capacity, DDS_ANY_SAMPLE_STATE, DDS_ANY_VIEW_STATE, DDS_ANY_INSTANCE_STATE)
+            : 0;
         for (int i = 0; i < n_vel_taken; i++) {
             if (!velocity_infos[i].valid_data) continue;
             velocity_order[n_velocity++] = velocity_values[i].group_id;

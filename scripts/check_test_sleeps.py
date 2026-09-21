@@ -57,7 +57,16 @@ ALLOWLIST = {
     # on_reliable_writer_ready test above, plus a second wait for the
     # reader's own checkLeases() to notice the (deliberately shortened)
     # remote lease expiring after the writer participant is deleted.
-    "test/dcps/mock_loopback_test.zig": (20, "SPDP timer-thread discovery polling"),
+    # 21st/22nd/23rd added with the disabled-DataWriter-never-announces
+    # regression test (PR #91, Entity::enable()): a window proving no
+    # spurious match occurs while disabled, a second window proving a
+    # control (enabled-by-default) writer on the same participant DOES match
+    # in that same window (so the first window's lack of a match is real,
+    # not a broken mock network), and a third window proving enable()
+    # retroactively triggers the deferred announce and a real match follows
+    # -- same net.deliverAll()-in-a-loop SPDP/SEDP polling pattern as every
+    # other test in this file.
+    "test/dcps/mock_loopback_test.zig": (23, "SPDP timer-thread discovery polling"),
     # Same MockNetwork/MockTransport-with-real-SPDP-timer-thread pattern as
     # mock_loopback_test.zig above -- see that file's own rationale. This
     # file's 5 sleeps, across its two full-stack scenarios: the baseline

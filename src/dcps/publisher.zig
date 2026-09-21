@@ -458,8 +458,12 @@ pub const PublisherImpl = struct {
         // announcement -- with no outbound announcement of our own, no peer
         // can discover this writer to trigger any of it. (Verified by the
         // discovery-level test added alongside this change -- see
-        // test/dcps/mock_loopback_test.zig.)
-        dw.enabled.store(self.qos.entity_factory.autoenable_created_entities, .release);
+        // test/dcps/mock_loopback_test.zig.) Also gated on this Publisher's
+        // own current enabled state (PR #91 Greptile finding): a disabled
+        // Publisher with the (spec-default) true QoS must not produce an
+        // already-enabled DataWriter that could announce/match before its
+        // own parent is operational.
+        dw.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         if (dw.enabled.load(.acquire)) self.announceDataWriter(publication_handle);
         self.mu.lock();
         self.writers.append(self.alloc, dw) catch {

@@ -459,8 +459,10 @@ pub const SubscriberImpl = struct {
         // announceDataReader() runs later, from reader.zig's vtEnable, once
         // the app calls enable() on it. See publisher.zig's identical
         // comment for the reasoning on why the rest of this function's
-        // registrations are safe to leave unconditional.
-        dr.enabled.store(self.qos.entity_factory.autoenable_created_entities, .release);
+        // registrations are safe to leave unconditional. Also gated on this
+        // Subscriber's own current enabled state -- see publisher.zig's
+        // identical DataWriter gate (PR #91 Greptile finding).
+        dr.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         if (dr.enabled.load(.acquire)) self.announceDataReader(subscription_handle);
         self.mu.lock();
         self.readers.append(self.alloc, dr) catch {
