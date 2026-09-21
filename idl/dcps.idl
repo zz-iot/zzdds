@@ -542,7 +542,7 @@ module DDS {
     };
 
     struct EntityFactoryQosPolicy {
-        boolean autoenable_created_entities;
+        @default(TRUE) boolean autoenable_created_entities;
     };
 
     struct WriterDataLifecycleQosPolicy {

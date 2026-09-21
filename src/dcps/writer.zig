@@ -71,6 +71,13 @@ pub const DataWriterImpl = struct {
     parent_pinned: bool = false,
     proto_writer: proto.ProtocolWriter,
     qos: DDS.DataWriterQos,
+    /// Entity::enable() state. Seeded by publisher.zig's vtCreateDataWriter
+    /// from the owning Publisher's `qos.entity_factory.autoenable_created_entities`.
+    /// While false, the outbound SEDP announcement (publisher.zig's
+    /// announceDataWriter) is deferred -- everything else about construction
+    /// (proto_writer, matched/incompat/timer/liveliness registration) still
+    /// happens normally, since none of it is itself an outbound wire action.
+    enabled: std.atomic.Value(bool) = .init(true),
     // Unified listener storage: both the base OMG `set_listener()` and the
     // zzdds `set_listener_ex()` extension populate this same representation
     // (see listenerExFromBase/baseFromListenerEx) so on_reliable_reader_ready
@@ -300,7 +307,17 @@ pub const DataWriterImpl = struct {
     }
 
     /// Write a pre-serialized CDR payload (4-byte encap header + CDR bytes).
-    /// Called by the zidl-generated typed wrapper.
+    /// Called by the zidl-generated typed wrapper -- this is the native-Zig
+    /// path (via raw_ops.zig's module-level writeRaw()), a SEPARATE call path
+    /// from the C-ABI's vtWriteRaw below, which already checks
+    /// checkEnabledPrecondition() before ever reaching this function. Without
+    /// this check here too, a disabled writer's native-Zig typed write()/
+    /// dispose()/unregister_instance() (all three route through this one
+    /// function, see toChangeKind in raw_ops.zig) would silently succeed
+    /// instead of returning NOT_ENABLED -- found building the
+    /// integration-tests/zig/enable-defer scenario, which calls write()
+    /// directly on a disabled writer specifically to prove this guard works
+    /// end to end, not just at the C-ABI boundary.
     pub fn writeRaw(
         self: *Self,
         kind: history_mod.ChangeKind,
@@ -309,6 +326,7 @@ pub const DataWriterImpl = struct {
         key_hash: [16]u8,
         data: []const u8,
     ) !history_mod.SequenceNumber {
+        if (!self.enabled.load(.acquire)) return error.NotEnabled;
         // RESOURCE_LIMITS enforcement (max_samples for keyless topics, where
         // max_samples_per_instance == max_samples since there is one instance).
         // 0 means unlimited; only enforce whichever limits are active (> 0).
@@ -835,8 +853,20 @@ pub const DataWriterImpl = struct {
         return .{ .ptr = ctx, .vtable = &entity_vtable };
     }
 
-    fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtEnable(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
+        if (nil.isNil(self.publisher)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
+        if (!pub_.enabled.load(.acquire)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        self.enabled.store(true, .release);
+        pub_.announceDataWriter(self.instance_handle);
         return DDS.RETCODE_OK;
+    }
+
+    /// NOT_ENABLED precondition, mirroring participant.zig's identical helper.
+    fn checkEnabledPrecondition(self: *Self) DDS.ReturnCode_t {
+        return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
@@ -884,6 +914,8 @@ pub const DataWriterImpl = struct {
         return baseFromListenerEx(self.listener_ex_box.listener);
     }
 
+    // Neither navigational getter below is gated on enabled state -- see
+    // publisher.zig's vtGetParticipant comment for why.
     fn vtGetTopic(ctx: *anyopaque) DDS.Topic {
         return cast(ctx).topic;
     }
@@ -893,6 +925,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return DDS.RETCODE_OK;
         const last_sn = self.last_sn.load(.monotonic);
@@ -913,6 +946,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetLivelinessLost(ctx: *anyopaque, status: *DDS.LivelinessLostStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -926,6 +960,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.OfferedDeadlineMissedStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -939,6 +974,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetIncompatQos(ctx: *anyopaque, status: *DDS.OfferedIncompatibleQosStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
@@ -953,6 +989,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetPubMatched(ctx: *anyopaque, status: *DDS.PublicationMatchedStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -970,6 +1007,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtAssertLiveliness(ctx: *anyopaque) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         const now_ns = self.timer_clock.nowNs();
         self.liveliness_last_ns.store(now_ns, .monotonic);
@@ -987,6 +1025,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetMatchedSubs(ctx: *anyopaque, handles: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
@@ -1009,6 +1048,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetMatchedSubData(ctx: *anyopaque, data: *DDS.SubscriptionBuiltinTopicData, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
         defer guids.deinit(self.alloc);
@@ -1091,6 +1131,7 @@ pub const DataWriterImpl = struct {
         kind: DDS.WriteKind,
         source_timestamp: *const DDS.Time_t,
     ) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         const kh_seq = key_hash orelse return DDS.RETCODE_BAD_PARAMETER;
         const payload = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
@@ -1118,6 +1159,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtLoanRaw(ctx: *anyopaque, size: u32, cdr_payload: ?*DDS.OctetSeq) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
         // Same race as vtWriteRaw above, but a successful loan outlives this
@@ -1171,6 +1213,7 @@ pub const DataWriterImpl = struct {
         handle: DDS.InstanceHandle_t,
         kind: DDS.WriteKind,
     ) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
         const kh_seq = key_hash orelse return DDS.RETCODE_BAD_PARAMETER;
@@ -1203,6 +1246,7 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payload: ?*DDS.OctetSeq) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
         const full_buf: []u8 = (seq._buffer orelse return DDS.RETCODE_BAD_PARAMETER)[0..seq._maximum];

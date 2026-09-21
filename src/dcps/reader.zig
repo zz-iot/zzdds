@@ -257,6 +257,13 @@ pub const DataReaderImpl = struct {
     parent_pinned: bool = false,
     proto_reader: proto.ProtocolReader,
     qos: DDS.DataReaderQos,
+    /// Entity::enable() state. Seeded by subscriber.zig's vtCreateDataReader
+    /// from the owning Subscriber's `qos.entity_factory.autoenable_created_entities`.
+    /// While false, the outbound SEDP announcement (subscriber.zig's
+    /// announceDataReader) is deferred. Defaults true so the many existing
+    /// hand-built test fixtures in this file (which list every field but
+    /// predate this one) keep working unchanged.
+    enabled: std.atomic.Value(bool) = .init(true),
     // Unified listener storage: both the base OMG `set_listener()` and the
     // zzdds `set_listener_ex()` extension populate this same representation
     // (see listenerExFromBase/baseFromListenerEx) so on_reliable_writer_ready
@@ -1521,8 +1528,18 @@ pub const DataReaderImpl = struct {
                 // Instance already non-alive (disposed/unregistered) — skip.
                 const si = self.seen_instances.get(ih) orelse continue;
                 if (si.instance_state != DDS.ALIVE_INSTANCE_STATE) continue;
-                // Build synthetic change.
-                const empty = self.alloc.dupe(u8, &.{}) catch continue;
+                // Build synthetic change. A real wire DISPOSE/UNREGISTER always carries
+                // at least a valid CDR encapsulation header (RTPS Ch. 10), even when the
+                // key itself is empty (unkeyed types) -- generated TypeSupport's
+                // deserializeKeyInto (called for any !valid_data sample, keyed or not)
+                // requires >=4 bytes just to read that header before it can even ask
+                // "does this type have key fields to decode." A genuinely empty (0-byte)
+                // buffer isn't a valid CDR payload at all, so any typed DataReader.take()/
+                // read() on this synthetic sample threw error.InvalidEncapsulation --
+                // found via the `coherent-sets` integration test (a real, if narrow, race:
+                // a synthesized NOT_ALIVE_NO_WRITERS can fire this early). XCDR1 LE, no
+                // options, matches every other binding's default representation.
+                const empty = self.alloc.dupe(u8, &.{ 0x00, 0x01, 0x00, 0x00 }) catch continue;
                 const states = self.determineStatesLocked(ih, .not_alive_unregistered);
                 const now = time_mod.Time.now();
                 const pc = self.alloc.create(PendingChange) catch {
@@ -1619,14 +1636,23 @@ pub const DataReaderImpl = struct {
         // data_notifiers are fired by the subscriber after releasing all locks.
     }
 
-    /// Returns true if there is at least one pending sample.
-    /// Used as the `has_data_fn` in ReadConditionImpl.
-    /// ctx is a *DataReaderImpl.
+    /// Returns true if there is at least one pending sample, OR a complete
+    /// coherent set is staged and waiting for Subscriber.begin_access() to
+    /// promote it (`coherent_committed_ready`). Without the latter half, a
+    /// WaitSet/ReadCondition-driven `wait() -> begin_access() -> take() ->
+    /// end_access()` loop can only ever observe the *first* coherent set
+    /// that happens to get promoted by some other means (e.g. a writer
+    /// unmatch flush): `commitCoherentPendingLocked` (called only from
+    /// begin_access()) is the sole path that fills `pending`, so once it's
+    /// drained back to empty, trigger_value would go permanently false even
+    /// though `coherent_committed` still holds further complete sets --
+    /// nothing would ever wake the application to call begin_access() again.
+    /// Used as the `has_data_fn` in ReadConditionImpl. ctx is a *DataReaderImpl.
     pub fn hasPendingDataFn(ctx: *anyopaque) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
-        return self.pending.items.len > 0;
+        return self.pending.items.len > 0 or self.coherent_committed_ready;
     }
 
     pub fn hasPendingData(self: *Self) bool {
@@ -2829,8 +2855,20 @@ pub const DataReaderImpl = struct {
         return .{ .ptr = ctx, .vtable = &entity_vtable };
     }
 
-    fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtEnable(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
+        if (nil.isNil(self.subscriber)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        const sub_: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
+        if (!sub_.enabled.load(.acquire)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        self.enabled.store(true, .release);
+        sub_.announceDataReader(self.instance_handle);
         return DDS.RETCODE_OK;
+    }
+
+    /// NOT_ENABLED precondition, mirroring participant.zig's identical helper.
+    fn checkEnabledPrecondition(self: *Self) DDS.ReturnCode_t {
+        return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
@@ -2856,6 +2894,7 @@ pub const DataReaderImpl = struct {
         view_states: DDS.ViewStateMask,
         instance_states: DDS.InstanceStateMask,
     ) DDS.ReadCondition {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_readcondition; }
         const self = cast(ctx);
         // Without this, a create racing this reader's own deinit() could
         // track a new condition into read_conditions after reallyDeinit()
@@ -2900,6 +2939,7 @@ pub const DataReaderImpl = struct {
         query_expression: [*:0]const u8,
         query_parameters: ?*const DDS.StringSeq,
     ) DDS.QueryCondition {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_querycondition; }
         const self = cast(ctx);
         const qe_s = std.mem.span(query_expression);
         // A non-empty expression requires field-level access to evaluate.
@@ -2980,7 +3020,9 @@ pub const DataReaderImpl = struct {
         return DDS.RETCODE_OK;
     }
 
-    fn vtDeleteContained(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
+        const rc = cast(ctx).checkEnabledPrecondition();
+        if (rc != DDS.RETCODE_OK) return rc;
         return DDS.RETCODE_OK;
     }
 
@@ -3124,6 +3166,8 @@ pub const DataReaderImpl = struct {
         return sub.dispatchReaderFallback(field, bit, handle, args);
     }
 
+    // Neither navigational getter below is gated on enabled state -- see
+    // publisher.zig's vtGetParticipant comment for why.
     fn vtGetTopicDesc(ctx: *anyopaque) DDS.TopicDescription {
         return cast(ctx).topic_desc;
     }
@@ -3133,6 +3177,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSampleRejected(ctx: *anyopaque, status: *DDS.SampleRejectedStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3148,6 +3193,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetLivelinessChanged(ctx: *anyopaque, status: *DDS.LivelinessChangedStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3165,6 +3211,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.RequestedDeadlineMissedStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3178,6 +3225,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetIncompatQos(ctx: *anyopaque, status: *DDS.RequestedIncompatibleQosStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
@@ -3192,6 +3240,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSubMatched(ctx: *anyopaque, status: *DDS.SubscriptionMatchedStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3209,6 +3258,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSampleLost(ctx: *anyopaque, status: *DDS.SampleLostStatus) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3222,6 +3272,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtWaitForHistorical(ctx: *anyopaque, max_wait: *const DDS.Duration_t) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         if (self.qos.durability.kind == .VOLATILE_DURABILITY_QOS) return DDS.RETCODE_OK;
 
@@ -3261,6 +3312,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetMatchedPubs(ctx: *anyopaque, handles: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
@@ -3283,6 +3335,7 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetMatchedPubData(ctx: *anyopaque, data: *DDS.PublicationBuiltinTopicData, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
         defer guids.deinit(self.alloc);
@@ -3368,6 +3421,7 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
         max_samples: i32,
     ) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const f = resolveRawFilter(instance_handle, a_condition, sample_states, view_states, instance_states);
         return cast(ctx).rawReadOrTake(cdr_payloads, key_hashes, sample_infos, f, max_samples, true);
     }
@@ -3384,6 +3438,7 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
         max_samples: i32,
     ) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const f = resolveRawFilter(instance_handle, a_condition, sample_states, view_states, instance_states);
         return cast(ctx).rawReadOrTake(cdr_payloads, key_hashes, sample_infos, f, max_samples, false);
     }
@@ -3400,6 +3455,7 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
         max_samples: i32,
     ) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const f = resolveRawFilter(DDS.HANDLE_NIL, a_condition, sample_states, view_states, instance_states);
         return cast(ctx).rawReadOrTakeNextInstance(cdr_payloads, key_hashes, sample_infos, previous_handle, f, max_samples, true);
     }
@@ -3416,6 +3472,7 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
         max_samples: i32,
     ) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const f = resolveRawFilter(DDS.HANDLE_NIL, a_condition, sample_states, view_states, instance_states);
         return cast(ctx).rawReadOrTakeNextInstance(cdr_payloads, key_hashes, sample_infos, previous_handle, f, max_samples, false);
     }
@@ -3711,6 +3768,7 @@ pub const DataReaderImpl = struct {
     /// as any other pin release); absent means copy-mode (each descriptor
     /// independently owns its own buffer, freed directly here).
     fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payloads: ?*DDS.OctetSeqSeq, key_hashes: ?*DDS.OctetSeq, sample_infos: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
+        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
         const self = cast(ctx);
         const payloads_seq = cdr_payloads orelse return DDS.RETCODE_BAD_PARAMETER;
         const hashes_seq = key_hashes orelse return DDS.RETCODE_BAD_PARAMETER;
@@ -3888,6 +3946,116 @@ test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
     }
     try testing.expectEqual(@as(usize, 0), dr.coherent_wip.count());
     try testing.expect(dr.coherent_committed_ready);
+}
+
+test "coherent access: WaitSet trigger survives multiple queued committed sets (regression, hasPendingDataFn)" {
+    // hasPendingDataFn backs ReadConditionImpl's has_data_fn -- the only signal a
+    // WaitSet-driven wait() -> begin_access() -> take() -> end_access() loop has
+    // that there's more coherent data to fetch. commitCoherentPendingLocked only
+    // ever promotes ONE committed set per call (see its own doc comment), so with
+    // N>1 sets queued, the trigger must stay true across the whole
+    // drain-set-1-then-empty cycle, or the app never calls begin_access() again
+    // and sets 2..N are stranded in coherent_committed forever. Found via
+    // integration-tests/zig/coherent-sets (docs/design/integration-test-tier.md):
+    // a real cross-process GROUP-coherent-access scenario hung after its first
+    // group for exactly this reason -- this is that hang, reproduced in-process.
+    const alloc = testing.allocator;
+    var clock = time_test.ManualClock.init(0);
+    const pres = DDS.PresentationQosPolicy{ .coherent_access = true };
+
+    var dr = DataReaderImpl{
+        .alloc = alloc,
+        .topic_desc = nil.nil_topic_description,
+        .subscriber = nil.nil_subscriber,
+        .proto_reader = undefined,
+        .qos = .{},
+        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
+        .listener_mask = 0,
+        .instance_handle = 1,
+        .status_changes = 0,
+        .status_cond = null,
+        .timer_clock = clock.clock(),
+        .last_received_ns = .init(clock.clock().nowNs()),
+        .data_notifiers = .empty,
+        .read_conditions = .empty,
+        .pending = .empty,
+        .coherent_wip = .{},
+        .coherent_committed = .empty,
+        .coherent_committed_ready = false,
+        .mu = .{},
+        .subscriber_presentation = pres,
+        .seen_instances = .empty,
+    };
+    defer {
+        var it = dr.coherent_wip.valueIterator();
+        while (it.next()) |e| {
+            for (e.samples.items) |pc| pc.deinit();
+            e.samples.deinit(alloc);
+        }
+        dr.coherent_wip.deinit(alloc);
+        for (dr.coherent_committed.items) |*set| {
+            for (set.items) |pc| pc.deinit();
+            set.deinit(alloc);
+        }
+        dr.coherent_committed.deinit(alloc);
+        for (dr.pending.items) |pc| {
+            pc.deinit();
+            alloc.destroy(pc);
+        }
+        dr.pending.deinit(alloc);
+        {
+            var _si = dr.seen_instances.valueIterator();
+            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
+        }
+        dr.seen_instances.deinit(alloc);
+        dr.listener_ex_box.releaseRef(alloc);
+    }
+
+    // Two already-complete coherent sets queued, as if two GROUP-scope
+    // begin/end_coherent_changes() brackets had both already arrived and been
+    // fully reassembled -- commitCoherentWipSamplesLocked's own job, covered by
+    // the other tests in this file, is bypassed here to isolate
+    // hasPendingDataFn/commitCoherentPendingLocked's interaction.
+    const info = DDS.SampleInfo{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true };
+    var set1: std.ArrayListUnmanaged(PendingChange) = .empty;
+    try set1.append(alloc, PendingChange{ .data = try alloc.dupe(u8, &.{0x01}), .alloc = alloc, .info = info });
+    try dr.coherent_committed.append(alloc, set1);
+    var set2: std.ArrayListUnmanaged(PendingChange) = .empty;
+    try set2.append(alloc, PendingChange{ .data = try alloc.dupe(u8, &.{0x02}), .alloc = alloc, .info = info });
+    try dr.coherent_committed.append(alloc, set2);
+    dr.coherent_committed_ready = true;
+
+    try testing.expect(DataReaderImpl.hasPendingDataFn(@ptrCast(&dr)));
+
+    // First begin_access(): promotes set 1 only. Set 2 stays queued.
+    dr.commitCoherentPendingLocked();
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expect(dr.coherent_committed_ready);
+
+    // The application takes set 1's sample, draining `pending` back to empty --
+    // the exact moment the bug manifested.
+    {
+        const pc = dr.pending.items[0];
+        dr.pending.items.len = 0;
+        pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
+    }
+
+    // The regression: without also checking coherent_committed_ready, this
+    // would wrongly return false here, permanently starving the WaitSet even
+    // though set 2 is still waiting.
+    try testing.expect(DataReaderImpl.hasPendingDataFn(@ptrCast(&dr)));
+
+    // Second begin_access(): promotes set 2. Nothing left after this.
+    dr.commitCoherentPendingLocked();
+    try testing.expectEqual(@as(usize, 1), dr.pending.items.len);
+    try testing.expect(!dr.coherent_committed_ready);
+    {
+        const pc = dr.pending.items[0];
+        dr.pending.items.len = 0;
+        pc.quiesce.beginTeardown(pc, PendingChange.reallyFree);
+    }
+
+    try testing.expect(!DataReaderImpl.hasPendingDataFn(@ptrCast(&dr)));
 }
 
 test "coherent WIP: CS transition discards incomplete previous WIP" {

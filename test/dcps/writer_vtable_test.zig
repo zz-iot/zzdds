@@ -219,12 +219,41 @@ const TwoPartyFixture = struct {
 
 // ── Tests: basic vtable methods ───────────────────────────────────────────────
 
-test "enable: returns RETCODE_OK" {
+test "enable: returns RETCODE_OK, idempotent on an already-enabled writer" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.enable(dw.ptr));
+    // Calling enable() again on an already-enabled entity is a harmless no-op.
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.enable(dw.ptr));
+}
+
+test "enable: a DataWriter created under a disabled Publisher starts disabled, rejects write_raw with NOT_ENABLED, and enable() makes it work" {
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    var disabled_pub_qos = DDS.PublisherQos{};
+    disabled_pub_qos.entity_factory.autoenable_created_entities = false;
+    const disabled_pub = fx.dp.create_publisher(disabled_pub_qos, null, 0);
+    defer _ = fx.dp.vtable.delete_publisher(fx.dp.ptr, disabled_pub);
+    const dw = disabled_pub.create_datawriter(fx.topic, .{}, null, 0);
+    defer _ = disabled_pub.vtable.delete_datawriter(disabled_pub.ptr, dw);
+
+    var payload = [_]u8{ 0x00, 0x01, 0x00, 0x00 };
+    var payload_seq = DDS.OctetSeq{ ._buffer = &payload, ._length = payload.len, ._maximum = payload.len, ._release = false };
+    var key_hash = [_]u8{0} ** 16;
+    var key_hash_seq = DDS.OctetSeq{ ._buffer = &key_hash, ._length = key_hash.len, ._maximum = key_hash.len, ._release = false };
+    const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
+    try testing.expectEqual(
+        DDS.RETCODE_NOT_ENABLED,
+        dw.vtable.write_raw(dw.ptr, &key_hash_seq, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts),
+    );
+
+    try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.enable(dw.ptr));
+    try testing.expectEqual(
+        DDS.RETCODE_OK,
+        dw.vtable.write_raw(dw.ptr, &key_hash_seq, DDS.HANDLE_NIL, &payload_seq, .ALIVE_WRITE_KIND, &ts),
+    );
 }
 
 test "get_statuscondition: returns non-nil condition" {

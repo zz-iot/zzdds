@@ -1,0 +1,7 @@
+// integration-tests/delete-contained-entities -- shared type across all
+// three topics (SessionOut1, SessionOut2, SessionIn). See
+// docs/design/integration-test-tier.md for the full scenario spec.
+@final
+struct SessionEvent {
+    int32 seq;
+};

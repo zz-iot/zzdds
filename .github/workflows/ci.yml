@@ -227,7 +227,7 @@ jobs:
     needs: test-linux
     permissions:
       contents: read
-    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@d9da5f9efc39d60b75e7207c753f5df872c82eae
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@929f5f639c52dce002eb7717b817a24dbae91f8b
     with:
       mode: zzdds-pr
       zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
@@ -289,6 +289,49 @@ jobs:
 
       - name: Run examples (strict)
         working-directory: examples
+        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
+
+  # ── integration tests ────────────────────────────────────────────────────
+  #
+  # Builds zzdds with every binding enabled, then runs integration-tests/'s
+  # own orchestrator (run_all.py) against that build. Distinct from the
+  # `examples` job above: every scenario here is built once per binding and
+  # run cross-binding, targeting one specific DCPS behavior with a hard
+  # correctness assertion rather than a demonstration -- see
+  # docs/design/integration-test-tier.md. One scenario today
+  # (coherent-sets); --strict means a missing binding is a hard failure
+  # here, same reasoning as the `examples` job above.
+  integration-tests:
+    name: integration-tests
+    needs: test-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out zzdds
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.16.0"
+
+      - name: Install JDK (java-binding needs jni.h, not just a JRE)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Python (integration-tests/'s build/run/interop scripts)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build zzdds (all bindings)
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
+
+      - name: Run integration tests (strict)
+        working-directory: integration-tests
         run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
 
   # ── examples: WaitSet + ThreadSanitizer ──────────────────────────────────

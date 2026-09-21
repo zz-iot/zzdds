@@ -1,0 +1,18 @@
+.{
+    .name = .zzdds_it_coherent_sets_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x20b3e3f7700b02a,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zzdds = .{
+            .path = "../../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "publisher.zig",
+        "subscriber.zig",
+        "idl",
+    },
+}

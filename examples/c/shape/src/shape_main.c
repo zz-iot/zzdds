@@ -341,6 +341,13 @@ static int run_publisher(DDS_DomainParticipant dp, DDS_Topic base_topic, const O
 
     DDS_PublisherQos pub_qos;
     memset(&pub_qos, 0, sizeof(pub_qos));
+    // memset(0) is spec-correct for every other QoS boolean in this struct,
+    // but ENTITY_FACTORY.autoenable_created_entities is one of the rare ones
+    // whose real default is TRUE, not zero -- set explicitly rather than
+    // relying on a zeroed struct (real apps constructing their own QoS this
+    // way, instead of starting from get_default_publisher_qos(), need the
+    // same explicit set).
+    pub_qos.entity_factory.autoenable_created_entities = true;
     pub_qos.presentation.access_scope = access_scope_kind(opts->access_scope);
     pub_qos.presentation.coherent_access = opts->coherent_access;
     pub_qos.presentation.ordered_access = opts->ordered_access;
@@ -639,6 +646,8 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
 
     DDS_SubscriberQos sub_qos;
     memset(&sub_qos, 0, sizeof(sub_qos));
+    // See the matching comment on pub_qos above.
+    sub_qos.entity_factory.autoenable_created_entities = true;
     sub_qos.presentation.access_scope = access_scope_kind(opts->access_scope);
     sub_qos.presentation.coherent_access = opts->coherent_access;
     sub_qos.presentation.ordered_access = opts->ordered_access;

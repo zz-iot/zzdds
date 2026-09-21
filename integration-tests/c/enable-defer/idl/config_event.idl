@@ -1,0 +1,7 @@
+// integration-tests/enable-defer -- shared type. Copied verbatim into each
+// language's own idl/ dir, matching every other integration-tests scenario's
+// convention. See docs/design/integration-test-tier.md.
+@final
+struct ConfigEvent {
+    int32 seq;
+};

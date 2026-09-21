@@ -191,11 +191,24 @@ pub const DomainParticipantFactoryImpl = struct {
         // on any failure path below doesn't free config — the caller retains ownership
         // and handles cleanup on error.
 
+        p.enabled.store(self.factory_qos.entity_factory.autoenable_created_entities, .release);
+
         // Start discovery; if it fails we still own the participant and must clean up.
-        p.start() catch {
-            p.deinit();
-            return null;
-        };
+        // Deferred entirely when created disabled (ENTITY_FACTORY QoS) -- enable()
+        // calls p.start() itself once the app is ready to go live (participant.zig's
+        // vtEnable). Per spec, a participant's own enabled state comes from the
+        // FACTORY's entity_factory QoS (self.factory_qos, set via
+        // set_qos()/DomainParticipantFactory_get_instance()) -- mirroring how a
+        // Publisher's enabled state comes from its owning participant's
+        // entity_factory, not its own -- NOT from `qos.entity_factory`, which is
+        // the QoS being applied to the new participant itself and has no
+        // factory-level meaning here.
+        if (self.factory_qos.entity_factory.autoenable_created_entities) {
+            p.start() catch {
+                p.deinit();
+                return null;
+            };
+        }
 
         self.mu.lock();
         self.participants.append(self.alloc, p) catch {

@@ -1,0 +1,16 @@
+// integration-tests/sample-rejected-lost -- wire types.
+//
+// A "slow consumer" scenario: a monitoring app that must be correctly
+// notified, not silently degraded, when the middleware drops data for two
+// different reasons -- reader-side RESOURCE_LIMITS overflow (SAMPLE_REJECTED)
+// and writer-side KEEP_LAST history eviction outrunning a reader's ack
+// (SAMPLE_LOST). One shared type reused across three topics (RejectedTopic,
+// LostTopic, SyncTopic -- the last used only to let the subscriber know the
+// publisher has finished writing before it checks final status, avoiding a
+// race against exactly how many rejections/losses have landed so far). See
+// docs/design/integration-test-tier.md for the full scenario spec.
+// Byte-identical copy required in c/, cpp/, java/, zig/.
+@final
+struct StatusEvent {
+    int32 seq;
+};
