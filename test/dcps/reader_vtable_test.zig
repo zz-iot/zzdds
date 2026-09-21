@@ -174,13 +174,42 @@ const TwoPartyFixture = struct {
 
 // ── vtable accessor tests ─────────────────────────────────────────────────────
 
-test "DataReader: enable returns RETCODE_OK" {
+test "DataReader: enable returns RETCODE_OK, idempotent when already enabled" {
     const alloc = testing.allocator;
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     const dr = fx.makeReader(nil.nil_dr_listener, 0);
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr);
     try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.enable(dr.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.enable(dr.ptr));
+}
+
+test "DataReader: created under a disabled Subscriber starts disabled, rejects take_raw with NOT_ENABLED, and enable() makes it work" {
+    const alloc = testing.allocator;
+    var fx = try SingleFixture.init(alloc);
+    defer fx.deinit();
+    var disabled_sub_qos = DDS.SubscriberQos{};
+    disabled_sub_qos.entity_factory.autoenable_created_entities = false;
+    const disabled_sub = fx.dp.create_subscriber(disabled_sub_qos, null, 0);
+    defer _ = fx.dp.vtable.delete_subscriber(fx.dp.ptr, disabled_sub);
+    const td = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic.ptr))).toTopicDescription();
+    const dr = disabled_sub.create_datareader(td, .{}, null, 0);
+    defer _ = disabled_sub.vtable.delete_datareader(disabled_sub.ptr, dr);
+
+    var seq = DDS.OctetSeqSeq{};
+    var kh = DDS.OctetSeq{};
+    var infos = DDS.SampleInfoSeq{};
+    try testing.expectEqual(
+        DDS.RETCODE_NOT_ENABLED,
+        dr.vtable.take_raw(dr.ptr, &seq, &kh, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1),
+    );
+
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.enable(dr.ptr));
+    try testing.expectEqual(
+        DDS.RETCODE_OK,
+        dr.vtable.take_raw(dr.ptr, &seq, &kh, &infos, DDS.HANDLE_NIL, nil.nil_readcondition, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1),
+    );
+    _ = dr.vtable.return_loan_raw(dr.ptr, &seq, &kh, &infos);
 }
 
 test "DataReader: get_statuscondition returns non-nil condition" {

@@ -27,6 +27,18 @@ pub const TopicImpl = struct {
     type_name: [:0]u8, // owned, null-terminated for C API compatibility
     participant_ptr: *anyopaque, // borrowed — points to ParticipantImpl
     get_participant_fn: *const fn (*anyopaque) DDS.DomainParticipant,
+    /// Entity::enable()'s "factory not enabled" precondition -- reads the
+    /// owning DomainParticipantImpl's `enabled` flag. A function pointer
+    /// rather than an import of participant.zig, matching participant_ptr's
+    /// existing opaque-pointer + accessor-function style.
+    is_participant_enabled_fn: *const fn (*anyopaque) bool,
+    /// Entity::enable() state. Seeded by vtCreateTopic (participant.zig)
+    /// from the owning participant's `qos.entity_factory.autoenable_created_entities`.
+    /// Topics have no wire footprint of their own -- unlike Publisher/
+    /// Subscriber (whose DataWriters/DataReaders defer an outbound SEDP
+    /// announcement while disabled), this flag only gates this Topic's own
+    /// operations.
+    enabled: std.atomic.Value(bool) = .init(true),
     qos: DDS.TopicQos,
     listener_box: *ListenerBox(DDS.TopicListener),
     /// Guards `listener_box` swaps/acquires only — never held across a
@@ -66,6 +78,7 @@ pub const TopicImpl = struct {
         type_name: []const u8,
         participant_ptr: *anyopaque,
         get_participant_fn: *const fn (*anyopaque) DDS.DomainParticipant,
+        is_participant_enabled_fn: *const fn (*anyopaque) bool,
         qos: DDS.TopicQos,
         listener: DDS.TopicListener,
         mask: DDS.StatusMask,
@@ -87,6 +100,7 @@ pub const TopicImpl = struct {
             .type_name = tt,
             .participant_ptr = participant_ptr,
             .get_participant_fn = get_participant_fn,
+            .is_participant_enabled_fn = is_participant_enabled_fn,
             .qos = qos_clone,
             .listener_box = listener_box,
             .listener_mask = mask,
@@ -167,8 +181,17 @@ pub const TopicImpl = struct {
         return cast(ctx).alloc;
     }
 
-    fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtEnable(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
+        if (!self.is_participant_enabled_fn(self.participant_ptr)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        self.enabled.store(true, .release);
         return DDS.RETCODE_OK;
+    }
+
+    /// NOT_ENABLED precondition, mirroring participant.zig's identical helper.
+    fn checkEnabledPrecondition(self: *Self) DDS.ReturnCode_t {
+        return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
@@ -196,6 +219,8 @@ pub const TopicImpl = struct {
         return cast(ctx).topic_name.ptr;
     }
 
+    // Not gated on enabled state -- see publisher.zig's vtGetParticipant
+    // comment for why.
     fn vtGetParticipant(ctx: *anyopaque) DDS.DomainParticipant {
         const self = cast(ctx);
         return self.get_participant_fn(self.participant_ptr);
@@ -243,6 +268,10 @@ pub const TopicImpl = struct {
     }
 
     fn vtGetInconsistent(ctx: *anyopaque, a_status: *DDS.InconsistentTopicStatus) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();

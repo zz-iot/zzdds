@@ -30,6 +30,11 @@ const generated_config_mod = @import("../config/generated.zig");
 pub const ParticipantCbs = struct {
     ctx: *anyopaque,
 
+    /// Entity::enable()'s "factory not enabled" precondition (spec: can't
+    /// enable a child before its own factory entity). Reads the owning
+    /// DomainParticipantImpl's `enabled` flag.
+    is_participant_enabled: *const fn (ctx: *anyopaque) bool,
+
     /// Allocate and start an RTPS ProtocolWriter for a topic.
     /// Called on create_datawriter; the returned ProtocolWriter is owned by
     /// the DataWriterImpl.
@@ -115,6 +120,11 @@ pub const PublisherImpl = struct {
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
     qos: DDS.PublisherQos,
+    /// Entity::enable() state. Seeded by vtCreatePublisher (participant.zig)
+    /// from the owning participant's `qos.entity_factory.autoenable_created_entities`
+    /// -- NOT from this Publisher's own `qos.entity_factory`, which instead
+    /// governs whether *this Publisher's* future DataWriters start enabled.
+    enabled: std.atomic.Value(bool),
     listener_box: *ListenerBox(DDS.PublisherListener),
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
@@ -178,6 +188,7 @@ pub const PublisherImpl = struct {
             .participant = participant,
             .cbs = cbs,
             .qos = .{},
+            .enabled = .init(true),
             .listener_box = undefined,
             .listener_mask = mask,
             .instance_handle = handle,
@@ -313,8 +324,17 @@ pub const PublisherImpl = struct {
         return .{ .ptr = ctx, .vtable = &entity_vtable };
     }
 
-    fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtEnable(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
+        if (!self.cbs.is_participant_enabled(self.cbs.ctx)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        self.enabled.store(true, .release);
         return DDS.RETCODE_OK;
+    }
+
+    /// NOT_ENABLED precondition, mirroring participant.zig's identical helper.
+    fn checkEnabledPrecondition(self: *Self) DDS.ReturnCode_t {
+        return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
@@ -341,6 +361,13 @@ pub const PublisherImpl = struct {
         a_listener: ?*const DDS.DataWriterListener,
         mask: DDS.StatusMask,
     ) DDS.DataWriter {
+        // NOT gated on this Publisher's own enabled state -- create_datawriter
+        // must work on a disabled Publisher (nested disabled trees are how
+        // autoenable_created_entities=false is meant to be used: build
+        // everything disabled, then enable() top-down). The new writer's OWN
+        // enabled state (below) is independently governed by this Publisher's
+        // qos.entity_factory, regardless of whether the Publisher itself is
+        // currently enabled.
         const self = cast(ctx);
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
@@ -421,14 +448,23 @@ pub const PublisherImpl = struct {
             .quiesce_acquire = writer_mod.DataWriterImpl.quiesceAcquireFn,
             .quiesce_release = writer_mod.DataWriterImpl.quiesceReleaseFn,
         });
-        const pname_seq = &self.qos.partition.name;
-        const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
-        var pname_buf: [64][]const u8 = undefined;
-        const pname_slice = pname_buf[0..@min(pname_count, pname_buf.len)];
-        if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
-            s.* = std.mem.span(b[i]);
-        };
-        self.cbs.announce_writer(self.cbs.ctx, publication_handle, self.instance_handle, pname_slice, presentation);
+        // Entity::enable() (ENTITY_FACTORY QoS): this Publisher's own
+        // qos.entity_factory governs whether ITS DataWriters start enabled.
+        // A disabled writer skips the outbound SEDP announcement entirely --
+        // announceDataWriter() runs later, from writer.zig's vtEnable, once
+        // the app calls enable() on it. Everything else above (proto writer,
+        // matched/incompat/timer/liveliness registration) is real, harmless
+        // local bookkeeping that only ever *reacts* to a remote peer's own
+        // announcement -- with no outbound announcement of our own, no peer
+        // can discover this writer to trigger any of it. (Verified by the
+        // discovery-level test added alongside this change -- see
+        // test/dcps/mock_loopback_test.zig.) Also gated on this Publisher's
+        // own current enabled state (PR #91 Greptile finding): a disabled
+        // Publisher with the (spec-default) true QoS must not produce an
+        // already-enabled DataWriter that could announce/match before its
+        // own parent is operational.
+        dw.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
+        if (dw.enabled.load(.acquire)) self.announceDataWriter(publication_handle);
         self.mu.lock();
         self.writers.append(self.alloc, dw) catch {
             self.mu.unlock();
@@ -440,7 +476,26 @@ pub const PublisherImpl = struct {
         return dw.toDDSDataWriter();
     }
 
+    /// The outbound SEDP publication announcement -- the one part of
+    /// create_datawriter's discovery wiring that's actually deferred while a
+    /// writer is disabled (see vtCreateDataWriter and writer.zig's vtEnable,
+    /// which calls this directly once the app enables the writer).
+    pub fn announceDataWriter(self: *Self, publication_handle: DDS.InstanceHandle_t) void {
+        const pname_seq = &self.qos.partition.name;
+        const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
+        var pname_buf: [64][]const u8 = undefined;
+        const pname_slice = pname_buf[0..@min(pname_count, pname_buf.len)];
+        if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
+            s.* = std.mem.span(b[i]);
+        };
+        self.cbs.announce_writer(self.cbs.ctx, publication_handle, self.instance_handle, pname_slice, self.qos.presentation);
+    }
+
     fn vtDeleteDataWriter(ctx: *anyopaque, a_datawriter: DDS.DataWriter) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -474,6 +529,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtLookupDataWriter(ctx: *anyopaque, topic_name: [*:0]const u8) DDS.DataWriter {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_datawriter;
+        }
         const self = cast(ctx);
         const tn_s = std.mem.span(topic_name);
         self.mu.lock();
@@ -487,6 +546,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const precondition = self.checkDeleteContainedPrecondition();
         if (precondition != DDS.RETCODE_OK) return precondition;
@@ -582,6 +645,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtSuspendPublications(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -591,6 +658,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtResumePublications(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -605,6 +676,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtBeginCoherent(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -616,6 +691,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtEndCoherent(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -666,6 +745,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const POLL_NS: u64 = 1_000_000; // 1 ms
         const deadline_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
@@ -696,10 +779,23 @@ pub const PublisherImpl = struct {
         }
     }
 
+    // NOT gated on enabled state: a pure navigational getter (no side effect,
+    // no dependency on the entity actually operating), same category as
+    // get_instance_handle -- which the spec explicitly exempts.
     fn vtGetParticipant(ctx: *anyopaque) DDS.DomainParticipant {
         return cast(ctx).participant;
     }
 
+    // NOT gated on enabled state -- empirically confirmed this must not be
+    // gated: building a disabled entity tree (autoenable_created_entities
+    // =false) legitimately needs to configure a still-disabled Publisher's
+    // default DataWriter QoS *before* enabling anything, exactly like
+    // create_datawriter itself (see vtCreateDataWriter's comment). Found via
+    // integration-tests/zig/enable-defer: a caller that (correctly, per an
+    // earlier draft of this guard) ignored this operation's return code got
+    // a silently-uninitialized QoS struct instead of a clear NOT_ENABLED it
+    // could act on -- gating this operation doesn't protect anything, it
+    // just makes the failure quieter.
     fn vtSetDefaultDwQos(ctx: *anyopaque, qos: *const DDS.DataWriterQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;

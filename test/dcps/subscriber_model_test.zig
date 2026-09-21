@@ -68,6 +68,11 @@ const Harness = struct {
         qos.presentation = presentation;
         const cbs = dcps.SubscriberParticipantCbs{
             .ctx = undefined,
+            .is_participant_enabled = struct {
+                fn f(_: *anyopaque) bool {
+                    return true;
+                }
+            }.f,
             .create_proto_reader = createProtoReader,
             .destroy_proto_reader = destroyProtoReader,
             .register_incompat_qos = registerIncompatQos,

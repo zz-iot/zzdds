@@ -1,0 +1,24 @@
+// integration-tests/coherent-sets -- wire types.
+//
+// A vehicle telemetry publisher must never let a subscriber observe a
+// Position update without its paired Velocity update (or vice versa) -- the
+// real-world reason GROUP coherent sets exist. Position and Velocity are
+// deliberately two separate topics (not two instances of one topic) so this
+// scenario exercises GROUP-scope coherence across *writers*, not just
+// per-instance history within one writer. See
+// docs/design/integration-test-tier.md for the full scenario spec.
+// Byte-identical copy required in c/, cpp/, java/, zig/ (same discipline
+// every other integration-tests/examples app follows).
+@final
+struct Position {
+    int32 group_id;
+    double x;
+    double y;
+};
+
+@final
+struct Velocity {
+    int32 group_id;
+    double vx;
+    double vy;
+};

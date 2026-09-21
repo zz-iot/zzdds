@@ -50,16 +50,16 @@ For each API found, classified as:
 | Category | APIs |
 |---|---|
 | Liveliness (narrowed 2026-09-17 — see below) | `on_liveliness_lost`, `get_liveliness_lost_status`/`get_liveliness_changed_status` (as a getter, not just the listener), AUTOMATIC/MANUAL_BY_PARTICIPANT kinds, `DomainParticipant.assert_liveliness()`. `assert_liveliness()`, `on_liveliness_changed`, and MANUAL_BY_TOPIC are now covered by the `presence` example (all 4 bindings) — see "Examples" bucket below |
-| Rejection/loss | `on_sample_rejected`/`on_sample_lost`, `get_sample_rejected_status`/`get_sample_lost_status` — neither listener nor polling form, anywhere |
+| Rejection/loss | ~~`on_sample_rejected`/`on_sample_lost`, `get_sample_rejected_status`/`get_sample_lost_status`~~ — **Done**, Integration-tier `sample-rejected-lost` scenario (see "First-pass classification" below) |
 | Historical data | `wait_for_historical_data` — confirmed zero across every harness |
 | Timestamped/explicit instance ops | `register_instance` (explicit), `register_instance_w_timestamp`, `write_w_timestamp`, `dispose_w_timestamp`, `unregister_instance_w_timestamp` |
 | Instance introspection | `lookup_instance`; `get_key_value` now exercised by the stress `instance` scenario, which found it returns the wrong key for non-leading-key types (zidl codegen, all backends — see below) |
 | Loans | `return_loan_raw`, any loaned-read (`take_raw`/`read_raw` in loan mode) or write-loan (`loan_raw`/`publish_loan_raw`) path — no `examples/` port exercises these yet (internal test-suite coverage exists, see the loan-lifecycle entry below) |
-| Entity admin, post-creation | `set_qos`/`get_qos` round-trip, `get_listener` read-back, `enable()`, `get_status_changes()`, `contains_entity()` |
+| Entity admin, post-creation | `set_qos`/`get_qos` round-trip, `get_listener` read-back, `get_status_changes()`, `contains_entity()`. ~~`enable()`/`autoenable_created_entities`~~ — **Done** (2026-09-21; was a uniform no-op stub across every entity type, see `docs/roadmap.md`'s Integration-tier entry) — both core semantics and the `enable-defer` cross-binding scenario now landed |
 | Discovery/ignore | `ignore_participant`/`ignore_topic`/`ignore_publication`/`ignore_subscription`, `get_discovered_participants`/`get_discovered_topics` + `_data` variants |
 | Misc participant ops | `find_topic`, `MultiTopic` (unimplemented in zzdds core — expected), `suspend_publications`/`resume_publications`, `notify_datareaders`, `get_current_time`, `get_domain_id`, `copy_from_topic_qos` |
 | Lookup/matched introspection | `lookup_datawriter`/`lookup_datareader`, `get_matched_subscriptions`/`get_matched_publications` + `_data` variants |
-| Bulk teardown | `delete_contained_entities` (every example tears down via `delete_participant`'s cascade instead) |
+| Bulk teardown | ~~`delete_contained_entities`~~ — **Done**, Integration-tier `delete-contained-entities` scenario (see "First-pass classification" below) |
 | WaitSet/Condition introspection | `WaitSet.get_conditions()`, every getter on every Condition type (`get_query_expression`/`get_query_parameters`/`set_query_parameters`, `get_sample_state_mask`/`get_view_state_mask`/`get_instance_state_mask`/`get_datareader`, `get_enabled_statuses`/`get_entity`, generic `get_trigger_value`) |
 | CFT introspection | `get_filter_expression`/`get_expression_parameters`/`set_expression_parameters`/`get_related_topic` — CFT is set once at creation, never read back or changed |
 | Conditional/batch reads | `read_w_condition`/`read_next_instance_w_condition`/`take_next_instance_w_condition` (only plain `take_w_condition` gets any exercise, in `waitset` only), batch `read_instance`/`take_instance` |
@@ -140,10 +140,20 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   and it found 4 real bugs. Remaining narrower slice — `on_liveliness_lost` +
   AUTOMATIC/MANUAL_BY_PARTICIPANT — could go here instead of a new example, since it's a
   terminal/negative-case scenario (no recovery) rather than a demo-friendly one.
-- **SAMPLE_REJECTED/SAMPLE_LOST through each binding** — same reasoning.
-- **`enable()` / `autoenable_created_entities=false`** — create disabled, verify no
-  discovery/matching occurs, call `enable()`, verify matching now proceeds. Currently
-  untested anywhere (worth checking whether even the Zig-native unit suite covers this).
+- ~~**SAMPLE_REJECTED/SAMPLE_LOST through each binding**~~ — **Done**, as the
+  `sample-rejected-lost` Integration-tier scenario (`integration-tests/{c,cpp,java,zig}/sample-rejected-lost`):
+  a tight-`resource_limits` reader deliberately overflowed by 5 back-to-back writes
+  (RejectedTopic), and a KEEP_LAST(1)/TRANSIENT_LOCAL writer that writes+evicts 5 samples
+  before any reader is matched at all, so a deliberately-late-joining reader hits a genuine
+  HEARTBEAT-implied gap (LostTopic). See `docs/roadmap.md`'s Integration-tier entry for the
+  full mechanism and the one design iteration it took to get LostTopic's trigger
+  deterministic rather than a race.
+- ~~**`enable()` / `autoenable_created_entities=false`**~~ — **Done**, as the `enable-defer`
+  Integration-tier scenario (`integration-tests/{c,cpp,java,zig}/enable-defer`). This
+  turned out not to be a test-coverage gap at all: `enable()` was a uniform no-op stub
+  across every entity type, so the feature itself had to be implemented first (see
+  `docs/roadmap.md`'s Integration-tier entry for the full mechanism, the real bugs found in
+  the process, and the two over-broad `NOT_ENABLED` guards it also found and corrected).
 - **`wait_for_historical_data`** — late-joining reader + DURABILITY, verify it unblocks
   only once durable replay actually lands, not on a timer.
 - **`ignore_participant`/`ignore_topic`/`ignore_publication`/`ignore_subscription`** —
@@ -154,9 +164,17 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   stress-tier `cft` scenario now covers its *concurrency safety* and fixed a UAF there).
   CFT has an established bug history in this project (missing null-checks found in this
   same audit).
-- **Coherent/ordered access grouping correctness** — build a real coherent set across
-  multiple writers, verify atomic delivery. High value given past CoherentSets
-  flakiness investigations.
+- ~~**Coherent/ordered access grouping correctness**~~ — **Done**, as the `coherent-sets`
+  Integration-tier scenario (`integration-tests/{c,cpp,java,zig}/coherent-sets`,
+  `docs/design/integration-test-tier.md`): a real coherent set across two DataWriters
+  (Position/Velocity) under one GROUP-scope Publisher, cross-process, all 4 bindings, 8
+  same/cross-binding pairs. Asserts atomic delivery directly (the two readers' taken-
+  `group_id` sequences must stay exactly equal-length and pairwise equal after every
+  `begin_access()`/`end_access()` bracket) — not a count-per-time-window guess, unlike the
+  now-understood `dds-rtps` CoherentSets flake this was motivated by. Building it found and
+  fixed a real `hasPendingDataFn` bug (see `docs/roadmap.md`'s Integration-tier entry for the
+  full mechanism) that permanently starved a `WaitSet`-driven coherent-access loop after its
+  first iteration.
 - **`_w_timestamp` family** — verify the explicit source timestamp actually propagates
   to `SampleInfo.source_timestamp` on the receiving side, not just "now".
 - **Loan lifecycle edges — real coverage now exists, but mostly outside this audit's own
@@ -176,8 +194,20 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   retcode-convention quirk this entry originally flagged no longer exists — the old
   hand-written `take_loaned_raw` family it applied to was deleted, replaced by the
   standard-convention `take_raw`/`read_raw`.
-- **`delete_contained_entities`** — bulk-teardown correctness across the C-ABI; this
-  project has repeatedly found real bugs specifically in teardown-cascade edge cases.
+- ~~**`delete_contained_entities`**~~ — **Done**, as the `delete-contained-entities`
+  Integration-tier scenario (`integration-tests/{c,cpp,java,zig}/delete-contained-entities`,
+  `docs/design/integration-test-tier.md`): a "session" builds a small entity tree (2
+  DataWriters, a plain DataReader, a ContentFilteredTopic-backed DataReader, a
+  WaitSet-attached ReadCondition) under one participant, exchanges samples with a "peer",
+  then tears the whole tree down in one shot instead of deleting each child first.
+  Confirms this project's own prior finding that this class of bug clusters in
+  teardown-cascade edge cases: `DomainParticipantImpl.vtDeleteContained`
+  (`src/dcps/participant.zig`) drained publishers/subscribers/topics but never
+  `cft_topics`, so `delete_contained_entities()` returned RETCODE_OK while leaving a
+  ContentFilteredTopic behind — the immediately-following `delete_participant()` then
+  always failed with PRECONDITION_NOT_MET for any app that had created one. Fixed; the
+  scenario also asserts no matched-status listener ever fires after teardown begins (a
+  UAF-class check).
 
 ### → Stress tests (new, in-repo)
 Landed in `stress-tests/` (`lifecycle_churn` scenarios + `entity_lifecycle_stress`):

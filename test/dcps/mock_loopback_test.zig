@@ -1491,3 +1491,103 @@ test "mock_loopback: onParticipantLost fires on_reliable_writer_ready(false) whe
     try std.testing.expectEqual(@as(usize, 2), state.ready_calls.load(.acquire));
     try std.testing.expect(state.last_ready.load(.acquire) == false);
 }
+
+test "mock_loopback: disabled DataWriter never announces or matches until enable()" {
+    // Validates the core design question behind Entity::enable()'s deferred-
+    // announcement mechanism (src/dcps/publisher.zig's vtCreateDataWriter):
+    // does skipping ONLY the outbound SEDP announce_writer call (while still
+    // unconditionally running create_proto_writer/register_incompat_qos/
+    // register_matched_notify/etc.) actually prevent matching, or does one of
+    // those other registrations let a remote peer's own independent
+    // announcement spuriously match against this writer anyway? Answer: no
+    // spurious match -- matching genuinely requires this side's own outbound
+    // announcement to reach the peer, confirmed empirically here rather than
+    // assumed (this project's own established discipline after the
+    // coherent-sets scenario's wrong SPDP hypothesis).
+    const alloc = std.testing.allocator;
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+
+    const mock_r = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_R, PORT_META_R)});
+    defer mock_r.deinit();
+    const disc_r = try SpdpSedpDiscovery.init(alloc, mock_r.transport(), 0, 100);
+    var factory_r = try DomainParticipantFactoryImpl.init(alloc, mock_r.transport(), disc_r.toDiscovery(), noop_security, .spec_random, .{});
+    defer {
+        factory_r.deinit();
+        disc_r.deinit();
+    }
+    const dpf_r = factory_r.toDDSFactory();
+    const dp_r = dpf_r.create_participant(0, .{}, null, 0);
+    defer _ = dpf_r.delete_participant(dp_r);
+    const sub_r = dp_r.create_subscriber(.{}, null, 0);
+    const topic_r = dp_r.create_topic("MockTopic", "MockType", .{}, null, 0);
+    const topic_desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+    const dr = sub_r.create_datareader(topic_desc_r, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    const mock_w = try MockTransport.init(alloc, net, &.{Locator.udp4(IP_W, PORT_META_W)});
+    defer mock_w.deinit();
+    const disc_w = try SpdpSedpDiscovery.init(alloc, mock_w.transport(), 0, 100);
+    var factory_w = try DomainParticipantFactoryImpl.init(alloc, mock_w.transport(), disc_w.toDiscovery(), noop_security, .spec_random, .{});
+    defer {
+        factory_w.deinit();
+        disc_w.deinit();
+    }
+    const dpf_w = factory_w.toDDSFactory();
+    const dp_w = dpf_w.create_participant(0, .{}, null, 0);
+    defer _ = dpf_w.delete_participant(dp_w);
+    const pub_w = dp_w.create_publisher(.{}, null, 0);
+    const topic_w = dp_w.create_topic("MockTopic", "MockType", .{}, null, 0);
+
+    // The Publisher's own entity_factory (not the DataWriter's) governs
+    // whether ITS DataWriters start enabled -- see publisher.zig's
+    // vtCreateDataWriter comment.
+    var disabled_pub_qos = DDS.PublisherQos{};
+    disabled_pub_qos.entity_factory.autoenable_created_entities = false;
+    const pub_w_disabled = dp_w.create_publisher(disabled_pub_qos, null, 0);
+    const dw = pub_w_disabled.create_datawriter(topic_w, dw_qos, null, 0);
+    const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+    try std.testing.expect(!dw_impl.enabled.load(.acquire));
+
+    // Pump the network for a full SPDP/SEDP discovery window. If the
+    // "defer only announce_writer" design were insufficient -- e.g. if
+    // create_proto_writer's registration alone let an incoming SEDP
+    // subscription announcement spuriously match -- this would show up here
+    // as sub_matched_current > 0 despite the writer never having announced.
+    const deadline = time_mod.nanoTimestamp() + 2 * std.time.ns_per_s;
+    while (time_mod.nanoTimestamp() < deadline) {
+        net.deliverAll();
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(i32, 0), dr_impl.sub_matched_current);
+
+    // A second, real (enabled-by-default) Publisher/DataWriter pair on the
+    // same participant proves the mock network + reader are otherwise
+    // healthy during this window -- i.e. a lack of match above is really
+    // because the disabled writer stayed silent, not because discovery
+    // itself was broken in this test.
+    const dw_control = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
+    _ = dw_control;
+    const control_deadline = time_mod.nanoTimestamp() + 2 * std.time.ns_per_s;
+    while (dr_impl.sub_matched_current < 1 and time_mod.nanoTimestamp() < control_deadline) {
+        net.deliverAll();
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(i32, 1), dr_impl.sub_matched_current);
+
+    // Now enable() the previously-disabled writer -- it must announce and
+    // match too.
+    try std.testing.expectEqual(DDS.RETCODE_OK, dw.enable());
+    try std.testing.expect(dw_impl.enabled.load(.acquire));
+    const enable_deadline = time_mod.nanoTimestamp() + 2 * std.time.ns_per_s;
+    while (dr_impl.sub_matched_current < 2 and time_mod.nanoTimestamp() < enable_deadline) {
+        net.deliverAll();
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(i32, 2), dr_impl.sub_matched_current);
+}

@@ -234,6 +234,7 @@ const BuiltinSubscriberState = struct {
         // Noop ParticipantCbs: no RTPS readers are created; destroy is a no-op.
         const noop_cbs = subscriber_mod.ParticipantCbs{
             .ctx = @ptrCast(participant),
+            .is_participant_enabled = DomainParticipantImpl.participantIsEnabledCb,
             .create_proto_reader = struct {
                 fn f(_: *anyopaque, _: []const u8, _: []const u8, _: DDS.DataReaderQos, _: DDS.PresentationQosPolicy, handle: *DDS.InstanceHandle_t, guid: *Guid) anyerror!proto.ProtocolReader {
                     handle.* = DDS.HANDLE_NIL;
@@ -827,6 +828,12 @@ pub const DomainParticipantImpl = struct {
     domain_id: DDS.DomainId_t,
     guid: Guid,
     qos: DDS.DomainParticipantQos,
+    /// Entity::enable() state (ENTITY_FACTORY QoS). Seeded from
+    /// `qos.entity_factory.autoenable_created_entities` at construction; set
+    /// true by `vtEnable` once `start()` has actually run. Atomic: read from
+    /// arbitrary discovery/timer threads via the NOT_ENABLED precondition
+    /// helper, written once from the application thread that calls enable().
+    enabled: std.atomic.Value(bool),
     listener_box: *ListenerBox(DDS.DomainParticipantListener),
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
@@ -1006,6 +1013,12 @@ pub const DomainParticipantImpl = struct {
             .domain_id = domain_id,
             .guid = guid,
             .qos = .{},
+            // Overridden by the factory right after this returns, from
+            // self.factory_qos.entity_factory -- the true "parent" QoS for a
+            // participant's own enable() state (see factory.zig's
+            // createParticipantWithConfigOwned). `qos` here is the QoS being
+            // applied TO this new participant, not the factory's own.
+            .enabled = .init(true),
             .listener_box = undefined,
             .listener_mask = mask,
             .instance_handle = handle,
@@ -2498,6 +2511,16 @@ pub const DomainParticipantImpl = struct {
         while (ar_it.next()) |ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, ar.type_name, data.type_name)) continue;
+            // Entity::enable(): symmetric to onReaderDiscovered's identical
+            // guard -- a reader created disabled never sent its own SEDP
+            // announcement, so matching it against a discovered writer here
+            // would be premature. matched_notify.ctx is always a
+            // *DataReaderImpl (see subscriber.zig's register_matched_notify
+            // call site).
+            if (ar.matched_notify) |mn| {
+                const dr_ptr: *reader_mod.DataReaderImpl = @ptrCast(@alignCast(mn.ctx));
+                if (!dr_ptr.enabled.load(.acquire)) continue;
+            }
             const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
             const result = qm_mod.checkDiscovered(data.qos, &local_rd);
             if (!result.isCompatible()) {
@@ -2746,6 +2769,21 @@ pub const DomainParticipantImpl = struct {
         while (aw_it.next()) |aw| {
             if (!std.mem.eql(u8, aw.topic_name, data.topic_name)) continue;
             if (!std.mem.eql(u8, aw.type_name, data.type_name)) continue;
+            // Entity::enable(): a writer created disabled (ENTITY_FACTORY QoS)
+            // never sent its own SEDP announcement, so a remote reader has no
+            // way to know it exists -- matching against it here anyway would
+            // fire on_publication_matched (and even addMatchedReader an RTPS
+            // proxy) for a writer the peer can't possibly be aware of. The
+            // writer's own deferred announce (see publisher.zig's
+            // announceDataWriter, called from vtEnable) already does the
+            // right retroactive match once actually enabled -- this is purely
+            // a guard against matching too early, not a second matching path.
+            // matched_notify.ctx is always a *DataWriterImpl (see
+            // publisher.zig's register_matched_notify call site).
+            if (aw.matched_notify) |mn| {
+                const dw_ptr: *writer_mod.DataWriterImpl = @ptrCast(@alignCast(mn.ctx));
+                if (!dw_ptr.enabled.load(.acquire)) continue;
+            }
             const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
             const result = qm_mod.checkDiscovered(&local_wd, data.qos);
             if (!result.isCompatible()) {
@@ -3443,9 +3481,14 @@ pub const DomainParticipantImpl = struct {
         }
     }
 
+    fn participantIsEnabledCb(ctx: *anyopaque) bool {
+        return cast(ctx).enabled.load(.acquire);
+    }
+
     fn makePubCbs(self: *Self) publisher_mod.ParticipantCbs {
         return .{
             .ctx = self,
+            .is_participant_enabled = participantIsEnabledCb,
             .create_proto_writer = pubCreateProtoWriter,
             .destroy_proto_writer = pubDestroyProtoWriter,
             .register_incompat_qos = pubRegisterWriterIncompatQos,
@@ -3461,6 +3504,7 @@ pub const DomainParticipantImpl = struct {
     fn makeSubCbs(self: *Self) subscriber_mod.ParticipantCbs {
         return .{
             .ctx = self,
+            .is_participant_enabled = participantIsEnabledCb,
             .create_proto_reader = subCreateProtoReader,
             .destroy_proto_reader = subDestroyProtoReader,
             .register_incompat_qos = subRegisterReaderIncompatQos,
@@ -3651,8 +3695,24 @@ pub const DomainParticipantImpl = struct {
         return .{ .ptr = ctx, .vtable = &entity_vtable };
     }
 
-    fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
+    /// DomainParticipantFactory has no enable/disable state of its own (it is
+    /// not an Entity per the DDS spec), so unlike every other type in this
+    /// file, a participant's enable() has no "factory not enabled" precondition
+    /// to check -- only the no-op-if-already-enabled case.
+    fn vtEnable(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
+        self.start() catch return DDS.RETCODE_ERROR;
+        self.enabled.store(true, .release);
         return DDS.RETCODE_OK;
+    }
+
+    /// NOT_ENABLED precondition, mirroring checkDeletePrecondition's shape
+    /// elsewhere in this file. Called at the top of every non-exempt Entity
+    /// operation (spec exempts set/get_qos, set/get_listener,
+    /// get_statuscondition, get_status_changes, enable, get_instance_handle).
+    fn checkEnabledPrecondition(self: *Self) DDS.ReturnCode_t {
+        return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
@@ -3678,6 +3738,12 @@ pub const DomainParticipantImpl = struct {
         a_listener: ?*const DDS.PublisherListener,
         mask: DDS.StatusMask,
     ) DDS.Publisher {
+        // NOT deliberately: create_publisher must work on a disabled
+        // participant -- that's the whole point of autoenable_created_entities
+        // =false (build the entire disabled tree, then enable() it top-down).
+        // Only operations that need the participant to actually be *operating*
+        // are gated; see checkEnabledPrecondition's call sites elsewhere in
+        // this file for those.
         const self = cast(ctx);
         const handle = nextHandle(ctx);
         const p = publisher_mod.PublisherImpl.init(
@@ -3690,6 +3756,16 @@ pub const DomainParticipantImpl = struct {
             mask,
             handle,
         ) catch return nil.nil_publisher;
+        // Publisher's own enable() state comes from the PARTICIPANT's
+        // entity_factory QoS -- distinct from this Publisher's own
+        // qos.entity_factory, which instead governs its future DataWriters.
+        // Also gated on THIS participant's own current enabled state (Greptile
+        // PR #91 finding): autoenable_created_entities=true is "auto-call
+        // enable() on creation," and enable() can never succeed while the
+        // parent isn't enabled (see vtEnable's PRECONDITION_NOT_MET check) --
+        // a disabled participant with the (spec-default) true QoS must not
+        // silently produce an already-enabled child.
+        p.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         self.mu.lock();
         self.publishers.append(self.alloc, p) catch {
             self.mu.unlock();
@@ -3701,6 +3777,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeletePublisher(ctx: *anyopaque, a_publisher: DDS.Publisher) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         var found: ?*publisher_mod.PublisherImpl = null;
@@ -3738,6 +3818,8 @@ pub const DomainParticipantImpl = struct {
         a_listener: ?*const DDS.SubscriberListener,
         mask: DDS.StatusMask,
     ) DDS.Subscriber {
+        // See vtCreatePublisher's identical comment on why create_subscriber
+        // is not gated by the participant's own enabled state.
         const self = cast(ctx);
         const handle = nextHandle(ctx);
         const s = subscriber_mod.SubscriberImpl.init(
@@ -3750,6 +3832,9 @@ pub const DomainParticipantImpl = struct {
             mask,
             handle,
         ) catch return nil.nil_subscriber;
+        // See vtCreatePublisher's identical comment (including the
+        // participant-enabled gate, PR #91 Greptile finding).
+        s.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         self.mu.lock();
         self.subscribers.append(self.alloc, s) catch {
             self.mu.unlock();
@@ -3761,6 +3846,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeleteSubscriber(ctx: *anyopaque, a_subscriber: DDS.Subscriber) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         var found: ?*subscriber_mod.SubscriberImpl = null;
@@ -3789,6 +3878,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtGetBuiltinSubscriber(ctx: *anyopaque) DDS.Subscriber {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_subscriber;
+        }
         const self = cast(ctx);
         if (self.builtin_sub) |bs| return bs.sub.toDDSSubscriber();
         return nil.nil_subscriber;
@@ -3802,6 +3895,8 @@ pub const DomainParticipantImpl = struct {
         a_listener: ?*const DDS.TopicListener,
         mask: DDS.StatusMask,
     ) DDS.Topic {
+        // See vtCreatePublisher's identical comment on why create_topic is
+        // not gated by the participant's own enabled state.
         const self = cast(ctx);
         const handle = nextHandle(ctx);
         const tn_s = std.mem.span(topic_name);
@@ -3812,11 +3907,15 @@ pub const DomainParticipantImpl = struct {
             tt_s,
             self,
             getDDSParticipant,
+            participantIsEnabledCb,
             qos.*,
             if (a_listener) |l| l.* else DDS.noop_TopicListener,
             mask,
             handle,
         ) catch return nil.nil_topic;
+        // Gated on the participant's own enabled state too -- see
+        // vtCreatePublisher's identical comment (PR #91 Greptile finding).
+        t.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
         self.mu.lock();
         self.topics.append(self.alloc, t) catch {
             self.mu.unlock();
@@ -3876,6 +3975,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeleteTopic(ctx: *anyopaque, a_topic: DDS.Topic) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         var found: ?*topic_mod.TopicImpl = null;
         self.mu.lock();
@@ -3895,6 +3998,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtFindTopic(ctx: *anyopaque, topic_name: [*:0]const u8, _: *const DDS.Duration_t) DDS.Topic {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_topic;
+        }
         const self = cast(ctx);
         const tn_s = std.mem.span(topic_name);
         self.mu.lock();
@@ -3906,6 +4013,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtLookupTopicDesc(ctx: *anyopaque, name: [*:0]const u8) DDS.TopicDescription {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_topic_description;
+        }
         const self = cast(ctx);
         const name_s = std.mem.span(name);
         self.mu.lock();
@@ -3923,6 +4034,10 @@ pub const DomainParticipantImpl = struct {
         filter_expression: [*:0]const u8,
         expression_parameters: ?*const DDS.StringSeq,
     ) DDS.ContentFilteredTopic {
+        // See vtCreatePublisher's identical comment. ContentFilteredTopic
+        // isn't itself a spec Entity (no enable() of its own), but the same
+        // "must be constructible on a disabled parent" reasoning applies to
+        // this factory operation.
         const self = cast(ctx);
         const name_s = std.mem.span(name);
         const filter_s = std.mem.span(filter_expression);
@@ -3946,6 +4061,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeleteCFTopic(ctx: *anyopaque, a_cft: DDS.ContentFilteredTopic) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3974,6 +4093,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         // Spec §2.2.2.2.1.18: PRECONDITION_NOT_MET propagates up from any
         // contained entity's own outstanding preconditions -- check every
@@ -4000,6 +4123,7 @@ pub const DomainParticipantImpl = struct {
         var pubs: std.ArrayListUnmanaged(*publisher_mod.PublisherImpl) = undefined;
         var subs: std.ArrayListUnmanaged(*subscriber_mod.SubscriberImpl) = undefined;
         var tops: std.ArrayListUnmanaged(*topic_mod.TopicImpl) = undefined;
+        var cfts: std.ArrayListUnmanaged(*topic_mod.ContentFilteredTopicImpl) = undefined;
         self.mu.lock();
         pubs = self.publishers;
         self.publishers = .empty;
@@ -4007,6 +4131,15 @@ pub const DomainParticipantImpl = struct {
         self.subscribers = .empty;
         tops = self.topics;
         self.topics = .empty;
+        // ContentFilteredTopics were never drained here (only by the
+        // participant's own deinit()) -- delete_contained_entities()
+        // reported RETCODE_OK while leaving cft_topics non-empty, so a
+        // subsequent delete_participant() always failed with
+        // PRECONDITION_NOT_MET (vtDeleteParticipant checks cft_topics.len)
+        // whenever the app had created a ContentFilteredTopic. Found via
+        // integration-tests/delete-contained-entities.
+        cfts = self.cft_topics;
+        self.cft_topics = .empty;
         self.mu.unlock();
         // Deinit outside lock to allow destroy_proto callbacks to re-lock mu.
         for (pubs.items) |p| p.deinit();
@@ -4015,6 +4148,8 @@ pub const DomainParticipantImpl = struct {
         subs.deinit(self.alloc);
         for (tops.items) |t| t.deinit();
         tops.deinit(self.alloc);
+        for (cfts.items) |c| c.deinit();
+        cfts.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }
 
@@ -4099,6 +4234,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtIgnoreParticipant(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4121,6 +4260,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtIgnoreTopic(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4153,6 +4296,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtIgnorePublication(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4168,6 +4315,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtIgnoreSubscription(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4184,6 +4335,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtAssertLiveliness(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4194,6 +4349,13 @@ pub const DomainParticipantImpl = struct {
         return DDS.RETCODE_OK;
     }
 
+    // None of the six set/get_default_*_qos operations below are gated on
+    // enabled state -- see publisher.zig's vtSetDefaultDwQos/vtGetDefaultDwQos
+    // comment for the empirically-confirmed reason
+    // (integration-tests/zig/enable-defer): a disabled entity tree
+    // legitimately needs to configure its own future children's default QoS
+    // before enabling anything, exactly like create_publisher/
+    // create_subscriber/create_topic themselves.
     fn vtSetDefaultPubQos(ctx: *anyopaque, qos: *const DDS.PublisherQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
@@ -4240,6 +4402,10 @@ pub const DomainParticipantImpl = struct {
         ctx: *anyopaque,
         handles: ?*DDS.InstanceHandleSeq,
     ) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         self.mu.lock();
@@ -4264,6 +4430,10 @@ pub const DomainParticipantImpl = struct {
         data: *DDS.ParticipantBuiltinTopicData,
         handle: DDS.InstanceHandle_t,
     ) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4281,6 +4451,10 @@ pub const DomainParticipantImpl = struct {
         ctx: *anyopaque,
         handles: ?*DDS.InstanceHandleSeq,
     ) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         self.mu.lock();
@@ -4305,6 +4479,10 @@ pub const DomainParticipantImpl = struct {
         data: *DDS.TopicBuiltinTopicData,
         handle: DDS.InstanceHandle_t,
     ) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4354,6 +4532,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtContainsEntity(ctx: *anyopaque, handle: DDS.InstanceHandle_t) bool {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return false;
+        }
         const self = cast(ctx);
         if (self.instance_handle == handle) return true;
         self.mu.lock();

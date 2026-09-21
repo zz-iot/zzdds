@@ -92,13 +92,46 @@ const Harness = struct {
 
 // ── Publisher vtable coverage ─────────────────────────────────────────────────
 
-test "Publisher: enable returns RETCODE_OK" {
+test "Publisher: enable returns RETCODE_OK, idempotent when already enabled" {
     var h = try Harness.init(0x20);
     defer h.deinit();
     const dp = h.factory.toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
     defer _ = h.factory.toDDSFactory().delete_participant(dp);
 
     const pub_ = dp.create_publisher(.{}, null, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.enable(pub_.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.enable(pub_.ptr));
+}
+
+test "Publisher: PRECONDITION_NOT_MET enabling a Publisher before its participant is enabled" {
+    // Two independent axes, both must be set to reach this scenario:
+    // factory_qos.entity_factory governs whether the new PARTICIPANT itself
+    // starts enabled; the DomainParticipantQos passed to create_participant
+    // governs whether the participant's own CHILDREN (this Publisher) start
+    // enabled. create_publisher/create_datawriter etc. are deliberately NOT
+    // gated by their caller's own enabled state (see participant.zig's
+    // vtCreatePublisher comment) -- that's what lets a whole tree be built
+    // while everything is still disabled, which is the entire point of
+    // autoenable_created_entities=false.
+    var h = try Harness.init(0x2A);
+    defer h.deinit();
+    var disabled_dp_factory_qos = DDS.DomainParticipantFactoryQos{};
+    disabled_dp_factory_qos.entity_factory.autoenable_created_entities = false;
+    const dpf = h.factory.toDDSFactory();
+    _ = dpf.vtable.set_qos(dpf.ptr, &disabled_dp_factory_qos);
+    var disabled_dp_qos = DDS.DomainParticipantQos{};
+    disabled_dp_qos.entity_factory.autoenable_created_entities = false;
+    const dp = dpf.create_participant(test_domain.get(), disabled_dp_qos, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    defer _ = dp.vtable.delete_publisher(dp.ptr, pub_);
+
+    // Can't enable the Publisher before its factory (the participant) is enabled.
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, pub_.vtable.enable(pub_.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.enable(dp.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.enable(pub_.ptr));
+    // Idempotent: already enabled now.
     try testing.expectEqual(DDS.RETCODE_OK, pub_.vtable.enable(pub_.ptr));
 }
 
@@ -323,6 +356,29 @@ test "Subscriber: enable, get_statuscondition, get_status_changes, get_instance_
     try testing.expect(ih != 0);
 
     _ = dp.vtable.delete_contained_entities(dp.ptr);
+}
+
+test "Subscriber: PRECONDITION_NOT_MET enabling before its participant is enabled" {
+    // See Publisher's identical-shaped test above for why both QoS objects
+    // are needed.
+    var h = try Harness.init(0x3A);
+    defer h.deinit();
+    var disabled_dp_factory_qos = DDS.DomainParticipantFactoryQos{};
+    disabled_dp_factory_qos.entity_factory.autoenable_created_entities = false;
+    const dpf = h.factory.toDDSFactory();
+    _ = dpf.vtable.set_qos(dpf.ptr, &disabled_dp_factory_qos);
+    var disabled_dp_qos = DDS.DomainParticipantQos{};
+    disabled_dp_qos.entity_factory.autoenable_created_entities = false;
+    const dp = dpf.create_participant(test_domain.get(), disabled_dp_qos, null, 0);
+    defer _ = h.factory.toDDSFactory().delete_participant(dp);
+
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
+
+    try testing.expectEqual(DDS.RETCODE_PRECONDITION_NOT_MET, sub.vtable.enable(sub.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.enable(dp.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.enable(sub.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, sub.vtable.enable(sub.ptr));
 }
 
 test "Subscriber: lookup_datareader found and not-found" {

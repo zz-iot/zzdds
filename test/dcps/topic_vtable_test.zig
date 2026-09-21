@@ -46,13 +46,40 @@ const Fixture = struct {
 
 // ── TopicImpl vtable tests ────────────────────────────────────────────────────
 
-test "Topic: enable returns RETCODE_OK" {
+test "Topic: enable returns RETCODE_OK, idempotent when already enabled" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit();
     const topic = fx.dp.create_topic("TVtEnable", "T", .{}, null, 0);
     defer _ = fx.dp.vtable.delete_topic(fx.dp.ptr, topic);
     try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.enable(topic.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.enable(topic.ptr));
+}
+
+test "Topic: created under a participant with autoenable_created_entities=false starts disabled, rejects get_inconsistent_topic_status with NOT_ENABLED, and enable() makes it work" {
+    const alloc = testing.allocator;
+    var delivery = try IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+    const t = try delivery.newTransport();
+    defer t.deinit();
+    const d = try delivery.newDiscovery();
+    defer d.deinit();
+    const factory = try DomainParticipantFactoryImpl.init(alloc, t.transport(), d.toDiscovery(), noop_security, .spec_random, .{});
+    defer factory.deinit();
+    var disabled_dp_qos = DDS.DomainParticipantQos{};
+    disabled_dp_qos.entity_factory.autoenable_created_entities = false;
+    const dp = factory.toDDSFactory().create_participant(test_domain.get(), disabled_dp_qos, null, 0);
+    defer _ = factory.toDDSFactory().delete_participant(dp);
+    try testing.expect(dp.ptr != nil.nil_participant.ptr);
+    const topic = dp.create_topic("TVtDisabled", "T", .{}, null, 0);
+    try testing.expect(topic.ptr != nil.nil_topic.ptr);
+    defer _ = dp.vtable.delete_topic(dp.ptr, topic);
+
+    var status: DDS.InconsistentTopicStatus = undefined;
+    try testing.expectEqual(DDS.RETCODE_NOT_ENABLED, topic.vtable.get_inconsistent_topic_status(topic.ptr, &status));
+
+    try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.enable(topic.ptr));
+    try testing.expectEqual(DDS.RETCODE_OK, topic.vtable.get_inconsistent_topic_status(topic.ptr, &status));
 }
 
 test "Topic: get_name and get_type_name return correct strings" {

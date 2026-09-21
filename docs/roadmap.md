@@ -303,18 +303,145 @@ DCPS operations, statuses, and QoS behaviours with zero or unverified coverage a
 four example bindings, and proposes two new test tiers on top of the existing Tier 1–4
 model:
 
-- **Integration tier** — SAMPLE_REJECTED / SAMPLE_LOST; `enable()` /
-  `autoenable_created_entities=false`; late-joiner durability replay; `ignore_*` across two
-  processes; runtime `set_expression_parameters` CFT reconfiguration; coherent/ordered
-  grouping atomicity across multiple writers; `_w_timestamp` source-timestamp propagation;
-  `delete_contained_entities` across the C-ABI. Liveliness/status marshaling per binding
-  is now substantially covered by the `presence` example (see "Reference-app" note above
-  under Testing) — cross-process, all 4 bindings + 8 same/cross-binding pairs, found and
-  fixed 4 real bugs including a wire-level one (`PID_LIVELINESS` never encoded). Remaining
-  narrower gap, not yet covered anywhere: `on_liveliness_lost`/`get_liveliness_lost_status`
-  and the AUTOMATIC/MANUAL_BY_PARTICIPANT kinds — deliberately left out of `presence` to
-  keep it a single-scenario example (`examples/docs/design/presence-reference-app.md`,
-  "Deliberately out of scope").
+- **Integration tier** — landed in `integration-tests/` (structure, cross-binding matrix
+  strategy, and the full scenario backlog spec'd in
+  [`design/integration-test-tier.md`](design/integration-test-tier.md)), CI-gated in
+  `ci.yml`. Scenario #1, **coherent/ordered access grouping atomicity across multiple
+  writers**, is done: `coherent-sets`, all four bindings, the same 8-pair cross-binding
+  subset `raw-loan` uses. Building it found and fixed a real bug — not in discovery
+  (an initial hypothesis pointing at SPDP's `beginProbe`/participant-lost path turned out to
+  be a red herring, ruled out with live instrumentation) but in `DataReaderImpl.hasPendingDataFn`
+  (`src/dcps/reader.zig`): a GROUP-scope coherent set is promoted into `pending` only by
+  `begin_access()` → `commitCoherentPendingLocked`, but the app only calls `begin_access()`
+  once a `WaitSet` wakes it — and the trigger only checked `pending`, not
+  `coherent_committed_ready`. Once the first coherent set drained back to empty, the
+  `WaitSet` would never wake again even with further complete sets sitting in
+  `coherent_committed`, permanently starving a `wait() -> begin_access() -> take() ->
+  end_access()` loop after its first iteration. One-line fix (`hasPendingDataFn` now also
+  checks `coherent_committed_ready`); verified via the direct pub/sub repro (hung
+  reproducibly before, clean 20/20 after) and the full cross-binding harness. Scenario #2,
+  **`delete_contained_entities` bulk-teardown correctness**, is also done: a "session"
+  builds a small entity tree (2 DataWriters, a plain DataReader, a
+  ContentFilteredTopic-backed DataReader, a WaitSet-attached ReadCondition) then tears it
+  all down in one `delete_contained_entities()` call instead of deleting each child first.
+  Found and fixed a real bug: `DomainParticipantImpl.vtDeleteContained`
+  (`src/dcps/participant.zig`) drained `publishers`/`subscribers`/`topics` but never
+  `cft_topics` — `delete_contained_entities()` reported RETCODE_OK while leaving a
+  ContentFilteredTopic behind, so the immediately-following `delete_participant()` always
+  failed with PRECONDITION_NOT_MET for any app that had created one. One-line fix
+  (mirroring the exact drain-outside-lock pattern the participant's own `deinit()` already
+  used for `cft_topics`); verified the same way — direct repro failed with
+  PRECONDITION_NOT_MET before, passed cleanly after, deliberately re-broken once to confirm
+  the fix is load-bearing. Scenario #3, **SAMPLE_REJECTED / SAMPLE_LOST**, is also done:
+  `sample-rejected-lost` -- a "slow consumer" scenario with three topics.
+  `RejectedTopic` (RELIABLE, KEEP_ALL): a reader with tight `resource_limits`
+  (`max_samples`/`max_samples_per_instance` = 3) deliberately never drains until it has
+  confirmed rejection, so the publisher's 5 back-to-back writes overflow it (2 rejected, 3
+  buffered — asserted as a count-conservation invariant, not a hardcoded split).
+  `LostTopic` (RELIABLE, KEEP_LAST depth=1, TRANSIENT_LOCAL): the writer writes+evicts 5
+  samples *before* any reader is matched at all, and the subscriber deliberately defers
+  creating that reader until a `SyncTopic` signal confirms the publisher is done — a
+  genuine, deterministic late-join gap, not a real-time ack race. An earlier version of
+  this scenario tried racing fast writes against an *already-matched* reader (hoping
+  `writer_sm.zig`'s KEEP_LAST-eviction GAP-notification would fire); it didn't, because
+  localhost round-trips are fast enough that each sample got acked before the next write
+  evicted it — a good example of the same "looked solid on paper, wrong in practice"
+  lesson scenario #1's SPDP hypothesis taught. No zzdds core bug found this time — the
+  mechanisms (`RESOURCE_LIMITS` rejection, HEARTBEAT-implied-gap loss detection) both
+  worked exactly as documented once the scenario itself was designed correctly. Scenario
+  #4, **`enable()`/`autoenable_created_entities`**, turned out not to be a test-coverage
+  gap at all: `vtEnable` was a uniform no-op (`return RETCODE_OK`) across every entity
+  type, with no `NOT_ENABLED` precondition anywhere and every entity fully
+  live/discoverable the instant it's constructed regardless of QoS. Done end to end
+  (2026-09-21): real semantics landed first, then the `enable-defer` Integration-tier
+  scenario built against them (`integration-tests/{c,cpp,java,zig}/enable-defer`, same
+  8-pair cross-binding matrix as scenarios #1-#3) — a "configuration phase" app that builds
+  a disabled Publisher+DataWriter tree, proves `write()` on the still-disabled writer fails
+  and enabling a child before its own factory returns `PRECONDITION_NOT_MET`, then enables
+  top-down and confirms a live peer observes zero matching beforehand and clean
+  matching/data exchange immediately after.
+  - **Root-cause bug found in the process**: generated `EntityFactoryQosPolicy{}.autoenable_created_entities`
+    defaulted to `false` — inverted from the DDS spec's `true` — because `idl/dcps.idl`'s
+    field had no `@default` annotation, so zidl emitted the type's zero-value. Fixed with
+    `@default(TRUE)`; harmless until real gating landed (the field was never read anywhere
+    in `src/` before this), but would have silently made every entity in every example
+    disabled-by-default the moment gating went live. Found and fixed one real fallout:
+    `examples/c/shape/src/shape_main.c` builds its QoS via `memset(..., 0, ...)` then sets
+    only the fields it cares about — the one place in the whole tree relying on the old
+    (wrong) zeroed default.
+  - **`enabled: std.atomic.Value(bool)`** added to all six entity impl types
+    (`src/dcps/{participant,publisher,subscriber,reader,writer,topic}.zig`), seeded from
+    the *parent's* `entity_factory.autoenable_created_entities` QoS at construction. Real
+    `enable()`: no-op if already enabled, `PRECONDITION_NOT_MET` if the parent isn't itself
+    enabled (spec: can't enable a child before its factory), otherwise flips the flag and
+    performs the previously-deferred wire action (participant: `start()`; writer/reader:
+    the SEDP publication/subscription announcement). `NOT_ENABLED` precondition guard added
+    across ~90 non-exempt operation call sites (spec exempts `set/get_qos`,
+    `set/get_listener`, `get_statuscondition`, `get_status_changes`, `enable`,
+    `get_instance_handle`).
+  - **Two design mistakes caught and fixed during implementation, not assumed away**: (1) a
+    participant's own enabled state must come from the *factory's* QoS
+    (`DomainParticipantFactoryQos.entity_factory`), not the `DomainParticipantQos` being
+    applied to the new participant (which governs its children, not itself); (2) gating the
+    six `create_*` factory operations on the *caller's* own enabled state would have made it
+    impossible to ever build a disabled entity tree at all — the entire point of
+    `autoenable_created_entities=false`. Caught via a failing test proving the opposite
+    should work, not assumed correct.
+  - Deferring only the outbound SEDP announcement (not the surrounding proto-writer/
+    incompat-QoS/matched-notify bookkeeping) was confirmed empirically sufficient to prevent
+    all discovery/matching while disabled — new mock-transport test,
+    `test/dcps/mock_loopback_test.zig`. Verified by deliberately removing the guard once
+    (exactly one test failed) and restoring it.
+  - `zig build test` 1122/1122, `examples/run_all.py --strict` and
+    `integration-tests/run_all.py --strict` (existing 3 scenarios, 24 pairs) both clean —
+    zero regression from a change touching every entity's construction path.
+  - **Deliberately left ungated, disclosed not overlooked**: `get_domain_id`/`get_current_time`
+    (participant), `get_type_name`/`get_name` (topic) — harmless static getters, no clean
+    `NOT_ENABLED`-compatible sentinel for their return types. `ContentFilteredTopic`'s own
+    operations — it's a `TopicDescription`, not a spec `Entity`, so it has no `enable()`
+    semantics at all.
+  - **Building the `enable-defer` scenario found the "worth revisiting" judgment call above
+    was actually wrong, and fixed it**: gating `set/get_default_datawriter_qos` (and the
+    analogous default-QoS/`copy_from_topic_qos` family on Publisher, Subscriber, and
+    DomainParticipant) behind `NOT_ENABLED` broke exactly the workflow ENTITY_FACTORY exists
+    for — a disabled Publisher's own `get_default_datawriter_qos()` returned
+    `NOT_ENABLED` and left the output struct entirely uninitialized; a caller that (like the
+    scenario's own first draft) didn't check the return code got a writer built from garbage
+    QoS instead of a clear error to act on. Same reasoning as `create_datawriter` itself not
+    being gated on the Publisher's own state: default-QoS/copy-from-topic operations
+    configure *future children*, they don't operate the entity itself. Un-gated the six
+    default-QoS operations plus `copy_from_topic_qos` on Publisher/Subscriber, and the
+    `get_participant`/`get_topic`/`get_publisher`/`get_subscriber` navigational getters
+    (same "pure accessor, no side effect" category as the already-exempt
+    `get_instance_handle`) across all six entity types.
+  - **Two more real bugs found and fixed while building the scenario, unrelated to the
+    gating audit above**: (1) `onReaderDiscovered`/`onWriterDiscovered`
+    (`src/dcps/participant.zig`) matched a newly-discovered remote reader/writer against
+    *every* local `active_writers`/`active_readers` entry regardless of that entry's own
+    `enabled` state — a disabled writer that never announced itself could still be
+    incorrectly matched (and its `on_publication_matched` incorrectly fired) purely because
+    a compatible remote reader happened to be discovered first. Fixed by skipping disabled
+    entries in both scan loops. (2) `DataWriterImpl.writeRaw` (`src/dcps/writer.zig`) — the
+    native-Zig call path (via `raw_ops.zig`, used by every zidl-generated Zig `write()`/
+    `dispose()`/`unregister_instance()`) bypassed the `NOT_ENABLED` guard entirely; only the
+    C-ABI's `vtWriteRaw` checked it before delegating to this same function. A disabled
+    writer's native-Zig `write()` silently succeeded instead of erroring. Fixed by adding
+    the same one-line check inside `writeRaw` itself, protecting every caller of it, not
+    just the C-ABI entry point.
+  - `zig build test` 1122/1122, `examples/run_all.py --strict`, and
+    `integration-tests/run_all.py --strict` (all 4 scenarios, 32 cross-binding pairs) all
+    clean.
+
+  Remaining backlog, reordered by the spec doc: late-joiner durability replay; `ignore_*`
+  across two processes; runtime `set_expression_parameters` CFT reconfiguration;
+  `_w_timestamp` source-timestamp propagation. Liveliness/status marshaling per binding is now
+  substantially covered by the `presence` example (see "Reference-app" note above under
+  Testing) — cross-process, all 4 bindings + 8 same/cross-binding pairs, found and fixed 4
+  real bugs including a wire-level one (`PID_LIVELINESS` never encoded). Remaining narrower
+  gap, not yet covered anywhere: `on_liveliness_lost`/`get_liveliness_lost_status` and the
+  AUTOMATIC/MANUAL_BY_PARTICIPANT kinds — deliberately left out of `presence` to keep it a
+  single-scenario example (`examples/docs/design/presence-reference-app.md`, "Deliberately
+  out of scope"); candidate to fold into the Integration tier instead of a second example.
 - **Stress tier** — landed in `stress-tests/` as seven `lifecycle_churn` scenarios
   (`reentrant`, `entities`, `waitset`, `listener`, `cft`, `participants`, `instance`) plus
   the `entity_lifecycle_stress` multi-process port. Found + fixed three concurrency bugs

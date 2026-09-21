@@ -29,6 +29,11 @@ const ZZDDS = @import("zzdds_ext_generated").zzdds;
 pub const ParticipantCbs = struct {
     ctx: *anyopaque,
 
+    /// Entity::enable()'s "factory not enabled" precondition (spec: can't
+    /// enable a child before its own factory entity). Reads the owning
+    /// DomainParticipantImpl's `enabled` flag.
+    is_participant_enabled: *const fn (ctx: *anyopaque) bool,
+
     /// Allocate and start an RTPS ProtocolReader for a topic.
     create_proto_reader: *const fn (
         ctx: *anyopaque,
@@ -129,6 +134,11 @@ pub const SubscriberImpl = struct {
     participant: DDS.DomainParticipant,
     cbs: ParticipantCbs,
     qos: DDS.SubscriberQos,
+    /// Entity::enable() state. Seeded by vtCreateSubscriber (participant.zig)
+    /// from the owning participant's `qos.entity_factory.autoenable_created_entities`
+    /// -- NOT from this Subscriber's own `qos.entity_factory`, which instead
+    /// governs whether *this Subscriber's* future DataReaders start enabled.
+    enabled: std.atomic.Value(bool),
     listener_box: *ListenerBox(DDS.SubscriberListener),
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
@@ -180,6 +190,7 @@ pub const SubscriberImpl = struct {
             .participant = participant,
             .cbs = cbs,
             .qos = .{},
+            .enabled = .init(true),
             .listener_box = undefined,
             .listener_mask = mask,
             .instance_handle = handle,
@@ -304,8 +315,17 @@ pub const SubscriberImpl = struct {
         return .{ .ptr = ctx, .vtable = &entity_vtable };
     }
 
-    fn vtEnable(_: *anyopaque) DDS.ReturnCode_t {
+    fn vtEnable(ctx: *anyopaque) DDS.ReturnCode_t {
+        const self = cast(ctx);
+        if (self.enabled.load(.acquire)) return DDS.RETCODE_OK;
+        if (!self.cbs.is_participant_enabled(self.cbs.ctx)) return DDS.RETCODE_PRECONDITION_NOT_MET;
+        self.enabled.store(true, .release);
         return DDS.RETCODE_OK;
+    }
+
+    /// NOT_ENABLED precondition, mirroring participant.zig's identical helper.
+    fn checkEnabledPrecondition(self: *Self) DDS.ReturnCode_t {
+        return if (self.enabled.load(.acquire)) DDS.RETCODE_OK else DDS.RETCODE_NOT_ENABLED;
     }
 
     fn vtGetStatusCond(ctx: *anyopaque) DDS.StatusCondition {
@@ -332,6 +352,8 @@ pub const SubscriberImpl = struct {
         a_listener: ?*const DDS.DataReaderListener,
         mask: DDS.StatusMask,
     ) DDS.DataReader {
+        // See publisher.zig's identical comment on create_datawriter: not
+        // gated on this Subscriber's own enabled state, for the same reason.
         const self = cast(ctx);
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
@@ -431,15 +453,17 @@ pub const SubscriberImpl = struct {
             .quiesce_acquire = reader_mod.DataReaderImpl.quiesceAcquireFn,
             .quiesce_release = reader_mod.DataReaderImpl.quiesceReleaseFn,
         });
-        // Convert partition name StringSeq (C extern struct) to []const []const u8 for announce_reader.
-        const pname_seq = &self.qos.partition.name;
-        const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
-        var pname_buf: [64][]const u8 = undefined;
-        const pname_slice = pname_buf[0..@min(pname_count, pname_buf.len)];
-        if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
-            s.* = std.mem.span(b[i]);
-        };
-        self.cbs.announce_reader(self.cbs.ctx, subscription_handle, pname_slice, presentation);
+        // Entity::enable() (ENTITY_FACTORY QoS): this Subscriber's own
+        // qos.entity_factory governs whether ITS DataReaders start enabled.
+        // A disabled reader skips the outbound SEDP announcement entirely --
+        // announceDataReader() runs later, from reader.zig's vtEnable, once
+        // the app calls enable() on it. See publisher.zig's identical
+        // comment for the reasoning on why the rest of this function's
+        // registrations are safe to leave unconditional. Also gated on this
+        // Subscriber's own current enabled state -- see publisher.zig's
+        // identical DataWriter gate (PR #91 Greptile finding).
+        dr.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
+        if (dr.enabled.load(.acquire)) self.announceDataReader(subscription_handle);
         self.mu.lock();
         self.readers.append(self.alloc, dr) catch {
             self.mu.unlock();
@@ -451,7 +475,26 @@ pub const SubscriberImpl = struct {
         return dr.toDDSDataReader();
     }
 
+    /// The outbound SEDP subscription announcement -- the one part of
+    /// create_datareader's discovery wiring that's actually deferred while a
+    /// reader is disabled (see vtCreateDataReader and reader.zig's vtEnable,
+    /// which calls this directly once the app enables the reader).
+    pub fn announceDataReader(self: *Self, subscription_handle: DDS.InstanceHandle_t) void {
+        const pname_seq = &self.qos.partition.name;
+        const pname_count: u32 = if (pname_seq._buffer != null) pname_seq._length else 0;
+        var pname_buf: [64][]const u8 = undefined;
+        const pname_slice = pname_buf[0..@min(pname_count, pname_buf.len)];
+        if (pname_seq._buffer) |b| for (pname_slice, 0..) |*s, i| {
+            s.* = std.mem.span(b[i]);
+        };
+        self.cbs.announce_reader(self.cbs.ctx, subscription_handle, pname_slice, self.qos.presentation);
+    }
+
     fn vtDeleteDataReader(ctx: *anyopaque, a_datareader: DDS.DataReader) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -485,6 +528,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const precondition = self.checkDeleteContainedPrecondition();
         if (precondition != DDS.RETCODE_OK) return precondition;
@@ -499,6 +546,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtLookupDataReader(ctx: *anyopaque, topic_name: [*:0]const u8) DDS.DataReader {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_datareader;
+        }
         const self = cast(ctx);
         const tn_s = std.mem.span(topic_name);
         self.mu.lock();
@@ -518,6 +569,10 @@ pub const SubscriberImpl = struct {
         view_states: DDS.ViewStateMask,
         instance_states: DDS.InstanceStateMask,
     ) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const seq = readers orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         self.mu.lock();
@@ -549,6 +604,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtNotifyDataReaders(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -698,6 +757,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtBeginAccess(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const pres = self.qos.presentation;
         if (!pres.coherent_access and !pres.ordered_access) return DDS.RETCODE_OK;
@@ -869,6 +932,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtEndAccess(ctx: *anyopaque) DDS.ReturnCode_t {
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self: *Self = @ptrCast(@alignCast(ctx));
         const pres: DDS.PresentationQosPolicy = self.qos.presentation;
         if (pres.ordered_access) {
@@ -902,10 +969,15 @@ pub const SubscriberImpl = struct {
         return a_gsn < b_gsn;
     }
 
+    // NOT gated on enabled state: a pure navigational getter, same category
+    // as get_instance_handle -- see publisher.zig's identical comment.
     fn vtGetParticipant(ctx: *anyopaque) DDS.DomainParticipant {
         return cast(ctx).participant;
     }
 
+    // NOT gated on enabled state -- see publisher.zig's vtSetDefaultDwQos/
+    // vtGetDefaultDwQos comment for the empirically-confirmed reason
+    // (integration-tests/zig/enable-defer).
     fn vtSetDefaultDrQos(ctx: *anyopaque, qos: *const DDS.DataReaderQos) DDS.ReturnCode_t {
         const self = cast(ctx);
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
