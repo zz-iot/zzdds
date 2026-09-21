@@ -268,7 +268,10 @@ pub const TopicImpl = struct {
     }
 
     fn vtGetInconsistent(ctx: *anyopaque, a_status: *DDS.InconsistentTopicStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();

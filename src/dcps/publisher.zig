@@ -488,7 +488,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtDeleteDataWriter(ctx: *anyopaque, a_datawriter: DDS.DataWriter) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -522,7 +525,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtLookupDataWriter(ctx: *anyopaque, topic_name: [*:0]const u8) DDS.DataWriter {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_datawriter; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_datawriter;
+        }
         const self = cast(ctx);
         const tn_s = std.mem.span(topic_name);
         self.mu.lock();
@@ -536,7 +542,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const precondition = self.checkDeleteContainedPrecondition();
         if (precondition != DDS.RETCODE_OK) return precondition;
@@ -632,7 +641,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtSuspendPublications(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -642,7 +654,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtResumePublications(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -657,7 +672,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtBeginCoherent(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -669,7 +687,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtEndCoherent(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -720,7 +741,10 @@ pub const PublisherImpl = struct {
     }
 
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const POLL_NS: u64 = 1_000_000; // 1 ms
         const deadline_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and

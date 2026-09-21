@@ -2894,7 +2894,10 @@ pub const DataReaderImpl = struct {
         view_states: DDS.ViewStateMask,
         instance_states: DDS.InstanceStateMask,
     ) DDS.ReadCondition {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_readcondition; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_readcondition;
+        }
         const self = cast(ctx);
         // Without this, a create racing this reader's own deinit() could
         // track a new condition into read_conditions after reallyDeinit()
@@ -2939,7 +2942,10 @@ pub const DataReaderImpl = struct {
         query_expression: [*:0]const u8,
         query_parameters: ?*const DDS.StringSeq,
     ) DDS.QueryCondition {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_querycondition; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_querycondition;
+        }
         const self = cast(ctx);
         const qe_s = std.mem.span(query_expression);
         // A non-empty expression requires field-level access to evaluate.
@@ -3177,7 +3183,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSampleRejected(ctx: *anyopaque, status: *DDS.SampleRejectedStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3193,7 +3202,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetLivelinessChanged(ctx: *anyopaque, status: *DDS.LivelinessChangedStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3211,7 +3223,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.RequestedDeadlineMissedStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3225,7 +3240,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetIncompatQos(ctx: *anyopaque, status: *DDS.RequestedIncompatibleQosStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
@@ -3240,7 +3258,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSubMatched(ctx: *anyopaque, status: *DDS.SubscriptionMatchedStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3258,7 +3279,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetSampleLost(ctx: *anyopaque, status: *DDS.SampleLostStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -3272,7 +3296,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtWaitForHistorical(ctx: *anyopaque, max_wait: *const DDS.Duration_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         if (self.qos.durability.kind == .VOLATILE_DURABILITY_QOS) return DDS.RETCODE_OK;
 
@@ -3312,7 +3339,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetMatchedPubs(ctx: *anyopaque, handles: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
@@ -3335,7 +3365,10 @@ pub const DataReaderImpl = struct {
     }
 
     fn vtGetMatchedPubData(ctx: *anyopaque, data: *DDS.PublicationBuiltinTopicData, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
         defer guids.deinit(self.alloc);
@@ -3421,7 +3454,10 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
         max_samples: i32,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const f = resolveRawFilter(instance_handle, a_condition, sample_states, view_states, instance_states);
         return cast(ctx).rawReadOrTake(cdr_payloads, key_hashes, sample_infos, f, max_samples, true);
     }
@@ -3438,7 +3474,10 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
         max_samples: i32,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const f = resolveRawFilter(instance_handle, a_condition, sample_states, view_states, instance_states);
         return cast(ctx).rawReadOrTake(cdr_payloads, key_hashes, sample_infos, f, max_samples, false);
     }
@@ -3455,7 +3494,10 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
         max_samples: i32,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const f = resolveRawFilter(DDS.HANDLE_NIL, a_condition, sample_states, view_states, instance_states);
         return cast(ctx).rawReadOrTakeNextInstance(cdr_payloads, key_hashes, sample_infos, previous_handle, f, max_samples, true);
     }
@@ -3472,7 +3514,10 @@ pub const DataReaderImpl = struct {
         instance_states: DDS.InstanceStateMask,
         max_samples: i32,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const f = resolveRawFilter(DDS.HANDLE_NIL, a_condition, sample_states, view_states, instance_states);
         return cast(ctx).rawReadOrTakeNextInstance(cdr_payloads, key_hashes, sample_infos, previous_handle, f, max_samples, false);
     }
@@ -3768,7 +3813,10 @@ pub const DataReaderImpl = struct {
     /// as any other pin release); absent means copy-mode (each descriptor
     /// independently owns its own buffer, freed directly here).
     fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payloads: ?*DDS.OctetSeqSeq, key_hashes: ?*DDS.OctetSeq, sample_infos: ?*DDS.SampleInfoSeq) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const payloads_seq = cdr_payloads orelse return DDS.RETCODE_BAD_PARAMETER;
         const hashes_seq = key_hashes orelse return DDS.RETCODE_BAD_PARAMETER;

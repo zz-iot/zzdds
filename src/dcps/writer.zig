@@ -925,7 +925,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return DDS.RETCODE_OK;
         const last_sn = self.last_sn.load(.monotonic);
@@ -946,7 +949,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetLivelinessLost(ctx: *anyopaque, status: *DDS.LivelinessLostStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -960,7 +966,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetDeadlineMissed(ctx: *anyopaque, status: *DDS.OfferedDeadlineMissedStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -974,7 +983,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetIncompatQos(ctx: *anyopaque, status: *DDS.OfferedIncompatibleQosStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
@@ -989,7 +1001,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetPubMatched(ctx: *anyopaque, status: *DDS.PublicationMatchedStatus) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -1007,7 +1022,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtAssertLiveliness(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const now_ns = self.timer_clock.nowNs();
         self.liveliness_last_ns.store(now_ns, .monotonic);
@@ -1025,7 +1043,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetMatchedSubs(ctx: *anyopaque, handles: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
@@ -1048,7 +1069,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtGetMatchedSubData(ctx: *anyopaque, data: *DDS.SubscriptionBuiltinTopicData, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         var guids: std.ArrayListUnmanaged(Guid) = .empty;
         defer guids.deinit(self.alloc);
@@ -1131,7 +1155,10 @@ pub const DataWriterImpl = struct {
         kind: DDS.WriteKind,
         source_timestamp: *const DDS.Time_t,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const kh_seq = key_hash orelse return DDS.RETCODE_BAD_PARAMETER;
         const payload = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
@@ -1159,7 +1186,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtLoanRaw(ctx: *anyopaque, size: u32, cdr_payload: ?*DDS.OctetSeq) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
         // Same race as vtWriteRaw above, but a successful loan outlives this
@@ -1213,7 +1243,10 @@ pub const DataWriterImpl = struct {
         handle: DDS.InstanceHandle_t,
         kind: DDS.WriteKind,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
         const kh_seq = key_hash orelse return DDS.RETCODE_BAD_PARAMETER;
@@ -1246,7 +1279,10 @@ pub const DataWriterImpl = struct {
     }
 
     fn vtReturnLoanRaw(ctx: *anyopaque, cdr_payload: ?*DDS.OctetSeq) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const seq = cdr_payload orelse return DDS.RETCODE_BAD_PARAMETER;
         const full_buf: []u8 = (seq._buffer orelse return DDS.RETCODE_BAD_PARAMETER)[0..seq._maximum];

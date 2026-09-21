@@ -3771,7 +3771,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeletePublisher(ctx: *anyopaque, a_publisher: DDS.Publisher) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         var found: ?*publisher_mod.PublisherImpl = null;
@@ -3836,7 +3839,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeleteSubscriber(ctx: *anyopaque, a_subscriber: DDS.Subscriber) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         var found: ?*subscriber_mod.SubscriberImpl = null;
@@ -3865,7 +3871,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtGetBuiltinSubscriber(ctx: *anyopaque) DDS.Subscriber {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_subscriber; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_subscriber;
+        }
         const self = cast(ctx);
         if (self.builtin_sub) |bs| return bs.sub.toDDSSubscriber();
         return nil.nil_subscriber;
@@ -3957,7 +3966,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeleteTopic(ctx: *anyopaque, a_topic: DDS.Topic) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         var found: ?*topic_mod.TopicImpl = null;
         self.mu.lock();
@@ -3977,7 +3989,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtFindTopic(ctx: *anyopaque, topic_name: [*:0]const u8, _: *const DDS.Duration_t) DDS.Topic {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_topic; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_topic;
+        }
         const self = cast(ctx);
         const tn_s = std.mem.span(topic_name);
         self.mu.lock();
@@ -3989,7 +4004,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtLookupTopicDesc(ctx: *anyopaque, name: [*:0]const u8) DDS.TopicDescription {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_topic_description; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_topic_description;
+        }
         const self = cast(ctx);
         const name_s = std.mem.span(name);
         self.mu.lock();
@@ -4034,7 +4052,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeleteCFTopic(ctx: *anyopaque, a_cft: DDS.ContentFilteredTopic) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4063,7 +4084,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         // Spec §2.2.2.2.1.18: PRECONDITION_NOT_MET propagates up from any
         // contained entity's own outstanding preconditions -- check every
@@ -4201,7 +4225,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtIgnoreParticipant(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4224,7 +4251,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtIgnoreTopic(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4257,7 +4287,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtIgnorePublication(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4273,7 +4306,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtIgnoreSubscription(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4290,7 +4326,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtAssertLiveliness(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4354,7 +4393,10 @@ pub const DomainParticipantImpl = struct {
         ctx: *anyopaque,
         handles: ?*DDS.InstanceHandleSeq,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         self.mu.lock();
@@ -4379,7 +4421,10 @@ pub const DomainParticipantImpl = struct {
         data: *DDS.ParticipantBuiltinTopicData,
         handle: DDS.InstanceHandle_t,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4397,7 +4442,10 @@ pub const DomainParticipantImpl = struct {
         ctx: *anyopaque,
         handles: ?*DDS.InstanceHandleSeq,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const seq = handles orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         self.mu.lock();
@@ -4422,7 +4470,10 @@ pub const DomainParticipantImpl = struct {
         data: *DDS.TopicBuiltinTopicData,
         handle: DDS.InstanceHandle_t,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -4472,7 +4523,10 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn vtContainsEntity(ctx: *anyopaque, handle: DDS.InstanceHandle_t) bool {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return false; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return false;
+        }
         const self = cast(ctx);
         if (self.instance_handle == handle) return true;
         self.mu.lock();

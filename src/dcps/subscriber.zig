@@ -489,7 +489,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtDeleteDataReader(ctx: *anyopaque, a_datareader: DDS.DataReader) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -523,7 +526,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtDeleteContained(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const precondition = self.checkDeleteContainedPrecondition();
         if (precondition != DDS.RETCODE_OK) return precondition;
@@ -538,7 +544,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtLookupDataReader(ctx: *anyopaque, topic_name: [*:0]const u8) DDS.DataReader {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return nil.nil_datareader; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return nil.nil_datareader;
+        }
         const self = cast(ctx);
         const tn_s = std.mem.span(topic_name);
         self.mu.lock();
@@ -558,7 +567,10 @@ pub const SubscriberImpl = struct {
         view_states: DDS.ViewStateMask,
         instance_states: DDS.InstanceStateMask,
     ) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const seq = readers orelse return DDS.RETCODE_BAD_PARAMETER;
         const self = cast(ctx);
         self.mu.lock();
@@ -590,7 +602,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtNotifyDataReaders(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         self.mu.lock();
         defer self.mu.unlock();
@@ -740,7 +755,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtBeginAccess(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self = cast(ctx);
         const pres = self.qos.presentation;
         if (!pres.coherent_access and !pres.ordered_access) return DDS.RETCODE_OK;
@@ -912,7 +930,10 @@ pub const SubscriberImpl = struct {
     }
 
     fn vtEndAccess(ctx: *anyopaque) DDS.ReturnCode_t {
-        { const rc = cast(ctx).checkEnabledPrecondition(); if (rc != DDS.RETCODE_OK) return rc; }
+        {
+            const rc = cast(ctx).checkEnabledPrecondition();
+            if (rc != DDS.RETCODE_OK) return rc;
+        }
         const self: *Self = @ptrCast(@alignCast(ctx));
         const pres: DDS.PresentationQosPolicy = self.qos.presentation;
         if (pres.ordered_access) {
