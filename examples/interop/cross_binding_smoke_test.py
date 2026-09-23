@@ -51,6 +51,7 @@ def build_one(dir_: Path, zig_out: Path) -> bool:
         log_path=build_dir / "cmake.log",
     ):
         print(f"FAIL: cmake configure failed for {name} -- see {build_dir}/cmake.log", file=sys.stderr)
+        print((build_dir / "cmake.log").read_text(errors="replace"), file=sys.stderr)
         return False
 
     # `cmake --build`, not `make` directly: generator-agnostic (Makefiles,
@@ -64,6 +65,7 @@ def build_one(dir_: Path, zig_out: Path) -> bool:
         log_path=build_dir / "make.log",
     ):
         print(f"FAIL: build failed for {name} -- see {build_dir}/make.log", file=sys.stderr)
+        print((build_dir / "make.log").read_text(errors="replace"), file=sys.stderr)
         return False
     return True
 

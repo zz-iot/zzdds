@@ -78,9 +78,11 @@ def build_cmake(name: str, source_dir: Path, build_dir: Path, zig_out: Path) -> 
         log_path=log_path,
     ):
         print(f"FAIL: {name} configure -- see {log_path}", file=sys.stderr)
+        print(log_path.read_text(errors="replace"), file=sys.stderr)
         return False
     if not run_build(["cmake", "--build", str(build_dir)], cwd=SCRIPT_DIR, log_path=log_path):
         print(f"FAIL: {name} build -- see {log_path}", file=sys.stderr)
+        print(log_path.read_text(errors="replace"), file=sys.stderr)
         return False
     print(log_path.read_text(errors="replace"))
     return True
