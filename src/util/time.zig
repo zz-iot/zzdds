@@ -515,6 +515,19 @@ test "RtpsDuration.toDuration: near-infinite fraction at seconds=maxInt(i32) sat
     try std.testing.expectEqual(@as(u32, std.time.ns_per_s - 1), d.nanosec);
 }
 
+test "RtpsDuration.toDuration: ordinary (non-boundary) carry increments seconds normally" {
+    // Regression for a coverage gap found via kcov/PR-diff comparison: the
+    // boundary test above exercises the saturation branch, and the existing
+    // round-trip test below never rounds up to a full second at all (0.5s
+    // fraction), so the plain "carry, not at maxInt(i32)" branch this fix
+    // introduced (sec += 1; ns = 0) had no test ever exercising it.
+    const rd = RtpsDuration{ .seconds = 3, .fraction = 0xffff_ffff };
+    try std.testing.expect(!rd.isInfinite());
+    const d = rd.toDuration();
+    try std.testing.expectEqual(@as(i32, 4), d.sec);
+    try std.testing.expectEqual(@as(u32, 0), d.nanosec);
+}
+
 test "RtpsDuration fromDuration round-trip approximate" {
     const d = Duration{ .sec = 3, .nanosec = 500_000_000 };
     const rt = RtpsDuration.fromDuration(d);

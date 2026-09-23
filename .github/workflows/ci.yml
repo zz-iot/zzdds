@@ -248,9 +248,41 @@ jobs:
   # behavior for the latter case).
 
   examples:
-    name: examples
+    name: examples / ${{ matrix.name }}
     needs: test-linux
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            java_binding: true
+            install_opencv: true
+            strict: true
+          # Windows leg: c-binding + cpp-binding only, not --strict. Two
+          # deliberate, documented gaps, not oversights:
+          #   - java-binding is excluded: Windows Java/JNI has a known,
+          #     unresolved silent crash at the first native call (see
+          #     test-other's "Java binding on Windows is DEFERRED" comment,
+          #     docs/design/ci-platform-coverage-expansion.md's Item 2, and
+          #     docs/roadmap.md's "Deferred (investigation trails exist)"
+          #     entry for the full investigation trail).
+          #   - every interop/*-cross-binding section in run_all.py requires
+          #     c_binding AND cpp_binding AND java_binding together (only
+          #     interop/cross-binding needs just c+cpp) -- so with java
+          #     excluded, most cross-binding sections report SKIP here, not
+          #     PASS. Not --strict specifically so those (and opencv_zzdds,
+          #     which needs a Windows OpenCV toolchain not set up here
+          #     either) skip cleanly instead of failing the job. What this
+          #     leg still verifies genuinely usefully: the c and cpp example
+          #     apps actually build and run correctly on Windows, plus the
+          #     one c+cpp-only cross-binding smoke test.
+          - name: Windows x86_64
+            os: windows-latest
+            java_binding: false
+            install_opencv: false
+            strict: false
+    runs-on: ${{ matrix.os }}
     # 30, not 20: the "Install OpenCV" step below (libopencv-dev, ~30
     # transitive codec/graphics packages, uncached) has been observed taking
     # long enough on a slow apt mirror day to blow a 20-minute budget on its
@@ -268,7 +300,12 @@ jobs:
         with:
           version: "0.16.0"
 
+      - name: Allow inbound UDP (Windows)
+        if: runner.os == 'Windows'
+        run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
+
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
+        if: matrix.java_binding
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -280,42 +317,82 @@ jobs:
           python-version: "3.12"
 
       - name: Install OpenCV (for cpp/opencv_zzdds)
+        if: matrix.install_opencv
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libopencv-dev
 
-      - name: Build zzdds (all bindings)
-        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
+      - name: Build zzdds
+        shell: bash
+        run: |
+          if [ "${{ matrix.java_binding }}" = "true" ]; then
+            zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
+          else
+            zig build -Dc-binding=true -Dcpp-binding=true install
+          fi
 
-      - name: Run examples (strict)
+      - name: Run examples
         working-directory: examples
-        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
+        shell: bash
+        run: |
+          if [ "${{ matrix.strict }}" = "true" ]; then
+            ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
+          else
+            ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py
+          fi
 
   # ── integration tests ────────────────────────────────────────────────────
   #
-  # Builds zzdds with every binding enabled, then runs integration-tests/'s
-  # own orchestrator (run_all.py) against that build. Distinct from the
-  # `examples` job above: every scenario here is built once per binding and
-  # run cross-binding, targeting one specific DCPS behavior with a hard
-  # correctness assertion rather than a demonstration -- see
-  # docs/design/integration-test-tier.md. 9 scenarios today (coherent-sets,
+  # One matrix leg per scenario, each running its own fully self-contained
+  # interop/*_cross_binding_test.py (every scenario already builds its own
+  # per-scenario C/C++/Java artifacts -- see
+  # integration-tests/c/<scenario>/CMakeLists.txt -- so this parallelizes
+  # cleanly with no shared-build/artifact-download plumbing needed). See
+  # docs/design/integration-test-tier.md for what this tier is and how it
+  # differs from `examples` above. 9 scenarios today (coherent-sets,
   # delete-contained-entities, sample-rejected-lost, enable-defer,
   # wait-for-historical-data, ignore-entities, cft-reconfigure,
-  # source-timestamp, liveliness-lost); --strict means a missing binding is
-  # a hard failure here, same reasoning as the `examples` job above.
+  # source-timestamp, liveliness-lost).
+  #
+  # Previously one job ran all 9 sequentially via run_all.py (~21.5 min
+  # wall-clock, and climbing every time a scenario is added); matrixing cuts
+  # that to whatever the single slowest scenario takes (found via Greptile
+  # review's CI-budget point). run_all.py itself is untouched and remains the
+  # right tool for a local, single-command run of everything -- including the
+  # one thing this matrix intentionally gives up: run_all.py's own top-level
+  # "c"/"cpp" sections build all 9 scenarios together in one CMake project
+  # (integration-tests/c/CMakeLists.txt's add_subdirectory list), which is
+  # the only thing that would catch a CMake target-name collision *between*
+  # two different scenarios -- each matrix leg here builds only its own
+  # scenario in isolation. Accepted tradeoff: that class of collision is
+  # still caught immediately and loudly by anyone running run_all.py locally
+  # before pushing, or by CMake itself the moment two scenarios' subdirectories
+  # are ever built together again.
   integration-tests:
-    name: integration-tests
+    name: integration-tests / ${{ matrix.scenario }}
     needs: test-linux
     runs-on: ubuntu-latest
-    # Raised from 20: 5 new heavyweight suites landed together (each rebuilds 4
-    # bindings, then runs 8 combinations sequentially with per-pair internal
-    # deadline chains up to 240s for ignore-entities), on top of the 4 already
-    # here. A slow CI runner absorbing that added weight risks the job getting
-    # killed by this ceiling itself -- a confusing failure mode that names no
-    # scenario -- rather than by one of run_all.py's own scenario-level
-    # timeouts, which at least explain what actually went wrong (found via
-    # Greptile review).
-    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - coherent-sets
+          - delete-contained-entities
+          - sample-rejected-lost
+          - enable-defer
+          - wait-for-historical-data
+          - ignore-entities
+          - cft-reconfigure
+          - source-timestamp
+          - liveliness-lost
+    # Generous, uniform per-scenario headroom -- comfortably covers even
+    # ignore-entities (the heaviest: 3-process, up to a 240s internal
+    # deadline chain per triple, 8 triples run sequentially within this one
+    # leg) under realistic conditions (it completed in a few minutes even
+    # under this session's own deliberate CPU-stress testing); nowhere near
+    # the old monolithic job's 40min, since that budget no longer has to
+    # cover all 9 scenarios cumulatively.
+    timeout-minutes: 20
 
     steps:
       - name: Check out zzdds
@@ -340,9 +417,12 @@ jobs:
       - name: Build zzdds (all bindings)
         run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
-      - name: Run integration tests (strict)
-        working-directory: integration-tests
-        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
+      - name: Run ${{ matrix.scenario }} cross-binding interop
+        working-directory: integration-tests/interop
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python3 "${SCENARIO//-/_}_cross_binding_test.py"
 
   # ── examples: WaitSet + ThreadSanitizer ──────────────────────────────────
   #
