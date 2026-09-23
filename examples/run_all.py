@@ -87,10 +87,18 @@ def build_cmake(name: str, source_dir: Path, build_dir: Path, zig_out: Path) -> 
 
 
 def has_opencv() -> bool:
-    if shutil.which("pkg-config") and subprocess.run(
-        ["pkg-config", "--exists", "opencv4"]
-    ).returncode == 0:
-        return True
+    if shutil.which("pkg-config"):
+        try:
+            if subprocess.run(["pkg-config", "--exists", "opencv4"]).returncode == 0:
+                return True
+        except OSError:
+            # Seen on Windows: shutil.which() can match a same-named file that
+            # isn't actually launchable this way (e.g. a non-.exe tool from Git's
+            # bundled Unix toolchain on PATH) -- CreateProcess then raises
+            # FileNotFoundError instead of just failing to find opencv4. Treat
+            # that the same as "pkg-config genuinely not usable here" and fall
+            # through to the include-path check below, rather than crashing.
+            pass
     for inc in (
         "/usr/include/opencv4",
         "/usr/local/include/opencv4",

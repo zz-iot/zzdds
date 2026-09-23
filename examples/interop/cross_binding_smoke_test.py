@@ -53,8 +53,13 @@ def build_one(dir_: Path, zig_out: Path) -> bool:
         print(f"FAIL: cmake configure failed for {name} -- see {build_dir}/cmake.log", file=sys.stderr)
         return False
 
+    # `cmake --build`, not `make` directly: generator-agnostic (Makefiles,
+    # Ninja, or Visual Studio/MSBuild -- CMake's default generator on
+    # Windows, where a literal `make` isn't even on PATH). --parallel is the
+    # equivalent of make's -j across all of those (found via Greptile review:
+    # a Windows leg invoking this exact script failed here first).
     if not run_build(
-        ["make", f"-j{multiprocessing.cpu_count()}"],
+        ["cmake", "--build", ".", "--parallel", str(multiprocessing.cpu_count())],
         cwd=build_dir,
         log_path=build_dir / "make.log",
     ):
@@ -63,26 +68,55 @@ def build_one(dir_: Path, zig_out: Path) -> bool:
     return True
 
 
+def find_executable(build_dir: Path, name: str) -> Path:
+    """Locate a just-built executable under build_dir, robust to both
+    single-config generators (Makefiles/Ninja: build_dir/name[.exe]) and
+    multi-config ones (Visual Studio on Windows: build_dir/<Config>/name.exe)
+    -- rather than assuming a specific generator/layout, which this repo's
+    CI had never actually exercised on Windows before (found via Greptile
+    review). Also makes sure zzdds.toml (CMake-copied to build_dir itself,
+    see this example's CMakeLists.txt) is colocated with wherever the
+    executable actually landed: ambient config resolution looks for
+    "./zzdds.toml" relative to the *process's* cwd, which must be the
+    executable's own directory, not build_dir itself, for a multi-config
+    layout where those two differ.
+    """
+    exe_name = f"{name}.exe" if sys.platform == "win32" else name
+    candidates = sorted(build_dir.rglob(exe_name))
+    if not candidates:
+        raise FileNotFoundError(f"{exe_name} not found anywhere under {build_dir}")
+    exe = candidates[0]
+    toml_src = build_dir / "zzdds.toml"
+    toml_dst = exe.parent / "zzdds.toml"
+    if toml_src.is_file() and not toml_dst.exists():
+        shutil.copyfile(toml_src, toml_dst)
+    return exe
+
+
 def run_pair(pub_dir: Path, sub_dir: Path, label: str, zig_out: Path) -> bool:
     print(f"== {label} ==")
     env = run_env(zig_out)
 
-    # cwd matters here, not just for tidiness: each example's zzdds.toml
-    # (CMake-copied next to the binary) is resolved relative to the
-    # process's working directory, the same way the original bash version
-    # relied on `cd "$dir/build"` before running.
+    sub_exe = find_executable(sub_dir / "build", "subscriber")
+    pub_exe = find_executable(pub_dir / "build", "publisher")
+
+    # cwd matters here, not just for tidiness: zzdds.toml is resolved
+    # relative to the process's working directory, the same way the
+    # original bash version relied on `cd "$dir/build"` before running --
+    # find_executable() above already made sure it's colocated with
+    # wherever the binary actually is.
     sub = LiveProcess(
-        ["./subscriber"],
-        cwd=sub_dir / "build",
+        [str(sub_exe)],
+        cwd=sub_exe.parent,
         env=env,
-        log_path=sub_dir / "build" / "sub.log",
+        log_path=sub_exe.parent / "sub.log",
     )
     time.sleep(1)
     pub = LiveProcess(
-        ["./publisher"],
-        cwd=pub_dir / "build",
+        [str(pub_exe)],
+        cwd=pub_exe.parent,
         env=env,
-        log_path=pub_dir / "build" / "pub.log",
+        log_path=pub_exe.parent / "pub.log",
     )
 
     # wait() gives it a chance to exit cleanly on its own; stop() is always
