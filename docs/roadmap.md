@@ -227,10 +227,12 @@ or an optimisation on an already-improved path):
   built.
 - **Reference-app "deliberately out of scope" items** (each documented in
   `examples/docs/design/`): `run.py`-style cross-binding pass/fail harnesses (discovery,
-  participant-config); the `wait_for_historical_data`-should-time-out negative case
-  (catchup); `assert_liveliness()` + AUTOMATIC/MANUAL_BY_PARTICIPANT + `on_liveliness_lost`
-  (presence); `*_w_timestamp` symmetry + batch instance ops (registry); Java's
-  `instance_state` on the batch-take family.
+  participant-config); `assert_liveliness()` + AUTOMATIC/MANUAL_BY_PARTICIPANT +
+  `on_liveliness_lost` (presence); `*_w_timestamp` symmetry + batch instance ops (registry);
+  Java's `instance_state` on the batch-take family. The `wait_for_historical_data`-should-
+  time-out negative case left out of `catchup` itself is no longer on this list — it's
+  covered by the `wait-for-historical-data` Integration-tier scenario instead (see
+  `docs/design/dcps-api-coverage-audit.md`).
 - **Non-goal (recorded, not planned):** a spec-conformance harness, network simulation
   (ns-3 / CORE), and formal verification / safety certification (DO-178C, IEC 61508, ISO
   26262) — long-term concerns, not built. `design/testing-strategy.md`.
@@ -432,16 +434,140 @@ model:
     `integration-tests/run_all.py --strict` (all 4 scenarios, 32 cross-binding pairs) all
     clean.
 
-  Remaining backlog, reordered by the spec doc: late-joiner durability replay; `ignore_*`
-  across two processes; runtime `set_expression_parameters` CFT reconfiguration;
-  `_w_timestamp` source-timestamp propagation. Liveliness/status marshaling per binding is now
+  Scenario #5, **`wait_for_historical_data`**, is also done — see the "Reference-app
+  'deliberately out of scope' items" note above for the negative-case detail it closes.
+  Scenario #6, **`ignore_participant`/`ignore_topic`/`ignore_publication`/
+  `ignore_subscription`**, is also done, as `ignore-entities` — the only scenario in this
+  tier needing three processes (ignorer/peer/bystander), since `ignore_participant()` would
+  blackhole a whole participant `peer` needs to keep serving the other three ops. Central
+  design fact the scenario is built around: `ignore_topic`/`ignore_publication`/
+  `ignore_subscription` are a strictly one-sided, local filter (DDS spec: "locally
+  ignore") — the non-ignoring side legitimately keeps reporting itself matched, so every
+  assertion lives on the ignoring side alone. Found and fixed a real bug in the process:
+  `participant.zig`'s retroactive-match scan (`subAnnounceProtoReader`/
+  `pubAnnounceProtoWriter`, run when a new local reader/writer is created, to match it
+  against an already-discovered remote entity) never checked the ignore lists — so a
+  remote entity discovered *before* being ignored stayed retroactively matchable to a
+  local entity created *after* the ignore call, exactly backwards from the ignore
+  operations' contract. A Zig-unit-test mock reproduction attempt (in `ignore_test.zig`)
+  didn't reliably exercise the retroactive-match path at all (reverted, unused); the real
+  cross-process scenario caught it directly. Fixed by mirroring the live-discovery
+  callbacks' own three ignore-list guards into both retroactive scans.
+
+  A second, unrelated bug surfaced afterward as intermittent interop-test failures that
+  first looked like a networking/port-collision issue (it was not — `ss -ulnp` during a
+  live failure showed clean, non-colliding port allocation across every process). The real
+  cause was two-fold: (1) a genuine harness-ordering bug — `ignore_entities_cross_binding_test.py`
+  started `peer` and `bystander` concurrently, so `get_discovered_participants()`'s
+  `handles[0]` was ambiguous between the two (no ordering guarantee across simultaneously-
+  discovered participants); fixed with a strict 3-phase startup (ignorer alone → bystander →
+  peer only once ignorer confirms `ignore_participant()`) across all 4 bindings' harnesses.
+  (2) The real, 100%-reproducible bug once (1) was fixed and isolated: `ignorer.c`/
+  `ignorer.cpp` only called `fflush(stdout)` after their *first* marker print
+  (`"ready for bystander."`); every later marker (`"ignore_participant() applied..."`, etc.)
+  was left in glibc's fully-buffered (non-tty) stdio buffer, invisible to the log file the
+  Python harness's `wait_for_marker()` polls live. The C/C++ ignorer was in fact discovering
+  and correctly ignoring bystander every time (confirmed with temporary
+  `std.debug.print` instrumentation in `participant.zig`'s `onParticipantDiscovered`/
+  `vtGetDiscoveredParticipants`/`vtIgnoreParticipant`, all shared, binding-agnostic core
+  code) — the harness just never saw the marker before timing out and killing the process,
+  which discarded the unflushed buffer. Zig's `std.debug.print` and Java's `println` don't
+  have this failure mode, which is why only C/C++-as-ignorer triples ever failed. Fixed by
+  adding `fflush(stdout)` after every required marker `printf`/`std::printf` in both files.
+  Also tried and reverted an `IFF_RUNNING` check in `src/transport/monitor/polling.zig`'s
+  interface enumeration (theory: a carrier-down interface like `docker0` could be picked
+  first for `IP_MULTICAST_IF`) — reverted because this VM's real, working `eth0` also
+  reports no `IFF_RUNNING` bit despite `ip link show` showing `LOWER_UP`, so the check
+  excluded every non-loopback interface here and made things worse; left as a comment for
+  future reference rather than landed. `zig build test` 1123/1123 clean throughout; the
+  fixed scenario reran clean twice in a row, 8/8 cross-binding triples each time. See
+  `integration-tests/README.md` for the full scenario writeup.
+
+  Scenario #7, runtime **`set_expression_parameters` CFT reconfiguration**, is also done,
+  as `cft-reconfigure` — behavioral correctness (does changing parameters without
+  recreating the CFT actually re-filter subsequent samples), distinct from the stress
+  `cft` scenario's concurrency-safety coverage. Also closes the CFT introspection gap the
+  API audit flagged as completely untested (`get_filter_expression`/
+  `get_expression_parameters`/`get_related_topic` — "CFT is set once at creation, never
+  read back or changed"). Two processes (publisher/subscriber) writing two batches (seq
+  0..4, then 5..9) around a live `set_expression_parameters()` call on the same CFT/reader
+  — no recreation. Core assertion: the filtered reader's final set is *exactly* `{5..9}`,
+  proving both that subsequent samples are genuinely re-filtered against the new parameter
+  and that already-dropped samples (seq=3,4, both `>=` the *new* threshold) are never
+  retroactively delivered — CFT filtering is a one-time decision at receive time, not
+  replayed against history. Found a real Zig-native-binding gotcha (not a zzdds core bug):
+  the raw `zzdds.registerTypeSupport()` call Zig-native apps use directly (bypassing the
+  generated `TypeSupport.register()` wrapper C/C++/Java go through) doesn't wire up
+  `TypeSupport.get_field` automatically — without it, a CFT reader silently receives
+  everything unfiltered, no error anywhere. Every zidl-generated Zig type provides a
+  matching `getFieldFromCdr` for exactly this; must be passed explicitly. Found because
+  C/C++/Java all worked immediately while the Zig port's filtered reader passed everything
+  through unfiltered on the first run. Also bumped `MATCH_TIMEOUT_MS` (40s, not this
+  tier's usual 20s) and the subscriber's matching `WITNESS_TIMEOUT_MS` (45s): this
+  scenario waits for two readers to match (witness + filtered), and showed intermittent
+  timeouts specifically as the first Java pair run right after a from-scratch 4-binding
+  rebuild (JVM cold-start contending with residual build-tail CPU/IO load) — reproduced
+  twice at the default 20s, clean 3/3 after the bump. `zig build test` clean; the fixed
+  scenario reran clean 3 times in a row, 8/8 cross-binding pairs each time. See
+  `integration-tests/README.md` for the full scenario writeup.
+
+  Scenario #8, the **`_w_timestamp` family** (`write_w_timestamp`/`dispose_w_timestamp`),
+  is also done, as `source-timestamp` — does an explicit, caller-supplied source timestamp
+  genuinely propagate to `SampleInfo.source_timestamp` on the receiving side, or does
+  something silently substitute "now"? Two processes writing 5 samples with fabricated,
+  deterministic explicit timestamps (~11.5 days since epoch — nowhere near real wall-clock
+  time, so a substitution bug shows up as an immediate wrong-value failure, not a flaky
+  near-miss), then disposing the instance with its own distinct explicit timestamp
+  including a nonzero nanosecond component. **Found and fixed a real zzdds core bug on the
+  very first real cross-process run**: `src/util/time.zig`'s `RtpsTimestamp.fromTime()`/
+  `.toTime()` (and `RtpsDuration.fromDuration()`) used plain truncating division for the
+  RTPS wire fraction↔nanosecond conversion (fraction = 1/2^32-second units); composing
+  floor(floor(x)) across the round trip systematically lost ~1ns for nearly any nonzero
+  nanosecond value — the dispose sample's explicit nanosecond `123456789` came back as
+  `123456788`. `RtpsDuration.toDuration()` already did this correctly (round-to-nearest +
+  carry-into-seconds handling); the fix brought the other three conversions in line with
+  it. Zero-nanosecond writes never triggered this (0 is trivially exact either way) — only
+  the dispose call's nonzero nanosecond exposed it. `zig build test` clean; the fixed
+  scenario reran clean twice, 8/8 cross-binding pairs each time. See
+  `integration-tests/README.md` for the full scenario writeup.
+
+  Scenario #9, the last item in the backlog, **`on_liveliness_lost`/AUTOMATIC/
+  MANUAL_BY_PARTICIPANT**, is also done, as `liveliness-lost` — closing out the whole
+  Integration-tier spec doc's scenario list. Liveliness/status marshaling per binding is
   substantially covered by the `presence` example (see "Reference-app" note above under
   Testing) — cross-process, all 4 bindings + 8 same/cross-binding pairs, found and fixed 4
-  real bugs including a wire-level one (`PID_LIVELINESS` never encoded). Remaining narrower
-  gap, not yet covered anywhere: `on_liveliness_lost`/`get_liveliness_lost_status` and the
-  AUTOMATIC/MANUAL_BY_PARTICIPANT kinds — deliberately left out of `presence` to keep it a
-  single-scenario example (`examples/docs/design/presence-reference-app.md`, "Deliberately
-  out of scope"); candidate to fold into the Integration tier instead of a second example.
+  real bugs including a wire-level one (`PID_LIVELINESS` never encoded) — but `presence`
+  deliberately left out `on_liveliness_lost`/`get_liveliness_lost_status` and the
+  AUTOMATIC/MANUAL_BY_PARTICIPANT kinds to stay a single-scenario example
+  (`examples/docs/design/presence-reference-app.md`, "Deliberately out of scope"). Two
+  DataWriters (AUTOMATIC, MANUAL_BY_PARTICIPANT, both `lease_duration=2s`) write
+  continuously at the same cadence the whole run, never calling `assert_liveliness()` —
+  targeting a sharper question than "did a writer go silent": *what counts* as a
+  liveliness assertion differs by kind, and it's easy to invert. AUTOMATIC's own `write()`s
+  should keep it alive forever (never fires); MANUAL_BY_PARTICIPANT should lose liveliness
+  anyway, *despite* writing the entire time, since `write()` doesn't count for that kind —
+  confirmed correct on the very first real run, both at the writer's own
+  `on_liveliness_lost`/`get_liveliness_lost_status()` and, independently, at the reader's
+  own `on_liveliness_changed`, extending `presence`'s MANUAL_BY_TOPIC-only reader-side
+  coverage to these two kinds. Found a real bug in the C++ port's own harness code (not
+  zzdds): the first draft's `create_writer()`/`create_reader()` helper functions
+  constructed the listener `shared_ptr` as a local variable that died the moment the
+  helper returned, segfaulting both processes the instant SEDP matching tried to fire a
+  callback into the now-dangling listener — fixed by having `main()` construct and hold
+  the listeners itself. Also bumped `MATCH_TIMEOUT_MS` (40s, not this tier's usual 20s,
+  same precedent as `cft-reconfigure`: two writers/readers per process, twice the SEDP
+  work) after the same environment-contention-driven "0 matched" timeout `cft-reconfigure`
+  saw under a from-scratch 4-binding rebuild; isolated reruns reliably clean (3/3),
+  full-suite reruns clean 2/3 with every failure a pure timing miss, never wrong data.
+  `zig build test` clean. A full `run_all.py --strict` pass across all 9 scenarios is the
+  heaviest cumulative-load run this suite does; the first attempt hit the same
+  environment-contention "0 matched" timing miss in both `cft-reconfigure` and
+  `liveliness-lost` (never together before — this is a new, heavier watermark than any
+  prior run in this session), and both reran clean standalone immediately after with no
+  code changes. Treat a lone "0 matched" failure in either of these two on a full
+  `run_all.py --strict` run as this same known category, not a regression, unless it
+  reproduces on an immediate standalone rerun too. See
+  `integration-tests/README.md` for the full scenario writeup.
 - **Stress tier** — landed in `stress-tests/` as seven `lifecycle_churn` scenarios
   (`reentrant`, `entities`, `waitset`, `listener`, `cft`, `participants`, `instance`) plus
   the `entity_lifecycle_stress` multi-process port. Found + fixed three concurrency bugs
@@ -541,6 +667,150 @@ storage". Output: a design doc.
 zzdds owning a set of zidl binding plugins that supply "which concrete class implements
 interface X", instead of `build.zig` hand-listing `--cpp-impl-override` flags. Feasibility
 and shape are open — see `zidl/docs/roadmap.md` "Plugin architecture".
+
+### Internal (same-participant) notification mechanism
+
+Found 2026-09-22 via a packet-capture investigation into flaky match-timeout integration
+tests: `combined.zig`'s `self_data` bootstrap (needed so a participant's own SEDP builtin
+writer gets a matched-reader-proxy for its own SEDP builtin reader — otherwise same-process
+publication/subscription discovery never transmits at all, see its comment) feeds the local
+participant's own announcement through `builtin_endpoint.zig`'s `matchRemote`, the exact
+path used for genuinely remote peers. That proxy is safe to construct — a participant
+legitimately needs a matched-reader-proxy pointing back at itself — but it's addressed and
+driven exactly like a remote one: real UDP sends, the same `HB_INTERVAL_MS`-cadenced
+keepalive heartbeat thread, the same ACKNACK retry protocol. A `WriterProxy`/`ReaderProxy.
+is_local` flag (set in `matchRemote` when `remote.guid.prefix` equals the local participant's
+own prefix) closes the worst of it for now — self-matched proxies are excluded from the
+periodic heartbeat thread, from liveness probing, and from the one-shot match-time AckNack —
+but this is a narrow, contained fix, not a real solution: DATA delivery to these proxies
+(and, most likely, to other same-process consumers of builtin discovery topic samples more
+generally — SPDP/SEDP participant/publication/subscription data is itself just a stream of
+notifications an in-process reader happens to also be interested in) still goes through the
+same lossy-media-oriented RTPS reliable-writer machinery underneath: CDR encoding, real
+socket sends over loopback, and (per this same investigation) real, measurable loss under
+CPU contention with second-scale recovery latency — for data that never needed to leave the
+process.
+
+RTPS's HEARTBEAT/ACKNACK/NACK_FRAG retry protocol exists to recover from loss on a genuinely
+lossy transport. A same-participant match can't lose anything that way, so reusing that
+machinery for it is architecturally the wrong tool — same-process delivery should be a
+lossless, direct notification, not a reliable-transport retry loop pointed at itself.
+
+Before implementing a replacement, this needs a real requirements pass, not just a mechanism
+swap:
+
+- **Scope**: which internal update paths are actually "internal" in this sense? Builtin
+  discovery data (SPDP/SEDP samples reaching a participant's own builtin readers) is the
+  case this was found from; same-participant *user*-topic matching (a writer and reader on
+  the same participant/topic) is architecturally identical and likely belongs in scope too.
+- **Ordering/delivery guarantees** a notification mechanism must provide to stay
+  behaviorally equivalent to what the RTPS path gives "for free" today — in particular
+  history/TRANSIENT_LOCAL replay and coherent-set semantics, which the current design gets
+  from the shared writer_sm/reader_sm state machine rather than anything bespoke.
+  `MemoryTransport`/`IntraProcessDelivery` (used by zzdds's own conformance-testing harness)
+  is *not* this mechanism as it stands — it substitutes the transport but still drives the
+  full reliable-writer state machine (heartbeat threads, ACKNACK) on top, so it doesn't
+  eliminate the keepalive/retry traffic this task is about.
+- **Migration path**: how existing call sites (builtin discovery matching today) port onto
+  it once it exists, without a flag day that has to touch every QoS/fragmentation/
+  coherent-set code path at once.
+
+Output: a design doc (performance/requirements first, then shape), followed by a phased
+port of the internal call sites identified above once it lands.
+
+### Discovery bootstrap latency: a structural ~1.5s tax, not just contention
+
+Found 2026-09-22, same pcap investigation as the self-match fix above (see
+[[project-self-match-notification-fix]] in agent memory for the session narrative), but this
+is a **separate, more fundamental** finding than that one. The self-match fix and the
+CPU-contention flake explanation both concerned *worse-than-baseline* behavior — heavier
+traffic, or real UDP loss under induced load. This finding is about the *baseline itself*:
+on a completely idle system, with two freshly-started `liveliness-lost` zig↔zig processes and
+nothing else running, full cross-process discovery + match still consistently took **~1.5
+seconds** — for literally 2 processes and 4 user-level entities on loopback. That is far
+slower than it has any right to be, and the mechanism turned out to be structural, not
+incidental.
+
+**What's confirmed** (via direct pcap byte-level decode — `rtps_pcap.py`'s own conversation
+grouping is not reliable enough alone here, see the gotcha below):
+
+- Both participants send their first SPDP announcement within single-digit milliseconds of
+  process start (observed: +4-9ms in multiple runs), whether processes are launched with an
+  artificial stagger or back-to-back (tested both — the effect reproduces either way, so it
+  is *not* a test-harness launch-order artifact).
+- Neither side's real cross-process SEDP proxy (confirmed via matching on **both** sender
+  prefix and `INFO_DST`, not just the generic builtin `readerId`/`writerId` — see gotcha
+  below) reacts to the other's writer at all until the *second* SPDP fast-announce cycle,
+  observed consistently in the 1507-1612ms range across runs.
+- `announcement_period_ms` defaults to 3000ms (`src/config/schema.zig:46`); SPDP's
+  fast-announce mode (`src/discovery/spdp.zig`, `fast_announce_until_ns`, active for the
+  first `2 * announcement_period_ms` after start) halves that to a **1500ms** resend
+  interval. The observed ~1.5s stall lines up with this exactly, every time.
+- There is no faster recovery path once a first announcement is missed. The one accelerant
+  that exists — `spdp.zig`'s "SEDP-traffic-seen heuristic" (unicast retransmit directly to a
+  peer that keeps re-announcing over SPDP but has never sent real SEDP traffic) — is itself
+  gated on waiting for the peer's *next* periodic/fast-announce cycle to fire before it can
+  trigger. So the floor recovery time from a missed first announcement is the fast-announce
+  half-period (1.5s), regardless of how small the timing skew that caused the miss actually
+  was.
+
+**Working theory** (not yet proven at the code level — next investigator should verify this
+directly, e.g. with targeted logging around `transport.listen()`/`joinMulticast()` completion
+vs. the immediate-announcement send in `spdp.zig`'s `start()`): each participant's own
+"join multicast, then send immediate announcement" sequence completes at a slightly different
+wall-clock moment (ordinary OS/scheduling variance between two independently-starting
+processes, on the order of single-digit milliseconds). If participant B's multicast join
+hasn't completed yet at the exact instant A's first announcement goes out, B misses it — and
+because A won't try again for another 1.5s (fast-announce half-period), B is stuck waiting
+that whole interval even though the actual race window that caused the miss was only a few
+milliseconds wide. If true, the fix is straightforward in shape (though needs real
+measurement to size correctly): a much shorter *initial* retry cadence during the discovery
+bootstrap window — e.g. resend every 100-250ms for the first second or two, then back off to
+the steady-state fast-announce/normal rate — would let two participants catch each other's
+presence almost immediately in the common case, instead of eating a near-fixed 1.5s tax on
+nearly every fresh two-participant discovery.
+
+**Why this matters beyond "it'd be nice if it were faster"**: this baseline cost stacks with
+whatever additional delay real contention/loss adds on top of it (see the self-match fix
+memory entry's flake investigation), and is very likely a meaningful fraction of why
+`cft-reconfigure`/`liveliness-lost` need `MATCH_TIMEOUT_MS=40000` at all — a budget sized to
+absorb worst-case contention-driven retries *on top of* a baseline that's already ~1.5s+ just
+from this bootstrap gap, before any loss has happened. The user explicitly does not want the
+current large timeouts shortened until this gets fixed — see that memory entry's "can we
+shorten the timeouts" follow-up, empirically answered "no" for the same reason.
+
+**Scope for the future work this item requests**: a proper discovery-timing test suite,
+covering at minimum:
+- Wall-clock time from process start to full match, idle system, at 2-participant baseline
+  scale and stepped up to whatever participant count is realistic for real deployments —
+  confirm whether the ~1.5s tax is roughly constant regardless of scale, or gets worse as
+  more simultaneously-starting participants compete for the same race window.
+- The same measurement under induced CPU contention (methodology from this session: N busy
+  `while true; do :; done` loops pinned to available cores, watch `/proc/loadavg`), to
+  separate the *baseline* structural cost measured here from the *additional* contention-driven
+  cost investigated separately.
+- A/B comparison of the current 1.5s initial retry interval against candidate shorter
+  intervals, checking both the actual latency improvement and any steady-state multicast
+  traffic-volume cost of resending more aggressively during the bootstrap window.
+- Once a fix lands and is validated by this suite: revisit `MATCH_TIMEOUT_MS` in
+  `integration-tests/{c,cpp,java,zig}/{cft-reconfigure,liveliness-lost}` — very likely
+  shortenable at that point, per the user's explicit preference.
+
+**Investigation tooling notes for whoever picks this up**:
+- `dds-rtps/rtps_pcap.py` (`list`/`show`/`compare` CLI) is the right tool, but its
+  conversation grouping keys on the generic builtin `readerId`/`writerId` (identical across
+  *every* participant for builtin endpoints) plus `INFO_DST` when present — for a message
+  with `INFO_DST` absent (its own `no_info_dst`/`[*]` marker), it cannot always disambiguate
+  which of several plausible real participants a packet belongs to, since it discards raw
+  IP:port in `_strip_link` (`rtps_pcap.py:489-511`). When precision matters (as it did for
+  this finding), decode the relevant frames directly with `dpkt`, matching on **both** the
+  RTPS message header's own source prefix **and** the `INFO_DST` submessage's payload, not
+  submessage-level entity IDs alone.
+- `dumpcap`'s captured link-layer type is **not consistent** across invocations on this
+  system's `lo` interface — observed both `DLT_LINUX_SLL` (113) and plain `DLT_EN10MB` (1)
+  across different capture sessions of the identical `dumpcap -i lo` command. Always check
+  `dpkt.pcapng.Reader.datalink()` before writing a raw parser; `rtps_pcap.py` itself already
+  dispatches on this correctly, a hand-rolled verification script must too.
 
 ---
 

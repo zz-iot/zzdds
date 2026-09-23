@@ -159,6 +159,51 @@ def main() -> int:
     else:
         skip_or_fail("interop/enable-defer-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
 
+    # ── Wait-for-historical-data cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section(
+            "interop/wait-for-historical-data-cross-binding",
+            lambda: run_script(SCRIPT_DIR / "interop" / "wait_for_historical_data_cross_binding_test.py", env=env),
+        )
+    else:
+        skip_or_fail("interop/wait-for-historical-data-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
+    # ── Ignore-entities cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section(
+            "interop/ignore-entities-cross-binding",
+            lambda: run_script(SCRIPT_DIR / "interop" / "ignore_entities_cross_binding_test.py", env=env),
+        )
+    else:
+        skip_or_fail("interop/ignore-entities-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
+    # ── Cft-reconfigure cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section(
+            "interop/cft-reconfigure-cross-binding",
+            lambda: run_script(SCRIPT_DIR / "interop" / "cft_reconfigure_cross_binding_test.py", env=env),
+        )
+    else:
+        skip_or_fail("interop/cft-reconfigure-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
+    # ── Source-timestamp cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section(
+            "interop/source-timestamp-cross-binding",
+            lambda: run_script(SCRIPT_DIR / "interop" / "source_timestamp_cross_binding_test.py", env=env),
+        )
+    else:
+        skip_or_fail("interop/source-timestamp-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
+    # ── Liveliness-lost cross-binding interop (needs c, cpp, and java; zig is native) ──
+    if c_binding and cpp_binding and java_binding:
+        run_section(
+            "interop/liveliness-lost-cross-binding",
+            lambda: run_script(SCRIPT_DIR / "interop" / "liveliness_lost_cross_binding_test.py", env=env),
+        )
+    else:
+        skip_or_fail("interop/liveliness-lost-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
+
     # ── Summary ──────────────────────────────────────────────────────────
     print("======================================")
     print(f"Passed:  {' '.join(PASSED) if PASSED else '(none)'}")

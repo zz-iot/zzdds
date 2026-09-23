@@ -115,8 +115,10 @@ pub const RtpsTimestamp = extern struct {
 
     /// Convert a DCPS Time to an RTPS Timestamp.
     pub fn fromTime(t: Time) RtpsTimestamp {
-        // fraction = nanosec * 2^32 / 1e9 ≈ nanosec * 4.295
-        const frac: u64 = @as(u64, t.nanosec) * 0x1_0000_0000 / std.time.ns_per_s;
+        // fraction = nanosec * 2^32 / 1e9 ≈ nanosec * 4.295, rounded to nearest
+        // (not truncated) so this round-trips exactly back through toTime()
+        // for any integer nanosecond value -- see toTime()'s matching comment.
+        const frac: u64 = (@as(u64, t.nanosec) * 0x1_0000_0000 + std.time.ns_per_s / 2) / std.time.ns_per_s;
         return .{
             .seconds = @intCast(t.sec),
             .fraction = @intCast(frac),
@@ -125,9 +127,22 @@ pub const RtpsTimestamp = extern struct {
 
     /// Convert an RTPS Timestamp to a DCPS Time.
     pub fn toTime(self: RtpsTimestamp) Time {
-        const ns: u32 = @intCast(@as(u64, self.fraction) * std.time.ns_per_s / 0x1_0000_0000);
+        // Round to nearest, not truncate: a plain floor((fraction * 1e9) /
+        // 2^32) composed with fromTime()'s own floor systematically loses up
+        // to ~1ns on the round trip for nearly every nonzero nanosecond value
+        // (found via integration-tests/source-timestamp: an explicit
+        // dispose_w_timestamp() nanosecond of 123456789 round-tripped back as
+        // 123456788). Mirrors RtpsDuration.toDuration()'s already-correct
+        // rounding + carry handling below -- this and fromTime() were the
+        // two conversions that hadn't been brought in line with it yet.
+        var sec = self.seconds;
+        var ns: u32 = @intCast((@as(u64, self.fraction) * std.time.ns_per_s + 0x8000_0000) / 0x1_0000_0000);
+        if (ns == std.time.ns_per_s) {
+            sec += 1;
+            ns = 0;
+        }
         return .{
-            .sec = @intCast(self.seconds),
+            .sec = @intCast(sec),
             .nanosec = ns,
         };
     }
@@ -157,7 +172,10 @@ pub const RtpsDuration = extern struct {
     /// Convert a DDS/DCPS Duration to an RTPS wire Duration.
     pub fn fromDuration(d: Duration) RtpsDuration {
         if (d.isInfinite()) return infinite;
-        const frac: u64 = @as(u64, d.nanosec) * 0x1_0000_0000 / std.time.ns_per_s;
+        // Rounded to nearest, not truncated -- see RtpsTimestamp.fromTime()'s
+        // matching comment; toDuration() below already rounds on the way
+        // back, this brings the write direction in line with it.
+        const frac: u64 = (@as(u64, d.nanosec) * 0x1_0000_0000 + std.time.ns_per_s / 2) / std.time.ns_per_s;
         return .{
             .seconds = d.sec,
             .fraction = @intCast(frac),

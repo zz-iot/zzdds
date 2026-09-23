@@ -49,10 +49,10 @@ For each API found, classified as:
 
 | Category | APIs |
 |---|---|
-| Liveliness (narrowed 2026-09-17 — see below) | `on_liveliness_lost`, `get_liveliness_lost_status`/`get_liveliness_changed_status` (as a getter, not just the listener), AUTOMATIC/MANUAL_BY_PARTICIPANT kinds, `DomainParticipant.assert_liveliness()`. `assert_liveliness()`, `on_liveliness_changed`, and MANUAL_BY_TOPIC are now covered by the `presence` example (all 4 bindings) — see "Examples" bucket below |
+| Liveliness (narrowed 2026-09-22 — see below) | ~~`on_liveliness_lost`, `get_liveliness_lost_status`, AUTOMATIC/MANUAL_BY_PARTICIPANT kinds~~ — **Done**, Integration-tier `liveliness-lost` scenario (see "First-pass classification" below). `assert_liveliness()`, `on_liveliness_changed`, and MANUAL_BY_TOPIC are covered by the `presence` example (all 4 bindings) — see "Examples" bucket below. Still open, small: `get_liveliness_changed_status` called as an explicit getter (both `presence` and `liveliness-lost` only ever observe it via the listener callback's own status parameter, never call the getter directly) |
 | Rejection/loss | ~~`on_sample_rejected`/`on_sample_lost`, `get_sample_rejected_status`/`get_sample_lost_status`~~ — **Done**, Integration-tier `sample-rejected-lost` scenario (see "First-pass classification" below) |
 | Historical data | `wait_for_historical_data` — confirmed zero across every harness |
-| Timestamped/explicit instance ops | `register_instance` (explicit), `register_instance_w_timestamp`, `write_w_timestamp`, `dispose_w_timestamp`, `unregister_instance_w_timestamp` |
+| Timestamped/explicit instance ops | ~~`register_instance` (explicit), `write_w_timestamp`, `dispose_w_timestamp`~~ — **Done**, Integration-tier `source-timestamp` scenario (see "First-pass classification" below). Still uncovered: `register_instance_w_timestamp` (its timestamp is a documented no-op in zidl, covered by zidl's own backend unit tests instead), `unregister_instance_w_timestamp` (shares the same underlying wire-timestamp plumbing `write_w_timestamp`/`dispose_w_timestamp` already exercise, so a dedicated scenario is low-value) |
 | Instance introspection | `lookup_instance`; `get_key_value` now exercised by the stress `instance` scenario, which found it returns the wrong key for non-leading-key types (zidl codegen, all backends — see below) |
 | Loans | `return_loan_raw`, any loaned-read (`take_raw`/`read_raw` in loan mode) or write-loan (`loan_raw`/`publish_loan_raw`) path — no `examples/` port exercises these yet (internal test-suite coverage exists, see the loan-lifecycle entry below) |
 | Entity admin, post-creation | `set_qos`/`get_qos` round-trip, `get_listener` read-back, `get_status_changes()`, `contains_entity()`. ~~`enable()`/`autoenable_created_entities`~~ — **Done** (2026-09-21; was a uniform no-op stub across every entity type, see `docs/roadmap.md`'s Integration-tier entry) — both core semantics and the `enable-defer` cross-binding scenario now landed |
@@ -61,7 +61,6 @@ For each API found, classified as:
 | Lookup/matched introspection | `lookup_datawriter`/`lookup_datareader`, `get_matched_subscriptions`/`get_matched_publications` + `_data` variants |
 | Bulk teardown | ~~`delete_contained_entities`~~ — **Done**, Integration-tier `delete-contained-entities` scenario (see "First-pass classification" below) |
 | WaitSet/Condition introspection | `WaitSet.get_conditions()`, every getter on every Condition type (`get_query_expression`/`get_query_parameters`/`set_query_parameters`, `get_sample_state_mask`/`get_view_state_mask`/`get_instance_state_mask`/`get_datareader`, `get_enabled_statuses`/`get_entity`, generic `get_trigger_value`) |
-| CFT introspection | `get_filter_expression`/`get_expression_parameters`/`set_expression_parameters`/`get_related_topic` — CFT is set once at creation, never read back or changed |
 | Conditional/batch reads | `read_w_condition`/`read_next_instance_w_condition`/`take_next_instance_w_condition` (only plain `take_w_condition` gets any exercise, in `waitset` only), batch `read_instance`/`take_instance` |
 
 ## Called but not verified
@@ -108,10 +107,9 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   all 4 bindings and all 8 same/cross-binding pairs
   (`interop/presence_cross_binding_smoke_test.py`). Found and fixed 4 real bugs, including
   a wire-level one (`PID_LIVELINESS` was never encoded on the wire at all). Deliberately
-  left out to keep it one scenario: `on_liveliness_lost`/`get_liveliness_lost_status`,
-  AUTOMATIC/MANUAL_BY_PARTICIPANT kinds, `DomainParticipant.assert_liveliness()` — still a
-  real gap, small enough it could be a second small example or folded into the Integration
-  tier instead (see below).
+  left out to keep it one scenario: `on_liveliness_lost`/`get_liveliness_lost_status` and
+  the AUTOMATIC/MANUAL_BY_PARTICIPANT kinds — since closed by the Integration-tier
+  `liveliness-lost` scenario instead of a second example (see below).
 - New small example: **loaned read/write** (`take_raw`/`read_raw` in loan mode —
   `cdr_payloads._maximum == 0` on entry — plus `return_loan_raw`; and the write side,
   `loan_raw`/`publish_loan_raw`/`return_loan_raw`) — distinct usage pattern. The old
@@ -133,13 +131,11 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   demo-able ("list what's on the network"), not just a correctness check.
 
 ### → Integration tests (new, in-repo)
-- ~~**Liveliness through each binding's listener/status marshaling**~~ — substantially
-  closed by the `presence` example (see "Examples" bucket above), which turned out to
-  *be* a real binding-correctness/integration test in everything but name: cross-process,
-  all 4 bindings, hard pass/fail assertion (must observe ONLINE→OFFLINE→ONLINE in order),
-  and it found 4 real bugs. Remaining narrower slice — `on_liveliness_lost` +
-  AUTOMATIC/MANUAL_BY_PARTICIPANT — could go here instead of a new example, since it's a
-  terminal/negative-case scenario (no recovery) rather than a demo-friendly one.
+- ~~**Liveliness through each binding's listener/status marshaling**~~ — closed by the
+  `presence` example (see "Examples" bucket above) for MANUAL_BY_TOPIC/`assert_liveliness()`/
+  `on_liveliness_changed`, and by the Integration-tier `liveliness-lost` scenario for the
+  remaining narrower slice — `on_liveliness_lost`/`get_liveliness_lost_status` and the
+  AUTOMATIC/MANUAL_BY_PARTICIPANT kinds — see "First-pass classification" below.
 - ~~**SAMPLE_REJECTED/SAMPLE_LOST through each binding**~~ — **Done**, as the
   `sample-rejected-lost` Integration-tier scenario (`integration-tests/{c,cpp,java,zig}/sample-rejected-lost`):
   a tight-`resource_limits` reader deliberately overflowed by 5 back-to-back writes
@@ -154,16 +150,38 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   across every entity type, so the feature itself had to be implemented first (see
   `docs/roadmap.md`'s Integration-tier entry for the full mechanism, the real bugs found in
   the process, and the two over-broad `NOT_ENABLED` guards it also found and corrected).
-- **`wait_for_historical_data`** — late-joining reader + DURABILITY, verify it unblocks
-  only once durable replay actually lands, not on a timer.
-- **`ignore_participant`/`ignore_topic`/`ignore_publication`/`ignore_subscription`** —
-  needs 2 real processes to mean anything.
-- **`set_expression_parameters` at runtime** (CFT dynamic reconfiguration) — does
-  changing parameters without recreating the CFT actually re-filter subsequent samples?
-  Real spec-mandated behavior; the *behavioural* question is still untested (the
-  stress-tier `cft` scenario now covers its *concurrency safety* and fixed a UAF there).
-  CFT has an established bug history in this project (missing null-checks found in this
-  same audit).
+- ~~**`wait_for_historical_data`**~~ — **Done**, as the `wait-for-historical-data`
+  Integration-tier scenario (`integration-tests/{c,cpp,java,zig}/wait-for-historical-data`).
+  Modeled on `examples/*/catchup`'s late-joining-reader mechanism but held to a harder bar:
+  a deterministic negative case (a short, non-zero `max_wait` called while no writer exists
+  anywhere on the domain yet must return `RETCODE_TIMEOUT`, not `RETCODE_OK` — closing the
+  negative case `docs/roadmap.md` recorded as deliberately out of scope for `catchup`
+  itself) followed by a positive case (a generous `max_wait` must return `RETCODE_OK` only
+  once every historical sample has actually been delivered). See `integration-tests/README.md`
+  for the full scenario writeup.
+- ~~**`ignore_participant`/`ignore_topic`/`ignore_publication`/`ignore_subscription`**~~ —
+  **Done**, as the `ignore-entities` Integration-tier scenario
+  (`integration-tests/{c,cpp,java,zig}/ignore-entities`) — the only scenario in this tier
+  needing three processes (ignorer/peer/bystander), since `ignore_participant()` would
+  blackhole a whole participant `peer` needs to keep serving the other three ops. Found and
+  fixed a real bug: the retroactive-match scan run when a new local reader/writer is
+  created never checked the ignore lists, so an already-discovered-then-ignored remote
+  entity stayed retroactively matchable to an entity created after the ignore call. See
+  `integration-tests/README.md` for the full scenario writeup and `docs/roadmap.md` for the
+  bug.
+- ~~**`set_expression_parameters` at runtime** (CFT dynamic reconfiguration)~~ — **Done**,
+  as the `cft-reconfigure` Integration-tier scenario
+  (`integration-tests/{c,cpp,java,zig}/cft-reconfigure`) — behavioral correctness (does
+  changing parameters without recreating the CFT actually re-filter subsequent samples),
+  distinct from the stress-tier `cft` scenario's concurrency-safety coverage (a UAF
+  between reconfigure and receive-thread filter eval, already found and fixed there).
+  Also closes the CFT introspection gap this same audit flags below
+  (`get_filter_expression`/`get_expression_parameters`/`get_related_topic`). Found a real
+  Zig-native-binding gotcha along the way: the raw `zzdds.registerTypeSupport()` call
+  doesn't wire up `TypeSupport.get_field` automatically the way the generated
+  `TypeSupport.register()` wrapper C/C++/Java go through does, silently leaving a CFT
+  reader unfiltered with no error. See `integration-tests/README.md` for the full scenario
+  writeup and `docs/roadmap.md` for the bug.
 - ~~**Coherent/ordered access grouping correctness**~~ — **Done**, as the `coherent-sets`
   Integration-tier scenario (`integration-tests/{c,cpp,java,zig}/coherent-sets`,
   `docs/design/integration-test-tier.md`): a real coherent set across two DataWriters
@@ -175,8 +193,14 @@ concurrency/lifecycle-under-load, `OpenDDS EntityLifecycleStress`-shaped).
   fixed a real `hasPendingDataFn` bug (see `docs/roadmap.md`'s Integration-tier entry for the
   full mechanism) that permanently starved a `WaitSet`-driven coherent-access loop after its
   first iteration.
-- **`_w_timestamp` family** — verify the explicit source timestamp actually propagates
-  to `SampleInfo.source_timestamp` on the receiving side, not just "now".
+- ~~**`_w_timestamp` family**~~ — **Done**, as the `source-timestamp` Integration-tier
+  scenario (`integration-tests/{c,cpp,java,zig}/source-timestamp`) — verifies the explicit
+  source timestamp actually propagates to `SampleInfo.source_timestamp` on the receiving
+  side, not just "now". Found and fixed a real zzdds core bug on the very first real
+  cross-process run: `src/util/time.zig`'s RTPS wire fraction↔nanosecond conversion used
+  truncating division, systematically losing ~1ns for nearly any nonzero explicit
+  nanosecond value. See `integration-tests/README.md` for the full scenario writeup and
+  `docs/roadmap.md` for the bug.
 - **Loan lifecycle edges — real coverage now exists, but mostly outside this audit's own
   defined scope** (see this doc's intro: cross-process/cross-binding only, not zzdds's
   Zig-native unit suite). As of the 2026-08-22 raw/loan API redesign:

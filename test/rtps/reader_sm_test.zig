@@ -178,6 +178,47 @@ fn makeReader(
     return r;
 }
 
+// ── is_local: same-participant self-matches skip the match-time AckNack ──────
+//
+// BuiltinPair.matchRemote (builtin_endpoint.zig) sets WriterProxy.is_local when
+// remote.guid.prefix equals the reader's own prefix -- exactly what happens when
+// combined.zig's `self_data` call bootstraps same-participant builtin-endpoint
+// matching. That proxy can't lose data to a lossy network, so the one-shot
+// match-time AckNack (otherwise sent to recover a real writer-side replay race)
+// would just be a self-addressed send repeated forever for nothing.
+
+test "addMatchedWriter: is_local proxy does not send the match-time AckNack" {
+    const reader_guid = makeGuid(0x01, READER_EID);
+    const writer_guid = makeGuid(0x01, WRITER_EID); // same prefix as the reader
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7400);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    var wp = try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true);
+    wp.is_local = true;
+    try r.addMatchedWriter(wp);
+
+    try testing.expectEqual(@as(usize, 0), rec.n);
+}
+
+test "addMatchedWriter: non-local proxy still sends the match-time AckNack" {
+    const reader_guid = makeGuid(0x01, READER_EID);
+    const writer_guid = makeGuid(0x02, WRITER_EID); // genuinely different prefix
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7400);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true);
+    try r.addMatchedWriter(wp);
+
+    try testing.expect(rec.n > 0);
+    _ = findAckNack(&rec) orelse return error.NoAckNackFound;
+}
+
 // ── Heartbeat: non-final with missing SNs → AckNack with NACK bitmap ─────────
 
 test "handleHeartbeat: non-final with missing SNs generates AckNack bitmap" {

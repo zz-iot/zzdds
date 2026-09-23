@@ -37,7 +37,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-6d9c01d' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-bdcdd3b' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -298,9 +298,11 @@ jobs:
   # `examples` job above: every scenario here is built once per binding and
   # run cross-binding, targeting one specific DCPS behavior with a hard
   # correctness assertion rather than a demonstration -- see
-  # docs/design/integration-test-tier.md. One scenario today
-  # (coherent-sets); --strict means a missing binding is a hard failure
-  # here, same reasoning as the `examples` job above.
+  # docs/design/integration-test-tier.md. 9 scenarios today (coherent-sets,
+  # delete-contained-entities, sample-rejected-lost, enable-defer,
+  # wait-for-historical-data, ignore-entities, cft-reconfigure,
+  # source-timestamp, liveliness-lost); --strict means a missing binding is
+  # a hard failure here, same reasoning as the `examples` job above.
   integration-tests:
     name: integration-tests
     needs: test-linux

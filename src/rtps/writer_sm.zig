@@ -310,6 +310,16 @@ pub const ReaderProxy = struct {
     /// vtAddMatchedReader; defaults to false (Example 3, the smaller spec-legal
     /// end-of-coherent-set form) for readers with no known quirk.
     needs_pid_coherent_set_marker: bool = false,
+    /// True when this proxy represents the reader's OWN local participant --
+    /// i.e. it exists only to bootstrap same-participant builtin-endpoint
+    /// matching (see combined.zig's `self_data` call), not a genuinely remote
+    /// reader reachable over a lossy network. Set by BuiltinPair.matchRemote.
+    /// Excludes this proxy from the periodic heartbeat thread's keepalive
+    /// sends and from liveness probing (see sendHeartbeat/beginProbe): RTPS's
+    /// HEARTBEAT/ACKNACK retry protocol exists to recover from real media
+    /// loss, which a same-process match can't suffer from -- without this,
+    /// the writer would re-offer/probe its own port, pointlessly, forever.
+    is_local: bool = false,
     /// Sum of transport.connectionGeneration() across this proxy's effective
     /// locators, as of the last time we replayed to it (at match, or on a
     /// detected reconnect). UDP/connectionless locators always report
@@ -564,7 +574,7 @@ pub const StatefulWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
         for (self.reader_proxies.items) |*rp| {
-            if (rp.guid.prefix.eql(prefix) and rp.reliable) {
+            if (rp.guid.prefix.eql(prefix) and rp.reliable and !rp.is_local) {
                 rp.probe_deadline_ns = deadline_ns;
             }
         }
@@ -674,6 +684,7 @@ pub const StatefulWriter = struct {
                 rp.reliable = proxy.reliable;
                 rp.expects_inline_qos = proxy.expects_inline_qos;
                 rp.wants_replay = proxy.wants_replay;
+                rp.is_local = proxy.is_local;
                 // Locators may have changed on this refresh, and — separately
                 // — a reconnect may have happened since the last periodic
                 // check. Route through the shared resync helper (not a plain
@@ -1328,6 +1339,13 @@ pub const StatefulWriter = struct {
             // assert_liveliness() on a MANUAL_BY_TOPIC writer never reached
             // them, and their lease expired on schedule regardless.
             if (!rp.reliable and !liveliness) continue;
+            // is_local proxies (see ReaderProxy.is_local) never need the periodic
+            // keepalive/re-offer HB: same-participant matches can't lose data to a
+            // lossy network, so there's nothing for this cycle to recover from, only
+            // a self-addressed HB to send every HB_INTERVAL_MS forever. DATA delivery
+            // itself (sendChangeToAllLocked, including its own per-write trailing HB)
+            // is unaffected -- this only skips the background timer's resend.
+            if (rp.is_local) continue;
             const locs = rp.effectiveLocators();
             if (locs.len == 0) continue;
             const last_sn = adj_last;

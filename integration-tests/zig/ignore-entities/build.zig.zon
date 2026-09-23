@@ -1,0 +1,19 @@
+.{
+    .name = .zzdds_it_ignore_ents_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x377baf04e7cf9631,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zzdds = .{
+            .path = "../../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "ignorer.zig",
+        "peer.zig",
+        "bystander.zig",
+        "idl",
+    },
+}
