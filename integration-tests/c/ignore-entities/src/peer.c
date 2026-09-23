@@ -32,10 +32,21 @@
 #include <unistd.h>
 
 #define SAMPLE_COUNT 5
-/* Comfortably longer than ignorer's own SETTLE_WINDOW_S (3s) plus its probe
- * -match round trips -- by the time this window closes, the ignorer has
- * finished every ignore_*() call. */
-#define SETTLE_WINDOW_S 6
+/* NOT long enough to guarantee the ignorer has finished every ignore_*()
+ * call -- its own PROBE_MATCH_TIMEOUT_MS (45s) applies twice, sequentially,
+ * for the publication and subscription probes, so its true worst case is
+ * well over a minute. Raised from 6s to match this file's own MATCH_TIMEOUT_MS
+ * convention as a meaningfully better (not watertight) margin: the
+ * SubscriptionIgnoredTopic check below can still report a false pass -- zero
+ * samples because the real (post-ignore) writer hasn't been created yet,
+ * not because ignore_subscription() worked -- if the ignorer is still deep
+ * in its own probe/settle choreography when this window closes. A fully
+ * watertight fix needs an explicit cross-process signal (e.g. a dedicated
+ * marker topic) rather than a fixed sleep; not done here to avoid adding a
+ * worst-case 100+s wait on top of an already CI-budget-constrained suite
+ * (found via Greptile review; see docs/roadmap.md's discovery-latency entry
+ * for the same underlying "how long is long enough" tension). */
+#define SETTLE_WINDOW_S 20
 #define MATCH_TIMEOUT_MS 20000
 #define DRAIN_TIMEOUT_MS 15000
 #define POLL_PERIOD_MS 20

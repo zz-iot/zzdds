@@ -1339,13 +1339,20 @@ pub const StatefulWriter = struct {
             // assert_liveliness() on a MANUAL_BY_TOPIC writer never reached
             // them, and their lease expired on schedule regardless.
             if (!rp.reliable and !liveliness) continue;
-            // is_local proxies (see ReaderProxy.is_local) never need the periodic
-            // keepalive/re-offer HB: same-participant matches can't lose data to a
-            // lossy network, so there's nothing for this cycle to recover from, only
-            // a self-addressed HB to send every HB_INTERVAL_MS forever. DATA delivery
-            // itself (sendChangeToAllLocked, including its own per-write trailing HB)
-            // is unaffected -- this only skips the background timer's resend.
-            if (rp.is_local) continue;
+            // is_local proxies (see ReaderProxy.is_local) skip the periodic
+            // keepalive/re-offer HB only once fully caught up: DATA delivery itself
+            // (sendChangeToAllLocked, including its own per-write trailing HB) still
+            // goes over the real transport unchanged, which CAN drop a packet under
+            // load same as any other send (see docs/roadmap.md's discovery-latency
+            // investigation for direct evidence this happens even on loopback) --
+            // so while this proxy still has unacknowledged data outstanding, the
+            // periodic HB remains the only recovery path for that loss and must keep
+            // firing, same as for any other proxy. Once caught up there's nothing
+            // left to recover, only a self-addressed HB to send every HB_INTERVAL_MS
+            // forever, which is what this actually skips (found via Greptile review:
+            // an earlier unconditional skip here could leave a same-participant
+            // match hung forever if its one real send was lost, with no fallback).
+            if (rp.is_local and rp.highest_acked_sn >= adj_last) continue;
             const locs = rp.effectiveLocators();
             if (locs.len == 0) continue;
             const last_sn = adj_last;

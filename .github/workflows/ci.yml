@@ -307,7 +307,15 @@ jobs:
     name: integration-tests
     needs: test-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Raised from 20: 5 new heavyweight suites landed together (each rebuilds 4
+    # bindings, then runs 8 combinations sequentially with per-pair internal
+    # deadline chains up to 240s for ignore-entities), on top of the 4 already
+    # here. A slow CI runner absorbing that added weight risks the job getting
+    # killed by this ceiling itself -- a confusing failure mode that names no
+    # scenario -- rather than by one of run_all.py's own scenario-level
+    # timeouts, which at least explain what actually went wrong (found via
+    # Greptile review).
+    timeout-minutes: 40
 
     steps:
       - name: Check out zzdds

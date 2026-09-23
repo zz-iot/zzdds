@@ -12,7 +12,22 @@ import io.zzdds.dcps.Dcps;
 
 public class Peer {
     static final int SAMPLE_COUNT = 5;
-    static final int SETTLE_WINDOW_MS = 6000;
+    // NOT long enough to guarantee the ignorer has finished every ignore_*()
+    // call -- its own PROBE_MATCH_TIMEOUT_MS (45s) applies twice, sequentially,
+    // for the publication and subscription probes, so its true worst case is
+    // well over a minute. Raised from 6s to match this file's own
+    // MATCH_TIMEOUT_MS convention as a meaningfully better (not watertight)
+    // margin: the SubscriptionIgnoredTopic check below can still report a
+    // false pass -- zero samples because the real (post-ignore) writer hasn't
+    // been created yet, not because ignore_subscription() worked -- if the
+    // ignorer is still deep in its own probe/settle choreography when this
+    // window closes. A fully watertight fix needs an explicit cross-process
+    // signal (e.g. a dedicated marker topic) rather than a fixed sleep; not
+    // done here to avoid adding a worst-case 100+s wait on top of an already
+    // CI-budget-constrained suite (found via Greptile review; see
+    // docs/roadmap.md's discovery-latency entry for the same underlying "how
+    // long is long enough" tension).
+    static final int SETTLE_WINDOW_MS = 20000;
     static final int MATCH_TIMEOUT_MS = 20000;
     static final int DRAIN_TIMEOUT_MS = 15000;
     static final int POLL_PERIOD_MS = 20;

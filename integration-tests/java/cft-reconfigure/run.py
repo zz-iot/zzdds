@@ -17,7 +17,12 @@ from _common import LiveProcess, java_cmd, require_path, run_env, zzdds_zig_out
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLASSES_DIR = SCRIPT_DIR / "build" / "classes"
 
-PROC_TIMEOUT_S = 60
+# Matches interop/cft_reconfigure_cross_binding_test.py's own PROC_TIMEOUT_S --
+# shorter than the scenario's own internal deadline chain (match wait 40s +
+# go-ahead wait 20s + drain wait 15s = 75s worst case) would let this script's
+# own stop() kill an otherwise-valid run before its FAIL message could explain
+# why, instead of the run failing on its own terms (found via Greptile review).
+PROC_TIMEOUT_S = 100
 
 
 def main() -> int:

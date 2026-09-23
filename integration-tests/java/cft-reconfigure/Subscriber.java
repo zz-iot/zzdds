@@ -266,6 +266,21 @@ public class Subscriber {
         System.out.println("Subscriber: witnessed all " + TOTAL_COUNT + " total samples via unfiltered reader.");
         System.out.flush();
 
+        // The witness and filtered readers are separate DataReaders with independent
+        // delivery/dispatch, so the witness reader reaching TOTAL_COUNT does not
+        // guarantee the filtered reader's own listener has finished processing its
+        // (fewer) samples yet. Wait for the filtered reader's own count before
+        // asserting its exact contents below, or a correct implementation can fail
+        // this nondeterministically (found via Greptile review).
+        deadline = System.currentTimeMillis() + FINAL_TIMEOUT_MS;
+        while (filteredState.count.get() < PHASE2_COUNT) {
+            if (System.currentTimeMillis() > deadline) {
+                System.err.println("FAIL: filtered reader only saw " + filteredState.count.get() + "/" + PHASE2_COUNT + " phase2 samples within " + (FINAL_TIMEOUT_MS / 1000) + "s");
+                System.exit(1);
+            }
+            Thread.sleep(POLL_PERIOD_MS);
+        }
+
         // -- The core assertion: the filtered reader must have received
         // *exactly* {5,6,7,8,9} -- phase2 correctly re-filtered against the
         // new threshold (proving live reconfiguration works), and phase1's

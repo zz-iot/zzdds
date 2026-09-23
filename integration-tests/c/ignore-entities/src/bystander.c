@@ -13,7 +13,12 @@
  * participant exists -- a wide, comfortable window (same convention as
  * enable-defer's PRE_ENABLE_DELAY) for the ignorer to discover and ignore
  * this participant before the writer's SEDP announcement can ever reach
- * it.
+ * it. Set comfortably beyond the harness's own
+ * BYSTANDER_IGNORED_TIMEOUT_S (20s, ignore_entities_cross_binding_test.py)
+ * for confirming that ignore -- a shorter delay here could let this
+ * writer's SEDP announcement race ahead of ignore_participant() even in
+ * runs the harness itself still considers within budget (found via
+ * Greptile review).
  *
  * IMPORTANT: this process's own match-count is NOT expected to be zero,
  * and this file does not assert that it is. ignore_participant() is called
@@ -42,7 +47,7 @@
 #include <unistd.h>
 
 #define SAMPLE_COUNT 5
-#define PRE_WRITER_DELAY_S 4
+#define PRE_WRITER_DELAY_S 22
 #define POST_WRITE_SETTLE_S 6
 
 static uint32_t parse_domain(int argc, char **argv) {

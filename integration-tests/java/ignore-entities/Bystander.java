@@ -11,7 +11,12 @@ import io.zzdds.dcps.Dcps;
 
 public class Bystander {
     static final int SAMPLE_COUNT = 5;
-    static final int PRE_WRITER_DELAY_MS = 4000;
+    // Set comfortably beyond the harness's own BYSTANDER_IGNORED_TIMEOUT_S (20s,
+    // ignore_entities_cross_binding_test.py) for confirming that ignore -- a
+    // shorter delay here could let this writer's SEDP announcement race ahead
+    // of ignore_participant() even in runs the harness itself still considers
+    // within budget (found via Greptile review).
+    static final int PRE_WRITER_DELAY_MS = 22000;
     static final int POST_WRITE_SETTLE_MS = 6000;
 
     static int parseDomain(String[] args) {

@@ -329,6 +329,21 @@ int main(int argc, char **argv) {
     printf("Subscriber: witnessed all %d total samples via unfiltered reader.\n", TOTAL_COUNT);
     fflush(stdout);
 
+    /* -- The witness and filtered readers are separate DataReaders with
+     * independent delivery/dispatch, so the witness reader reaching
+     * TOTAL_COUNT does not guarantee the filtered reader's own listener has
+     * finished processing its (fewer) samples yet. Wait for the filtered
+     * reader's own count before asserting its exact contents below, or a
+     * correct implementation can fail this nondeterministically (found via
+     * Greptile review). -- */
+    for (int waited_ms = 0; atomic_load(&filtered_state.count) < PHASE2_COUNT; waited_ms += POLL_PERIOD_MS) {
+        if (waited_ms >= FINAL_TIMEOUT_MS) {
+            fprintf(stderr, "FAIL: filtered reader only saw %d/%d phase2 samples within %ds\n", atomic_load(&filtered_state.count), PHASE2_COUNT, FINAL_TIMEOUT_MS / 1000);
+            return 1;
+        }
+        usleep(POLL_PERIOD_MS * 1000);
+    }
+
     /* -- The core assertion: the filtered reader must have received
      * *exactly* {5,6,7,8,9} -- phase2 correctly re-filtered against the new
      * threshold (proving live reconfiguration works), and phase1's seq=3

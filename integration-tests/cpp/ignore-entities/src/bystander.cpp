@@ -20,7 +20,12 @@
 namespace {
 
 constexpr int SAMPLE_COUNT = 5;
-constexpr int PRE_WRITER_DELAY_S = 4;
+// Set comfortably beyond the harness's own BYSTANDER_IGNORED_TIMEOUT_S (20s,
+// ignore_entities_cross_binding_test.py) for confirming that ignore -- a
+// shorter delay here could let this writer's SEDP announcement race ahead of
+// ignore_participant() even in runs the harness itself still considers
+// within budget (found via Greptile review).
+constexpr int PRE_WRITER_DELAY_S = 22;
 constexpr int POST_WRITE_SETTLE_S = 6;
 
 uint32_t parse_domain(int argc, char **argv) {

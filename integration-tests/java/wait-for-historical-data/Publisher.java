@@ -112,6 +112,20 @@ public class Publisher {
             System.out.println("Publisher: wrote historical seq_num=" + seq);
         }
 
+        // Verify the batch above was genuinely historical: the subscriber and its
+        // reader already exist by the time this process starts (see the harness),
+        // so nothing here actually stops discovery from completing fast enough to
+        // match before this fast, unthrottled write loop finishes -- which would
+        // silently turn some or all of it into ordinary live delivery instead of
+        // exercising TRANSIENT_LOCAL replay, without the subscriber's
+        // sequence-number-only check ever noticing (found via Greptile review).
+        // Assert unmatched here instead of just assuming it, so a race like that
+        // fails loudly instead of silently validating nothing.
+        if (state.matchedCurrentCount.get() != 0) {
+            System.err.println("FAIL: reader matched before the historical batch finished writing -- not exercising late-join replay");
+            System.exit(1);
+        }
+
         // -- Wait for the late-joining reader to match. --
         long deadline = System.currentTimeMillis() + MATCH_TIMEOUT_MS;
         while (!state.everMatched.get()) {

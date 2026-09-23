@@ -292,6 +292,21 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.print("Subscriber: witnessed all {d} total samples via unfiltered reader.\n", .{TOTAL_COUNT});
 
+    // The witness and filtered readers are separate DataReaders with independent
+    // delivery/dispatch, so the witness reader reaching TOTAL_COUNT does not
+    // guarantee the filtered reader's own listener has finished processing its
+    // (fewer) samples yet. Wait for the filtered reader's own count before
+    // asserting its exact contents below, or a correct implementation can fail
+    // this nondeterministically (found via Greptile review).
+    const filtered_deadline = monoNs(io) + FINAL_TIMEOUT_NS;
+    while (filtered_state.count.load(.acquire) < PHASE2_COUNT) {
+        if (monoNs(io) > filtered_deadline) {
+            std.debug.print("FAIL: filtered reader only saw {d}/{d} phase2 samples within {d}s\n", .{ filtered_state.count.load(.acquire), PHASE2_COUNT, @divExact(FINAL_TIMEOUT_NS, std.time.ns_per_s) });
+            std.process.exit(1);
+        }
+        sleepNs(io, POLL_PERIOD_NS);
+    }
+
     // -- The core assertion: the filtered reader must have received
     // *exactly* {5,6,7,8,9} -- phase2 correctly re-filtered against the new
     // threshold (proving live reconfiguration works), and phase1's seq=3

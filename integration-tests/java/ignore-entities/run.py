@@ -35,7 +35,14 @@ IGNORER_HEAD_START_S = 5
 # plus bystander's own JVM startup -- gives ignorer time to discover and
 # ignore bystander's participant before peer ever exists.
 BYSTANDER_HEAD_START_S = 10
-PROC_TIMEOUT_S = 60
+# Matches interop/ignore_entities_cross_binding_test.py's own PROC_TIMEOUT_S --
+# ignorer's own internal deadline chain (DISCOVER_BYSTANDER_TIMEOUT_MS 15s +
+# PROBE_MATCH_TIMEOUT_MS 45s, twice + settle/match/receive waits) plus the
+# head starts above run well past 60s; a shorter timeout here would let this
+# script's own stop() kill an otherwise-valid run before its FAIL message
+# could explain why, instead of the run failing on its own terms (found via
+# Greptile review).
+PROC_TIMEOUT_S = 240
 
 
 def main() -> int:

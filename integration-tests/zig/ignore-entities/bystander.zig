@@ -38,7 +38,12 @@ const DDS = @import("zzdds_generated").DDS;
 const ignore_event_gen = @import("ignore_event_gen");
 
 const SAMPLE_COUNT: i32 = 5;
-const PRE_WRITER_DELAY_NS: u64 = 4 * std.time.ns_per_s;
+// Set comfortably beyond the harness's own BYSTANDER_IGNORED_TIMEOUT_S (20s,
+// ignore_entities_cross_binding_test.py) for confirming that ignore -- a
+// shorter delay here could let this writer's SEDP announcement race ahead of
+// ignore_participant() even in runs the harness itself still considers
+// within budget (found via Greptile review).
+const PRE_WRITER_DELAY_NS: u64 = 22 * std.time.ns_per_s;
 const POST_WRITE_SETTLE_NS: u64 = 6 * std.time.ns_per_s;
 const POLL_PERIOD_NS: u64 = 20 * std.time.ns_per_ms;
 

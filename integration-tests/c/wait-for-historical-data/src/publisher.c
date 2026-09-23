@@ -126,6 +126,21 @@ int main(int argc, char **argv) {
         printf("Publisher: wrote historical seq_num=%d\n", seq);
     }
 
+    /* -- Verify the batch above was genuinely historical: the subscriber and
+     * its reader already exist by the time this process starts (see the
+     * harness), so nothing here actually stops discovery from completing
+     * fast enough to match before this fast, unthrottled write loop
+     * finishes -- which would silently turn some or all of it into ordinary
+     * live delivery instead of exercising TRANSIENT_LOCAL replay, without
+     * the subscriber's sequence-number-only check ever noticing (found via
+     * Greptile review). Assert unmatched here instead of just assuming it,
+     * so a race like that fails loudly instead of silently validating
+     * nothing. -- */
+    if (atomic_load(&state.matched_current_count) != 0) {
+        fprintf(stderr, "FAIL: reader matched before the historical batch finished writing -- not exercising late-join replay\n");
+        return 1;
+    }
+
     /* -- Wait for the late-joining reader to match. -- */
     for (int waited_ms = 0; !atomic_load(&state.ever_matched); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= MATCH_TIMEOUT_MS) {
