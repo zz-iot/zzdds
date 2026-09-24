@@ -79,6 +79,7 @@ int main(void) {
 
     check(SensorSampleTypeSupport_register(dp, "SensorSample"),
           "register_type_support");
+    fprintf(stderr, "CHECKPOINT: SensorSample type registered\n"); fflush(stderr);
 
     DDS_Topic topic = DDS_DomainParticipant_create_topic(dp, "SensorTopic", "SensorSample", NULL, NULL, 0);
     if (!topic) {
@@ -86,11 +87,14 @@ int main(void) {
         return 1;
     }
 
+    fprintf(stderr, "CHECKPOINT: SensorSample topic created\n"); fflush(stderr);
+
     DDS_Subscriber sub = DDS_DomainParticipant_create_subscriber(dp, NULL, NULL, 0);
     if (!sub) {
         fprintf(stderr, "FAIL: create_subscriber returned NULL\n");
         return 1;
     }
+    fprintf(stderr, "CHECKPOINT: subscriber created\n"); fflush(stderr);
 
     DDS_TopicDescription topic_desc = zzdds_topic_as_description(topic);
     DDS_DataReader dr = DDS_Subscriber_create_datareader(sub, topic_desc, NULL, NULL, 0);
@@ -101,15 +105,18 @@ int main(void) {
 
     SensorSampleDataReader typed_reader;
     SensorSampleDataReader_init(&typed_reader, dr);
+    fprintf(stderr, "CHECKPOINT: SensorSample datareader created+init\n"); fflush(stderr);
 
     check(SensorLogTypeSupport_register(dp, "SensorLog"),
           "register_type_support (SensorLog)");
+    fprintf(stderr, "CHECKPOINT: SensorLog type registered\n"); fflush(stderr);
 
     DDS_Topic log_topic = DDS_DomainParticipant_create_topic(dp, "SensorLogTopic", "SensorLog", NULL, NULL, 0);
     if (!log_topic) {
         fprintf(stderr, "FAIL: create_topic (SensorLog) returned NULL\n");
         return 1;
     }
+    fprintf(stderr, "CHECKPOINT: SensorLog topic created\n"); fflush(stderr);
 
     DDS_TopicDescription log_topic_desc = zzdds_topic_as_description(log_topic);
     DDS_DataReader log_dr = DDS_Subscriber_create_datareader(sub, log_topic_desc, NULL, NULL, 0);
@@ -120,6 +127,7 @@ int main(void) {
 
     SensorLogDataReader log_reader;
     SensorLogDataReader_init(&log_reader, log_dr);
+    fprintf(stderr, "CHECKPOINT: SensorLog datareader created+init\n"); fflush(stderr);
 
     /* Give discovery/matching a moment to settle before arming the guard:
      * SPDP/SEDP built-in discovery endpoints spawn a heartbeat thread per

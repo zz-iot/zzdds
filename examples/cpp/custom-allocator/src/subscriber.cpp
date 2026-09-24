@@ -76,6 +76,7 @@ int main() {
     auto dp_handle = dp->native_handle();
 
     check(SensorSampleTypeSupport::register_type(dp_handle), "register_type");
+    std::fprintf(stderr, "CHECKPOINT: SensorSample type registered\n"); std::fflush(stderr);
 
     auto topic = dp->create_topic(
         "SensorTopic", "SensorSample", ::DDS::TopicQos::default_value(), nullptr, 0);
@@ -84,11 +85,14 @@ int main() {
         return 1;
     }
 
+    std::fprintf(stderr, "CHECKPOINT: SensorSample topic created\n"); std::fflush(stderr);
+
     auto sub = dp->create_subscriber(::DDS::SubscriberQos::default_value(), nullptr, 0);
     if (!sub) {
         std::fprintf(stderr, "FAIL: create_subscriber returned null\n");
         return 1;
     }
+    std::fprintf(stderr, "CHECKPOINT: subscriber created\n"); std::fflush(stderr);
 
     auto dr = sub->create_datareader(topic, ::DDS::DataReaderQos::default_value(), nullptr, 0);
     if (!dr) {
@@ -98,8 +102,10 @@ int main() {
     auto dr_handle = dr->native_handle();
 
     SensorSampleDataReader typed_reader(dr_handle);
+    std::fprintf(stderr, "CHECKPOINT: SensorSample datareader created+init\n"); std::fflush(stderr);
 
     check(SensorLogTypeSupport::register_type(dp_handle), "register_type (SensorLog)");
+    std::fprintf(stderr, "CHECKPOINT: SensorLog type registered\n"); std::fflush(stderr);
 
     auto log_topic = dp->create_topic(
         "SensorLogTopic", "SensorLog", ::DDS::TopicQos::default_value(), nullptr, 0);
@@ -107,6 +113,7 @@ int main() {
         std::fprintf(stderr, "FAIL: create_topic (SensorLog) returned null\n");
         return 1;
     }
+    std::fprintf(stderr, "CHECKPOINT: SensorLog topic created\n"); std::fflush(stderr);
 
     auto log_dr = sub->create_datareader(log_topic, ::DDS::DataReaderQos::default_value(), nullptr, 0);
     if (!log_dr) {
@@ -116,6 +123,7 @@ int main() {
     auto log_dr_handle = log_dr->native_handle();
 
     SensorLogDataReader log_reader(log_dr_handle);
+    std::fprintf(stderr, "CHECKPOINT: SensorLog datareader created+init\n"); std::fflush(stderr);
 
     // Give discovery/matching a moment to settle before arming the guard:
     // SPDP/SEDP built-in discovery endpoints spawn a heartbeat thread per

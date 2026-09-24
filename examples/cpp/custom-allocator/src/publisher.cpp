@@ -88,6 +88,7 @@ int main() {
     auto dp_handle = dp->native_handle();
 
     check(SensorSampleTypeSupport::register_type(dp_handle), "register_type");
+    std::fprintf(stderr, "CHECKPOINT: SensorSample type registered\n"); std::fflush(stderr);
 
     auto topic = dp->create_topic(
         "SensorTopic", "SensorSample", ::DDS::TopicQos::default_value(), nullptr, 0);
@@ -96,11 +97,14 @@ int main() {
         return 1;
     }
 
+    std::fprintf(stderr, "CHECKPOINT: SensorSample topic created\n"); std::fflush(stderr);
+
     auto pub = dp->create_publisher(::DDS::PublisherQos::default_value(), nullptr, 0);
     if (!pub) {
         std::fprintf(stderr, "FAIL: create_publisher returned null\n");
         return 1;
     }
+    std::fprintf(stderr, "CHECKPOINT: publisher created\n"); std::fflush(stderr);
 
     auto dw = pub->create_datawriter(topic, ::DDS::DataWriterQos::default_value(), nullptr, 0);
     if (!dw) {
@@ -110,6 +114,7 @@ int main() {
     auto dw_handle = dw->native_handle();
 
     SensorSampleDataWriter typed_writer(dw_handle);
+    std::fprintf(stderr, "CHECKPOINT: SensorSample datawriter created+init\n"); std::fflush(stderr);
 
     // Milestone 2: SensorLog has an unbounded string and sequence -- writing
     // it needs no heap at all (the fields just get assigned from this
@@ -117,6 +122,7 @@ int main() {
     // of unbounded fields on the wire, which the subscriber's decode side
     // then has to handle.
     check(SensorLogTypeSupport::register_type(dp_handle), "register_type (SensorLog)");
+    std::fprintf(stderr, "CHECKPOINT: SensorLog type registered\n"); std::fflush(stderr);
 
     auto log_topic = dp->create_topic(
         "SensorLogTopic", "SensorLog", ::DDS::TopicQos::default_value(), nullptr, 0);
@@ -124,6 +130,7 @@ int main() {
         std::fprintf(stderr, "FAIL: create_topic (SensorLog) returned null\n");
         return 1;
     }
+    std::fprintf(stderr, "CHECKPOINT: SensorLog topic created\n"); std::fflush(stderr);
 
     auto log_dw = pub->create_datawriter(log_topic, ::DDS::DataWriterQos::default_value(), nullptr, 0);
     if (!log_dw) {
@@ -133,6 +140,7 @@ int main() {
     auto log_dw_handle = log_dw->native_handle();
 
     SensorLogDataWriter log_writer(log_dw_handle);
+    std::fprintf(stderr, "CHECKPOINT: SensorLog datawriter created+init\n"); std::fflush(stderr);
 
     std::printf("publisher: writing %d samples on domain %d...\n", SAMPLE_COUNT, DOMAIN_ID);
 

@@ -80,6 +80,7 @@ int main(void) {
 
     check(SensorSampleTypeSupport_register(dp, "SensorSample"),
           "register_type_support");
+    fprintf(stderr, "CHECKPOINT: SensorSample type registered\n"); fflush(stderr);
 
     DDS_Topic topic = DDS_DomainParticipant_create_topic(dp, "SensorTopic", "SensorSample", NULL, NULL, 0);
     if (!topic) {
@@ -87,11 +88,14 @@ int main(void) {
         return 1;
     }
 
+    fprintf(stderr, "CHECKPOINT: SensorSample topic created\n"); fflush(stderr);
+
     DDS_Publisher pub = DDS_DomainParticipant_create_publisher(dp, NULL, NULL, 0);
     if (!pub) {
         fprintf(stderr, "FAIL: create_publisher returned NULL\n");
         return 1;
     }
+    fprintf(stderr, "CHECKPOINT: publisher created\n"); fflush(stderr);
 
     DDS_DataWriter dw = DDS_Publisher_create_datawriter(pub, topic, NULL, NULL, 0);
     if (!dw) {
@@ -101,6 +105,7 @@ int main(void) {
 
     SensorSampleDataWriter typed_writer;
     SensorSampleDataWriter_init(&typed_writer, dw, ZIDL_XCDR1);
+    fprintf(stderr, "CHECKPOINT: SensorSample datawriter created+init\n"); fflush(stderr);
 
     /* Milestone 2: SensorLog has an unbounded string and sequence -- writing
      * it needs no heap at all (the fields just point at this process's own
@@ -109,12 +114,14 @@ int main(void) {
      * zidl_cdr allocator injection) then has to handle. */
     check(SensorLogTypeSupport_register(dp, "SensorLog"),
           "register_type_support (SensorLog)");
+    fprintf(stderr, "CHECKPOINT: SensorLog type registered\n"); fflush(stderr);
 
     DDS_Topic log_topic = DDS_DomainParticipant_create_topic(dp, "SensorLogTopic", "SensorLog", NULL, NULL, 0);
     if (!log_topic) {
         fprintf(stderr, "FAIL: create_topic (SensorLog) returned NULL\n");
         return 1;
     }
+    fprintf(stderr, "CHECKPOINT: SensorLog topic created\n"); fflush(stderr);
 
     DDS_DataWriter log_dw = DDS_Publisher_create_datawriter(pub, log_topic, NULL, NULL, 0);
     if (!log_dw) {
@@ -124,6 +131,7 @@ int main(void) {
 
     SensorLogDataWriter log_writer;
     SensorLogDataWriter_init(&log_writer, log_dw, ZIDL_XCDR1);
+    fprintf(stderr, "CHECKPOINT: SensorLog datawriter created+init\n"); fflush(stderr);
 
     printf("publisher: writing %d samples on domain %d...\n", SAMPLE_COUNT, DOMAIN_ID);
 
