@@ -651,6 +651,16 @@ pub fn build(b: *std.Build) void {
             run_gen_def.addFileArg(gen_c_lib_dir.path(b, "dcps_cdr.c"));
             run_gen_def.addFileArg(gen_zzdds_c_lib_dir.path(b, "zzdds_cdr.c"));
             zzdds_lib.win32_module_definition = zzdds_def;
+            // Unlike addCSourceFile/addIncludePath, assigning
+            // win32_module_definition directly does NOT wire up a step
+            // dependency on its own -- confirmed the hard way: without
+            // this, zzdds_lib's own compile step can run before
+            // run_gen_def has produced the .def file, panicking
+            // ("misconfigured build script": "getPath() was called on a
+            // GeneratedFile that wasn't built yet") on the Windows
+            // "Windows x86_64" core CI job, which is exactly where this
+            // path first actually ran.
+            zzdds_lib.step.dependOn(&run_gen_def.step);
         }
 
         const install_zzdds_lib_step: *std.Build.Step = if (target.result.os.tag == .macos) blk: {
