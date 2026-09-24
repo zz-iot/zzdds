@@ -151,8 +151,11 @@ pub fn parse(alloc: std.mem.Allocator, src: []const u8) Error!Table {
 /// (the ambient zero-arg resolve case) or a real problem (an explicitly named
 /// path) make that call themselves; this function never silently swallows anything.
 pub fn parseFile(alloc: std.mem.Allocator, path: []const u8) !Table {
+    std.debug.print("CHECKPOINT: toml.parseFile entered\n", .{});
     const io = std.Io.Threaded.global_single_threaded.io();
+    std.debug.print("CHECKPOINT: got threaded io\n", .{});
     const src = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, std.Io.Limit.limited(256 * 1024));
+    std.debug.print("CHECKPOINT: readFileAlloc returned, {d} bytes\n", .{src.len});
     return parse(alloc, src);
 }
 
