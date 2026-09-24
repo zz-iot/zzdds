@@ -219,7 +219,10 @@ int main(int argc, char **argv) {
     watchdog.gc = gc;
     watchdog.stop = false;
     portable_thread_t watchdog_thread;
-    portable_thread_create(&watchdog_thread, watchdog_run, &watchdog);
+    if (portable_thread_create(&watchdog_thread, watchdog_run, &watchdog) != 0) {
+        fprintf(stderr, "FAIL: watchdog thread creation failed\n");
+        return 1;
+    }
 
     DDS_Condition gc_cond = DDS_GuardCondition_as_DDS_Condition(gc);
     DDS_Condition sc_cond = DDS_StatusCondition_as_DDS_Condition(sc);

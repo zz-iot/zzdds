@@ -494,6 +494,30 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .sanitize_thread = sanitize_thread,
+            // This module is installed as a standalone static library for
+            // direct third-party C/C++ linking (see installArtifact below),
+            // not just embedded into libzzdds's own final link — so it must
+            // not depend on runtime hooks only Zig's own linker step would
+            // satisfy. Left at Zig's default (unset), Debug/ReleaseSafe
+            // optimize modes instrument zidl_cdr.c's C source with
+            // -fsanitize-c (emitting calls to __ubsan_handle_*) and
+            // -fstack-protector (__stack_chk_fail/__stack_chk_guard).
+            // Those get resolved for free when this module is linked into
+            // libzzdds.so/.dll (Zig statically links its own compiler-rt at
+            // that final link step) and, on Linux, __stack_chk_fail/_guard
+            // happen to also be satisfied by glibc regardless -- but an
+            // external MSVC-linked consumer of the exported zidl_cdr.lib has
+            // no such runtime available for any of these symbols, and fails
+            // with LNK2019 unresolved externals (found building the Windows
+            // examples lane, which is the first place anything linked
+            // zidl_cdr.lib directly via a non-Zig toolchain). zidl_cdr.c is
+            // vendored, narrow, mechanical CDR encode/decode logic from the
+            // zidl dependency, not zzdds's own Zig code -- disabling these
+            // C-source-specific checks here doesn't touch Zig's own native
+            // safety checks (bounds/overflow/etc.) anywhere else in the
+            // project, which are a separate, unaffected mechanism.
+            .sanitize_c = .off,
+            .stack_protector = false,
         });
         zidl_cdr_mod.addCSourceFile(.{
             .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
