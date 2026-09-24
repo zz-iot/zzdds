@@ -19,7 +19,13 @@
 #include <csignal>
 #include <ctime>
 #include <cinttypes>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 #include <memory>
 #include <string>
 #include <vector>
@@ -383,7 +389,7 @@ int run_publisher(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr<
          * GSN so the subscriber joins mid-stream and never receives a
          * complete set. */
         if (use_coherent_gating && !printed_matched) {
-            usleep(static_cast<useconds_t>(opts.write_period_ms * 1000));
+            sleep_ms(static_cast<int>(opts.write_period_ms));
             continue;
         }
 
@@ -445,7 +451,7 @@ int run_publisher(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr<
         }
 
         iteration++;
-        usleep(static_cast<useconds_t>(opts.write_period_ms * 1000));
+        sleep_ms(static_cast<int>(opts.write_period_ms));
     }
 
     /* Unregister/dispose all instances across all topics on finite run. */
@@ -695,7 +701,7 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
          * on_requested_deadline_missed() fires on its own. */
 
         iteration++;
-        usleep(static_cast<useconds_t>(opts.read_period_ms * 1000));
+        sleep_ms(static_cast<int>(opts.read_period_ms));
     }
 
     if (cft) dp->delete_contentfilteredtopic(cft);

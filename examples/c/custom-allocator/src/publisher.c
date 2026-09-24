@@ -13,7 +13,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define DOMAIN_ID 7
 #define SAMPLE_COUNT 10
@@ -125,7 +131,7 @@ int main(void) {
      * std.heap.c_allocator on the libc/pthread backend (SpawnConfig.allocator
      * is silently ignored there) -- a one-time, bounded, per-newly-matched-peer
      * cost, not a per-sample hot-path one, so it belongs before arming. */
-    sleep(2);
+    sleep_ms(2000);
 
     /* All one-time/discovery-adjacent allocation is done -- arm the guard so
      * any further malloc/calloc/realloc/free aborts the process. */
@@ -141,7 +147,7 @@ int main(void) {
 
         check(SensorSampleDataWriter_write(&typed_writer, &sample, DDS_HANDLE_NIL), "DataWriter_write");
         printf("  wrote sample %d: temp=%.1fC label=%s\n", i, sample.temperature_c, sample.label);
-        usleep(200 * 1000);
+        sleep_ms(200);
     }
 
     printf("publisher: writing %d log samples...\n", LOG_COUNT);
@@ -161,12 +167,12 @@ int main(void) {
 
         check(SensorLogDataWriter_write(&log_writer, &log_sample, DDS_HANDLE_NIL), "SensorLogDataWriter_write");
         printf("  wrote log %d: %s\n", i, message);
-        usleep(200 * 1000);
+        sleep_ms(200);
     }
 
     /* Give the last samples time to actually go out over the wire before
      * tearing everything down. */
-    sleep(1);
+    sleep_ms(1000);
 
     noalloc_guard_try_disarm();
     zzdds_destroy_factory(factory);

@@ -14,11 +14,17 @@
 #include "zzdds_c.h"
 #include "zzdds.h"
 
-#include <stdatomic.h>
+#include <signal.h> /* sig_atomic_t */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define EXPECTED_SAMPLES 3
 #define RECEIVE_TIMEOUT_MS 30000
@@ -30,7 +36,7 @@
 typedef struct {
     ConfigPingDataReader *reader;
     int32_t expected_next;
-    atomic_bool all_received;
+    volatile sig_atomic_t all_received;
 } SubState;
 
 static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
@@ -62,7 +68,7 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
         state->expected_next++;
 
         if (state->expected_next == EXPECTED_SAMPLES) {
-            atomic_store(&state->all_received, true);
+            state->all_received = true;
         }
     }
 }
@@ -171,7 +177,7 @@ int main(int argc, char **argv) {
     SubState state;
     state.reader = NULL;
     state.expected_next = 0;
-    atomic_init(&state.all_received, false);
+    state.all_received = false;
 
     DDS_DataReaderListener listener;
     memset(&listener, 0, sizeof(listener));
@@ -201,13 +207,13 @@ int main(int argc, char **argv) {
     }
 
     printf("Subscriber: waiting for %d samples...\n", EXPECTED_SAMPLES);
-    for (int waited_ms = 0; !atomic_load(&state.all_received); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !(state.all_received); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= RECEIVE_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: only received %d/%d samples within %ds\n",
                     state.expected_next, EXPECTED_SAMPLES, RECEIVE_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     DDS_Subscriber_delete_datareader(sub, dr);

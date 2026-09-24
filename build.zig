@@ -826,19 +826,57 @@ pub fn build(b: *std.Build) void {
             \\
             \\if(NOT TARGET ZZDDS::zzdds)
             \\    add_library(ZZDDS::zzdds SHARED IMPORTED)
-            \\    find_library(_ZZDDS_SHLIB
-            \\        NAMES zzdds
-            \\        HINTS "${{_ZZDDS_PREFIX}}/lib"
-            \\        NO_DEFAULT_PATH
-            \\    )
-            \\    if(NOT _ZZDDS_SHLIB)
-            \\        message(FATAL_ERROR "ZZDDS: libzzdds not found under ${{_ZZDDS_PREFIX}}/lib")
+            \\    if(WIN32)
+            \\        # Windows keeps the runtime DLL and its link-time import
+            \\        # library in separate install dirs (zig's own default:
+            \\        # bin/zzdds.dll + lib/zzdds.lib) -- a SHARED IMPORTED
+            \\        # target there needs BOTH IMPORTED_LOCATION (the DLL) and
+            \\        # IMPORTED_IMPLIB (the .lib actually fed to the linker).
+            \\        # Setting only IMPORTED_LOCATION (as the non-Windows
+            \\        # branch below does, where the .so/.dylib IS both) leaves
+            \\        # IMPORTED_IMPLIB unset, and CMake then has nothing to
+            \\        # link consumers against -- surfaces downstream as
+            \\        # "LINK : fatal error LNK1104: cannot open file
+            \\        # 'ZZDDS::zzdds-NOTFOUND.obj'", not as a configure-time
+            \\        # error here.
+            \\        find_file(_ZZDDS_DLL
+            \\            NAMES zzdds.dll
+            \\            HINTS "${{_ZZDDS_PREFIX}}/bin"
+            \\            NO_DEFAULT_PATH
+            \\        )
+            \\        find_library(_ZZDDS_IMPLIB
+            \\            NAMES zzdds
+            \\            HINTS "${{_ZZDDS_PREFIX}}/lib"
+            \\            NO_DEFAULT_PATH
+            \\        )
+            \\        if(NOT _ZZDDS_DLL)
+            \\            message(FATAL_ERROR "ZZDDS: zzdds.dll not found under ${{_ZZDDS_PREFIX}}/bin")
+            \\        endif()
+            \\        if(NOT _ZZDDS_IMPLIB)
+            \\            message(FATAL_ERROR "ZZDDS: zzdds.lib not found under ${{_ZZDDS_PREFIX}}/lib")
+            \\        endif()
+            \\        set_target_properties(ZZDDS::zzdds PROPERTIES
+            \\            IMPORTED_LOCATION "${{_ZZDDS_DLL}}"
+            \\            IMPORTED_IMPLIB "${{_ZZDDS_IMPLIB}}"
+            \\            INTERFACE_INCLUDE_DIRECTORIES "${{_ZZDDS_PREFIX}}/include"
+            \\        )
+            \\        unset(_ZZDDS_DLL CACHE)
+            \\        unset(_ZZDDS_IMPLIB CACHE)
+            \\    else()
+            \\        find_library(_ZZDDS_SHLIB
+            \\            NAMES zzdds
+            \\            HINTS "${{_ZZDDS_PREFIX}}/lib"
+            \\            NO_DEFAULT_PATH
+            \\        )
+            \\        if(NOT _ZZDDS_SHLIB)
+            \\            message(FATAL_ERROR "ZZDDS: libzzdds not found under ${{_ZZDDS_PREFIX}}/lib")
+            \\        endif()
+            \\        set_target_properties(ZZDDS::zzdds PROPERTIES
+            \\            IMPORTED_LOCATION "${{_ZZDDS_SHLIB}}"
+            \\            INTERFACE_INCLUDE_DIRECTORIES "${{_ZZDDS_PREFIX}}/include"
+            \\        )
+            \\        unset(_ZZDDS_SHLIB CACHE)
             \\    endif()
-            \\    set_target_properties(ZZDDS::zzdds PROPERTIES
-            \\        IMPORTED_LOCATION "${{_ZZDDS_SHLIB}}"
-            \\        INTERFACE_INCLUDE_DIRECTORIES "${{_ZZDDS_PREFIX}}/include"
-            \\    )
-            \\    unset(_ZZDDS_SHLIB CACHE)
             \\endif()
             \\
             \\if(NOT TARGET ZZDDS::zidl_cdr)

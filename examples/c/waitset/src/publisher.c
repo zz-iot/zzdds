@@ -36,12 +36,45 @@
 #include "zzdds_c.h"
 #include "zzdds.h"
 
+#ifdef _WIN32
+#include <windows.h>
+typedef HANDLE portable_thread_t;
+typedef struct { void *(*fn)(void *); void *arg; } portable_thread_start_t;
+static DWORD WINAPI portable_thread_trampoline(LPVOID p) {
+    portable_thread_start_t *s = (portable_thread_start_t *)p;
+    void *(*fn)(void *) = s->fn;
+    void *arg = s->arg;
+    free(s);
+    fn(arg);
+    return 0;
+}
+static int portable_thread_create(portable_thread_t *t, void *(*fn)(void *), void *arg) {
+    portable_thread_start_t *s = (portable_thread_start_t *)malloc(sizeof(*s));
+    if (!s) return -1;
+    s->fn = fn;
+    s->arg = arg;
+    *t = CreateThread(NULL, 0, portable_thread_trampoline, s, 0, NULL);
+    if (!*t) { free(s); return -1; }
+    return 0;
+}
+static void portable_thread_join(portable_thread_t t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+#else
 #include <pthread.h>
-#include <stdatomic.h>
+typedef pthread_t portable_thread_t;
+static int portable_thread_create(portable_thread_t *t, void *(*fn)(void *), void *arg) { return pthread_create(t, NULL, fn, arg); }
+static void portable_thread_join(portable_thread_t t) { pthread_join(t, NULL); }
+#endif
+#include <signal.h> /* sig_atomic_t */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define SAMPLE_COUNT 10
 #define WAIT_STEP_SEC 1
@@ -50,19 +83,19 @@
 
 typedef struct {
     DDS_GuardCondition gc;
-    atomic_bool stop;
+    volatile sig_atomic_t stop;
 } Watchdog;
 
 static void *watchdog_run(void *arg) {
     Watchdog *w = (Watchdog *)arg;
     int elapsed_ms = 0;
-    while (!atomic_load(&w->stop)) {
+    while (!(w->stop)) {
         if (elapsed_ms >= OVERALL_DEADLINE_MS) {
             printf("Watchdog: overall deadline exceeded, triggering GuardCondition\n");
             DDS_GuardCondition_set_trigger_value(w->gc, true);
             return NULL;
         }
-        usleep(WATCHDOG_POLL_MS * 1000);
+        sleep_ms(WATCHDOG_POLL_MS);
         elapsed_ms += WATCHDOG_POLL_MS;
     }
     return NULL;
@@ -161,9 +194,9 @@ int main(int argc, char **argv) {
 
     Watchdog watchdog;
     watchdog.gc = gc;
-    atomic_init(&watchdog.stop, false);
-    pthread_t watchdog_thread;
-    pthread_create(&watchdog_thread, NULL, watchdog_run, &watchdog);
+    watchdog.stop = false;
+    portable_thread_t watchdog_thread;
+    portable_thread_create(&watchdog_thread, watchdog_run, &watchdog);
 
     DDS_Condition gc_cond = DDS_GuardCondition_as_DDS_Condition(gc);
     DDS_Condition sc_cond = DDS_StatusCondition_as_DDS_Condition(sc);
@@ -249,8 +282,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    atomic_store(&watchdog.stop, true);
-    pthread_join(watchdog_thread, NULL);
+    watchdog.stop = true;
+    portable_thread_join(watchdog_thread);
 
     /* Well-behaved cleanup for the GuardCondition... */
     DDS_WaitSet_detach_condition(ws, DDS_GuardCondition_as_DDS_Condition(gc));

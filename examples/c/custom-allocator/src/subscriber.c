@@ -12,7 +12,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define DOMAIN_ID 7
 #define EXPECTED_SAMPLES 10
@@ -119,7 +125,7 @@ int main(void) {
      * through the injected allocator. It's a one-time, bounded,
      * per-newly-discovered-peer cost though, not a per-sample hot-path one,
      * so it belongs before arming, same as factory/entity bootstrap. */
-    sleep(2);
+    sleep_ms(2000);
 
     noalloc_guard_try_arm();
 
@@ -194,7 +200,7 @@ int main(void) {
             received++;
             continue; /* check for more immediately, no sleep */
         }
-        usleep(50 * 1000);
+        sleep_ms(50);
     }
 
     int received_logs = 0;
@@ -219,7 +225,7 @@ int main(void) {
             received_logs++;
             continue;
         }
-        usleep(50 * 1000);
+        sleep_ms(50);
     }
 
     noalloc_guard_try_disarm();

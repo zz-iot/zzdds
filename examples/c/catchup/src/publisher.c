@@ -15,11 +15,17 @@
 #include "catchup_sample.h"
 #include "zzdds_c.h"
 
-#include <stdatomic.h>
+#include <signal.h> /* sig_atomic_t */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define HISTORICAL_COUNT 10
 #define LIVE_COUNT 5
@@ -28,15 +34,15 @@
 #define POLL_PERIOD_MS 20
 
 typedef struct {
-    atomic_bool ever_matched;
-    atomic_int matched_current_count;
+    volatile sig_atomic_t ever_matched;
+    volatile sig_atomic_t matched_current_count;
 } PubState;
 
 static void on_publication_matched(DDS_DataWriter writer, const DDS_PublicationMatchedStatus *status, void *listener_data) {
     (void)writer;
     PubState *state = (PubState *)listener_data;
-    atomic_store(&state->matched_current_count, status->current_count);
-    if (status->current_count > 0) atomic_store(&state->ever_matched, true);
+    state->matched_current_count = status->current_count;
+    if (status->current_count > 0) state->ever_matched = true;
     printf("on_publication_matched() current_count=%d\n", status->current_count);
 }
 
@@ -97,8 +103,8 @@ int main(int argc, char **argv) {
     printf("Create writer for topic: HistoryEvent\n");
 
     PubState state;
-    atomic_init(&state.ever_matched, false);
-    atomic_init(&state.matched_current_count, 0);
+    state.ever_matched = false;
+    state.matched_current_count = 0;
 
     DDS_DataWriterListener listener;
     memset(&listener, 0, sizeof(listener));
@@ -126,12 +132,12 @@ int main(int argc, char **argv) {
     }
 
     /* -- Wait for the late-joining reader to match. -- */
-    for (int waited_ms = 0; !atomic_load(&state.ever_matched); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !(state.ever_matched); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= MATCH_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: no reader matched within %ds\n", MATCH_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
     printf("Publisher: reader matched, writing live batch\n");
 
@@ -148,13 +154,13 @@ int main(int argc, char **argv) {
     }
 
     for (int waited_ms = 0;
-         !(atomic_load(&state.ever_matched) && atomic_load(&state.matched_current_count) == 0);
+         !((state.ever_matched) && (state.matched_current_count) == 0);
          waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     printf("Publisher: done.\n");

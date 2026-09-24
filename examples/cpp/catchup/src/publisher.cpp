@@ -21,7 +21,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 namespace {
 
@@ -136,7 +142,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "FAIL: no reader matched within %ds\n", MATCH_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
     std::printf("Publisher: reader matched, writing live batch\n");
 
@@ -158,7 +164,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     std::printf("Publisher: done.\n");

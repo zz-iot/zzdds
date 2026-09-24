@@ -16,11 +16,17 @@
 #include "registry_sample.h"
 #include "zzdds_c.h"
 
-#include <stdatomic.h>
+#include <signal.h> /* sig_atomic_t */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define RECEIVE_TIMEOUT_MS 30000
 #define POLL_PERIOD_MS 20
@@ -45,7 +51,7 @@ typedef struct {
     SensorReadingDataReader *reader;
     /* Only ever touched from the listener's dispatch thread. */
     InstanceTrack tracks[3];
-    atomic_bool all_done;
+    volatile sig_atomic_t all_done;
 } SubState;
 
 static InstanceTrack *track_for(SubState *state, int32_t sensor_id) {
@@ -125,7 +131,7 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
                 exit(1);
         }
 
-        if (all_instances_done(state) && !atomic_load(&state->all_done) && !became_done) {
+        if (all_instances_done(state) && !(state->all_done) && !became_done) {
             InstanceTrack *c_track = track_for(state, 3);
             SensorReading query;
             memset(&query, 0, sizeof(query));
@@ -141,7 +147,7 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
     }
 
     if (became_done) {
-        atomic_store(&state->all_done, true);
+        state->all_done = true;
     }
 }
 
@@ -198,7 +204,7 @@ int main(int argc, char **argv) {
     state.tracks[0].sensor_id = 1;
     state.tracks[1].sensor_id = 2;
     state.tracks[2].sensor_id = 3;
-    atomic_init(&state.all_done, false);
+    state.all_done = false;
 
     DDS_DataReaderListener listener;
     memset(&listener, 0, sizeof(listener));
@@ -228,12 +234,12 @@ int main(int argc, char **argv) {
     }
 
     printf("Subscriber: waiting for all three instance lifecycles...\n");
-    for (int waited_ms = 0; !atomic_load(&state.all_done); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !(state.all_done); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= RECEIVE_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: did not observe all three instance lifecycles within %ds\n", RECEIVE_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     DDS_Subscriber_delete_datareader(sub, dr);

@@ -53,8 +53,14 @@ target_link_libraries(static_pool_allocator PUBLIC ZZDDS::zzdds Threads::Threads
 # only via LD_PRELOAD at run time) that aborts on any
 # malloc/calloc/realloc/free/operator new/operator delete once armed, making
 # "zero heap allocation after startup" a falsifiable test.
-add_library(noalloc_guard SHARED src/noalloc_guard_preload.cpp)
-target_link_libraries(noalloc_guard PRIVATE ${CMAKE_DL_LIBS})
+# LD_PRELOAD has no Windows equivalent, so this target (and the interposer
+# technique it implements) is POSIX-only -- see noalloc_guard_client.c's
+# matching _WIN32 branch, which is what publisher/subscriber actually link
+# against and already degrades gracefully to "unguarded" without this.
+if(NOT WIN32)
+    add_library(noalloc_guard SHARED src/noalloc_guard_preload.cpp)
+    target_link_libraries(noalloc_guard PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 # Compiled into publisher/subscriber directly: resolves noalloc_guard_arm/_disarm
 # via dlsym(RTLD_DEFAULT, ...) so the app runs fine (unguarded) even without

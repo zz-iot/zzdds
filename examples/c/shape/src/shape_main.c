@@ -16,7 +16,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 #include <signal.h>
 #include <time.h>
 #include <inttypes.h>
@@ -444,7 +450,7 @@ static int run_publisher(DDS_DomainParticipant dp, DDS_Topic base_topic, const O
          * GSN so the subscriber joins mid-stream and never receives a
          * complete set. */
         if (use_coherent_gating && !printed_matched) {
-            usleep((useconds_t)(opts->write_period_ms * 1000));
+            sleep_ms((int)(opts->write_period_ms));
             continue;
         }
 
@@ -513,7 +519,7 @@ static int run_publisher(DDS_DomainParticipant dp, DDS_Topic base_topic, const O
         }
 
         iteration++;
-        usleep((useconds_t)(opts->write_period_ms * 1000));
+        sleep_ms((int)(opts->write_period_ms));
     }
 
     /* Unregister/dispose all instances across all topics on finite run. */
@@ -835,7 +841,7 @@ static int run_subscriber(DDS_DomainParticipant dp, DDS_Topic base_topic, const 
          * on_requested_deadline_missed() fires on its own. */
 
         iteration++;
-        usleep((useconds_t)(opts->read_period_ms * 1000));
+        sleep_ms((int)(opts->read_period_ms));
     }
 
     if (cft) DDS_DomainParticipant_delete_contentfilteredtopic(dp, cft);

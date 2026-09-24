@@ -27,11 +27,17 @@
 #include "zzdds_c.h"
 #include "zzdds.h"
 
-#include <stdatomic.h>
+#include <signal.h> /* sig_atomic_t */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define SAMPLE_COUNT 3
 #define READER_READY_TIMEOUT_MS 10000
@@ -42,23 +48,23 @@
 #define TYPE_NAME "DiscoveryPing"
 
 typedef struct {
-    atomic_bool reader_ready;
-    atomic_bool ever_matched;
-    atomic_int matched_current_count;
+    volatile sig_atomic_t reader_ready;
+    volatile sig_atomic_t ever_matched;
+    volatile sig_atomic_t matched_current_count;
 } PubState;
 
 static void on_reliable_reader_ready(DDS_InstanceHandle_t reader_handle, bool is_ready, void *listener_data) {
     (void)reader_handle;
     PubState *state = (PubState *)listener_data;
-    if (is_ready) atomic_store(&state->reader_ready, true);
+    if (is_ready) state->reader_ready = true;
     printf("on_reliable_reader_ready() is_ready=%s\n", is_ready ? "true" : "false");
 }
 
 static void on_publication_matched(DDS_DataWriter writer, const DDS_PublicationMatchedStatus *status, void *listener_data) {
     (void)writer;
     PubState *state = (PubState *)listener_data;
-    atomic_store(&state->matched_current_count, status->current_count);
-    if (status->current_count > 0) atomic_store(&state->ever_matched, true);
+    state->matched_current_count = status->current_count;
+    if (status->current_count > 0) state->ever_matched = true;
     printf("on_publication_matched() current_count=%d\n", status->current_count);
 }
 
@@ -162,9 +168,9 @@ int main(int argc, char **argv) {
     printf("Create writer for topic: %s\n", TOPIC_NAME);
 
     PubState state;
-    atomic_init(&state.reader_ready, false);
-    atomic_init(&state.ever_matched, false);
-    atomic_init(&state.matched_current_count, 0);
+    state.reader_ready = false;
+    state.ever_matched = false;
+    state.matched_current_count = 0;
 
     zzdds_DataWriter zdw = DDS_DataWriter_as_zzdds_DataWriter(dw);
     zzdds_DataWriterListenerEx listener_ex;
@@ -180,12 +186,12 @@ int main(int argc, char **argv) {
     DiscoveryPingDataWriter writer;
     DiscoveryPingDataWriter_init(&writer, dw, ZIDL_XCDR1);
 
-    for (int waited_ms = 0; !atomic_load(&state.reader_ready); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !(state.reader_ready); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= READER_READY_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: no reliable reader became ready within %ds\n", READER_READY_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     /* Writer-level discovery: the remote subscriber has definitely matched
@@ -232,13 +238,13 @@ int main(int argc, char **argv) {
     }
 
     for (int waited_ms = 0;
-         !(atomic_load(&state.ever_matched) && atomic_load(&state.matched_current_count) == 0);
+         !((state.ever_matched) && (state.matched_current_count) == 0);
          waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     printf("Publisher: done.\n");

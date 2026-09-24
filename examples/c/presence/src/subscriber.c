@@ -14,11 +14,17 @@
 #include "presence_sample.h"
 #include "zzdds_c.h"
 
-#include <stdatomic.h>
+#include <signal.h> /* sig_atomic_t */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define CYCLE_TIMEOUT_MS 30000
 #define POLL_PERIOD_MS 20
@@ -29,8 +35,8 @@ typedef struct {
     PresenceBeaconDataReader *reader;
     /* Only ever touched from the listener's dispatch thread. */
     Phase phase;
-    atomic_int step;
-    atomic_bool cycle_complete;
+    volatile sig_atomic_t step;
+    volatile sig_atomic_t cycle_complete;
 } SubState;
 
 static void on_liveliness_changed(DDS_DataReader the_reader, const DDS_LivelinessChangedStatus *status, void *listener_data) {
@@ -47,20 +53,20 @@ static void on_liveliness_changed(DDS_DataReader the_reader, const DDS_Livelines
     case PHASE_WAITING_FIRST_ONLINE:
         if (online) {
             state->phase = PHASE_WAITING_OFFLINE;
-            atomic_store(&state->step, 1);
+            state->step = 1;
         }
         break;
     case PHASE_WAITING_OFFLINE:
         if (!online) {
             state->phase = PHASE_WAITING_SECOND_ONLINE;
-            atomic_store(&state->step, 2);
+            state->step = 2;
         }
         break;
     case PHASE_WAITING_SECOND_ONLINE:
         if (online) {
             state->phase = PHASE_DONE;
-            atomic_store(&state->step, 3);
-            atomic_store(&state->cycle_complete, true);
+            state->step = 3;
+            state->cycle_complete = true;
         }
         break;
     case PHASE_DONE:
@@ -147,8 +153,8 @@ int main(int argc, char **argv) {
     SubState state;
     state.reader = NULL;
     state.phase = PHASE_WAITING_FIRST_ONLINE;
-    atomic_init(&state.step, 0);
-    atomic_init(&state.cycle_complete, false);
+    state.step = 0;
+    state.cycle_complete = false;
 
     DDS_DataReaderListener listener;
     memset(&listener, 0, sizeof(listener));
@@ -179,13 +185,13 @@ int main(int argc, char **argv) {
     }
 
     printf("Subscriber: waiting for online -> offline -> online cycle...\n");
-    for (int waited_ms = 0; !atomic_load(&state.cycle_complete); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !(state.cycle_complete); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= CYCLE_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: did not observe the full cycle within %ds (stuck at step=%d)\n",
-                    CYCLE_TIMEOUT_MS / 1000, atomic_load(&state.step));
+                    CYCLE_TIMEOUT_MS / 1000, (state.step));
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     DDS_Subscriber_delete_datareader(sub, dr);

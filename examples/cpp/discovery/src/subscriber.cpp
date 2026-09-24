@@ -24,7 +24,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 namespace {
 
@@ -171,7 +177,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "FAIL: no matched publication within %ds\n", MATCH_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
     ::DDS::PublicationBuiltinTopicData pub_data;
     if (dr->get_matched_publication_data(pub_data, pub_handles[0]) != ::DDS::RETCODE_OK) {
@@ -193,7 +199,7 @@ int main(int argc, char **argv) {
                           state.expected_next, EXPECTED_SAMPLES, RECEIVE_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     sub->delete_datareader(dr);
