@@ -309,6 +309,7 @@ pub const SpdpEndpoints = struct {
         local: *const ParticipantAnnouncement,
         callbacks: *const Callbacks,
     ) !void {
+        std.debug.print("CHECKPOINT: spdp.start entered\n", .{});
         self.callbacks = callbacks;
         self.data_reachable = local.data_reachable;
 
@@ -389,17 +390,20 @@ pub const SpdpEndpoints = struct {
         writer_published = true;
 
         // Listen on SPDP multicast port and join the multicast group.
+        std.debug.print("CHECKPOINT: spdp.start before transport.listen\n", .{});
         const listen_locator = Locator.udp4(.{ 0, 0, 0, 0 }, self.spdp_multicast_port);
         // Non-fatal: writer still sends and unicast paths remain open if this fails.
         self.transport.listen(&listen_locator, ReceiveHandler{
             .ctx = self,
             .on_receive = onReceive,
         }) catch |err| log.spdp.warn("spdp: listen failed: {}", .{err});
+        std.debug.print("CHECKPOINT: spdp.start after transport.listen\n", .{});
         for (local.metatraffic_multicast_locators) |loc| {
             self.transport.joinMulticast(&loc) catch |err| {
                 log.spdp.warn("spdp: joinMulticast failed: {}", .{err});
             };
         }
+        std.debug.print("CHECKPOINT: spdp.start after joinMulticast\n", .{});
 
         // Send an immediate announcement before spawning the timer thread, so
         // there's no window where the timer's first cycle could race this send
@@ -452,6 +456,7 @@ pub const SpdpEndpoints = struct {
     // ── Transport receive callback ────────────────────────────────────────────
 
     fn onReceive(ctx: *anyopaque, data: []const u8, from: Locator, channel: tr_iface.Channel) void {
+        std.debug.print("CHECKPOINT: spdp.onReceive entered, {d} bytes\n", .{data.len});
         const self: *Self = @ptrCast(@alignCast(ctx));
         _ = from;
         _ = channel;
@@ -541,10 +546,13 @@ pub const SpdpEndpoints = struct {
 
         log.spdp.debug("spdp: received from {x}", .{guid_prefix.bytes});
 
+        std.debug.print("CHECKPOINT: processSpdpPayload before decodeSpdpParticipant\n", .{});
         var kp = decodeSpdpParticipant(self.alloc, guid_prefix, self.domain_id, payload, vendor_id) catch |err| {
+            std.debug.print("CHECKPOINT: decodeSpdpParticipant returned error {}\n", .{err});
             log.spdp.warn("spdp: decode error: {}", .{err});
             return;
         };
+        std.debug.print("CHECKPOINT: decodeSpdpParticipant returned OK\n", .{});
         self.filterKnownParticipantLocators(&kp);
         const now_ns = self.clock.nowNs();
         kp.expires_ns = now_ns + @as(i64, @intCast(kp.data.lease_duration_ms)) * std.time.ns_per_ms;
@@ -949,7 +957,9 @@ pub fn decodeSpdpParticipant(
     var r = try zidl_rt.CdrReader.init(payload);
     var data: Disc.SPDPdiscoveredParticipantData = .{};
     defer data.deinit(alloc);
+    std.debug.print("CHECKPOINT: decodeSpdpParticipant before deserializeFromPlCdr, payload.len={d}\n", .{payload.len});
     try Disc.SPDPdiscoveredParticipantData.deserializeFromPlCdr(&data, &r, alloc, .lenient);
+    std.debug.print("CHECKPOINT: decodeSpdpParticipant after deserializeFromPlCdr\n", .{});
 
     // `guid_prefix` is the RTPS message header's own source prefix -- transport-verified,
     // in the sense that it's what our own receive path extracted from the datagram that
