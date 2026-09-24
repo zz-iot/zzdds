@@ -28,6 +28,7 @@
 #include "zzdds_c.h"
 #include "zzdds.h"
 
+#include <stdlib.h> /* malloc/free, used below before this file's own <stdlib.h> include */
 #ifdef _WIN32
 #include <windows.h>
 typedef HANDLE portable_thread_t;
@@ -56,7 +57,29 @@ typedef pthread_t portable_thread_t;
 static int portable_thread_create(portable_thread_t *t, void *(*fn)(void *), void *arg) { return pthread_create(t, NULL, fn, arg); }
 static void portable_thread_join(portable_thread_t t) { pthread_join(t, NULL); }
 #endif
-#include <signal.h> /* sig_atomic_t */
+/* atomic_bool/atomic_int's inter-thread guarantees matter here: these
+ * fields are written from a DDS listener callback (a different thread)
+ * than main()'s polling loop. <stdatomic.h> needs a compiler flag on
+ * MSVC this repo's example CMakeLists don't set (error C1189: "C atomic
+ * support is not enabled") -- rather than chase that flag, or weaken this
+ * to a plain volatile flag (drops the actual cross-thread memory-ordering
+ * guarantee, not just the type -- flagged in PR review, see git history),
+ * use Win32's Interlocked* intrinsics directly on Windows, real C11
+ * atomics elsewhere. atomic_init() sites stay plain assignments on both
+ * platforms -- they run before the listener thread exists, and the C
+ * standard's own atomic_init() is itself non-atomic, meant exactly for
+ * that pre-concurrency case. */
+#ifdef _WIN32
+#include <windows.h>
+typedef volatile LONG portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { InterlockedExchange(a, v); }
+static int patomic_load(portable_atomic_t *a) { return InterlockedExchangeAdd(a, 0); }
+#else
+#include <stdatomic.h>
+typedef atomic_int portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { atomic_store(a, v); }
+static int patomic_load(portable_atomic_t *a) { return atomic_load(a); }
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,13 +99,13 @@ static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
 
 typedef struct {
     DDS_GuardCondition gc;
-    volatile sig_atomic_t stop;
+    portable_atomic_t stop;
 } Watchdog;
 
 static void *watchdog_run(void *arg) {
     Watchdog *w = (Watchdog *)arg;
     int elapsed_ms = 0;
-    while (!(w->stop)) {
+    while (!patomic_load(&w->stop)) {
         if (elapsed_ms >= OVERALL_DEADLINE_MS) {
             printf("Watchdog: overall deadline exceeded, triggering GuardCondition\n");
             DDS_GuardCondition_set_trigger_value(w->gc, true);
@@ -334,7 +357,7 @@ int main(int argc, char **argv) {
 
     printf("Subscriber: received all %d samples.\n", EXPECTED_SAMPLES);
 
-    watchdog.stop = true;
+    patomic_store(&watchdog.stop, true);
     portable_thread_join(watchdog_thread);
 
     /* Well-behaved cleanup: detach and delete every condition explicitly

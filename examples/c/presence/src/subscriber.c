@@ -14,7 +14,29 @@
 #include "presence_sample.h"
 #include "zzdds_c.h"
 
-#include <signal.h> /* sig_atomic_t */
+/* atomic_bool/atomic_int's inter-thread guarantees matter here: these
+ * fields are written from a DDS listener callback (a different thread)
+ * than main()'s polling loop. <stdatomic.h> needs a compiler flag on
+ * MSVC this repo's example CMakeLists don't set (error C1189: "C atomic
+ * support is not enabled") -- rather than chase that flag, or weaken this
+ * to a plain volatile flag (drops the actual cross-thread memory-ordering
+ * guarantee, not just the type -- flagged in PR review, see git history),
+ * use Win32's Interlocked* intrinsics directly on Windows, real C11
+ * atomics elsewhere. atomic_init() sites stay plain assignments on both
+ * platforms -- they run before the listener thread exists, and the C
+ * standard's own atomic_init() is itself non-atomic, meant exactly for
+ * that pre-concurrency case. */
+#ifdef _WIN32
+#include <windows.h>
+typedef volatile LONG portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { InterlockedExchange(a, v); }
+static int patomic_load(portable_atomic_t *a) { return InterlockedExchangeAdd(a, 0); }
+#else
+#include <stdatomic.h>
+typedef atomic_int portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { atomic_store(a, v); }
+static int patomic_load(portable_atomic_t *a) { return atomic_load(a); }
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,8 +57,8 @@ typedef struct {
     PresenceBeaconDataReader *reader;
     /* Only ever touched from the listener's dispatch thread. */
     Phase phase;
-    volatile sig_atomic_t step;
-    volatile sig_atomic_t cycle_complete;
+    portable_atomic_t step;
+    portable_atomic_t cycle_complete;
 } SubState;
 
 static void on_liveliness_changed(DDS_DataReader the_reader, const DDS_LivelinessChangedStatus *status, void *listener_data) {
@@ -53,20 +75,20 @@ static void on_liveliness_changed(DDS_DataReader the_reader, const DDS_Livelines
     case PHASE_WAITING_FIRST_ONLINE:
         if (online) {
             state->phase = PHASE_WAITING_OFFLINE;
-            state->step = 1;
+            patomic_store(&state->step, 1);
         }
         break;
     case PHASE_WAITING_OFFLINE:
         if (!online) {
             state->phase = PHASE_WAITING_SECOND_ONLINE;
-            state->step = 2;
+            patomic_store(&state->step, 2);
         }
         break;
     case PHASE_WAITING_SECOND_ONLINE:
         if (online) {
             state->phase = PHASE_DONE;
-            state->step = 3;
-            state->cycle_complete = true;
+            patomic_store(&state->step, 3);
+            patomic_store(&state->cycle_complete, true);
         }
         break;
     case PHASE_DONE:
@@ -185,10 +207,10 @@ int main(int argc, char **argv) {
     }
 
     printf("Subscriber: waiting for online -> offline -> online cycle...\n");
-    for (int waited_ms = 0; !(state.cycle_complete); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !patomic_load(&state.cycle_complete); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= CYCLE_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: did not observe the full cycle within %ds (stuck at step=%d)\n",
-                    CYCLE_TIMEOUT_MS / 1000, (state.step));
+                    CYCLE_TIMEOUT_MS / 1000, patomic_load(&state.step));
             return 1;
         }
         sleep_ms(POLL_PERIOD_MS);

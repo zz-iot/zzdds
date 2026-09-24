@@ -118,11 +118,26 @@ static void handle_sigint(int sig) {
 
 /* ── Time helpers ──────────────────────────────────────────────────────────── */
 
+/* CLOCK_MONOTONIC/clock_gettime() are POSIX-only -- MSVC's <time.h> doesn't
+ * define either. QueryPerformanceCounter/-Frequency is the Windows
+ * equivalent (monotonic, arbitrary epoch, matching CLOCK_MONOTONIC's own
+ * contract). The split whole/fractional-part division avoids overflowing
+ * int64_t on a long-uptime CI runner, where counter*1e9 alone would not. */
+#ifdef _WIN32
+static int64_t mono_ns(void) {
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (counter.QuadPart / freq.QuadPart) * 1000000000LL +
+           ((counter.QuadPart % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+}
+#else
 static int64_t mono_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
+#endif
 
 /* ── Listener contexts ─────────────────────────────────────────────────────── */
 

@@ -1,8 +1,21 @@
 #include "static_pool_allocator.h"
 
-#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#ifdef _WIN32
+#include <windows.h>
+typedef SRWLOCK portable_mutex_t;
+#define PORTABLE_MUTEX_INITIALIZER SRWLOCK_INIT
+static void portable_mutex_lock(portable_mutex_t *m) { AcquireSRWLockExclusive(m); }
+static void portable_mutex_unlock(portable_mutex_t *m) { ReleaseSRWLockExclusive(m); }
+#else
+#include <pthread.h>
+typedef pthread_mutex_t portable_mutex_t;
+#define PORTABLE_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
+static void portable_mutex_lock(portable_mutex_t *m) { pthread_mutex_lock(m); }
+static void portable_mutex_unlock(portable_mutex_t *m) { pthread_mutex_unlock(m); }
+#endif
 
 #ifndef STATIC_POOL_BLOCK_SIZE
 #define STATIC_POOL_BLOCK_SIZE 4096
@@ -26,26 +39,26 @@ static FreeNode *g_free_list;
  * never call concurrently" as their contract). A plain free-list without a
  * lock corrupts under concurrent alloc/free here in practice, not just in
  * theory -- confirmed by a real crash during initial testing. */
-static pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+static portable_mutex_t g_pool_mutex = PORTABLE_MUTEX_INITIALIZER;
 
 void static_pool_allocator_reset(void) {
-    pthread_mutex_lock(&g_pool_mutex);
+    portable_mutex_lock(&g_pool_mutex);
     g_free_list = NULL;
     for (size_t i = 0; i < STATIC_POOL_BLOCK_COUNT; i++) {
         FreeNode *node = (FreeNode *)g_pool[i];
         node->next = g_free_list;
         g_free_list = node;
     }
-    pthread_mutex_unlock(&g_pool_mutex);
+    portable_mutex_unlock(&g_pool_mutex);
 }
 
 static void *pool_alloc(void *ctx, size_t len, size_t alignment) {
     (void)ctx;
     if (len > STATIC_POOL_BLOCK_SIZE || alignment > STATIC_POOL_ALIGN) return NULL;
-    pthread_mutex_lock(&g_pool_mutex);
+    portable_mutex_lock(&g_pool_mutex);
     FreeNode *node = g_free_list;
     if (node) g_free_list = node->next;
-    pthread_mutex_unlock(&g_pool_mutex);
+    portable_mutex_unlock(&g_pool_mutex);
     return node; /* NULL if the pool was exhausted -- graceful failure, per contract */
 }
 
@@ -66,10 +79,10 @@ static void pool_free(void *ctx, void *ptr, size_t len, size_t alignment) {
     (void)alignment;
     if (!ptr) return; /* required no-op per ZidlAllocator's contract */
     FreeNode *node = (FreeNode *)ptr;
-    pthread_mutex_lock(&g_pool_mutex);
+    portable_mutex_lock(&g_pool_mutex);
     node->next = g_free_list;
     g_free_list = node;
-    pthread_mutex_unlock(&g_pool_mutex);
+    portable_mutex_unlock(&g_pool_mutex);
 }
 
 const ZidlAllocator static_pool_allocator = {

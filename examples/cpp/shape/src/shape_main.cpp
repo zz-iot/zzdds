@@ -32,7 +32,6 @@ static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
 #include <optional>
 #include <algorithm>
 #include <unordered_map>
-#include <unistd.h>
 
 namespace {
 
@@ -104,11 +103,26 @@ void handle_sigint(int) { g_all_done = 1; }
 
 /* ── Time helpers ──────────────────────────────────────────────────────────── */
 
+/* CLOCK_MONOTONIC/clock_gettime() are POSIX-only -- MSVC's <ctime> doesn't
+ * define either. QueryPerformanceCounter/-Frequency is the Windows
+ * equivalent (monotonic, arbitrary epoch, matching CLOCK_MONOTONIC's own
+ * contract). The split whole/fractional-part division avoids overflowing
+ * int64_t on a long-uptime CI runner, where counter*1e9 alone would not. */
+#ifdef _WIN32
+int64_t mono_ns() {
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (counter.QuadPart / freq.QuadPart) * 1000000000LL +
+           ((counter.QuadPart % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+}
+#else
 int64_t mono_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
+#endif
 
 /* ── Listeners ─────────────────────────────────────────────────────────────── */
 
