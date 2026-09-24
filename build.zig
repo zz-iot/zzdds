@@ -583,6 +583,21 @@ pub fn build(b: *std.Build) void {
         });
         zzdds_lib.root_module.addOptions("build_options", build_options);
         zzdds_lib.root_module.link_libc = true;
+        // Without this, only Zig's own `export fn` C-ABI surface
+        // (--zig-generate-c-api) ends up in zzdds.dll's export table on
+        // Windows -- the plain-struct CDR functions (dcps_cdr.c/
+        // zzdds_cdr.c, compiled in as ordinary C source below, not Zig
+        // `export fn`) have no dllexport annotation of their own and are
+        // invisible to it, so any C/C++ consumer calling e.g.
+        // DDS_TopicBuiltinTopicData_default() or
+        // zzdds_DomainParticipantConfig_default() fails at Windows link
+        // time with LNK2019 -- found building the Windows examples lane,
+        // whose discovery/participant-config/shape examples call exactly
+        // those. -fdll-export-fns is Windows-only -- Zig rejects it outright
+        // ("only Windows OS targets support DLLs") on every other target.
+        if (target.result.os.tag == .windows) {
+            zzdds_lib.dll_export_fns = true;
+        }
         if (target.result.os.tag == .windows) {
             zzdds_lib.root_module.linkSystemLibrary("ws2_32", .{});
         }
