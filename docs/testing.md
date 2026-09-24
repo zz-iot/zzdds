@@ -116,3 +116,19 @@ edge case, minimize it into a vendor-free regression under `test/fuzz/corpus/`,
 See `docs/design/testing-strategy.md` for the tier model, clock abstraction rationale,
 and notes on what we are *not* building (spec conformance harness, network simulation,
 formal verification).
+
+## Concurrency synchronization experiment
+
+The test-only prototype in `test/concurrency/` has focused `test-concurrency` and
+`test-concurrency-tsan` targets. It is also wired into the normal, LLVM emission,
+ReleaseSmall and TSan test graphs. To run it without resolving zidl:
+
+```sh
+zig build --build-file test/concurrency/build.zig test
+zig build --build-file test/concurrency/build.zig test-tsan
+```
+
+Both runners exercise the same prototype; POSIX threaded tests use explicit
+condition checkpoints rather than sleep-based scheduling. See
+[prototype scope and limitations](design/concurrency-prototype.md) before treating
+these tests as evidence for the production runtime or complete DDS behavior.

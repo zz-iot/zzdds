@@ -1217,9 +1217,19 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
+    const concurrency_support = @import("test/concurrency/build_support.zig");
+    const concurrency_step = b.step("test-concurrency", "Run isolated concurrency prototype tests");
 
     // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
     const emit_tests_step = b.step("emit-tests", "Build test binaries for kcov coverage analysis");
+    for (concurrency_support.tests(b, target, optimize, sanitize_thread, sanitize_thread, "")) |t| {
+        const run = b.addRunArtifact(t);
+        concurrency_step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
+    }
 
     // Library self-tests
     const zzdds_tests = b.addTest(.{
@@ -1304,6 +1314,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // Discovery-layer tests.
+    const discovery_step = b.step("test-discovery", "Run discovery and discovery-wire tests");
     const discovery_test_files = [_][]const u8{
         "test/discovery/spdp_lease_test.zig",
         "test/discovery/sedp_test.zig",
@@ -1322,7 +1333,9 @@ pub fn build(b: *std.Build) void {
             }),
         });
         t.root_module.link_libc = true;
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        const run = b.addRunArtifact(t);
+        test_step.dependOn(&run.step);
+        discovery_step.dependOn(&run.step);
         emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
@@ -1520,6 +1533,12 @@ pub fn build(b: *std.Build) void {
     // and release.yml, mirroring `release-fast` (`zig build test
     // -Doptimize=ReleaseSmall` on the normal self-hosted backend).
     const test_release_small_step = b.step("test-release-small", "Run the unit suite at ReleaseSmall (LLVM backend -- see comment: works around a Zig 0.16 self-hosted-backend rodata-alignment bug)");
+    for (concurrency_support.tests(b, target_llvm_safe, optimize, false, true, "")) |t| {
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
+    }
 
     const zzdds_tests_llvm = b.addTest(.{
         .name = "zzdds_lib",
@@ -1645,6 +1664,12 @@ pub fn build(b: *std.Build) void {
     // Covers concurrency in state machines, WaitSet, and discovery code.
 
     const tsan_step = b.step("test-tsan", "Run Zenzen DDS tests under ThreadSanitizer");
+    const concurrency_tsan_step = b.step("test-concurrency-tsan", "Run concurrency prototype under ThreadSanitizer");
+    for (concurrency_support.tests(b, target, optimize, true, true, "")) |t| {
+        const run = b.addRunArtifact(t);
+        tsan_step.dependOn(&run.step);
+        concurrency_tsan_step.dependOn(&run.step);
+    }
 
     const zidl_dep_tsan = b.dependency("zidl", .{
         .target = target,

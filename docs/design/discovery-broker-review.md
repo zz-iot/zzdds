@@ -294,3 +294,33 @@ deliverable and the cached profile follows once its prerequisites (§2) are in.
 
 4. **As those features arrive:** XTypes TypeLookup routing and `opaque_peer` DDS Security,
    per the spec's own phases 5–6.
+
+## 11. Reconciliation disposition — 2026-09-17
+
+Revision 0.2 of [the broker specification](discovery-broker.md) reconciles this review
+with the user's general-purpose broker goal, the accepted concurrency baseline and
+local zzdds main c37181e / zidl 26dc737. Sections 1–10 remain the original historical
+review; their source-status and sequencing claims are not current implementation facts.
+No production broker or wire freeze is claimed by this disposition.
+
+| Review concern | Disposition in revision 0.2 |
+| --- | --- |
+| Cached endpoint discovery versus ROS 2 rendezvous | Keep cached discovery as the primary profile for configurable endpoint distribution and scaling. ROS 2 is not the motivating product constraint. Participant-only rendezvous remains a possible compatibility mode, not a prerequisite deliverable. |
+| Reliability scaling / threads / send-under-lock | Adopt the concern. Preserve RTPS stream semantics but require shared-runtime timers, bounded work and no owner locks across I/O. Do not mechanically instantiate today's thread-owning state machines per session. Actual scale claims remain measured release gates. |
+| Threaded-only v1 client | Do not adopt. Protocol logic targets manual and hosted execution under the accepted concurrency contract; backend availability is explicit. No working MCU transport is claimed. |
+| Shared discovery codec prerequisite | Implemented for SPDP/SEDP; typed QoS has replaced QosSnapshot. Broker original-byte retention and strict admission/fidelity remain work. Remove duplicate codec-extraction task. |
+| Channel prerequisite | Implemented Channel/sendOnChannel and close callbacks are reused. Remaining work is session binding, safe bounded retention, async completion and precise UDP source-address behavior. |
+| Route resolver overlap | Resolver controls eligible paths/provenance; LocatorSelector ranks ordinary direct candidates. An established channel bypasses ranking. Future nomination constrains route eligibility. |
+| WLP plumbing | Retained as explicit integration work, including reverse native reliability messages and original liveliness semantics. Session health never synthesizes WLP. |
+| Proprietary protocol/versioning commitment | Retained as a separate wire-freeze gate with generated schema and cross-version fixtures. C ABI compatibility and network protocol compatibility are separate commitments. |
+| Mutable control encoding / zidl support | Still a gate; existing discovery codecs do not prove the proposed control-envelope evolution behavior. Generic reference Config bindings are also not yet production-ready. |
+| Test infrastructure | Targeted socket/network-namespace tests are an explicit broker integration deliverable. General network simulation is not required; unavailable privileged coverage cannot be reported as passed. |
+| Config ownership / environment assumptions | Public additions originate in zzdds.idl with generated bindings and TOML. Process-local resources follow construction-only rules. No environment-variable configuration is introduced. |
+| XTypes/Security / opaque cost | Preserve the original limitations and future native service routing; byte preservation alone is not Security conformance. Cached trust and opaque peer association costs remain explicit. |
+| Restart and freshness | Epoch change still requires resynchronization and cannot extend stale leases. Local teardown cannot wait for broker CLOSE acknowledgment; finite remote leases cover failed notification. |
+
+Remaining specification decisions are enumerated in section 16 of the revised draft.
+Start with readiness/status semantics (including startup default and wait behavior),
+then complete control schema/version negotiation and wire-freeze review. Provider and
+resource/scale validation remain named implementation/release gates. The protocol
+specification is not complete merely because its concurrency prerequisites are settled.

@@ -1,5 +1,9 @@
 # Thread Model and Type Information
 
+This document describes current behavior. Proposed future behavior is tracked in the
+[listener execution contract](listener-execution.md) and
+[concurrency design](concurrency-model.md); those drafts do not describe implemented guarantees.
+
 ## Current Thread Ownership
 
 The default UDP/SPDP path is multi-threaded:

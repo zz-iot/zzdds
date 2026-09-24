@@ -803,3 +803,35 @@ test "SPDP: start() does not leak the writer when a later allocation fails" {
 
     try testing.expectError(error.OutOfMemory, spdp.start(&local, &c));
 }
+
+test "SPDP: foreign explicit domain neither installs nor refreshes a participant" {
+    const alloc = testing.allocator;
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+    var clock = ManualClock.init(0);
+    spdp.setClock(clock.clock());
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+    const peer = prefix(0xCC);
+    const payload = try buildPayload(alloc, peer, 500);
+    defer alloc.free(payload);
+    var foreign: std.ArrayList(u8) = .empty;
+    defer foreign.deinit(alloc);
+    try foreign.appendSlice(alloc, payload[0..4]);
+    try foreign.appendSlice(alloc, &.{ 0x0f, 0, 4, 0, 7, 0, 0, 0 });
+    try foreign.appendSlice(alloc, payload[4..]);
+    spdp.processSpdpPayload(peer, 1, foreign.items, .{ .bytes = .{ 0, 0 } });
+    try testing.expectEqual(@as(u32, 0), tr.discovered);
+    try testing.expectEqual(@as(usize, 0), spdp.known.count());
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0, 0 } });
+    const expiry = spdp.known.get(peer).?.expires_ns;
+    spdp.processSpdpPayload(peer, 2, foreign.items, .{ .bytes = .{ 0, 0 } });
+    try testing.expectEqual(expiry, spdp.known.get(peer).?.expires_ns);
+    try testing.expectEqual(@as(i64, 1), spdp.known.get(peer).?.last_writer_sn);
+    try testing.expectEqual(@as(u32, 1), tr.discovered);
+}

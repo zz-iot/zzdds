@@ -1,0 +1,505 @@
+// DESIGN ARTIFACT ONLY: provisional member IDs/bounds, not production wire ABI.
+// Operation codes, RTPS entity IDs, magic and encoding IDs require wire review.
+// See ../broker-wire-contract.md. Generated decoding is not admission validation.
+module BrokerWireDraft {
+    typedef octet Id128[16];
+    typedef octet GuidBytes[16];
+    typedef octet Digest256[32];
+    typedef sequence<octet, 1048576> BodyBytes;
+    typedef sequence<octet, 524288> DiscoveryBytes;
+    typedef sequence<octet, 16384> MetadataBytes;
+    typedef sequence<octet, 512> TokenBytes;
+    typedef sequence<unsigned long, 128> FeatureIds;
+
+    // Provisional native-discovery PID, not a production advertisement.
+    const unsigned short PID_ZZDDS_ORIGIN_VERSION = 0x8003;
+    @final struct OriginVersion {
+        Id128 incarnation_id;
+        unsigned long long origin_revision;
+    };
+
+    // Proposed byte baseline; see broker-wire-bytes.md (not frozen).
+    const unsigned short BODY_ENCODING_XCDR2_LE = 1;
+    const unsigned short DISCOVERY_ENCODING_PL_CDR_LE = 1;
+    const unsigned short DISCOVERY_ENCODING_PL_CDR_BE = 2;
+
+    // Fixed framing inside the RTPS serialized sample, not a new TCP delimiter.
+    @final struct Frame {
+        octet magic[8];
+        unsigned short major_version;
+        unsigned short minor_version;
+        unsigned short operation_code;
+        unsigned short encoding_id;
+        BodyBytes body;
+    };
+
+    @final struct ScopeValue {
+        string<256> domain_tag;
+        unsigned long domain_id;
+    };
+
+    @final struct VersionRange {
+        unsigned short major_version;
+        unsigned short minimum_minor;
+        unsigned short maximum_minor;
+    };
+    typedef sequence<VersionRange, 16> VersionRanges;
+    typedef sequence<unsigned short, 16> EncodingIds;
+
+    @final struct ReceiveLimits {
+        unsigned long maximum_frame_bytes;
+        unsigned long maximum_record_bytes;
+        unsigned long long maximum_inventory_bytes;
+        unsigned long long maximum_view_bytes;
+        unsigned long maximum_records;
+        unsigned long maximum_orphan_items;
+        unsigned long long maximum_orphan_bytes;
+        unsigned long maximum_presence_queries;
+        unsigned long maximum_presence_entries;
+        unsigned long maximum_presence_chunks;
+        unsigned long long maximum_presence_bytes;
+    };
+    @final struct ResumeCursor {
+        Id128 previous_epoch;
+        Id128 previous_session;
+        unsigned long long previous_owner_generation;
+        unsigned long long view_generation;
+        unsigned long long snapshot_cut;
+        Digest256 snapshot_digest;
+        unsigned long long applied_delivery_seq;
+        boolean baseline_retained;
+    };
+    @final struct ControlEndpointPair {
+        // Endpoints owned by the sender of REGISTER or ACCEPT, respectively.
+        unsigned short channel_class;
+        GuidBytes writer_guid;
+        GuidBytes reader_guid;
+    };
+    typedef sequence<ControlEndpointPair, 4> ControlEndpointPairs;
+
+    // HISTORICAL TYPES ONLY for pre-SPDP-bootstrap fixture comparisons.
+    // No active opcode permits these bodies.
+    @mutable struct LegacyHello {
+        @id(1) @must_understand Id128 admission_attempt;
+        @id(2) @must_understand Id128 client_nonce;
+        @id(3) @must_understand VersionRanges versions;
+        @id(4) @must_understand EncodingIds encodings;
+        @id(5) @must_understand FeatureIds offered_features;
+        @id(6) @must_understand FeatureIds required_features;
+        @id(7) @must_understand ScopeValue scope;
+        @id(8) @must_understand unsigned short discovery_profile;
+        @id(9) @must_understand GuidBytes participant_guid;
+        @id(10) @must_understand Id128 incarnation_id;
+        @id(11) @must_understand ReceiveLimits receive_limits;
+        @id(12) @must_understand unsigned long long requested_lease_ns;
+        @id(13) @optional ResumeCursor resume_hint;
+        @id(14) @must_understand ControlEndpointPairs control_endpoints;
+    };
+    @mutable struct LegacyChallenge {
+        @id(1) @must_understand Id128 admission_attempt;
+        @id(2) @must_understand Id128 client_nonce;
+        @id(3) @must_understand TokenBytes cookie;
+        @id(4) @must_understand unsigned short selected_major;
+        @id(5) @must_understand unsigned short selected_minor;
+        @id(6) @must_understand unsigned short selected_encoding;
+        @id(7) @must_understand FeatureIds selected_features;
+        @id(8) @must_understand Digest256 transcript_binding;
+    };
+    @mutable struct LegacyOpenRequest {
+        @id(1) @must_understand LegacyHello offer;
+        @id(2) @must_understand LegacyChallenge challenge_response;
+        // Reserved: absent in initial v1; not an ownership requirement.
+        @id(3) @optional TokenBytes continuity_credential;
+        @id(4) @must_understand unsigned short requested_view_mode;
+    };
+    // Provisional zzdds discovery extension PIDs; CDR ParameterList value bodies.
+    const unsigned short PID_ZZDDS_SERVICE_CAPABILITIES = 0x8004;
+    const unsigned short PID_ZZDDS_SERVICE_REQUEST = 0x8005;
+    const unsigned short PID_ZZDDS_SERVICE_OFFER = 0x8006;
+    const unsigned short SERVICE_BROKER_DISCOVERY = 1;
+    const unsigned short ROLE_CLIENT = 1;
+    const unsigned short ROLE_SERVER = 2;
+    typedef octet EntityIdBytes[4];
+    @final struct ServiceDescriptor {
+        unsigned short service_kind;
+        unsigned short roles;
+        VersionRanges versions;
+        EncodingIds encodings;
+        FeatureIds supported_features;
+        EntityIdBytes introduction_writer;
+        EntityIdBytes introduction_reader;
+    };
+    typedef sequence<ServiceDescriptor, 8> ServiceDescriptors;
+    @final struct ServiceCapabilities {
+        unsigned short descriptor_version;
+        ServiceDescriptors services;
+    };
+    @final struct ServiceRequestContext {
+        unsigned short descriptor_version;
+        unsigned short service_kind;
+        Id128 admission_attempt;
+        Id128 client_nonce;
+    };
+    @final struct ServiceOfferContext {
+        unsigned short descriptor_version;
+        unsigned short service_kind;
+        Id128 admission_attempt;
+        Id128 client_nonce;
+        Id128 introduction_id;
+        Id128 broker_epoch;
+        Digest256 client_sample_digest;
+        Digest256 server_sample_digest;
+    };
+    typedef sequence<octet, 64> PathCookie;
+    @mutable struct PathChallenge {
+        @id(1) @must_understand Id128 admission_attempt;
+        @id(2) @must_understand Id128 client_nonce;
+        @id(3) @must_understand Digest256 request_digest;
+        @id(4) @must_understand PathCookie cookie;
+    };
+    // PATH_RESPONSE echoes the exact PathChallenge body, unchanged.
+    @mutable struct RegisterRequest {
+        @id(1) @must_understand Id128 introduction_id;
+        @id(2) @must_understand Id128 admission_attempt;
+        @id(3) @must_understand Id128 client_nonce;
+        @id(4) @must_understand ScopeValue scope;
+        @id(5) @must_understand Id128 incarnation_id;
+        @id(6) @must_understand unsigned short service_kind;
+        @id(7) @must_understand unsigned short selected_major;
+        @id(8) @must_understand unsigned short selected_minor;
+        @id(9) @must_understand unsigned short selected_encoding;
+        @id(10) @must_understand unsigned short discovery_profile;
+        @id(11) @must_understand FeatureIds selected_features;
+        @id(12) @must_understand ReceiveLimits receive_limits;
+        @id(13) @must_understand unsigned long long requested_lease_ns;
+        @id(14) @must_understand unsigned short requested_view_mode;
+        @id(15) @must_understand ControlEndpointPairs control_endpoints;
+        @id(16) @optional ResumeCursor resume_hint;
+    };
+
+    // Direct bootstrap body, never an established Envelope.
+    @mutable struct AdmissionReject {
+        @id(1) @must_understand Id128 admission_attempt;
+        @id(2) @must_understand Id128 client_nonce;
+        @id(3) @must_understand unsigned short rejected_operation;
+        @id(4) @must_understand unsigned short reason;
+        @id(5) @must_understand unsigned long long retry_after_ns;
+        @id(6) @must_understand Digest256 request_digest;
+    };
+    @mutable struct AcceptReply {
+        @id(1) @must_understand Id128 admission_attempt;
+        @id(2) @must_understand Digest256 transcript_binding;
+        @id(3) @must_understand ScopeValue scope;
+        @id(4) @must_understand Id128 broker_epoch;
+        @id(5) @must_understand Id128 session_id;
+        @id(6) @must_understand unsigned long long owner_generation;
+        @id(7) @must_understand unsigned short selected_major;
+        @id(8) @must_understand unsigned short selected_minor;
+        @id(9) @must_understand unsigned short selected_encoding;
+        @id(10) @must_understand FeatureIds selected_features;
+        @id(11) @must_understand ReceiveLimits receive_limits;
+        @id(12) @must_understand unsigned long long origin_lease_ns;
+        @id(13) @must_understand unsigned long long renewal_period_ns;
+        @id(14) @must_understand unsigned long long establishment_timeout_ns;
+        @id(15) @must_understand unsigned long long admission_retry_window_ns;
+        @id(16) @must_understand ControlEndpointPairs control_endpoints;
+        // Must be true for every new session in initial v1.
+        @id(17) @must_understand boolean origin_inventory_required;
+        // Registry pending: snapshot required or downstream resume accepted.
+        @id(18) @must_understand unsigned short downstream_outcome;
+        @id(19) @optional ResumeCursor resumed_cursor;
+        // Reserved: absent in initial v1; no credential handoff in ACCEPT.
+        @id(20) @optional TokenBytes continuity_credential;
+        @id(21) @must_understand unsigned short selected_profile;
+        @id(22) @must_understand unsigned short selected_view_mode;
+        @id(23) @must_understand Id128 introduction_id;
+    };
+
+    @mutable struct Envelope {
+        @id(1) @must_understand ScopeValue scope;
+        @id(2) @must_understand Id128 broker_epoch;
+        @id(3) @must_understand Id128 session_id;
+        @id(4) @must_understand unsigned long long owner_generation;
+        @id(5) @must_understand Id128 request_id;
+        @id(6) @must_understand FeatureIds required_features;
+        @id(7) @must_understand BodyBytes operation_body;
+    };
+
+    @final struct EntityKey {
+        GuidBytes participant_guid;
+        Id128 incarnation_id;
+        unsigned short record_kind;
+        GuidBytes entity_guid;
+    };
+
+    // Stable canonical record within protocol major 1; extensions use metadata.
+    @final struct OriginRecord {
+        EntityKey entity;
+        unsigned long long origin_revision;
+        unsigned short change_kind;
+        unsigned short discovery_encoding;
+        octet origin_protocol_version[2];
+        octet origin_vendor_id[2];
+        GuidBytes native_writer_guid;
+        boolean has_native_sequence;
+        long long native_sequence;
+        MetadataBytes change_metadata;
+        DiscoveryBytes discovery_payload;
+    };
+
+    @final struct RecordItem {
+        unsigned long long item_index;
+        BodyBytes record_bytes;
+    };
+
+    @mutable struct InventoryBegin {
+        @id(1) @must_understand unsigned long long inventory_generation;
+        @id(2) @must_understand unsigned long long local_cut;
+        @id(3) @must_understand unsigned long long record_count;
+        @id(4) @must_understand unsigned long long total_record_bytes;
+    };
+    @mutable struct InventoryRecord {
+        @id(1) @must_understand unsigned long long inventory_generation;
+        @id(2) @must_understand RecordItem item;
+    };
+    @mutable struct InventoryEnd {
+        @id(1) @must_understand unsigned long long inventory_generation;
+        @id(2) @must_understand unsigned long long record_count;
+        @id(3) @must_understand Digest256 digest;
+    };
+
+    @mutable struct ViewBegin {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand unsigned long long store_cut;
+        @id(3) @must_understand unsigned long long record_count;
+        @id(4) @must_understand unsigned long long total_record_bytes;
+    };
+    @mutable struct ViewRecord {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand unsigned long long store_cut;
+        @id(3) @must_understand RecordItem item;
+    };
+    @mutable struct ViewEnd {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand unsigned long long store_cut;
+        @id(3) @must_understand unsigned long long record_count;
+        @id(4) @must_understand Digest256 digest;
+        @id(5) @must_understand unsigned long long ready_through_delivery_seq;
+    };
+    @mutable struct Delta {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand unsigned long long delivery_seq;
+        @id(3) @must_understand unsigned short delta_kind;
+        @id(4) @must_understand EntityKey entity;
+        @id(5) @must_understand unsigned long long origin_revision;
+        @id(6) @must_understand unsigned long long freshness_generation;
+        @id(7) @must_understand BodyBytes record_bytes;
+        @id(8) @must_understand unsigned short removal_reason;
+    };
+
+    const unsigned short PRESENCE_AVAILABLE = 1;
+    const unsigned short PRESENCE_UNAVAILABLE = 2;
+    @final struct PresenceEntry {
+        GuidBytes participant_guid;
+        Id128 incarnation_id;
+        unsigned long long freshness_generation;
+        unsigned long long remaining_lease_ns;
+        unsigned short availability;
+    };
+    typedef sequence<PresenceEntry, 256> PresenceEntries;
+    @mutable struct PresenceProof {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand Id128 challenge_nonce;
+        @id(3) @must_understand unsigned long chunk_index;
+        @id(4) @must_understand unsigned long chunk_count;
+        @id(5) @must_understand PresenceEntries entries;
+        @id(6) @must_understand unsigned long long view_delivery_seq;
+        @id(7) @must_understand unsigned long long query_serial;
+    };
+
+    @mutable struct ErrorBody {
+        @id(1) @must_understand unsigned short error_code;
+        @id(2) @must_understand unsigned short recovery_action;
+        @id(3) @must_understand Id128 related_request;
+        @id(4) @optional EntityKey affected_entity;
+        @id(5) @optional unsigned long long affected_revision;
+        @id(6) @optional unsigned long long retry_after_ns;
+    };
+
+    // EXPERIMENTAL registry values. Never advertise as frozen production IDs.
+    const unsigned short RESERVED_OP_HELLO = 1;
+    const unsigned short RESERVED_OP_CHALLENGE = 2;
+    const unsigned short RESERVED_OP_OPEN = 3;
+    const unsigned short OP_ACCEPT = 4;
+    const unsigned short OP_ORIGIN_BEGIN = 5;
+    const unsigned short OP_ORIGIN_RECORD = 6;
+    const unsigned short OP_ORIGIN_END = 7;
+    const unsigned short OP_MUTATE = 8;
+    const unsigned short OP_COMMIT = 9;
+    const unsigned short OP_REJECT = 10;
+    const unsigned short OP_VIEW_REQUEST = 11;
+    const unsigned short OP_SNAPSHOT_BEGIN = 12;
+    const unsigned short OP_SNAPSHOT_RECORD = 13;
+    const unsigned short OP_SNAPSHOT_END = 14;
+    const unsigned short OP_DELTA = 15;
+    const unsigned short OP_APPLIED = 16;
+    const unsigned short OP_VIEW_SYNC = 17;
+    const unsigned short OP_RESYNC_REQUIRED = 18;
+    const unsigned short OP_LEASE_CHALLENGE = 19;
+    const unsigned short OP_LEASE_PROOF = 20;
+    const unsigned short OP_PRESENCE_QUERY = 21;
+    const unsigned short OP_PRESENCE_PROOF = 22;
+    // Retired draft operations: reserved, not supported or negotiable in v1.
+    const unsigned short RESERVED_OP_ROUTE = 23;
+    const unsigned short RESERVED_OP_ROUTE_ERROR = 24;
+    const unsigned short OP_CLOSE = 25;
+    const unsigned short OP_CLOSED = 26;
+    const unsigned short OP_STATUS = 27;
+    const unsigned short OP_ERROR = 28;
+    const unsigned short OP_ADMISSION_REJECT = 29;
+    const unsigned short OP_PATH_CHALLENGE = 30;
+    const unsigned short OP_PATH_RESPONSE = 31;
+    const unsigned short OP_REGISTER = 32;
+    const unsigned short RECORD_PARTICIPANT = 1;
+    const unsigned short RECORD_WRITER = 2;
+    const unsigned short RECORD_READER = 3;
+    const unsigned short CHANGE_UPSERT = 1;
+    const unsigned short CHANGE_REMOVE = 2;
+    const unsigned short DELTA_UPSERT = 1;
+    const unsigned short DELTA_REMOVE = 2;
+    const unsigned short DELTA_VIEW_WITHDRAW = 3;
+    const unsigned short DELTA_LEASE_REDUCTION = 4;
+    const unsigned short RECOVERY_RETRY_SAME = 1;
+    const unsigned short RECOVERY_NEW_ADMISSION = 2;
+    const unsigned short RECOVERY_NEW_INVENTORY = 3;
+    const unsigned short RECOVERY_NEW_VIEW = 4;
+    const unsigned short RECOVERY_REVALIDATE_PATH = 5;
+    const unsigned short RECOVERY_TERMINAL = 6;
+    const unsigned short ERROR_MALFORMED = 1;
+    const unsigned short ERROR_UNSUPPORTED = 2;
+    const unsigned short ERROR_UNAUTHORIZED = 3;
+    const unsigned short ERROR_OWNER_CONFLICT = 4;
+    const unsigned short ERROR_STALE_SESSION = 5;
+    const unsigned short ERROR_REVISION_CONFLICT = 6;
+    const unsigned short ERROR_LIMIT = 7;
+    const unsigned short ERROR_TRANSACTION_EXPIRED = 8;
+    const unsigned short ERROR_CURSOR_UNAVAILABLE = 9;
+    const unsigned short ERROR_DESTINATION_UNAVAILABLE = 10;
+    const unsigned short ERROR_BACKEND_FAILURE = 11;
+    const unsigned short DOWNSTREAM_SNAPSHOT_REQUIRED = 1;
+    const unsigned short DOWNSTREAM_RESUME_ACCEPTED = 2;
+    const unsigned short COMMIT_INVENTORY = 1;
+    const unsigned short COMMIT_MUTATION = 2;
+    const unsigned short COMMIT_CLOSE = 3;
+    const unsigned short VIEW_ALL = 1;
+    const unsigned short VIEW_TOPIC_CANDIDATES = 2;
+    const unsigned short PROFILE_CACHED = 1;
+    const unsigned short PROFILE_OPAQUE_PEER = 2;
+    const unsigned short CHANNEL_CONTROL = 1;
+    const unsigned short CHANNEL_STATE = 2;
+    const unsigned short RESERVED_CHANNEL_PEER_METATRAFFIC = 3;
+    const unsigned short RESERVED_SERVICE_WLP = 1;
+    const unsigned short RESERVED_SERVICE_TYPE_LOOKUP = 2;
+    const unsigned short RESERVED_SERVICE_SECURITY = 3;
+    // Experimental vendor no-key endpoints, octets in GUID order (not host integers).
+    const octet BROKER_WRITER_KIND = 0x43;
+    const octet BROKER_READER_KIND = 0x44;
+    const unsigned long BOOTSTRAP_ENTITY_KEY = 0x7a0001;
+    const unsigned short KEY_REPRESENTATION_FULL_DATA = 1;
+    const unsigned short KEY_REPRESENTATION_KEY_ONLY = 2;
+    const unsigned short KEY_REPRESENTATION_INLINE_HASH = 3;
+    const unsigned short METADATA_KEY_REPRESENTATION = 1;
+    const unsigned short METADATA_STATUS_INFO = 2;
+    const unsigned short METADATA_INLINE_QOS = 3;
+    const unsigned short FEATURE_TOPIC_CANDIDATES = 1;
+    const unsigned short FEATURE_DOWNSTREAM_RESUME = 2;
+    const unsigned short FEATURE_OPAQUE_PEER = 3;
+    const unsigned short FEATURE_TYPE_LOOKUP_ROUTE = 4;
+    const unsigned short FEATURE_SECURITY_ROUTE = 5;
+
+    const unsigned short REASON_ORIGIN_REMOVE = 1;
+    const unsigned short REASON_PARTICIPANT_CLOSE = 2;
+    const unsigned short REASON_LEASE_EXPIRED = 3;
+    const unsigned short REASON_VIEW_INTEREST = 4;
+    const unsigned short REASON_AUTHORIZATION_REVOKED = 5;
+    const unsigned short STATUS_PROGRESS = 1;
+    const unsigned short STATUS_RECOVERY_PENDING = 2;
+    const unsigned short STATUS_DRAINING = 3;
+
+    @final struct MetadataEntry {
+        unsigned short tag;
+        boolean required;
+        MetadataBytes value;
+    };
+    typedef sequence<MetadataEntry, 64> MetadataEntries;
+    @final struct MetadataList { MetadataEntries entries; };
+    @final struct ParticipantIdentity {
+        GuidBytes participant_guid;
+        Id128 incarnation_id;
+    };
+    typedef sequence<ParticipantIdentity, 256> ParticipantIdentities;
+    @mutable struct Mutation {
+        @id(1) @must_understand BodyBytes record_bytes;
+    };
+    @mutable struct CommitReply {
+        @id(1) @must_understand Id128 related_request;
+        @id(2) @must_understand unsigned short commit_kind;
+        @id(3) @must_understand unsigned long long store_cut;
+        @id(4) @must_understand unsigned long long inventory_generation;
+        @id(5) @must_understand EntityKey entity;
+        @id(6) @must_understand unsigned long long origin_revision;
+    };
+    @mutable struct RejectReply {
+        @id(1) @must_understand ErrorBody failure;
+        @id(2) @must_understand unsigned long long inventory_generation;
+    };
+    @mutable struct ViewRequest {
+        @id(1) @must_understand unsigned short view_mode;
+        @id(2) @must_understand boolean request_resume;
+        @id(3) @must_understand ResumeCursor cursor;
+        // Client-assigned, increasing within the admitted session; distinct from cursor.
+        @id(4) @must_understand unsigned long long view_generation;
+    };
+    @mutable struct Applied {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand unsigned long long snapshot_cut;
+        @id(3) @must_understand Digest256 snapshot_digest;
+        @id(4) @must_understand unsigned long long applied_delivery_seq;
+    };
+    @mutable struct ViewSync {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand unsigned long long ready_through_delivery_seq;
+    };
+    @mutable struct ResyncRequired {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand unsigned short reason;
+        @id(3) @must_understand unsigned long long retry_after_ns;
+    };
+    @mutable struct LeaseChallenge {
+        @id(1) @must_understand Id128 challenge_nonce;
+    };
+    @mutable struct LeaseProof {
+        @id(1) @must_understand Id128 challenge_nonce;
+    };
+    @mutable struct PresenceQuery {
+        @id(1) @must_understand unsigned long long view_generation;
+        @id(2) @must_understand Id128 challenge_nonce;
+        @id(3) @must_understand boolean full_view;
+        @id(4) @must_understand ParticipantIdentities participants;
+        @id(5) @must_understand unsigned long long query_serial;
+    };
+    @mutable struct CloseRequest {
+        @id(1) @must_understand ParticipantIdentity participant;
+    };
+    @mutable struct ClosedReply {
+        @id(1) @must_understand Id128 related_request;
+        @id(2) @must_understand ParticipantIdentity participant;
+        @id(3) @must_understand unsigned long long store_cut;
+    };
+    @mutable struct StatusBody {
+        @id(1) @must_understand Id128 related_request;
+        @id(2) @must_understand unsigned long long view_generation;
+        @id(3) @must_understand unsigned long long inventory_generation;
+        @id(4) @must_understand unsigned short status_code;
+    };
+};
