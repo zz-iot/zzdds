@@ -627,6 +627,32 @@ pub fn build(b: *std.Build) void {
         zzdds_lib.root_module.addIncludePath(b.path("include"));
         zzdds_lib.root_module.linkLibrary(zidl_cdr_lib);
 
+        // dll_export_fns (above) only covers Zig's own `export fn` surface,
+        // not the plain C functions just compiled in from dcps_cdr.c/
+        // zzdds_cdr.c -- confirmed empirically, not just by inspection: it
+        // alone did NOT clear the Windows examples lane's LNK2019s. Those
+        // two generated files need their own .def EXPORTS entries, built by
+        // scanning them directly (tools/gen_windows_def.zig) rather than
+        // hand-maintaining a symbol list that would silently drift out of
+        // sync with the IDL. A .def file's EXPORTS section is additive
+        // alongside whatever dll_export_fns already covers, never a
+        // replacement, so this can't un-export anything that already works.
+        if (target.result.os.tag == .windows) {
+            const gen_windows_def_exe = b.addExecutable(.{
+                .name = "gen_windows_def",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tools/gen_windows_def.zig"),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                }),
+            });
+            const run_gen_def = b.addRunArtifact(gen_windows_def_exe);
+            const zzdds_def = run_gen_def.addOutputFileArg("zzdds_generated.def");
+            run_gen_def.addFileArg(gen_c_lib_dir.path(b, "dcps_cdr.c"));
+            run_gen_def.addFileArg(gen_zzdds_c_lib_dir.path(b, "zzdds_cdr.c"));
+            zzdds_lib.win32_module_definition = zzdds_def;
+        }
+
         const install_zzdds_lib_step: *std.Build.Step = if (target.result.os.tag == .macos) blk: {
             // Zig 0.16 incorrectly publishes the Mach-O linker-synthesized
             // ___dso_handle in a dylib's export trie. An Apple-clang C++
