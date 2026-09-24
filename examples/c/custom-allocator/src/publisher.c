@@ -39,6 +39,7 @@ static char g_stdout_buf[8192];
 int main(void) {
     setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
+    fprintf(stderr, "CHECKPOINT: pool reset\n"); fflush(stderr);
     /* Routes zidl-cdr's own internal buffer growth (the CDR writer's
      * malloc/realloc-backed default) through the same static-pool allocator
      * used for entity bootstrap -- without this, the writer would still grow
@@ -46,6 +47,7 @@ int main(void) {
      * allocator. It's this application's responsibility to size the pool for
      * whatever it serializes. */
     zidl_cdr_set_allocator(&static_pool_allocator);
+    fprintf(stderr, "CHECKPOINT: cdr allocator set\n"); fflush(stderr);
 
     /* Resolve+install zzdds.toml as the process-wide config BEFORE creating
      * any factory, through the same static-pool allocator everything else in
@@ -59,12 +61,14 @@ int main(void) {
         fprintf(stderr, "FAIL: zzdds_process_configure_from_file (rc=%d)\n", (int)cfg_rc);
         return 1;
     }
+    fprintf(stderr, "CHECKPOINT: config loaded\n"); fflush(stderr);
 
     zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&static_pool_allocator);
     if (zzdds_factory_is_nil(factory)) {
         fprintf(stderr, "FAIL: zzdds_create_factory_with_allocator returned nil\n");
         return 1;
     }
+    fprintf(stderr, "CHECKPOINT: factory created\n"); fflush(stderr);
     DDS_DomainParticipantFactory dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
 
     DDS_DomainParticipant dp = DDS_DomainParticipantFactory_create_participant(dds_factory, DOMAIN_ID, NULL, NULL, 0);
@@ -72,6 +76,7 @@ int main(void) {
         fprintf(stderr, "FAIL: create_participant returned NULL\n");
         return 1;
     }
+    fprintf(stderr, "CHECKPOINT: participant created\n"); fflush(stderr);
 
     check(SensorSampleTypeSupport_register(dp, "SensorSample"),
           "register_type_support");

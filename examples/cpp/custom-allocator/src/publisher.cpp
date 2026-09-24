@@ -48,6 +48,7 @@ char g_stdout_buf[8192];
 int main() {
     std::setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
+    std::fprintf(stderr, "CHECKPOINT: pool reset\n"); std::fflush(stderr);
     // Two separate, independent allocator registrations (see
     // allocator-strategy.md): zidl_cdr_set_allocator routes the CDR writer's
     // own scratch-buffer growth; zidl::setCppAllocator routes every C++
@@ -56,6 +57,7 @@ int main() {
     // zero-libc-malloc process.
     zidl_cdr_set_allocator(&static_pool_allocator);
     zidl::setCppAllocator(&static_pool_allocator);
+    std::fprintf(stderr, "CHECKPOINT: cdr+cpp allocator set\n"); std::fflush(stderr);
 
     // Resolve+install zzdds.toml as the process-wide config BEFORE creating
     // any factory, through the same static-pool allocator everything else in
@@ -67,12 +69,14 @@ int main() {
         std::fprintf(stderr, "FAIL: process_configure_from_file\n");
         return 1;
     }
+    std::fprintf(stderr, "CHECKPOINT: config loaded\n"); std::fflush(stderr);
 
     auto factory = zzdds::create_factory(&static_pool_allocator);
     if (!factory) {
         std::fprintf(stderr, "FAIL: create_factory returned null\n");
         return 1;
     }
+    std::fprintf(stderr, "CHECKPOINT: factory created\n"); std::fflush(stderr);
 
     auto dp = factory->create_participant(
         DOMAIN_ID, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
@@ -80,6 +84,7 @@ int main() {
         std::fprintf(stderr, "FAIL: create_participant returned null\n");
         return 1;
     }
+    std::fprintf(stderr, "CHECKPOINT: participant created\n"); std::fflush(stderr);
     auto dp_handle = dp->native_handle();
 
     check(SensorSampleTypeSupport::register_type(dp_handle), "register_type");
