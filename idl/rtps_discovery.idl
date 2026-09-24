@@ -79,6 +79,7 @@
 
 @mutable @pl_retain_unknown
 struct SPDPdiscoveredParticipantData {
+    @id(0x000f) @optional unsigned long domainId; // always emitted; absent defaults to receiver domain
     @id(0x0015)           ProtocolVersion_t protocolVersion;   // always emitted ({2,5})
     @id(0x0016)           VendorId_t        vendorId;          // always emitted
     @id(0x0050) @optional octet             participantGuid[16]; // prefix[12] + entityId[4]; zzdds always emits it; decode falls back to the RTPS message header's guid_prefix when a peer omits it

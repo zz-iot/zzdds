@@ -22,6 +22,35 @@ Forward-looking only: known gaps, planned features, and open design questions.
 
 ### Discovery / RTPS / transport
 
+- **Standard RTPS domain tags and domain identity admission** — required prerequisite
+  for broker discovery, replacing the proposed broker realm. Add DomainConfig.tag
+  (empty default), PID_DOMAIN_TAG (0x4014, string<256>) and PID_DOMAIN_ID decoding/
+  announcement support. Enforce identity before native peer installation, locator/lease
+  updates and SEDP/WLP matching, including direct discovery. Regenerate config/bindings
+  and test defaults, domain/tag mismatch, malformed inputs and both byte orders. See
+  the [accepted domain identity decision](design/broker-domain-identity.md). Not yet
+  implemented as a complete feature; explicit domain-ID emission/decoding and SPDP
+  mismatch filtering are now in the working tree. Tag propagation and remaining
+  admission checks are still required; opaque unknown-PID retention is insufficient.
+
+- **Strengthen reception and admission boundaries** — audit the path from input
+  validation through RTPS sequence/ACK accounting, DDS processing and history admission.
+  The [historical-data wait audit](design/historical-data-wait.md) identifies sequence
+  accounting before fallible cache operations, discarded failures and a void internal
+  delivery callback that cannot report admission outcomes. Define explicit outcomes
+  for admission, policy exclusion, resource rejection, retained retry and terminal
+  failure; distinguish these from malformed/untrusted input. Review ACK/repair behavior
+  per outcome rather than moving every ACK after cache admission indiscriminately.
+  Preserve GAP/filter/removal distinctions where available, and never let unrelated
+  invalid traffic complete or fail a legitimate historical transfer. Make space for
+  future XTypes validation/type lookup and DDS Security authentication/authorization
+  without claiming those features implemented. Validate with malformed/fragmented
+  input, allocation/resource fault injection, GAPs, retransmission and teardown races;
+  check bounded retention, correct status reporting and absence of false completion.
+  The concurrency spec owns state ownership, handoff and completion requirements;
+  this roadmap task owns the production audit, fixes and integration tests. It need
+  not block finishing that spec or the broker design, but affected implementation
+  guarantees require these fixes and tests before being claimed.
 - **Static and broker discovery plugins** — `src/discovery/interface.zig` and the config
   schema reserve `static` and `broker` discovery kinds, but only SPDP/SEDP and direct
   in-process discovery are implemented. Either implement static-config loading + broker
@@ -94,6 +123,26 @@ Forward-looking only: known gaps, planned features, and open design questions.
   `design/rtps-message-builder.md`.
 
 ### DCPS / QoS
+
+#### Optional DDS profile builds
+
+- Add compile-time switches for optional DDS profiles, prioritizing removal of existing
+  GROUP presentation/coherent coordination and EXCLUSIVE ownership machinery. Audit
+  Annex A boundaries and dependencies, including Ownership's history-depth provision,
+  before finalizing flag names. Plan Persistence selection alongside its implementation;
+  do not conflate it with required TRANSIENT_LOCAL support.
+- Audit the existing `-Dcontent-subscription-profile=false` switch for complete parser,
+  evaluator and dedicated-state removal, and correct unavailable-feature behavior for
+  ContentFilteredTopic/QueryCondition. MultiTopic remains unimplemented; a switch does
+  not establish full profile compliance.
+- Follow the agreed [compile-out requirement](design/concurrency-model.md#71-agreed-optional-profiles-must-compile-out):
+  remove dedicated storage and hot-path work, not only runtime behavior. Preserve core
+  listener/concurrency guarantees and required non-GROUP behavior. Reject unavailable
+  requests appropriately rather than silently weakening QoS or filtering.
+- Add representative enabled/disabled build coverage and reproducible footprint comparisons:
+  application code/read-only data, static RAM, per-entity/per-sample storage and peak
+  memory, with target, optimization and binding/linkage held constant. Measure individual
+  switches and a combined minimal configuration; savings are currently unmeasured.
 
 - **Keyed-instance handle without a wire key-hash** — without an inline `PID_KEY_HASH` or a
   registered `TypeSupport.compute_key_hash`, keyed samples all collapse to the NIL instance
@@ -508,7 +557,37 @@ acceptable if a runtime switch proves impractical). The design must account for:
   (DEADLINE/LIVELINESS, interface-change poll, wire-trace flush; possibly heartbeat and
   SPDP) collapse onto one scheduler regardless of the model chosen.
 
-Output: a design doc; the roadmap keeps a pointer.
+Drafts: [Concurrency model: state ownership and progress](design/concurrency-model.md)
+and [Listener execution contract](design/listener-execution.md). They separate agreed
+requirements from proposals and open decisions. Take-turns execution with an explicit
+admission boundary is selected initially. The participant-plus-endpoint ownership proposal
+and parent coordinator interactions are consolidated in concurrency-model section 4.4;
+shared GROUP access brackets and optional-profile removal are agreed. Backend, API and
+exact build flags remain open. Refined FIFO/resource-fair admission and a shared runtime
+progress domain are accepted. The [test-only synchronization prototype](design/concurrency-prototype.md)
+now covers integrated admission/commit, idle-worker wakeup/shutdown, explicit-time
+operation expiry, and snapshot FIFO service under finite workloads and partial-installation
+checkpoints. Prepared storage now includes allocator-backed payloads, explicit
+replacement reservations and delayed pin reclamation. The [integrated review](design/concurrency-prototype-review.md)
+prioritizes explicit completion/reference retirement and safe request/node reuse,
+then bounded preparation/reclamation publication and FIFO helper admission.
+The [lifetime/reuse proposal](design/request-lifetime.md) now specifies these
+boundaries. A separate tiny-pool experiment now exercises reuse and delayed
+references. Admission queue/executor/gate/observer ownership transfers are now
+integrated and structurally audited. Independent node identity/reuse, explicit ledger
+order and checked request handles now complete the current experiment checkpoint.
+The [listener identity note](design/listener-identity-decision.md) proposes default
+identity scope. Replacement/quiescence now has an accepted initial contract and
+a bounded retirement-frontier fixture; binding identity and callback delegation
+remain specification work.
+The [specification status map](design/concurrency-spec-status.md) recommends closing
+this validation branch and resolving remaining listener/runtime/transport contracts,
+then consolidating the concurrency suite and revising the broker proposal. Integrated
+request-slot reuse and production storage work remain explicit later tasks.
+Remaining work also includes automatic
+clock/timer integration, production storage/index and reuse coverage, and remaining
+listener identity/lifecycle details before committing to
+the production runtime refactor.
 
 ### Single-threaded / embedded `drive(timeout)` API
 
