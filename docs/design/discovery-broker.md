@@ -1,21 +1,27 @@
 # Centralized discovery broker for zzdds
 
-Status: proposed design specification, revision 0.1, 2026-09-08. No implementation is included. MUST, SHOULD, and MAY express requirements of this proposed zzdds protocol, not additional OMG requirements. Wire identifiers and generated IDL require a subsequent protocol-freeze review; implementation must not invent incompatible private assignments independently.
+Status: consolidated design baseline, 2026-09-24; not a wire freeze. Start with the
+[implementer guide](broker-spec-guide.md) for controlling contracts and reading order,
+and the [closure ledger](broker-spec-closure.md) for compatibility gates. MUST/SHOULD/MAY
+express requirements of this proposed zzdds protocol, not new OMG requirements.
+The overview below is complemented by the linked detailed contracts. No working broker,
+production concurrency migration or frozen generated ABI is claimed. See the
+[final handoff](specification-handoff.md) for completion scope and implementation gates.
 
 ## 1. Decision
 
-Implement an opt-in **BrokerDiscovery** plugin and a separate **zzdds discovery broker** executable. The broker distributes participant and endpoint state; applications exchange user data directly. Both UDP and TCP client connections use zzdds transports and the same discovery semantics. Discovery transport selection is independent of user-data transport selection.
+Implement an opt-in **broker discovery service association** and a separate **zzdds discovery broker** executable. Broker-only is a configuration preset; ordinary directed and multicast discovery may coexist with it. The broker distributes participant and endpoint state; applications exchange user data directly. Both UDP and TCP client connections use zzdds transports and the same discovery semantics. Discovery transport selection is independent of user-data transport selection.
 
 Use an explicitly versioned alternative participant/endpoint discovery protocol, with the existing SPDP/SEDP serialized discovery data as its authoritative payload. The broker owns its delivery streams; original participants own the advertised entities. Never impersonate an origin's SEDP writer to make cached discovery look like an ordinary peer transmission.
 
-Provide a separate, destination-addressed **metatraffic route** for built-in protocols that need exchanges between actual participants: WLP now, TypeLookup and DDS Security later. This carries protocol messages, including their reliability control messages, without interpreting them as cached endpoint state. It is a small control-plane forwarding service. It does not grant permission to forward user topics.
+Keep native metatraffic participant-to-participant in v1: broker discovery supplies the information needed to associate WLP endpoints, while WLP messages use direct reachable transports. Allocated opaque transport relays are a later capability; see the [accepted relay direction](broker-relay-direction.md).
 
 There are two discovery profiles:
 
 | Profile | Behavior | Initial scope |
 | --- | --- | --- |
 | `cached` | Broker retains origin-owned SPDP/SEDP payloads and distributes state through independent reliable streams. Clients trust broker discovery assertions. | Required in v1 |
-| `opaque_peer` | Broker introduces participants and routes original native peer metatraffic; secure discovery is validated by the actual peers. No broker interpretation of encrypted endpoint discovery. | Reserved architecture; implement with DDS Security |
+| `opaque_peer` | Broker introduces participants; native peer exchanges use direct or future allocated relay transports; secure discovery is validated by the actual peers. No broker interpretation of encrypted endpoint discovery. | Reserved architecture; implement with DDS Security |
 
 This distinction is essential: preserving a ParameterList is useful extensibility, but it does not make a plaintext cache a transparent DDS Security intermediary.
 
@@ -25,12 +31,13 @@ RTPS 2.5 §8.5.6 explicitly permits alternative discovery protocols, including c
 
 The baseline references are [DDS 1.4](https://www.omg.org/spec/DDS/1.4), [RTPS 2.5](https://www.omg.org/spec/DDSI-RTPS/2.5), [XTypes 1.3](https://www.omg.org/spec/DDS-XTypes/1.3), and [DDS Security 1.2](https://www.omg.org/spec/DDS-SECURITY/1.2). Preserve DDS entity identity, QoS interpretation, matching, and status behavior in the clients. Broker protocol extensions, routing metadata, tenant isolation, and session leases are zzdds-specific.
 
-Relevant comparisons, consulted after examining zzdds:
+Relevant comparisons from the original 2026-09-08 research, retained as design
+context rather than a newly verified survey of current vendor offerings:
 
 | System | Useful evidence | Consequence for this proposal |
 | --- | --- | --- |
 | OpenDDS RtpsRelay | Forwards RTPS across NAT, distinguishes SPDP/SEDP/data traffic, and uses STUN and ICE. Its documented ICE implementation does not use TURN. | Separate traffic classes and candidate gathering by actual socket; do not make data relaying the default. [OpenDDS documentation](https://opendds.readthedocs.io/en/master/devguide/internet_enabled_rtps.html) |
-| Fast DDS Discovery Server | Reuses discovery structures, supports TCP and redundant servers, and keeps user data direct. The current 3.x documentation distinguishes Pro filtering from unfiltered open-source distribution; older v2 descriptions should not be assumed to describe current editions. | Independent transport configuration and explicit disclosure modes are useful; benchmark rather than assume filtering guarantees. [Current documentation](https://fast-dds.docs.eprosima.com/en/3.x/fastdds/discovery/discovery_server.html) |
+| Fast DDS Discovery Server | Reuses discovery structures, supports TCP and redundant servers, and keeps user data direct. The consulted 3.x documentation distinguishes Pro filtering from unfiltered open-source distribution; older v2 descriptions should not be assumed to describe current editions. | Independent transport configuration and explicit disclosure modes are useful; benchmark rather than assume filtering guarantees. [Referenced documentation](https://fast-dds.docs.eprosima.com/en/3.x/fastdds/discovery/discovery_server.html) |
 | RTI Cloud Discovery Service | Centrally forwards participant announcements and preserves domain isolation; documents additional domain tags. | Participant rendezvous is a viable simpler alternative, but by itself does not meet the endpoint-discovery scaling objective. Preserve numeric domain isolation explicitly. [Core concepts](https://community.rti.com/static/documentation/connext-dds/current/doc/manuals/addon_products/cloud_discovery_service/core_concepts.html) |
 
 No wire compatibility with these services is promised. Unmodified third-party DDS participants use the existing SPDP/SEDP path. A broker merely configured as an ordinary initial peer is not sufficient to speak this protocol.
@@ -45,7 +52,7 @@ No wire compatibility with these services is promised. Unmodified third-party DD
 
 ## 3. Scope and invariants
 
-V1 includes a single authoritative broker, UDP and TCP sessions, bounded reliable state distribution, complete late-join synchronization, endpoint disposal, participant expiry, all-domain and conservative topic-based disclosure, WLP forwarding, authenticated deployment options, metrics, and reconnect recovery. It supports routed networks, VPNs, public addresses, and operator-configured port mappings. Automatic NAT traversal is not a v1 claim.
+V1 includes a single authoritative broker, UDP and TCP sessions, bounded reliable state distribution, complete late-join synchronization, endpoint disposal, participant expiry, all-domain and conservative topic-based disclosure, direct native WLP integration, authenticated deployment options, metrics, and reconnect recovery. It supports routed networks, VPNs, public addresses, and operator-configured port mappings. Automatic NAT traversal is not a v1 claim.
 
 Required invariants:
 
@@ -80,15 +87,74 @@ The broker has four components with separate resource budgets:
 * **Session/admission layer:** binds an authenticated client to a scope and participant; validates return paths and owns connection lifecycle.
 * **Discovery store:** immutable origin payloads plus parsed indexes, ownership, entity revisions and tombstones.
 * **View distributor:** constructs each client's authorized graph, snapshots and deltas; owns downstream reliability.
-* **Metatraffic router:** forwards bounded original protocol messages using explicit source/destination participant identities and traffic classes.
+* **Native metatraffic integration:** connects broker-installed participants to direct WLP associations and receive/repair paths. No broker forwarding service in v1.
 
 A participant has a discovery-state adapter, shared discovery codecs, normal local DDS matching, and a route resolver. The route resolver separates an advertised peer locator from the currently usable direct or broker-assisted path. Network changes update routes without changing GUIDs or rewriting signed discovery.
 
+The resolver owns route eligibility, provenance and lifetime above locator selection.
+For an ordinary direct route it supplies eligible locators to the existing
+`LocatorSelector` for preference/fanout selection; it does not introduce a second
+competing ranking policy. An established broker Channel uses `sendOnChannel` directly
+and bypasses locator ranking. Future nominated connectivity paths constrain the eligible
+set; they are not mixed indiscriminately with unvalidated advertised addresses.
+`canReach` remains a transport capability filter, not evidence that a peer path works.
+
 The broker's protocol endpoints are internal control entities. They MUST NOT appear as user publishers/subscribers or pollute the application's DDS built-in topic view.
+
+### 4.1 Runtime, scheduling and shutdown
+
+BrokerDiscovery is participant-owned protocol state on the shared runtime. Its admission,
+inventory/view commit, matching and teardown transitions serialize through participant
+control (or an internal subordinate owner with explicit ordering), not a new dedicated
+receive thread. Endpoint-local changes contribute retained records without holding
+endpoint rights through broker I/O. The service uses bounded session work and a serialized
+commit boundary per scope; this logical ordering does not mandate one thread or a global
+mutex for the entire broker.
+
+Both client and server protocol logic MUST support manual and hosted drivers. A particular
+transport/protection backend may initially support only some targets, but unavailable
+combinations fail explicitly. Reusing today's threaded transport for a bounded prototype
+is not evidence of an evented/MCU implementation. No thread per control writer, session
+or timer is a protocol requirement. Broker-only configurations cannot silently spawn
+workers in a manual-only build.
+
+Transport callbacks borrow their input and must not block. Process under eligible bounded
+admission or retain/copy into accounted storage before returning. Queued work retains the
+transport, session generation, target and payload lifetime; a Channel value alone is not
+a lease. Validate again before commit so an old receive, timer or send completion cannot
+mutate a replaced session. Application listeners follow the shared entity/identity/group
+contract, including inline eligibility; no store/context rights span their invocation.
+
+Publishing a complete view is an internal discovery-state commit. Queue the resulting
+matching/status work only after that commit and preserve dependency ordering. This is
+not a promise to synchronously execute every application callback before APPLIED, nor
+a globally atomic snapshot of all independently queried DDS entities. A new listener
+scheduler must not turn broker callbacks into an exception to normal exclusion.
+
+Reserve cancellation/completion and retirement capacity before accepting work. Fairly
+schedule control, state and peer metatraffic with bounded priority; control priority
+must not starve state indefinitely. Do not block an origin/store on a slow session.
+Lease proofs must be processed by the participant's discovery progress path; a socket
+reader or unrelated keepalive thread cannot prove that path is responsive.
+
+Participant close fences local mutations and routes, cancels retry/renewal, and publishes
+its cleanup obligation before releasing runtime ownership. Send CLOSE when possible,
+but local DDS deletion and runtime retirement MUST NOT wait for remote CLOSED, broker
+availability or lease expiry. If notification cannot arrive, the broker's finite lease
+removes the remote inventory. A late COMMIT cannot reopen a locally closed participant.
+Hosted cleanup, ordinary manual teardown tails and explicitly attached external loops
+follow [runtime retirement](runtime-retirement.md) and
+[bootstrap](runtime-bootstrap-contract.md); the broker adds no mandatory shutdown API.
 
 ## 5. Scope, ownership and data model
 
-Every lookup, subscription, route and cache key includes `Scope = (realm_id, domain_id)`. `realm_id` is an immutable, administratively assigned opaque identifier authorized at admission. It is not a DDS partition, topic prefix, or replacement for `domain_id`. Domain translation and cross-realm forwarding are not supported.
+Every cache, ownership, inventory, view and recovery key includes
+`Scope = (domain_id, domain_tag)` within the configured broker authority. These are the
+origin participant's standard domain values, not a broker-local namespace or Partition QoS.
+A broker uses a distinct logical service participant per configured scope, sharing runtime
+and listening addresses as appropriate. No domain translation or cross-scope graph merging
+is supported. See [domain identity](broker-domain-identity.md) and the accepted
+[multi-domain service arrangement](broker-multidomain-service.md).
 
 The broker MUST verify any domain value in origin metadata against the admitted domain. A matching DDS domain number alone grants no access. DDS partition QoS remains an endpoint matching input, not an access-control boundary.
 
@@ -101,14 +167,19 @@ The broker MUST verify any domain value in origin metadata against the admitted 
 | `owner_generation` | Broker-issued fencing generation; only one generation may publish for an incarnation |
 | `entity_key` | Scope, participant incarnation, record kind, entity GUID |
 | `origin_revision` | Strictly increasing unsigned 64-bit counter per entity, starting at 1; includes removals |
-| `view_generation` | Changes when a client view is replaced or its filter/security scope changes |
+| `view_generation` | Client-assigned, increasing per session/request; broker invalidation requires a new client request. Resume cursor retains its old baseline identity separately. |
 | `delivery_seq` | Contiguous per-client, per-view delivery order; distinct from RTPS writer sequence numbers |
 
 Counters MUST NOT wrap. Exhaustion requires a fresh relevant session/view or entity identity before further writes.
 
 An origin record contains the key, revision, operation (`UPSERT` or `REMOVE`), serialization/profile identifier, original protocol/vendor metadata, raw serialized discovery payload, and needed change metadata (key representation, status information and inline QoS). Preserve an original built-in writer GUID/sequence number when one exists for diagnostics or hybrid deduplication; these are not the broker delivery ordering mechanism.
 
-Use SPDP participant data and SEDP publication/subscription data encoded by shared codecs. Retain the complete owned byte representation, including encapsulation, unknown optional parameters, repeated parameters and padding. Parsed indexes are disposable derivatives. Do not decode into today's `QosSnapshot` and then reconstruct the authoritative payload. Preserve unknown locator kinds even if this broker cannot use them.
+Use SPDP participant data and SEDP publication/subscription data encoded by shared codecs. Retain the complete owned byte representation, including encapsulation, unknown optional parameters, repeated parameters and padding. Parsed indexes are disposable derivatives. The old flat `QosSnapshot` has already been replaced by typed QoS. Typed projections
+still are not a lossless wire representation: do not reconstruct authoritative broker
+records from `ParticipantData` or endpoint matching data. The generated PL_CDR codecs
+and `discovery/wire_codec.zig` are reusable; retain the original owned bytes alongside
+any generated parsed value. Re-encoding preserved unknown fields alone is not proof
+of byte-exact original ordering/padding retention. Preserve unknown locator kinds even if this broker cannot use them.
 
 RTPS ParameterLists allow repeated parameters and distinguish ignorable from must-understand unknown parameters. Enforce that distinction when semantically accepting data; preserving bytes does not permit a client to accept semantics it does not understand. [RTPS 2.5 §9.4.2.11](https://www.omg.org/spec/DDSI-RTPS/2.5/PDF).
 
@@ -120,21 +191,33 @@ Endpoint GUID prefixes MUST belong to the admitted participant. A removal includ
 
 ### 6.1 Bootstrap and channels
 
+The [wire contract draft](broker-wire-contract.md) supplies proposed field schemas,
+framing/version negotiation, cross-stream assembly, digest and resume rules, with a
+[experimental control IDL](schema/broker-control-draft.idl). All named operations have draft body types and a
+[provisional registry](broker-wire-registry.md); codec evidence is recorded in the wire
+contract. These details remain under protocol review; no numeric assignment or experimental schema is production ABI.
+
 Clients receive a list of broker service addresses out of band. No multicast, SEDP, TypeLookup, or application endpoint match is needed to bootstrap. DNS names resolve to service addresses; the authenticated service identity is independent of the resolved IP.
 
-Use RTPS DATA/DATA_FRAG and the existing reliability machinery for explicitly configured zzdds control endpoint pairs. Their identities are assigned in a documented zzdds vendor extension namespace at wire freeze, never by reusing standardized SPDP, SEDP, WLP, TypeLookup or Security entity IDs. A minimal bounded bootstrap endpoint pair is known in advance; admission returns fresh per-session endpoint identities and capabilities. Automatic discovery of these endpoints is unnecessary.
+Use RTPS DATA/DATA_FRAG and RTPS reliability semantics for explicitly configured zzdds
+control endpoint pairs. Reuse reusable protocol logic and codecs, not the current
+thread-owning `StatefulWriter`/`StatefulReader` lifecycle as a mandatory broker design.
+Control streams require runtime-driven timers, bounded history/repair and no send under
+owner locks. Extract/adapt the relevant engine rather than add a second proprietary
+reliability protocol; existing state machines are not evidence those scale gates pass. Their identities are assigned in a documented zzdds vendor extension namespace at wire freeze, never by reusing standardized SPDP, SEDP, WLP, TypeLookup or Security entity IDs. A minimal bounded bootstrap endpoint pair is known in advance; REGISTER offers fresh client endpoint identities; admission returns fresh broker endpoint identities and capabilities. The [endpoint and feature draft](broker-wire-details.md) specifies directions, provisional vendor IDs and metadata formats. Automatic discovery of these endpoints is unnecessary.
 
-Generate the control payload types with zidl. The envelope has an explicit protocol major/minor, operation kind, required-feature flags, scope, broker epoch, session/owner generation, request identity and bounded body. Its extensibility rules MUST allow unknown optional members while rejecting unknown required features. V1 uses one fixed baseline encoding independent of runtime TypeLookup; propose XCDR2 mutable types subject to zidl round-trip fixtures before wire freeze.
+Generate the control payload types with zidl. The envelope has an explicit protocol major/minor, operation kind, required-feature flags, scope, broker epoch, session/owner generation, request identity and bounded body. Its extensibility rules MUST allow unknown optional members while rejecting unknown required features. V1 uses one fixed baseline encoding independent of runtime TypeLookup; the wire draft
+proposes a fixed bootstrap frame around XCDR2 mutable envelope/body types, subject to
+required/duplicate-field validation and round-trip/version fixtures before wire freeze.
 
-There are three logical channel classes:
+There are two v1 logical channel classes:
 
 | Channel | Delivery | Contents |
 | --- | --- | --- |
 | Control | Reliable, bounded, highest scheduling priority | Admission, commit results, view boundaries, errors and shutdown |
 | State | Reliable, bounded, application snapshot/delta cursors | Origin registrations and downstream views |
-| Peer metatraffic | Native end-to-end reliability; outer forwarding does not acknowledge native writers | WLP, future TypeLookup/security, complete original RTPS messages |
 
-Lease challenges use a small expiring control exchange; stale retransmitted responses are never treated as fresh. Peer metatraffic is volatile and MUST NOT be placed in a late-join state snapshot. Underlying TCP is reliable, but that does not change a forwarded protocol's DDS durability or reliability semantics.
+Lease challenges use a small expiring control exchange; stale retransmitted responses are never treated as fresh. Native metatraffic uses direct participant transports and is not carried as broker snapshot state. Broker TCP reliability does not establish native writer liveliness.
 
 The same semantic messages operate over UDP and TCP. TCP preserves zzdds's existing four-byte big-endian length framing around transport messages. Do not add a competing stream delimiter. The sender's successful write is not a broker commit. Retain RTPS reliability behavior initially on both transports; optimize redundant TCP repair only after proving equivalent reconnect and history behavior.
 
@@ -142,14 +225,15 @@ The same semantic messages operate over UDP and TCP. TCP preserves zzdds's exist
 
 | Operation | Required semantics |
 | --- | --- |
-| `HELLO / CHALLENGE / OPEN / ACCEPT` | Negotiate version, required capabilities, scope, profile, limits, lease and authenticated return path; establish fencing generation |
+| `SPDP introduction / PATH validation / REGISTER / ACCEPT` | Negotiate version, required capabilities, scope, profile, limits, lease and authenticated return path; establish fencing generation |
 | `ORIGIN_BEGIN / RECORD / ORIGIN_END` | Atomically publish a complete participant inventory at a local inventory cut; buffer subsequent mutations |
 | `MUTATE / COMMIT / REJECT` | Idempotent single-entity change under active ownership; explicit acceptance or typed rejection |
 | `VIEW_REQUEST / SNAPSHOT_BEGIN / RECORD / SNAPSHOT_END` | Complete authorized view at a specified cut, with count and digest |
 | `DELTA / APPLIED` | Contiguous changes after the cut and an acknowledgment of successful view installation |
 | `RESYNC_REQUIRED` | Invalidate cursor and staged changes; obtain a fresh snapshot |
+| `VIEW_SYNC` | Fixed synchronization target for resumed views; does not imply callback completion |
+| `PRESENCE_QUERY / PRESENCE_PROOF` | Observer nonce-bound, chunked remaining-lease evidence for the installed view |
 | `LEASE_CHALLENGE / LEASE_PROOF` | Correlate fresh evidence to an outstanding nonce and local deadline |
-| `ROUTE / ROUTE_ERROR` | Send original bounded metatraffic to an admitted destination incarnation |
 | `CLOSE / CLOSED` | Retract participant inventory and invalidate its routes/session |
 | `STATUS / ERROR` | Expose lifecycle, authorization, capacity and unsupported-feature failures |
 
@@ -159,7 +243,7 @@ Assign independent RTPS sequence spaces to each session's control/state writers.
 
 ### 6.3 UDP obligations
 
-The client binds a specific local channel before sending HELLO. Replies MUST return through the same socket/path, and the broker MUST use the service address contacted by the client as the reply source. Existing address-family support checks are not path validation.
+The client binds a specific local channel before sending its directed SPDP service request. Replies MUST return through the same socket/path, and the broker MUST use the service address contacted by the client as the reply source. Existing address-family support checks are not path validation.
 
 Before address validation, the server stays stateless or strictly bounded and MUST NOT send more bytes than received. Use an expiring integrity-protected return-routability cookie; cookies are not client authentication. Allocate reliable history only after validation/admission. An authenticated packet from a new tuple initiates path validation; it does not immediately redirect queued traffic. Retain the old validated path for a bounded overlap.
 
@@ -167,15 +251,46 @@ Fragment control samples at RTPS level. Start with a configurable conservative m
 
 Reliability MUST include paced transmission, RTT-sensitive repair, bounded in-flight bytes, backoff, and an aggregate congestion budget covering all streams to a client. An unlimited HEARTBEAT/NACK retransmission loop is not an acceptable WAN congestion policy. Loss, blocked ICMP and delayed acknowledgments must not trigger unbounded traffic.
 
+A UDP Channel identifies a local socket, not one remote peer. Bind the session to its
+validated remote tuple as well as transport lifetime and channel generation. Socket
+closure can affect several sessions; a packet on that socket does not authenticate any
+of them. Wildcard-bound service sockets must preserve the contacted destination address
+as the reply source, or reject that service configuration: socket identity alone does
+not establish the source-address requirement on a multihomed host.
+
 ### 6.4 TCP obligations
 
-The client initiates the connection; the broker replies over that accepted connection, even when the client's listening locator is unreachable from the broker. Add a connection/channel handle to the transport abstraction rather than pretending a NAT-translated source tuple is a universally dialable listener.
+The client initiates the connection; the broker replies over that accepted connection, even when the client's listening locator is unreachable from the broker. Use the implemented `Channel`/`sendOnChannel` transport API; do not redial a
+NAT-translated source tuple as though it were a universally reachable listener.
 
 Disable `reuse_connection_by_host` for broker channels. Participants behind one NAT must not share a route simply because their source IP is equal. Demultiplex by authenticated session and ownership, not host alone.
 
 Enforce frame limits before allocation, incomplete-frame deadlines, bounded send queues, connect/write deadlines, and cancellation. A slow receiver MUST NOT block the discovery store or other sessions. Cap state frame sizes so that control work gets scheduling opportunities; TCP byte-stream head-of-line blocking remains a limitation. Separate physical priority connections are an optional later negotiated capability.
 
 On any reconnect, establish or explicitly resume a session before sending mutations. A new TCP connection generation does not establish discovery state consistency by itself.
+
+### 6.5 Channel lifetime and output completion
+
+Correlate a Channel with its owning transport and session binding. Current close
+notifications broadcast to registered handlers; ignore unknown/already retired tokens,
+and never treat every callback as failure of this session. Invalidate only affected
+paths. TCP connection death, UDP socket death and a remote UDP lease timeout are
+separate events. Detect stalled paths through broker deadlines even when the OS has
+not yet reported a close.
+
+Use a bounded shared ingress dispatcher per service/transport registration, followed
+by session demultiplexing. Do not register a receive handler per session against the
+current 64-handler cap. Current pointer-shaped tokens rely on retention until transport
+close; the evented backend needs safe bounded identity retirement, not an unbounded
+UDP socket graveyard or an unchecked pointer plus generation.
+
+The current send API returns `anyerror!void`; it does not supply asynchronous transfer
+or completion. Adapt it to the [transport/runtime contract](transport-runtime-contract.md):
+not accepted retains producer ownership; accepted pending holds immutable bytes through
+exactly one terminal completion; cancellation request alone does not release them.
+Preserve TCP partial-frame cursors and datagram boundaries. Local send completion,
+RTPS acknowledgment, broker COMMIT and client APPLIED are four distinct boundaries.
+An output failure after a store commit cannot turn it into an uncommitted mutation.
 
 ## 7. Lifecycle and synchronization
 
@@ -184,8 +299,8 @@ Client states are `DISCONNECTED → CONNECTING → ADMITTED → REGISTERING → 
 ### 7.1 Registration
 
 1. Authenticate the session, authorize scope and select the discovery profile.
-2. Claim participant GUID/incarnation. Reject a concurrent different owner. A valid resumption credential may replace a prior connection with a higher fencing generation; old connections immediately lose mutation rights.
-3. Publish participant metadata and a complete endpoint inventory. `ORIGIN_BEGIN/END` identify a consistent cut, item count and digest. Local endpoint mutations after that cut are queued as subsequent ordered operations.
+2. Register participant GUID/incarnation. Serialize conflicts by scope/GUID. A competing connection waits for the old registration to close/expire unless authenticated participant continuity explicitly authorizes replacement. No ownership secret is required for unsecured participants; see [admission policy](broker-admission-protection.md). Replacement fences old connections immediately.
+3. Publish participant metadata and a complete endpoint inventory. `ORIGIN_BEGIN/END` identify a consistent cut, item count and digest. Local endpoint mutations after that cut are queued locally and transmitted only after matching inventory COMMIT in v1. See the [inventory barrier and future pipelining design](broker-inventory-barrier.md).
 4. Validate and atomically commit the inventory. Do not advertise half of an initial participant inventory as complete. Existing committed inventory remains visible during a valid same-incarnation repair until replacement is complete.
 5. Install the requested downstream view and then report READY.
 
@@ -197,7 +312,9 @@ For v1, deleting and recreating an endpoint MUST allocate a fresh endpoint GUID.
 
 The broker serializes accepted mutations within each scope. A view snapshot is taken at store cut `C`; dependent participant records precede endpoint records. Buffer subsequent applicable changes while streaming the snapshot. `SNAPSHOT_END` includes the cut, record count and SHA-256 digest over the ordered, length-delimited serialized records, independent of packetization.
 
-The client stages the snapshot, validates dependencies and limits, and installs it only when the end marker and digest agree. It reconciles the old and new view in one serialized discovery update, then invokes ordered callbacks. Retained identical GUID/revision records must not cause a lost/found storm. Deltas after `C` use contiguous per-view `delivery_seq`; a gap blocks installation until repaired or a new snapshot is requested.
+The client stages the snapshot, validates dependencies and limits, and installs it only when the end marker and digest agree. It reconciles the old and new view in one serialized discovery update, then publishes
+dependency-ordered matching/status work under section 4.1. Application callbacks use
+the normal listener scheduler; they need not finish before APPLIED. Retained identical GUID/revision records must not cause a lost/found storm. Deltas after `C` use contiguous per-view `delivery_seq`; a gap blocks installation until repaired or a new snapshot is requested.
 
 Client `APPLIED` acknowledges an installed prefix, not a received fragment or incomplete staging buffer. No exactly-once network delivery is promised; logical application is idempotent. There is no global simultaneity guarantee between clients.
 
@@ -205,7 +322,13 @@ Snapshot/delta buffering has byte/time limits. If churn outruns a snapshot, send
 
 ### 7.3 Deletes and tombstones
 
-An accepted REMOVE advances the entity revision and leaves a tombstone. A participant close atomically closes its ownership and removes dependent state. Delayed upserts, delayed inventory fragments, and expired sessions cannot revive it.
+An accepted REMOVE advances the entity revision and leaves a tombstone. A participant close atomically closes its ownership and removes dependent state. Delayed upserts, delayed inventory fragments, and expired-session packets cannot
+revive it. Registration expiry withdraws broker-backed state but is not terminal
+application deletion: a still-live incarnation may re-register through fresh authorized
+admission, inventory and proof. Explicit participant CLOSE permanently fences its registration and derived work. Once
+all associated session, replay, delivery and runtime obligations retire, the registration
+can be forgotten and fresh admission with the same identity is permitted under current
+policy. No automatic identity blacklist is required in v1. Confirmed transport disconnect promptly withdraws registration and endpoints; silent failures use finite detection/lease deadlines. Unsecured readmission after withdrawal needs no historical ownership proof. Delayed old-session cleanup must compare session/generation before changing a successor registration.
 
 Keep a per-incarnation high-water record even after an endpoint's payload is reclaimed. Delivery tombstones can be collected after every resumable view has acknowledged beyond the removal or has been invalidated. Bound resumption retention; a cursor older than retention MUST receive a full snapshot. Reclaim incarnation fencing records only once all associated sessions, cursors and accepted replay windows have been invalidated. Do not rely on a guessed network packet lifetime to make GUID reuse safe.
 
@@ -215,7 +338,9 @@ Withdrawal from a filtered view is `VIEW_WITHDRAW`, not an origin DDS dispose. I
 
 Connection failure marks discovery DEGRADED immediately but does not immediately erase installed peers. Existing direct data paths can operate while peer presence and writer liveliness remain valid. They are not guaranteed to survive indefinitely: when broker-backed presence expires, normal endpoint teardown applies unless a separately enabled direct presence authority exists.
 
-V1 uses one authoritative service per scope and no merging of independent brokers. Multiple addresses may reach that same authority. An operator-switched replacement has a new epoch; all clients re-register and resynchronize. Resume only when epoch, session ownership, view generation and retained cursor all match. On epoch change, stage replacement state and preserve unchanged valid associations where possible; never extend old leases merely because the new broker connected.
+V1 uses one authoritative service per scope and no merging of independent brokers. Multiple addresses may reach that same authority. An operator-switched replacement has a new epoch; all clients re-register and resynchronize. Every newly admitted session requires a fresh origin inventory. Independently resume
+the downstream view only when epoch, ownership continuity, view configuration, retained
+client baseline and broker cursor/history all validate. A saved cursor alone is insufficient. On epoch change, stage replacement state and preserve unchanged valid associations where possible; never extend old leases merely because the new broker connected.
 
 Automatic multi-broker availability is a later feature requiring explicit ownership/fencing and partition semantics. An arbitrary ordered list of independent servers is not a correct HA implementation: clients may split into disjoint discovery graphs.
 
@@ -238,17 +363,19 @@ For cached discovery, the negotiated origin lease MUST NOT exceed a finite parti
 Observer presence must account for delayed replay without requiring synchronized clocks. V1's reference algorithm is a batched client challenge:
 
 * Client sends nonce `q` at local monotonic time `t0` for its current view generation.
-* Broker returns `q`, entity incarnation/freshness generation, and each visible participant's remaining registration lease `r`, evaluated when producing the proof. This may be chunked but every chunk is tied to `q` and the view generation.
+* Broker captures an immutable answer at a named view delivery frontier and returns `q`, entity incarnation/freshness generation, and each visible participant's remaining registration lease `r`, evaluated when producing the proof. This may be chunked but every chunk is tied to `q` and the view generation.
 * Client sets that participant's broker-backed deadline to `t0 + r`, never `receive_time + r`. If already elapsed, ignore the proof. A duplicate `q` is not a new challenge. An old generation cannot override a newer removal.
 * Proposals for compressed/batched equivalents must preserve this conservative bound. Account for configured monotonic clock-rate tolerance; clocks need no common epoch. Suspend/resume invalidates outstanding proofs unless the clock reliably includes suspend time.
 
 Freshness generations are broker-owned monotonic values within an epoch, advanced on accepted renewals, lease reductions and terminal removal. Include the generation on removal/lease-reduction events; invalidate earlier proofs when either event is installed. Accept a proof only for its requested scope/view/epoch and a currently outstanding nonce. Never reduce an already valid deadline merely because an older proof arrives out of order; take the maximum of valid conservative deadlines unless an authoritative removal or lease reduction imposes an earlier bound. Initial inventory commit requires a fresh origin proof and must leave enough lease margin to complete downstream activation.
 
+The [presence completeness contract](broker-presence-completeness.md) defines explicit unavailable entries, aggregate proof limits, fixed membership and subset fallback. A complete timely answer may account for an inactive participant in the fixed READY target without granting it fresh presence.
+
 State snapshots do not grant fresh presence. New records require an unexpired corresponding proof before activation; proofs cannot activate records absent from the installed authorized view. Broker expiry removes the participant at the broker; observer timers ensure bounded expiry when removals cannot be delivered. A slow client may expire a healthy participant conservatively, which is preferable to reviving a dead one indefinitely.
 
 Proposed defaults are a requested 30-second origin lease (negotiated down to the advertised finite participant lease when smaller), 5-second challenge period, full-jitter reconnect backoff from 250 ms to 30 s, and 60-second bounded cursor retention. These are tunable starting points, not performance evidence. Infinite broker registration leases are rejected in v1 even if a different discovery mode accepts infinite participant leases. Reject timer combinations that cannot accommodate configured RTT/deadline margins.
 
-WLP assertions are forwarded only from actual origin WLP processing. The broker never synthesizes AUTOMATIC or MANUAL_BY_PARTICIPANT assertions from its session timer. MANUAL_BY_TOPIC remains governed by the native writer/data path. Forwarding preserves WLP writer sequence identity, suppresses duplicate application, and has a finite queue lifetime; reconnect does not replay a stored assertion as new liveliness.
+WLP assertions originate in actual participant WLP processing and travel over direct native paths in v1. The broker never synthesizes AUTOMATIC or MANUAL_BY_PARTICIPANT assertions from its session timer. MANUAL_BY_TOPIC remains governed by the native writer/data path.
 
 ## 9. Disclosure and matching
 
@@ -263,21 +390,23 @@ Topic-only candidate selection intentionally includes incompatible QoS/type cand
 
 When interest expands, deliver retained current records immediately; do not wait for origin reannouncement. When it contracts, issue ordered view withdrawals and maintain participant reference counts until all endpoint, diagnostic and in-flight built-in-service dependencies are released. Pending services have bounded pin durations and are cancelled on participant removal or authorization revocation.
 
-Filtering changes DDS built-in topic visibility: `topic_candidates` is a partial discovery view, explicitly advertised in diagnostics and API documentation. Applications requiring complete participant inventories select `all`. Neither mode claims full visibility across other realms, domains or unavailable brokers.
+Filtering changes DDS built-in topic visibility: `topic_candidates` is a partial discovery view, explicitly advertised in diagnostics and API documentation. Applications requiring complete participant inventories select `all`. Neither mode claims full visibility across other domain IDs/tags or unavailable brokers.
 
 More aggressive filters require a proof that they introduce no false negatives for the supported DDS/XTypes semantics, including partition expressions, mutable QoS, content-filtered topics and group presentation. Unknown semantics fall back to a broader authorized view. A content-filter expression on user samples is not by itself a safe endpoint discovery filter.
 
 ## 10. Built-in services and security evolution
 
-### 10.1 General metatraffic routing
+### 10.1 Direct native metatraffic
 
-`ROUTE` includes scope, admitted source incarnation, destination participant incarnation, service class, route generation, bounded lifetime and complete original RTPS message bytes. Reject absent destinations and cross-scope routes. The trusted local dispatcher chooses the service class; the broker checks visible native identifiers where possible. Mixed user/control messages must be separated before encapsulation. Unrecognized service classes require explicit capability negotiation and policy permission.
+Broker-installed participant information establishes native WLP associations, using the
+advertised capabilities and metatraffic locators. Preserve native message identities,
+receive dispatch and reliability/repair paths. SEDP receive plumbing may be shared today,
+but broker mode must not require native SEDP discovery exchanges merely to receive WLP.
 
-The receiver gets both original RTPS bytes and route context. Original source identity is never inferred from the broker's network address. Keep RTPS header, INFO_SRC/INFO_DST context, sequence numbers, timestamps, fragments and crypto bytes intact. Replies resolve the remote participant to the reverse metatraffic route. Do not inject broker addresses into original advertised locators.
-
-Native DATA, HEARTBEAT, GAP, ACKNACK, DATA_FRAG, HEARTBEAT_FRAG and NACK_FRAG must all follow the same appropriate participant route. Outer receipt never manufactures native ACKNACKs. Normal originating state machines retain retransmission responsibility. Bounded router drops are observable; reliable native services repair, best-effort services retain their own retry/loss behavior.
-
-Route registration is independent of user endpoint matching. WLP routes follow participant dependencies; TypeLookup routes exist while type matching is pending; authentication routes must exist before protected discovery can match endpoints. This avoids a discovery/authentication circular dependency.
+Both user-data and metatraffic paths must be reachable independently. The broker provides
+no forwarding fallback in v1. Native TypeLookup and DDS Security will use direct or later
+allocated relay transports when those services are implemented. The [relay direction](broker-relay-direction.md)
+defines the extension boundary; do not implement a temporary DDS-specific routing service.
 
 ### 10.2 XTypes
 
@@ -295,9 +424,9 @@ For v1 `cached`, transport/session authentication protects registration and acce
 
 Future `opaque_peer` requirements:
 
-1. Introduce authorized candidate participants with bootstrap metadata sufficient to run native DDS authentication. Such introductions are untrusted hints until peer validation succeeds.
+1. Introduce authorized candidate participants with bootstrap metadata sufficient to run native DDS authentication. Such introductions are untrusted hints until peer validation succeeds; native exchanges use direct paths or a separately implemented allocated relay.
 2. Run authentication, permissions checks, secure participant/endpoint discovery and key exchange between actual participants. Install protected state only after native validation; the plaintext cached-state adapter is bypassed for that peer relationship.
-3. Forward entire protected messages without locator substitution, re-signing, impersonation or replay into a new recipient's crypto session. Late join invokes the origin's native discovery history and per-peer security processing.
+3. Any future allocated relay carries entire protected messages without locator substitution, re-signing, impersonation or replay into a new recipient's crypto session. Late join invokes the origin's native discovery history and per-peer security processing.
 4. With hidden endpoint metadata, use the whole authorized participant scope as the default candidate set. Do not promise topic-based filtering or its scaling benefit. Optional disclosure hints need a separately agreed confidentiality policy.
 5. Keep origin/receiver security identities and receiver-specific protection intact across broker failover. A broker restart may interrupt routing; it cannot generate fresh peer tokens or secure history.
 6. Negotiation binds the chosen profile to authenticated configuration. If no supported secure profile exists, fail explicitly. Never strip protection to make discovery succeed.
@@ -336,6 +465,8 @@ Use standard [ICE RFC 8445](https://www.rfc-editor.org/info/rfc8445/) with its a
 
 Future connectivity policy defaults to `direct_preferred`: authenticated checks and nomination choose working direct paths first. `direct_only` forbids relayed user data; `relay_allowed` authorizes bounded fallback. Do not exhaust an unbounded list of direct candidates before offering fallback: candidate priorities and a configured direct-attempt deadline govern escalation.
 
+The accepted [relay direction](broker-relay-direction.md) makes allocation ownership and peer access lifetimes separate, permits origin-advertised relay locators, and reserves direct-only/direct-preferred/forced-relay policy space. No relay allocation is a v1 capability.
+
 The broker is the candidate signaling rendezvous; STUN/TURN may be separate services or optional colocated components. TURN allocations, credentials, permissions, channel bindings, quotas, refresh and expiry are a separate data-plane service. UDP versus TCP/TLS access to TURN and relayed peer transport are separate negotiated facts. No automatic allocation charged to a user without the configured policy allowing it.
 
 Route nomination updates the local route table, leaving original GUIDs and discovery data intact. Path changes cover both data and RTPS repair/control in both directions. In-flight duplicates remain subject to native RTPS sequence handling. Bound concurrent checks and apply destination policy so a malicious participant cannot use candidate exchange to trigger unrestricted scans of another client's network.
@@ -346,13 +477,15 @@ Let `N` be participants, `E` total endpoints, `R` delivered endpoint-to-observer
 
 Therefore centralization is not an unconditional performance improvement. It trades multicast/peer work for server indexing, fanout, queues and a failure dependency. Include single-host and small-LAN workloads in benchmarks where the broker may lose.
 
-Store raw payloads once with immutable reference-counted ownership. Index by scope and topic/direction; maintain per-view membership and dependency counts. Snapshot streaming avoids cloning the entire database for each joining client. Batch small records within MTU/frame limits. Use per-client round-robin or deficit scheduling with reserved control capacity and finite repair budgets. No global store lock may be held across network writes or application callbacks.
+Store raw payloads once with immutable retained ownership (reference counting or an equivalent bounded lifetime mechanism). Index by scope and topic/direction; maintain per-view membership and dependency counts. Snapshot streaming avoids cloning the entire database for each joining client. Batch small records within MTU/frame limits. Use per-client round-robin or deficit scheduling with reserved control capacity and finite repair budgets. No global store lock may be held across network writes or application callbacks.
 
-V1 MUST configure and report bounds for: sessions, participants, endpoints per participant/scope, raw record bytes, view bytes, outstanding mutations, repair history, tombstones, snapshot staging, incomplete inventories, reassembly, route queues, accepted unauthenticated work, candidate records, and per-principal egress. Admission accounts for the requested view, not just its ingress record size.
+V1 MUST configure and report bounds for: sessions, participants, endpoints per participant/scope, raw record bytes, view bytes, outstanding mutations, repair history, tombstones, snapshot staging, incomplete inventories, reassembly, accepted unauthenticated work, candidate records, and per-principal egress. Admission accounts for the requested view, not just its ingress record size.
 
 Do not solve a slow observer by blocking all origins. Disconnect or invalidate that observer's cursor with an explicit reason when its retention budget is exhausted. An origin whose mutation cannot be committed retains/retries it or reports discovery failure to its application. Endpoint creation semantics must expose asynchronous announcement failure; local creation success alone cannot promise remote discovery.
 
-The existing TCP implementation uses a receive thread per connection. Reusing it is suitable for a bounded prototype; large-scale support requires an event-driven backend or measured evidence that the thread/memory budget meets the claimed envelope. Preserve the transport interface while changing the backend. Do not market 100,000-client scalability based solely on asymptotic analysis.
+The existing TCP implementation uses a receive thread per connection, and current
+`StatefulWriter` can spawn a heartbeat thread. A broker session must not mechanically
+multiply either lifecycle for every logical control/state endpoint. Reusing it is suitable for a bounded prototype; large-scale support requires an event-driven backend or measured evidence that the thread/memory budget meets the claimed envelope. Preserve the transport interface while changing the backend. Do not market 100,000-client scalability based solely on asymptotic analysis.
 
 Required metrics include admission/authentication failures, active and degraded sessions, participant/endpoint counts, committed-to-applied latency, ready latency, expiry/withdrawal reasons, queue bytes, repair traffic, snapshot retries, cursor invalidations, duplicates/conflicts, route errors, direct-path success, and future relay utilization. Avoid GUID/topic labels in unbounded metric dimensions; use sampled traces with redacted credentials.
 
@@ -360,27 +493,23 @@ Readiness means the broker can admit and serve its configured scopes, not merely
 
 ## 13. Configuration and API contract
 
-Illustrative TOML below is proposed syntax, not accepted by the current parser:
+The [public API reconciliation](broker-public-api.md) proposes compatibility presets,
+independent discovery overrides, bounded configuration and extension status signatures.
+The example below uses the current proposed surface; it is not accepted by the
+current parser:
 
 ```toml
 [discovery]
 kind = "broker"
 
 [discovery.broker]
-realm = "production-eu"
 addresses = ["tcp://discovery.example.net:7443"]
-profile = "cached"
 view = "topic_candidates"
-session_security = "authenticated"
+security = "authenticated"
 credential_ref = "workload-identity"
-origin_lease_ms = 30000
-renewal_period_ms = 5000
-startup = "require_ready"
+startup = "require_ready" # Explicit override; default is allow_degraded.
+[discovery.broker.bootstrap]
 startup_timeout_ms = 15000
-
-[discovery.broker.connectivity]
-policy = "direct_only"
-# Future: stun_servers, turn_servers, candidate policy and check budgets.
 
 [transport.tcp]
 enabled = false # Existing user-data selection: UDP user data in this example.
@@ -388,29 +517,83 @@ enabled = false # Existing user-data selection: UDP user data in this example.
 
 For UDP control, configure `udp://...` service addresses and the authenticated datagram channel. A broker may listen on both UDP and TCP for the same authoritative scope; UDP-connected and TCP-connected clients discover each other. Mixed addresses in one service configuration select a reachable transport to that same authority, not independent graph authorities.
 
-`startup = require_ready` fails participant startup on timeout; `allow_degraded` permits local operation and exposes asynchronous discovery status. Neither silently enables multicast fallback. Expose `wait_discovery_ready`, broker status, view completeness, registration failure and peer connectivity diagnostics through Zig and the C ABI, then existing language bindings. Preserve existing `spdp` defaults and transport behavior for applications that do not opt in.
+`startup = require_ready` fails participant startup on timeout; `allow_degraded` permits local operation and exposes asynchronous discovery status. Neither silently enables multicast fallback. Expose readiness waiting, broker status, view completeness, registration failure and
+peer connectivity diagnostics through zzdds extension interfaces in `idl/zzdds.idl`,
+then generate Zig/C and other bindings. Do not add proprietary operations/status bits
+to `dcps.idl` or introduce ad hoc language-specific ownership arguments. Preserve existing `spdp` defaults and transport behavior for applications that do not opt in.
 
-Broker-only mode emits no SPDP multicast and does not create peer SEDP associations for cached peers. A future explicit hybrid mode may run native discovery concurrently, but needs shared per-origin provenance, source-specific leases, idempotent lifecycle callbacks and loop prevention. Do not implement hybrid by simply running two plugins against the same callbacks; one source disappearing must not delete an entity still valid through another source. Automatic LAN import/export and cross-vendor broker gateways are outside v1.
+Multicast, ordinary directed discovery and configured broker services are independently
+selectable; broker-only is a preset, not an exclusive plugin requirement. Broker-installed
+peers do not automatically trigger ordinary discovery fan-out. The [coexistence proposal](broker-discovery-coexistence.md)
+defines one graph with source-specific evidence and proposes shared origin revisions for
+cross-path ordering. The shared graph, source-specific evidence and shared origin-version direction are accepted; wire metadata/equivalence rules are defined in the origin-version contract; production integration remains pending. Automatic LAN import/
+export and cross-vendor broker gateways remain outside v1.
+
+### 13.1 Readiness, effects and asynchronous failure
+
+The [accepted readiness contract](broker-readiness-contract.md) selects allow-degraded
+startup by default, a recovery-following wait with one deadline, non-resetting status
+and optional coalesced notification. A separate registration barrier is deferred.
+Same-participant matching and local lifecycle MUST remain independent of broker
+connectivity, including before first admission. Data transfer still uses the configured
+data path. Broker self-echo/expiry cannot override authoritative local entity state.
+
+The required API separates local DDS creation, origin registration, installed view and
+peer data reachability. `READY` means the selected inventory/view synchronization cut
+has completed with valid freshness evidence; it does not mean all peers matched, that
+listeners have executed, or that every later local mutation is already committed.
+Concurrent churn must not require an impossible globally quiet graph. Status carries
+session/view generations so observations from a replaced synchronization are recognizable.
+
+Local endpoint creation reserves bounded announcement bookkeeping before publication.
+Failure to reserve can fail local creation under its existing constructor convention.
+Once the endpoint exists, network rejection/timeout is asynchronous discovery failure,
+not retroactive failure of the returned DDS entity or a fabricated DDS dispose. Retain
+its pending revision for bounded retry/resync, or report a terminal registration error;
+never silently forget it while claiming synchronization of that revision. Close fences
+pending announcement work. This does not make local creation remotely transactional.
+
+`require_ready` startup must use one deadline while making permitted internal progress,
+withhold usable participant publication until its startup condition succeeds, and cancel
+staged startup on failure. No application listener may observe a half-constructed
+participant. Rollback cannot rely on a remote CLOSE acknowledgment. `allow_degraded`
+publishes local operation with observable discovery state; it does not change normal
+DDS writer reliability or provide connectivity that the configured network lacks.
+
+Readiness waiting must preserve callback rights, exclude automatic nested callbacks,
+and reject proven self-dependencies under the concurrency contract. Waiting does not
+own the runtime indefinitely or restart its deadline on reconnect. Getters must remain
+useful to standard applications that configure broker mode but install no zzdds-specific
+listener; asynchronous failures also have bounded diagnostics/metrics.
+
+The readiness wait follows recovery across broker session/epoch changes without
+restarting its deadline, as specified in the accepted readiness contract. Concrete
+public status/error types and generated signatures remain API integration work;
+bindings must preserve the selected behavior.
+A separate registration barrier, if offered, must name the local revision frontier it
+covers; a general READY flag is not a receipt for every endpoint mutation.
 
 ## 14. Integration with the current repositories
 
-Inspection baseline: zzdds `f083f95`, zidl `35d7735`. This was an architecture/source inspection, not a claim that the existing test suite was executed.
+Reconciliation baseline: local zzdds `d41e540` (broker documents rebased on main
+`c37181e`) and zidl `26dc737`, inspected 2026-09-17. These are local audit baselines,
+not a claim to have fetched today's remote heads. No production tests were rerun for
+this documentation revision. See [main refresh](main-refresh-review.md).
 
-| Existing area | Evidence / required work |
+| Existing area | Available now / remaining broker work |
 | --- | --- |
-| `src/discovery/interface.zig` | Already anticipates broker plugins; add raw record ownership/provenance and update/batch semantics without making reduced `QosSnapshot` the authoritative wire model. Maintain callback lifetime and stop guarantees. |
-| `src/discovery/combined.zig`, `builtin_endpoint.zig`, `wlp.zig` | Reuse built-in state machine and dispatch concepts. Separate native peer matching from broker-record installation and route WLP explicitly. |
-| `src/discovery/spdp.zig`, `sedp.zig` | Extract shared codecs; current parsed structures discard unknown data and are insufficient for lossless broker storage. Add strict structural validation before public network use. |
-| `src/transport/interface.zig` | `send(locator)` plus `on_receive(data, src)` does not express a validated reply channel, local socket component or peer route. Add optional channel/session and ingress-context capabilities. `canReach` is capability filtering, not connectivity proof. |
-| `src/transport/udp.zig` | Send path selects cached source sockets. Establish explicit same-socket send/receive semantics for broker sessions and future candidate components; test instead of assuming current behavior suffices. |
-| `src/transport/tcp.zig` | Existing bounded length framing and connection generations are reusable. Add accepted-channel replies, bounded asynchronous sends, session-aware routing and eventual scalable I/O. Disable host-only reuse. |
-| `src/dcps/participant.zig` | Currently assumes UDP discovery and constructs TCP as a separate optional data transport. Refactor stack ownership so broker control does not accidentally become the data transport or data locator source. |
-| `src/c_abi/extensions.zig` | `ParticipantStack` currently constructs concrete UDP + `SpdpSedpDiscovery`. Introduce tagged/owned stack construction selected by configuration. |
-| `src/config/schema.zig`, generated config and TOML | `DiscoveryKind.broker` exists as a future enum value; add real configuration and dispatch, with unsupported settings rejected explicitly. Update the generating schema/source, not only generated output. |
-| `idl/rtps_discovery.idl`, zidl codecs | Reuse encoding capabilities, but preserve raw discovery bytes independently of generated known fields. Add broker control IDL and deterministic fixtures; no new IDL language feature should be needed unless implementation proves otherwise. |
-| `src/security/*`, `docs/design/security-pipeline.md` | Real DDS Security enforcement is not implemented. Treat the proposed pipeline as a future integration dependency, not evidence of working protected discovery. |
+| `src/discovery/interface.zig` | Typed QoS replaced flat QosSnapshot. Retain raw-record provenance independently; add transactional view/update integration with explicit callback lifetimes. |
+| `src/discovery/spdp.zig`, `sedp.zig`, `wire_codec.zig`, `idl/rtps_discovery.idl` | Generated SPDP/SEDP PL_CDR codecs are implemented. Ordinary SPDP decode projects fields and deinitializes generated data. Broker retention must capture original bytes before projection; validation/fidelity tests still required. Do not schedule another codec extraction. |
+| `src/discovery/combined.zig`, `builtin_endpoint.zig`, `wlp.zig` | Feed broker participant state into direct WLP associations; preserve receive dispatch and native repair independently of peer SEDP discovery. Test metatraffic reachability separately from user data. |
+| `src/transport/interface.zig`, `udp.zig`, `tcp.zig` | Channel, same-socket UDP replies, accepted-connection TCP replies and close notifications exist. Add broker session validation, bounded retained lifetime and async submission/completion. Test source address as well as socket selection. Current close callbacks broadcast; current pointer tokens require retained transport storage. |
+| `src/transport/locator_selector.zig` | Keep direct-locator ranking below route eligibility; established channel sends bypass it. Future connectivity nomination supplies validated route constraints. |
+| `src/rtps/writer_sm.zig`, `reader_sm.zig` | Reuse protocol semantics with shared-runtime timers/ownership. Thread multiplication, remaining send-under-lock paths and repair/congestion budgets are integration/scale gates, not a new discovery wire format. |
+| `src/dcps/participant.zig`, `src/c_abi/extensions.zig` | The inspected ParticipantStack still owns concrete SpdpSedpDiscovery. Add tagged discovery/stack ownership selected by configuration; separate broker control from data transport and advertised data locators. |
+| `idl/zzdds.idl`, `src/config/schema.zig`, generated TOML config | Broker enum is not an implementation. Add real scalar configuration and zzdds extension APIs at the IDL source; regenerate. No environment-variable configuration is introduced. Process-local runtime/resource references follow the construction-only Config contract. |
+| zidl control codecs and bindings | Existing discovery codec work is reusable; broker envelope encoding/unknown-member fixtures and control IDL are separate gates. Generic managed-reference Config work remains experimental and must not be mistaken for production binding support. |
+| `src/security/*`, `docs/design/security-pipeline.md` | Full DDS Security and authenticated broker transport deployment remain separate implementation gates. No protected-discovery claim follows from preserving bytes. |
 
-Recommended new modules: `discovery/broker_client.zig`, shared `discovery/codec/`, `discovery/state_store.zig`, `discovery/metatraffic_router.zig`, `connectivity/interface.zig`, and a broker executable backed by a reusable service library. Exact file organization is an implementation choice. Keep protocol/state logic testable without real sockets.
+Recommended new modules: `discovery/broker_client.zig`, `discovery/state_store.zig`, `connectivity/interface.zig`, and a broker executable backed by a reusable service library. Exact file organization is an implementation choice. Keep protocol/state logic testable without real sockets.
 
 ## 15. Verification and release gates
 
@@ -425,32 +608,60 @@ Tests must establish observable behavior, particularly where broker semantics di
 | Transport matrix | UDP↔UDP, TCP↔TCP and UDP↔TCP control clients with independent UDP/TCP data choices; IPv4/IPv6; same NAT source IP; return over accepted TCP connection; UDP rebinding. |
 | Reliability/resource limits | Loss, duplication, reorder, MTU reduction, fragment floods, slow TCP reader, oversized frame and reconnect storm. Bounded memory and fair progress for healthy sessions. |
 | Filtering | Full-view versus candidate-view differential matching; late interest, zero endpoints, partition/QoS mismatch reporting, distinct assignable type names, mutable updates and pending service pins. |
-| Routing | Native ACKNACK/GAP/fragment repair follows reverse routes; no user-topic forwarding in v1; no WLP replay on reconnect. |
-| Security | Cross-domain/realm denial, spoofed owner, expired/revoked credentials, downgrade attempts, unauthenticated amplification, replay and candidate destination abuse. |
+| Direct metatraffic | Broker-installed WLP peers work with peer SPDP/SEDP disabled; native replies/repair use reachable direct paths; blocked metatraffic does not gain false liveliness from broker presence. |
+| Security | Cross-domain-ID/tag denial, spoofed owner, expired/revoked credentials, downgrade attempts, unauthenticated amplification, replay and candidate destination abuse. |
 | Future XTypes/Security | TypeLookup before endpoint match; protected authentication before secure discovery; each crypto protection scope; secure late join and broker restart. Required before advertising those capabilities. |
+| Runtime/lifetime | Same protocol traces under manual and hosted drivers; final-participant deletion from a callback, pending send cancellation, stale channel-close/wake, wrapper failures and external-loop retirement. No per-session thread assumption. |
 | Existing interoperability | Native SPDP/SEDP and supported data interoperability remain unchanged when broker mode is disabled. Cross-vendor broker compatibility remains explicitly unsupported. |
 
-Use deterministic fake clocks, memory/lossy transports and model-based event sequences for ownership, snapshots and lease invariants. Fuzz bootstrap, envelope, raw ParameterList, inventory and fragment parsers. Real socket/network-namespace tests are required for NAT/source-port and TCP return-path claims; in-memory tests cannot establish them.
+Use deterministic fake clocks, memory/lossy transports and model-based event sequences for ownership, snapshots and lease invariants. Fuzz bootstrap, envelope, raw ParameterList, inventory and fragment parsers. Real socket/network-namespace tests are required for NAT/source-port and TCP return-path
+claims; in-memory tests cannot establish them. This adds a targeted, explicitly configured
+integration-test facility; it does not require adopting a general network simulator or
+claiming those tests already exist in CI. Privileged test requirements and skips must be
+reported rather than turning missing environment coverage into a pass.
 
 Benchmark native SPDP/SEDP and both broker transports at proposed tiers of 2, 100, 1,000 and 10,000 participants, subject to available hardware. Vary endpoints per participant, interest density, churn, WAN RTT/loss and payload size. Record p50/p95/p99 time from origin commit to installed peer state, startup-ready time, bytes, CPU, peak memory, thread count and recovery convergence. Include full disclosure, candidate filtering and slow observers. Publish hardware/configuration and supported limits; do not impose an unsupported latency number as a design claim.
 
 ### Delivery sequence
 
-1. **Protocol foundations:** finalize IDL/identifiers, raw codec fidelity, ownership/inventory/view model, fake-clock tests and channel contract. Prototype full-view cached mode in memory.
-2. **Functional broker:** single broker, UDP/TCP channels, full lifecycle, WLP routes, configuration/bindings and routed-network integration tests. Candidate filtering follows full-view differential tests.
+1. **Protocol foundations:** reuse merged codecs/channels; close the section 16.1 decisions,
+   draft control IDL/identifiers and cross-version fixtures, then review wire freeze.
+   Validate raw-record fidelity and full-view cached state using fake clocks/in-memory
+   channels. Do not repeat the completed general concurrency investigation.
+2. **Functional broker:** single broker, UDP/TCP channels, full lifecycle, direct WLP integration, configuration/bindings and routed-network integration tests. Candidate filtering follows full-view differential tests.
 3. **Production hardening:** authenticated TCP/UDP deployment, quotas, pacing, backpressure, restart recovery, observability and published scale envelope. These are public-deployment release gates, not optional cleanup.
 4. **Direct connectivity assistance:** candidate signaling, socket-specific STUN/ICE, nomination and path migration; implement ICE-TCP separately if needed.
 5. **Fallback and availability:** explicit TURN service integration; consensus/fenced HA specification and implementation. Either may be prioritized independently.
-6. **OMG extensions:** integrate native TypeLookup and `opaque_peer` DDS Security as those features arrive. They may proceed before traversal/HA; the route architecture exists from phase 1.
+6. **OMG extensions:** integrate native TypeLookup and `opaque_peer` DDS Security as those features arrive. They may proceed over direct transports before traversal/HA; native service associations and transport-extension boundaries are preserved from phase 1.
 
-## 16. Decisions still requiring implementation evidence
+## 16. Remaining decisions and release gates
 
-This proposal makes the architecture, trust boundary, default scope, consistency and failure semantics concrete. Before wire freeze, settle these bounded engineering items:
+### 16.1 Specification and wire-freeze decisions
 
-* Exact vendor endpoint/parameter assignments and versioned control IDL, with cross-version fixtures. No numeric assignment in this proposal is an OMG allocation.
+The [implementer guide](broker-spec-guide.md) identifies controlling contracts. Public
+behavior and reviewed admission/recovery/lifetime invariants are consolidated. All 27
+active operations have draft bodies and a phase/effect table; reserved operations remain
+unsupported. Exact bytes and hashes have independent fixtures, not deployed compatibility.
+
+The [closure ledger](broker-spec-closure.md) names the remaining wire-freeze gates:
+recipient-specific inline introduction feasibility, path/protection provider contract,
+assignment/version review and schema/storage agreement. Generated API integration and
+production validation remain separate delivery gates. No new feature investigation is
+needed to understand the accepted baseline.
+
+### 16.2 Implementation and deployment gates
+
 * TLS/DTLS provider and Zig/platform integration; maintain authenticated UDP/TCP parity.
-* Channel API shape and the smallest reusable change to current transport ownership/source-socket behavior.
-* Default memory/record/view limits and timers from measured workloads, plus the supported scale of the existing TCP backend.
-* Application-facing asynchronous announcement failure/status API consistent across bindings.
+  Public authenticated deployment is unavailable until both advertised paths meet policy.
+* Broker stream integration over the implemented Channel API: bounded ownership,
+  asynchronous completion, same-source UDP replies and runtime-driven reliability.
+  The basic channel shape is settled; production adapter behavior still needs evidence.
+* Measured memory/record/view limits, timers and supported scale; concrete defaults may
+  vary within negotiated protocol limits. These are not unspecified interoperability rules.
+* Generated extension bindings, original-byte retention, failure injection, manual/hosted
+  execution, target-specific backend coverage and the section 15 integration matrix.
+
+These gates remain mandatory for the corresponding production claims. Completing all
+of them is not a prerequisite for writing the remaining protocol specification.
 
 The most consequential future policy decision is whether a deployment trusts the broker with discovery plaintext. `cached` chooses that trust for scaling; `opaque_peer` preserves peer-owned security processing at a potentially substantial discovery cost. Both belong in the architecture, and neither should be presented as providing the other's properties automatically.

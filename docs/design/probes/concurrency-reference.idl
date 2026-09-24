@@ -1,0 +1,9 @@
+module Probe {
+ @shared_c_abi_box interface Ref { boolean is_ready(); };
+ typedef sequence<Ref> RefSeq;
+ struct Config { Ref runtime; RefSeq runtimes; @default(1) unsigned long limit; };
+ @shared_c_abi_box interface Factory {
+   Ref create(in Config options);
+   long acquire(inout Ref result);
+ };
+};
