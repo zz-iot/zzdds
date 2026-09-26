@@ -85,6 +85,13 @@ added; sketched as two above only to separate "needs JDK" from "doesn't").
 
 **Platforms:** Linux ARM64, macOS ARM64, Windows x86_64.
 
+**Update (2026-09-25):** Windows Java/JNI smoke tests now pass and are enabled in
+CI/release validation. Native debugging traced the silent termination below to
+UDP socket cleanup calling CRT `close` on a Winsock handle, triggering the CRT
+invalid-parameter handler. UDP and TCP now use `closesocket`; this also fixes
+the Windows custom-allocator example failure. The CFG hypothesis below was not
+the cause. The remaining text records the original investigation.
+
 **Risk:** medium, assessed pre-implementation — correctly predicted "expect this to take
 iteration," undershot by how much. **Outcome (PR #65, 2026-08-17): C/C++ landed on all three
 platforms. Java/JNI landed on Linux ARM64 and macOS. Java/JNI on Windows is deferred, not

@@ -40,36 +40,14 @@ target_link_libraries(participant_config_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zi
 
 add_executable(participant_config_pub src/publisher.cpp)
 if(MSVC)
-    # zzdds's ambient config resolution (getForNewFactory ->
-    # resolve.resolveProcessConfig -> toml.parseFile) runs
-    # through std.Io.Threaded's single-threaded (inline, no
-    # spawned worker) file-read path on this process's own
-    # main thread on every process's first factory creation --
-    # confirmed by direct checkpoint instrumentation to
-    # overflow MSVC's 1MB default stack reserve there, even
-    # though it never comes close on Linux's roomier 8MB
-    # default. Found building the Windows examples lane
-    # (custom-allocator, the only example actually run there
-    # so far) but this call path is universal -- every C/C++
-    # example hits it, not just this one.
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
     target_link_options(participant_config_pub PRIVATE /STACK:8388608)
 endif()
 target_link_libraries(participant_config_pub PRIVATE participant_config_dcps_impl ZZDDS::zzdds)
 
 add_executable(participant_config_sub src/subscriber.cpp)
 if(MSVC)
-    # zzdds's ambient config resolution (getForNewFactory ->
-    # resolve.resolveProcessConfig -> toml.parseFile) runs
-    # through std.Io.Threaded's single-threaded (inline, no
-    # spawned worker) file-read path on this process's own
-    # main thread on every process's first factory creation --
-    # confirmed by direct checkpoint instrumentation to
-    # overflow MSVC's 1MB default stack reserve there, even
-    # though it never comes close on Linux's roomier 8MB
-    # default. Found building the Windows examples lane
-    # (custom-allocator, the only example actually run there
-    # so far) but this call path is universal -- every C/C++
-    # example hits it, not just this one.
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
     target_link_options(participant_config_sub PRIVATE /STACK:8388608)
 endif()
 target_link_libraries(participant_config_sub PRIVATE participant_config_dcps_impl ZZDDS::zzdds)

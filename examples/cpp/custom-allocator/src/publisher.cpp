@@ -48,7 +48,6 @@ char g_stdout_buf[8192];
 int main() {
     std::setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
-    std::fprintf(stderr, "CHECKPOINT: pool reset\n"); std::fflush(stderr);
     // Two separate, independent allocator registrations (see
     // allocator-strategy.md): zidl_cdr_set_allocator routes the CDR writer's
     // own scratch-buffer growth; zidl::setCppAllocator routes every C++
@@ -57,7 +56,6 @@ int main() {
     // zero-libc-malloc process.
     zidl_cdr_set_allocator(&static_pool_allocator);
     zidl::setCppAllocator(&static_pool_allocator);
-    std::fprintf(stderr, "CHECKPOINT: cdr+cpp allocator set\n"); std::fflush(stderr);
 
     // Resolve+install zzdds.toml as the process-wide config BEFORE creating
     // any factory, through the same static-pool allocator everything else in
@@ -69,14 +67,12 @@ int main() {
         std::fprintf(stderr, "FAIL: process_configure_from_file\n");
         return 1;
     }
-    std::fprintf(stderr, "CHECKPOINT: config loaded\n"); std::fflush(stderr);
 
     auto factory = zzdds::create_factory(&static_pool_allocator);
     if (!factory) {
         std::fprintf(stderr, "FAIL: create_factory returned null\n");
         return 1;
     }
-    std::fprintf(stderr, "CHECKPOINT: factory created\n"); std::fflush(stderr);
 
     auto dp = factory->create_participant(
         DOMAIN_ID, ::DDS::DomainParticipantQos::default_value(), nullptr, 0);
@@ -84,11 +80,9 @@ int main() {
         std::fprintf(stderr, "FAIL: create_participant returned null\n");
         return 1;
     }
-    std::fprintf(stderr, "CHECKPOINT: participant created\n"); std::fflush(stderr);
     auto dp_handle = dp->native_handle();
 
     check(SensorSampleTypeSupport::register_type(dp_handle), "register_type");
-    std::fprintf(stderr, "CHECKPOINT: SensorSample type registered\n"); std::fflush(stderr);
 
     auto topic = dp->create_topic(
         "SensorTopic", "SensorSample", ::DDS::TopicQos::default_value(), nullptr, 0);
@@ -97,14 +91,12 @@ int main() {
         return 1;
     }
 
-    std::fprintf(stderr, "CHECKPOINT: SensorSample topic created\n"); std::fflush(stderr);
 
     auto pub = dp->create_publisher(::DDS::PublisherQos::default_value(), nullptr, 0);
     if (!pub) {
         std::fprintf(stderr, "FAIL: create_publisher returned null\n");
         return 1;
     }
-    std::fprintf(stderr, "CHECKPOINT: publisher created\n"); std::fflush(stderr);
 
     auto dw = pub->create_datawriter(topic, ::DDS::DataWriterQos::default_value(), nullptr, 0);
     if (!dw) {
@@ -114,7 +106,6 @@ int main() {
     auto dw_handle = dw->native_handle();
 
     SensorSampleDataWriter typed_writer(dw_handle);
-    std::fprintf(stderr, "CHECKPOINT: SensorSample datawriter created+init\n"); std::fflush(stderr);
 
     // Milestone 2: SensorLog has an unbounded string and sequence -- writing
     // it needs no heap at all (the fields just get assigned from this
@@ -122,7 +113,6 @@ int main() {
     // of unbounded fields on the wire, which the subscriber's decode side
     // then has to handle.
     check(SensorLogTypeSupport::register_type(dp_handle), "register_type (SensorLog)");
-    std::fprintf(stderr, "CHECKPOINT: SensorLog type registered\n"); std::fflush(stderr);
 
     auto log_topic = dp->create_topic(
         "SensorLogTopic", "SensorLog", ::DDS::TopicQos::default_value(), nullptr, 0);
@@ -130,7 +120,6 @@ int main() {
         std::fprintf(stderr, "FAIL: create_topic (SensorLog) returned null\n");
         return 1;
     }
-    std::fprintf(stderr, "CHECKPOINT: SensorLog topic created\n"); std::fflush(stderr);
 
     auto log_dw = pub->create_datawriter(log_topic, ::DDS::DataWriterQos::default_value(), nullptr, 0);
     if (!log_dw) {
@@ -140,7 +129,6 @@ int main() {
     auto log_dw_handle = log_dw->native_handle();
 
     SensorLogDataWriter log_writer(log_dw_handle);
-    std::fprintf(stderr, "CHECKPOINT: SensorLog datawriter created+init\n"); std::fflush(stderr);
 
     std::printf("publisher: writing %d samples on domain %d...\n", SAMPLE_COUNT, DOMAIN_ID);
 

@@ -115,57 +115,15 @@ jobs:
       - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
         run: zig build test -Ddebug-allocator=true
 
-      # Skipped on Windows: java-binding is deferred there (see below), so
-      # there's nothing on Windows that needs a JDK.
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
-        if: runner.os != 'Windows'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
 
-      # Java binding on Windows is DEFERRED, not implemented here (PR #65).
-      # The DLL-search-path issue (Windows has no rpath equivalent) and a
-      # JVM-native-thread-stack-size issue were both found and fixed here,
-      # but a third failure followed: `java.exe` exits with code 9 and
-      # *zero* output right at the first JNI call (createFactory()) -- no
-      # JVM crash report (hs_err_pid*.log), no Windows Error Reporting
-      # "Application" event, and Windows Defender ruled out (its own
-      # operational log shows no detection/block action; an explicit
-      # workspace exclusion made no difference). Adding -XX:ErrorFile (an
-      # explicit, known-writable path) and -XX:+CreateMinidumpOnCrash still
-      # produced no crash file at all -- conclusive evidence the JVM's own
-      # crash handler never runs, not that it's writing somewhere
-      # unexpected. That signature (silent termination, zero trace anywhere
-      # the JVM or WER would normally leave one) points at something
-      # terminating the process in a way that bypasses SEH entirely --
-      # Control Flow Guard is the leading (unconfirmed) suspect: jvm.dll
-      # ships CFG-instrumented on Windows, JNI is extremely
-      # function-pointer-heavy, and zig cc-built DLLs are not known to be
-      # CFG-instrumented. Diagnosing further needs a live debugger on real
-      # Windows hardware, which CI can't provide -- see the handoff
-      # investigation brief and docs/roadmap.md item 2 for the full trail
-      # and suggested next steps for whoever picks this up.
-      #
-      # See test-linux's identical step for the non-Windows case (still
-      # includes -Djava-binding=true there and on macOS/Linux ARM64, where
-      # it works). -Djava-binding=true is included on those platforms
-      # (unlike test-linux, which only needs the Linux signal once) because
-      # build.zig's Java/JNI build path is platform-aware (see build.zig's
-      # findJniIncludeDir, which switches on linux/darwin/win32 include-dir
-      # layout) but had never been exercised outside Linux before this pass.
-      # $RUNNER_TEMP (not /tmp) — the only temp-dir env var GitHub Actions
-      # guarantees exists and is writable on all three runner OSes, including
-      # Windows, where /tmp isn't a given outside Git Bash's own mapping.
       - name: C/C++/Java binding smoke tests
-        if: runner.os != 'Windows'
         shell: bash
         run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
-
-      - name: C/C++ binding smoke tests (Windows -- Java deferred, see above)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
 
       # build.zig downgrades a missing JDK/JNI headers or javac to a
       # std.log.warn + skip, not a build failure (see build.zig's two
@@ -242,10 +200,10 @@ jobs:
   #
   # --strict turns "examples/ couldn't find a binding/dependency it needs"
   # into a hard failure instead of a silent skip — appropriate here since
-  # every binding and OpenCV are deliberately installed in this job, so a
+  # every binding is deliberately installed in this job, so a
   # skip would mean something regressed, not that the environment is just
   # missing an optional piece (see run_all.py's own default, unstrict
-  # behavior for the latter case).
+  # behavior for the latter case). Windows explicitly excludes only OpenCV.
 
   examples:
     name: examples / ${{ matrix.name }}
@@ -256,40 +214,17 @@ jobs:
         include:
           - name: Linux x86_64
             os: ubuntu-latest
-            java_binding: true
             install_opencv: true
-            strict: true
-          # Windows leg: c-binding + cpp-binding only, not --strict. Two
-          # deliberate, documented gaps, not oversights:
-          #   - java-binding is excluded: Windows Java/JNI has a known,
-          #     unresolved silent crash at the first native call (see
-          #     test-other's "Java binding on Windows is DEFERRED" comment,
-          #     docs/design/ci-platform-coverage-expansion.md's Item 2, and
-          #     docs/roadmap.md's "Deferred (investigation trails exist)"
-          #     entry for the full investigation trail).
-          #   - every interop/*-cross-binding section in run_all.py requires
-          #     c_binding AND cpp_binding AND java_binding together (only
-          #     interop/cross-binding needs just c+cpp) -- so with java
-          #     excluded, most cross-binding sections report SKIP here, not
-          #     PASS. Not --strict specifically so those (and opencv_zzdds,
-          #     which needs a Windows OpenCV toolchain not set up here
-          #     either) skip cleanly instead of failing the job. What this
-          #     leg still verifies genuinely usefully: the c and cpp example
-          #     apps actually build and run correctly on Windows, plus the
-          #     one c+cpp-only cross-binding smoke test.
+            timeout: 30
+          # All bindings and mesh scenarios run on Windows. Only OpenCV is
+          # excluded, since its Windows toolchain is not installed here.
           - name: Windows x86_64
             os: windows-latest
-            java_binding: false
             install_opencv: false
-            strict: false
+            timeout: 60
     runs-on: ${{ matrix.os }}
-    # 30, not 20: the "Install OpenCV" step below (libopencv-dev, ~30
-    # transitive codec/graphics packages, uncached) has been observed taking
-    # long enough on a slow apt mirror day to blow a 20-minute budget on its
-    # own -- the actual build+run work here normally completes in ~15min
-    # even including that install. This is slack for mirror variance, not a
-    # sign the job's real work grew heavier.
-    timeout-minutes: 30
+    # Windows now also builds nine native Zig examples and runs the full mesh.
+    timeout-minutes: ${{ matrix.timeout }}
 
     steps:
       - name: Check out zzdds
@@ -305,7 +240,6 @@ jobs:
         run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
 
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
-        if: matrix.java_binding
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -322,23 +256,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libopencv-dev
 
+      - name: Test portable example helpers
+        run: python -m unittest discover -s examples -p test_common.py
+
       - name: Build zzdds
-        shell: bash
-        run: |
-          if [ "${{ matrix.java_binding }}" = "true" ]; then
-            zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
-          else
-            zig build -Dc-binding=true -Dcpp-binding=true install
-          fi
+        run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
       - name: Run examples
         working-directory: examples
         shell: bash
         run: |
-          if [ "${{ matrix.strict }}" = "true" ]; then
-            ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
+          if [ "${{ matrix.install_opencv }}" = "true" ]; then
+            ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python run_all.py --strict
           else
-            ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py
+            ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python run_all.py --strict --skip-opencv
           fi
 
   # ── integration tests ────────────────────────────────────────────────────

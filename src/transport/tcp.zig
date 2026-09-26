@@ -81,6 +81,7 @@ const WinPoll = if (builtin.os.tag == .windows) struct {
 // Winsock requires WSAStartup before any socket call. Call once lazily.
 
 const wsa = if (builtin.os.tag == .windows) struct {
+    extern "ws2_32" fn closesocket(s: posix.socket_t) callconv(.winapi) c_int;
     const WSADATA = [408]u8;
     extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) c_int;
     var initiated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -112,7 +113,32 @@ fn socketCreate(family: u32, sock_type: u32) !posix.socket_t {
 }
 
 fn socketClose(fd: posix.socket_t) void {
-    _ = c.close(fd);
+    if (builtin.os.tag == .windows) {
+        // Winsock handles must not be passed to the CRT's close().
+        _ = wsa.closesocket(fd);
+    } else {
+        _ = c.close(fd);
+    }
+}
+
+test "socketClose releases a bound TCP port" {
+    const fd = try socketCreate(posix.AF.INET, posix.SOCK.STREAM);
+    var open = true;
+    defer if (open) socketClose(fd);
+    var addr = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try std.testing.expectEqual(@as(c_int, 0), c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))));
+    var len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+    try std.testing.expectEqual(@as(c_int, 0), c.getsockname(fd, @ptrCast(&addr), &len));
+    socketClose(fd);
+    open = false;
+
+    const replacement = try socketCreate(posix.AF.INET, posix.SOCK.STREAM);
+    defer socketClose(replacement);
+    try std.testing.expectEqual(@as(c_int, 0), c.bind(replacement, @ptrCast(&addr), len));
 }
 
 fn socketShutdown(fd: posix.socket_t, how: c_int) void {

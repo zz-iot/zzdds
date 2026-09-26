@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import (
     LiveProcess,
     REPO_ROOT,
+    executable_path,
     print_fail,
     require_tool,
     run_build,
@@ -60,7 +61,7 @@ def build_one(dir_: Path, zig_out: Path) -> bool:
     # equivalent of make's -j across all of those (found via Greptile review:
     # a Windows leg invoking this exact script failed here first).
     if not run_build(
-        ["cmake", "--build", ".", "--parallel", str(multiprocessing.cpu_count())],
+        ["cmake", "--build", ".", "--config", "Debug", "--parallel", str(multiprocessing.cpu_count())],
         cwd=build_dir,
         log_path=build_dir / "make.log",
     ):
@@ -83,11 +84,9 @@ def find_executable(build_dir: Path, name: str) -> Path:
     executable's own directory, not build_dir itself, for a multi-config
     layout where those two differ.
     """
-    exe_name = f"{name}.exe" if sys.platform == "win32" else name
-    candidates = sorted(build_dir.rglob(exe_name))
-    if not candidates:
-        raise FileNotFoundError(f"{exe_name} not found anywhere under {build_dir}")
-    exe = candidates[0]
+    exe = executable_path(build_dir / name)
+    if not exe.is_file():
+        raise FileNotFoundError(f"Executable not found: {exe}")
     toml_src = build_dir / "zzdds.toml"
     toml_dst = exe.parent / "zzdds.toml"
     if toml_src.is_file() and not toml_dst.exists():

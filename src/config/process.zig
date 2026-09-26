@@ -63,11 +63,8 @@ pub fn configure(alloc: std.mem.Allocator, cfg: ProcessConfig) !void {
 /// would otherwise use. Same "must be called before any factory exists"
 /// precondition as `configure` (surfaces as `error.AlreadyConfigured`).
 pub fn configureFromFile(alloc: std.mem.Allocator, path: []const u8) !void {
-    std.debug.print("CHECKPOINT: configureFromFile entered\n", .{});
     const cfg = try resolve.resolveProcessConfigFrom(alloc, path);
-    std.debug.print("CHECKPOINT: resolveProcessConfigFrom returned\n", .{});
     try configure(alloc, cfg);
-    std.debug.print("CHECKPOINT: configure returned\n", .{});
 }
 
 /// Called when constructing a new factory. Returns a clone of the process-wide

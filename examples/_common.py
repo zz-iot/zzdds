@@ -37,6 +37,22 @@ def zzdds_zig_out() -> Path:
     return Path(os.environ.get("ZZDDS_ZIG_OUT", str(REPO_ROOT.parent / "zig-out")))
 
 
+def executable_path(path: Path) -> Path:
+    """Resolve a native binary from a Zig or CMake Debug build.
+
+    Single-config CMake generators put executables directly in the build
+    directory; multi-config generators put them under Debug/. Callers build
+    with --config Debug so the lookup and selected configuration agree.
+    Return the direct path when missing so prerequisite checks can report it.
+    """
+    if sys.platform == "win32":
+        path = path.with_name(path.name + ".exe")
+    if path.is_file():
+        return path
+    configured = path.parent / "Debug" / path.name
+    return configured if configured.is_file() else path
+
+
 def run_env(zig_out: Path) -> dict:
     """Environment for running a built binary/jar against zig_out's libs.
 
@@ -61,10 +77,12 @@ def run_env(zig_out: Path) -> dict:
 
 
 def java_cmd(zig_out: Path, classpath: Path, main_class: str, *args: str) -> list[str]:
+    lib_dir = zig_out / ("bin" if sys.platform == "win32" else "lib")
     return [
         "java",
         "--enable-native-access=ALL-UNNAMED",
-        f"-Djava.library.path={zig_out / 'lib'}",
+        "-Xss8m",
+        f"-Djava.library.path={lib_dir}",
         "-cp",
         str(classpath),
         main_class,
@@ -171,12 +189,9 @@ class LiveProcess:
         there is no Windows equivalent of a plain SIGINT here without also
         spawning with CREATE_NEW_PROCESS_GROUP, which this class doesn't do,
         to avoid CTRL_C_EVENT hitting this Python process too). This path
-        only runs when a process didn't exit on its own within its wait()
-        window -- already a failure by that point regardless of platform --
-        so going straight to terminate() there trades "graceful shutdown
-        exercised on the way out" for "no risk of send_signal itself
-        raising and masking the real timeout," which is the one this
-        function exists to report.
+        uses terminate() for bounded cleanup. Callers requiring successful
+        self-termination check the exit code; intentionally long-running
+        checks (such as shape filtering) validate their output instead.
         """
         if self.proc.poll() is None:
             try:

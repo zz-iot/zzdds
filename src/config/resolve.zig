@@ -114,14 +114,11 @@ pub fn resolveProcessConfigFrom(alloc: std.mem.Allocator, path: []const u8) !Pro
 /// varies by type. The `table`'s own memory (an arena) never needs to outlive
 /// this call — `applyToml` dupes whatever it keeps into `alloc`.
 fn resolveFrom(comptime T: type, alloc: std.mem.Allocator, path: []const u8) !T {
-    std.debug.print("CHECKPOINT: resolveFrom entered\n", .{});
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const table = try toml.parseFile(arena.allocator(), path);
-    std.debug.print("CHECKPOINT: toml.parseFile returned\n", .{});
     var cfg: T = .{};
     try cfg.applyToml(alloc, table);
-    std.debug.print("CHECKPOINT: applyToml returned\n", .{});
     return cfg;
 }
 

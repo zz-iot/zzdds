@@ -1046,6 +1046,8 @@ static int parse_args(int argc, char **argv, Options *opts) {
 /* ── main ──────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    /* Discovery/filter smoke tests observe stdout while the process runs. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     signal(SIGINT, handle_sigint);
 
     Options opts = default_options();

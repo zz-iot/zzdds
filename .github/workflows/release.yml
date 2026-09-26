@@ -143,29 +143,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: zig build test -Dtarget=x86_64-linux-musl
 
-      # Binding smoke tests, mirroring ci.yml's test-other job: the release
-      # gate previously ran only `zig build test` (+ReleaseFast +TSan) and
-      # never built a single binding, so a PR breaking the C/C++/Java
-      # generated bindings could still cut a release. `test-bindings` is
-      # pure Zig-build-system (zig cc / zig c++, no external CMake), so it
-      # runs on every platform; Java/JNI on Windows stays deferred (see
-      # ci.yml's test-other for the full CFG-hypothesis writeup).
+      # Exercise the generated C/C++/Java bindings on every release platform.
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
-        if: runner.os != 'Windows'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
 
       - name: C/C++/Java binding smoke tests
-        if: runner.os != 'Windows'
         shell: bash
         run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
-
-      - name: C/C++ binding smoke tests (Windows -- Java deferred, see ci.yml)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
 
       # build.zig downgrades missing JDK/JNI headers or javac to a
       # std.log.warn + skip rather than a build failure -- without this

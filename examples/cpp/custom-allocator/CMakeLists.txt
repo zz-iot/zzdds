@@ -71,36 +71,14 @@ target_link_libraries(noalloc_guard_client PUBLIC ${CMAKE_DL_LIBS})
 
 add_executable(publisher src/publisher.cpp)
 if(MSVC)
-    # zzdds's ambient config resolution (getForNewFactory ->
-    # resolve.resolveProcessConfig -> toml.parseFile) runs
-    # through std.Io.Threaded's single-threaded (inline, no
-    # spawned worker) file-read path on this process's own
-    # main thread on every process's first factory creation --
-    # confirmed by direct checkpoint instrumentation to
-    # overflow MSVC's 1MB default stack reserve there, even
-    # though it never comes close on Linux's roomier 8MB
-    # default. Found building the Windows examples lane
-    # (custom-allocator, the only example actually run there
-    # so far) but this call path is universal -- every C/C++
-    # example hits it, not just this one.
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
     target_link_options(publisher PRIVATE /STACK:8388608)
 endif()
 target_link_libraries(publisher PRIVATE custom_allocator_dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
 
 add_executable(subscriber src/subscriber.cpp)
 if(MSVC)
-    # zzdds's ambient config resolution (getForNewFactory ->
-    # resolve.resolveProcessConfig -> toml.parseFile) runs
-    # through std.Io.Threaded's single-threaded (inline, no
-    # spawned worker) file-read path on this process's own
-    # main thread on every process's first factory creation --
-    # confirmed by direct checkpoint instrumentation to
-    # overflow MSVC's 1MB default stack reserve there, even
-    # though it never comes close on Linux's roomier 8MB
-    # default. Found building the Windows examples lane
-    # (custom-allocator, the only example actually run there
-    # so far) but this call path is universal -- every C/C++
-    # example hits it, not just this one.
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
     target_link_options(subscriber PRIVATE /STACK:8388608)
 endif()
 target_link_libraries(subscriber PRIVATE custom_allocator_dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
@@ -109,18 +87,7 @@ target_link_libraries(subscriber PRIVATE custom_allocator_dcps_impl static_pool_
 # fix specifically -- see src/bootstrap_noalloc_check.cpp.
 add_executable(bootstrap_noalloc_check src/bootstrap_noalloc_check.cpp)
 if(MSVC)
-    # zzdds's ambient config resolution (getForNewFactory ->
-    # resolve.resolveProcessConfig -> toml.parseFile) runs
-    # through std.Io.Threaded's single-threaded (inline, no
-    # spawned worker) file-read path on this process's own
-    # main thread on every process's first factory creation --
-    # confirmed by direct checkpoint instrumentation to
-    # overflow MSVC's 1MB default stack reserve there, even
-    # though it never comes close on Linux's roomier 8MB
-    # default. Found building the Windows examples lane
-    # (custom-allocator, the only example actually run there
-    # so far) but this call path is universal -- every C/C++
-    # example hits it, not just this one.
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
     target_link_options(bootstrap_noalloc_check PRIVATE /STACK:8388608)
 endif()
 target_link_libraries(bootstrap_noalloc_check PRIVATE custom_allocator_dcps_impl static_pool_allocator noalloc_guard_client ZZDDS::zzdds)

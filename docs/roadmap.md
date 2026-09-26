@@ -832,8 +832,8 @@ release notes).
   job runs `zig build test -Doptimize=ReleaseFast` on all four platforms.
 - **C/C++ binding smoke tests everywhere** (PR #65 for `ci.yml`; 2026-08-28 for `release.yml`)
   — `zig build test-bindings -Dc-binding -Dcpp-binding` runs on all `test-other` /
-  `release.yml` `test` platforms (Java added on Linux ARM64 + macOS; Java-on-Windows
-  deferred, see below).
+  `release.yml` `test` platforms (Java added on Linux ARM64 + macOS; Windows Java/JNI
+  enabled after the Winsock socket-cleanup fix, 2026-09-25).
 - **Prebuilt library bundles** (2026-08-28) — `release.yml`'s new `package-libs` job builds
   the C/C++ install tree (dynamic `libzzdds` + static `libzidl_cdr` + headers + pkgconfig +
   CMake package files) on each of the four release platforms, verifies completeness, and
@@ -880,10 +880,6 @@ release notes).
 
 ### Deferred (investigation trails exist)
 
-- **Java/JNI binding smoke test on Windows** — `java.exe` exits code 9 with no crash file at
-  the first JNI call; leading hypothesis is a Control Flow Guard mismatch between `jvm.dll`
-  and the zig-cc-built zzdds DLLs. Needs WinDbg on real Windows hardware. Trail:
-  `zz-dev/windows-jni-crash-investigation.md`.
 - **TSan lane on macOS ARM64** — even `test-tsan-self-check` segfaults before app code;
   likely an upstream Zig/LLVM `libtsan` gap (`pthread_introspection_hook_install` private-API
   drift). Revisit when Zig bundles a newer LLVM. Trail:

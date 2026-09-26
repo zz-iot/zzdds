@@ -39,7 +39,6 @@ static char g_stdout_buf[8192];
 int main(void) {
     setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
-    fprintf(stderr, "CHECKPOINT: pool reset\n"); fflush(stderr);
     /* Routes zidl-cdr's own internal buffer growth (the CDR writer's
      * malloc/realloc-backed default) through the same static-pool allocator
      * used for entity bootstrap -- without this, the writer would still grow
@@ -47,7 +46,6 @@ int main(void) {
      * allocator. It's this application's responsibility to size the pool for
      * whatever it serializes. */
     zidl_cdr_set_allocator(&static_pool_allocator);
-    fprintf(stderr, "CHECKPOINT: cdr allocator set\n"); fflush(stderr);
 
     /* Resolve+install zzdds.toml as the process-wide config BEFORE creating
      * any factory, through the same static-pool allocator everything else in
@@ -61,14 +59,12 @@ int main(void) {
         fprintf(stderr, "FAIL: zzdds_process_configure_from_file (rc=%d)\n", (int)cfg_rc);
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: config loaded\n"); fflush(stderr);
 
     zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&static_pool_allocator);
     if (zzdds_factory_is_nil(factory)) {
         fprintf(stderr, "FAIL: zzdds_create_factory_with_allocator returned nil\n");
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: factory created\n"); fflush(stderr);
     DDS_DomainParticipantFactory dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
 
     DDS_DomainParticipant dp = DDS_DomainParticipantFactory_create_participant(dds_factory, DOMAIN_ID, NULL, NULL, 0);
@@ -76,11 +72,9 @@ int main(void) {
         fprintf(stderr, "FAIL: create_participant returned NULL\n");
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: participant created\n"); fflush(stderr);
 
     check(SensorSampleTypeSupport_register(dp, "SensorSample"),
           "register_type_support");
-    fprintf(stderr, "CHECKPOINT: SensorSample type registered\n"); fflush(stderr);
 
     DDS_Topic topic = DDS_DomainParticipant_create_topic(dp, "SensorTopic", "SensorSample", NULL, NULL, 0);
     if (!topic) {
@@ -88,14 +82,12 @@ int main(void) {
         return 1;
     }
 
-    fprintf(stderr, "CHECKPOINT: SensorSample topic created\n"); fflush(stderr);
 
     DDS_Publisher pub = DDS_DomainParticipant_create_publisher(dp, NULL, NULL, 0);
     if (!pub) {
         fprintf(stderr, "FAIL: create_publisher returned NULL\n");
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: publisher created\n"); fflush(stderr);
 
     DDS_DataWriter dw = DDS_Publisher_create_datawriter(pub, topic, NULL, NULL, 0);
     if (!dw) {
@@ -105,7 +97,6 @@ int main(void) {
 
     SensorSampleDataWriter typed_writer;
     SensorSampleDataWriter_init(&typed_writer, dw, ZIDL_XCDR1);
-    fprintf(stderr, "CHECKPOINT: SensorSample datawriter created+init\n"); fflush(stderr);
 
     /* Milestone 2: SensorLog has an unbounded string and sequence -- writing
      * it needs no heap at all (the fields just point at this process's own
@@ -114,14 +105,12 @@ int main(void) {
      * zidl_cdr allocator injection) then has to handle. */
     check(SensorLogTypeSupport_register(dp, "SensorLog"),
           "register_type_support (SensorLog)");
-    fprintf(stderr, "CHECKPOINT: SensorLog type registered\n"); fflush(stderr);
 
     DDS_Topic log_topic = DDS_DomainParticipant_create_topic(dp, "SensorLogTopic", "SensorLog", NULL, NULL, 0);
     if (!log_topic) {
         fprintf(stderr, "FAIL: create_topic (SensorLog) returned NULL\n");
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: SensorLog topic created\n"); fflush(stderr);
 
     DDS_DataWriter log_dw = DDS_Publisher_create_datawriter(pub, log_topic, NULL, NULL, 0);
     if (!log_dw) {
@@ -131,7 +120,6 @@ int main(void) {
 
     SensorLogDataWriter log_writer;
     SensorLogDataWriter_init(&log_writer, log_dw, ZIDL_XCDR1);
-    fprintf(stderr, "CHECKPOINT: SensorLog datawriter created+init\n"); fflush(stderr);
 
     printf("publisher: writing %d samples on domain %d...\n", SAMPLE_COUNT, DOMAIN_ID);
 

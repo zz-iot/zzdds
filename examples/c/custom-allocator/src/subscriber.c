@@ -39,14 +39,12 @@ static char g_stdout_buf[8192];
 int main(void) {
     setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
-    fprintf(stderr, "CHECKPOINT: pool reset\n"); fflush(stderr);
     /* Needed for SensorLog: decoding its unbounded string/sequence fields
      * allocates via zidl_cdr_alloc, which routes through this registered
      * allocator instead of libc malloc (Phase 2's read-side CDR allocator
      * injection). SensorSample never needs this -- it has no unbounded
      * fields to decode. */
     zidl_cdr_set_allocator(&static_pool_allocator);
-    fprintf(stderr, "CHECKPOINT: cdr allocator set\n"); fflush(stderr);
 
     /* Resolve+install zzdds.toml as the process-wide config BEFORE creating
      * any factory, through the same static-pool allocator everything else in
@@ -60,14 +58,12 @@ int main(void) {
         fprintf(stderr, "FAIL: zzdds_process_configure_from_file (rc=%d)\n", (int)cfg_rc);
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: config loaded\n"); fflush(stderr);
 
     zzdds_DomainParticipantFactory factory = zzdds_create_factory_with_allocator(&static_pool_allocator);
     if (zzdds_factory_is_nil(factory)) {
         fprintf(stderr, "FAIL: zzdds_create_factory_with_allocator returned nil\n");
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: factory created\n"); fflush(stderr);
     DDS_DomainParticipantFactory dds_factory = zzdds_DomainParticipantFactory_as_DDS_DomainParticipantFactory(factory);
 
     DDS_DomainParticipant dp = DDS_DomainParticipantFactory_create_participant(dds_factory, DOMAIN_ID, NULL, NULL, 0);
@@ -75,11 +71,9 @@ int main(void) {
         fprintf(stderr, "FAIL: create_participant returned NULL\n");
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: participant created\n"); fflush(stderr);
 
     check(SensorSampleTypeSupport_register(dp, "SensorSample"),
           "register_type_support");
-    fprintf(stderr, "CHECKPOINT: SensorSample type registered\n"); fflush(stderr);
 
     DDS_Topic topic = DDS_DomainParticipant_create_topic(dp, "SensorTopic", "SensorSample", NULL, NULL, 0);
     if (!topic) {
@@ -87,14 +81,12 @@ int main(void) {
         return 1;
     }
 
-    fprintf(stderr, "CHECKPOINT: SensorSample topic created\n"); fflush(stderr);
 
     DDS_Subscriber sub = DDS_DomainParticipant_create_subscriber(dp, NULL, NULL, 0);
     if (!sub) {
         fprintf(stderr, "FAIL: create_subscriber returned NULL\n");
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: subscriber created\n"); fflush(stderr);
 
     DDS_TopicDescription topic_desc = zzdds_topic_as_description(topic);
     DDS_DataReader dr = DDS_Subscriber_create_datareader(sub, topic_desc, NULL, NULL, 0);
@@ -105,18 +97,15 @@ int main(void) {
 
     SensorSampleDataReader typed_reader;
     SensorSampleDataReader_init(&typed_reader, dr);
-    fprintf(stderr, "CHECKPOINT: SensorSample datareader created+init\n"); fflush(stderr);
 
     check(SensorLogTypeSupport_register(dp, "SensorLog"),
           "register_type_support (SensorLog)");
-    fprintf(stderr, "CHECKPOINT: SensorLog type registered\n"); fflush(stderr);
 
     DDS_Topic log_topic = DDS_DomainParticipant_create_topic(dp, "SensorLogTopic", "SensorLog", NULL, NULL, 0);
     if (!log_topic) {
         fprintf(stderr, "FAIL: create_topic (SensorLog) returned NULL\n");
         return 1;
     }
-    fprintf(stderr, "CHECKPOINT: SensorLog topic created\n"); fflush(stderr);
 
     DDS_TopicDescription log_topic_desc = zzdds_topic_as_description(log_topic);
     DDS_DataReader log_dr = DDS_Subscriber_create_datareader(sub, log_topic_desc, NULL, NULL, 0);
@@ -127,7 +116,6 @@ int main(void) {
 
     SensorLogDataReader log_reader;
     SensorLogDataReader_init(&log_reader, log_dr);
-    fprintf(stderr, "CHECKPOINT: SensorLog datareader created+init\n"); fflush(stderr);
 
     /* Give discovery/matching a moment to settle before arming the guard:
      * SPDP/SEDP built-in discovery endpoints spawn a heartbeat thread per
