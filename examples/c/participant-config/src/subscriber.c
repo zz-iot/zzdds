@@ -14,11 +14,39 @@
 #include "zzdds_c.h"
 #include "zzdds.h"
 
+/* atomic_bool/atomic_int's inter-thread guarantees matter here: these
+ * fields are written from a DDS listener callback (a different thread)
+ * than main()'s polling loop. <stdatomic.h> needs a compiler flag on
+ * MSVC this repo's example CMakeLists don't set (error C1189: "C atomic
+ * support is not enabled") -- rather than chase that flag, or weaken this
+ * to a plain volatile flag (drops the actual cross-thread memory-ordering
+ * guarantee, not just the type -- flagged in PR review, see git history),
+ * use Win32's Interlocked* intrinsics directly on Windows, real C11
+ * atomics elsewhere. atomic_init() sites stay plain assignments on both
+ * platforms -- they run before the listener thread exists, and the C
+ * standard's own atomic_init() is itself non-atomic, meant exactly for
+ * that pre-concurrency case. */
+#ifdef _WIN32
+#include <windows.h>
+typedef volatile LONG portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { InterlockedExchange(a, v); }
+static int patomic_load(portable_atomic_t *a) { return InterlockedExchangeAdd(a, 0); }
+#else
 #include <stdatomic.h>
+typedef atomic_int portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { atomic_store(a, v); }
+static int patomic_load(portable_atomic_t *a) { return atomic_load(a); }
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define EXPECTED_SAMPLES 3
 #define RECEIVE_TIMEOUT_MS 30000
@@ -30,7 +58,7 @@
 typedef struct {
     ConfigPingDataReader *reader;
     int32_t expected_next;
-    atomic_bool all_received;
+    portable_atomic_t all_received;
 } SubState;
 
 static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
@@ -62,7 +90,7 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
         state->expected_next++;
 
         if (state->expected_next == EXPECTED_SAMPLES) {
-            atomic_store(&state->all_received, true);
+            patomic_store(&state->all_received, true);
         }
     }
 }
@@ -171,7 +199,7 @@ int main(int argc, char **argv) {
     SubState state;
     state.reader = NULL;
     state.expected_next = 0;
-    atomic_init(&state.all_received, false);
+    state.all_received = false;
 
     DDS_DataReaderListener listener;
     memset(&listener, 0, sizeof(listener));
@@ -201,13 +229,13 @@ int main(int argc, char **argv) {
     }
 
     printf("Subscriber: waiting for %d samples...\n", EXPECTED_SAMPLES);
-    for (int waited_ms = 0; !atomic_load(&state.all_received); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !patomic_load(&state.all_received); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= RECEIVE_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: only received %d/%d samples within %ds\n",
                     state.expected_next, EXPECTED_SAMPLES, RECEIVE_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     DDS_Subscriber_delete_datareader(sub, dr);

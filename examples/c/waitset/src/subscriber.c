@@ -28,12 +28,68 @@
 #include "zzdds_c.h"
 #include "zzdds.h"
 
+#include <stdlib.h> /* malloc/free, used below before this file's own <stdlib.h> include */
+#ifdef _WIN32
+#include <windows.h>
+typedef HANDLE portable_thread_t;
+typedef struct { void *(*fn)(void *); void *arg; } portable_thread_start_t;
+static DWORD WINAPI portable_thread_trampoline(LPVOID p) {
+    portable_thread_start_t *s = (portable_thread_start_t *)p;
+    void *(*fn)(void *) = s->fn;
+    void *arg = s->arg;
+    free(s);
+    fn(arg);
+    return 0;
+}
+static int portable_thread_create(portable_thread_t *t, void *(*fn)(void *), void *arg) {
+    portable_thread_start_t *s = (portable_thread_start_t *)malloc(sizeof(*s));
+    if (!s) return -1;
+    s->fn = fn;
+    s->arg = arg;
+    *t = CreateThread(NULL, 0, portable_thread_trampoline, s, 0, NULL);
+    if (!*t) { free(s); return -1; }
+    return 0;
+}
+static void portable_thread_join(portable_thread_t t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+#else
 #include <pthread.h>
+typedef pthread_t portable_thread_t;
+static int portable_thread_create(portable_thread_t *t, void *(*fn)(void *), void *arg) { return pthread_create(t, NULL, fn, arg); }
+static void portable_thread_join(portable_thread_t t) { pthread_join(t, NULL); }
+#endif
+/* atomic_bool/atomic_int's inter-thread guarantees matter here: these
+ * fields are written from a DDS listener callback (a different thread)
+ * than main()'s polling loop. <stdatomic.h> needs a compiler flag on
+ * MSVC this repo's example CMakeLists don't set (error C1189: "C atomic
+ * support is not enabled") -- rather than chase that flag, or weaken this
+ * to a plain volatile flag (drops the actual cross-thread memory-ordering
+ * guarantee, not just the type -- flagged in PR review, see git history),
+ * use Win32's Interlocked* intrinsics directly on Windows, real C11
+ * atomics elsewhere. atomic_init() sites stay plain assignments on both
+ * platforms -- they run before the listener thread exists, and the C
+ * standard's own atomic_init() is itself non-atomic, meant exactly for
+ * that pre-concurrency case. */
+#ifdef _WIN32
+#include <windows.h>
+typedef volatile LONG portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { InterlockedExchange(a, v); }
+static int patomic_load(portable_atomic_t *a) { return InterlockedExchangeAdd(a, 0); }
+#else
 #include <stdatomic.h>
+typedef atomic_int portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { atomic_store(a, v); }
+static int patomic_load(portable_atomic_t *a) { return atomic_load(a); }
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define EXPECTED_SAMPLES 10
 #define HIGH_PRIORITY_THRESHOLD "4" /* priority > 4 => count 5..9 */
@@ -43,19 +99,19 @@
 
 typedef struct {
     DDS_GuardCondition gc;
-    atomic_bool stop;
+    portable_atomic_t stop;
 } Watchdog;
 
 static void *watchdog_run(void *arg) {
     Watchdog *w = (Watchdog *)arg;
     int elapsed_ms = 0;
-    while (!atomic_load(&w->stop)) {
+    while (!patomic_load(&w->stop)) {
         if (elapsed_ms >= OVERALL_DEADLINE_MS) {
             printf("Watchdog: overall deadline exceeded, triggering GuardCondition\n");
             DDS_GuardCondition_set_trigger_value(w->gc, true);
             return NULL;
         }
-        usleep(WATCHDOG_POLL_MS * 1000);
+        sleep_ms(WATCHDOG_POLL_MS);
         elapsed_ms += WATCHDOG_POLL_MS;
     }
     return NULL;
@@ -209,9 +265,12 @@ int main(int argc, char **argv) {
 
     Watchdog watchdog;
     watchdog.gc = gc;
-    atomic_init(&watchdog.stop, false);
-    pthread_t watchdog_thread;
-    pthread_create(&watchdog_thread, NULL, watchdog_run, &watchdog);
+    watchdog.stop = false;
+    portable_thread_t watchdog_thread;
+    if (portable_thread_create(&watchdog_thread, watchdog_run, &watchdog) != 0) {
+        fprintf(stderr, "FAIL: watchdog thread creation failed\n");
+        return 1;
+    }
 
     /* ── Main loop: wait, branch on which conditions triggered ── */
 
@@ -301,8 +360,8 @@ int main(int argc, char **argv) {
 
     printf("Subscriber: received all %d samples.\n", EXPECTED_SAMPLES);
 
-    atomic_store(&watchdog.stop, true);
-    pthread_join(watchdog_thread, NULL);
+    patomic_store(&watchdog.stop, true);
+    portable_thread_join(watchdog_thread);
 
     /* Well-behaved cleanup: detach and delete every condition explicitly
      * before tearing the reader down (contrast with publisher.c, which

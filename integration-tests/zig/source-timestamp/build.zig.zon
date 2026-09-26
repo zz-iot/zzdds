@@ -1,0 +1,18 @@
+.{
+    .name = .zzdds_it_source_timestamp_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x9ba5769eb3b8b1ac,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zzdds = .{
+            .path = "../../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "publisher.zig",
+        "subscriber.zig",
+        "idl",
+    },
+}

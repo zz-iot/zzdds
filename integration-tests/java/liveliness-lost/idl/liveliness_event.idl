@@ -1,0 +1,11 @@
+// integration-tests/liveliness-lost -- shared type. Deliberately minimal (a
+// bare sequence number), unkeyed, single instance -- the point of this
+// scenario is on_liveliness_lost()/get_liveliness_lost_status()'s
+// AUTOMATIC-vs-MANUAL_BY_PARTICIPANT trigger semantics, not the payload
+// (same discipline every other integration-tests scenario's own idl/
+// follows). Byte-identical copy required in every language's own idl/ dir.
+// See docs/design/integration-test-tier.md.
+@final
+struct LivelinessEvent {
+    int32 seq;
+};

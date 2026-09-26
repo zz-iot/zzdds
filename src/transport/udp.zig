@@ -86,6 +86,7 @@ const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 // Winsock requires WSAStartup before any socket call. We call it once lazily.
 
 const wsa = if (builtin.os.tag == .windows) struct {
+    extern "ws2_32" fn closesocket(s: posix.socket_t) callconv(.winapi) c_int;
     // WSADATA layout varies by platform but is ≤ 408 bytes; we only need storage.
     const WSADATA = [408]u8;
     extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) c_int;
@@ -148,7 +149,35 @@ fn socketRecvFrom(fd: posix.socket_t, buf: []u8, src: *posix.sockaddr, src_len: 
 }
 
 fn socketClose(fd: posix.socket_t) void {
-    _ = c.close(fd);
+    if (builtin.os.tag == .windows) {
+        // Winsock handles are not CRT file descriptors. close() invokes the
+        // CRT invalid-parameter handler (and can terminate the host process).
+        _ = wsa.closesocket(fd);
+    } else {
+        _ = c.close(fd);
+    }
+}
+
+test "socketClose releases a bound UDP port" {
+    const fd = try socketCreate(posix.AF.INET, posix.SOCK.DGRAM);
+    var open = true;
+    defer if (open) socketClose(fd);
+    var addr = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try socketBind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    var len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+    try std.testing.expectEqual(@as(c_int, 0), c.getsockname(fd, @ptrCast(&addr), &len));
+    socketClose(fd);
+    open = false;
+
+    // A CRT close on Windows can silently leave the Winsock handle open.
+    // Rebinding proves the OS actually released it, even with such a CRT.
+    const replacement = try socketCreate(posix.AF.INET, posix.SOCK.DGRAM);
+    defer socketClose(replacement);
+    try socketBind(replacement, @ptrCast(&addr), len);
 }
 
 /// setsockopt wrapper. Uses std.c.setsockopt directly because

@@ -34,7 +34,15 @@ target_include_directories(raw_loan_types PUBLIC "${GENERATED_DIR}")
 target_link_libraries(raw_loan_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(raw_loan_pub src/publisher.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(raw_loan_pub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(raw_loan_pub PRIVATE raw_loan_types ZZDDS::zzdds)
 
 add_executable(raw_loan_sub src/subscriber.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(raw_loan_sub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(raw_loan_sub PRIVATE raw_loan_types ZZDDS::zzdds)

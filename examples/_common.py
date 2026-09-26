@@ -37,20 +37,52 @@ def zzdds_zig_out() -> Path:
     return Path(os.environ.get("ZZDDS_ZIG_OUT", str(REPO_ROOT.parent / "zig-out")))
 
 
+def executable_path(path: Path) -> Path:
+    """Resolve a native binary from a Zig or CMake Debug build.
+
+    Single-config CMake generators put executables directly in the build
+    directory; multi-config generators put them under Debug/. Callers build
+    with --config Debug so the lookup and selected configuration agree.
+    Return the direct path when missing so prerequisite checks can report it.
+    """
+    if sys.platform == "win32":
+        path = path.with_name(path.name + ".exe")
+    if path.is_file():
+        return path
+    configured = path.parent / "Debug" / path.name
+    return configured if configured.is_file() else path
+
+
 def run_env(zig_out: Path) -> dict:
-    """Environment for running a built binary/jar against zig_out's libs."""
+    """Environment for running a built binary/jar against zig_out's libs.
+
+    Platform-specific: build.zig installs the shared library to a different
+    directory, and the loader consults a different search-path variable, on
+    each OS -- Linux (libzzdds.so in zig-out/lib, LD_LIBRARY_PATH), macOS
+    (libzzdds.dylib in zig-out/lib, DYLD_LIBRARY_PATH), Windows (zzdds.dll in
+    zig-out/bin, since .dll counts as isDll() -- see build.zig's
+    zzdds_dll_install_dir -- and Windows has no rpath equivalent, so it's
+    found via PATH like any other DLL, not a dedicated variable).
+    """
     env = os.environ.copy()
-    lib_dir = str(zig_out / "lib")
-    existing = env.get("LD_LIBRARY_PATH", "")
-    env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else lib_dir
+    if sys.platform == "win32":
+        var, lib_dir = "PATH", str(zig_out / "bin")
+    elif sys.platform == "darwin":
+        var, lib_dir = "DYLD_LIBRARY_PATH", str(zig_out / "lib")
+    else:
+        var, lib_dir = "LD_LIBRARY_PATH", str(zig_out / "lib")
+    existing = env.get(var, "")
+    env[var] = f"{lib_dir}{os.pathsep}{existing}" if existing else lib_dir
     return env
 
 
 def java_cmd(zig_out: Path, classpath: Path, main_class: str, *args: str) -> list[str]:
+    lib_dir = zig_out / ("bin" if sys.platform == "win32" else "lib")
     return [
         "java",
         "--enable-native-access=ALL-UNNAMED",
-        f"-Djava.library.path={zig_out / 'lib'}",
+        "-Xss8m",
+        f"-Djava.library.path={lib_dir}",
         "-cp",
         str(classpath),
         main_class,
@@ -150,10 +182,23 @@ class LiveProcess:
         it's still alive. Always returns promptly with an exit code --
         this is the one place an indefinite hang is structurally
         prevented.
+
+        Windows exception: Popen.send_signal() there only accepts SIGTERM,
+        CTRL_C_EVENT, or CTRL_BREAK_EVENT -- anything else, including
+        SIGINT, raises ValueError (verified against cpython's subprocess.py;
+        there is no Windows equivalent of a plain SIGINT here without also
+        spawning with CREATE_NEW_PROCESS_GROUP, which this class doesn't do,
+        to avoid CTRL_C_EVENT hitting this Python process too). This path
+        uses terminate() for bounded cleanup. Callers requiring successful
+        self-termination check the exit code; intentionally long-running
+        checks (such as shape filtering) validate their output instead.
         """
         if self.proc.poll() is None:
             try:
-                self.proc.send_signal(signal.SIGINT)
+                if sys.platform == "win32":
+                    self.proc.terminate()
+                else:
+                    self.proc.send_signal(signal.SIGINT)
             except ProcessLookupError:
                 pass
             try:

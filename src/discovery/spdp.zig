@@ -951,10 +951,23 @@ pub fn decodeSpdpParticipant(
     defer data.deinit(alloc);
     try Disc.SPDPdiscoveredParticipantData.deserializeFromPlCdr(&data, &r, alloc, .lenient);
 
-    const decoded_prefix = if (data.participantGuid) |g|
-        wire_codec.guidFromBytes(&g).prefix
-    else
-        guid_prefix;
+    // `guid_prefix` is the RTPS message header's own source prefix -- transport-verified,
+    // in the sense that it's what our own receive path extracted from the datagram that
+    // actually carried this announcement. `data.participantGuid` is merely self-asserted
+    // by the sender inside the payload, and has no comparable guarantee: an ACKNACK/
+    // HEARTBEAT later built from a WriterProxy/ReaderProxy sourced from this value gets
+    // its INFO_DST from whatever we decide here, and a receiving writer can only tell
+    // an ACKNACK was meant for it by matching INFO_DST against its own prefix -- so a
+    // wrong prefix here means that writer either silently drops a legitimate ACKNACK or
+    // (if entity IDs and locators happened to collide) misattributes one meant for
+    // someone else. Trust the header; use the payload field only as a consistency check.
+    const decoded_prefix = guid_prefix;
+    if (data.participantGuid) |g| {
+        const claimed_prefix = wire_codec.guidFromBytes(&g).prefix;
+        if (!claimed_prefix.eql(guid_prefix)) {
+            log.spdp.warn("spdp: participantGuid {x} in SPDP payload from {x} does not match the message header's source prefix -- trusting the header", .{ claimed_prefix.bytes, guid_prefix.bytes });
+        }
+    }
 
     const lease_ms: u32 = if (data.leaseDuration) |ld| blk: {
         const lease = (time_mod.RtpsDuration{ .seconds = ld.seconds, .fraction = ld.fraction }).toDuration();

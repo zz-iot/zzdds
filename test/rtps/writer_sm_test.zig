@@ -481,6 +481,115 @@ test "sendHeartbeat without the liveliness path does not set the LIVELINESS flag
     try testing.expect(!hb.isLiveliness());
 }
 
+// ── is_local: same-participant self-matches skip the periodic keepalive ──────
+//
+// BuiltinPair.matchRemote (builtin_endpoint.zig) sets ReaderProxy.is_local when
+// remote.guid.prefix equals the writer's own prefix -- exactly what happens when
+// combined.zig's `self_data` call bootstraps same-participant builtin-endpoint
+// matching. That proxy can't lose data to a lossy network, so there's nothing
+// for the periodic keepalive/re-offer HB to recover -- only a self-addressed
+// send to repeat every HB_INTERVAL_MS forever.
+
+test "sendHeartbeat: is_local proxy is excluded from the periodic keepalive" {
+    const writer_guid = makeGuid(0x20, WRITER_EID);
+    const reader_guid = makeGuid(0x20, READER_EID); // same prefix as the writer
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    var rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, true);
+    rp.is_local = true;
+    try w.addMatchedReader(rp);
+    rec.reset(); // discard the match-time replay send (none expected, but be explicit)
+
+    w.sendHeartbeat(false, false);
+
+    try testing.expectEqual(@as(usize, 0), rec.n);
+}
+
+test "sendHeartbeat: is_local proxy with unacked data still gets the periodic keepalive" {
+    // Regression for a real gap found via Greptile review: an earlier version of
+    // this gate skipped is_local proxies unconditionally, which would leave a
+    // same-participant match hung forever if the one real DATA/trailing-HB send
+    // (over the real transport, unchanged by is_local) was ever lost -- with no
+    // periodic heartbeat, there was no remaining recovery path at all. The gate
+    // must only skip once the proxy has actually caught up.
+    const writer_guid = makeGuid(0x21, WRITER_EID);
+    const reader_guid = makeGuid(0x21, READER_EID); // same prefix as the writer
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    var rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, true);
+    rp.is_local = true;
+    try w.addMatchedReader(rp);
+    // Simulate the proxy's one real DATA send having been lost: write a sample
+    // (advances the writer's cache/adj_last) without ever recording an ACKNACK
+    // from this proxy (highest_acked_sn stays 0, as ReaderProxy.init leaves it).
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "lost");
+    rec.reset();
+
+    w.sendHeartbeat(false, false);
+
+    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 1), hb.last_sn);
+}
+
+test "beginProbe: does not set deadline on is_local proxy" {
+    const writer_guid = makeGuid(0x20, WRITER_EID);
+    const reader_guid = makeGuid(0x20, READER_EID); // same prefix as the writer
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        writer_guid,
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+
+    var rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, true);
+    rp.is_local = true;
+    try w.addMatchedReader(rp);
+
+    const far_future: i64 = std.math.maxInt(i64);
+    w.beginProbe(reader_guid.prefix, far_future);
+
+    w.mu.lock();
+    const deadline = for (w.reader_proxies.items) |rp2| {
+        if (rp2.guid.eql(reader_guid)) break rp2.probe_deadline_ns;
+    } else -1;
+    w.mu.unlock();
+    try testing.expectEqual(@as(i64, 0), deadline);
+}
+
 // ── Heartbeat: empty cache ────────────────────────────────────────────────────
 
 test "sendHeartbeat: empty cache → firstSN=1, lastSN=0 (spec-legal empty range)" {

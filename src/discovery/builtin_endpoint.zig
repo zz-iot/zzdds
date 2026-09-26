@@ -104,14 +104,24 @@ pub const BuiltinPair = struct {
         if (eps & self.remote_writer_bit != 0) {
             if (self.reader) |r| {
                 const guid = Guid{ .prefix = remote.guid.prefix, .entity_id = self.writer_entity_id };
-                const wp = WriterProxy.init(alloc, guid, uc, mc, self.reliable) catch return;
+                var wp = WriterProxy.init(alloc, guid, uc, mc, self.reliable) catch return;
+                // combined.zig's vtStart feeds this participant's own announcement
+                // through this exact function (see its `self_data` call) to
+                // bootstrap same-participant builtin-endpoint matching -- without
+                // it, a participant's own SEDP writer would never get a matched
+                // reader-proxy for its own SEDP reader. remote.guid.prefix equal
+                // to our own reader's prefix is exactly that case, not a
+                // genuinely remote writer reachable over a lossy network.
+                wp.is_local = remote.guid.prefix.eql(r.guid.prefix);
                 r.addMatchedWriter(wp) catch {};
             }
         }
         if (eps & self.remote_reader_bit != 0) {
             if (self.writer) |w| {
                 const guid = Guid{ .prefix = remote.guid.prefix, .entity_id = self.reader_entity_id };
-                const rp = ReaderProxy.init(alloc, guid, uc, mc, false, self.reliable) catch return;
+                var rp = ReaderProxy.init(alloc, guid, uc, mc, false, self.reliable) catch return;
+                // Same self-match case as above, mirrored for the reverse direction.
+                rp.is_local = remote.guid.prefix.eql(w.guid.prefix);
                 w.addMatchedReader(rp) catch {};
             }
         }

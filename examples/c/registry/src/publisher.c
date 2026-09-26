@@ -19,35 +19,85 @@
 #include "zzdds_c.h"
 #include "zzdds.h"
 
+/* atomic_bool/atomic_int's inter-thread guarantees matter here: these
+ * fields are written from a DDS listener callback (a different thread)
+ * than main()'s polling loop. <stdatomic.h> needs a compiler flag on
+ * MSVC this repo's example CMakeLists don't set (error C1189: "C atomic
+ * support is not enabled") -- rather than chase that flag, or weaken this
+ * to a plain volatile flag (drops the actual cross-thread memory-ordering
+ * guarantee, not just the type -- flagged in PR review, see git history),
+ * use Win32's Interlocked* intrinsics directly on Windows, real C11
+ * atomics elsewhere. atomic_init() sites stay plain assignments on both
+ * platforms -- they run before the listener thread exists, and the C
+ * standard's own atomic_init() is itself non-atomic, meant exactly for
+ * that pre-concurrency case. */
+#ifdef _WIN32
+#include <windows.h>
+typedef volatile LONG portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { InterlockedExchange(a, v); }
+static int patomic_load(portable_atomic_t *a) { return InterlockedExchangeAdd(a, 0); }
+#else
 #include <stdatomic.h>
+typedef atomic_int portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { atomic_store(a, v); }
+static int patomic_load(portable_atomic_t *a) { return atomic_load(a); }
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define READER_READY_TIMEOUT_MS 10000
 #define DRAIN_TIMEOUT_MS 15000
 #define POLL_PERIOD_MS 20
 
+/* CLOCK_REALTIME/clock_gettime() are POSIX-only -- MSVC's <time.h> defines
+ * struct timespec but neither of those. GetSystemTimeAsFileTime is the
+ * Windows equivalent wall-clock source (100ns intervals since 1601-01-01);
+ * 116444736000000000 is the well-known offset to the Unix epoch
+ * (1970-01-01) in those same 100ns units. */
+#ifdef _WIN32
+static void realtime_now(struct timespec *ts) {
+    FILETIME ft;
+    ULARGE_INTEGER uli;
+    GetSystemTimeAsFileTime(&ft);
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+    uint64_t unix_100ns = uli.QuadPart - 116444736000000000ULL;
+    ts->tv_sec = (time_t)(unix_100ns / 10000000ULL);
+    ts->tv_nsec = (long)((unix_100ns % 10000000ULL) * 100);
+}
+#else
+static void realtime_now(struct timespec *ts) {
+    clock_gettime(CLOCK_REALTIME, ts);
+}
+#endif
+
 typedef struct {
-    atomic_bool reader_ready;
-    atomic_bool ever_matched;
-    atomic_int matched_current_count;
+    portable_atomic_t reader_ready;
+    portable_atomic_t ever_matched;
+    portable_atomic_t matched_current_count;
 } PubState;
 
 static void on_reliable_reader_ready(DDS_InstanceHandle_t reader_handle, bool is_ready, void *listener_data) {
     (void)reader_handle;
     PubState *state = (PubState *)listener_data;
-    if (is_ready) atomic_store(&state->reader_ready, true);
+    if (is_ready) patomic_store(&state->reader_ready, true);
     printf("on_reliable_reader_ready() is_ready=%s\n", is_ready ? "true" : "false");
 }
 
 static void on_publication_matched(DDS_DataWriter writer, const DDS_PublicationMatchedStatus *status, void *listener_data) {
     (void)writer;
     PubState *state = (PubState *)listener_data;
-    atomic_store(&state->matched_current_count, status->current_count);
-    if (status->current_count > 0) atomic_store(&state->ever_matched, true);
+    patomic_store(&state->matched_current_count, status->current_count);
+    if (status->current_count > 0) patomic_store(&state->ever_matched, true);
     printf("on_publication_matched() current_count=%d\n", status->current_count);
 }
 
@@ -107,9 +157,9 @@ int main(int argc, char **argv) {
     printf("Create writer for topic: SensorReading\n");
 
     PubState state;
-    atomic_init(&state.reader_ready, false);
-    atomic_init(&state.ever_matched, false);
-    atomic_init(&state.matched_current_count, 0);
+    state.reader_ready = false;
+    state.ever_matched = false;
+    state.matched_current_count = 0;
 
     zzdds_DataWriter zdw = DDS_DataWriter_as_zzdds_DataWriter(dw);
     zzdds_DataWriterListenerEx listener_ex;
@@ -125,12 +175,12 @@ int main(int argc, char **argv) {
     SensorReadingDataWriter writer;
     SensorReadingDataWriter_init(&writer, dw, ZIDL_XCDR1);
 
-    for (int waited_ms = 0; !atomic_load(&state.reader_ready); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !patomic_load(&state.reader_ready); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= READER_READY_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: no reliable reader became ready within %ds\n", READER_READY_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     /* -- Instance A (sensor_id=1): register -> write x2 -> dispose -- */
@@ -174,7 +224,7 @@ int main(int argc, char **argv) {
     printf("Publisher: registered instance sensor_id=2\n");
 
     struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
+    realtime_now(&now);
     DDS_Time_t ts;
     ts.sec = (int32_t)now.tv_sec;
     ts.nanosec = (uint32_t)now.tv_nsec;
@@ -226,13 +276,13 @@ int main(int argc, char **argv) {
     printf("Publisher: get_key_value round-trip OK for sensor_id=1\n");
 
     for (int waited_ms = 0;
-         !(atomic_load(&state.ever_matched) && atomic_load(&state.matched_current_count) == 0);
+         !(patomic_load(&state.ever_matched) && patomic_load(&state.matched_current_count) == 0);
          waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= DRAIN_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     printf("Publisher: done.\n");

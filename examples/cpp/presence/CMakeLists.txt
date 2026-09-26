@@ -43,7 +43,15 @@ target_include_directories(presence_dcps_impl PUBLIC "${GENERATED_DIR}")
 target_link_libraries(presence_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(presence_pub src/publisher.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(presence_pub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(presence_pub PRIVATE presence_dcps_impl ZZDDS::zzdds)
 
 add_executable(presence_sub src/subscriber.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(presence_sub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(presence_sub PRIVATE presence_dcps_impl ZZDDS::zzdds)

@@ -115,8 +115,10 @@ pub const RtpsTimestamp = extern struct {
 
     /// Convert a DCPS Time to an RTPS Timestamp.
     pub fn fromTime(t: Time) RtpsTimestamp {
-        // fraction = nanosec * 2^32 / 1e9 ≈ nanosec * 4.295
-        const frac: u64 = @as(u64, t.nanosec) * 0x1_0000_0000 / std.time.ns_per_s;
+        // fraction = nanosec * 2^32 / 1e9 ≈ nanosec * 4.295, rounded to nearest
+        // (not truncated) so this round-trips exactly back through toTime()
+        // for any integer nanosecond value -- see toTime()'s matching comment.
+        const frac: u64 = (@as(u64, t.nanosec) * 0x1_0000_0000 + std.time.ns_per_s / 2) / std.time.ns_per_s;
         return .{
             .seconds = @intCast(t.sec),
             .fraction = @intCast(frac),
@@ -125,9 +127,31 @@ pub const RtpsTimestamp = extern struct {
 
     /// Convert an RTPS Timestamp to a DCPS Time.
     pub fn toTime(self: RtpsTimestamp) Time {
-        const ns: u32 = @intCast(@as(u64, self.fraction) * std.time.ns_per_s / 0x1_0000_0000);
+        // Round to nearest, not truncate: a plain floor((fraction * 1e9) /
+        // 2^32) composed with fromTime()'s own floor systematically loses up
+        // to ~1ns on the round trip for nearly every nonzero nanosecond value
+        // (found via integration-tests/source-timestamp: an explicit
+        // dispose_w_timestamp() nanosecond of 123456789 round-tripped back as
+        // 123456788). Mirrors RtpsDuration.toDuration()'s already-correct
+        // rounding + carry handling below -- this and fromTime() were the
+        // two conversions that hadn't been brought in line with it yet.
+        var ns: u32 = @intCast((@as(u64, self.fraction) * std.time.ns_per_s + 0x8000_0000) / 0x1_0000_0000);
+        var sec64: u64 = self.seconds;
+        if (ns == std.time.ns_per_s) {
+            sec64 += 1;
+            ns = 0;
+        }
+        // self.seconds/fraction come straight off the wire (INFO_TS is peer-controlled)
+        // and RtpsTimestamp's u32 seconds range already exceeds what Time.sec (i32) can
+        // hold, even before the rounding carry above pushes a boundary value (e.g.
+        // seconds=0x7fffffff with a high fraction) further out of range. Saturate
+        // instead of letting the @intCast below panic a receive thread on out-of-range
+        // or boundary wire input (found via Greptile review).
+        if (sec64 > @as(u64, std.math.maxInt(i32))) {
+            return .{ .sec = std.math.maxInt(i32), .nanosec = std.time.ns_per_s - 1 };
+        }
         return .{
-            .sec = @intCast(self.seconds),
+            .sec = @intCast(sec64),
             .nanosec = ns,
         };
     }
@@ -157,7 +181,10 @@ pub const RtpsDuration = extern struct {
     /// Convert a DDS/DCPS Duration to an RTPS wire Duration.
     pub fn fromDuration(d: Duration) RtpsDuration {
         if (d.isInfinite()) return infinite;
-        const frac: u64 = @as(u64, d.nanosec) * 0x1_0000_0000 / std.time.ns_per_s;
+        // Rounded to nearest, not truncated -- see RtpsTimestamp.fromTime()'s
+        // matching comment; toDuration() below already rounds on the way
+        // back, this brings the write direction in line with it.
+        const frac: u64 = (@as(u64, d.nanosec) * 0x1_0000_0000 + std.time.ns_per_s / 2) / std.time.ns_per_s;
         return .{
             .seconds = d.sec,
             .fraction = @intCast(frac),
@@ -170,8 +197,18 @@ pub const RtpsDuration = extern struct {
         var sec = self.seconds;
         var ns: u32 = @intCast((@as(u64, self.fraction) * std.time.ns_per_s + 0x8000_0000) / 0x1_0000_0000);
         if (ns == std.time.ns_per_s) {
-            sec += 1;
-            ns = 0;
+            // self.fraction is wire-controlled; isInfinite() above only excludes the
+            // exact DURATION_INFINITE sentinel, so a peer can still reach seconds ==
+            // maxInt(i32) with a merely-near-infinite fraction that rounds up to this
+            // carry. `sec += 1` at that boundary is an i32 overflow -- saturate
+            // instead of panicking a receive thread (found via Greptile review,
+            // same root cause as RtpsTimestamp.toTime()'s sibling fix above).
+            if (sec == std.math.maxInt(i32)) {
+                ns = std.time.ns_per_s - 1;
+            } else {
+                sec += 1;
+                ns = 0;
+            }
         }
         return .{
             .sec = sec,
@@ -441,6 +478,21 @@ test "RtpsTimestamp.fromTime round-trip approximate" {
     try std.testing.expect(diff >= -1 and diff <= 1);
 }
 
+test "RtpsTimestamp.toTime: seconds=maxInt(i32) with carry saturates instead of panicking" {
+    // fraction=0xffffffff rounds up to exactly ns_per_s, forcing the carry path.
+    const rt = RtpsTimestamp{ .seconds = 0x7fff_ffff, .fraction = 0xffff_ffff };
+    const t = rt.toTime();
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), t.sec);
+    try std.testing.expectEqual(@as(u32, std.time.ns_per_s - 1), t.nanosec);
+}
+
+test "RtpsTimestamp.toTime: seconds beyond i32 range saturates instead of panicking" {
+    const rt = RtpsTimestamp{ .seconds = 0xffff_ffff, .fraction = 0 };
+    const t = rt.toTime();
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), t.sec);
+    try std.testing.expectEqual(@as(u32, std.time.ns_per_s - 1), t.nanosec);
+}
+
 test "RtpsDuration size is 8 bytes" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(RtpsDuration));
 }
@@ -450,6 +502,30 @@ test "RtpsDuration infinite uses RTPS max fraction" {
     try std.testing.expectEqual(@as(i32, 0x7fff_ffff), rt.seconds);
     try std.testing.expectEqual(@as(u32, 0xffff_ffff), rt.fraction);
     try std.testing.expect(rt.toDuration().isInfinite());
+}
+
+test "RtpsDuration.toDuration: near-infinite fraction at seconds=maxInt(i32) saturates instead of overflowing" {
+    // fraction=0xfffffffe (one less than DURATION_INFINITE's) still rounds up to
+    // exactly ns_per_s, forcing the carry path without tripping isInfinite()'s
+    // exact-match shortcut.
+    const rd = RtpsDuration{ .seconds = std.math.maxInt(i32), .fraction = 0xffff_fffe };
+    try std.testing.expect(!rd.isInfinite());
+    const d = rd.toDuration();
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), d.sec);
+    try std.testing.expectEqual(@as(u32, std.time.ns_per_s - 1), d.nanosec);
+}
+
+test "RtpsDuration.toDuration: ordinary (non-boundary) carry increments seconds normally" {
+    // Regression for a coverage gap found via kcov/PR-diff comparison: the
+    // boundary test above exercises the saturation branch, and the existing
+    // round-trip test below never rounds up to a full second at all (0.5s
+    // fraction), so the plain "carry, not at maxInt(i32)" branch this fix
+    // introduced (sec += 1; ns = 0) had no test ever exercising it.
+    const rd = RtpsDuration{ .seconds = 3, .fraction = 0xffff_ffff };
+    try std.testing.expect(!rd.isInfinite());
+    const d = rd.toDuration();
+    try std.testing.expectEqual(@as(i32, 4), d.sec);
+    try std.testing.expectEqual(@as(u32, 0), d.nanosec);
 }
 
 test "RtpsDuration fromDuration round-trip approximate" {

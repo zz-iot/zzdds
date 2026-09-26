@@ -18,11 +18,39 @@
 #include "catchup_sample.h"
 #include "zzdds_c.h"
 
+/* atomic_bool/atomic_int's inter-thread guarantees matter here: these
+ * fields are written from a DDS listener callback (a different thread)
+ * than main()'s polling loop. <stdatomic.h> needs a compiler flag on
+ * MSVC this repo's example CMakeLists don't set (error C1189: "C atomic
+ * support is not enabled") -- rather than chase that flag, or weaken this
+ * to a plain volatile flag (drops the actual cross-thread memory-ordering
+ * guarantee, not just the type -- flagged in PR review, see git history),
+ * use Win32's Interlocked* intrinsics directly on Windows, real C11
+ * atomics elsewhere. atomic_init() sites stay plain assignments on both
+ * platforms -- they run before the listener thread exists, and the C
+ * standard's own atomic_init() is itself non-atomic, meant exactly for
+ * that pre-concurrency case. */
+#ifdef _WIN32
+#include <windows.h>
+typedef volatile LONG portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { InterlockedExchange(a, v); }
+static int patomic_load(portable_atomic_t *a) { return InterlockedExchangeAdd(a, 0); }
+#else
 #include <stdatomic.h>
+typedef atomic_int portable_atomic_t;
+static void patomic_store(portable_atomic_t *a, int v) { atomic_store(a, v); }
+static int patomic_load(portable_atomic_t *a) { return atomic_load(a); }
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 #define HISTORICAL_COUNT 10
 #define LIVE_COUNT 5
@@ -32,10 +60,10 @@
 
 typedef struct {
     HistoryEventDataReader *reader;
-    atomic_bool historical_received[10];
-    atomic_bool live_received[5];
-    atomic_bool historical_confirmed;
-    atomic_bool all_done;
+    portable_atomic_t historical_received[10];
+    portable_atomic_t live_received[5];
+    portable_atomic_t historical_confirmed;
+    portable_atomic_t all_done;
 } SubState;
 
 /* Pure readiness check -- does NOT store all_done itself. Callers decide
@@ -44,9 +72,9 @@ typedef struct {
  * all_done, so storing it while still inside a take loop would let
  * delete_datareader() race that same invocation's next take() call). */
 static bool ready_to_finish(SubState *state) {
-    if (!atomic_load(&state->historical_confirmed)) return false;
+    if (!patomic_load(&state->historical_confirmed)) return false;
     for (int i = 0; i < LIVE_COUNT; i++) {
-        if (!atomic_load(&state->live_received[i])) return false;
+        if (!patomic_load(&state->live_received[i])) return false;
     }
     return true;
 }
@@ -82,11 +110,11 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
 
         int32_t seq_num = value.seq_num;
         if (seq_num >= 0 && seq_num < HISTORICAL_COUNT) {
-            atomic_store(&state->historical_received[seq_num], true);
+            patomic_store(&state->historical_received[seq_num], true);
         } else if (seq_num >= HISTORICAL_COUNT && seq_num < HISTORICAL_COUNT + LIVE_COUNT) {
             printf("LIVE SAMPLE seq_num=%d\n", seq_num);
-            atomic_store(&state->live_received[seq_num - HISTORICAL_COUNT], true);
-            if (!atomic_load(&state->all_done) && !became_done && ready_to_finish(state)) {
+            patomic_store(&state->live_received[seq_num - HISTORICAL_COUNT], true);
+            if (!patomic_load(&state->all_done) && !became_done && ready_to_finish(state)) {
                 became_done = true;
             }
         } else {
@@ -96,7 +124,7 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
     }
 
     if (became_done) {
-        atomic_store(&state->all_done, true);
+        patomic_store(&state->all_done, true);
     }
 }
 
@@ -151,10 +179,10 @@ int main(int argc, char **argv) {
 
     SubState state;
     memset(&state, 0, sizeof(state));
-    for (int i = 0; i < HISTORICAL_COUNT; i++) atomic_init(&state.historical_received[i], false);
-    for (int i = 0; i < LIVE_COUNT; i++) atomic_init(&state.live_received[i], false);
-    atomic_init(&state.historical_confirmed, false);
-    atomic_init(&state.all_done, false);
+    for (int i = 0; i < HISTORICAL_COUNT; i++) state.historical_received[i] = false;
+    for (int i = 0; i < LIVE_COUNT; i++) state.live_received[i] = false;
+    state.historical_confirmed = false;
+    state.all_done = false;
 
     DDS_DataReaderListener listener;
     memset(&listener, 0, sizeof(listener));
@@ -202,24 +230,24 @@ int main(int argc, char **argv) {
      * historical sample must already have been delivered by now. */
     int historical_count = 0;
     for (int i = 0; i < HISTORICAL_COUNT; i++) {
-        if (atomic_load(&state.historical_received[i])) historical_count++;
+        if (patomic_load(&state.historical_received[i])) historical_count++;
     }
     if (historical_count != HISTORICAL_COUNT) {
         fprintf(stderr, "FAIL: wait_for_historical_data() returned OK but only %d/%d historical samples were actually received\n", historical_count, HISTORICAL_COUNT);
         return 1;
     }
     printf("HISTORICAL BATCH COMPLETE (%d samples)\n", HISTORICAL_COUNT);
-    atomic_store(&state.historical_confirmed, true);
+    patomic_store(&state.historical_confirmed, true);
     if (ready_to_finish(&state)) {
-        atomic_store(&state.all_done, true);
+        patomic_store(&state.all_done, true);
     }
 
-    for (int waited_ms = 0; !atomic_load(&state.all_done); waited_ms += POLL_PERIOD_MS) {
+    for (int waited_ms = 0; !patomic_load(&state.all_done); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= RECEIVE_TIMEOUT_MS) {
             fprintf(stderr, "FAIL: did not observe the full live batch within %ds\n", RECEIVE_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     DDS_Subscriber_delete_datareader(sub, dr);

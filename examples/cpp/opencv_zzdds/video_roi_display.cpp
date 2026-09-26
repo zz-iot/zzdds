@@ -13,7 +13,8 @@
  *  - TypeSupport: ovidds_FrameTypeSupport                      →  ovidds::FrameTypeSupport  (A2)
  *  - Type name: "ovidds_Frame"                                 →  "ovidds::Frame"            (A1)
  *  - String params: const_cast<char*>(...)                     →  literal string direct       (A3)
- *  - entity creation: C ABI with nullptr QoS; C++ create_* also usable (D3)
+ *  - Entity creation: via the generated C++ DDS::DomainParticipant/DDS::Subscriber
+ *    create_* methods (default-value() QoS structs, not nullptr)
  *
  * To get the ovidds::FrameDataReader typed wrapper inside on_data_available,
  * we call native_handle() directly on the shared_ptr<DDS::DataReader> — it is
@@ -164,20 +165,24 @@ int main(int /*argc*/, char** /*argv*/)
     }
     DDS_DomainParticipant raw_part = participant->native_handle();
 
+    // register_type() is a zidl-generated per-type helper, not itself part of
+    // the DDS::DomainParticipant interface, so it still takes the raw C-ABI
+    // participant handle -- that's its own documented, intended surface (see
+    // video_capture.cpp's matching comment).
     if (ovidds::FrameTypeSupport::register_type(raw_part, FRAME_TYPE_NAME) != 0) {
         std::cerr << "Failed to register Frame type." << std::endl;
         return 1;
     }
 
-    DDS_Topic topic = DDS_DomainParticipant_create_topic(
-        raw_part, FRAME_TOPIC_NAME, FRAME_TYPE_NAME, nullptr, nullptr, 0);
+    auto topic = participant->create_topic(
+        FRAME_TOPIC_NAME, FRAME_TYPE_NAME, ::DDS::TopicQos::default_value(), nullptr, 0);
     if (!topic) {
         std::cerr << "Failed to create topic." << std::endl;
         return 1;
     }
 
-    DDS_Subscriber subscriber = DDS_DomainParticipant_create_subscriber(
-        raw_part, nullptr, nullptr, 0);
+    auto subscriber = participant->create_subscriber(
+        ::DDS::SubscriberQos::default_value(), nullptr, 0);
     if (!subscriber) {
         std::cerr << "Failed to create subscriber." << std::endl;
         return 1;
@@ -186,19 +191,17 @@ int main(int /*argc*/, char** /*argv*/)
     // Must match video_capture's DataWriter reliability -- see that file's
     // comment for why RELIABLE is required for a Frame-sized (~900KB,
     // fragmented) sample to ever fully reassemble.
-    DDS_DataReaderQos dr_qos{};
-    DDS_Subscriber_get_default_datareader_qos(subscriber, &dr_qos);
-    dr_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
+    ::DDS::DataReaderQos dr_qos{};
+    subscriber->get_default_datareader_qos(dr_qos);
+    dr_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
 
     auto listener = std::make_shared<FrameReaderListener>();
-    DDS_DataReaderListener c_listener = listener->c_listener();
 
-    DDS_TopicDescription topic_desc =
-        DDS_DomainParticipant_lookup_topicdescription(raw_part, FRAME_TOPIC_NAME);
-    DDS_DataReader raw_dr = DDS_Subscriber_create_datareader(
-        subscriber, topic_desc, &dr_qos, &c_listener,
+    auto topic_desc = participant->lookup_topicdescription(FRAME_TOPIC_NAME);
+    auto dr = subscriber->create_datareader(
+        topic_desc, dr_qos, listener,
         DDS_DATA_AVAILABLE_STATUS | DDS_SUBSCRIPTION_MATCHED_STATUS);
-    if (!raw_dr) {
+    if (!dr) {
         std::cerr << "Failed to create datareader." << std::endl;
         return 1;
     }

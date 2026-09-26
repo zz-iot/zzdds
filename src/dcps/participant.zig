@@ -3077,7 +3077,24 @@ pub const DomainParticipantImpl = struct {
                     // that already exist at the moment a reader is discovered, so
                     // without this a reader discovered first would never be matched.
                     const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
-                    for (self.discovered_readers.items) |*dr| {
+                    reader_scan: for (self.discovered_readers.items) |*dr| {
+                        // Mirrors onReaderDiscovered's own ignore-list guards (see that
+                        // function, above) -- see subAnnounceProtoReader's matching
+                        // comment (the symmetric fix on the reader side) for why this
+                        // is needed: a reader ignored before this writer existed still
+                        // sits in self.discovered_readers, and without these checks a
+                        // writer created *after* the ignore call would retroactively
+                        // re-match it here.
+                        for (self.ignored_prefixes.items) |p| {
+                            if (p.eql(dr.guid.prefix)) continue :reader_scan;
+                        }
+                        const dr_sub_handle = writer_mod.guidToHandle(dr.guid);
+                        for (self.ignored_subscription_handles.items) |h| {
+                            if (h == dr_sub_handle) continue :reader_scan;
+                        }
+                        for (self.ignored_topic_names.items) |n| {
+                            if (std.mem.eql(u8, n, dr.topic_name)) continue :reader_scan;
+                        }
                         if (!std.mem.eql(u8, dr.topic_name, aw.topic_name)) continue;
                         if (!std.mem.eql(u8, dr.type_name, aw.type_name)) continue;
                         const result = qm_mod.checkDiscovered(&local_wd, &dr.qos);
@@ -3209,7 +3226,26 @@ pub const DomainParticipantImpl = struct {
                     // that already exist at the moment a writer is discovered, so
                     // without this a writer discovered first would never be matched.
                     const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
-                    for (self.discovered_writers.items) |*dw| {
+                    writer_scan: for (self.discovered_writers.items) |*dw| {
+                        // Mirrors onWriterDiscovered's own ignore-list guards (see that
+                        // function, above): a writer ignored (by prefix, handle, or
+                        // topic name) *before* this reader existed still sits in
+                        // self.discovered_writers -- ignore_*() never retroactively
+                        // purges the cache, only blocks future live discoveries -- so
+                        // without these checks a reader created *after* the ignore
+                        // call would retroactively re-match it here. Found building
+                        // integration-tests/ignore-entities -- see
+                        // docs/design/integration-test-tier.md.
+                        for (self.ignored_prefixes.items) |p| {
+                            if (p.eql(dw.guid.prefix)) continue :writer_scan;
+                        }
+                        const dw_pub_handle = writer_mod.guidToHandle(dw.guid);
+                        for (self.ignored_publication_handles.items) |h| {
+                            if (h == dw_pub_handle) continue :writer_scan;
+                        }
+                        for (self.ignored_topic_names.items) |n| {
+                            if (std.mem.eql(u8, n, dw.topic_name)) continue :writer_scan;
+                        }
                         if (!std.mem.eql(u8, dw.topic_name, ar.topic_name)) continue;
                         if (!std.mem.eql(u8, dw.type_name, ar.type_name)) continue;
                         const result = qm_mod.checkDiscovered(&dw.qos, &local_rd);

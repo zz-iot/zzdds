@@ -36,7 +36,15 @@ target_include_directories(catchup_dcps_impl PUBLIC "${GENERATED_DIR}")
 target_link_libraries(catchup_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(catchup_pub src/publisher.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(catchup_pub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(catchup_pub PRIVATE catchup_dcps_impl ZZDDS::zzdds)
 
 add_executable(catchup_sub src/subscriber.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(catchup_sub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(catchup_sub PRIVATE catchup_dcps_impl ZZDDS::zzdds)

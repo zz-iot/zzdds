@@ -39,7 +39,15 @@ target_link_libraries(hello_world_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 # Distinct target names from shape/custom-allocator's publisher/subscriber,
 # per docs/design/shape-reference-app.md's naming convention.
 add_executable(hello_world_pub src/publisher.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(hello_world_pub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(hello_world_pub PRIVATE hello_world_types ZZDDS::zzdds)
 
 add_executable(hello_world_sub src/subscriber.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(hello_world_sub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(hello_world_sub PRIVATE hello_world_types ZZDDS::zzdds)

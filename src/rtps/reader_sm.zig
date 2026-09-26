@@ -204,6 +204,15 @@ pub const WriterProxy = struct {
     /// ENTITYID_UNKNOWN heartbeat, which proves nothing about per-reader
     /// registration.
     protocol_ready: bool = false,
+    /// True when this proxy represents the writer's OWN local participant --
+    /// i.e. it exists only to bootstrap same-participant builtin-endpoint
+    /// matching (see combined.zig's `self_data` call), not a genuinely remote
+    /// writer reachable over a lossy network. Set by BuiltinPair.matchRemote.
+    /// Suppresses the one-shot match-time AckNack in addMatchedWriter, which
+    /// would otherwise be sent, pointlessly, to this participant's own port
+    /// forever (RTPS's ACK/NACK retry protocol exists to recover from real
+    /// media loss; a same-process match can't lose anything that way).
+    is_local: bool = false,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -435,6 +444,7 @@ pub const StatefulReader = struct {
                 wp.multicast_locators = proxy.multicast_locators;
                 wp.selected_locators = proxy.selected_locators;
                 wp.reliable = proxy.reliable;
+                wp.is_local = proxy.is_local;
                 // Dispose the incoming proxy's empty tracking fields cleanly.
                 var discarded = proxy;
                 discarded.unicast_locators = .empty;
@@ -493,7 +503,12 @@ pub const StatefulReader = struct {
         // BEST_EFFORT writers (no periodic heartbeats per §8.4.15) this is the only
         // trigger that compensates for the race between writer-side replay and
         // reader-side proxy setup.
-        self.sendAckNackUnlocked(new_wp, 0, false);
+        //
+        // Skipped for is_local proxies: same-participant matches (see WriterProxy.is_local)
+        // can't race a writer-side replay against a lossy network -- write() delivers
+        // straight through the normal reliable-writer path over loopback, so there's
+        // nothing here to compensate for, only a self-addressed AckNack to send forever.
+        if (!new_wp.is_local) self.sendAckNackUnlocked(new_wp, 0, false);
         // Captured under the lock, not re-read from self after unlocking --
         // setProtocolReadyCallback can run concurrently from another thread
         // (it takes the same lock), so self.protocol_ready_fn/ctx are only

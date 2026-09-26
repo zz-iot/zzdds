@@ -81,7 +81,7 @@
 struct SPDPdiscoveredParticipantData {
     @id(0x0015)           ProtocolVersion_t protocolVersion;   // always emitted ({2,5})
     @id(0x0016)           VendorId_t        vendorId;          // always emitted
-    @id(0x0050) @optional octet             participantGuid[16]; // prefix[12] + entityId[4]; zzdds always emits it; decode falls back to the RTPS message header's guid_prefix when a peer omits it
+    @id(0x0050) @optional octet             participantGuid[16]; // prefix[12] + entityId[4]; zzdds always emits it; decode trusts the RTPS message header's own (transport-verified) guid_prefix instead, using this field only as a mismatch check -- never as an override
     @id(0x0058)           unsigned long     builtinEndpointSet;
     @id(0x0002) @optional Duration_t        leaseDuration;     // zzdds always emits it; decode defaults to 10s when a peer omits it
     @id(0x0032) @optional @pl_repeated sequence<Locator_t> metatrafficUnicastLocatorList;

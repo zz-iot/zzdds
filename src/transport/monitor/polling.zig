@@ -75,7 +75,25 @@ fn enumeratePosix(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(IfAddr)
         const addr = entry.ifa_addr orelse continue;
         const flags = entry.ifa_flags;
 
-        // Skip: down, loopback, or no multicast support.
+        // Skip: administratively down, loopback, or no multicast support.
+        //
+        // Tried adding an IFF_RUNNING (carrier/link present) check here too,
+        // on the theory that a dormant bridge like Docker's `docker0` with
+        // no veth attached reports IFF_UP|IFF_MULTICAST but no IFF_RUNNING,
+        // and could end up first in enumeration order, becoming the
+        // IP_MULTICAST_IF udp.zig's vtJoinMulticast picks for outbound
+        // SPDP/SEDP sends (see that function's own comment), silently
+        // failing to reach anyone since the interface has no actual link.
+        // Reverted: on this VM, the real, working `eth0` interface ALSO
+        // reports no IFF_RUNNING bit (/sys/class/net/eth0/flags == 0x1003,
+        // same as docker0's), despite `ip link show eth0` displaying
+        // LOWER_UP -- some virtualized/cloud NIC drivers don't reliably set
+        // IFF_RUNNING even when the link is fully functional. The check
+        // excluded every non-loopback interface here, which is worse than
+        // the bug it was meant to fix. If the docker0-first-in-enumeration
+        // problem recurs, look for a different signal (e.g. reading
+        // /sys/class/net/<if>/carrier, or deprioritizing bridge-typed
+        // interfaces) instead of IFF_RUNNING.
         if (flags & IFF_UP == 0) continue;
         if (flags & IFF_LOOPBACK != 0) continue;
         if (flags & IFF_MULTICAST == 0) continue;

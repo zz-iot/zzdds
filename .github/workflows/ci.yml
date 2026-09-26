@@ -37,7 +37,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-6d9c01d' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-bdcdd3b' }}
 
 jobs:
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
@@ -115,57 +115,15 @@ jobs:
       - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
         run: zig build test -Ddebug-allocator=true
 
-      # Skipped on Windows: java-binding is deferred there (see below), so
-      # there's nothing on Windows that needs a JDK.
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
-        if: runner.os != 'Windows'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
 
-      # Java binding on Windows is DEFERRED, not implemented here (PR #65).
-      # The DLL-search-path issue (Windows has no rpath equivalent) and a
-      # JVM-native-thread-stack-size issue were both found and fixed here,
-      # but a third failure followed: `java.exe` exits with code 9 and
-      # *zero* output right at the first JNI call (createFactory()) -- no
-      # JVM crash report (hs_err_pid*.log), no Windows Error Reporting
-      # "Application" event, and Windows Defender ruled out (its own
-      # operational log shows no detection/block action; an explicit
-      # workspace exclusion made no difference). Adding -XX:ErrorFile (an
-      # explicit, known-writable path) and -XX:+CreateMinidumpOnCrash still
-      # produced no crash file at all -- conclusive evidence the JVM's own
-      # crash handler never runs, not that it's writing somewhere
-      # unexpected. That signature (silent termination, zero trace anywhere
-      # the JVM or WER would normally leave one) points at something
-      # terminating the process in a way that bypasses SEH entirely --
-      # Control Flow Guard is the leading (unconfirmed) suspect: jvm.dll
-      # ships CFG-instrumented on Windows, JNI is extremely
-      # function-pointer-heavy, and zig cc-built DLLs are not known to be
-      # CFG-instrumented. Diagnosing further needs a live debugger on real
-      # Windows hardware, which CI can't provide -- see the handoff
-      # investigation brief and docs/roadmap.md item 2 for the full trail
-      # and suggested next steps for whoever picks this up.
-      #
-      # See test-linux's identical step for the non-Windows case (still
-      # includes -Djava-binding=true there and on macOS/Linux ARM64, where
-      # it works). -Djava-binding=true is included on those platforms
-      # (unlike test-linux, which only needs the Linux signal once) because
-      # build.zig's Java/JNI build path is platform-aware (see build.zig's
-      # findJniIncludeDir, which switches on linux/darwin/win32 include-dir
-      # layout) but had never been exercised outside Linux before this pass.
-      # $RUNNER_TEMP (not /tmp) — the only temp-dir env var GitHub Actions
-      # guarantees exists and is writable on all three runner OSes, including
-      # Windows, where /tmp isn't a given outside Git Bash's own mapping.
       - name: C/C++/Java binding smoke tests
-        if: runner.os != 'Windows'
         shell: bash
         run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true -Djava-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
-
-      - name: C/C++ binding smoke tests (Windows -- Java deferred, see above)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true 2>&1 | tee "$RUNNER_TEMP/binding-smoke.log"
 
       # build.zig downgrades a missing JDK/JNI headers or javac to a
       # std.log.warn + skip, not a build failure (see build.zig's two
@@ -242,22 +200,31 @@ jobs:
   #
   # --strict turns "examples/ couldn't find a binding/dependency it needs"
   # into a hard failure instead of a silent skip — appropriate here since
-  # every binding and OpenCV are deliberately installed in this job, so a
+  # every binding is deliberately installed in this job, so a
   # skip would mean something regressed, not that the environment is just
   # missing an optional piece (see run_all.py's own default, unstrict
-  # behavior for the latter case).
+  # behavior for the latter case). Windows explicitly excludes only OpenCV.
 
   examples:
-    name: examples
+    name: examples / ${{ matrix.name }}
     needs: test-linux
-    runs-on: ubuntu-latest
-    # 30, not 20: the "Install OpenCV" step below (libopencv-dev, ~30
-    # transitive codec/graphics packages, uncached) has been observed taking
-    # long enough on a slow apt mirror day to blow a 20-minute budget on its
-    # own -- the actual build+run work here normally completes in ~15min
-    # even including that install. This is slack for mirror variance, not a
-    # sign the job's real work grew heavier.
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            install_opencv: true
+            timeout: 30
+          # All bindings and mesh scenarios run on Windows. Only OpenCV is
+          # excluded, since its Windows toolchain is not installed here.
+          - name: Windows x86_64
+            os: windows-latest
+            install_opencv: false
+            timeout: 60
+    runs-on: ${{ matrix.os }}
+    # Windows now also builds nine native Zig examples and runs the full mesh.
+    timeout-minutes: ${{ matrix.timeout }}
 
     steps:
       - name: Check out zzdds
@@ -267,6 +234,10 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: "0.16.0"
+
+      - name: Allow inbound UDP (Windows)
+        if: runner.os == 'Windows'
+        run: netsh advfirewall firewall add rule name="zzdds-test-udp" protocol=UDP dir=in action=allow
 
       - name: Install JDK (java-binding needs jni.h, not just a JRE)
         uses: actions/setup-java@v4
@@ -280,31 +251,78 @@ jobs:
           python-version: "3.12"
 
       - name: Install OpenCV (for cpp/opencv_zzdds)
+        if: matrix.install_opencv
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libopencv-dev
 
-      - name: Build zzdds (all bindings)
+      - name: Test portable example helpers
+        run: python -m unittest discover -s examples -p test_common.py
+
+      - name: Build zzdds
         run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
-      - name: Run examples (strict)
+      - name: Run examples
         working-directory: examples
-        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
+        shell: bash
+        run: |
+          if [ "${{ matrix.install_opencv }}" = "true" ]; then
+            ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python run_all.py --strict
+          else
+            ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python run_all.py --strict --skip-opencv
+          fi
 
   # ── integration tests ────────────────────────────────────────────────────
   #
-  # Builds zzdds with every binding enabled, then runs integration-tests/'s
-  # own orchestrator (run_all.py) against that build. Distinct from the
-  # `examples` job above: every scenario here is built once per binding and
-  # run cross-binding, targeting one specific DCPS behavior with a hard
-  # correctness assertion rather than a demonstration -- see
-  # docs/design/integration-test-tier.md. One scenario today
-  # (coherent-sets); --strict means a missing binding is a hard failure
-  # here, same reasoning as the `examples` job above.
+  # One matrix leg per scenario, each running its own fully self-contained
+  # interop/*_cross_binding_test.py (every scenario already builds its own
+  # per-scenario C/C++/Java artifacts -- see
+  # integration-tests/c/<scenario>/CMakeLists.txt -- so this parallelizes
+  # cleanly with no shared-build/artifact-download plumbing needed). See
+  # docs/design/integration-test-tier.md for what this tier is and how it
+  # differs from `examples` above. 9 scenarios today (coherent-sets,
+  # delete-contained-entities, sample-rejected-lost, enable-defer,
+  # wait-for-historical-data, ignore-entities, cft-reconfigure,
+  # source-timestamp, liveliness-lost).
+  #
+  # Previously one job ran all 9 sequentially via run_all.py (~21.5 min
+  # wall-clock, and climbing every time a scenario is added); matrixing cuts
+  # that to whatever the single slowest scenario takes (found via Greptile
+  # review's CI-budget point). run_all.py itself is untouched and remains the
+  # right tool for a local, single-command run of everything -- including the
+  # one thing this matrix intentionally gives up: run_all.py's own top-level
+  # "c"/"cpp" sections build all 9 scenarios together in one CMake project
+  # (integration-tests/c/CMakeLists.txt's add_subdirectory list), which is
+  # the only thing that would catch a CMake target-name collision *between*
+  # two different scenarios -- each matrix leg here builds only its own
+  # scenario in isolation. Accepted tradeoff: that class of collision is
+  # still caught immediately and loudly by anyone running run_all.py locally
+  # before pushing, or by CMake itself the moment two scenarios' subdirectories
+  # are ever built together again.
   integration-tests:
-    name: integration-tests
+    name: integration-tests / ${{ matrix.scenario }}
     needs: test-linux
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - coherent-sets
+          - delete-contained-entities
+          - sample-rejected-lost
+          - enable-defer
+          - wait-for-historical-data
+          - ignore-entities
+          - cft-reconfigure
+          - source-timestamp
+          - liveliness-lost
+    # Generous, uniform per-scenario headroom -- comfortably covers even
+    # ignore-entities (the heaviest: 3-process, up to a 240s internal
+    # deadline chain per triple, 8 triples run sequentially within this one
+    # leg) under realistic conditions (it completed in a few minutes even
+    # under this session's own deliberate CPU-stress testing); nowhere near
+    # the old monolithic job's 40min, since that budget no longer has to
+    # cover all 9 scenarios cumulatively.
     timeout-minutes: 20
 
     steps:
@@ -330,9 +348,12 @@ jobs:
       - name: Build zzdds (all bindings)
         run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
-      - name: Run integration tests (strict)
-        working-directory: integration-tests
-        run: ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" ./run_all.py --strict
+      - name: Run ${{ matrix.scenario }} cross-binding interop
+        working-directory: integration-tests/interop
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python3 "${SCENARIO//-/_}_cross_binding_test.py"
 
   # ── examples: WaitSet + ThreadSanitizer ──────────────────────────────────
   #

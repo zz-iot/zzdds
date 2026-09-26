@@ -25,7 +25,7 @@ CLASSES_DIR = BUILD_DIR / "classes"
 
 def main() -> int:
     zig_out = zzdds_zig_out()
-    zidl_exe = zig_out / "bin" / "zidl"
+    zidl_exe = zig_out / "bin" / ("zidl.exe" if sys.platform == "win32" else "zidl")
 
     if not require_path(
         zidl_exe,

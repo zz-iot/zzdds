@@ -71,7 +71,15 @@ target_link_libraries(waitset_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 find_package(Threads REQUIRED)
 
 add_executable(waitset_pub src/publisher.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(waitset_pub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(waitset_pub PRIVATE waitset_dcps_impl ZZDDS::zzdds Threads::Threads)
 
 add_executable(waitset_sub src/subscriber.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(waitset_sub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(waitset_sub PRIVATE waitset_dcps_impl ZZDDS::zzdds Threads::Threads)

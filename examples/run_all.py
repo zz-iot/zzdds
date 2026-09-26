@@ -16,7 +16,10 @@ are always failures, in both modes -- --strict only changes how a missing
 prerequisite is treated.
 
 Usage:
-  ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.py [--strict]
+  ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.py [--strict] [--skip-opencv]
+
+--skip-opencv explicitly excludes the optional OpenCV example while retaining
+strict prerequisite checks for every binding and cross-language scenario.
 
 Defaults to ../zig-out (the zzdds repo this examples/ directory lives in)
 if ZZDDS_ZIG_OUT isn't set -- see _common.py's zzdds_zig_out().
@@ -30,7 +33,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import run_build, zzdds_zig_out
+from _common import executable_path, run_build, zzdds_zig_out
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -78,19 +81,29 @@ def build_cmake(name: str, source_dir: Path, build_dir: Path, zig_out: Path) -> 
         log_path=log_path,
     ):
         print(f"FAIL: {name} configure -- see {log_path}", file=sys.stderr)
+        print(log_path.read_text(errors="replace"), file=sys.stderr)
         return False
-    if not run_build(["cmake", "--build", str(build_dir)], cwd=SCRIPT_DIR, log_path=log_path):
+    if not run_build(["cmake", "--build", str(build_dir), "--config", "Debug"], cwd=SCRIPT_DIR, log_path=log_path):
         print(f"FAIL: {name} build -- see {log_path}", file=sys.stderr)
+        print(log_path.read_text(errors="replace"), file=sys.stderr)
         return False
     print(log_path.read_text(errors="replace"))
     return True
 
 
 def has_opencv() -> bool:
-    if shutil.which("pkg-config") and subprocess.run(
-        ["pkg-config", "--exists", "opencv4"]
-    ).returncode == 0:
-        return True
+    if shutil.which("pkg-config"):
+        try:
+            if subprocess.run(["pkg-config", "--exists", "opencv4"]).returncode == 0:
+                return True
+        except OSError:
+            # Seen on Windows: shutil.which() can match a same-named file that
+            # isn't actually launchable this way (e.g. a non-.exe tool from Git's
+            # bundled Unix toolchain on PATH) -- CreateProcess then raises
+            # FileNotFoundError instead of just failing to find opencv4. Treat
+            # that the same as "pkg-config genuinely not usable here" and fall
+            # through to the include-path check below, rather than crashing.
+            pass
     for inc in (
         "/usr/include/opencv4",
         "/usr/local/include/opencv4",
@@ -105,11 +118,14 @@ def has_opencv() -> bool:
 def main() -> int:
     args = sys.argv[1:]
     strict = False
+    skip_opencv = False
     for arg in args:
         if arg == "--strict":
             strict = True
+        elif arg == "--skip-opencv":
+            skip_opencv = True
         else:
-            print(f"Unknown argument: {arg} (only --strict is supported)", file=sys.stderr)
+            print(f"Unknown argument: {arg} (supported: --strict, --skip-opencv)", file=sys.stderr)
             return 2
 
     zig_out = zzdds_zig_out()
@@ -122,7 +138,7 @@ def main() -> int:
     # installs java/ and (like every binding) needs the shared bin/zidl.
     c_binding = (zig_out / "include" / "zzdds_c.h").is_file()
     cpp_binding = (zig_out / "src" / "dcps_impl.cpp").is_file()
-    java_binding = (zig_out / "java").is_dir() and (zig_out / "bin" / "zidl").is_file()
+    java_binding = (zig_out / "java").is_dir() and executable_path(zig_out / "bin" / "zidl").is_file()
     opencv = has_opencv()
 
     print(f"ZZDDS_ZIG_OUT={zig_out}")
@@ -217,7 +233,9 @@ def main() -> int:
         skip_or_fail("interop/raw-loan-cross-binding", "needs c-binding, cpp-binding, and java-binding", strict)
 
     # ── opencv_zzdds (needs cpp-binding and OpenCV) ─────────────────────
-    if cpp_binding and opencv:
+    if skip_opencv:
+        skip_or_fail("cpp/opencv_zzdds", "excluded by --skip-opencv", False)
+    elif cpp_binding and opencv:
         run_section("cpp/opencv_zzdds", lambda: run_script(SCRIPT_DIR / "cpp" / "opencv_zzdds" / "smoke_test.py", env=env))
     elif cpp_binding:
         skip_or_fail("cpp/opencv_zzdds", "OpenCV not found (install libopencv-dev)", strict)

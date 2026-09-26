@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import (
     LiveProcess,
     REPO_ROOT,
+    executable_path,
     java_cmd,
     print_fail,
     require_tool,
@@ -77,7 +78,7 @@ def build_all(zig_out: Path) -> bool:
         if not run_build(["cmake", f"-DCMAKE_PREFIX_PATH={zig_out}", "-B", str(build_dir), "-S", str(dir_)], cwd=dir_, log_path=log_path):
             print(f"FAIL: {name} build -- see {log_path}", file=sys.stderr)
             return False
-        if not run_build(["cmake", "--build", str(build_dir)], cwd=dir_, log_path=log_path):
+        if not run_build(["cmake", "--build", str(build_dir), "--config", "Debug"], cwd=dir_, log_path=log_path):
             print(f"FAIL: {name} build -- see {log_path}", file=sys.stderr)
             return False
 
@@ -91,9 +92,9 @@ def build_all(zig_out: Path) -> bool:
         return False
 
     for bin_ in (
-        ZIG_DIR / "zig-out" / "bin" / "shape_main",
-        C_DIR / "build" / "shape_main",
-        CPP_DIR / "build" / "shape_main",
+        executable_path(ZIG_DIR / "zig-out" / "bin" / "shape_main"),
+        executable_path(C_DIR / "build" / "shape_main"),
+        executable_path(CPP_DIR / "build" / "shape_main"),
     ):
         if not bin_.is_file():
             print(f"FAIL: expected binary not found: {bin_}", file=sys.stderr)
@@ -106,9 +107,9 @@ def build_all(zig_out: Path) -> bool:
 
 def base_cmd(lang: str, zig_out: Path) -> list[str]:
     return {
-        "zig": [str(ZIG_DIR / "zig-out" / "bin" / "shape_main")],
-        "c": [str(C_DIR / "build" / "shape_main")],
-        "cpp": [str(CPP_DIR / "build" / "shape_main")],
+        "zig": [str(executable_path(ZIG_DIR / "zig-out" / "bin" / "shape_main"))],
+        "c": [str(executable_path(C_DIR / "build" / "shape_main"))],
+        "cpp": [str(executable_path(CPP_DIR / "build" / "shape_main"))],
         "java": java_cmd(zig_out, JAVA_CP, "ShapeMain"),
     }[lang]
 
@@ -119,7 +120,10 @@ def run_pair(pub_lang: str, sub_lang: str, zig_out: Path) -> bool:
     logdir = REPO_ROOT / "interop" / ".smoke-logs" / f"shape-{pub_lang}-{sub_lang}"
 
     sub = LiveProcess(
-        base_cmd(sub_lang, zig_out) + ["-S", "-d", DOMAIN, "-i", ITERATIONS, "--read-period", PERIOD_MS],
+        # Subscriber iterations count polls, not received samples. Keep it
+        # alive through publisher startup/discovery and stop after observing
+        # data, instead of spending its whole poll budget before data arrives.
+        base_cmd(sub_lang, zig_out) + ["-S", "-d", DOMAIN, "-i", "-1", "--read-period", PERIOD_MS],
         env=env,
         log_path=logdir / "sub.log",
     )
@@ -132,13 +136,18 @@ def run_pair(pub_lang: str, sub_lang: str, zig_out: Path) -> bool:
 
     pub.wait(PROC_TIMEOUT_S)
     pub_rc = pub.stop()
-    sub.wait(PROC_TIMEOUT_S)
+    deadline = time.monotonic() + PROC_TIMEOUT_S
+    while sub.poll() is None and MATCHED_RE.search(sub.log_text()) is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+    sub_running = sub.poll() is None
     sub_rc = sub.stop()
 
     pub_log = pub.log_text()
     sub_log = sub.log_text()
 
-    ok = pub_rc == 0 and sub_rc == 0
+    # The publisher must finish cleanly; the infinite subscriber is stopped
+    # by the harness (TerminateProcess on Windows), after proving delivery.
+    ok = pub_rc == 0 and (sub_running or sub_rc == 0)
     ok = ok and "on_publication_matched()" in pub_log
     ok = ok and MATCHED_RE.search(sub_log) is not None
     ok = ok and "incompatible_qos" not in pub_log.lower() and "incompatible_qos" not in sub_log.lower()
@@ -210,20 +219,14 @@ def run_cft_check(lang: str, zig_out: Path) -> bool:
     env = run_env(zig_out)
     logdir = REPO_ROOT / "interop" / ".smoke-logs" / f"shape-cft-{lang}"
 
-    # stdbuf -oL: when stdout isn't a TTY, glibc fully-buffers instead of
-    # line-buffering by default, so a C/C++ binary's early
-    # on_publication_matched() print can sit unflushed for a long time
-    # (found live: it took well over 30s to become visible without this).
-    # Zig flushes explicitly per print and Java's System.out auto-flushes
-    # on newline by default, so this is a no-op for them, but applying it
-    # uniformly is simpler than special-casing which languages need it.
+    # Each binding flushes live output; no platform-specific stdbuf wrapper.
     sub = LiveProcess(
-        ["stdbuf", "-oL", "-eL", *base_cmd(lang, zig_out), "-S", "-d", DOMAIN, "--cft", "shapesize > 2", "-i", "-1", "--read-period", PERIOD_MS],
+        [*base_cmd(lang, zig_out), "-S", "-d", DOMAIN, "--cft", "shapesize > 2", "-i", "-1", "--read-period", PERIOD_MS],
         env=env,
         log_path=logdir / "sub.log",
     )
 
-    pub_cmd_argv = ["stdbuf", "-oL", "-eL", *base_cmd(lang, zig_out), "-P", "-w", "-d", DOMAIN, "-z", "0", "--size-modulo", "4", "-i", "-1", "--write-period", PERIOD_MS]
+    pub_cmd_argv = [*base_cmd(lang, zig_out), "-P", "-w", "-d", DOMAIN, "-z", "0", "--size-modulo", "4", "-i", "-1", "--write-period", PERIOD_MS]
 
     matched = False
     pub = None
@@ -248,7 +251,7 @@ def run_cft_check(lang: str, zig_out: Path) -> bool:
         return False
 
     time.sleep(POST_MATCH_MARGIN_S)
-    # Exit code isn't meaningful here, unlike the mesh test's -i N
+    # Exit code isn't meaningful here, unlike the mesh publisher's -i N
     # self-termination: these processes are *always* stopped externally by
     # us, by design, so a JVM dying from the raw SIGINT (exit 130, since
     # it doesn't chain to zzdds's native handler the way the native
@@ -278,7 +281,7 @@ def run_cft_check(lang: str, zig_out: Path) -> bool:
 
 
 def main() -> int:
-    for tool in ("zig", "cmake", "java", "stdbuf"):
+    for tool in ("zig", "cmake", "java"):
         if not require_tool(tool):
             return 1
     zig_out = zzdds_zig_out()

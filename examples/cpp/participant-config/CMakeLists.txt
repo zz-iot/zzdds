@@ -39,7 +39,15 @@ target_include_directories(participant_config_dcps_impl PUBLIC "${GENERATED_DIR}
 target_link_libraries(participant_config_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(participant_config_pub src/publisher.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(participant_config_pub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(participant_config_pub PRIVATE participant_config_dcps_impl ZZDDS::zzdds)
 
 add_executable(participant_config_sub src/subscriber.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(participant_config_sub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(participant_config_sub PRIVATE participant_config_dcps_impl ZZDDS::zzdds)

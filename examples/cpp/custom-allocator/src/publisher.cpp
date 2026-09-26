@@ -18,7 +18,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 namespace {
 
@@ -85,6 +91,7 @@ int main() {
         return 1;
     }
 
+
     auto pub = dp->create_publisher(::DDS::PublisherQos::default_value(), nullptr, 0);
     if (!pub) {
         std::fprintf(stderr, "FAIL: create_publisher returned null\n");
@@ -134,7 +141,7 @@ int main() {
     // std.heap.c_allocator on the libc/pthread backend (SpawnConfig.allocator
     // is silently ignored there) -- a one-time, bounded, per-newly-matched-peer
     // cost, not a per-sample hot-path one, so it belongs before arming.
-    sleep(2);
+    sleep_ms(2000);
 
     // All one-time/discovery-adjacent allocation is done -- arm the guard so
     // any further malloc/calloc/realloc/free/operator new aborts the process.
@@ -151,7 +158,7 @@ int main() {
 
         check(typed_writer.write(sample), "DataWriter::write");
         std::printf("  wrote sample %d: temp=%.1fC label=%s\n", i, sample.temperature_c, sample.label.c_str());
-        usleep(200 * 1000);
+        sleep_ms(200);
     }
 
     std::printf("publisher: writing %d log samples...\n", LOG_COUNT);
@@ -165,12 +172,12 @@ int main() {
 
         check(log_writer.write(log_sample), "SensorLogDataWriter::write");
         std::printf("  wrote log %d: %s\n", i, log_sample.log_message.c_str());
-        usleep(200 * 1000);
+        sleep_ms(200);
     }
 
     // Give the last samples time to actually go out over the wire before
     // tearing everything down.
-    sleep(1);
+    sleep_ms(1000);
 
     noalloc_guard_try_disarm();
     std::printf("publisher: done\n");

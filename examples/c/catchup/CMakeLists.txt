@@ -30,7 +30,15 @@ target_include_directories(catchup_types PUBLIC "${GENERATED_DIR}")
 target_link_libraries(catchup_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(catchup_pub src/publisher.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(catchup_pub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(catchup_pub PRIVATE catchup_types ZZDDS::zzdds)
 
 add_executable(catchup_sub src/subscriber.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(catchup_sub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(catchup_sub PRIVATE catchup_types ZZDDS::zzdds)

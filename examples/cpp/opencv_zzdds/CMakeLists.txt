@@ -56,6 +56,10 @@ target_include_directories(ovidds_idl PUBLIC
 # ── video_capture (publisher) ─────────────────────────────────────────────────
 
 add_executable(video_capture video_capture.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(video_capture PRIVATE /STACK:8388608)
+endif()
 target_compile_options(video_capture PRIVATE -Wall -Wextra)
 target_link_libraries(video_capture PRIVATE
     ovidds_idl
@@ -68,6 +72,10 @@ target_link_libraries(video_capture PRIVATE
 # ── video_roi_display (subscriber) ───────────────────────────────────────────
 
 add_executable(video_roi_display video_roi_display.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(video_roi_display PRIVATE /STACK:8388608)
+endif()
 target_compile_options(video_roi_display PRIVATE -Wall -Wextra)
 target_link_libraries(video_roi_display PRIVATE
     ovidds_idl
@@ -79,6 +87,10 @@ target_link_libraries(video_roi_display PRIVATE
 # ── roi_generator (standalone face detector, no DDS) ─────────────────────────
 
 add_executable(roi_generator roi_generator.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(roi_generator PRIVATE /STACK:8388608)
+endif()
 target_compile_options(roi_generator PRIVATE -Wall -Wextra)
 target_link_libraries(roi_generator PRIVATE
     OpenCV::opencv_core

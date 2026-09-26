@@ -1,0 +1,11 @@
+// integration-tests/source-timestamp -- shared type. Keyed (single fixed
+// instance, id=0) so dispose_w_timestamp() has a real instance to target;
+// `seq` orders the writes independently of the key. Byte-identical copy
+// required in every language's own idl/ dir, matching every other
+// integration-tests scenario's convention. See
+// docs/design/integration-test-tier.md.
+@final
+struct TimestampEvent {
+    @key int32 id;
+    int32 seq;
+};

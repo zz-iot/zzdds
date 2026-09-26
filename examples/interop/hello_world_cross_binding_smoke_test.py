@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import (
     LiveProcess,
     REPO_ROOT,
+    executable_path,
     java_cmd,
     print_fail,
     require_tool,
@@ -68,7 +69,7 @@ def build_all(zig_out: Path) -> bool:
         if not run_build(["cmake", f"-DCMAKE_PREFIX_PATH={zig_out}", "-B", str(build_dir), "-S", str(dir_)], cwd=dir_, log_path=log_path):
             print(f"FAIL: {name} build -- see {log_path}", file=sys.stderr)
             return False
-        if not run_build(["cmake", "--build", str(build_dir)], cwd=dir_, log_path=log_path):
+        if not run_build(["cmake", "--build", str(build_dir), "--config", "Debug"], cwd=dir_, log_path=log_path):
             print(f"FAIL: {name} build -- see {log_path}", file=sys.stderr)
             return False
 
@@ -82,12 +83,12 @@ def build_all(zig_out: Path) -> bool:
         return False
 
     for bin_ in (
-        ZIG_DIR / "zig-out" / "bin" / "hello_world_pub",
-        ZIG_DIR / "zig-out" / "bin" / "hello_world_sub",
-        C_DIR / "build" / "hello_world_pub",
-        C_DIR / "build" / "hello_world_sub",
-        CPP_DIR / "build" / "hello_world_pub",
-        CPP_DIR / "build" / "hello_world_sub",
+        executable_path(ZIG_DIR / "zig-out" / "bin" / "hello_world_pub"),
+        executable_path(ZIG_DIR / "zig-out" / "bin" / "hello_world_sub"),
+        executable_path(C_DIR / "build" / "hello_world_pub"),
+        executable_path(C_DIR / "build" / "hello_world_sub"),
+        executable_path(CPP_DIR / "build" / "hello_world_pub"),
+        executable_path(CPP_DIR / "build" / "hello_world_sub"),
     ):
         if not bin_.is_file():
             print(f"FAIL: expected binary not found: {bin_}", file=sys.stderr)
@@ -100,18 +101,18 @@ def build_all(zig_out: Path) -> bool:
 
 def pub_cmd(lang: str, zig_out: Path) -> list[str]:
     return {
-        "zig": [str(ZIG_DIR / "zig-out" / "bin" / "hello_world_pub")],
-        "c": [str(C_DIR / "build" / "hello_world_pub")],
-        "cpp": [str(CPP_DIR / "build" / "hello_world_pub")],
+        "zig": [str(executable_path(ZIG_DIR / "zig-out" / "bin" / "hello_world_pub"))],
+        "c": [str(executable_path(C_DIR / "build" / "hello_world_pub"))],
+        "cpp": [str(executable_path(CPP_DIR / "build" / "hello_world_pub"))],
         "java": java_cmd(zig_out, JAVA_CP, "Publisher"),
     }[lang]
 
 
 def sub_cmd(lang: str, zig_out: Path) -> list[str]:
     return {
-        "zig": [str(ZIG_DIR / "zig-out" / "bin" / "hello_world_sub")],
-        "c": [str(C_DIR / "build" / "hello_world_sub")],
-        "cpp": [str(CPP_DIR / "build" / "hello_world_sub")],
+        "zig": [str(executable_path(ZIG_DIR / "zig-out" / "bin" / "hello_world_sub"))],
+        "c": [str(executable_path(C_DIR / "build" / "hello_world_sub"))],
+        "cpp": [str(executable_path(CPP_DIR / "build" / "hello_world_sub"))],
         "java": java_cmd(zig_out, JAVA_CP, "Subscriber"),
     }[lang]
 

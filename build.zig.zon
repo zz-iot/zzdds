@@ -19,5 +19,7 @@
         // build.zig runs scripts/fix_macos_dylib_exports.sh during a macOS
         // `-Dc-binding` install, so it must travel with the package.
         "scripts",
+        // Windows C-ABI builds generate DLL exports from generated C sources.
+        "tools/gen_windows_def.zig",
     },
 }

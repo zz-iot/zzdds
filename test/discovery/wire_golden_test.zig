@@ -206,6 +206,36 @@ test "SPDP decode round-trips locators, name, lease, and builtin endpoint set" {
     try testing.expectEqual(Locator.udp4(.{ 10, 0, 0, 1 }, 7411), kp.data.default_unicast_locators[0]);
 }
 
+test "SPDP decode trusts the RTPS header guid_prefix over a mismatched payload participantGuid" {
+    // The payload's participantGuid PID is self-asserted by the sender; the
+    // guid_prefix passed to decodeSpdpParticipant is what our own receive path
+    // extracted from the RTPS message header of the datagram that actually
+    // carried this announcement. A WriterProxy/ReaderProxy built from the
+    // decoded prefix later supplies INFO_DST for every AckNack/Heartbeat sent
+    // against it, so trusting an unverified payload claim over the header would
+    // let a wrong prefix silently propagate into that addressing.
+    const claimed_guid = guid(0xE5, 0xc1); // what the payload's participantGuid PID says
+    const header_prefix = guid(0x7A, 0x00).prefix; // what the RTPS header actually says
+
+    const b = try spdp.encodeSpdpParticipant(alloc, &.{
+        .guid = claimed_guid,
+        .domain_id = 0,
+        .name = "node1",
+        .metatraffic_unicast_locators = &.{},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 10_000,
+        .builtin_endpoint_set = 0,
+    });
+    defer alloc.free(b);
+
+    var kp = try spdp.decodeSpdpParticipant(alloc, header_prefix, 0, b, .{ .bytes = .{ 0x01, 0x02 } });
+    defer kp.deinit();
+
+    try testing.expectEqual(header_prefix, kp.data.guid.prefix);
+}
+
 test "SPDP decode falls back to the RTPS header guid_prefix and a 10s lease when a peer omits both PIDs" {
     // encap header + sentinel only — matches test/fuzz/fuzz_plcdr.zig's
     // "encap header + sentinel only" corpus case, exercised here for the

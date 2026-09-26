@@ -19,14 +19,19 @@
 #include <csignal>
 #include <ctime>
 #include <cinttypes>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 #include <memory>
 #include <string>
 #include <vector>
 #include <optional>
 #include <algorithm>
 #include <unordered_map>
-#include <unistd.h>
 
 namespace {
 
@@ -98,11 +103,26 @@ void handle_sigint(int) { g_all_done = 1; }
 
 /* ── Time helpers ──────────────────────────────────────────────────────────── */
 
+/* CLOCK_MONOTONIC/clock_gettime() are POSIX-only -- MSVC's <ctime> doesn't
+ * define either. QueryPerformanceCounter/-Frequency is the Windows
+ * equivalent (monotonic, arbitrary epoch, matching CLOCK_MONOTONIC's own
+ * contract). The split whole/fractional-part division avoids overflowing
+ * int64_t on a long-uptime CI runner, where counter*1e9 alone would not. */
+#ifdef _WIN32
+int64_t mono_ns() {
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (counter.QuadPart / freq.QuadPart) * 1000000000LL +
+           ((counter.QuadPart % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+}
+#else
 int64_t mono_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
+#endif
 
 /* ── Listeners ─────────────────────────────────────────────────────────────── */
 
@@ -383,7 +403,7 @@ int run_publisher(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr<
          * GSN so the subscriber joins mid-stream and never receives a
          * complete set. */
         if (use_coherent_gating && !printed_matched) {
-            usleep(static_cast<useconds_t>(opts.write_period_ms * 1000));
+            sleep_ms(static_cast<int>(opts.write_period_ms));
             continue;
         }
 
@@ -445,7 +465,7 @@ int run_publisher(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr<
         }
 
         iteration++;
-        usleep(static_cast<useconds_t>(opts.write_period_ms * 1000));
+        sleep_ms(static_cast<int>(opts.write_period_ms));
     }
 
     /* Unregister/dispose all instances across all topics on finite run. */
@@ -695,7 +715,7 @@ int run_subscriber(std::shared_ptr<::DDS::DomainParticipant> dp, std::shared_ptr
          * on_requested_deadline_missed() fires on its own. */
 
         iteration++;
-        usleep(static_cast<useconds_t>(opts.read_period_ms * 1000));
+        sleep_ms(static_cast<int>(opts.read_period_ms));
     }
 
     if (cft) dp->delete_contentfilteredtopic(cft);
@@ -883,6 +903,8 @@ int parse_args(int argc, char **argv, Options &opts) {
 /* ── main ──────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    // Discovery/filter smoke tests observe stdout while the process runs.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     std::signal(SIGINT, handle_sigint);
 
     Options opts;

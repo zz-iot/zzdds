@@ -100,6 +100,20 @@ prerequisite* is treated.
 ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./run_all.py --strict
 ```
 
+On Windows, run from a development shell with Zig, a JDK, Python, CMake and
+the Visual Studio C++ tools on PATH. From the repository root:
+
+```bat
+zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
+python examples\run_all.py --strict --skip-opencv
+```
+
+`--skip-opencv` explicitly excludes only the optional OpenCV example. Every
+binding and cross-language scenario remains required. The runners support
+Windows `.exe` names and both single-config CMake generators (Ninja/Makefiles)
+and multi-config generators (Visual Studio, using `Debug`). Shape filter tests
+observe flushed application output directly and do not require `stdbuf`.
+
 ## Building everything for one language
 
 `run_all.py` covers all of this at once; the commands below are the same

@@ -45,8 +45,7 @@ fn onPublicationMatched(state: *State, dw: DDS.DataWriter, status: DDS.Publicati
     std.debug.print("on_publication_matched() current_count={d}\n", .{status.current_count});
 }
 
-fn parseDomain(process_args: std.process.Args) u32 {
-    var it = std.process.Args.Iterator.init(process_args);
+fn parseDomain(it: *std.process.Args.Iterator) u32 {
     _ = it.skip();
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--domain")) {
@@ -58,12 +57,14 @@ fn parseDomain(process_args: std.process.Args) u32 {
 }
 
 pub fn main(init: std.process.Init) !void {
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.arena.allocator());
+    defer args.deinit();
     const io = init.io;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const domain_id = parseDomain(init.minimal.args);
+    const domain_id = parseDomain(&args);
 
     var factory = zzdds.createFactory() catch {
         std.debug.print("FAIL: createFactory() failed\n", .{});

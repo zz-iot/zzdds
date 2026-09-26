@@ -128,9 +128,11 @@ const Harness = struct {
             .prefix = prefix,
             .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
         };
+        var repr = [_]i16{2}; // XCDR2 -- matches the local default so a genuine match can occur
         var q = iface.DiscoveredWriterData{
             .reliability = .{ .kind = 2, .max_blocking_time = .{} },
             .history = .{ .kind = 0, .depth = 1 },
+            .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &repr, ._release = false },
         };
         const data = iface.WriterData{
             .guid = writer_guid,
@@ -157,8 +159,10 @@ const Harness = struct {
             .prefix = prefix,
             .entity_id = .{ .entity_key = .{ 0, 0, 4 }, .entity_kind = 0x07 },
         };
+        var repr = [_]i16{2}; // XCDR2 -- matches the local default so a genuine match can occur
         var q = iface.DiscoveredReaderData{
             .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+            .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &repr, ._release = false },
         };
         const data = iface.ReaderData{
             .guid = reader_guid,
@@ -461,6 +465,95 @@ test "ignore_subscription: ignored reader not matched to writer" {
     try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_subscription(dp.ptr, sub_handle));
     h.fireReaderDiscovered(dp_impl, prefix, "SubTopic", "T");
     try testing.expectEqual(@as(usize, 0), dw_impl.matchedReaderCount());
+}
+
+// ── Retroactive-match scan vs. an ignore applied after discovery ────────────
+//
+// Every test above ignores first, then discovers -- covering the "normal"
+// order onWriterDiscovered/onReaderDiscovered's own ignore-list guards
+// handle. There's a second, symmetric path: pubAnnounceProtoWriter/
+// subAnnounceProtoReader's own retroactive-match scan, run when a *local*
+// writer/reader is created (or a previously-disabled one is enabled) after
+// some remote counterpart was already discovered. ignore_*() never
+// retroactively purges the discovery cache (self.discovered_readers/
+// self.discovered_writers), so a counterpart discovered *before* an ignore
+// call still sits there when this scan runs -- these two tests reverse the
+// order (discover, then ignore, then create-and-enable the local entity) to
+// prove that scan's own ignore-list guards (participant.zig, found building
+// integration-tests/ignore-entities) hold too. No test exercised this order
+// before (found via a kcov/PR-diff coverage-gap comparison).
+
+test "ignore_topic: retroactive writer-creation scan skips a reader ignored after it was discovered" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const topic = dp.create_topic("RetroTopic", "T", .{}, null, 0);
+    const topic_handle = topic.vtable.get_instance_handle(topic.ptr);
+
+    // Discovered first, before anything is ignored -- lands in
+    // self.discovered_readers.
+    h.fireReaderDiscovered(dp_impl, makePrefix(0xF0), "RetroTopic", "T");
+
+    // Ignored second. Doesn't purge the entry fired above.
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_topic(dp.ptr, topic_handle));
+
+    // Creating (and enabling, the default) a writer on the same topic third
+    // triggers announceDataWriter()'s retroactive scan over
+    // self.discovered_readers -- must still skip the reader above despite
+    // predating the ignore.
+    const pub_ = dp.create_publisher(.{}, null, 0);
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dw = pub_.create_datawriter(topic, dw_qos, null, 0);
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const dw_impl: *dcps.DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
+
+    try testing.expectEqual(@as(usize, 0), dw_impl.matchedReaderCount());
+}
+
+test "ignore_topic: retroactive reader-creation scan skips a writer ignored after it was discovered" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const topic = dp.create_topic("RetroTopic2", "T", .{}, null, 0);
+    const topic_handle = topic.vtable.get_instance_handle(topic.ptr);
+
+    // Discovered first, before anything is ignored -- lands in
+    // self.discovered_writers.
+    h.fireWriterDiscovered(dp_impl, makePrefix(0xF1), "RetroTopic2", "T");
+
+    // Ignored second. Doesn't purge the entry fired above.
+    try testing.expectEqual(DDS.RETCODE_OK, dp.vtable.ignore_topic(dp.ptr, topic_handle));
+
+    // Creating (and enabling, the default) a reader on the same topic third
+    // triggers announceDataReader()'s retroactive scan over
+    // self.discovered_writers -- must still skip the writer above despite
+    // predating the ignore.
+    const sub = dp.create_subscriber(.{}, null, 0);
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dr = sub.create_datareader(
+        @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription(),
+        dr_qos,
+        null,
+        0,
+    );
+    defer _ = dp.vtable.delete_contained_entities(dp.ptr);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    try testing.expectEqual(@as(usize, 0), dr_impl.matchedWriterCount());
 }
 
 test "ignore_publication/subscription: duplicate call is idempotent" {

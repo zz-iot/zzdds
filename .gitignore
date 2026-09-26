@@ -55,6 +55,9 @@ test/interop/*.o
 # Per-run log directory and artifact tarballs (from `make bundle-artifacts`).
 test/interop/logs/
 test/interop/interop-artifacts-*.tar.gz
+**/build
+# Per-run subprocess stdout/stderr captures from integration-tests/interop/*_cross_binding_test.py.
+integration-tests/interop/.smoke-logs/
 
 # ── Editor / OS ───────────────────────────────────────────────────────────────
 .DS_Store

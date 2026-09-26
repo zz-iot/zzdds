@@ -20,7 +20,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 namespace {
 
@@ -183,7 +189,7 @@ int main(int argc, char **argv) {
                           CYCLE_TIMEOUT_MS / 1000, state.step.load());
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     sub->delete_datareader(dr);

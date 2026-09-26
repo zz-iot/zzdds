@@ -19,6 +19,7 @@
 //!               "[<number>]" in the sample line  or  "on_requested_incompatible_qos()"
 
 const std = @import("std");
+const builtin = @import("builtin");
 const dds = @import("dds");
 const DDS = dds.DDS;
 const shape_gen = @import("shape_gen");
@@ -46,16 +47,11 @@ fn sleepNs(io: std.Io, ns: u64) void {
 }
 
 // ── Stdout helpers ────────────────────────────────────────────────────────────
-// std.io was removed in Zig 0.16; write directly via the Linux write(2) syscall.
+// Set before starting DDS threads; std.Io writes to redirected stdout on every OS.
+var output_io: std.Io = undefined;
 
 fn stdoutWrite(bytes: []const u8) void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const rc = std.os.linux.write(std.posix.STDOUT_FILENO, remaining.ptr, remaining.len);
-        const n = @as(isize, @bitCast(rc));
-        if (n <= 0) break;
-        remaining = remaining[@intCast(n)..];
-    }
+    std.Io.File.stdout().writeStreamingAll(output_io, bytes) catch {};
 }
 
 fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
@@ -73,6 +69,19 @@ fn handleSigint(sig: std.posix.SIG) callconv(.c) void {
     _ = sig;
     g_all_done.store(true, .release);
 }
+
+const win_console = struct {
+    extern "kernel32" fn SetConsoleCtrlHandler(
+        handler: ?*const fn (u32) callconv(.winapi) i32,
+        add: i32,
+    ) callconv(.winapi) i32;
+
+    fn handle(control: u32) callconv(.winapi) i32 {
+        if (control != 0 and control != 1) return 0; // Ctrl+C / Ctrl+Break
+        g_all_done.store(true, .release);
+        return 1;
+    }
+};
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -800,9 +809,8 @@ fn instanceColor(alloc: std.mem.Allocator, base: []const u8, inst: usize) ![]con
 
 // ── Argument parsing ──────────────────────────────────────────────────────────
 
-fn parseArgs(process_args: std.process.Args) !Options {
+fn parseArgs(it: *std.process.Args.Iterator) !Options {
     var opts = Options{};
-    var it = std.process.Args.Iterator.init(process_args);
     _ = it.skip(); // program name
 
     while (it.next()) |arg| {
@@ -993,13 +1001,21 @@ fn parseArgs(process_args: std.process.Args) !Options {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) !void {
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.arena.allocator());
+    defer args.deinit();
     const io = init.io;
-    const sa = std.posix.Sigaction{
-        .handler = .{ .handler = handleSigint },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+    output_io = io;
+    if (builtin.os.tag == .windows) {
+        if (win_console.SetConsoleCtrlHandler(win_console.handle, 1) == 0)
+            return error.ConsoleHandlerRegistrationFailed;
+    } else {
+        const sa = std.posix.Sigaction{
+            .handler = .{ .handler = handleSigint },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+    }
 
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1010,7 +1026,7 @@ pub fn main(init: std.process.Init) !void {
         if (ms > 0) sleepNs(io, ms * std.time.ns_per_ms);
     }
 
-    const opts = parseArgs(init.minimal.args) catch |err| {
+    const opts = parseArgs(&args) catch |err| {
         std.log.err("argument error: {}", .{err});
         std.process.exit(1);
     };

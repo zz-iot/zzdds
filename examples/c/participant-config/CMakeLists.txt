@@ -30,7 +30,15 @@ target_include_directories(config_ping_types PUBLIC "${GENERATED_DIR}")
 target_link_libraries(config_ping_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 
 add_executable(participant_config_pub src/publisher.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(participant_config_pub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(participant_config_pub PRIVATE config_ping_types ZZDDS::zzdds)
 
 add_executable(participant_config_sub src/subscriber.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(participant_config_sub PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(participant_config_sub PRIVATE config_ping_types ZZDDS::zzdds)

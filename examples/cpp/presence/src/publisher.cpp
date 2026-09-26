@@ -20,7 +20,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#ifdef _WIN32
+#include <windows.h>
+static void sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
 #include <unistd.h>
+static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
 
 namespace {
 
@@ -134,7 +140,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "FAIL: no reliable reader became ready within %ds\n", READER_READY_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     // -- Online phase --
@@ -147,13 +153,13 @@ int main(int argc, char **argv) {
             return 1;
         }
         std::printf("Publisher: wrote sequence=%d\n", seq);
-        usleep(BEACON_PERIOD_MS * 1000);
+        sleep_ms(BEACON_PERIOD_MS);
     }
 
     // -- Offline phase: no writes, no asserts, longer than the lease --
     std::printf("Publisher: going offline (no writes/asserts for %ds, lease is %ds)\n",
                 OFFLINE_DURATION_MS / 1000, LEASE_DURATION_S);
-    usleep(OFFLINE_DURATION_MS * 1000);
+    sleep_ms(OFFLINE_DURATION_MS);
 
     // -- Recovery --
     std::printf("Publisher: asserting liveliness and resuming\n");
@@ -170,7 +176,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         std::printf("Publisher: wrote sequence=%d\n", seq);
-        usleep(BEACON_PERIOD_MS * 1000);
+        sleep_ms(BEACON_PERIOD_MS);
     }
 
     for (int waited_ms = 0;
@@ -180,7 +186,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "FAIL: subscriber did not disconnect within %ds\n", DRAIN_TIMEOUT_MS / 1000);
             return 1;
         }
-        usleep(POLL_PERIOD_MS * 1000);
+        sleep_ms(POLL_PERIOD_MS);
     }
 
     std::printf("Publisher: done.\n");

@@ -494,6 +494,30 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .sanitize_thread = sanitize_thread,
+            // This module is installed as a standalone static library for
+            // direct third-party C/C++ linking (see installArtifact below),
+            // not just embedded into libzzdds's own final link — so it must
+            // not depend on runtime hooks only Zig's own linker step would
+            // satisfy. Left at Zig's default (unset), Debug/ReleaseSafe
+            // optimize modes instrument zidl_cdr.c's C source with
+            // -fsanitize-c (emitting calls to __ubsan_handle_*) and
+            // -fstack-protector (__stack_chk_fail/__stack_chk_guard).
+            // Those get resolved for free when this module is linked into
+            // libzzdds.so/.dll (Zig statically links its own compiler-rt at
+            // that final link step) and, on Linux, __stack_chk_fail/_guard
+            // happen to also be satisfied by glibc regardless -- but an
+            // external MSVC-linked consumer of the exported zidl_cdr.lib has
+            // no such runtime available for any of these symbols, and fails
+            // with LNK2019 unresolved externals (found building the Windows
+            // examples lane, which is the first place anything linked
+            // zidl_cdr.lib directly via a non-Zig toolchain). zidl_cdr.c is
+            // vendored, narrow, mechanical CDR encode/decode logic from the
+            // zidl dependency, not zzdds's own Zig code -- disabling these
+            // C-source-specific checks here doesn't touch Zig's own native
+            // safety checks (bounds/overflow/etc.) anywhere else in the
+            // project, which are a separate, unaffected mechanism.
+            .sanitize_c = .off,
+            .stack_protector = false,
         });
         zidl_cdr_mod.addCSourceFile(.{
             .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
@@ -559,6 +583,21 @@ pub fn build(b: *std.Build) void {
         });
         zzdds_lib.root_module.addOptions("build_options", build_options);
         zzdds_lib.root_module.link_libc = true;
+        // Without this, only Zig's own `export fn` C-ABI surface
+        // (--zig-generate-c-api) ends up in zzdds.dll's export table on
+        // Windows -- the plain-struct CDR functions (dcps_cdr.c/
+        // zzdds_cdr.c, compiled in as ordinary C source below, not Zig
+        // `export fn`) have no dllexport annotation of their own and are
+        // invisible to it, so any C/C++ consumer calling e.g.
+        // DDS_TopicBuiltinTopicData_default() or
+        // zzdds_DomainParticipantConfig_default() fails at Windows link
+        // time with LNK2019 -- found building the Windows examples lane,
+        // whose discovery/participant-config/shape examples call exactly
+        // those. -fdll-export-fns is Windows-only -- Zig rejects it outright
+        // ("only Windows OS targets support DLLs") on every other target.
+        if (target.result.os.tag == .windows) {
+            zzdds_lib.dll_export_fns = true;
+        }
         if (target.result.os.tag == .windows) {
             zzdds_lib.root_module.linkSystemLibrary("ws2_32", .{});
         }
@@ -587,6 +626,42 @@ pub fn build(b: *std.Build) void {
         zzdds_lib.root_module.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
         zzdds_lib.root_module.addIncludePath(b.path("include"));
         zzdds_lib.root_module.linkLibrary(zidl_cdr_lib);
+
+        // dll_export_fns (above) only covers Zig's own `export fn` surface,
+        // not the plain C functions just compiled in from dcps_cdr.c/
+        // zzdds_cdr.c -- confirmed empirically, not just by inspection: it
+        // alone did NOT clear the Windows examples lane's LNK2019s. Those
+        // two generated files need their own .def EXPORTS entries, built by
+        // scanning them directly (tools/gen_windows_def.zig) rather than
+        // hand-maintaining a symbol list that would silently drift out of
+        // sync with the IDL. A .def file's EXPORTS section is additive
+        // alongside whatever dll_export_fns already covers, never a
+        // replacement, so this can't un-export anything that already works.
+        if (target.result.os.tag == .windows) {
+            const gen_windows_def_exe = b.addExecutable(.{
+                .name = "gen_windows_def",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tools/gen_windows_def.zig"),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                }),
+            });
+            const run_gen_def = b.addRunArtifact(gen_windows_def_exe);
+            const zzdds_def = run_gen_def.addOutputFileArg("zzdds_generated.def");
+            run_gen_def.addFileArg(gen_c_lib_dir.path(b, "dcps_cdr.c"));
+            run_gen_def.addFileArg(gen_zzdds_c_lib_dir.path(b, "zzdds_cdr.c"));
+            zzdds_lib.win32_module_definition = zzdds_def;
+            // Unlike addCSourceFile/addIncludePath, assigning
+            // win32_module_definition directly does NOT wire up a step
+            // dependency on its own -- confirmed the hard way: without
+            // this, zzdds_lib's own compile step can run before
+            // run_gen_def has produced the .def file, panicking
+            // ("misconfigured build script": "getPath() was called on a
+            // GeneratedFile that wasn't built yet") on the Windows
+            // "Windows x86_64" core CI job, which is exactly where this
+            // path first actually ran.
+            zzdds_lib.step.dependOn(&run_gen_def.step);
+        }
 
         const install_zzdds_lib_step: *std.Build.Step = if (target.result.os.tag == .macos) blk: {
             // Zig 0.16 incorrectly publishes the Mach-O linker-synthesized
@@ -826,19 +901,57 @@ pub fn build(b: *std.Build) void {
             \\
             \\if(NOT TARGET ZZDDS::zzdds)
             \\    add_library(ZZDDS::zzdds SHARED IMPORTED)
-            \\    find_library(_ZZDDS_SHLIB
-            \\        NAMES zzdds
-            \\        HINTS "${{_ZZDDS_PREFIX}}/lib"
-            \\        NO_DEFAULT_PATH
-            \\    )
-            \\    if(NOT _ZZDDS_SHLIB)
-            \\        message(FATAL_ERROR "ZZDDS: libzzdds not found under ${{_ZZDDS_PREFIX}}/lib")
+            \\    if(WIN32)
+            \\        # Windows keeps the runtime DLL and its link-time import
+            \\        # library in separate install dirs (zig's own default:
+            \\        # bin/zzdds.dll + lib/zzdds.lib) -- a SHARED IMPORTED
+            \\        # target there needs BOTH IMPORTED_LOCATION (the DLL) and
+            \\        # IMPORTED_IMPLIB (the .lib actually fed to the linker).
+            \\        # Setting only IMPORTED_LOCATION (as the non-Windows
+            \\        # branch below does, where the .so/.dylib IS both) leaves
+            \\        # IMPORTED_IMPLIB unset, and CMake then has nothing to
+            \\        # link consumers against -- surfaces downstream as
+            \\        # "LINK : fatal error LNK1104: cannot open file
+            \\        # 'ZZDDS::zzdds-NOTFOUND.obj'", not as a configure-time
+            \\        # error here.
+            \\        find_file(_ZZDDS_DLL
+            \\            NAMES zzdds.dll
+            \\            HINTS "${{_ZZDDS_PREFIX}}/bin"
+            \\            NO_DEFAULT_PATH
+            \\        )
+            \\        find_library(_ZZDDS_IMPLIB
+            \\            NAMES zzdds
+            \\            HINTS "${{_ZZDDS_PREFIX}}/lib"
+            \\            NO_DEFAULT_PATH
+            \\        )
+            \\        if(NOT _ZZDDS_DLL)
+            \\            message(FATAL_ERROR "ZZDDS: zzdds.dll not found under ${{_ZZDDS_PREFIX}}/bin")
+            \\        endif()
+            \\        if(NOT _ZZDDS_IMPLIB)
+            \\            message(FATAL_ERROR "ZZDDS: zzdds.lib not found under ${{_ZZDDS_PREFIX}}/lib")
+            \\        endif()
+            \\        set_target_properties(ZZDDS::zzdds PROPERTIES
+            \\            IMPORTED_LOCATION "${{_ZZDDS_DLL}}"
+            \\            IMPORTED_IMPLIB "${{_ZZDDS_IMPLIB}}"
+            \\            INTERFACE_INCLUDE_DIRECTORIES "${{_ZZDDS_PREFIX}}/include"
+            \\        )
+            \\        unset(_ZZDDS_DLL CACHE)
+            \\        unset(_ZZDDS_IMPLIB CACHE)
+            \\    else()
+            \\        find_library(_ZZDDS_SHLIB
+            \\            NAMES zzdds
+            \\            HINTS "${{_ZZDDS_PREFIX}}/lib"
+            \\            NO_DEFAULT_PATH
+            \\        )
+            \\        if(NOT _ZZDDS_SHLIB)
+            \\            message(FATAL_ERROR "ZZDDS: libzzdds not found under ${{_ZZDDS_PREFIX}}/lib")
+            \\        endif()
+            \\        set_target_properties(ZZDDS::zzdds PROPERTIES
+            \\            IMPORTED_LOCATION "${{_ZZDDS_SHLIB}}"
+            \\            INTERFACE_INCLUDE_DIRECTORIES "${{_ZZDDS_PREFIX}}/include"
+            \\        )
+            \\        unset(_ZZDDS_SHLIB CACHE)
             \\    endif()
-            \\    set_target_properties(ZZDDS::zzdds PROPERTIES
-            \\        IMPORTED_LOCATION "${{_ZZDDS_SHLIB}}"
-            \\        INTERFACE_INCLUDE_DIRECTORIES "${{_ZZDDS_PREFIX}}/include"
-            \\    )
-            \\    unset(_ZZDDS_SHLIB CACHE)
             \\endif()
             \\
             \\if(NOT TARGET ZZDDS::zidl_cdr)
@@ -1166,18 +1279,8 @@ pub fn build(b: *std.Build) void {
                 const zzdds_dll_install_dir: std.Build.InstallDir = if (target.result.os.tag == .windows) .bin else .lib;
                 const zzdds_dll_install_path = b.getInstallPath(zzdds_dll_install_dir, "");
 
-                // -Xss8m: PR #65 CI hit an immediate EXCEPTION_STACK_OVERFLOW
-                // inside libzzdds, crashing right as JavaSmoke's very first
-                // native call (createFactory()) enters the JNI bridge --
-                // despite that same native factory/participant bootstrap
-                // running clean under the plain (non-JNI) Windows test suite
-                // moments earlier in the same job. The JVM's default native
-                // thread stack (~1MB) is the prime suspect: it's the one
-                // thing genuinely smaller on Windows than the pthread
-                // defaults this call path apparently fits under on
-                // Linux/macOS (both closer to 8MB). 8MB matches that
-                // headroom; harmless to set on every platform.
-                const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
+                // Native config parsing needs more than the JVM's default Windows thread stack.
+                const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
                 run_java_smoke.addArg(b.fmt("-Djava.library.path={s}", .{zzdds_dll_install_path}));
                 run_java_smoke.addPathDir(zzdds_dll_install_path);
                 run_java_smoke.addArg("JavaSmoke");

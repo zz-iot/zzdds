@@ -38,4 +38,8 @@ target_link_libraries(shape_types PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 # the authoritative CLI/behavior spec) and the dds-rtps interop harness
 # convention of one binary path handed to both roles.
 add_executable(shape_main src/shape_main.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(shape_main PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(shape_main PRIVATE shape_types ZZDDS::zzdds)

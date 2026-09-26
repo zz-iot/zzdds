@@ -8,6 +8,27 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-25
+
+- **Full four-language example mesh on Windows.** All nine mesh runners support
+  Windows executable names and CMake's Debug output directory. Zig examples use
+  portable argument handling, and the shape example uses portable output and
+  platform-specific console handling. Shape tests no longer depend on `stdbuf`
+  or terminate subscribers after a fixed number of discovery polls. Windows CI
+  now runs the strict examples suite, excluding only optional OpenCV explicitly.
+  Native Windows validation passed all 88 mesh pairs and all four shape filters.
+- **Windows socket cleanup and Java/JNI restored.** UDP and TCP now close Winsock
+  sockets with `closesocket`, rather than the CRT's `close`. The latter could
+  leak sockets or terminate the host through its invalid-parameter handler:
+  native debugging reproduced both the custom-allocator cross-binding failure
+  (`0xC0000409`, reason 5) and Java's silent exit code 9 on this path. Regression
+  tests verify that closing each transport's socket releases its bound port.
+  Windows Java binding smoke tests are enabled in CI and release validation.
+- Java example scripts select `zidl.exe` and the JNI DLL's `bin/` directory on
+  Windows, and reserve sufficient Java thread stack space for native config parsing.
+  Removed temporary config/custom-allocator checkpoints and shortened repeated
+  CMake stack-size investigation comments.
+
 ## 2026-09-16
 
 - **`userDataOnReceive` also listens on the metatraffic unicast port, fixing a

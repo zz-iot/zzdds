@@ -1,0 +1,11 @@
+// integration-tests/wait-for-historical-data -- shared type. Deliberately
+// minimal (a bare sequence number), unkeyed, single instance -- the point of
+// this scenario is wait_for_historical_data()'s durability/timing semantics,
+// not the payload (same discipline examples/*/catchup's catchup_sample.idl
+// follows). Byte-identical copy required in every language's own idl/ dir,
+// matching every other integration-tests scenario's convention. See
+// docs/design/integration-test-tier.md.
+@appendable
+struct HistoryEvent {
+    int32 seq_num;
+};

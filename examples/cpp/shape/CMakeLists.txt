@@ -48,4 +48,8 @@ target_link_libraries(shape_dcps_impl PUBLIC ZZDDS::zzdds ZZDDS::zidl_cdr)
 # zig/shape for why (matches the dds-rtps interop harness convention of one
 # binary path for both roles).
 add_executable(shape_main src/shape_main.cpp)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(shape_main PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(shape_main PRIVATE shape_dcps_impl ZZDDS::zzdds)

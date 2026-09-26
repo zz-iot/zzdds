@@ -72,9 +72,8 @@ const Options = struct {
     config_path: ?[]const u8 = null,
 };
 
-fn parseArgs(process_args: std.process.Args) Options {
+fn parseArgs(it: *std.process.Args.Iterator) Options {
     var opts = Options{};
-    var it = std.process.Args.Iterator.init(process_args);
     _ = it.skip(); // program name
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--domain")) {
@@ -88,12 +87,14 @@ fn parseArgs(process_args: std.process.Args) Options {
 }
 
 pub fn main(init: std.process.Init) !void {
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.arena.allocator());
+    defer args.deinit();
     const io = init.io;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const opts = parseArgs(init.minimal.args);
+    const opts = parseArgs(&args);
 
     // Must run before the first factory is created in this process -- see
     // zzdds's src/config/process.zig. Deliberately std.heap.c_allocator, not

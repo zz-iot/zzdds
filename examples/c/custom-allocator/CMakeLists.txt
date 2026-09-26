@@ -42,8 +42,14 @@ target_link_libraries(static_pool_allocator PUBLIC ZZDDS::zzdds Threads::Threads
 # Standalone LD_PRELOAD shim (not linked into publisher/subscriber -- loaded
 # only via LD_PRELOAD at run time) that aborts on any malloc/calloc/realloc/free
 # once armed, making "zero heap allocation after startup" a falsifiable test.
-add_library(noalloc_guard SHARED src/noalloc_guard_preload.c)
-target_link_libraries(noalloc_guard PRIVATE ${CMAKE_DL_LIBS})
+# LD_PRELOAD has no Windows equivalent, so this target (and the interposer
+# technique it implements) is POSIX-only -- see noalloc_guard_client.c's
+# matching _WIN32 branch, which is what publisher/subscriber actually link
+# against and already degrades gracefully to "unguarded" without this.
+if(NOT WIN32)
+    add_library(noalloc_guard SHARED src/noalloc_guard_preload.c)
+    target_link_libraries(noalloc_guard PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 # Compiled into publisher/subscriber directly: resolves noalloc_guard_arm/_disarm
 # via dlsym(RTLD_DEFAULT, ...) so the app runs fine (unguarded) even without
@@ -53,14 +59,26 @@ target_include_directories(noalloc_guard_client PUBLIC src)
 target_link_libraries(noalloc_guard_client PUBLIC ${CMAKE_DL_LIBS})
 
 add_executable(publisher src/publisher.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(publisher PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(publisher PRIVATE sensor_types static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
 
 add_executable(subscriber src/subscriber.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(subscriber PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(subscriber PRIVATE sensor_types static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
 
 # Narrow regression check for the zzdds_process_configure_from_file bootstrap
 # fix specifically -- see src/bootstrap_noalloc_check.c.
 add_executable(bootstrap_noalloc_check src/bootstrap_noalloc_check.c)
+if(MSVC)
+    # Native config parsing needs more than MSVC's default 1 MiB stack.
+    target_link_options(bootstrap_noalloc_check PRIVATE /STACK:8388608)
+endif()
 target_link_libraries(bootstrap_noalloc_check PRIVATE static_pool_allocator noalloc_guard_client ZZDDS::zzdds)
 
 # publisher/subscriber both run with this directory as their cwd; zzdds's
