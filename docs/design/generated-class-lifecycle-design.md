@@ -34,7 +34,7 @@ call site needing to release it already had the reader handle in scope, so this 
 gap with no new mechanism at all, not even a new global. The general shape of the bug — any
 C-ABI output that *can* be allocated by a per-entity allocator but is released through a
 function with no entity context — turned out not to be an isolated incident (see
-[Enforcement & tooling](#enforcement--tooling)): the same class of bug was found four more
+[Enforcement & tooling](generated-class-lifecycle-design.md#enforcement--tooling)): the same class of bug was found four more
 times as this design was built out, and a sixth instance the moment real test coverage for
 it was added. Every instance traces to the same root cause: a generic free function was
 still hardcoded to a single allocator when a per-entity or process-configured one could
@@ -57,14 +57,14 @@ to the entity that produced it, or does the application hold it and free it dire
   is in scope at release time, by construction — not a gap to close, an inherent property
   of this shape. A generic free for a Category 2 type must never hardcode a specific
   allocator; it must route through whatever the process has been configured with (see
-  [Allocator resolution](#allocator-resolution)).
+  [Allocator resolution](generated-class-lifecycle-design.md#allocator-resolution)).
 
 Any type where ownership crosses the app/middleware boundary directly — the app constructs
 it and hands it in, or the middleware produces it and hands it out for the app to free — is
 Category 2 by construction: Category 1's defining property (a "give it back" op) is exactly
 what's absent when ownership transfers outright. This is the shape of both
 `GuardCondition`/`WaitSet` (app constructs, no factory op) and `ConditionSeq`
-(middleware produces, no return-style op) — see the [appendix](#appendix-boundary-crossing-type-audit).
+(middleware produces, no return-style op) — see the [appendix](generated-class-lifecycle-design.md#appendix-boundary-crossing-type-audit).
 
 This rule does not conflict with `docs/decisions.md`'s "always explicit, no global
 allocator" invariant. That invariant is about zzdds's Zig core — every Zig-native
@@ -262,7 +262,7 @@ a type's release *shape* (Category 1 vs. 2) was a deliberate choice.
 `zidl -b <any> --audit-lifecycle <file.idl>`, walks an IDL file's interfaces and classifies
 every operation's heap-owning output/return type: does a same-interface operation take it
 back as an `inout` parameter? Found → Category 1; not found → Category 2, the normal case,
-not an error. Prints a Markdown table (see the [appendix](#appendix-boundary-crossing-type-audit)
+not an error. Prints a Markdown table (see the [appendix](generated-class-lifecycle-design.md#appendix-boundary-crossing-type-audit)
 for the real output against `dcps.idl`/`zzdds.idl`). This is a reporting tool, not a build
 gate — the classification rule's own text makes "no return-op" a definitive Category 2
 answer, not an ambiguous one, so a hard-error-on-unclassifiable pass would essentially never
@@ -311,7 +311,7 @@ on a pointer that was never allocated from its own buffer.
 ## Known limitations & future work
 
 - **The app-owned boxed buffer's allocator match is not structurally enforced** — see
-  [Allocator resolution](#allocator-resolution). Closing it needs `{Type}_free()` to take an
+  [Allocator resolution](generated-class-lifecycle-design.md#allocator-resolution). Closing it needs `{Type}_free()` to take an
   entity parameter, a real C-ABI shape change.
 - **The classification sweep is a diagnostic, not a build gate.** No case in the real IDL
   currently warrants hard-failing the build, but if one ever does, promoting it from report
@@ -326,7 +326,7 @@ on a pointer that was never allocated from its own buffer.
 - **No real Rust (or Python/C#/Haskell) binding exists** — the Rust allocator spike answers
   one design question empirically; it is not the start of an implementation.
 - **Java's explicit-only GC contract isn't written down in Java's own binding docs yet** —
-  see [The GC-lifecycle contract](#the-gc-lifecycle-contract).
+  see [The GC-lifecycle contract](generated-class-lifecycle-design.md#the-gc-lifecycle-contract).
 
 ## Engineering notes
 
@@ -378,7 +378,7 @@ Hand-curated, with narrative detail the automated sweep below doesn't capture:
 |---|---|---|---|---|---|
 | `GuardCondition` | `zzdds_create_guardcondition[_with_allocator]` (hand-written, no IDL op) | `zzdds_destroy_guardcondition` | Y | N — self-contained pair already threads its own allocator | 2 (hand-written, `@standalone`-marked) |
 | `WaitSet` | `zzdds_create_waitset[_with_allocator]` (hand-written, no IDL op) | `zzdds_destroy_waitset` | Y | N — same pattern | 2 (hand-written, `@standalone`-marked) |
-| `ConditionSeq` (`WaitSet::wait()`/`get_conditions()` output) | Boxed via `emitTypedef`'s `is_entity_seq` branch | Generic `_free()`, routes through the process-wide allocator (app-owned half) / entity's own `get_allocator()` (native-temporary half) | Y (buffer of boxed handles) | Split — see [Allocator resolution](#allocator-resolution); the sweep below independently flags `wait`/`get_conditions` as a structurally-ambiguous pair, consistent with this | 2 |
+| `ConditionSeq` (`WaitSet::wait()`/`get_conditions()` output) | Boxed via `emitTypedef`'s `is_entity_seq` branch | Generic `_free()`, routes through the process-wide allocator (app-owned half) / entity's own `get_allocator()` (native-temporary half) | Y (buffer of boxed handles) | Split — see [Allocator resolution](generated-class-lifecycle-design.md#allocator-resolution); the sweep below independently flags `wait`/`get_conditions` as a structurally-ambiguous pair, consistent with this | 2 |
 | `key_hashes`/`cdr_payloads`/`sample_infos` (`take_raw`/`read_raw`) | Produced by `DataReader::take_raw`/`read_raw` | `return_loan_raw(reader, ...)` | Y | N | 1 — reference example, cleanly confirmed by the sweep below (no review flag) |
 | Struct-with-owned-fields (e.g. `SensorLog`) | Decoded via generated `_deserialize` | Generic `{Type}_free()`, routes through the process-wide allocator | Y | N — already allocator-aware | 2 |
 | `DomainParticipantFactory` | `zzdds_create_factory[_with_allocator]` | `zzdds_destroy_factory` | Y (root) | N — root/bootstrap case, binds the allocator everything else inherits | Root exception |
@@ -390,7 +390,7 @@ Tool-generated (`zidl -b zig --audit-lifecycle <file>`), every operation output/
 across both files that structurally owns heap memory, per the classification rule.
 **Flag = review** means the match is structurally plausible but not name-confirmed as a
 release op; none of the flagged cases below are bugs — all are legitimate type-reuse or
-getter/producer ambiguity (see [Enforcement & tooling](#enforcement--tooling)).
+getter/producer ambiguity (see [Enforcement & tooling](generated-class-lifecycle-design.md#enforcement--tooling)).
 
 **`dcps.idl`:**
 

@@ -2,7 +2,7 @@
 
 # Broker path validation and protection provider contract
 
-> Review revision in progress (2026-09-28): [decision index](../../review-decisions.md)
+> Review revision in progress (2026-09-28): [decision index](../../concurrency-broker-status.md)
 > controls D1–D8 and records unfinished reconciliation. Pre-review policies/fixtures below
 > are not evidence for the revised access, security or freshness mechanisms.
 

@@ -4,7 +4,7 @@ Forward-looking only: known gaps, planned features, and open design questions.
 
 - Shipped work → [`../CHANGELOG.md`](../CHANGELOG.md)
 - What exists today + its limitations → [`implementation_status.md`](implementation_status.md)
-- Fleshed-out designs → [`design/`](design/)
+- Fleshed-out designs → [`design/`](design)
 - Rationale for stable decisions → [`decisions.md`](decisions.md)
 
 > **Restructured 2026-08-27.** This file used to also hold dated shipped-work write-ups.
@@ -28,14 +28,14 @@ Forward-looking only: known gaps, planned features, and open design questions.
   announcement support. Enforce identity before native peer installation, locator/lease
   updates and SEDP/WLP matching, including direct discovery. Regenerate config/bindings
   and test defaults, domain/tag mismatch, malformed inputs and both byte orders. See
-  the [accepted domain identity decision](design/broker-domain-identity.md). Not yet
+  the [accepted domain identity decision](design/broker/coexistence.md#broker-domain-identity). Not yet
   implemented as a complete feature; explicit domain-ID emission/decoding and SPDP
   mismatch filtering are now in the working tree. Tag propagation and remaining
   admission checks are still required; opaque unknown-PID retention is insufficient.
 
 - **Strengthen reception and admission boundaries** — audit the path from input
   validation through RTPS sequence/ACK accounting, DDS processing and history admission.
-  The [historical-data wait audit](design/historical-data-wait.md) identifies sequence
+  The [historical-data wait audit](design/concurrency/operations.md#historical-data-wait) identifies sequence
   accounting before fallible cache operations, discarded failures and a void internal
   delivery callback that cannot report admission outcomes. Define explicit outcomes
   for admission, policy exclusion, resource rejection, retained retry and terminal
@@ -135,7 +135,7 @@ Forward-looking only: known gaps, planned features, and open design questions.
   evaluator and dedicated-state removal, and correct unavailable-feature behavior for
   ContentFilteredTopic/QueryCondition. MultiTopic remains unimplemented; a switch does
   not establish full profile compliance.
-- Follow the agreed [compile-out requirement](design/concurrency-model.md#71-agreed-optional-profiles-must-compile-out):
+- Follow the agreed [compile-out requirement](design/concurrency/architecture.md#concurrency-model--71-agreed-optional-profiles-must-compile-out):
   remove dedicated storage and hot-path work, not only runtime behavior. Preserve core
   listener/concurrency guarantees and required non-GROUP behavior. Reject unavailable
   requests appropriately rather than silently weakening QoS or filtering.
@@ -683,30 +683,30 @@ acceptable if a runtime switch proves impractical). The design must account for:
   (DEADLINE/LIVELINESS, interface-change poll, wire-trace flush; possibly heartbeat and
   SPDP) collapse onto one scheduler regardless of the model chosen.
 
-Drafts: [Concurrency model: state ownership and progress](design/concurrency-model.md)
-and [Listener execution contract](design/listener-execution.md). They separate agreed
+Drafts: [Concurrency model: state ownership and progress](design/concurrency/architecture.md#concurrency-model)
+and [Listener execution contract](design/concurrency/listeners.md#listener-execution). They separate agreed
 requirements from proposals and open decisions. Take-turns execution with an explicit
 admission boundary is selected initially. The participant-plus-endpoint ownership proposal
 and parent coordinator interactions are consolidated in concurrency-model section 4.4;
 shared GROUP access brackets and optional-profile removal are agreed. Backend, API and
 exact build flags remain open. Refined FIFO/resource-fair admission and a shared runtime
-progress domain are accepted. The [test-only synchronization prototype](design/concurrency-prototype.md)
+progress domain are accepted. The [test-only synchronization prototype](design/concurrency-broker-status.md)
 now covers integrated admission/commit, idle-worker wakeup/shutdown, explicit-time
 operation expiry, and snapshot FIFO service under finite workloads and partial-installation
 checkpoints. Prepared storage now includes allocator-backed payloads, explicit
-replacement reservations and delayed pin reclamation. The [integrated review](design/concurrency-prototype-review.md)
+replacement reservations and delayed pin reclamation. The [integrated review](design/concurrency-broker-status.md)
 prioritizes explicit completion/reference retirement and safe request/node reuse,
 then bounded preparation/reclamation publication and FIFO helper admission.
-The [lifetime/reuse proposal](design/request-lifetime.md) now specifies these
+The [lifetime/reuse proposal](design/concurrency/architecture.md#request-lifetime) now specifies these
 boundaries. A separate tiny-pool experiment now exercises reuse and delayed
 references. Admission queue/executor/gate/observer ownership transfers are now
 integrated and structurally audited. Independent node identity/reuse, explicit ledger
 order and checked request handles now complete the current experiment checkpoint.
-The [listener identity note](design/listener-identity-decision.md) proposes default
+The [listener identity note](design/concurrency/listeners.md#listener-identity-decision) proposes default
 identity scope. Replacement/quiescence now has an accepted initial contract and
 a bounded retirement-frontier fixture; binding identity and callback delegation
 remain specification work.
-The [specification status map](design/concurrency-spec-status.md) recommends closing
+The [specification status map](design/concurrency-broker-status.md) recommends closing
 this validation branch and resolving remaining listener/runtime/transport contracts,
 then consolidating the concurrency suite and revising the broker proposal. Integrated
 request-slot reuse and production storage work remain explicit later tasks.

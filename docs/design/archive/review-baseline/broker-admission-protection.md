@@ -2,7 +2,7 @@
 
 # Broker admission, identity and reconnect
 
-> Review revision in progress (2026-09-28): [decision index](../../review-decisions.md)
+> Review revision in progress (2026-09-28): [decision index](../../concurrency-broker-status.md)
 > controls D1–D8 and records unfinished reconciliation. Pre-review policies/fixtures below
 > are not evidence for the revised access, security or freshness mechanisms.
 
@@ -66,7 +66,7 @@ session as occupying the registration until its finite establishment deadline ex
 * An integration that cannot establish continuity uses the same wait-for-close/expiry
   path as unsecured discovery. Initial v1 need not implement secure live replacement.
 
-Use [ADMISSION_REJECT](../../broker-bootstrap-rejection.md) for a correlatable bootstrap
+Use [ADMISSION_REJECT](../../broker/protocol.md#broker-bootstrap-rejection) for a correlatable bootstrap
 conflict once reply/path/authorization checks permit it. Use OWNER_CONFLICT without
 revealing incumbent details. Silence remains permitted under resource or response-budget
 limits. Retry backoff never extends the client's original startup/wait deadline.
@@ -125,7 +125,7 @@ claim secret, broker token rotation or lost-token recovery protocol is required.
 
 ## Exact introduction and registration correlation
 
-The [current registry](../../broker-wire-registry.md#spdp-service-revision-2026-09-18) defines
+The [current registry](../consolidation-2026-09-29/broker-wire-registry.md#spdp-service-revision-2026-09-18) defines
 all active digest inputs. Client/server SPDP hashes include the original encapsulated
 payload; the path hash additionally binds inline representation and exact request value.
 ACCEPT.transcript_binding uses the register/v1 domain, introduction ID and exact REGISTER
@@ -159,14 +159,14 @@ bounded outcome retirement, provider integration and loss/reordering tests. Auth
 providers must explicitly document whether they can establish participant continuity;
 transport authentication alone must not silently enable replacement.
 
-The accepted [retry-retirement rules](../../broker-retry-retirement.md) require consumed-attempt
+The accepted [retry-retirement rules](../../broker/protocol.md#broker-retry-retirement) require consumed-attempt
 guards through challenge expiry, reserved before side effects. After full expiry a fresh
 introduction may admit reused participant identity; an old REGISTER cannot execute
 against an absent/retired introduction ID.
 
 ## Concrete path-provider baseline
 
-The [path provider contract](../../broker-path-provider-contract.md) specifies bounded pending
+The [path provider contract](../../broker/protocol.md#broker-path-provider-contract) specifies bounded pending
 SPDP storage, a proposed 32-byte stateful cookie within the existing 64-byte wire ceiling,
 atomic consumption, expiry and protected-association requirements. A cookie is not a
 stateless substitute for retaining the original announcement. Provider validation remains

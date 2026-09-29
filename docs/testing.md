@@ -131,7 +131,7 @@ zig build --build-file test/concurrency/build.zig test-tsan
 
 Both runners exercise the same prototype; POSIX threaded tests use explicit
 condition checkpoints rather than sleep-based scheduling. See
-[prototype scope and limitations](design/concurrency-prototype.md) before treating
+[prototype scope and limitations](design/concurrency-broker-status.md) before treating
 these tests as evidence for the production runtime or complete DDS behavior.
 
 Run review models and independent wire vectors with `python3 scripts/check_design_specs.py`

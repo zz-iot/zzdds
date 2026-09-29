@@ -10,10 +10,10 @@ ops = {name.removeprefix('OP_'): value for name, value in constants.items() if n
 reserved = {value for name, value in constants.items() if name.startswith('RESERVED_OP_')}
 assert len(ops) == 27 and reserved == {1, 2, 3, 21, 22, 23, 24}
 assert len(set(ops.values())) == len(ops) and not set(ops.values()) & reserved
-registry = (root / 'broker-wire-registry.md').read_text()
+registry = (root / 'broker/wire.md').read_text()
 rows = {name: int(code) for code, name in re.findall(r'^\| (\d+) \| ([A-Z_]+) \|', registry, re.M)}
 assert rows == ops, (rows, ops)
-admission = (root / 'broker-operation-validation.md').read_text()
+admission = (root / 'broker/protocol.md').read_text()
 for name, code in ops.items():
     assert re.search(rf'^\| {code} {name} \|', admission, re.M), name
 # Draft 3 has a deliberately small mutable bootstrap boundary. Everything else
@@ -49,3 +49,6 @@ for value in pids:
 assert constants['BOOTSTRAP_ENTITY_KEY'] == 0x7a0001
 assert (constants['BROKER_WRITER_KIND'], constants['BROKER_READER_KIND']) == (0x43, 0x44)
 print(f'27 opcode mappings; {count} mutable member-ID sets; {len(groups)} discriminator namespaces; draft PID and endpoint assignments: PASS')
+
+for name, body in re.findall(r'@final\s+struct\s+(\w+)\s*\{(.*?)\};', schema, re.S):
+    assert '@id(' not in body and '@must_understand' not in body, name

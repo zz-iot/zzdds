@@ -5,7 +5,7 @@
 Status: narrowed v1 scope accepted, 2026-09-18. Specification only. The larger API
 proposal below is deferred, not required to finish v1.
 
-The [storage contract](../../broker-storage-contract.md) defines the required internal accounting
+The [storage contract](../../broker/wire.md#broker-storage-contract) defines the required internal accounting
 and byte-ownership rules without reviving the deferred public tuning APIs below.
 
 ## Required for v1

@@ -3,7 +3,7 @@
 # Broker route authority and forwarding errors
 
 Status: superseded, 2026-09-18. Historical unaccepted proposal; do not implement.
-The [accepted relay direction](../../broker-relay-direction.md) removes v1 forwarding and
+The [accepted relay direction](../../concurrency-broker-status.md) removes v1 forwarding and
 preserves direct WLP. Original analysis follows for context only.
 Scope: single-broker cached v1 metatraffic, initially WLP. Not user-topic relaying,
 a native DDS Security protocol, ICE nomination or a durable service message queue.

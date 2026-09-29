@@ -2,7 +2,7 @@
 
 # Synchronous output preparation and failure
 
-> Review revision in progress (2026-09-28): [decision index](../../review-decisions.md)
+> Review revision in progress (2026-09-28): [decision index](../../concurrency-broker-status.md)
 > controls D1–D8 and records unfinished reconciliation. Pre-review policies/fixtures below
 > are not evidence for the revised access, security or freshness mechanisms.
 
@@ -58,7 +58,7 @@ reinserting samples after other operations have observed its removal.
 Selection conflicts require revalidation/reselection or a defined conflict failure,
 not stale commitment. Pinning storage is insufficient to preserve semantic validity.
 Do not copy listener preparation's numeric retry budgets into read/take implicitly;
-the selected contention/progress policy is in [prepared-read-conflicts.md](../../prepared-read-conflicts.md). Any
+the selected contention/progress policy is in [prepared-read-conflicts.md](../../concurrency/operations.md#prepared-read-conflicts). Any
 reservation that excludes another consumer must have explicit bounded lifetime and
 reentrant-call rules before being selected as the implementation.
 
@@ -107,11 +107,11 @@ Entity-returning creation requires safe wrapper construction/cleanup and its own
 publication audit. The table is a common classification, not proof that every API has
 identical error codes or a complete solution for every creation path.
 
-The prepared-access direction is selected. The [candidate conflict proposal](../../prepared-read-conflicts.md)
+The prepared-access direction is selected. The [candidate conflict proposal](../../concurrency/operations.md#prepared-read-conflicts)
 selects optimistic whole-batch validation with bounded retries and an explicit
 same-reader recursion guard; its two-consumer bounded model passes. Exact binding error mappings remain
 before closing R3; a bounded ownership model alone cannot settle observable semantics.
 
-The [binding failure mapping proposal](../../binding-access-failures.md) now records the
+The [binding failure mapping proposal](../../concurrency/operations.md#binding-access-failures) now records the
 CDR/DDS code-domain mismatch, precise batch helper migration and Java convenience
 exception policy. These application-visible refinements await acceptance.

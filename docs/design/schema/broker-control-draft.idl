@@ -1,7 +1,7 @@
 // Draft revision 3 (ZZDBRK03), incompatible with prior drafts.
 // DESIGN ARTIFACT ONLY: provisional member IDs/bounds, not production wire ABI.
 // Operation codes, RTPS entity IDs, magic and encoding IDs require wire review.
-// See ../broker-wire-contract.md. Generated decoding is not admission validation.
+// See ../broker/wire.md. Generated decoding is not admission validation.
 module BrokerWireDraft {
     typedef octet Id128[16];
     typedef octet GuidBytes[16];
@@ -19,7 +19,7 @@ module BrokerWireDraft {
         unsigned long long origin_revision;
     };
 
-    // Proposed byte baseline; see broker-wire-bytes.md (not frozen).
+    // Proposed byte baseline; see broker/wire.md (not frozen).
     const unsigned short BODY_ENCODING_XCDR2_LE = 1;
     const unsigned short DISCOVERY_ENCODING_PL_CDR_LE = 1;
     const unsigned short DISCOVERY_ENCODING_PL_CDR_BE = 2;
@@ -216,9 +216,9 @@ module BrokerWireDraft {
     // Scope/session/epoch/owner generation come from the admitted endpoint association.
     // IDs 1-4 are retired, never optional substitutes for missing association validation.
     @final struct Envelope {
-        @id(5) @must_understand Id128 request_id;
-        @id(6) @must_understand FeatureIds required_features;
-        @id(7) @must_understand BodyBytes operation_body;
+        Id128 request_id;
+        FeatureIds required_features;
+        BodyBytes operation_body;
     };
 
     @final struct EntityKey {
@@ -249,46 +249,46 @@ module BrokerWireDraft {
     };
 
     @final struct InventoryBegin {
-        @id(1) @must_understand unsigned long long inventory_generation;
-        @id(2) @must_understand unsigned long long local_cut;
-        @id(3) @must_understand unsigned long long record_count;
-        @id(4) @must_understand unsigned long long total_record_bytes;
+        unsigned long long inventory_generation;
+        unsigned long long local_cut;
+        unsigned long long record_count;
+        unsigned long long total_record_bytes;
     };
     @final struct InventoryRecord {
-        @id(1) @must_understand unsigned long long inventory_generation;
-        @id(2) @must_understand RecordItem item;
+        unsigned long long inventory_generation;
+        RecordItem item;
     };
     @final struct InventoryEnd {
-        @id(1) @must_understand unsigned long long inventory_generation;
-        @id(2) @must_understand unsigned long long record_count;
+        unsigned long long inventory_generation;
+        unsigned long long record_count;
     };
 
     @final struct ViewBegin {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand unsigned long long store_cut;
-        @id(3) @must_understand unsigned long long record_count;
-        @id(4) @must_understand unsigned long long total_record_bytes;
+        unsigned long long view_generation;
+        unsigned long long store_cut;
+        unsigned long long record_count;
+        unsigned long long total_record_bytes;
     };
     @final struct ViewRecord {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand unsigned long long store_cut;
-        @id(3) @must_understand RecordItem item;
+        unsigned long long view_generation;
+        unsigned long long store_cut;
+        RecordItem item;
     };
     @final struct ViewEnd {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand unsigned long long store_cut;
-        @id(3) @must_understand unsigned long long record_count;
-        @id(5) @must_understand unsigned long long ready_through_delivery_seq;
+        unsigned long long view_generation;
+        unsigned long long store_cut;
+        unsigned long long record_count;
+        unsigned long long ready_through_delivery_seq;
     };
     @final struct Delta {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand unsigned long long delivery_seq;
-        @id(3) @must_understand unsigned short delta_kind;
-        @id(4) @must_understand EntityKey entity;
-        @id(5) @must_understand unsigned long long origin_revision;
-        @id(6) @must_understand unsigned long long freshness_generation;
-        @id(7) @must_understand BodyBytes record_bytes;
-        @id(8) @must_understand unsigned short removal_reason;
+        unsigned long long view_generation;
+        unsigned long long delivery_seq;
+        unsigned short delta_kind;
+        EntityKey entity;
+        unsigned long long origin_revision;
+        unsigned long long freshness_generation;
+        BodyBytes record_bytes;
+        unsigned short removal_reason;
     };
 
     @final struct FreshnessException {
@@ -298,20 +298,20 @@ module BrokerWireDraft {
     };
     typedef sequence<FreshnessException, 256> FreshnessExceptions;
     @final struct FreshnessMarker {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand Id128 challenge_nonce;
-        @id(3) @must_understand unsigned long long view_delivery_seq;
-        @id(4) @must_understand unsigned long long common_remaining_lease_ns;
-        @id(5) @must_understand FreshnessExceptions exceptions;
+        unsigned long long view_generation;
+        Id128 challenge_nonce;
+        unsigned long long view_delivery_seq;
+        unsigned long long common_remaining_lease_ns;
+        FreshnessExceptions exceptions;
     };
 
     @final struct ErrorBody {
-        @id(1) @must_understand unsigned short error_code;
-        @id(2) @must_understand unsigned short recovery_action;
-        @id(3) @must_understand Id128 related_request;
-        @id(4) @optional EntityKey affected_entity;
-        @id(5) @optional unsigned long long affected_revision;
-        @id(6) @optional unsigned long long retry_after_ns;
+        unsigned short error_code;
+        unsigned short recovery_action;
+        Id128 related_request;
+        @optional EntityKey affected_entity;
+        @optional unsigned long long affected_revision;
+        @optional unsigned long long retry_after_ns;
     };
 
     // EXPERIMENTAL registry values. Never advertise as frozen production IDs.
@@ -431,64 +431,64 @@ module BrokerWireDraft {
     };
     typedef sequence<ParticipantIdentity, 256> ParticipantIdentities;
     @final struct Mutation {
-        @id(1) @must_understand BodyBytes record_bytes;
+        BodyBytes record_bytes;
     };
     @final struct CommitReply {
-        @id(1) @must_understand Id128 related_request;
-        @id(2) @must_understand unsigned short commit_kind;
-        @id(3) @must_understand unsigned long long store_cut;
-        @id(4) @must_understand unsigned long long inventory_generation;
-        @id(5) @must_understand EntityKey entity;
-        @id(6) @must_understand unsigned long long origin_revision;
+        Id128 related_request;
+        unsigned short commit_kind;
+        unsigned long long store_cut;
+        unsigned long long inventory_generation;
+        EntityKey entity;
+        unsigned long long origin_revision;
     };
     @final struct RejectReply {
-        @id(1) @must_understand ErrorBody failure;
-        @id(2) @must_understand unsigned long long inventory_generation;
+        ErrorBody failure;
+        unsigned long long inventory_generation;
     };
     @final struct ViewRequest {
-        @id(1) @must_understand unsigned short view_mode;
-        @id(2) @must_understand boolean request_resume;
-        @id(3) @must_understand ResumeCursor cursor;
+        unsigned short view_mode;
+        boolean request_resume;
+        ResumeCursor cursor;
         // Client-assigned, increasing within the admitted session; distinct from cursor.
-        @id(4) @must_understand unsigned long long view_generation;
+        unsigned long long view_generation;
     };
     @final struct Applied {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand unsigned long long snapshot_cut;
-        @id(4) @must_understand unsigned long long applied_delivery_seq;
+        unsigned long long view_generation;
+        unsigned long long snapshot_cut;
+        unsigned long long applied_delivery_seq;
     };
     @final struct ViewSync {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand unsigned long long ready_through_delivery_seq;
+        unsigned long long view_generation;
+        unsigned long long ready_through_delivery_seq;
     };
     @final struct ResyncRequired {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand unsigned short reason;
-        @id(3) @must_understand unsigned long long retry_after_ns;
+        unsigned long long view_generation;
+        unsigned short reason;
+        unsigned long long retry_after_ns;
     };
     @final struct LeaseChallenge {
-        @id(1) @must_understand Id128 challenge_nonce;
+        Id128 challenge_nonce;
     };
     @final struct LeaseProof {
-        @id(1) @must_understand Id128 challenge_nonce;
+        Id128 challenge_nonce;
     };
     @final struct FreshnessQuery {
-        @id(1) @must_understand unsigned long long view_generation;
-        @id(2) @must_understand Id128 challenge_nonce;
+        unsigned long long view_generation;
+        Id128 challenge_nonce;
     };
     @final struct CloseRequest {
-        @id(1) @must_understand ParticipantIdentity participant;
+        ParticipantIdentity participant;
     };
     @final struct ClosedReply {
-        @id(1) @must_understand Id128 related_request;
-        @id(2) @must_understand ParticipantIdentity participant;
-        @id(3) @must_understand unsigned long long store_cut;
+        Id128 related_request;
+        ParticipantIdentity participant;
+        unsigned long long store_cut;
     };
     @final struct StatusBody {
-        @id(1) @must_understand Id128 related_request;
-        @id(2) @must_understand unsigned long long view_generation;
-        @id(3) @must_understand unsigned long long inventory_generation;
-        @id(4) @must_understand unsigned short status_code;
+        Id128 related_request;
+        unsigned long long view_generation;
+        unsigned long long inventory_generation;
+        unsigned short status_code;
     };
 };
 

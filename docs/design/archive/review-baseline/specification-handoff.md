@@ -2,7 +2,7 @@
 
 # Concurrency and discovery broker: specification handoff
 
-> Review revision in progress (2026-09-28): [decision index](../../review-decisions.md)
+> Review revision in progress (2026-09-28): [decision index](../../concurrency-broker-status.md)
 > controls D1–D8 and records unfinished reconciliation. Pre-review policies/fixtures below
 > are not evidence for the revised access, security or freshness mechanisms.
 
@@ -14,10 +14,10 @@ scope. Neither a frozen public ABI nor a deployed broker wire protocol is claime
 
 | Package | Controlling entry point | Baseline result |
 | --- | --- | --- |
-| Concurrency | [Contract](../../concurrency-contract.md), [final review](../../concurrency-final-review.md) | Execution ownership, listener contract, waits, preparation/commit, lifetime, runtime driving and shutdown behavior settled |
-| Broker | [Implementer guide](../../broker-spec-guide.md), [public API](../../broker-public-api.md), [operation table](../../broker-operation-validation.md) | Configuration, discovery coexistence, bootstrap/admission, origin/view synchronization, freshness, recovery and resource behavior specified |
-| Broker bytes | [Registry](../../broker-wire-registry.md), [compatibility review](../../broker-wire-compatibility-review.md), [draft IDL](../../schema/broker-control-draft.idl) | Concrete proposed layouts/assignments and independent fixtures; explicit compatibility gates before publication |
-| Production migration | [Concurrency migration](../../concurrency-migration-plan.md), [broker closure ledger](../../broker-spec-closure.md) | Named implementation stages and acceptance evidence, separated from design decisions |
+| Concurrency | [Contract](../../concurrency-broker-status.md), [final review](../../concurrency-broker-status.md) | Execution ownership, listener contract, waits, preparation/commit, lifetime, runtime driving and shutdown behavior settled |
+| Broker | [Implementer guide](../../concurrency-broker-status.md), [public API](../../broker/api.md#broker-public-api), [operation table](../../broker/protocol.md#broker-operation-validation) | Configuration, discovery coexistence, bootstrap/admission, origin/view synchronization, freshness, recovery and resource behavior specified |
+| Broker bytes | [Registry](../../broker/wire.md#broker-wire-registry), [compatibility review](../../broker/wire.md#broker-wire-compatibility-review), [draft IDL](../../schema/broker-control-draft.idl) | Concrete proposed layouts/assignments and independent fixtures; explicit compatibility gates before publication |
+| Production migration | [Concurrency migration](../../concurrency-broker-status.md), [broker closure ledger](../../concurrency-broker-status.md) | Named implementation stages and acceptance evidence, separated from design decisions |
 
 Detailed contracts govern their named behavior. The broker guide identifies controlling
 contracts; the concurrency final review identifies its gate documents. Chronological
@@ -75,7 +75,7 @@ with a requirement or an unavoidable wire change, reopen that named decision wit
 ## Implementation handoff order
 
 1. Preserve the refreshed main codec/channel integration and PR #92 discovery regressions
-   when merged. The [PR review](../../pr-92-discovery-review.md) records the inspected head and
+   when merged. The [PR review](../../concurrency-broker-status.md) records the inspected head and
    local-recovery, origin-identity and cached-ignore constraints; it is not a merge review.
 2. Begin the concurrency plan's first vertical slice: one reliable reader/writer pair,
    manual and hosted driving, listeners, timed waits and automatic runtime retirement.

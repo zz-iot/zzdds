@@ -1,8 +1,8 @@
 # Thread Model and Type Information
 
 This document describes current behavior. Proposed future behavior is tracked in the
-[listener execution contract](listener-execution.md) and
-[concurrency design](concurrency-model.md); those drafts do not describe implemented guarantees.
+[listener execution contract](concurrency/listeners.md#listener-execution) and
+[concurrency design](concurrency/architecture.md#concurrency-model); those drafts do not describe implemented guarantees.
 
 ## Current Thread Ownership
 

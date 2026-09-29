@@ -625,13 +625,15 @@ test "REGISTER and both outcomes match independent bytes and exact-request hashe
 }
 
 test "current bootstrap sizing covers domain tag resume feature and cookie bounds" {
-    inline for (.{ false, true }) |large| {
+    inline for (.{ @as(u8, 0), 1, 2 }) |variant| {
+        const large = variant != 0;
         var req = registrationFixture();
         req.scope.domain_tag.clearRetainingCapacity();
         for (0..if (large) @as(usize, 256) else 8) |_| req.scope.domain_tag.appendAssumeCapacity('r');
         if (large) req.resume_hint = .{ .baseline_retained = true, .view_generation = 9 };
-        const feature_count: usize = if (large) 128 else 2;
-        for (0..feature_count) |i| req.selected_features.appendAssumeCapacity(@intCast(i + 1));
+        const feature_count: usize = if (variant == 2) 128 else if (large) 3 else 2;
+        req.selected_features.clearRetainingCapacity();
+        for (0..feature_count) |i| req.selected_features.appendAssumeCapacity(if (variant == 1 and i == 2) 6 else @intCast(i + 1));
         const accept: wire.AcceptReply = .{
             .admission_attempt = req.admission_attempt, .introduction_id = req.introduction_id,
             .scope = req.scope, .selected_features = req.selected_features,
@@ -648,7 +650,7 @@ test "current bootstrap sizing covers domain tag resume feature and cookie bound
             defer testing.allocator.free(frame);
             sizes[i] = frame.len;
         }
-        std.debug.print("\ncurrent bootstrap large={any} features={d} REGISTER/ACCEPT/PATH Frames={any}\n", .{large, feature_count, sizes});
+        std.debug.print("\nbootstrap sizing large={any} features={d} REGISTER/ACCEPT/PATH Frames={any}\n", .{large, feature_count, sizes});
     }
 }
 
@@ -717,4 +719,13 @@ test "draft3 rejects previous frame magic and mutable VIEW_SYNC grammar" {
     try testing.expectError(error.InvalidFrame, decodeFinalExact(wire.ViewSync, old));
     old[1] = 7; // relabeling the old mutable body cannot evade exact extent validation
     try testing.expectError(error.TrailingBytes, decodeFinalExact(wire.ViewSync, old));
+}
+
+test "final ErrorBody optional presence flags match independent bytes" {
+    var value: wire.ErrorBody = .{ .error_code = 1, .recovery_action = 2, .related_request = @splat(3) };
+    try checkFinalGolden(wire.ErrorBody, value, "final_error_absent");
+    value.affected_entity = .{ .participant_guid = @splat(4), .incarnation_id = @splat(5), .record_kind = 1, .entity_guid = @splat(6) };
+    value.affected_revision = 7;
+    value.retry_after_ns = 8;
+    try checkFinalGolden(wire.ErrorBody, value, "final_error_present");
 }

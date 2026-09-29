@@ -2,13 +2,13 @@
 
 # Presence proof completeness during view churn
 
-> Review revision in progress (2026-09-28): [decision index](../../review-decisions.md)
+> Review revision in progress (2026-09-28): [decision index](../../concurrency-broker-status.md)
 > controls D1–D8 and records unfinished reconciliation. Pre-review policies/fixtures below
 > are not evidence for the revised access, security or freshness mechanisms.
 
 Status: F3 accepted and incorporated in experimental IDL, 2026-09-18.
 Wire remains unfrozen; codec evidence is not state-machine validation.
-The [presence contract](../../discovery-broker.md#8-presence-liveliness-and-freshness) already
+The [presence contract](../consolidation-2026-09-29/discovery-broker.md#8-presence-liveliness-and-freshness) already
 requires nonce correlation and conservative observer deadlines. This document addresses
 what a complete answer means, rather than changing that freshness algorithm.
 
@@ -165,7 +165,7 @@ contents. Current query retries reuse an immutable retained answer. Once retired
 must not be reconstructed as a different answer; its bounded replay/outcome retention
 implementation remains part of checklist W3, not an unbounded result-cache requirement.
 
-[Retry retirement](../../broker-retry-retirement.md) now supplies query_serial in both query
+[Retry retirement](../../broker/protocol.md#broker-retry-retirement) now supplies query_serial in both query
 and proof. Admit new serials in reliable control-stream order before parallel answer
 work. Retired serials cannot reconstruct answers; active slots may complete out of order.
 Nonce freshness correlation remains mandatory and is not replaced by the serial.

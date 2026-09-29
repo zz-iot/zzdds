@@ -2,7 +2,7 @@
 
 # Broker specification closure ledger
 
-> Review revision in progress (2026-09-28): [decision index](../../review-decisions.md)
+> Review revision in progress (2026-09-28): [decision index](../../concurrency-broker-status.md)
 > controls D1–D8 and records unfinished reconciliation. Pre-review policies/fixtures below
 > are not evidence for the revised access, security or freshness mechanisms.
 
@@ -33,20 +33,20 @@ must not turn into new API features. W5 is deliberately not labeled frozen.
 
 1. **Introduction transport feasibility:** demonstrate recipient-specific SPDP inline context
    without changing canonical participant payloads per recipient. The
-   [source review](../../broker-inline-context-feasibility.md) retains inline context with bounded
+   [source review](../../concurrency-broker-status.md) retains inline context with bounded
    internal extensions; send/receive integration evidence remains pending. A dedicated
    introduction sample would require a wire revision, not an automatic fallback.
-2. **Protected/path profile:** the [provider contract](../../broker-path-provider-contract.md)
+2. **Protected/path profile:** the [provider contract](../../broker/protocol.md#broker-path-provider-contract)
    now specifies the proposed bounded stateful-cookie baseline, validation/expiry/replay
    behavior and protection boundary. Provider and abuse-test evidence remains pending. Cookies are opaque to clients, so provider
    internals need not be a common client ABI; their size and path-binding contract must hold.
    Do not advertise public authenticated deployment or future DDS Security compatibility
    without its corresponding integration evidence.
-3. **Assignments and compatibility:** the [assignment review](../../broker-wire-compatibility-review.md)
+3. **Assignments and compatibility:** the [assignment review](../../broker/wire.md#broker-wire-compatibility-review)
    checks active/reserved namespaces, member IDs, version boundaries and unknown-field rules.
    No renumbering resulted; production allocator/parser enforcement remains to be tested. A generated decoder's acceptance is not authority to omit required/duplicate
    member validation. Fix any wire-affecting discovery before frozen version 1.0 publication.
-4. **Schema/implementation agreement:** the [storage contract](../../broker-storage-contract.md)
+4. **Schema/implementation agreement:** the [storage contract](../../broker/wire.md#broker-storage-contract)
    specifies borrowed validation views, bounded immutable ownership, overlap accounting
    and generic generator requirements without changing wire layouts. Concrete mappings,
    exact byte agreement and peak-memory measurements remain implementation gates.
@@ -62,7 +62,7 @@ Current evidence: 20 codec tests and 49 independent byte/hash vectors passed aft
 2026-09-23 refresh; all 27 active opcode/name pairs match the admission table. This final
 editorial/scope/error pass changed no wire bytes and did not rerun network tests.
 
-The [final handoff](../../specification-handoff.md) now separates settled behavior, concrete
+The [final handoff](../../concurrency-broker-status.md) now separates settled behavior, concrete
 implementation directions and remaining evidence. No additional product-policy decision
 was identified. The directional design effort is complete; the gates above govern
 implementation validation and compatibility publication, not another broad design cycle.

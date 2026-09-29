@@ -4,7 +4,7 @@
 
 Status: selected initial R3 policy, bounded-model checked, 2026-09-15.
 No production implementation change; binding mappings are accepted in
-[binding-access-failures.md](../../binding-access-failures.md).
+[binding-access-failures.md](../../concurrency/operations.md#binding-access-failures).
 
 ## Recommended initial approach
 

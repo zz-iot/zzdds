@@ -2,12 +2,12 @@
 
 # Broker specification and implementation checklist
 
-Final design handoff: [scope, completion and remaining gates](../../specification-handoff.md),
+Final design handoff: [scope, completion and remaining gates](../../concurrency-broker-status.md),
 2026-09-24.
 
 ## Current entry point
 
-Start with the [implementer guide](../../broker-spec-guide.md) and [closure ledger](../../broker-spec-closure.md).
+Start with the [implementer guide](../../concurrency-broker-status.md) and [closure ledger](../../concurrency-broker-status.md).
 The public-behavior and protocol consistency reviews are complete within their stated
 scope. Wire compatibility remains provisional pending the named checks. The concurrency
 behavioral baseline is settled; production migration and a working broker remain separate.
@@ -37,11 +37,11 @@ closure ledger. No additional diagnostic-management API or scheduler prototype i
 
 | Artifact | What exists | What it does not establish |
 | --- | --- | --- |
-| [Main spec](../../discovery-broker.md) | Architecture, deployment scope and delivery stages | Production implementation |
-| [Readiness contract](../../broker-readiness-contract.md) | Accepted observable behavior | Concrete public IDL/configuration mappings |
-| [Wire contract](../../broker-wire-contract.md), [registry](../../broker-wire-registry.md), [IDL](../../schema/broker-control-draft.idl) | 27 active operation bodies and provisional numeric registries | Frozen compatibility or complete semantic validation |
-| [Byte baseline](../../broker-wire-bytes.md), [wire details](../../broker-wire-details.md) | Framing, digests, metadata, features and endpoint roles | All malformed-input and cross-version behavior |
-| [Admission policy](../../broker-admission-protection.md), [rejection](../../broker-bootstrap-rejection.md) | Identity/reconnect and phase-specific rejection rules | Implemented security provider or parser |
+| [Main spec](../../concurrency-broker-status.md) | Architecture, deployment scope and delivery stages | Production implementation |
+| [Readiness contract](../../broker/api.md#broker-readiness-contract) | Accepted observable behavior | Concrete public IDL/configuration mappings |
+| [Wire contract](../../concurrency-broker-status.md), [registry](../../broker/wire.md#broker-wire-registry), [IDL](../../schema/broker-control-draft.idl) | 27 active operation bodies and provisional numeric registries | Frozen compatibility or complete semantic validation |
+| [Byte baseline](../../broker/wire.md#broker-wire-bytes), [wire details](../../broker/wire.md#broker-wire-details) | Framing, digests, metadata, features and endpoint roles | All malformed-input and cross-version behavior |
+| [Admission policy](../../broker/protocol.md#broker-admission-protection), [rejection](../../broker/protocol.md#broker-bootstrap-rejection) | Identity/reconnect and phase-specific rejection rules | Implemented security provider or parser |
 | [Trace review](../../broker-admission-traces.md) | 16 manually reviewed loss/race scenarios | Executed model or network tests |
 | [Codec probe](../../probes/broker_wire_codec.zig) | 18 passing generated-code tests; 13 independent Python vectors | Security, resource bounds or full broker state-machine correctness |
 
@@ -61,10 +61,10 @@ independent implementations must not assume compatibility before W5.
 
 | ID | Remaining deliverable | Completion criterion |
 | --- | --- | --- |
-| W1 | Public configuration, readiness/status/error IDL ([proposal](../../broker-public-api.md)) | Review concrete zzdds.idl extension signatures and Config fields, defaults, supported discovery modes, timeout/error mapping and generated binding ownership. Standard DCPS APIs retain sensible defaults. No non-OMG API added to dcps.idl. |
-| W2 | Complete semantic admission table ([27-row draft](../../broker-operation-validation.md); F1–F3 accepted; F4 removed from v1) | For all 27 active operations specify permitted phase/direction/stream, required fields and cross-field constraints, accepted identity/generation, duplicate handling, resource reservation, state effects and failure response. Include malformed metadata, transcript comparison and unauthenticated reply restrictions. |
-| W3 | Bounded retention and retirement rules ([review](../../broker-retention-review.md); registration-scoped retirement accepted; compact replay direction accepted; lifecycle horizons remain) | Specify reclamation conditions for admission outcomes/challenges, closed registrations, revisions, withdrawn records and cursors. Show that forgetting old state cannot reexecute old work; capacity pressure has a defined failure path. Distinguish replay protection from the rejected permanent ownership registry. |
-| W4 | Bootstrap and endpoint lifecycle completeness ([sizing/lifecycle review](../../broker-bootstrap-lifecycle.md)) | Confirm SPDP/context, PATH and REGISTER/ACCEPT fit configured non-fragmented budgets, including security overhead; define oversize failure rather than hidden fragmentation. Specify endpoint establishment/confirmation, timeout, resource rollback and late ACK/close handling for both established endpoint pairs. Resolve retained raw nested transcript representation. |
+| W1 | Public configuration, readiness/status/error IDL ([proposal](../../broker/api.md#broker-public-api)) | Review concrete zzdds.idl extension signatures and Config fields, defaults, supported discovery modes, timeout/error mapping and generated binding ownership. Standard DCPS APIs retain sensible defaults. No non-OMG API added to dcps.idl. |
+| W2 | Complete semantic admission table ([27-row draft](../../broker/protocol.md#broker-operation-validation); F1–F3 accepted; F4 removed from v1) | For all 27 active operations specify permitted phase/direction/stream, required fields and cross-field constraints, accepted identity/generation, duplicate handling, resource reservation, state effects and failure response. Include malformed metadata, transcript comparison and unauthenticated reply restrictions. |
+| W3 | Bounded retention and retirement rules ([review](../../broker/protocol.md#broker-retention-review); registration-scoped retirement accepted; compact replay direction accepted; lifecycle horizons remain) | Specify reclamation conditions for admission outcomes/challenges, closed registrations, revisions, withdrawn records and cursors. Show that forgetting old state cannot reexecute old work; capacity pressure has a defined failure path. Distinguish replay protection from the rejected permanent ownership registry. |
+| W4 | Bootstrap and endpoint lifecycle completeness ([sizing/lifecycle review](../../broker/protocol.md#broker-bootstrap-lifecycle)) | Confirm SPDP/context, PATH and REGISTER/ACCEPT fit configured non-fragmented budgets, including security overhead; define oversize failure rather than hidden fragmentation. Specify endpoint establishment/confirmation, timeout, resource rollback and late ACK/close handling for both established endpoint pairs. Resolve retained raw nested transcript representation. |
 | W5 | Wire review and compatibility baseline | Review all provisional assignments, exact bytes and feature/version rules together. Define strict decoding behavior, add representative old/new-version fixtures and negative cases, and identify any remaining wire-affecting implementation findings before declaring the baseline frozen. |
 
 W3 now scopes terminal CLOSE to its registration and derived work. After full retirement,
@@ -86,7 +86,7 @@ These are delivery gates, not reasons to reopen the settled general architecture
 | I6 | Protected deployment | Select maintained TLS/DTLS provider and authorization integration; test replay, revocation, downgrade, amplification, disclosure and quotas. DDS Security live replacement remains unavailable until participant-continuity evidence exists. |
 | I7 | Operational and performance envelope | Measured memory/default limits, backoff/pacing, fairness under slow observers and reconnect storms, metrics and documented scale/latency results. Native discovery regression coverage. |
 
-The complete integration matrix remains in [main spec §15](../../discovery-broker.md#15-verification-and-release-gates).
+The complete integration matrix remains in [main spec §15](../consolidation-2026-09-29/discovery-broker.md#15-verification-and-release-gates).
 An in-memory test cannot certify NAT/source-address behavior. An authenticated transport
 cannot certify DDS Security protected discovery. Target-specific skips must be reported.
 
@@ -118,7 +118,7 @@ relays are later work. Next examine W3 retention/reclamation, then W4 bootstrap/
 lifecycle, W1 public APIs and final W5 review. Experiments should resolve named gaps,
 not introduce another forwarding protocol or repeat general concurrency investigations.
 
-The [coexistence investigation](../../broker-discovery-coexistence.md) recommends one graph with
+The [coexistence investigation](../../broker/coexistence.md#broker-discovery-coexistence) recommends one graph with
 source-specific evidence and shared origin revisions in zzdds SPDP/SEDP extensions.
 Shared origin-version ordering is accepted; vendor metadata placement and canonical
 content comparison remain explicit wire tasks, not solved by receipt order.
@@ -127,7 +127,7 @@ Origin-version placement/comparison is accepted, with provisional PID 0x8003 and
 additional structural LE/BE vectors. The 17-test codec suite still includes old-bootstrap
 fixtures; it does not validate the proposed SPDP introduction or production coexistence.
 
-The [service introduction field proposal](../../broker-service-introduction.md) is the current
+The [service introduction field proposal](../../broker/protocol.md#broker-service-introduction) is the current
 W4 handshake candidate; old bootstrap fixture sizes do not measure its messages.
 
 SPDP service sequence/introduction records are now accepted with experimental schema
@@ -144,20 +144,20 @@ of the remaining historical admission/lifecycle sections before the W1 API pass.
 
 Current handshake closure pass (2026-09-18): 21 codec tests / 49 independent vectors
 pass, including REGISTER/ACCEPT/rejection hashes and current size profiles. The revised
-[lifecycle contract](../../broker-bootstrap-lifecycle.md) separates introduction admission
+[lifecycle contract](../../broker/protocol.md#broker-bootstrap-lifecycle) separates introduction admission
 expiry from retained-result expiry, and cookie replay guards from both. Large ACCEPT is
 1204 bytes before RTPS/security; whole-exchange preflight is required. Production deadline,
 size-failure and endpoint tests remain gates. Next reconcile W1 public configuration with
 independent direct/multicast/broker settings and these bounded bootstrap failures; do not
 reopen concurrency or imply that production bootstrap is implemented.
 
-W1 configuration pass (2026-09-18): [public API proposal](../../broker-public-api.md) preserves
+W1 configuration pass (2026-09-18): [public API proposal](../../broker/api.md#broker-public-api) preserves
 create_participant_ex, resolves DiscoveryKind as a preset with explicit overrides, and
 defines one-authority status/wait/listener semantics even in mixed discovery. Remaining
 W1 review: resolved defaults/resource-budget mapping, per-entity diagnostics and generated
 IDL/TOML/binding validation. No production API is changed by this draft.
 
-Accepted domain identity revision (2026-09-18): [domainTag replaces realm](../../broker-domain-identity.md).
+Accepted domain identity revision (2026-09-18): [domainTag replaces realm](../../broker/coexistence.md#broker-domain-identity).
 Native support is absent and is now an explicit roadmap prerequisite. W1 uses DomainConfig.tag;
 W2 admission and W5 wire/schema/fixture review must use standard domain identity. Next migrate
 scope encoding/request-context fixtures together, and implement native domain admission before
@@ -170,7 +170,7 @@ IDs retain receiver-domain fallback for interoperability. DomainTag/config propa
 early SEDP eligibility review and broker scope fixture migration remain pending; this
 increment is not full domain-tag compliance.
 
-Next domain-identity decision: [multi-domain service identities](../../broker-multidomain-service.md)
+Next domain-identity decision: [multi-domain service identities](../../broker/coexistence.md#broker-multidomain-service)
 recommends one logical broker participant per configured domain ID/tag, sharing listeners
 and runtime. No application configuration change or new round trip is required. This is
 a review proposal; native implementation and wire-fixture migration are not expanded here.
@@ -183,20 +183,20 @@ was removed. Current maximum profile REGISTER/ACCEPT sizes are 1240/1336 bytes b
 RTPS/security. Next spec work: W1 resource budget/default mapping and per-entity failure
 diagnostics. Native tag implementation remains deferred to delivery work.
 
-W1 next recommendation: [resource configuration and diagnostics](../../broker-resource-diagnostics.md).
+W1 next recommendation: [resource configuration and diagnostics](../../broker/api.md#broker-resource-diagnostics).
 Review a small public resource group with derived wire limits, a resolved-plan getter and
 restartable bounded current-failure pages. Numeric platform tuning remains an implementation
 gate; deterministic resolution, units and failure semantics are specification requirements.
 No new production code or experiment was added for this decision.
 
-Resource/API scope narrowed by user acceptance: see [v1 disposition](../../broker-resource-diagnostics.md).
+Resource/API scope narrowed by user acceptance: see [v1 disposition](../../broker/api.md#broker-resource-diagnostics).
 The previously proposed six resource fields, resolved-plan getter and failure pagination are
 all deferred. Keep internal bounds, reservation/failure semantics, participant observability
 and bounded diagnostic logs. Public status includes a registration-rejection category;
 individual errors do not require a new collection API. No production code was changed.
 
 2026-09-23 refresh: rebased onto zzdds f14dd08 and updated zidl to 53177d9; see
-[review](../../main-refresh-review.md#refresh--2026-09-23). Concurrency architecture stands;
+[review](../consolidation-2026-09-29/main-refresh-review.md#refresh--2026-09-23). Concurrency architecture stands;
 new reader readiness callback, enablement/deletion/coherent-readiness fixes and raw-loan
 identity mappings become migration regression requirements. Twenty codec tests and 49
 vectors pass with rebuilt zidl. Wire-contract OPEN prose and retention open-question text
@@ -211,7 +211,7 @@ is the consolidated public IDL/API review (return-code table, status invariants 
 ownership), followed by one cross-document W2–W5 consistency pass. No new feature design
 or production implementation is required to proceed.
 
-2026-09-23 final public-behavior review: [disposition and return table](../../broker-public-api-review.md).
+2026-09-23 final public-behavior review: [disposition and return table](../../concurrency-broker-status.md).
 The narrowed surface is sufficient. Corrected callback annotation and missing view status,
 disabled-child vs disabled-participant distinction, timeout scope, summary failures/counts
 and listener ownership/quiescence. No new API feature or user decision identified. W1
@@ -219,14 +219,14 @@ behavior review is complete; generated declaration/layout and binding checks rem
 gates before API publication. Proceed with cross-document W2–W5 protocol consistency;
 this is not a claim that the entire broker spec or wire ABI is frozen.
 
-2026-09-23 protocol consolidation: [review and disposition](../../broker-protocol-review.md).
+2026-09-23 protocol consolidation: [review and disposition](../../concurrency-broker-status.md).
 Corrected REGISTER first-admission versus replay expiry, replaced retired transcript rules,
 reconciled endpoint negotiation and scoped historical model evidence. Mechanically verified
 all 27 active opcode/name pairs against the schema. No wire bytes, production code or new
 feature decisions changed. Remaining work is the final byte/error/scope consistency pass
 and an explicit W1–W5 closure/blocker ledger, not additional concurrency prototypes.
 
-Current closure disposition is consolidated in [broker-spec-closure.md](../../broker-spec-closure.md).
+Current closure disposition is consolidated in [broker-spec-closure.md](../../concurrency-broker-status.md).
 Use that ledger rather than treating older chronological "next" paragraphs as open tasks.
 Public behavior and the reviewed protocol invariants are settled; wire compatibility is
 still provisional pending the named integration/assignment checks. Final scope/error/byte

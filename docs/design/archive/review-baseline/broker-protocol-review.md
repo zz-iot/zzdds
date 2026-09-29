@@ -62,5 +62,5 @@ Final byte/error/scope pass: corrected direct bootstrap body classification (inc
 ADMISSION_REJECT) and prohibited bootstrap fragmentation explicitly. Replaced remaining
 normative realm/OPEN references in the registry. Added domain identity, parent-dependency,
 key-only removal and resume checks plus a phase-specific error table to the operation
-contract. The [closure ledger](../../broker-spec-closure.md) separates settled behavior from
+contract. The [closure ledger](../../concurrency-broker-status.md) separates settled behavior from
 named wire-freeze and delivery gates. No new protocol operation or user decision added.

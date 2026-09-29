@@ -299,7 +299,7 @@ deliverable and the cached profile follows once its prerequisites (§2) are in.
 
 ## 11. Reconciliation disposition — 2026-09-17
 
-Revision 0.2 of [the broker specification](../../discovery-broker.md) reconciles this review
+Revision 0.2 of [the broker specification](../../concurrency-broker-status.md) reconciles this review
 with the user's general-purpose broker goal, the accepted concurrency baseline and
 local zzdds main c37181e / zidl 26dc737. Sections 1–10 remain the original historical
 review; their source-status and sequencing claims are not current implementation facts.
