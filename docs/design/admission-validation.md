@@ -64,6 +64,6 @@ An executor may advance another caller's internal request, but automatic callbac
 
 ## Outcome and next verification
 
-The candidate is viable under the stated assumptions but incomplete without separate resource fairness, close-safe internal admission and a runtime-wide inline budget. The user has accepted these refinements; the concrete synchronized transitions remain to be specified and tested. No priorities or permanent assigned workers are required by these traces.
+The candidate is viable under the stated assumptions but incomplete without separate resource fairness, close-safe internal admission and runtime-wide fairness through bounded inline service. The user has accepted these refinements; the concrete synchronized transitions remain to be specified and tested. No priorities or permanent assigned workers are required by these traces.
 
 Before implementation claims, encode deterministic schedules for: close before/after ticket completion; cancellation before/after resource reservation and commit; repeated newcomers competing with an old capacity waiter; continuous receive readiness with due timers and another ready context; exhausted external queue with internal completion due; and enqueue racing with executor release. Run the same schedules with one driver and multiple executors. Measure latency and queue bounds separately; these traces supply no numerical performance estimate.

@@ -64,8 +64,9 @@ subset of the offer, contain all requirements, and satisfy the following matrix.
 
 | Feature | Earliest established version | Dependencies / initial availability |
 | --- | --- | --- |
-| TOPIC_CANDIDATES (1) | 1.0 | CACHED profile; optional implementation capability |
+| TOPIC_CANDIDATES (1) | 1.0 | CACHED profile; required zzdds-broker capability, negotiated for other implementations |
 | DOWNSTREAM_RESUME (2) | 1.0 | CACHED profile, retained baseline and broker history; optional capability |
+| TOPIC_PARTITION_CANDIDATES (6) | 1.0 draft revision 3 | Requires TOPIC_CANDIDATES; required when view mode 3 is requested |
 | OPAQUE_PEER (3) | Unassigned | Reserved; must not be selected in initial v1 |
 | TYPE_LOOKUP_ROUTE (4) | Unassigned | Reserved pending service contract; must not be selected in initial v1 |
 | SECURITY_ROUTE (5) | Unassigned | Reserved pending service/security contract; must not be selected in initial v1 |
@@ -74,7 +75,8 @@ CACHED, VIEW_ALL, fresh inventory/snapshot recovery, lease/presence proofs are b
 is not an implemented feature. A cached record may retain type information without
 claiming the TypeLookup routing service. No feature implies successful peer reachability.
 
-Without feature 1, request VIEW_ALL. Without feature 2, omit resume_hint, do not request
+If the application selected a candidate mode, missing feature 1 (or 6 for mode 3)
+fails admission; do not switch to VIEW_ALL. A client configured for ALL needs neither. Without feature 2, omit resume_hint, do not request
 resume, and require SNAPSHOT_REQUIRED with no resumed cursor. An optional resume hint
 may be declined even when feature 2 is selected. Feature selection never skips fresh
 origin inventory. Per-envelope required_features must be a subset of selected features;
@@ -105,7 +107,9 @@ exchange them explicitly: REGISTER.control_endpoints supplies the client's endpo
 ACCEPT.control_endpoints supplies the broker's. Each list has exactly one CONTROL and one STATE pair, in that order. writer_guid sends from the owner of the list;
 reader_guid receives at that owner. Connect client writer to broker reader and broker
 writer to client reader for each class. Broker STATE writer sends downstream records;
-client STATE writer sends origin records. Control carries boundaries and results.
+client STATE writer sends origin records. Control carries results and independent requests.
+Inventory/snapshot boundaries, records, VIEW_SYNC and freshness markers use STATE;
+COMMIT/REJECT, query/lease requests and other independent control use CONTROL.
 Both classes use reliable RTPS streams, bounded histories and application recovery;
 transport delivery/RTPS ACK is never application COMMIT or APPLIED.
 

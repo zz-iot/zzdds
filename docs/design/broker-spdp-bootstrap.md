@@ -80,21 +80,14 @@ An established connection is the return path for this service association. Recei
 SPDP over TCP requires adapting current SPDP plumbing; the existing UDP-oriented listener
 and initial-peer support do not establish that this sequence is already implemented.
 
-## Protected transports and future DDS Security
+## Future DDS Security
 
-Complete TLS/DTLS transport protection as configured before processing protected broker
-service traffic. If the provider has validated the current return path, use the TCP-like
-SPDP → REGISTER → ACCEPT sequence without an additional broker cookie round trip.
-For DTLS, a changed tuple needs supported path revalidation; a connection ID or the mere
-existence of an association is not evidence that its new address is validated. Never
-fallback to an unsecured sequence when required protection fails.
-
-Provider authentication of access to the broker is separate from DDS Security participant
-authentication. When DDS Security is implemented, preserve its required participant
-validation/permissions ordering and native authentication endpoints; secure discovery
-bootstrap cannot require a broker endpoint to be authenticated using information obtainable
-only after admission. Exact secure-service endpoint protection is a future integration
-contract. This proposal does not grant plaintext cached discovery secure-peer authority.
+V1 is insecure cached discovery. Future secure mode derives from participant DDS Security
+and must preserve authentication, permissions and protected endpoint ordering on UDP/TCP.
+UDP path validation precedes expensive authentication. Broker endpoints must not depend on
+identity available only after admission, and ordinary SPDP matching cannot bypass that gate.
+Secure operation fails until supported, without plaintext fallback. Optional TLS/DTLS/QUIC
+is later scope, not a v1 prerequisite. See [the security contract](broker-security-and-filtering.md).
 
 ## What replaces the old handshake
 

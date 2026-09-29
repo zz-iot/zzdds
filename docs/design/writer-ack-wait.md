@@ -3,6 +3,10 @@
 Status: accepted L5 policy, bounded model checked, 2026-09-14. Scope is protocol acknowledgment for one
 writer; Publisher aggregation and application acknowledgment extensions are separate.
 
+D1 clarification (2026-09-28): warn at most once per BEST_EFFORT writer lifetime on
+ACK wait; still return OK after ordinary validation. A reliable writer matched only to
+best-effort readers does not warn. Logging must not add an allocation/failure dependency.
+
 ## Standards boundary
 
 DDS 1.4 section 2.2.2.4.2.15 makes best-effort writer waits immediately successful

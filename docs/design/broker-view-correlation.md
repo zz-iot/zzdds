@@ -1,36 +1,8 @@
 # View request correlation and recovery
 
-Status: F2 direction accepted, 2026-09-18. ViewRequest member 4 now carries the
-client-assigned generation in the experimental IDL; the wire remains unfrozen. Builds on the [operation table](broker-operation-validation.md).
-
-## Problem
-
-The current VIEW_REQUEST contains mode and optional resume cursor, but replies identify
-only a view_generation chosen elsewhere. The client cannot reliably attribute an early
-state-stream record to a replacement request before its control-stream BEGIN arrives.
-One outstanding request reduces concurrency but does not itself distinguish a delayed
-reply from an abandoned request. The envelope's request_id is a logical message identity;
-using it implicitly as a transaction identifier for all records would change its meaning.
-
-Separately, a client can receive and RTPS-acknowledge a snapshot record, then fail to
-retain its application staging. It must explicitly abandon that view; ordinary RTPS
-repair cannot recover data whose delivery was already acknowledged.
-
-## Options
-
-1. Keep the existing fields and serialize whole view exchanges. Resolve an outstanding
-   request before starting another, or reconnect when its outcome is uncertain. This
-   minimizes wire changes but turns local snapshot failure into potentially expensive
-   session recovery and a fresh origin upload. It still needs precise association and
-   control-processing rules; a single-flight label alone is not sufficient.
-2. Add a request identity echoed in response boundaries, retaining broker-assigned view
-   generations. This preserves separate request and view concepts. However, early state
-   records need that identity too or must remain unattributed bounded orphans until a
-   boundary arrives. Multiple identifiers must stay consistent across every response.
-3. Let the client allocate the session-local view generation in VIEW_REQUEST. Existing
-   view-bearing replies echo it. This provides correlation even before BEGIN and uses
-   the generation already present throughout snapshot/delta/presence messages. It changes
-   generation ownership, so broker-initiated replacement and resume need explicit rules.
+Status: accepted draft-3 view correlation, 2026-09-28. [Archived alternatives](archive/review-baseline/broker-view-correlation.md)
+record the former cross-stream reasoning. Ordered STATE removes pre-BEGIN orphan staging;
+client-assigned generations still distinguish abandoned/replaced requests and recovery.
 
 ## Accepted initial design: option 3
 
@@ -57,10 +29,10 @@ generation, retransmission never selects a new snapshot cut or resets deadlines.
 original response/history is no longer available, invalidate it and require a new generation.
 
 All view-bearing output uses the generation supplied by its triggering request. The
-client stages only its current requested generation, including RECORD/DELTA that precede
-BEGIN. Older generations are ignored; unsolicited future generations are rejected without
+client stages only its current requested generation. In revised STATE ordering,
+RECORD/DELTA cannot precede their applicable BEGIN/baseline. Older generations are ignored; unsolicited future generations are rejected without
 allocating orphan state. BEGIN still validates the aggregate declared limits before
-installation, and early items still consume the negotiated orphan budget.
+installation, and preconfirmation traffic still consumes its independent bounded budget.
 
 ## Resume and broker-initiated invalidation
 
@@ -70,8 +42,11 @@ an established control message confirming receipt of ACCEPT. The cursor in that 
 identifies the old baseline; view_generation identifies the new exchange. These fields
 have deliberately different roles even if their numeric values happen to match.
 
-On accepted resume, keep the old verified snapshot cut/digest and delivery-sequence
-position, and emit subsequent delivery/VIEW_SYNC under the new session-local generation.
+Resolve resume against the retained previous epoch/session/owner generation/view
+generation/cut, scope, policy and contiguous history. Unknown identity requires snapshot
+fallback; neither a matching cut alone nor a cursor assertion reconstructs missing state.
+No transaction digest is carried. On accepted resume, keep the verified snapshot cut
+and delivery-sequence position, and emit subsequent delivery/VIEW_SYNC under the new session-local generation.
 Remap retained history consistently rather than requiring old serialized envelopes to
 remain reusable. Snapshot fallback establishes sequence zero and a new snapshot baseline.
 Readiness still requires fresh presence evidence and the fixed synchronization target;
@@ -128,7 +103,8 @@ roundtrip checks establish encoding only, not implemented peer compatibility.
 ## Accepted trace expectations
 
 * Request 1 is abandoned; its BEGIN arrives after request 2: ignore generation 1.
-* Record for request 2 arrives before BEGIN 2: stage boundedly as request 2, not unknown work.
+* Record for request 2 arrives before BEGIN 2: reject the invalid STATE sequence; do not
+  create orphan staging. This supersedes the earlier cross-stream staging proposal.
 * Duplicate request 2 arrives after its snapshot cut was chosen: same result, no new cut.
 * Conflicting request 2 arrives: reject; no replacement under an old generation.
 * Client drops RTPS-acknowledged staging: invalidate 2, request 3; no expectation of repair for 2.

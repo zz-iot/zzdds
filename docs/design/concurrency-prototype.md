@@ -26,13 +26,17 @@ executor, gate and observer ownership explicitly, but does not yet recycle slots
 | `scripts/run_deterministic_matrix.py`, `docs/testing.md` | Existing optimization/minimal-feature checks and optional TSan invocation; no need to invent a second full matrix |
 | `test/tsan_self_check.zig` | Existing instrumentation sanity check; use the repository TSan graph rather than assume a flag on a new target instruments it correctly |
 
-`test/support` currently contains domain allocation support, not a general deterministic scheduler. Small barrier/checkpoint support will be needed for controlled threaded races. Zig was absent from PATH but subsequently located at `/home/tsimpson/code/zig-x86_64-linux-0.16.0/zig` and verified as 0.16.0. No compiler installation was needed.
+`test/support` currently contains domain allocation support, not a general deterministic scheduler. Small barrier/checkpoint support will be needed for controlled threaded races. The original experiment used Zig 0.16.0; supply its executable via PATH or an explicit path.
 
 ## Placement and build integration
 
 Use a new `test/concurrency/` module root containing prototype implementation/support and two runners: deterministic stepping and hosted threaded execution. Keep it outside production exports and generated IDL. A small explicit module import for hosted utilities avoids making the experiment depend on full DCPS construction or discovery. Choose exact imports at implementation time; Zig module-root restrictions mean cross-directory helpers need proper module wiring.
 
-Add a focused `test-concurrency` step, include appropriate runners in normal `test` and `emit-tests`, and wire the threaded runner into the instrumented `test-tsan` graph (including its LLVM selection). Check other shared test-list consumers such as LLVM emission/ReleaseSmall before declaring coverage complete. The build wiring now exists: `test-concurrency`, `test-concurrency-tsan`, normal tests/emission, LLVM emission/ReleaseSmall and TSan. A dependency-free entry point also exists: `zig build --build-file test/concurrency/build.zig test` (or `test-tsan`), exercising the same helper without fetching zidl. Root graph execution still depends on the pinned zidl package being available.
+Use dedicated `test-concurrency` / `test-concurrency-tsan` targets and the dependency-free
+`zig build --build-file test/concurrency/build.zig test` (or `test-tsan`). Review revision
+2026-09-28 removes prototype runners from production test/coverage/ReleaseSmall aggregates;
+a separate design-validation CI job runs them. Root targets still resolve the pinned zidl
+package. This replaces the earlier all-aggregate wiring recommendation.
 
 ## One integrated implementation, two drivers
 

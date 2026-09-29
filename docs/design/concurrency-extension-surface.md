@@ -33,7 +33,7 @@ WaitSets and runtimes need not be children of a DomainParticipant.
 | Factory extension | Configure default-following versus explicitly owned runtime selection | Explicit selection acquires ownership transactionally; default-following factory holds policy only |
 | Participant construction extension | Optional explicit runtime override | Participant acquires a lease before publication; runtime remains fixed for its lifetime |
 | Participant runtime getter | Return RuntimeRef | Does not keep workers operational merely because the runtime was inspected |
-| Participant concurrency configuration | Positive finite delegation nesting limit and prepared-access stale-validation limit | Creation-time; build-changeable defaults eight and four respectively; cross-participant nesting uses the accepted minimum rule |
+| Participant concurrency configuration | Positive finite delegation nesting limit; distinct listener preparation budgets | Creation-time; nesting build default eight and cross-participant minimum rule; no read/take stale-validation budget (D7/D8) |
 | Writer preparation configuration | Maximum outstanding prepared history reservations per instance | Per-writer setting, default one; not a thread count or aggregate memory budget |
 | WaitSet extension | Idempotent non-draining close; construction-time helping policy and finite runtime references | Default shared-runtime policy; explicit set retains observers, not owners; no-helping is explicit |
 | Tracked resource scope | Seal new independent admission; obtain independently retained completion observation | Optional for borrowed resources; seal neither deletes entities nor stops required cleanup |
@@ -144,7 +144,8 @@ semantic table alone guarantees generator support.
 The creation, driver, reference/configuration and portable bootstrap reviews are complete.
 The [readiness review](concurrency-final-review.md) records the behavioral v1 milestone.
 Concrete ABI generation/publication and actual backend validation remain release gates.
-The next specification work is broker reconciliation, not another general prototype.
+Broker reconciliation is recorded in the current handoff; another general prototype is
+not a prerequisite for this accepted surface.
 
 Production race tests, backend performance and embedded footprint measurements remain
 implementation acceptance work. They do not require extending this specification phase
@@ -156,3 +157,14 @@ The [API draft](concurrency-api-draft.md) translates the selected creation, owne
 group and single-outer-driver policies into IDL fragments and bootstrap signatures.
 The next integration gate is interface-reference ownership and construction-only
 config fields; production IDL remains unchanged.
+
+## First shipped subset versus complete design
+
+A first vertical slice may ship scalar Config creation defaults, ordinary DDS entity APIs,
+one manual driver and hosted runtime, while deferring explicit runtime-owner/resource/group
+objects. Standard creation still enforces canonical listener exclusion and automatic runtime
+cleanup. An unsupported extension must fail explicitly, never weaken shared semantics.
+The cooperative measurement profile uses one participant, bounded reliable writer/reader,
+ReadCondition/WaitSet and UDP with fixed storage; no advanced extension is needed merely
+to exercise its standard operations. The full reference ownership and construction-only
+Config contract remains the integration target for later surfaces.

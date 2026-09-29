@@ -120,8 +120,9 @@ formal verification).
 ## Concurrency synchronization experiment
 
 The test-only prototype in `test/concurrency/` has focused `test-concurrency` and
-`test-concurrency-tsan` targets. It is also wired into the normal, LLVM emission,
-ReleaseSmall and TSan test graphs. To run it without resolving zidl:
+`test-concurrency-tsan` targets. It is intentionally excluded from normal production, coverage emission,
+ReleaseSmall and production TSan aggregates. A dedicated design-validation CI job runs
+the maintained models/vectors and isolated prototype targets. To run it without resolving zidl:
 
 ```sh
 zig build --build-file test/concurrency/build.zig test
@@ -132,3 +133,8 @@ Both runners exercise the same prototype; POSIX threaded tests use explicit
 condition checkpoints rather than sleep-based scheduling. See
 [prototype scope and limitations](design/concurrency-prototype.md) before treating
 these tests as evidence for the production runtime or complete DDS behavior.
+
+Run review models and independent wire vectors with `python3 scripts/check_design_specs.py`
+(or `zig build test-design-models` when package dependencies are available). Generated
+codec and representation checks need a built zidl and run separately; see
+[test/design-models/README.md](../test/design-models/README.md).

@@ -1,12 +1,10 @@
 # Discovery broker v1: implementer entry point
 
-Final design handoff: [scope, completion and remaining gates](specification-handoff.md),
-2026-09-24.
-
-Design baseline consolidated 2026-09-23. Read this page first. The public behavior and
-protocol direction are settled; the wire profile remains provisional until the explicit
-[freeze gates](broker-spec-closure.md#wire-freeze-blockers-and-non-blockers) are cleared.
-This package is not a claim of a working broker or deployed wire compatibility.
+Review-reconciled implementation baseline, 2026-09-28. Read this page first. The
+[handoff](specification-handoff.md) and [decision index](review-decisions.md) record
+completion of the agreed review changes. Draft-3 bytes remain provisional until the
+[publication gates](broker-spec-closure.md#wire-freeze-blockers-and-non-blockers) pass.
+This is not a claim of a working broker or deployed wire compatibility.
 
 ## Intended behavior
 
@@ -40,10 +38,11 @@ peers are alive, matched or reachable. Listeners never gate protocol completion.
 | Architecture and goals | [Overview](discovery-broker.md), with current details below |
 | Runtime, callbacks, waits and lifetime | [Concurrency contract](concurrency-contract.md), [final review](concurrency-final-review.md), [migration plan](concurrency-migration-plan.md) |
 | Application configuration/results | [Public API](broker-public-api.md), [API review](broker-public-api-review.md), [readiness](broker-readiness-contract.md), [narrowed resource scope](broker-resource-diagnostics.md) |
+| Security and disclosure | [Insecure v1/future DDS Security, filtering and v1.1 continuity](broker-security-and-filtering.md) |
 | Domain identity and shared service ingress | [Domain identity](broker-domain-identity.md), [multi-domain service](broker-multidomain-service.md) |
 | Introduction, admission and endpoint lifecycle | [Sequence](broker-spdp-bootstrap.md), [introduction](broker-service-introduction.md), [inline-context feasibility](broker-inline-context-feasibility.md), [protection](broker-admission-protection.md), [path provider](broker-path-provider-contract.md), [lifecycle](broker-bootstrap-lifecycle.md), [rejection](broker-bootstrap-rejection.md) |
 | Per-message legality and effects | [Operation table](broker-operation-validation.md) |
-| Inventory, view and presence cross-message rules | [Inventory barrier](broker-inventory-barrier.md), [view correlation](broker-view-correlation.md), [presence completeness](broker-presence-completeness.md) |
+| Inventory, view and presence cross-message rules | [Inventory barrier](broker-inventory-barrier.md), [view correlation](broker-view-correlation.md), [aggregate freshness](broker-aggregate-freshness.md) |
 | Retry and physical reclamation | [Retry retirement](broker-retry-retirement.md), [retention](broker-retention-review.md), with lifecycle deadlines above |
 | Mixed discovery and original content | [Coexistence](broker-discovery-coexistence.md), [origin version](broker-origin-version-wire.md) |
 | Bounded decoding and byte ownership | [Storage contract](broker-storage-contract.md), [resource scope](broker-resource-diagnostics.md) |
@@ -79,7 +78,7 @@ future allocated-relay direction. Expanded resource knobs and diagnostic paginat
 broker-resource-diagnostics.md are explicitly deferred. LegacyHello/Challenge/Open types
 and their reserved opcodes are not supported messages. Do not implement two handshakes.
 
-Current evidence is 20 codec tests, 49 independent vectors and mechanical coverage of
+Current draft-3 evidence is 23 codec tests, 53 independent vectors and mechanical coverage of
 27 active operations, as recorded after the latest refresh. Older abstract models cover
 the states they actually modeled, not the full revised bootstrap. No evidence here proves
 public-internet security, native domain-tag implementation, future DDS Security integration,

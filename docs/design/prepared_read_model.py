@@ -1,3 +1,4 @@
+# Historical pre-review model: excluded from maintained design validation; see test/design-models/README.md.
 """Two competing takes of a two-sample batch, with one invalidating state update.
 
 Retained identity and version are abstract; no real decoding/loan storage. A small

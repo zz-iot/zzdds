@@ -4,11 +4,23 @@ const rt = @import("zidl_rt");
 const wire = @import("wire").BrokerWireDraft;
 const testing = std.testing;
 
+// These synthetic standalone headers label nested-body fixtures. Production
+// broker bodies inherit XCDR2 from Frame and carry no encapsulation header.
+// The general runtime reader does not currently accept PL_CDR2_LE; initialize
+// its nested-body context explicitly here, without changing runtime support.
+fn fixtureReader(bytes: []const u8) !rt.CdrReader {
+    if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], &.{ 0, 0x0b, 0, 0 })) {
+        return .{ .data = bytes, .pos = 4, .byte_order = .little, .xcdr_version = .xcdr2, .is_pl_cdr = false };
+    }
+    return rt.CdrReader.init(bytes);
+}
+
 fn encode(comptime T: type, value: T) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(testing.allocator);
     var w = rt.CdrWriter(.xcdr2).init(&buf, testing.allocator);
     try w.writeEncapHeader();
+    if (T == wire.AcceptReply or T == wire.RegisterRequest or T == wire.AdmissionReject or T == wire.PathChallenge) buf.items[1] = 0x0b;
     try T.serialize(&w, value);
     return buf.toOwnedSlice(testing.allocator);
 }
@@ -23,7 +35,7 @@ test "ACCEPT preserves independent recovery fields and optional cursor" {
     value.resumed_cursor = .{ .view_generation = 3, .applied_delivery_seq = 19, .baseline_retained = true };
     const bytes = try encode(wire.AcceptReply, value);
     defer testing.allocator.free(bytes);
-    var r = try rt.CdrReader.init(bytes);
+    var r = try fixtureReader(bytes);
     var out: wire.AcceptReply = .{};
     try wire.AcceptReply.deserializeInto(&out, &r, testing.allocator);
     try testing.expectEqual(value.owner_generation, out.owner_generation);
@@ -36,15 +48,15 @@ test "ACCEPT preserves independent recovery fields and optional cursor" {
     try testing.expectEqualSlices(u8, bytes, again);
 }
 
-test "snapshot end digest and target roundtrip; truncation rejects" {
-    const value: wire.ViewEnd = .{ .view_generation = 4, .store_cut = 12, .record_count = 2, .digest = @splat(0xab), .ready_through_delivery_seq = 27 };
+test "snapshot end count and target roundtrip; truncation rejects" {
+    const value: wire.ViewEnd = .{ .view_generation = 4, .store_cut = 12, .record_count = 2, .ready_through_delivery_seq = 27 };
     const bytes = try encode(wire.ViewEnd, value);
     defer testing.allocator.free(bytes);
-    var r = try rt.CdrReader.init(bytes);
+    var r = try fixtureReader(bytes);
     var out: wire.ViewEnd = .{};
     try wire.ViewEnd.deserializeInto(&out, &r, testing.allocator);
     try testing.expectEqualDeep(value, out);
-    var short = try rt.CdrReader.init(bytes[0 .. bytes.len - 1]);
+    var short = try fixtureReader(bytes[0 .. bytes.len - 1]);
     try testing.expectError(error.EndOfStream, wire.ViewEnd.deserializeInto(&out, &short, testing.allocator));
 }
 
@@ -53,6 +65,7 @@ fn syncBytes(extra_required: ?bool, missing: bool, duplicate: bool) ![]u8 {
     errdefer buf.deinit(testing.allocator);
     var w = rt.CdrWriter(.xcdr2).init(&buf, testing.allocator);
     try w.writeEncapHeader();
+    buf.items[1] = 0x0b; // test-only mutable PL_CDR2_LE
     const dh = try w.reserveDheader();
     try w.writeEmheaderFixed(1, true, 3);
     try w.writeU64(5);
@@ -75,28 +88,28 @@ fn syncBytes(extra_required: ?bool, missing: bool, duplicate: bool) ![]u8 {
 test "old body decoder skips new optional field and rejects new required field" {
     const optional = try syncBytes(false, false, false);
     defer testing.allocator.free(optional);
-    var r = try rt.CdrReader.init(optional);
-    var out: wire.ViewSync = .{};
-    try wire.ViewSync.deserializeInto(&out, &r, testing.allocator);
+    var r = try fixtureReader(optional);
+    var out: @import("wire").BrokerCodecProbe.Evolution = .{};
+    try @import("wire").BrokerCodecProbe.Evolution.deserializeInto(&out, &r, testing.allocator);
     try testing.expectEqual(@as(u64, 5), out.view_generation);
     try testing.expectEqual(@as(u64, 23), out.ready_through_delivery_seq);
     const required = try syncBytes(true, false, false);
     defer testing.allocator.free(required);
-    var rr = try rt.CdrReader.init(required);
-    try testing.expectError(error.UnknownMustUnderstand, wire.ViewSync.deserializeInto(&out, &rr, testing.allocator));
+    var rr = try fixtureReader(required);
+    try testing.expectError(error.UnknownMustUnderstand, @import("wire").BrokerCodecProbe.Evolution.deserializeInto(&out, &rr, testing.allocator));
 }
 
 test "characterization: missing and duplicate members need admission validation" {
     const missing = try syncBytes(null, true, false);
     defer testing.allocator.free(missing);
-    var r = try rt.CdrReader.init(missing);
-    var out: wire.ViewSync = .{};
-    try wire.ViewSync.deserializeInto(&out, &r, testing.allocator);
+    var r = try fixtureReader(missing);
+    var out: @import("wire").BrokerCodecProbe.Evolution = .{};
+    try @import("wire").BrokerCodecProbe.Evolution.deserializeInto(&out, &r, testing.allocator);
     try testing.expectEqual(@as(u64, 0), out.ready_through_delivery_seq);
     const duplicate = try syncBytes(null, false, true);
     defer testing.allocator.free(duplicate);
-    var rr = try rt.CdrReader.init(duplicate);
-    try wire.ViewSync.deserializeInto(&out, &rr, testing.allocator);
+    var rr = try fixtureReader(duplicate);
+    try @import("wire").BrokerCodecProbe.Evolution.deserializeInto(&out, &rr, testing.allocator);
     try testing.expectEqual(@as(u64, 99), out.view_generation);
     // These accepted malformed shapes are a documented production blocker, not
     // the intended future broker policy. Update this characterization when fixed.
@@ -107,20 +120,20 @@ test "bounded sequence representation footprint is explicit" {
     try testing.expect(@sizeOf(wire.OriginRecord) >= 524288);
 }
 
-test "presence proof decodes a populated bounded sequence of structs" {
-    var value: wire.PresenceProof = .{ .view_generation = 8, .challenge_nonce = @splat(3), .chunk_count = 1, .view_delivery_seq = 27, .query_serial = 12 };
-    value.entries.appendAssumeCapacity(.{ .participant_guid = @splat(4), .incarnation_id = @splat(5), .freshness_generation = 9, .remaining_lease_ns = 123456, .availability = wire.PRESENCE_AVAILABLE });
-    value.entries.appendAssumeCapacity(.{ .participant_guid = @splat(6), .incarnation_id = @splat(7), .availability = wire.PRESENCE_UNAVAILABLE });
-    const bytes = try encode(wire.PresenceProof, value);
+test "freshness marker decodes a populated bounded sequence of structs" {
+    var value: wire.FreshnessMarker = .{ .view_generation = 8, .challenge_nonce = @splat(3), .view_delivery_seq = 27, .common_remaining_lease_ns = 500000 };
+    value.exceptions.appendAssumeCapacity(.{ .participant_guid = @splat(4), .incarnation_id = @splat(5), .remaining_lease_ns = 123456 });
+    value.exceptions.appendAssumeCapacity(.{ .participant_guid = @splat(6), .incarnation_id = @splat(7) });
+    const bytes = try encode(wire.FreshnessMarker, value);
     defer testing.allocator.free(bytes);
-    var r = try rt.CdrReader.init(bytes);
-    var out: wire.PresenceProof = .{};
-    try wire.PresenceProof.deserializeInto(&out, &r, testing.allocator);
-    try testing.expectEqual(@as(usize, 2), out.entries.slice().len);
+    var r = try fixtureReader(bytes);
+    var out: wire.FreshnessMarker = .{};
+    try wire.FreshnessMarker.deserializeInto(&out, &r, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), out.exceptions.slice().len);
     try testing.expectEqual(value.view_delivery_seq, out.view_delivery_seq);
-    try testing.expectEqual(value.query_serial, out.query_serial);
-    try testing.expectEqualDeep(value.entries.slice()[0], out.entries.slice()[0]);
-    try testing.expectEqualDeep(value.entries.slice()[1], out.entries.slice()[1]);
+    try testing.expectEqual(value.common_remaining_lease_ns, out.common_remaining_lease_ns);
+    try testing.expectEqualDeep(value.exceptions.slice()[0], out.exceptions.slice()[0]);
+    try testing.expectEqualDeep(value.exceptions.slice()[1], out.exceptions.slice()[1]);
 }
 
 fn hexBytes(text: []const u8) ![]u8 {
@@ -134,7 +147,7 @@ fn hexBytes(text: []const u8) ![]u8 {
 fn framed(operation: u16, body: []const u8) ![]u8 {
     const value = try testing.allocator.create(wire.Frame);
     defer testing.allocator.destroy(value);
-    value.* = .{ .magic = "ZZDBRK01".*, .major_version = 1, .operation_code = operation, .encoding_id = 1 };
+    value.* = .{ .magic = "ZZDBRK03".*, .major_version = 1, .operation_code = operation, .encoding_id = 1 };
     for (body) |b| value.body.appendAssumeCapacity(b);
     const unpadded = try encode(wire.Frame, value.*);
     defer testing.allocator.free(unpadded);
@@ -150,7 +163,7 @@ fn framed(operation: u16, body: []const u8) ![]u8 {
 fn frameBody(bytes: []const u8, maximum: usize) ![]const u8 {
     if (bytes.len > maximum or bytes.len < 24) return error.InvalidFrame;
     if (!std.mem.eql(u8, bytes[0..3], &.{ 0, 7, 0 }) or bytes[3] > 3) return error.InvalidFrame;
-    if (!std.mem.eql(u8, bytes[4..12], "ZZDBRK01")) return error.InvalidFrame;
+    if (!std.mem.eql(u8, bytes[4..12], "ZZDBRK03")) return error.InvalidFrame;
     if (std.mem.readInt(u16, bytes[12..14], .little) != 1 or std.mem.readInt(u16, bytes[14..16], .little) != 0) return error.InvalidFrame;
     if (std.mem.readInt(u16, bytes[18..20], .little) != 1) return error.InvalidFrame;
     const n: usize = std.mem.readInt(u32, bytes[20..24], .little);
@@ -169,9 +182,7 @@ test "VIEW_SYNC body and final Frame match independent golden bytes" {
     try testing.expectEqualSlices(u8, body, encoded[4..]); // no inner encapsulation
     const env = try testing.allocator.create(wire.Envelope);
     defer testing.allocator.destroy(env);
-    env.* = .{ .broker_epoch = @splat(0x11), .session_id = @splat(0x22), .owner_generation = 9, .request_id = @splat(0x33) };
-    env.scope.domain_id = 7;
-    env.scope.domain_tag.appendAssumeCapacity('r');
+    env.* = .{ .request_id = @splat(0x33) };
     for (body) |b| env.operation_body.appendAssumeCapacity(b);
     const env_bytes = try encode(wire.Envelope, env.*);
     defer testing.allocator.free(env_bytes);
@@ -184,7 +195,7 @@ test "VIEW_SYNC body and final Frame match independent golden bytes" {
     defer testing.allocator.free(golden);
     try testing.expectEqualSlices(u8, golden, actual);
     try testing.expectEqualSlices(u8, env_golden, try frameBody(actual, 1048600));
-    var reader = try rt.CdrReader.init(actual);
+    var reader = try fixtureReader(actual);
     const decoded = try testing.allocator.create(wire.Frame);
     defer testing.allocator.destroy(decoded);
     decoded.* = .{};
@@ -211,27 +222,7 @@ test "Frame padding golden and malformed boundaries" {
     try testing.expectError(error.InvalidFrame, frameBody(actual, actual.len));
 }
 
-fn recordDigest(label: []const u8, records: []const []const u8) [32]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(label);
-    var n: [8]u8 = undefined;
-    std.mem.writeInt(u64, &n, @intCast(records.len), .little);
-    h.update(&n);
-    for (records) |record| {
-        std.mem.writeInt(u64, &n, @intCast(record.len), .little);
-        h.update(&n);
-        h.update(record);
-    }
-    return h.finalResult();
-}
-
-fn expectDigest(actual: [32]u8, expected_text: []const u8) !void {
-    const expected = try hexBytes(expected_text);
-    defer testing.allocator.free(expected);
-    try testing.expectEqualSlices(u8, expected, &actual);
-}
-
-test "OriginRecord golden preserves payload bytes and domain-separated digests" {
+test "OriginRecord golden preserves original payload bytes" {
     const record = try testing.allocator.create(wire.OriginRecord);
     defer testing.allocator.destroy(record);
     record.* = .{};
@@ -251,9 +242,6 @@ test "OriginRecord golden preserves payload bytes and domain-separated digests" 
     const golden = try hexBytes(@embedFile("broker_golden/origin_record.hex"));
     defer testing.allocator.free(golden);
     try testing.expectEqualSlices(u8, golden, bytes[4..]);
-    try expectDigest(recordDigest("zzdds-broker/snapshot/v1\x00", &.{}), @embedFile("broker_golden/empty_snapshot.sha256"));
-    try expectDigest(recordDigest("zzdds-broker/inventory/v1\x00", &.{golden}), @embedFile("broker_golden/one_origin_inventory.sha256"));
-    try expectDigest(recordDigest("zzdds-broker/snapshot/v1\x00", &.{golden}), @embedFile("broker_golden/one_origin_snapshot.sha256"));
 }
 
 
@@ -279,7 +267,7 @@ test "metadata list matches independent endian-preserving golden values" {
         const golden = try hexBytes(golden_text);
         defer testing.allocator.free(golden);
         try testing.expectEqualSlices(u8, golden, bytes[4..]);
-        var reader = try rt.CdrReader.init(bytes);
+        var reader = try fixtureReader(bytes);
         const decoded = try testing.allocator.create(wire.MetadataList);
         defer testing.allocator.destroy(decoded);
         decoded.* = .{};
@@ -316,7 +304,7 @@ test "historical retired-OPEN rejection matches independent body and Frame golde
     const golden = try hexBytes(@embedFile("broker_golden/admission_reject_body.hex"));
     defer testing.allocator.free(golden);
     try testing.expectEqualSlices(u8, golden, bytes[4..]);
-    var reader = try rt.CdrReader.init(bytes);
+    var reader = try fixtureReader(bytes);
     var decoded: wire.AdmissionReject = .{};
     try wire.AdmissionReject.deserializeInto(&decoded, &reader, testing.allocator);
     try testing.expectEqualDeep(value, decoded);
@@ -337,57 +325,54 @@ test "view request separates new generation from retained resume cursor" {
         .cursor = .{
             .previous_epoch = @splat(7), .previous_session = @splat(8),
             .previous_owner_generation = 3, .view_generation = 19,
-            .snapshot_cut = 41, .snapshot_digest = @splat(9),
+            .snapshot_cut = 41,
             .applied_delivery_seq = 57, .baseline_retained = true,
         },
     };
     const bytes = try encode(wire.ViewRequest, value);
     defer testing.allocator.free(bytes);
-    var reader = try rt.CdrReader.init(bytes);
+    var reader = try fixtureReader(bytes);
     var decoded: wire.ViewRequest = .{};
     try wire.ViewRequest.deserializeInto(&decoded, &reader, testing.allocator);
     try testing.expectEqualDeep(value, decoded);
-    var short_reader = try rt.CdrReader.init(bytes[0 .. bytes.len - 1]);
+    var short_reader = try fixtureReader(bytes[0 .. bytes.len - 1]);
     try testing.expectError(error.EndOfStream, wire.ViewRequest.deserializeInto(&decoded, &short_reader, testing.allocator));
 }
 
 
-test "presence budgets roundtrip in HELLO and empty proof is explicit" {
-    var offer: wire.LegacyHello = .{};
-    offer.receive_limits.maximum_presence_queries = 2;
-    offer.receive_limits.maximum_presence_entries = 1024;
-    offer.receive_limits.maximum_presence_chunks = 8;
-    offer.receive_limits.maximum_presence_bytes = 65536;
-    const bytes = try encode(wire.LegacyHello, offer);
+test "freshness bounds roundtrip in REGISTER and empty marker is explicit" {
+    var offer: wire.RegisterRequest = .{};
+    offer.receive_limits.maximum_freshness_exceptions = 1024;
+    offer.receive_limits.maximum_freshness_marker_bytes = 65536;
+    const bytes = try encode(wire.RegisterRequest, offer);
     defer testing.allocator.free(bytes);
-    var reader = try rt.CdrReader.init(bytes);
-    var decoded: wire.LegacyHello = .{};
-    try wire.LegacyHello.deserializeInto(&decoded, &reader, testing.allocator);
+    var reader = try fixtureReader(bytes);
+    var decoded: wire.RegisterRequest = .{};
+    try wire.RegisterRequest.deserializeInto(&decoded, &reader, testing.allocator);
     try testing.expectEqualDeep(offer.receive_limits, decoded.receive_limits);
-    const proof: wire.PresenceProof = .{
+    const proof: wire.FreshnessMarker = .{
         .view_generation = 1, .challenge_nonce = @splat(5),
-        .chunk_count = 1, .chunk_index = 0, .view_delivery_seq = 0, .query_serial = 1,
+        .view_delivery_seq = 0, .common_remaining_lease_ns = 1000,
     };
-    const proof_bytes = try encode(wire.PresenceProof, proof);
+    const proof_bytes = try encode(wire.FreshnessMarker, proof);
     defer testing.allocator.free(proof_bytes);
-    var proof_reader = try rt.CdrReader.init(proof_bytes);
-    var out: wire.PresenceProof = .{};
-    try wire.PresenceProof.deserializeInto(&out, &proof_reader, testing.allocator);
-    try testing.expectEqual(@as(u32, 1), out.chunk_count);
-    try testing.expectEqual(@as(usize, 0), out.entries.slice().len);
+    var proof_reader = try fixtureReader(proof_bytes);
+    var out: wire.FreshnessMarker = .{};
+    try wire.FreshnessMarker.deserializeInto(&out, &proof_reader, testing.allocator);
+    try testing.expectEqual(@as(u64, 1000), out.common_remaining_lease_ns);
+    try testing.expectEqual(@as(usize, 0), out.exceptions.slice().len);
 }
 
 
-test "presence query carries independent serial and nonce" {
-    const value: wire.PresenceQuery = .{
+test "freshness query carries view and nonce" {
+    const value: wire.FreshnessQuery = .{
         .view_generation = 4, .challenge_nonce = @splat(7),
-        .full_view = true, .query_serial = 23,
     };
-    const bytes = try encode(wire.PresenceQuery, value);
+    const bytes = try encode(wire.FreshnessQuery, value);
     defer testing.allocator.free(bytes);
-    var reader = try rt.CdrReader.init(bytes);
-    var decoded: wire.PresenceQuery = .{};
-    try wire.PresenceQuery.deserializeInto(&decoded, &reader, testing.allocator);
+    var reader = try fixtureReader(bytes);
+    var decoded: wire.FreshnessQuery = .{};
+    try wire.FreshnessQuery.deserializeInto(&decoded, &reader, testing.allocator);
     try testing.expectEqualDeep(value, decoded);
 }
 
@@ -435,7 +420,7 @@ test "origin version full and key-only inline fixtures preserve both byte orders
         var encoded: [28]u8 = undefined;
         @memcpy(encoded[0..4], &[_]u8{ 0, if (endian == .little) 1 else 0, 0, 0 });
         @memcpy(encoded[4..], expected);
-        var reader = try rt.CdrReader.init(&encoded);
+        var reader = try fixtureReader(&encoded);
         var decoded: wire.OriginVersion = .{};
         try wire.OriginVersion.deserializeInto(&decoded, &reader, testing.allocator);
         try testing.expectEqual(@as(u64, 0x0102030405060708), decoded.origin_revision);
@@ -463,7 +448,7 @@ test "SPDP service context and compact REGISTER roundtrip" {
     };
     const ctx_bytes = try encode(wire.ServiceOfferContext, context);
     defer testing.allocator.free(ctx_bytes);
-    var ctx_reader = try rt.CdrReader.init(ctx_bytes);
+    var ctx_reader = try fixtureReader(ctx_bytes);
     var ctx_out: wire.ServiceOfferContext = .{};
     try wire.ServiceOfferContext.deserializeInto(&ctx_out, &ctx_reader, testing.allocator);
     try testing.expectEqualDeep(context, ctx_out);
@@ -479,7 +464,7 @@ test "SPDP service context and compact REGISTER roundtrip" {
     req.resume_hint = .{ .baseline_retained = true, .view_generation = 9, .applied_delivery_seq = 13 };
     const bytes = try encode(wire.RegisterRequest, req);
     defer testing.allocator.free(bytes);
-    var reader = try rt.CdrReader.init(bytes);
+    var reader = try fixtureReader(bytes);
     var decoded: wire.RegisterRequest = .{};
     try wire.RegisterRequest.deserializeInto(&decoded, &reader, testing.allocator);
     try testing.expectEqualDeep(req, decoded);
@@ -510,7 +495,7 @@ test "native CDR1 service parameters and path hashes match independent fixtures"
             defer testing.allocator.free(encoded);
             @memcpy(encoded[0..4], &[_]u8{0, if (index == 0) 1 else 0, 0, 0});
             @memcpy(encoded[4..], value);
-            var reader = try rt.CdrReader.init(encoded);
+            var reader = try fixtureReader(encoded);
             var decoded: T = .{};
             try T.deserializeInto(&decoded, &reader, testing.allocator);
             try testing.expectEqual(@as(u16, 1), decoded.descriptor_version);
@@ -565,8 +550,8 @@ fn registrationFixture() wire.RegisterRequest {
             .maximum_frame_bytes = 4096, .maximum_record_bytes = 2048,
             .maximum_inventory_bytes = 65536, .maximum_view_bytes = 65536,
             .maximum_records = 32, .maximum_orphan_items = 4, .maximum_orphan_bytes = 8192,
-            .maximum_presence_queries = 2, .maximum_presence_entries = 32,
-            .maximum_presence_chunks = 4, .maximum_presence_bytes = 8192,
+            .maximum_freshness_exceptions = 32,
+            .maximum_freshness_marker_bytes = 8192,
         },
     };
     for ("realm") |b| req.scope.domain_tag.appendAssumeCapacity(b);
@@ -587,7 +572,7 @@ fn checkRegistrationGolden(comptime T: type, value: T, op: u16, comptime name: [
     const expected_frame = try hexBytes(@embedFile("broker_golden/" ++ name ++ "_frame.hex"));
     defer testing.allocator.free(expected_frame);
     try testing.expectEqualSlices(u8, expected_frame, actual_frame);
-    var reader = try rt.CdrReader.init(encoded);
+    var reader = try fixtureReader(encoded);
     var decoded: T = .{};
     try T.deserializeInto(&decoded, &reader, testing.allocator);
     try testing.expectEqualDeep(value, decoded);
@@ -665,4 +650,71 @@ test "current bootstrap sizing covers domain tag resume feature and cookie bound
         }
         std.debug.print("\ncurrent bootstrap large={any} features={d} REGISTER/ACCEPT/PATH Frames={any}\n", .{large, feature_count, sizes});
     }
+}
+
+test "draft3 freshness bodies match independent vectors" {
+    const q = try encode(wire.FreshnessQuery, .{ .view_generation = 8, .challenge_nonce = @splat(3) });
+    defer testing.allocator.free(q);
+    const qg = try hexBytes(@embedFile("broker_golden/freshness_query_body.hex"));
+    defer testing.allocator.free(qg);
+    try testing.expectEqualSlices(u8, qg, q[4..]);
+    var marker: wire.FreshnessMarker = .{
+        .view_generation = 8, .challenge_nonce = @splat(3),
+        .view_delivery_seq = 27, .common_remaining_lease_ns = 500000,
+    };
+    const empty = try encode(wire.FreshnessMarker, marker);
+    defer testing.allocator.free(empty);
+    const eg = try hexBytes(@embedFile("broker_golden/freshness_empty_marker_body.hex"));
+    defer testing.allocator.free(eg);
+    try testing.expectEqualSlices(u8, eg, empty[4..]);
+    marker.exceptions.appendAssumeCapacity(.{ .participant_guid = @splat(4), .incarnation_id = @splat(5), .remaining_lease_ns = 123456 });
+    marker.exceptions.appendAssumeCapacity(.{ .participant_guid = @splat(6), .incarnation_id = @splat(7), .remaining_lease_ns = 0 });
+    const full = try encode(wire.FreshnessMarker, marker);
+    defer testing.allocator.free(full);
+    const fg = try hexBytes(@embedFile("broker_golden/freshness_marker_body.hex"));
+    defer testing.allocator.free(fg);
+    try testing.expectEqualSlices(u8, fg, full[4..]);
+}
+
+// Fixture strict boundary: generated deserialization alone need not reject trailing bytes.
+fn decodeFinalExact(comptime T: type, bytes: []const u8) !T {
+    if (bytes.len < 4 or !std.mem.eql(u8, bytes[0..4], &.{ 0, 7, 0, 0 })) return error.InvalidFrame;
+    var reader = try fixtureReader(bytes);
+    var value: T = .{};
+    try T.deserializeInto(&value, &reader, testing.allocator);
+    if (reader.remaining() != 0) return error.TrailingBytes;
+    return value;
+}
+fn checkFinalGolden(comptime T: type, value: T, comptime name: []const u8) !void {
+    const encoded = try encode(T, value);
+    defer testing.allocator.free(encoded);
+    const golden = try hexBytes(@embedFile("broker_golden/" ++ name ++ ".hex"));
+    defer testing.allocator.free(golden);
+    try testing.expectEqualSlices(u8, golden, encoded[4..]);
+    try testing.expectEqualDeep(value, try decodeFinalExact(T, encoded));
+    try testing.expectError(error.EndOfStream, decodeFinalExact(T, encoded[0 .. encoded.len - 1]));
+    const extra = try testing.allocator.alloc(u8, encoded.len + 1);
+    defer testing.allocator.free(extra);
+    @memcpy(extra[0..encoded.len], encoded);
+    extra[encoded.len] = 0;
+    try testing.expectError(error.TrailingBytes, decodeFinalExact(T, extra));
+}
+test "draft3 final transaction and resume bodies have exact positional extent" {
+    try checkFinalGolden(wire.InventoryEnd, .{ .inventory_generation = 3, .record_count = 2 }, "final_inventory_end");
+    try checkFinalGolden(wire.ViewEnd, .{ .view_generation = 4, .store_cut = 12, .record_count = 2, .ready_through_delivery_seq = 27 }, "final_snapshot_end");
+    try checkFinalGolden(wire.Applied, .{ .view_generation = 4, .snapshot_cut = 12, .applied_delivery_seq = 27 }, "final_applied");
+    try checkFinalGolden(wire.ResumeCursor, .{ .previous_epoch = @splat(1), .previous_session = @splat(2), .previous_owner_generation = 3, .view_generation = 4, .snapshot_cut = 12, .applied_delivery_seq = 27, .baseline_retained = true }, "final_resume_cursor");
+}
+test "draft3 rejects previous frame magic and mutable VIEW_SYNC grammar" {
+    const frame = try framed(wire.OP_VIEW_SYNC, &.{});
+    defer testing.allocator.free(frame);
+    frame[11] = '2';
+    try testing.expectError(error.InvalidFrame, frameBody(frame, frame.len));
+    frame[11] = '1';
+    try testing.expectError(error.InvalidFrame, frameBody(frame, frame.len));
+    const old = try syncBytes(null, false, false);
+    defer testing.allocator.free(old);
+    try testing.expectError(error.InvalidFrame, decodeFinalExact(wire.ViewSync, old));
+    old[1] = 7; // relabeling the old mutable body cannot evade exact extent validation
+    try testing.expectError(error.TrailingBytes, decodeFinalExact(wire.ViewSync, old));
 }

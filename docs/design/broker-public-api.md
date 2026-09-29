@@ -1,6 +1,6 @@
 # Broker public configuration and status API
 
-Status: W1 consolidated public API review, 2026-09-23. Reconciles accepted independent
+Status: public API revised for D3–D6, 2026-09-28; wire mappings remain provisional. Reconciles accepted independent
 discovery, readiness and runtime contracts. These are design fragments for zzdds.idl,
 not production IDL changes, generated ABI guarantees or accepted TOML syntax.
 
@@ -48,9 +48,8 @@ Within module zzdds (existing types omitted):
 
 ```idl
 enum BrokerStartupPolicy { BROKER_ALLOW_DEGRADED, BROKER_REQUIRE_READY };
-enum BrokerViewPolicy { BROKER_VIEW_ALL, BROKER_VIEW_TOPIC_CANDIDATES };
-enum BrokerSecurityPolicy { BROKER_SECURITY_UNSPECIFIED,
-                            BROKER_TRUSTED_NETWORK, BROKER_AUTHENTICATED };
+enum BrokerViewPolicy { BROKER_VIEW_ALL, BROKER_VIEW_TOPIC_CANDIDATES,
+                        BROKER_VIEW_TOPIC_PARTITION_CANDIDATES };
 typedef sequence<string<1024>, 16> BrokerAddresses;
 struct BrokerBootstrapConfig {
     @optional unsigned long udp_payload_limit_bytes;
@@ -65,8 +64,7 @@ struct BrokerDiscoveryConfig {
     BrokerAddresses addresses;
     @default(BROKER_VIEW_ALL) BrokerViewPolicy view;
     @default(BROKER_ALLOW_DEGRADED) BrokerStartupPolicy startup;
-    @default(BROKER_SECURITY_UNSPECIFIED) BrokerSecurityPolicy security;
-    string<256> credential_ref;
+    // No independent broker security/credential selector: use participant DDS Security.
     BrokerBootstrapConfig bootstrap;
 };
 // Add to the existing DiscoveryConfig, preserving its existing fields:
@@ -75,7 +73,7 @@ struct BrokerDiscoveryConfig {
 // BrokerDiscoveryConfig broker;
 ```
 
-Address/reference bounds above are proposed public limits. Standard domain identity is
+Address bounds above are proposed public limits. Standard domain identity is
 configured once on DomainConfig: existing id plus `@default("") string<256> tag`.
 There is no broker realm. See the accepted [domain identity decision](broker-domain-identity.md)
 for standard encoding, defaults and required native support. The participant's resolved
@@ -87,18 +85,27 @@ independent stores. At most one admitted session is active. Reconnect through an
 address follows epoch/ownership and fresh-inventory rules. Retire/fence old candidate work
 before replacement; late replies cannot select another authority or revive a session.
 Do not imply replicated-server continuity merely because two addresses share a list.
-Authenticated provider configuration must bind expected service identity, not just trust
-any certificate accepted by a broad trust store.
+Future DDS Security configuration must validate the intended broker participant and its
+permissions. A configured address or domain/tag alone is not authenticated identity.
 
 Each address explicitly selects UDP or TCP; endpoint grammar and transport provider
 validation must reuse zzdds transport channels. Broker control transport is independent
 of user-data transport enable flags. Enabling broker TCP does not require enabling TCP
 user data, nor does disabling UDP user data disable an explicitly selected UDP broker
-channel. Unsupported requested providers fail construction, including authenticated
-profiles unavailable in the build. No fallback to plaintext. Security UNSPECIFIED is
-valid only while broker service is disabled; enabling it requires an explicit trusted
-network or authenticated policy. credential_ref names provider configuration, never an
-inline secret. Transport authentication is not DDS Security participant authentication.
+channel. Unsupported requested transports fail construction. V1 is traditional, insecure
+cached discovery; it provides no cryptographic authentication, confidentiality or access
+control. Secure broker operation follows participant DDS Security configuration and must
+fail explicitly until the required integration exists. No fallback from requested security
+to plaintext. BrokerSecurityPolicy and credential_ref from the old proposal are removed.
+
+A candidate-view policy is a required capability, not permission to fall back to VIEW_ALL.
+The operator's disclosure ceiling applies first; client topic/partition candidate selection
+can only narrow it. The zzdds broker implements topic and partition candidate filtering.
+If a configured client cannot use the offered filtering or bounded view, fail admission/
+synchronization explicitly. Partition changes trigger re-evaluation; no QoS/type filtering
+may silently suppress incompatible-QoS reporting. The registry assigns feature 1 to topic candidates and feature 6 (requiring 1) to
+topic/partition candidates. Server administration syntax is an implementation surface;
+this fragment introduces no arbitrary client filter-expression API.
 
 Initial v1 has fixed cached discovery and direct-only user/WLP traffic: omit configurable
 relay/ICE/profile selectors until supported. Existing illustrative future settings do not
@@ -298,3 +305,10 @@ No participant/listener reference is serialized in Config or wire data.
 
 See [public API review](broker-public-api-review.md) for return mapping, audit disposition
 and remaining implementation gates. These fragments still require generated ABI review.
+
+## UDP oversize diagnostics
+
+For locally detected bootstrap oversize, report the encoded size and configured budget,
+and name existing UdpConfig.interfaces restriction and an explicitly configured TCP broker
+address as remedies. Do not silently strip canonical announcements or switch transport.
+A remote offer that cannot fit may yield only a bounded timeout; do not invent its cause.

@@ -21,24 +21,17 @@ a particular live participant. See [DDS Security 1.2 §§9.3.2.11 and 10.3](http
 A broker authenticating a participant itself must participate in the appropriate security
 exchanges. An opaque broker forwarding peer authentication cannot infer that it has
 itself authenticated either participant. Native peer authentication, permissions and
-protected discovery remain mandatory wherever configured. Cached plaintext discovery
-must not be substituted for secure peer discovery.
+protected discovery remain mandatory wherever configured. Future cached secure discovery requires the explicitly trusted metadata intermediary
+model; it must not masquerade as independently peer-authenticated discovery.
 
-TLS/DTLS can separately protect access to the broker service, including before DDS
-Security is implemented. Such service authentication does not automatically establish
-DDS participant identity. Require the deployment's configured protections and scope
-permissions on every admission; never downgrade to unsecured operation on failure.
-An unsecured DDS participant may still use a protected broker transport.
-
-Use maintained protection providers. On protected associations, do not process broker
-messages as early data; TLS 1.3 early data lacks inherent replay protection. Require
-DTLS replay detection and retain application-level duplicate/session checks.
-[TLS 1.3 §8](https://www.rfc-editor.org/rfc/rfc8446.html#section-8),
-[DTLS 1.3 §3.4](https://www.rfc-editor.org/rfc/rfc9147.html#section-3.4).
-Validated migration within a surviving DTLS association is not a new admission. A
-connection ID alone does not validate a new return path; use provider-supported
-[DTLS return-routability checks](https://www.rfc-editor.org/rfc/rfc9853.html) where available.
-In unsecured UDP mode, validated source paths provide reachability, not authentication.
+V1 is traditional insecure cached discovery over UDP/TCP. There is no independent
+broker credential/security selector or mandatory transport-security provider. Future
+secure admission derives from participant DDS Security and must explicitly protect the
+vendor broker endpoints on both transports. A requested secure configuration fails until
+supported; it must never fall back to plaintext. Optional TLS/DTLS/QUIC is later scope.
+The [security/filtering contract](broker-security-and-filtering.md) controls that integration.
+UDP return-path validation establishes reachability only and precedes expensive future
+authentication. It does not defend against on-path impersonation or reachable abuse.
 
 ## Registration and competing connections
 
@@ -50,7 +43,8 @@ session as occupying the registration until its finite establishment deadline ex
 
 * If the old registration has closed or expired, admit a new attempt under current
   deployment policy. No proof of historical ownership is required for unsecured use.
-* If the old registration is still live, reject a competing attempt unless an available
+* In v1, if the old registration is still live, reject a competing attempt. In future
+  secure integration, replacement requires an available
   authentication integration explicitly establishes continuity of that same participant
   and authorizes replacement. A shared broker login, copied GUID, certificate alone or
   client assertion does not establish this result.
@@ -114,8 +108,9 @@ A delayed bootstrap request is handled by attempt/challenge validation, not that
 
 REGISTER has no continuity credential. ACCEPT.continuity_credential is absent in v1.
 Its draft member ID is reserved for a future negotiated extension; nonempty values
-cannot authorize replacement and must be rejected as unsupported. No client-generated
-claim secret, broker token rotation or lost-token recovery protocol is required.
+cannot authorize replacement and must be rejected as unsupported. No token authorizes replacement in v1. D2 schedules a client-requested, single-use
+bearer continuity capability for v1.1; its rotation, binding and unresolved lost-reply
+requirements are specified in [the scope contract](broker-security-and-filtering.md).
 
 ## Exact introduction and registration correlation
 
@@ -140,7 +135,8 @@ introduction are conflicting reuse, not an identical retry. No hash includes ACC
 
 UDP cookies bind service identity/epoch, current return path, attempt/nonce, request digest
 and finite expiry through a reviewed protection provider. They grant return reachability
-only. TCP and already validated protected paths omit this exchange. Never use advertised
+only. TCP on the current connection omits this exchange; future protected paths require
+explicit evidence of current return reachability before doing so. Never use advertised
 locators as authority for the return destination or allow a valid cookie to recreate a
 retired introduction. Keep consumed-cookie protection until all associated cookies expire.
 

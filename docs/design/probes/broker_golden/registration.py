@@ -21,13 +21,13 @@ def mutable(fields):
     return struct.pack('<I', len(out)) + out
 
 def frame(op, body):
-    raw = b'ZZDBRK01' + struct.pack('<HHHHI', 1, 0, op, 1, len(body)) + body
+    raw = b'ZZDBRK03' + struct.pack('<HHHHI', 1, 0, op, 1, len(body)) + body
     padding = (-len(raw)) % 4
     return b'\0\7\0' + bytes([padding]) + raw + bytes(padding)
 
 intro, attempt, nonce = bytes([3])*16, bytes([1])*16, bytes([2])*16
 scope = struct.pack('<I', 6) + b'realm\0' + bytes(2) + struct.pack('<I', 7)
-limits = struct.pack('<IIQQIIQIIIQ', 4096, 2048, 65536, 65536, 32, 4, 8192, 2, 32, 4, 8192)
+limits = struct.pack('<IIQQIIQII', 4096, 2048, 65536, 65536, 32, 4, 8192, 32, 8192)
 features = struct.pack('<I', 0)
 pairs = struct.pack('<I', 2) + struct.pack('<H', 1) + bytes([8])*16 + bytes([9])*16 + struct.pack('<H', 2) + bytes([10])*16 + bytes([11])*16
 register = mutable([(1,None,intro), (2,None,attempt), (3,None,nonce), (4,None,scope),

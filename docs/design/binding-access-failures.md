@@ -1,6 +1,6 @@
 # Binding-visible prepared access failures
 
-Status: R3 mapping direction accepted, 2026-09-15. Source audit completed; no generator,
+Status: revised for D7/D8, 2026-09-28. Source audit completed; no generator,
 IDL or runtime implementation changed. This refines
 [synchronous output failure](synchronous-output-failure.md) and the selected
 [prepared access conflict policy](prepared-read-conflicts.md).
@@ -34,13 +34,14 @@ DDS adapter boundary, not in the standalone codec.
 | Valid fresh selection is empty | NO_DATA | None by this call |
 | Proven allocation failure, or configured preparation storage limit exhausted | OUT_OF_RESOURCES | None |
 | Truncated/invalid received representation or unsupported decoding of that representation | ERROR, decode diagnostic | None |
-| Four invalidated attempts exhausted with eligible data remaining | ERROR, conflict diagnostic | None |
+| Foreign conversion failure after selection | ERROR or OUT_OF_RESOURCES by cause; preserve language exceptions | READ/NOT_NEW retained; take claims restored only if still eligible |
 | Same-reader recursive preparation in one synchronous chain | ERROR, recursion diagnostic | None |
 | Recognized logical close before commit | ALREADY_DELETED | None |
 | Existing argument, condition, access-period or enablement precondition fails | Existing operation-specific result | None |
 | Unavoidable publication failure after commit | ERROR, or OUT_OF_RESOURCES for proven allocation failure; language exception rules below | Committed; output may be partial |
 
-The four-attempt value is the configurable initial default, not a hard-coded ABI.
+There is no stale-validation retry budget in the revised claim contract. The allocation/
+decode no-effect rows apply before selection; after selection use the foreign-failure row.
 Ordinary context contention is not storage exhaustion. No wait-for-data timeout is
 introduced. An unsupported optional operation/profile keeps its applicable UNSUPPORTED
 result; malformed incoming bytes do not make the caller's API arguments BAD_PARAMETER.
@@ -87,7 +88,8 @@ leases safely, then rethrow only after returning to the C++ boundary. No depende
 on allocating a diagnostic is allowed to make cleanup fail. Throwing destructors or
 non-returning callbacks are outside the recoverable exception contract.
 
-A failure before commit has no read/take effect. A publication exception after commit
+A failure before selection has no read/take effect. Foreign conversion failure after
+selection retains state effects and restores eligible take claims under D7/D8. A publication exception after commit
 may leave partial caller output and must never trigger automatic re-execution. A
 ReturnCode-only caller must follow this documented distinction; it cannot infer
 absence of effects from every non-OK code on arbitrary-output paths.
@@ -104,7 +106,7 @@ and may leave partial list output after a committed access.
 Typed convenience methods check the raw/prepared result explicitly. Genuine NO_DATA
 remains null for a single sample or an empty array for a batch. Other DDS failures
 throw a proposed unchecked zzdds AccessFailure carrying the DDS return code, a bounded
-reason enum and effect phase (not committed or committed). Define shared public error
+reason enum and effect phase (no selection effects, selection state committed, or consumption committed). Define shared public error
 metadata in zzdds.idl, not dcps.idl; attach a Java cause in the binding when available.
 Names/layout are integration work, not a new DDS ReturnCode or a standard DDS exception.
 
@@ -135,9 +137,9 @@ and evented execution make per-invocation results more reliable.
 
 Apply the preparation boundary to single and batch read/take, instance and next-instance
 selection, condition variants, raw copy and raw loan paths. Key-only invalid_data
-samples still need correct key decoding. Revalidate condition ownership/generation,
+samples still need correct key decoding. Validate condition ownership/generation,
 instance/cursor eligibility, ranks, sample/view state and GROUP access dependencies
-as applicable; do not copy plain FIFO selection into every variant. A successful read
+at selection; foreign conversion does not reselect after effects are committed. do not copy plain FIFO selection into every variant. A successful read
 can change read/view state even though it retains payloads.
 
 get_key_value, entity creation and WaitSet conversion share cleanup/error principles
@@ -159,3 +161,10 @@ additive C/C++ precise batch helper and unchecked Java convenience exception. Th
 settles R3's read/take failure mapping direction. The broader operation-variant audit and
 concrete IDL/bridge integration remain tracked separately; no claim that all binding
 or concurrency review items are closed follows from this decision.
+
+## Required binding limitation note
+
+Carry the known-limitation paragraph from [prepared access](prepared-read-conflicts.md)
+into every binding using foreign conversion: failed access may retain READ/NOT_NEW;
+NOT_READ/NEW filters can skip undelivered data; ANY-state retry is the workaround, subject
+to normal retention. Certified native eligibility is capability-based, not language-based.

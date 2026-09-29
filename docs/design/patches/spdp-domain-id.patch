@@ -1,0 +1,152 @@
+diff --git a/idl/rtps_discovery.idl b/idl/rtps_discovery.idl
+index abd87ab..5d5dca2 100644
+--- a/idl/rtps_discovery.idl
++++ b/idl/rtps_discovery.idl
+@@ -79,6 +79,7 @@
+
+ @mutable @pl_retain_unknown
+ struct SPDPdiscoveredParticipantData {
++    @id(0x000f) @optional unsigned long domainId; // always emitted; absent defaults to receiver domain
+     @id(0x0015)           ProtocolVersion_t protocolVersion;   // always emitted ({2,5})
+     @id(0x0016)           VendorId_t        vendorId;          // always emitted
+     @id(0x0050) @optional octet             participantGuid[16]; // prefix[12] + entityId[4]; zzdds always emits it; decode trusts the RTPS message header's own (transport-verified) guid_prefix instead, using this field only as a mismatch check -- never as an override
+diff --git a/src/discovery/spdp.zig b/src/discovery/spdp.zig
+index eb708ac..eee5d74 100644
+--- a/src/discovery/spdp.zig
++++ b/src/discovery/spdp.zig
+@@ -545,6 +545,12 @@ pub const SpdpEndpoints = struct {
+             log.spdp.warn("spdp: decode error: {}", .{err});
+             return;
+         };
++        // RTPS 2.5 §8.5.5.1: reject a foreign domain before learning locators
++        // or refreshing participant state. An absent PID uses the local default.
++        if (kp.data.domain_id != self.domain_id) {
++            kp.deinit();
++            return;
++        }
+         self.filterKnownParticipantLocators(&kp);
+         const now_ns = self.clock.nowNs();
+         kp.expires_ns = now_ns + @as(i64, @intCast(kp.data.lease_duration_ms)) * std.time.ns_per_ms;
+@@ -892,6 +898,7 @@ pub fn encodeSpdpParticipant(alloc: std.mem.Allocator, ann: *const ParticipantAn
+     });
+
+     var out: Disc.SPDPdiscoveredParticipantData = .{
++        .domainId = ann.domain_id,
+         .protocolVersion = .{ .major = 2, .minor = 5 },
+         .vendorId = .{ .vendorId = pid_mod.ZZDDS_VENDOR_ID },
+         // RTPS §9.3.1.5: a participant's GUID entity_id is always the
+@@ -1005,7 +1012,7 @@ pub fn decodeSpdpParticipant(
+                 .prefix = decoded_prefix,
+                 .entity_id = EntityIds.participant,
+             },
+-            .domain_id = domain_id,
++            .domain_id = data.domainId orelse domain_id,
+             .name = name,
+             .metatraffic_unicast_locators = meta_uc,
+             .metatraffic_multicast_locators = meta_mc,
+diff --git a/test/discovery/spdp_lease_test.zig b/test/discovery/spdp_lease_test.zig
+index a538bd4..4e77082 100644
+--- a/test/discovery/spdp_lease_test.zig
++++ b/test/discovery/spdp_lease_test.zig
+@@ -803,3 +803,35 @@ test "SPDP: start() does not leak the writer when a later allocation fails" {
+
+     try testing.expectError(error.OutOfMemory, spdp.start(&local, &c));
+ }
++
++test "SPDP: foreign explicit domain neither installs nor refreshes a participant" {
++    const alloc = testing.allocator;
++    const net = try MockNetwork.init(alloc);
++    defer net.deinit();
++    const mt = try MockTransport.init(alloc, net, &.{});
++    defer mt.deinit();
++    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
++    defer spdp.deinit();
++    var clock = ManualClock.init(0);
++    spdp.setClock(clock.clock());
++    var tr = Tracker{};
++    const c = tr.cbs();
++    spdp.callbacks = &c;
++    const peer = prefix(0xCC);
++    const payload = try buildPayload(alloc, peer, 500);
++    defer alloc.free(payload);
++    var foreign: std.ArrayList(u8) = .empty;
++    defer foreign.deinit(alloc);
++    try foreign.appendSlice(alloc, payload[0..4]);
++    try foreign.appendSlice(alloc, &.{ 0x0f, 0, 4, 0, 7, 0, 0, 0 });
++    try foreign.appendSlice(alloc, payload[4..]);
++    spdp.processSpdpPayload(peer, 1, foreign.items, .{ .bytes = .{ 0, 0 } });
++    try testing.expectEqual(@as(u32, 0), tr.discovered);
++    try testing.expectEqual(@as(usize, 0), spdp.known.count());
++    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0, 0 } });
++    const expiry = spdp.known.get(peer).?.expires_ns;
++    spdp.processSpdpPayload(peer, 2, foreign.items, .{ .bytes = .{ 0, 0 } });
++    try testing.expectEqual(expiry, spdp.known.get(peer).?.expires_ns);
++    try testing.expectEqual(@as(i64, 1), spdp.known.get(peer).?.last_writer_sn);
++    try testing.expectEqual(@as(u32, 1), tr.discovered);
++}
+diff --git a/test/discovery/wire_golden_test.zig b/test/discovery/wire_golden_test.zig
+index 334ea89..843d22d 100644
+--- a/test/discovery/wire_golden_test.zig
++++ b/test/discovery/wire_golden_test.zig
+@@ -194,7 +194,7 @@ test "SPDP decode round-trips locators, name, lease, and builtin endpoint set" {
+     defer kp.deinit();
+
+     try testing.expectEqual(ann_guid.prefix, kp.data.guid.prefix);
+-    try testing.expectEqual(@as(u32, 7), kp.data.domain_id);
++    try testing.expectEqual(@as(u32, 0), kp.data.domain_id);
+     try testing.expectEqualStrings("node1", kp.data.name);
+     try testing.expectEqual(@as(u32, 10_000), kp.data.lease_duration_ms);
+     try testing.expectEqual(@as(u32, 0x0000_0c3f), kp.data.builtin_endpoint_set);
+@@ -318,18 +318,43 @@ const EXPECTED_R_PART = [_]u8{
+ };
+
+ const EXPECTED_SPDP = [_]u8{
+-    0x00, 0x03, 0x00, 0x00, 0x15, 0x00, 0x04, 0x00, 0x02, 0x05, 0x00, 0x00, 0x16, 0x00, 0x04, 0x00,
+-    0x01, 0x1b, 0x00, 0x00, 0x50, 0x00, 0x10, 0x00, 0xe5, 0xe5, 0xe5, 0xe5, 0xe5, 0xe5, 0xe5, 0xe5,
+-    0xe5, 0xe5, 0xe5, 0xe5, 0x00, 0x00, 0x01, 0xc1, 0x58, 0x00, 0x04, 0x00, 0x3f, 0x0c, 0x00, 0x00,
+-    0x02, 0x00, 0x08, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0x18, 0x00,
+-    0x01, 0x00, 0x00, 0x00, 0xf2, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-    0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x31, 0x00, 0x18, 0x00, 0x01, 0x00, 0x00, 0x00,
+-    0xf3, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-    0x0a, 0x00, 0x00, 0x01, 0x62, 0x00, 0x0c, 0x00, 0x06, 0x00, 0x00, 0x00, 0x6e, 0x6f, 0x64, 0x65,
+-    0x31, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
++    0x00, 0x03, 0x00, 0x00, // encapsulation
++    0x0f, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // explicit domain 0
++    0x15, 0x00, 0x04, 0x00, 0x02, 0x05, 0x00, 0x00,
++    0x16, 0x00, 0x04, 0x00, 0x01, 0x1b, 0x00, 0x00,
++    0x50, 0x00, 0x10, 0x00, 0xe5, 0xe5, 0xe5, 0xe5,
++    0xe5, 0xe5, 0xe5, 0xe5, 0xe5, 0xe5, 0xe5, 0xe5,
++    0x00, 0x00, 0x01, 0xc1, 0x58, 0x00, 0x04, 0x00,
++    0x3f, 0x0c, 0x00, 0x00, 0x02, 0x00, 0x08, 0x00,
++    0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x32, 0x00, 0x18, 0x00, 0x01, 0x00, 0x00, 0x00,
++    0xf2, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x0a, 0x00, 0x00, 0x01, 0x31, 0x00, 0x18, 0x00,
++    0x01, 0x00, 0x00, 0x00, 0xf3, 0x1c, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01,
++    0x62, 0x00, 0x0c, 0x00, 0x06, 0x00, 0x00, 0x00,
++    0x6e, 0x6f, 0x64, 0x65, 0x31, 0x00, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x00,
+ };
+
+ const EXPECTED_DISPOSE = [_]u8{
+     0x00, 0x03, 0x00, 0x00, 0x5a, 0x00, 0x10, 0x00, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6,
+     0xf6, 0xf6, 0xf6, 0xf6, 0x00, 0x00, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00,
+ };
++
++test "SPDP explicit domain ID is independent of receiver domain and byte order" {
++    const prefix = guid(0x7A, 0).prefix;
++    const little = [_]u8{ 0, 3, 0, 0, 0x0f, 0, 4, 0, 42, 0, 0, 0, 1, 0, 0, 0 };
++    const big = [_]u8{ 0, 2, 0, 0, 0, 0x0f, 0, 4, 0, 0, 0, 42, 0, 1, 0, 0 };
++    for ([_][]const u8{ &little, &big }) |payload| {
++        var kp = try spdp.decodeSpdpParticipant(alloc, prefix, 7, payload, .{ .bytes = .{ 0, 0 } });
++        defer kp.deinit();
++        try testing.expectEqual(@as(u32, 42), kp.data.domain_id);
++    }
++    const absent = [_]u8{ 0, 3, 0, 0, 1, 0, 0, 0 };
++    var kp = try spdp.decodeSpdpParticipant(alloc, prefix, 7, &absent, .{ .bytes = .{ 0, 0 } });
++    defer kp.deinit();
++    try testing.expectEqual(@as(u32, 7), kp.data.domain_id);
++}

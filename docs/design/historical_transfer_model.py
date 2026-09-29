@@ -1,3 +1,4 @@
+# Historical pre-review model: excluded from maintained design validation; see test/design-models/README.md.
 """Bounded historical wait: one captured source, two covered sequence positions.
 
 Protocol receipt/GAP accounting is separate from retained DDS processing. Boundary

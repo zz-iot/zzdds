@@ -37,8 +37,6 @@ kind = "broker"
 
 [discovery.broker]
 addresses = ["tcp://discovery.example.net:7443"]
-security = "authenticated"
-credential_ref = "workload-identity"
 ```
 
 The same domain tag applies with ordinary multicast, directed SPDP, mixed discovery,

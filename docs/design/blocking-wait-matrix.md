@@ -1,5 +1,11 @@
 # Blocking waits and closure: L5 decision matrix
 
+Review scope (2026-09-28): [fast paths](concurrency-fast-paths.md) governs INSTANCE/TOPIC
+specialization and hosted/manual helping. Publisher tickets/group gates below apply only
+to GROUP coordination, not every ordinary write. Foreign hooks run outside owner rights.
+[Selection/claims](prepared-read-conflicts.md) replaces optimistic read/take validation;
+listener preparation retries remain separate. Dated experiments describe their own scope.
+
 Status: operation-policy consolidation, 2026-09-15. Existing callback, writer commit
 and deletion decisions remain authoritative. Linked wait contracts and result-mapping
 direction are accepted; concrete variant/runtime integration remains an audit gate.
@@ -87,14 +93,11 @@ callback that is waiting. The library must not promise eventual success for eith
    no implicit resume/end and bounded aggregation validation. This decision is
    complete; concrete runtime integration remains an implementation task.
 3. Resolve WaitSet and historical waits, including manual/cross-runtime progress.
-   The [historical-data investigation](historical-data-wait.md) now records current
-   first-heartbeat/ever-matched behavior and accepted fixed known-source scope,
-   including immediate OK for an empty captured set. Receive-versus-protocol
-   completion uses the accepted receive-processing direction. Reliable-transfer
-   boundaries/departure direction and best-effort timeout risk are selected in that
-   document; bounded transfer validation passes 59,320 scenario-states and 182,540
-   transitions. Best-effort alone does not
-   make the wait unsupported or complete without evidence.
+   [Historical waits](historical-data-wait.md) now use D1: VOLATILE, BEST_EFFORT and
+   an empty captured known-source set return OK after ordinary validation. BEST_EFFORT
+   logs once per reader; OK means no obligation, not verified transfer. Reliable
+   obligations retain protocol plus final-processing completion. Earlier BE timeout
+   traces are historical and do not validate this revised fast return.
    The [WaitSet proposal](waitset-wait.md) separates standard single-waiter/live
    attachment rules from proposed observation, lifetime and helping boundaries.
    Temporary result ownership across concurrent detach/delete is accepted and

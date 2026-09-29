@@ -112,7 +112,10 @@ RuntimeRef get_runtime();
 
 struct ParticipantConcurrencyConfig {
     @default(8) unsigned long delegation_nesting_limit;
-    @default(4) unsigned long prepared_access_stale_validation_limit;
+    @default(2) unsigned long listener_preparation_attempts_per_turn;
+    @default(8) unsigned long listener_stale_validation_limit;
+    @default(1) unsigned long listener_retry_initial_ms;
+    @default(1000) unsigned long listener_retry_max_ms;
 };
 // Additional fields in zzdds::DomainParticipantConfig:
 // RuntimeSelection runtime_selection;
@@ -121,9 +124,9 @@ struct ParticipantConcurrencyConfig {
 ```
 
 Names are draft spellings of the accepted inventory, not production declarations.
-The two numeric defaults are build-changeable; the generated default-config path
+These numeric defaults are build-changeable; the generated default-config path
 must reflect the selected build defaults consistently across bindings rather than
-hard-code the illustrative annotation values independently. Both limits are positive,
+hard-code the illustrative annotation values independently. Counts and delays are positive; initial retry delay must not exceed its cap. They are
 finite and fixed at participant creation. Cross-participant delegation uses the
 accepted minimum limit along the chain. Standard creation receives these same defaults.
 
@@ -264,7 +267,7 @@ emission and aggregate C-ABI conversion gaps. The declarations above remain a
 semantic draft; do not apply them to production IDL until the documented generator
 work or an explicitly reviewed alternative representation is ready.
 
-The [generic binding requirements](../../../zidl/docs/design/construction-reference-bindings.md)
+The [generic binding requirements](https://github.com/zz-iot/zidl/blob/6f69558/docs/design/construction-reference-bindings.md)
 now define the required sequence, mixed-Config and TOML behavior: independent owned
 elements, staged cloning with rollback, safe defaults, and file overlays that preserve
 programmatic references and reject attempts to configure them from a file. Mixed

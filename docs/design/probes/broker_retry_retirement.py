@@ -1,3 +1,4 @@
+# Historical pre-review model: excluded from maintained design validation; see test/design-models/README.md.
 """Bounded abstract protocol checks; no sockets, cryptography or production code."""
 from collections import deque
 from itertools import permutations

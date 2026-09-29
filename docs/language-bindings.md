@@ -204,3 +204,23 @@ on `zidl` that pins the generated import paths and interface shapes to a named
 API tier. zzdds maintains that tier throughout a major version — the same
 pattern protobuf/gRPC use for generated stub compatibility. This flag is not
 yet implemented; it becomes relevant when the first stable API tier is declared.
+
+## Planned read/take failure contract
+
+The concurrency specification proposes the following behavior; it is not a claim that
+current generated helpers already implement it. Bindings using foreign conversion
+(for example Java, or conversion with application hooks) may fail after sample selection.
+Such a failure leaves selected samples READ and their instances NOT_NEW. A later read/take
+using NOT_READ or NEW masks, including equivalent ReadCondition/QueryCondition masks, may
+skip samples the application never received.
+
+After that failure, retry with ANY sample and view state masks if recovery is needed,
+subject to normal retention/expiry/deletion. Applications unable to tolerate this should
+avoid those state filters on such bindings. Failed takes restore still-eligible retained
+samples, but can temporarily hide them from concurrent callers. The certified native path
+is unaffected only when conversion and final transfer are non-reentrant and infallible
+after selection; C/C++/Zig language choice alone does not establish that capability.
+
+See [the access contract](design/prepared-read-conflicts.md) and
+[binding result mappings](design/binding-access-failures.md) for effect phases and the
+separate case of an output container failing after successful consumption.

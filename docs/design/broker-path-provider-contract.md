@@ -91,37 +91,25 @@ access. Global storage bounds remain mandatory even if source addresses are vari
 After validation, introduction/session quotas, finite deadlines and service authorization
 still apply. No identity blacklist or permanent ownership record is introduced.
 
-## Protected and connected path provider boundary
+## Connected paths and future security integration
 
-The internal provider supplies a generation-fenced association/path handle, current return-
-path validation state, protection/handshake completion state, authenticated service principal
-when available, authorization result for the requested scope, and bounded send overhead.
-These are distinct results, not one `secure` boolean. No generated DDS API changes follow.
+The internal provider supplies a generation-fenced association/path handle, current
+return-path validation and bounded send overhead. TCP supplies return reachability on
+that connection; UDP uses the challenge above. Neither authenticates the participant.
+V1 supports traditional insecure cached discovery and has no mandatory TLS/DTLS provider.
 
-* Established plain TCP supplies return reachability on that connection, not identity or
-  authorization. It skips PATH under explicitly selected trusted-network policy.
-* Plain UDP uses the challenge above under trusted-network policy. That policy is an
-  explicit deployment choice, not evidence of resistance to on-path impersonation.
-* Authenticated mode requires a configured, supported provider: authenticate the intended
-  broker, protect both directions, and establish client service access according to the
-  deployment's credentials and scope policy before admission. Missing provider/credentials
-  are configuration failures; no plaintext fallback. Transport login alone never proves
-  continuity of a DDS participant or authorizes live GUID takeover.
-* Complete configured protection before broker messages; accept no broker early data.
-  Require provider replay detection for datagrams plus broker duplicate/session checks.
-  [TLS 1.3 §8](https://www.rfc-editor.org/rfc/rfc8446.html#section-8) describes early-data
-  replay concerns; [DTLS 1.3 §3.4](https://www.rfc-editor.org/rfc/rfc9147.html#section-3.4)
-  distinguishes datagram replay properties from TLS.
-* Skip PATH only with evidence for the current return path. A connection ID or authenticated
-  packet from a new address alone is insufficient. If migration validation is unsupported,
-  require a fresh supported association/introduction; do not silently reuse old validation.
-* Revocation/closure invalidates bound work and cached success. Protection-key updates
-  within a surviving validated association need not create a new registration, but may
-  not erase application replay guards or change authorization silently.
+Future DDS Security integration adds distinct authentication, permissions and protection
+results, not one `secure` boolean. It must protect the vendor endpoints explicitly and
+validate UDP return reachability before expensive security work. No plaintext fallback.
+Broker messages cannot bypass required authentication via ordinary SPDP endpoint matching.
+No authenticated support may be advertised before actual UDP and TCP integration tests.
 
-No specific TLS/DTLS backend or public-internet conformance is certified here. Provider
-capabilities must be checked before advertising authenticated support. Future DDS Security
-authentication, access control and protected discovery remain a separate integration gate.
+Skip PATH only with evidence for the current return path. A connection ID or an
+authenticated packet from a new address alone is insufficient. If validated migration
+is unsupported, use fresh association/introduction. Closure/revocation fences bound work;
+key updates cannot erase replay guards or silently change authorization. Optional transport
+security is later scope and must document its own early-data/replay/migration behavior.
+See [security and filtering](broker-security-and-filtering.md).
 
 ## Acceptance evidence required
 
@@ -129,8 +117,8 @@ Test concurrent duplicate consumption; unknown/altered token and every changed b
 field; exact expiry; lost challenge/offer; early pending eviction; replay after introduction
 retirement; restart/socket-generation replacement; allocation failure at each reservation;
 CSPRNG failure/collision handling; and byte/rate accounting under repeated/spoofed traffic.
-Verify retained memory remains bounded when sources vary. Test revoked protection, early
-data rejection, unvalidated migration, handshake overhead and missing-provider failures.
+Verify retained memory remains bounded when sources vary. For later secure support, additionally test revoked protection, unvalidated migration,
+handshake overhead and missing-security-support failures.
 
 Existing codec vectors demonstrate the opaque field's capacity, not these properties.
 The 64-byte-cookie sizing fixture is a ceiling exercise and stays valid even though the

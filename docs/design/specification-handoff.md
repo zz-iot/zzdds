@@ -1,6 +1,6 @@
 # Concurrency and discovery broker: specification handoff
 
-Design baseline, 2026-09-24. This closes the current directional specification effort.
+Design baseline, 2026-09-28. This closes the current directional specification effort.
 Both packages are ready to guide implementation and focused review within their stated
 scope. Neither a frozen public ABI nor a deployed broker wire protocol is claimed.
 
@@ -34,8 +34,11 @@ continues independently of broker availability. Directed SPDP carries per-transm
 inline service context while canonical participant payloads remain unchanged. Plain UDP
 uses bounded pending challenges; REGISTER/ACCEPT establish fenced sessions, fresh origin
 inventory and independent downstream synchronization. WLP and user data remain direct.
-GUID identity does not imply authentication; service protection and future DDS Security
-participant authentication remain distinct.
+V1 is insecure. Secure cached discovery later derives from DDS Security; there is no
+independent broker credential selector or mandatory TLS/DTLS-first deployment. Operator
+ceilings precede required conservative topic/partition candidate filtering. Ordered STATE
+and aggregate freshness replace chunked proofs; final established encoding replaces
+mutable established bodies. Resume resolves retained identity without transaction digests.
 
 The latest implementation directions are bounded stateful cookies (32-byte provider value
 within the existing opaque 64-byte wire bound), strict borrowed decoding with explicit
@@ -50,7 +53,7 @@ mandated zidl API spelling. No additional product-policy question was found in t
 | Concurrency implementation | Real manual/hosted lifecycle, scheduler/queue fairness, cancellation, callback exclusion, output failure and retirement tests; latency and memory measurements |
 | Public API/ABI publication | Production zzdds.idl declarations and generic zidl mappings, defaults/ownership/error behavior across C, Zig, C++ and Java; compatibility/version rollout |
 | Broker inline introduction | Unchanged canonical sample with directed context; both SPDP ingress paths preserve effective identity/path; duplicate, endian, size and channel-lifetime tests |
-| Path/protection implementation | Entropy and pending/consumed challenge bounds, atomic consumption, replay/expiry/rate accounting; configured protection, revocation and migration behavior for each advertised backend |
+| Path/protection implementation | Entropy and pending/consumed challenge bounds, atomic consumption, replay/expiry/rate accounting; future DDS Security protection/revocation evidence before advertising secure support |
 | Broker codec/storage | Required/unique members, nested exact bounds, raw-byte retention, allocation-failure cleanup, bounded reassembly, peak native memory and independent byte agreement |
 | Broker protocol integration | Loss/reorder/duplicate tests across introduction, inventory, view, freshness and close; source coexistence, enable/ignore rules, domain ID/tag and endpoint identity allocation |
 | Release/compatibility publication | Explicit version/assignment review after wire-affecting findings; supported platform/profile/transport regression evidence and documented deployment limits |
@@ -88,15 +91,18 @@ or merge/publish the current checkout as part of this documentation task.
 
 ## Evidence inventory and limits
 
-The 2026-09-23 refreshed generator passed 20 broker codec tests; 49 independent byte/hash
-vectors cover the current draft. The registry checker covers 27 operations, 30 mutable
-member-ID sets and 17 discriminator namespaces. Earlier bounded concurrency models and
-binding experiments retain their individual scope/limitations; their counts do not add
-up to validation of a complete runtime. PR #92 was source-reviewed at 8fc4ab1, not executed.
+Current evidence: 23 generated codec tests, 53 independent vectors, 27 operation mappings,
+8 mutable fixture/legacy/bootstrap member sets, and 17 discriminator namespaces. New
+bounded models and traces cover selection claims, coherent sealing, aggregate freshness
+and retained baseline identity. [Validation inventory](../../test/design-models/README.md)
+records exact commands, state counts and limits. No complete network, security or runtime
+correctness claim follows; PR #92 remains a source review at its recorded head.
 
-This handoff changes documentation only. The final checks rerun the independent vectors,
-registry consistency, local links in the current handoff entry points and whitespace.
-No fresh production-network, security-provider or complete binding test result is claimed.
+Historical review ledgers and superseded rules are in `archive/review-baseline/`.
+[Review decisions](review-decisions.md) maps accepted concerns to current contracts.
+Production-fix separation and dedicated experiment targets are described in
+[merge preparation](review-merge-preparation.md); no commits or history rewrite are part
+of this documentation task.
 
 ## Definition of done for this effort
 

@@ -40,6 +40,22 @@ env:
   INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-bdcdd3b' }}
 
 jobs:
+  design-validation:
+    name: Specification models and prototypes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: "0.16.0"
+      - name: Maintained models and independent wire vectors
+        run: python3 scripts/check_design_specs.py
+      - name: Isolated concurrency prototypes
+        run: zig build --build-file test/concurrency/build.zig test
+      - name: Isolated concurrency prototypes under TSan
+        run: zig build --build-file test/concurrency/build.zig test-tsan
+
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
   test-linux:
     name: Linux x86_64

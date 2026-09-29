@@ -1,3 +1,4 @@
+// Draft revision 3 (ZZDBRK03), incompatible with prior drafts.
 // DESIGN ARTIFACT ONLY: provisional member IDs/bounds, not production wire ABI.
 // Operation codes, RTPS entity IDs, magic and encoding IDs require wire review.
 // See ../broker-wire-contract.md. Generated decoding is not admission validation.
@@ -54,10 +55,8 @@ module BrokerWireDraft {
         unsigned long maximum_records;
         unsigned long maximum_orphan_items;
         unsigned long long maximum_orphan_bytes;
-        unsigned long maximum_presence_queries;
-        unsigned long maximum_presence_entries;
-        unsigned long maximum_presence_chunks;
-        unsigned long long maximum_presence_bytes;
+        unsigned long maximum_freshness_exceptions;
+        unsigned long maximum_freshness_marker_bytes;
     };
     @final struct ResumeCursor {
         Id128 previous_epoch;
@@ -65,7 +64,6 @@ module BrokerWireDraft {
         unsigned long long previous_owner_generation;
         unsigned long long view_generation;
         unsigned long long snapshot_cut;
-        Digest256 snapshot_digest;
         unsigned long long applied_delivery_seq;
         boolean baseline_retained;
     };
@@ -215,11 +213,9 @@ module BrokerWireDraft {
         @id(23) @must_understand Id128 introduction_id;
     };
 
-    @mutable struct Envelope {
-        @id(1) @must_understand ScopeValue scope;
-        @id(2) @must_understand Id128 broker_epoch;
-        @id(3) @must_understand Id128 session_id;
-        @id(4) @must_understand unsigned long long owner_generation;
+    // Scope/session/epoch/owner generation come from the admitted endpoint association.
+    // IDs 1-4 are retired, never optional substitutes for missing association validation.
+    @final struct Envelope {
         @id(5) @must_understand Id128 request_id;
         @id(6) @must_understand FeatureIds required_features;
         @id(7) @must_understand BodyBytes operation_body;
@@ -252,41 +248,39 @@ module BrokerWireDraft {
         BodyBytes record_bytes;
     };
 
-    @mutable struct InventoryBegin {
+    @final struct InventoryBegin {
         @id(1) @must_understand unsigned long long inventory_generation;
         @id(2) @must_understand unsigned long long local_cut;
         @id(3) @must_understand unsigned long long record_count;
         @id(4) @must_understand unsigned long long total_record_bytes;
     };
-    @mutable struct InventoryRecord {
+    @final struct InventoryRecord {
         @id(1) @must_understand unsigned long long inventory_generation;
         @id(2) @must_understand RecordItem item;
     };
-    @mutable struct InventoryEnd {
+    @final struct InventoryEnd {
         @id(1) @must_understand unsigned long long inventory_generation;
         @id(2) @must_understand unsigned long long record_count;
-        @id(3) @must_understand Digest256 digest;
     };
 
-    @mutable struct ViewBegin {
+    @final struct ViewBegin {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand unsigned long long store_cut;
         @id(3) @must_understand unsigned long long record_count;
         @id(4) @must_understand unsigned long long total_record_bytes;
     };
-    @mutable struct ViewRecord {
+    @final struct ViewRecord {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand unsigned long long store_cut;
         @id(3) @must_understand RecordItem item;
     };
-    @mutable struct ViewEnd {
+    @final struct ViewEnd {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand unsigned long long store_cut;
         @id(3) @must_understand unsigned long long record_count;
-        @id(4) @must_understand Digest256 digest;
         @id(5) @must_understand unsigned long long ready_through_delivery_seq;
     };
-    @mutable struct Delta {
+    @final struct Delta {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand unsigned long long delivery_seq;
         @id(3) @must_understand unsigned short delta_kind;
@@ -297,27 +291,21 @@ module BrokerWireDraft {
         @id(8) @must_understand unsigned short removal_reason;
     };
 
-    const unsigned short PRESENCE_AVAILABLE = 1;
-    const unsigned short PRESENCE_UNAVAILABLE = 2;
-    @final struct PresenceEntry {
+    @final struct FreshnessException {
         GuidBytes participant_guid;
         Id128 incarnation_id;
-        unsigned long long freshness_generation;
-        unsigned long long remaining_lease_ns;
-        unsigned short availability;
+        unsigned long long remaining_lease_ns; // zero grants no new validity
     };
-    typedef sequence<PresenceEntry, 256> PresenceEntries;
-    @mutable struct PresenceProof {
+    typedef sequence<FreshnessException, 256> FreshnessExceptions;
+    @final struct FreshnessMarker {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand Id128 challenge_nonce;
-        @id(3) @must_understand unsigned long chunk_index;
-        @id(4) @must_understand unsigned long chunk_count;
-        @id(5) @must_understand PresenceEntries entries;
-        @id(6) @must_understand unsigned long long view_delivery_seq;
-        @id(7) @must_understand unsigned long long query_serial;
+        @id(3) @must_understand unsigned long long view_delivery_seq;
+        @id(4) @must_understand unsigned long long common_remaining_lease_ns;
+        @id(5) @must_understand FreshnessExceptions exceptions;
     };
 
-    @mutable struct ErrorBody {
+    @final struct ErrorBody {
         @id(1) @must_understand unsigned short error_code;
         @id(2) @must_understand unsigned short recovery_action;
         @id(3) @must_understand Id128 related_request;
@@ -347,8 +335,8 @@ module BrokerWireDraft {
     const unsigned short OP_RESYNC_REQUIRED = 18;
     const unsigned short OP_LEASE_CHALLENGE = 19;
     const unsigned short OP_LEASE_PROOF = 20;
-    const unsigned short OP_PRESENCE_QUERY = 21;
-    const unsigned short OP_PRESENCE_PROOF = 22;
+    const unsigned short RESERVED_OP_PRESENCE_QUERY = 21;
+    const unsigned short RESERVED_OP_PRESENCE_PROOF = 22;
     // Retired draft operations: reserved, not supported or negotiable in v1.
     const unsigned short RESERVED_OP_ROUTE = 23;
     const unsigned short RESERVED_OP_ROUTE_ERROR = 24;
@@ -360,6 +348,8 @@ module BrokerWireDraft {
     const unsigned short OP_PATH_CHALLENGE = 30;
     const unsigned short OP_PATH_RESPONSE = 31;
     const unsigned short OP_REGISTER = 32;
+    const unsigned short OP_FRESHNESS_QUERY = 33;
+    const unsigned short OP_FRESHNESS_MARKER = 34;
     const unsigned short RECORD_PARTICIPANT = 1;
     const unsigned short RECORD_WRITER = 2;
     const unsigned short RECORD_READER = 3;
@@ -393,6 +383,7 @@ module BrokerWireDraft {
     const unsigned short COMMIT_CLOSE = 3;
     const unsigned short VIEW_ALL = 1;
     const unsigned short VIEW_TOPIC_CANDIDATES = 2;
+    const unsigned short VIEW_TOPIC_PARTITION_CANDIDATES = 3;
     const unsigned short PROFILE_CACHED = 1;
     const unsigned short PROFILE_OPAQUE_PEER = 2;
     const unsigned short CHANNEL_CONTROL = 1;
@@ -413,6 +404,7 @@ module BrokerWireDraft {
     const unsigned short METADATA_INLINE_QOS = 3;
     const unsigned short FEATURE_TOPIC_CANDIDATES = 1;
     const unsigned short FEATURE_DOWNSTREAM_RESUME = 2;
+    const unsigned short FEATURE_TOPIC_PARTITION_CANDIDATES = 6;
     const unsigned short FEATURE_OPAQUE_PEER = 3;
     const unsigned short FEATURE_TYPE_LOOKUP_ROUTE = 4;
     const unsigned short FEATURE_SECURITY_ROUTE = 5;
@@ -438,10 +430,10 @@ module BrokerWireDraft {
         Id128 incarnation_id;
     };
     typedef sequence<ParticipantIdentity, 256> ParticipantIdentities;
-    @mutable struct Mutation {
+    @final struct Mutation {
         @id(1) @must_understand BodyBytes record_bytes;
     };
-    @mutable struct CommitReply {
+    @final struct CommitReply {
         @id(1) @must_understand Id128 related_request;
         @id(2) @must_understand unsigned short commit_kind;
         @id(3) @must_understand unsigned long long store_cut;
@@ -449,57 +441,61 @@ module BrokerWireDraft {
         @id(5) @must_understand EntityKey entity;
         @id(6) @must_understand unsigned long long origin_revision;
     };
-    @mutable struct RejectReply {
+    @final struct RejectReply {
         @id(1) @must_understand ErrorBody failure;
         @id(2) @must_understand unsigned long long inventory_generation;
     };
-    @mutable struct ViewRequest {
+    @final struct ViewRequest {
         @id(1) @must_understand unsigned short view_mode;
         @id(2) @must_understand boolean request_resume;
         @id(3) @must_understand ResumeCursor cursor;
         // Client-assigned, increasing within the admitted session; distinct from cursor.
         @id(4) @must_understand unsigned long long view_generation;
     };
-    @mutable struct Applied {
+    @final struct Applied {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand unsigned long long snapshot_cut;
-        @id(3) @must_understand Digest256 snapshot_digest;
         @id(4) @must_understand unsigned long long applied_delivery_seq;
     };
-    @mutable struct ViewSync {
+    @final struct ViewSync {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand unsigned long long ready_through_delivery_seq;
     };
-    @mutable struct ResyncRequired {
+    @final struct ResyncRequired {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand unsigned short reason;
         @id(3) @must_understand unsigned long long retry_after_ns;
     };
-    @mutable struct LeaseChallenge {
+    @final struct LeaseChallenge {
         @id(1) @must_understand Id128 challenge_nonce;
     };
-    @mutable struct LeaseProof {
+    @final struct LeaseProof {
         @id(1) @must_understand Id128 challenge_nonce;
     };
-    @mutable struct PresenceQuery {
+    @final struct FreshnessQuery {
         @id(1) @must_understand unsigned long long view_generation;
         @id(2) @must_understand Id128 challenge_nonce;
-        @id(3) @must_understand boolean full_view;
-        @id(4) @must_understand ParticipantIdentities participants;
-        @id(5) @must_understand unsigned long long query_serial;
     };
-    @mutable struct CloseRequest {
+    @final struct CloseRequest {
         @id(1) @must_understand ParticipantIdentity participant;
     };
-    @mutable struct ClosedReply {
+    @final struct ClosedReply {
         @id(1) @must_understand Id128 related_request;
         @id(2) @must_understand ParticipantIdentity participant;
         @id(3) @must_understand unsigned long long store_cut;
     };
-    @mutable struct StatusBody {
+    @final struct StatusBody {
         @id(1) @must_understand Id128 related_request;
         @id(2) @must_understand unsigned long long view_generation;
         @id(3) @must_understand unsigned long long inventory_generation;
         @id(4) @must_understand unsigned short status_code;
     };
+};
+
+// Test-only evolution fixture; not an operation or protocol type.
+module BrokerCodecProbe {
+ @mutable struct Evolution {
+  @id(1) @must_understand unsigned long long view_generation;
+  @id(2) @must_understand unsigned long long ready_through_delivery_seq;
+ };
 };

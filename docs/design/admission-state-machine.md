@@ -63,6 +63,9 @@ Publisher tickets complicate this boundary: assigning group order before writer 
 
 ### 4.1 Agreed: unnumbered tickets and bounded group commit
 
+This section is GROUP-specific. INSTANCE and TOPIC use the specialization in
+[fast paths](concurrency-fast-paths.md); neither acquires this gate for ordinary writes.
+
 A ticket records control generation, permitted coherent membership and one outstanding completion obligation. It does not allocate a writer sequence number or group sequence number. All storage and continuation credits are reserved before the ticket is issued. Cancellation before commit retires the ticket and releases storage without creating a sequence hole. Final coherent close counts actual committed changes, not tickets issued.
 
 The candidate final write transition holds writer execution rights and briefly claims a Publisher group-commit gate. Under that gate it validates ticket/deadline/cancellation state, claims commit, assigns writer/group sequence numbers and installs the prepared cache entry. Only then does it publish group progress and release the gate. The first committed member establishes the group's first sequence identifier. Empty/cancelled-only sets and end-marker sequencing need explicit treatment in the wire algorithm. GROUP sequence numbering also applies outside coherent brackets where required by the configured presentation scope.
@@ -96,7 +99,8 @@ mechanisms are not yet implemented in the fixed-record prototype.
 
 ## 5. Waiter sleep and shared runtime progress
 
-A synchronous caller observes its retained request and helps its shared runtime within the accepted budgets. It never needs to resume a private stack frame inside an unfinished protocol transition. Supported callback waits help protocol work while retaining callback exclusion.
+An ordinary hosted caller observes its retained request while runtime workers progress it.
+Manual/callback-chain waiters help the shared runtime within accepted budgets. It never needs to resume a private stack frame inside an unfinished protocol transition. Supported callback waits help protocol work while retaining callback exclusion.
 
 Sleeping needs a predicate/wakeup handshake: register wake interest, recheck completion/ready work/due timers, and atomically arm the wait relative to producers, or use an equivalent monotonic wake sequence protocol. Completion before registration must be found by the recheck; completion afterwards must wake the waiter. Spurious wakes recheck predicates. Select the earliest relevant operation or runtime timer deadline.
 

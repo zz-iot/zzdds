@@ -8,7 +8,7 @@ constants = dict((name, int(value, 0)) for name, value in re.findall(
     r'const\s+(?:unsigned short|unsigned long|octet)\s+(\w+)\s*=\s*(0x[0-9a-fA-F]+|\d+)\s*;', schema))
 ops = {name.removeprefix('OP_'): value for name, value in constants.items() if name.startswith('OP_')}
 reserved = {value for name, value in constants.items() if name.startswith('RESERVED_OP_')}
-assert len(ops) == 27 and reserved == {1, 2, 3, 23, 24}
+assert len(ops) == 27 and reserved == {1, 2, 3, 21, 22, 23, 24}
 assert len(set(ops.values())) == len(ops) and not set(ops.values()) & reserved
 registry = (root / 'broker-wire-registry.md').read_text()
 rows = {name: int(code) for code, name in re.findall(r'^\| (\d+) \| ([A-Z_]+) \|', registry, re.M)}
@@ -16,6 +16,17 @@ assert rows == ops, (rows, ops)
 admission = (root / 'broker-operation-validation.md').read_text()
 for name, code in ops.items():
     assert re.search(rf'^\| {code} {name} \|', admission, re.M), name
+# Draft 3 has a deliberately small mutable bootstrap boundary. Everything else
+# is positional; Evolution is only a decoder characterization fixture.
+shapes = dict((name, kind) for kind, name in re.findall(
+    r'@(mutable|final|appendable)\s+struct\s+(\w+)', schema))
+mutable = {'LegacyHello', 'LegacyChallenge', 'LegacyOpenRequest', 'PathChallenge',
+           'RegisterRequest', 'AdmissionReject', 'AcceptReply', 'Evolution'}
+assert {name for name, kind in shapes.items() if kind == 'mutable'} == mutable
+assert all(kind == 'final' for name, kind in shapes.items() if name not in mutable)
+assert shapes['Envelope'] == 'final'
+assert 'snapshot_digest' not in schema
+assert not re.search(r'Digest256\s+digest\s*;', schema)
 count = 0
 for name, body in re.findall(r'@mutable\s+struct\s+(\w+)\s*\{(.*?)\};', schema, re.S):
     ids = [int(i) for i in re.findall(r'@id\((\d+)\)', body)]

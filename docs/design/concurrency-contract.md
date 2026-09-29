@@ -1,6 +1,6 @@
 # Concurrency contract: consolidated decision baseline
 
-Status: v1 behavioral implementation baseline, 2026-09-17. This is the reading
+Status: v1 behavioral implementation baseline, 2026-09-28. This is the reading
 entry point for accepted concurrency policy, not a production implementation or ABI
 readiness claim. Detailed linked contracts govern operation-specific behavior.
 See the [readiness review](concurrency-final-review.md) for scope and outstanding
@@ -19,7 +19,15 @@ waits, network operations or application callbacks. Eligible inline execution pr
 the low-latency path; listener safety is not disabled by a performance build option.
 Internal protocol progress is independent of automatic callback dispatch. Optional
 profiles must compile out their exclusive machinery; GROUP-disabled builds do not
-inherit group-view state solely to support ordinary operations.
+inherit group-view state solely to support ordinary operations. INSTANCE writes use no
+GROUP Publisher ticket/gate. TOPIC coherent completion uses reserved retained seal work;
+GROUP alone uses the shared-order commit protocol. Foreign preparation occurs outside
+rights, and initial send may run on the same executor after commit rights are released.
+See [fast paths](concurrency-fast-paths.md) for the controlling specialization.
+
+Ordinary hosted callers do not help by default; retained workers provide background
+progress. Manual drivers and callback-chain waits provide bounded internal helping,
+without recursive automatic callbacks. Fairness need not use a shared per-call counter.
 
 Details: [owner/progress model](concurrency-model.md), [admission](admission-state-machine.md),
 [prepared commits](commit-preparation.md), [request lifetime](request-lifetime.md).
@@ -59,7 +67,12 @@ serviceable during lifecycle coordination. Bindings must distinguish delivery fa
 from an operation that never committed.
 
 The [operation-result mappings](operation-result-mapping.md) are accepted as the
-mapping direction. The writer/reader variant audits and accepted binding failure contract refine it.
+mapping direction. [Read/take selection and claims](prepared-read-conflicts.md) controls
+D7/D8: certified infallible native access has no claims/retry; foreign access commits
+READ/NOT_NEW at selection and hides take claims. Failed conversion restores only eligible
+retained samples, retaining state effects. NOT_READ/NEW filters may skip undelivered data;
+ANY-state retry is a documented recovery option, subject to ordinary retention. The
+writer/reader variant audits and binding failure contract refine the other operations.
 Actual generated conversion and production variant coverage remain implementation
 gates, not evidence supplied by scalar models.
 
@@ -68,7 +81,7 @@ gates, not evidence supplied by scalar models.
 | Writer ACK | Fixed committed sequence and relevant association generations; ACK or logical unmatch retires obligations |
 | Publisher ACK | Fixed writer membership, independent writer captures, one deadline; outstanding placeholders include uncaptured writers |
 | WaitSet | One admitted invocation, live attachments, level observation and retained selected results; close is non-draining; default runtime resolved per invocation |
-| Historical data | Known sources, empty-set OK, finite per-association history boundary; protocol accounting plus final DDS processing; missing best-effort evidence can wait until timeout or forever |
+| Historical data | Known sources, empty-set OK, finite per-association history boundary; protocol accounting plus final DDS processing; BEST_EFFORT/VOLATILE return immediate OK with the defined no-obligation meaning |
 
 Each wait has its own close/departure rules and no general guarantee of arbitrary
 application deadlock avoidance. See the [L5 matrix](blocking-wait-matrix.md) and linked
@@ -138,8 +151,8 @@ publication, transport backpressure, malformed-input/resource fault injection, m
 and hosted progress tests, optional-profile builds and latency/size measurements.
 Do not invent measured performance or size savings from the abstract architecture.
 
-The final consistency review is recorded. Next reconcile the broker specification;
-it need not await production refactoring or a complete MCU port.
+Review revisions and their evidence are recorded in [the decision index](review-decisions.md).
+Production refactoring and a complete MCU port are separate delivery milestones.
 
 ## Extension surface consolidation
 

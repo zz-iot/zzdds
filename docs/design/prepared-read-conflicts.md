@@ -1,112 +1,92 @@
-# Prepared read/take conflicts
+# Prepared read/take: selection, claims and failure
 
-Status: selected initial R3 policy, bounded-model checked, 2026-09-15.
-No production implementation change; binding mappings are accepted in
-[binding-access-failures.md](binding-access-failures.md).
+Status: revised behavioral contract, 2026-09-28, implementing user decisions D7/D8.
+Replaces optimistic validation and the four-conflict ERROR budget. The old policy/model
+is historical, not evidence for this replacement. See [decisions](review-decisions.md).
 
-## Recommended initial approach
+## Admission and conversion capability
 
-Use optimistic candidate retention, validation and whole-batch commit. Holding a
-payload pin does not reserve the sample against another consumer, preserve its
-eligibility or publish an application loan. Other read/take, receive, lifecycle and
-presentation operations keep their normal admission. No reader turn, protocol lock
-or shared-consumption reservation spans foreign conversion.
+Validate arguments, enablement, reader lifetime, masks, condition and presentation access
+before effects. Bound candidate pins, output and restoration bookkeeping per reader and
+runtime. Exhaustion before selection has no access effect. Select the entire collection
+under the relevant reader/presentation ownership and capture its SampleInfo at that point.
+Ranks and view state use that observation, not a later decode completion time.
 
-At selection capture sample lifetime/generation, immutable payload and dependencies
-that determine membership, returned SampleInfo, ordering and access legality. At
-commit validate those dependencies under their authoritative ownership. Relevant
-changes include another take, sample/view/instance state change, expiry, query or
-access-generation change and logical close. A new unrelated sample need not invalidate
-an attempt unless it affects required ordering/rank/metadata. Do not use one blanket
-reader-update version that restarts every conversion under continuous ingress.
+Two paths share those semantics:
 
-Commit all prepared samples and their read/take/loan effects in one logical operation,
-or none of that attempt. Do not silently publish only the surviving subset: its
-SampleInfo/ranks, next-instance cursor and requested ordering may no longer match the
-prepared batch. A validated selection must satisfy the applicable DDS operation;
-this document does not declare arbitrary retained subsets valid for every variant.
-Where final metadata can be filled without failure at commit, the generator can do
-so; otherwise its prepared value participates in validation.
+* Certified native: conversion and output transfer are non-reentrant and bounded. Validate
+  representation, reserve all nested output/loan storage and ensure final transfer cannot
+  fail before irreversible selection effects. Native language or library allocator alone
+  is not certification. Conversion may then execute under reader rights without claims or
+  retry. If these properties cannot be established, use the foreign path.
+* Foreign: capture immutable payloads and commit READ/NOT_NEW state at selection. For take,
+  install claims atomically with selection; for read, retain payload pins without hiding
+  samples. Release protocol rights before conversion, cleanup or application code.
 
-## Retry and result policy
+No stale-validation retry or conflict-exhaustion ERROR applies. Same-reader recursive
+foreign preparation retains the explicit recursion guard; removing optimistic retries
+alone does not authorize unbounded recursive conversion.
 
-On a conflict, release attempt-local typed output and pins outside locks, then make
-a fresh selection under normal admission. Reuse immutable decoded payload only when
-its exact identity, representation and ownership remain valid; never reuse stale
-SampleInfo merely because payload bytes did not change.
+## Claims and restoration
 
-Use a separate participant-configured stale-validation budget, positive and
-fixed at participant creation, with a build-changeable initial default of four
-invalidated attempts per invocation. This number is an initial policy, not
-a measured optimum and not inherited from listener retry limits. The budget does
-not reset on worker migration, reselection or a query-generation change. Ordinary
-context contention does not consume it, and it is not a new time-based timeout.
-Yield to normal scheduling between conflicted attempts; do not hold an executor in
-an unbounded immediate retry loop.
+A take claim hides its samples from other reads/takes and from condition evaluation; it
+counts as consumption for the applicable shared GROUP access view. Payloads remain pinned
+and logical history depth includes claims until normal eviction or expiry removes them.
+A claim is not a new public loan and does not prevent lifecycle processing.
 
-On budget exhaustion, first perform normal current-state/precondition checking without
-committing effects: close returns ALREADY_DELETED on a recognized retained lifetime;
-invalid operation preconditions retain their existing errors; a valid fresh selection
-with no eligible data returns NO_DATA. If eligible data remains but another attempt
-would exceed the budget, return ERROR with a conflict-exhaustion diagnostic. Never
-report NO_DATA solely because the prior prepared candidates were invalidated. No
-attempt in that failed invocation has committed read/take effects, though concurrent
-operations and normal protocol/lifecycle processing can have changed the reader.
+Successful conversion completes removal without a second eligibility selection. On failed
+conversion, restore only samples still logically retained and eligible for restoration,
+in their original ordering positions. Never resurrect an evicted/expired sample or deleted reader. A closed/replaced
+presentation-access generation cannot be reopened. Retire claims and pins exactly
+once. For a still-open captured GROUP bracket, release that claim's consumption reservation.
+If the bracket closed, retire its consumption reservation without modifying a successor
+view. Restore an otherwise retained sample to the reader cache; subsequent access periods
+may admit it under their ordinary boundary/eligibility rules. Closing a bracket alone
+must not turn failed conversion into permanent cache removal. Restoration is not a new
+arrival that automatically bypasses a successor bracket's fixed admission boundary.
 
-Two takers selecting the same sample illustrate the rule: one commits, the other's
-validation fails. The latter reselects and either takes different eligible samples,
-returns NO_DATA if none remain, or reaches the documented conflict bound under further
-contention. Two reads may both succeed when their state/metadata observations remain
-valid; this is not an exclusive single-consumer contract.
+Restoration reevaluates conditions and signals waiters when predicates become true. It does
+not create a new source sample or timestamp. Reevaluate normal data-availability notification
+eligibility without inventing a new wire arrival. Instance lifecycle continues normally;
+restoration never overwrites current instance state or generation counts.
 
-Preparation resource/decode errors use the separate synchronous-output failure table;
-only actual stale validations charge this budget. Retained candidate capacity must be
-bounded independently so concurrent preparers cannot pin unbounded history. Per-reader
-pin/preparation admission limits and their exact resource mapping are an integration
-requirement, not implied by the per-call retry count.
+READ and NOT_NEW changes committed at selection are never rolled back. A later lifecycle
+rebirth can legitimately make an instance NEW again; delayed failure cleanup must not
+reapply NOT_NEW to that new generation. Read failures have no claims to restore but keep
+their selection-time state effects. Decode output from a failed conversion is discarded.
 
-## Reentrancy and alternative
+## Observable failure contract
 
-Foreign conversion and cleanup can reenter DDS. An inner call can invalidate an outer
-candidate, but cannot make that candidate commit stale effects. Same-target preparation
-recursion needs an explicit active-operation guard before any reentrant foreign hook;
-return ERROR for recursive prepared read/take on the same reader lifetime in the
-same synchronous chain, independent of which interface view was used. This rule is
-separate from, not a consequence of listener notify_datareaders recursion limits.
-Cross-reader application recursion is not bounded by this same-reader check; supported
-foreign preparation hooks need the binding's explicit recursion/resource contract.
+Foreign-path failed takes may temporarily hide samples: a concurrent call may return
+NO_DATA, followed by a later call obtaining restored samples without another arrival.
+This failed-call isolation weakening is explicitly accepted. Normal history eviction,
+expiry, close or another consumer can still prevent later recovery.
 
-Alternative: an exclusive access reservation held through conversion. It reduces
-retry work and can provide stronger progress under contention, but another consumer
-may wait behind allocation, deserialization or arbitrary reentrant code. It also needs
-new reservation-versus-expiry/lifecycle and dependency rules. Prefer optimistic access
-initially; do not add a hidden exclusive fallback after retry exhaustion.
+Known limitation for binding users: a foreign-conversion read/take that fails after
+selection (including OOM or a conversion exception) leaves selected samples READ and
+instances NOT_NEW. A later operation using NOT_READ or NEW masks, including equivalent
+ReadCondition/QueryCondition masks, may skip data never delivered to the application.
+Retry with ANY sample and view state masks when recovery is needed; this does not promise
+that samples remain retained. Applications unable to tolerate this should avoid those
+filters on such bindings. The certified native path is unaffected only when its complete
+infallibility/non-reentrancy preconditions hold, not merely because it is C/C++/Zig.
 
-The cost of the recommendation is possible ERROR under sustained contention, plus
-wasted conversion work. It preserves independent consumer progress and bounds work
-per call without requiring a mandatory thread handoff. Applications seeking predictable
-single-consumer behavior can coordinate their access explicitly.
+Use existing ERROR/OUT_OF_RESOURCES and language exception mappings. Track effect phase
+internally: no selection effects; selection state committed with claims restored or retired;
+or successful consumption followed by output-publication failure. No new standard DDS
+ReturnCode is introduced. A failure after successful final output transfer must not unclaim
+or automatically repeat an already-completed take.
 
-## Bounded validation and remaining work
+## Acceptance traces
 
-Run `python3 docs/design/prepared_read_model.py` from zzdds. Two competing takers,
-two samples, one relevant state update, expiry and close were explored with retry
-limits 1, 2 and 4: respectively 922/1,135, 1,629/2,087 and 1,790/2,302
-states/transitions (4,341 states and 5,524 transitions across scenarios).
-
-The model checks no duplicate consumption, no stale whole-batch commitment, immutable
-completed outcomes, and no access effects for failed calls. It exercises exhaustion,
-true empty reselection, expiry/reselection and close before/after commitment. Negative
-controls detect omitted validation, stale survivor commitment and false NO_DATA on
-exhaustion. Every reachable state has a path to completion; this is not a fairness
-or production progress proof.
-
-The small retry limit exercises exhaustion; the finite environment does not establish
-behavior under four successive conflicts or justify four as a measured default.
-The model abstracts relevant metadata as one version and models takes only. It does
-not validate read-state/rank calculations, query/GROUP dependencies, pin capacity,
-recursive foreign hooks or generated conversion exception safety. Those remain
-implementation validation requirements, not reasons to expand this scalar experiment.
-
-Next settle exact binding error mappings and review the operation variants before
-closing R3. No bounded model can make an arbitrary foreign callback terminate.
+Check two takers with one failing; a successful read depending on an earlier failed read's
+READ state; lifecycle rebirth; KEEP_LAST eviction; expiry; reader/access close; overlapping
+GROUP consumers; restoration order; condition and WaitSet wake; and output failure after
+consumption. Negative controls must detect rollback of READ state and restoration of an
+evicted sample. Pin/claim capacity and partial nested output cleanup are independent bounds.
+The review trace suite passes 363 claim/access/condition schedules, including two takers,
+read-state dependence, eviction/expiry/deletion, rebirth, access close and restoration wake.
+The earlier 24-order trace has negative controls for state rollback and resurrection.
+These are abstract cache/predicate traces, not concrete QueryCondition evaluation, full
+coherent wire assembly or generated conversion. The archived optimistic model cannot
+establish the replacement contract; binding fault injection remains an implementation gate.

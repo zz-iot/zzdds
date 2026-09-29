@@ -30,8 +30,8 @@ No RTPS entity IDs, magic bytes or public service port are allocated by this tab
 | 18 | RESYNC_REQUIRED | ResyncRequired | Either admitted peer |
 | 19 | LEASE_CHALLENGE | LeaseChallenge | Broker to client |
 | 20 | LEASE_PROOF | LeaseProof | Client to broker |
-| 21 | PRESENCE_QUERY | PresenceQuery | Client to broker |
-| 22 | PRESENCE_PROOF | PresenceProof | Broker to client |
+| 33 | FRESHNESS_QUERY | FreshnessQuery | Client to broker, CONTROL |
+| 34 | FRESHNESS_MARKER | FreshnessMarker | Broker to client, ordered STATE |
 | 25 | CLOSE | CloseRequest | Client to broker |
 | 26 | CLOSED | ClosedReply | Broker to client |
 | 27 | STATUS | StatusBody | Either admitted peer |
@@ -41,13 +41,17 @@ No RTPS entity IDs, magic bytes or public service port are allocated by this tab
 | 31 | PATH_RESPONSE | PathChallenge (exact echo) | Client to broker |
 | 32 | REGISTER | RegisterRequest | Client to broker, validated introduction |
 
-Codes 4 and 29–32 carry introduction bodies directly in Frame. Retired codes 1–3
+Retired presence opcodes 21/22 are reserved; no chunked presence grammar is supported
+in draft revision 3 (`ZZDBRK03`). Codes 4 and 29–32 carry introduction bodies directly in Frame. Retired codes 1–3
 are reserved and unsupported. All remaining operations use
-the established Envelope. [ADMISSION_REJECT](broker-bootstrap-rejection.md) supplies
+the final positional established Envelope and final operation bodies. Bootstrap bodies
+remain mutable; final layouts require exact consumption and cannot gain trailing fields
+without a negotiated mapping change. [ADMISSION_REJECT](broker-bootstrap-rejection.md) supplies
 bounded preadmission diagnostics; silence remains permitted when reply checks fail.
 Established ERROR is never used for bootstrap. Identical REGISTER against a consumed introduction returns its recorded ACCEPT while
 the result and session remain valid; first-admission expiry is a separate check. Origin/snapshot items are state traffic; admission,
-results, boundaries, leases and status are control traffic. Opcode values 23/24 are
+results, origin leases and status are control traffic. Inventory/snapshot boundaries,
+VIEW_SYNC and aggregate freshness markers share ordered STATE with records. Opcode values 23/24 are
 reserved and unsupported; no peer-metatraffic forwarding service exists in v1. Priority does not establish cross-stream order.
 
 ## Other registries and shape validation
@@ -70,15 +74,18 @@ negotiated and actually supported.
   echo it; the resume cursor identifies the old baseline independently.
 * A ViewRequest without resume has an all-zero cursor. With resume it carries the prior
   baseline/cursor and asserts retained state. ACCEPT checks the selected outcome against
-  optional resumed_cursor presence. Current v1 always requires fresh origin inventory.
+  optional resumed_cursor presence. Resolve the full prior epoch/session/owner generation/
+  view generation/cut against retained scope, policy and contiguous history; absent state
+  requires snapshot fallback. No transaction digest is carried. Current v1 always requires fresh origin inventory.
 * DELTA UPSERT carries a complete record matching entity/revision and no removal reason.
   REMOVE/VIEW_WITHDRAW carry no upsert record and an explicit reason. A lease reduction
   carries participant/freshness generation; obtain fresh nonce-bound presence evidence
   before extending validity. Until that evidence arrives, conservatively invalidate the
   prior lease bound rather than infer a new deadline from reception time.
-* PresenceQuery full_view requires an empty participant list; a subset request uses a
-  nonempty deduplicated list scoped to the view. Responses bind every chunk to the same
-  nonce/generation and validate index/count, distinct entries and aggregate bounds.
+* FreshnessQuery has view generation and nonce; at most one is outstanding per view/session.
+  FreshnessMarker has that correlation, exact view frontier, common horizon and bounded
+  incarnation-specific exceptions. No chunk index/count, query serial or availability enum.
+  Zero exception duration grants no new evidence. Apply after the corresponding STATE cut.
 * ErrorBody retry hints apply only to actions permitting retry and never reset deadlines.
   Optional entity/revision fields must be paired when describing a particular mutation.
   StatusBody is informational and never substitutes for COMMIT, APPLIED or freshness.
@@ -105,7 +112,7 @@ status. Empty metadata is an encoded empty list, not an ambiguous arbitrary byte
 
 ## Remaining physical assignments
 
-Frame magic, encapsulation/body encoding IDs and digest labels now have concrete
+Frame magic, encapsulation/body encoding IDs and correlation hashes now have concrete
 proposals and golden evidence in [the byte baseline](broker-wire-bytes.md).
 Metadata values, feature/version rules and vendor endpoint roles now have concrete
 proposals in [the detailed wire rules](broker-wire-details.md). Protected transcript/
@@ -126,21 +133,22 @@ RESYNC_REQUIRED uses the restricted reasons and direction-specific retry rules i
 [the accepted view contract](broker-view-correlation.md); invalidation never creates a
 successor view without a newer client request.
 
-Presence availability is AVAILABLE=1 or UNAVAILABLE=2. Available entries require positive
-freshness generation/remaining lease; unavailable entries use zero for both and convey
-no withdrawal. PresenceProof includes a view delivery frontier, fixed across chunks.
-The [presence contract](broker-presence-completeness.md) defines aggregate limit negotiation,
-empty replies and complete-set validation. ReceiveLimits gained four presence budget
-fields; this changes the provisional final-struct layout before wire freeze.
+ReceiveLimits replaces four presence fields with maximum_freshness_exceptions and
+maximum_freshness_marker_bytes (complete serialized Frame bytes, including Envelope).
+Both effective limits must fit the session's ordinary frame/resource limits; Xmax may be
+zero, selecting a common minimum horizon with no exceptions. The schema ceiling is 256,
+not a requirement to advertise or allocate that many entries. Orphan budgets remain only
+for bounded preconfirmation/cross-stream handling, not record-before-BEGIN within STATE.
 
-Retired opcode values 23/24 and peer-channel/service constants remain reserved, not
-negotiable capabilities. The [relay direction](broker-relay-direction.md) supersedes
-older special-forwarding proposals.
+Envelope member IDs 1–4 are retired. Required member IDs 5/6/7 remain request_id,
+required_features and operation_body. The validated endpoint/channel association supplies
+scope/epoch/session/owner generation to every internal admitted-work descriptor. Reject
+retired members in this profile, including when sent without must-understand; do not
+accept a peer's copies as alternate authority. Unknown optional new IDs retain normal rules.
 
-PresenceQuery member 5 and PresenceProof member 7 carry query_serial. The accepted
-[retry-retirement contract](broker-retry-retirement.md) defines ordered admission, bounded
-active results and stale-serial rejection independently of nonce freshness.
-
+Feature 6 and view mode 3 denote topic-plus-partition candidates; feature 6 depends on
+feature 1 and is implemented by the zzdds broker. Required filtering never falls back to
+VIEW_ALL. Features 3–5 remain reserved. See broker-security-and-filtering.md for scope.
 
 Native discovery extension: provisional PID_ZZDDS_ORIGIN_VERSION = 0x8003, a 24-byte
 incarnation/revision value, scoped to the zzdds vendor/profile. See [origin-version wire](broker-origin-version-wire.md)

@@ -1,5 +1,11 @@
 # Concurrency model: state ownership and progress
 
+Review scope (2026-09-28): [fast paths](concurrency-fast-paths.md) governs INSTANCE/TOPIC
+specialization and hosted/manual helping. Publisher tickets/group gates below apply only
+to GROUP coordination, not every ordinary write. Foreign hooks run outside owner rights.
+[Selection/claims](prepared-read-conflicts.md) replaces optimistic read/take validation;
+listener preparation retries remain separate. Dated experiments describe their own scope.
+
 Start with the [consolidated decision baseline](concurrency-contract.md), updated
 2026-09-17, for accepted policies and implementation boundaries.
 
@@ -83,7 +89,8 @@ The refined policy is accepted following [design-level trace validation](admissi
 
 * Execute directly only when no older ready work exists; otherwise use FIFO ready admission within each context.
 * Bound each turn. Runnable continuations and awakened requests join the tail; condition waiters remain outside the ready queue while still counting against storage limits.
-* Service ready contexts round-robin. Apply a runtime-wide inline budget and protocol-progress checkpoints so repeated direct calls cannot indefinitely bypass other ready contexts or due timers.
+* Service ready contexts round-robin. Enforce runtime-wide fairness with per-executor inline budgets and progress checkpoints
+  (no shared counter on every direct call is required) so repeated direct calls cannot indefinitely bypass other ready contexts or due timers.
 * Treat history-resource fairness separately: reserve available resources for the oldest eligible waiter before making it runnable. Define eligibility across instance-specific and combined resource limits in the detailed contract.
 * Reserve bounded continuation/completion capacity for admitted internal work. Closing rejects applicable new submissions while preserving the progress needed to finish admitted operations.
 * Any eligible executor may advance retained internal operations; waits hold no protocol execution rights. Protocol helping preserves listener exclusion and does not authorize arbitrary recursive callbacks.
@@ -142,7 +149,7 @@ Proposed write sequence: prepare payload and reserve writer-local resources; rel
 
 There must be no allocation, capacity wait, callback or network operation inside the admitted local commit. A ticket holder still needs writer execution admission: closing a coherent window must allow that commit to progress, and must not wait while owning either the coordinator or writer. In manual mode the pending commit must be runnable by the driver; it cannot depend on resuming a blocked caller's private continuation.
 
-An outer coherent boundary closes the relevant ticket generation, drains admitted commits without retaining coordinator rights, and seals completion metadata before permitting subsequent publication to overtake it. It does not wait for remote acknowledgments. Ordinary capacity waiters have not joined the old generation. Exact sequence allocation, failure/closure ordering, completion-marker retention and suspension interaction need a state-machine specification. Non-GROUP coherent boundaries still require the applicable Publisher coordination; compiling out GROUP removes group-specific ordering/state, not all Publisher controls.
+For GROUP, an outer coherent boundary closes the relevant ticket generation, drains admitted commits without retaining coordinator rights, and seals completion metadata before permitting subsequent publication to overtake it. It does not wait for remote acknowledgments. Ordinary capacity waiters have not joined the old generation. Exact sequence allocation, failure/closure ordering, completion-marker retention and suspension interaction need a state-machine specification. TOPIC uses the retained seal protocol in concurrency-fast-paths.md, with no GROUP ticket; compiling out GROUP removes group-specific ordering/state, not all Publisher controls.
 
 #### Subscriber operations spanning readers
 

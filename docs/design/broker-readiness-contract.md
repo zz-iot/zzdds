@@ -83,12 +83,11 @@ client. It requires:
   deltas applied contiguously through the advertised synchronization target. Activation
   observes the presence-proof rules; staged or stale records are not active discovery.
 
-An empty authorized view can be ready. Presence completeness is evaluated for the fixed
-synchronization target: each participant is proved, withdrawn, or explicitly evaluated
-as unavailable and left inactive. A complete timely proof answer may account for an
-identity without granting a lease. Missing chunks or an expired query do not establish
-that completeness. Existing valid evidence is not revoked by an unavailable result.
-See [presence completeness](broker-presence-completeness.md). READY does not require
+An empty authorized view can be ready. Apply a timely nonce-correlated aggregate marker
+at or after the fixed synchronization frontier. It accounts for that membership; zero or
+already-elapsed evidence leaves affected origins inactive without revoking independent
+valid evidence. Missing or timed-out markers do not establish freshness evaluation.
+See [aggregate freshness](broker-aggregate-freshness.md). READY does not require
 all cached remote participants to be active simultaneously. The target is fixed for each synchronization
 attempt, not moved forward forever by concurrent remote churn. Local changes after the
 origin cut can remain pending without invalidating that completed cut. Report that
@@ -130,7 +129,8 @@ wait for endpoint matches or pretend SPDP converges to a complete graph.
   for that attempt and remain observable until corrected/recovery is explicitly possible.
 
 Use the concurrency contract's deadline/result arbitration and retained-lifetime rules.
-The wait helps permitted internal progress, retains callback rights if entered from a
+Ordinary hosted waiters do not help by default; manual/callback-chain waits help only
+permitted internal progress. The wait retains callback rights if entered from a
 callback and does not dispatch nested automatic listeners. Reject a proven self-dependency
 with ERROR. It does not create an extra operational runtime lease. An infinite wait is
 allowed by the explicit wait API, with the ordinary possibility of never becoming ready;
@@ -184,8 +184,7 @@ nor a matched-reader status may be documented as that barrier today.
 
 ## Required validation and next step
 
-Before implementation publication, cover: broker unavailable at construction; wrong
-credentials versus transient disconnect; empty-view readiness; continuous churn after
+Before implementation publication, cover: broker unavailable at construction; unsupported security request versus transient disconnect; empty-view readiness; continuous churn after
 fixed cuts; reconnect/epoch change during a wait; timeout versus READY and delete;
 late old-session completion; endpoint rejection followed by repair/removal; and status
 coalescing/absent listener under manual and hosted progress. These are concrete integration

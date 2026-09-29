@@ -1,7 +1,7 @@
 # Concurrency v1 readiness review
 
 Status: behavioral baseline ready for implementation within the scope below,
-2026-09-17. The user accepted the final bootstrap refinements. This review closes the
+2026-09-28, including D1–D8 review revisions. This review closes the
 concurrency policy investigation; it does not freeze public ABI, certify production
 conformance or authorize a production refactor. Start at concurrency-contract.md.
 
@@ -14,7 +14,7 @@ conformance or authorize a production refactor. Start at concurrency-contract.md
 | Delegation and lifecycle | Bounded synchronous traversal, retained rights, minimum nesting limit, external retirement frontier, callback-chain non-drain, atomic subtree preflight; listener-delegation-decision.md, listener-bulk-deletion.md | Cross-owner and foreign-unwind integration |
 | R1: borrowed resources | Retained owner or explicit tracked scope/fence; independent completion storage; runtime-resource-ownership.md | Allocator/environment coverage and final-hook accounting |
 | R2: runtime identities | Owners versus observers, transactional acquisition, automatic final-owner retirement, per-creation default resolution; runtime-ownership.md, runtime-resource-ownership.md | Generated references, registry races and coordinated ABI rollout |
-| R3: binding output failures | Prepare/validate/commit whole batches; preserve effects on postcommit delivery failure; binding-access-failures.md, prepared-read-conflicts.md | Actual C/Zig/C++/Java preparation and failure fixtures |
+| R3: binding output failures | Certified native infallibility; foreign selection-time effects/claims and eligible restoration; preserve effects on postcommit delivery failure; binding-access-failures.md, prepared-read-conflicts.md | Actual C/Zig/C++/Java preparation and failure fixtures |
 | Operation results | Operation-specific deadlines, ACK/history/WaitSet predicates, release-only progress; blocking-wait-matrix.md, operation-result-mapping.md | Native and generated variant coverage; no universal invented error mapping |
 | Reader/writer variants | Audited lifecycle blocking, handle/key and condition/loan provenance; strict next-instance advancement accepted as zzdds interpretation; writer-lifecycle-results.md, reader-variant-results.md | Correct current implementation deficiencies; preserve the documented DDS wording discrepancy |
 | Runtime shutdown | Hosted retained executor, ordinary manual teardown tail, explicit external-loop servicing obligation; runtime-retirement.md, manual-runtime-driver.md | Real cancellation/drain, final-worker reclamation, no self-join |
@@ -58,7 +58,9 @@ coverage of one runtime. Existing zidl tests passed on 2026-09-16: 1,115 tests p
 23 integration build steps, including Java data/CDR and generated entity/JNI paths.
 Those results do not validate experimental Java managed references, which are unsupported.
 
-This final pass changed documentation only. Check local links and whitespace; no need
+The original final pass changed documentation only; review revisions also update experimental
+schemas, fixtures, models and dedicated test wiring. Existing production fixes are separately
+identified in [merge preparation](review-merge-preparation.md). Check local links and whitespace; no need
 to rerun unchanged executable models or claim additional runtime validation.
 
 ## Completion and handoff

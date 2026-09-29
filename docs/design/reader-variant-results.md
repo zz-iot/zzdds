@@ -55,9 +55,10 @@ with the access-period cross-reference to §2.2.2.5.2.8.
   not conceal an invalid request. Exact raw extension compatibility should be stated
   during ABI migration rather than inferred from a helper's permissiveness.
 * takeNextInstanceFiltered/readNextInstanceFiltered use strict cursor advancement.
-  Keep the requested cursor fixed across retries. Revalidate the selected instance
-  against all eligible instances under the chosen ordering, not just retained sample
-  membership; insertion of a nearer eligible instance may invalidate selection.
+  Keep the requested cursor fixed until selection. Select the next eligible instance
+  under reader/presentation ownership using the chosen ordering. Selection commits its
+  state effects; a nearer instance arriving during foreign conversion does not invalidate
+  that completed selection or trigger a retry.
 
 These are inspected paths on the refreshed baseline, not reproduced security or
 fault-injection tests. The raw API differs deliberately from standard typed sequences;
@@ -72,8 +73,10 @@ availability. The descriptor determines eligibility and metadata dependencies; d
 reduce every variant to plain FIFO plus a final filter.
 
 Validate preconditions without consuming samples or changing caller-owned collections.
-Perform foreign decoding outside ownership locks, then revalidate the entire selected
-batch and applicable access rights before publishing read/take and loan effects.
+At selection, validate the complete variant and capture SampleInfo under reader/access
+ownership. The certified native path preflights all fallible work; the foreign path commits
+READ/NOT_NEW and take claims, then decodes outside rights. Follow
+[claim completion/restoration](prepared-read-conflicts.md), without optimistic reselection.
 Retain immutable returned SampleInfo independently of subsequent internal state changes.
 A published loan pins storage, not continued eligibility for another consumer.
 

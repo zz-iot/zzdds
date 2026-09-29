@@ -27,7 +27,9 @@ ORIGIN_BEGIN. Successful or definitively rejected outcomes suffice; an unknown o
 does not. If the client cannot resolve outstanding work within its retry budget, recover
 through a fresh session/inventory instead of letting delayed old mutations overlap a
 replacement cut. Duplicate requests whose results remain retained never execute twice.
-This avoids relying on ordering between control BEGIN and the independent state stream.
+BEGIN now shares STATE ordering with records/mutations. Retain this outcome-drain rule
+until replacement-result retirement is separately validated; transport order does not
+prove whether an earlier application mutation committed.
 
 Within one inventory generation, retry the same immutable cut/records/END and request
 identities. Lost COMMIT is repaired through retained transaction results, without changing

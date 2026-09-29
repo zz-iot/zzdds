@@ -49,7 +49,7 @@ local references may still require deferred memory release under the runtime con
 | View snapshot/delta history | Deliver and resume an exact installed prefix | APPLIED advances retention only for its view; remove acknowledged entries when no other retained view needs them. Pressure invalidates affected views/cursors explicitly before dropping required history. Saved client cursor does not force indefinite server retention. |
 | Removal delivery records | Tell observers to withdraw stale state | Retain until relevant views acknowledge or are invalidated. Disconnected observers rely on conservative presence expiry; do not keep a global removal forever solely because an observer vanished. |
 | View request outcomes | Prevent old requests creating successor snapshots | Session-local monotonic request generation/high-water plus bounded current outcome. An older generation cannot restart; an unavailable result requires a newer generation. |
-| Presence proof chunks/results | Keep one immutable answer per query nonce | Finish/expire query, then reject late use. Random nonce alone does not give a compact order: see the query-retirement gap below. Pressure rejects queries before promising complete answers. |
+| Aggregate freshness capture/result | Immutable nonce-correlated result and reliable STATE output | Once-only reliable CONTROL admission, bounded retained output until ACK/retirement; new queries may get LIMIT. No application same-nonce retry on a new writer sequence. |
 | In-flight transport/runtime references | Prevent use-after-free and stale completion effects | Logical invalidation first; memory release only after completions and observers relinquish references. Cancellation request is not completion. Bound outstanding work at submission. |
 
 Across sessions, preserve origin revision monotonicity in the client as already required.
@@ -65,18 +65,16 @@ unconsumed introduction's expiry. Retain UDP consumed-cookie correlation until a
 associated cookies expire; TCP/protected paths do not require that extra cookie guard.
 Reserve result/guard capacity before effects. See [current lifecycle](broker-bootstrap-lifecycle.md).
 
-Presence queries use increasing session-local serials admitted in control-stream order,
-with bounded active result slots and retained admission high-water. Older/forgotten serials
-cannot recreate an answer; completion order may differ from admission order. Observer
-nonces still bind freshness independently. This is the accepted [retry-retirement contract](broker-retry-retirement.md),
-not an open choice between arbitrary nonces and unbounded result caches.
+Aggregate queries submit once on reliable CONTROL. RTPS admission sequence state prevents
+repair from reconstructing capture; results retain exact bytes through STATE delivery.
+Clients abandon timed-out nonces and never reuse them. See [retry retirement](broker-retry-retirement.md)
+for capacity refusal and stale-session handling; the old serial/chunk scheme is retired.
 
 ## Required validation after decisions
 
 Exercise long-running create/delete churn with fixed quotas; stale CLOSE/commit after
 session replacement; old REGISTER after result eviction and consumed UDP path responses before cookie expiry; removal
-with disconnected observers; resumption after delta eviction; and concurrent presence
-queries whose replies complete out of order. Account separately for logical map entries,
+with disconnected observers; resumption after delta eviction; and timed-out freshness queries with retained results and capacity refusal. Account separately for logical map entries,
 retained payload bytes and deferred runtime references. An apparent empty lookup table
 is not evidence all memory can be freed.
 
@@ -99,5 +97,6 @@ It supersedes the earlier sliding-window suggestion as the preferred design, pen
 acceptance; query admission already has an ordered reliable control stream.
 
 The retry-retirement direction is now accepted: consumed guards through challenge expiry
-and ordered presence serials. Earlier sliding-window alternatives are historical. Exact
+and once-only CONTROL admission for aggregate freshness. Earlier presence-serial and
+sliding-window alternatives are historical. Exact
 configured horizons and bootstrap fit/endpoint lifecycle remain W4 integration work.

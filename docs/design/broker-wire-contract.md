@@ -16,7 +16,7 @@ downstream resume, uncertain commits and bounded pre-BEGIN staging. Framing byte
 registries and codec validation still require wire-freeze review.
 
 The [byte baseline](broker-wire-bytes.md) now supplies concrete draft Frame magic,
-encapsulation, alignment/padding, encoding IDs and digest labels, checked against
+encapsulation, alignment/padding, encoding IDs and correlation hashes, checked against
 independent golden fixtures. It supersedes the placeholder assignments below without
 freezing production compatibility. The [metadata, feature and endpoint draft](broker-wire-details.md)
 adds exact metadata values, version gates and bidirectional endpoint offers.
@@ -31,7 +31,7 @@ Recommend a fixed Frame containing magic, protocol major/minor, operation code,
 encoding identifier and bounded body bytes. The bootstrap framing/encoding is invariant
 across negotiations; its proposed magic, encapsulation and numeric encoding assignments
 are covered by the byte-baseline fixtures. The body contains a versioned Envelope and
-operation-specific body. Both body layers use XCDR2 little-endian mutable structs;
+operation-specific body. Both established body layers use XCDR2 little-endian final positional structs;
 the fixed Frame/common final structs use the corresponding fixed encoding rules.
 Generated serialize methods and the containing encapsulation must agree explicitly;
 do not insert a new encapsulation at every nested struct boundary.
@@ -45,11 +45,11 @@ fails admission. An incompatible fixed bootstrap is dropped/diagnosed within the
 pre-admission response budget, not decoded using a guessed layout.
 
 SPDP service descriptors offer capabilities; REGISTER binds its selections to a
-validated introduction; ACCEPT confirms the exact registration digest. Bind these values to the protected session. Return-path cookies
-are server-generated opaque tokens, not client authentication or substitute TLS/DTLS.
-Trusted-network policy remains explicitly configured; no homemade encryption is added.
+validated introduction; ACCEPT confirms the exact registration digest. Bind these values to the admitted association. Return-path cookies are server-generated
+opaque tokens, not authentication. V1 is insecure; future protected admission derives
+from DDS Security as specified in [the security disposition](broker-security-and-filtering.md).
 
-Minor versions may add optional members to mutable types with safe absence defaults, negotiated features
+Bootstrap evolution may add optional members to mutable types with safe absence defaults, negotiated features
 and new operations used only after negotiation. Never reuse a member/operation/feature
 ID or change an existing member's type, ownership or meaning within a major. Required
 new behavior needs negotiation; an incompatible baseline change needs a new major.
@@ -58,16 +58,17 @@ Final positional layouts cannot be extended by simply appending members. See the
 descriptor and established-version rules. The protocol major is independent of zzdds
 release number and generated C ABI version.
 
-Unknown optional members may be skipped; unknown must-understand members or required
+In mutable bootstrap bodies, unknown optional members may be skipped; unknown must-understand members or required
 features reject the message. Unknown operation codes never count as an applied delta
 or successful mutation. Return bounded UNSUPPORTED when authorized; invalidate a view
 if its required stream cannot be interpreted. Do not silently skip holes in state.
 
 ## Envelope and decoding boundaries
 
-Established-session messages carry scope, broker epoch, session ID, owner generation,
-request ID, required features and operation body. Session IDs bind to the authenticated
-channel/principal, not a source IP. Validate all fencing values before mutation, lease
+Draft revision 3 established Envelopes carry request ID, required features and operation
+body. Scope, epoch, session ID and owner generation are resolved from the validated
+endpoint/channel association and retained in internal work descriptors. Traditional-mode
+binding is not authentication; future secure mode additionally binds authenticated context. Validate all fencing values before mutation, lease
 renewal or discovery-state changes. Request IDs identify logical operations; responses carry
 an explicit related request. Repeated messages keep their logical request identity.
 
@@ -76,7 +77,7 @@ unused established-session fields are not fabricated as authority. Define phase-
 body types rather than allowing missing session fields on arbitrary post-admission work.
 
 The IDL bounds are provisional schema ceilings (body 1 MiB, discovery payload 512 KiB,
-metadata 16 KiB, 128 features and 256 presence entries/chunk), not measured defaults.
+metadata 16 KiB, 128 features and 256 freshness exceptions), not measured defaults.
 Negotiation imposes lower per-message and aggregate limits. Account for nested envelope
 and encoding overhead: an inner body fitting its bound need not fit the outer frame.
 Before path validation, use the separate small, non-fragmented bootstrap budget and
@@ -107,21 +108,21 @@ Names in parentheses denote correlation, not an additional network protocol.
 | ADMISSION_REJECT | Attempt, nonce, rejected REGISTER operation, restricted reason, bounded retry hint and exact request digest; direct bootstrap body, no Envelope |
 | ORIGIN_BEGIN | Inventory generation, local inventory cut, expected record count and total record bytes |
 | ORIGIN_RECORD | Inventory generation, zero-based item index, immutable serialized OriginRecord bytes |
-| ORIGIN_END | Inventory generation, final count and digest; not proof all records have arrived |
+| ORIGIN_END | Inventory generation, final count; exact complete indexed assembly required at ordered END |
 | MUTATE | Serialized OriginRecord and request identity; origin revision governs idempotence |
 | COMMIT | Related request, commit kind (inventory/mutation/close), inventory generation or entity/revision, store cut and outcome; confirms store installation, not disk durability |
 | REJECT | Related request, affected inventory/entity/revision, error code and recovery action; cannot contradict an already committed result |
 | VIEW_REQUEST | Client-assigned session-local view generation, view mode/options, explicit fresh versus resume request, and prior epoch/view/cursor proof if resuming |
 | SNAPSHOT_BEGIN | View generation, store cut, record count and total bytes |
 | SNAPSHOT_RECORD | View generation/cut, item index and serialized OriginRecord bytes |
-| SNAPSHOT_END | View generation/cut, count/digest and fixed ready-through delivery sequence |
+| SNAPSHOT_END | View generation/cut, count and fixed ready-through delivery sequence |
 | DELTA | View generation, contiguous delivery sequence, change kind, entity key/revision, freshness generation when relevant, optional record bytes; explicit removal/withdrawal reason |
-| APPLIED | View generation, installed snapshot cut/digest and highest contiguous installed delta sequence; independent of callback completion |
+| APPLIED | View generation, installed snapshot cut and highest contiguous installed delta sequence; independent of callback completion |
 | VIEW_SYNC | View generation and fixed ready-through delivery sequence for a resumed stream without a new snapshot |
 | RESYNC_REQUIRED | Either direction: affected view generation, restricted reason and bounded retry hint (zero from client); invalidates old staging/cursor |
 | LEASE_CHALLENGE / LEASE_PROOF | Origin nonce and correlation under epoch/session/owner generation; deadline stays on server, no foreign absolute timestamp is compared |
-| PRESENCE_QUERY | Increasing session-local query serial, observer nonce, view generation and bounded participant subset or explicit full-view request |
-| PRESENCE_PROOF | Echoed query serial, observer nonce/view and view delivery frontier, chunk index/count, participant identity and availability; positive entries carry freshness generation/remaining lease, unavailable entries use zero for both |
+| FRESHNESS_QUERY | Current view generation and fresh observer nonce; one logical submission on reliable CONTROL |
+| FRESHNESS_MARKER | Nonce/view, exact ordered STATE frontier, common remaining horizon and bounded incarnation-specific exceptions; zero grants no new validity |
 | CLOSE / CLOSED | Participant incarnation, close request and acknowledged fencing/store outcome; local teardown never waits indefinitely for the reply |
 | STATUS / ERROR | Related operation/generation, machine-readable category/recovery action; optional bounded diagnostic metadata, never an authoritative replacement for COMMIT/APPLIED |
 
@@ -140,7 +141,7 @@ Bootstrap size/anti-amplification limits apply to the actual encoded sample even
 individual field values fit their IDL ceilings. ACCEPT uses the authenticated bootstrap
 binding because the receiver does not yet know the admitted Envelope identity.
 
-## Record bytes, digest and ordering
+## Record bytes and transaction ordering
 
 OriginRecord contains participant/incarnation, kind and entity GUID, origin revision,
 UPSERT/REMOVE, source encoding/protocol/vendor identity, optional native writer sequence,
@@ -155,13 +156,13 @@ rules and assignments are defined in the current metadata/registry draft; raw di
 rewritten into those tags. Unknown optional metadata remains retained byte-for-byte.
 Never use the same tag for a broker withdrawal reason and an origin DDS dispose.
 
-Recommend hashing ordered record bytes, not a parsed/re-serialized graph: initialize
-SHA-256 with a fixed inventory-versus-snapshot domain label (literal bytes to freeze),
-then append u64 little-endian record count and, for each item in index order, u64
-little-endian byte length followed by its exact record bytes. Records have the specified
-baseline serialization; packet headers, request IDs and delivery retries are excluded.
-The transaction/view generation and cut bind the digest through BEGIN/END and session
-validation. A digest detects inconsistent assembly, not unauthenticated origin identity.
+Do not compute transaction digests in draft 3. Validate indexed assembly, exact bytes,
+counts and bounds; retain assigned retry bytes. APPLIED binds the currently admitted
+session/view and retained snapshot cut. Resume must resolve the full previous
+epoch/session/owner generation/view generation/cut against retained scope, policy and
+contiguous history; an unknown identity requires snapshot fallback. Equal cuts alone do
+not identify equal views. These checks intentionally do not replace a content checksum.
+See [the digest disposition](broker-encoding-and-digests.md) for costs and bounded tests.
 
 Participant records precede dependent endpoints. Within each class sort by participant
 GUID, incarnation bytes, record kind and entity GUID (unsigned byte/integer order).
@@ -180,16 +181,13 @@ record at the same revision is a conflict. A control-envelope minor change does 
 change the major's OriginRecord baseline serialization; do not create artificial revision
 conflicts by re-encoding retries differently after negotiation.
 
-Control and state writers have independent sequence spaces. END may arrive before any
-RECORD; retain bounded end metadata and wait for the complete indexed set within the
-transaction deadline. Do not declare corruption merely because separate streams reorder.
-RECORD or DELTA can also precede BEGIN. Charge bounded orphan staging to the admitted
-session and transaction/view generation; validate its aggregate against BEGIN before
-assembly. On timeout/capacity failure abort that attempt and explicitly require a fresh
-transaction/resync. If failure notification cannot be delivered, degrade/terminate the
-session rather than imply success. Do not discard an application-staged item after its
-RTPS ACK and assume transport repair will send it again. Failure notification capacity
-is reserved independently of data staging.
+Control and STATE writers retain independent sequence spaces, but transaction boundaries
+and records share STATE. Reject RECORD before its BEGIN or END with an incomplete indexed
+set; there is no intra-STATE orphan assembly or cross-stream excuse for those sequences.
+Only preconfirmation CONTROL-versus-STATE staging remains bounded as specified by bootstrap
+lifecycle. On deadline/capacity failure, abort the transaction and require explicit recovery.
+Do not ACK-and-discard application staging expecting transport repair; reserve failure
+notification capacity independently, or fail the session when safe recovery cannot be kept.
 Likewise COMMIT must not advance local pending state for a different inventory request.
 Per-stream RTPS ACK does not join these application-level dependencies.
 
@@ -211,7 +209,8 @@ VIEW_WITHDRAW changes view membership without inventing a newer origin revision.
 Every newly admitted transport session obtains fresh session identity and owner fencing.
 Unsecured identity is the participant GUID; no persistent ownership secret is required.
 DDS Security authentication, where configured, supplies participant authentication through
-its plugins. Broker transport authentication is a separate protection boundary.
+its plugins. V1 has no broker authentication provider; future secure admission follows the DDS Security
+contract, with optional transport security as a separate later choice.
 
 Confirmed disconnect withdraws registration and endpoints promptly; silent failure/UDP
 absence uses finite detection or lease deadlines. Expiry/disconnect is not terminal
@@ -285,7 +284,7 @@ ZIG_EXE set. Generated artifacts are temporary; no production protocol is instal
 
 The malformed-member characterization deliberately demonstrates a remaining admission
 gap, not acceptance of malformed broker messages. These tests are not a complete two-release compatibility matrix or network/state-machine
-validation. Digest golden vectors now exist; semantic admission coverage remains incomplete. Large inline bounded storage also remains a production/embedded mapping
+validation. Independent positional golden vectors now exist; semantic admission coverage remains incomplete. Large inline bounded storage also remains a production/embedded mapping
 gate, recorded with other generator follow-ups in zidl's roadmap.
 
 Regression validation: the full local zidl `zig build test` target passed after the
@@ -302,16 +301,11 @@ earlier stable ownership-secret proposal.
 See [bootstrap rejection](broker-bootstrap-rejection.md) for preadmission error correlation,
 retry behavior and response-budget rules.
 
-Current fixture evidence: 12 tests pass, including exact Frame/metadata/rejection bytes
-against 13 independent Python vectors. This supersedes the initial six-check count
-above; full semantic admission, two-release compatibility and network tests remain open.
-
-The [operation admission table](broker-operation-validation.md) covers every current
-operation and records the accepted inventory/view rules (F1–F2) and accepted presence completeness (F3) and the removal of v1 forwarding (F4).
-Its coverage does not mean semantic validation is complete.
-
-[Presence completeness](broker-presence-completeness.md) defines immutable chunk membership,
-aggregate ReceiveLimits and explicit unavailable results without fabricated withdrawals.
+Current fixture evidence: 23 generated tests and 53 independent vectors; full semantic
+admission, two-release compatibility and network tests remain open. The operation table
+uses ordered STATE boundaries/records and aggregate freshness. The controlling
+[aggregate freshness contract](broker-aggregate-freshness.md) replaces chunked presence;
+older presence-completeness reasoning is transitional, not the current wire grammar.
 
 [Retry retirement](broker-retry-retirement.md) defines consumed-admission guards through
-cookie expiry and bounded presence-result slots protected by an admission high-water mark.
+cookie expiry and bounded aggregate results protected by once-only reliable CONTROL admission.

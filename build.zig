@@ -1323,15 +1323,16 @@ pub fn build(b: *std.Build) void {
     const concurrency_support = @import("test/concurrency/build_support.zig");
     const concurrency_step = b.step("test-concurrency", "Run isolated concurrency prototype tests");
 
+    const design_step = b.step("test-design-models", "Check maintained specification models and wire fixtures");
+    const design_run = b.addSystemCommand(&.{ "python3", "scripts/check_design_specs.py" });
+    design_step.dependOn(&design_run.step);
+
     // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
     const emit_tests_step = b.step("emit-tests", "Build test binaries for kcov coverage analysis");
     for (concurrency_support.tests(b, target, optimize, sanitize_thread, sanitize_thread, "")) |t| {
         const run = b.addRunArtifact(t);
         concurrency_step.dependOn(&run.step);
-        test_step.dependOn(&run.step);
-        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
-            .dest_dir = .{ .override = .{ .custom = "tests" } },
-        }).step);
+        // Design prototypes deliberately stay out of production/coverage aggregates.
     }
 
     // Library self-tests
@@ -1636,13 +1637,6 @@ pub fn build(b: *std.Build) void {
     // and release.yml, mirroring `release-fast` (`zig build test
     // -Doptimize=ReleaseSmall` on the normal self-hosted backend).
     const test_release_small_step = b.step("test-release-small", "Run the unit suite at ReleaseSmall (LLVM backend -- see comment: works around a Zig 0.16 self-hosted-backend rodata-alignment bug)");
-    for (concurrency_support.tests(b, target_llvm_safe, optimize, false, true, "")) |t| {
-        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
-            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
-        }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
-    }
-
     const zzdds_tests_llvm = b.addTest(.{
         .name = "zzdds_lib",
         .root_module = zzdds_mod_llvm_safe,
@@ -1770,7 +1764,6 @@ pub fn build(b: *std.Build) void {
     const concurrency_tsan_step = b.step("test-concurrency-tsan", "Run concurrency prototype under ThreadSanitizer");
     for (concurrency_support.tests(b, target, optimize, true, true, "")) |t| {
         const run = b.addRunArtifact(t);
-        tsan_step.dependOn(&run.step);
         concurrency_tsan_step.dependOn(&run.step);
     }
 

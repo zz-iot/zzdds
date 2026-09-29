@@ -1,22 +1,21 @@
 # Broker wire assignment and compatibility review
 
-Specification audit, 2026-09-24. Retain current proposed assignments; no renumbering or
-schema change resulted. This is not a production allocation or compatibility freeze.
+Draft-3 assignment audit, 2026-09-28. This is not a production allocation or compatibility freeze.
 
 ## Assignment disposition
 
 `schema/broker-control-draft.idl` remains the numeric source. The mechanical checker
 `probes/check_broker_registry.py` verifies 27 opcode/name mappings against the registry
-and operation table, 30 mutable types' member-ID uniqueness, and 17 discriminator
+and operation table, 8 mutable types' member-ID uniqueness (four active bootstrap, three legacy and one test-only), and 17 discriminator
 namespaces. It also checks the draft PIDs against current native PID declarations.
 
 | Namespace | Disposition |
 | --- | --- |
-| Operations | 4–22 and 25–32 active; 1–3 and 23/24 reserved and unsupported |
+| Operations | 4–20 and 25–34 active; 1–3 and 21–24 reserved and unsupported |
 | Vendor discovery PIDs | Native locator assignments 0x8001/0x8002 unchanged; draft origin version 0x8003 and service fields 0x8004–0x8006 distinct |
 | Bootstrap endpoints | Key 7a0001, writer kind 43 and reader kind 44 retained; allocator must reserve these identities and exclude standard/native endpoints |
 | Established endpoints | Dynamically allocated per owner with lifetime fencing; not a global fixed pair |
-| Features | 1/2 optional supported capabilities; 3–5 reserved, not selectable in v1 |
+| Features | 1/2/6 supported capabilities (6 requires 1); 3–5 reserved, not selectable in v1 |
 | Profiles/channels | CACHED and CONTROL/STATE supported; OPAQUE_PEER and peer-metatraffic remain unsupported |
 | Mutable member IDs | Scoped to their containing type; never renumber or reuse retired members |
 
@@ -85,13 +84,12 @@ announcements are not rewritten into the broker's little-endian encoding.
 
 ## Evidence and remaining work
 
-The checker passes against the current checkout. This review changed documentation and
-added that checker only; existing codec/golden tests were not rerun because no encoded
-layout changed. The checker does not validate parser behavior, cryptography, interoperability,
-all cross-message semantics or production allocator behavior.
+The checker and current independent vectors pass; generated codec evidence is recorded
+in [the validation inventory](../../test/design-models/README.md). Draft 3 changed magic,
+established body representation and transaction fields; it is not compatible with prior
+draft bytes. All assignments remain provisional until deliberate publication.
 
-Assignment/version policy is now reviewed at specification level. Remaining freeze gates
-are the named inline/path integration evidence and schema/native-storage agreement, plus
-an explicit publication decision. Next specification pass should settle bounded decoding
-and retained-byte ownership so large schema ceilings do not imply megabyte stack objects.
-No additional feature or broad concurrency investigation is needed for that pass.
+Remaining gates are strict production parser/storage enforcement, inline/path transport
+integration and independent compatibility tests. Required-member checks still apply to
+mutable bootstrap; exact positional extent replaces member evolution on established bodies.
+No wire/ABI or security conformance follows from schema compilation alone.

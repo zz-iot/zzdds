@@ -1,5 +1,11 @@
 # Prepared writer commits and fair gate handoff
 
+Review scope (2026-09-28): [fast paths](concurrency-fast-paths.md) governs INSTANCE/TOPIC
+specialization and hosted/manual helping. Publisher tickets/group gates below apply only
+to GROUP coordination, not every ordinary write. Foreign hooks run outside owner rights.
+[Selection/claims](prepared-read-conflicts.md) replaces optimistic read/take validation;
+listener preparation retries remain separate. Dated experiments describe their own scope.
+
 Status: reservation direction consolidated, 2026-09-10. Unnumbered Publisher tickets, the short group-commit gate, a per-writer configurable preparation limit (default one per instance), and an ordered preparation ledger with head-only ticket admission are selected. Exact handoff synchronization, storage structures and public configuration APIs remain unimplemented proposals. See [admission state machine](admission-state-machine.md).
 
 ## 1. Two distinct gate objects
@@ -24,7 +30,9 @@ Entitlement can cause head-of-line delay, but it is not a mutex held across writ
 
 ## 3. Prepared change contract
 
-Preparation runs under writer ownership as needed, outside the group metadata gate. Its result owns:
+Foreign serialization, allocator hooks and fallible payload preparation run outside writer
+rights. Bounded internal reservation bookkeeping may use writer ownership, outside the
+group metadata gate. Its result owns:
 
 * Serialized payload or explicitly retained loan storage with the required immutability/lifetime.
 * A history node/slot that can be linked without allocation or array growth.

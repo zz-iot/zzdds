@@ -1,0 +1,54 @@
+diff --git a/src/backend/zig.zig b/src/backend/zig.zig
+index 7752504..49354ba 100644
+--- a/src/backend/zig.zig
++++ b/src/backend/zig.zig
+@@ -7107,7 +7130,9 @@ fn typeRefNeedsAllocator(tr: ir.TypeRef) bool {
+     return switch (tr) {
+         .string => |bound| bound == null,
+         .wstring => true, // readWstring always allocates, even for bounded wstring
+-        .sequence => |seq| seq.bound == null,
++        // Bounded storage does not allocate, but its element decoder may
++        // forward allocator. Match emitSequenceElementRead's supported shapes.
++        .sequence => |seq| seq.bound == null or sequenceElementUsesAllocator(seq.element.*),
+         .named => |td| switch (td) {
+             // Conservatively: may have nested strings/seqs. A union case can
+             // just as easily own a string/sequence as a struct field can --
+@@ -7123,6 +7148,17 @@ fn typeRefNeedsAllocator(tr: ir.TypeRef) bool {
+     };
+ }
+
++fn sequenceElementUsesAllocator(tr: ir.TypeRef) bool {
++    return switch (tr) {
++        .named => |td| switch (td) {
++            .enum_, .bitmask => false,
++            .typedef => |t| t.dimensions.len == 0 and sequenceElementUsesAllocator(t.type_ref),
++            else => true,
++        },
++        else => false,
++    };
++}
++
+ /// Returns true if `tr` maps to a C-ABI-compatible Zig type — one that may
+ /// legally appear as a field in an `extern struct`.
+ ///
+@@ -8426,6 +8462,20 @@ test "zig_backend: typedef needsAllocator recurses correctly" {
+     try testing.expect(!has(out.items, "_ = allocator;"));
+ }
+
++test "zig_backend: bounded sequence elements forward allocator through typedefs" {
++    var out = try testGen(
++        \\struct Element { long value; };
++        \\typedef Element ElementAlias;
++        \\typedef sequence<ElementAlias, 4> Elements;
++        \\struct Holder { Elements rows; };
++    , "bounded_allocator");
++    defer out.deinit(testing.allocator);
++    const start = std.mem.indexOf(u8, out.items, "pub const Holder = struct").?;
++    const holder = out.items[start..];
++    try testing.expect(has(holder, "Element.deserializeInto"));
++    try testing.expect(!has(holder, "_ = allocator;"));
++}
++
+ test "zig_backend: serialize @key member in serializeKey" {
+     var out = try testGen("struct S { @key long id; long val; };", "key");
+     defer out.deinit(testing.allocator);

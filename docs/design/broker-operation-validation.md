@@ -1,6 +1,6 @@
 # Broker operation admission and effects
 
-Status: first complete operation-table draft, 2026-09-17. Covers all 27 active IDL
+Status: STATE ordering revised 2026-09-28; aggregate freshness and final established bodies integrated. Covers all 27 active IDL
 operations. F1–F4 below have dispositions; cross-message validation remains subject
 to the consolidated protocol review. It is a specification audit, not an executed protocol model.
 
@@ -59,24 +59,24 @@ content within its valid retention window, not merely a repeated RTPS sequence n
 | Code / operation | Direction; stream; phase | Additional checks and permitted effect | Duplicate / failure behavior |
 | --- | --- | --- | --- |
 | 4 ACCEPT | Bkr→C; boot; B | Outstanding REGISTER/introduction binding, scope, selected limits/profile/view/features, fresh session/generation, broker endpoints; inventory-required true; resume cursor/outcome agree; credential absent. Install mapping, not READY. | Same result idempotent. Conflicting result for one attempt fails admission; late results cannot replace a newer attempt/session. |
-| 5 ORIGIN_BEGIN | C→Bkr; ctl; S | Current owner, increasing inventory generation, local cut, one participant plus bounded endpoint count/bytes; one active generation. Reserve complete declared staging and reconcile orphans. | Same BEGIN does not reset deadline. Conflicting generation/content aborts affected transaction; operation failure. |
-| 6 ORIGIN_RECORD | C→Bkr; state; S/I | Generation/index, exact record bounds, local participant/incarnation ownership, kind/GUID and revision validity. Stage only; early items use bounded orphan budget. | Same index/bytes harmless; conflicting index invalidates inventory. No install before join with BEGIN/END. Operation failure. |
-| 7 ORIGIN_END | C→Bkr; ctl; S/I | Generation/count/digest; exact indexed set and byte total, ordering/dependencies, current fence and freshness activation rules. Atomic inventory replacement after full validation. | Early END may wait within fixed deadline. Same completed transaction returns retained result; no second commit or timeout extension. |
+| 5 ORIGIN_BEGIN | C→Bkr; state; S | Current owner, increasing inventory generation, local cut, one participant plus bounded endpoint count/bytes; one active generation. Reserve complete declared staging before accepting records on this ordered STATE transaction. | Same BEGIN does not reset deadline. Conflicting generation/content aborts affected transaction; operation failure. |
+| 6 ORIGIN_RECORD | C→Bkr; state; S/I | Generation/index, exact record bounds, local participant/incarnation ownership, kind/GUID and revision validity. Stage only; require preceding BEGIN on the same ordered STATE stream. | Same index/bytes harmless; conflicting index invalidates inventory. No install before join with BEGIN/END. Operation failure. |
+| 7 ORIGIN_END | C→Bkr; state; S/I | Generation/count; exact indexed set and byte total, ordering/dependencies, current fence and freshness activation rules. Atomic inventory replacement after full validation. | END follows records in STATE order; missing records at END fail the transaction. Same completed transaction returns retained result; no second commit or timeout extension. |
 | 8 MUTATE | C→Bkr; state; S/O | Complete owned record, revision high-water check, valid change/metadata and dependent participant. Reserve store/delta/result capacity; commit only against current owner and correct inventory baseline. | Same revision/bytes idempotent; changed bytes at same revision conflict. No early mutation staging; the accepted F1 barrier applies. |
 | 9 COMMIT | Bkr→C; ctl; S | related_request and commit kind match retained inventory/mutation/close operation; applicable entity/revision/generation agree, unused fields zero. Advance only that operation's committed frontier. | Duplicate harmless; unknown/stale correlation cannot clear current pending work. A successful result never implies view synchronization. |
 | 10 REJECT | Bkr→C; ctl; S | Correlated origin operation, inventory generation or entity/revision as applicable, legal error/recovery action. Fail that uncommitted attempt; preserve authoritative local state for repair. | Cannot contradict an already committed result. Conflicting outcomes require session recovery, not rollback of committed store effects. |
 | 11 VIEW_REQUEST | C→Bkr; ctl; S | Negotiated view mode; resume feature, retained baseline/cursor and authorization compatibility; non-resume cursor zero. Reserve snapshot/delta retention or select valid resume. | Same request must not create another view. Client-assigned generation increases for new requests; old/failed generations cannot restart work. Operation failure or snapshot fallback where permitted. |
-| 12 SNAPSHOT_BEGIN | Bkr→C; ctl; S/V | View generation/cut, count/total budgets, selected authorized mode; empty downstream snapshot allowed. Reserve staging and reconcile early items/deltas. | Same BEGIN idempotent without extending deadline; conflicting baseline invalidates view. |
-| 13 SNAPSHOT_RECORD | Bkr→C; state; S/V | View/cut/index, complete record, entity dependencies and negotiated metadata semantics. Stage only; account early records as orphans. | Same index/bytes harmless; conflicting or over-budget data invalidates view. RTPS ACK cannot stand in for application retention. |
-| 14 SNAPSHOT_END | Bkr→C; ctl; S/V | Matching generation/cut/count/digest, complete ordered set and fixed ready-through target. Install baseline atomically; apply buffered deltas contiguously. Activate only with fresh presence. | Early END waits boundedly. Duplicate cannot reinstall or refresh presence. Invalid assembly causes view recovery. |
-| 15 DELTA | Bkr→C; state; S/V/A | Current view, positive delivery sequence, kind-specific record/reason/revision/freshness fields. Buffer before baseline; apply only next contiguous sequence with valid dependencies. | Identical retained duplicate harmless; conflicts/gaps trigger bounded repair/resync. Withdrawals do not invent native dispose or origin revision. |
-| 16 APPLIED | C→Bkr; ctl; S/V | Current view and baseline cut/digest; monotonic contiguous applied sequence no greater than actually sent history. Advance retention cursor only. | Same/lower valid acknowledgment adds no effect. Cannot refresh lease, invent received state or acknowledge another view. Invalid claim is operation failure. |
-| 17 VIEW_SYNC | Bkr→C; ctl; S/V/A | Accepted resume, current retained baseline/view, fixed ready-through target. Establish target for resumed synchronization. | Same target idempotent; conflicting target for one synchronization is invalid. Never substitutes for missing baseline or presence. |
+| 12 SNAPSHOT_BEGIN | Bkr→C; state; S/V | View generation/cut, count/total budgets, selected authorized mode; empty downstream snapshot allowed. Reserve staging before records; establish this view generation in ordered STATE. | Same BEGIN idempotent without extending deadline; conflicting baseline invalidates view. |
+| 13 SNAPSHOT_RECORD | Bkr→C; state; S/V | View/cut/index, complete record, entity dependencies and negotiated metadata semantics. Stage only; require the current preceding snapshot BEGIN. | Same index/bytes harmless; conflicting or over-budget data invalidates view. RTPS ACK cannot stand in for application retention. |
+| 14 SNAPSHOT_END | Bkr→C; state; S/V | Matching generation/cut/count, complete ordered set and fixed ready-through target. Install baseline atomically; then apply subsequent STATE deltas contiguously. Activate only with fresh presence. | END follows snapshot records; incomplete assembly fails rather than waiting for overtaken records. Duplicate cannot reinstall or refresh presence. Invalid assembly causes view recovery. |
+| 15 DELTA | Bkr→C; state; S/V/A | Current view, positive delivery sequence, kind-specific record/reason/revision/freshness fields. Require installed baseline or valid resumed baseline; apply only next contiguous sequence with valid dependencies. | Identical retained duplicate harmless; conflicts/gaps trigger bounded repair/resync. Withdrawals do not invent native dispose or origin revision. |
+| 16 APPLIED | C→Bkr; ctl; S/V | Current view and retained baseline cut; monotonic contiguous applied sequence no greater than actually sent history. Advance retention cursor only. | Same/lower valid acknowledgment adds no effect. Cannot refresh lease, invent received state or acknowledge another view. Invalid claim is operation failure. |
+| 17 VIEW_SYNC | Bkr→C; state; S/V/A | Accepted resume, current retained baseline/view, fixed ready-through target. Establish target for resumed synchronization. | Same target idempotent; conflicting target for one synchronization is invalid. Never substitutes for missing baseline or presence. |
 | 18 RESYNC_REQUIRED | Either; ctl; S/V/A | Applicable view, recognized reason and bounded retry hint. Invalidate affected synchronization/cursor and start fresh view within existing deadlines. | Old view must not invalidate successor. Client-originated invalidation has zero retry hint; newer VIEW_REQUEST also retires predecessor. |
 | 19 LEASE_CHALLENGE | Bkr→C; ctl; S | Current session, nonzero nonce, bounded outstanding-proof work. Return matching proof only while participant/registration is live. | Duplicate does not create new freshness or extend broker deadline. D phase must not renew. |
 | 20 LEASE_PROOF | C→Bkr; ctl; S | Outstanding nonce, current owner, server-local send-time deadline and valid policy. Consume proof and update origin freshness according to lease contract. | Replayed/late/unsolicited proof never renews. Admission alone is not proof. |
-| 21 PRESENCE_QUERY | C→Bkr; ctl; S/V/A | Increasing query serial admitted in control-stream order, outstanding view, nonce, full-view empty list or nonempty deduplicated authorized subset; bounded proof work. Snapshot current evidence into correlated chunks. | Duplicate cannot reset observer's original query deadline or authorize extra disclosure. Capacity errors must not manufacture validity. |
-| 22 PRESENCE_PROOF | Bkr→C; ctl; S/V/A | Outstanding session/serial/nonce/view, bounded chunk count/index, unique entries, matching incarnation/freshness and conservative send-time-based remaining lease. | Duplicate cannot extend deadline; conflicting chunks invalidate proof assembly. Missing participants are not inferred fresh. F3 defines immutable frontier membership and explicit unavailable results. |
+| 33 FRESHNESS_QUERY | C→Bkr; ctl; S/V | Current view and nonzero outstanding nonce; bounded rate/capture state. Capture actual unexpired membership and queue its marker after required STATE withdrawals. | Submit once; RTPS repair retains sequence/bytes/t0 and admits capture once. Timeout uses a new nonce; retained result capacity may refuse new work. See retry retirement. |
+| 34 FRESHNESS_MARKER | Bkr→C; state; S/V | Matching outstanding nonce/view; installed frontier; unique incarnation exceptions within Xmax and marker-byte bounds; valid common/exception durations. Apply evidence only to covered membership. | First application consumes nonce. Duplicate, abandoned and old-session markers cannot extend validity. Earlier authoritative changes prevail. |
 | 25 CLOSE | C→Bkr; ctl; S/D | Exact participant incarnation/current owner. Reserve terminal/result/withdrawal state; atomically fence and withdraw dependent records. | Duplicate retained result returns CLOSED; old-owner CLOSE cannot remove replacement. Post-close limited reply handling is not a live session. |
 | 26 CLOSED | Bkr→C; ctl; D | Outstanding CLOSE identity/request and valid reply binding; release remote-wait obligation. | Late/duplicate harmless. Local destruction already has its own bounded completion path and never requires this reply. |
 | 27 STATUS | Either; ctl; S/D | Related request/generations if applicable, recognized informational code. Update bounded diagnostics only. | Coalescing allowed; cannot establish COMMIT, READY, lease or authority. Inapplicable fields zero. |
@@ -101,11 +101,11 @@ remains distinct. RESYNC_REQUIRED is bidirectional with restricted reasons, zero
 retry hints and no response loop. The [accepted view contract](broker-view-correlation.md)
 defines high-water retirement, failed-request behavior and authorization invalidation.
 
-**F3 — resolved: fixed presence answers.** The [accepted presence contract](broker-presence-completeness.md)
-adds a view delivery frontier, explicit available/unavailable entries and four aggregate
-limits. Complete timely answers account for the fixed READY target; unavailable entries
-remain inactive and cannot revoke existing evidence. Full-view overflow uses bounded
-subset queries, not truncated success. Replay retention remains W3 implementation work.
+**F3 — revised: ordered aggregate freshness.** The [current contract](broker-aggregate-freshness.md)
+uses an exact STATE frontier, common horizon and bounded exceptions. Timely markers account
+for the fixed READY cut without requiring every origin to be active. No chunks, subsets,
+availability discriminator or query serial remains. [Retry retirement](broker-retry-retirement.md)
+specifies once-only logical submission and bounded reliable result retention.
 
 **F4 — resolved by scope correction.** No broker forwarding in v1. Remove ROUTE and
 ROUTE_ERROR bodies, reserve their IDs and peer-channel/service numbers, and preserve
@@ -176,3 +176,14 @@ Reject its effects and fail the affected operation/session under the existing po
 response must use the verified original association. Unknown/untrusted traffic cannot tear
 down another session. Error-code availability in the registry does not authorize that code
 in every phase. ADMISSION_REJECT and RESYNC_REQUIRED retain their explicit reason subsets.
+
+## Review revision boundary
+
+BEGIN/RECORD/END and VIEW_SYNC now share STATE order. Transport reassembly still needs
+bounds and application retention; ordering does not authorize ACK-and-forget. Confirm
+ACCEPT with an established CONTROL request (normally VIEW_REQUEST), not ORIGIN_BEGIN.
+Preconfirmation state/control reordering remains distinct from removed intra-STATE orphans.
+
+Draft revision 3 reserves old presence opcodes 21/22 and uses 33/34. The schema and
+independent fixtures now encode the aggregate query/marker; this is codec evidence,
+not production admission or resource validation.

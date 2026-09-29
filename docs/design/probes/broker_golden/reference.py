@@ -1,13 +1,12 @@
 """Independent struct/hashlib reference, not the generated codec.
 Default checks committed draft vectors; --write explicitly regenerates them.
 """
-import hashlib
 from pathlib import Path
 import struct
 import sys
 
 root = Path(__file__).resolve().parent
-MAGIC = b"ZZDBRK01"
+MAGIC = b"ZZDBRK03"
 INV = b"zzdds-broker/inventory/v1\x00"
 SNAP = b"zzdds-broker/snapshot/v1\x00"
 
@@ -18,28 +17,13 @@ def frame(operation, body):
     return b"\x00\x07\x00" + bytes([padding]) + payload + bytes(padding)
 
 
-def digest(label, records):
-    data = label + struct.pack("<Q", len(records))
-    for record in records:
-        data += struct.pack("<Q", len(record)) + record
-    return hashlib.sha256(data).hexdigest()
-
-
-# ViewSync: mutable DHEADER and two MU scalar members (LC=3, uint64).
-sync = struct.pack("<IIQIQ", 24, 0xB0000001, 5, 0xB0000002, 23)
+# ViewSync: final positional two uint64 fields.
+sync = struct.pack("<QQ", 5, 23)
 
 def member(member_id, payload):
     return struct.pack("<II", 0xC0000000 | member_id, len(payload)) + payload
 
-scope = struct.pack("<I", 2) + b"r\0" + bytes(2) + struct.pack("<I", 7)
-envelope_members = member(1, scope)
-envelope_members += member(2, bytes([0x11]) * 16)
-envelope_members += member(3, bytes([0x22]) * 16)
-envelope_members += struct.pack("<IQ", 0xB0000004, 9)
-envelope_members += member(5, bytes([0x33]) * 16)
-envelope_members += member(6, struct.pack("<I", 0))
-envelope_members += member(7, struct.pack("<I", len(sync)) + sync)
-envelope = struct.pack("<I", len(envelope_members)) + envelope_members
+envelope = bytes([0x33])*16 + struct.pack('<II', 0, len(sync)) + sync
 
 # A structurally encoded OriginRecord, not a semantically complete SPDP sample.
 guid = bytes(range(12)) + bytes.fromhex("000001c1")
@@ -90,9 +74,6 @@ vectors = {
     "view_sync_frame.hex": frame(17, envelope).hex() + "\n",
     "padding_frame.hex": frame(27, b"\x10\x20\x30").hex() + "\n",
     "origin_record.hex": record.hex() + "\n",
-    "empty_snapshot.sha256": digest(SNAP, []) + "\n",
-    "one_origin_inventory.sha256": digest(INV, [record]) + "\n",
-    "one_origin_snapshot.sha256": digest(SNAP, [record]) + "\n",
 }
 for name, content in vectors.items():
     target = root / name

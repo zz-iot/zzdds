@@ -18,8 +18,8 @@ semantically authorized participants or a selected cookie cryptographic format.
 
 | Domain-tag bytes (excluding NUL) | Selected features | Resume | REGISTER | ACCEPT | PATH_CHALLENGE / RESPONSE |
 | --- | --- | --- | --- | --- | --- |
-| 8 | 2 | No | 380 | 476 | 192 |
-| 256 | 128 | Yes | 1240 | 1336 | 192 |
+| 8 | 2 | No | 368 | 464 | 192 |
+| 256 | 128 | Yes | 1228 | 1324 | 192 |
 
 The current rejection fixture is 144 bytes including Frame. Native SPDP introductions
 are not Frames: their total depends on the complete canonical participant payload,
@@ -65,7 +65,7 @@ TCP configuration or a larger supported path budget remain deployment choices.
 3. ACCEPT travels on the bootstrap binding. Broker installs incoming session validation
    but does not initiate established output before receipt confirmation.
 4. Client validates ACCEPT, installs both endpoint mappings, then sends an established
-   control request, normally ORIGIN_BEGIN or VIEW_REQUEST. Broker processes this valid
+   control request, normally VIEW_REQUEST. ORIGIN_BEGIN is now STATE traffic and does not confirm ACCEPT. Broker processes this valid
    control message as confirmation of receipt; it is not a separate lease renewal.
 5. Established reliability and protocol work proceed. CONTROL/STATE remain independent;
    early state records may use bounded orphan staging once session identity is validated.
