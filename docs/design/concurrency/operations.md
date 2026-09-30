@@ -1,12 +1,17 @@
 # Concurrency: operations
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="operation-result-mapping"></a>
-## Remaining L5 operation results
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
 
-<a id="operation-result-mapping--shared-effect-boundary"></a>
+Each operation separates admission, irreversible effects, result publication and cleanup.
+The shared rules precede read/take and binding results, writer lifecycle, ACK/history waits
+and WaitSet behavior.
+
+<a id="operation-effects-and-results"></a>
+## Operation effects and results
+
+<a id="shared-effect-boundary"></a>
 ### Shared effect boundary
 
 Keep effect commitment, result delivery and storage reclamation distinct. Before an
@@ -23,7 +28,7 @@ checked again at the relevant effect boundary. A proven retained-rights dependen
 can return ERROR under the existing dependency policy; do not reject merely because
 an operation was invoked from a callback.
 
-<a id="operation-result-mapping--mapping-table"></a>
+<a id="mapping-table"></a>
 ### Mapping table
 
 | Operation | Effect/result boundary | Required mapping |
@@ -45,7 +50,7 @@ max_blocking_time, while return_loan on valid collections that were not loaned i
 permitted. These facts do not grant every operation an identical timeout/error set.
 [OMG DDS 1.4](https://www.omg.org/spec/DDS/1.4/PDF).
 
-<a id="operation-result-mapping--deadline-and-failure-classification"></a>
+<a id="deadline-and-failure-classification"></a>
 ### Deadline and failure classification
 
 Use one deadline for operations that actually have a specified blocking budget;
@@ -69,10 +74,10 @@ local operations or release-only cleanup. WaitSet's independent wake/guard behav
 remains its explicit exception. Already committed mutations still need retained
 cleanup and result delivery; runtime shutdown cannot abandon them.
 
-<a id="prepared-read-conflicts"></a>
+<a id="prepared-readtake-selection-claims-and-failure"></a>
 ## Prepared read/take: selection, claims and failure
 
-<a id="prepared-read-conflicts--admission-and-conversion-capability"></a>
+<a id="admission-and-conversion-capability"></a>
 ### Admission and conversion capability
 
 Validate arguments, enablement, reader lifetime, masks, condition and presentation access
@@ -96,7 +101,7 @@ No stale-validation retry or conflict-exhaustion ERROR applies. Same-reader recu
 foreign preparation retains the explicit recursion guard; removing optimistic retries
 alone does not authorize unbounded recursive conversion.
 
-<a id="prepared-read-conflicts--claims-and-restoration"></a>
+<a id="claims-and-restoration"></a>
 ### Claims and restoration
 
 A take claim hides its samples from other reads/takes and from condition evaluation; it
@@ -125,7 +130,7 @@ rebirth can legitimately make an instance NEW again; delayed failure cleanup mus
 reapply NOT_NEW to that new generation. Read failures have no claims to restore but keep
 their selection-time state effects. Decode output from a failed conversion is discarded.
 
-<a id="prepared-read-conflicts--observable-failure-contract"></a>
+<a id="observable-failure-contract"></a>
 ### Observable failure contract
 
 Foreign-path failed takes may temporarily hide samples: a concurrent call may return
@@ -148,10 +153,10 @@ or successful consumption followed by output-publication failure. No new standar
 ReturnCode is introduced. A failure after successful final output transfer must not unclaim
 or automatically repeat an already-completed take.
 
-<a id="binding-access-failures"></a>
+<a id="binding-visible-prepared-access-failures"></a>
 ## Binding-visible prepared access failures
 
-<a id="binding-access-failures--common-mapping"></a>
+<a id="common-mapping"></a>
 ### Common mapping
 
 | Condition | DDS ReturnCode result | Access effect |
@@ -182,10 +187,10 @@ to ERROR. Until provenance exists, ambiguous OVERFLOW maps to ERROR, never a gue
 allocation diagnosis. Migration must supply explicit categories through a private
 adapter result or an additive codec facility without renumbering existing CDR codes.
 
-<a id="binding-access-failures--language-contracts"></a>
+<a id="language-contracts"></a>
 ### Language contracts
 
-<a id="binding-access-failures--zig-and-raw-c"></a>
+<a id="zig-and-raw-c"></a>
 #### Zig and raw C
 
 Generated DDS ReturnCode operations return the table's codes. Internal Zig errors
@@ -202,7 +207,7 @@ counts/loan outputs in their documented empty state. No C++ exception or Java pe
 exception may unwind through the C ABI. Supported foreign hooks must communicate
 failure explicitly through the private preparation protocol.
 
-<a id="binding-access-failures--c"></a>
+<a id="c"></a>
 #### C++
 
 ReturnCode methods map generated preparation std::bad_alloc to OUT_OF_RESOURCES and
@@ -223,7 +228,7 @@ may leave partial caller output and must never trigger automatic re-execution. A
 ReturnCode-only caller must follow this documented distinction; it cannot infer
 absence of effects from every non-OK code on arbitrary-output paths.
 
-<a id="binding-access-failures--java"></a>
+<a id="java"></a>
 #### Java
 
 Raw generated ReturnCode methods retain their numeric result for native DDS failures.
@@ -235,7 +240,7 @@ and may leave partial list output after a committed access.
 
 Typed convenience methods check the raw/prepared result explicitly. Genuine NO_DATA
 remains null for a single sample or an empty array for a batch. Other DDS failures
-throw a proposed unchecked zzdds AccessFailure carrying the DDS return code, a bounded
+throw an unchecked zzdds AccessFailure carrying the DDS return code, a bounded
 reason enum and effect phase (no selection effects, selection state committed, or consumption committed). Define shared public error
 metadata in zzdds.idl, not dcps.idl; attach a Java cause in the binding when available.
 Names/layout are integration work, not a new DDS ReturnCode or a standard DDS exception.
@@ -247,11 +252,11 @@ Sample/array before commit so returning its reference does not require allocatio
 Arbitrary caller containers retain the weaker publication guarantee above. The custom
 exception improves convenience API observability; standard APIs require no new setup.
 
-<a id="binding-access-failures--batch-helper-compatibility"></a>
+<a id="batch-helper-compatibility"></a>
 ### Batch helper compatibility
 
 C/C++ count-returning convenience helpers cannot carry a precise DDS failure without
-an additional convention. Recommend additive result-and-count helpers: return a DDS
+an additional convention. Provide additive result-and-count helpers: return a DDS
 ReturnCode and write a count only on success (zero on NO_DATA/error). These are typed
 binding helpers, not new methods on DCPS entity interfaces. Any shared public types
 or entity extensions belong in zzdds.idl.
@@ -264,7 +269,7 @@ are not the new precise API; document changes to the previous empty/error behavi
 in migration notes. Avoid a thread-local last-error mechanism: reentrant preparation
 and evented execution make per-invocation results more reliable.
 
-<a id="binding-access-failures--variant-coverage-and-migration-gates"></a>
+<a id="variant-coverage-and-migration-gates"></a>
 ### Variant coverage and migration gates
 
 Apply the preparation boundary to single and batch read/take, instance and next-instance
@@ -286,15 +291,15 @@ condition/next-instance variants. Prove the actual generated non-throwing transf
 preserve allocator/loan lifetime. These are implementation gates, not grounds for a
 new scalar prototype.
 
-<a id="binding-access-failures--required-binding-limitation-note"></a>
+<a id="required-binding-limitation-note"></a>
 ### Required binding limitation note
 
-Carry the known-limitation paragraph from [prepared access](operations.md#prepared-read-conflicts)
+Carry the known-limitation paragraph from [prepared access](operations.md#prepared-readtake-selection-claims-and-failure)
 into every binding using foreign conversion: failed access may retain READ/NOT_NEW;
 NOT_READ/NEW filters can skip undelivered data; ANY-state retry is the workaround, subject
 to normal retention. Certified native eligibility is capability-based, not language-based.
 
-<a id="reader-variant-results"></a>
+<a id="reader-variants-and-preconditions"></a>
 ## Reader variants and preconditions
 
 ### Standard API preconditions
@@ -313,7 +318,7 @@ These requirements follow the DDS 1.4 sample-access contracts (§§2.2.2.5.3.8�
 the cursor interpretation below explicitly records the textual inconsistency.
 
 
-<a id="reader-variant-results--prepared-access-composition"></a>
+<a id="prepared-access-composition"></a>
 ### Prepared-access composition
 
 For each operation, prepare an explicit variant descriptor: state masks or retained
@@ -326,16 +331,16 @@ Validate preconditions without consuming samples or changing caller-owned collec
 At selection, validate the complete variant and capture SampleInfo under reader/access
 ownership. The certified native path preflights all fallible work; the foreign path commits
 READ/NOT_NEW and take claims, then decodes outside rights. Follow
-[claim completion/restoration](operations.md#prepared-read-conflicts), without optimistic reselection.
+[claim completion/restoration](operations.md#prepared-readtake-selection-claims-and-failure), without optimistic reselection.
 Retain immutable returned SampleInfo independently of subsequent internal state changes.
 A published loan pins storage, not continued eligibility for another consumer.
 
 The existing GROUP access contract supplies access-period ownership. Do not create a
 second epoch mechanism for prepared conversion. GROUP-disabled builds remove those
 specific dependencies but retain ordinary sample/view state, condition, identity and
-loan validation. No new timeout or listener exclusion policy follows from this audit.
+loan validation. These rules introduce no new timeout or listener exclusion policy.
 
-<a id="reader-variant-results--cursor-interpretation-and-finish-line"></a>
+<a id="cursor-interpretation"></a>
 ### Cursor interpretation
 
 Use strict advancement for both plain and condition next-instance operations.
@@ -349,8 +354,8 @@ nearer-instance insertion, mismatched loans/copy results, repeated valid no-loan
 return, GROUP one-sample ordering, and invalid_data metadata. They should exercise
 the actual generated adapters and native core; no additional scalar model is needed.
 
-<a id="reader-variant-results--cursor-follow-up-evidence"></a>
-### Cursor follow-up evidence
+<a id="cursor-rationale"></a>
+### Cursor rationale
 
 With an ANY-state read condition, inclusive selection can repeatedly return the
 same instance when callers feed back the last returned handle. Strict advancement
@@ -375,7 +380,7 @@ variants retain these rules. DDS 1.4 §§2.2.2.4.2.5–.14 does not establish a 
 precedence for simultaneous faults; ordinary validation remains operation-specific.
 
 
-<a id="writer-lifecycle-results--contract-implications"></a>
+<a id="contract-implications"></a>
 ### Contract implications
 
 Use the existing writer admission ledger for lifecycle operations as well as data.
@@ -389,9 +394,9 @@ identity/generation validation at commit. Hash equality alone is not proof of a 
 registration. Binding caches are derived conveniences. Concurrent registration of
 one instance must resolve to one registration; an admitted unregister must not retire
 a newer registration accidentally. Exact handle allocation/collision strategy is
-implementation work, not fixed by this audit.
+an implementation choice constrained by these identity and lifetime rules.
 
-For the proposed implementation, failed implicit registration plus write must leave
+ failed implicit registration plus write must leave
 no newly published registration or history effect. Explicit registration is its own
 commit. Successful unregister retires registration atomically with required lifecycle
 publication, honoring autodispose; retained key/control storage may outlive logical
@@ -404,11 +409,11 @@ applications to use extensions. If precise application-facing registration resul
 are later exposed, place the additional interface in zzdds.idl. No new public API is
 needed to adopt the concurrency rule here.
 
-<a id="writer-ack-wait"></a>
+<a id="datawriter-acknowledgment-wait-frontier-and-completion-contract"></a>
 ## DataWriter acknowledgment wait: frontier and completion contract
 
-<a id="writer-ack-wait--recommended-capture"></a>
-### Recommended capture
+<a id="captured-acknowledgment-frontier"></a>
+### Captured acknowledgment frontier
 
 After argument/lifetime validation, capture a committed writer sequence frontier and
 its currently relevant reliable association generations under writer state ownership.
@@ -430,10 +435,10 @@ wait for a reader to appear must use discovery/matching separately. Best-effort 
 return OK after normal argument/entity validation; this does not promise queued
 best-effort sends have reached the network.
 
-<a id="writer-ack-wait--association-changes-while-waiting"></a>
+<a id="association-changes-while-waiting"></a>
 ### Association changes while waiting
 
-Recommend a fixed set whose obligations can be satisfied or retired:
+Capture a fixed set whose obligations can be satisfied or retired:
 
 * Valid ACK progress for a captured association satisfies its covered obligations.
 * Logical unmatch retires that association's remaining obligations from the wait.
@@ -447,15 +452,12 @@ Recommend a fixed set whose obligations can be satisfied or retired:
 * Temporary transport failure does not count as acknowledgment or unmatch. Wait for
   legitimate protocol progress, actual association retirement, timeout or writer close.
 
-Alternative: report ERROR if any selected reader departs before acknowledgment. This
-provides a stronger outcome for the originally selected set, but makes routine discovery
-churn fail a standard protocol wait. Another alternative retains a departed reader
-until timeout, which cannot progress once its association no longer exists. The
-recommended removal policy fits current-match reliability operation, with explicit
-wording to avoid advertising end-to-end delivery assurance.
+**Rationale.** Successful completion means no obligations remain against the captured
+current-match reliability set; it is not an end-to-end receipt guarantee for a reader
+that has departed.
 
-<a id="writer-ack-wait--deadline-close-and-completion-proposal"></a>
-### Deadline, close and completion proposal
+<a id="deadline-close-and-completion"></a>
+### Deadline, close and completion
 
 Use one monotonic absolute deadline derived from API entry. Initial capture checks
 whether the predicate is already satisfied; a zero-duration call is a nonblocking
@@ -476,10 +478,10 @@ completion through the same request protocol:
 The initial predicate check is an explicit polling rule, not a promise to reconstruct
 when already-acknowledged data became complete before registration. Duration validation,
 overflow-safe deadline construction and terminal request publication are required.
-An irreversibly stopped runtime with a still-live writer is a separate proposed ERROR,
+An irreversibly stopped runtime with a still-live writer is a separate ERROR,
 not ALREADY_DELETED. Manual-driver idleness is not runtime failure.
 
-<a id="writer-ack-wait--callback-and-manual-progress"></a>
+<a id="callback-and-manual-progress"></a>
 ### Callback and manual progress
 
 Allow this wait from callback/preparation chains with their rights retained. Protocol
@@ -492,14 +494,14 @@ state or reset another wait's progress.
 There is no guarantee of success when delivery depends on application behavior,
 including a remote reader making history space or an in-process callback releasing
 resources. Infinite wait remains capable of application-level deadlock. Known internal
-self-dependencies should be handled by the L5 dependency policy; do not infer one just
+self-dependencies use the [dependency policy](#deadline-and-failure-classification); do not infer one just
 because a callback called wait_for_acknowledgments.
 
-<a id="publisher-ack-wait"></a>
+<a id="publisher-acknowledgment-wait-aggregation-contract"></a>
 ## Publisher acknowledgment wait: aggregation contract
 
-<a id="publisher-ack-wait--recommended-scope-fixed-membership-per-writer-capture"></a>
-### Recommended scope: fixed membership, per-writer capture
+<a id="fixed-membership-and-per-writer-capture"></a>
+### Fixed membership and per-writer capture
 
 1. Derive one absolute monotonic deadline at API entry, after safe duration
    validation. Under lifecycle membership synchronization, capture and retain the
@@ -519,17 +521,12 @@ concurrent commits are covered if they precede that writer's capture. An associa
 matching after Publisher entry but before its writer capture can be included. After
 that capture, later writes and matches cannot extend that child's target.
 
-Alternative: one Publisher-wide instantaneous cut, including all writer association
-state. This provides a stronger cross-writer snapshot, but requires coordinated
-snapshot state, version retention or freezing multiple endpoint contexts. The existing
-GROUP commit gate alone does not capture independently changing associations, and
-requiring it in every small build would undermine the optional-profile requirement.
-Recommend the vector contract initially. It is explicitly weaker than a global cut,
-and must not be described as equivalent to one. Sequential *blocking* calls to the
-public writer wait are also not equivalent: their late captures can include writes
-made while earlier writers were waiting.
+This per-writer vector is not a Publisher-wide instantaneous cut. Sequential blocking
+calls to the public writer wait are also not equivalent: their late captures can include
+writes made while earlier writers were waiting. Dispatch retained captures without
+waiting for one writer's ACK completion before capturing the next.
 
-<a id="publisher-ack-wait--completion-timeout-and-lifecycle"></a>
+<a id="completion-timeout-and-lifecycle"></a>
 ### Completion, timeout and lifecycle
 
 All capture, registration and ACK progress uses the original deadline. Never give
@@ -559,13 +556,11 @@ writer state. Concrete bounded storage and handoff design remains to be validate
 * A previously terminal aggregate result is immutable. At/after the deadline, an
   unresolved registered aggregate resolves TIMEOUT before accepting new progress.
 
-ERROR for child loss distinguishes an interrupted operation from deletion of the
-Publisher handle itself. Alternatives are propagating child ALREADY_DELETED (simpler
-but ambiguous about which entity was deleted) or retiring the writer like a reader
-unmatch (permits OK after destroying unacknowledged local history). Recommend ERROR.
-This is an operation-specific policy, not a change to DataWriter close behavior.
+**Rationale.** ERROR for unfinished child loss distinguishes an interrupted Publisher
+operation from deletion of the Publisher handle itself. DataWriter close behavior stays
+operation-specific.
 
-<a id="publisher-ack-wait--suspension-coherent-changes-and-progress"></a>
+<a id="suspension-coherent-changes-and-progress"></a>
 ### Suspension, coherent changes and progress
 
 Include already committed changes even if transmission is deferred by suspension or
@@ -595,10 +590,10 @@ for this API. Work/storage scales with selected writers and their captured relia
 associations, not the number of subsequent writes; implementation must bound resources
 and service captures fairly. No mandatory polling interval or new public API is needed.
 
-<a id="historical-data-wait"></a>
+<a id="historical-data-wait-contract"></a>
 ## Historical-data wait contract
 
-<a id="historical-data-wait--entry-and-completion"></a>
+<a id="entry-and-completion"></a>
 ### Entry and completion
 
 Perform normal argument, duration, enablement and lifetime validation first. Return OK
@@ -630,26 +625,23 @@ stay complete. Same-GUID rematch is a new association, not a substitute for inte
 work. Reader close follows normal ALREADY_DELETED lifetime rules. Completion, timeout
 and close resolve once under the shared request contract.
 
-<a id="historical-data-wait--migration-and-evidence"></a>
-### Migration and evidence
+<a id="historical-wait-compatibility"></a>
+### Historical-wait compatibility
 
 The current implementation's nonzero wait for a first match is replaced by immediate
 empty-source OK. Record this and best-effort immediate success in the implementation's
 CHANGELOG and binding guidance: applications requiring discovery readiness must wait for
 that explicit predicate, not historical data on an unmatched reader.
 
-The historical transfer model covers abstract retained processing and terminal ordering;
-its pre-D1 best-effort scenarios are historical until updated. Real target establishment,
-processing-failure accounting and supported-provider signals remain integration gates.
-See [archived investigation](../archive/review-baseline/historical-data-wait.md) for evidence,
-not controlling requirements. DDS describes historical receipt for nonvolatile readers;
+Implementation must validate real target establishment, processing-failure accounting
+and supported-provider signals. DDS describes historical receipt for nonvolatile readers;
 D1 is the explicit zzdds no-obligation behavior, not a claim that ACK/history predicates
 are interchangeable. [DDS 1.4 §2.2.2.5.3.32](https://www.omg.org/spec/DDS/1.4/PDF).
 
-<a id="waitset-wait"></a>
+<a id="waitset-waiting"></a>
 ## WaitSet waiting
 
-<a id="waitset-wait--one-admitted-invocation-live-membership"></a>
+<a id="one-admitted-invocation-live-membership"></a>
 ### One admitted invocation, live membership
 
 Use one admitted wait invocation per WaitSet, from admission through output publication
@@ -659,6 +651,10 @@ This gives a precise rule slightly stronger than the standard's blocked-thread w
 Executor migration does not create another waiter. Rejected callers do not mutate the
 active invocation's request or output; normal argument validation still applies.
 
+WaitSet is independent of participant lifetime and may attach conditions from different
+participants. Attaching a true condition must wake the admitted wait; detaching an absent
+condition returns PRECONDITION_NOT_MET.
+
 Attachments remain live throughout the wait. New conditions can participate; detach
 or logical condition deletion withdraws their attachment generation. Reattachment is
 a new generation, so an old queued wake cannot restore an old attachment. Duplicate
@@ -666,7 +662,7 @@ attachment does not create another entry or replace its retention registration.
 An empty WaitSet can wait for a later attachment, guard activity after attachment,
 or timeout. Removing its last condition does not return OK or delete the WaitSet.
 
-<a id="waitset-wait--level-observation-not-a-queue-of-trigger-events"></a>
+<a id="level-observation-not-a-queue-of-trigger-events"></a>
 ### Level observation, not a queue of trigger events
 
 A notification schedules a fresh condition scan. It is not a latched success and
@@ -687,7 +683,7 @@ retention are secured. Before that point, errors or invalidation do not consume 
 state. After that point, timeout or reset does not retroactively change OK. No
 successful empty result is invented for a spurious wake or attachment change.
 
-<a id="waitset-wait--deadline-and-closure"></a>
+<a id="deadline-and-closure"></a>
 ### Deadline and closure
 
 Use one absolute monotonic deadline from API entry. Initial nonblocking inspection
@@ -715,7 +711,7 @@ contract; do not quietly redefine raw C condition handles as owning references o
 add an incompatible sequence layout. Resolve this before claiming safe concurrent
 condition deletion across all bindings.
 
-<a id="waitset-wait--progress-across-runtimes"></a>
+<a id="progress-across-runtimes"></a>
 ### Progress across runtimes
 
 Separate wake registration from permission to execute a runtime. A WaitSet accepts
@@ -726,7 +722,7 @@ nested pump or grant permission to execute its callbacks.
 
 Use the configured shared-runtime helping contract for standard API applications.
 The construction-time policy and per-invocation default resolution are defined in
-[WaitSet progress selection](#waitset-close-progress). A guard-only WaitSet needs no
+[WaitSet progress selection](#waitset-close-and-runtime-helping). A guard-only WaitSet needs no
 participant. Attachment order never chooses or changes its runtime.
 
 A callback waiter retains its execution rights and helps only permitted internal
@@ -737,11 +733,11 @@ runtime does not by itself fail the whole WaitSet: another condition or GuardCon
 may still trigger. Failure of the WaitSet's own indispensable wait/progress mechanism
 resolves an unresolved wait as ERROR, as specified below.
 
-<a id="waitset-result-ownership"></a>
+<a id="waitset-result-ownership-across-bindings"></a>
 ## WaitSet result ownership across bindings
 
-<a id="waitset-result-ownership--recommended-mechanism-retained-result-batch"></a>
-### Recommended mechanism: retained result batch
+<a id="retained-result-batch"></a>
+### Retained result batch
 
 Give a selected result an internal lease containing exact condition lifetimes,
 attachment generations, native/C-box retention and any binding ownership anchors.
@@ -791,7 +787,7 @@ condition. Safe deleted-handle invocation requires the separate lifetime-aware h
 contract. In particular, a shared_ptr or Java reference protects wrapper storage, not
 automatically the native DDS object's operational lifetime.
 
-<a id="waitset-result-ownership--completion-versus-conversion-failure"></a>
+<a id="completion-versus-conversion-failure"></a>
 ### Completion versus conversion failure
 
 Keep the terminal wait observation separate from delivery of its output. Once a
@@ -808,10 +804,10 @@ reentrancy receives PRECONDITION_NOT_MET. Exact ReturnCode versus language-excep
 mapping needs to follow the binding's error conventions and remains an implementation
 contract item; today's generated panic is not the desired recoverable path.
 
-<a id="waitset-close-progress"></a>
+<a id="waitset-close-and-runtime-helping"></a>
 ## WaitSet close and runtime helping
 
-<a id="waitset-close-progress--explicit-close-separate-destruction"></a>
+<a id="explicit-close-separate-destruction"></a>
 ### Explicit close, separate destruction
 
 Provide an idempotent, permanent, non-draining close operation on the zzdds WaitSet
@@ -845,13 +841,13 @@ close cannot depend on allocating a new task after marking the object closed. Th
 runtime must drain accepted cleanup before destroying its backend resources. Optional
 external quiescence APIs are not needed for this initial close operation.
 
-Alternative: close waits until the active invocation and hooks finish. That makes
-some external cleanup convenient, but risks self-wait during reentrant conversion or
-hook execution and needs the callback-context distinctions used by entity deletion.
-Use non-draining close consistently; normal wrapper/thread ownership supplies
-the application's destruction ordering.
+Cleanup and wakeup must remain serviceable after every selected runtime stops. Use an
+independently retained WaitSet backend/cleanup obligation or equivalent guarantee;
+a stopped selected runtime's ordinary queue cannot be the only cleanup path. Physical
+cleanup may require backend service after logical close. Allocators and binding resources
+outlive that obligation, not merely the close call.
 
-<a id="waitset-close-progress--stable-helping-policy"></a>
+<a id="stable-helping-policy"></a>
 ### Stable helping policy
 
 A WaitSet needs a wake/deadline mechanism, but is not owned by a participant and need
@@ -859,7 +855,7 @@ not create a participant, socket or worker. Provide these construction policies:
 
 | Policy | Permission granted to a waiting caller |
 | --- | --- |
-| Default shared runtime | Bounded internal helping on the configured default shared runtime only |
+| Default shared runtime | Resolve the configured default runtime; ordinary hosted callers observe only, while manual-runtime and callback-chain waits may help permitted internal work |
 | Explicit runtime set | Bounded internal helping on the explicitly retained, finite selected runtime set |
 | No helping | Observe conditions and block on notifications/deadline; runtime progress is supplied elsewhere |
 
@@ -869,15 +865,19 @@ retain that identity until the invocation finishes output conversion or unwind.
 Attachment order and configuration changes during that invocation do not retarget it.
 If no default runtime exists, use no helping for that invocation, without creating
 one merely for a guard-only wait. A later invocation can discover a subsequently
-configured default. This per-invocation resolution is accepted and replaces the
-earlier first-wait binding proposal.
+configured default. Runtime selection is stable only for that invocation.
+
+Runtime selection/retention is part of wait setup and consumes the same absolute
+deadline. Rejected second waiters do not acquire a helping scope or alter the active
+request. Close racing setup uses the same lifecycle arbitration; no late admission or
+retained-runtime leak is permitted.
 
 The default policy is fixed on the WaitSet; its resolved runtime is fixed on the
 invocation. Explicit-runtime and no-helping policies do not follow default changes.
 Resolving and retaining the selected runtime must be safe against concurrent stop
 or replacement; a pointer lookup followed by an unprotected retain is insufficient.
-The runtime configuration specification must define the default explicitly, rather
-than letting incidental factory creation or condition attachment order choose it.
+Resolve the default through the explicit core selection in [runtime](runtime.md);
+incidental factory creation and condition attachment order do not choose it.
 
 Explicit configuration is construction-time, belongs in zzdds.idl, and does not
 require corresponding methods on dcps.idl. Preserve ordinary factory-less language
@@ -888,7 +888,9 @@ process. No-helping remains useful for externally integrated loops and thread-af
 runtime backends. An explicit set must be validated for the selected build/backend's
 helping capabilities at construction; unsupported configurations fail visibly.
 
-Hosted default applications can rely on background progress. In a manual build,
+Ordinary hosted callers using DEFAULT_SHARED_RUNTIME must not execute runtime work;
+background workers supply progress. Callback-chain waits may help permitted internal
+work on that selected runtime while retaining callback exclusion. In a manual build,
 waiting can drive permitted internal protocol/timer/condition work with bounded fair
 turns, but cannot automatically dispatch nested application listeners. Callback
 callers retain their accepted exclusion rights. Participants using other runtimes
@@ -900,7 +902,7 @@ runtime admission/budget rules. There is no mandatory thread hop for an already 
 condition. The wait backend must remain usable for GuardCondition and timeout even
 without any runtime configured.
 
-<a id="waitset-close-progress--runtime-stop-is-not-waitset-close"></a>
+<a id="runtime-stop-is-not-waitset-close"></a>
 ### Runtime stop is not WaitSet close
 
 Stopping one selected runtime removes its ability to make protocol progress; it does

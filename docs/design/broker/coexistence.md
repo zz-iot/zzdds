@@ -1,12 +1,12 @@
 # Broker: coexistence
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="broker-domain-identity"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+<a id="standard-domain-identity-replaces-broker-realm"></a>
 ## Standard domain identity replaces broker realm
 
-<a id="broker-domain-identity--standard-basis"></a>
+<a id="standard-basis"></a>
 ### Standard basis
 
 OMG DDSI-RTPS 2.5 defines domainTag in SPDPdiscoveredParticipantData (Table 8.78).
@@ -25,11 +25,11 @@ The 0x4000 flag in the PID requires correct handling by a receiver that does not
 understand it. An older implementation cannot be assumed to support nonempty tags.
 Neither domain IDs/tags nor Partition QoS are authentication or access control.
 
-<a id="broker-domain-identity--public-configuration"></a>
+<a id="public-configuration"></a>
 ### Public configuration
 
 Add `@default("") string<256> tag;` to zzdds::DomainConfig alongside id, and carry it
-through native configuration, generated bindings and TOML. Example proposed syntax:
+through native configuration, generated bindings and TOML. Illustrative TOML syntax:
 
 ```toml
 [domain]
@@ -50,7 +50,7 @@ factory default changes affect future participants. Keep configuration on zzdds.
 because the existing DomainConfig is its public configuration surface; do not invent
 a new DCPS operation solely to expose an RTPS participant property.
 
-<a id="broker-domain-identity--native-implementation-requirement"></a>
+<a id="native-implementation-requirement"></a>
 ### Native implementation requirement
 
 Inspection found no domainTag/domain_tag/PID_DOMAIN_TAG support in src, idl or tests.
@@ -80,7 +80,7 @@ Native support is therefore a broker prerequisite:
 
 Do not call support complete merely because the codec can retain an unknown PID.
 
-<a id="broker-domain-identity--broker-reconciliation-requirement"></a>
+<a id="broker-reconciliation-requirement"></a>
 ### Broker reconciliation requirement
 
 Scope becomes `(domain_id, domain_tag)` within the configured broker authority. Partition
@@ -102,7 +102,7 @@ A broker service administers configured domain identities using a distinct logic
 participant per scope, with shared listeners/runtime. Client and selected broker participant
 must agree on domain ID/tag. Service ingress selects the identity before ordinary peer
 installation; it does not authorize cross-domain associations. See the accepted
-[multi-domain service arrangement](coexistence.md#broker-multidomain-service).
+[multi-domain service arrangement](coexistence.md#multi-domain-broker-service-identities).
 
 The experimental ScopeValue now uses string<256> domain_tag followed by domain_id;
 ServiceRequestContext no longer carries requested_realm. Independent fixtures use CDR
@@ -116,10 +116,10 @@ explicit LE/BE remote IDs, missing-ID receiver fallback, and foreign-domain reje
 without installation or refresh. This does not validate domainTag, full-suite behavior,
 live cross-vendor interoperability or the remaining early-SEDP admission boundary.
 
-<a id="broker-multidomain-service"></a>
+<a id="multi-domain-broker-service-identities"></a>
 ## Multi-domain broker service identities
 
-<a id="broker-multidomain-service--choice"></a>
+<a id="choice"></a>
 ### Choice
 
 One configured broker address may serve many `(domain_id, domain_tag)` scopes. Two designs
@@ -135,12 +135,12 @@ thread, process, socket, independent store or full public DDS object. Implementa
 share runtime workers, network listeners, timers and storage while preserving identity and
 per-scope accounting. Cost grows with served scopes, not one extra participant per client.
 
-<a id="broker-multidomain-service--standard-boundary"></a>
+<a id="standard-boundary"></a>
 ### Standard boundary
 
 RTPS 2.5 §8.5.1 permits vendor-specific discovery protocols. Section 8.5.5.1 checks domain
 ID/tag before ordinary SEDP associations. Neither section standardizes this broker service.
-The recommendation keeps same-domain service associations rather than assuming the
+The contract keeps same-domain service associations rather than assuming the
 vendor-extension permission proves arbitrary cross-domain DDS Security compatibility.
 Source: https://www.omg.org/spec/DDSI-RTPS/2.5/PDF
 
@@ -150,7 +150,7 @@ recipient. Its canonical SPDP describes itself; origin participant records in th
 store retain their original GUIDs and domain identity. The broker service participant is
 not inserted into the distributed application inventory merely because it serves clients.
 
-<a id="broker-multidomain-service--shared-ingress-and-bootstrap"></a>
+<a id="shared-ingress-and-bootstrap"></a>
 ### Shared ingress and bootstrap
 
 1. A client sends its canonical SPDP plus directed service-request context to the configured
@@ -182,10 +182,10 @@ Different domains/tags may use the same UDP/TCP listen address. After bootstrap,
 using validated association plus destination endpoint identity, not GUID prefix alone or
 an untrusted scope field. Introduction parsing and path-validation work have global as
 well as per-scope budgets. Unknown scope must not allocate reliable endpoint/history state.
-This proposal does not add an extra round trip or require applications to know the broker
+This mechanism does not add an extra round trip or require applications to know the broker
 participant GUID in advance.
 
-<a id="broker-multidomain-service--isolation-and-lifecycle"></a>
+<a id="isolation-and-lifecycle"></a>
 ### Isolation and lifecycle
 
 Ordinary multicast/directed peer processing retains domain equality checks. A service
@@ -212,10 +212,10 @@ that future secure discovery can use today's plaintext service messages unchange
 Transport credentials may be shared administratively; that does not grant cross-domain
 DDS permissions or replace participant authentication.
 
-<a id="broker-discovery-coexistence"></a>
+<a id="reconciliation-of-direct-and-broker-discovery"></a>
 ## Reconciliation of direct and broker discovery
 
-<a id="broker-discovery-coexistence--one-graph-separately-retained-evidence"></a>
+<a id="one-graph-separately-retained-evidence"></a>
 ### One graph, separately retained evidence
 
 Use one participant/endpoint graph and one matching/lifecycle path. Identify entities by
@@ -236,29 +236,23 @@ older endpoint definition into the newest one. A direct packet's arrival time li
 does not prove that its endpoint payload is newer than an already installed broker record.
 Never compare a broker delivery sequence with a native RTPS writer sequence.
 
-<a id="broker-discovery-coexistence--the-difficult-case-comparing-updates-across-paths"></a>
+<a id="the-difficult-case-comparing-updates-across-paths"></a>
 ### The difficult case: comparing updates across paths
 
 Example: direct SEDP installs endpoint revision 8; a delayed broker view still contains
 revision 7. After direct discovery expires, blindly preferring the surviving source would
 roll the endpoint back. “Prefer direct while available” postpones rather than solves this.
 
-Options:
-
-1. Arrival order: easy, but delayed snapshots can overwrite newer data. Reject.
-2. Fixed source preference: predictable, but can ignore newer updates or roll back during
-   failover unless conflicts remain unresolved. Useful only as an explicit limited policy.
-3. A shared origin version on both paths: receiver can select the newest admitted origin
-   state independently of path. Adds a small zzdds discovery extension and origin bookkeeping.
-
-Option 3 is accepted for zzdds participants using both paths. Reuse the broker's existing
+Use a shared origin version for zzdds participants on both paths. This identifies
+newest admitted origin state independently of path, rather than using packet arrival
+order or a fixed preference that could roll back after source loss. Reuse the broker's
 per-entity origin_revision, generated once when local discovery state changes, and expose
 it plus the participant incarnation through vendor parameters in direct SPDP/SEDP records.
 The same revision describes the same logical state in broker inventory/mutations. Periodic
 reannouncement, retransmission, lease renewal and broker reconnect do not increment it;
 a real discovery-state change does. Runtime-only directed service-request metadata is not
 part of this canonical state version. Counter overflow requires defined identity renewal,
-not wrapping. Exact parameter IDs/encoding and generation integration need review.
+not wrapping. The [wire contract](wire.md) defines provisional encoding/assignments; generated integration is a publication gate.
 
 Standard peers may ignore these optional vendor parameters. Do not claim the extension
 itself authenticates the revision: unsecured operation remains unsecured. Secure installs
@@ -271,7 +265,7 @@ refer to the same originating writer lifetime and sample. It is useful evidence,
 universal replacement for the shared revision: some broker records have no corresponding
 native sample, and different built-in writers have independent sequence spaces.
 
-<a id="broker-discovery-coexistence--selecting-content-and-freshness"></a>
+<a id="selecting-content-and-freshness"></a>
 ### Selecting content and freshness
 
 Within a recognized incarnation, retain the highest validated origin revision and its
@@ -294,7 +288,7 @@ validated paths, but must not blindly union locators from stale versions or diff
 incarnations. Installing broker records does not start unsolicited direct SPDP/SEDP fan-out;
 ordinary direct discoveries still follow configured peer policy.
 
-<a id="broker-discovery-coexistence--removal-is-not-source-loss"></a>
+<a id="removal-is-not-source-loss"></a>
 ### Removal is not source loss
 
 * Broker view filtering, broker disconnect, registration expiry or direct lease expiry
@@ -316,7 +310,7 @@ its replay/session/native-writer dependencies before freeing needed ordering gua
 retention cannot safely reconcile conflicting evidence, force source resynchronization or
 report bounded resource failure; do not drop the guard and choose whatever arrives next.
 
-<a id="broker-discovery-coexistence--peers-without-the-shared-revision-extension"></a>
+<a id="peers-without-the-shared-revision-extension"></a>
 ### Peers without the shared revision extension
 
 Ordinary direct discovery of non-zzdds peers continues normally. V1 does not automatically
@@ -332,7 +326,7 @@ A fixed-authority policy could be an explicit later option, but is not equivalen
 proof that the preferred source is newer. Independent unrelated participants colliding on
 a GUID must not be merged merely because the GUID bytes match.
 
-<a id="broker-discovery-coexistence--origin-update-boundary"></a>
+<a id="origin-update-boundary"></a>
 ### Origin update boundary
 
 Create one immutable logical discovery version at the local entity's committed update
@@ -355,10 +349,10 @@ revision or manufacture that deletion. Recreating an endpoint uses a fresh GUID;
 not reset revisions under the deleted GUID. Incarnation/revision comparisons remain scoped
 to the proper participant identity and validated provenance.
 
-<a id="broker-discovery-coexistence--direct-source-versus-broker-origin-decoding"></a>
+<a id="direct-source-versus-broker-origin-decoding"></a>
 ### Direct-source versus broker-origin decoding
 
-The [PR #92 review](../concurrency-broker-status.md) highlights a required codec boundary.
+The raw/typed codec boundary is required:
 For a broker-delivered OriginRecord, validate embedded participant identity against its
 record origin, never the enclosing broker RTPS prefix. Do not let a direct-SPDP decoder's
 source-prefix preference silently rewrite conflicting broker records. Preserve exact
@@ -367,10 +361,10 @@ RTPS header is not authenticated identity; effective INFO_SRC and configured pro
 remain separate checks. All installation/rematching paths honor current enable/ignore/QoS
 policy, even when the underlying discovery evidence remains cached.
 
-<a id="broker-origin-version-wire"></a>
+<a id="origin-version-placement-and-canonical-discovery-content"></a>
 ## Origin-version placement and canonical discovery content
 
-<a id="broker-origin-version-wire--placement"></a>
+<a id="placement"></a>
 ### Placement
 
 Use a vendor-specific, optional-to-legacy-readers origin-version parameter carrying
@@ -418,7 +412,7 @@ still gets its version from the common local origin-update boundary. It must not
 native status/sequence provenance. If direct deletion is also emitted, it uses that same
 origin version, regardless of the relative transmission times.
 
-<a id="broker-origin-version-wire--what-the-revision-versions"></a>
+<a id="what-the-revision-versions"></a>
 ### What the revision versions
 
 Version canonical entity discovery content, not the serialized packet or an observation's
@@ -446,7 +440,7 @@ and separate directed broker-service request context from canonical origin conte
 exact list of excluded zzdds service PIDs will be assigned with the revised handshake.
 An unknown vendor parameter is not automatically service context.
 
-<a id="broker-origin-version-wire--native-operational-fields"></a>
+<a id="native-operational-fields"></a>
 ### Native operational fields
 
 SPDP manualLivelinessCount is an operational assertion counter, not a persistent discovery
@@ -464,7 +458,7 @@ persistent QoS/locators from an older origin revision. The native protocol's own
 rules still apply. Exact field classification must be reflected in the implementation's
 per-record comparator and tests; excluding arbitrary fields would be a correctness bug.
 
-<a id="broker-origin-version-wire--unknown-fields-and-byte-preservation"></a>
+<a id="unknown-fields-and-byte-preservation"></a>
 ### Unknown fields and byte preservation
 
 For recognized content, compare decoded effective values. For unknown optional content,

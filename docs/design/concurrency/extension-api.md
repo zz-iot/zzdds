@@ -1,12 +1,12 @@
 # Concurrency: extension api
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="concurrency-api-draft"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+<a id="concurrency-api"></a>
 ## Concurrency API
 
-<a id="concurrency-api-draft--configured-entity-creation"></a>
+<a id="configured-entity-creation"></a>
 ### Configured entity creation
 
 Retain the existing create_participant_ex signature. Extend its DomainParticipantConfig
@@ -16,7 +16,7 @@ file configuration supplies scalar defaults only. If the generator cannot safely
 separate those roles, use a versioned construction-options envelope at the bridge
 rather than serialize handles or silently replace the existing ABI.
 
-Proposed types (forward declarations and @shared_c_abi_box annotations omitted here):
+Target types (forward declarations and @shared_c_abi_box annotations omitted here):
 
 ```idl
 interface ListenerGroup {};
@@ -72,7 +72,7 @@ rolls back on failure, returning a nil entity by the existing constructor conven
 A shared ListenerGroup does not contain entities or own their runtimes. Releasing the
 application handle leaves entity-held and in-flight group references intact.
 
-<a id="concurrency-api-draft--runtime-ownership-and-selection"></a>
+<a id="runtime-ownership-and-selection"></a>
 ### Runtime ownership and selection
 
 ```idl
@@ -159,7 +159,7 @@ has not been reclaimed. BACKEND_STOPPED is distinct from a ResourceCompletion fe
 No force-stop operation is required in this initial signature set; adding one requires
 an explicit authority/error contract rather than an alias for owner release.
 
-<a id="concurrency-api-draft--waitset-and-resources"></a>
+<a id="waitset-and-resources"></a>
 ### WaitSet and resources
 
 ```idl
@@ -180,14 +180,18 @@ interface ResourceScope {
 };
 ```
 
-Default helping policy is DEFAULT_SHARED_RUNTIME, with an empty sequence. Sequence
+Default helping policy is DEFAULT_SHARED_RUNTIME, with an empty sequence.
+For ordinary hosted callers this is observe-only; manual-runtime and callback-chain
+waits may help permitted internal work on the resolved runtime. Explicit-runtime
+selection permits helping only within the selected backend's capabilities and the
+callback exclusion rules; NO_HELPING never pumps runtime work. Sequence
 inputs are borrowed for the call; construction retains deduplicated runtime identities.
 Sealing is idempotent, blocks new independent resource admission and preserves existing
 cleanup rights. Completion becomes ready only after sealing and all covered use ends.
 Acquire its independently allocated observation token before dismantling the scope.
 Resource anchors and allocator descriptors use the versioned bootstrap below.
 
-<a id="concurrency-api-draft--simple-driver-signatures"></a>
+<a id="simple-driver-signatures"></a>
 ### Simple driver signatures
 
 ```idl
@@ -213,10 +217,10 @@ Driver creation validates manual backend compatibility and any thread affinity.
 The driver retains progress resources, not operational ownership. Accepted standard
 teardown tails may exceed the normal turn/wait budget.
 
-<a id="concurrency-api-draft--versioned-standalone-bootstrap"></a>
+<a id="versioned-standalone-bootstrap"></a>
 ### Versioned standalone bootstrap
 
-The [bootstrap contract](runtime.md#runtime-bootstrap-contract) defines accepted validation,
+The [bootstrap contract](runtime.md#standalone-runtime-bootstrap-contract) defines accepted validation,
 failure/publication, resource retention and clock compatibility rules for this table.
 Its initial external attachment restriction is accepted. Concrete signatures/layouts
 still require coordinated generation and ABI review before publication.
@@ -241,13 +245,13 @@ ExternalDriver must expose bounded nonblocking service, atomic prepare-to-wait,
 wake acknowledgment/recheck and explicit detach. Platform wait handles and clock
 representations belong in the platform adapter. The portable contract returns an
 opaque wake generation, immediate readiness, next deadline and retirement obligation;
-see manual-runtime-driver.md. A portable timestamp cannot be finalized before choosing
+see [external-loop driving](runtime.md#manual-runtime-driving-and-external-loop-integration). A portable timestamp cannot be finalized before choosing
 the backend clock-domain bridge. Detach cannot abandon accepted cleanup.
 
 <a id="concurrency-extension-surface"></a>
 ## Concurrency extension surface
 
-<a id="concurrency-extension-surface--standard-application-baseline"></a>
+<a id="standard-application-baseline"></a>
 ### Standard application baseline
 
 Standard participant construction follows the factory's configured selection and
@@ -262,7 +266,7 @@ callbacks can run inline. No stable thread affinity is promised. Standard WaitSe
 resolve the default runtime at each admitted wait without creating it for a guard-only
 wait. Default owned resources need no application reclamation fence.
 
-<a id="concurrency-extension-surface--required-extension-inventory"></a>
+<a id="required-extension-inventory"></a>
 ### Required extension inventory
 
 All new entity interfaces, shared public types and application configuration below
@@ -295,7 +299,7 @@ ParticipantConfig family. Runtime references are construction inputs, not serial
 network addresses or numeric pointer values in a config file. Keep runtime/resource
 object inputs distinct from file-loadable scalar backend defaults.
 
-<a id="concurrency-extension-surface--first-shipped-subset-versus-complete-design"></a>
+<a id="first-shipped-subset-versus-complete-design"></a>
 ### First shipped subset versus complete design
 
 A first vertical slice may ship scalar Config creation defaults, ordinary DDS entity APIs,
@@ -310,7 +314,7 @@ Config contract remains the integration target for later surfaces.
 <a id="listener-group-reference-lifecycle"></a>
 ## Listener-group reference lifecycle
 
-<a id="listener-group-reference-lifecycle--what-the-application-does"></a>
+<a id="what-the-application-does"></a>
 ### What the application does
 
 Create a group, place it in a reader Config, and pass that Config to
@@ -324,7 +328,7 @@ and generated managed-reference bridge supply those functions once. Group member
 controls callback exclusion; it does not retain an operational runtime lease or extend
 the lifetime of application-owned listener contexts.
 
-<a id="listener-group-reference-lifecycle--ownership-trace"></a>
+<a id="ownership-trace"></a>
 ### Ownership trace
 
 The counts below represent logical ownership obligations, not a requirement for one
@@ -349,7 +353,7 @@ A group does not own its member entities permanently. Dispatch may retain an ent
 (which protects its group transitively) or retain the group directly; either is valid
 provided the obligation is explicit and not duplicated or lost.
 
-<a id="listener-group-reference-lifecycle--callback-and-replacement-cases"></a>
+<a id="callback-and-replacement-cases"></a>
 ### Callback and replacement cases
 
 An eligible invocation holds entity, listener-identity and optional group execution
@@ -373,7 +377,7 @@ Pending records must retire or relinquish ownership when invalidated. A group qu
 must not permanently own an entity that owns the group: cancellation/claim retirement
 must break any temporary cycle, and dormant membership must not create one.
 
-<a id="listener-group-reference-lifecycle--binding-consequences"></a>
+<a id="binding-consequences"></a>
 ### Binding consequences
 
 **C++:** an owning group wrapper can use shared ownership; copying it into a Config
@@ -401,3 +405,41 @@ conventions clearly. This helper requirement is generic, not listener-group-spec
 with explicit cleanup. Both must convert interface views correctly and propagate failure.
 Neither may accidentally add an operational lease, drop a group, or substitute nil.
 A borrowed conversion does not permit the callee to save pointers into the Config.
+
+## Generated reference and construction-Config requirements
+
+These are generic zidl capabilities used by zzdds, not generator special cases keyed to
+RuntimeOwner or other DDS names. Opted-in managed references retain storage/identity;
+consumer objects define operational ownership, close and retirement. Existing shared C-ABI
+boxing preserves interface views but does not itself imply managed-reference lifetime.
+Plugin extraction is separate future work and is not a prerequisite.
+
+Inputs borrow for the call; retaining/queueing stores its own reference. Owned return/out
+values transfer one reference to the result; failed boxing releases it. Owning Config
+fields and sequence elements each retain an independent non-nil reference. Clone stages
+all fallible work and rolls back partial acquisition; destruction releases exactly those
+references. Nil defaults must be initialized and safely destructible in every binding.
+C/Zig shallow assignment is not implicit retain. Ref copies never acquire an operational
+RuntimeOwner lease implicitly. Raw lookup followed by unprotected retain is insufficient.
+
+Use correct declared-interface conversion for base/extension views, including adjusted
+pointers; do not reinterpret vtables or copy native fat references into opaque C handle
+fields. Preserve layout/alignment and identity. Inout needs an actual replaceable slot
+or language holder; a Java reference passed by value is not output replacement. Stage
+replacement and cleanup explicitly, retaining the old owned slot on failed publication.
+Operation-specific success/effect conventions remain explicit; the generic generator must
+not interpret integer zero or DDS return codes as universal transaction success.
+
+Construction Configs combine scalar settings with process-local references, but are not
+wire types. File overlays apply supported scalars while preserving programmatic references
+and rejecting attempts to set those references from a file. A nested struct is not an
+exclusion mechanism by itself. Require generic construction-only metadata/conversion;
+do not silently ignore unsupported fields, manufacture nil, or turn failed sequence
+conversion into an empty successful runtime selection. Keep the chosen _ex(..., Config)
+public pattern; private bridge envelopes may implement it without adding user parameters.
+
+Before publication, compile and execute scalar/reference/sequence and mixed-Config cases
+across C, Zig, C++ and Java. Cover nil defaults, inout replacement, allocation failure,
+partial clone rollback, base/extension aliases, release hooks and scalar TOML overlays.
+Generation alone or the bounded direct-reference probe does not establish support.
+Standalone managed references do not inherit DDS entity deletion conventions.

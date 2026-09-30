@@ -1,12 +1,17 @@
 # Concurrency: runtime
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="runtime-ownership"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+
+Operational owners keep a runtime running; observers only retain identity/storage.
+Construction and driving establish progress before resources are published. Retirement
+and transport completion preserve that progress until retained obligations finish.
+
+<a id="shared-runtime-ownership-and-construction"></a>
 ## Shared runtime ownership and construction
 
-<a id="runtime-ownership--separate-dds-containment-from-execution-resources"></a>
+<a id="separate-dds-containment-from-execution-resources"></a>
 ### Separate DDS containment from execution resources
 
 A runtime owns execution/progress infrastructure: ready work, timer/wakeup integration,
@@ -21,7 +26,7 @@ discovery/security values and a participant list per factory. Its current deinit
 iterates participants. The shared-runtime design must not infer runtime ownership
 from that existing containment or silently make one factory a process singleton.
 
-<a id="runtime-ownership--selected-selection-hierarchy"></a>
+<a id="selected-selection-hierarchy"></a>
 ### Selected selection hierarchy
 
 | Construction | Runtime choice |
@@ -44,10 +49,10 @@ operations belong in zzdds.idl. Standard DDS APIs remain usable with the default
 Cross-runtime listener identity exclusion stays core-wide and is unaffected by which
 runtime a participant selects.
 
-<a id="runtime-ownership--default-registry-and-implicit-construction"></a>
+<a id="default-registry-and-implicit-construction"></a>
 ### Default registry and implicit construction
 
-Recommend one designated default-runtime slot per loaded core registry instance,
+Use one designated default-runtime slot per loaded core registry instance,
 not one runtime per factory and not a promise spanning independently loaded copies.
 An application can install an explicitly created runtime as the default. Otherwise,
 standard participant creation lazily establishes a default using configured runtime
@@ -82,7 +87,7 @@ to an unrelated implicit runtime. Explicit disable remains distinct from automat
 retirement of an implicit default. Core unload still requires all retained core work
 and foreign binding callbacks to retire.
 
-<a id="runtime-ownership--operational-ownership-versus-storage-retention"></a>
+<a id="operational-ownership-versus-storage-retention"></a>
 ### Operational ownership versus storage retention
 
 Use two distinct lifetime roles, regardless of their concrete reference-count layout:
@@ -116,7 +121,7 @@ old cleanup drains. Configuration and transport binding still determine whether 
 participant construction can actually succeed; this is not a guarantee that sockets
 held by the retiring generation are immediately reusable.
 
-<a id="runtime-ownership--automatic-shutdown-and-optional-lifecycle-controls"></a>
+<a id="automatic-shutdown-and-optional-lifecycle-controls"></a>
 ### Automatic shutdown and optional lifecycle controls
 
 Automatic shutdown means initiating a retained shutdown protocol, not unconditionally
@@ -138,17 +143,16 @@ WaitSet wake/deadline/close remains independently usable even if its selected ru
 retires. Its retained identity is not permission to restart that runtime or switch to
 a new default during an active invocation. A later default-policy wait resolves anew.
 
-Explicit stop/completion controls, if provided, belong exclusively to zzdds interfaces
-and are optional for standard applications. Their authority/preconditions remain a
-separate API decision; the previously proposed mandatory manual-stop sequence is
-withdrawn. Forced stop with live participants is not implicitly authorized by releasing
+Additional explicit stop controls are outside v1. If added, they belong exclusively
+to zzdds interfaces and must specify authority and preconditions. Standard applications
+use automatic retirement and the defined completion fences. Forced stop with live participants is not implicitly authorized by releasing
 an ordinary handle. Unexpected backend failure still uses the accepted operation
 failure mappings and cannot abandon already committed effects or retained cleanup.
 
-<a id="runtime-resource-ownership"></a>
+<a id="runtime-handles-and-resource-reclamation"></a>
 ## Runtime handles and resource reclamation
 
-<a id="runtime-resource-ownership--public-ownership-roles"></a>
+<a id="public-ownership-roles"></a>
 ### Public ownership roles
 
 Expose operational ownership separately from observation, with these semantic roles
@@ -182,7 +186,7 @@ release operations; managed bindings provide their deterministic cleanup convent
 with safe finalization fallback. Holding an owner while waiting for automatic runtime
 retirement is a self-created dependency; release it and observe via RuntimeRef instead.
 
-<a id="runtime-resource-ownership--three-resource-modes"></a>
+<a id="three-resource-modes"></a>
 ### Three resource modes
 
 1. **Library-owned default:** allocation/backend owners are retained internally;
@@ -195,7 +199,7 @@ retirement is a self-created dependency; release it and observe via RuntimeRef i
    explicit tracked resource scope can provide a completion fence for safe local teardown.
 
 `include/zzdds_c.h` currently documents borrowed allocator lifetime for factory,
-WaitSet and GuardCondition construction. This proposal does not append fields to
+WaitSet and GuardCondition construction. The versioned resource bootstrap must not append fields to
 ZidlAllocator, reinterpret those pointers as owned, or claim existing destroy functions
 already provide an allocator fence. Migration must document/validate the existing
 path and provide a versioned opt-in path before recommending stack/arena teardown
@@ -207,7 +211,7 @@ lifetime owner with that capability. No API can infer or extend arbitrary borrow
 memory lifetime. Anchor release is exactly once after its accepted users retire,
 outside metadata locks, with the required binding environment.
 
-<a id="runtime-resource-ownership--tracked-resource-scope-and-fence"></a>
+<a id="tracked-resource-scope-and-fence"></a>
 ### Tracked resource scope and fence
 
 A resource scope accounts for every accepted user of the covered allocator/environment,
@@ -244,10 +248,10 @@ ResourceCompletion succeeds; destroy arena. The token remains independently vali
 Default library-owned resources and properly retained custom owners need no such
 application wait merely to preserve memory safety.
 
-<a id="runtime-bootstrap-contract"></a>
+<a id="standalone-runtime-bootstrap-contract"></a>
 ## Standalone runtime bootstrap contract
 
-<a id="runtime-bootstrap-contract--configuration-and-build-capabilities"></a>
+<a id="configuration-and-build-capabilities"></a>
 ### Configuration and build capabilities
 
 RuntimeConfig describes execution infrastructure, not participant discovery, transports,
@@ -275,7 +279,7 @@ load arbitrary plugin code. Missing required capabilities, including timer, canc
 and retirement progress, fail before the runtime becomes usable. Builds may remove
 unused backends and optional DDS profiles; unsupported choices remain visible failures.
 
-<a id="runtime-bootstrap-contract--bootstrap-validation-and-publication"></a>
+<a id="bootstrap-validation-and-publication"></a>
 ### Bootstrap validation and publication
 
 The bootstrap is scoped to one loaded core identity domain. A versioned entry-point
@@ -322,7 +326,7 @@ This table concerns new bootstrap calls; standard DDS entity constructors keep t
 existing nil failure convention. It is not a universal error mapping for all DDS APIs.
 Foreign invalid pointers cannot be safely validated merely by reading a version field.
 
-<a id="runtime-bootstrap-contract--resource-selection-and-reclamation"></a>
+<a id="resource-selection-and-reclamation"></a>
 ### Resource selection and reclamation
 
 Resource selection explicitly chooses library-owned defaults, a retained custom owner,
@@ -343,7 +347,7 @@ provider hooks either use independent storage or remain explicitly accounted use
 no observer silently keeps its own reclamation condition unsatisfiable. Releasing the
 last runtime lease is not equivalent to completing a resource scope.
 
-<a id="runtime-bootstrap-contract--manual-construction-and-external-attachment"></a>
+<a id="manual-construction-and-external-attachment"></a>
 ### Manual construction and external attachment
 
 An ordinary manual runtime initially has the simple driver's shutdown servicing
@@ -383,7 +387,7 @@ an application using borrowed loop state must keep that state alive and keep ser
 This obligation is explicit only for external-loop integration. Ordinary hosted/simple
 manual applications still require no extra runtime shutdown call.
 
-<a id="runtime-bootstrap-contract--clock-and-wake-compatibility"></a>
+<a id="clock-and-wake-compatibility"></a>
 ### Clock and wake compatibility
 
 Execution waiting needs a monotonic scheduling clock with documented units, epoch,
@@ -418,130 +422,23 @@ as host sleep intervals. Supporting every existing custom clock in every backend
 not an initial requirement, but unsupported combinations must fail visibly. This is
 a migration requirement, not a claim that today's registry supplies these guarantees.
 
-<a id="runtime-bootstrap-contract--finite-completion-gates"></a>
+<a id="finite-completion-gates"></a>
 ### Finite completion gates
 
-The attachment restriction, clock-domain compatibility and bootstrap failure/publication
-rules above are accepted. Concrete
-descriptor layouts, symbol names, platform timer formats and measured capacity values
-are required before publishing the corresponding ABI, not before broker design work.
+Descriptor layouts, symbol names, platform timer formats and measured capacity values
+are required before publishing the corresponding ABI. The index tracks the open
+external-loop ABI separately from implementation validation.
 
 Implementation acceptance must cover: unsupported/malformed descriptors; failure after
 each acquired resource; borrowed-input rollback; attachment versus participant admission
 and final-owner release; wake versus detach; earlier timer during arm; distinct clock
 epochs; conversion overflow; and custom-clock advance where supported. Run these against
-real adapters and bindings. Existing scalar models are supporting evidence only; this
-review introduces no new prototype requirement.
+real adapters and bindings; scalar models alone are insufficient evidence.
 
-<a id="runtime-retirement"></a>
-## Runtime retirement progress and backend shutdown
-
-<a id="runtime-retirement--state-and-retained-progress-obligation"></a>
-### State and retained progress obligation
-
-Use RUNNING -> RETIRING -> BACKEND_STOPPED -> RECLAIMED. The final operational-owner
-release atomically enters RETIRING and publishes a pre-reserved retirement obligation.
-No new participant can attach to that generation. Retained internal references are
-not operational owners and cannot prevent entry into RETIRING.
-
-RETIRING closes ordinary work admission and disables recurrence, while preserving
-completion, cancellation, output-result delivery and release-only cleanup admission.
-Every accepted operation either completes its committed effect or resolves its
-uncommitted state according to the accepted operation contract. Backend stop requires
-all users of backend resources to retire or transfer to independently owned resources.
-RECLAIMED additionally requires all residual identity/storage references to retire.
-An idle WaitSet can retain a stopped runtime identity without retaining sockets or
-workers indefinitely.
-
-The retirement obligation has a concrete owner at all times: the active outer driver,
-a surviving hosted shutdown executor, or an explicitly registered external-loop
-completion path. Transfer ownership before the previous progress source can exit.
-Do not enqueue cleanup onto an ordinary ready queue and then terminate its only driver.
-Retirement publication must not allocate; duplicate final-release/cancel wakes are
-idempotent and carry runtime/request generations.
-
-<a id="runtime-retirement--final-release-inside-a-callback"></a>
-### Final release inside a callback
-
-The callback may delete the final participant. Its deletion publishes required local
-teardown, releases operational ownership and returns under the accepted callback
-non-draining rule. Runtime storage and callback/binding resources remain retained.
-Do not recurse into a shutdown pump from inside the callback or its foreign conversion.
-
-When that invocation and its cleanup unwind, the surrounding driver/API frame observes
-the retirement obligation and enters shutdown servicing with no listener rights or
-endpoint/coordinator locks held. It can service internal completions and required
-release hooks under their documented contracts, but cannot start new automatic
-application callbacks. Already claimed invocations on other executors must unwind;
-retirement neither destroys their storage nor pretends they have finished.
-
-If multiple runtimes are active on an explicit nested call chain, each retirement
-obligation is handed to an executor authorized for that runtime. Domain-wide listener
-identity does not authorize arbitrary foreign-runtime driving during unwind.
-
-<a id="runtime-retirement--hosted-and-manual-driver-obligations"></a>
-### Hosted and manual driver obligations
-
-Hosted mode retains a shutdown executor until backend teardown completes. Workers
-cannot join themselves. A backend can use a surviving coordinator, detachable worker
-exit accounting or another explicit mechanism, but it must identify the last thread's
-reclamation owner. No unconditional process-global reaper thread is mandated.
-
-For the standard/manual synchronous path, propose a teardown tail at the outermost
-eligible API/driver boundary. If final-owner release occurs outside an active driver,
-that releasing path becomes the shutdown driver where the backend permits it. If it
-occurs inside a callback, the tail runs after callback/conversion unwind. Standard DDS
-applications do not have to call a new runtime-shutdown operation.
-
-A teardown tail may exceed an ordinary work-turn budget: cancellation/drain is not a
-claim of bounded destructor latency. It must not wait for remote ACKs, peer discovery,
-a graceful TCP peer response or a remote lease to expire. Local outstanding callbacks,
-foreign cleanup hooks and backend cancellation completions can still delay completion.
-Do not promise both bounded synchronous teardown and complete reclamation without an
-external progress source. No busy-spin is allowed while waiting for local completion.
-
-For an explicitly integrated external-loop/nonblocking driver, preserve its budget
-and transfer retirement to the already registered loop wake/completion contract.
-The application must service that loop until its outstanding-work indication clears,
-as part of its existing driver ownership contract; dropping the final participant
-does not make outstanding I/O disappear. This requirement is explicit at runtime/driver
-construction, not a hidden shutdown API discovered after teardown. Such a backend
-cannot be selected as the implicit standard synchronous path unless it also supplies
-a valid automatic teardown tail. Interrupt-only or thread-affine entry must defer to
-its registered executor rather than running foreign cleanup on the interrupt stack.
-
-<a id="runtime-retirement--transport-and-timer-shutdown-boundary"></a>
-### Transport and timer shutdown boundary
-
-* Disable timer rearm and recurring discovery/heartbeat generation under the same
-  state transition used to admit them. Cancel registrations; retain their targets
-  until cancellation completion or in-flight callback retirement. A stale fire can
-  retire its own reference, never revive recurrence or act on a new generation.
-* Stop admitting ordinary receive work, unregister each runtime's dispatch entries,
-  and retain in-flight buffers/targets through completion. Shared resources close
-  only after their actual owners release them; retiring one runtime cannot close a
-  socket still used by another live owner.
-* For queued output, distinguish local committed DDS state from transmission success.
-  Cancel unsent work or finish locally as its operation contract requires, reporting
-  asynchronous failure through the selected output interface. Never retroactively
-  turn a committed write into a precommit failure. Disposal/discovery announcements
-  during teardown are best-effort with respect to reaching the peer; no remote wait
-  is introduced merely to reclaim local transport state.
-* Keep wake/deadline and cancellation-completion service alive until no shutdown
-  operation needs it. WaitSet-owned guard/deadline service has independent lifetime.
-  Destroying sockets/timers is not sufficient evidence that queued completions can
-  no longer run. A backend must provide a cancellation/quiescence contract.
-* Mandatory foreign cleanup executes outside metadata locks, with a valid binding
-  environment. Allocator/JVM/plugin ownership must outlive it. Backend failure may
-  change operation outcomes but does not waive memory-safety obligations.
-
-Concrete ingress/output queue limits, admission failure/backpressure mapping and
-channel ownership follow the bootstrap and transport sections below.
-
-<a id="manual-runtime-driver"></a>
+<a id="manual-runtime-driving-and-external-loop-integration"></a>
 ## Manual runtime driving and external-loop integration
 
-<a id="manual-runtime-driver--two-public-layers-one-internal-engine"></a>
+<a id="two-public-layers-one-internal-engine"></a>
 ### Two public layers, one internal engine
 
 A simple driver supports an application's ordinary main-thread pump. An external-loop
@@ -562,11 +459,12 @@ API callers; internal helping continues under the normal context admission rules
 A thread-affine backend additionally validates its designated driving thread. Do not
 silently steal a hosted backend into manual mode.
 
-<a id="manual-runtime-driver--simple-driver-operation"></a>
+<a id="simple-driver-operation"></a>
 ### Simple driver operation
 
-Proposed semantic operation: drive(budget, max_wait) returns a DDS status plus a
-small result structure. Concrete spelling and duration representation await IDL review.
+The drive operation returns a DDS status and a bounded result structure.
+[The extension API](extension-api.md#simple-driver-signatures)
+defines its signature and duration input.
 
 * Require a positive finite work-turn budget. A turn can include an admitted listener
   invocation; the library cannot preempt application code. The budget bounds scheduling
@@ -591,7 +489,7 @@ for remote ACKs to retire the backend. Report backend-stopped normally on subseq
 safe observations; the driver reference does not revive it. ResourceCompletion remains
 the separate test for reclamation of a custom resource scope.
 
-<a id="manual-runtime-driver--external-loop-adapter"></a>
+<a id="external-loop-adapter"></a>
 ### External-loop adapter
 
 Construction registers the loop's wake/completion path before participants or I/O can
@@ -622,8 +520,8 @@ External service preserves its turn budget during retirement and returns control
 the loop. Report retirement_pending independently of immediate work and retain the
 wake source until backend cleanup no longer needs the loop. The application must
 continue its already-declared servicing obligation until completion; idle is not
-permission to detach. Detach during live dependence fails PRECONDITION_NOT_MET unless
-a replacement executor has atomically accepted the obligation. Dropping a wrapper
+permission to detach. Detach during live dependence fails PRECONDITION_NOT_MET. V1 does not support live
+replacement executors; keep the registered progress path until its obligations finish. Dropping a wrapper
 cannot silently unregister the only completion path. Define explicit adapter detach
 and foreign-resource lifetime in the bootstrap contract.
 
@@ -631,7 +529,7 @@ This is the accepted external-loop ownership obligation, not a mandatory shutdow
 call for ordinary DDS applications. A platform integration unable to honor it must
 use the simple driver's teardown contract or a hosted backend instead.
 
-<a id="manual-runtime-driver--result-distinctions-and-validation"></a>
+<a id="result-distinctions-and-validation"></a>
 ### Result distinctions and validation
 
 Keep these concepts separate in the eventual result types:
@@ -653,23 +551,128 @@ Required integration fixtures: enqueue between arm and sleep; earlier timer inse
 wake during acknowledgment; final participant deleted inside a listener; callback
 blocked on protocol progress; cross-runtime group release; late cancellation after an
 idle result; attempted recursive/concurrent driving; detach before retirement finishes.
-Existing scalar retirement/wakeup models support portions of this contract but do not
-validate a real platform adapter. No new model is required before reviewing this API.
+These fixtures must run against a real platform adapter; scalar models alone are
+insufficient evidence.
 
-<a id="manual-runtime-driver--accepted-bootstrap-integration--2026-09-17"></a>
-### bootstrap integration — 2026-09-17
+<a id="bootstrap-integration"></a>
+### Bootstrap integration
 
-Single outer driving and the two progress contracts are accepted. The
-[runtime bootstrap contract](runtime.md#runtime-bootstrap-contract) fixes initial external
+The
+[runtime bootstrap contract](runtime.md#standalone-runtime-bootstrap-contract) fixes initial external
 attachment before participants/I/O, atomic progress handoff, clock compatibility and
-no live executor replacement in v1. Its narrower detach rule supersedes the possible
-replacement-executor exception above. Concrete platform ABI and backend fixtures remain
+no live executor replacement in v1. Live executor replacement and detach before retained retirement finishes are not
+supported in v1. Concrete platform ABI and backend fixtures remain
 implementation gates. Owner release and automatic retirement suffice for ordinary use.
 
-<a id="transport-runtime-contract"></a>
+<a id="runtime-retirement-progress-and-backend-shutdown"></a>
+## Runtime retirement progress and backend shutdown
+
+<a id="state-and-retained-progress-obligation"></a>
+### State and retained progress obligation
+
+Use RUNNING -> RETIRING -> BACKEND_STOPPED -> RECLAIMED. The final operational-owner
+release atomically enters RETIRING and publishes a pre-reserved retirement obligation.
+No new participant can attach to that generation. Retained internal references are
+not operational owners and cannot prevent entry into RETIRING.
+
+RETIRING closes ordinary work admission and disables recurrence, while preserving
+completion, cancellation, output-result delivery and release-only cleanup admission.
+Every accepted operation either completes its committed effect or resolves its
+uncommitted state according to the accepted operation contract. Backend stop requires
+all users of backend resources to retire or transfer to independently owned resources.
+RECLAIMED additionally requires all residual identity/storage references to retire.
+An idle WaitSet can retain a stopped runtime identity without retaining sockets or
+workers indefinitely.
+
+The retirement obligation has a concrete owner at all times: the active outer driver,
+a surviving hosted shutdown executor, or an explicitly registered external-loop
+completion path. Transfer ownership before the previous progress source can exit.
+Do not enqueue cleanup onto an ordinary ready queue and then terminate its only driver.
+Retirement publication must not allocate; duplicate final-release/cancel wakes are
+idempotent and carry runtime/request generations.
+
+<a id="final-release-inside-a-callback"></a>
+### Final release inside a callback
+
+The callback may delete the final participant. Its deletion publishes required local
+teardown, releases operational ownership and returns under the accepted callback
+non-draining rule. Runtime storage and callback/binding resources remain retained.
+Do not recurse into a shutdown pump from inside the callback or its foreign conversion.
+
+When that invocation and its cleanup unwind, the surrounding driver/API frame observes
+the retirement obligation and enters shutdown servicing with no listener rights or
+endpoint/coordinator locks held. It can service internal completions and required
+release hooks under their documented contracts, but cannot start new automatic
+application callbacks. Already claimed invocations on other executors must unwind;
+retirement neither destroys their storage nor pretends they have finished.
+
+If multiple runtimes are active on an explicit nested call chain, each retirement
+obligation is handed to an executor authorized for that runtime. Domain-wide listener
+identity does not authorize arbitrary foreign-runtime driving during unwind.
+
+<a id="hosted-and-manual-driver-obligations"></a>
+### Hosted and manual driver obligations
+
+Hosted mode retains a shutdown executor until backend teardown completes. Workers
+cannot join themselves. A backend can use a surviving coordinator, detachable worker
+exit accounting or another explicit mechanism, but it must identify the last thread's
+reclamation owner. No unconditional process-global reaper thread is mandated.
+
+For the standard/manual synchronous path, provide a teardown tail at the outermost
+eligible API/driver boundary. If final-owner release occurs outside an active driver,
+that releasing path becomes the shutdown driver where the backend permits it. If it
+occurs inside a callback, the tail runs after callback/conversion unwind. Standard DDS
+applications do not have to call a new runtime-shutdown operation.
+
+A teardown tail may exceed an ordinary work-turn budget: cancellation/drain is not a
+claim of bounded destructor latency. It must not wait for remote ACKs, peer discovery,
+a graceful TCP peer response or a remote lease to expire. Local outstanding callbacks,
+foreign cleanup hooks and backend cancellation completions can still delay completion.
+Do not promise both bounded synchronous teardown and complete reclamation without an
+external progress source. No busy-spin is allowed while waiting for local completion.
+
+For an explicitly integrated external-loop/nonblocking driver, preserve its budget
+and transfer retirement to the already registered loop wake/completion contract.
+The application must service that loop until its outstanding-work indication clears,
+as part of its existing driver ownership contract; dropping the final participant
+does not make outstanding I/O disappear. This requirement is explicit at runtime/driver
+construction, not a hidden shutdown API discovered after teardown. Such a backend
+cannot be selected as the implicit standard synchronous path unless it also supplies
+a valid automatic teardown tail. Interrupt-only or thread-affine entry must defer to
+its registered executor rather than running foreign cleanup on the interrupt stack.
+
+<a id="transport-and-timer-shutdown-boundary"></a>
+### Transport and timer shutdown boundary
+
+* Disable timer rearm and recurring discovery/heartbeat generation under the same
+  state transition used to admit them. Cancel registrations; retain their targets
+  until cancellation completion or in-flight callback retirement. A stale fire can
+  retire its own reference, never revive recurrence or act on a new generation.
+* Stop admitting ordinary receive work, unregister each runtime's dispatch entries,
+  and retain in-flight buffers/targets through completion. Shared resources close
+  only after their actual owners release them; retiring one runtime cannot close a
+  socket still used by another live owner.
+* For queued output, distinguish local committed DDS state from transmission success.
+  Cancel unsent work or finish locally as its operation contract requires, reporting
+  asynchronous failure through the selected output interface. Never retroactively
+  turn a committed write into a precommit failure. Disposal/discovery announcements
+  during teardown are best-effort with respect to reaching the peer; no remote wait
+  is introduced merely to reclaim local transport state.
+* Keep wake/deadline and cancellation-completion service alive until no shutdown
+  operation needs it. WaitSet-owned guard/deadline service has independent lifetime.
+  Destroying sockets/timers is not sufficient evidence that queued completions can
+  no longer run. A backend must provide a cancellation/quiescence contract.
+* Mandatory foreign cleanup executes outside metadata locks, with a valid binding
+  environment. Allocator/JVM/plugin ownership must outlive it. Backend failure may
+  change operation outcomes but does not waive memory-safety obligations.
+
+Concrete ingress/output queue limits, admission failure/backpressure mapping and
+channel ownership follow the bootstrap and transport sections below.
+
+<a id="transportruntime-ownership-and-backpressure"></a>
 ## Transport/runtime ownership and backpressure
 
-<a id="transport-runtime-contract--ingress"></a>
+<a id="ingress"></a>
 ### Ingress
 
 A channel owns socket/connection state, framing and I/O buffers. Delivery to an endpoint
@@ -702,7 +705,7 @@ One slow peer/endpoint must not consume every configured ingress resource: expos
 per-channel/peer limits plus aggregate bounds. Exact defaults are measurement and
 configuration work, not selected numbers in this specification.
 
-<a id="transport-runtime-contract--output-submission-and-completion"></a>
+<a id="output-submission-and-completion"></a>
 ### Output submission and completion
 
 Use these conceptual outcomes, with an explicit request/buffer lifetime:
@@ -735,10 +738,10 @@ its bytes against history reclamation. Best-effort postcommit output failure has
 invented retransmission guarantee. Async failures feed the owning protocol/channel
 state and diagnostics; they do not retroactively change a returned write result.
 
-<a id="transport-runtime-contract--capacity-needed-for-progress"></a>
+<a id="capacity-needed-for-progress"></a>
 ### Capacity needed for progress
 
-Recommend bounded ordinary ingress/output capacity, plus separately reserved internal
+Require bounded ordinary ingress/output capacity, plus separately reserved internal
 completion/cancellation/retirement records. Reserve each accepted operation's terminal
 record before acceptance; rejected submissions need no later completion record.
 A full data queue must not prevent returning buffers, publishing an accepted send's
@@ -758,7 +761,7 @@ require application consumption. Protocol/channel topology and supported runtime
 helping must account for those limits. Do not promise that QoS or priority eliminates
 all head-of-line blocking.
 
-<a id="transport-runtime-contract--close-and-retirement"></a>
+<a id="close-and-retirement"></a>
 ### Close and retirement
 
 Unregister logically prevents new dispatch claims. Already claimed dispatch and I/O
@@ -773,8 +776,8 @@ service even when ordinary queues are full; it must not wait for remote peers so
 to reclaim local state. Shared transport resources close only when their actual owners
 release them. A retained stopped runtime identity is not a live channel owner.
 
-<a id="transport-runtime-contract--channel-integration-after-main-refresh"></a>
-### Channel integration after main refresh
+<a id="channel-integration-requirements"></a>
+### Channel integration requirements
 
 Preserve received-channel routing from the implemented Channel/sendOnChannel API.
 Retained queued work must also retain or safely resolve the owning transport lifetime;

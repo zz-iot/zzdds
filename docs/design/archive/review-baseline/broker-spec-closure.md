@@ -36,17 +36,17 @@ must not turn into new API features. W5 is deliberately not labeled frozen.
    [source review](../../concurrency-broker-status.md) retains inline context with bounded
    internal extensions; send/receive integration evidence remains pending. A dedicated
    introduction sample would require a wire revision, not an automatic fallback.
-2. **Protected/path profile:** the [provider contract](../../broker/protocol.md#broker-path-provider-contract)
+2. **Protected/path profile:** the [provider contract](../../broker/protocol.md#broker-path-validation-and-protection-provider-contract)
    now specifies the proposed bounded stateful-cookie baseline, validation/expiry/replay
    behavior and protection boundary. Provider and abuse-test evidence remains pending. Cookies are opaque to clients, so provider
    internals need not be a common client ABI; their size and path-binding contract must hold.
    Do not advertise public authenticated deployment or future DDS Security compatibility
    without its corresponding integration evidence.
-3. **Assignments and compatibility:** the [assignment review](../../broker/wire.md#broker-wire-compatibility-review)
+3. **Assignments and compatibility:** the [assignment review](../../broker/wire.md#wire-assignments-and-compatibility)
    checks active/reserved namespaces, member IDs, version boundaries and unknown-field rules.
    No renumbering resulted; production allocator/parser enforcement remains to be tested. A generated decoder's acceptance is not authority to omit required/duplicate
    member validation. Fix any wire-affecting discovery before frozen version 1.0 publication.
-4. **Schema/implementation agreement:** the [storage contract](../../broker/wire.md#broker-storage-contract)
+4. **Schema/implementation agreement:** the [storage contract](../../broker/wire.md#broker-bounded-decoding-and-retained-byte-ownership)
    specifies borrowed validation views, bounded immutable ownership, overlap accounting
    and generic generator requirements without changing wire layouts. Concrete mappings,
    exact byte agreement and peak-memory measurements remain implementation gates.

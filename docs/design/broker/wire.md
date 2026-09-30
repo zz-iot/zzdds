@@ -1,12 +1,12 @@
 # Broker: wire
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="broker-wire-bytes"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+<a id="broker-wire-byte-baseline"></a>
 ## Broker wire byte baseline
 
-<a id="broker-wire-bytes--fixed-sample-wrapper"></a>
+<a id="fixed-sample-wrapper"></a>
 ### Fixed sample wrapper
 
 The outermost serialized object is final Frame. Use little-endian PLAIN_CDR2 with
@@ -16,7 +16,7 @@ types use a different identifier. This is why the broker Frame can carry mutable
 bytes without being a top-level mutable object.
 [OMG DDS-XTypes 1.3, section 7.6.3.1.2 / table 60](https://www.omg.org/spec/DDS-XTypes/1.3/PDF).
 
-Proposed major/minor baseline is 1.0; bootstrap framing remains invariant while
+The initial major/minor baseline is 1.0; bootstrap framing remains invariant while
 negotiating the supported application protocol version. All multibyte Frame fields
 except the encapsulation identifier are little-endian.
 
@@ -49,7 +49,7 @@ unfragmented under the lifecycle contract; this paragraph does not permit preadm
 reassembly.
 No second stream delimiter or ad hoc checksum is introduced.
 
-<a id="broker-wire-bytes--body-origins-and-exact-bytes"></a>
+<a id="body-origins-and-exact-bytes"></a>
 ### Body origins and exact bytes
 
 ACCEPT, ADMISSION_REJECT, PATH_CHALLENGE, PATH_RESPONSE and REGISTER bodies are
@@ -73,7 +73,7 @@ unknown negotiated future encodings must not be parsed as this baseline. Interna
 canonical record alignment padding is zero. Absent native-sequence state uses zero
 sequence and writer GUID, distinct from a fabricated native publication.
 
-<a id="broker-wire-bytes--transaction-assembly-without-digests"></a>
+<a id="transaction-assembly-without-digests"></a>
 ### Transaction assembly without digests
 
 Draft 3 carries no inventory/snapshot digest in END, APPLIED or ResumeCursor.
@@ -95,17 +95,16 @@ frontier no greater than sent history. Resume resolves the full retained previou
 epoch/session/owner generation/view generation/cut and checks scope, policy and history.
 Missing state requires snapshot fallback, never reconstruction from a cursor. These
 checks do not provide a checksum against storage/assembly corruption. See the
-[encoding and digest disposition](wire.md#broker-encoding-and-digests).
+[encoding and digest disposition](wire.md#established-encoding-and-transaction-digest-disposition).
 
-SPDP, path and REGISTER/rejection correlation hashes remain unchanged in purpose;
-none authenticates an insecure sender. Historical transaction hash vectors are archived
-under `archive/review-baseline/transaction-digests/` and are not draft-3 wire requirements.
+SPDP, path and REGISTER/rejection hashes provide correlation; none authenticates an
+insecure sender. Transaction digests are not part of draft 3.
 
-<a id="broker-wire-bytes--draft-revision-3-migration"></a>
-### Draft revision 3 migration
+<a id="draft-revision-3-migration"></a>
+### Established-message grammar
 
-The magic change rejects draft 1/2 before body decoding. Selected protocol remains
-provisional 1.0 and encoding 1; do not accept old layouts under the new magic.
+The draft-3 magic rejects incompatible framing before body decoding. The baseline is
+provisional protocol 1.0 and encoding 1; do not accept another layout under that magic.
 Bootstrap bodies remain mutable. Established Envelope and bodies are final positional
 layouts: no DHEADER/member headers, unknown-field skipping or trailing extensions.
 A layout change requires a separately negotiated mapping/version. Bootstrap mutable
@@ -125,10 +124,10 @@ flag followed by the aligned value when present; no mutable member header is emi
 The independent present/absent vectors check both layouts. Final schema members carry
 no @id or @must_understand annotation, and receive no unknown-member skipping semantics.
 
-<a id="broker-wire-registry"></a>
+<a id="broker-wire-registry-and-body-mapping"></a>
 ## Broker wire registry and body mapping
 
-<a id="broker-wire-registry--operation-registry"></a>
+<a id="operation-registry"></a>
 ### Operation registry
 
 | Draft code | Operation | Body type | Direction |
@@ -166,7 +165,7 @@ in draft revision 3 (`ZZDBRK03`). Codes 4 and 29–32 carry introduction bodies 
 are reserved and unsupported. All remaining operations use
 the final positional established Envelope and final operation bodies. Bootstrap bodies
 remain mutable; final layouts require exact consumption and cannot gain trailing fields
-without a negotiated mapping change. [ADMISSION_REJECT](protocol.md#broker-bootstrap-rejection) supplies
+without a negotiated mapping change. [ADMISSION_REJECT](protocol.md#bootstrap-rejection-reply) supplies
 bounded preadmission diagnostics; silence remains permitted when reply checks fail.
 Established ERROR is never used for bootstrap. Identical REGISTER against a consumed introduction returns its recorded ACCEPT while
 the result and session remain valid; first-admission expiry is a separate check. Origin/snapshot items are state traffic; admission,
@@ -174,7 +173,7 @@ results, origin leases and status are control traffic. Inventory/snapshot bounda
 VIEW_SYNC and aggregate freshness markers share ordered STATE with records. Opcode values 23/24 are
 reserved and unsupported; no peer-metatraffic forwarding service exists in v1. Priority does not establish cross-stream order.
 
-<a id="broker-wire-registry--other-registries-and-shape-validation"></a>
+<a id="other-registries-and-shape-validation"></a>
 ### Other registries and shape validation
 
 The schema supplies experimental constants for record/change/delta kinds, recovery
@@ -215,8 +214,8 @@ negotiated and actually supported.
   host-endian integers. Negative native sequence values are invalid when present;
   absent native sequence fields have canonical zero values.
 
-<a id="broker-wire-registry--record-metadata-encoding-proposal"></a>
-### Record metadata encoding proposal
+<a id="record-metadata-encoding"></a>
+### Record metadata encoding
 
 OriginRecord.change_metadata contains a baseline XCDR2 little-endian MetadataList,
 without a nested encapsulation header. MetadataEntry holds tag, required flag and
@@ -227,12 +226,12 @@ not merely each individual value. The 64-entry limit is an additional bound.
 
 KEY_REPRESENTATION describes the retained key encoding; STATUS_INFO retains original
 status bytes; INLINE_QOS retains the original inline ParameterList representation.
-Their exact value grammar and feature/endpoint rules are proposed in
-[the detailed wire rules](wire.md#broker-wire-details), with golden fixtures. Never reconstruct
+Their value grammar and feature/endpoint rules are defined in
+[the detailed wire rules](wire.md#broker-metadata-negotiation-and-endpoint), with golden fixtures. Never reconstruct
 raw discovery payloads from these fields or substitute broker expiry reasons for native
 status. Empty metadata is an encoded empty list, not an ambiguous arbitrary byte sequence.
 
-<a id="broker-wire-registry--spdp-service-revision"></a>
+<a id="spdp-service-revision"></a>
 ### SPDP service revision
 
 Provisional optional vendor PIDs: capabilities 0x8004 (canonical full SPDP payload),
@@ -256,7 +255,7 @@ be REGISTER=32; uncorrelatable SPDP/path failures remain bounded silence in init
 The former OPEN rejection vector is explicitly historical and not a valid current reply.
 
 Define H(label, blobs...) as SHA-256 of ASCII label plus one NUL, followed by each blob's
-u64 little-endian byte length and exact bytes. Proposed labels:
+u64 little-endian byte length and exact bytes. Hash domain labels:
 
 * `zzdds-broker/client-spdp/v1` and `zzdds-broker/server-spdp/v1`: corresponding original
   encapsulated SPDP payload, excluding submessage/inline-QoS context.
@@ -274,8 +273,8 @@ encapsulation. AdmissionReject retains its rejected-request hash algorithm with 
 and exact REGISTER bytes. Fresh generations of these exchanges require new identifiers;
 retired/unknown introduction IDs never reconstruct server state from REGISTER.
 
-<a id="broker-wire-registry--accepted-domain-identity-wire-revision"></a>
-### domain identity wire revision
+<a id="domain-identity-encoding"></a>
+### Domain identity encoding
 
 ScopeValue is final XCDR2: string<256> domain_tag, then unsigned long domain_id.
 The string length includes the terminating NUL; the bound excludes that terminator.
@@ -293,10 +292,10 @@ REGISTER 380, ACCEPT 476; 256-byte tag/128 features/resume: REGISTER 1240, ACCEP
 These include Frame encoding, exclude transport/RTPS/security, and are not complete
 semantically authorized sessions. Whole-exchange preflight remains mandatory.
 
-<a id="broker-wire-details"></a>
+<a id="broker-metadata-negotiation-and-endpoint"></a>
 ## Broker metadata, negotiation and endpoint
 
-<a id="broker-wire-details--metadata-values"></a>
+<a id="metadata-values"></a>
 ### Metadata values
 
 The outer MetadataList is XCDR2 little-endian without encapsulation. Each value
@@ -341,13 +340,13 @@ key-only discovery ParameterLists separately from full samples. These rules moti
 keeping original bytes separate from broker lifecycle reasons.
 [RTPS 2.5, §§9.6.2.2, 9.6.4.8–9](https://www.omg.org/spec/DDSI-RTPS/2.5/PDF).
 
-<a id="broker-wire-details--version-and-feature-selection"></a>
+<a id="version-and-feature-selection"></a>
 ### Version and feature selection
 
 Bootstrap Frames always carry header version 1.0 and body encoding 1. SPDP service descriptors' version
 ranges negotiate the established protocol, not the bootstrap layout. Thus a future
 established minor can be selected without guessing how to parse introduction metadata. Major bootstrap
-changes need a separate bootstrap discriminator/magic and are outside this draft.
+changes need a separate bootstrap discriminator/magic and are outside this baseline.
 Select the highest mutually supported major, then highest mutually supported minor,
 that satisfies both sides' required behavior and implemented dependencies. Reject
 inverted/overlapping ranges and duplicate or unsorted feature IDs. A required feature
@@ -379,7 +378,7 @@ that rule. Established Envelope Frames use the selected version and encoding. Bo
 (including retained ACCEPT retries) keep bootstrap version 1.0 and encoding 1. Reconnect
 renegotiates; it does not inherit the old session's capability set implicitly.
 
-<a id="broker-wire-details--rtps-endpoint-identities-and-directions"></a>
+<a id="rtps-endpoint-identities-and-directions"></a>
 ### RTPS endpoint identities and directions
 
 RTPS reserves entityKind's high bits 01 for vendor-specific entities. This draft uses
@@ -387,7 +386,7 @@ vendor no-key writer 0x43 and reader 0x44, and leaves standard SPDP/SEDP endpoin
 BuiltinEndpointSet bits untouched. These are zzdds extension assignments, not OMG
 standard broker endpoints. [RTPS 2.5, §9.3.1.2](https://www.omg.org/spec/DDSI-RTPS/2.5/PDF).
 
-The proposed bootstrap entity key is the three octets 7a 00 01: writer ID 7a 00 01 43,
+The provisional bootstrap entity key is the three octets 7a 00 01: writer ID 7a 00 01 43,
 reader ID 7a 00 01 44. Each side uses its own participant prefix. A configured broker
 address may initially have an unknown prefix; directed SPDP starts introduction on
 its native endpoint. PATH validation uses the predefined vendor pair and outstanding
@@ -421,7 +420,7 @@ PEER_METATRAFFIC and operation IDs 23/24 are reserved, unsupported in v1. Native
 uses direct participant metatraffic locators and retains its normal endpoint identities.
 No TypeLookup/Security routing capability is implied. See [relay direction](../concurrency-broker-status.md).
 
-<a id="broker-wire-details--validation-and-remaining-gates"></a>
+<a id="validation-and-remaining-gates"></a>
 ### Validation and remaining gates
 
 Independent golden fixtures cover a MetadataList with key-only, disposed status and
@@ -433,14 +432,14 @@ remain implementation/freeze gates. In particular, explicit endpoint offers must
 included in the protected transcript and may not become an arbitrary-address reflector.
 
 Protected admission, exact transcript correlation and recovery after lost ACCEPT are
-reviewed in the [admission protection proposal](protocol.md#broker-admission-protection). Its
-GUID-based unsecured identity and authenticated live-replacement rules supersede the
-earlier stable ownership-secret proposal.
+specified in the [admission contract](protocol.md#broker-admission-identity-and-reconnect). Its
+GUID-based insecure identity requires no permanent ownership secret. Live replacement
+is unavailable in v1; the optional v1.1 continuity capability has separate rules.
 
-<a id="broker-wire-compatibility-review"></a>
-## Broker wire assignment and compatibility review
+<a id="wire-assignments-and-compatibility"></a>
+## Wire assignments and compatibility
 
-<a id="broker-wire-compatibility-review--version-boundaries"></a>
+<a id="version-boundaries"></a>
 ### Version boundaries
 
 There are separate version domains: RTPS protocol, service descriptor, bootstrap Frame,
@@ -460,7 +459,7 @@ established broker protocol, zzdds release and generated ABI. One cannot stand i
 * An incompatible bootstrap grammar needs its own explicitly distinguishable bootstrap
   revision. Changing an established major alone cannot change the fixed bootstrap parser.
 
-<a id="broker-wire-compatibility-review--extension-rules"></a>
+<a id="extension-rules"></a>
 ### Extension rules
 
 The existing minor-extension rule applies to **mutable** structures, not arbitrary IDL
@@ -496,10 +495,10 @@ opaque metadata tags each retain their own extension/framing rules. Their numeri
 and must-understand mechanisms are not interchangeable. Bytes retained from native
 announcements are not rewritten into the broker's little-endian encoding.
 
-<a id="broker-storage-contract"></a>
+<a id="broker-bounded-decoding-and-retained-byte-ownership"></a>
 ## Broker bounded decoding and retained-byte ownership
 
-<a id="broker-storage-contract--representation-decision"></a>
+<a id="representation-decision"></a>
 ### Representation decision
 
 Use bounded borrowed views to inspect received bytes, then retain only the immutable
@@ -521,7 +520,7 @@ or binding ABI requirement. Do not silently change existing zidl mappings for al
 Small current generated types remain usable where their measured storage and validation
 properties fit. A broker validation layer still enforces phase, scope and state semantics.
 
-<a id="broker-storage-contract--receive-stages"></a>
+<a id="receive-stages"></a>
 ### Receive stages
 
 1. Enforce transport frame/datagram and outstanding-input limits before allocation. TCP
@@ -555,7 +554,7 @@ A complete protected/reassembled sample may require a contiguous provider buffer
 contract permits that bounded allocation; it does not require zero-copy across encryption,
 fragmentation or network APIs. It forbids uncontrolled duplication through nested codecs.
 
-<a id="broker-storage-contract--ownership-and-retention"></a>
+<a id="ownership-and-retention"></a>
 ### Ownership and retention
 
 | Data | Retention rule |
@@ -587,7 +586,7 @@ retry history and output simultaneously. Logical obligations each count against 
 own limits even when physical byte storage is shared. Sharing is an optimization, not
 an excuse to omit worst-case capacity planning or required independent lifetime fencing.
 
-<a id="broker-storage-contract--resource-accounting-and-progress"></a>
+<a id="resource-accounting-and-progress"></a>
 ### Resource accounting and progress
 
 Wire ReceiveLimits count serialized protocol quantities; local capacity counts actual
@@ -611,10 +610,10 @@ installed state remains intact until its replacement commits or its own validity
 These rules require no new resource-plan getter, six-knob API or per-message allocation
 callback; those proposals remain deferred.
 
-<a id="broker-encoding-and-digests"></a>
+<a id="established-encoding-and-transaction-digest-disposition"></a>
 ## Established encoding and transaction digest disposition
 
-<a id="broker-encoding-and-digests--decision-and-compatibility-cost"></a>
+<a id="decision-and-compatibility-cost"></a>
 ### Decision and compatibility cost
 
 Draft 3 uses final positional encoding for established Envelope and operation bodies. Those peers already negotiate the exact established version/encoding;
@@ -640,7 +639,7 @@ to couple that change to this revision. Signal the incompatible draft clearly. B
 scope/epoch/session/generation from the validated transport/endpoint association to every
 internal descriptor before dispatch, as in draft 2.
 
-<a id="broker-encoding-and-digests--resume-identity-safety"></a>
+<a id="resume-identity-safety"></a>
 ### Resume identity safety
 
 Resolve a cursor only against an existing retained baseline identified by previous broker
@@ -651,7 +650,7 @@ creates a baseline. Two views at one global cut are not interchangeable. A new s
 view generation is distinct from the old cursor generation. Apply acknowledgements only
 to their currently bound session/view. Removal of digests must not relax any of these rules.
 
-<a id="broker-encoding-and-digests--hashes-and-bytes-that-remain"></a>
+<a id="hashes-and-bytes-that-remain"></a>
 ### Hashes and bytes that remain
 
 Keep client/server SPDP, path-request and REGISTER/rejection correlation hashes. Their

@@ -1,12 +1,65 @@
 # Broker: protocol
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="broker-spdp-bootstrap"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+
+Transport obligations precede establishment and admission. Inventory/view synchronization,
+leases/freshness, retention and the operation table define the established session.
+The overview defines identities; the wire contract owns encoding and assignments.
+
+## Transport and channel requirements
+
+For UDP, bind the local channel before sending the directed SPDP service request. Reply
+through the same socket/path, using the contacted service address as the reply source.
+Wildcard-bound services must preserve the received destination address for replies or
+reject that configuration. Address-family compatibility is not return-path validation.
+Bind sessions to validated remote tuples and transport/channel lifetimes. One UDP socket
+may carry several sessions; receiving on it does not authenticate any of them. A changed
+tuple requires path validation, with at most bounded overlap with the old validated path.
+
+Before validation, obey the introduction's bounded-state and at-most-1:1 response budget.
+Bootstrap is unfragmented. Established samples may use bounded RTPS fragmentation; avoid
+reliance on IP fragmentation. Respect the configured UDP payload budget, including all
+protocol overhead, and support smaller limits/path-MTU adaptation. Bound aggregate and
+per-session reassembly bytes, fragment counts, duplicate work and incomplete lifetimes.
+
+UDP reliability must pace transmissions, use RTT-sensitive repair, cap in-flight bytes,
+back off, and apply an aggregate congestion budget across all streams to a client.
+Unlimited HEARTBEAT/NACK repair loops are not acceptable. Loss, blocked ICMP and delayed
+ACKs must not cause unbounded traffic; fair repair must preserve healthy-session progress.
+
+For TCP, the client initiates and the broker replies on that accepted connection through
+Channel/sendOnChannel. Do not redial a NAT-translated source as a listening locator.
+Disable reuse_connection_by_host for broker channels: equal NAT source IPs do not identify
+a shared session or owner. Correlate admitted sessions and owner generations independently
+of host identity; secure profiles additionally authenticate them.
+
+Validate frame limits before allocation. Bound incomplete-frame time, send queues and
+connect/write deadlines, with cancellation. A slow receiver must not block the discovery
+store or other sessions. Cap STATE frame sizes to give CONTROL scheduling opportunities;
+TCP byte-stream head-of-line blocking still applies. Separate priority connections are a
+later negotiated capability. A reconnect requires admission/explicit resume before mutation;
+a new connection generation does not establish graph consistency.
+
+Use bounded shared ingress dispatch per service/transport registration, then demultiplex
+sessions. Do not register one transport handler per session; the existing handler cap is
+not a client-capacity mechanism. Close notifications must be correlated to retained
+transport/channel/session identities. Ignore unknown or retired tokens; invalidate only
+affected paths. TCP connection death, UDP socket death and remote lease expiry are distinct.
+Deadlines detect stalls without waiting for an OS close indication. Identity retirement
+must be bounded and safe against stale completions, not an unbounded socket graveyard.
+
+The [runtime transport contract](../concurrency/runtime.md#transportruntime-ownership-and-backpressure)
+owns ingress/output lifetime: not-accepted retains producer ownership, accepted output
+pins immutable bytes through one terminal completion, and cancellation is not completion.
+Local output completion, RTPS ACK, broker COMMIT and client APPLIED are distinct boundaries.
+Output failure after store commit cannot turn a mutation into an uncommitted one.
+
+<a id="spdp-based-broker-service-establishment"></a>
 ## SPDP-based broker service establishment
 
-<a id="broker-spdp-bootstrap--common-structure"></a>
+<a id="common-structure"></a>
 ### Common structure
 
 Use ordinary SPDP participant information to introduce the client and configured broker.
@@ -14,7 +67,7 @@ A vendor parameter announces zzdds service roles, compatible versions and predef
 vendor service-introduction endpoints. A directed broker-service request parameter
 identifies a client attempt/nonce and the requested service; treat it as relationship
 context, never an alternate canonical participant capability record. Its exact parameter
-IDs, encoding and cryptographic binding are a new wire-review deliverable.
+The [wire contract](wire.md) defines provisional IDs, encoding and correlation hashes; cryptographic provider validation is a deployment gate.
 
 Keep standard participant capabilities stable across recipients. Advertising support
 never authorizes an association. Ordinary peers select SEDP; a configured broker service
@@ -31,7 +84,7 @@ publish a registered participant into the broker's distributed view. Keep provis
 introduction state separate from the admitted store. Capability-bearing advertisements
 are parsed under strict size/CPU/rate limits before state allocation.
 
-<a id="broker-spdp-bootstrap--plain-udp-sequence"></a>
+<a id="plain-udp-sequence"></a>
 ### Plain UDP sequence
 
 1. Client sends directed SPDP to the configured broker service address using the bound
@@ -42,7 +95,7 @@ are parsed under strict size/CPU/rate limits before state allocation.
    limits. Do not respond with an arbitrarily larger full broker SPDP sample. Bind the
    challenge to the observed path, attempt, request content and expiry through a reviewed
    integrity mechanism; no admitted history/state allocation yet. Reserve bounded provisional
-   request storage as specified in the [path provider contract](protocol.md#broker-path-provider-contract).
+   request storage as specified in the [path provider contract](protocol.md#broker-path-validation-and-protection-provider-contract).
 3. Client echoes the compact challenge in a service-validation message on that endpoint.
    Broker validates it, then returns its SPDP service advertisement on the validated
    path. The sender may cache only minimal provisional identification before this point.
@@ -69,7 +122,7 @@ transport-specific validation. Combining steps later is possible only if prevali
 size and state bounds remain explicit; do not optimize round trips by quietly allocating
 unbounded pending introductions.
 
-<a id="broker-spdp-bootstrap--tcp-sequence"></a>
+<a id="tcp-sequence"></a>
 ### TCP sequence
 
 1. Client opens the connection to the configured service and sends directed SPDP over
@@ -84,7 +137,7 @@ An established connection is the return path for this service association. Recei
 SPDP over TCP requires adapting current SPDP plumbing; the existing UDP-oriented listener
 and initial-peer support do not establish that this sequence is already implemented.
 
-<a id="broker-spdp-bootstrap--coexistence-boundary"></a>
+<a id="coexistence-boundary"></a>
 ### Coexistence boundary
 
 Separate ordinary initial peer addresses from broker-service addresses. Do not add
@@ -99,13 +152,13 @@ exclusive discovery. Internal adapters may remain modular. More than one configu
 service address does not imply federation or multiple simultaneous authorities: preserve
 v1's single-authority rule unless explicitly redesigned.
 
-<a id="broker-service-introduction"></a>
+<a id="service-introduction-metadata-and-compact-registration"></a>
 ## Service introduction metadata and compact registration
 
-<a id="broker-service-introduction--separate-capability-directed-intent-and-registration"></a>
+<a id="separate-capability-directed-intent-and-registration"></a>
 ### Separate capability, directed intent and registration
 
-| Object | Placement | Proposed contents |
+| Object | Placement | Contents |
 | --- | --- | --- |
 | ServiceCapabilities | Vendor parameter in full canonical SPDP payload | Descriptor version; bounded service entries, each with service kind, client/server roles, supported protocol ranges/encodings and introduction writer/reader entity IDs |
 | ServiceRequestContext | Vendor parameter in directed SPDP inline QoS | Descriptor version; service kind; random nonzero attempt ID and client nonce; scope comes from the canonical client SPDP payload |
@@ -119,7 +172,7 @@ own descriptors and protocols; reserved capability names are not implemented end
 ServiceCapabilities describe actual supported roles, not permission to connect. Scope
 access is checked independently. Native standard built-in endpoint bits remain stable.
 
-<a id="broker-service-introduction--canonical-introduction-binding"></a>
+<a id="canonical-introduction-binding"></a>
 ### Canonical introduction binding
 
 Digest the exact serialized SPDP sample bytes (including its encapsulation), not a decoded
@@ -132,7 +185,7 @@ Use distinct hash domains for client sample, server sample, directed context and
 The offer reports the paired sample digests; the client validates them against the bounded
 samples it retained. A changed offer requires a fresh introduction/attempt rather than
 silently changing the interpretation of a retried Register. Exact domain strings and
-encoding are specified in the [current registry](../archive/consolidation-2026-09-29/broker-wire-registry.md#spdp-service-revision-2026-09-18)
+encoding are specified in the [current registry](wire.md#spdp-service-revision)
 and checked by independent fixtures. Hashes provide correlation,
 not origin authentication. The configured binding/security policy supplies authority.
 
@@ -141,14 +194,14 @@ or the complete capability lists. It selects a supported combination; the server
 that selection against the retained introductions and current policy. Requested scope must
 agree exactly with the introduced participant domain ID/tag. The selected broker
 service participant has the same domain ID/tag, under the accepted
-[multi-domain service arrangement](coexistence.md#broker-multidomain-service). Participant GUID comes
+[multi-domain service arrangement](coexistence.md#multi-domain-broker-service-identities). Participant GUID comes
 from the retained client sample; incarnation must agree with its origin-version metadata.
 No second independent claimant GUID is necessary in Register.
 
-<a id="broker-service-introduction--bounded-validated-introduction-record"></a>
+<a id="bounded-validated-introduction-record"></a>
 ### Bounded validated introduction record
 
-Recommend an ephemeral server introduction record after return-path validation, including
+Maintain an ephemeral server introduction record after return-path validation, including
 on TCP and already validated protected transports. It retains:
 
 * service/binding/path generation, attempt/nonce and any authenticated principal;
@@ -184,15 +237,15 @@ same offer, not allocate more records. Expiry permits reclamation only after the
 cannot recreate that introduction. TCP skips that path challenge entirely. A validated
 UDP path change needs fresh validation; no reply destination comes from advertised locators.
 
-<a id="broker-service-introduction--limits-messages-and-lifecycle"></a>
+<a id="limits-messages-and-lifecycle"></a>
 ### Limits, messages and lifecycle
 
-This proposal removes the need for an unconditional application-level cookie and eliminates
+This introduction removes the need for an unconditional application-level cookie and eliminates
 full HELLO+CHALLENGE repetition. It does not prove messages fit every MTU: full SPDP may
 contain many locators or vendor parameters. Directed introduction sample/context, server
 reply and REGISTER each require encoded-size checks. Before validation the response budget
 still forbids a larger full reply merely because it is SPDP. Do not silently strip canonical
-origin fields to make the sample fit. The [current sizing contract](protocol.md#broker-bootstrap-lifecycle) requires unfragmented
+origin fields to make the sample fit. The [current sizing contract](protocol.md#bootstrap-sizing-and-endpoint-lifecycle) requires unfragmented
 bootstrap and explicit failure when the required exchange cannot fit.
 
 Reliable CONTROL/STATE endpoint resources are reserved only when admitting REGISTER.
@@ -206,10 +259,10 @@ must not remove an ordinary direct participant record learned independently from
 GUID. Server SPDP lease expiry, admission timeout and registered broker presence remain
 separate observations with explicit dependencies, not one shared timer.
 
-<a id="broker-path-provider-contract"></a>
+<a id="broker-path-validation-and-protection-provider-contract"></a>
 ## Broker path validation and protection provider contract
 
-<a id="broker-path-provider-contract--plain-udp-bounded-pending-challenges"></a>
+<a id="plain-udp-bounded-pending-challenges"></a>
 ### Plain UDP: bounded pending challenges
 
 PATH_RESPONSE echoes challenge data, not the original client SPDP. A request digest cannot
@@ -242,7 +295,7 @@ its own reviewed key rotation and overlap bounds; it cannot recover absent SPDP 
 from a digest or remove the need for consumed-attempt state. It is not an alternate v1
 implementation requirement.
 
-<a id="broker-path-provider-contract--binding-expiry-and-consumption"></a>
+<a id="binding-expiry-and-consumption"></a>
 ### Binding, expiry and consumption
 
 The record binds the current broker epoch, logical service participant and domain scope;
@@ -276,11 +329,11 @@ this does not leave their finiteness, start point or non-extension behavior opti
 A lost pending record requires another challenge. Fresh cookies never make old tokens
 valid again. Close and restart must fence outstanding asynchronous validation work.
 
-<a id="broker-path-provider-contract--reflection-and-admission-abuse"></a>
+<a id="reflection-and-admission-abuse"></a>
 ### Reflection and admission abuse
 
 Before return validation, permit only a bounded challenge response to an eligible directed
-SPDP request. The proposed plain-UDP limit is **at most 1:1 UDP-payload response bytes to
+SPDP request. The plain-UDP limit is **at most 1:1 UDP-payload response bytes to
 eligible received request bytes**, counting complete RTPS messages. Charge sends, including
 retries, to bounded per-path and global budgets; multiple requests in one datagram cannot
 each claim its entire byte length. Invalid PATH_RESPONSE contributes no credit. Server
@@ -299,7 +352,7 @@ access. Global storage bounds remain mandatory even if source addresses are vari
 After validation, introduction/session quotas, finite deadlines and service authorization
 still apply. No identity blacklist or permanent ownership record is introduced.
 
-<a id="broker-path-provider-contract--connected-paths-and-future-security-integration"></a>
+<a id="connected-paths-and-future-security-integration"></a>
 ### Connected paths and future security integration
 
 The internal provider supplies a generation-fenced association/path handle, current
@@ -318,13 +371,13 @@ authenticated packet from a new address alone is insufficient. If validated migr
 is unsupported, use fresh association/introduction. Closure/revocation fences bound work;
 key updates cannot erase replay guards or silently change authorization. Optional transport
 security is later scope and must document its own early-data/replay/migration behavior.
-See [security and filtering](security-and-filtering.md#broker-security-and-filtering).
+See [security and filtering](security-and-filtering.md#broker-security-profiles-and-disclosure).
 
-<a id="broker-bootstrap-lifecycle"></a>
+<a id="bootstrap-sizing-and-endpoint-lifecycle"></a>
 ## Bootstrap sizing and endpoint lifecycle
 
-<a id="broker-bootstrap-lifecycle--current-encoded-sizes"></a>
-### Current encoded sizes
+<a id="current-encoded-sizes"></a>
+### Whole-exchange preflight
 
 The [evidence inventory](../../../test/design-models/README.md) separates supported-v1
 feature sizing from schema-ceiling stress fixtures. Measurements exclude RTPS/transport
@@ -363,7 +416,7 @@ an offer can therefore appear as a bounded introduction timeout, not a guarantee
 reply. Before path validation, aggregate anti-amplification limits apply in addition to
 per-message size limits; server retransmission does not create new credit. Received-request
 accounting and bounded provisional storage follow the
-[path provider contract](protocol.md#broker-path-provider-contract).
+[path provider contract](protocol.md#broker-path-validation-and-protection-provider-contract).
 
 No side may strip canonical SPDP fields, required features, domain-tag bytes, endpoint identity
 or protection to force a fit. A client may omit an optional resume hint in a fresh attempt;
@@ -374,7 +427,7 @@ still cannot fit, report a local size/configuration failure or bounded REGISTER 
 where available. Do not silently fragment, switch transports or weaken security. Explicit
 TCP configuration or a larger supported path budget remain deployment choices.
 
-<a id="broker-bootstrap-lifecycle--establishment-ordering"></a>
+<a id="establishment-ordering"></a>
 ### Establishment ordering
 
 1. Client reserves local endpoint identities and bounded attempt buffers; endpoints are
@@ -402,7 +455,7 @@ not the broker Envelope: endpoint identities and channel/path checks must preven
 ACK from mutating replacement stream state. Endpoint reuse cannot rely on a guessed
 network packet lifetime; use fresh identities or a demonstrated equivalent protection.
 
-<a id="broker-bootstrap-lifecycle--deadline-relationships"></a>
+<a id="deadline-relationships"></a>
 ### Deadline relationships
 
 Each owner uses its monotonic clock. Wire durations are finite bounds, not foreign
@@ -451,10 +504,10 @@ defaults require realistic RTT/scheduling and provider measurements, not merely 
 durations. Timing out a broker attempt does not disable local matching or independent
 discovery under allow-degraded startup.
 
-<a id="broker-admission-protection"></a>
+<a id="broker-admission-identity-and-reconnect"></a>
 ## Broker admission, identity and reconnect
 
-<a id="broker-admission-protection--registration-and-competing-connections"></a>
+<a id="registration-and-competing-connections"></a>
 ### Registration and competing connections
 
 Serialize admission by (scope, participant GUID), not merely GUID plus incarnation:
@@ -476,7 +529,7 @@ session as occupying the registration until its finite establishment deadline ex
 * An integration that cannot establish continuity uses the same wait-for-close/expiry
   path as unsecured discovery. Initial v1 need not implement secure live replacement.
 
-Use [ADMISSION_REJECT](protocol.md#broker-bootstrap-rejection) for a correlatable bootstrap
+Use [ADMISSION_REJECT](protocol.md#bootstrap-rejection-reply) for a correlatable bootstrap
 conflict once reply/path/authorization checks permit it. Use OWNER_CONFLICT without
 revealing incumbent details. Silence remains permitted under resource or response-budget
 limits. Retry backoff never extends the client's original startup/wait deadline.
@@ -503,7 +556,7 @@ Old packets cannot create this admission. No epoch-long identity ban or automati
 misbehavior/incompatibility blacklist is required in v1. Rate limits, quotas, retry backoff
 and configured authorization remain independent requirements.
 
-<a id="broker-admission-protection--lost-accept-and-stale-work"></a>
+<a id="lost-accept-and-stale-work"></a>
 ### Lost ACCEPT and stale work
 
 Identical REGISTER on the same binding within its retry window returns the recorded ACCEPT
@@ -533,12 +586,12 @@ REGISTER has no continuity credential. ACCEPT.continuity_credential is absent in
 Its draft member ID is reserved for a future negotiated extension; nonempty values
 cannot authorize replacement and must be rejected as unsupported. No token authorizes replacement in v1. D2 schedules a client-requested, single-use
 bearer continuity capability for v1.1; its rotation, binding and unresolved lost-reply
-requirements are specified in [the scope contract](security-and-filtering.md#broker-security-and-filtering).
+requirements are specified in [the scope contract](security-and-filtering.md#broker-security-profiles-and-disclosure).
 
-<a id="broker-admission-protection--exact-introduction-and-registration-correlation"></a>
+<a id="exact-introduction-and-registration-correlation"></a>
 ### Exact introduction and registration correlation
 
-The [current registry](../archive/consolidation-2026-09-29/broker-wire-registry.md#spdp-service-revision-2026-09-18) defines
+The [current registry](wire.md#spdp-service-revision) defines
 all active digest inputs. Client/server SPDP hashes include the original encapsulated
 payload; the path hash additionally binds inline representation and exact request value.
 ACCEPT.transcript_binding uses the register/v1 domain, introduction ID and exact REGISTER
@@ -564,10 +617,10 @@ explicit evidence of current return reachability before doing so. Never use adve
 locators as authority for the return destination or allow a valid cookie to recreate a
 retired introduction. Keep consumed-cookie protection until all associated cookies expire.
 
-<a id="broker-bootstrap-rejection"></a>
+<a id="bootstrap-rejection-reply"></a>
 ## Bootstrap rejection reply
 
-<a id="broker-bootstrap-rejection--fields-and-correlation"></a>
+<a id="fields-and-correlation"></a>
 ### Fields and correlation
 
 Required fields: admission_attempt, client_nonce, rejected_operation (REGISTER=32),
@@ -584,7 +637,7 @@ configured service, current binding and expected response path. Protected deploy
 also require the authenticated association; never accept an unprotected rejection there.
 Unsecured replies provide diagnostics, not protection against network impersonation.
 
-<a id="broker-bootstrap-rejection--reasons-and-retry-behavior"></a>
+<a id="reasons-and-retry-behavior"></a>
 ### Reasons and retry behavior
 
 Use the existing numeric error registry, restricted to:
@@ -615,7 +668,7 @@ but this means its admission is no longer usable, not that it never succeeded.
 An ACCEPT received before a delayed rejection makes the rejection irrelevant; no
 bootstrap rejection can tear down an established session.
 
-<a id="broker-bootstrap-rejection--reply-eligibility-and-resource-limits"></a>
+<a id="reply-eligibility-and-resource-limits"></a>
 ### Reply eligibility and resource limits
 
 Malformed, uncorrelatable or incompatible fixed framing is silently dropped. Do not
@@ -641,10 +694,10 @@ optional members must still fit the configured non-fragmented bootstrap budget. 
 reply improves diagnosis where deliverable; it does not eliminate timeout-based failure
 detection. Local activity remains available under allow-degraded startup.
 
-<a id="broker-inventory-barrier"></a>
+<a id="origin-inventory-barrier-and-future-pipelining"></a>
 ## Origin inventory barrier and future pipelining
 
-<a id="broker-inventory-barrier--v1-admission-rule"></a>
+<a id="v1-admission-rule"></a>
 ### V1 admission rule
 
 Capture an immutable inventory cut and close the client's mutation-send gate before
@@ -680,7 +733,7 @@ Old-session results and delayed COMMIT from a superseded inventory cannot open t
 Same-session transaction failure/retirement must invalidate its staging before reuse;
 new-session fencing is the fallback where the outcome cannot safely be established.
 
-<a id="broker-inventory-barrier--local-buffering-visibility-and-failure"></a>
+<a id="local-buffering-visibility-and-failure"></a>
 ### Local buffering, visibility and failure
 
 Coalesce only unassigned announcement changes, preserving authoritative revisions and
@@ -702,8 +755,8 @@ The accepted fixed-target READY rule is unchanged: later pending changes are rep
 separately, rather than extending the synchronization target indefinitely. Steady-state
 mutations do not each wait on a new inventory barrier.
 
-<a id="broker-inventory-barrier--likely-follow-on-negotiated-inventory-dependent-mutations"></a>
-### Likely follow-on: negotiated inventory-dependent mutations
+<a id="deferred-inventory-pipelining"></a>
+### Deferred inventory pipelining
 
 Keep the gate and pending-state ownership explicit in the client so a later policy can
 release dependent mutations earlier. Keep the broker's inventory commit boundary explicit
@@ -735,11 +788,49 @@ may transmit dependency-free early mutations. Measure registration/repair latenc
 real RTT/churn before choosing default pipeline limits. Preserve identical committed
 state, freshness and READY semantics for both execution policies.
 
-<a id="broker-view-correlation"></a>
+## Origin inventory identity and recovery
+
+Allow one active inventory per owner generation, with monotonically increasing inventory
+generation on each record/boundary. Replacement inventory is authoritative at its cut:
+remove omitted endpoints while retaining required revision high-water marks. Interrupted
+staging expires without altering the last valid committed inventory. Initial activation
+requires fresh origin proof; old expired inventory stays withdrawn. Inventory must not
+reopen a closed participant. The inventory COMMIT barrier orders post-cut mutations.
+
+Retain exact bytes/revisions for retries; a lost COMMIT does not cause a revision bump.
+Fence old-owner commits against replacement under the same store commit ordering. A
+commit before fencing can enter repair history; one after fencing cannot mutate the store.
+After result retention expires, use revision/high-water state only when it establishes
+the outcome; otherwise require inventory repair, never guess or replay side effects.
+CLOSE is idempotent for its fenced registration. Recovery never requires recreating a
+locally deleted endpoint to repair the graph.
+
+## Snapshot installation and bounded convergence
+
+Serialize accepted mutations within each scope. Capture a view at store cut C and buffer
+applicable later changes while sending its ordered snapshot. END carries the fixed
+ready-through target; validate exact assembly and dependencies before installation.
+Stage and reconcile the old and replacement views in one serialized discovery commit,
+then publish dependency-ordered matching/status work. Budget preparatory reconciliation
+across turns; partial staging is not visible as a complete view. Identical retained
+GUID/revision records must not generate artificial lost/found cycles.
+
+The snapshot baseline is delivery sequence zero; post-cut deltas start at one and
+use contiguous per-view delivery_seq. A gap blocks installation until
+repair or replacement. APPLIED acknowledges an installed prefix, not receipt or staging;
+listener completion is not required before APPLIED. Logical application is idempotent,
+not exactly-once network delivery or simultaneous visibility across observers.
+
+Bound snapshot/delta buffering in bytes and time. When churn outruns an attempt, send
+RESYNC_REQUIRED, cancel staging and retry with backoff. Exhausting the configured retry
+budget reports capacity failure rather than retrying forever. Reject views that exceed
+negotiated limits and never report READY for a partial view.
+
+<a id="view-request-correlation-and-recovery"></a>
 ## View request correlation and recovery
 
-<a id="broker-view-correlation--accepted-initial-design-option-3"></a>
-### initial design: option 3
+<a id="current-view-requests-and-retained-baseline-resume"></a>
+### Current-view requests and retained-baseline resume
 
 ViewRequest has a required, nonzero u64 view_generation. The client starts at 1 and
 increments it for each new logical request within an admitted session, including requests
@@ -769,7 +860,7 @@ RECORD/DELTA cannot precede their applicable BEGIN/baseline. Older generations a
 allocating orphan state. BEGIN still validates the aggregate declared limits before
 installation, and preconfirmation traffic still consumes its independent bounded budget.
 
-<a id="broker-view-correlation--resume-and-broker-initiated-invalidation"></a>
+<a id="resume-and-broker-initiated-invalidation"></a>
 ### Resume and broker-initiated invalidation
 
 ACCEPT selects snapshot versus resume eligibility, but does not start streaming a view.
@@ -795,7 +886,7 @@ not wait for the client to request another view before stopping forbidden disclo
 The client must apply any required authorization withdrawal locally as specified by the
 security/view policy; old cached records are not a reason to continue unauthorized use.
 
-<a id="broker-view-correlation--client-detected-failure"></a>
+<a id="client-detected-failure"></a>
 ### Client-detected failure
 
 Allow RESYNC_REQUIRED in both directions on the reliable control stream, using its
@@ -824,10 +915,28 @@ The broker may release old view repair history only after marking that view inva
 it must not discard still-required delivery history while pretending the stream remains
 valid. If the control path cannot deliver recovery, session failure remains the fallback.
 
-<a id="broker-aggregate-freshness"></a>
-## Ordered aggregate freshness revision
+## Origin lease renewal
 
-<a id="broker-aggregate-freshness--state-ordering"></a>
+Origin registration renewals come from the participant discovery agent, not an independent
+socket reader that could remain responsive while participant processing is stalled. The
+broker issues a nonce challenge with a server-monotonic deadline. A timely valid proof
+establishes an origin deadline no later than challenge-send time plus the negotiated lease;
+duplicates do not extend it. Negotiate renewal margin for RTT and scheduling. TCP ACKs,
+old SPDP bytes, replayed endpoint records and successful view resume never renew registration.
+
+The negotiated cached-origin lease must not exceed a finite participant lease advertised
+in preserved SPDP. A shorter advertised lease caps the existing broker deadline immediately
+when the participant update commits. Infinite broker registration leases are rejected in v1,
+even if another discovery mechanism supports infinite participant leases. Reject timer
+combinations that cannot accommodate configured RTT/deadline margins. A snapshot grants no
+fresh presence: activation requires corresponding unexpired proof and authorized installed
+records. Native presence and writer liveliness remain separate authorities.
+
+
+<a id="ordered-aggregate-freshness-revision"></a>
+## Ordered aggregate freshness
+
+<a id="state-ordering"></a>
 ### STATE ordering
 
 Place ORIGIN_BEGIN/RECORD/END, MUTATE, SNAPSHOT_BEGIN/RECORD/END, DELTA, VIEW_SYNC and
@@ -843,12 +952,12 @@ replacement can exploit STATE ordering but cannot assume previously failed/unkno
 succeeded; define transaction retirement before relaxing its existing drain rule. Ordering
 removes record-before-BEGIN staging within STATE, not all staging between STATE and CONTROL.
 
-<a id="broker-aggregate-freshness--query-and-marker"></a>
+<a id="query-and-marker"></a>
 ### Query and marker
 
 One outstanding nonce per observer session/view. Record local monotonic t0 at first send;
 transport repairs retain it. Submit the logical query once; application timeout starts
-a new nonce, as specified by [retry retirement](protocol.md#broker-retry-retirement). Broker captures membership/freshness against an exact committed view
+a new nonce, as specified by [retry retirement](protocol.md#bounded-admission-and-freshness-retirement). Broker captures membership/freshness against an exact committed view
 frontier, applies expiry evaluation using actual deadlines, and orders required withdrawals
 before its marker. A scheduled but unprocessed expiration cannot receive fresh validity.
 Build marker M(nonce, view_generation, frontier, H, exceptions) from immutable capture data.
@@ -879,7 +988,7 @@ and arithmetic; comparable monotonic epochs are not required. Consume the nonce 
 application. Duplicate responses cannot extend it. Marker bytes remain owned through normal
 reliability obligations; at most one logical query does not mean zero retained output.
 
-<a id="broker-aggregate-freshness--reductions-and-failure-semantics"></a>
+<a id="reductions-and-failure-semantics"></a>
 ### Reductions and failure semantics
 
 A reduction decided before capture is reflected in ordered preceding state and evidence.
@@ -895,7 +1004,7 @@ freshness. STATE backpressure prevents marker application and conservatively exp
 records; independent CONTROL capacity must permit recovery. No control keepalive grants
 freshness by itself.
 
-<a id="broker-aggregate-freshness--cadence-and-scale"></a>
+<a id="cadence-and-scale"></a>
 ### Cadence and scale
 
 A suggested initial default schedules refresh before expiry, targeting roughly half of
@@ -918,10 +1027,10 @@ snapshots/indexing and bound reconciliation turns. Do not claim CPU scaling from
 scaling. Benchmark steady state, one failing origin, correlated renewals, view churn and
 restart separately. Exact capacities/cadence require implementation measurement.
 
-<a id="broker-retry-retirement"></a>
+<a id="bounded-admission-and-freshness-retirement"></a>
 ## Bounded admission and freshness retirement
 
-<a id="broker-retry-retirement--admission-introduction-consumption-and-independent-replay-horizons"></a>
+<a id="admission-introduction-consumption-and-independent-replay-horizons"></a>
 ### Admission: introduction consumption and independent replay horizons
 
 An unconsumed introduction admits REGISTER only before its fixed expiry and on its
@@ -946,10 +1055,10 @@ and outcome rules still apply. Duplicate traffic never extends any deadline.
 
 Fresh SPDP attempts after retirement may obtain fresh introduction IDs under normal
 policy. They cannot make old REGISTER bytes valid. Detailed timer origins, endpoint
-confirmation and resource retirement follow the [lifecycle contract](protocol.md#broker-bootstrap-lifecycle).
+confirmation and resource retirement follow the [lifecycle contract](protocol.md#bootstrap-sizing-and-endpoint-lifecycle).
 The earlier cookie-authorized OPEN experiment is historical, not the current handshake.
 
-<a id="broker-retry-retirement--aggregate-freshness-reliable-delivery-and-bounded-result-lifetime"></a>
+<a id="aggregate-freshness-reliable-delivery-and-bounded-result-lifetime"></a>
 ### Aggregate freshness: reliable delivery and bounded result lifetime
 
 Draft 3 uses one outstanding FRESHNESS_QUERY nonce per session/view, not query serials
@@ -975,10 +1084,10 @@ outstanding nonce, consumes it once, and never moves t0 on a retry. A malicious 
 cannot obtain stronger authentication or access by choosing a nonce; rate and allocation
 bounds apply independently. A newer view/session rejects all older result associations.
 
-<a id="broker-retention-review"></a>
+<a id="bounded-protocol-retention-and-reclamation"></a>
 ## Bounded protocol retention and reclamation
 
-<a id="broker-retention-review--reclamation-inventory"></a>
+<a id="reclamation-inventory"></a>
 ### Reclamation inventory
 
 These rules describe the accepted retirement structure; the compact-replay mechanisms
@@ -990,7 +1099,7 @@ local references may still require deferred memory release under the runtime con
 | --- | --- | --- |
 | Validated introduction, UDP cookie and REGISTER result | Return the same outcome; reject expired/replayed admission | Invalidate the attempt's admission capability before evicting its outcome. Expired challenges never execute; a surviving still-valid challenge needs negative/high-water state or retirement of its binding. Pressure refuses new work, never silently converts a duplicate into new admission. |
 | Current registration/session | Fence mutations and cleanup to one owner | Remove from active lookup atomically, invalidate its queues/tasks and retain only necessary result/withdrawal dependencies. Unknown established sessions reject without allocating a replacement. Fresh session identity cannot reuse a still-referenced token. |
-| Closed-registration result | Answer duplicate CLOSE; complete withdrawals safely | Retain within bounded result window and while dependencies require it, then reject old-session traffic through absence from active lookup. No epoch-long closed-identity reservation under the recommendation. |
+| Closed-registration result | Answer duplicate CLOSE; complete withdrawals safely | Retain within bounded result window and while dependencies require it, then reject old-session traffic through absence from active lookup. No epoch-long closed-identity reservation in v1. |
 | Origin revision high-water/tombstones | Reject stale same-session updates and conflicting retries | Retain while the origin session and its mutation/inventory dependencies can reference them. If capacity cannot preserve needed revision history, force fenced new-session/full-inventory recovery. Never silently forget a tombstone while accepting old-session mutations. |
 | Inventory staging/result | Atomic assembly and idempotent commit outcome | Fixed transaction deadline; retire generation before releasing staging. Keep result within retry budget or make outcome unavailable and require defined recovery. One active generation plus monotonic high-water avoids retaining every aborted transaction forever. |
 | View snapshot/delta history | Deliver and resume an exact installed prefix | APPLIED advances retention only for its view; remove acknowledged entries when no other retained view needs them. Pressure invalidates affected views/cursors explicitly before dropping required history. Saved client cursor does not force indefinite server retention. |
@@ -1004,21 +1113,21 @@ A new session's authoritative inventory establishes its baseline; old-session me
 cannot enter that namespace. Retained downstream history remains generation/cursor-bound
 and cannot overwrite a newly installed replacement baseline.
 
-<a id="broker-retention-review--resolved-compact-replay-rules"></a>
-### Resolved compact-replay rules
+<a id="resolved-compact-replay-rules"></a>
+### Replay retention rules
 
 REGISTER consumes a validated introduction. Unknown/retired introduction IDs never
 reconstruct admission. A consumed result has its own replay deadline, separate from the
 unconsumed introduction's expiry. Retain UDP consumed-cookie correlation until all
 associated cookies expire; TCP/protected paths do not require that extra cookie guard.
-Reserve result/guard capacity before effects. See [current lifecycle](protocol.md#broker-bootstrap-lifecycle).
+Reserve result/guard capacity before effects. See [current lifecycle](protocol.md#bootstrap-sizing-and-endpoint-lifecycle).
 
 Aggregate queries submit once on reliable CONTROL. RTPS admission sequence state prevents
 repair from reconstructing capture; results retain exact bytes through STATE delivery.
-Clients abandon timed-out nonces and never reuse them. See [retry retirement](protocol.md#broker-retry-retirement)
+Clients abandon timed-out nonces and never reuse them. See [retry retirement](protocol.md#bounded-admission-and-freshness-retirement)
 for capacity refusal and stale-session handling; the old serial/chunk scheme is retired.
 
-<a id="broker-retention-review--blacklists-and-next-decision"></a>
+<a id="blacklists"></a>
 ### Blacklists
 
 No automatic misbehavior, repeated-incompatibility or reconnect blacklist is required for
@@ -1028,20 +1137,15 @@ authorization and rejection of stale sessions. None requires a permanent partici
 A future blacklist needs explicit scope, expiry/recovery and administrative policy; GUID
 or source IP alone is not authenticated identity and shared NATs require care.
 
-The [retry retirement proposal](protocol.md#broker-retry-retirement) now recommends expiring
-consumed-admission guards and ordered presence-query serials with bounded active slots.
-It supersedes the earlier sliding-window suggestion as the preferred design, pending
-acceptance; query admission already has an ordered reliable control stream.
+Retain consumed guards through challenge expiry and admit aggregate queries once
+on reliable CONTROL. Configure finite horizons and validate bootstrap fit and endpoint
+lifecycle before deployment. Presence-query serials and a separate sliding window are
+not part of this protocol.
 
-The retry-retirement direction is now accepted: consumed guards through challenge expiry
-and once-only CONTROL admission for aggregate freshness. Earlier presence-serial and
-sliding-window alternatives are historical. Exact
-configured horizons and bootstrap fit/endpoint lifecycle remain W4 integration work.
-
-<a id="broker-operation-validation"></a>
+<a id="broker-operation-admission-and-effects"></a>
 ## Broker operation admission and effects
 
-<a id="broker-operation-validation--shared-validation-before-dispatch"></a>
+<a id="shared-validation-before-dispatch"></a>
 ### Shared validation before dispatch
 
 Validate Frame bounds, encapsulation/options/padding, version, opcode and body encoding
@@ -1089,7 +1193,7 @@ Failure classes used below:
   if a safe mandatory result cannot be delivered.
 * **view**: invalidate affected staging/view and request a fresh view; never skip a hole.
 
-<a id="broker-operation-validation--operation-table"></a>
+<a id="operation-table"></a>
 ### Operation table
 
 Every row inherits the shared checks. “Same” below means identical logical request and
@@ -1125,7 +1229,7 @@ content within its valid retention window, not merely a repeated RTPS sequence n
 | 31 PATH_RESPONSE | C→Bkr; boot; B | Verify path-bound cookie/digest/expiry before reserving validated introduction state. | Same valid response repeats the same retained offer; no repeated allocation. |
 | 32 REGISTER | C→Bkr; boot; B | First admission: existing unconsumed unexpired introduction/binding, matching attempt/nonce/domain scope/incarnation, same-scope broker identity, valid selections/limits and two endpoint pairs. Reserve resources before consumption. Consumed introductions use retained-result/session validity, independent of the old introduction expiry. | Same bytes repeat valid result; conflict/expired/unknown ID rejects without reconstructing state. |
 
-<a id="broker-operation-validation--domain-scope-checks-at-record-boundaries"></a>
+<a id="domain-scope-checks-at-record-boundaries"></a>
 ### Domain scope checks at record boundaries
 
 The admitted scope is immutable standard domain ID/tag within the configured authority.
@@ -1155,7 +1259,7 @@ or view, never silently installs an orphan. Broker withdrawal is distinct from o
 Resume must validate original authority/scope/baseline retention as well as cursor numbers;
 a cursor from another scope cannot be rebound by changing its Envelope.
 
-<a id="broker-operation-validation--phase-appropriate-errors"></a>
+<a id="phase-appropriate-errors"></a>
 ### Phase-appropriate errors
 
 | Input / phase | Permitted response / effect |
@@ -1173,20 +1277,3 @@ Reject its effects and fail the affected operation/session under the existing po
 response must use the verified original association. Unknown/untrusted traffic cannot tear
 down another session. Error-code availability in the registry does not authorize that code
 in every phase. ADMISSION_REJECT and RESYNC_REQUIRED retain their explicit reason subsets.
-
-## Origin lease renewal
-
-Origin registration renewals come from the participant discovery agent, not an independent
-socket reader that could remain responsive while participant processing is stalled. The
-broker issues a nonce challenge with a server-monotonic deadline. A timely valid proof
-establishes an origin deadline no later than challenge-send time plus the negotiated lease;
-duplicates do not extend it. Negotiate renewal margin for RTT and scheduling. TCP ACKs,
-old SPDP bytes, replayed endpoint records and successful view resume never renew registration.
-
-The negotiated cached-origin lease must not exceed a finite participant lease advertised
-in preserved SPDP. A shorter advertised lease caps the existing broker deadline immediately
-when the participant update commits. Infinite broker registration leases are rejected in v1,
-even if another discovery mechanism supports infinite participant leases. Reject timer
-combinations that cannot accommodate configured RTT/deadline margins. A snapshot grants no
-fresh presence: activation requires corresponding unexpired proof and authorized installed
-records. Native presence and writer liveliness remain separate authorities.

@@ -40,12 +40,9 @@ not speed or MCU footprint. The isolated Zig prototype tests exercise the older 
 admission/lifetime synchronization slice; they do not implement the new native/foreign
 access paths, aggregate broker, or INSTANCE/TOPIC specialization.
 
-`prepared_read_model.py`, `historical_transfer_model.py` and
-`broker_retry_retirement.py` in `docs/design/archive/consolidation-2026-09-29/` are historical abstractions of superseded policies.
-They are intentionally excluded from this runner. Other existing operation/listener
-models retain their documented narrow evidence; their counts are not summed into one
-runtime-conformance claim. Network, concrete clock/skew, binding exceptions, real condition
-predicates, memory/latency and platform integration remain implementation acceptance tests.
+Only the maintained artifacts listed above contribute to current validation claims.
+Older experiments are excluded. Network, concrete clock/skew, binding exceptions,
+real conditions, memory/latency and platform integration remain acceptance tests.
 
 Final local validation, 2026-09-29: the standalone Python runner and root
 `test-design-models` target pass; generated codec tests (24) and all three representation

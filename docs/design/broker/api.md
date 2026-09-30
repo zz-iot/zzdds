@@ -1,12 +1,12 @@
 # Broker: api
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="broker-public-api"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+<a id="broker-public-configuration-and-status-api"></a>
 ## Broker public configuration and status API
 
-<a id="broker-public-api--creation-and-compatibility"></a>
+<a id="creation-and-compatibility"></a>
 ### Creation and compatibility
 
 Keep `DomainParticipantFactory.create_participant_ex(..., DomainParticipantConfig)`.
@@ -42,10 +42,10 @@ peer discovery is a configuration error, rather than silently contacting those p
 Broker-introduced peers never automatically become ordinary SPDP/SEDP seed destinations.
 Multicast controls discovery traffic only, not multicast user-data transport. Stable
 participant-wide capability advertisement and per-association endpoint eligibility follow
-[service introduction](protocol.md#broker-service-introduction). All-disabled remote discovery is
+[service introduction](protocol.md#service-introduction-metadata-and-compact-registration). All-disabled remote discovery is
 valid; same-participant matching still works through the local path.
 
-<a id="broker-public-api--proposed-config-fields"></a>
+<a id="config-fields"></a>
 ### Config fields
 
 Within module zzdds (existing types omitted):
@@ -77,9 +77,9 @@ struct BrokerDiscoveryConfig {
 // BrokerDiscoveryConfig broker;
 ```
 
-Address bounds above are proposed public limits. Standard domain identity is
+Address bounds above are the initial public limits. Standard domain identity is
 configured once on DomainConfig: existing id plus `@default("") string<256> tag`.
-There is no broker realm. See the accepted [domain identity decision](coexistence.md#broker-domain-identity)
+There is no broker realm. See the accepted [domain identity decision](coexistence.md#standard-domain-identity-replaces-broker-realm)
 for standard encoding, defaults and required native support. The participant's resolved
 domain identity is used by ordinary discovery and broker admission alike.
 
@@ -100,7 +100,7 @@ channel. Unsupported requested transports fail construction. V1 is traditional, 
 cached discovery; it provides no cryptographic authentication, confidentiality or access
 control. Secure broker operation follows participant DDS Security configuration and must
 fail explicitly until the required integration exists. No fallback from requested security
-to plaintext. BrokerSecurityPolicy and credential_ref from the old proposal are removed.
+to plaintext. No separate BrokerSecurityPolicy or credential_ref is part of this Config.
 
 A candidate-view policy is a required capability, not permission to fall back to VIEW_ALL.
 The operator's disclosure ceiling applies first; client topic/partition candidate selection
@@ -119,10 +119,10 @@ Unspecified bootstrap values resolve to finite build/platform defaults. Zero is 
 alias for infinity or default; reject it for these fields. Require retry_min <= retry_max,
 checked duration conversion, sufficient transport/provider minima and bounded buffers.
 Publish exact resolved defaults with the implementation; this draft does not claim an
-untested timeout or safe MTU. The [lifecycle contract](protocol.md#broker-bootstrap-lifecycle)
+untested timeout or safe MTU. The [lifecycle contract](protocol.md#bootstrap-sizing-and-endpoint-lifecycle)
 defines whole-message preflight, result retention and deadlines. Use the runtime's common resource configuration and finite defaults for the initial
 resource plan; detailed wire limits are derived internally. The accepted
-[resource scope](api.md#broker-resource-diagnostics) defers additional broker-specific tuning
+[resource scope](api.md#initial-broker-resource-and-diagnostic-surface) defers additional broker-specific tuning
 knobs and the resolved-plan getter.
 
 Local detectable errors fail construction even under allow-degraded. Remote oversize
@@ -131,10 +131,10 @@ locally usable with observable failure/retry state. require_ready uses a finite 
 startup deadline and rolls back an unsuccessful construction. An explicit later readiness
 wait may be infinite; recovery does not extend its original deadline.
 
-<a id="broker-public-api--readiness-and-status-signatures"></a>
+<a id="readiness-and-status-signatures"></a>
 ### Readiness and status signatures
 
-Proposed operations on zzdds::DomainParticipant:
+Required operations on zzdds::DomainParticipant:
 
 ```idl
 DDS::ReturnCode_t wait_discovery_ready(in DDS::Duration_t max_wait);
@@ -149,7 +149,7 @@ completion predicate. Existing readiness return-code, deadline, cancellation and
 helping rules are unchanged. The getter is supported even with broker disabled, reporting
 DISABLED/ready=false. Invalid configuration is not represented as a live participant.
 
-Proposed bounded snapshot, with numeric enum assignments deferred to the IDL review:
+Bounded status snapshot; numeric enum assignments require generated ABI validation before publication:
 
 ```idl
 enum DiscoveryPhase { DISCOVERY_DISABLED, DISCOVERY_WAITING_FOR_ENABLE, DISCOVERY_CONNECTING,
@@ -205,7 +205,7 @@ is monotonic within participant lifetime; updates during a callback leave newer 
 No callback is needed to make READY true or complete a wait. No private callback thread or
 recursive automatic dispatch is introduced.
 
-<a id="broker-public-api--enablement-interaction"></a>
+<a id="enablement-interaction"></a>
 ### Enablement interaction
 
 The broker Config enabled switch selects a mechanism; DDS Entity enablement is separate.
@@ -226,8 +226,8 @@ convention. Do not silently enable the participant or wait for a timeout while n
 can yet enable it. Applications needing staged creation use allow_degraded, enable the
 participant when ready, then call wait_discovery_ready explicitly. This is an accepted specification requirement, not an existing implementation behavior.
 
-<a id="broker-public-api--final-review-clarifications"></a>
-### Final review clarifications
+<a id="configuration-validation-and-status-semantics"></a>
+### Configuration validation and status semantics
 
 Enabled broker configuration requires at least one nonempty, supported service address.
 Validate address syntax/provider support locally; DNS resolution and connection failure
@@ -292,10 +292,10 @@ uses the binding's nil getter convention, not a fabricated handle. Callback part
 handles are borrowed for the callback and may be retained only using normal binding rules.
 No participant/listener reference is serialized in Config or wire data.
 
-See [public API review](../concurrency-broker-status.md) for return mapping, audit disposition
-and remaining implementation gates. These fragments still require generated ABI review.
+These declarations require generated ABI validation before publication; see the
+[index](../concurrency-broker-status.md) for implementation gates.
 
-<a id="broker-public-api--udp-oversize-diagnostics"></a>
+<a id="udp-oversize-diagnostics"></a>
 ### UDP oversize diagnostics
 
 For locally detected bootstrap oversize, report the encoded size and configured budget,
@@ -303,11 +303,11 @@ and name existing UdpConfig.interfaces restriction and an explicitly configured 
 address as remedies. Do not silently strip canonical announcements or switch transport.
 A remote offer that cannot fit may yield only a bounded timeout; do not invent its cause.
 
-<a id="broker-readiness-contract"></a>
+<a id="broker-readiness-and-registration-status"></a>
 ## Broker readiness and registration status
 
-<a id="broker-readiness-contract--accepted-startup-default"></a>
-### startup default
+<a id="startup-default"></a>
+### Startup default
 
 Default broker startup to `allow_degraded`: create a locally usable participant after
 local validation/resource admission, and progress discovery asynchronously. This follows
@@ -339,7 +339,7 @@ This default is a choice, not an OMG requirement. The alternative default,
 standard participant creation in broker mode to a network dependency. Neither default
 proves peer data connectivity or application matching.
 
-<a id="broker-readiness-contract--broker-independent-local-discovery"></a>
+<a id="broker-independent-local-discovery"></a>
 ### Broker-independent local discovery
 
 Matching between enabled readers and writers belonging to the same local participant
@@ -375,7 +375,7 @@ silently discard a required assigned record or removal while claiming successful
 registration. Local resource exhaustion can still fail new entity creation; allowing
 local activity does not promise unlimited offline history or unlimited endpoints.
 
-<a id="broker-readiness-contract--what-ready-means"></a>
+<a id="what-ready-means"></a>
 ### What ready means
 
 Readiness is a current synchronization condition of the local participant's broker
@@ -392,7 +392,7 @@ An empty authorized view can be ready. Apply a timely nonce-correlated aggregate
 at or after the fixed synchronization frontier. It accounts for that membership; zero or
 already-elapsed evidence leaves affected origins inactive without revoking independent
 valid evidence. Missing or timed-out markers do not establish freshness evaluation.
-See [aggregate freshness](protocol.md#broker-aggregate-freshness). READY does not require
+See [aggregate freshness](protocol.md#ordered-aggregate-freshness-revision). READY does not require
 all cached remote participants to be active simultaneously. The target is fixed for each synchronization
 attempt, not moved forward forever by concurrent remote churn. Local changes after the
 origin cut can remain pending without invalidating that completed cut. Report that
@@ -407,10 +407,10 @@ peer state and direct data paths follow their independent lease/liveliness rules
 No callback must execute for the readiness predicate to become true. An application
 reading READY observes a fact at one point in time, not a promise it remains true.
 
-<a id="broker-readiness-contract--readiness-wait"></a>
+<a id="readiness-wait"></a>
 ### Readiness wait
 
-Proposed semantic operation on zzdds::DomainParticipant:
+Readiness wait on zzdds::DomainParticipant:
 `wait_discovery_ready(max_wait) -> DDS::ReturnCode_t`.
 
 For v1 this operation is supported when a broker service is enabled, including mixed
@@ -442,7 +442,7 @@ with ERROR. It does not create an extra operational runtime lease. An infinite w
 allowed by the explicit wait API, with the ordinary possibility of never becoming ready;
 that does not make infinite startup waiting the default.
 
-<a id="broker-readiness-contract--status-and-asynchronous-failures"></a>
+<a id="status-and-asynchronous-failures"></a>
 ### Status and asynchronous failures
 
 Expose a non-resetting coherent status getter on the zzdds participant extension. Its
@@ -478,10 +478,10 @@ existing entity, canonical listener and configured group exclusion; no private c
 thread or new DDS StatusMask bits. Replacement/claim and absent-callback preservation
 follow the listener contract. Intermediate transitions may coalesce, so it is not an
 exact event log. Installing a listener provides catch-up to current status. Getter/wait
-behavior does not depend on a listener being installed. Exact IDL spelling and bounded
-reason types follow acceptance; no production listener interface is added here.
+behavior does not depend on a listener being installed. Generated IDL and bounded reason types require ABI validation before implementation
+publication; this contract does not claim an implemented listener interface.
 
-<a id="broker-readiness-contract--registration-barrier-scope"></a>
+<a id="registration-barrier-scope"></a>
 ### Registration barrier scope
 
 Do not add a separate per-endpoint registration barrier in initial v1. It is useful but
@@ -490,14 +490,14 @@ commit remain observable. A later barrier must capture a local mutation frontier
 specify superseded revisions, deletion, reconnect and epoch replacement; neither READY
 nor a matched-reader status may be documented as that barrier today.
 
-<a id="broker-resource-diagnostics"></a>
+<a id="initial-broker-resource-and-diagnostic-surface"></a>
 ## Initial broker resource and diagnostic surface
 
 Use the runtime's common finite resource plan and negotiated broker ReceiveLimits.
 Initial v1 does not add a resolved-plan getter, diagnostic pagination or a new family
 of per-broker resource knobs. It must still bound global/session storage, pending
 challenges, staging, overlap, repair, freshness capture/output and deferred references.
-The [storage contract](wire.md#broker-storage-contract) defines ownership/accounting.
+The [storage contract](wire.md#broker-bounded-decoding-and-retained-byte-ownership) defines ownership/accounting.
 
 Use the existing configuration path for finite build/platform defaults; explicit limits
 must be validated before work is promised. Rate-limited logs plus the participant's
@@ -505,7 +505,6 @@ non-resetting current status expose failure without a listener. Credentials, coo
 unbounded entity/topic labels are not diagnostics. Per-record detail can be logged
 boundedly; no unbounded status payload is permitted.
 
-The [public API](api.md#broker-public-api) controls the v1 Config/status fields. Expanded
+The [public API](api.md#broker-public-configuration-and-status-api) controls the v1 Config/status fields. Expanded
 resource controls and programmatic diagnostic enumeration remain later extensions.
-The [archived proposal](../archive/review-baseline/broker-resource-diagnostics.md) is not a
-second public API or a requirement to ship those deferred controls.
+No second resource-control API is required in initial v1.

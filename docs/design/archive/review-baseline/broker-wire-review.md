@@ -9,7 +9,7 @@ Current policy: unsecured participants use GUID identity without historical owne
 proof. Confirmed disconnect withdraws registration; a new competing binding waits for
 old-session closure/expiry unless authenticated participant continuity permits replacement.
 No mandatory continuity token is issued in ACCEPT. Lost ACCEPT recovery may wait for the
-finite establishment deadline. See [current admission policy](../../broker/protocol.md#broker-admission-protection).
+finite establishment deadline. See [current admission policy](../../broker/protocol.md#broker-admission-identity-and-reconnect).
 The later retention decision also supersedes epoch-long CLOSE terminality: after the
 closed registration and all obligations retire, fresh admission may reuse its identity.
 The original review reasoning is retained below as history. Recommendation language

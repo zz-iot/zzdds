@@ -221,6 +221,6 @@ samples, but can temporarily hide them from concurrent callers. The certified na
 is unaffected only when conversion and final transfer are non-reentrant and infallible
 after selection; C/C++/Zig language choice alone does not establish that capability.
 
-See [the access contract](design/concurrency/operations.md#prepared-read-conflicts) and
-[binding result mappings](design/concurrency/operations.md#binding-access-failures) for effect phases and the
+See [the access contract](design/concurrency/operations.md#prepared-readtake-selection-claims-and-failure) and
+[binding result mappings](design/concurrency/operations.md#binding-visible-prepared-access-failures) for effect phases and the
 separate case of an output container failing after successful consumption.

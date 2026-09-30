@@ -30,7 +30,7 @@ and outcome rules still apply. Duplicate traffic never extends any deadline.
 
 Fresh SPDP attempts after retirement may obtain fresh introduction IDs under normal
 policy. They cannot make old REGISTER bytes valid. Detailed timer origins, endpoint
-confirmation and resource retirement follow the [lifecycle contract](../../broker/protocol.md#broker-bootstrap-lifecycle).
+confirmation and resource retirement follow the [lifecycle contract](../../broker/protocol.md#bootstrap-sizing-and-endpoint-lifecycle).
 The earlier cookie-authorized OPEN experiment is historical, not the current handshake.
 
 ## Presence: ordered query serial plus bounded active answers

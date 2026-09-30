@@ -3,7 +3,7 @@
 # View request correlation and recovery
 
 Status: F2 direction accepted, 2026-09-18. ViewRequest member 4 now carries the
-client-assigned generation in the experimental IDL; the wire remains unfrozen. Builds on the [operation table](../../broker/protocol.md#broker-operation-validation).
+client-assigned generation in the experimental IDL; the wire remains unfrozen. Builds on the [operation table](../../broker/protocol.md#broker-operation-admission-and-effects).
 
 ## Problem
 

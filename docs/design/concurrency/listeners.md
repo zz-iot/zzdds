@@ -1,30 +1,35 @@
 # Concurrency: listeners
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="listener-execution"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+
+The contract covers exclusion and identity, preparation/dispatch failure, status routing,
+explicit delegation, then replacement and deletion. Application-facing configuration
+is defined in the extension API; no callback-group configuration is needed for the defaults.
+
+<a id="listener-execution-contract"></a>
 ## Listener execution contract
 
-<a id="listener-execution--1-purpose-and-api-boundary"></a>
+<a id="purpose-and-api-boundary"></a>
 ### Purpose and API boundary
 
-**Agreed.** Provide predictable callback serialization, ordering and lifetime behavior while preserving direct, low-latency delivery. Standard DDS-only applications must get useful defaults without using extension methods. Threaded and application-driven backends must implement the same observable listener contract; their placement and timing may differ.
+Provide predictable callback serialization, ordering and lifetime behavior while preserving direct, low-latency delivery. Standard DDS-only applications must get useful defaults without using extension methods. Threaded and application-driven backends must implement the same observable listener contract; their placement and timing may differ.
 
-OMG operations belong in `dcps.idl`. New application controls for callback groups, executors, affinity, or driving progress belong on zzdds extension entity interfaces in `idl/zzdds.idl`. Generate bindings from that IDL rather than hand-editing generated surfaces. No public listener-identity accessor is currently proposed. Internal binding support for identity must not require inventing an operation on an OMG interface.
+OMG operations belong in `dcps.idl`. New application controls for callback groups, executors, affinity, or driving progress belong on zzdds extension entity interfaces in `idl/zzdds.idl`. Generate bindings from that IDL rather than hand-editing generated surfaces. No public listener-identity accessor is required. Internal binding support for identity must not require inventing an operation on an OMG interface.
 
-**Agreed.** Distinct reader listeners under the same Subscriber remain independent by default. A shared listener or an explicitly configured group can provide broader serialization. A Subscriber is not automatically one execution group for all its children.
+Distinct reader listeners under the same Subscriber remain independent by default. A shared listener or an explicitly configured group can provide broader serialization. A Subscriber is not automatically one execution group for all its children.
 
-<a id="listener-execution--2-omg-boundary"></a>
+<a id="omg-boundary"></a>
 ### OMG boundary
 
-DDS 1.4 §§2.2.4.2–2.2.4.3 define status reset behavior, the most-specific enabled listener for plain statuses, subscriber-level precedence for data notifications, and permitted aggregation of status changes. These sections do not prescribe a general listener-object mutex or executor. This proposal adds an explicit execution contract while preserving those semantics. [DDS 1.4](https://www.omg.org/spec/DDS/1.4/PDF).
+DDS 1.4 §§2.2.4.2–2.2.4.3 define status reset behavior, the most-specific enabled listener for plain statuses, subscriber-level precedence for data notifications, and permitted aggregation of status changes. These sections do not prescribe a general listener-object mutex or executor. This contract adds an explicit execution contract while preserving those semantics. [DDS 1.4](https://www.omg.org/spec/DDS/1.4/PDF).
 
 `Subscriber::notify_datareaders()` invokes eligible reader listeners and is expressly intended for use from `on_data_on_readers()`. Explicit delegation therefore needs distinct treatment from accidental callback re-entry. Callback count is not sample count: DDS does not require a callback for every individual change. [DDS 1.4 §§2.2.2.5.2.11, 2.2.4.3.2](https://www.omg.org/spec/DDS/1.4/PDF).
 
 Do not describe this contract as an OMG-mandated threading model or as proof of general DDS conformance. Data access ordering and coherent presentation remain responsibilities of DDS history/presentation processing, not of the callback scheduler.
 
-<a id="listener-execution--3-terms"></a>
+<a id="terms"></a>
 ### Terms
 
 | Term | Meaning |
@@ -40,10 +45,10 @@ Do not describe this contract as an OMG-mandated threading model or as proof of 
 
 Serialization means no overlapping automatic invocations in a shared exclusion domain. Non-reentrancy also excludes nesting on the same thread. Neither implies fixed thread affinity. Execution rights are scheduler state, not entity/protocol mutexes held while executing user code.
 
-<a id="listener-execution--4-default-behavior"></a>
+<a id="default-behavior"></a>
 ### Default behavior
 
-**Agreed requirements:**
+Requirements:
 
 1. Automatic callbacks for one entity are serialized across methods, including callbacks resolved through parent listeners.
 2. Automatic callbacks to the same identifiable listener instance are serialized across registrations and methods. Shared listener identity across bindings is a release gate, not a property supplied by today's `ListenerBox`.
@@ -56,10 +61,10 @@ Serialization means no overlapping automatic invocations in a shared exclusion d
 
 The blanket lock rule in item 7 is a target requirement and requires a call-chain audit. Dropping the reader lock is insufficient if the caller still holds a participant or subscriber lock.
 
-<a id="listener-execution--5-inline-path-and-pending-work"></a>
+<a id="inline-path-and-pending-work"></a>
 ### Inline path and pending work
 
-**Proposed mechanism, preserving the agreed fast path:**
+The dispatch boundary must obey this sequence; its queue representation is an implementation choice:
 
 1. Under state ownership, commit the relevant state change, update status/conditions and publish notification eligibility/order.
 2. Select the applicable listener through DDS routing rules. Atomically coordinate eligibility, registration generation and execution-right acquisition.
@@ -71,13 +76,13 @@ Multiple overlapping exclusion domains require an all-or-retry reservation proto
 
 Pending work should normally identify an entity/status and relevant generations, rather than copy an unlimited event log. Allocate reusable pending storage at entity/registration creation where practical. Overload must not silently erase accumulated status counters or cause unbounded allocation. Precise limits and failure reporting require the resource-policy design.
 
-**Agreed.** A low-latency build must not disable serialization, ordering or lifetime guarantees. Build-time specialization may eliminate synchronization only when exclusive execution is established, including interrupt/other-core boundaries. Different executor availability or default placement is acceptable; different safety semantics are not.
+A low-latency build must not disable serialization, ordering or lifetime guarantees. Build-time specialization may eliminate synchronization only when exclusive execution is established, including interrupt/other-core boundaries. Different executor availability or default placement is acceptable; different safety semantics are not.
 
 Inline-when-eligible is the initial placement policy. Future designated-executor or
 application-controlled dispatch may constrain placement but cannot relax exclusion;
 those extensions are outside the first shipped surface.
 
-<a id="listener-execution--creation-time-explicit-groups"></a>
+<a id="creation-time-explicit-groups"></a>
 ### Creation-time explicit groups
 
 The [extension surface](extension-api.md#concurrency-extension-surface) records optional fixed
@@ -86,21 +91,26 @@ membership; groups supplement shared-listener identity exclusion and may span
 runtimes in one core. No parent-to-child inheritance or thread affinity is implied.
 Existing same-chain explicit delegation remains permitted under its admission rules.
 
-<a id="listener-identity-decision"></a>
+<a id="listener-identity"></a>
 ## Listener identity
 
-<a id="listener-identity-decision--concrete-v1-decision-package"></a>
-### Concrete v1 decision package
+<a id="canonical-identity-requirements"></a>
+### Canonical identity requirements
 
-Review checkpoint, 2026-09-15: after consolidating L5, the recommendations below
-remain the proposed final L1/nesting refinements. No new prototype is needed to
-choose them. A loaded core instance means the concrete core identity-registry
+A loaded core instance means the concrete core identity-registry
 instance shared by its bindings, not merely a library filename or an OS process;
 independently instantiated/static-linked registries are separate domains. Internal
 keys must include their identity kind/namespace (native context, C++ complete object,
 or Java VM/object token) to prevent accidental numeric collisions. Cross-binding
 aliases require deliberate canonicalization; pointer equality across unrelated
 namespaces does not establish shared object identity.
+
+Reinstalling the same live listener while an old registration is retiring must find the
+same exclusion record. Registry removal occurs only after registrations, active chains,
+pending uses and claims retire under registry synchronization. Address reuse obtains a
+new generation; it cannot make destruction of a still-used application object safe.
+Cross-runtime exclusion release signals retained destination wake obligations without
+recursively driving that runtime or invoking application code under registry locks.
 
 The scope has a deliberate cost: sharing a listener across participants/runtimes
 couples their callback admission, so a slow callback can delay another registration
@@ -145,11 +155,11 @@ can be tracked across runtimes without granting execution permission there.
 6. **Bounded lifetime and failure.** Identity records retire only after registrations,
    claims and pending internal users release them. Generation reuse cannot substitute
    for lifetime protection. Registration capacity failure preserves the installed
-   registration; precise setter error mapping remains an L4/API task. Internal stale
+   registration; setter resource-failure mapping is an [open API item](../concurrency-broker-status.md#open-design-items). Internal stale
    records surviving external quiescence must contain no borrowed application access.
 
-<a id="listener-identity-decision--participant-nesting-configuration-recommendation"></a>
-#### Participant nesting configuration recommendation
+<a id="participant-nesting-limits"></a>
+#### Participant nesting limits
 
 Fix each participant's positive finite nesting limit at creation. Standard-only
 creation uses the build-time default (initially eight). Explicit configuration belongs
@@ -158,7 +168,7 @@ build's configurable default from its supported maximum capacity; validate the v
 before publishing the participant. Zero is invalid, rather than a hidden unlimited
 or delegation-disabled mode. Exact configuration failure mapping follows its API.
 
-For each proposed nested call, count total active `notify_datareaders` frames plus
+For each nested call, count total active `notify_datareaders` frames plus
 one, and compare against the smallest participant limit represented in the active
 callback/delegation chain, including the destination participant. Include the root
 callback's participant even if it has no active `notify_datareaders` frame yet.
@@ -177,19 +187,19 @@ application recursion, callback stack frames or the total dependency graph. Fixi
 configuration at creation avoids retroactively invalidating active calls and gives
 storage sizing a stable bound. Live mutation can be a later extension if justified.
 
-<a id="listener-identity-decision--selected-binding-architecture-refinement"></a>
-### Selected binding architecture refinement
+<a id="binding-identity-and-ownership"></a>
+### Binding identity and ownership
 
-The discussion accepted separating dispatch context, canonical identity and ownership
-as the binding direction. This does not select a callback-struct layout or freeze a
-new ABI, and it does not by itself accept every scope/configuration proposal above.
+Dispatch context, canonical identity and application ownership are separate. The
+identity and nesting rules above are required. Descriptor layout/version negotiation
+is an [open ABI item](../concurrency-broker-status.md#open-design-items).
 
 Preserve the current dispatch context exactly as required by each generated trampoline.
 Supply canonical identity independently at registration, retain the resolved exclusion
 record for callbacks, and track binding-resource ownership separately. An identity
 record is not ownership of a borrowed application object.
 
-For C++, registration-time `dynamic_cast<void*>(this)` is the preferred candidate
+**Conforming approach — C++ identity.** Registration-time `dynamic_cast<void*>(this)` is a candidate
 for obtaining complete-object identity while retaining the adjusted ListenerBase
 pointer for dispatch. It needs no new application override or common virtual base.
 Constructor/destructor registration and multiple-inheritance/interface-view tests
@@ -197,7 +207,7 @@ must be addressed before selecting the implementation. Separate forwarding objec
 remain distinct unless an adapter explicitly supplies common identity or the
 application groups them. This is not an entity-wrapper identity mechanism.
 
-For Java, prefer binding-owned canonicalization of actual object identity over a
+**Conforming approach — Java identity.** Prefer binding-owned canonicalization of actual object identity over a
 mandatory application superclass containing a native handle. Registration-time lookup
 and reference bookkeeping keep this work off the callback path. Raw C/Zig retain
 application-context identity defaults. Canonical tokens must have an explicit namespace
@@ -215,11 +225,249 @@ existing shared C-ABI box/interface-view machinery. Listener identity derives fr
 the application object through the binding. Unifying their dispatch representations
 is not a prerequisite for implementing either identity contract.
 
-<a id="listener-status-ordering"></a>
+<a id="callback-failure-and-binding-unwind-policy"></a>
+## Callback failure and binding unwind policy
+
+<a id="failure-after-dispatch-commit"></a>
+### Failure after dispatch commit
+
+Catch a recoverable language exception at the generated listener bridge, report a
+bounded internal failure outcome, and return normally through the C ABI. The core
+then completes the invocation's normal ownership cleanup. Do not depend on language
+unwinding through Zig frames to release execution rights or retirement obligations.
+
+| Context | Accepted result after contained listener exception |
+| --- | --- |
+| Automatic callback | Report failure, release invocation ownership, continue normal scheduling |
+| Explicit delegated child | Complete cleanup, stop this delegation batch and return ERROR to its immediate caller |
+| Callback catches its own exception and returns normally | Ordinary successful callback completion |
+
+Do not retry the failed invocation, restore already-consumed status, undo application
+side effects, implicitly delete the entity or automatically remove the listener.
+A callback that throws has already entered and may have read samples, published data,
+replaced its listener or logically deleted entities. Those effects remain committed.
+New status changes during execution retain their normal pending state. Later fresh
+notifications may invoke the same listener again; repeated failure diagnostics must
+be bounded/rate-limited without erasing DDS status information.
+
+This default contains propagation; it does not prove that the application's state
+is usable after an exception. Applications needing termination or recovery sequencing
+should handle that inside their listener or a future explicit failure-policy extension.
+Such controls belong in zzdds.idl and must not change ordinary callback signatures
+on dcps.idl. No new mandatory application listener methods are required.
+
+An inner notify_datareaders returning ERROR is still different from its caller
+throwing. If the caller handles that ERROR and returns normally, the outer operation
+may succeed, as already accepted. If the caller itself throws, its own invocation
+fails and the immediate containing delegation observes that failure.
+
+<a id="binding-boundary-and-ownership"></a>
+### Binding boundary and ownership
+
+C++ generated trampolines should contain a try/catch boundary around callback entry
+(and classify failures from adaptation separately). Adding noexcept alone would
+terminate on an escaping exception rather than report it. Exception-disabled builds
+cannot promise interception of exceptions; supported callbacks there must return
+normally. Abort/terminate, undefined behavior and nonlocal jumps across the bridge
+are outside recoverable cleanup guarantees. Raw C callbacks must not longjmp over
+core frames; Zig callback panics are not modeled as recoverable error returns.
+
+Java generated trampolines must inspect pending JNI exceptions at fallible JNI steps
+and after invocation, capture/report a callback-local failure and clear the pending
+exception before returning control to core processing. JNI exceptions do not unwind
+native frames automatically; only restricted JNI operations are permitted with an
+exception pending. Local reference frames and thread attachment ownership require
+explicit cleanup. Do not clear an unrelated pending exception at callback entry or
+continue normal conversion after a failed lookup/allocation.
+[JNI design, exception handling](https://docs.oracle.com/en/java/javase/24/docs/specs/jni/design.html#exception-handling).
+
+A void-return callback ABI requires an internal
+invocation-outcome mechanism: for example, a scoped per-invocation record accessible
+to generated bridges, or a versioned descriptor outcome hook. It must distinguish
+nested invocations, restore the outer frame on return, and carry the same explicit
+chain across supported binding/runtime transitions. One sticky thread-wide error
+flag is insufficient. Exact ABI shape is tracked with identity metadata in the index; no raw
+exception object is required to cross the ABI or be retained after reporting.
+
+Cleanup has one structured epilogue on every recoverable path: retire the active
+invocation frame, release callback rights/access guards and retained arguments,
+settle applicable references/hooks, then publish wakes and failure reporting without
+internal locks spanning application code. Do not drop the application-access drain
+obligation before cleanup that can still touch borrowed listener state has finished.
+A diagnostic record must not keep a borrowed listener pointer alive implicitly or
+reenter a listener while its rights remain held. Basic failure reason/entity-generation
+reporting must work even if richer diagnostic allocation fails.
+
+A throwing release hook is not equivalent to a failed listener method: catching it
+does not establish that the hook completed its ownership duties. Require lifecycle
+release hooks to complete without throwing. Violations cannot be reported as successful
+quiescence unless remaining access/ownership is independently proven; they need a
+binding fatal-error policy, not a silent success path. This constraint belongs in
+the binding ownership contract and requires explicit documentation.
+
+<a id="preparation-before-dispatch"></a>
+### Preparation before dispatch
+
+Prepare/validate/commit with bounded retries is required. Preparation retains chain
+identity and application-access obligations, but not callback execution rights.
+The final-entry and retry rules below apply to every binding.
+
+1. Retain a candidate entity lifetime and current registration, and snapshot the
+   applicable status with a validation version. Capturing does not reset status.
+2. Prepare binding arguments and required storage outside internal locks and without
+   holding callback execution rights merely to perform conversion. The preparation
+   carries a retained application-access obligation and execution-chain context.
+3. At final admission, validate entity lifetime, selected registration, eligibility,
+   status version and execution rights together. For a valid candidate, claim the
+   callback and reset status at the same ordered boundary. Invoke with the already
+   prepared arguments after releasing internal locks.
+4. If validation fails, consume nothing. Recheck whether the candidate is still
+   eligible; skip if no longer eligible, otherwise refresh preparation within the
+   bounded retry policy. Binding conversion/allocation failure returns an explicit
+   failure outcome rather than pretending a callback occurred.
+
+Preparation may run foreign adaptation code, but must not access mutable application
+listener state without independent protection. It has not acquired listener execution
+rights merely by retaining identity or application lifetime.
+
+The version must distinguish updates and consumption, including zero-net changes.
+A status getter or another dispatch invalidates a prepared aggregate. Comparison of
+counter values alone is insufficient. Replacement/deletion invalidates unclaimed
+preparation; any remaining cleanup retains its application-access obligation through
+its last relevant access. A prepared argument is not a callback claim and does not
+permit invocation on a retired registration.
+
+<a id="retry-and-placement-rules"></a>
+#### Retry and placement rules
+
+Limit preparation/revalidation attempts per service turn. Automatic work retains
+pending status and yields for a later scheduling opportunity; resource-failure retries
+must use bounded backoff or an explicit resource wake, not immediate busy spinning.
+Do not silently disable the listener or erase the notification. Explicit delegation
+also has a finite total preparation-retry budget for each candidate; exhaustion stops
+the batch with ERROR, preserving unconsumed status and earlier child effects.
+
+Ordinary waiting for busy callback rights is not itself a failed preparation attempt.
+A wake may require revalidation and another preparation if state changed, but must not
+turn mere contention into a busy error. Release scarce prepared resources while waiting
+where necessary, without falsely marking the candidate handled. The extension API defines the finite retry defaults and configuration. Any finite retry rule means that
+continuous state interference can cause explicit ERROR rather than guaranteeing
+progress at the cost of an unbounded preparation loop.
+
+JNI local references and other thread-affine preparation cannot migrate to a different
+worker unchecked. Prepare and commit on the appropriate thread, discard/reprepare on
+migration, or explicitly use transferable retained representations. Executor placement
+is a constraint on the prepared invocation, not permission to reuse a foreign JNIEnv.
+
+<a id="preparation-recursion-and-final-entry"></a>
+### Preparation recursion and final entry
+
+<a id="extend-the-recursion-guard-across-preparation"></a>
+#### Extend the recursion guard across preparation
+
+Register a chain-local active dispatch frame keyed by entity lifetime and callback
+kind before any foreign argument preparation. Keep it through preparation, validation,
+invocation and foreign cleanup. A nested explicit delegation attempting that same
+entity/kind fails with the existing recursion ERROR, even if the listener method has
+not entered. Replacement does not evade the key. Sequential retries reuse the frame
+without increasing nesting; they must not recursively call the preparation routine.
+Different targets can still nest through explicit delegation within the accepted
+chain-depth limit. Automatic callbacks remain prohibited on a nested pump stack.
+
+For example, automatic preparation for reader A constructs a wrapper whose code
+calls notify_datareaders. If that traversal reaches A, reject its attempt before
+preparing A again. It may have handled earlier eligible other readers, so existing
+partial-completion semantics apply. This closes a hole that an entered-listener-only
+recursion guard misses. The dispatch frame tracks recursion and lifetime, not exclusive
+rights over the listener during argument construction. Independent chains still use
+ordinary admission; any duplicate prepared observations revalidate before claim.
+
+<a id="final-entry-cannot-provide-a-universal-body-start-proof"></a>
+#### Final entry cannot provide a universal body-start proof
+
+Treat status consumption commit as an **irrevocable dispatch attempt**, with
+these explicit outcomes:
+
+* Preparation or final validation fails before commit: no status consumption and no
+  callback attempt. Preserve the accepted recheck/retry or ERROR behavior.
+* Commit succeeds: prepared arguments and rights are fixed, status is consumed, and
+  the bridge makes the final invocation attempt without intervening ordinary fallible
+  conversion or admission cancellation. Replacement/deletion cannot revoke this claim.
+* Invocation reports an exception/failure after commit: record failed dispatch, clean
+  up and apply automatic reporting or explicit ERROR. Do not restore consumed status
+  or replay the invocation, even when actual listener-body entry cannot be established.
+
+No-consumption on failure applies before dispatch commit. It cannot be promised for
+every language-runtime failure at final entry. Do not describe uncertain entry as a proven application exception.
+Diagnostics should distinguish preparation failure, known application failure where
+available, and committed invocation failure with unknown entry.
+
+A callback's committed status observation is not sample consumption. A failed entry
+can leave samples available through normal access, but must not manufacture a new
+status notification solely to replay the failed invocation. New independent status
+changes remain pending normally. This makes failure semantics consistent across
+thread placement without guessing whether application side effects occurred.
+
+<a id="retry-scheduling"></a>
+### Retry scheduling
+
+Retry limits are finite configuration bounds, not measured latency or memory guarantees.
+
+Numeric defaults and construction-time validation belong in
+[ParticipantConcurrencyConfig](extension-api.md#runtime-ownership-and-selection).
+Manual drivers expose retry deadlines through the normal timer/progress interface;
+retry timers do not create a helper thread.
+
+The per-turn count applies to actual preparation work. The explicit cumulative budget
+counts stale validation, not waiting for execution rights or releasing thread-affine
+prepared objects solely because a worker changes. Check deletion/ineligibility before
+charging a stale retry: an ineligible target is skipped, not converted into an error.
+A still-eligible candidate that reaches its configured stale-validation limit returns ERROR without
+another attempt. Replacement does not reset that candidate's cumulative budget.
+Each new explicit call starts a new budget; application retry loops remain application
+behavior. Count work across all turns/binding transitions of the same candidate.
+
+<a id="distinguish-the-causes"></a>
+#### Distinguish the causes
+
+* **Status/registration changed during preparation:** automatic work refreshes within
+  its turn budget, then yields at the tail of runnable preparation work. Keep its
+  existing eligible notification/admission age where the accepted ordering permits;
+  scheduler service position is distinct from notification age. Registration changes
+  still require fresh admission. Do not clear the status or reset counters on retry.
+* **Callback rights busy:** follow the existing admission/wake protocol. Do not retry
+  conversion in a tight loop while rights remain unavailable or count wait duration
+  as stale validation. The fast path still prepares and claims inline when eligible.
+* **Recoverable conversion/resource failure:** explicit delegation reports ERROR
+  immediately with prior effects retained. Automatic notification stays pending and
+  arms one bounded retry obligation, preferably a generation-safe resource-ready
+  wake. Without dependable notification, use the capped timer above.
+* **Committed invocation fails:** use the accepted exception reporting/ERROR policy;
+  never schedule a replay of the consumed notification. A genuinely newer change is
+  independently eligible.
+
+New data does not bypass an existing resource-failure backoff or create another timer
+for the same pending opportunity. Successful preparation resets the failure delay;
+ordinary new arrivals do not. Replacing the listener invalidates old wake tokens and
+permits a new registration attempt, but must not duplicate retained work. Resource
+notifications can request an earlier attempt, coalesced and subject to normal runtime
+service budgets. They must not synchronously dispatch callbacks from the resource
+release path. Resource-waiting opportunities retain status but do not reserve scarce
+callback rights or block unrelated entities' admission.
+
+A known structural bridge error (missing method, incompatible descriptor, invalid
+binding setup) is not transient memory pressure. Report it distinctly and suppress
+blind timer retries for that unchanged broken configuration. Reattempt on relevant
+registration/configuration repair or explicit application delegation, reporting ERROR
+if still broken. This does not remove the installed listener or consume its status;
+it is a visible dispatch fault, not a silent automatic unregistration. Exact diagnostic
+surfacing belongs to the binding/runtime reporting interface.
+
+<a id="ordering-and-coalescing-of-listener-statuses"></a>
 ## Ordering and coalescing of listener statuses
 
-<a id="listener-status-ordering--accepted-mechanism-and-observable-scope"></a>
-### mechanism and observable scope
+<a id="status-ordering-requirements"></a>
+### Status ordering requirements
 
 * Maintain accumulated status independently of automatic callback eligibility.
   Each source entity/status kind has at most one unclaimed notification opportunity,
@@ -231,9 +479,8 @@ is not a prerequisite for implementing either identity contract.
   internal tie order; do not turn that tie into a public fixed status priority.
 * A status with no selected automatic callback retains its DDS state but has no
   automatic admission reservation blocking other kinds. If later made deliverable,
-  recommend publishing a fresh opportunity then, without backdating it ahead of
-  existing eligible work. This catch-up-on-registration behavior is zzdds policy
-  proposed here; exact listener routing and nil semantics remain applicable.
+  publish a fresh opportunity without backdating it ahead of existing eligible work.
+  Catch-up on registration follows the same routing and nil-listener rules.
 * Snapshot arguments and reset the selected kind's deltas/changed flag at actual
   claim, under its status-consumption synchronization. A specific getter can win
   first and invalidate the pending opportunity. A subsequent change gets a fresh
@@ -246,6 +493,13 @@ is not a prerequisite for implementing either identity contract.
   If still deliverable, readmission gets a fresh position. Status counters survive
   that change. Mask changes, parent routing changes and status consumption must all
   invalidate obsolete admission without losing the accumulated state.
+
+Status aggregation follows each DDS status's fields, not a generic sum. Zero net count
+change does not erase unobserved transitions, and last-handle fields are not event lists.
+Updates during a callback create new pending work that callback return cannot clear.
+Unchanged unread cache contents alone must not produce a self-sustaining DATA_AVAILABLE
+callback loop. Commit required association/history changes before dependent notification
+eligibility; this does not promise one match callback before every data callback.
 
 Local order is attached to the source entity, even when a parent listener handles
 its plain status. Sharing a listener across different entities supplies exclusion
@@ -260,11 +514,11 @@ status ordering. Consequently no universal match-before-data callback guarantee 
 made, even though association/history state required for processing must already be
 committed before dependent notification eligibility is published.
 
-<a id="listener-notification-boundary"></a>
+<a id="delegation-membership-and-notification-boundary"></a>
 ## Delegation membership and notification boundary
 
-<a id="listener-notification-boundary--accepted-traversal-contract"></a>
-### traversal contract
+<a id="traversal-contract"></a>
+### Traversal contract
 
 1. After entry recursion/depth checks, capture the Subscriber's contained reader
    entity lifetimes at one membership boundary. Retain safe internal handles for
@@ -279,7 +533,7 @@ committed before dependent notification eligibility is published.
    its DATA_AVAILABLE status is no longer changed. Do not use the Subscriber's
    DATA_ON_READERS flag as a gate for this explicit operation. Explicit delegation
    selects reader callbacks, with no fallback into another Subscriber callback.
-   The accepted [selection policy](listeners.md#listener-selection-audit) ignores the reader
+   The accepted [selection policy](listeners.md#explicit-delegation-listener-selection-audit) ignores the reader
    listener mask for explicit delegation. An absent/null callback is skipped without
    consuming reader or Subscriber status; there is no parent fallback.
 4. If waiting for rights, consume no status. Replacement withdraws old admission
@@ -309,7 +563,7 @@ and independent consumption. Do not guarantee another automatic callback for eve
 unprocessed change. Applications needing to drain samples should use their data-access
 loop, not infer draining from a successful notification traversal.
 
-<a id="listener-notification-boundary--reader-and-subscriber-status-coordination"></a>
+<a id="reader-and-subscriber-status-coordination"></a>
 ### Reader and Subscriber status coordination
 
 DATA_AVAILABLE and DATA_ON_READERS have distinct reset rules. A reader callback
@@ -336,11 +590,11 @@ its specific getter. Do not generalize the existing plain-status getter discussi
 into a rule that every inspection clears DATA_AVAILABLE. The reader read/take and
 callback paths need their own exact reset audit, including unsuccessful access cases.
 
-<a id="listener-selection-audit"></a>
-## Explicit delegation listener-selection audit
+<a id="explicit-delegation-listener-selection-audit"></a>
+## Explicit delegation callback selection
 
-<a id="listener-selection-audit--accepted-selection-table-for-zzdds"></a>
-### selection table for zzdds
+<a id="selection-table-for-zzdds"></a>
+### Selection table for zzdds
 
 Assume a live retained reader, current changed DATA_AVAILABLE, and successful admission.
 
@@ -360,8 +614,8 @@ replacement contract. Pending admission withdraws and retries against that gener
 being masked out no longer makes the explicit callback ineligible. This does not
 relax recursion, rights, depth or quiescence rules.
 
-<a id="listener-selection-audit--accepted-nil-listener-distinction"></a>
-### nil-listener distinction
+<a id="absent-callbacks"></a>
+### Absent callbacks
 
 Skip an absent/null callback without consuming its pending status. The skip itself
 resets neither reader DATA_AVAILABLE nor Subscriber DATA_ON_READERS; another real
@@ -370,21 +624,20 @@ that intentionally does nothing is invoked and consumes status at the normal cla
 boundary. Generated bindings must preserve this distinction between absence and an
 application no-op method.
 
-This deliberately differs from the documented OpenSplice behavior and the inspected
-OpenDDS ordinary-reader path described above. A Subscriber can legitimately combine
+A Subscriber can combine
 listener-driven readers with readers handled through polling or WaitSets. Explicit
 notification traversal should not consume status merely because no callback is
 attached to one of those readers. Missing callbacks therefore produce no warning by
 default. This preserves notification state, not a private sample or history snapshot.
 
-<a id="listener-delegation-decision"></a>
+<a id="explicit-reader-listener-delegation"></a>
 ## Explicit reader-listener delegation
 
-<a id="listener-delegation-decision--accepted-observable-direction"></a>
-### observable direction
+<a id="delegation-requirements"></a>
+### Delegation requirements
 
 1. Capture a bounded retained set of candidates. The accepted
-   [notification boundary](listeners.md#listener-notification-boundary) fixes reader membership
+   [notification boundary](listeners.md#delegation-membership-and-notification-boundary) fixes reader membership
    once and observes current status per dispatch claim; it does not freeze historical
    notification generations for the whole batch.
    Reader creation and later notifications do not make this invocation chase an
@@ -412,18 +665,21 @@ default. This preserves notification state, not a private sample or history snap
    cannot be rolled back. Do not consume statuses for children that were not invoked;
    leave them eligible for subsequent handling. Do not report all-or-nothing behavior.
 
+Dependency checking must include earlier FIFO admission reservations as well as active
+owners. A queued chain may hold no new rights yet still block a later claimant. If a
+registration or required-rights set changes while waiting, withdraw the old admission and
+recheck dependency/cycle rules before publishing a replacement; do not mutate a queued
+claim into an unchecked dependency. Bound graph storage and wake obligations, and report
+capacity exhaustion through the delegation ERROR mapping.
+
 The partial-progress rule is a real API tradeoff. Acquiring the whole batch first
 could reduce pre-dispatch failures but broadens callback exclusion and still cannot
-make arbitrary application callbacks transactional. No requirement to acquire an
-entire subscriber's listeners is proposed for ordinary automatic notification.
+make arbitrary application callbacks transactional. Ordinary automatic notification does not acquire every listener in a Subscriber.
 
-<a id="listener-delegation-decision--accepted-recursion-nesting-and-failure-policy"></a>
-### recursion, nesting and failure policy
+<a id="recursion-and-failure"></a>
+### Recursion and failure
 
-This section records the accepted initial policy. It defines nesting without claiming that the
-two-chain models validate deeper stacks.
-
-<a id="listener-delegation-decision--supported-explicit-nesting"></a>
+<a id="supported-explicit-nesting"></a>
 #### Supported explicit nesting
 
 Permit delegation from a callback to a different Subscriber, subject to ordinary
@@ -453,37 +709,17 @@ returns is allowed. Application code that repeatedly calls without consuming dat
 or resolving an error can still loop; these rules do not police arbitrary user code.
 Direct application calls to listener methods are outside middleware tracking.
 
-<a id="listener-delegation-decision--bounded-nesting"></a>
+<a id="bounded-nesting"></a>
 #### Bounded nesting
 
-Use a default maximum of **8 simultaneously active `notify_datareaders`
-frames per execution chain**, configurable per participant with a build-time-changeable
-default. The first call, whether external or callback-originated,
-counts as one; sequential children in its batch do not each add a frame. At the default, a ninth
-call fails at entry before capturing candidates, claiming rights or consuming status.
-Eight is an initial engineering default, not a measured stack-safety result.
+Apply the [participant nesting rule](#participant-nesting-limits):
+count the whole chain against its smallest active participant limit, including the root
+callback and destination. Reject before capture or status consumption if the next frame
+would exceed the limit. Standard and explicitly configured calls have identical rules;
+crossing a runtime does not create another allowance. This bounds delegation frames,
+not batch size, wait duration, arbitrary stack use or dependency-graph size.
 
-Expose the setting through participant configuration in the zzdds extension surface,
-not DDS QoS or `dcps.idl`. Standard-only applications inherit the build's default.
-A value of one still supports normal Subscriber-to-reader delegation, but rejects
-further nesting from those children. Keep the configured bound finite and distinguish
-the default from any build-imposed storage ceiling. Document supported values and
-validate configuration before use; the extension API defines its generated Config field. Do not create a fresh allowance when a chain crosses a runtime.
-
-Accepted configuration refinement: fix the value at participant
-creation and apply the smallest limit of participants represented by active chain
-frames, including the proposed target. Count total chain depth against that limit,
-then restore the enclosing bound on unwind. This avoids bypass through another
-participant. This cross-participant composition rule is accepted.
-The [concrete identity/configuration package](listeners.md#listener-identity-decision--concrete-v1-decision-package)
-refines this to include the root callback's participant even before it has an active
-delegation frame, and gives creation-time validation and cross-participant examples.
-
-This bounds library-tracked delegation depth, not arbitrary application stack use,
-batch size, wait duration or graph size. Those require separate resource bounds.
-The same configured limit and failure semantics apply to manual and threaded drivers.
-
-<a id="listener-delegation-decision--return-and-partial-completion-rules"></a>
+<a id="return-and-partial-completion-rules"></a>
 #### Return and partial-completion rules
 
 For a valid live Subscriber, use the following mappings. Existing standard
@@ -528,11 +764,11 @@ DDS-only callers can rely on the documented return/partial-completion contract.
 Binding-specific callback exceptions and unwinding remain a separate contract;
 this table does not imply that arbitrary exceptions can safely cross an ABI.
 
-<a id="listener-quiescence-decision"></a>
+<a id="listener-replacement-and-quiescence"></a>
 ## Listener replacement and quiescence
 
-<a id="listener-quiescence-decision--accepted-return-contract"></a>
-### return contract
+<a id="replacement-completion"></a>
+### Replacement completion
 
 From ordinary application code outside a zzdds callback chain, successful
 `set_listener` publishes the replacement and waits for all relevant uses through
@@ -568,7 +804,7 @@ Implementation needs a common scope across bindings/runtimes; foreign applicatio
 threads causally spawned by a callback are not automatically detectable as that
 callback chain.
 
-<a id="listener-quiescence-decision--why-the-frontier-includes-previously-retired-registrations"></a>
+<a id="why-the-frontier-includes-previously-retired-registrations"></a>
 ### Why the frontier includes previously retired registrations
 
 Consider A replacing itself with B from a callback. A is retired but still running.
@@ -582,11 +818,11 @@ if another setter subsequently changed it.
 
 Retirement bookkeeping must be bounded. Prepare all needed storage before committing
 a registration change; failure must leave the previous registration intact. The
-mapping of resource failures to permitted DDS return codes still requires the API
-review. Do not add TIMEOUT behavior to standard `set_listener` without that review;
-this proposal has no finite return-time guarantee if a callback never returns.
+[open API items](../concurrency-broker-status.md#open-design-items) track the permitted
+resource-failure return mapping. No TIMEOUT is added to standard `set_listener`;
+this operation has no finite return-time guarantee if a callback never returns.
 
-<a id="listener-quiescence-decision--standard-only-ownership-pattern"></a>
+<a id="standard-only-ownership-pattern"></a>
 ### Standard-only ownership pattern
 
 A management thread can clear or replace every registration that uses an old
@@ -612,11 +848,11 @@ application lock or wait dependency that the retiring callback needs. The librar
 can prevent its own self/cross-callback drain waits, not arbitrary application
 cycles such as a callback joining a management thread that is draining that callback.
 
-<a id="listener-deletion-decision"></a>
+<a id="datareader-deletion-callback-and-return-boundary"></a>
 ## DataReader deletion: callback and return boundary
 
-<a id="listener-deletion-decision--accepted-initial-behavior"></a>
-### initial behavior
+<a id="initial-behavior"></a>
+### Initial behavior
 
 Use one logical deletion boundary followed by retained retirement. External deletion
 waits for applicable application access to quiesce; deletion from any callback chain
@@ -645,7 +881,7 @@ authorize destruction of borrowed listener state or further public use of the re
 The operation-race refinements below still need their named validation and result
 mapping; acceptance does not imply that those implementation details are complete.
 
-<a id="listener-deletion-decision--admission-preconditions-and-operation-races"></a>
+<a id="admission-preconditions-and-operation-races"></a>
 ### Admission, preconditions and operation races
 
 1. Resolve a safe reader lifetime through the owning Subscriber. Wrong live owner,
@@ -675,7 +911,7 @@ mapping; acceptance does not imply that those implementation details are complet
 
 Concurrent deletion must have a single close winner and no double protocol teardown.
 Calls that safely resolved the lifetime before close need a documented loser result;
-recommend ALREADY_DELETED for a recognized already-closed target, retaining
+return ALREADY_DELETED for a recognized already-closed target, retaining
 PRECONDITION_NOT_MET for a live target owned elsewhere. Arbitrary stale raw pointers
 cannot be made safe merely by reading a generation field in freed memory. Binding
 handles need safe lookup/retention or the documented application synchronization rule.
@@ -686,7 +922,7 @@ only an actual claimed invocation/application use contributes to the drain bound
 Otherwise a suspended parent traversal could prevent deletion even after its pending
 child was invalidated.
 
-<a id="listener-deletion-decision--lifetime-consequence-of-callback-context-deletion"></a>
+<a id="lifetime-consequence-of-callback-context-deletion"></a>
 ### Lifetime consequence of callback-context deletion
 
 This case is less convenient than asynchronous listener replacement: once deleted,
@@ -710,11 +946,11 @@ invocations already claimed for it. It does not quiesce every use of a shared li
 on other entities, or an entire Subscriber traversal merely because that traversal
 once included the reader.
 
-<a id="listener-bulk-deletion"></a>
+<a id="parent-and-bulk-deletion-contract"></a>
 ## Parent and bulk deletion contract
 
-<a id="listener-bulk-deletion--accepted-observable-policy"></a>
-### observable policy
+<a id="logical-deletion-requirements"></a>
+### Logical deletion requirements
 
 1. Preserve strict single-parent deletion preconditions. Do not make
    delete_subscriber implicitly delete readers, or delete_publisher implicitly delete
@@ -739,7 +975,7 @@ once included the reader.
    after logical commit, before any external callback-drain wait. Concurrent later
    creation may therefore make it nonempty again before the deleting call returns.
    Applications requiring "empty, then delete parent" must coordinate creation with
-   those calls. No endless rescan to capture newly created children is proposed.
+   those calls. Do not rescan indefinitely to capture newly created children.
 6. Extend the accepted context distinction to the deleted set: external calls drain
    applicable application access through the deleted entities; any callback-chain
    call returns after logical commit without callback-drain waiting. A surviving
@@ -751,7 +987,7 @@ This policy favors predictable failure over the simpler delete-until-one-fails l
 Its preparation cost grows with the target subtree and requires explicit bounded
 storage. It does not require transaction support for ordinary sample processing.
 
-<a id="listener-bulk-deletion--concurrency-requirements-for-preparation"></a>
+<a id="concurrency-requirements-for-preparation"></a>
 ### Concurrency requirements for preparation
 
 A mere recursive precheck followed by a deletion loop is insufficient. Establish a
@@ -769,9 +1005,9 @@ operations, including return_loan, must remain serviceable throughout preparatio
 Preparation must not wait for whole callback lifetimes, and a conflicting callback
 operation must not be forced into a dependency on its own completion. Define the
 precise wait/retry or permitted error/nil result for concurrent creators and resource
-publishers in the operation matrix. This admission algorithm/result mapping is an
-explicit remaining design task, not an assertion established by the single-reader
-model. Avoid rejecting ordinary reads/writes merely because an unrelated subtree
+publishers in the operation matrix. The [subtree reservation protocol](#subtree-admission-protocol)
+below defines admission and retry behavior; operation-specific result mapping is
+owned by [operations](operations.md). Avoid rejecting ordinary reads/writes merely because an unrelated subtree
 is preparing deletion.
 
 On preflight failure release all reservations and wake affected work. On commit,
@@ -782,19 +1018,15 @@ external drain dependent on an unrelated parent traversal. Drain includes applic
 older retired registration uses, not just the current listeners of the children.
 
 An empty parent can still retain internal references to previously logically deleted
-children. Its physical retirement must respect those references. Whether external
-parent deletion also drains previously detached descendant application uses needs
-an explicit frontier rule; do not infer that emptiness proves descendant quiescence.
+children. Its physical retirement must respect those references. External
+parent deletion also drains previously detached descendant application uses under
+the frontier rule below; emptiness does not prove descendant quiescence.
 This is especially important after callback-context child/bulk deletion.
 
-<a id="listener-bulk-deletion--detached-descendant-retirement-frontier-accepted-refinement"></a>
-### Detached-descendant retirement frontier: accepted refinement
+<a id="descendant-retirement-frontiers"></a>
+### Descendant retirement frontiers
 
-The no-partial-logical-deletion direction for ordinary preflight failure is accepted
-in discussion. The frontier refinement below is accepted. It is not implemented or validated by
-the existing single-reader model.
-
-<a id="listener-bulk-deletion--what-an-external-parent-deletion-waits-for"></a>
+<a id="what-an-external-parent-deletion-waits-for"></a>
 #### What an external parent deletion waits for
 
 Include outstanding application-access obligations from the parent's own lifetime
@@ -823,7 +1055,7 @@ Nor does it cover arbitrary application work that retained its own unrelated ref
 to application state. Reclamation still requires the application to account for such
 uses and prevent reinstallation elsewhere.
 
-<a id="listener-bulk-deletion--keep-application-quiescence-separate-from-storage-reclamation"></a>
+<a id="keep-application-quiescence-separate-from-storage-reclamation"></a>
 #### Keep application quiescence separate from storage reclamation
 
 A parent can remain physically retained by a child even after all application accesses
@@ -842,17 +1074,10 @@ This does not force every destructor to run early. It requires separating any
 application-touching part from cleanup that can safely run later. Do not execute
 application callbacks or hooks under ancestry/identity bookkeeping locks.
 
-Current source illustrates why the distinction matters: reader.reallyDeinit releases
-its listener box, then near its end releases its retained Subscriber reference
-(src/dcps/reader.zig:633–636). Subscriber.reallyDeinit releases its own listener box
-(src/dcps/subscriber.zig:228). Waiting for the parent's final reference count while
-retaining the deletion call's reference would not provide a usable barrier. This is
-source-level motivation, not proof that today's complete teardown has that deadlock.
-
-<a id="listener-bulk-deletion--bulk-calls-on-a-surviving-root"></a>
+<a id="bulk-calls-on-a-surviving-root"></a>
 #### Bulk calls on a surviving root
 
-Recommend that an external delete_contained_entities call drain both its newly
+An external delete_contained_entities call must drain both its newly
 deleted descendants and previously detached descendants through a captured retirement
 frontier. This makes an external bulk call useful even when public membership is
 already empty following earlier callback-context deletion. The call must still pass
@@ -870,7 +1095,7 @@ creation gate reopens do not extend the wait, nor do their later retirements. Re
 empty external bulk calls may capture successively newer frontiers. Callback-context
 bulk calls still never become drain barriers, even with empty live membership.
 
-<a id="listener-bulk-deletion--required-bookkeeping-properties"></a>
+<a id="required-bookkeeping-properties"></a>
 #### Required bookkeeping properties
 
 * Assign stable descendant lifetime/retirement identity and publish ancestry coverage
@@ -892,10 +1117,10 @@ bulk calls still never become drain barriers, even with empty live membership.
   wait publication and completion notification still require stale-generation-safe
   wake handling and progress without holding application exclusion needed by others.
 
-<a id="listener-bulk-deletion--subtree-admission-protocol-proposed-initial-mechanism"></a>
-### Subtree admission protocol: proposed initial mechanism
+<a id="subtree-admission-protocol"></a>
+### Subtree admission protocol
 
-<a id="listener-bulk-deletion--one-reservation-before-descendant-inspection"></a>
+<a id="one-reservation-before-descendant-inspection"></a>
 #### One reservation before descendant inspection
 
 Use a participant-local lifecycle coordinator with short metadata critical sections.
@@ -913,7 +1138,7 @@ remain in their existing contexts. This adds a short gate to loan publication, n
 participant execution turn around the full read or write. Its cost must be measured;
 per-endpoint counters without a reservation handshake are not a correct substitute.
 
-<a id="listener-bulk-deletion--phases"></a>
+<a id="phases"></a>
 #### Phases
 
 1. **Prepare request storage:** retain the root and reserve a transaction record and
@@ -952,7 +1177,7 @@ that retry will also fail. Conditions in the target plan are deleted rather than
 mistaken for external blockers. Ordinary valid publications cannot add a blocker
 behind a successful inspection because reservation remains in force until decision.
 
-<a id="listener-bulk-deletion--which-operations-pause-and-which-keep-running"></a>
+<a id="which-operations-pause-and-which-keep-running"></a>
 #### Which operations pause and which keep running
 
 | Operation | Reservation behavior |
@@ -970,10 +1195,10 @@ Do not expose transient reservation as PRECONDITION_NOT_MET or as an arbitrary n
 creation result. Preserve an operation's existing deadline if it has one; reservation
 wait consumes that budget. On release, a still-live root creator retries, whereas a
 creator/loan publisher targeting a deleted old entity resolves closure using its
-operation-specific mapping. Exact closure/error codes remain in L5; no universal new
+operation-specific mapping. The [operations contract](operations.md) owns closure/error results; no universal new
 DDS error is introduced by this protocol.
 
-<a id="listener-bulk-deletion--why-a-callback-can-wait-without-creating-a-drain-cycle"></a>
+<a id="why-a-callback-can-wait-without-creating-a-drain-cycle"></a>
 #### Why a callback can wait without creating a drain cycle
 
 If callback A encounters a reserved subtree while trying to publish a loan, A releases
@@ -985,252 +1210,7 @@ external drain as the condition for releasing the reservation.
 
 For a manual driver, synchronous waiting may help bounded lifecycle-coordinator work
 as internal progress, without invoking automatic callbacks. Another worker is not
-required. Callback self-bulk-deletion follows the same internal path. If a proposed
+required. Callback self-bulk-deletion follows the same internal path. If an
 implementation needs application execution to complete the reserved phase, it violates
 this mechanism and must release/retry rather than waiting with the reservation held.
 The ordinary no-protocol-lock-across-application-code requirement remains essential.
-
-<a id="listener-callback-failure"></a>
-## Callback failure and binding unwind policy
-
-<a id="listener-callback-failure--accepted-post-entry-behavior"></a>
-### post-entry behavior
-
-Catch a recoverable language exception at the generated listener bridge, report a
-bounded internal failure outcome, and return normally through the C ABI. The core
-then completes the invocation's normal ownership cleanup. Do not depend on language
-unwinding through Zig frames to release execution rights or retirement obligations.
-
-| Context | Accepted result after contained listener exception |
-| --- | --- |
-| Automatic callback | Report failure, release invocation ownership, continue normal scheduling |
-| Explicit delegated child | Complete cleanup, stop this delegation batch and return ERROR to its immediate caller |
-| Callback catches its own exception and returns normally | Ordinary successful callback completion |
-
-Do not retry the failed invocation, restore already-consumed status, undo application
-side effects, implicitly delete the entity or automatically remove the listener.
-A callback that throws has already entered and may have read samples, published data,
-replaced its listener or logically deleted entities. Those effects remain committed.
-New status changes during execution retain their normal pending state. Later fresh
-notifications may invoke the same listener again; repeated failure diagnostics must
-be bounded/rate-limited without erasing DDS status information.
-
-This default contains propagation; it does not prove that the application's state
-is usable after an exception. Applications needing termination or recovery sequencing
-should handle that inside their listener or a future explicit failure-policy extension.
-Such controls belong in zzdds.idl and must not change ordinary callback signatures
-on dcps.idl. No new mandatory application listener methods are proposed.
-
-An inner notify_datareaders returning ERROR is still different from its caller
-throwing. If the caller handles that ERROR and returns normally, the outer operation
-may succeed, as already accepted. If the caller itself throws, its own invocation
-fails and the immediate containing delegation observes that failure.
-
-<a id="listener-callback-failure--binding-boundary-and-ownership"></a>
-### Binding boundary and ownership
-
-C++ generated trampolines should contain a try/catch boundary around callback entry
-(and classify failures from adaptation separately). Adding noexcept alone would
-terminate on an escaping exception rather than report it. Exception-disabled builds
-cannot promise interception of exceptions; supported callbacks there must return
-normally. Abort/terminate, undefined behavior and nonlocal jumps across the bridge
-are outside recoverable cleanup guarantees. Raw C callbacks must not longjmp over
-core frames; Zig callback panics are not modeled as recoverable error returns.
-
-Java generated trampolines must inspect pending JNI exceptions at fallible JNI steps
-and after invocation, capture/report a callback-local failure and clear the pending
-exception before returning control to core processing. JNI exceptions do not unwind
-native frames automatically; only restricted JNI operations are permitted with an
-exception pending. Local reference frames and thread attachment ownership require
-explicit cleanup. Do not clear an unrelated pending exception at callback entry or
-continue normal conversion after a failed lookup/allocation.
-[JNI design, exception handling](https://docs.oracle.com/en/java/javase/24/docs/specs/jni/design.html#exception-handling).
-
-The callback ABI currently returns void. A bridge therefore needs an internal
-invocation-outcome mechanism: for example, a scoped per-invocation record accessible
-to generated bridges, or a versioned descriptor outcome hook. It must distinguish
-nested invocations, restore the outer frame on return, and carry the same explicit
-chain across supported binding/runtime transitions. One sticky thread-wide error
-flag is insufficient. Exact ABI shape is open alongside identity metadata; no raw
-exception object is required to cross the ABI or be retained after reporting.
-
-Cleanup has one structured epilogue on every recoverable path: retire the active
-invocation frame, release callback rights/access guards and retained arguments,
-settle applicable references/hooks, then publish wakes and failure reporting without
-internal locks spanning application code. Do not drop the application-access drain
-obligation before cleanup that can still touch borrowed listener state has finished.
-A diagnostic record must not keep a borrowed listener pointer alive implicitly or
-reenter a listener while its rights remain held. Basic failure reason/entity-generation
-reporting must work even if richer diagnostic allocation fails.
-
-A throwing release hook is not equivalent to a failed listener method: catching it
-does not establish that the hook completed its ownership duties. Require lifecycle
-release hooks to complete without throwing. Violations cannot be reported as successful
-quiescence unless remaining access/ownership is independently proven; they need a
-binding fatal-error policy, not a silent success path. This constraint belongs in
-the binding ownership contract and requires explicit documentation.
-
-<a id="listener-callback-failure--accepted-initial-preparation-protocol"></a>
-### initial preparation protocol
-
-The discussion selected optimistic prepare/validate/commit, bounded retry, and
-callback-chain lifetime/reentrancy handling during preparation. This supersedes the
-open direction above, while leaving the final invocation failure boundary and exact
-retry budget as named refinements. No implementation or model results are claimed.
-
-1. Retain a candidate entity lifetime and current registration, and snapshot the
-   applicable status with a validation version. Capturing does not reset status.
-2. Prepare binding arguments and required storage outside internal locks and without
-   holding callback execution rights merely to perform conversion. The preparation
-   carries a retained application-access obligation and execution-chain context.
-3. At final admission, validate entity lifetime, selected registration, eligibility,
-   status version and execution rights together. For a valid candidate, claim the
-   callback and reset status at the same ordered boundary. Invoke with the already
-   prepared arguments after releasing internal locks.
-4. If validation fails, consume nothing. Recheck whether the candidate is still
-   eligible; skip if no longer eligible, otherwise refresh preparation within the
-   bounded retry policy. Binding conversion/allocation failure returns an explicit
-   failure outcome rather than pretending a callback occurred.
-
-The version must distinguish updates and consumption, including zero-net changes.
-A status getter or another dispatch invalidates a prepared aggregate. Comparison of
-counter values alone is insufficient. Replacement/deletion invalidates unclaimed
-preparation; any remaining cleanup retains its application-access obligation through
-its last relevant access. A prepared argument is not a callback claim and does not
-permit invocation on a retired registration.
-
-<a id="listener-callback-failure--retry-and-placement-rules"></a>
-#### Retry and placement rules
-
-Limit preparation/revalidation attempts per service turn. Automatic work retains
-pending status and yields for a later scheduling opportunity; resource-failure retries
-must use bounded backoff or an explicit resource wake, not immediate busy spinning.
-Do not silently disable the listener or erase the notification. Explicit delegation
-also has a finite total preparation-retry budget for each candidate; exhaustion stops
-the batch with ERROR, preserving unconsumed status and earlier child effects.
-
-Ordinary waiting for busy callback rights is not itself a failed preparation attempt.
-A wake may require revalidation and another preparation if state changed, but must not
-turn mere contention into a busy error. Release scarce prepared resources while waiting
-where necessary, without falsely marking the candidate handled. The extension API defines the finite retry defaults and configuration. Any finite retry rule means that
-continuous state interference can cause explicit ERROR rather than guaranteeing
-progress at the cost of an unbounded preparation loop.
-
-JNI local references and other thread-affine preparation cannot migrate to a different
-worker unchecked. Prepare and commit on the appropriate thread, discard/reprepare on
-migration, or explicitly use transferable retained representations. Executor placement
-is a constraint on the prepared invocation, not permission to reuse a foreign JNIEnv.
-
-<a id="listener-callback-failure--preparation-recursion-and-final-entry-audit"></a>
-### Preparation recursion and final entry audit
-
-<a id="listener-callback-failure--extend-the-recursion-guard-across-preparation"></a>
-#### Extend the recursion guard across preparation
-
-Register a chain-local active dispatch frame keyed by entity lifetime and callback
-kind before any foreign argument preparation. Keep it through preparation, validation,
-invocation and foreign cleanup. A nested explicit delegation attempting that same
-entity/kind fails with the existing recursion ERROR, even if the listener method has
-not entered. Replacement does not evade the key. Sequential retries reuse the frame
-without increasing nesting; they must not recursively call the preparation routine.
-Different targets can still nest through explicit delegation within the accepted
-chain-depth limit. Automatic callbacks remain prohibited on a nested pump stack.
-
-For example, automatic preparation for reader A constructs a wrapper whose code
-calls notify_datareaders. If that traversal reaches A, reject its attempt before
-preparing A again. It may have handled earlier eligible other readers, so existing
-partial-completion semantics apply. This closes a hole that an entered-listener-only
-recursion guard misses. The dispatch frame tracks recursion and lifetime, not exclusive
-rights over the listener during argument construction. Independent chains still use
-ordinary admission; any duplicate prepared observations revalidate before claim.
-
-<a id="listener-callback-failure--final-entry-cannot-provide-a-universal-body-start-proof"></a>
-#### Final entry cannot provide a universal body-start proof
-
-Treat status consumption commit as an **irrevocable dispatch attempt**, with
-these explicit outcomes:
-
-* Preparation or final validation fails before commit: no status consumption and no
-  callback attempt. Preserve the accepted recheck/retry or ERROR behavior.
-* Commit succeeds: prepared arguments and rights are fixed, status is consumed, and
-  the bridge makes the final invocation attempt without intervening ordinary fallible
-  conversion or admission cancellation. Replacement/deletion cannot revoke this claim.
-* Invocation reports an exception/failure after commit: record failed dispatch, clean
-  up and apply automatic reporting or explicit ERROR. Do not restore consumed status
-  or replay the invocation, even when actual listener-body entry cannot be established.
-
-This is a deliberate qualification of the earlier "no consumption if the listener
-never ran" wording. That guarantee remains valid for preparation/validation failures;
-it cannot be promised for every language-runtime failure at final entry with the
-current bridges. Do not describe uncertain entry as a proven application exception.
-Diagnostics should distinguish preparation failure, known application failure where
-available, and committed invocation failure with unknown entry.
-
-A callback's committed status observation is not sample consumption. A failed entry
-can leave samples available through normal access, but must not manufacture a new
-status notification solely to replay the failed invocation. New independent status
-changes remain pending normally. This makes failure semantics consistent across
-thread placement without guessing whether application side effects occurred.
-
-The alternative is a larger language-entry/status-consumption handshake, with explicit
-coordination of concurrent getters and user-body dispatch. It increases binding/core
-coupling and still needs a precise boundary for fatal or asynchronous runtime failure.
-The committed-attempt contract is the accepted initial choice, including this
-qualification of the earlier listener-body-entry guarantee.
-
-<a id="listener-callback-failure--retry-defaults-and-scheduling-accepted-configuration"></a>
-### Retry defaults and scheduling: accepted configuration
-
-The preparation mechanism, numeric defaults and scheduling details in this section
-are accepted as the initial configuration. Values are engineering starting
-points, not measured latency or embedded-memory guarantees.
-
-Numeric defaults and construction-time validation belong in
-[ParticipantConcurrencyConfig](extension-api.md#concurrency-api-draft--runtime-ownership-and-selection).
-Manual drivers expose retry deadlines through the normal timer/progress interface;
-retry timers do not create a helper thread.
-
-The per-turn count applies to actual preparation work. The explicit cumulative budget
-counts stale validation, not waiting for execution rights or releasing thread-affine
-prepared objects solely because a worker changes. Check deletion/ineligibility before
-charging a stale retry: an ineligible target is skipped, not converted into an error.
-A still-eligible candidate that reaches its configured stale-validation limit returns ERROR without
-another attempt. Replacement does not reset that candidate's cumulative budget.
-Each new explicit call starts a new budget; application retry loops remain application
-behavior. Count work across all turns/binding transitions of the same candidate.
-
-<a id="listener-callback-failure--distinguish-the-causes"></a>
-#### Distinguish the causes
-
-* **Status/registration changed during preparation:** automatic work refreshes within
-  its turn budget, then yields at the tail of runnable preparation work. Keep its
-  existing eligible notification/admission age where the accepted ordering permits;
-  scheduler service position is distinct from notification age. Registration changes
-  still require fresh admission. Do not clear the status or reset counters on retry.
-* **Callback rights busy:** follow the existing admission/wake protocol. Do not retry
-  conversion in a tight loop while rights remain unavailable or count wait duration
-  as stale validation. The fast path still prepares and claims inline when eligible.
-* **Recoverable conversion/resource failure:** explicit delegation reports ERROR
-  immediately with prior effects retained. Automatic notification stays pending and
-  arms one bounded retry obligation, preferably a generation-safe resource-ready
-  wake. Without dependable notification, use the capped timer above.
-* **Committed invocation fails:** use the accepted exception reporting/ERROR policy;
-  never schedule a replay of the consumed notification. A genuinely newer change is
-  independently eligible.
-
-New data does not bypass an existing resource-failure backoff or create another timer
-for the same pending opportunity. Successful preparation resets the failure delay;
-ordinary new arrivals do not. Replacing the listener invalidates old wake tokens and
-permits a new registration attempt, but must not duplicate retained work. Resource
-notifications can request an earlier attempt, coalesced and subject to normal runtime
-service budgets. They must not synchronously dispatch callbacks from the resource
-release path. Resource-waiting opportunities retain status but do not reserve scarce
-callback rights or block unrelated entities' admission.
-
-A known structural bridge error (missing method, incompatible descriptor, invalid
-binding setup) is not transient memory pressure. Report it distinctly and suppress
-blind timer retries for that unchanged broken configuration. Reattempt on relevant
-registration/configuration repair or explicit application delegation, reporting ERROR
-if still broken. This does not remove the installed listener or consume its status;
-it is a visible dispatch fault, not a silent automatic unregistration. Exact diagnostic
-surfacing belongs to the binding/runtime reporting interface.

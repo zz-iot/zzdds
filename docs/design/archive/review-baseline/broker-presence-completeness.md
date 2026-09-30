@@ -165,7 +165,7 @@ contents. Current query retries reuse an immutable retained answer. Once retired
 must not be reconstructed as a different answer; its bounded replay/outcome retention
 implementation remains part of checklist W3, not an unbounded result-cache requirement.
 
-[Retry retirement](../../broker/protocol.md#broker-retry-retirement) now supplies query_serial in both query
+[Retry retirement](../../broker/protocol.md#bounded-admission-and-freshness-retirement) now supplies query_serial in both query
 and proof. Admit new serials in reliable control-stream order before parallel answer
 work. Retired serials cannot reconstruct answers; active slots may complete out of order.
 Nonce freshness correlation remains mandatory and is not replaced by the serial.

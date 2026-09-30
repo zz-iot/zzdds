@@ -66,7 +66,7 @@ session as occupying the registration until its finite establishment deadline ex
 * An integration that cannot establish continuity uses the same wait-for-close/expiry
   path as unsecured discovery. Initial v1 need not implement secure live replacement.
 
-Use [ADMISSION_REJECT](../../broker/protocol.md#broker-bootstrap-rejection) for a correlatable bootstrap
+Use [ADMISSION_REJECT](../../broker/protocol.md#bootstrap-rejection-reply) for a correlatable bootstrap
 conflict once reply/path/authorization checks permit it. Use OWNER_CONFLICT without
 revealing incumbent details. Silence remains permitted under resource or response-budget
 limits. Retry backoff never extends the client's original startup/wait deadline.
@@ -159,14 +159,14 @@ bounded outcome retirement, provider integration and loss/reordering tests. Auth
 providers must explicitly document whether they can establish participant continuity;
 transport authentication alone must not silently enable replacement.
 
-The accepted [retry-retirement rules](../../broker/protocol.md#broker-retry-retirement) require consumed-attempt
+The accepted [retry-retirement rules](../../broker/protocol.md#bounded-admission-and-freshness-retirement) require consumed-attempt
 guards through challenge expiry, reserved before side effects. After full expiry a fresh
 introduction may admit reused participant identity; an old REGISTER cannot execute
 against an absent/retired introduction ID.
 
 ## Concrete path-provider baseline
 
-The [path provider contract](../../broker/protocol.md#broker-path-provider-contract) specifies bounded pending
+The [path provider contract](../../broker/protocol.md#broker-path-validation-and-protection-provider-contract) specifies bounded pending
 SPDP storage, a proposed 32-byte stateful cookie within the existing 64-byte wire ceiling,
 atomic consumption, expiry and protected-association requirements. A cookie is not a
 stateless substitute for retaining the original announcement. Provider validation remains

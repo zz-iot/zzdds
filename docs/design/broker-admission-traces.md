@@ -3,7 +3,7 @@
 Status: manual trace review, reconciled to REGISTER 2026-09-23. Each first
 REGISTER presupposes a valid same-scope SPDP introduction; duplicate-result replay follows
 the independent outcome deadline, not the original introduction expiry. These are manual state-transition
-checks, not executed network tests. Uses the [reconciled admission policy](broker/protocol.md#broker-admission-protection).
+checks, not executed network tests. Uses the [reconciled admission policy](broker/protocol.md#broker-admission-identity-and-reconnect).
 A registration token means epoch/session/generation together; GUID alone is not a token.
 
 | Trace | Required state/result | Review |
@@ -33,7 +33,7 @@ per scope/GUID. Correctness depends on compare-before-remove cleanup, atomic fen
 finite unconfirmed-admission deadlines and non-reexecutable expired attempts. These must
 be asserted in later executable broker tests, including callback/commit interleavings.
 
-The [bootstrap rejection addition](broker/protocol.md#broker-bootstrap-rejection) now gives a bounded
+The [bootstrap rejection addition](broker/protocol.md#bootstrap-rejection-reply) now gives a bounded
 phase-specific OWNER_CONFLICT response, without promising delivery or extending deadlines.
 DDS Security live replacement still requires explicit participant-continuity integration;
 v1 rejects live replacement and waits for disconnect/expiry. D2 bearer-token replacement

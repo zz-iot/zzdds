@@ -3,7 +3,7 @@
 This is the single entry point and decision index for the concurrency/broker design.
 The contracts below describe an implementation baseline. They do not claim a migrated
 production runtime, a working broker, frozen ABI/wire compatibility, or measured latency
-and MCU footprint. Historical investigations are explicitly non-normative.
+and MCU footprint. This index defines scope, requirement conventions and the remaining design/validation gates.
 
 ## Contracts and responsibility
 
@@ -24,11 +24,27 @@ and MCU footprint. Historical investigations are explicitly non-normative.
 The subject contracts own behavior; the API documents own declaration/default spelling;
 the schema owns provisional numeric assignments. Examples and implementation approaches
 must preserve those rules but do not select one internal container or scheduler algorithm.
-Source snapshots and superseded proposals in `archive/` explain history only. If a future
-implementation exposes a contradiction, resolve the named rule instead of silently choosing
-an easier behavior or reopening unrelated architecture.
+The contracts are self-contained; historical investigations and review correspondence
+are not required inputs. If implementation exposes a contradiction, resolve the named
+rule explicitly rather than silently choosing different behavior.
 
-## Accepted review decisions
+## Requirement convention
+
+Declarative obligations and imperatives in these contracts are requirements: "must",
+"never", "do not", "use" and "require" constrain conforming implementations. "May" permits
+an option. Sections or paragraphs labelled **Conforming approach** describe one permitted
+implementation; another may be used if it preserves the surrounding requirements.
+**Rationale** and examples explain those requirements without adding API guarantees.
+"Prefer" and "should" express recommendations, not additional conformance conditions.
+
+Future/deferred features impose no v1 implementation requirement unless explicitly stated
+as a reserved field or compatibility constraint. Code/IDL snippets describe the target
+surface; provisional numeric assignments and ABI layouts need the publication checks below.
+An implementation gate calls for evidence, not another product-policy decision. An open
+design item identifies a genuinely incomplete contract and must be resolved before its
+particular interface/behavior is implemented or advertised as final.
+
+## Key behavioral decisions
 
 | Decision | Contract |
 | --- | --- |
@@ -54,6 +70,20 @@ SPDP/SEDP bytes and bootstrap correlation hashes remain. Delayed reductions cann
 retroactively revoke observer grants before delivery. Fairness, storage and output remain
 bounded independently of these wire simplifications.
 
+## Open design items
+
+| Item | Required resolution | Boundary already fixed |
+| --- | --- | --- |
+| Local entity publication versus discovery announcement/disposal | Specify ordering when creation, asynchronous announcement and deletion race, including retained disposal work and failure reporting; place the result in architecture/operations | No usable entity before local publication, no stale generation mutation, no callback before corresponding state commit; broker announcement failure never retroactively undoes local creation |
+| Listener bridge ABI and resource-failure results | Select/version the generated identity/ownership/invocation-outcome descriptor and document permitted set_listener resource-exhaustion results and per-binding mappings | Preserve original dispatch pointer, canonicalize identity at registration, retain old registration on preparation failure, no exception crosses core frames, no new standard setter timeout |
+| External-loop platform ABI | Define clock-domain conversion, wake representation and platform-specific adapter descriptor/version validation | One outer driver, atomic arm/recheck, attach before participants/I/O, no live executor replacement or premature detach in v1 |
+
+Concrete queue/pool/container selection, internal cancellation batching and scheduling of
+built-in endpoints are implementation choices constrained by the contracts, not open public
+semantics. GROUP wire/history/lifespan validation is a required optional-profile gate;
+the endpoint ownership partition and shared access-period behavior are settled. DDS Security,
+relays, opaque mode and v1.1 continuity recovery belong to their expressly deferred scopes.
+
 ## Implementation and publication gates
 
 | Gate | Evidence required before the associated claim |
@@ -74,15 +104,46 @@ with one scope, fresh inventory, view/readiness, reconnect and local matching du
 then implement required candidate filtering and both advertised control transports.
 No automatic authorization to refactor production or publish releases follows from this index.
 
-## Evidence and review provenance
+## Acceptance criteria
 
-[Test/design-models/README.md](../../test/design-models/README.md) is the sole current
-inventory of executed checks, counts, fixture sizes and limitations. Maintained model and
-wire checks run separately from production tests. Historical Python models are in
-[the consolidation archive](archive/consolidation-2026-09-29/README.md), next to source notes.
-Do not aggregate independent model counts into a full-system correctness claim.
+The implementation must cover the matrix below before claiming its associated capability.
+Run the same core traces under manual and hosted drivers; exact bounded model results alone
+do not establish native memory ordering, generated-binding correctness or interoperability.
 
-The root [revision review](../../concurrency_and_broker_spec_revision_review.md) and
-[reply](../../concurrency_and_broker_spec_revision_review_reply.md) record the consolidation
-scope, review dispositions and packaging recommendations. Commit/PR splitting is process
-work recorded there; there is no second design-status or merge-preparation ledger.
+| Area | Required evidence |
+| --- | --- |
+| Codec fidelity | Little/big-endian native payloads, repeated/unknown optional and required PIDs, malformed lengths, key-only disposal, nondefault QoS and TypeInformation; byte-exact retained storage/replay |
+| State ordering | Endpoint-before-participant input, update/delete reorder, revision conflicts, replacement inventory during mutation, GUID collision and stale-generation work; no resurrection |
+| Synchronization | Continuous churn, missing END/delta, mid-snapshot disconnect, exhausted retention, bounded retries and complete-view readiness; unchanged records produce no lost/found storm |
+| Failure detection | Origin/discovery-agent/broker stall or crash, one-way loss, delayed/replayed proofs, suspend/resume and clock changes; bounded expiry with no fabricated writer liveliness |
+| Transport | UDP↔UDP, TCP↔TCP and UDP↔TCP control clients with independent UDP/TCP data choices; IPv4/IPv6, same-NAT source IP, accepted TCP return path and UDP rebinding |
+| Resource/congestion | Loss, duplicate/reorder, reduced MTU, fragments, slow TCP reader, oversized frames and reconnect storms; bounded memory/repair traffic and healthy-client fairness |
+| Filtering | Full versus candidate differential matching; late/zero interest, partitions, incompatible-QoS diagnostics, distinct assignable type names, mutable updates and future service pins when supported |
+| Direct metatraffic | WLP peers installed through broker with peer SPDP/SEDP disabled; reachable native reply/repair paths; blocked WLP is not rescued by broker freshness |
+| Security boundary | Domain ID/tag isolation, spoofed ownership attempts, amplification/replay and destination abuse in v1; expired/revoked credentials, downgrade and native protection scopes before secure-profile claims |
+| Runtime and bindings | Receive-to-callback, reliable backpressure and shutdown paths; final deletion inside callback, cancellation, stale closes/wakes, foreign preparation/entry failure, claim restoration and external-loop retirement |
+| Constrained builds | No thread/sleep/socket dependency in freestanding core; optional-profile state removal measured in matched builds; actual adapter, work/stack and memory bounds before MCU claims |
+| Existing interoperability | Native SPDP/SEDP and supported data interoperability unchanged with broker disabled; cross-vendor broker compatibility is not promised |
+| Future services | TypeLookup before matching, secure late join/restart and authentication before secure discovery, tested before advertising the respective capability |
+
+Use fake clocks, bounded/lossy transports and model event schedules for deterministic
+invariants. Fuzz bootstrap, envelope, ParameterList, inventory and fragment parsing.
+Real sockets and network namespaces are required for NAT/source-port and TCP return-path
+claims. Report privileged test requirements and environment skips; a skipped path is not
+passing coverage. A general network simulator is not required.
+
+Benchmark native discovery against both broker control transports, targeting 2, 100,
+1,000 and 10,000 participants as hardware permits. Report achieved coverage and capacity;
+these tiers are evaluation targets, not minimum advertised capacity. Vary endpoints,
+interest density, churn, RTT/loss, payload size, full/candidate views and slow clients.
+Include single-host/small-LAN cases. Report p50/p95/p99 origin-commit-to-peer-install,
+startup readiness and recovery convergence, alongside bytes, CPU, peak memory, thread
+count and configuration/hardware. For concurrency, report uncontended and overloaded
+latency, handoffs and queue depth. Do not replace measurements with asymptotic claims.
+
+## Evidence
+
+[The evidence inventory](../../test/design-models/README.md) records executed checks,
+counts, fixture sizes and limitations. Maintained model/wire checks run separately from
+production tests. No historical review or archive is required to interpret the contracts.
+Independent model counts must not be aggregated into a full-system correctness claim.

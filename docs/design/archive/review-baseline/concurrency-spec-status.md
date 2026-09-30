@@ -3,9 +3,9 @@
 # Concurrency and discovery-broker specification status
 
 Current work: [review decisions and revision ledger](../../concurrency-broker-status.md). The earlier
-final handoff is reopened. Revised contracts: [access](../../concurrency/operations.md#prepared-read-conflicts),
-[history wait](../../concurrency/operations.md#historical-data-wait), [fast paths](../../concurrency/architecture.md#concurrency-fast-paths), and
-[broker security/filtering](../../broker/security-and-filtering.md#broker-security-and-filtering). Wire revision is pending.
+final handoff is reopened. Revised contracts: [access](../../concurrency/operations.md#prepared-readtake-selection-claims-and-failure),
+[history wait](../../concurrency/operations.md#historical-data-wait-contract), [fast paths](../../concurrency/architecture.md#fast-paths-and-progress-profiles), and
+[broker security/filtering](../../broker/security-and-filtering.md#broker-security-profiles-and-disclosure). Wire revision is pending.
 
 Current handoff: [concurrency and broker design baseline](../../concurrency-broker-status.md),
 2026-09-24. The directional specification effort is complete within its stated scope.
@@ -36,7 +36,7 @@ not prerequisites for finishing these specifications.
 1. [Consolidated contract](../../concurrency-broker-status.md): entry point for accepted behavior.
 2. [Readiness review](../../concurrency-broker-status.md): each gate, its resolution and limits.
 3. [Extension inventory](../../concurrency/extension-api.md#concurrency-extension-surface),
-   [API draft](../../concurrency/extension-api.md#concurrency-api-draft) and [bootstrap](../../concurrency/runtime.md#runtime-bootstrap-contract):
+   [API draft](../../concurrency/extension-api.md#concurrency-api) and [bootstrap](../../concurrency/runtime.md#standalone-runtime-bootstrap-contract):
    public responsibilities, draft signatures and accepted portable construction rules.
 4. [Migration plan](../../concurrency-broker-status.md): production stages and acceptance.
 5. [Broker guide](../../concurrency-broker-status.md) and [closure ledger](../../concurrency-broker-status.md):
@@ -102,7 +102,7 @@ work. Next settle the application readiness/status contract, then control schema
 wire compatibility. The broker is still a proposed protocol, not implementation-ready
 or wire-frozen. This reconciliation changed documents only.
 
-The [broker readiness proposal](../../broker/api.md#broker-readiness-contract) is now ready for review:
+The [broker readiness proposal](../../broker/api.md#broker-readiness-and-registration-status) is now ready for review:
 allow-degraded default, fixed-deadline recovery-following readiness wait, independent
 pending/failure status and optional coalesced extension notification. It proposes no
 separate registration barrier in initial v1. These are not yet accepted decisions.
@@ -127,20 +127,20 @@ ACCEPT/cursor fields and still generates Zig successfully. Next complete the rem
 message bodies/registries and validate actual codec/version behavior before wire freeze.
 
 All 28 broker operations now have draft body types and a
-[provisional registry](../../broker/wire.md#broker-wire-registry). Six executable codec checks pass,
+[provisional registry](../../broker/wire.md#broker-wire-registry-and-body-mapping). Six executable codec checks pass,
 including synthetic optional/required field evolution and a populated bounded struct
 sequence. A narrow zidl allocator-forwarding codegen defect was fixed. Missing/duplicate
 member validation, large inline bounded storage and unsupported nested-sequence decoding
 are explicitly tracked; no wire freeze or complete cross-version validation is claimed.
 
-The [wire byte baseline](../../broker/wire.md#broker-wire-bytes) proposes exact Frame/alignment/padding
+The [wire byte baseline](../../broker/wire.md#broker-wire-byte-baseline) proposes exact Frame/alignment/padding
 and digest bytes. Eight independent Python golden vectors agree with generated Zig
 output; all nine codec fixture tests passed. Metadata value grammar, feature/version
 policy, vendor endpoint assignments and admission/state-machine validation remain
 wire-freeze gates. No production code changed in this byte-fixture pass.
 
 
-The [metadata/feature/endpoint draft](../../broker/wire.md#broker-wire-details) now defines original-endian
+The [metadata/feature/endpoint draft](../../broker/wire.md#broker-metadata-negotiation-and-endpoint) now defines original-endian
 inline QoS retention, native status/key representation, v1 feature gates and vendor
 endpoint directions. HELLO explicitly offers client endpoints; ACCEPT supplies broker
 endpoints. CONTROL and STATE are reliable; routed peer metatraffic preserves native
@@ -151,7 +151,7 @@ integration, especially endpoint offers, lost ACCEPT and reconnect authorization
 then consolidate the remaining wire-freeze and production-validation gates.
 
 
-The [admission protection review](../../broker/protocol.md#broker-admission-protection) proposes exact
+The [admission protection review](../../broker/protocol.md#broker-admission-identity-and-reconnect) proposes exact
 transcript correlation and stable pre-OPEN ownership authority, so even the first lost
 ACCEPT cannot strand a client without a credential. It identifies inactive-claim quota
 costs, superseded cached outcomes, and revocation precedence. These policy choices await
@@ -169,7 +169,7 @@ no executable security validation is claimed. Next decide whether a typed bootst
 rejection should make conflicts diagnosable, then consolidate the remaining wire gates.
 
 
-The [bootstrap rejection draft](../../broker/protocol.md#broker-bootstrap-rejection) adds operation 29 and
+The [bootstrap rejection draft](../../broker/protocol.md#bootstrap-rejection-reply) adds operation 29 and
 AdmissionReject, with request correlation, restricted reasons, bounded retry hints,
 no-amplification and no incumbent-identity disclosure before authorization/path checks.
 Twelve generated-code codec tests and thirteen independent golden vectors pass; the new
@@ -178,20 +178,20 @@ rate-limit and replay tests remain production gates. The next step is to consoli
 wire-readiness gaps into one implementation checklist rather than extend admission policy.
 
 
-The [29-operation admission table](../../broker/protocol.md#broker-operation-validation) now maps direction,
+The [29-operation admission table](../../broker/protocol.md#broker-operation-admission-and-effects) now maps direction,
 stream, phase, validation, effects and failure handling; names/codes match the IDL.
 W2 remains open: inventory/mutation dependency, view correlation/recovery, presence-proof
 membership and route-generation authority require decisions. No codec or runtime change
 was made. Next choose F1's post-inventory mutation admission rule.
 
 
-F1 is accepted: [v1 inventory COMMIT barrier](../../broker/protocol.md#broker-inventory-barrier), with explicit
+F1 is accepted: [v1 inventory COMMIT barrier](../../broker/protocol.md#origin-inventory-barrier-and-future-pipelining), with explicit
 local buffering and same-session replacement draining. A likely follow-on negotiates
 inventory-dependent mutations with bounded staging; no feature ID or v1 wire change is
 introduced. Documentation-only trace review; next is F2 view request correlation/recovery.
 
 
-F2 investigation: the [view correlation proposal](../../broker/protocol.md#broker-view-correlation) recommends
+F2 investigation: the [view correlation proposal](../../broker/protocol.md#view-request-correlation-and-recovery) recommends
 client-assigned session-local view generations and bidirectional RESYNC_REQUIRED. It
 covers early records, abandoned requests, resume rebinding and broker invalidation.
 This is pending acceptance; no IDL or codec change/test run occurred. Next review that
@@ -237,7 +237,7 @@ All 14 codec tests pass; 13 existing golden vectors verify. F4 is resolved by sc
 next is W3 bounded retention/reclamation. See [relay direction](../../concurrency-broker-status.md).
 
 
-W3 investigation (2026-09-18): [retention review](../../broker/protocol.md#broker-retention-review) identifies
+W3 investigation (2026-09-18): [retention review](../../broker/protocol.md#bounded-protocol-retention-and-reclamation) identifies
 that epoch-long closed-incarnation rejection conflicts with unrestricted churn and bounded
 memory. Recommendation: terminality fences the closed registration and its old work,
 while fresh admission after reclamation is governed by current policy, not an eternal
@@ -251,7 +251,7 @@ identity is then allowed. No automatic blacklist in v1; quotas/rate limits/backo
 configured authorization remain. Next: compact bootstrap and presence-query replay rules.
 
 
-W3 retry investigation (2026-09-18): [retry retirement](../../broker/protocol.md#broker-retry-retirement)
+W3 retry investigation (2026-09-18): [retry retirement](../../broker/protocol.md#bounded-admission-and-freshness-retirement)
 proposes consumed-admission guards lasting through cookie expiry, and monotonically
 ordered presence-query serials with bounded result slots. It avoids an unbounded random-
 nonce tombstone set and uses ordered control admission, while allowing out-of-order answer
@@ -266,7 +266,7 @@ codec tests pass; 13 independent vectors verify. No production replay/security c
 Next reconcile W4 bootstrap sizing, endpoint establishment and lifecycle deadline horizons.
 
 
-W4 investigation (2026-09-18): [bootstrap lifecycle](../../broker/protocol.md#broker-bootstrap-lifecycle)
+W4 investigation (2026-09-18): [bootstrap lifecycle](../../broker/protocol.md#bootstrap-sizing-and-endpoint-lifecycle)
 records measured HELLO/CHALLENGE/OPEN/ACCEPT sizes. OPEN is 852 bytes with 128-byte realm,
 resume and 64-byte cookie, but 1300 with a 512-byte cookie, before RTPS/security overhead.
 Recommendation: exact nonfragmented preflight, explicit failure when required fields do
@@ -282,7 +282,7 @@ attempt retirement must be redesigned with the sequence. Next review sequence an
 reconciliation for coexisting direct/broker discovery. See broker-spdp-bootstrap.md.
 
 
-Coexistence investigation (2026-09-18): [direct/broker reconciliation](../../broker/coexistence.md#broker-discovery-coexistence)
+Coexistence investigation (2026-09-18): [direct/broker reconciliation](../../broker/coexistence.md#reconciliation-of-direct-and-broker-discovery)
 proposes one installed graph, source-specific freshness, and shared origin revisions in
 zzdds vendor discovery parameters. Source expiry is not origin deletion; stale surviving
 sources cannot roll state backward. Conflicts lacking comparable versions are not silently
@@ -302,7 +302,7 @@ vendor parameter in full discovery payloads, inline QoS for key-only lifecycle m
 and typed canonical comparison separate from native operational counters and exact broker
 retry bytes. Unknown optional fields compare conservatively. No PID or production IDL
 assigned yet; next accept/refine placement and comparison, then add endian/deletion fixtures.
-See [wire proposal](../../broker/coexistence.md#broker-origin-version-wire).
+See [wire proposal](../../broker/coexistence.md#origin-version-placement-and-canonical-discovery-content).
 
 
 Origin-version placement/comparison accepted (2026-09-18). Design-schema PID 0x8003 and

@@ -1,12 +1,12 @@
 # Broker: security and filtering
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="broker-security-and-filtering"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+<a id="broker-security-profiles-and-disclosure"></a>
 ## Broker security, profiles and disclosure
 
-<a id="broker-security-and-filtering--shipping-and-future-modes"></a>
+<a id="shipping-and-future-modes"></a>
 ### Shipping and future modes
 
 V1 is traditional insecure cached discovery over UDP or TCP. It provides no cryptographic
@@ -32,7 +32,7 @@ withhold or falsify discovery assertions. Optional peer secure-SEDP confirmation
 hardening design, not an already-completed trust proof. Opaque_peer and transport relays are
 later profiles; no DDS Security relay-plugin conformance is claimed by this document.
 
-<a id="broker-security-and-filtering--disclosure-and-candidate-filtering"></a>
+<a id="disclosure-and-candidate-filtering"></a>
 ### Disclosure and candidate filtering
 
 Scope by domain ID/tag first. Operators set the maximum disclosed graph per scope; clients
@@ -48,12 +48,21 @@ not a new ad hoc glob interpretation. Do not filter on type/QoS compatibility an
 suppress diagnostics. With DDS Security, integrate actual validated permissions and current
 revocation policy rather than trusting an unvalidated permissions document.
 
+Topic candidates are opposite-direction endpoints with the same topic name. Topic/partition
+mode additionally uses the DDS partition rules. Upload all local endpoints independently
+of current interests. Interest expansion sends current retained records without waiting
+for reannouncement; contraction emits ordered VIEW_WITHDRAW. Preserve bounded built-in
+service dependencies and parent records. Candidate mode intentionally makes built-in-topic
+visibility partial; ALL is complete only within the operator's disclosure ceiling.
+Recheck current authorization/disclosure at output, including queued output after a policy
+change; previously prepared work does not bypass revocation.
+
 The zzdds broker implements candidate filtering. A constrained client can require it and
 refuse unsupported service; no silent VIEW_ALL fallback. Filtering does not guarantee any
 workload fits: retain explicit record/byte limits and bounded failure. Whether every future
 third-party broker must implement filters is not a v1 delivery prerequisite.
 
-<a id="broker-security-and-filtering--constrained-broker-client-acceptance-profile"></a>
+<a id="constrained-broker-client-acceptance-profile"></a>
 ### Constrained broker client acceptance profile
 
 Use one domain scope and authority, a required topic/partition candidate view, explicit
@@ -69,7 +78,7 @@ raw records and marker exceptions. An MCU may select TCP instead if available an
 introduction size is unsuitable; no automatic transport switch or field stripping follows.
 Actual maximum peers/endpoints and target memory are measured implementation claims.
 
-<a id="broker-security-and-filtering--optional-continuity-v11"></a>
+<a id="optional-continuity-v11"></a>
 ### Optional continuity: v1.1
 
 D2 authorizes a client-requested random single-use registration continuity capability in
@@ -83,3 +92,18 @@ bounds until fresh upload commits. Replacement alone cannot renew stale origin e
 Lost initial ACCEPT leaves the established short timeout/expiry recovery path. Specify lost
 replacement ACCEPT and duplicate-token outcomes before v1.1 implementation. v1 still omits
 the reserved continuity field and never grants replacement on an unimplemented token.
+
+### Deferred opaque-peer constraints
+
+Opaque introductions are untrusted candidate hints until native peer authentication,
+permissions, protected discovery and key exchange succeed. Install protected state only
+after peer validation, bypassing the plaintext cached-state adapter for that relationship.
+Preserve peer identities, receiver-specific protection and native late-join history across
+broker restart; the broker cannot fabricate tokens or fresh origin history.
+
+Hidden endpoint metadata means an authorized participant-scope candidate set by default,
+not a promise of topic filtering or its scale benefit. Optional disclosure hints require
+a confidentiality policy. Whole-message encryption may prevent broker classification of
+metatraffic versus data; class declarations, recipient dispatch checks and separate quotas
+must not be represented as cryptographic payload classification. Bind profile selection
+to authenticated configuration and fail if a supported secure path does not exist.

@@ -15,8 +15,8 @@ scope. Neither a frozen public ABI nor a deployed broker wire protocol is claime
 | Package | Controlling entry point | Baseline result |
 | --- | --- | --- |
 | Concurrency | [Contract](../../concurrency-broker-status.md), [final review](../../concurrency-broker-status.md) | Execution ownership, listener contract, waits, preparation/commit, lifetime, runtime driving and shutdown behavior settled |
-| Broker | [Implementer guide](../../concurrency-broker-status.md), [public API](../../broker/api.md#broker-public-api), [operation table](../../broker/protocol.md#broker-operation-validation) | Configuration, discovery coexistence, bootstrap/admission, origin/view synchronization, freshness, recovery and resource behavior specified |
-| Broker bytes | [Registry](../../broker/wire.md#broker-wire-registry), [compatibility review](../../broker/wire.md#broker-wire-compatibility-review), [draft IDL](../../schema/broker-control-draft.idl) | Concrete proposed layouts/assignments and independent fixtures; explicit compatibility gates before publication |
+| Broker | [Implementer guide](../../concurrency-broker-status.md), [public API](../../broker/api.md#broker-public-configuration-and-status-api), [operation table](../../broker/protocol.md#broker-operation-admission-and-effects) | Configuration, discovery coexistence, bootstrap/admission, origin/view synchronization, freshness, recovery and resource behavior specified |
+| Broker bytes | [Registry](../../broker/wire.md#broker-wire-registry-and-body-mapping), [compatibility review](../../broker/wire.md#wire-assignments-and-compatibility), [draft IDL](../../schema/broker-control-draft.idl) | Concrete proposed layouts/assignments and independent fixtures; explicit compatibility gates before publication |
 | Production migration | [Concurrency migration](../../concurrency-broker-status.md), [broker closure ledger](../../concurrency-broker-status.md) | Named implementation stages and acceptance evidence, separated from design decisions |
 
 Detailed contracts govern their named behavior. The broker guide identifies controlling

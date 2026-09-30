@@ -1,13 +1,17 @@
 # Concurrency: architecture
 
-This is a current contract. Scope, decisions and implementation gates are in
-[the single status index](../concurrency-broker-status.md). Validation results are maintained
-only in [the evidence inventory](../../../test/design-models/README.md).
-<a id="concurrency-model"></a>
+Requirements use the [shared convention](../concurrency-broker-status.md#requirement-convention).
+[The index](../concurrency-broker-status.md) owns scope and unresolved design items;
+[the evidence inventory](../../../test/design-models/README.md) records validation.
+
+Execution owners and fast paths define the common runtime. Admission, reservations and
+retained lifetimes below constrain both manual and hosted implementations.
+
+<a id="concurrency-model-state-ownership-and-progress"></a>
 ## Concurrency model: state ownership and progress
 
-<a id="concurrency-model--1-requirements-established-in-discussion"></a>
-### Requirements established in discussion
+<a id="scope-and-execution-requirements"></a>
+### Scope and execution requirements
 
 * The protocol core must be capable of progress on one application thread, without background OS threads. MCU/RTOS use is an active target, although a complete MCU DDS feature/resource profile is separate work.
 * Hosted applications may use background execution and multiple application threads. Preserve useful concurrent API access rather than equating manual progress with a universal non-thread-safe library.
@@ -15,9 +19,9 @@ only in [the evidence inventory](../../../test/design-models/README.md).
 * Protocol components must not require their own receive/timer threads. Scheduling must be separable from protocol state transitions.
 * Callback serialization and lifetime guarantees are independent of backend. The default permits inline callbacks when eligible and keeps distinct reader listeners under a subscriber independent.
 * Additional public execution controls belong in `zzdds.idl`, not `dcps.idl`. Standard DDS applications retain a useful automatic-progress default in hosted builds.
-* Build-time selection is acceptable. Exact flag spelling remains implementation work; supported manual/hosted selection and external driving follow runtime-bootstrap-contract.md.
+* Build-time selection is acceptable. Exact flag spelling remains implementation work; supported manual/hosted selection and external driving follow the [runtime contract](runtime.md).
 
-<a id="concurrency-model--2-three-independent-axes"></a>
+<a id="three-independent-axes"></a>
 ### Three independent axes
 
 | Axis | Choices to represent |
@@ -32,12 +36,12 @@ Zig 0.16 introduces `std.Io` implementations, but its release notes describe `Io
 
 Use `std.Io` where useful in hosted adapters. Do not make bare-metal support depend on a particular stackful coroutine backend. A MicroZig adapter needs the selected network driver/stack, clock, wakeup and interrupt ownership contract. No working adapter or version compatibility is asserted here. [MicroZig project](https://github.com/ZigEmbeddedGroup/microzig).
 
-<a id="concurrency-model--3-proposed-core-boundary"></a>
-### core boundary
+<a id="core-progress-boundary"></a>
+### Core progress boundary
 
 The engine contract: express protocol progress as bounded state-machine operations over explicit input, time and available resources. They produce outgoing work, status eligibility and a next deadline. Long I/O waits and user callbacks occur outside protocol-state ownership.
 
-Conceptual operations, not proposed public signatures:
+**Conforming approach — internal engine operations.** These are not public signatures:
 
 ```text
 submit(command) -> admitted | retry | error
@@ -52,8 +56,8 @@ Output may be sent immediately when the adapter supports bounded submission; pro
 
 No lost wakeups: checking that work is absent and arming a wait must coordinate with command/input publication. Fair budgets cover receives, commands, repairs, timers and callbacks so a flood in one class cannot prevent leases or shutdown from progressing. A callback's arbitrary duration is not bounded by a scheduler budget.
 
-<a id="concurrency-model--41-agreed-take-turns-execution"></a>
-#### take-turns execution
+<a id="take-turns-execution"></a>
+#### Take-turns execution
 
 An execution context has at most one active protocol-state executor at a time, without permanent thread ownership. An eligible application thread, receive worker or manual driver may acquire execution rights and perform the same state transitions directly. The uncontended path must not require a command/response handoff solely to reach an assigned worker.
 
@@ -61,14 +65,14 @@ Context admission must be explicit and separate from the transitions it protects
 
 Execution rights cover bounded state transitions. Release them before user callbacks, blocking network operations or waits whose progress requires the context. Waiting inside a callback retains the separate callback exclusion rights. A nested protocol pump reacquires context rights as needed; it does not recursively retain a context lock.
 
-<a id="concurrency-model--42-agreed-admission-policy-state-transitions-to-develop"></a>
+<a id="admission-policy"></a>
 #### Admission policy
 
-The [prepared-commit contract](architecture.md#commit-preparation) records the selected ordered per-instance preparation ledger, configurable per writer with default limit one, and head-only Publisher ticket admission. Implementation gates are listed in the single status index.
+The [prepared-commit contract](architecture.md#prepared-writer-commits-and-fair-gate-handoff) records the selected ordered per-instance preparation ledger, configurable per writer with default limit one, and head-only Publisher ticket admission. Implementation gates are listed in the single status index.
 
-The [admission state-machine draft](architecture.md#admission-state-machine) now separates context lifecycle/execution, request placement, resource ownership and effect commitment. Its synchronization mechanisms and operation-specific boundaries remain proposals for review.
+The [admission state machine](architecture.md#admission-and-request-state-transitions) defines context lifecycle/execution, request placement, resource ownership and effect commitment. These transitions and the operation-specific effect boundaries are requirements; concrete queues and synchronization primitives are implementation choices.
 
-The refined policy is accepted following [design-level trace validation](../concurrency-broker-status.md). A [test-only synchronization prototype](../concurrency-broker-status.md) now exercises part of this policy with deterministic and hosted threaded drivers. Production scheduler validation and latency measurements remain outstanding.
+Production scheduler validation and latency measurements are required before implementation claims; [the evidence inventory](../../../test/design-models/README.md) records the limited model and prototype coverage.
 
 * Execute directly only when no older ready work exists; otherwise use FIFO ready admission within each context.
 * Bound each turn. Runnable continuations and awakened requests join the tail; condition waiters remain outside the ready queue while still counting against storage limits.
@@ -86,8 +90,8 @@ If an operation is queued, completion and cancellation must have a defined order
 
 Ownership: use participant control plus per-writer/per-reader contexts, with narrowly scoped Publisher/Subscriber coordinators, as defined by the ownership table below. This follows the user's preference for endpoint independence; concrete synchronization requires receive/write/shutdown integration validation. Context count does not imply thread count. Shared sockets route input to its owner explicitly; callback rights remain separate.
 
-<a id="concurrency-model--43-agreed-shared-subscriber-group-access-brackets"></a>
-#### shared Subscriber GROUP access brackets
+<a id="shared-subscriber-group-access-periods"></a>
+#### Shared Subscriber GROUP access periods
 
 The initial design uses one shared access period per Subscriber for GROUP presentation. This is a zzdds execution/access decision, not a claim that DDS mandates this concurrency mechanism. It supports cooperating consumers without promising a private snapshot or exclusive traversal.
 
@@ -98,12 +102,12 @@ The initial design uses one shared access period per Subscriber for GROUP presen
 * Access-period references and loan ownership are separate. Closing a period must neither free outstanding loan storage nor wait for loan return. Loan return and deletion preconditions retain their own bookkeeping.
 * Internal access guards for the special Subscriber callback path must preserve the active period while callbacks use it. Their accounting must be separate from explicit begin/end depth so callback exit cannot close an application's bracket. The listener contract defines explicit callback/delegation admission and recursion limits; this does not authorize automatic nested callbacks or deferred delegation semantics.
 
-No per-thread balance checking or task ownership API is selected. A later explicit ownership extension, if justified, belongs in `zzdds.idl`. When GROUP is compiled out, omit this access-period machinery as required by section 7.1; required non-GROUP behavior remains.
+No per-thread balance checking or task ownership API is selected. A later explicit ownership extension, if justified, belongs in `zzdds.idl`. When GROUP is compiled out, omit this access-period machinery as required by [optional profile removal](#optional-profile-removal); required non-GROUP behavior remains.
 
-Before implementation, validate overlapping/nested brackets, concurrent take versus ordered traversal, callback guard versus final explicit end, bounded storage during a prolonged period, and final end with outstanding loans. Context granularity and the detailed visibility/retention algorithm are not settled by this access-contract decision.
+Before implementation, validate overlapping/nested brackets, concurrent take versus ordered traversal, callback guard versus final explicit end, bounded storage during a prolonged period, and final end with outstanding loans. The ownership partition below fixes context granularity. The optional GROUP profile must still validate coherent visibility, retention and incomplete-set handling against these access-period rules.
 
-<a id="concurrency-model--44-proposed-ownership-map-and-coordinator-interactions"></a>
-#### ownership map and coordinator interactions
+<a id="execution-owners-and-coordination"></a>
+#### Execution owners and coordination
 
 The ownership partition below is required; it does not mandate one internal queue/container implementation. All execution owners use the selected take-turns policy; one application thread can advance them sequentially, while a hosted runtime can advance independent owners concurrently.
 
@@ -118,7 +122,7 @@ The ownership partition below is required; it does not mandate one internal queu
 
 Coordinators own bounded shared transitions, not all child execution. They need admission and lifetime protection but no dedicated thread. Listener registration/exclusion remains governed by the listener contract; callbacks execute outside these owners' protocol rights. Transport-channel ownership is a required seam, not a settled I/O backend. Placement of built-in discovery endpoints within or alongside participant control is an implementation choice subject to these ownership and progress rules.
 
-<a id="concurrency-model--coordination-rules"></a>
+<a id="coordination-rules"></a>
 ##### Coordination rules
 
 1. Ordinary endpoint work should execute with endpoint rights alone. Shared policy/matching decisions are installed as versioned updates; do not acquire participant control for every sample.
@@ -129,16 +133,18 @@ Coordinators own bounded shared transitions, not all child execution. They need 
 
 Use bounded pending storage and explicit overload handling. These rules do not authorize dropping admitted commands or treating queue admission as successful DDS history admission. The accepted short group-commit gate is a narrow exception, permitting bounded sequencing/history installation while holding writer execution rights. Its acquisition graph and preparation requirements are specified in the admission draft; it does not authorize entering general Publisher execution under writer rights. Other multi-owner operations need a separate lock-order and boundedness proof.
 
-<a id="concurrency-model--publisher-operations-spanning-writers"></a>
+<a id="publisher-operations-spanning-writers"></a>
 ##### Publisher operations spanning writers
 
-Proposed write sequence: prepare payload and reserve writer-local resources; release writer execution rights; obtain a short-lived Publisher ticket where shared publication controls require it; commit the prepared change under writer rights; then complete the ticket. A resource reservation survives release of execution rights. The accepted ticket fixes the applicable control generation but is unnumbered. Group order is assigned at actual installation under the accepted short group-commit gate; see [the commit contract](architecture.md#admission-state-machine--41-agreed-unnumbered-tickets-and-bounded-group-commit). Closing admission must not invalidate resources required by an already-admitted commit.
+INSTANCE and TOPIC writes prepare payloads and reserve writer-local resources, then commit under writer rights without a Publisher ticket or group gate. TOPIC additionally obeys retained coherent-set sealing; see [fast paths](#fast-paths-and-progress-profiles).
+
+For GROUP writes only, prepare payload and reserve writer-local resources; release writer execution rights; obtain a short-lived Publisher ticket; commit the prepared change under writer rights and the bounded group gate; then complete the ticket. A resource reservation survives release of execution rights. The accepted ticket fixes the applicable control generation but is unnumbered. Group order is assigned at actual installation under the accepted short group-commit gate; see [the commit contract](architecture.md#group-tickets-and-bounded-commit). Closing admission must not invalidate resources required by an already-admitted commit.
 
 There must be no allocation, capacity wait, callback or network operation inside the admitted local commit. A ticket holder still needs writer execution admission: closing a coherent window must allow that commit to progress, and must not wait while owning either the coordinator or writer. In manual mode the pending commit must be runnable by the driver; it cannot depend on resuming a blocked caller's private continuation.
 
-For GROUP, an outer coherent boundary closes the relevant ticket generation, drains admitted commits without retaining coordinator rights, and seals completion metadata before permitting subsequent publication to overtake it. It does not wait for remote acknowledgments. Ordinary capacity waiters have not joined the old generation. Exact sequence allocation, failure/closure ordering, completion-marker retention and suspension interaction need a state-machine specification. TOPIC uses the retained seal protocol in the TOPIC completion section below, with no GROUP ticket; compiling out GROUP removes group-specific ordering/state, not all Publisher controls.
+For GROUP, an outer coherent boundary closes the relevant ticket generation, drains admitted commits without retaining coordinator rights, and seals completion metadata before permitting subsequent publication to overtake it. It does not wait for remote acknowledgments. Ordinary capacity waiters have not joined the old generation. Sequence installation and close follow the admission/commit rules below; completion-marker retention, repair and suspension interactions require validation against the optional GROUP wire profile. TOPIC uses the retained seal protocol in the TOPIC completion section below, with no GROUP ticket; compiling out GROUP removes group-specific ordering/state, not all Publisher controls.
 
-<a id="concurrency-model--subscriber-operations-spanning-readers"></a>
+<a id="subscriber-operations-spanning-readers"></a>
 ##### Subscriber operations spanning readers
 
 Readers submit retained prepared contributions to the Subscriber coordinator. Group records identify the remote publishing group and coherent set; readiness is not a scan asking whether every local reader has some completed data. Unrelated remote groups must not be coupled by an all-readers barrier.
@@ -147,18 +153,18 @@ Before a group becomes visible, all affected reader contributions and necessary 
 
 The agreed access brackets in the shared-access section above reference the eligible view; they hold no coordinator or reader execution rights across application code. Closing an access period releases its own retention independently of outstanding loans and callback guards. Distinct reader listeners remain independent under the listener contract, with shared consumption rather than private callback views.
 
-<a id="concurrency-model--lifecycle-and-validation"></a>
+<a id="lifecycle-and-validation"></a>
 ##### Lifecycle and validation
 
-Creation reserves child identity/membership under parent control, initializes child state, then publishes a usable endpoint under a defined commit boundary. Failure before publication rolls back reservations. Deletion closes new admission, resolves retained work and detaches membership before eventual reclamation, subject to API preconditions. Do not destroy a child while a coordinator contribution, ticket, callback, loan or transport completion still references it. Exact discovery announcement/disposal ordering remains to be specified.
+Creation reserves child identity/membership under parent control, initializes child state, then publishes a usable endpoint under a defined commit boundary. Failure before publication rolls back reservations. Deletion closes new admission, resolves retained work and detaches membership before eventual reclamation, subject to API preconditions. Do not destroy a child while a coordinator contribution, ticket, callback, loan or transport completion still references it. The local-publication/announcement/disposal ordering for concurrent entity creation and deletion is an [open design item](../concurrency-broker-status.md#open-design-items).
 
-Validate at least: discovery removal racing with queued input; write admission racing with coherent close/deletion; a busy writer needed by a closing Publisher; a group whose last reader contribution fails preparation; final access end racing with a callback guard; and one-thread progress through each sequence. Compare uncontended inline work and contended admission, including allocation count, handoffs and fairness. These fixtures must precede treating the proposed ownership map as an implemented guarantee.
+Validate at least: discovery removal racing with queued input; write admission racing with coherent close/deletion; a busy writer needed by a closing Publisher; a group whose last reader contribution fails preparation; final access end racing with a callback guard; and one-thread progress through each sequence. Compare uncontended inline work and contended admission, including allocation count, handoffs and fairness. These fixtures must precede treating the ownership map as an implemented guarantee.
 
-<a id="concurrency-model--7-platform-memory-and-blocking-boundaries"></a>
+<a id="platform-memory-and-blocking-boundaries"></a>
 ### Platform, memory and blocking boundaries
 
-<a id="concurrency-model--71-agreed-optional-profiles-must-compile-out"></a>
-#### optional profiles must compile out
+<a id="optional-profile-removal"></a>
+#### Optional profile removal
 
 Disabling an optional profile must remove its dedicated state and processing from ordinary endpoint paths while preserving core execution, listener exclusion and lifetime guarantees. Use compile-time component selection for both behavior and storage; runtime-disabled branches with permanently embedded maps, queues or per-sample metadata are insufficient. Small unsupported-operation stubs and necessary interoperability parsing may remain.
 
@@ -168,10 +174,10 @@ DDS 1.4 Annex A identifies Group access, Content-subscription, Persistence and O
 
 Validate removal using matched builds: final application code/read-only data, static RAM, per-entity/per-sample storage and peak working memory. Include static application and exported-library configurations; do not infer savings from source lines or assume individual savings add together. No size savings have been measured yet. This requirement and the shared Subscriber access-period contract in the shared-access section above are agreed.
 
-<a id="concurrency-model--72-platform-boundaries"></a>
+<a id="platform-boundaries"></a>
 #### Platform boundaries
 
-**Proposal C5:** MCU interrupt handlers publish bounded events and wake the driver; they do not invoke DDS listeners or run unbounded protocol work. Single-threaded application execution does not eliminate synchronization with interrupts or a second core. Timer clocks must specify wrap, resolution and suspend behavior. Idle waiting must not lose interrupts between testing for work and sleeping.
+MCU interrupt handlers publish bounded events and wake the driver; they do not invoke DDS listeners or run unbounded protocol work. Single-threaded application execution does not eliminate synchronization with interrupts or a second core. Timer clocks must specify wrap, resolution and suspend behavior. Idle waiting must not lose interrupts between testing for work and sleeping.
 
 Budget histories, command queues, callback pending state, fragments, timer entries and payload buffers. Prefer caller-supplied allocators/pools and make exhaustion explicit. Removing threads does not by itself make full DDS suitable for every device that can run an XRCE client.
 
@@ -179,10 +185,10 @@ Hosted TLS/DTLS, DNS and transport connection setup need bounded/cancellable int
 
 Current `src/util/mutex.zig` uses pthread/Windows primitives, and transports use direct platform sockets. Supporting `std.Io` or a freestanding backend requires explicit adapter/synchronization changes; selecting a Zig build option is insufficient.
 
-<a id="admission-state-machine"></a>
+<a id="admission-and-request-state-transitions"></a>
 ## Admission and request state transitions
 
-<a id="admission-state-machine--1-separate-state-dimensions"></a>
+<a id="separate-state-dimensions"></a>
 ### Separate state dimensions
 
 Do not combine execution, lifecycle, resource ownership and API outcome into one enum. A closing context can still execute; a resource-reserved request can still be queued.
@@ -197,7 +203,7 @@ Do not combine execution, lifecycle, resource ownership and API outcome into one
 
 SCHEDULED means one service obligation exists for a nonexecuting context. It need not mean a particular queue implementation. RUNNING can have a nonempty FIFO behind its executor. CLOSED means no remaining protocol work, not that all externally retained storage has been reclaimed.
 
-<a id="admission-state-machine--2-context-admission-and-turn-completion"></a>
+<a id="context-admission-and-turn-completion"></a>
 ### Context admission and turn completion
 
 All transitions below require a common admission synchronization protocol. A short gate is the baseline conceptual model; an atomic optimization must preserve the same ordering. Never invoke application code or block while holding the gate.
@@ -216,7 +222,7 @@ A small batch may retain the executor between turns within a finite budget, alwa
 
 Runtime queue publication must itself be allocation-free after admission. A design may use an embedded ready node or an explicit publication handshake; context-gate/runtime-gate ordering and the precise handshake must be specified before implementation. Do not assume two independent queue/flag stores establish the invariant.
 
-<a id="admission-state-machine--3-resource-waits-and-reservations"></a>
+<a id="resource-waits-and-reservations"></a>
 ### Resource waits and reservations
 
 Under the resource owner's rights, check eligibility and either reserve resources or register a waiter before releasing ownership. Wait records retain request identity and a wait-generation number. Resource release services the oldest eligible waiter, reserves its required resources, then makes its continuation READY. Wakeups for an obsolete wait generation are ignored without releasing a newer reservation.
@@ -225,10 +231,10 @@ A reservation has one owner and is consumed by commit or released by cleanup exa
 
 For cross-context notifications, the producer retains a preallocated completion record and publishes evidence; the destination applies it under its own rights. It does not mutate the destination's private protocol state directly. An operation can have several internal steps, but at most one executor advances its mutable continuation state at once.
 
-<a id="admission-state-machine--4-commit-cancellation-and-result-delivery"></a>
+<a id="commit-cancellation-and-result-delivery"></a>
 ### Commit, cancellation and result delivery
 
-Preparation, ready admission and resource reservation do not mean API success. Each operation defines an effect boundary. For a write, the proposed boundary is the irrevocable acceptance of its prepared change into history, with installation guaranteed by the reserved resources.
+Preparation, ready admission and resource reservation do not mean API success. Each operation defines an effect boundary. For a write, the boundary is the irrevocable acceptance of its prepared change into history, with installation guaranteed by the reserved resources.
 
 Before that boundary, cancellation and commit compete through one synchronized decision:
 
@@ -243,27 +249,29 @@ Cancellation after COMMIT_CLAIMED loses the precommit race. A caller may not ret
 
 After ABORT_CLAIMED no executor may commit the request. It enters RETIRING while owners release reservations, tickets and references. A waiting caller can be notified only when returning cannot invalidate retained memory or leave untracked cleanup. The initial safe baseline completes cleanup before returning; separately retained asynchronous cleanup is a possible later optimization. Terminal result publication occurs once, with result writes visible before the waiter observes completion.
 
-Publisher tickets complicate this boundary: assigning group order before writer installation makes cancellation require a sequence-reservation retirement protocol. The candidate below instead leaves tickets unnumbered. It supersedes early discussion of tickets fixing group sequence numbers, and the user accepted the unnumbered-ticket/short-gate approach on 2026-09-10; ticket issuance is not successful DDS history admission.
+GROUP tickets are unnumbered. Assign group sequence order only at writer installation under the short group gate; issuing a ticket is not successful DDS history admission. This avoids reserving sequence numbers for work that can still be cancelled before installation.
 
-<a id="admission-state-machine--41-agreed-unnumbered-tickets-and-bounded-group-commit"></a>
-#### unnumbered tickets and bounded group commit
+<a id="group-tickets-and-bounded-commit"></a>
+#### GROUP tickets and bounded commit
 
 This section is GROUP-specific. INSTANCE and TOPIC use the specialization in
-[fast paths](architecture.md#concurrency-fast-paths); neither acquires this gate for ordinary writes.
+[fast paths](architecture.md#fast-paths-and-progress-profiles); neither acquires this gate for ordinary writes.
 
 A ticket records control generation, permitted coherent membership and one outstanding completion obligation. It does not allocate a writer sequence number or group sequence number. All storage and continuation credits are reserved before the ticket is issued. Cancellation before commit retires the ticket and releases storage without creating a sequence hole. Final coherent close counts actual committed changes, not tickets issued.
 
 The candidate final write transition holds writer execution rights and briefly claims a Publisher group-commit gate. Under that gate it validates ticket/deadline/cancellation state, claims commit, assigns writer/group sequence numbers and installs the prepared cache entry. Only then does it publish group progress and release the gate. The first committed member establishes the group's first sequence identifier. Empty/cancelled-only sets and end-marker sequencing need explicit treatment in the wire algorithm. GROUP sequence numbering also applies outside coherent brackets where required by the configured presentation scope.
 
-The group-commit gate owns only shared sequencing/commit metadata, not general Publisher execution. This is an explicit exception to the baseline one-owner-at-a-time rule: writer-local installation overlaps ownership of a narrow shared gate. It requires an audited acquisition graph. No path holding this gate may enter or wait for a writer/participant/coordinator context. Network work, allocation, history scans/eviction cleanup and callbacks are excluded. Preallocate a directly installable history node/slot and defer reclamation work. Gate contention must release writer rights and register a retry without lost wakeups or busy spinning; queued gate claimants need fair service consistent with the accepted admission policy. The FIFO entitlement contract is described in [commit preparation](architecture.md#commit-preparation); its test-only implementation does not establish production contention behavior.
+The group-commit gate owns only shared sequencing/commit metadata, not general Publisher execution. This is an explicit exception to the baseline one-owner-at-a-time rule: writer-local installation overlaps ownership of a narrow shared gate. It requires an audited acquisition graph. No path holding this gate may enter or wait for a writer/participant/coordinator context. Network work, allocation, history scans/eviction cleanup and callbacks are excluded. Preallocate a directly installable history node/slot and defer reclamation work. Gate contention must release writer rights and register a retry without lost wakeups or busy spinning; queued gate claimants need fair service consistent with the accepted admission policy. The FIFO entitlement contract is described in [commit preparation](architecture.md#prepared-writer-commits-and-fair-gate-handoff); its test-only implementation does not establish production contention behavior.
 
 Coherent close stops new tickets for G, then waits without coordinator execution rights for every G ticket to commit or abort and retire. Existing G tickets remain valid during the drain; tickets for subsequent publication cannot overtake the sealed boundary. A committed ticket reports its installed result through retained completion storage. Delayed retirement can delay close but cannot make uninstalled data appear committed.
 
 The narrow gate prevents a dangerous schedule: writer A reserves GSN 10 and stalls before installation, while writer B installs GSN 11 and publishes group progress that could let receivers infer 10 is absent. Group progress snapshots must be taken consistently with installed writer ranges; stale precommit heartbeat construction must not be combined with a newer group watermark. This requirement applies to initial sends, repair and heartbeat construction, not just the counter increment.
 
-Alternative: keep strictly separate owners, with numbered reservations plus installation acknowledgments and a safe advertised progress frontier. That avoids the overlapping gate but requires bounded reservation tracking, cancellation-hole handling and a wire-order proof. The bounded group-commit gate is selected, with the validation requirements below. The alternative is not selected; production synchronization and wire behavior have not been tested. Group-specific gate/state compiles out when GROUP support is absent; non-GROUP Publisher controls retain their own required coordination.
+GROUP gate/state must compile out when GROUP support is absent. Non-GROUP Publisher
+controls retain their own required coordination. Production gate synchronization and
+coherent wire behavior require the implementation evidence in the index.
 
-<a id="admission-state-machine--5-waiter-sleep-and-shared-runtime-progress"></a>
+<a id="waiter-sleep-and-shared-runtime-progress"></a>
 ### Waiter sleep and shared runtime progress
 
 An ordinary hosted caller observes its retained request while runtime workers progress it.
@@ -271,19 +279,19 @@ Manual/callback-chain waiters help the shared runtime within accepted budgets. I
 
 Sleeping needs a predicate/wakeup handshake: register wake interest, recheck completion/ready work/due timers, and atomically arm the wait relative to producers, or use an equivalent monotonic wake sequence protocol. Completion before registration must be found by the recheck; completion afterwards must wake the waiter. Spurious wakes recheck predicates. Select the earliest relevant operation or runtime timer deadline.
 
-The shared runtime is the progress domain, not one global executor. Multiworker ready-queue ownership and per-context admission still guarantee a single executor per context. WaitSets across runtimes, public runtime construction and callback delegation rules remain outside this draft.
+The shared runtime is the progress domain, not one global executor. Multiworker ready-queue ownership and per-context admission still guarantee a single executor per context. [Operations](operations.md), [runtime](runtime.md) and [listeners](listeners.md) specify cross-runtime WaitSets, runtime construction and callback delegation.
 
-<a id="admission-state-machine--6-closing"></a>
+<a id="closing"></a>
 ### Closing
 
 OPEN -> DRAINING closes applicable new external admission at one defined point. New external requests ordered after that point are rejected according to the API; earlier queued but uncommitted requests follow that operation's cancel-or-drain policy. Accepted commits and mandatory internal completions remain serviceable using retained credits. Lifecycle close and commit claim must be ordered so neither invalidates resources promised to the other.
 
 DRAINING -> CLOSED requires no ready/running protocol work, no registered protocol waits, and no outstanding internal publication/ticket obligations. External loans or callback references can delay reclamation independently. Destruction cannot wait for its own callback. Runtime shutdown must keep servicing drain work rather than stopping workers first. Public deletion preconditions and exact cancel-or-drain choices remain operation-specific.
 
-<a id="commit-preparation"></a>
+<a id="prepared-writer-commits-and-fair-gate-handoff"></a>
 ## Prepared writer commits and fair gate handoff
 
-<a id="commit-preparation--1-two-distinct-gate-objects"></a>
+<a id="two-distinct-gate-objects"></a>
 ### Two distinct gate objects
 
 Separate a FIFO admission record from the physical metadata gate. A request may own the next turn without holding the gate or writer execution rights. The head request's entitlement persists while it waits for its writer turn. New requests cannot bypass it.
@@ -292,7 +300,7 @@ Each retained gate request includes request identity, lifecycle/wait generation,
 
 Conceptual states: QUEUED -> ENTITLED -> ACTIVE -> FINISHED, or QUEUED/ENTITLED -> CANCELLED. These are scheduling states, distinct from the request's irrevocable commit decision. Physical gate acquisition alone does not cause a write effect.
 
-<a id="commit-preparation--2-handoff-protocol"></a>
+<a id="handoff-protocol"></a>
 ### Handoff protocol
 
 1. Under a short admission gate, append once to the FIFO. If there is no active request or entitlement, select the head and assign a unique entitlement generation. Publish its retained writer-ready notification as part of the synchronized handoff protocol.
@@ -305,7 +313,7 @@ Cancellation of QUEUED/ENTITLED records removes or tombstones the record under a
 
 Entitlement can cause head-of-line delay, but it is not a mutex held across writer scheduling. Any eligible runtime executor can service the entitled continuation. Writer turns must be bounded and new writer-ready work cannot bypass it. If preparation is no longer valid and needs additional resources, release entitlement before registering the resource wait; do not retain the Publisher's next commit turn through a capacity wait. Ordinarily reservations should make this unnecessary.
 
-<a id="commit-preparation--3-prepared-change-contract"></a>
+<a id="prepared-change-contract"></a>
 ### Prepared change contract
 
 Foreign serialization, allocator hooks and fallible payload preparation run outside writer
@@ -326,21 +334,21 @@ Inside the gate, after all checks: claim commit, assign sequence metadata, detac
 
 No externally observable half-installed history is allowed. Writer ownership protects writer data; the group gate protects sequencing/progress metadata; snapshot users take compatible ownership and copy immutable results. Numeric sequence exhaustion must be checked before effect commitment, with failure behavior defined separately.
 
-<a id="commit-preparation--4-close-and-resource-conservation"></a>
+<a id="close-and-resource-conservation"></a>
 ### Close and resource conservation
 
-<a id="commit-preparation--41-selected-keep_last-reservation-direction"></a>
-#### Selected KEEP_LAST reservation direction
+<a id="keep_last-reservations"></a>
+#### KEEP_LAST reservations
 
 Reserve a logical history admission credit separately from physical storage. A replacement reservation claims the right to replace one retained change; it does not overwrite that change or lend its buffer to preparation. The new payload/node and deferred-retirement capacity have their own bounded memory budget. Logical depth one can temporarily require storage for old data, prepared new data and externally pinned retired data.
 
-User-requested configuration direction: a per-writer limit on outstanding prepared history reservations per instance, default one. This is a ceiling for each instance of that writer, not a count of application threads or a writer-wide aggregate budget. Standard DDS-only applications receive the default. Any public setting belongs on the writer extension interface in `zzdds.idl`; the creation-time DataWriterConfig.preparation_limit_per_instance field is defined in the extension API. Acquire reservation rights after fallible payload preparation and before a Publisher ticket. Requests exceeding the limit remain resource waiters; other instances and writers can continue. This is not an instance mutex held by an application thread and does not block ACK/repair/timer processing.
+Require a per-writer limit on outstanding prepared history reservations per instance, default one. This is a ceiling for each instance of that writer, not a count of application threads or a writer-wide aggregate budget. Standard DDS-only applications receive the default. Any public setting belongs on the writer extension interface in `zzdds.idl`; the creation-time DataWriterConfig.preparation_limit_per_instance field is defined in the extension API. Acquire reservation rights after fallible payload preparation and before a Publisher ticket. Requests exceeding the limit remain resource waiters; other instances and writers can continue. This is not an instance mutex held by an application thread and does not block ACK/repair/timer processing.
 
 The one-reservation path remains the initial simple baseline. Supporting values above one requires a bounded per-instance reservation ledger; merely raising a counter is incorrect. In particular, multiple reservations for depth one cannot each independently claim replacement of the same old entry. Use ordered reservation positions, whose replacement entitlement advances through actual commit/abort decisions: aborting a predecessor must not invalidate a successor's guaranteed storage or require work inside the commit gate. The implementation must validate the ledger, GROUP gate composition and cancellation before advertising higher values. A request whose commit still depends on predecessor resolution must not hold Publisher gate entitlement. Head-only ticket admission is selected below; exact scheduling and synchronization remain to be implemented.
 
 The selected refinement uses head-only logical history admission: later ledger entries own prepared physical storage and their ordered place, not independent claims on the same history slot. Only the head may secure actual replacement/free credit, obtain a Publisher ticket and join the gate queue. Removing a cancelled predecessor advances the ledger without renumbering or transferring ownership of a successor's prepared buffer. The successor chooses the current eligible history entry when promoted, rather than storing a pointer to a predecessor's future sample. If policy/resources prevent promotion, it waits without a Publisher ticket or gate entitlement. Thus prepared successors may cross a coherent boundary if their eventual ticket admission occurs after close; preparation alone does not establish coherent membership.
 
-All configurations preserved ledger bounds, exclusive buffer ownership, cancellation without resident-data removal, per-instance commit order and coherent-generation commit order. From every state, completion/retirement/reclamation remained reachable without cancelling any additional request. This assumes eventual service and policy-permitted removal/reclamation; it is not universal termination under arbitrary schedules. A constructed negative control admits the successor to the gate first and demonstrates that neither predecessor nor successor can commit. The head-only rule prevents that ordering.
+The ledger must preserve exclusive buffer ownership, cancellation without resident-data removal, per-instance commit order and coherent-generation commit order. Completion requires eventual service and policy-permitted reclamation. Admitting a successor to the gate before its unresolved predecessor can prevent either from committing; head-only admission prohibits that cycle.
 
 Higher configured limits permit preparation to overlap; they do not permit concurrent mutation of one writer history or bypass FIFO/resource fairness. They consume bounded prepared-payload/node/notification storage independently of DDS HISTORY depth and RESOURCE_LIMITS. Keep aggregate writer/runtime memory limits as separate admission constraints, including payloads prepared before a reservation is obtained. Do not promise improved throughput without measurement. Prefer bounded preallocated bookkeeping for configured capacity and define configuration-time failure when it cannot be provided; live resizing semantics are not selected. Until the ledger is implemented, reject unsupported values rather than silently clamp them or advertise support. A model of one capacity does not validate arbitrary configured capacities.
 
@@ -358,10 +366,10 @@ Coherent close stops new generation tickets but retains service for existing com
 
 Every request owns a ledger of reservation, history/payload references, ticket and scheduling credits. Commit transfers payload/history ownership to the cache; abort releases preparation ownership. Cleanup and stale wake consumption return remaining credits exactly once. Endpoint deletion cannot reclaim state still retained by either path.
 
-<a id="request-lifetime"></a>
+<a id="request-completion-reference-retirement-and-storage-reuse"></a>
 ## Request completion, reference retirement and storage reuse
 
-<a id="request-lifetime--1-three-distinct-boundaries"></a>
+<a id="three-distinct-boundaries"></a>
 ### Three distinct boundaries
 
 | Boundary | Required condition | What becomes possible |
@@ -383,10 +391,10 @@ reclamation remains, a retained history/pin/reclamation owner accounts for it;
 the request must not leave an untracked cleanup obligation. Operation-specific
 postcommit waits remain distinct and may delay that operation's result completion.
 
-<a id="request-lifetime--2-separate-identity-from-order-and-lifetime"></a>
+<a id="separate-identity-from-order-and-lifetime"></a>
 ### Separate identity from order and lifetime
 
-Use a stable pool control block with identities of the form `(pool, slot,
+**Conforming approach — pooled storage.** Use a stable pool control block with identities of the form `(pool, slot,
 slot_generation)`. The pool component may be implicit when an enclosing retained
 object unambiguously identifies it. Request and history-node pools have distinct
 identities even if their storage is allocated together. Neither a naked pointer
@@ -400,8 +408,8 @@ Four counters have different purposes:
 * Ledger order identifies write admission order within an instance.
 
 Reusing a slot must not change ledger ordering, coherent membership or sequence
-numbers. Replace the prototype's `req[0..id]` order scan with explicit retained
-instance-ledger links before enabling reuse. A ledger holds references until
+numbers. Maintain explicit retained instance-ledger order independent of reusable
+slot indices. A ledger holds references until
 unlinking; slot position has no ordering meaning. History must identify a node,
 not refer back to a request record merely to recover sample identity. Sequence
 metadata and immutable diagnostics can be copied without retaining the request.
@@ -412,7 +420,7 @@ wait generations; do not roll them over while an old notification can survive.
 Exact widths and configured pool sizes are implementation choices, not settled
 by this contract.
 
-<a id="request-lifetime--3-reference-acquisition-and-transfer"></a>
+<a id="reference-acquisition-and-transfer"></a>
 ### Reference acquisition and transfer
 
 Pool metadata remains alive independently of individual entries. A lookup by a
@@ -452,7 +460,7 @@ cleanup may not fail because external work exhausted the pool. Coalescing is val
 only with a retained producer/publication obligation and a synchronized predicate.
 Queue duplication must not create uncounted references or double releases.
 
-<a id="request-lifetime--4-cancellation-obsolete-notifications-and-completion"></a>
+<a id="cancellation-obsolete-notifications-and-completion"></a>
 ### Cancellation, obsolete notifications and completion
 
 Cancellation still competes with commit at the protected effect boundary. Winning
@@ -483,7 +491,7 @@ a slot occupied; bounded capacity must report this rather than silently recycle 
 A synchronous wrapper can copy its result and drop the handle before returning.
 Neither behavior introduces a new standard DDS API.
 
-<a id="request-lifetime--5-history-nodes-payloads-and-replacement-reservations"></a>
+<a id="history-nodes-payloads-and-replacement-reservations"></a>
 ### History nodes, payloads and replacement reservations
 
 Node lifecycle is independent of request lifecycle. Preparation owns the new node;
@@ -515,7 +523,7 @@ itself specify that executor or allocator adapter. Multi-stage preparation rollb
 uses the same ownership ledger: every successful stage is either transferred to
 the next stage or reclaimed after failure, including failure before any ticket exists.
 
-<a id="request-lifetime--6-reusable-state-decision-and-teardown"></a>
+<a id="reusable-state-decision-and-teardown"></a>
 ### Reusable-state decision and teardown
 
 A request becomes eligible for reclamation only when completion is published,
@@ -540,19 +548,20 @@ still be able to service reclamation, or final-release cleanup must have a defin
 safe synchronous path. Do not enqueue work onto workers that have been destroyed.
 The initial contract requires explicit reclamation completion before destroying
 the pool; it does not require hidden threads, waiting inside callbacks, or recursive
-protocol execution. Whether a public destroy operation reports outstanding owners
-or follows another allowed deletion policy remains a separate API decision.
+protocol execution. Public deletion results follow [operations](operations.md) and [listeners](listeners.md);
+resource completion is the separate [runtime](runtime.md) reclamation fence.
 
-This document does not select atomic cancel-all versus close-then-cancel shutdown
-semantics. Either choice must preserve already-claimed commit resources and these
-retained lifetimes. No extension belongs in `dcps.idl`; any future nonstandard
+Internal shutdown may batch cancellation or close admission before cancelling
+uncommitted work, but must preserve already-claimed commit resources and retained
+lifetimes. The observable close/results/retirement rules in [runtime](runtime.md) and
+[operations](operations.md) apply to either implementation. No extension belongs in `dcps.idl`; any future nonstandard
 runtime/result configuration belongs on `zzdds.idl` extension interfaces, with
 safe default ownership for standard-only applications.
 
-<a id="concurrency-fast-paths"></a>
+<a id="fast-paths-and-progress-profiles"></a>
 ## Fast paths and progress profiles
 
-<a id="concurrency-fast-paths--ordinary-operations"></a>
+<a id="ordinary-operations"></a>
 ### Ordinary operations
 
 PRESENTATION eligibility is fixed at creation. INSTANCE writes do not acquire GROUP
@@ -580,7 +589,7 @@ control work without dropping required changes. No new application flush API is 
 Suspension is an output hint, not a reason for every ordinary write to enter GROUP admission;
 resume must signal pending output even if no further writes occur.
 
-<a id="concurrency-fast-paths--topic-coherent-completion"></a>
+<a id="topic-coherent-completion"></a>
 ### TOPIC coherent completion
 
 For coherent TOPIC Publishers, publish depth and generation consistently. Only outermost
@@ -611,8 +620,7 @@ Sequence capacity must also be checked before effects; never preassign a marker 
 that later data would need to precede.
 
 Direct retained per-writer scheduling is also permitted if it meets the same ordering,
-lifetime, completion-capacity and bounded-progress requirements. One conforming
-implementation uses a retained Publisher close-scan obligation with a
+lifetime, completion-capacity and bounded-progress requirements. **Conforming approach — retained close scan.** One implementation uses a retained Publisher close-scan obligation with a
 fixed membership frontier and
 closed-generation high-water. Child publication/removal and frontier capture share a
 short metadata synchronization boundary. Each writer has a pre-reserved seal command;
@@ -631,7 +639,7 @@ retains required cleanup references and does not fabricate completion for an inc
 set. Publisher deletion follows the same rule for its subtree. End closes metadata and
 publishes/reserves the scan obligation, then returns without waiting for writer turns.
 
-<a id="concurrency-fast-paths--helping-and-fairness"></a>
+<a id="helping-and-fairness"></a>
 ### Helping and fairness
 
 Hosted ordinary application callers do not help by default. Background workers guarantee
@@ -648,7 +656,7 @@ inversion for GROUP and bound turn/critical-section work rather than promise rea
 priority inheritance. Stage remote view reconciliation in budgeted turns with fair local
 progress and a short validated visibility commit; avoid absolute local priority starvation.
 
-<a id="concurrency-fast-paths--cooperative-measurement-profile"></a>
+<a id="cooperative-measurement-profile"></a>
 ### Cooperative measurement profile
 
 Initial target: one participant/manual runtime, one bounded reliable writer/reader with
@@ -663,7 +671,7 @@ async completion ownership. Produce flash/static/peak RAM measurements on a name
 configuration, including history replacement overlap, marker reserves and pinned retired
 samples. No MCU size claim follows from a compressed hosted binary or test-only struct.
 
-<a id="concurrency-fast-paths--required-footprint-worksheet"></a>
+<a id="required-footprint-worksheet"></a>
 #### Required footprint worksheet
 
 Measure one concrete target/build with explicit endpoint/history/payload capacities.
@@ -683,3 +691,24 @@ A single-thread build may remove mutex/atomic synchronization under exclusive ow
 it retains state transitions, generations, pins and asynchronous completion bookkeeping.
 GROUP/content-query-exclusive state must compile out when disabled. Report flash, static
 RAM and peak RAM, not compressed hosted executable size or only `sizeof` of one struct.
+
+## Required integration paths
+
+Consolidate periodic tasks into runtime timer work; writers must not require individual
+heartbeat threads. Manual and hosted drivers advance the same state machines. Compile a
+minimal freestanding core without thread, sleep or socket dependencies; platform adapters
+supply those services. That compile establishes isolation, not a complete MCU DDS profile.
+
+Validate these paths with both drivers and bounded resources:
+
+| Path | Required ordering and observations |
+| --- | --- |
+| Receive to callback | Transport completion → owner admission → parse/history/status commit → notification eligibility → release protocol ownership → callback claim and inline entry or retained pending work. Deferral must not delay ACK solely for a callback; history policy still governs acknowledgment. Count allocations and handoffs. |
+| Reliable write under backpressure | Prepare/retain → attempt history admission → publish if admitted, otherwise register predicate/deadline → release rights → background/internal manual progress → retry or operation-specific timeout/closure. No check/insertion gap, deadline restart or mutex retained across waiting. |
+| Shutdown | Close admission → invalidate new work for closing lifetimes → wake/cancel and quiesce affected ingress → finish retained effects/application uses → reclaim when references/loans permit. Never join the executing callback or break shared channels used by other contexts. |
+
+Exercise loss, saturation, continuous ingress, stale completion and callback-initiated
+closure, with equivalent observable results under manual and hosted progress. Report
+uncontended and overloaded p50/p95/p99 latency, handoffs, queue depth, CPU and memory.
+Hosted validation includes races; manual validation includes bounded work/stack use and
+reproducible scheduling. No fixed latency target is inferred from a scalar model.
