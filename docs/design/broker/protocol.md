@@ -1265,9 +1265,11 @@ Both client and selected logical broker participant must advertise that scope in
 introduction. Broker-profile client SPDP requires explicit domain ID; absent domain tag
 means empty. No source-port inference, case folding or realm alias selects scope.
 
-REGISTER and every established Envelope must equal that retained scope; equality does
-not itself authorize the principal. Recheck current session/owner at commit. A syntactically
-valid foreign-scope Envelope cannot select another scope's store or return its contents.
+REGISTER's requested scope must equal that retained scope. An established Envelope carries
+no scope: the scope of the validated endpoint association it arrives on must equal the
+retained scope. Equality does not itself authorize the principal. Recheck current
+session/owner at commit. An Envelope arriving on another scope's association cannot select
+this scope's store or return its contents.
 Destination endpoint/association, introduction/session and scope must agree independently.
 
 For an origin participant record, validate payload GUID/incarnation/domain identity against

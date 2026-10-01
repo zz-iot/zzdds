@@ -200,10 +200,20 @@ or an optimisation on an already-improved path):
   for the `_w_condition` family is a separate, not-yet-done retrofit (`idl/dcps.idl:1114`).
 - **`@standalone` interface annotation is inert** — placed so a future validation pass has
   something to check; no codegen reads it (`idl/dcps.idl:283`).
-- **`dds-rtps` `CoherentSets_1x/2x` flakiness is a test-harness issue, not zzdds** —
-  `coherent_sets_w_instances` asserted a poll-timing coincidence (exactly 36 samples per
-  read cycle). ~2,500 runs found no ordering/loss/tear faults in any direction or build.
-  Fix PR'd to `omg-dds/dds-rtps`. See `implementation_status.md` / `decisions.md`.
+- **`dds-rtps` `CoherentSets_10/11/12/19/20/21` still flake: the harness check needs
+  re-fixing.** The cause is harness timing, not zzdds: `coherent_sets_w_instances` judges
+  each read iteration, so it depends on how the subscriber's take period lines up with the
+  publisher's writes. The 2026-08-28 campaign (~2,500 runs) found no ordering, loss,
+  duplication or coherent-set-tear faults. Our rewrite, which judged the whole run and
+  removed the flake, was declined upstream in favour of improving the per-iteration
+  assertions (`6d9c01d`, non-GROUP checks only). That reduced the flake but did not remove
+  it: when read and write iterations drift far out of step, the tests still report
+  `DATA_NOT_CORRECT`. This happens on both check variants, non-GROUP (10, 11, 19, 20) and
+  GROUP (12, 21, which still expects exactly 36 samples per set), most often in the
+  DebugAllocator lanes (four failures across #94 and #95). Next: re-fix the check logic and
+  propose it upstream again; if it is not accepted, carry it on the `zz-iot/dds-rtps`
+  branch CI already pins (`INTEROP_RTPS_REF`), merging upstream `master` into it to stay
+  current. See `implementation_status.md` / `decisions.md`.
 
 ### Bindings
 
@@ -284,12 +294,15 @@ or an optimisation on an already-improved path):
   time-out negative case left out of `catchup` itself is no longer on this list — it's
   covered by the `wait-for-historical-data` Integration-tier scenario instead (see
   `docs/design/dcps-api-coverage-audit.md`).
-- **Integration-tier pairs intermittently never discover each other — cause unknown.**
-  In `cft-reconfigure`, `liveliness-lost`, `source-timestamp` and `sample-rejected-lost`,
-  one pair per CI job (almost always the job's first, zig subscriber ← zig publisher)
-  reports zero matches for the whole 20–40 s window ("readers never matched", "no reader
-  matched"), while every later pair in the same job passes. SPDP re-announces every 3 s,
-  so that is 7–13 consecutive missed announcements: the packet-loss-and-retransmit
+- **Cross-binding pairs intermittently never discover each other — cause unknown.**
+  In the integration tier (`cft-reconfigure`, `liveliness-lost`, `source-timestamp`,
+  `sample-rejected-lost`), a pair (most often the job's first, zig subscriber ← zig
+  publisher, sometimes two pairs in one job) reports zero matches for the whole 20–40 s
+  window ("readers never matched", "no reader matched"), while the other pairs in the
+  same job pass. The examples tier shows it too, including on Windows: in #95's CI one
+  `hello-world-cross-binding` pair (java publisher → zig subscriber) found no reliable
+  reader within 10 s while the other 11 pairs passed. SPDP re-announces every 3 s, so a
+  20–40 s window is 7–13 consecutive missed announcements: the packet-loss-and-retransmit
   explanation recorded under *Discovery bootstrap latency* (~1.5 s recovery) does not
   account for it. `cft-reconfigure` failed 2 of 17 runs before #92 merged and 4 of 4 runs
   after, although the merged tree is identical to the last passing PR head, so a CI

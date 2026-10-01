@@ -6,12 +6,14 @@ zidl's generated codec against those vectors. It is not a broker implementation,
 complete protocol model or interoperability certification.
 
 ```sh
-python3 scripts/check_design_specs.py   # or: zig build test-design-models
-ZIDL_EXE=/path/to/zidl ZIG_EXE=/path/to/zig bash docs/design/probes/run_broker_wire_codec.sh
+zig build test-design-models              # everything below; runs in CI
+python3 scripts/check_design_specs.py     # registry and vectors only; needs only Python
+zig build test-design-models --fork=../zidl   # codec probe against a local zidl checkout
 ```
 
-The first command needs only Python and runs in CI. The codec probe needs a built zidl
-(v0.3.19 or later, which writes XCDR2 collection DHEADERs) and a Zig executable.
+`test-design-models` generates the draft schema's codec with zzdds's pinned zidl (v0.3.19
+or later writes the XCDR2 collection DHEADERs the vectors require), compiles the probe
+against its zidl-rt runtime, and runs the Python checks. It is not part of `zig build test`.
 
 | Artifact | Coverage | Limit |
 | --- | --- | --- |

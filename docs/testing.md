@@ -119,8 +119,9 @@ formal verification).
 
 ## Broker wire-format checks
 
-`python3 scripts/check_design_specs.py` (or `zig build test-design-models`) checks the
-discovery-broker schema's identifier registry and re-derives every independent wire vector
-from the specification's byte rules. A dedicated `design-validation` CI job runs it; it
-needs only Python. The generated-codec probe needs a built zidl and runs separately; see the
+`zig build test-design-models` checks the discovery-broker schema's identifier registry,
+re-derives every independent wire vector from the specification's byte rules, and checks
+that the codec the pinned zidl generates from the draft schema reproduces those vectors.
+A dedicated `design-validation` CI job runs it; it is not part of `zig build test`.
+`python3 scripts/check_design_specs.py` runs the registry and vector checks alone. See the
 [broker wire-format evidence](design/probes/README.md).

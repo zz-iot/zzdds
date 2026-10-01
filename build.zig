@@ -1321,9 +1321,34 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
 
-    const design_step = b.step("test-design-models", "Check the broker schema registry and independent wire vectors");
+    // Broker design evidence (docs/design/probes/README.md): the Python check re-derives the
+    // independent wire vectors; the codec probe compiles the draft schema with the pinned
+    // zidl and checks the generated codec reproduces them. Not part of `test`.
+    const design_step = b.step("test-design-models", "Check the broker schema registry, wire vectors and generated codec");
     const design_run = b.addSystemCommand(&.{ "python3", "scripts/check_design_specs.py" });
     design_step.dependOn(&design_run.step);
+    const gen_broker = b.addRunArtifact(zidl_exe);
+    gen_broker.addArgs(&.{ "-b", "zig", "--no-typeobject-support", "-o" });
+    const gen_broker_dir = gen_broker.addOutputDirectoryArg("zzdds-generated-broker-draft");
+    gen_broker.addFileArg(b.path("docs/design/schema/broker-control-draft.idl"));
+    const broker_codec_test = b.addTest(.{
+        .name = "broker_wire_codec",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("docs/design/probes/broker_wire_codec.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wire", .module = b.createModule(.{
+                    .root_source_file = gen_broker_dir.path(b, "broker-control-draft.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod }},
+                }) },
+                .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            },
+        }),
+    });
+    design_step.dependOn(&b.addRunArtifact(broker_codec_test).step);
 
     // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
     const emit_tests_step = b.step("emit-tests", "Build test binaries for kcov coverage analysis");

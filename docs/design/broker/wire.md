@@ -287,10 +287,11 @@ Because the current request value is aligned already, its fixture has no termina
 padding; padding inclusion remains the general hash rule. Old realm-era hash values
 are replaced, not retained as a second supported encoding. No production ABI was frozen.
 
-Revised generated sizes with two endpoint pairs: 8-byte tag/two features/no resume:
-REGISTER 380, ACCEPT 476; 256-byte tag/128 features/resume: REGISTER 1240, ACCEPT 1336.
-These include Frame encoding, exclude transport/RTPS/security, and are not complete
-semantically authorized sessions. Whole-exchange preflight remains mandatory.
+Generated REGISTER/ACCEPT/PATH sizes with two endpoint pairs, across domain-tag, feature
+and resume variants, are measured in the
+[evidence inventory](../probes/README.md#bootstrap-and-established-message-sizing). They
+include Frame encoding, exclude transport/RTPS/security, and are not complete semantically
+authorized sessions. Whole-exchange preflight remains mandatory.
 
 <a id="broker-metadata-negotiation-and-endpoint"></a>
 ## Broker metadata, negotiation and endpoint
