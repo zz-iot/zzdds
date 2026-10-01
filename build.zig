@@ -763,14 +763,6 @@ pub fn build(b: *std.Build) void {
                 .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
                 .flags = &.{ "-std=c99", "-Wall" },
             });
-            cpp_smoke_mod.addIncludePath(gen_smoke_cpp_dir);
-            cpp_smoke_mod.addIncludePath(gen_c_dir);
-            cpp_smoke_mod.addIncludePath(gen_zzdds_c_dir);
-            cpp_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
-            cpp_smoke_mod.addIncludePath(b.path("include"));
-            cpp_smoke_mod.linkLibrary(zzdds_lib);
-            const cpp_smoke = b.addExecutable(.{ .name = "zzdds_cpp_binding_smoke", .root_module = cpp_smoke_mod });
-            binding_smoke_step.dependOn(&b.addRunArtifact(cpp_smoke).step);
 
             // Binding smoke test for zzdds_cpp.hpp's allocator-injection surfaces
             // (factory bootstrap + C++ wrapper-object PMR allocation), including
@@ -837,6 +829,24 @@ pub fn build(b: *std.Build) void {
             _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_c_dir.path(b, "zzdds.h"), "zzdds.h");
             _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_cpp_impl_dir.path(b, "zzdds_impl.hpp"), "zzdds_impl.hpp");
             const alloc_smoke_zzdds_impl_cpp = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_cpp_impl_dir.path(b, "zzdds_impl.cpp"), "zzdds_impl.cpp");
+
+            // The C++ binding smoke test's generated header includes "dcps.hpp"
+            // (typed-reader condition methods take std::shared_ptr<DDS::ReadCondition>)
+            // and its CDR source includes "dcps_impl.hpp" (and links against the
+            // DataReaderImpl/DataWriterImpl definitions in dcps_impl.cpp), so it uses
+            // the same merged, deduplicated directory: one copy each of
+            // dcps.h/zzdds.h/dcps.hpp, for the reason given above.
+            cpp_smoke_mod.addCSourceFile(.{
+                .file = alloc_smoke_dcps_impl_cpp,
+                .flags = &.{ "-std=c++17", "-Wall" },
+            });
+            cpp_smoke_mod.addIncludePath(gen_smoke_cpp_dir);
+            cpp_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+            cpp_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            cpp_smoke_mod.addIncludePath(b.path("include"));
+            cpp_smoke_mod.linkLibrary(zzdds_lib);
+            const cpp_smoke = b.addExecutable(.{ .name = "zzdds_cpp_binding_smoke", .root_module = cpp_smoke_mod });
+            binding_smoke_step.dependOn(&b.addRunArtifact(cpp_smoke).step);
 
             const cpp_alloc_smoke_mod = b.createModule(.{
                 .root_source_file = null,

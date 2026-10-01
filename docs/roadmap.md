@@ -217,6 +217,29 @@ or an optimisation on an already-improved path):
 
 ### Bindings
 
+- **C++ application code still reaches raw C handles through `native_handle()`.** zidl's
+  generated `{T}TypeSupport::register_type` and typed `{T}DataReader`/`{T}DataWriter`
+  constructors take C-ABI handles (zidl roadmap, *C++ backend*), so the C++ examples
+  (waitset, registry, raw-loan, discovery, shape) call `register_type(dp->native_handle())`
+  and build typed readers/writers from `dr->native_handle()` / `dw->native_handle()`. Once
+  zidl accepts the C++ entity objects, migrate the examples and narrow `native_handle()` to
+  an explicit interop accessor. The exported `DDS_*` C ABI itself stays: it is the C
+  binding's public API, the layer the C++ and Java bindings are built on, and what
+  `rmw_zzdds` deliberately uses.
+- **Zig: `dcps/root.zig` publicly re-exports implementation types.** Zig has no
+  package-private visibility, so `DomainParticipantFactoryImpl`, `DomainParticipantImpl`,
+  `PublisherImpl`, `SubscriberImpl`, `SubscriberParticipantCbs`, `DataWriterImpl`,
+  `guidToHandle`, `DataReaderImpl`, `PendingChange`, `CoherentWipEntry`, `TakenSample`,
+  `TopicImpl`, `ContentFilteredTopicImpl`, `WaitSetImpl`, `GuardConditionImpl`,
+  `StatusConditionImpl`, `ReadConditionImpl`, `QueryConditionImpl`, `DataNotifyFn` and
+  `WakeupHandle` are reachable as `zzdds.dcps.*`, which let application code cast into
+  internals instead of using the generated interfaces (`dds-rtps`'s Zig shape app did,
+  fixed 2026-09-22). Checked feasible then: zzdds's own code imports these through relative
+  paths, no external Zig consumer uses them (`rmw_zzdds` has no Zig code), and zidl's
+  generated code does not reference them. Keep public `TypeSupport`, `filter`
+  (`FilterValue`/`CdrFieldGetter`, used by generated `getFieldFromCdr`) and the
+  `nil_*`/`NIL_PTR` sentinels. Small edit; verify with `zig build test`, the strict
+  examples suite and a `dds-rtps` rebuild.
 - **Java: a few DCPS ops taking a bare `sequence<T>` parameter** (not inside a struct) throw
   `UnsupportedOperationException` (`get_datareaders`, some batch ops). `zzdds.idl`
   vendor-extension / cross-file type refs in zidl's Java backend may be partly stale versus
