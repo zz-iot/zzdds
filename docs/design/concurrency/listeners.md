@@ -1123,6 +1123,18 @@ bulk calls still never become drain barriers, even with empty live membership.
 <a id="one-reservation-before-descendant-inspection"></a>
 #### One reservation before descendant inspection
 
+Required properties: a deletion preflight observes a fixed structural membership for
+its selected root, and no new child, condition, loan obligation or cross-subtree
+reference can be published into that membership between inspection and the commit/abort
+decision. No context execution turn, application callback, loan return or network wait
+is held or awaited while that membership is fixed. Disjoint deletions do not serialize
+each other beyond short metadata synchronization. The pause/continue table below and the
+[operations contract](operations.md#mapping-table) define the observable results.
+
+**Conforming approach — participant lifecycle coordinator.** The remainder of this
+section describes one mechanism satisfying those properties; another is permitted if
+it preserves them and the observable table.
+
 Use a participant-local lifecycle coordinator with short metadata critical sections.
 Publish one reservation for the selected root before inspecting its descendants.
 The reservation freezes relevant structural publication through that root; it is

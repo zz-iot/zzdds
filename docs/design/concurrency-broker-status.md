@@ -90,7 +90,7 @@ relays, opaque mode and v1.1 continuity recovery belong to their expressly defer
 | --- | --- |
 | Concurrency | Real queue/publication/memory-order correctness, cancellation, callback exclusion, claim restoration, conditions, manual/hosted retirement and bounded fairness |
 | Optional presentation | Actual TOPIC markers and repair; GROUP coherent visibility, history/lifespan interactions and incomplete-set handling. Concurrency invariants do not supply the entire optional wire profile. |
-| Bindings and ABI | Generated zzdds.idl extensions, generic zidl reference/Config ownership, nil/default/error behavior, mixed file configuration and language exception/cleanup tests |
+| Bindings and ABI | Generated zzdds.idl extensions, generic zidl reference/Config ownership (specified in the zidl repository's `docs/design/managed-references.md`; required only for the advanced extension objects, not the first shipped subset), nil/default/error behavior, mixed file configuration and language exception/cleanup tests |
 | Broker introduction | Recipient-specific inline SPDP context with unchanged canonical payload; both transport ingress paths, domain ID/tag, bounded whole-message sizing and same-source replies |
 | Parsing/storage | Required/unique mutable members, exact final extent, malformed/oversize nested bodies, retained bytes, allocation failure, bounded reassembly and native peak-memory accounting |
 | Broker state machine | Loss/reorder/duplicate/expiry tests across PATH/REGISTER/inventory/view/freshness/close, retained resume identity, local activity during outage and direct-source coexistence |

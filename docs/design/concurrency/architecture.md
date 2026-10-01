@@ -303,6 +303,15 @@ Conceptual states: QUEUED -> ENTITLED -> ACTIVE -> FINISHED, or QUEUED/ENTITLED 
 <a id="handoff-protocol"></a>
 ### Handoff protocol
 
+Required properties: GROUP commits obtain the metadata gate in FIFO entitlement order;
+an entitled request holds no gate or writer rights while waiting for its writer turn;
+no executor spins, allocates to publish a wake, or waits for another context while
+holding the gate; cancellation transfers entitlement exactly once; and snapshot requests
+receive bounded fair service alongside commits.
+
+**Conforming approach.** The numbered handoff below satisfies those properties;
+another synchronization design is permitted if it preserves them.
+
 1. Under a short admission gate, append once to the FIFO. If there is no active request or entitlement, select the head and assign a unique entitlement generation. Publish its retained writer-ready notification as part of the synchronized handoff protocol.
 2. Do not acquire writer execution while holding the admission/metadata gate. The notification joins the writer's ordinary ready FIFO. A direct path is permitted when both writer admission and gate entitlement are immediately eligible, respecting runtime budgets and older work.
 3. When the continuation gets writer execution, validate the entitlement and prepared resources. Atomically claim ACTIVE and the physical metadata gate using a nonblocking try. If the short admission gate is occupied, register a generation-aware retry, release writer rights, and leave the entitlement in place. Registration and release notification must share synchronization; do not spin or repeatedly enqueue duplicate retries.

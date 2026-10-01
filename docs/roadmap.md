@@ -29,9 +29,10 @@ Forward-looking only: known gaps, planned features, and open design questions.
   updates and SEDP/WLP matching, including direct discovery. Regenerate config/bindings
   and test defaults, domain/tag mismatch, malformed inputs and both byte orders. See
   the [accepted domain identity decision](design/broker/coexistence.md#standard-domain-identity-replaces-broker-realm). Not yet
-  implemented as a complete feature; explicit domain-ID emission/decoding and SPDP
-  mismatch filtering are now in the working tree. Tag propagation and remaining
-  admission checks are still required; opaque unknown-PID retention is insufficient.
+  implemented as a complete feature. Explicit domain-ID emission/decoding and SPDP
+  mismatch filtering are a separate, independently reviewed change; domain-tag
+  propagation and the remaining admission checks are still required. Opaque unknown-PID
+  retention is insufficient.
 
 - **Strengthen reception and admission boundaries** — audit the path from input
   validation through RTPS sequence/ACK accounting, DDS processing and history admission.
@@ -54,7 +55,9 @@ Forward-looking only: known gaps, planned features, and open design questions.
 - **Static and broker discovery plugins** — `src/discovery/interface.zig` and the config
   schema reserve `static` and `broker` discovery kinds, but only SPDP/SEDP and direct
   in-process discovery are implemented. Either implement static-config loading + broker
-  client support, or remove the advertised config surface, before v1.
+  client support, or remove the advertised config surface, before v1. The broker
+  client/service is specified in [the broker contracts](design/concurrency-broker-status.md);
+  its implementation sequence and acceptance criteria are listed there.
 - **MTU-aware fragment sizing** — `rtps.fragment_size` is a static config value. Add an
   interface-MTU / path-MTU aware default (accounting for IP / UDP / RTPS / future security
   overhead) while keeping the explicit override for deterministic tests.
@@ -683,45 +686,30 @@ acceptable if a runtime switch proves impractical). The design must account for:
   (DEADLINE/LIVELINESS, interface-change poll, wire-trace flush; possibly heartbeat and
   SPDP) collapse onto one scheduler regardless of the model chosen.
 
-Drafts: [Concurrency model: state ownership and progress](design/concurrency/architecture.md#concurrency-model-state-ownership-and-progress)
-and [Listener execution contract](design/concurrency/listeners.md#listener-execution-contract). They separate agreed
-requirements from proposals and open decisions. Take-turns execution with an explicit
-admission boundary is selected initially. The participant-plus-endpoint ownership proposal
-and parent coordinator interactions are consolidated in concurrency-model section 4.4;
-shared GROUP access brackets and optional-profile removal are agreed. Backend, API and
-exact build flags remain open. Refined FIFO/resource-fair admission and a shared runtime
-progress domain are accepted. The [test-only synchronization prototype](design/concurrency-broker-status.md)
-now covers integrated admission/commit, idle-worker wakeup/shutdown, explicit-time
-operation expiry, and snapshot FIFO service under finite workloads and partial-installation
-checkpoints. Prepared storage now includes allocator-backed payloads, explicit
-replacement reservations and delayed pin reclamation. The [integrated review](design/concurrency-broker-status.md)
-prioritizes explicit completion/reference retirement and safe request/node reuse,
-then bounded preparation/reclamation publication and FIFO helper admission.
-The [lifetime/reuse proposal](design/concurrency/architecture.md#request-completion-reference-retirement-and-storage-reuse) now specifies these
-boundaries. A separate tiny-pool experiment now exercises reuse and delayed
-references. Admission queue/executor/gate/observer ownership transfers are now
-integrated and structurally audited. Independent node identity/reuse, explicit ledger
-order and checked request handles now complete the current experiment checkpoint.
-The [listener identity note](design/concurrency/listeners.md#listener-identity) proposes default
-identity scope. Replacement/quiescence now has an accepted initial contract and
-a bounded retirement-frontier fixture; binding identity and callback delegation
-remain specification work.
-The [specification status map](design/concurrency-broker-status.md) recommends closing
-this validation branch and resolving remaining listener/runtime/transport contracts,
-then consolidating the concurrency suite and revising the broker proposal. Integrated
-request-slot reuse and production storage work remain explicit later tasks.
-Remaining work also includes automatic
-clock/timer integration, production storage/index and reuse coverage, and remaining
-listener identity/lifecycle details before committing to
-the production runtime refactor.
+Specified: the [concurrency and broker contracts](design/concurrency-broker-status.md)
+now define the behavioral baseline (take-turns participant/endpoint contexts, one shared
+manual/hosted progress engine, listener exclusion with inline eligibility, operation
+results/waits, runtime ownership/retirement and the transport boundary). Their open
+design items, implementation gates and acceptance criteria are listed in that index.
+Remaining work is implementation: the first vertical slice (one reliable reader/writer
+pair under manual and hosted drivers, listeners, timed waits and automatic retirement),
+then broader endpoint migration, thread consolidation onto the shared runtime timers,
+optional-profile builds and the measured latency/footprint work. The test-only
+synchronization prototype under `test/concurrency/` is design evidence, not production
+code. Advanced extension objects (explicit runtime owners/refs, listener groups, resource
+scopes) additionally depend on zidl's managed-reference/construction-only Config
+support; the first shipped subset does not.
 
 ### Single-threaded / embedded `drive(timeout)` API
 
 Even a minimal two-participant setup runs several background threads. An embedded target
 needs a `DomainParticipant.drive(timeout)` that pumps transport polling + `checkTimers()`
 from the caller's loop with no threads spawned. The design keeps this possible (non-blocking
-transport seams, explicit `checkTimers()`) but nothing implements it. Scoped together with
-the concurrency-model task above.
+transport seams, explicit `checkTimers()`) but nothing implements it. Now specified as the
+[ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
+(`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
+measurement profile in the concurrency architecture; implementation follows the
+concurrency task above.
 
 ### CDR-layer allocator scoping vs. the entity layer
 
