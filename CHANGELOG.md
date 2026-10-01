@@ -8,6 +8,16 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-09-30
+
+- **SPDP carries and enforces the participant's domain ID.** Every SPDP announcement
+  now includes `PID_DOMAIN_ID` (0x000f). Received SPDP that names a different domain is
+  dropped before its locators are learned, so it neither discovers a participant nor
+  refreshes an existing participant's lease. This matters wherever
+  port mapping alone doesn't keep domains apart: a shared TCP or unicast locator, or
+  colliding port mappings. SPDP without the PID is treated as belonging to the
+  receiver's domain, as the spec requires, so peers that omit it still interoperate.
+
 ## 2026-09-25
 
 - **Full four-language example mesh on Windows.** All nine mesh runners support

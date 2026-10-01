@@ -545,6 +545,13 @@ pub const SpdpEndpoints = struct {
             log.spdp.warn("spdp: decode error: {}", .{err});
             return;
         };
+        // Drop another domain's announcement (PID_DOMAIN_ID) before learning its
+        // locators or refreshing participant state. An absent PID means the
+        // receiver's own domain.
+        if (kp.data.domain_id != self.domain_id) {
+            kp.deinit();
+            return;
+        }
         self.filterKnownParticipantLocators(&kp);
         const now_ns = self.clock.nowNs();
         kp.expires_ns = now_ns + @as(i64, @intCast(kp.data.lease_duration_ms)) * std.time.ns_per_ms;
@@ -892,6 +899,7 @@ pub fn encodeSpdpParticipant(alloc: std.mem.Allocator, ann: *const ParticipantAn
     });
 
     var out: Disc.SPDPdiscoveredParticipantData = .{
+        .domainId = ann.domain_id,
         .protocolVersion = .{ .major = 2, .minor = 5 },
         .vendorId = .{ .vendorId = pid_mod.ZZDDS_VENDOR_ID },
         // RTPS §9.3.1.5: a participant's GUID entity_id is always the
@@ -1005,7 +1013,7 @@ pub fn decodeSpdpParticipant(
                 .prefix = decoded_prefix,
                 .entity_id = EntityIds.participant,
             },
-            .domain_id = domain_id,
+            .domain_id = data.domainId orelse domain_id,
             .name = name,
             .metatraffic_unicast_locators = meta_uc,
             .metatraffic_multicast_locators = meta_mc,
