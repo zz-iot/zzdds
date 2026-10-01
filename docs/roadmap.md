@@ -4,7 +4,7 @@ Forward-looking only: known gaps, planned features, and open design questions.
 
 - Shipped work → [`../CHANGELOG.md`](../CHANGELOG.md)
 - What exists today + its limitations → [`implementation_status.md`](implementation_status.md)
-- Fleshed-out designs → [`design/`](design/)
+- Fleshed-out designs → [`design/`](design)
 - Rationale for stable decisions → [`decisions.md`](decisions.md)
 
 > **Restructured 2026-08-27.** This file used to also hold dated shipped-work write-ups.
@@ -22,10 +22,41 @@ Forward-looking only: known gaps, planned features, and open design questions.
 
 ### Discovery / RTPS / transport
 
+- **Standard RTPS domain tags and domain identity admission** — required prerequisite
+  for broker discovery, replacing the proposed broker realm. Add DomainConfig.tag
+  (empty default), PID_DOMAIN_TAG (0x4014, string<256>) and PID_DOMAIN_ID decoding/
+  announcement support. Enforce identity before native peer installation, locator/lease
+  updates and SEDP/WLP matching, including direct discovery. Regenerate config/bindings
+  and test defaults, domain/tag mismatch, malformed inputs and both byte orders. See
+  the [accepted domain identity decision](design/broker/coexistence.md#standard-domain-identity-replaces-broker-realm). Not yet
+  implemented as a complete feature. PID_DOMAIN_ID emission/decoding and SPDP domain
+  mismatch filtering landed separately (#94); domain-tag propagation and the remaining
+  admission checks are still required. Opaque unknown-PID retention is insufficient.
+
+- **Strengthen reception and admission boundaries** — audit the path from input
+  validation through RTPS sequence/ACK accounting, DDS processing and history admission.
+  The [historical-data wait audit](design/concurrency/operations.md#historical-data-wait-contract) identifies sequence
+  accounting before fallible cache operations, discarded failures and a void internal
+  delivery callback that cannot report admission outcomes. Define explicit outcomes
+  for admission, policy exclusion, resource rejection, retained retry and terminal
+  failure; distinguish these from malformed/untrusted input. Review ACK/repair behavior
+  per outcome rather than moving every ACK after cache admission indiscriminately.
+  Preserve GAP/filter/removal distinctions where available, and never let unrelated
+  invalid traffic complete or fail a legitimate historical transfer. Make space for
+  future XTypes validation/type lookup and DDS Security authentication/authorization
+  without claiming those features implemented. Validate with malformed/fragmented
+  input, allocation/resource fault injection, GAPs, retransmission and teardown races;
+  check bounded retention, correct status reporting and absence of false completion.
+  The concurrency spec owns state ownership, handoff and completion requirements;
+  this roadmap task owns the production audit, fixes and integration tests. It need
+  not block finishing that spec or the broker design, but affected implementation
+  guarantees require these fixes and tests before being claimed.
 - **Static and broker discovery plugins** — `src/discovery/interface.zig` and the config
   schema reserve `static` and `broker` discovery kinds, but only SPDP/SEDP and direct
   in-process discovery are implemented. Either implement static-config loading + broker
-  client support, or remove the advertised config surface, before v1.
+  client support, or remove the advertised config surface, before v1. The broker
+  client/service is specified in [the broker contracts](design/concurrency-broker-status.md);
+  its implementation sequence and acceptance criteria are listed there.
 - **MTU-aware fragment sizing** — `rtps.fragment_size` is a static config value. Add an
   interface-MTU / path-MTU aware default (accounting for IP / UDP / RTPS / future security
   overhead) while keeping the explicit override for deterministic tests.
@@ -94,6 +125,26 @@ Forward-looking only: known gaps, planned features, and open design questions.
   `design/rtps-message-builder.md`.
 
 ### DCPS / QoS
+
+#### Optional DDS profile builds
+
+- Add compile-time switches for optional DDS profiles, prioritizing removal of existing
+  GROUP presentation/coherent coordination and EXCLUSIVE ownership machinery. Audit
+  Annex A boundaries and dependencies, including Ownership's history-depth provision,
+  before finalizing flag names. Plan Persistence selection alongside its implementation;
+  do not conflate it with required TRANSIENT_LOCAL support.
+- Audit the existing `-Dcontent-subscription-profile=false` switch for complete parser,
+  evaluator and dedicated-state removal, and correct unavailable-feature behavior for
+  ContentFilteredTopic/QueryCondition. MultiTopic remains unimplemented; a switch does
+  not establish full profile compliance.
+- Follow the agreed [compile-out requirement](design/concurrency/architecture.md#optional-profile-removal):
+  remove dedicated storage and hot-path work, not only runtime behavior. Preserve core
+  listener/concurrency guarantees and required non-GROUP behavior. Reject unavailable
+  requests appropriately rather than silently weakening QoS or filtering.
+- Add representative enabled/disabled build coverage and reproducible footprint comparisons:
+  application code/read-only data, static RAM, per-entity/per-sample storage and peak
+  memory, with target, optimization and binding/linkage held constant. Measure individual
+  switches and a combined minimal configuration; savings are currently unmeasured.
 
 - **Keyed-instance handle without a wire key-hash** — without an inline `PID_KEY_HASH` or a
   registered `TypeSupport.compute_key_hash`, keyed samples all collapse to the NIL instance
@@ -233,6 +284,49 @@ or an optimisation on an already-improved path):
   time-out negative case left out of `catchup` itself is no longer on this list — it's
   covered by the `wait-for-historical-data` Integration-tier scenario instead (see
   `docs/design/dcps-api-coverage-audit.md`).
+- **Integration-tier pairs intermittently never discover each other — cause unknown.**
+  In `cft-reconfigure`, `liveliness-lost`, `source-timestamp` and `sample-rejected-lost`,
+  one pair per CI job (almost always the job's first, zig subscriber ← zig publisher)
+  reports zero matches for the whole 20–40 s window ("readers never matched", "no reader
+  matched"), while every later pair in the same job passes. SPDP re-announces every 3 s,
+  so that is 7–13 consecutive missed announcements: the packet-loss-and-retransmit
+  explanation recorded under *Discovery bootstrap latency* (~1.5 s recovery) does not
+  account for it. `cft-reconfigure` failed 2 of 17 runs before #92 merged and 4 of 4 runs
+  after, although the merged tree is identical to the last passing PR head, so a CI
+  environment or timing change is implicated rather than code. It has not reproduced
+  locally. Next step: capture evidence in CI rather than guess — on failure, upload a
+  packet capture of the pair and both processes' discovery debug logs (and stack dumps; see
+  below), then analyse with `dds-rtps`'s `rtps_pcap.py`.
+- **`Test_Ownership_3` flakes in the DebugAllocator CoreDX-publisher lane.** The zzdds
+  subscriber reports `RECEIVING_FROM_BOTH` instead of `RECEIVING_FROM_ONE` (two exclusive-
+  ownership publishers, strengths 3 and 4, same instance). Seen twice with identical
+  symptoms (2026-09-14 on `main`, 2026-10-01 on #94) and not in other lanes, so it is
+  timing-sensitive under the slow allocator. Determine whether samples from the weaker
+  writer are accepted before the stronger writer is matched (possibly legitimate transient
+  ownership that the harness check counts) or whether ownership arbitration has a real
+  race, e.g. a strength comparison against a writer whose proxy or strength isn't yet
+  installed.
+- **Stack dumps for hung or unfinished test processes.** When a harness gives up on a
+  child process, record every thread's stack in the job log before killing it, so a hang
+  in CI is diagnosable after the fact. Prior art: ACE's Perl test framework (used by
+  OpenDDS) does this in `PerlACE/Process_Unix.pm`'s `WaitKill` when
+  `ACE_TEST_LOG_STUCK_STACKS` is set — on timeout it runs
+  `gdb --batch -p <pid> -ex 'set pagination off' -ex 'thread apply all backtrace'` (`lldb
+  -o 'bt all'` on macOS; `ACE_TEST_DEBUGGER` overrides the debugger) between "Begin/End
+  stuck stacks" markers on stderr, then kills the process. `ACE_TEST_GENERATE_CORE_FILE`
+  additionally saves a core with `gcore`, and crashed processes get a backtrace from their
+  core file unless `ACE_TEST_DISABLE_STACK_TRACE` is set. OpenDDS CI enables it by
+  installing gdb, setting `kernel.yama.ptrace_scope=0` (the harness's gdb is not the
+  target's parent), `ulimit -c unlimited` and a `kernel.core_pattern`. For zzdds the
+  natural hook is `examples/_common.py`'s `LiveProcess.stop()` (its SIGINT→SIGKILL
+  escalation, shared by the examples and integration tiers), plus the other bounded-wait
+  sites (`examples/scripts/run_tsan_pubsub_pair.py`, `scripts/verify_release_bundle.py`)
+  and, separately, `dds-rtps`'s pexpect harness. Investigate: an opt-in environment
+  variable; Windows (`cdb` or `procdump`); symbol quality of ReleaseSafe versus stripped
+  binaries; JVM processes (`jstack` is more useful than gdb there); and keeping the dump
+  itself bounded so it cannot hang the job. Note that the integration discovery failures
+  above end with the processes exiting on their own match timeout, so catching those
+  would also need an "on reported failure" dump, not only an "on kill" one.
 - **Non-goal (recorded, not planned):** a spec-conformance harness, network simulation
   (ns-3 / CORE), and formal verification / safety certification (DO-178C, IEC 61508, ISO
   26262) — long-term concerns, not built. `design/testing-strategy.md`.
@@ -634,15 +728,30 @@ acceptable if a runtime switch proves impractical). The design must account for:
   (DEADLINE/LIVELINESS, interface-change poll, wire-trace flush; possibly heartbeat and
   SPDP) collapse onto one scheduler regardless of the model chosen.
 
-Output: a design doc; the roadmap keeps a pointer.
+Specified: the [concurrency and broker contracts](design/concurrency-broker-status.md)
+now define the behavioral baseline (take-turns participant/endpoint contexts, one shared
+manual/hosted progress engine, listener exclusion with inline eligibility, operation
+results/waits, runtime ownership/retirement and the transport boundary). Their open
+design items, implementation gates and acceptance criteria are listed in that index.
+Remaining work is implementation: the first vertical slice (one reliable reader/writer
+pair under manual and hosted drivers, listeners, timed waits and automatic retirement),
+then broader endpoint migration, thread consolidation onto the shared runtime timers,
+optional-profile builds and the measured latency/footprint work. The review-era
+synchronization prototype and bounded models stay on the `concurrency-broker-specs` branch
+(see the [evidence inventory](design/probes/README.md)). Advanced extension objects (explicit runtime owners/refs, listener groups, resource
+scopes) additionally depend on zidl's managed-reference/construction-only Config
+support; the first shipped subset does not.
 
 ### Single-threaded / embedded `drive(timeout)` API
 
 Even a minimal two-participant setup runs several background threads. An embedded target
 needs a `DomainParticipant.drive(timeout)` that pumps transport polling + `checkTimers()`
 from the caller's loop with no threads spawned. The design keeps this possible (non-blocking
-transport seams, explicit `checkTimers()`) but nothing implements it. Scoped together with
-the concurrency-model task above.
+transport seams, explicit `checkTimers()`) but nothing implements it. Now specified as the
+[ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
+(`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
+measurement profile in the concurrency architecture; implementation follows the
+concurrency task above.
 
 ### CDR-layer allocator scoping vs. the entity layer
 

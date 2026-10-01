@@ -1321,6 +1321,10 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
 
+    const design_step = b.step("test-design-models", "Check the broker schema registry and independent wire vectors");
+    const design_run = b.addSystemCommand(&.{ "python3", "scripts/check_design_specs.py" });
+    design_step.dependOn(&design_run.step);
+
     // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
     const emit_tests_step = b.step("emit-tests", "Build test binaries for kcov coverage analysis");
 

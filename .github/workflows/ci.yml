@@ -40,6 +40,15 @@ env:
   INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-bdcdd3b' }}
 
 jobs:
+  design-validation:
+    name: Broker schema and wire vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Schema registry and independent wire vectors
+        run: python3 scripts/check_design_specs.py
+
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
   test-linux:
     name: Linux x86_64
