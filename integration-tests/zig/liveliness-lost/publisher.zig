@@ -115,20 +115,18 @@ pub fn main(init: std.process.Init) !void {
     auto_dw_qos.liveliness.kind = .AUTOMATIC_LIVELINESS_QOS;
     auto_dw_qos.liveliness.lease_duration = .{ .sec = LEASE_DURATION_SEC, .nanosec = 0 };
 
-    const auto_dw = publisher.create_datawriter(auto_topic, auto_dw_qos, null, 0);
+    // Listener passed at creation: a reader discovered earlier matches inside
+    // create_datawriter, so a listener attached afterwards could miss it.
+    const auto_dw_listener = DDS.dataWriterListener(&auto_state, .{
+        .on_publication_matched = onPublicationMatched,
+        .on_liveliness_lost = onLivelinessLost,
+    });
+    const auto_dw = publisher.create_datawriter(auto_topic, auto_dw_qos, auto_dw_listener, DDS.PUBLICATION_MATCHED_STATUS | DDS.LIVELINESS_LOST_STATUS);
     if (auto_dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter(AutomaticLivelinessTopic) failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create writer for topic: AutomaticLivelinessTopic\n", .{});
-    const auto_dw_listener = DDS.dataWriterListener(&auto_state, .{
-        .on_publication_matched = onPublicationMatched,
-        .on_liveliness_lost = onLivelinessLost,
-    });
-    if (auto_dw.set_listener(auto_dw_listener, DDS.PUBLICATION_MATCHED_STATUS | DDS.LIVELINESS_LOST_STATUS) != DDS.RETCODE_OK) {
-        std.debug.print("FAIL: set_listener(AutomaticLivelinessTopic) failed\n", .{});
-        std.process.exit(1);
-    }
 
     const manual_topic = dp.create_topic("ManualByParticipantLivelinessTopic", "LivelinessEvent", .{}, null, 0);
     if (manual_topic.ptr == zzdds.dcps.NIL_PTR) {
@@ -143,20 +141,18 @@ pub fn main(init: std.process.Init) !void {
     manual_dw_qos.liveliness.kind = .MANUAL_BY_PARTICIPANT_LIVELINESS_QOS;
     manual_dw_qos.liveliness.lease_duration = .{ .sec = LEASE_DURATION_SEC, .nanosec = 0 };
 
-    const manual_dw = publisher.create_datawriter(manual_topic, manual_dw_qos, null, 0);
+    // Listener passed at creation: a reader discovered earlier matches inside
+    // create_datawriter, so a listener attached afterwards could miss it.
+    const manual_dw_listener = DDS.dataWriterListener(&manual_state, .{
+        .on_publication_matched = onPublicationMatched,
+        .on_liveliness_lost = onLivelinessLost,
+    });
+    const manual_dw = publisher.create_datawriter(manual_topic, manual_dw_qos, manual_dw_listener, DDS.PUBLICATION_MATCHED_STATUS | DDS.LIVELINESS_LOST_STATUS);
     if (manual_dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter(ManualByParticipantLivelinessTopic) failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create writer for topic: ManualByParticipantLivelinessTopic\n", .{});
-    const manual_dw_listener = DDS.dataWriterListener(&manual_state, .{
-        .on_publication_matched = onPublicationMatched,
-        .on_liveliness_lost = onLivelinessLost,
-    });
-    if (manual_dw.set_listener(manual_dw_listener, DDS.PUBLICATION_MATCHED_STATUS | DDS.LIVELINESS_LOST_STATUS) != DDS.RETCODE_OK) {
-        std.debug.print("FAIL: set_listener(ManualByParticipantLivelinessTopic) failed\n", .{});
-        std.process.exit(1);
-    }
 
     const auto_writer = liveliness_event_gen.LivelinessEventDataWriter.init(auto_dw, alloc);
     const manual_writer = liveliness_event_gen.LivelinessEventDataWriter.init(manual_dw, alloc);

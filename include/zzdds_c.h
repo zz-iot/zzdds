@@ -212,6 +212,14 @@ zzdds_DataWriter DDS_DataWriter_as_zzdds_DataWriter(DDS_DataWriter writer);
 DDS_DataReader zzdds_DataReader_as_DDS_DataReader(zzdds_DataReader reader);
 /** NOTE: only valid for readers owned by a zzdds FactoryOwner participant. */
 zzdds_DataReader DDS_DataReader_as_zzdds_DataReader(DDS_DataReader reader);
+DDS_Publisher zzdds_Publisher_as_DDS_Publisher(zzdds_Publisher publisher);
+/** NOTE: only valid for publishers owned by a zzdds FactoryOwner participant.
+ *  Reaches zzdds_Publisher_create_datawriter_ex. */
+zzdds_Publisher DDS_Publisher_as_zzdds_Publisher(DDS_Publisher publisher);
+DDS_Subscriber zzdds_Subscriber_as_DDS_Subscriber(zzdds_Subscriber subscriber);
+/** NOTE: only valid for subscribers owned by a zzdds FactoryOwner participant.
+ *  Reaches zzdds_Subscriber_create_datareader_ex. */
+zzdds_Subscriber DDS_Subscriber_as_zzdds_Subscriber(DDS_Subscriber subscriber);
 DDS_TopicDescription zzdds_topic_as_description(DDS_Topic topic);
 
 /**

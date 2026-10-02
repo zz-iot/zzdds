@@ -74,13 +74,9 @@ public class Publisher {
         dwQos.get_durability().set_kind(Dcps.DDS.DurabilityQosPolicyKind.TRANSIENT_LOCAL_DURABILITY_QOS);
         dwQos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
 
-        Dcps.DDS.DataWriter dw = pub.create_datawriter(topic, dwQos, null, 0);
-        if (dw == null) {
-            System.err.println("FAIL: create_datawriter() failed");
-            System.exit(1);
-        }
-        System.out.println("Create writer for topic: HistoryEvent");
-
+        // Listener passed at creation (below): a reader discovered earlier
+        // matches inside create_datawriter, so a listener attached afterwards
+        // could miss it.
         PubState state = new PubState();
         Dcps.DDS.DataWriterListener listener = new Dcps.DDS.DataWriterListener() {
             public void on_offered_deadline_missed(Dcps.DDS.DataWriter w, Dcps.DDS.OfferedDeadlineMissedStatus s) {}
@@ -93,10 +89,12 @@ public class Publisher {
                 System.out.println("on_publication_matched() current_count=" + s.get_current_count());
             }
         };
-        if (dw.set_listener(listener, Dcps.DDS.PUBLICATION_MATCHED_STATUS.value) != 0) {
-            System.err.println("FAIL: set_listener failed");
+        Dcps.DDS.DataWriter dw = pub.create_datawriter(topic, dwQos, listener, Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
+        if (dw == null) {
+            System.err.println("FAIL: create_datawriter() failed");
             System.exit(1);
         }
+        System.out.println("Create writer for topic: HistoryEvent");
 
         HistoryEventDataWriter writer = new HistoryEventDataWriter(dw);
 

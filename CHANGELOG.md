@@ -8,6 +8,41 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-02
+
+- **zidl pinned to v0.3.20.** Generated C++ and Java now accept an imported file's
+  subtypes wherever an operation takes a base entity type from that file, which the new
+  extension operations below need: `create_datareader_ex` takes a `DDS::TopicDescription`,
+  and passing a `ContentFilteredTopic` or `Topic` crashed the Java binding before this fix.
+- **Extended listeners can be installed at creation.** New zzdds extension operations
+  `zzdds::Publisher::create_datawriter_ex` and `zzdds::Subscriber::create_datareader_ex`
+  take a `DataWriterListenerEx` / `DataReaderListenerEx` and a mask. A remote endpoint
+  discovered earlier matches inside entity creation, so an extended listener installed
+  afterwards with `set_listener_ex` could miss `on_publication_matched` /
+  `on_subscription_matched` and the reliable-ready callbacks. Available in every binding:
+  C via the new `DDS_Publisher_as_zzdds_Publisher` / `DDS_Subscriber_as_zzdds_Subscriber`
+  upcasts, C++ by `dynamic_pointer_cast` to `zzdds::PublisherImpl` /
+  `zzdds::SubscriberImpl`, Java via `ZzddsRuntime.asZzddsPublisher` / `asZzddsSubscriber`,
+  and Zig via `zzdds.asZzddsPublisher` / `asZzddsSubscriber`.
+- **C++: extended-listener callbacks receive the application's own entity object.** The
+  `DataWriterListenerEx` / `DataReaderListenerEx` bridges wrapped the writer or reader in a
+  plain `DDS::DataWriterImpl` / `DDS::DataReaderImpl`, replacing the cached wrapper, so
+  the callback's entity was a different object from the one the application held and did
+  not upcast to `zzdds::DataWriterImpl` / `zzdds::DataReaderImpl`. All generated C++ now
+  uses zzdds's wrapper classes, which publishers and subscribers also get, so they upcast
+  to `zzdds::PublisherImpl` / `zzdds::SubscriberImpl`.
+- **Matched statuses are no longer double-counted.** When the participant re-reported a
+  writer/reader pair (direct discovery replays readers on each writer announcement; SEDP
+  re-delivers on updates), `total_count` and `current_count` in
+  `PublicationMatchedStatus` / `SubscriptionMatchedStatus` grew again and the matched
+  callback fired again. Each writer and reader now tracks the remote endpoints it has
+  matched and reports each match and unmatch once.
+- **Fixed intermittent "never matched" failures in examples and integration tests.** The
+  apps created writers and readers without a listener and installed it afterwards, losing
+  the matched callback whenever discovery finished first. Every app now passes its
+  listener at creation, using the new extension operations where it needs the
+  reliable-ready callbacks.
+
 ## 2026-10-01
 
 - **zidl pinned to v0.3.19: XCDR2 encoding fixes for user types.** Generated code now

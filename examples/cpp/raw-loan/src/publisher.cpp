@@ -158,20 +158,23 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
 
-    auto dw = pub->create_datawriter(topic, dw_qos, nullptr, 0);
+    PubState state;
+    auto listener = std::make_shared<PubListener>(&state);
+    // The extended listener is passed at creation, through zzdds's Publisher
+    // extension class: a reader discovered earlier matches inside
+    // create_datawriter, so a listener attached afterwards could miss
+    // on_publication_matched and on_reliable_reader_ready.
+    auto zpub = std::dynamic_pointer_cast<::zzdds::PublisherImpl>(pub);
+    if (!zpub) {
+        std::fprintf(stderr, "FAIL: publisher is not a zzdds::PublisherImpl\n");
+        return 1;
+    }
+    auto dw = zpub->create_datawriter_ex(topic, dw_qos, listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!dw) {
-        std::fprintf(stderr, "FAIL: create_datawriter() failed\n");
+        std::fprintf(stderr, "FAIL: create_datawriter_ex() failed\n");
         return 1;
     }
     std::printf("Create writer for topic: LoanedPing\n");
-
-    PubState state;
-    auto listener = std::make_shared<PubListener>(&state);
-    auto zdw = std::static_pointer_cast<::zzdds::DataWriterImpl>(dw);
-    if (zdw->set_listener_ex(listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK) {
-        std::fprintf(stderr, "FAIL: set_listener_ex failed\n");
-        return 1;
-    }
 
     for (int waited_ms = 0; !state.reader_ready.load(); waited_ms += POLL_PERIOD_MS) {
         if (waited_ms >= READER_READY_TIMEOUT_MS) {

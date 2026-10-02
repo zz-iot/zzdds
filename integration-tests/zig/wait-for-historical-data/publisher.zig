@@ -107,21 +107,18 @@ pub fn main(init: std.process.Init) !void {
     dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
 
-    const dw = publisher.create_datawriter(topic, dw_qos, null, 0);
+    // Listener passed at creation: a reader discovered earlier matches inside
+    // create_datawriter, so a listener attached afterwards could miss it.
+    var state = State{};
+    const dw_listener = DDS.dataWriterListener(&state, .{
+        .on_publication_matched = onPublicationMatched,
+    });
+    const dw = publisher.create_datawriter(topic, dw_qos, dw_listener, DDS.PUBLICATION_MATCHED_STATUS);
     if (dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter() failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create writer for topic: HistoryEvent\n", .{});
-
-    var state = State{};
-    const dw_listener = DDS.dataWriterListener(&state, .{
-        .on_publication_matched = onPublicationMatched,
-    });
-    if (dw.set_listener(dw_listener, DDS.PUBLICATION_MATCHED_STATUS) != DDS.RETCODE_OK) {
-        std.debug.print("FAIL: set_listener failed\n", .{});
-        std.process.exit(1);
-    }
 
     const writer = history_event_gen.HistoryEventDataWriter.init(dw, alloc);
 

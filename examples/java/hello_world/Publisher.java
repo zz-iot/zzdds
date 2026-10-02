@@ -82,21 +82,19 @@ public class Publisher {
         dwQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
         dwQos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
 
-        Dcps.DDS.DataWriter rawWriter = pub.create_datawriter(topic, dwQos, null, 0);
-        if (rawWriter == null) {
-            System.err.println("FAIL: create_datawriter() failed");
-            System.exit(1);
-        }
-        System.out.println("Create writer for topic: HelloWorld");
 
         final AtomicBoolean readerReady = new AtomicBoolean(false);
         final AtomicBoolean everMatched = new AtomicBoolean(false);
         final AtomicInteger matchedCurrentCount = new AtomicInteger(0);
 
-        Zzdds.zzdds.DataWriter zdWriter =
-            (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(rawWriter);
-        if (zdWriter == null) {
-            System.err.println("FAIL: asZzddsDataWriter() failed");
+        // The extended listener is passed at creation, through zzdds's
+        // Publisher extension view: a reader discovered earlier matches inside
+        // create_datawriter, so a listener attached afterwards could miss
+        // on_publication_matched and on_reliable_reader_ready.
+        Zzdds.zzdds.Publisher zdPublisher =
+            (Zzdds.zzdds.Publisher) io.zzdds.runtime.ZzddsRuntime.asZzddsPublisher(pub);
+        if (zdPublisher == null) {
+            System.err.println("FAIL: asZzddsPublisher() failed");
             System.exit(1);
         }
 
@@ -116,10 +114,12 @@ public class Publisher {
                 System.out.println("on_reliable_reader_ready() is_ready=" + isReady);
             }
         };
-        if (zdWriter.set_listener_ex(writerListener, Dcps.DDS.PUBLICATION_MATCHED_STATUS.value) != 0) {
-            System.err.println("FAIL: set_listener_ex failed");
+        Dcps.DDS.DataWriter rawWriter = zdPublisher.create_datawriter_ex(topic, dwQos, writerListener, Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
+        if (rawWriter == null) {
+            System.err.println("FAIL: create_datawriter_ex() failed");
             System.exit(1);
         }
+        System.out.println("Create writer for topic: HelloWorld");
 
         HelloWorldDataWriter writer = new HelloWorldDataWriter(rawWriter);
 

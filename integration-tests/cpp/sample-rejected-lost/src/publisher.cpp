@@ -112,7 +112,20 @@ int main(int argc, char **argv) {
     // regardless of durability.
     lost_qos.durability.kind = ::DDS::DurabilityQosPolicyKind::TRANSIENT_LOCAL_DURABILITY_QOS;
 
-    auto lost_dw = pub->create_datawriter(lost_topic, lost_qos, nullptr, 0);
+    // Writers get their extended listeners at creation, through zzdds's
+    // Publisher extension class: a reader discovered earlier matches inside
+    // creation, so a listener attached afterwards could miss
+    // on_publication_matched and on_reliable_reader_ready.
+    auto zpub = std::dynamic_pointer_cast<::zzdds::PublisherImpl>(pub);
+    if (!zpub) {
+        std::fprintf(stderr, "FAIL: publisher is not a zzdds::PublisherImpl\n");
+        return 1;
+    }
+    WriterSyncState rejected_state, sync_state, lost_state;
+    auto rejected_listener = std::make_shared<WriterListener>(&rejected_state);
+    auto sync_listener = std::make_shared<WriterListener>(&sync_state);
+    auto lost_listener = std::make_shared<WriterListener>(&lost_state);
+    auto lost_dw = zpub->create_datawriter_ex(lost_topic, lost_qos, lost_listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!lost_dw) {
         std::fprintf(stderr, "FAIL: create_datawriter(LostTopic) failed\n");
         return 1;
@@ -135,7 +148,7 @@ int main(int argc, char **argv) {
     auto rejected_qos = ::DDS::DataWriterQos::default_value();
     rejected_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
     rejected_qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
-    auto rejected_dw = pub->create_datawriter(rejected_topic, rejected_qos, nullptr, 0);
+    auto rejected_dw = zpub->create_datawriter_ex(rejected_topic, rejected_qos, rejected_listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!rejected_dw) {
         std::fprintf(stderr, "FAIL: create_datawriter(RejectedTopic) failed\n");
         return 1;
@@ -144,27 +157,12 @@ int main(int argc, char **argv) {
 
     auto sync_qos = ::DDS::DataWriterQos::default_value();
     sync_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
-    auto sync_dw = pub->create_datawriter(sync_topic, sync_qos, nullptr, 0);
+    auto sync_dw = zpub->create_datawriter_ex(sync_topic, sync_qos, sync_listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!sync_dw) {
         std::fprintf(stderr, "FAIL: create_datawriter(SyncTopic) failed\n");
         return 1;
     }
     std::printf("Create writer for topic: SyncTopic\n");
-
-    WriterSyncState rejected_state, sync_state, lost_state;
-    auto rejected_listener = std::make_shared<WriterListener>(&rejected_state);
-    auto sync_listener = std::make_shared<WriterListener>(&sync_state);
-    auto lost_listener = std::make_shared<WriterListener>(&lost_state);
-    auto zrejected_dw = std::static_pointer_cast<::zzdds::DataWriterImpl>(rejected_dw);
-    auto zsync_dw = std::static_pointer_cast<::zzdds::DataWriterImpl>(sync_dw);
-    auto zlost_dw = std::static_pointer_cast<::zzdds::DataWriterImpl>(lost_dw);
-    if (zrejected_dw->set_listener_ex(rejected_listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK ||
-        zsync_dw->set_listener_ex(sync_listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK ||
-        zlost_dw->set_listener_ex(lost_listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK)
-    {
-        std::fprintf(stderr, "FAIL: set_listener_ex failed\n");
-        return 1;
-    }
 
     // Only Rejected/Sync need to wait for their reader -- the subscriber
     // creates those two immediately at startup. LostTopic's reader isn't

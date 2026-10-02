@@ -107,19 +107,16 @@ int main(int argc, char **argv) {
     dw_qos.durability.kind = ::DDS::DurabilityQosPolicyKind::TRANSIENT_LOCAL_DURABILITY_QOS;
     dw_qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
 
-    auto dw = pub->create_datawriter(topic, dw_qos, nullptr, 0);
+    // Listener passed at creation: a reader discovered earlier matches inside
+    // create_datawriter, so a listener attached afterwards could miss it.
+    PubState state;
+    auto listener = std::make_shared<PubListener>(&state);
+    auto dw = pub->create_datawriter(topic, dw_qos, listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!dw) {
         std::fprintf(stderr, "FAIL: create_datawriter() failed\n");
         return 1;
     }
     std::printf("Create writer for topic: HistoryEvent\n");
-
-    PubState state;
-    auto listener = std::make_shared<PubListener>(&state);
-    if (dw->set_listener(listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK) {
-        std::fprintf(stderr, "FAIL: set_listener failed\n");
-        return 1;
-    }
 
     auto dw_handle = dw->native_handle();
     HistoryEventDataWriter writer(dw_handle);

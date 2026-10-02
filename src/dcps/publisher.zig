@@ -14,6 +14,8 @@ const DDS = @import("zzdds_generated").DDS;
 const nil = @import("nil.zig");
 const proto = @import("../protocol/interface.zig");
 const writer_mod = @import("writer.zig");
+const ZZDDS = @import("zzdds_ext_generated").zzdds;
+const extensions_mod = @import("../c_abi/extensions.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
@@ -306,9 +308,15 @@ pub const PublisherImpl = struct {
     };
 
     /// One `CAbiViews` value for the whole object (see `zidl_rt.unboxAsView`).
-    pub const views = DDS.Publisher.CAbiViews{
-        .base = .{ .flat_vtable = &entity_vtable },
-        .flat_vtable = &vtable,
+    /// One `CAbiViews` value for the whole object, covering Entity,
+    /// Publisher and (via `extensions.zig`'s `publisher_vtable`, sharing this
+    /// same `c_abi` field) zzdds::Publisher. See `DataWriterImpl.views`.
+    pub const views = ZZDDS.Publisher.CAbiViews{
+        .base = .{
+            .base = .{ .flat_vtable = &entity_vtable },
+            .flat_vtable = &vtable,
+        },
+        .flat_vtable = &extensions_mod.publisher_vtable,
     };
 
     fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
@@ -361,6 +369,22 @@ pub const PublisherImpl = struct {
         a_listener: ?*const DDS.DataWriterListener,
         mask: DDS.StatusMask,
     ) DDS.DataWriter {
+        const listener = writer_mod.listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataWriterListener);
+        return cast(ctx).createDataWriter(a_topic, qos, listener, mask);
+    }
+
+    /// create_datawriter with an extended listener, which is what the writer
+    /// stores either way. Backs both DDS create_datawriter (listener widened)
+    /// and zzdds::Publisher::create_datawriter_ex. The listener is installed
+    /// before the writer announces itself or matches a remote reader, so no
+    /// status change during creation can reach an empty listener.
+    pub fn createDataWriter(
+        self: *Self,
+        a_topic: DDS.Topic,
+        qos: *const DDS.DataWriterQos,
+        listener: ZZDDS.DataWriterListenerEx,
+        mask: DDS.StatusMask,
+    ) DDS.DataWriter {
         // NOT gated on this Publisher's own enabled state -- create_datawriter
         // must work on a disabled Publisher (nested disabled trees are how
         // autoenable_created_entities=false is meant to be used: build
@@ -368,7 +392,6 @@ pub const PublisherImpl = struct {
         // enabled state (below) is independently governed by this Publisher's
         // qos.entity_factory, regardless of whether the Publisher itself is
         // currently enabled.
-        const self = cast(ctx);
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
         const presentation = self.qos.presentation;
@@ -389,7 +412,7 @@ pub const PublisherImpl = struct {
             self.toDDSPublisher(),
             pw,
             qos.*,
-            if (a_listener) |l| l.* else DDS.noop_DataWriterListener,
+            listener,
             mask,
             publication_handle,
             guid,

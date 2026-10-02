@@ -109,6 +109,8 @@ pub const asZzddsDataWriter = raw_ops.asZzddsDataWriter;
 pub const asZzddsDataReader = raw_ops.asZzddsDataReader;
 pub const asZzddsTopic = raw_ops.asZzddsTopic;
 pub const asZzddsDomainParticipant = raw_ops.asZzddsDomainParticipant;
+pub const asZzddsPublisher = raw_ops.asZzddsPublisher;
+pub const asZzddsSubscriber = raw_ops.asZzddsSubscriber;
 pub const createWaitSet = raw_ops.createWaitSet;
 pub const createGuardCondition = raw_ops.createGuardCondition;
 

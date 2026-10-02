@@ -64,22 +64,27 @@ static uint32_t parse_domain(int argc, char **argv) {
     return 0;
 }
 
-static int set_writer_listener_ex(DDS_DataWriter dw, MatchState *state) {
-    zzdds_DataWriter zdw = DDS_DataWriter_as_zzdds_DataWriter(dw);
+/* Writers and readers get their listeners at creation: an endpoint
+ * discovered earlier matches inside creation, so a listener attached
+ * afterwards could miss the matched status (and on_reliable_reader_ready). */
+static DDS_DataWriter create_writer_ex(DDS_Publisher pub, DDS_Topic topic, const DDS_DataWriterQos *qos,
+                                       MatchState *state) {
     zzdds_DataWriterListenerEx listener_ex;
     memset(&listener_ex, 0, sizeof(listener_ex));
     listener_ex.listener_data = state;
     listener_ex.on_publication_matched = on_publication_matched_ex;
     listener_ex.on_reliable_reader_ready = on_reliable_reader_ready;
-    return zzdds_DataWriter_set_listener_ex(zdw, &listener_ex, DDS_PUBLICATION_MATCHED_STATUS);
+    return zzdds_Publisher_create_datawriter_ex(DDS_Publisher_as_zzdds_Publisher(pub), topic, qos, &listener_ex,
+                                                DDS_PUBLICATION_MATCHED_STATUS);
 }
 
-static int set_reader_listener(DDS_DataReader dr, MatchState *state) {
+static DDS_DataReader create_reader(DDS_Subscriber sub, DDS_TopicDescription topic, const DDS_DataReaderQos *qos,
+                                    MatchState *state) {
     DDS_DataReaderListener listener;
     memset(&listener, 0, sizeof(listener));
     listener.listener_data = state;
     listener.on_subscription_matched = on_subscription_matched;
-    return DDS_DataReader_set_listener(dr, &listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
+    return DDS_Subscriber_create_datareader(sub, topic, qos, &listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
 }
 
 int main(int argc, char **argv) {
@@ -136,7 +141,12 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
 
-    DDS_DataWriter in_dw = DDS_Publisher_create_datawriter(pub, in_topic, &dw_qos, NULL, 0);
+    MatchState writer_state, out1_state, out2_state;
+    memset(&writer_state, 0, sizeof(writer_state));
+    memset(&out1_state, 0, sizeof(out1_state));
+    memset(&out2_state, 0, sizeof(out2_state));
+
+    DDS_DataWriter in_dw = create_writer_ex(pub, in_topic, &dw_qos, &writer_state);
     if (!in_dw) {
         fprintf(stderr, "FAIL: create_datawriter(SessionIn) failed\n");
         return 1;
@@ -149,7 +159,7 @@ int main(int argc, char **argv) {
     dr_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
 
     DDS_TopicDescription out1_desc = zzdds_topic_as_description(out1_topic);
-    DDS_DataReader out1_dr = DDS_Subscriber_create_datareader(sub, out1_desc, &dr_qos, NULL, 0);
+    DDS_DataReader out1_dr = create_reader(sub, out1_desc, &dr_qos, &out1_state);
     if (!out1_dr) {
         fprintf(stderr, "FAIL: create_datareader(SessionOut1) failed\n");
         return 1;
@@ -157,25 +167,12 @@ int main(int argc, char **argv) {
     printf("Create reader for topic: SessionOut1\n");
 
     DDS_TopicDescription out2_desc = zzdds_topic_as_description(out2_topic);
-    DDS_DataReader out2_dr = DDS_Subscriber_create_datareader(sub, out2_desc, &dr_qos, NULL, 0);
+    DDS_DataReader out2_dr = create_reader(sub, out2_desc, &dr_qos, &out2_state);
     if (!out2_dr) {
         fprintf(stderr, "FAIL: create_datareader(SessionOut2) failed\n");
         return 1;
     }
     printf("Create reader for topic: SessionOut2\n");
-
-    MatchState writer_state, out1_state, out2_state;
-    memset(&writer_state, 0, sizeof(writer_state));
-    memset(&out1_state, 0, sizeof(out1_state));
-    memset(&out2_state, 0, sizeof(out2_state));
-
-    if (set_writer_listener_ex(in_dw, &writer_state) != DDS_RETCODE_OK ||
-        set_reader_listener(out1_dr, &out1_state) != DDS_RETCODE_OK ||
-        set_reader_listener(out2_dr, &out2_state) != DDS_RETCODE_OK)
-    {
-        fprintf(stderr, "FAIL: set_listener failed\n");
-        return 1;
-    }
 
     SessionEventDataWriter in_writer;
     SessionEventDataWriter_init(&in_writer, in_dw, ZIDL_XCDR1);

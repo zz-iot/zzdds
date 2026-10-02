@@ -126,25 +126,24 @@ pub fn main(init: std.process.Init) !void {
     dw_qos.liveliness.kind = .MANUAL_BY_TOPIC_LIVELINESS_QOS;
     dw_qos.liveliness.lease_duration = .{ .sec = LEASE_DURATION_S, .nanosec = 0 };
 
-    const dw = publisher.create_datawriter(topic, dw_qos, null, 0);
+    // The extended listener is passed at creation, through zzdds's Publisher
+    // extension view: a reader discovered earlier matches inside
+    // create_datawriter, so a listener attached afterwards could miss
+    // on_publication_matched and on_reliable_reader_ready.
+    var state = State{};
+    const zpub = zzdds.asZzddsPublisher(publisher) orelse {
+        std.debug.print("FAIL: asZzddsPublisher() failed\n", .{});
+        std.process.exit(1);
+    };
+    const dw = zpub.create_datawriter_ex(topic, dw_qos, ZZDDS.dataWriterListenerEx(&state, .{
+        .on_publication_matched = onPublicationMatched,
+        .on_reliable_reader_ready = onReliableReaderReady,
+    }), DDS.PUBLICATION_MATCHED_STATUS);
     if (dw.ptr == zzdds.dcps.NIL_PTR) {
-        std.debug.print("FAIL: create_datawriter() failed\n", .{});
+        std.debug.print("FAIL: create_datawriter_ex() failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create writer for topic: PresenceBeacon\n", .{});
-
-    var state = State{};
-    const zdw = zzdds.asZzddsDataWriter(dw) orelse {
-        std.debug.print("FAIL: asZzddsDataWriter() failed\n", .{});
-        std.process.exit(1);
-    };
-    if (zdw.set_listener_ex(ZZDDS.dataWriterListenerEx(&state, .{
-        .on_publication_matched = onPublicationMatched,
-        .on_reliable_reader_ready = onReliableReaderReady,
-    }), DDS.PUBLICATION_MATCHED_STATUS) != DDS.RETCODE_OK) {
-        std.debug.print("FAIL: set_listener_ex failed\n", .{});
-        std.process.exit(1);
-    }
 
     const writer = presence_gen.PresenceBeaconDataWriter.init(dw, alloc);
 

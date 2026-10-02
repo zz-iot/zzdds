@@ -943,6 +943,42 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsDataWriter(
     return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zw);
 }
 
+/* Same narrowing as asZzddsDataWriter above, for Publisher (reaches
+ * create_datawriter_ex). */
+JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsPublisher(
+    JNIEnv *env, jclass self_cls, jobject publisher)
+{
+    (void)self_cls;
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, publisher, "publisher")) return NULL;
+    if (!zzdds_java_require_instance_of(env, publisher, &type_check_cache, "io/zzdds/dcps/PublisherImpl", "publisher")) return NULL;
+    DDS_Publisher p = (DDS_Publisher)zzdds_java_require_unboxed(env, publisher, "publisher");
+    if (p == NULL) return NULL;
+    zzdds_Publisher zp = DDS_Publisher_as_zzdds_Publisher(p);
+
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/ext/PublisherImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zp);
+}
+
+/* Same narrowing as asZzddsDataWriter above, for Subscriber (reaches
+ * create_datareader_ex). */
+JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsSubscriber(
+    JNIEnv *env, jclass self_cls, jobject subscriber)
+{
+    (void)self_cls;
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, subscriber, "subscriber")) return NULL;
+    if (!zzdds_java_require_instance_of(env, subscriber, &type_check_cache, "io/zzdds/dcps/SubscriberImpl", "subscriber")) return NULL;
+    DDS_Subscriber s = (DDS_Subscriber)zzdds_java_require_unboxed(env, subscriber, "subscriber");
+    if (s == NULL) return NULL;
+    zzdds_Subscriber zs = DDS_Subscriber_as_zzdds_Subscriber(s);
+
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/ext/SubscriberImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zs);
+}
+
 /* Mirrors zzdds_c.h's zzdds_process_configure_from_file -- a plain string-in,
  * retcode-out call, so (unlike create_participant_ex/get_default_participant_
  * config's DomainParticipantConfig struct parameter -- see CHANGELOG.md

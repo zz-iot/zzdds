@@ -67,14 +67,18 @@ static uint32_t parse_domain(int argc, char **argv) {
     return 0;
 }
 
-static int set_writer_listener(DDS_DataWriter dw, WriterSyncState *state) {
-    zzdds_DataWriter zdw = DDS_DataWriter_as_zzdds_DataWriter(dw);
+/* Creates a writer with its extended listener installed from the start: a
+ * reader discovered earlier matches inside creation, so a listener attached
+ * afterwards could miss on_publication_matched and on_reliable_reader_ready. */
+static DDS_DataWriter create_writer_ex(DDS_Publisher pub, DDS_Topic topic, const DDS_DataWriterQos *qos,
+                                       WriterSyncState *state) {
     zzdds_DataWriterListenerEx listener_ex;
     memset(&listener_ex, 0, sizeof(listener_ex));
     listener_ex.listener_data = state;
     listener_ex.on_publication_matched = on_publication_matched;
     listener_ex.on_reliable_reader_ready = on_reliable_reader_ready;
-    return zzdds_DataWriter_set_listener_ex(zdw, &listener_ex, DDS_PUBLICATION_MATCHED_STATUS);
+    return zzdds_Publisher_create_datawriter_ex(DDS_Publisher_as_zzdds_Publisher(pub), topic, qos, &listener_ex,
+                                                DDS_PUBLICATION_MATCHED_STATUS);
 }
 
 int main(int argc, char **argv) {
@@ -139,7 +143,12 @@ int main(int argc, char **argv) {
      * regardless of durability. */
     lost_qos.durability.kind = DDS_DurabilityQosPolicyKind_TRANSIENT_LOCAL_DURABILITY_QOS;
 
-    DDS_DataWriter lost_dw = DDS_Publisher_create_datawriter(pub, lost_topic, &lost_qos, NULL, 0);
+    WriterSyncState rejected_state, sync_state, lost_state;
+    memset(&rejected_state, 0, sizeof(rejected_state));
+    memset(&sync_state, 0, sizeof(sync_state));
+    memset(&lost_state, 0, sizeof(lost_state));
+
+    DDS_DataWriter lost_dw = create_writer_ex(pub, lost_topic, &lost_qos, &lost_state);
     if (!lost_dw) {
         fprintf(stderr, "FAIL: create_datawriter(LostTopic) failed\n");
         return 1;
@@ -163,7 +172,7 @@ int main(int argc, char **argv) {
     DDS_Publisher_get_default_datawriter_qos(pub, &rejected_qos);
     rejected_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
     rejected_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
-    DDS_DataWriter rejected_dw = DDS_Publisher_create_datawriter(pub, rejected_topic, &rejected_qos, NULL, 0);
+    DDS_DataWriter rejected_dw = create_writer_ex(pub, rejected_topic, &rejected_qos, &rejected_state);
     if (!rejected_dw) {
         fprintf(stderr, "FAIL: create_datawriter(RejectedTopic) failed\n");
         return 1;
@@ -173,25 +182,12 @@ int main(int argc, char **argv) {
     DDS_DataWriterQos sync_qos;
     DDS_Publisher_get_default_datawriter_qos(pub, &sync_qos);
     sync_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
-    DDS_DataWriter sync_dw = DDS_Publisher_create_datawriter(pub, sync_topic, &sync_qos, NULL, 0);
+    DDS_DataWriter sync_dw = create_writer_ex(pub, sync_topic, &sync_qos, &sync_state);
     if (!sync_dw) {
         fprintf(stderr, "FAIL: create_datawriter(SyncTopic) failed\n");
         return 1;
     }
     printf("Create writer for topic: SyncTopic\n");
-
-    WriterSyncState rejected_state, sync_state, lost_state;
-    memset(&rejected_state, 0, sizeof(rejected_state));
-    memset(&sync_state, 0, sizeof(sync_state));
-    memset(&lost_state, 0, sizeof(lost_state));
-
-    if (set_writer_listener(rejected_dw, &rejected_state) != DDS_RETCODE_OK ||
-        set_writer_listener(sync_dw, &sync_state) != DDS_RETCODE_OK ||
-        set_writer_listener(lost_dw, &lost_state) != DDS_RETCODE_OK)
-    {
-        fprintf(stderr, "FAIL: set_listener_ex failed\n");
-        return 1;
-    }
 
     /* Only Rejected/Sync need to wait for their reader -- the subscriber
      * creates those two immediately at startup. LostTopic's reader isn't

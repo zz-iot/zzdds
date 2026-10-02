@@ -99,14 +99,8 @@ static DDS_DataWriter create_writer(DDS_DomainParticipant dp, DDS_Publisher pub,
     dw_qos.liveliness.lease_duration.sec = LEASE_DURATION_SEC;
     dw_qos.liveliness.lease_duration.nanosec = 0;
 
-    DDS_DataWriter dw = DDS_Publisher_create_datawriter(pub, topic, &dw_qos, NULL, 0);
-    if (!dw) {
-        fprintf(stderr, "FAIL: create_datawriter(%s) failed\n", topic_name);
-        return NULL;
-    }
-    printf("Create writer for topic: %s\n", topic_name);
-    fflush(stdout);
-
+    /* Listener passed at creation: a reader discovered earlier matches inside
+     * create_datawriter, so a listener attached afterwards could miss it. */
     atomic_init(&state->matched_current_count, 0);
     atomic_init(&state->liveliness_lost_count, 0);
     DDS_DataWriterListener listener;
@@ -114,10 +108,14 @@ static DDS_DataWriter create_writer(DDS_DomainParticipant dp, DDS_Publisher pub,
     listener.listener_data = state;
     listener.on_publication_matched = on_publication_matched;
     listener.on_liveliness_lost = on_liveliness_lost;
-    if (DDS_DataWriter_set_listener(dw, &listener, DDS_PUBLICATION_MATCHED_STATUS | DDS_LIVELINESS_LOST_STATUS) != DDS_RETCODE_OK) {
-        fprintf(stderr, "FAIL: set_listener(%s) failed\n", topic_name);
+    DDS_DataWriter dw = DDS_Publisher_create_datawriter(pub, topic, &dw_qos, &listener,
+                                                        DDS_PUBLICATION_MATCHED_STATUS | DDS_LIVELINESS_LOST_STATUS);
+    if (!dw) {
+        fprintf(stderr, "FAIL: create_datawriter(%s) failed\n", topic_name);
         return NULL;
     }
+    printf("Create writer for topic: %s\n", topic_name);
+    fflush(stdout);
     return dw;
 }
 

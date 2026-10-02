@@ -142,6 +142,26 @@ public final class ZzddsRuntime {
     public static native Object asZzddsDataWriter(Object writer);
 
     /**
+     * Narrows a plain {@code io.zzdds.dcps.Dcps.DDS.Publisher} (as returned
+     * by {@code DomainParticipant.create_publisher}) to zzdds's own
+     * {@code io.zzdds.ext.Zzdds.zzdds.Publisher} extension view, to reach
+     * {@code create_datawriter_ex}: create a writer with a
+     * {@code DataWriterListenerEx} installed from the start, so no
+     * {@code on_publication_matched} or {@code on_reliable_reader_ready}
+     * during creation is missed. See {@code include/zzdds_c.h}'s
+     * {@code DDS_Publisher_as_zzdds_Publisher}. Returns an
+     * {@code io.zzdds.ext.PublisherImpl}.
+     */
+    public static native Object asZzddsPublisher(Object publisher);
+
+    /**
+     * Same as {@link #asZzddsPublisher} for a {@code Subscriber}, to reach
+     * {@code create_datareader_ex}. Returns an
+     * {@code io.zzdds.ext.SubscriberImpl}.
+     */
+    public static native Object asZzddsSubscriber(Object subscriber);
+
+    /**
      * Resolves {@code path} as a zzdds TOML config file and installs it as
      * the process-wide default participant config, entirely native-side —
      * the real API this binding previously lacked (see {@code shape}'s own

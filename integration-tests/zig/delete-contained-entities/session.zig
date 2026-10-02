@@ -73,12 +73,16 @@ fn onSubscriptionMatched(ctx: *ReaderSyncNoop, dr: DDS.DataReader, status: DDS.S
     }
 }
 
-fn setWriterListenerEx(dw: DDS.DataWriter, state: *WriterSyncState) !void {
-    const zdw = zzdds.asZzddsDataWriter(dw) orelse return error.AsZzddsDataWriterFailed;
-    if (zdw.set_listener_ex(ZZDDS.dataWriterListenerEx(state, .{
+/// Creates a writer with its extended listener installed from the start: a
+/// reader discovered earlier matches inside creation, so a listener attached
+/// afterwards could miss on_publication_matched and on_reliable_reader_ready.
+/// Returns the nil writer on failure.
+fn createWriterEx(publisher: DDS.Publisher, topic: DDS.Topic, qos: DDS.DataWriterQos, state: *WriterSyncState) DDS.DataWriter {
+    const zpub = zzdds.asZzddsPublisher(publisher) orelse return zzdds.dcps.nil_datawriter;
+    return zpub.create_datawriter_ex(topic, qos, ZZDDS.dataWriterListenerEx(state, .{
         .on_publication_matched = onPublicationMatchedEx,
         .on_reliable_reader_ready = onReliableReaderReady,
-    }), DDS.PUBLICATION_MATCHED_STATUS) != DDS.RETCODE_OK) return error.SetListenerExFailed;
+    }), DDS.PUBLICATION_MATCHED_STATUS);
 }
 
 fn parseDomain(process_args: std.process.Args) u32 {
@@ -145,25 +149,16 @@ pub fn main(init: std.process.Init) !void {
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
 
-    const out1_dw = publisher.create_datawriter(out1_topic, dw_qos, null, 0);
-    const out2_dw = publisher.create_datawriter(out2_topic, dw_qos, null, 0);
+    var out1_state = WriterSyncState{};
+    var out2_state = WriterSyncState{};
+    const out1_dw = createWriterEx(publisher, out1_topic, dw_qos, &out1_state);
+    const out2_dw = createWriterEx(publisher, out2_topic, dw_qos, &out2_state);
     if (out1_dw.ptr == zzdds.dcps.NIL_PTR or out2_dw.ptr == zzdds.dcps.NIL_PTR) {
-        std.debug.print("FAIL: create_datawriter() failed\n", .{});
+        std.debug.print("FAIL: create_datawriter_ex() failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create writer for topic: SessionOut1\n", .{});
     std.debug.print("Create writer for topic: SessionOut2\n", .{});
-
-    var out1_state = WriterSyncState{};
-    var out2_state = WriterSyncState{};
-    setWriterListenerEx(out1_dw, &out1_state) catch {
-        std.debug.print("FAIL: set_listener_ex(SessionOut1) failed\n", .{});
-        std.process.exit(1);
-    };
-    setWriterListenerEx(out2_dw, &out2_state) catch {
-        std.debug.print("FAIL: set_listener_ex(SessionOut2) failed\n", .{});
-        std.process.exit(1);
-    };
 
     const subscriber = dp.create_subscriber(.{}, null, 0);
     if (subscriber.ptr == zzdds.dcps.NIL_PTR) {
@@ -175,8 +170,13 @@ pub fn main(init: std.process.Init) !void {
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
 
+    // Reader listeners are attached at creation, so their "never after
+    // teardown" check covers the readers' whole lifetime.
+    const in_dr_listener = DDS.dataReaderListener(&reader_sync_noop, .{
+        .on_subscription_matched = onSubscriptionMatched,
+    });
     const in_topic_desc = dp.lookup_topicdescription("SessionIn");
-    const in_dr = subscriber.create_datareader(in_topic_desc, dr_qos, null, 0);
+    const in_dr = subscriber.create_datareader(in_topic_desc, dr_qos, in_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS);
     if (in_dr.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datareader(SessionIn) failed\n", .{});
         std.process.exit(1);
@@ -192,22 +192,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
     const cft_desc = cft.vtable.as_TopicDescription(cft.ptr);
-    const cft_dr = subscriber.create_datareader(cft_desc, dr_qos, null, 0);
+    const cft_dr = subscriber.create_datareader(cft_desc, dr_qos, in_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS);
     if (cft_dr.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datareader(SessionIn_cft) failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create reader for topic: SessionIn_cft\n", .{});
-
-    const in_dr_listener = DDS.dataReaderListener(&reader_sync_noop, .{
-        .on_subscription_matched = onSubscriptionMatched,
-    });
-    if (in_dr.vtable.set_listener(in_dr.ptr, &in_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS) != DDS.RETCODE_OK or
-        cft_dr.vtable.set_listener(cft_dr.ptr, &in_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS) != DDS.RETCODE_OK)
-    {
-        std.debug.print("FAIL: set_listener (reader) failed\n", .{});
-        std.process.exit(1);
-    }
 
     const ws = zzdds.createWaitSet(alloc) catch {
         std.debug.print("FAIL: createWaitSet() failed\n", .{});

@@ -37,7 +37,7 @@ const GuidPrefix = proto.GuidPrefix;
 /// Build the unified listener representation from a plain `set_listener()`
 /// (base OMG API) call, with the extension callback unset. Mirrors
 /// writer.zig's identical widen/narrow scheme for DataWriterListenerEx.
-fn listenerExFromBase(l: DDS.DataReaderListener) ZZDDS.DataReaderListenerEx {
+pub fn listenerExFromBase(l: DDS.DataReaderListener) ZZDDS.DataReaderListenerEx {
     return .{
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
@@ -302,6 +302,9 @@ pub const DataReaderImpl = struct {
     sub_matched_total: i32 = 0,
     sub_matched_total_change: i32 = 0,
     sub_matched_current: i32 = 0,
+    /// Remote writers counted in `sub_matched_current`; see
+    /// `DataWriterImpl.matched_subscriptions`. Under `mu`.
+    matched_publications: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void) = .empty,
     sub_matched_current_change: i32 = 0,
     sub_matched_last_handle: DDS.InstanceHandle_t = 0,
 
@@ -493,7 +496,10 @@ pub const DataReaderImpl = struct {
         subscriber: DDS.Subscriber,
         proto_reader: proto.ProtocolReader,
         qos: DDS.DataReaderQos,
-        listener: DDS.DataReaderListener,
+        /// Installed before the reader can match anything (see
+        /// `SubscriberImpl.createDataReader`); a standard listener is widened
+        /// with `listenerExFromBase`.
+        listener: ZZDDS.DataReaderListenerEx,
         mask: DDS.StatusMask,
         instance_handle: DDS.InstanceHandle_t,
         guid: proto.Guid,
@@ -524,7 +530,7 @@ pub const DataReaderImpl = struct {
             .seen_instances = .empty,
         };
         errdefer alloc.destroy(self);
-        self.listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(listener));
+        self.listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listener);
         errdefer alloc.destroy(self.listener_ex_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
@@ -594,6 +600,7 @@ pub const DataReaderImpl = struct {
         self.listener_ex_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
+        self.matched_publications.deinit(self.alloc);
         // Tear down any ReadCondition/QueryCondition the app never explicitly
         // deleted via delete_readcondition(). Each condition's own teardown
         // detaches it from any WaitSet that still has it attached, removes
@@ -2563,6 +2570,10 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         const delta: i32 = if (added) 1 else -1;
         self.mu.lock();
+        if (!writer_mod.trackMatch(&self.matched_publications, self.alloc, remote_handle, added)) {
+            self.mu.unlock();
+            return;
+        }
         if (added) self.sub_matched_total += 1;
         self.sub_matched_total_change += if (added) 1 else 0;
         self.sub_matched_current += delta;

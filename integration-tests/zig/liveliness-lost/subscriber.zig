@@ -116,20 +116,18 @@ pub fn main(init: std.process.Init) !void {
     auto_dr_qos.liveliness.lease_duration = .{ .sec = LEASE_DURATION_SEC, .nanosec = 0 };
 
     const auto_topic_desc = auto_topic.vtable.as_TopicDescription(auto_topic.ptr);
-    const auto_dr = subscriber.create_datareader(auto_topic_desc, auto_dr_qos, null, 0);
+    // Listener passed at creation: a writer discovered earlier matches inside
+    // create_datareader, so a listener attached afterwards could miss it.
+    const auto_dr_listener = DDS.dataReaderListener(&auto_state, .{
+        .on_subscription_matched = onSubscriptionMatched,
+        .on_liveliness_changed = onLivelinessChanged,
+    });
+    const auto_dr = subscriber.create_datareader(auto_topic_desc, auto_dr_qos, auto_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS | DDS.LIVELINESS_CHANGED_STATUS);
     if (auto_dr.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datareader(AutomaticLivelinessTopic) failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create reader for topic: AutomaticLivelinessTopic\n", .{});
-    const auto_dr_listener = DDS.dataReaderListener(&auto_state, .{
-        .on_subscription_matched = onSubscriptionMatched,
-        .on_liveliness_changed = onLivelinessChanged,
-    });
-    if (auto_dr.set_listener(auto_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS | DDS.LIVELINESS_CHANGED_STATUS) != DDS.RETCODE_OK) {
-        std.debug.print("FAIL: set_listener(AutomaticLivelinessTopic) failed\n", .{});
-        std.process.exit(1);
-    }
 
     const manual_topic = dp.create_topic("ManualByParticipantLivelinessTopic", "LivelinessEvent", .{}, null, 0);
     if (manual_topic.ptr == zzdds.dcps.NIL_PTR) {
@@ -145,20 +143,18 @@ pub fn main(init: std.process.Init) !void {
     manual_dr_qos.liveliness.lease_duration = .{ .sec = LEASE_DURATION_SEC, .nanosec = 0 };
 
     const manual_topic_desc = manual_topic.vtable.as_TopicDescription(manual_topic.ptr);
-    const manual_dr = subscriber.create_datareader(manual_topic_desc, manual_dr_qos, null, 0);
+    // Listener passed at creation: a writer discovered earlier matches inside
+    // create_datareader, so a listener attached afterwards could miss it.
+    const manual_dr_listener = DDS.dataReaderListener(&manual_state, .{
+        .on_subscription_matched = onSubscriptionMatched,
+        .on_liveliness_changed = onLivelinessChanged,
+    });
+    const manual_dr = subscriber.create_datareader(manual_topic_desc, manual_dr_qos, manual_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS | DDS.LIVELINESS_CHANGED_STATUS);
     if (manual_dr.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datareader(ManualByParticipantLivelinessTopic) failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create reader for topic: ManualByParticipantLivelinessTopic\n", .{});
-    const manual_dr_listener = DDS.dataReaderListener(&manual_state, .{
-        .on_subscription_matched = onSubscriptionMatched,
-        .on_liveliness_changed = onLivelinessChanged,
-    });
-    if (manual_dr.set_listener(manual_dr_listener, DDS.SUBSCRIPTION_MATCHED_STATUS | DDS.LIVELINESS_CHANGED_STATUS) != DDS.RETCODE_OK) {
-        std.debug.print("FAIL: set_listener(ManualByParticipantLivelinessTopic) failed\n", .{});
-        std.process.exit(1);
-    }
 
     const match_deadline = monoNs(io) + MATCH_TIMEOUT_NS;
     while (auto_state.matched_current_count.load(.acquire) < 1 or manual_state.matched_current_count.load(.acquire) < 1) {
