@@ -67,6 +67,31 @@ class StuckStackTests(unittest.TestCase):
             self.assertEqual(dump.call_count, 0)
 
 
+class OverdueTests(unittest.TestCase):
+    """Marker deadlines and explicit failures count as overdue, like wait() timeouts."""
+
+    def stop_count(self, setup) -> int:
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {_common.STUCK_STACKS_ENV: "1"}), patch("_common.dump_stacks") as dump:
+            proc = LiveProcess(SLEEPER, log_path=Path(tmp) / "p.log")
+            setup(proc)
+            proc.stop(grace=5)
+            return dump.call_count
+
+    def test_marker_timeout_dumps(self):
+        self.assertEqual(self.stop_count(lambda p: self.assertFalse(p.wait_for_output("never", 0.2))), 1)
+
+    def test_mark_overdue_dumps(self):
+        self.assertEqual(self.stop_count(lambda p: p.mark_overdue()), 1)
+
+    def test_marker_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = LiveProcess([sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(60)"],
+                               log_path=Path(tmp) / "p.log")
+            self.assertTrue(proc.wait_for_output("ready", 30))
+            proc.stop(grace=5)
+
+
 class StackDumpCommandTests(unittest.TestCase):
     def test_java_uses_jstack_beside_java(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,6 +118,15 @@ class StackDumpCommandTests(unittest.TestCase):
 
 
 class MetaFileTests(unittest.TestCase):
+    def test_meta_written_at_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = LiveProcess(SLEEPER, log_path=Path(tmp) / "p.log")
+            meta = (Path(tmp) / "p.log.meta").read_text()
+            self.assertIn("started_utc:", meta)
+            self.assertNotIn("stopped_utc:", meta)
+            proc.stop(grace=5)
+            self.assertIn("stopped_externally: true", (Path(tmp) / "p.log.meta").read_text())
+
     def test_meta_records_times_and_outcome(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "sub.log"

@@ -61,7 +61,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
@@ -218,14 +217,7 @@ def wait_for_marker(proc: LiveProcess, marker: str, timeout: float) -> bool:
     """Polls proc's own log for `marker` -- a real signal that a specific
     phase of the app has completed, not a fixed sleep. See the module
     docstring for why this scenario's three-phase startup is load-bearing."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if marker in proc.log_text():
-            return True
-        if proc.poll() is not None:
-            return marker in proc.log_text()
-        time.sleep(0.05)
-    return marker in proc.log_text()
+    return proc.wait_for_output(marker, timeout)
 
 
 def run_triple(ignorer_lang: str, peer_lang: str, bystander_lang: str, domain: str, zig_out: Path) -> bool:

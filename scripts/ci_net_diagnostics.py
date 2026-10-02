@@ -114,28 +114,44 @@ def alive(pid: int) -> bool:
         return False
 
 
-def signal_pid(pid: int, sig: int, use_sudo: bool) -> None:
-    """Signal a recorder's whole session (sudo forwards to tcpdump; `ip` has no children)."""
+def signal_pid(pid: int, sig: int, use_sudo: bool) -> bool:
+    """Signal a recorder's whole session (sudo forwards to tcpdump; `ip` has no
+    children). Returns whether the signal was delivered."""
     if use_sudo:
-        subprocess.run(["sudo", "-n", "kill", f"-{int(sig)}", "--", f"-{pid}"], stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=CMD_TIMEOUT_S)
-        return
+        try:
+            result = subprocess.run(["sudo", "-n", "kill", f"-{int(sig)}", "--", f"-{pid}"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    timeout=CMD_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"could not signal pid {pid}: {e}")
+            return False
+        if result.returncode != 0:
+            print(f"could not signal pid {pid}: {result.stdout.decode(errors='replace').strip()}")
+        return result.returncode == 0
     try:
         os.killpg(pid, sig)
-    except OSError:
-        pass
+        return True
+    except OSError as e:
+        print(f"could not signal pid {pid}: {e}")
+        return False
 
 
 def stop_recorder(pidfile: Path, use_sudo: bool) -> None:
     if not pidfile.exists():
         return
     pid = int(pidfile.read_text())
-    signal_pid(pid, signal.SIGINT, use_sudo)
-    deadline = time.monotonic() + STOP_GRACE_S
-    while alive(pid) and time.monotonic() < deadline:
-        time.sleep(0.2)
+    if signal_pid(pid, signal.SIGINT, use_sudo):
+        deadline = time.monotonic() + STOP_GRACE_S
+        while alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.2)
     if alive(pid):
         signal_pid(pid, signal.SIGKILL, use_sudo)
+        time.sleep(0.5)
+    if alive(pid):
+        # Keep the PID file: the recorder is still running and its output may be
+        # incomplete. Report it rather than claim a clean stop.
+        print(f"WARNING: recorder pid {pid} is still running; its output may be incomplete")
+        return
     pidfile.unlink()
     print(f"stopped pid {pid}")
 

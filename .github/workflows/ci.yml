@@ -228,12 +228,17 @@ jobs:
             os: ubuntu-latest
             install_opencv: true
             timeout: 30
+            # Below `timeout` with room for setup/build before it and the
+            # diagnostics upload after it; a typical run takes ~18 min.
+            test_timeout: 24
           # All bindings and mesh scenarios run on Windows. Only OpenCV is
           # excluded, since its Windows toolchain is not installed here.
           - name: Windows x86_64
             os: windows-latest
             install_opencv: false
             timeout: 60
+            # A typical run takes ~22 min.
+            test_timeout: 50
     runs-on: ${{ matrix.os }}
     # Windows now also builds nine native Zig examples and runs the full mesh.
     timeout-minutes: ${{ matrix.timeout }}
@@ -295,6 +300,9 @@ jobs:
       - name: Run examples
         working-directory: examples
         shell: bash
+        # A hang fails this step before the job timeout cancels the job, so the
+        # diagnostics steps below still run.
+        timeout-minutes: ${{ matrix.test_timeout }}
         env:
           ZZDDS_TEST_LOG_STUCK_STACKS: "1"
         run: |
@@ -310,7 +318,7 @@ jobs:
         run: python scripts/ci_net_diagnostics.py stop "$RUNNER_TEMP/net-diagnostics"
 
       - name: Upload failure diagnostics
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: diagnostics-examples-${{ matrix.os }}
@@ -417,6 +425,9 @@ jobs:
 
       - name: Run ${{ matrix.scenario }} cross-binding interop
         working-directory: integration-tests/interop
+        # Below the job's 20 min (the slowest scenario takes ~7 min), so a hang
+        # fails this step and leaves time for the diagnostics steps below.
+        timeout-minutes: 15
         env:
           SCENARIO: ${{ matrix.scenario }}
           ZZDDS_TEST_LOG_STUCK_STACKS: "1"
@@ -429,7 +440,7 @@ jobs:
         run: python scripts/ci_net_diagnostics.py stop "$RUNNER_TEMP/net-diagnostics"
 
       - name: Upload failure diagnostics
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: diagnostics-integration-${{ matrix.scenario }}

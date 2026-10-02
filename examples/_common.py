@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -167,6 +168,10 @@ class LiveProcess:
             stdout, stderr = None, None
         self._started = _utc_now()
         self.proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=stdout, stderr=stderr)
+        if log_path is not None:
+            # Written now as well as at stop(), so a process that is never stopped
+            # (or whose script dies first) still has its start time on record.
+            self._write_meta(None)
 
     def poll(self) -> int | None:
         return self.proc.poll()
@@ -182,6 +187,29 @@ class LiveProcess:
         except subprocess.TimeoutExpired:
             self._wait_timed_out = True
             return None
+
+    def wait_for_output(self, marker: str, timeout: float) -> bool:
+        """Poll this process's log for `marker` until it appears, the process
+        exits, or `timeout` passes. A real signal that a phase of the app has
+        completed, not a fixed sleep. A timeout with the process still running
+        marks it overdue, like a timed-out wait()."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if marker in self.log_text():
+                return True
+            if self.proc.poll() is not None:
+                return marker in self.log_text()
+            time.sleep(0.05)
+        if marker in self.log_text():
+            return True
+        if self.proc.poll() is None:
+            self._wait_timed_out = True
+        return False
+
+    def mark_overdue(self) -> None:
+        """Record that the caller expected progress from this process by now
+        (e.g. a match it never reported), so stop() treats it as hung."""
+        self._wait_timed_out = True
 
     def stop(self, grace: float = 5) -> int:
         """Ensure the process is stopped. If still running: SIGINT (the
@@ -227,20 +255,24 @@ class LiveProcess:
             self._write_meta(killed_while_running)
         return self.proc.returncode if self.proc.returncode is not None else -1
 
-    def _write_meta(self, killed_while_running: bool) -> None:
+    def _write_meta(self, killed_while_running: bool | None) -> None:
         """Record wall-clock start/stop times beside the log, so CI packet
         captures and interface-change logs (scripts/ci_net_diagnostics.py)
-        can be matched to the pair that was running at the time."""
+        can be matched to the pair that was running at the time.
+        killed_while_running=None writes the start-only record."""
         assert self.log_path is not None
-        rc = self.proc.returncode
         lines = [
             f"cmd: {' '.join(self.cmd)}",
             f"pid: {self.proc.pid}",
             f"started_utc: {self._started}",
-            f"stopped_utc: {_utc_now()}",
-            f"returncode: {rc if rc is not None else 'unknown'}",
-            f"stopped_externally: {str(killed_while_running).lower()}",
         ]
+        if killed_while_running is not None:
+            rc = self.proc.returncode
+            lines += [
+                f"stopped_utc: {_utc_now()}",
+                f"returncode: {rc if rc is not None else 'unknown'}",
+                f"stopped_externally: {str(killed_while_running).lower()}",
+            ]
         try:
             self.log_path.with_name(self.log_path.name + ".meta").write_text("\n".join(lines) + "\n")
         except OSError:

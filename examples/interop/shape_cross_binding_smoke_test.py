@@ -235,7 +235,10 @@ def run_cft_check(lang: str, zig_out: Path) -> bool:
     while time.monotonic() < deadline:
         if pub is None or pub.poll() is not None:
             # First attempt, or the previous one hit its own internal
-            # give-up deadline and exited unmatched -- relaunch fresh.
+            # give-up deadline and exited unmatched -- relaunch fresh. stop()
+            # on the exited attempt closes its log and records its timing.
+            if pub is not None:
+                pub.stop()
             attempt += 1
             pub = LiveProcess(pub_cmd_argv, env=env, log_path=logdir / f"pub-attempt-{attempt}.log")
         if "on_publication_matched()" in pub.log_text():
@@ -244,8 +247,12 @@ def run_cft_check(lang: str, zig_out: Path) -> bool:
         time.sleep(0.1)
 
     if not matched:
+        # Both were expected to have matched by now: dump their stacks if
+        # stuck-stack logging is on (see _common.dump_stacks).
         if pub is not None:
+            pub.mark_overdue()
             pub.stop()
+        sub.mark_overdue()
         sub.stop()
         print_fail(label, f"publisher never reported a match within {MATCH_POLL_TIMEOUT_S}s across {attempt} attempt(s)", ("publisher (last attempt)", pub), ("subscriber", sub))
         return False
