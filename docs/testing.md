@@ -116,3 +116,12 @@ edge case, minimize it into a vendor-free regression under `test/fuzz/corpus/`,
 See `docs/design/testing-strategy.md` for the tier model, clock abstraction rationale,
 and notes on what we are *not* building (spec conformance harness, network simulation,
 formal verification).
+
+## Broker wire-format checks
+
+`zig build test-design-models` checks the discovery-broker schema's identifier registry,
+re-derives every independent wire vector from the specification's byte rules, and checks
+that the codec the pinned zidl generates from the draft schema reproduces those vectors.
+A dedicated `design-validation` CI job runs it; it is not part of `zig build test`.
+`python3 scripts/check_design_specs.py` runs the registry and vector checks alone. See the
+[broker wire-format evidence](design/probes/README.md).

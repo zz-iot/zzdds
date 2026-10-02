@@ -8,6 +8,27 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-01
+
+- **zidl pinned to v0.3.19: XCDR2 encoding fixes for user types.** Generated code now
+  writes the XCDR2 collection DHEADER before sequences, arrays and maps of non-primitive
+  elements (strings, enums, bitmasks, structs, unions), as the XTypes specification and
+  other implementations require; earlier output omitted it, so such members did not
+  interoperate under XCDR2. Also from this release: nested sequences and sequences of
+  array typedefs generate correctly in every binding, `@appendable`/`@mutable` top-level
+  types use the D_CDR2/PL_CDR2 representation identifiers, EMHEADER length codes 5-7 are
+  decoded, and minimal TypeObject hashes match other implementations. XCDR1 encodings and
+  types without such members are unchanged.
+  **C++ API change:** generated typed-reader condition methods (`read_w_condition`,
+  `take_w_condition`, `*_next_instance_w_condition`) now take
+  `std::shared_ptr<DDS::ReadCondition>` instead of a raw C `DDS_ReadCondition` handle; a
+  `QueryCondition` passes directly. The C++ waitset example is updated accordingly.
+- **Concurrency and discovery-broker specifications.** Contracts under
+  `docs/design/concurrency/` and `docs/design/broker/`, indexed by
+  `docs/design/concurrency-broker-status.md`, with the draft broker schema, independent
+  wire vectors and a generated-codec probe checked by `zig build test-design-models` in a
+  new `design-validation` CI job. Design only; nothing is implemented yet.
+
 ## 2026-09-30
 
 - **SPDP carries and enforces the participant's domain ID.** Every SPDP announcement

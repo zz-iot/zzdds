@@ -200,11 +200,13 @@ and `PID_GROUP_COHERENT_SET` (0x0063) inline QoS per RTPS 2.5 §9.6.3.7. The rec
 directions, ReleaseSafe/TSan/DebugAllocator): **no zzdds defect.** Every failure is the
 harness's `coherent_sets_w_instances` asserting a per-poll-cycle sample count (exactly 36),
 which depends on the phase alignment of two unsynchronised sleep loops rather than the
-coherent_access contract. The shipped `zzdds-0.2.0` binary flakes identically. Fixed by a
-`coherent_sets_w_instances` rewrite (asserts per-instance ordering, no loss/dup, and
-atomic per-instance coherent-set delivery over the whole run) PR'd to `omg-dds/dds-rtps` —
-same spirit as their `95b6f62` "Added tolerance to the ordered_access test". No zzdds
-wire-format change was needed. `CoherentSets_8` passes.
+coherent_access contract. The shipped `zzdds-0.2.0` binary flakes identically. Our
+`coherent_sets_w_instances` rewrite (asserting per-instance ordering, no loss/dup, and
+atomic per-instance coherent-set delivery over the whole run, in the spirit of their
+`95b6f62` "Added tolerance to the ordered_access test") was declined upstream in favour of
+improved per-iteration assertions (`6d9c01d`, non-GROUP only). Those reduce but do not
+remove the timing dependence, so residual flakes remain and the check still needs
+re-fixing (roadmap). No zzdds wire-format change was needed. `CoherentSets_8` passes.
 
 **Listener hierarchy fallback (DDS 1.4 §2.2.4.1.5): reader/writer own listener first,
 then Subscriber/Publisher, then DomainParticipant — every level's `listener_mask`

@@ -40,6 +40,18 @@ env:
   INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-bdcdd3b' }}
 
 jobs:
+  design-validation:
+    name: Broker schema, wire vectors and generated codec
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.16.0"
+      - name: Schema registry, independent wire vectors and generated codec
+        run: zig build test-design-models
+
   # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
   test-linux:
     name: Linux x86_64
@@ -899,8 +911,9 @@ jobs:
           # flakes seen against it (and against connext under the sanitizer
           # lanes) were run to ground 2026-08-28 — ~2,500 live runs, zero
           # ordering/loss/tear faults in any direction or build. The cause is
-          # the dds-rtps harness's coherent_sets_w_instances asserting an exact
-          # per-poll-cycle sample count; fixed upstream in omg-dds/dds-rtps.
+          # the dds-rtps harness's coherent_sets_w_instances judging each read
+          # iteration. Upstream's per-iteration improvement (6d9c01d) reduced but
+          # did not remove it; re-fixing the check is on the roadmap.
           #
           # zzdds is included so the pinned RELEASE binary runs against the
           # freshly-built HEAD binary every CI run (both directions, in the

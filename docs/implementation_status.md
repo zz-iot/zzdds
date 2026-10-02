@@ -172,9 +172,12 @@ ThreadSanitizer / DebugAllocator builds, found **zero** ordering, loss, duplicat
 coherent-set-tear faults; every failure was the per-poll-cycle count assertion. It is
 direction-specific (vendor publishes, zzdds subscribes), worst against CoreDX (round-robins
 instances) and under the slower sanitizer builds, and the shipped `zzdds-0.2.0` binary
-flakes the same way. Fix: a `coherent_sets_w_instances` rewrite that asserts the real
+flakes the same way. Our fix, a `coherent_sets_w_instances` rewrite asserting the real
 invariants (per-instance ordering, no loss/dup, per-instance coherent-set atomic delivery)
-over the whole run — PR'd to `omg-dds/dds-rtps`. `CoherentSets_8` (pure GROUP_PRESENTATION
+over the whole run, was declined upstream in favour of improved per-iteration assertions
+(`6d9c01d`, non-GROUP checks only). That reduced but did not remove the flake: all six tests
+can still fail when read and write iterations drift out of step, so the check needs
+re-fixing (see the roadmap). `CoherentSets_8` (pure GROUP_PRESENTATION
 compatibility) currently passes. `OrderedAccess_8` was not re-examined in this campaign;
 RTI added timing tolerance to `ordered_access_w_instances` upstream in Aug 2026 (`95b6f62`).
 

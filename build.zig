@@ -763,14 +763,6 @@ pub fn build(b: *std.Build) void {
                 .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
                 .flags = &.{ "-std=c99", "-Wall" },
             });
-            cpp_smoke_mod.addIncludePath(gen_smoke_cpp_dir);
-            cpp_smoke_mod.addIncludePath(gen_c_dir);
-            cpp_smoke_mod.addIncludePath(gen_zzdds_c_dir);
-            cpp_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
-            cpp_smoke_mod.addIncludePath(b.path("include"));
-            cpp_smoke_mod.linkLibrary(zzdds_lib);
-            const cpp_smoke = b.addExecutable(.{ .name = "zzdds_cpp_binding_smoke", .root_module = cpp_smoke_mod });
-            binding_smoke_step.dependOn(&b.addRunArtifact(cpp_smoke).step);
 
             // Binding smoke test for zzdds_cpp.hpp's allocator-injection surfaces
             // (factory bootstrap + C++ wrapper-object PMR allocation), including
@@ -837,6 +829,24 @@ pub fn build(b: *std.Build) void {
             _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_c_dir.path(b, "zzdds.h"), "zzdds.h");
             _ = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_cpp_impl_dir.path(b, "zzdds_impl.hpp"), "zzdds_impl.hpp");
             const alloc_smoke_zzdds_impl_cpp = alloc_smoke_merged.addCopyFile(gen_alloc_smoke_zzdds_cpp_impl_dir.path(b, "zzdds_impl.cpp"), "zzdds_impl.cpp");
+
+            // The C++ binding smoke test's generated header includes "dcps.hpp"
+            // (typed-reader condition methods take std::shared_ptr<DDS::ReadCondition>)
+            // and its CDR source includes "dcps_impl.hpp" (and links against the
+            // DataReaderImpl/DataWriterImpl definitions in dcps_impl.cpp), so it uses
+            // the same merged, deduplicated directory: one copy each of
+            // dcps.h/zzdds.h/dcps.hpp, for the reason given above.
+            cpp_smoke_mod.addCSourceFile(.{
+                .file = alloc_smoke_dcps_impl_cpp,
+                .flags = &.{ "-std=c++17", "-Wall" },
+            });
+            cpp_smoke_mod.addIncludePath(gen_smoke_cpp_dir);
+            cpp_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+            cpp_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            cpp_smoke_mod.addIncludePath(b.path("include"));
+            cpp_smoke_mod.linkLibrary(zzdds_lib);
+            const cpp_smoke = b.addExecutable(.{ .name = "zzdds_cpp_binding_smoke", .root_module = cpp_smoke_mod });
+            binding_smoke_step.dependOn(&b.addRunArtifact(cpp_smoke).step);
 
             const cpp_alloc_smoke_mod = b.createModule(.{
                 .root_source_file = null,
@@ -1320,6 +1330,35 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
+
+    // Broker design evidence (docs/design/probes/README.md): the Python check re-derives the
+    // independent wire vectors; the codec probe compiles the draft schema with the pinned
+    // zidl and checks the generated codec reproduces them. Not part of `test`.
+    const design_step = b.step("test-design-models", "Check the broker schema registry, wire vectors and generated codec");
+    const design_run = b.addSystemCommand(&.{ "python3", "scripts/check_design_specs.py" });
+    design_step.dependOn(&design_run.step);
+    const gen_broker = b.addRunArtifact(zidl_exe);
+    gen_broker.addArgs(&.{ "-b", "zig", "--no-typeobject-support", "-o" });
+    const gen_broker_dir = gen_broker.addOutputDirectoryArg("zzdds-generated-broker-draft");
+    gen_broker.addFileArg(b.path("docs/design/schema/broker-control-draft.idl"));
+    const broker_codec_test = b.addTest(.{
+        .name = "broker_wire_codec",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("docs/design/probes/broker_wire_codec.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wire", .module = b.createModule(.{
+                    .root_source_file = gen_broker_dir.path(b, "broker-control-draft.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod }},
+                }) },
+                .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            },
+        }),
+    });
+    design_step.dependOn(&b.addRunArtifact(broker_codec_test).step);
 
     // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
     const emit_tests_step = b.step("emit-tests", "Build test binaries for kcov coverage analysis");

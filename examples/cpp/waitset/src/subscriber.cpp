@@ -271,9 +271,7 @@ int main(int argc, char **argv) {
         // trusting which call it came from.
         std::vector<WaitsetSample> high_values(EXPECTED_SAMPLES);
         std::vector<DDS_SampleInfo> high_infos(EXPECTED_SAMPLES);
-        int n_high = reader.take_w_condition(
-            DDS_QueryCondition_as_DDS_ReadCondition(qc_cond->native_handle()),
-            high_values.data(), high_infos.data(), EXPECTED_SAMPLES);
+        int n_high = reader.take_w_condition(qc_cond, high_values.data(), high_infos.data(), EXPECTED_SAMPLES);
 
         std::vector<WaitsetSample> low_values(EXPECTED_SAMPLES);
         std::vector<DDS_SampleInfo> low_infos(EXPECTED_SAMPLES);
