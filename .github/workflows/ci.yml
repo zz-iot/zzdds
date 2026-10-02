@@ -228,12 +228,17 @@ jobs:
             os: ubuntu-latest
             install_opencv: true
             timeout: 30
+            # Below `timeout` with room for setup/build before it and the
+            # diagnostics upload after it; a typical run takes ~18 min.
+            test_timeout: 24
           # All bindings and mesh scenarios run on Windows. Only OpenCV is
           # excluded, since its Windows toolchain is not installed here.
           - name: Windows x86_64
             os: windows-latest
             install_opencv: false
             timeout: 60
+            # A typical run takes ~22 min.
+            test_timeout: 50
     runs-on: ${{ matrix.os }}
     # Windows now also builds nine native Zig examples and runs the full mesh.
     timeout-minutes: ${{ matrix.timeout }}
@@ -274,15 +279,55 @@ jobs:
       - name: Build zzdds
         run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
+      - name: Prepare failure diagnostics (Linux)
+        if: runner.os == 'Linux'
+        # gdb for stuck-process stack dumps (examples/_common.py), tcpdump for
+        # scripts/ci_net_diagnostics.py. ptrace_scope=0 lets gdb attach to a test
+        # process it didn't start. Best-effort: never fails the job.
+        run: |
+          missing=""
+          command -v gdb >/dev/null || missing="$missing gdb"
+          command -v tcpdump >/dev/null || missing="$missing tcpdump"
+          if [ -n "$missing" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $missing || true
+          fi
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope || true
+
+      - name: Start network diagnostics
+        shell: bash
+        run: python scripts/ci_net_diagnostics.py start "$RUNNER_TEMP/net-diagnostics"
+
       - name: Run examples
         working-directory: examples
         shell: bash
+        # A hang fails this step before the job timeout cancels the job, so the
+        # diagnostics steps below still run.
+        timeout-minutes: ${{ matrix.test_timeout }}
+        env:
+          ZZDDS_TEST_LOG_STUCK_STACKS: "1"
         run: |
           if [ "${{ matrix.install_opencv }}" = "true" ]; then
             ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python run_all.py --strict
           else
             ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python run_all.py --strict --skip-opencv
           fi
+
+      - name: Stop network diagnostics
+        if: always()
+        shell: bash
+        run: python scripts/ci_net_diagnostics.py stop "$RUNNER_TEMP/net-diagnostics"
+
+      - name: Upload failure diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-examples-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/net-diagnostics
+            examples/interop/.smoke-logs
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ── integration tests ────────────────────────────────────────────────────
   #
@@ -360,12 +405,51 @@ jobs:
       - name: Build zzdds (all bindings)
         run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
+      - name: Prepare failure diagnostics (Linux)
+        if: runner.os == 'Linux'
+        # gdb for stuck-process stack dumps (examples/_common.py), tcpdump for
+        # scripts/ci_net_diagnostics.py. ptrace_scope=0 lets gdb attach to a test
+        # process it didn't start. Best-effort: never fails the job.
+        run: |
+          missing=""
+          command -v gdb >/dev/null || missing="$missing gdb"
+          command -v tcpdump >/dev/null || missing="$missing tcpdump"
+          if [ -n "$missing" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $missing || true
+          fi
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope || true
+
+      - name: Start network diagnostics
+        shell: bash
+        run: python scripts/ci_net_diagnostics.py start "$RUNNER_TEMP/net-diagnostics"
+
       - name: Run ${{ matrix.scenario }} cross-binding interop
         working-directory: integration-tests/interop
+        # Below the job's 20 min (the slowest scenario takes ~7 min), so a hang
+        # fails this step and leaves time for the diagnostics steps below.
+        timeout-minutes: 15
         env:
           SCENARIO: ${{ matrix.scenario }}
+          ZZDDS_TEST_LOG_STUCK_STACKS: "1"
         run: |
           ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python3 "${SCENARIO//-/_}_cross_binding_test.py"
+
+      - name: Stop network diagnostics
+        if: always()
+        shell: bash
+        run: python scripts/ci_net_diagnostics.py stop "$RUNNER_TEMP/net-diagnostics"
+
+      - name: Upload failure diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-integration-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/net-diagnostics
+            integration-tests/interop/.smoke-logs
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ── examples: WaitSet + ThreadSanitizer ──────────────────────────────────
   #

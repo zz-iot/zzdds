@@ -111,6 +111,20 @@ edge case, minimize it into a vendor-free regression under `test/fuzz/corpus/`,
 `test/rtps/*_model_test.zig`, `test/dcps/*_model_test.zig`, or
 `test/interop_regressions/README.md` as appropriate.
 
+## Failure diagnostics for the examples and integration tiers
+
+The process harness (`examples/_common.py`) writes a `<name>.log.meta` file beside each
+process log in `.smoke-logs/`, with the command, PID, start and stop times (UTC) and exit
+status. With `ZZDDS_TEST_LOG_STUCK_STACKS=1`, a process that is still running when the
+harness's `wait()` has run out of time gets every thread's stack printed to stderr (gdb,
+lldb on macOS or `ZZDDS_TEST_DEBUGGER`, `jstack` for Java) before it is killed. On Linux
+the debugger needs `kernel.yama.ptrace_scope=0`.
+
+`scripts/ci_net_diagnostics.py start|stop <dir>` records network snapshots, an
+`ip -ts monitor` change log and (with tcpdump and passwordless sudo) a UDP packet capture
+around a run. CI does both for the examples and integration jobs and uploads the results
+as a `diagnostics-*` artifact when a job fails.
+
 ## Test design philosophy
 
 See `docs/design/testing-strategy.md` for the tier model, clock abstraction rationale,

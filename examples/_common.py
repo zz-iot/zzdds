@@ -22,12 +22,14 @@ regardless of which subdirectory it lives in:
 """
 from __future__ import annotations
 
+import datetime
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -152,6 +154,11 @@ class LiveProcess:
         """
         self.cmd = cmd
         self.log_path = log_path
+        # Set when a wait() ran out of time: the caller expected the process to
+        # exit by then, so a later stop() that has to kill it is a hang worth
+        # diagnosing (see dump_stacks). Callers that stop a deliberately
+        # long-running process don't wait() on it first.
+        self._wait_timed_out = False
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = open(log_path, "wb")
@@ -159,7 +166,12 @@ class LiveProcess:
         else:
             self._log_file = None
             stdout, stderr = None, None
+        self._started = _utc_now()
         self.proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=stdout, stderr=stderr)
+        if log_path is not None:
+            # Written now as well as at stop(), so a process that is never stopped
+            # (or whose script dies first) still has its start time on record.
+            self._write_meta(None)
 
     def poll(self) -> int | None:
         return self.proc.poll()
@@ -173,7 +185,31 @@ class LiveProcess:
         try:
             return self.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            self._wait_timed_out = True
             return None
+
+    def wait_for_output(self, marker: str, timeout: float) -> bool:
+        """Poll this process's log for `marker` until it appears, the process
+        exits, or `timeout` passes. A real signal that a phase of the app has
+        completed, not a fixed sleep. A timeout with the process still running
+        marks it overdue, like a timed-out wait()."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if marker in self.log_text():
+                return True
+            if self.proc.poll() is not None:
+                return marker in self.log_text()
+            time.sleep(0.05)
+        if marker in self.log_text():
+            return True
+        if self.proc.poll() is None:
+            self._wait_timed_out = True
+        return False
+
+    def mark_overdue(self) -> None:
+        """Record that the caller expected progress from this process by now
+        (e.g. a match it never reported), so stop() treats it as hung."""
+        self._wait_timed_out = True
 
     def stop(self, grace: float = 5) -> int:
         """Ensure the process is stopped. If still running: SIGINT (the
@@ -193,6 +229,9 @@ class LiveProcess:
         self-termination check the exit code; intentionally long-running
         checks (such as shape filtering) validate their output instead.
         """
+        killed_while_running = self.proc.poll() is None
+        if killed_while_running and self._wait_timed_out and stuck_stacks_enabled():
+            dump_stacks(self.proc.pid, self.cmd)
         if self.proc.poll() is None:
             try:
                 if sys.platform == "win32":
@@ -212,7 +251,32 @@ class LiveProcess:
         if self._log_file is not None:
             self._log_file.flush()
             self._log_file.close()
+            self._log_file = None
+            self._write_meta(killed_while_running)
         return self.proc.returncode if self.proc.returncode is not None else -1
+
+    def _write_meta(self, killed_while_running: bool | None) -> None:
+        """Record wall-clock start/stop times beside the log, so CI packet
+        captures and interface-change logs (scripts/ci_net_diagnostics.py)
+        can be matched to the pair that was running at the time.
+        killed_while_running=None writes the start-only record."""
+        assert self.log_path is not None
+        lines = [
+            f"cmd: {' '.join(self.cmd)}",
+            f"pid: {self.proc.pid}",
+            f"started_utc: {self._started}",
+        ]
+        if killed_while_running is not None:
+            rc = self.proc.returncode
+            lines += [
+                f"stopped_utc: {_utc_now()}",
+                f"returncode: {rc if rc is not None else 'unknown'}",
+                f"stopped_externally: {str(killed_while_running).lower()}",
+            ]
+        try:
+            self.log_path.with_name(self.log_path.name + ".meta").write_text("\n".join(lines) + "\n")
+        except OSError:
+            pass  # diagnostics only; never fail a test over it
 
     def log_text(self) -> str:
         if self.log_path is None:
@@ -221,6 +285,60 @@ class LiveProcess:
             return self.log_path.read_text(errors="replace")
         except FileNotFoundError:
             return ""
+
+
+def _utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+STUCK_STACKS_ENV = "ZZDDS_TEST_LOG_STUCK_STACKS"
+STACK_DUMP_TIMEOUT_S = 60
+
+
+def stuck_stacks_enabled() -> bool:
+    return os.environ.get(STUCK_STACKS_ENV, "") not in ("", "0")
+
+
+def _stack_dump_cmd(pid: int, cmd: list[str]) -> list[str] | None:
+    """Debugger command printing every thread's stack for `pid`, or None if
+    this platform has no supported tool. Java gets jstack (JVM frames, not the
+    interpreter's native ones); native processes get gdb, or lldb on macOS.
+    ZZDDS_TEST_DEBUGGER overrides the native debugger (gdb or lldb)."""
+    if Path(cmd[0]).name.lower() in ("java", "java.exe"):
+        jstack = Path(cmd[0]).with_name("jstack.exe" if cmd[0].lower().endswith(".exe") else "jstack")
+        tool = str(jstack) if jstack.is_file() else shutil.which("jstack")
+        return [tool, "-l", str(pid)] if tool else None
+    if sys.platform == "win32":
+        return None
+    debugger = os.environ.get("ZZDDS_TEST_DEBUGGER") or ("lldb" if sys.platform == "darwin" else "gdb")
+    if shutil.which(debugger) is None:
+        return None
+    if Path(debugger).name.startswith("lldb"):
+        return [debugger, "--batch", "-p", str(pid), "-o", "bt all"]
+    return [debugger, "--batch", "-p", str(pid), "-ex", "set pagination off", "-ex", "thread apply all backtrace"]
+
+
+def dump_stacks(pid: int, cmd: list[str]) -> None:
+    """Print every thread's stack of a process that failed to exit in time, so
+    a hang in CI can be diagnosed from the job log. Opt in with
+    ZZDDS_TEST_LOG_STUCK_STACKS=1 (modelled on ACE's ACE_TEST_LOG_STUCK_STACKS).
+    The debugger itself is bounded: it is killed after STACK_DUMP_TIMEOUT_S.
+    On Linux, attaching to a process that isn't the debugger's own child needs
+    kernel.yama.ptrace_scope=0 (CI sets it)."""
+    print(f"\n======= Begin stuck stacks: pid {pid}: {' '.join(cmd)} =======", file=sys.stderr, flush=True)
+    dump_cmd = _stack_dump_cmd(pid, cmd)
+    if dump_cmd is None:
+        print("(no stack-dump tool available on this platform)", file=sys.stderr)
+    else:
+        try:
+            result = subprocess.run(dump_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, timeout=STACK_DUMP_TIMEOUT_S)
+            sys.stderr.write(result.stdout.decode(errors="replace"))
+        except subprocess.TimeoutExpired:
+            print(f"(stack dump timed out after {STACK_DUMP_TIMEOUT_S}s)", file=sys.stderr)
+        except OSError as e:
+            print(f"(stack dump failed: {e})", file=sys.stderr)
+    print("======= End stuck stacks =======", file=sys.stderr, flush=True)
 
 
 def print_fail(label: str, detail: str = "", *log_sections: tuple[str, "LiveProcess | str"]) -> None:

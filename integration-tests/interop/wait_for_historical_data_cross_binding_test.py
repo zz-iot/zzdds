@@ -33,7 +33,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
@@ -158,14 +157,7 @@ def wait_for_marker(proc: LiveProcess, marker: str, timeout: float) -> bool:
     phase of the app has completed, not a fixed sleep. See the module
     docstring for why the subscriber's own "ready for publisher" marker is
     load-bearing for this scenario specifically."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if marker in proc.log_text():
-            return True
-        if proc.poll() is not None:
-            return marker in proc.log_text()
-        time.sleep(0.05)
-    return marker in proc.log_text()
+    return proc.wait_for_output(marker, timeout)
 
 
 def run_pair(subscriber_lang: str, publisher_lang: str, zig_out: Path) -> bool:
