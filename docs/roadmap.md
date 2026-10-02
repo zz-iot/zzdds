@@ -234,12 +234,18 @@ or an optimisation on an already-improved path):
   `StatusConditionImpl`, `ReadConditionImpl`, `QueryConditionImpl`, `DataNotifyFn` and
   `WakeupHandle` are reachable as `zzdds.dcps.*`, which let application code cast into
   internals instead of using the generated interfaces (`dds-rtps`'s Zig shape app did,
-  fixed 2026-09-22). Checked feasible then: zzdds's own code imports these through relative
-  paths, no external Zig consumer uses them (`rmw_zzdds` has no Zig code), and zidl's
-  generated code does not reference them. Keep public `TypeSupport`, `filter`
-  (`FilterValue`/`CdrFieldGetter`, used by generated `getFieldFromCdr`) and the
-  `nil_*`/`NIL_PTR` sentinels. Small edit; verify with `zig build test`, the strict
-  examples suite and a `dds-rtps` rebuild.
+  fixed 2026-09-22). zzdds's library code imports these through relative paths, no
+  external Zig consumer uses them (`rmw_zzdds` has no Zig code), and zidl's generated code
+  does not reference them. zzdds's own tests do: about 164 references in 29 files under
+  `test/` (mostly `test/dcps/`, plus `test/c_abi/` and `test/support/`) reach them as
+  `zzdds.dcps.*`. Those tests are separate modules importing `zzdds`, so they cannot switch
+  to relative imports of `src/` files (a file belongs to one module; importing it twice
+  duplicates its types). Removing the re-exports therefore needs a test-only route to the
+  internals first, such as a separate internal module wired in `build.zig` for test
+  targets, or a namespace exposed only when `@import("builtin").is_test` is set, and the
+  tests migrated to it. Keep public `TypeSupport`, `filter` (`FilterValue`/`CdrFieldGetter`,
+  used by generated `getFieldFromCdr`) and the `nil_*`/`NIL_PTR` sentinels. Verify with
+  `zig build test`, the strict examples suite and a `dds-rtps` rebuild.
 - **Java: a few DCPS ops taking a bare `sequence<T>` parameter** (not inside a struct) throw
   `UnsupportedOperationException` (`get_datareaders`, some batch ops). `zzdds.idl`
   vendor-extension / cross-file type refs in zidl's Java backend may be partly stale versus
