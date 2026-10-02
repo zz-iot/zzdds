@@ -274,15 +274,52 @@ jobs:
       - name: Build zzdds
         run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
+      - name: Prepare failure diagnostics (Linux)
+        if: runner.os == 'Linux'
+        # gdb for stuck-process stack dumps (examples/_common.py), tcpdump for
+        # scripts/ci_net_diagnostics.py. ptrace_scope=0 lets gdb attach to a test
+        # process it didn't start. Best-effort: never fails the job.
+        run: |
+          missing=""
+          command -v gdb >/dev/null || missing="$missing gdb"
+          command -v tcpdump >/dev/null || missing="$missing tcpdump"
+          if [ -n "$missing" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $missing || true
+          fi
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope || true
+
+      - name: Start network diagnostics
+        shell: bash
+        run: python scripts/ci_net_diagnostics.py start "$RUNNER_TEMP/net-diagnostics"
+
       - name: Run examples
         working-directory: examples
         shell: bash
+        env:
+          ZZDDS_TEST_LOG_STUCK_STACKS: "1"
         run: |
           if [ "${{ matrix.install_opencv }}" = "true" ]; then
             ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python run_all.py --strict
           else
             ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python run_all.py --strict --skip-opencv
           fi
+
+      - name: Stop network diagnostics
+        if: always()
+        shell: bash
+        run: python scripts/ci_net_diagnostics.py stop "$RUNNER_TEMP/net-diagnostics"
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-examples-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/net-diagnostics
+            examples/interop/.smoke-logs
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ── integration tests ────────────────────────────────────────────────────
   #
@@ -360,12 +397,48 @@ jobs:
       - name: Build zzdds (all bindings)
         run: zig build -Dc-binding=true -Dcpp-binding=true -Djava-binding=true install
 
+      - name: Prepare failure diagnostics (Linux)
+        if: runner.os == 'Linux'
+        # gdb for stuck-process stack dumps (examples/_common.py), tcpdump for
+        # scripts/ci_net_diagnostics.py. ptrace_scope=0 lets gdb attach to a test
+        # process it didn't start. Best-effort: never fails the job.
+        run: |
+          missing=""
+          command -v gdb >/dev/null || missing="$missing gdb"
+          command -v tcpdump >/dev/null || missing="$missing tcpdump"
+          if [ -n "$missing" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $missing || true
+          fi
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope || true
+
+      - name: Start network diagnostics
+        shell: bash
+        run: python scripts/ci_net_diagnostics.py start "$RUNNER_TEMP/net-diagnostics"
+
       - name: Run ${{ matrix.scenario }} cross-binding interop
         working-directory: integration-tests/interop
         env:
           SCENARIO: ${{ matrix.scenario }}
+          ZZDDS_TEST_LOG_STUCK_STACKS: "1"
         run: |
           ZZDDS_ZIG_OUT="$GITHUB_WORKSPACE/zig-out" python3 "${SCENARIO//-/_}_cross_binding_test.py"
+
+      - name: Stop network diagnostics
+        if: always()
+        shell: bash
+        run: python scripts/ci_net_diagnostics.py stop "$RUNNER_TEMP/net-diagnostics"
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-integration-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/net-diagnostics
+            integration-tests/interop/.smoke-logs
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ── examples: WaitSet + ThreadSanitizer ──────────────────────────────────
   #

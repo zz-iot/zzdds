@@ -22,6 +22,21 @@ Forward-looking only: known gaps, planned features, and open design questions.
 
 ### Discovery / RTPS / transport
 
+- **Interface changes never reach the SPDP announcement.** The interface monitor
+  (`transport/monitor/polling.zig`, every `interface_poll_interval_ms`, default 5 s)
+  notices added and removed addresses, and `UdpTransport.onIfaceChange` adds or retires
+  per-interface sockets and multicast joins and rebuilds its locator list. But SPDP
+  encodes the participant announcement once, in `start()` (`spdp.zig`, `local_payload`),
+  and resends those bytes for the participant's lifetime; no production code registers a
+  `locator_change_handler` with the UDP transport. A participant whose host gains an
+  address never advertises it, and one that loses an address keeps advertising a locator
+  whose socket is closed. Same-host peers are unaffected (127.0.0.1 is always advertised,
+  is the preferred locator tier, and SPDP multicast is also sent and joined on loopback);
+  multi-host deployments with DHCP renumbering, VPNs or Wi-Fi roaming are not. Fix:
+  register a handler that re-encodes and re-sends the SPDP announcement (and check that
+  peers update existing proxies' locators when a known participant's announcement
+  changes). `onIfaceChange` also logs nothing, so a change is invisible in process logs.
+
 - **Standard RTPS domain tags and domain identity admission** — required prerequisite
   for broker discovery, replacing the proposed broker realm. Add DomainConfig.tag
   (empty default), PID_DOMAIN_TAG (0x4014, string<256>) and PID_DOMAIN_ID decoding/
@@ -336,9 +351,14 @@ or an optimisation on an already-improved path):
   account for it. `cft-reconfigure` failed 2 of 17 runs before #92 merged and 4 of 4 runs
   after, although the merged tree is identical to the last passing PR head, so a CI
   environment or timing change is implicated rather than code. It has not reproduced
-  locally. Next step: capture evidence in CI rather than guess — on failure, upload a
-  packet capture of the pair and both processes' discovery debug logs (and stack dumps; see
-  below), then analyse with `dds-rtps`'s `rtps_pcap.py`.
+  locally, so the examples and integration jobs now record evidence in CI
+  (`scripts/ci_net_diagnostics.py`): a `tcpdump -i any udp` capture (Linux), a timestamped
+  `ip monitor` log of interface/address/route changes, and before/after snapshots of
+  interfaces, routes, multicast memberships and UDP sockets. On failure they are uploaded
+  with `.smoke-logs`, whose `*.log.meta` files give each process's start/stop time and
+  exit status. Next: analyse the next failure's capture with `dds-rtps`'s `rtps_pcap.py`.
+  Process-side visibility is still thin: SPDP has three debug log lines and SEDP none, and
+  the wire tracer (`-Dwire-trace`) has to be configured in code by each application.
 - **`Test_Ownership_3` flakes in the DebugAllocator CoreDX-publisher lane.** The zzdds
   subscriber reports `RECEIVING_FROM_BOTH` instead of `RECEIVING_FROM_ONE` (two exclusive-
   ownership publishers, strengths 3 and 4, same instance). Seen twice with identical
@@ -348,27 +368,22 @@ or an optimisation on an already-improved path):
   ownership that the harness check counts) or whether ownership arbitration has a real
   race, e.g. a strength comparison against a writer whose proxy or strength isn't yet
   installed.
-- **Stack dumps for hung or unfinished test processes.** When a harness gives up on a
-  child process, record every thread's stack in the job log before killing it, so a hang
-  in CI is diagnosable after the fact. Prior art: ACE's Perl test framework (used by
-  OpenDDS) does this in `PerlACE/Process_Unix.pm`'s `WaitKill` when
-  `ACE_TEST_LOG_STUCK_STACKS` is set — on timeout it runs
-  `gdb --batch -p <pid> -ex 'set pagination off' -ex 'thread apply all backtrace'` (`lldb
-  -o 'bt all'` on macOS; `ACE_TEST_DEBUGGER` overrides the debugger) between "Begin/End
-  stuck stacks" markers on stderr, then kills the process. `ACE_TEST_GENERATE_CORE_FILE`
-  additionally saves a core with `gcore`, and crashed processes get a backtrace from their
-  core file unless `ACE_TEST_DISABLE_STACK_TRACE` is set. OpenDDS CI enables it by
-  installing gdb, setting `kernel.yama.ptrace_scope=0` (the harness's gdb is not the
-  target's parent), `ulimit -c unlimited` and a `kernel.core_pattern`. For zzdds the
-  natural hook is `examples/_common.py`'s `LiveProcess.stop()` (its SIGINT→SIGKILL
-  escalation, shared by the examples and integration tiers), plus the other bounded-wait
-  sites (`examples/scripts/run_tsan_pubsub_pair.py`, `scripts/verify_release_bundle.py`)
-  and, separately, `dds-rtps`'s pexpect harness. Investigate: an opt-in environment
-  variable; Windows (`cdb` or `procdump`); symbol quality of ReleaseSafe versus stripped
-  binaries; JVM processes (`jstack` is more useful than gdb there); and keeping the dump
-  itself bounded so it cannot hang the job. Note that the integration discovery failures
-  above end with the processes exiting on their own match timeout, so catching those
-  would also need an "on reported failure" dump, not only an "on kill" one.
+- **Stack dumps for hung or unfinished test processes — examples/integration tiers done;
+  other harnesses remain.** `examples/_common.py`'s `LiveProcess.stop()` (shared by the
+  examples and integration tiers) now prints every thread's stack between "Begin/End
+  stuck stacks" markers before killing a process, when `ZZDDS_TEST_LOG_STUCK_STACKS=1` and
+  the caller's own `wait()` ran out of time (a deliberate stop of a long-running process
+  is not a hang). It uses gdb, lldb on macOS (`ZZDDS_TEST_DEBUGGER` overrides), or
+  `jstack` for Java, bounded to 60 s. CI sets the variable for both tiers and, on Linux,
+  installs gdb and sets `kernel.yama.ptrace_scope=0` (the debugger is not the target's
+  parent). Modelled on ACE's Perl test framework, used by OpenDDS:
+  `PerlACE/Process_Unix.pm`'s `WaitKill` with `ACE_TEST_LOG_STUCK_STACKS`, plus
+  `ACE_TEST_GENERATE_CORE_FILE` (save a core with `gcore`) and backtraces from crashed
+  processes' core files. Remaining: Windows (`cdb` or `procdump`); core files and crash
+  backtraces; the other bounded-wait sites (`examples/scripts/run_tsan_pubsub_pair.py`,
+  `scripts/verify_release_bundle.py`); `dds-rtps`'s pexpect harness; and a dump at the
+  moment a process reports failure, since the integration discovery failures above end
+  with the processes exiting on their own match timeout, which this hook does not see.
 - **Non-goal (recorded, not planned):** a spec-conformance harness, network simulation
   (ns-3 / CORE), and formal verification / safety certification (DO-178C, IEC 61508, ISO
   26262) — long-term concerns, not built. `design/testing-strategy.md`.
