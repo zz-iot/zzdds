@@ -54,12 +54,16 @@ fn onSubscriptionMatched(state: *MatchState, dr: DDS.DataReader, status: DDS.Sub
     if (status.current_count > 0) state.ever_matched.store(true, .release);
 }
 
-fn setWriterListenerEx(dw: DDS.DataWriter, state: *MatchState) !void {
-    const zdw = zzdds.asZzddsDataWriter(dw) orelse return error.AsZzddsDataWriterFailed;
-    if (zdw.set_listener_ex(ZZDDS.dataWriterListenerEx(state, .{
+/// Creates a writer with its extended listener installed from the start: a
+/// reader discovered earlier matches inside creation, so a listener attached
+/// afterwards could miss on_publication_matched and on_reliable_reader_ready.
+/// Returns the nil writer on failure.
+fn createWriterEx(publisher: DDS.Publisher, topic: DDS.Topic, qos: DDS.DataWriterQos, state: *MatchState) DDS.DataWriter {
+    const zpub = zzdds.asZzddsPublisher(publisher) orelse return zzdds.dcps.nil_datawriter;
+    return zpub.create_datawriter_ex(topic, qos, ZZDDS.dataWriterListenerEx(state, .{
         .on_publication_matched = onPublicationMatchedEx,
         .on_reliable_reader_ready = onReliableReaderReady,
-    }), DDS.PUBLICATION_MATCHED_STATUS) != DDS.RETCODE_OK) return error.SetListenerExFailed;
+    }), DDS.PUBLICATION_MATCHED_STATUS);
 }
 
 fn parseDomain(process_args: std.process.Args) u32 {
@@ -128,7 +132,11 @@ pub fn main(init: std.process.Init) !void {
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
 
-    const in_dw = publisher.create_datawriter(in_topic, dw_qos, null, 0);
+    // Readers get their listeners at creation too, for the same reason.
+    var writer_state = MatchState{};
+    var out1_state = MatchState{};
+    var out2_state = MatchState{};
+    const in_dw = createWriterEx(publisher, in_topic, dw_qos, &writer_state);
     if (in_dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter(SessionIn) failed\n", .{});
         std.process.exit(1);
@@ -141,32 +149,16 @@ pub fn main(init: std.process.Init) !void {
 
     const out1_topic_desc = dp.lookup_topicdescription("SessionOut1");
     const out2_topic_desc = dp.lookup_topicdescription("SessionOut2");
-    const out1_dr = subscriber.create_datareader(out1_topic_desc, dr_qos, null, 0);
-    const out2_dr = subscriber.create_datareader(out2_topic_desc, dr_qos, null, 0);
+    const out1_listener = DDS.dataReaderListener(&out1_state, .{ .on_subscription_matched = onSubscriptionMatched });
+    const out2_listener = DDS.dataReaderListener(&out2_state, .{ .on_subscription_matched = onSubscriptionMatched });
+    const out1_dr = subscriber.create_datareader(out1_topic_desc, dr_qos, out1_listener, DDS.SUBSCRIPTION_MATCHED_STATUS);
+    const out2_dr = subscriber.create_datareader(out2_topic_desc, dr_qos, out2_listener, DDS.SUBSCRIPTION_MATCHED_STATUS);
     if (out1_dr.ptr == zzdds.dcps.NIL_PTR or out2_dr.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datareader() failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create reader for topic: SessionOut1\n", .{});
     std.debug.print("Create reader for topic: SessionOut2\n", .{});
-
-    var writer_state = MatchState{};
-    var out1_state = MatchState{};
-    var out2_state = MatchState{};
-
-    setWriterListenerEx(in_dw, &writer_state) catch {
-        std.debug.print("FAIL: set_listener_ex(SessionIn) failed\n", .{});
-        std.process.exit(1);
-    };
-
-    const out1_listener = DDS.dataReaderListener(&out1_state, .{ .on_subscription_matched = onSubscriptionMatched });
-    const out2_listener = DDS.dataReaderListener(&out2_state, .{ .on_subscription_matched = onSubscriptionMatched });
-    if (out1_dr.vtable.set_listener(out1_dr.ptr, &out1_listener, DDS.SUBSCRIPTION_MATCHED_STATUS) != DDS.RETCODE_OK or
-        out2_dr.vtable.set_listener(out2_dr.ptr, &out2_listener, DDS.SUBSCRIPTION_MATCHED_STATUS) != DDS.RETCODE_OK)
-    {
-        std.debug.print("FAIL: set_listener (reader) failed\n", .{});
-        std.process.exit(1);
-    }
 
     const in_writer = session_event_gen.SessionEventDataWriter.init(in_dw, alloc);
     var out1_reader = session_event_gen.SessionEventDataReader.init(out1_dr, alloc);

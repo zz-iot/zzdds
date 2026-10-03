@@ -24,6 +24,8 @@ const DataWriterImpl = dcps_writer.DataWriterImpl;
 const DataReaderImpl = dcps_reader.DataReaderImpl;
 const DomainParticipantImpl = dcps_participant.DomainParticipantImpl;
 const TopicImpl = dcps_topic.TopicImpl;
+const PublisherImpl = @import("dcps/publisher.zig").PublisherImpl;
+const SubscriberImpl = @import("dcps/subscriber.zig").SubscriberImpl;
 const WaitSetImpl = dcps_waitset.WaitSetImpl;
 const GuardConditionImpl = dcps_waitset.GuardConditionImpl;
 
@@ -101,6 +103,20 @@ pub fn asZzddsDataReader(reader: DDS.DataReader) ?ZZDDS.DataReader {
 pub fn asZzddsTopic(topic: DDS.Topic) ?ZZDDS.Topic {
     if (topic.vtable != &TopicImpl.topic_vtable) return null;
     return .{ .ptr = topic.ptr, .vtable = &zzdds_ext.topic_vtable };
+}
+
+/// See `asZzddsDataWriter` -- same shape, for `Publisher` (reaches
+/// `create_datawriter_ex`).
+pub fn asZzddsPublisher(publisher: DDS.Publisher) ?ZZDDS.Publisher {
+    if (publisher.vtable != &PublisherImpl.vtable) return null;
+    return .{ .ptr = publisher.ptr, .vtable = &zzdds_ext.publisher_vtable };
+}
+
+/// See `asZzddsDataWriter` -- same shape, for `Subscriber` (reaches
+/// `create_datareader_ex`).
+pub fn asZzddsSubscriber(subscriber: DDS.Subscriber) ?ZZDDS.Subscriber {
+    if (subscriber.vtable != &SubscriberImpl.vtable) return null;
+    return .{ .ptr = subscriber.ptr, .vtable = &zzdds_ext.subscriber_vtable };
 }
 
 /// See `asZzddsDataWriter` -- same shape, for `DomainParticipant`.

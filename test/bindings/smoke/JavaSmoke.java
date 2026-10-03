@@ -51,16 +51,17 @@ public class JavaSmoke {
         publisher.get_default_datawriter_qos(writerQos);
         writerQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
 
-        Dcps.DDS.DataWriter rawWriter = publisher.create_datawriter(topicWriter, writerQos, null, 0);
-        check(rawWriter != null, "create_datawriter() returned non-null");
-
-        // Narrow to zzdds's own extension view to reach set_listener_ex —
-        // same underlying writer, see ZzddsRuntime.asZzddsDataWriter's javadoc.
-        Zzdds.zzdds.DataWriter zdWriter =
-            (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(rawWriter);
-        check(zdWriter != null, "asZzddsDataWriter() returned non-null");
+        // Narrow to zzdds's own extension views to reach create_datawriter_ex /
+        // create_datareader_ex: the extended listeners are installed as the
+        // entities are created, so no match during creation is missed.
+        Zzdds.zzdds.Publisher zdPublisher =
+            (Zzdds.zzdds.Publisher) io.zzdds.runtime.ZzddsRuntime.asZzddsPublisher(publisher);
+        Zzdds.zzdds.Subscriber zdSubscriber =
+            (Zzdds.zzdds.Subscriber) io.zzdds.runtime.ZzddsRuntime.asZzddsSubscriber(subscriber);
+        check(zdPublisher != null && zdSubscriber != null, "asZzddsPublisher/asZzddsSubscriber() returned non-null");
 
         final CountDownLatch readerReady = new CountDownLatch(1);
+        final CountDownLatch writerReady = new CountDownLatch(1);
         final CountDownLatch dataAvailable = new CountDownLatch(1);
 
         // Protocol-ready RELIABLE readiness signal — deliberately not
@@ -76,13 +77,16 @@ public class JavaSmoke {
                 if (isReady) readerReady.countDown();
             }
         };
-        check(zdWriter.set_listener_ex(writerListener, 0xFFFFFFFF) == 0, "set_listener_ex() rc == 0");
+        Dcps.DDS.DataWriter rawWriter = zdPublisher.create_datawriter_ex(topicWriter, writerQos, writerListener, 0xFFFFFFFF);
+        check(rawWriter != null, "create_datawriter_ex() returned non-null");
+        // The writer still narrows to its own extension view (set_listener_ex etc.).
+        check(io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(rawWriter) != null, "asZzddsDataWriter() returned non-null");
 
         Dcps.DDS.DataReaderQos readerQos = new Dcps.DDS.DataReaderQos();
         subscriber.get_default_datareader_qos(readerQos);
         readerQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
 
-        Dcps.DDS.DataReaderListener listener = new Dcps.DDS.DataReaderListener() {
+        Zzdds.zzdds.DataReaderListenerEx listener = new Zzdds.zzdds.DataReaderListenerEx() {
             public void on_requested_deadline_missed(Dcps.DDS.DataReader r, Dcps.DDS.RequestedDeadlineMissedStatus s) {}
             public void on_requested_incompatible_qos(Dcps.DDS.DataReader r, Dcps.DDS.RequestedIncompatibleQosStatus s) {}
             public void on_sample_rejected(Dcps.DDS.DataReader r, Dcps.DDS.SampleRejectedStatus s) {}
@@ -90,13 +94,18 @@ public class JavaSmoke {
             public void on_data_available(Dcps.DDS.DataReader r) { dataAvailable.countDown(); }
             public void on_subscription_matched(Dcps.DDS.DataReader r, Dcps.DDS.SubscriptionMatchedStatus s) {}
             public void on_sample_lost(Dcps.DDS.DataReader r, Dcps.DDS.SampleLostStatus s) {}
+            public void on_reliable_writer_ready(int writerHandle, boolean isReady) {
+                if (isReady) writerReady.countDown();
+            }
         };
 
-        Dcps.DDS.DataReader rawReader = subscriber.create_datareader(topicReader, readerQos, listener, 0xFFFFFFFF);
-        check(rawReader != null, "create_datareader() returned non-null");
+        Dcps.DDS.DataReader rawReader = zdSubscriber.create_datareader_ex(topicReader, readerQos, listener, 0xFFFFFFFF);
+        check(rawReader != null, "create_datareader_ex() returned non-null");
 
         check(readerReady.await(20, TimeUnit.SECONDS), "on_reliable_reader_ready fired within 20s (real UDP discovery + RELIABLE handshake)");
         System.out.println("  reliable reader ready: OK");
+        check(writerReady.await(20, TimeUnit.SECONDS), "on_reliable_writer_ready fired within 20s");
+        System.out.println("  reliable writer ready: OK");
 
         BindingSmokeStatusDataWriter writer = new BindingSmokeStatusDataWriter(rawWriter);
         BindingSmokeStatusDataReader reader = new BindingSmokeStatusDataReader(rawReader);

@@ -121,7 +121,19 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
 
-    auto in_dw = pub->create_datawriter(in_topic, dw_qos, nullptr, 0);
+    // Listeners are passed at creation: an endpoint discovered earlier matches
+    // inside creation, so a listener attached afterwards could miss the
+    // matched status (and on_reliable_reader_ready).
+    MatchState writer_state, out1_state, out2_state;
+    auto writer_listener = std::make_shared<WriterListener>(&writer_state);
+    auto out1_listener = std::make_shared<ReaderListener>(&out1_state);
+    auto out2_listener = std::make_shared<ReaderListener>(&out2_state);
+    auto zpub = std::dynamic_pointer_cast<::zzdds::PublisherImpl>(pub);
+    if (!zpub) {
+        std::fprintf(stderr, "FAIL: publisher is not a zzdds::PublisherImpl\n");
+        return 1;
+    }
+    auto in_dw = zpub->create_datawriter_ex(in_topic, dw_qos, writer_listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!in_dw) {
         std::fprintf(stderr, "FAIL: create_datawriter(SessionIn) failed\n");
         return 1;
@@ -134,7 +146,7 @@ int main(int argc, char **argv) {
 
     auto zout1_topic = std::static_pointer_cast<::zzdds::TopicImpl>(out1_topic);
     auto out1_desc = zout1_topic->as_topic_description();
-    auto out1_dr = sub->create_datareader(out1_desc, dr_qos, nullptr, 0);
+    auto out1_dr = sub->create_datareader(out1_desc, dr_qos, out1_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
     if (!out1_dr) {
         std::fprintf(stderr, "FAIL: create_datareader(SessionOut1) failed\n");
         return 1;
@@ -143,28 +155,12 @@ int main(int argc, char **argv) {
 
     auto zout2_topic = std::static_pointer_cast<::zzdds::TopicImpl>(out2_topic);
     auto out2_desc = zout2_topic->as_topic_description();
-    auto out2_dr = sub->create_datareader(out2_desc, dr_qos, nullptr, 0);
+    auto out2_dr = sub->create_datareader(out2_desc, dr_qos, out2_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
     if (!out2_dr) {
         std::fprintf(stderr, "FAIL: create_datareader(SessionOut2) failed\n");
         return 1;
     }
     std::printf("Create reader for topic: SessionOut2\n");
-
-    MatchState writer_state, out1_state, out2_state;
-    auto writer_listener = std::make_shared<WriterListener>(&writer_state);
-    auto zin_dw = std::static_pointer_cast<::zzdds::DataWriterImpl>(in_dw);
-    if (zin_dw->set_listener_ex(writer_listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK) {
-        std::fprintf(stderr, "FAIL: set_listener_ex (writer) failed\n");
-        return 1;
-    }
-    auto out1_listener = std::make_shared<ReaderListener>(&out1_state);
-    auto out2_listener = std::make_shared<ReaderListener>(&out2_state);
-    if (out1_dr->set_listener(out1_listener, DDS_SUBSCRIPTION_MATCHED_STATUS) != ::DDS::RETCODE_OK ||
-        out2_dr->set_listener(out2_listener, DDS_SUBSCRIPTION_MATCHED_STATUS) != ::DDS::RETCODE_OK)
-    {
-        std::fprintf(stderr, "FAIL: set_listener (reader) failed\n");
-        return 1;
-    }
 
     SessionEventDataWriter in_writer(in_dw->native_handle());
     SessionEventDataReader out1_reader(out1_dr->native_handle());

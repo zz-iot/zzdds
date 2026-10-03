@@ -49,19 +49,22 @@ DDS::Topic create_topic_ex(
     in TopicConfig config);
 ```
 
-New extensions preserve the ordinary factory relationship:
+New extensions preserve the ordinary factory relationship. zzdds.idl already has
+create_datawriter_ex and create_datareader_ex without the config parameter (they
+install an extended listener at creation); append config to those operations rather
+than add new names, as IDL has no overloading:
 
 ```idl
 interface Publisher : DDS::Publisher {
     DDS::DataWriter create_datawriter_ex(
         in DDS::Topic a_topic, in DDS::DataWriterQos qos,
-        in DDS::DataWriterListener a_listener, in DDS::StatusMask mask,
+        in DataWriterListenerEx a_listener, in DDS::StatusMask mask,
         in DataWriterConfig config);
 };
 interface Subscriber : DDS::Subscriber {
     DDS::DataReader create_datareader_ex(
         in DDS::TopicDescription a_topic, in DDS::DataReaderQos qos,
-        in DDS::DataReaderListener a_listener, in DDS::StatusMask mask,
+        in DataReaderListenerEx a_listener, in DDS::StatusMask mask,
         in DataReaderConfig config);
 };
 ```

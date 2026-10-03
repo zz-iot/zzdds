@@ -119,26 +119,26 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
 
-    auto out1_dw = pub->create_datawriter(out1_topic, dw_qos, nullptr, 0);
-    auto out2_dw = pub->create_datawriter(out2_topic, dw_qos, nullptr, 0);
+    // Writers get their extended listeners at creation, through zzdds's
+    // Publisher extension class: a reader discovered earlier matches inside
+    // creation, so a listener attached afterwards could miss
+    // on_publication_matched and on_reliable_reader_ready.
+    auto zpub = std::dynamic_pointer_cast<::zzdds::PublisherImpl>(pub);
+    if (!zpub) {
+        std::fprintf(stderr, "FAIL: publisher is not a zzdds::PublisherImpl\n");
+        return 1;
+    }
+    WriterSyncState out1_state, out2_state;
+    auto out1_listener = std::make_shared<WriterListener>(&out1_state);
+    auto out2_listener = std::make_shared<WriterListener>(&out2_state);
+    auto out1_dw = zpub->create_datawriter_ex(out1_topic, dw_qos, out1_listener, DDS_PUBLICATION_MATCHED_STATUS);
+    auto out2_dw = zpub->create_datawriter_ex(out2_topic, dw_qos, out2_listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!out1_dw || !out2_dw) {
         std::fprintf(stderr, "FAIL: create_datawriter() failed\n");
         return 1;
     }
     std::printf("Create writer for topic: SessionOut1\n");
     std::printf("Create writer for topic: SessionOut2\n");
-
-    WriterSyncState out1_state, out2_state;
-    auto out1_listener = std::make_shared<WriterListener>(&out1_state);
-    auto out2_listener = std::make_shared<WriterListener>(&out2_state);
-    auto zout1_dw = std::static_pointer_cast<::zzdds::DataWriterImpl>(out1_dw);
-    auto zout2_dw = std::static_pointer_cast<::zzdds::DataWriterImpl>(out2_dw);
-    if (zout1_dw->set_listener_ex(out1_listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK ||
-        zout2_dw->set_listener_ex(out2_listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK)
-    {
-        std::fprintf(stderr, "FAIL: set_listener_ex (writer) failed\n");
-        return 1;
-    }
 
     auto sub = dp->create_subscriber(::DDS::SubscriberQos::default_value(), nullptr, 0);
     if (!sub) {
@@ -150,9 +150,12 @@ int main(int argc, char **argv) {
     dr_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
 
+    // Reader listeners are attached at creation, so their "never after
+    // teardown" check covers the readers' whole lifetime.
+    auto reader_listener = std::make_shared<ReaderListener>();
     auto zin_topic = std::static_pointer_cast<::zzdds::TopicImpl>(in_topic);
     auto in_desc = zin_topic->as_topic_description();
-    auto in_dr = sub->create_datareader(in_desc, dr_qos, nullptr, 0);
+    auto in_dr = sub->create_datareader(in_desc, dr_qos, reader_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
     if (!in_dr) {
         std::fprintf(stderr, "FAIL: create_datareader(SessionIn) failed\n");
         return 1;
@@ -167,20 +170,12 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "FAIL: create_contentfilteredtopic() failed\n");
         return 1;
     }
-    auto cft_dr = sub->create_datareader(cft, dr_qos, nullptr, 0);
+    auto cft_dr = sub->create_datareader(cft, dr_qos, reader_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
     if (!cft_dr) {
         std::fprintf(stderr, "FAIL: create_datareader(SessionIn_cft) failed\n");
         return 1;
     }
     std::printf("Create reader for topic: SessionIn_cft\n");
-
-    auto reader_listener = std::make_shared<ReaderListener>();
-    if (in_dr->set_listener(reader_listener, DDS_SUBSCRIPTION_MATCHED_STATUS) != ::DDS::RETCODE_OK ||
-        cft_dr->set_listener(reader_listener, DDS_SUBSCRIPTION_MATCHED_STATUS) != ::DDS::RETCODE_OK)
-    {
-        std::fprintf(stderr, "FAIL: set_listener (reader) failed\n");
-        return 1;
-    }
 
     auto ws = zzdds::create_waitset();
     if (!ws) {

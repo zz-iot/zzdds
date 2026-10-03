@@ -35,7 +35,7 @@ fn durationIsActive(d: DDS.Duration_t) bool {
 
 /// Build the unified listener representation from a plain `set_listener()`
 /// (base OMG API) call, with the extension callback unset.
-fn listenerExFromBase(l: DDS.DataWriterListener) ZZDDS.DataWriterListenerEx {
+pub fn listenerExFromBase(l: DDS.DataWriterListener) ZZDDS.DataWriterListenerEx {
     return .{
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
@@ -217,7 +217,10 @@ pub const DataWriterImpl = struct {
         publisher: DDS.Publisher,
         proto_writer: proto.ProtocolWriter,
         qos: DDS.DataWriterQos,
-        listener: DDS.DataWriterListener,
+        /// Installed before the writer can match anything (see
+        /// `PublisherImpl.createDataWriter`); a standard listener is widened
+        /// with `listenerExFromBase`.
+        listener: ZZDDS.DataWriterListenerEx,
         mask: DDS.StatusMask,
         instance_handle: DDS.InstanceHandle_t,
         guid: proto.Guid,
@@ -245,7 +248,7 @@ pub const DataWriterImpl = struct {
             .wlp_last_assert_ns = .init(now),
         };
         errdefer alloc.destroy(self);
-        self.listener_ex_box = try ListenerBox(ZZDDS.DataWriterListenerEx).create(alloc, listenerExFromBase(listener));
+        self.listener_ex_box = try ListenerBox(ZZDDS.DataWriterListenerEx).create(alloc, listener);
         errdefer alloc.destroy(self.listener_ex_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);

@@ -91,24 +91,22 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
 
-    DDS_DataWriter dw = DDS_Publisher_create_datawriter(pub, topic, &dw_qos, NULL, 0);
-    if (!dw) {
-        fprintf(stderr, "FAIL: create_datawriter() failed\n");
-        return 1;
-    }
-    printf("Create writer for topic: TimestampEvent\n");
-    fflush(stdout);
-
+    /* Listener passed at creation (below): a reader discovered earlier
+     * matches inside create_datawriter, so a listener attached afterwards
+     * could miss it. */
     PubState state;
     atomic_init(&state.matched_current_count, 0);
     DDS_DataWriterListener listener;
     memset(&listener, 0, sizeof(listener));
     listener.listener_data = &state;
     listener.on_publication_matched = on_publication_matched;
-    if (DDS_DataWriter_set_listener(dw, &listener, DDS_PUBLICATION_MATCHED_STATUS) != DDS_RETCODE_OK) {
-        fprintf(stderr, "FAIL: set_listener failed\n");
+    DDS_DataWriter dw = DDS_Publisher_create_datawriter(pub, topic, &dw_qos, &listener, DDS_PUBLICATION_MATCHED_STATUS);
+    if (!dw) {
+        fprintf(stderr, "FAIL: create_datawriter() failed\n");
         return 1;
     }
+    printf("Create writer for topic: TimestampEvent\n");
+    fflush(stdout);
 
     TimestampEventDataWriter writer;
     TimestampEventDataWriter_init(&writer, dw, ZIDL_XCDR1);

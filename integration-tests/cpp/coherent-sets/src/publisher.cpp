@@ -115,31 +115,31 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = ::DDS::HistoryQosPolicyKind::KEEP_ALL_HISTORY_QOS;
 
-    auto position_dw = pub->create_datawriter(position_topic, dw_qos, nullptr, 0);
+    // Writers get their extended listeners at creation, through zzdds's
+    // Publisher extension class: a reader discovered earlier matches inside
+    // creation, so a listener attached afterwards could miss
+    // on_publication_matched and on_reliable_reader_ready.
+    auto zpub = std::dynamic_pointer_cast<::zzdds::PublisherImpl>(pub);
+    if (!zpub) {
+        std::fprintf(stderr, "FAIL: publisher is not a zzdds::PublisherImpl\n");
+        return 1;
+    }
+    WriterSyncState position_state, velocity_state;
+    auto position_listener = std::make_shared<WriterListener>(&position_state);
+    auto velocity_listener = std::make_shared<WriterListener>(&velocity_state);
+    auto position_dw = zpub->create_datawriter_ex(position_topic, dw_qos, position_listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!position_dw) {
         std::fprintf(stderr, "FAIL: create_datawriter(Position) failed\n");
         return 1;
     }
     std::printf("Create writer for topic: Position\n");
 
-    auto velocity_dw = pub->create_datawriter(velocity_topic, dw_qos, nullptr, 0);
+    auto velocity_dw = zpub->create_datawriter_ex(velocity_topic, dw_qos, velocity_listener, DDS_PUBLICATION_MATCHED_STATUS);
     if (!velocity_dw) {
         std::fprintf(stderr, "FAIL: create_datawriter(Velocity) failed\n");
         return 1;
     }
     std::printf("Create writer for topic: Velocity\n");
-
-    WriterSyncState position_state, velocity_state;
-    auto position_listener = std::make_shared<WriterListener>(&position_state);
-    auto velocity_listener = std::make_shared<WriterListener>(&velocity_state);
-    auto zposition_dw = std::static_pointer_cast<::zzdds::DataWriterImpl>(position_dw);
-    auto zvelocity_dw = std::static_pointer_cast<::zzdds::DataWriterImpl>(velocity_dw);
-    if (zposition_dw->set_listener_ex(position_listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK ||
-        zvelocity_dw->set_listener_ex(velocity_listener, DDS_PUBLICATION_MATCHED_STATUS) != ::DDS::RETCODE_OK)
-    {
-        std::fprintf(stderr, "FAIL: set_listener_ex failed\n");
-        return 1;
-    }
 
     for (int waited_ms = 0;
          !(position_state.reader_ready.load() && velocity_state.reader_ready.load());

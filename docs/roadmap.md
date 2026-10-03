@@ -184,6 +184,47 @@ Forward-looking only: known gaps, planned features, and open design questions.
     reflection, and every one of zzdds's own `examples/`/`stress-tests/` registrations
     passes it — see `CHANGELOG.md` 2026-09-14. Closed; not a gap anymore.
 
+- **Hashed handles collide; replace them with allocated handles ("registries").**
+  `keyHashToHandle` and `guidToHandle` (`src/dcps/writer.zig`) fold a 16-byte key hash or
+  GUID into a 31-bit FNV-1a value. `topicToHandle` (`participant.zig`) does the same for
+  discovered topics. Distinct values can share a handle, and the chance grows with count:
+  - *Instance handles (data loss).* KEEP_LAST trimming, OWNERSHIP, TIME_BASED_FILTER,
+    instance state and the writer's key registry are all keyed on the instance handle, so
+    two colliding instances silently become one; with depth 1, one evicts the other's
+    sample. The chance of any collision is about 2% at 10,000 instances on a topic and
+    90% at 100,000.
+  - *Endpoint handles (ambiguity).* `get_matched_*_data`, `ignore_publication`/
+    `ignore_subscription`, `SampleInfo.publication_handle` and the matched/liveliness
+    `last_*_handle` fields become ambiguous. Low risk at realistic endpoint counts; two
+    sites already detect it (`DataReaderImpl.publication_guids`, and
+    `get_matched_subscription_rtps_guid` returning PRECONDITION_NOT_MET).
+
+  Hashing was never a recorded decision (both functions date from the initial commit);
+  it is stateless, not meaningfully faster than one map lookup per sample. Plan:
+  1. **Bounded study of registry patterns**, sized to the codebase's current needs and
+     those the specs foresee (concurrency, broker), not a general survey. Inventory the
+     existing maps (key types, directions, lifetimes, guarding lock, hot paths); review
+     what Zig's standard library provides (`HashMap`/`AutoHashMap`, `ArrayHashMap`,
+     hash contexts, `std.hash`) against hand-rolled options, with benchmarks where it
+     matters; and settle reusable patterns: standard hash contexts for GUIDs, prefixes and
+     entity IDs, and a registry that owns both directions so they cannot drift (a hash
+     map from key to handle plus a dense array indexed by handle, rather than two hash
+     maps). Decide handle lifetime: never reclaim, or reclaim with per-slot generation
+     counters so a stale handle in a queued or loaned sample is detected; generation bits
+     share the 32-bit `InstanceHandle_t`. Respect the concurrency specs' locking rules and
+     `design/allocator-strategy.md` (bound instance registries by RESOURCE_LIMITS
+     `max_instances`). Record the outcome in `docs/decisions.md`.
+  2. **Fix instance handles with the chosen pattern**, as the study's primary use case:
+     per-reader/per-writer allocation (the DDS spec scopes instance handles to the
+     entity), plus anything else that fits the pattern cleanly. Endpoint handles need a
+     participant-wide registry so handles from the built-in topics, `get_matched_*`,
+     `SampleInfo` and `ignore_*` agree; once it exists the two collision workarounds can
+     go. Handles never go on the wire, so there is no interop or IDL change; check tests
+     that assume a writer and a reader share a handle for the same key.
+  3. **Follow-ons** the study identifies (other lookups such as locators by GUID prefix,
+     or further investigation) become their own roadmap items, migrated when that code
+     is next worked on rather than in one sweep.
+
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
 zidl v0.3.12 adds a mask-driven selective parser (`deserialize_selected(want)` /
@@ -338,27 +379,24 @@ or an optimisation on an already-improved path):
   time-out negative case left out of `catchup` itself is no longer on this list — it's
   covered by the `wait-for-historical-data` Integration-tier scenario instead (see
   `docs/design/dcps-api-coverage-audit.md`).
-- **Cross-binding pairs intermittently never discover each other — cause unknown.**
-  In the integration tier (`cft-reconfigure`, `liveliness-lost`, `source-timestamp`,
-  `sample-rejected-lost`), a pair (most often the job's first, zig subscriber ← zig
-  publisher, sometimes two pairs in one job) reports zero matches for the whole 20–40 s
-  window ("readers never matched", "no reader matched"), while the other pairs in the
-  same job pass. The examples tier shows it too, including on Windows: in #95's CI one
-  `hello-world-cross-binding` pair (java publisher → zig subscriber) found no reliable
-  reader within 10 s while the other 11 pairs passed. SPDP re-announces every 3 s, so a
-  20–40 s window is 7–13 consecutive missed announcements: the packet-loss-and-retransmit
-  explanation recorded under *Discovery bootstrap latency* (~1.5 s recovery) does not
-  account for it. `cft-reconfigure` failed 2 of 17 runs before #92 merged and 4 of 4 runs
-  after, although the merged tree is identical to the last passing PR head, so a CI
-  environment or timing change is implicated rather than code. It has not reproduced
-  locally, so the examples and integration jobs now record evidence in CI
-  (`scripts/ci_net_diagnostics.py`): a `tcpdump -i any udp` capture (Linux), a timestamped
-  `ip monitor` log of interface/address/route changes, and before/after snapshots of
-  interfaces, routes, multicast memberships and UDP sockets. On failure they are uploaded
-  with `.smoke-logs`, whose `*.log.meta` files give each process's start/stop time and
-  exit status. Next: analyse the next failure's capture with `dds-rtps`'s `rtps_pcap.py`.
-  Process-side visibility is still thin: SPDP has three debug log lines and SEDP none, and
-  the wire tracer (`-Dwire-trace`) has to be configured in code by each application.
+- **Cross-binding "never matched" failures — resolved: listeners installed after entity
+  creation.** Root-caused 2026-10-02 from CI captures (`scripts/ci_net_diagnostics.py`,
+  PR #96): in `liveliness-lost` (cpp subscriber ← c publisher) and `source-timestamp`
+  (java ← java) discovery completed within ~2 ms of process start and the writers were
+  sending heartbeats and data to the subscriber, yet the publisher reported "never
+  matched"; no interface, address or route changed. The apps created entities with no
+  listener and installed it afterwards. A remote endpoint already known at creation
+  matches inside `create_datawriter`/`create_datareader`, so `on_*_matched` and zzdds's
+  reliable-ready callbacks fired before the listener existed and were lost (DDS does not
+  replay earlier status changes to a later listener). Fixed by passing every listener at
+  creation; listeners with zzdds's extension callbacks use the new
+  `zzdds::Publisher::create_datawriter_ex` / `zzdds::Subscriber::create_datareader_ex`.
+  Apps still attach a listener late only where that is safe: DATA_AVAILABLE-only
+  listeners (zzdds raises DATA_AVAILABLE on install when data is already buffered) and
+  `enable-defer` (the entity is still disabled). The CI network diagnostics stay. Open
+  follow-up: process-side discovery visibility is thin (SPDP has three debug log lines
+  and SEDP none, and the wire tracer, `-Dwire-trace`, has to be configured in code by
+  each application).
 - **`Test_Ownership_3` flakes in the DebugAllocator CoreDX-publisher lane.** The zzdds
   subscriber reports `RECEIVING_FROM_BOTH` instead of `RECEIVING_FROM_ONE` (two exclusive-
   ownership publishers, strengths 3 and 4, same instance). Seen twice with identical

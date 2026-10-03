@@ -49,6 +49,24 @@ fn findJniIncludeDir(b: *std.Build, java_path: []const u8) ?JniIncludeDirs {
     return .{ .base = base, .platform = platform };
 }
 
+// C++ entity-wrapper overrides for every `--cpp-generate-impl` pass that is
+// compiled against include/zzdds_cpp.hpp (the installed binding and the C++
+// binding smoke tests). Both the dcps.idl and the zzdds.idl pass need them:
+// the zzdds.idl pass's create_datawriter_ex/create_datareader_ex and its
+// extended-listener bridges wrap DDS_DataWriter/DDS_DataReader handles too,
+// and must produce the same *Support object the dcps.idl pass caches for that
+// entity (a base DDS::*Impl there would replace the cached wrapper and hand
+// callbacks a different object than the application holds).
+const cpp_impl_override_args = [_][]const u8{
+    "--cpp-impl-override", "DDS::Topic=::zzdds::detail::TopicSupport",
+    "--cpp-impl-override", "DDS::DataWriter=::zzdds::detail::DataWriterSupport",
+    "--cpp-impl-override", "DDS::DataReader=::zzdds::detail::DataReaderSupport",
+    "--cpp-impl-override", "DDS::Publisher=::zzdds::detail::PublisherSupport",
+    "--cpp-impl-override", "DDS::Subscriber=::zzdds::detail::SubscriberSupport",
+    "--cpp-impl-override", "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport",
+    "--cpp-impl-include",  "zzdds_cpp.hpp",
+};
+
 pub fn build(b: *std.Build) void {
     // A native macOS target otherwise inherits the build host's current OS
     // version (for example 26.6.2), making release dylibs unusable to consumers
@@ -203,8 +221,12 @@ pub fn build(b: *std.Build) void {
         \\
         \\pub const DataReader = Generated.DataReader;
         \\pub const DataReaderListener = Generated.DataReaderListener;
+        \\pub const DataReaderQos = Generated.DataReaderQos;
         \\pub const DataWriter = Generated.DataWriter;
         \\pub const DataWriterListener = Generated.DataWriterListener;
+        \\pub const DataWriterQos = Generated.DataWriterQos;
+        \\pub const Publisher = Generated.Publisher;
+        \\pub const Subscriber = Generated.Subscriber;
         \\pub const DomainId_t = Generated.DomainId_t;
         \\pub const DomainParticipant = Generated.DomainParticipant;
         \\pub const DomainParticipantListener = Generated.DomainParticipantListener;
@@ -793,7 +815,9 @@ pub fn build(b: *std.Build) void {
             gen_alloc_smoke_cpp.addFileArg(dcps_idl);
 
             const gen_alloc_smoke_cpp_impl = b.addRunArtifact(zidl_exe);
-            gen_alloc_smoke_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl", "-o" });
+            gen_alloc_smoke_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl" });
+            gen_alloc_smoke_cpp_impl.addArgs(&cpp_impl_override_args);
+            gen_alloc_smoke_cpp_impl.addArg("-o");
             const gen_alloc_smoke_cpp_impl_dir = gen_alloc_smoke_cpp_impl.addOutputDirectoryArg("zzdds-binding-smoke-cpp-alloc-impl");
             if (xtypes) gen_alloc_smoke_cpp_impl.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
             gen_alloc_smoke_cpp_impl.addFileArg(dcps_idl);
@@ -804,7 +828,9 @@ pub fn build(b: *std.Build) void {
             gen_alloc_smoke_zzdds_cpp.addFileArg(b.path("idl/zzdds.idl"));
 
             const gen_alloc_smoke_zzdds_cpp_impl = b.addRunArtifact(zidl_exe);
-            gen_alloc_smoke_zzdds_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl", "-o" });
+            gen_alloc_smoke_zzdds_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl" });
+            gen_alloc_smoke_zzdds_cpp_impl.addArgs(&cpp_impl_override_args);
+            gen_alloc_smoke_zzdds_cpp_impl.addArg("-o");
             const gen_alloc_smoke_zzdds_cpp_impl_dir = gen_alloc_smoke_zzdds_cpp_impl.addOutputDirectoryArg("zzdds-binding-smoke-cpp-ext-alloc-impl");
             gen_alloc_smoke_zzdds_cpp_impl.addFileArg(b.path("idl/zzdds.idl"));
 
@@ -840,6 +866,10 @@ pub fn build(b: *std.Build) void {
                 .file = alloc_smoke_dcps_impl_cpp,
                 .flags = &.{ "-std=c++17", "-Wall" },
             });
+            cpp_smoke_mod.addCSourceFile(.{
+                .file = alloc_smoke_zzdds_impl_cpp,
+                .flags = &.{ "-std=c++17", "-Wall" },
+            });
             cpp_smoke_mod.addIncludePath(gen_smoke_cpp_dir);
             cpp_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
             cpp_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
@@ -873,6 +903,33 @@ pub fn build(b: *std.Build) void {
             cpp_alloc_smoke_mod.linkLibrary(zzdds_lib);
             const cpp_alloc_smoke = b.addExecutable(.{ .name = "zzdds_cpp_allocator_smoke", .root_module = cpp_alloc_smoke_mod });
             binding_smoke_step.dependOn(&b.addRunArtifact(cpp_alloc_smoke).step);
+
+            // zzdds::Publisher::create_datawriter_ex / Subscriber::create_datareader_ex
+            // through the zzdds_cpp.hpp wrappers, over real loopback discovery.
+            const cpp_ext_smoke_mod = b.createModule(.{
+                .root_source_file = null,
+                .target = target,
+                .optimize = .Debug,
+                .link_libc = true,
+                .link_libcpp = true,
+            });
+            cpp_ext_smoke_mod.addCSourceFiles(.{
+                .files = &.{"test/bindings/smoke/cpp_extension_smoke.cpp"},
+                .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
+            });
+            cpp_ext_smoke_mod.addCSourceFile(.{ .file = alloc_smoke_dcps_impl_cpp, .flags = &.{ "-std=c++17", "-Wall" } });
+            cpp_ext_smoke_mod.addCSourceFile(.{ .file = alloc_smoke_zzdds_impl_cpp, .flags = &.{ "-std=c++17", "-Wall" } });
+            cpp_ext_smoke_mod.addIncludePath(alloc_smoke_merged.getDirectory());
+            cpp_ext_smoke_mod.addIncludePath(zidl_dep.path("packages/zidl-cdr/include"));
+            cpp_ext_smoke_mod.addIncludePath(b.path("include"));
+            cpp_ext_smoke_mod.linkLibrary(zzdds_lib);
+            const cpp_ext_smoke = b.addExecutable(.{ .name = "zzdds_cpp_extension_smoke", .root_module = cpp_ext_smoke_mod });
+            const cpp_ext_smoke_run = b.addRunArtifact(cpp_ext_smoke);
+            // Own domain: binding smoke binaries run in parallel with each other
+            // (the Java smoke uses domain 0) and with `zig build test` lanes,
+            // whose addTestRun domains count up from 1.
+            cpp_ext_smoke_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "230");
+            binding_smoke_step.dependOn(&cpp_ext_smoke_run.step);
         }
 
         // Generate and install lib/pkgconfig/zzdds.pc.
@@ -1050,16 +1107,11 @@ pub fn build(b: *std.Build) void {
         // DomainParticipantFactorySupport (which doesn't need this flag --
         // it's a bootstrap singleton, never constructed via another entity's
         // factory method).
+        // See cpp_impl_override_args (file scope) for the override list.
         const gen_dcps_cpp_impl = b.addRunArtifact(zidl_exe);
-        gen_dcps_cpp_impl.addArgs(&.{
-            "-b",                                                               "cpp",
-            "--cpp-generate-impl",                                              "--cpp-impl-override",
-            "DDS::Topic=::zzdds::detail::TopicSupport",                         "--cpp-impl-override",
-            "DDS::DataWriter=::zzdds::detail::DataWriterSupport",               "--cpp-impl-override",
-            "DDS::DataReader=::zzdds::detail::DataReaderSupport",               "--cpp-impl-override",
-            "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport", "--cpp-impl-include",
-            "zzdds_cpp.hpp",                                                    "-o",
-        });
+        gen_dcps_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl" });
+        gen_dcps_cpp_impl.addArgs(&cpp_impl_override_args);
+        gen_dcps_cpp_impl.addArg("-o");
         const gen_cpp_impl_dir = gen_dcps_cpp_impl.addOutputDirectoryArg("zzdds-cpp-impl");
         if (xtypes) gen_dcps_cpp_impl.addArgs(&.{ "-D", "ZZDDS_XTYPES" });
         gen_dcps_cpp_impl.addFileArg(dcps_idl);
@@ -1067,7 +1119,9 @@ pub fn build(b: *std.Build) void {
         gen_only_step.dependOn(&gen_dcps_cpp_impl.step);
 
         const gen_zzdds_cpp_impl = b.addRunArtifact(zidl_exe);
-        gen_zzdds_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl", "-o" });
+        gen_zzdds_cpp_impl.addArgs(&.{ "-b", "cpp", "--cpp-generate-impl" });
+        gen_zzdds_cpp_impl.addArgs(&cpp_impl_override_args);
+        gen_zzdds_cpp_impl.addArg("-o");
         const gen_zzdds_cpp_impl_dir = gen_zzdds_cpp_impl.addOutputDirectoryArg("zzdds-cpp-ext-impl");
         gen_zzdds_cpp_impl.addFileArg(b.path("idl/zzdds.idl"));
         gen_only_step.dependOn(&gen_zzdds_cpp_impl.step);
@@ -1253,14 +1307,21 @@ pub fn build(b: *std.Build) void {
                 }
                 // idl/zzdds.idl's ext binding (DataWriterListenerEx /
                 // on_reliable_reader_ready, …) — see JavaSmoke.java's use of
-                // ZzddsRuntime.asZzddsDataWriter/set_listener_ex.
+                // ZzddsRuntime.asZzddsPublisher/asZzddsSubscriber and
+                // create_datawriter_ex/create_datareader_ex. The runtime boxes
+                // the ext *Impl classes by name (JNI FindClass), so every one it
+                // can return must be compiled here even if JavaSmoke.java never
+                // names it.
                 for (&[_][]const u8{
                     "Zzdds.java",
                     "DataReaderImpl.java",
+                    "DataReaderListenerExImpl.java",
                     "DataWriterImpl.java",
                     "DataWriterListenerExImpl.java",
                     "DomainParticipantFactoryImpl.java",
                     "DomainParticipantImpl.java",
+                    "PublisherImpl.java",
+                    "SubscriberImpl.java",
                     "TopicImpl.java",
                 }) |f| {
                     compile_java_smoke.addFileArg(gen_zzdds_ext_java_dir.path(b, f));

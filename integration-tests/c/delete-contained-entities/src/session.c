@@ -62,14 +62,18 @@ static void on_reliable_reader_ready(DDS_InstanceHandle_t reader_handle, bool is
     if (is_ready) atomic_store(&state->reader_ready, true);
 }
 
-static int set_writer_listener_ex(DDS_DataWriter dw, WriterSyncState *state) {
-    zzdds_DataWriter zdw = DDS_DataWriter_as_zzdds_DataWriter(dw);
+/* Creates a writer with its extended listener installed from the start: a
+ * reader discovered earlier matches inside creation, so a listener attached
+ * afterwards could miss on_publication_matched and on_reliable_reader_ready. */
+static DDS_DataWriter create_writer_ex(DDS_Publisher pub, DDS_Topic topic, const DDS_DataWriterQos *qos,
+                                       WriterSyncState *state) {
     zzdds_DataWriterListenerEx listener_ex;
     memset(&listener_ex, 0, sizeof(listener_ex));
     listener_ex.listener_data = state;
     listener_ex.on_publication_matched = on_publication_matched_ex;
     listener_ex.on_reliable_reader_ready = on_reliable_reader_ready;
-    return zzdds_DataWriter_set_listener_ex(zdw, &listener_ex, DDS_PUBLICATION_MATCHED_STATUS);
+    return zzdds_Publisher_create_datawriter_ex(DDS_Publisher_as_zzdds_Publisher(pub), topic, qos, &listener_ex,
+                                                DDS_PUBLICATION_MATCHED_STATUS);
 }
 
 static void on_subscription_matched(DDS_DataReader reader, const DDS_SubscriptionMatchedStatus *status, void *listener_data) {
@@ -144,24 +148,17 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
 
-    DDS_DataWriter out1_dw = DDS_Publisher_create_datawriter(pub, out1_topic, &dw_qos, NULL, 0);
-    DDS_DataWriter out2_dw = DDS_Publisher_create_datawriter(pub, out2_topic, &dw_qos, NULL, 0);
+    WriterSyncState out1_state, out2_state;
+    memset(&out1_state, 0, sizeof(out1_state));
+    memset(&out2_state, 0, sizeof(out2_state));
+    DDS_DataWriter out1_dw = create_writer_ex(pub, out1_topic, &dw_qos, &out1_state);
+    DDS_DataWriter out2_dw = create_writer_ex(pub, out2_topic, &dw_qos, &out2_state);
     if (!out1_dw || !out2_dw) {
-        fprintf(stderr, "FAIL: create_datawriter() failed\n");
+        fprintf(stderr, "FAIL: create_datawriter_ex() failed\n");
         return 1;
     }
     printf("Create writer for topic: SessionOut1\n");
     printf("Create writer for topic: SessionOut2\n");
-
-    WriterSyncState out1_state, out2_state;
-    memset(&out1_state, 0, sizeof(out1_state));
-    memset(&out2_state, 0, sizeof(out2_state));
-    if (set_writer_listener_ex(out1_dw, &out1_state) != DDS_RETCODE_OK ||
-        set_writer_listener_ex(out2_dw, &out2_state) != DDS_RETCODE_OK)
-    {
-        fprintf(stderr, "FAIL: set_listener_ex (writer) failed\n");
-        return 1;
-    }
 
     DDS_Subscriber sub = DDS_DomainParticipant_create_subscriber(dp, NULL, NULL, 0);
     if (!sub) {
@@ -174,8 +171,14 @@ int main(int argc, char **argv) {
     dr_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
     dr_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
 
+    /* Reader listeners are attached at creation, so their "never after
+     * teardown" check covers the readers' whole lifetime. */
+    DDS_DataReaderListener dr_listener;
+    memset(&dr_listener, 0, sizeof(dr_listener));
+    dr_listener.on_subscription_matched = on_subscription_matched;
+
     DDS_TopicDescription in_desc = zzdds_topic_as_description(in_topic);
-    DDS_DataReader in_dr = DDS_Subscriber_create_datareader(sub, in_desc, &dr_qos, NULL, 0);
+    DDS_DataReader in_dr = DDS_Subscriber_create_datareader(sub, in_desc, &dr_qos, &dr_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
     if (!in_dr) {
         fprintf(stderr, "FAIL: create_datareader(SessionIn) failed\n");
         return 1;
@@ -191,22 +194,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     DDS_TopicDescription cft_desc = DDS_ContentFilteredTopic_as_DDS_TopicDescription(cft);
-    DDS_DataReader cft_dr = DDS_Subscriber_create_datareader(sub, cft_desc, &dr_qos, NULL, 0);
+    DDS_DataReader cft_dr = DDS_Subscriber_create_datareader(sub, cft_desc, &dr_qos, &dr_listener, DDS_SUBSCRIPTION_MATCHED_STATUS);
     if (!cft_dr) {
         fprintf(stderr, "FAIL: create_datareader(SessionIn_cft) failed\n");
         return 1;
     }
     printf("Create reader for topic: SessionIn_cft\n");
-
-    DDS_DataReaderListener dr_listener;
-    memset(&dr_listener, 0, sizeof(dr_listener));
-    dr_listener.on_subscription_matched = on_subscription_matched;
-    if (DDS_DataReader_set_listener(in_dr, &dr_listener, DDS_SUBSCRIPTION_MATCHED_STATUS) != DDS_RETCODE_OK ||
-        DDS_DataReader_set_listener(cft_dr, &dr_listener, DDS_SUBSCRIPTION_MATCHED_STATUS) != DDS_RETCODE_OK)
-    {
-        fprintf(stderr, "FAIL: set_listener (reader) failed\n");
-        return 1;
-    }
 
     DDS_WaitSet ws = zzdds_create_waitset();
     if (zzdds_waitset_is_nil(ws)) {

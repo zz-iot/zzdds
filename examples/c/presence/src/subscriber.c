@@ -54,7 +54,6 @@ static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
 typedef enum { PHASE_WAITING_FIRST_ONLINE, PHASE_WAITING_OFFLINE, PHASE_WAITING_SECOND_ONLINE, PHASE_DONE } Phase;
 
 typedef struct {
-    PresenceBeaconDataReader *reader;
     /* Only ever touched from the listener's dispatch thread. */
     Phase phase;
     portable_atomic_t step;
@@ -97,8 +96,9 @@ static void on_liveliness_changed(DDS_DataReader the_reader, const DDS_Livelines
 }
 
 static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
-    (void)the_reader;
-    SubState *state = (SubState *)listener_data;
+    (void)listener_data;
+    PresenceBeaconDataReader reader;
+    PresenceBeaconDataReader_init(&reader, the_reader);
 
     for (;;) {
         PresenceBeacon value;
@@ -108,7 +108,7 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
         uint8_t buf[512];
         size_t cdr_len = 0;
 
-        int rc = PresenceBeaconDataReader_take(state->reader, &value, &info, buf, sizeof(buf), &cdr_len);
+        int rc = PresenceBeaconDataReader_take(&reader, &value, &info, buf, sizeof(buf), &cdr_len);
         if (rc == DDS_RETCODE_NO_DATA) break;
         if (rc != DDS_RETCODE_OK) {
             fprintf(stderr, "FAIL: take() CDR error (rc=%d)\n", rc);
@@ -173,7 +173,6 @@ int main(int argc, char **argv) {
     dr_qos.liveliness.lease_duration.nanosec = 0;
 
     SubState state;
-    state.reader = NULL;
     state.phase = PHASE_WAITING_FIRST_ONLINE;
     state.step = 0;
     state.cycle_complete = false;
@@ -184,27 +183,17 @@ int main(int argc, char **argv) {
     listener.on_data_available = on_data_available;
     listener.on_liveliness_changed = on_liveliness_changed;
 
-    /* Create with no listener attached yet: on_data_available/
-     * on_liveliness_changed fire on a zzdds-internal dispatch thread as soon
-     * as the reader matches, which can race state.reader's own
-     * initialization below. Attach the listener only once state.reader is
-     * set, via set_listener() below, closing the window entirely. */
+    /* Listener passed at creation, so no liveliness change can be missed:
+     * the callbacks use the reader DDS passes them, not one set up after
+     * create_datareader returns. */
     DDS_TopicDescription topic_desc = zzdds_topic_as_description(topic);
-    DDS_DataReader dr = DDS_Subscriber_create_datareader(sub, topic_desc, &dr_qos, NULL, 0);
+    DDS_DataReader dr = DDS_Subscriber_create_datareader(sub, topic_desc, &dr_qos, &listener,
+                                                         DDS_DATA_AVAILABLE_STATUS | DDS_LIVELINESS_CHANGED_STATUS);
     if (!dr) {
         fprintf(stderr, "FAIL: create_datareader() failed\n");
         return 1;
     }
     printf("Create reader for topic: PresenceBeacon\n");
-
-    PresenceBeaconDataReader reader;
-    PresenceBeaconDataReader_init(&reader, dr);
-    state.reader = &reader;
-
-    if (DDS_DataReader_set_listener(dr, &listener, DDS_DATA_AVAILABLE_STATUS | DDS_LIVELINESS_CHANGED_STATUS) != DDS_RETCODE_OK) {
-        fprintf(stderr, "FAIL: set_listener() failed\n");
-        return 1;
-    }
 
     printf("Subscriber: waiting for online -> offline -> online cycle...\n");
     for (int waited_ms = 0; !patomic_load(&state.cycle_complete); waited_ms += POLL_PERIOD_MS) {

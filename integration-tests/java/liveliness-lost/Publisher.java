@@ -72,18 +72,16 @@ public class Publisher {
         dwQos.get_liveliness().get_lease_duration().set_sec(LEASE_DURATION_SEC);
         dwQos.get_liveliness().get_lease_duration().set_nanosec(0);
 
-        Dcps.DDS.DataWriter dw = pub.create_datawriter(topic, dwQos, null, 0);
+        // Listener passed at creation: a reader discovered earlier matches
+        // inside create_datawriter, so a listener attached afterwards could miss it.
+        Dcps.DDS.DataWriter dw = pub.create_datawriter(topic, dwQos, makeListener(state),
+            Dcps.DDS.PUBLICATION_MATCHED_STATUS.value | Dcps.DDS.LIVELINESS_LOST_STATUS.value);
         if (dw == null) {
             System.err.println("FAIL: create_datawriter(" + topicName + ") failed");
             System.exit(1);
         }
         System.out.println("Create writer for topic: " + topicName);
         System.out.flush();
-
-        if (dw.set_listener(makeListener(state), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value | Dcps.DDS.LIVELINESS_LOST_STATUS.value) != 0) {
-            System.err.println("FAIL: set_listener(" + topicName + ") failed");
-            System.exit(1);
-        }
         return dw;
     }
 

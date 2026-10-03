@@ -657,6 +657,12 @@ pub const StatefulWriter = struct {
         }
     }
 
+    /// Like addOrRefreshMatchedReader, for callers that don't need to know whether the
+    /// match was new.
+    pub fn addMatchedReader(self: *Self, proxy: ReaderProxy) !void {
+        _ = try self.addOrRefreshMatchedReader(proxy);
+    }
+
     /// Add a matched reader. When a proxy with the same GUID already exists,
     /// acts as a lease refresh: updates locators and metadata but preserves
     /// `highest_acked_sn` and `start_sn`.  History replay and heartbeats are
@@ -667,7 +673,10 @@ pub const StatefulWriter = struct {
     /// full history cache is replayed.  For VOLATILE writers `start_sn` is set to
     /// the writer's next SN so the reader only sees future data, and a Heartbeat
     /// is sent to communicate this range.
-    pub fn addMatchedReader(self: *Self, proxy: ReaderProxy) !void {
+    ///
+    /// Returns true when the reader is newly matched, false for a lease refresh
+    /// of an existing match.
+    pub fn addOrRefreshMatchedReader(self: *Self, proxy: ReaderProxy) !bool {
         self.mu.lock();
         for (self.reader_proxies.items) |*rp| {
             if (rp.guid.eql(proxy.guid)) {
@@ -702,7 +711,7 @@ pub const StatefulWriter = struct {
                 discarded.selected_locators = .empty;
                 discarded.deinit(self.alloc);
                 self.mu.unlock();
-                return;
+                return false;
             }
         }
         self.reader_proxies.append(self.alloc, proxy) catch |err| {
@@ -761,6 +770,7 @@ pub const StatefulWriter = struct {
         if (newly_ready_guid) |guid| {
             if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
+        return true;
     }
 
     /// Send all cached changes to a single reader proxy (called under mu).

@@ -106,35 +106,30 @@ public class Publisher {
         dwQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
         dwQos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
 
-        Dcps.DDS.DataWriter positionDw = pub.create_datawriter(positionTopic, dwQos, null, 0);
+        // Writers get their extended listeners at creation, through zzdds's
+        // Publisher extension view: a reader discovered earlier matches inside
+        // creation, so a listener attached afterwards could miss
+        // on_publication_matched and on_reliable_reader_ready.
+        Zzdds.zzdds.Publisher zPub = (Zzdds.zzdds.Publisher) io.zzdds.runtime.ZzddsRuntime.asZzddsPublisher(pub);
+        if (zPub == null) {
+            System.err.println("FAIL: asZzddsPublisher() failed");
+            System.exit(1);
+        }
+        WriterSyncState positionState = new WriterSyncState();
+        WriterSyncState velocityState = new WriterSyncState();
+        Dcps.DDS.DataWriter positionDw = zPub.create_datawriter_ex(positionTopic, dwQos, makeListener(positionState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
         if (positionDw == null) {
             System.err.println("FAIL: create_datawriter(Position) failed");
             System.exit(1);
         }
         System.out.println("Create writer for topic: Position");
 
-        Dcps.DDS.DataWriter velocityDw = pub.create_datawriter(velocityTopic, dwQos, null, 0);
+        Dcps.DDS.DataWriter velocityDw = zPub.create_datawriter_ex(velocityTopic, dwQos, makeListener(velocityState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
         if (velocityDw == null) {
             System.err.println("FAIL: create_datawriter(Velocity) failed");
             System.exit(1);
         }
         System.out.println("Create writer for topic: Velocity");
-
-        WriterSyncState positionState = new WriterSyncState();
-        WriterSyncState velocityState = new WriterSyncState();
-
-        Zzdds.zzdds.DataWriter zPositionDw = (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(positionDw);
-        Zzdds.zzdds.DataWriter zVelocityDw = (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(velocityDw);
-        if (zPositionDw == null || zVelocityDw == null) {
-            System.err.println("FAIL: asZzddsDataWriter() failed");
-            System.exit(1);
-        }
-        if (zPositionDw.set_listener_ex(makeListener(positionState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value) != 0 ||
-            zVelocityDw.set_listener_ex(makeListener(velocityState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value) != 0)
-        {
-            System.err.println("FAIL: set_listener_ex failed");
-            System.exit(1);
-        }
 
         long deadline = System.currentTimeMillis() + READER_READY_TIMEOUT_MS;
         while (!(positionState.readerReady.get() && velocityState.readerReady.get())) {

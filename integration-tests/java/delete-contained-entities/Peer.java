@@ -113,7 +113,18 @@ public class Peer {
         dwQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
         dwQos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
 
-        Dcps.DDS.DataWriter inDw = pub.create_datawriter(inTopic, dwQos, null, 0);
+        // Listeners are passed at creation: an endpoint discovered earlier
+        // matches inside creation, so a listener attached afterwards could
+        // miss the matched status (and on_reliable_reader_ready).
+        MatchState writerState = new MatchState();
+        MatchState out1State = new MatchState();
+        MatchState out2State = new MatchState();
+        Zzdds.zzdds.Publisher zPub = (Zzdds.zzdds.Publisher) io.zzdds.runtime.ZzddsRuntime.asZzddsPublisher(pub);
+        if (zPub == null) {
+            System.err.println("FAIL: asZzddsPublisher() failed");
+            System.exit(1);
+        }
+        Dcps.DDS.DataWriter inDw = zPub.create_datawriter_ex(inTopic, dwQos, makeWriterListener(writerState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
         if (inDw == null) {
             System.err.println("FAIL: create_datawriter(SessionIn) failed");
             System.exit(1);
@@ -125,34 +136,14 @@ public class Peer {
         drQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
         drQos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
 
-        Dcps.DDS.DataReader out1Dr = sub.create_datareader(out1Topic, drQos, null, 0);
-        Dcps.DDS.DataReader out2Dr = sub.create_datareader(out2Topic, drQos, null, 0);
+        Dcps.DDS.DataReader out1Dr = sub.create_datareader(out1Topic, drQos, makeReaderListener(out1State), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
+        Dcps.DDS.DataReader out2Dr = sub.create_datareader(out2Topic, drQos, makeReaderListener(out2State), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value);
         if (out1Dr == null || out2Dr == null) {
             System.err.println("FAIL: create_datareader() failed");
             System.exit(1);
         }
         System.out.println("Create reader for topic: SessionOut1");
         System.out.println("Create reader for topic: SessionOut2");
-
-        MatchState writerState = new MatchState();
-        MatchState out1State = new MatchState();
-        MatchState out2State = new MatchState();
-
-        Zzdds.zzdds.DataWriter zInDw = (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(inDw);
-        if (zInDw == null) {
-            System.err.println("FAIL: asZzddsDataWriter() failed");
-            System.exit(1);
-        }
-        if (zInDw.set_listener_ex(makeWriterListener(writerState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value) != 0) {
-            System.err.println("FAIL: set_listener_ex (writer) failed");
-            System.exit(1);
-        }
-        if (out1Dr.set_listener(makeReaderListener(out1State), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value) != 0 ||
-            out2Dr.set_listener(makeReaderListener(out2State), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value) != 0)
-        {
-            System.err.println("FAIL: set_listener (reader) failed");
-            System.exit(1);
-        }
 
         SessionEventDataWriter inWriter = new SessionEventDataWriter(inDw);
         SessionEventDataReader out1Reader = new SessionEventDataReader(out1Dr);

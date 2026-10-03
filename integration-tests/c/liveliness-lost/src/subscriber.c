@@ -85,14 +85,8 @@ static DDS_DataReader create_reader(DDS_DomainParticipant dp, DDS_Subscriber sub
     dr_qos.liveliness.lease_duration.nanosec = 0;
 
     DDS_TopicDescription topic_desc = zzdds_topic_as_description(topic);
-    DDS_DataReader dr = DDS_Subscriber_create_datareader(sub, topic_desc, &dr_qos, NULL, 0);
-    if (!dr) {
-        fprintf(stderr, "FAIL: create_datareader(%s) failed\n", topic_name);
-        return NULL;
-    }
-    printf("Create reader for topic: %s\n", topic_name);
-    fflush(stdout);
-
+    /* Listener passed at creation: a writer discovered earlier matches inside
+     * create_datareader, so a listener attached afterwards could miss it. */
     atomic_init(&state->matched_current_count, 0);
     atomic_init(&state->alive_count, 0);
     atomic_init(&state->ever_not_alive, false);
@@ -101,10 +95,14 @@ static DDS_DataReader create_reader(DDS_DomainParticipant dp, DDS_Subscriber sub
     listener.listener_data = state;
     listener.on_subscription_matched = on_subscription_matched;
     listener.on_liveliness_changed = on_liveliness_changed;
-    if (DDS_DataReader_set_listener(dr, &listener, DDS_SUBSCRIPTION_MATCHED_STATUS | DDS_LIVELINESS_CHANGED_STATUS) != DDS_RETCODE_OK) {
-        fprintf(stderr, "FAIL: set_listener(%s) failed\n", topic_name);
+    DDS_DataReader dr = DDS_Subscriber_create_datareader(sub, topic_desc, &dr_qos, &listener,
+                                                         DDS_SUBSCRIPTION_MATCHED_STATUS | DDS_LIVELINESS_CHANGED_STATUS);
+    if (!dr) {
+        fprintf(stderr, "FAIL: create_datareader(%s) failed\n", topic_name);
         return NULL;
     }
+    printf("Create reader for topic: %s\n", topic_name);
+    fflush(stdout);
     return dr;
 }
 

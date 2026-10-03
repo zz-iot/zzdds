@@ -77,18 +77,16 @@ public class Subscriber {
         drQos.get_liveliness().get_lease_duration().set_sec(LEASE_DURATION_SEC);
         drQos.get_liveliness().get_lease_duration().set_nanosec(0);
 
-        Dcps.DDS.DataReader dr = sub.create_datareader(topic, drQos, null, 0);
+        // Listener passed at creation: a writer discovered earlier matches
+        // inside create_datareader, so a listener attached afterwards could miss it.
+        Dcps.DDS.DataReader dr = sub.create_datareader(topic, drQos, makeListener(state),
+            Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value | Dcps.DDS.LIVELINESS_CHANGED_STATUS.value);
         if (dr == null) {
             System.err.println("FAIL: create_datareader(" + topicName + ") failed");
             System.exit(1);
         }
         System.out.println("Create reader for topic: " + topicName);
         System.out.flush();
-
-        if (dr.set_listener(makeListener(state), Dcps.DDS.SUBSCRIPTION_MATCHED_STATUS.value | Dcps.DDS.LIVELINESS_CHANGED_STATUS.value) != 0) {
-            System.err.println("FAIL: set_listener(" + topicName + ") failed");
-            System.exit(1);
-        }
         return dr;
     }
 

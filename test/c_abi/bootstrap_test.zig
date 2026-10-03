@@ -427,6 +427,14 @@ test "get_allocator: extensions-layer C-ABI vtables return the injected custom a
     const zdr_boxed = extensions.DDS_DataReader_as_zzdds_DataReader(dr.vtable.get_c_abi_handle(dr.ptr));
     const zdr = zidl_rt.unboxAsView(ZZDDS.DataReader, zdr_boxed);
     try testing.expectEqual(expected, zdr.vtable.get_allocator(zdr.ptr));
+
+    const zpub_boxed = extensions.DDS_Publisher_as_zzdds_Publisher(pub_ent.vtable.get_c_abi_handle(pub_ent.ptr));
+    const zpub = zidl_rt.unboxAsView(ZZDDS.Publisher, zpub_boxed);
+    try testing.expectEqual(expected, zpub.vtable.get_allocator(zpub.ptr));
+
+    const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(sub_ent.vtable.get_c_abi_handle(sub_ent.ptr));
+    const zsub = zidl_rt.unboxAsView(ZZDDS.Subscriber, zsub_boxed);
+    try testing.expectEqual(expected, zsub.vtable.get_allocator(zsub.ptr));
 }
 
 test "get_allocator: every nil singleton returns the fixed nil allocator" {
@@ -799,6 +807,75 @@ test "extensions: DataReader's Entity, DataReader, and ZZDDS.DataReader views al
     try testing.expectEqual(dr_boxed, zdr_boxed);
 }
 
+const ExReaderState = struct {
+    matched_current: i32 = 0,
+    ready_calls: usize = 0,
+};
+
+fn exOnSubscriptionMatched(_: *anyopaque, s: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
+    @as(*ExReaderState, @ptrCast(@alignCast(ld))).matched_current = s.current_count;
+}
+
+fn exOnWriterReady(_: DDS.InstanceHandle_t, ready: bool, ld: ?*anyopaque) callconv(.c) void {
+    if (ready) @as(*ExReaderState, @ptrCast(@alignCast(ld))).ready_calls += 1;
+}
+
+test "extensions: DDS_Publisher/Subscriber_as_zzdds_* share the boxed handle and create entities through the C-ABI vtables" {
+    // What a C caller does: upcast its boxed DDS_Publisher/DDS_Subscriber to
+    // the zzdds extension view, then call create_datawriter_ex/
+    // create_datareader_ex through that view's vtable (with a listener
+    // pointer, or NULL).
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+    const np = zzdds.dcps.NIL_PTR;
+
+    const pub_boxed = fx.pub_w.vtable.get_c_abi_handle(fx.pub_w.ptr);
+    const zpub_boxed = extensions.DDS_Publisher_as_zzdds_Publisher(pub_boxed);
+    try testing.expectEqual(pub_boxed, zpub_boxed);
+    const zpub = zidl_rt.unboxAsView(ZZDDS.Publisher, zpub_boxed);
+    try testing.expectEqual(fx.pub_w.ptr, zpub.ptr);
+    try testing.expectEqual(fx.pub_w.ptr, zpub.vtable.as_Publisher(zpub.ptr).ptr);
+
+    const sub_boxed = fx.sub_r.vtable.get_c_abi_handle(fx.sub_r.ptr);
+    const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(sub_boxed);
+    try testing.expectEqual(sub_boxed, zsub_boxed);
+    const zsub = zidl_rt.unboxAsView(ZZDDS.Subscriber, zsub_boxed);
+    try testing.expectEqual(fx.sub_r.ptr, zsub.ptr);
+    try testing.expectEqual(fx.sub_r.ptr, zsub.vtable.as_Subscriber(zsub.ptr).ptr);
+
+    // BEST_EFFORT on both sides, so readiness fires at match (no handshake).
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+
+    var state = ExReaderState{};
+    const listener = ZZDDS.DataReaderListenerEx{
+        .listener_data = &state,
+        .on_subscription_matched = exOnSubscriptionMatched,
+        .on_reliable_writer_ready = exOnWriterReady,
+    };
+    const td = fx.topic_r.vtable.as_TopicDescription(fx.topic_r.ptr);
+    const dr = zsub.vtable.create_datareader_ex(zsub.ptr, td, &dr_qos, &listener, DDS.SUBSCRIPTION_MATCHED_STATUS);
+    try testing.expect(dr.ptr != np);
+    defer _ = fx.sub_r.delete_datareader(dr);
+
+    // NULL listener: allowed, like create_datawriter's.
+    const dw = zpub.vtable.create_datawriter_ex(zpub.ptr, fx.topic_w, &dw_qos, null, 0);
+    try testing.expect(dw.ptr != np);
+    defer _ = fx.pub_w.delete_datawriter(dw);
+    try testing.expectEqual(fx.pub_w.ptr, dw.get_publisher().ptr);
+
+    try testing.expectEqual(@as(i32, 1), state.matched_current);
+    try testing.expectEqual(@as(usize, 1), state.ready_calls);
+
+    // NULL listener on the reader side too.
+    const dr_plain = zsub.vtable.create_datareader_ex(zsub.ptr, td, &dr_qos, null, 0);
+    try testing.expect(dr_plain.ptr != np);
+    defer _ = fx.sub_r.delete_datareader(dr_plain);
+}
+
 // ── Condition conversion valid-handle tests ───────────────────────────────────
 
 test "extensions: DDS_GuardCondition_as_DDS_Condition with real GuardCondition" {
@@ -1048,6 +1125,27 @@ test "extensions: as_Base borrowed-view upcasts are safe on nil ZZDDS handles" {
     const zdr = zidl_rt.unboxAsView(ZZDDS.DataReader, zdr_boxed);
     const back_dr = zdr.vtable.as_DataReader(zdr.ptr);
     try testing.expectEqual(nd.nil_datareader.ptr, back_dr.ptr);
+
+    // Publisher/Subscriber: a foreign (here nil) handle upcasts to the nil
+    // extension view, whose operations return nil entities rather than
+    // dereferencing the nil context.
+    const nil_pub_boxed = nd.nil_publisher.vtable.get_c_abi_handle(nd.nil_publisher.ptr);
+    const zpub_boxed = extensions.DDS_Publisher_as_zzdds_Publisher(nil_pub_boxed);
+    const zpub = zidl_rt.unboxAsView(ZZDDS.Publisher, zpub_boxed);
+    try testing.expectEqual(nd.NIL_PTR, zpub.ptr);
+    try testing.expectEqual(nd.nil_publisher.ptr, zpub.vtable.as_Publisher(zpub.ptr).ptr);
+    try testing.expectEqual(std.heap.c_allocator, zpub.vtable.get_allocator(zpub.ptr));
+    const dw_qos = DDS.DataWriterQos{};
+    try testing.expectEqual(nd.NIL_PTR, zpub.vtable.create_datawriter_ex(zpub.ptr, nd.nil_topic, &dw_qos, null, 0).ptr);
+
+    const nil_sub_boxed = nd.nil_subscriber.vtable.get_c_abi_handle(nd.nil_subscriber.ptr);
+    const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(nil_sub_boxed);
+    const zsub = zidl_rt.unboxAsView(ZZDDS.Subscriber, zsub_boxed);
+    try testing.expectEqual(nd.NIL_PTR, zsub.ptr);
+    try testing.expectEqual(nd.nil_subscriber.ptr, zsub.vtable.as_Subscriber(zsub.ptr).ptr);
+    try testing.expectEqual(std.heap.c_allocator, zsub.vtable.get_allocator(zsub.ptr));
+    const dr_qos = DDS.DataReaderQos{};
+    try testing.expectEqual(nd.NIL_PTR, zsub.vtable.create_datareader_ex(zsub.ptr, nd.nil_topic_description, &dr_qos, null, 0).ptr);
 }
 
 test "extensions: DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory rejects foreign handles" {

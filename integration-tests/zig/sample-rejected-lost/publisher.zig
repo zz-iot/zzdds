@@ -71,12 +71,16 @@ fn parseDomain(process_args: std.process.Args) u32 {
     return 0;
 }
 
-fn setWriterListener(dw: DDS.DataWriter, state: *WriterSyncState) !void {
-    const zdw = zzdds.asZzddsDataWriter(dw) orelse return error.AsZzddsDataWriterFailed;
-    if (zdw.set_listener_ex(ZZDDS.dataWriterListenerEx(state, .{
+/// Creates a writer with its extended listener installed from the start: a
+/// reader discovered earlier matches inside creation, so a listener attached
+/// afterwards could miss on_publication_matched and on_reliable_reader_ready.
+/// Returns the nil writer on failure.
+fn createWriterEx(publisher: DDS.Publisher, topic: DDS.Topic, qos: DDS.DataWriterQos, state: *WriterSyncState) DDS.DataWriter {
+    const zpub = zzdds.asZzddsPublisher(publisher) orelse return zzdds.dcps.nil_datawriter;
+    return zpub.create_datawriter_ex(topic, qos, ZZDDS.dataWriterListenerEx(state, .{
         .on_publication_matched = onPublicationMatched,
         .on_reliable_reader_ready = onReliableReaderReady,
-    }), DDS.PUBLICATION_MATCHED_STATUS) != DDS.RETCODE_OK) return error.SetListenerExFailed;
+    }), DDS.PUBLICATION_MATCHED_STATUS);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -153,7 +157,13 @@ pub fn main(init: std.process.Init) !void {
     // late joiner can reach what's currently cached, not whether KEEP_LAST
     // still evicts.
     lost_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
-    const lost_dw = publisher.create_datawriter(topic_descs[1], lost_qos, null, 0);
+    var rejected_state = WriterSyncState{};
+    var sync_state = WriterSyncState{};
+    // LostTopic's listener only serves the final drain-wait below -- its
+    // reader is created well after this writer, so nothing gates the first
+    // write on it.
+    var lost_state = WriterSyncState{};
+    const lost_dw = createWriterEx(publisher, topic_descs[1], lost_qos, &lost_state);
     if (lost_dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter(LostTopic) failed\n", .{});
         std.process.exit(1);
@@ -175,7 +185,7 @@ pub fn main(init: std.process.Init) !void {
     var rejected_qos = DDS.DataWriterQos{};
     rejected_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     rejected_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
-    const rejected_dw = publisher.create_datawriter(topic_descs[0], rejected_qos, null, 0);
+    const rejected_dw = createWriterEx(publisher, topic_descs[0], rejected_qos, &rejected_state);
     if (rejected_dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter(RejectedTopic) failed\n", .{});
         std.process.exit(1);
@@ -184,31 +194,12 @@ pub fn main(init: std.process.Init) !void {
 
     var sync_qos = DDS.DataWriterQos{};
     sync_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    const sync_dw = publisher.create_datawriter(topic_descs[2], sync_qos, null, 0);
+    const sync_dw = createWriterEx(publisher, topic_descs[2], sync_qos, &sync_state);
     if (sync_dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter(SyncTopic) failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create writer for topic: SyncTopic\n", .{});
-
-    var rejected_state = WriterSyncState{};
-    var sync_state = WriterSyncState{};
-    var lost_state = WriterSyncState{};
-    setWriterListener(rejected_dw, &rejected_state) catch {
-        std.debug.print("FAIL: set_listener_ex(RejectedTopic) failed\n", .{});
-        std.process.exit(1);
-    };
-    setWriterListener(sync_dw, &sync_state) catch {
-        std.debug.print("FAIL: set_listener_ex(SyncTopic) failed\n", .{});
-        std.process.exit(1);
-    };
-    // Only used for the final drain-wait below -- LostTopic's reader isn't
-    // created until well after this writer already exists, so there's
-    // nothing to gate the first write on here.
-    setWriterListener(lost_dw, &lost_state) catch {
-        std.debug.print("FAIL: set_listener_ex(LostTopic) failed\n", .{});
-        std.process.exit(1);
-    };
 
     // Only Rejected/Sync need to wait for their reader -- the subscriber
     // creates those two immediately at startup. LostTopic's reader isn't

@@ -439,6 +439,100 @@ fn writerGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
     return impl.c_abi.get(impl.alloc, ctx, &DataWriterImpl.views);
 }
 
+pub const publisher_vtable = ZZDDS.Publisher.Vtable{
+    .create_datawriter_ex = publisherCreateDataWriterEx,
+    .deinit = borrowedDeinit,
+    .get_c_abi_handle = publisherGetCAbiHandleZzdds,
+    .get_allocator = publisherGetAllocator,
+    .as_Publisher = publisherAsDds,
+};
+
+fn publisherCreateDataWriterEx(
+    ctx: *anyopaque,
+    a_topic: DDS.Topic,
+    qos: *const DDS.DataWriterQos,
+    a_listener: ?*const ZZDDS.DataWriterListenerEx,
+    mask: DDS.StatusMask,
+) DDS.DataWriter {
+    if (ctx == nil.NIL_PTR) return nil.nil_datawriter;
+    const impl: *PublisherImpl = @ptrCast(@alignCast(ctx));
+    return impl.createDataWriter(a_topic, qos, if (a_listener) |l| l.* else ZZDDS.noop_DataWriterListenerEx, mask);
+}
+
+fn publisherGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+    if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
+    const impl: *PublisherImpl = @ptrCast(@alignCast(ctx));
+    return impl.alloc;
+}
+
+fn publisherAsDds(ctx: *anyopaque) DDS.Publisher {
+    if (ctx == nil.NIL_PTR) return nil.nil_publisher;
+    const impl: *PublisherImpl = @ptrCast(@alignCast(ctx));
+    return impl.toDDSPublisher();
+}
+
+var nil_zzdds_pub_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_zzdds_pub_views = ZZDDS.Publisher.CAbiViews{
+    .base = .{
+        .base = .{ .flat_vtable = nil.nil_entity.vtable },
+        .flat_vtable = nil.nil_publisher.vtable,
+    },
+    .flat_vtable = &publisher_vtable,
+};
+
+fn publisherGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return nil_zzdds_pub_c_abi.get(std.heap.c_allocator, ctx, &nil_zzdds_pub_views);
+    const impl: *PublisherImpl = @ptrCast(@alignCast(ctx));
+    return impl.c_abi.get(impl.alloc, ctx, &PublisherImpl.views);
+}
+
+pub const subscriber_vtable = ZZDDS.Subscriber.Vtable{
+    .create_datareader_ex = subscriberCreateDataReaderEx,
+    .deinit = borrowedDeinit,
+    .get_c_abi_handle = subscriberGetCAbiHandleZzdds,
+    .get_allocator = subscriberGetAllocator,
+    .as_Subscriber = subscriberAsDds,
+};
+
+fn subscriberCreateDataReaderEx(
+    ctx: *anyopaque,
+    a_topic: DDS.TopicDescription,
+    qos: *const DDS.DataReaderQos,
+    a_listener: ?*const ZZDDS.DataReaderListenerEx,
+    mask: DDS.StatusMask,
+) DDS.DataReader {
+    if (ctx == nil.NIL_PTR) return nil.nil_datareader;
+    const impl: *SubscriberImpl = @ptrCast(@alignCast(ctx));
+    return impl.createDataReader(a_topic, qos, if (a_listener) |l| l.* else ZZDDS.noop_DataReaderListenerEx, mask);
+}
+
+fn subscriberGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+    if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
+    const impl: *SubscriberImpl = @ptrCast(@alignCast(ctx));
+    return impl.alloc;
+}
+
+fn subscriberAsDds(ctx: *anyopaque) DDS.Subscriber {
+    if (ctx == nil.NIL_PTR) return nil.nil_subscriber;
+    const impl: *SubscriberImpl = @ptrCast(@alignCast(ctx));
+    return impl.toDDSSubscriber();
+}
+
+var nil_zzdds_sub_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_zzdds_sub_views = ZZDDS.Subscriber.CAbiViews{
+    .base = .{
+        .base = .{ .flat_vtable = nil.nil_entity.vtable },
+        .flat_vtable = nil.nil_subscriber.vtable,
+    },
+    .flat_vtable = &subscriber_vtable,
+};
+
+fn subscriberGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return nil_zzdds_sub_c_abi.get(std.heap.c_allocator, ctx, &nil_zzdds_sub_views);
+    const impl: *SubscriberImpl = @ptrCast(@alignCast(ctx));
+    return impl.c_abi.get(impl.alloc, ctx, &SubscriberImpl.views);
+}
+
 pub const reader_vtable = ZZDDS.DataReader.Vtable{
     .set_listener_ex = readerSetListenerEx,
     .get_rtps_guid = readerGetRtpsGuid,
@@ -722,9 +816,9 @@ pub export fn zzdds_process_configure_from_file(
 // IDL inheritance can't express "which concrete derived type is this," so
 // these still need a runtime vtable-identity check.
 //
-// `participant_vtable`/`topic_vtable`/`writer_vtable`/`reader_vtable` below
-// are `pub` so `raw_ops.zig`'s pure-Zig `asZzdds{Topic,DataWriter,DataReader,
-// DomainParticipant}` (the same runtime check, minus the C-ABI handle-boxing
+// `participant_vtable`/`topic_vtable`/`writer_vtable`/`reader_vtable`/
+// `publisher_vtable`/`subscriber_vtable` are `pub` so `raw_ops.zig`'s pure-Zig
+// `asZzdds{Topic,DataWriter,DataReader,DomainParticipant,Publisher,Subscriber}` (the same runtime check, minus the C-ABI handle-boxing
 // step) can reference the same canonical vtable instances rather than a
 // second, address-distinct copy.
 
@@ -775,6 +869,24 @@ pub export fn DDS_DataReader_as_zzdds_DataReader(reader: *anyopaque) callconv(.c
     const rd = zidl_rt.unboxAsView(DDS.DataReader, reader);
     if (rd.vtable != &DataReaderImpl.vtable) return readerGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.DataReader = .{ .ptr = rd.ptr, .vtable = &reader_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+/// Only valid for publishers owned by a FactoryOwner-owned participant.
+/// Returns a nil handle for any handle not issued by this implementation.
+pub export fn DDS_Publisher_as_zzdds_Publisher(publisher: *anyopaque) callconv(.c) *anyopaque {
+    const p = zidl_rt.unboxAsView(DDS.Publisher, publisher);
+    if (p.vtable != &PublisherImpl.vtable) return publisherGetCAbiHandleZzdds(nil.NIL_PTR);
+    const r: ZZDDS.Publisher = .{ .ptr = p.ptr, .vtable = &publisher_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+/// Only valid for subscribers owned by a FactoryOwner-owned participant.
+/// Returns a nil handle for any handle not issued by this implementation.
+pub export fn DDS_Subscriber_as_zzdds_Subscriber(subscriber: *anyopaque) callconv(.c) *anyopaque {
+    const s = zidl_rt.unboxAsView(DDS.Subscriber, subscriber);
+    if (s.vtable != &SubscriberImpl.vtable) return subscriberGetCAbiHandleZzdds(nil.NIL_PTR);
+    const r: ZZDDS.Subscriber = .{ .ptr = s.ptr, .vtable = &subscriber_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 

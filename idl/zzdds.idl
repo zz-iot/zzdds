@@ -168,6 +168,30 @@ module zzdds {
             in boolean               is_ready);
     };
 
+    // create_datawriter/create_datareader with an extended listener installed
+    // from the start. The entity's statuses can change during creation (a
+    // remote endpoint discovered earlier matches the new one immediately), so
+    // a listener installed afterwards with set_listener_ex can miss
+    // on_publication_matched / on_subscription_matched and the reliable-ready
+    // callbacks; these operations install it before the entity can match.
+    // `mask` selects the standard statuses, as for create_datawriter; the
+    // reliable-ready callback is always delivered when the listener provides it.
+    @shared_c_abi_box interface Publisher : DDS::Publisher {
+        DDS::DataWriter create_datawriter_ex(
+            in DDS::Topic           a_topic,
+            in DDS::DataWriterQos   qos,
+            in DataWriterListenerEx a_listener,
+            in DDS::StatusMask      mask);
+    };
+
+    @shared_c_abi_box interface Subscriber : DDS::Subscriber {
+        DDS::DataReader create_datareader_ex(
+            in DDS::TopicDescription a_topic,
+            in DDS::DataReaderQos    qos,
+            in DataReaderListenerEx  a_listener,
+            in DDS::StatusMask       mask);
+    };
+
     @shared_c_abi_box interface DataWriter : DDS::DataWriter {
         // write_serialized() was removed: DDS::DataWriter::write_raw() (see
         // dcps.idl) supersedes it -- same underlying zzdds core, but correct

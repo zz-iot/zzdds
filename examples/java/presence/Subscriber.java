@@ -74,7 +74,6 @@ public class Subscriber {
         drQos.get_liveliness().get_lease_duration().set_sec(2);
         drQos.get_liveliness().get_lease_duration().set_nanosec(0);
 
-        final Object[] readerBox = new Object[1]; // set right after create_datareader
         final Phase[] phase = { Phase.WAITING_FIRST_ONLINE };
         final AtomicInteger step = new AtomicInteger(0);
         final AtomicBoolean cycleComplete = new AtomicBoolean(false);
@@ -120,7 +119,7 @@ public class Subscriber {
             }
 
             public void on_data_available(Dcps.DDS.DataReader r) {
-                PresenceBeaconDataReader reader = (PresenceBeaconDataReader) readerBox[0];
+                PresenceBeaconDataReader reader = new PresenceBeaconDataReader(r);
                 PresenceBeaconDataReader.Sample sample;
                 while ((sample = reader.take()) != null) {
                     if (!sample.validData) continue;
@@ -129,24 +128,16 @@ public class Subscriber {
             }
         };
 
-        // Create with no listener attached yet: on_data_available/
-        // on_liveliness_changed fire on a zzdds-internal dispatch thread as
-        // soon as the reader matches, which can race readerBox[0]'s own
-        // assignment below. Attach the listener only once readerBox[0] is
-        // set, via set_listener() below, closing the window entirely.
-        Dcps.DDS.DataReader rawReader = sub.create_datareader(topic, drQos, null, 0);
+        // Listener passed at creation, so no liveliness change can be missed:
+        // the callbacks use the reader DDS passes them, not one set up after
+        // create_datareader returns.
+        int listenerMask = Dcps.DDS.DATA_AVAILABLE_STATUS.value | Dcps.DDS.LIVELINESS_CHANGED_STATUS.value;
+        Dcps.DDS.DataReader rawReader = sub.create_datareader(topic, drQos, listener, listenerMask);
         if (rawReader == null) {
             System.err.println("FAIL: create_datareader() failed");
             System.exit(1);
         }
         System.out.println("Create reader for topic: PresenceBeacon");
-
-        readerBox[0] = new PresenceBeaconDataReader(rawReader);
-        int listenerMask = Dcps.DDS.DATA_AVAILABLE_STATUS.value | Dcps.DDS.LIVELINESS_CHANGED_STATUS.value;
-        if (rawReader.set_listener(listener, listenerMask) != 0) {
-            System.err.println("FAIL: set_listener() failed");
-            System.exit(1);
-        }
 
         System.out.println("Subscriber: waiting for online -> offline -> online cycle...");
         long deadline = System.currentTimeMillis() + CYCLE_TIMEOUT_MS;

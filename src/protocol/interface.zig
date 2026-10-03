@@ -185,8 +185,10 @@ pub const ProtocolWriter = struct {
         ) anyerror!SequenceNumber,
 
         /// SEDP matched a new remote reader. The protocol layer adds a proxy
-        /// and begins sending cached history.
-        add_matched_reader: *const fn (ctx: *anyopaque, info: *const MatchedReaderInfo) anyerror!void,
+        /// and begins sending cached history. Returns true when the reader
+        /// was newly matched, false when it was already matched (discovery
+        /// can report a pair more than once; that only refreshes the proxy).
+        add_matched_reader: *const fn (ctx: *anyopaque, info: *const MatchedReaderInfo) anyerror!bool,
 
         /// SEDP removed a previously matched remote reader.
         remove_matched_reader: *const fn (ctx: *anyopaque, guid: Guid) void,
@@ -332,7 +334,7 @@ pub const ProtocolWriter = struct {
         return self.vtable.write(self.ctx, kind, source_timestamp, instance_handle, key_hash, data);
     }
 
-    pub fn addMatchedReader(self: ProtocolWriter, info: *const MatchedReaderInfo) anyerror!void {
+    pub fn addMatchedReader(self: ProtocolWriter, info: *const MatchedReaderInfo) anyerror!bool {
         return self.vtable.add_matched_reader(self.ctx, info);
     }
 
@@ -490,8 +492,11 @@ pub const ProtocolReader = struct {
         set_writer_match_callback: *const fn (ctx: *anyopaque, cb: WriterMatchCallback) void,
 
         /// SEDP matched a new remote writer. The protocol layer adds a proxy
-        /// and begins accepting data from that writer.
-        add_matched_writer: *const fn (ctx: *anyopaque, info: *const MatchedWriterInfo) anyerror!void,
+        /// and begins accepting data from that writer. Returns true when the
+        /// writer was newly matched, false when it was already matched
+        /// (discovery can report a pair more than once; that only refreshes
+        /// the proxy).
+        add_matched_writer: *const fn (ctx: *anyopaque, info: *const MatchedWriterInfo) anyerror!bool,
 
         /// SEDP removed a previously matched remote writer.
         remove_matched_writer: *const fn (ctx: *anyopaque, guid: Guid) void,
@@ -629,7 +634,7 @@ pub const ProtocolReader = struct {
         self.vtable.set_writer_match_callback(self.ctx, cb);
     }
 
-    pub fn addMatchedWriter(self: ProtocolReader, info: *const MatchedWriterInfo) anyerror!void {
+    pub fn addMatchedWriter(self: ProtocolReader, info: *const MatchedWriterInfo) anyerror!bool {
         return self.vtable.add_matched_writer(self.ctx, info);
     }
 

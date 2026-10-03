@@ -37,7 +37,7 @@ const GuidPrefix = proto.GuidPrefix;
 /// Build the unified listener representation from a plain `set_listener()`
 /// (base OMG API) call, with the extension callback unset. Mirrors
 /// writer.zig's identical widen/narrow scheme for DataWriterListenerEx.
-fn listenerExFromBase(l: DDS.DataReaderListener) ZZDDS.DataReaderListenerEx {
+pub fn listenerExFromBase(l: DDS.DataReaderListener) ZZDDS.DataReaderListenerEx {
     return .{
         .listener_data = l.listener_data,
         .release_listener_data = l.release_listener_data,
@@ -493,7 +493,10 @@ pub const DataReaderImpl = struct {
         subscriber: DDS.Subscriber,
         proto_reader: proto.ProtocolReader,
         qos: DDS.DataReaderQos,
-        listener: DDS.DataReaderListener,
+        /// Installed before the reader can match anything (see
+        /// `SubscriberImpl.createDataReader`); a standard listener is widened
+        /// with `listenerExFromBase`.
+        listener: ZZDDS.DataReaderListenerEx,
         mask: DDS.StatusMask,
         instance_handle: DDS.InstanceHandle_t,
         guid: proto.Guid,
@@ -524,7 +527,7 @@ pub const DataReaderImpl = struct {
             .seen_instances = .empty,
         };
         errdefer alloc.destroy(self);
-        self.listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(listener));
+        self.listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listener);
         errdefer alloc.destroy(self.listener_ex_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);

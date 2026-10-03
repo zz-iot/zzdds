@@ -24,6 +24,7 @@ const participant_mod = @import("participant.zig");
 const config_mod = @import("../config/schema.zig");
 const generated_config_mod = @import("../config/generated.zig");
 const ZZDDS = @import("zzdds_ext_generated").zzdds;
+const extensions_mod = @import("../c_abi/extensions.zig");
 
 /// Callbacks from the owning DomainParticipant, supplied at construction time.
 pub const ParticipantCbs = struct {
@@ -297,9 +298,15 @@ pub const SubscriberImpl = struct {
     };
 
     /// One `CAbiViews` value for the whole object (see `zidl_rt.unboxAsView`).
-    pub const views = DDS.Subscriber.CAbiViews{
-        .base = .{ .flat_vtable = &entity_vtable },
-        .flat_vtable = &vtable,
+    /// One `CAbiViews` value for the whole object, covering Entity,
+    /// Subscriber and (via `extensions.zig`'s `subscriber_vtable`)
+    /// zzdds::Subscriber. See `DataWriterImpl.views`.
+    pub const views = ZZDDS.Subscriber.CAbiViews{
+        .base = .{
+            .base = .{ .flat_vtable = &entity_vtable },
+            .flat_vtable = &vtable,
+        },
+        .flat_vtable = &extensions_mod.subscriber_vtable,
     };
 
     fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
@@ -352,9 +359,22 @@ pub const SubscriberImpl = struct {
         a_listener: ?*const DDS.DataReaderListener,
         mask: DDS.StatusMask,
     ) DDS.DataReader {
+        const listener = reader_mod.listenerExFromBase(if (a_listener) |l| l.* else DDS.noop_DataReaderListener);
+        return cast(ctx).createDataReader(a_topic, qos, listener, mask);
+    }
+
+    /// create_datareader with an extended listener; see
+    /// `PublisherImpl.createDataWriter`. Backs both DDS create_datareader and
+    /// zzdds::Subscriber::create_datareader_ex.
+    pub fn createDataReader(
+        self: *Self,
+        a_topic: DDS.TopicDescription,
+        qos: *const DDS.DataReaderQos,
+        listener: ZZDDS.DataReaderListenerEx,
+        mask: DDS.StatusMask,
+    ) DDS.DataReader {
         // See publisher.zig's identical comment on create_datawriter: not
         // gated on this Subscriber's own enabled state, for the same reason.
-        const self = cast(ctx);
         const topic_name = a_topic.get_name();
         const type_name = a_topic.get_type_name();
         const presentation = self.qos.presentation;
@@ -375,7 +395,7 @@ pub const SubscriberImpl = struct {
             self.toDDSSubscriber(),
             pr,
             qos.*,
-            if (a_listener) |l| l.* else DDS.noop_DataReaderListener,
+            listener,
             mask,
             subscription_handle,
             guid,

@@ -103,7 +103,19 @@ public class Publisher {
         // still happens regardless of durability.
         lostQos.get_durability().set_kind(Dcps.DDS.DurabilityQosPolicyKind.TRANSIENT_LOCAL_DURABILITY_QOS);
 
-        Dcps.DDS.DataWriter lostDw = pub.create_datawriter(lostTopic, lostQos, null, 0);
+        // Writers get their extended listeners at creation, through zzdds's
+        // Publisher extension view: a reader discovered earlier matches inside
+        // creation, so a listener attached afterwards could miss
+        // on_publication_matched and on_reliable_reader_ready.
+        Zzdds.zzdds.Publisher zPub = (Zzdds.zzdds.Publisher) io.zzdds.runtime.ZzddsRuntime.asZzddsPublisher(pub);
+        if (zPub == null) {
+            System.err.println("FAIL: asZzddsPublisher() failed");
+            System.exit(1);
+        }
+        WriterSyncState rejectedState = new WriterSyncState();
+        WriterSyncState syncState = new WriterSyncState();
+        WriterSyncState lostState = new WriterSyncState();
+        Dcps.DDS.DataWriter lostDw = zPub.create_datawriter_ex(lostTopic, lostQos, makeListener(lostState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
         if (lostDw == null) {
             System.err.println("FAIL: create_datawriter(LostTopic) failed");
             System.exit(1);
@@ -125,7 +137,7 @@ public class Publisher {
         pub.get_default_datawriter_qos(rejectedQos);
         rejectedQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
         rejectedQos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
-        Dcps.DDS.DataWriter rejectedDw = pub.create_datawriter(rejectedTopic, rejectedQos, null, 0);
+        Dcps.DDS.DataWriter rejectedDw = zPub.create_datawriter_ex(rejectedTopic, rejectedQos, makeListener(rejectedState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
         if (rejectedDw == null) {
             System.err.println("FAIL: create_datawriter(RejectedTopic) failed");
             System.exit(1);
@@ -135,31 +147,12 @@ public class Publisher {
         Dcps.DDS.DataWriterQos syncQos = new Dcps.DDS.DataWriterQos();
         pub.get_default_datawriter_qos(syncQos);
         syncQos.get_reliability().set_kind(Dcps.DDS.ReliabilityQosPolicyKind.RELIABLE_RELIABILITY_QOS);
-        Dcps.DDS.DataWriter syncDw = pub.create_datawriter(syncTopic, syncQos, null, 0);
+        Dcps.DDS.DataWriter syncDw = zPub.create_datawriter_ex(syncTopic, syncQos, makeListener(syncState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value);
         if (syncDw == null) {
             System.err.println("FAIL: create_datawriter(SyncTopic) failed");
             System.exit(1);
         }
         System.out.println("Create writer for topic: SyncTopic");
-
-        WriterSyncState rejectedState = new WriterSyncState();
-        WriterSyncState syncState = new WriterSyncState();
-        WriterSyncState lostState = new WriterSyncState();
-
-        Zzdds.zzdds.DataWriter zRejectedDw = (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(rejectedDw);
-        Zzdds.zzdds.DataWriter zSyncDw = (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(syncDw);
-        Zzdds.zzdds.DataWriter zLostDw = (Zzdds.zzdds.DataWriter) io.zzdds.runtime.ZzddsRuntime.asZzddsDataWriter(lostDw);
-        if (zRejectedDw == null || zSyncDw == null || zLostDw == null) {
-            System.err.println("FAIL: asZzddsDataWriter() failed");
-            System.exit(1);
-        }
-        if (zRejectedDw.set_listener_ex(makeListener(rejectedState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value) != 0 ||
-            zSyncDw.set_listener_ex(makeListener(syncState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value) != 0 ||
-            zLostDw.set_listener_ex(makeListener(lostState), Dcps.DDS.PUBLICATION_MATCHED_STATUS.value) != 0)
-        {
-            System.err.println("FAIL: set_listener_ex failed");
-            System.exit(1);
-        }
 
         // Only Rejected/Sync need to wait for their reader -- the
         // subscriber creates those two immediately at startup. LostTopic's

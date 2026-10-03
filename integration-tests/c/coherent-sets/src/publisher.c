@@ -56,14 +56,18 @@ static uint32_t parse_domain(int argc, char **argv) {
     return 0;
 }
 
-static int set_writer_listener(DDS_DataWriter dw, WriterSyncState *state) {
-    zzdds_DataWriter zdw = DDS_DataWriter_as_zzdds_DataWriter(dw);
+/* Creates a writer with its extended listener installed from the start: a
+ * reader discovered earlier matches inside creation, so a listener attached
+ * afterwards could miss on_publication_matched and on_reliable_reader_ready. */
+static DDS_DataWriter create_writer_ex(DDS_Publisher pub, DDS_Topic topic, const DDS_DataWriterQos *qos,
+                                       WriterSyncState *state) {
     zzdds_DataWriterListenerEx listener_ex;
     memset(&listener_ex, 0, sizeof(listener_ex));
     listener_ex.listener_data = state;
     listener_ex.on_publication_matched = on_publication_matched;
     listener_ex.on_reliable_reader_ready = on_reliable_reader_ready;
-    return zzdds_DataWriter_set_listener_ex(zdw, &listener_ex, DDS_PUBLICATION_MATCHED_STATUS);
+    return zzdds_Publisher_create_datawriter_ex(DDS_Publisher_as_zzdds_Publisher(pub), topic, qos, &listener_ex,
+                                                DDS_PUBLICATION_MATCHED_STATUS);
 }
 
 int main(int argc, char **argv) {
@@ -122,30 +126,23 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
 
-    DDS_DataWriter position_dw = DDS_Publisher_create_datawriter(pub, position_topic, &dw_qos, NULL, 0);
+    WriterSyncState position_state, velocity_state;
+    memset(&position_state, 0, sizeof(position_state));
+    memset(&velocity_state, 0, sizeof(velocity_state));
+
+    DDS_DataWriter position_dw = create_writer_ex(pub, position_topic, &dw_qos, &position_state);
     if (!position_dw) {
         fprintf(stderr, "FAIL: create_datawriter(Position) failed\n");
         return 1;
     }
     printf("Create writer for topic: Position\n");
 
-    DDS_DataWriter velocity_dw = DDS_Publisher_create_datawriter(pub, velocity_topic, &dw_qos, NULL, 0);
+    DDS_DataWriter velocity_dw = create_writer_ex(pub, velocity_topic, &dw_qos, &velocity_state);
     if (!velocity_dw) {
         fprintf(stderr, "FAIL: create_datawriter(Velocity) failed\n");
         return 1;
     }
     printf("Create writer for topic: Velocity\n");
-
-    WriterSyncState position_state, velocity_state;
-    memset(&position_state, 0, sizeof(position_state));
-    memset(&velocity_state, 0, sizeof(velocity_state));
-
-    if (set_writer_listener(position_dw, &position_state) != DDS_RETCODE_OK ||
-        set_writer_listener(velocity_dw, &velocity_state) != DDS_RETCODE_OK)
-    {
-        fprintf(stderr, "FAIL: set_listener_ex failed\n");
-        return 1;
-    }
 
     for (int waited_ms = 0;
          !(atomic_load(&position_state.reader_ready) && atomic_load(&velocity_state.reader_ready));

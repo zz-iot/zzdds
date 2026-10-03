@@ -60,12 +60,16 @@ fn parseDomain(process_args: std.process.Args) u32 {
     return 0;
 }
 
-fn setWriterListener(dw: DDS.DataWriter, state: *WriterSyncState) !void {
-    const zdw = zzdds.asZzddsDataWriter(dw) orelse return error.AsZzddsDataWriterFailed;
-    if (zdw.set_listener_ex(ZZDDS.dataWriterListenerEx(state, .{
+/// Creates a writer with its extended listener installed from the start: a
+/// reader discovered earlier matches inside creation, so a listener attached
+/// afterwards could miss on_publication_matched and on_reliable_reader_ready.
+/// Returns the nil writer on failure.
+fn createWriterEx(publisher: DDS.Publisher, topic: DDS.Topic, qos: DDS.DataWriterQos, state: *WriterSyncState) DDS.DataWriter {
+    const zpub = zzdds.asZzddsPublisher(publisher) orelse return zzdds.dcps.nil_datawriter;
+    return zpub.create_datawriter_ex(topic, qos, ZZDDS.dataWriterListenerEx(state, .{
         .on_publication_matched = onPublicationMatched,
         .on_reliable_reader_ready = onReliableReaderReady,
-    }), DDS.PUBLICATION_MATCHED_STATUS) != DDS.RETCODE_OK) return error.SetListenerExFailed;
+    }), DDS.PUBLICATION_MATCHED_STATUS);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -135,30 +139,21 @@ pub fn main(init: std.process.Init) !void {
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
 
-    const position_dw = publisher.create_datawriter(position_topic, dw_qos, null, 0);
+    var position_state = WriterSyncState{};
+    var velocity_state = WriterSyncState{};
+    const position_dw = createWriterEx(publisher, position_topic, dw_qos, &position_state);
     if (position_dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter(Position) failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create writer for topic: Position\n", .{});
 
-    const velocity_dw = publisher.create_datawriter(velocity_topic, dw_qos, null, 0);
+    const velocity_dw = createWriterEx(publisher, velocity_topic, dw_qos, &velocity_state);
     if (velocity_dw.ptr == zzdds.dcps.NIL_PTR) {
         std.debug.print("FAIL: create_datawriter(Velocity) failed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("Create writer for topic: Velocity\n", .{});
-
-    var position_state = WriterSyncState{};
-    var velocity_state = WriterSyncState{};
-    setWriterListener(position_dw, &position_state) catch {
-        std.debug.print("FAIL: set_listener_ex(Position) failed\n", .{});
-        std.process.exit(1);
-    };
-    setWriterListener(velocity_dw, &velocity_state) catch {
-        std.debug.print("FAIL: set_listener_ex(Velocity) failed\n", .{});
-        std.process.exit(1);
-    };
 
     const ready_deadline = monoNs(io) + READER_READY_TIMEOUT_NS;
     while (!(position_state.reader_ready.load(.acquire) and velocity_state.reader_ready.load(.acquire))) {

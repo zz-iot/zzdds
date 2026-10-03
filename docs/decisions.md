@@ -165,6 +165,18 @@ a new `zzdds::DataWriter::set_listener_ex()` alongside the standard `set_listene
 setters populate the same unified storage (`DataWriterImpl.listener_ex`) so the two OMG
 status callbacks and the extension callback are always dispatched from one place.
 
+**Extended listeners installed at creation (2026-10-02).** `set_listener_ex()` only exists
+on an already-created entity, but a remote endpoint discovered earlier matches the new one
+inside `create_datawriter`/`create_datareader`, so a listener installed afterwards can miss
+`on_publication_matched`/`on_subscription_matched` and the reliable-ready callbacks. DDS does
+not replay earlier status changes to a later listener, so zzdds doesn't either. Instead
+`zzdds::Publisher::create_datawriter_ex()` and `zzdds::Subscriber::create_datareader_ex()`
+take the extended listener and mask, mirroring the standard `create_*` signatures; the C
+binding reaches them through `DDS_Publisher_as_zzdds_Publisher` /
+`DDS_Subscriber_as_zzdds_Subscriber`. (The spec alternative, `autoenable_created_entities =
+FALSE` then `set_listener_ex()` then `enable()`, also works.) Topics, conditions and waitsets
+need no counterpart: they have no extended listener.
+
 Per-proxy correlation state: `ReaderProxy.first_sent_hb_first_sn` (recorded once, at match
 time, from the firstSN the initial Heartbeat to that proxy will carry) and
 `protocol_ready: bool` (sticky). A RELIABLE proxy becomes ready when an incoming AckNack's

@@ -149,28 +149,27 @@ int main(int argc, char **argv) {
     dw_qos.reliability.kind = DDS_ReliabilityQosPolicyKind_RELIABLE_RELIABILITY_QOS;
     dw_qos.history.kind = DDS_HistoryQosPolicyKind_KEEP_ALL_HISTORY_QOS;
 
-    DDS_DataWriter dw = DDS_Publisher_create_datawriter(pub, topic, &dw_qos, NULL, 0);
-    if (!dw) {
-        fprintf(stderr, "FAIL: create_datawriter() failed\n");
-        return 1;
-    }
-    printf("Create writer for topic: SensorReading\n");
-
     PubState state;
     state.reader_ready = false;
     state.ever_matched = false;
     state.matched_current_count = 0;
 
-    zzdds_DataWriter zdw = DDS_DataWriter_as_zzdds_DataWriter(dw);
+    /* The extended listener is passed at creation, through zzdds's Publisher
+     * extension view: a reader discovered earlier matches inside
+     * create_datawriter, so a listener attached afterwards could miss
+     * on_publication_matched and on_reliable_reader_ready. */
     zzdds_DataWriterListenerEx listener_ex;
     memset(&listener_ex, 0, sizeof(listener_ex));
     listener_ex.listener_data = &state;
     listener_ex.on_publication_matched = on_publication_matched;
     listener_ex.on_reliable_reader_ready = on_reliable_reader_ready;
-    if (zzdds_DataWriter_set_listener_ex(zdw, &listener_ex, DDS_PUBLICATION_MATCHED_STATUS) != DDS_RETCODE_OK) {
-        fprintf(stderr, "FAIL: set_listener_ex failed\n");
+    DDS_DataWriter dw = zzdds_Publisher_create_datawriter_ex(
+        DDS_Publisher_as_zzdds_Publisher(pub), topic, &dw_qos, &listener_ex, DDS_PUBLICATION_MATCHED_STATUS);
+    if (!dw) {
+        fprintf(stderr, "FAIL: create_datawriter_ex() failed\n");
         return 1;
     }
+    printf("Create writer for topic: SensorReading\n");
 
     SensorReadingDataWriter writer;
     SensorReadingDataWriter_init(&writer, dw, ZIDL_XCDR1);

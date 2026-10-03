@@ -269,6 +269,27 @@ fn makeWriterWithReader(
 
 // ── AckNack: non-final + empty bitmap ────────────────────────────────────────
 
+// ── addOrRefreshMatchedReader reports whether the match is new ────────────────
+//
+// The DCPS matched status counts only new matches: discovery can report an
+// already matched reader again, which just refreshes its proxy.
+
+test "addOrRefreshMatchedReader: true for a new match, false for a refresh, true again after removal" {
+    const reader_guid = makeGuid(0x02, READER_EID);
+    const writer_guid = makeGuid(0x01, WRITER_EID);
+    const reader_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7410);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, writer_guid, rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+
+    try testing.expect(try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, reader_guid, &.{reader_loc}, &.{}, false, true)));
+    try testing.expect(!try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, reader_guid, &.{reader_loc}, &.{}, false, true)));
+    try testing.expectEqual(@as(usize, 1), w.reader_proxies.items.len);
+    w.removeMatchedReader(reader_guid);
+    try testing.expect(try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, reader_guid, &.{reader_loc}, &.{}, false, true)));
+}
+
 test "handleAckNack: non-final + empty bitmap retransmits all changes >= base" {
     const writer_guid = makeGuid(0x01, WRITER_EID);
     const reader_guid = makeGuid(0x02, READER_EID);
