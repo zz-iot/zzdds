@@ -7,7 +7,8 @@
 //   - the publisher/subscriber from create_publisher/create_subscriber upcasts
 //     to the zzdds extension class (PublisherSupport/SubscriberSupport);
 //   - the entity created with an extended listener receives its matched
-//     callback and the reliable-ready callback;
+//     callback and, with RELIABLE QoS on both sides, the reliable-ready
+//     callback once the AckNack/Heartbeat handshake completes;
 //   - the entity passed to the matched callback is the same C++ object the
 //     application holds (one wrapper per entity; the extended-listener
 //     bridges once built a separate base wrapper);
@@ -95,16 +96,22 @@ int main() {
     auto zsub = std::dynamic_pointer_cast<::zzdds::SubscriberImpl>(sub);
     CHECK(zpub && zsub);
 
+    // RELIABLE on both sides, so the readiness callbacks wait for the
+    // AckNack/Heartbeat handshake (BEST_EFFORT would make them fire at match).
+    auto dr_qos = ::DDS::DataReaderQos::default_value();
+    dr_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
+    auto dw_qos = ::DDS::DataWriterQos::default_value();
+    dw_qos.reliability.kind = ::DDS::ReliabilityQosPolicyKind::RELIABLE_RELIABILITY_QOS;
+
     auto rlistener = std::make_shared<ReaderListener>();
     auto dr = zsub->create_datareader_ex(
         std::static_pointer_cast<::zzdds::TopicImpl>(topic_r)->as_topic_description(),
-        ::DDS::DataReaderQos::default_value(), rlistener, ::DDS::SUBSCRIPTION_MATCHED_STATUS);
+        dr_qos, rlistener, ::DDS::SUBSCRIPTION_MATCHED_STATUS);
     CHECK(dr);
     CHECK(std::dynamic_pointer_cast<::zzdds::DataReaderImpl>(dr));
 
     auto wlistener = std::make_shared<WriterListener>();
-    auto dw = zpub->create_datawriter_ex(topic_w, ::DDS::DataWriterQos::default_value(), wlistener,
-                                          ::DDS::PUBLICATION_MATCHED_STATUS);
+    auto dw = zpub->create_datawriter_ex(topic_w, dw_qos, wlistener, ::DDS::PUBLICATION_MATCHED_STATUS);
     CHECK(dw);
     CHECK(std::dynamic_pointer_cast<::zzdds::DataWriterImpl>(dw));
     CHECK(dw->get_publisher() == pub);

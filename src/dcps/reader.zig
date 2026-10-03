@@ -302,9 +302,6 @@ pub const DataReaderImpl = struct {
     sub_matched_total: i32 = 0,
     sub_matched_total_change: i32 = 0,
     sub_matched_current: i32 = 0,
-    /// Remote writers counted in `sub_matched_current`; see
-    /// `DataWriterImpl.matched_subscriptions`. Under `mu`.
-    matched_publications: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void) = .empty,
     sub_matched_current_change: i32 = 0,
     sub_matched_last_handle: DDS.InstanceHandle_t = 0,
 
@@ -600,7 +597,6 @@ pub const DataReaderImpl = struct {
         self.listener_ex_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
-        self.matched_publications.deinit(self.alloc);
         // Tear down any ReadCondition/QueryCondition the app never explicitly
         // deleted via delete_readcondition(). Each condition's own teardown
         // detaches it from any WaitSet that still has it attached, removes
@@ -2570,10 +2566,6 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         const delta: i32 = if (added) 1 else -1;
         self.mu.lock();
-        if (!writer_mod.trackMatch(&self.matched_publications, self.alloc, remote_handle, added)) {
-            self.mu.unlock();
-            return;
-        }
         if (added) self.sub_matched_total += 1;
         self.sub_matched_total_change += if (added) 1 else 0;
         self.sub_matched_current += delta;

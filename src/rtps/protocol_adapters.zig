@@ -155,7 +155,7 @@ pub const RtpsProtocolWriter = struct {
         return self.writer.write(kind, source_timestamp, instance_handle, key_hash, data);
     }
 
-    fn vtAddMatchedReader(ctx: *anyopaque, info: *const MatchedReaderInfo) anyerror!void {
+    fn vtAddMatchedReader(ctx: *anyopaque, info: *const MatchedReaderInfo) anyerror!bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         var proxy = try ReaderProxy.init(
             self.alloc,
@@ -167,7 +167,7 @@ pub const RtpsProtocolWriter = struct {
         );
         proxy.wants_replay = info.durability_kind != 0;
         proxy.needs_pid_coherent_set_marker = info.needs_pid_coherent_set_marker;
-        try self.writer.addMatchedReader(proxy);
+        return self.writer.addOrRefreshMatchedReader(proxy);
     }
 
     fn vtAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber) bool {
@@ -481,7 +481,7 @@ pub const RtpsProtocolReader = struct {
         self.writer_match_cb = cb;
     }
 
-    fn vtAddMatchedWriter(ctx: *anyopaque, info: *const MatchedWriterInfo) anyerror!void {
+    fn vtAddMatchedWriter(ctx: *anyopaque, info: *const MatchedWriterInfo) anyerror!bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         var proxy = try WriterProxy.init(
             self.alloc,
@@ -493,7 +493,7 @@ pub const RtpsProtocolReader = struct {
         // Mark the proxy as awaiting history delivery when the remote writer offers
         // TRANSIENT_LOCAL (or stronger) history with RELIABLE reliability.
         proxy.history_established = !info.history_expected;
-        try self.reader.addMatchedWriter(proxy);
+        const added = try self.reader.addOrRefreshMatchedWriter(proxy);
         // on_writer_matched first (DDS spec: subscription_matched precedes liveliness_changed),
         // then on_writer_alive — a newly matched writer is alive by definition.
         // Both fire only after addMatchedWriter succeeds so no callback leaks on OOM.
@@ -504,6 +504,7 @@ pub const RtpsProtocolReader = struct {
             c.on_writer_matched(c.ctx, info);
             if (c.on_writer_alive) |f| f(c.ctx, info.guid, .data);
         }
+        return added;
     }
 
     fn vtRemoveMatchedWriter(ctx: *anyopaque, guid: Guid) void {

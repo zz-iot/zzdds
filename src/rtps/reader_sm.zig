@@ -418,6 +418,12 @@ pub const StatefulReader = struct {
         self.protocol_ready_ctx = ctx;
     }
 
+    /// Like addOrRefreshMatchedWriter, for callers that don't need to know whether the
+    /// match was new.
+    pub fn addMatchedWriter(self: *Self, proxy: WriterProxy) !void {
+        _ = try self.addOrRefreshMatchedWriter(proxy);
+    }
+
     /// Add a matched writer. For new writers, sends an initial non-final AckNack
     /// to solicit available data (RTPS §8.4.10.3): RELIABLE writers respond by
     /// retransmitting missing cached changes, and TRANSIENT_LOCAL BEST_EFFORT
@@ -428,7 +434,10 @@ pub const StatefulReader = struct {
     /// ack_count, last_hb_count, and reassembly state are preserved.  This prevents
     /// spurious retransmit bursts caused by re-discovery (e.g. dual network interfaces
     /// presenting the same participant twice).
-    pub fn addMatchedWriter(self: *Self, proxy: WriterProxy) !void {
+    ///
+    /// Returns true when the writer is newly matched, false for a lease refresh
+    /// of an existing match.
+    pub fn addOrRefreshMatchedWriter(self: *Self, proxy: WriterProxy) !bool {
         self.mu.lock();
         for (self.writer_proxies.items) |*wp| {
             if (wp.guid.eql(proxy.guid)) {
@@ -452,7 +461,7 @@ pub const StatefulReader = struct {
                 discarded.selected_locators = .empty;
                 discarded.deinit(self.alloc);
                 self.mu.unlock();
-                return;
+                return false;
             }
         }
         self.writer_proxies.append(self.alloc, proxy) catch |err| {
@@ -520,6 +529,7 @@ pub const StatefulReader = struct {
         if (newly_ready_guid) |guid| {
             if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
+        return true;
     }
 
     /// A pending on_reliable_writer_ready(false) transition, returned instead

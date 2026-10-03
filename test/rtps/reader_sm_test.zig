@@ -219,6 +219,27 @@ test "addMatchedWriter: non-local proxy still sends the match-time AckNack" {
     _ = findAckNack(&rec) orelse return error.NoAckNackFound;
 }
 
+// ── addOrRefreshMatchedWriter reports whether the match is new ────────────────
+//
+// The DCPS matched status counts only new matches: discovery can report an
+// already matched writer again, which just refreshes its proxy.
+
+test "addOrRefreshMatchedWriter: true for a new match, false for a refresh, true again after removal" {
+    const reader_guid = makeGuid(0x01, READER_EID);
+    const writer_guid = makeGuid(0x02, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7400);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+
+    try testing.expect(try r.addOrRefreshMatchedWriter(try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true)));
+    try testing.expect(!try r.addOrRefreshMatchedWriter(try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true)));
+    try testing.expectEqual(@as(usize, 1), r.writer_proxies.items.len);
+    r.removeMatchedWriter(writer_guid);
+    try testing.expect(try r.addOrRefreshMatchedWriter(try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true)));
+}
+
 // ── Heartbeat: non-final with missing SNs → AckNack with NACK bitmap ─────────
 
 test "handleHeartbeat: non-final with missing SNs generates AckNack bitmap" {

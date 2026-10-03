@@ -35,8 +35,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   writer/reader pair (direct discovery replays readers on each writer announcement; SEDP
   re-delivers on updates), `total_count` and `current_count` in
   `PublicationMatchedStatus` / `SubscriptionMatchedStatus` grew again and the matched
-  callback fired again. Each writer and reader now tracks the remote endpoints it has
-  matched and reports each match and unmatch once.
+  callback fired again. A match is now reported only when the RTPS layer adds a new
+  proxy for the remote endpoint; a repeated report just refreshes the existing proxy. A
+  match whose proxy could not be added is no longer reported either; previously its count
+  never came back down.
 - **Fixed intermittent "never matched" failures in examples and integration tests.** The
   apps created writers and readers without a listener and installed it afterwards, losing
   the matched callback whenever discovery finished first. Every app now passes its

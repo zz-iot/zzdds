@@ -60,26 +60,6 @@ fn baseFromListenerEx(l: ZZDDS.DataWriterListenerEx) DDS.DataWriterListener {
     };
 }
 
-/// Records a match (`added`) or unmatch of `remote_handle` in `set`. Returns
-/// whether the matched status should change: false for a repeated report of
-/// an already counted match, an unmatch of an endpoint that was never
-/// counted, or (logged) when the set cannot grow, so the counters always
-/// agree with the set. Caller holds the entity's `mu`. Shared with
-/// `DataReaderImpl.notifySubscriptionMatched`.
-pub fn trackMatch(
-    set: *std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void),
-    alloc: std.mem.Allocator,
-    remote_handle: DDS.InstanceHandle_t,
-    added: bool,
-) bool {
-    if (!added) return set.remove(remote_handle);
-    const gop = set.getOrPut(alloc, remote_handle) catch {
-        std.log.scoped(.zzdds_dcps).warn("dcps: out of memory recording match of {d}; matched status not updated", .{remote_handle});
-        return false;
-    };
-    return !gop.found_existing;
-}
-
 pub const DataWriterImpl = struct {
     alloc: std.mem.Allocator,
     topic_name: []const u8, // borrowed from TopicImpl
@@ -169,11 +149,6 @@ pub const DataWriterImpl = struct {
     pub_matched_total: i32 = 0,
     pub_matched_total_change: i32 = 0,
     pub_matched_current: i32 = 0,
-    /// Remote readers counted in `pub_matched_current`, by instance handle.
-    /// The participant can report one pair more than once (an endpoint's
-    /// discovery data re-delivered or updated); only the first report of a
-    /// match, and an unmatch of a counted reader, change the status. Under `mu`.
-    matched_subscriptions: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void) = .empty,
     pub_matched_current_change: i32 = 0,
     pub_matched_last_handle: DDS.InstanceHandle_t = 0,
 
@@ -323,7 +298,6 @@ pub const DataWriterImpl = struct {
             while (it.next()) |v| self.alloc.free(v.*);
         }
         self.key_registry.deinit(self.alloc);
-        self.matched_subscriptions.deinit(self.alloc);
         // NOTE: proto_writer lifecycle is owned by the participant (via
         // pubDestroyProtoWriter callback), not by DataWriterImpl.
         const pinned = self.parent_pinned;
@@ -550,10 +524,6 @@ pub const DataWriterImpl = struct {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
-        if (!trackMatch(&self.matched_subscriptions, self.alloc, remote_handle, added)) {
-            self.mu.unlock();
-            return;
-        }
         if (added) self.pub_matched_total += 1;
         self.pub_matched_total_change += if (added) 1 else 0;
         const delta: i32 = if (added) 1 else -1;

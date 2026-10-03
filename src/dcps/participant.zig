@@ -89,7 +89,9 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: proto.WriterMatchCallback) void {}
     }.f,
     .add_matched_writer = struct {
-        fn f(_: *anyopaque, _: *const proto.MatchedWriterInfo) anyerror!void {}
+        fn f(_: *anyopaque, _: *const proto.MatchedWriterInfo) anyerror!bool {
+            return false;
+        }
     }.f,
     .remove_matched_writer = struct {
         fn f(_: *anyopaque, _: proto.Guid) void {}
@@ -2583,9 +2585,12 @@ pub const DomainParticipantImpl = struct {
         }
         self.mu.unlock();
         for (jobs.items) |job| {
-            job.proto.addMatchedWriter(&job.info) catch {};
+            // Only a new protocol-level match changes the matched status:
+            // discovery can report an already matched pair again, which
+            // just refreshes the proxy.
+            const added = job.proto.addMatchedWriter(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
-                cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+                if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
                 cb.quiesceRelease();
             };
             job.proto.quiesceRelease();
@@ -2839,9 +2844,12 @@ pub const DomainParticipantImpl = struct {
         }
         self.mu.unlock();
         for (jobs.items) |job| {
-            job.proto.addMatchedReader(&job.info) catch {};
+            // Only a new protocol-level match changes the matched status:
+            // discovery can report an already matched pair again, which
+            // just refreshes the proxy.
+            const added = job.proto.addMatchedReader(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
-                cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
+                if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
                 cb.quiesceRelease();
             };
             job.proto.quiesceRelease();
@@ -3133,9 +3141,12 @@ pub const DomainParticipantImpl = struct {
             }
         }
         for (jobs.items) |job| {
-            job.proto.addMatchedReader(&job.info) catch {};
+            // Only a new protocol-level match changes the matched status:
+            // discovery can report an already matched pair again, which
+            // just refreshes the proxy.
+            const added = job.proto.addMatchedReader(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
-                cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+                if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
                 cb.quiesceRelease();
             };
             job.proto.quiesceRelease();
@@ -3294,9 +3305,12 @@ pub const DomainParticipantImpl = struct {
             }
         }
         for (jobs.items) |job| {
-            job.proto.addMatchedWriter(&job.info) catch {};
+            // Only a new protocol-level match changes the matched status:
+            // discovery can report an already matched pair again, which
+            // just refreshes the proxy.
+            const added = job.proto.addMatchedWriter(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
-                cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
+                if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(job.remote_guid), true);
                 cb.quiesceRelease();
             };
             job.proto.quiesceRelease();
