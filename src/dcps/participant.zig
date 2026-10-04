@@ -2516,13 +2516,17 @@ pub const DomainParticipantImpl = struct {
             // Entity::enable(): symmetric to onReaderDiscovered's identical
             // guard -- a reader created disabled never sent its own SEDP
             // announcement, so matching it against a discovered writer here
-            // would be premature. matched_notify.ctx is always a
-            // *DataReaderImpl (see subscriber.zig's register_matched_notify
-            // call site).
-            if (ar.matched_notify) |mn| {
-                const dr_ptr: *reader_mod.DataReaderImpl = @ptrCast(@alignCast(mn.ctx));
-                if (!dr_ptr.enabled.load(.acquire)) continue;
-            }
+            // would be premature. A reader whose matched_notify is not yet
+            // registered is still inside create_datareader: skip it too, as
+            // its announce does the match once registered. Matching it here
+            // would add the RTPS match with no notify, and the announce's
+            // add would then be a refresh, so on_subscription_matched and
+            // the matched count would never report it. matched_notify.ctx is
+            // always a *DataReaderImpl (see subscriber.zig's
+            // register_matched_notify call site).
+            const reader_notify = ar.matched_notify orelse continue;
+            const dr_ptr: *reader_mod.DataReaderImpl = @ptrCast(@alignCast(reader_notify.ctx));
+            if (!dr_ptr.enabled.load(.acquire)) continue;
             const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
             const result = qm_mod.checkDiscovered(data.qos, &local_rd);
             if (!result.isCompatible()) {
@@ -2783,12 +2787,16 @@ pub const DomainParticipantImpl = struct {
             // announceDataWriter, called from vtEnable) already does the
             // right retroactive match once actually enabled -- this is purely
             // a guard against matching too early, not a second matching path.
-            // matched_notify.ctx is always a *DataWriterImpl (see
-            // publisher.zig's register_matched_notify call site).
-            if (aw.matched_notify) |mn| {
-                const dw_ptr: *writer_mod.DataWriterImpl = @ptrCast(@alignCast(mn.ctx));
-                if (!dw_ptr.enabled.load(.acquire)) continue;
-            }
+            // The same applies to a writer whose matched_notify is not yet
+            // registered (still inside create_datawriter): matching it here
+            // would add the RTPS match with no notify, and the announce's add
+            // would then be a refresh, so on_publication_matched and the
+            // matched count would never report it. matched_notify.ctx is
+            // always a *DataWriterImpl (see publisher.zig's
+            // register_matched_notify call site).
+            const writer_notify = aw.matched_notify orelse continue;
+            const dw_ptr: *writer_mod.DataWriterImpl = @ptrCast(@alignCast(writer_notify.ctx));
+            if (!dw_ptr.enabled.load(.acquire)) continue;
             const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
             const result = qm_mod.checkDiscovered(&local_wd, data.qos);
             if (!result.isCompatible()) {

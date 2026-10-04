@@ -392,20 +392,50 @@ pub const PublisherImpl = struct {
         // enabled state (below) is independently governed by this Publisher's
         // qos.entity_factory, regardless of whether the Publisher itself is
         // currently enabled.
-        const topic_name = a_topic.get_name();
-        const type_name = a_topic.get_type_name();
-        const presentation = self.qos.presentation;
-        var publication_handle = DDS.HANDLE_NIL;
-        var guid: proto.Guid = undefined;
-        const pw = self.cbs.create_proto_writer(
+        const parts = self.createProtoWriter(a_topic, qos) catch return nil.nil_datawriter;
+        return self.finishDataWriter(a_topic, qos, listener, mask, parts);
+    }
+
+    /// The protocol writer of a DataWriter under construction; see
+    /// `createProtoWriter`.
+    pub const ProtoWriterParts = struct {
+        pw: proto.ProtocolWriter,
+        publication_handle: DDS.InstanceHandle_t,
+        guid: proto.Guid,
+    };
+
+    /// First step of `createDataWriter`: creates the protocol writer, which
+    /// joins the participant's active writers. Discovery does not match it
+    /// until `finishDataWriter` has registered its matched notify. Separate
+    /// so tests can deliver discovery between the two steps.
+    pub fn createProtoWriter(self: *Self, a_topic: DDS.Topic, qos: *const DDS.DataWriterQos) !ProtoWriterParts {
+        var parts: ProtoWriterParts = .{ .pw = undefined, .publication_handle = DDS.HANDLE_NIL, .guid = undefined };
+        parts.pw = try self.cbs.create_proto_writer(
             self.cbs.ctx,
-            topic_name,
-            type_name,
+            a_topic.get_name(),
+            a_topic.get_type_name(),
             qos.*,
-            presentation,
-            &publication_handle,
-            &guid,
-        ) catch return nil.nil_datawriter;
+            self.qos.presentation,
+            &parts.publication_handle,
+            &parts.guid,
+        );
+        return parts;
+    }
+
+    /// Second step of `createDataWriter`: wraps the protocol writer in a
+    /// DataWriterImpl, registers its participant callbacks and announces it
+    /// (which matches it). Destroys the protocol writer on failure.
+    pub fn finishDataWriter(
+        self: *Self,
+        a_topic: DDS.Topic,
+        qos: *const DDS.DataWriterQos,
+        listener: ZZDDS.DataWriterListenerEx,
+        mask: DDS.StatusMask,
+        parts: ProtoWriterParts,
+    ) DDS.DataWriter {
+        const pw = parts.pw;
+        const publication_handle = parts.publication_handle;
+        const guid = parts.guid;
         const dw = writer_mod.DataWriterImpl.init(
             self.alloc,
             a_topic,
