@@ -8,6 +8,26 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-03
+
+- **Fixed a writer or reader that could stay at zero matches.** `create_datawriter` and
+  `create_datareader` add the new endpoint to the participant before registering its
+  matched-status callback, then announce it, which is where it is matched. A remote
+  endpoint discovered in that window was matched without the callback, so the
+  announce's match was a repeat and the matched status (and `on_publication_matched` /
+  `on_subscription_matched`) never counted it. Exposed by the 2026-10-02 change that
+  reports only new matches; before it, the repeat counted. Discovery now skips an
+  endpoint until its callback is registered, leaving the match to the announce. Seen as
+  an intermittent `rmw_service_server_is_available` timeout in rmw_zzdds's conformance
+  tests: the client's request writer never counted the service's request reader.
+- **A sample's publisher GUID resolves as soon as the sample can be taken.** A RELIABLE
+  reader buffers DATA that arrives before it has matched the writer, and adding the
+  match delivers it before the writer-matched callback that recorded the writer's GUID,
+  so `get_matched_publication_rtps_guid` for that sample's `publication_handle` could
+  return NO_DATA. The reader now records the GUID when each sample arrives. Seen as an
+  intermittent "failed to resolve the publisher RTPS GUID" in rmw_zzdds's
+  `take_sequence` conformance test.
+
 ## 2026-10-02
 
 - **zidl pinned to v0.3.20.** Generated C++ and Java now accept an imported file's

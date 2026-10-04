@@ -9,6 +9,7 @@ const std = @import("std");
 const test_domain = @import("test_domain");
 const zzdds = @import("zzdds");
 const DDS = @import("zzdds_generated").DDS;
+const ZZDDS = zzdds.ZZDDS;
 
 const IntraProcessDelivery = zzdds.intraprocess.IntraProcessDelivery;
 const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
@@ -602,4 +603,90 @@ test "sub_matched: a reader created after a known writer counts it once, and unm
         try testing.expectEqual(@as(i32, 0), s.current_count);
         try testing.expectEqual(@as(i32, 1), s.total_count);
     }
+}
+
+// ── Discovery waits for a writer's matched notify ────────────────────────────
+//
+// create_datawriter makes the protocol writer (which joins the participant's
+// active writers) before it registers the writer's matched notify, and only
+// then announces it, which is when the writer is matched. A remote reader
+// discovered in between must not be matched yet: the RTPS match would be
+// added with no notify, the announce's add would then only refresh it, and
+// the writer's matched status would never count that reader.
+
+test "pub_matched: discovery does not match a writer whose matched notify is not registered yet" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // The first step of create_datawriter, on its own.
+    const pub_impl: *zzdds.dcps.PublisherImpl = @ptrCast(@alignCast(fx.pub_w.ptr));
+    var handle: DDS.InstanceHandle_t = DDS.HANDLE_NIL;
+    var guid: zzdds.protocol.Guid = undefined;
+    const pw = try pub_impl.cbs.create_proto_writer(pub_impl.cbs.ctx, "MatchTopic", "MatchType", .{}, .{}, &handle, &guid);
+    defer pub_impl.cbs.destroy_proto_writer(pub_impl.cbs.ctx, handle);
+
+    // DirectDiscovery delivers the new reader to the writer's participant
+    // synchronously, inside create_datareader.
+    const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    try testing.expect(dr.ptr != zzdds.dcps.NIL_PTR);
+    defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
+
+    try testing.expectEqual(@as(usize, 0), pw.matchedReaderCount());
+}
+
+// ── A sample's publication handle resolves while it can be taken ─────────────
+//
+// Samples that reach a reader before it has matched their writer are
+// buffered, and adding the match delivers them -- before the writer-matched
+// callback runs. The publisher GUID must already resolve then.
+
+const GuidCheck = struct {
+    zdr: ZZDDS.DataReader,
+    handle: DDS.InstanceHandle_t,
+    calls: usize = 0,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+};
+
+fn guidCheckOnDataAvailable(check: *GuidCheck, _: DDS.DataReader) void {
+    var out = ZZDDS.RtpsGuid{};
+    check.rc = check.zdr.vtable.get_matched_publication_rtps_guid(check.zdr.ptr, check.handle, &out);
+    check.calls += 1;
+}
+
+test "sub data: a sample delivered when its writer is matched already resolves its publisher GUID" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const writer_guid = zzdds.protocol.Guid{
+        .prefix = .{ .bytes = [_]u8{0x5a} ** 12 },
+        .entity_id = .{ .entity_key = .{ 0, 0, 9 }, .entity_kind = 0x03 },
+    };
+    var check = GuidCheck{ .zdr = undefined, .handle = zzdds.dcps.guidToHandle(writer_guid) };
+    // RELIABLE: only a reliable reader buffers DATA from a writer it has not
+    // matched yet.
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), dr_qos, DDS.dataReaderListener(&check, .{
+        .on_data_available = guidCheckOnDataAvailable,
+    }), DDS.DATA_AVAILABLE_STATUS);
+    try testing.expect(dr.ptr != zzdds.dcps.NIL_PTR);
+    defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
+    check.zdr = zzdds.asZzddsDataReader(dr) orelse return error.TestUnexpectedResult;
+
+    // DATA from a writer this reader has not matched yet: buffered.
+    const pr = @as(*zzdds.dcps.DataReaderImpl, @ptrCast(@alignCast(dr.ptr))).proto_reader;
+    pr.handleIncomingChange(writer_guid, 1, .{ .seconds = 0, .fraction = 0 }, std.mem.zeroes([16]u8), &.{ 0x00, 0x01, 0x00, 0x00 }, .alive, null, null, null);
+    try testing.expectEqual(@as(usize, 0), check.calls);
+
+    // Matching the writer delivers it, before the writer-matched callback.
+    _ = try pr.addMatchedWriter(&.{
+        .guid = writer_guid,
+        .unicast_locators = &.{},
+        .multicast_locators = &.{},
+        .reliability = .reliable,
+    });
+    try testing.expectEqual(@as(usize, 1), check.calls);
+    try testing.expectEqual(DDS.RETCODE_OK, check.rc);
 }

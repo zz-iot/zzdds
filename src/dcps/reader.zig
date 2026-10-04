@@ -864,6 +864,12 @@ pub const DataReaderImpl = struct {
         const copy = self.alloc.dupe(u8, change.data) catch return;
         self.mu.lock();
 
+        // A sample's publication handle must resolve to its writer's GUID as
+        // soon as the sample can be taken. The writer-matched callback that
+        // also records it runs only after the protocol match is added, and
+        // adding the match first delivers any samples that arrived before it.
+        self.rememberPublicationGuidLocked(change.writer_guid);
+
         // Compute instance handle first — needed by both ownership and resource-limit checks.
         const ih = writer_mod.keyHashToHandle(change.key_hash);
 
@@ -4161,6 +4167,7 @@ test "coherent WIP: CS transition discards incomplete previous WIP" {
         var wit = dr.writer_instances.valueIterator();
         while (wit.next()) |v| v.deinit(alloc);
         dr.writer_instances.deinit(alloc);
+        dr.publication_guids.deinit(alloc);
     }
 
     const guid_mod = @import("../rtps/guid.zig");
@@ -4255,6 +4262,7 @@ test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" 
         var wit = dr.writer_instances.valueIterator();
         while (wit.next()) |v| v.deinit(alloc);
         dr.writer_instances.deinit(alloc);
+        dr.publication_guids.deinit(alloc);
     }
 
     const guid_mod = @import("../rtps/guid.zig");
