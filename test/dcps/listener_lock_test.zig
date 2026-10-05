@@ -272,15 +272,15 @@ test "listeners raised by notify_datareaders may call into their subscriber" {
 
 const ReadyProbe = struct {
     dp: DDS.DomainParticipant,
-    ready: std.atomic.Value(bool) = .init(false),
-    participant_ok: std.atomic.Value(bool) = .init(false),
+    ready: bool = false,
+    participant_ok: bool = false,
 };
 
 fn readyProbeOnReady(_: DDS.InstanceHandle_t, is_ready: bool, ld: ?*anyopaque) callconv(.c) void {
     const p: *ReadyProbe = @ptrCast(@alignCast(ld));
     if (!is_ready) return;
-    p.participant_ok.store(probeParticipant(p.dp), .release);
-    p.ready.store(true, .release);
+    p.participant_ok = probeParticipant(p.dp);
+    p.ready = true;
 }
 
 test "on_reliable_reader_ready may call into its participant" {
@@ -297,15 +297,13 @@ test "on_reliable_reader_ready may call into its participant" {
     const zpub = zzdds.asZzddsPublisher(fx.pub_w) orelse return error.TestUnexpectedResult;
     var dw_qos = DDS.DataWriterQos{};
     dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
-    // The handshake completes on an ACKNACK, which the participant dispatches
-    // (possibly before create_datawriter_ex returns).
+    // The handshake completes on an ACKNACK, which in-process delivery hands
+    // to the participant synchronously, before create_datawriter_ex returns.
     const dw = zpub.create_datawriter_ex(fx.topic_w, dw_qos, .{
         .listener_data = &probe,
         .on_reliable_reader_ready = readyProbeOnReady,
     }, 0);
     defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw);
-    const deadline = zzdds.util.time.nanoTimestamp() + 5 * std.time.ns_per_s;
-    while (!probe.ready.load(.acquire) and zzdds.util.time.nanoTimestamp() < deadline) zzdds.util.time.sleepNs(10 * std.time.ns_per_ms);
-    try testing.expect(probe.ready.load(.acquire));
-    try testing.expect(probe.participant_ok.load(.acquire));
+    try testing.expect(probe.ready);
+    try testing.expect(probe.participant_ok);
 }
