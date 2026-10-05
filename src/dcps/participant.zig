@@ -553,15 +553,39 @@ const IncompatQosNotify = struct {
 /// DomainParticipantImpl.raiseIncompatQos: they reach
 /// on_requested/offered_incompatible_qos, application code. Kept on the
 /// endpoint's own ActiveReader/ActiveWriter entry, so recording one needs no
-/// memory and cannot fail. Several recorded before they are raised are raised
-/// one by one, each with the last policy recorded.
+/// memory and cannot fail. Each recorded incompatibility is raised once, with
+/// its own policy; policies are counted per ID (they are few and bounded), and
+/// the most recently recorded one is raised last, so the status read
+/// afterwards reports it as last_policy_id.
 const IncompatQosPending = struct {
-    count: u32 = 0,
-    last_policy_id: i32 = 0,
+    const MAX_ID = blk: {
+        var max: u32 = 0;
+        for (@typeInfo(qm_mod.PolicyId).@"enum".fields) |f| max = @max(max, f.value);
+        break :blk max;
+    };
 
-    fn record(self: *IncompatQosPending, policy_id: i32) void {
-        self.count +|= 1;
-        self.last_policy_id = policy_id;
+    counts: [MAX_ID + 1]u32 = @splat(0),
+    any: bool = false,
+    last: qm_mod.PolicyId = undefined,
+
+    fn record(self: *IncompatQosPending, policy: qm_mod.PolicyId) void {
+        self.counts[@intFromEnum(policy)] +|= 1;
+        self.last = policy;
+        self.any = true;
+    }
+
+    /// Calls `notify(ctx, policy_id)` once per recorded incompatibility, the
+    /// most recently recorded policy last.
+    fn raise(self: *const IncompatQosPending, n: IncompatQosNotify) void {
+        if (!self.any) return;
+        const last: usize = @intFromEnum(self.last);
+        for (self.counts, 0..) |count, id| {
+            if (id == last) continue;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) n.notify(n.ctx, @intCast(id));
+        }
+        var i: u32 = 0;
+        while (i < self.counts[last]) : (i += 1) n.notify(n.ctx, @intCast(last));
     }
 };
 
@@ -2031,7 +2055,7 @@ pub const DomainParticipantImpl = struct {
                 .writers => self.active_writers.valueIterator(),
             };
             while (it.next()) |e| {
-                if (e.incompat_pending.count == 0) continue;
+                if (!e.incompat_pending.any) continue;
                 if (n == jobs.len) {
                     more = true;
                     break;
@@ -2046,8 +2070,7 @@ pub const DomainParticipantImpl = struct {
             }
             self.mu.unlock();
             for (jobs[0..n]) |job| {
-                var i: u32 = 0;
-                while (i < job.pending.count) : (i += 1) job.notify.notify(job.notify.ctx, job.pending.last_policy_id);
+                job.pending.raise(job.notify);
                 job.pin.quiesceRelease();
             }
             if (!more) return;
@@ -2727,7 +2750,7 @@ pub const DomainParticipantImpl = struct {
             const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
             const result = qm_mod.checkDiscovered(data.qos, &local_rd);
             if (!result.isCompatible()) {
-                ar.incompat_pending.record(@as(i32, @intCast(@intFromEnum(result.incompatible))));
+                ar.incompat_pending.record(result.incompatible);
                 continue;
             }
             const part_result = qm_mod.checkPartition(data.partition_names, ar.partition_names);
@@ -2997,7 +3020,7 @@ pub const DomainParticipantImpl = struct {
             const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
             const result = qm_mod.checkDiscovered(&local_wd, data.qos);
             if (!result.isCompatible()) {
-                aw.incompat_pending.record(@as(i32, @intCast(@intFromEnum(result.incompatible))));
+                aw.incompat_pending.record(result.incompatible);
                 continue;
             }
             const part_result = qm_mod.checkPartition(aw.partition_names, data.partition_names);
@@ -3507,7 +3530,7 @@ pub const DomainParticipantImpl = struct {
                             // this reader, since it only scans readers that already
                             // exist at discovery time -- this retroactive path is the
                             // only place that ever looks at this pairing again).
-                            ar.incompat_pending.record(@as(i32, @intCast(@intFromEnum(result.incompatible))));
+                            ar.incompat_pending.record(result.incompatible);
                             continue;
                         }
                         const part_result = qm_mod.checkPartition(dw.partition_names, ar.partition_names);
@@ -4898,4 +4921,29 @@ test "nextFanoutBatch visits every key once, in order, with a fixed buffer" {
     try testing.expectEqual(@as(usize, 38), n_seen);
     for (seen[0..37], 0..) |key, i| try testing.expectEqual(@as(u32, @intCast(100 + i)), key);
     try testing.expectEqual(@as(u32, 1000), seen[37]);
+}
+
+test "IncompatQosPending raises each recorded policy once, the latest last" {
+    const testing = std.testing;
+    const Rec = struct {
+        ids: [8]i32 = undefined,
+        n: usize = 0,
+        fn notify(ctx: *anyopaque, policy_id: i32) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.ids[r.n] = policy_id;
+            r.n += 1;
+        }
+    };
+    var rec: Rec = .{};
+    var p: IncompatQosPending = .{};
+    p.raise(.{ .ctx = &rec, .notify = Rec.notify }); // nothing recorded
+    try testing.expectEqual(@as(usize, 0), rec.n);
+
+    p.record(.durability);
+    p.record(.reliability);
+    p.record(.durability);
+    p.record(.deadline);
+    p.record(.reliability);
+    p.raise(.{ .ctx = &rec, .notify = Rec.notify });
+    try testing.expectEqualSlices(i32, &.{ 2, 2, 4, 11, 11 }, rec.ids[0..rec.n]);
 }

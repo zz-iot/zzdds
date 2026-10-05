@@ -371,3 +371,51 @@ test "every incompatible reader is notified once, however many there are" {
 
     for (counts) |c| try testing.expectEqual(@as(usize, 1), c.calls);
 }
+
+const IncompatPolicies = struct {
+    ids: [8]DDS.QosPolicyId_t = undefined,
+    n: usize = 0,
+    fn cb(p: *IncompatPolicies, _: DDS.DataReader, status: DDS.RequestedIncompatibleQosStatus) void {
+        if (p.n < p.ids.len) p.ids[p.n] = status.last_policy_id;
+        p.n += 1;
+    }
+};
+
+test "a reader incompatible with several writers is told each policy" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // Incompatible with a RELIABLE, TRANSIENT_LOCAL reader for different
+    // reasons: one on reliability only, the other on durability only.
+    var be_qos = DDS.DataWriterQos{};
+    be_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    be_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    const dw_be = fx.pub_w.create_datawriter(fx.topic_w, be_qos, null, 0);
+    defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_be);
+    var vol_qos = DDS.DataWriterQos{};
+    vol_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    vol_qos.durability.kind = .VOLATILE_DURABILITY_QOS;
+    const dw_vol = fx.pub_w.create_datawriter(fx.topic_w, vol_qos, null, 0);
+    defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_vol);
+
+    // Both writers are already discovered: checked as the reader is created.
+    var probe: IncompatPolicies = .{};
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), dr_qos, DDS.dataReaderListener(&probe, .{
+        .on_requested_incompatible_qos = IncompatPolicies.cb,
+    }), DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS);
+    defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
+
+    // The first two come from the check made as the reader is created, one
+    // per writer, each with its own policy. (Nothing after them is checked:
+    // this test's in-process discovery then announces both writers again,
+    // and an already-reported incompatible writer is currently reported
+    // again.)
+    try testing.expect(probe.n >= 2);
+    const first = probe.ids[0..2];
+    std.mem.sort(DDS.QosPolicyId_t, first, {}, std.sort.asc(DDS.QosPolicyId_t));
+    try testing.expectEqualSlices(DDS.QosPolicyId_t, &.{ DDS.DURABILITY_QOS_POLICY_ID, DDS.RELIABILITY_QOS_POLICY_ID }, first);
+}
