@@ -142,6 +142,13 @@ test "parse: invalid expression returns error" {
     try testing.expectError(error.ParseError, filter.parse(alloc, "x ="));
 }
 
+test "parse: an error after a complete operand frees what was already built" {
+    // testing.allocator reports any leaked AST nodes.
+    try testing.expectError(error.ParseError, filter.parse(testing.allocator, "value = 1 AND"));
+    try testing.expectError(error.ParseError, filter.parse(testing.allocator, "value = 1 OR value = 2 AND"));
+    try testing.expectError(error.ParseError, filter.parse(testing.allocator, "NOT NOT value = 1 OR"));
+}
+
 test "parse: trailing garbage returns error" {
     const alloc = testing.allocator;
     try testing.expectError(error.ParseError, filter.parse(alloc, "x = 5 garbage"));
@@ -628,4 +635,139 @@ test "cft: set_expression_parameters OOM after first string duped preserves old 
     try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
     try testing.expectEqual(@as(usize, 1), cft_impl.expr_params.items.len);
     try testing.expectEqualStrings("99", cft_impl.expr_params.items[0]);
+}
+
+// ── zzdds::ContentFilteredTopic::set_filter_expression ───────────────────────
+
+fn valueField(_: *anyopaque, payload: []const u8, field: []const u8, _: []u8) ?FilterValue {
+    if (std.mem.eql(u8, field, "value") and payload.len > 4) return .{ .int = payload[4] };
+    return null;
+}
+fn zeroKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
+    return std.mem.zeroes([16]u8);
+}
+
+fn takeValues(alloc: std.mem.Allocator, dr: *DataReaderImpl) !std.ArrayListUnmanaged(u8) {
+    var values: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer values.deinit(alloc);
+    while (dr.takeRaw()) |sample| {
+        defer alloc.free(sample.data);
+        try values.append(alloc, sample.data[4]);
+    }
+    return values;
+}
+
+test "cft: set_filter_expression switches a live reader's filter and keeps its match" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    // A get_field getter makes the reader filter on receipt.
+    const dp_r_impl: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    _ = dp_r_impl.registerTypeSupport("CftType", .{
+        .ctx = undefined,
+        .compute_key_hash = zeroKeyHash,
+        .get_field = valueField,
+    });
+
+    const cft_dds = fx.dp_r.create_contentfilteredtopic("CftSwitch", fx.topic_r, "value > 70", &DDS.StringSeq{});
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
+    const zcft = zzdds.asZzddsContentFilteredTopic(cft_dds) orelse return error.TestUnexpectedResult;
+    const cft: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
+
+    // KEEP_ALL, so each phase's samples are all still there to take.
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const dr_raw = fx.sub_r.create_datareader(cft.toTopicDescription(), dr_qos, null, 0);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+    const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
+
+    const low = [_]u8{ 0x00, 0x01, 0x00, 0x00, 66 };
+    const high = [_]u8{ 0x00, 0x01, 0x00, 0x00, 128 };
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    var before = try takeValues(alloc, dr);
+    defer before.deinit(alloc);
+    try testing.expectEqualSlices(u8, &.{128}, before.items);
+
+    const old_expr = cft_dds.get_filter_expression();
+    var params_strs = [1][*:0]const u8{"70"};
+    var params = DDS.StringSeq{ ._buffer = @ptrCast(&params_strs), ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, zcft.vtable.set_filter_expression(zcft.ptr, "value < %0", &params));
+    try testing.expectEqualStrings("value < %0", cft_dds.get_filter_expression());
+    // A pointer returned before the change still reads the old expression.
+    try testing.expectEqualStrings("value > 70", old_expr);
+
+    // Same reader, same match: only the filter changed.
+    var status = DDS.SubscriptionMatchedStatus{};
+    _ = dr_raw.vtable.get_subscription_matched_status(dr_raw.ptr, &status);
+    try testing.expectEqual(@as(i32, 1), status.current_count);
+    try testing.expectEqual(@as(i32, 1), status.total_count);
+
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    var after = try takeValues(alloc, dr);
+    defer after.deinit(alloc);
+    try testing.expectEqualSlices(u8, &.{66}, after.items);
+
+    // An empty expression passes everything.
+    try testing.expectEqual(DDS.RETCODE_OK, zcft.vtable.set_filter_expression(zcft.ptr, "", null));
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &low);
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &high);
+    var all = try takeValues(alloc, dr);
+    defer all.deinit(alloc);
+    try testing.expectEqualSlices(u8, &.{ 66, 128 }, all.items);
+}
+
+test "cft: set_filter_expression rejects a malformed expression and keeps the filter" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var p_strs = [1][*:0]const u8{"66"};
+    var p = DDS.StringSeq{ ._buffer = @ptrCast(&p_strs), ._length = 1, ._maximum = 1, ._release = false };
+    const cft_dds = fx.dp_r.create_contentfilteredtopic("CftBad", fx.topic_r, "value = %0", &p);
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
+    const zcft = zzdds.asZzddsContentFilteredTopic(cft_dds) orelse return error.TestUnexpectedResult;
+    const cft: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
+
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, zcft.vtable.set_filter_expression(zcft.ptr, "value = = 1", null));
+    try testing.expectEqualStrings("value = %0", cft_dds.get_filter_expression());
+    try testing.expectEqual(@as(usize, 1), cft.expr_params.items.len);
+    const sixty_six = [_]u8{ 0x00, 0x01, 0x00, 0x00, 66 };
+    var ctx = CdrCtx{ .data = &sixty_six };
+    try testing.expect(cft.matchSample(makeCdrAccessor(&ctx)));
+}
+
+test "cft: set_filter_expression out of memory at any allocation leaves the filter unchanged" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const cft_dds = fx.dp_r.create_contentfilteredtopic("CftOomExpr", fx.topic_r, "value = 66", &DDS.StringSeq{});
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft_dds);
+    const cft: *ContentFilteredTopicImpl = @ptrCast(@alignCast(cft_dds.ptr));
+    const saved_alloc = cft.alloc;
+
+    var new_strs = [2][*:0]const u8{ "1", "2" };
+    var new_params = DDS.StringSeq{ ._buffer = @ptrCast(&new_strs), ._length = 2, ._maximum = 2, ._release = false };
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fa = std.testing.FailingAllocator.init(saved_alloc, .{ .fail_index = fail_index });
+        cft.alloc = fa.allocator();
+        const rc = cft.setFilterExpression("value = %0 OR value = %1", &new_params);
+        cft.alloc = saved_alloc;
+        if (rc == DDS.RETCODE_OK) break;
+        try testing.expectEqual(DDS.RETCODE_OUT_OF_RESOURCES, rc);
+        try testing.expectEqualStrings("value = 66", cft_dds.get_filter_expression());
+        try testing.expectEqual(@as(usize, 0), cft.expr_params.items.len);
+    }
+    try testing.expect(fail_index > 0);
+    try testing.expectEqualStrings("value = %0 OR value = %1", cft_dds.get_filter_expression());
+    try testing.expectEqual(@as(usize, 2), cft.expr_params.items.len);
+}
+
+test "cft: asZzddsContentFilteredTopic rejects a foreign handle" {
+    try testing.expect(zzdds.asZzddsContentFilteredTopic(zzdds.dcps.nil_cft) == null);
 }

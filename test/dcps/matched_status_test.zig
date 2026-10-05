@@ -719,3 +719,63 @@ test "sub data: a sample delivered when its writer is matched already resolves i
     try testing.expectEqual(DDS.RETCODE_OK, check.rc);
     try testing.expectEqualSlices(u8, std.mem.asBytes(&writer_guid), &check.guid.value);
 }
+
+// ── on_sample_lost runs outside the protocol reader's lock ────────────────────
+//
+// A listener may call back into its own reader. get_matched_publications
+// takes the protocol reader's lock, so it deadlocked when on_sample_lost was
+// raised while that lock was held (GAP and Heartbeat processing).
+
+const LostCheck = struct {
+    dr: DDS.DataReader,
+    lost_total: i32 = 0,
+    matched_seen: usize = 0,
+};
+
+fn lostCheckOnSampleLost(check: *LostCheck, _: DDS.DataReader, status: DDS.SampleLostStatus) void {
+    check.lost_total = status.total_count;
+    var handles = DDS.InstanceHandleSeq{};
+    if (check.dr.vtable.get_matched_publications(check.dr.ptr, &handles) == DDS.RETCODE_OK) {
+        check.matched_seen = handles._length;
+    }
+    // Allocated with the reader's allocator (testing.allocator here).
+    if (handles._buffer) |b| testing.allocator.free(b[0..handles._maximum]);
+}
+
+test "sample lost: listener may call back into its reader for GAP and Heartbeat losses" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var check = LostCheck{ .dr = undefined };
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), dr_qos, DDS.dataReaderListener(&check, .{
+        .on_sample_lost = lostCheckOnSampleLost,
+    }), DDS.SAMPLE_LOST_STATUS);
+    try testing.expect(dr.ptr != zzdds.dcps.NIL_PTR);
+    defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
+    check.dr = dr;
+
+    const writer_guid = zzdds.protocol.Guid{
+        .prefix = .{ .bytes = [_]u8{0x6b} ** 12 },
+        .entity_id = .{ .entity_key = .{ 0, 0, 7 }, .entity_kind = 0x03 },
+    };
+    const pr = @as(*zzdds.dcps.DataReaderImpl, @ptrCast(@alignCast(dr.ptr))).proto_reader;
+    _ = try pr.addMatchedWriter(&.{
+        .guid = writer_guid,
+        .unicast_locators = &.{},
+        .multicast_locators = &.{},
+        .reliability = .reliable,
+    });
+
+    // GAP: SNs 1-2 are irreversibly gone.
+    pr.handleGap(writer_guid, 1, .{ .base = 3, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) });
+    try testing.expectEqual(@as(i32, 2), check.lost_total);
+    try testing.expectEqual(@as(usize, 1), check.matched_seen);
+
+    // Heartbeat whose firstSN is past SNs 3-4: they are gone too.
+    const reader_eid = @as(*zzdds.dcps.DataReaderImpl, @ptrCast(@alignCast(dr.ptr))).guid.entity_id;
+    pr.handleHeartbeat(writer_guid, reader_eid, 5, 6, 1, true, false);
+    try testing.expectEqual(@as(i32, 4), check.lost_total);
+}

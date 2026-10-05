@@ -104,7 +104,8 @@ pub const DataCallback = struct {
     ctx: *anyopaque,
     on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
     /// Optional: called when gap processing marks `count` sequence numbers as
-    /// irreversibly lost (never delivered). Called under the same lock as on_data.
+    /// irreversibly lost (never delivered). Called after the protocol
+    /// reader's lock is released, since it reaches application listeners.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
     /// Optional: called when a valid (non-duplicate) HEARTBEAT arrives from a
     /// writer.  Used to flush coherent WIP when no CS transition follows the set.
@@ -113,6 +114,20 @@ pub const DataCallback = struct {
     /// no PID_COHERENT_SET — the end-of-coherent-set signal.  RTPS-level consumers
     /// leave this null; the DCPS layer registers it to flush the coherent WIP.
     on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
+    /// Optional: called after the protocol reader's lock is released, by any
+    /// operation that called on_data/on_eoc/on_heartbeat while holding it.
+    /// Those hand changes over under the lock (which keeps them in order) and
+    /// must not reach application code; anything that does, such as
+    /// raising on_data_available, belongs here instead.
+    on_flush: ?*const fn (ctx: *anyopaque) void = null,
+    /// Let the adapter pin `ctx` alive for as long as the adapter itself is
+    /// alive, released only from its quiesce-protected teardown; see
+    /// ProtocolReadyCallback's matching fields. A receive thread dispatching
+    /// into the protocol reader holds the adapter's quiesce, which says
+    /// nothing about `ctx` (the DataReaderImpl), so without the pin a
+    /// concurrent delete_datareader could free `ctx` mid-dispatch.
+    quiesce_acquire: ?*const fn (ctx: *anyopaque) bool = null,
+    quiesce_release: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 /// Invoked when a matched reader proxy's protocol-ready state transitions.

@@ -224,6 +224,76 @@ test "addMatchedWriter: non-local proxy still sends the match-time AckNack" {
 // The DCPS matched status counts only new matches: discovery can report an
 // already matched writer again, which just refreshes its proxy.
 
+// ── Data callbacks run under the reader's lock, on_flush after it ────────────
+//
+// on_data hands changes over under the lock (keeping them in order); on_flush,
+// where anything reaching application code belongs, runs once it is released.
+
+const FlushProbe = struct {
+    reader: *StatefulReader = undefined,
+    data_calls: usize = 0,
+    data_under_lock: bool = true,
+    flush_calls: usize = 0,
+    flush_unlocked: bool = true,
+
+    fn onData(ctx: *anyopaque, _: *const rtps.history.CacheChange) void {
+        const p: *FlushProbe = @ptrCast(@alignCast(ctx));
+        p.data_calls += 1;
+        if (p.reader.mu.tryLock()) {
+            p.reader.mu.unlock();
+            p.data_under_lock = false;
+        }
+    }
+
+    fn onFlush(ctx: *anyopaque) void {
+        const p: *FlushProbe = @ptrCast(@alignCast(ctx));
+        p.flush_calls += 1;
+        if (p.reader.mu.tryLock()) p.reader.mu.unlock() else p.flush_unlocked = false;
+    }
+};
+
+test "data callbacks run under the reader's lock and on_flush after it is released" {
+    const reader_guid = makeGuid(0x01, READER_EID);
+    const writer_guid = makeGuid(0x02, WRITER_EID);
+    const writer_loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7400);
+
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, true);
+    defer r.deinit();
+    var probe = FlushProbe{ .reader = r };
+    r.setCallback(.{ .ctx = &probe, .on_data = FlushProbe.onData, .on_flush = FlushProbe.onFlush });
+
+    // Buffered before the match, then delivered by addOrRefreshMatchedWriter.
+    const early = rtps.history.CacheChange{
+        .kind = .alive,
+        .writer_guid = writer_guid,
+        .sequence_number = 1,
+        .source_timestamp = .{ .seconds = 0, .fraction = 0 },
+        .instance_handle = rtps.history.INSTANCE_HANDLE_NIL,
+        .key_hash = std.mem.zeroes([16]u8),
+        .data = &.{ 0, 1, 0, 0, 1 },
+    };
+    try r.handleData(writer_guid, early);
+    try testing.expectEqual(@as(usize, 0), probe.data_calls);
+    try testing.expect(try r.addOrRefreshMatchedWriter(try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true)));
+    try testing.expectEqual(@as(usize, 1), probe.data_calls);
+    try testing.expectEqual(@as(usize, 1), probe.flush_calls);
+
+    // Delivered by handleData itself.
+    var next = early;
+    next.sequence_number = 2;
+    try r.handleData(writer_guid, next);
+    try testing.expectEqual(@as(usize, 2), probe.data_calls);
+    try testing.expectEqual(@as(usize, 2), probe.flush_calls);
+
+    // Nothing delivered: no flush.
+    try r.handleData(writer_guid, next);
+    try testing.expectEqual(@as(usize, 2), probe.flush_calls);
+
+    try testing.expect(probe.data_under_lock);
+    try testing.expect(probe.flush_unlocked);
+}
+
 test "addOrRefreshMatchedWriter: true for a new match, false for a refresh, true again after removal" {
     const reader_guid = makeGuid(0x01, READER_EID);
     const writer_guid = makeGuid(0x02, WRITER_EID);

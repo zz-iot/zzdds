@@ -162,6 +162,18 @@ public final class ZzddsRuntime {
     public static native Object asZzddsSubscriber(Object subscriber);
 
     /**
+     * Narrows a plain {@code io.zzdds.dcps.Dcps.DDS.ContentFilteredTopic} (as
+     * returned by {@code DomainParticipant.create_contentfilteredtopic}) to
+     * zzdds's own {@code io.zzdds.ext.Zzdds.zzdds.ContentFilteredTopic}
+     * extension view, to reach {@code set_filter_expression}: change the
+     * filter expression in place, keeping readers on the topic matched. See
+     * {@code include/zzdds_c.h}'s
+     * {@code DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic}. Returns
+     * an {@code io.zzdds.ext.ContentFilteredTopicImpl}.
+     */
+    public static native Object asZzddsContentFilteredTopic(Object cft);
+
+    /**
      * Resolves {@code path} as a zzdds TOML config file and installs it as
      * the process-wide default participant config, entirely native-side —
      * the real API this binding previously lacked (see {@code shape}'s own

@@ -26,6 +26,7 @@ const DomainParticipantImpl = dcps_participant.DomainParticipantImpl;
 const TopicImpl = dcps_topic.TopicImpl;
 const PublisherImpl = @import("dcps/publisher.zig").PublisherImpl;
 const SubscriberImpl = @import("dcps/subscriber.zig").SubscriberImpl;
+const ContentFilteredTopicImpl = @import("dcps/topic.zig").ContentFilteredTopicImpl;
 const WaitSetImpl = dcps_waitset.WaitSetImpl;
 const GuardConditionImpl = dcps_waitset.GuardConditionImpl;
 
@@ -117,6 +118,13 @@ pub fn asZzddsPublisher(publisher: DDS.Publisher) ?ZZDDS.Publisher {
 pub fn asZzddsSubscriber(subscriber: DDS.Subscriber) ?ZZDDS.Subscriber {
     if (subscriber.vtable != &SubscriberImpl.vtable) return null;
     return .{ .ptr = subscriber.ptr, .vtable = &zzdds_ext.subscriber_vtable };
+}
+
+/// See `asZzddsDataWriter` -- same shape, for `ContentFilteredTopic` (reaches
+/// `set_filter_expression`).
+pub fn asZzddsContentFilteredTopic(cft: DDS.ContentFilteredTopic) ?ZZDDS.ContentFilteredTopic {
+    if (cft.vtable != &ContentFilteredTopicImpl.cft_vtable) return null;
+    return .{ .ptr = cft.ptr, .vtable = &zzdds_ext.cft_vtable };
 }
 
 /// See `asZzddsDataWriter` -- same shape, for `DomainParticipant`.

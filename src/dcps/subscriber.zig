@@ -629,11 +629,28 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
+        // Listeners run after self.mu is released (a listener may call back
+        // into this Subscriber); each reader is pinned so a concurrent
+        // delete_datareader cannot free it meanwhile.
+        var sfa = std.heap.stackFallback(16 * @sizeOf(*reader_mod.DataReaderImpl), self.alloc);
+        const a = sfa.get();
+        var pinned: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl) = .empty;
+        defer pinned.deinit(a);
         self.mu.lock();
-        defer self.mu.unlock();
         for (self.readers.items) |r| {
+            if (!r.acquireQuiesce()) continue;
+            pinned.append(a, r) catch {
+                r.releaseQuiesce();
+                self.mu.unlock();
+                for (pinned.items) |p| p.releaseQuiesce();
+                return DDS.RETCODE_OUT_OF_RESOURCES;
+            };
+        }
+        self.mu.unlock();
+        for (pinned.items) |r| {
             const dr = r.toDDSDataReader();
             _ = r.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, dr.vtable.get_c_abi_handle(dr.ptr), .{});
+            r.releaseQuiesce();
         }
         return DDS.RETCODE_OK;
     }

@@ -358,18 +358,23 @@ pub const ContentFilteredTopicImpl = struct {
     name: [:0]u8, // owned, null-terminated for C API
     filter_expr: [:0]u8, // owned, null-terminated for C API
     expr_params: std.ArrayListUnmanaged([]u8), // owned copies
-    /// Guards `expr_params` only. `set_expression_parameters` runs on an
-    /// application thread and frees + replaces the whole list; `matchSample`
-    /// runs on the RTPS receive thread that delivers a sample to a reader
-    /// built on this CFT and reads the list by reference for the duration of
-    /// `filter_mod.eval`. Without this, a concurrent reconfigure frees the
-    /// strings mid-evaluation (found by the `lifecycle_churn --scenario cft`
-    /// stress test: SEGV in `parseFloat` on a freed parameter). Evaluation
-    /// for one CFT is already serialised by the single receive thread, so a
-    /// plain mutex (vs. an rwlock) costs nothing in practice; only the rare
-    /// reconfigure writer ever blocks. `filter_expr`/`parsed_expr` are set
-    /// once at init and need no guard.
+    /// Guards `filter_expr`, `parsed_expr` and `expr_params`.
+    /// `set_expression_parameters` and zzdds's `set_filter_expression` run on
+    /// an application thread and replace them; `matchSample` runs on the RTPS
+    /// receive thread that delivers a sample to a reader built on this CFT
+    /// and reads them by reference for the duration of `filter_mod.eval`.
+    /// Without this, a concurrent reconfigure frees the strings
+    /// mid-evaluation (found by the `lifecycle_churn --scenario cft` stress
+    /// test: SEGV in `parseFloat` on a freed parameter). Evaluation for one
+    /// CFT is already serialised by the single receive thread, so a plain
+    /// mutex (vs. an rwlock) costs nothing in practice; only the rare
+    /// reconfigure writer ever blocks.
     params_lock: Mutex = .{},
+    /// Filter expressions replaced by `set_filter_expression`, freed at
+    /// deinit: `get_filter_expression` returns a borrowed pointer to the
+    /// current expression, which a caller may still hold after a change.
+    /// One string per change. Guarded by `params_lock`.
+    retired_exprs: std.ArrayListUnmanaged([:0]u8) = .empty,
     related: DDS.Topic,
     participant: DDS.DomainParticipant,
     /// Parsed AST of `filter_expr`; null when expression is empty or the
@@ -431,6 +436,8 @@ pub const ContentFilteredTopicImpl = struct {
     pub fn deinit(self: *Self) void {
         // Free the AST before the expression string (AST slices borrow from it).
         if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
+        for (self.retired_exprs.items) |e| self.alloc.free(e);
+        self.retired_exprs.deinit(self.alloc);
         self.c_abi.free(self.alloc);
         for (self.expr_params.items) |p| self.alloc.free(p);
         self.expr_params.deinit(self.alloc);
@@ -452,6 +459,55 @@ pub const ContentFilteredTopicImpl = struct {
         defer self.params_lock.unlock();
         const params_slice: []const []const u8 = @ptrCast(self.expr_params.items);
         return filter_mod.eval(self.parsed_expr, accessor, params_slice);
+    }
+
+    /// zzdds::ContentFilteredTopic::set_filter_expression: replaces the filter
+    /// expression and its parameters together. Everything that can fail (parse,
+    /// copies, retired-list capacity) happens before the swap, so on error the
+    /// filter is unchanged: BAD_PARAMETER for a malformed expression,
+    /// OUT_OF_RESOURCES otherwise.
+    pub fn setFilterExpression(
+        self: *Self,
+        filter_expression: []const u8,
+        expression_parameters: ?*const DDS.StringSeq,
+    ) DDS.ReturnCode_t {
+        const expr_copy = self.alloc.dupeZ(u8, filter_expression) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        var expr_owned = true;
+        defer if (expr_owned) self.alloc.free(expr_copy);
+        const parsed = filter_mod.parse(self.alloc, expr_copy) catch |err| return switch (err) {
+            error.OutOfMemory => DDS.RETCODE_OUT_OF_RESOURCES,
+            else => DDS.RETCODE_BAD_PARAMETER,
+        };
+        var parsed_owned = true;
+        defer if (parsed_owned) if (parsed) |ast| filter_mod.freeAst(self.alloc, ast);
+        var params: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (params.items) |p| self.alloc.free(p);
+            params.deinit(self.alloc);
+        }
+        if (expression_parameters) |seq| if (seq._buffer) |b| {
+            for (b[0..seq._length]) |p| {
+                const copy = self.alloc.dupe(u8, std.mem.span(p)) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+                params.append(self.alloc, copy) catch {
+                    self.alloc.free(copy);
+                    return DDS.RETCODE_OUT_OF_RESOURCES;
+                };
+            }
+        };
+
+        self.params_lock.lock();
+        defer self.params_lock.unlock();
+        self.retired_exprs.ensureUnusedCapacity(self.alloc, 1) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        // The old AST is unreachable once swapped out (matchSample holds this
+        // lock while evaluating); the old string may still be borrowed.
+        if (self.parsed_expr) |ast| filter_mod.freeAst(self.alloc, ast);
+        self.retired_exprs.appendAssumeCapacity(self.filter_expr);
+        self.filter_expr = expr_copy;
+        self.parsed_expr = parsed;
+        std.mem.swap(std.ArrayListUnmanaged([]u8), &self.expr_params, &params);
+        expr_owned = false;
+        parsed_owned = false;
+        return DDS.RETCODE_OK;
     }
 
     pub fn toDDSContentFilteredTopic(self: *Self) DDS.ContentFilteredTopic {
@@ -516,9 +572,14 @@ pub const ContentFilteredTopicImpl = struct {
     /// One `CAbiViews` value for the whole object, shared between both
     /// interface views (TopicDescription, ContentFilteredTopic) — see
     /// `GuardConditionImpl.views`'s identical-shape doc comment.
-    pub const views = DDS.ContentFilteredTopic.CAbiViews{
-        .base = .{ .flat_vtable = &td_vtable },
-        .flat_vtable = &cft_vtable,
+    /// The zzdds::ContentFilteredTopic view (set_filter_expression) shares
+    /// the same box.
+    pub const views = ZZDDS.ContentFilteredTopic.CAbiViews{
+        .base = .{
+            .base = .{ .flat_vtable = &td_vtable },
+            .flat_vtable = &cft_vtable,
+        },
+        .flat_vtable = &extensions_mod.cft_vtable,
     };
 
     fn vtGetCAbiHandle(ctx: *anyopaque) *anyopaque {
@@ -535,7 +596,10 @@ pub const ContentFilteredTopicImpl = struct {
     }
 
     fn cftGetExpr(ctx: *anyopaque) [*:0]const u8 {
-        return cast(ctx).filter_expr.ptr;
+        const self = cast(ctx);
+        self.params_lock.lock();
+        defer self.params_lock.unlock();
+        return self.filter_expr.ptr;
     }
 
     fn cftGetParams(ctx: *anyopaque, out: ?*DDS.StringSeq) DDS.ReturnCode_t {

@@ -286,6 +286,11 @@ pub const DataReaderImpl = struct {
     instance_handle: DDS.InstanceHandle_t,
     guid: proto.Guid = std.mem.zeroes(proto.Guid),
     status_changes: DDS.StatusMask,
+    /// Listeners recorded by the protocol reader's data callbacks (onDataCb,
+    /// onEocCb, onHeartbeatCb), which run under that reader's lock and so
+    /// must not reach application code; onFlushCb dispatches them once the
+    /// lock is released. Only DATA_AVAILABLE and SAMPLE_REJECTED.
+    pending_listeners: std.atomic.Value(DDS.StatusMask) = .init(0),
     status_cond: ?*waitset.StatusConditionImpl,
 
     /// Cumulative count of incompatible-QoS events; incompat_total_change/
@@ -531,13 +536,26 @@ pub const DataReaderImpl = struct {
         errdefer alloc.destroy(self.listener_ex_box);
         self.qos = try qos.clone(alloc);
         errdefer self.qos.deinit(alloc);
-        // Register delivery callback with the RTPS layer.
+        // Wire up StatusCondition.
+        const sc = try waitset.StatusConditionImpl.init(
+            alloc,
+            self.toEntity(),
+            getStatusFn,
+        );
+        self.status_cond = sc;
+        // Register delivery callback with the RTPS layer. After every step
+        // that can fail: the data callback pins `self` (quiesce hooks below)
+        // until the protocol reader is torn down, so `self` must not be
+        // destroyed by an init failure once it is registered.
         proto_reader.setDataCallback(.{
             .ctx = self,
             .on_data = onDataCb,
             .on_sample_lost = onSampleLostCb,
             .on_heartbeat = onHeartbeatCb,
             .on_eoc = onEocCb,
+            .on_flush = onFlushCb,
+            .quiesce_acquire = quiesceAcquireFn,
+            .quiesce_release = quiesceReleaseFn,
         });
         // Register writer-match callback for OWNERSHIP and LIVELINESS tracking.
         proto_reader.setWriterMatchCallback(.{
@@ -546,13 +564,6 @@ pub const DataReaderImpl = struct {
             .on_writer_unmatched = onWriterUnmatchedCb,
             .on_writer_alive = onWriterAliveCb,
         });
-        // Wire up StatusCondition.
-        const sc = try waitset.StatusConditionImpl.init(
-            alloc,
-            self.toEntity(),
-            getStatusFn,
-        );
-        self.status_cond = sc;
         // Lifetime ref on the parent SubscriberImpl (dropped in
         // reallyDeinit): keeps subscriber.zig's `dispatchReaderFallback`
         // from touching a SubscriberImpl freed by a racing
@@ -830,6 +841,44 @@ pub const DataReaderImpl = struct {
         return entry.guid;
     }
 
+    fn deferListener(self: *Self, status: DDS.StatusMask) void {
+        _ = self.pending_listeners.fetchOr(status, .acq_rel);
+    }
+
+    /// The protocol reader's on_flush: dispatches the listeners the data
+    /// callbacks deferred (see `pending_listeners`), with no lock held.
+    fn onFlushCb(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
+        const pending = self.pending_listeners.swap(0, .acq_rel);
+        if (pending & DDS.SAMPLE_REJECTED_STATUS != 0) {
+            self.mu.lock();
+            const status = DDS.SampleRejectedStatus{
+                .total_count = self.sample_rejected_total,
+                .total_count_change = self.sample_rejected_total_change,
+                .last_reason = self.sample_rejected_last_reason,
+                .last_instance_handle = self.sample_rejected_last_handle,
+            };
+            self.mu.unlock();
+            // Always attempt dispatch -- DDS 1.4 §2.2.4.1.5's fallback chain
+            // means a delivery can happen even when this reader's own
+            // `listener_mask` doesn't include the bit. Only reset the
+            // change-counters (under `mu`, matching `vtGetSampleRejected`'s
+            // own locking) if delivery actually happened somewhere in the
+            // chain.
+            if (self.dispatchListener("on_sample_rejected", DDS.SAMPLE_REJECTED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
+                self.mu.lock();
+                self.sample_rejected_total_change = 0;
+                self.status_changes &= ~DDS.SAMPLE_REJECTED_STATUS;
+                self.mu.unlock();
+            }
+        }
+        if (pending & DDS.DATA_AVAILABLE_STATUS != 0) {
+            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+        }
+    }
+
     /// Called from the RTPS receive thread when a new sample arrives.
     /// Matches the DataCallback.on_eoc function pointer signature.
     /// Called by reader_sm when a Connext-style zero-payload alive DATA arrives (no
@@ -850,7 +899,7 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
-            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+            self.deferListener(DDS.DATA_AVAILABLE_STATUS);
         }
     }
 
@@ -1053,7 +1102,7 @@ pub const DataReaderImpl = struct {
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
             if (transition_committed or data_committed) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
-                _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+                self.deferListener(DDS.DATA_AVAILABLE_STATUS);
             }
             return;
         }
@@ -1153,24 +1202,7 @@ pub const DataReaderImpl = struct {
             self.mu.unlock();
             self.alloc.free(copy);
             if (self.status_cond) |sc| sc.notifyWakeup();
-            // Always attempt dispatch -- DDS 1.4 §2.2.4.1.5's fallback chain
-            // means a delivery can happen even when this reader's own
-            // `listener_mask` doesn't include the bit. Only reset the
-            // change-counters (under `mu`, matching `vtGetSampleRejected`'s
-            // own locking) if delivery actually happened somewhere in the
-            // chain.
-            const delivered = self.dispatchListener("on_sample_rejected", DDS.SAMPLE_REJECTED_STATUS, vtable.get_c_abi_handle(self), .{&DDS.SampleRejectedStatus{
-                .total_count = self.sample_rejected_total,
-                .total_count_change = self.sample_rejected_total_change,
-                .last_reason = reason,
-                .last_instance_handle = ih,
-            }});
-            if (delivered) {
-                self.mu.lock();
-                self.sample_rejected_total_change = 0;
-                self.status_changes &= ~DDS.SAMPLE_REJECTED_STATUS;
-                self.mu.unlock();
-            }
+            self.deferListener(DDS.SAMPLE_REJECTED_STATUS);
             return;
         }
 
@@ -1236,7 +1268,7 @@ pub const DataReaderImpl = struct {
         if (self.status_cond) |sc| sc.notifyWakeup();
 
         // Fire listener if registered for DATA_AVAILABLE.
-        _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+        self.deferListener(DDS.DATA_AVAILABLE_STATUS);
     }
 
     // ── Coherent set helpers ───────────────────────────────────────────────────
@@ -1299,7 +1331,7 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         if (committed) {
             if (self.status_cond) |sc| sc.notifyWakeup();
-            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+            self.deferListener(DDS.DATA_AVAILABLE_STATUS);
         }
     }
 

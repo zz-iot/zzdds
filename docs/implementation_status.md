@@ -53,7 +53,7 @@ design decisions with rationale.
 | `Publisher` / `Subscriber` | Complete | `begin_coherent_changes`, `end_coherent_changes`, `suspend_publications`, `resume_publications` all implemented; `begin_access` / `end_access` implement ordered INSTANCE/TOPIC/GROUP sort; `suspend_publications` + `begin/end_coherent_changes` interplay is correct (suspension window re-armed atomically after each coherent flush) |
 | `DataWriter` / `DataReader` | Complete | |
 | `Topic` | Complete | |
-| `ContentFilteredTopic` lifecycle + parser/evaluator | Complete | API, parser, evaluator, and delivery-time filtering all wired; types must register `TypeSupport.get_field` for field-level filtering |
+| `ContentFilteredTopic` lifecycle + parser/evaluator | Complete | API, parser, evaluator, and delivery-time filtering all wired; types must register `TypeSupport.get_field` for field-level filtering. zzdds extension `set_filter_expression` changes the expression in place |
 | `WaitSet` | Complete | |
 | `ReadCondition` | Complete | |
 | `QueryCondition` | Complete | State-mask + SQL expression evaluated at read/take time via `filter.zig`; requires `TypeSupport.get_field` for field access; without it all samples pass through |

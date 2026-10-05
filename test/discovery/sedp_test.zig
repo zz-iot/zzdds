@@ -155,6 +155,18 @@ const Recorder = struct {
     readers_found: std.ArrayListUnmanaged(SnapshotR) = .empty,
     writers_lost: std.ArrayListUnmanaged(Guid) = .empty,
     readers_lost: std.ArrayListUnmanaged(Guid) = .empty,
+    /// When set, discovery callbacks check they are not running under one
+    /// of these SEDP endpoints' built-in reader locks (they reach
+    /// application listeners in a real participant).
+    sedp: ?*SedpEndpoints = null,
+    called_under_reader_lock: bool = false,
+
+    fn checkUnlocked(self: *Recorder) void {
+        const s = self.sedp orelse return;
+        inline for (.{ s.pub_reader, s.sub_reader }) |maybe_r| if (maybe_r) |r| {
+            if (r.mu.tryLock()) r.mu.unlock() else self.called_under_reader_lock = true;
+        };
+    }
 
     fn deinit(self: *Recorder) void {
         for (self.writers_found.items) |*s| s.deinit();
@@ -184,6 +196,7 @@ const Recorder = struct {
 
     fn onWriterDiscovered(ctx: *anyopaque, d: *const WriterData) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.checkUnlocked();
         const user_data = self.alloc.dupe(u8, iface.discUserData(d.qos)) catch return;
         const qos = d.qos.clone(self.alloc) catch return;
         const parts = dupePartitions(self.alloc, d.partition_names) catch return;
@@ -200,6 +213,7 @@ const Recorder = struct {
     }
     fn onReaderDiscovered(ctx: *anyopaque, d: *const ReaderData) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.checkUnlocked();
         const user_data = self.alloc.dupe(u8, iface.discUserData(d.qos)) catch return;
         const qos = d.qos.clone(self.alloc) catch return;
         const s = SnapshotR{
@@ -339,6 +353,43 @@ test "SEDP: WriterAnnouncement encode/decode round-trip" {
     try testing.expectEqualStrings("HelloWorldTopic", found.topic);
     try testing.expectEqualStrings("HelloWorld", found.typ);
     try testing.expectEqual(@as(u8, 1), relK(&found.qos));
+}
+
+test "SEDP: announcements are processed after the built-in reader's lock is released" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x01);
+    var remote = try Participant.init(net, 0x02);
+    defer local.deinit();
+    defer remote.deinit();
+    remote.rec.sedp = remote.sedp;
+
+    local.discoverPeer(0x02);
+    remote.discoverPeer(0x01);
+
+    try local.sedp.announceWriter(&.{
+        .guid = makeGuid(0x01, 0x10),
+        .participant_guid = makeGuid(0x01, 0x01),
+        .topic_name = "T",
+        .type_name = "Ty",
+        .qos = dwq(true, 0),
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    try local.sedp.announceReader(&.{
+        .guid = makeGuid(0x01, 0x11),
+        .participant_guid = makeGuid(0x01, 0x01),
+        .topic_name = "T",
+        .type_name = "Ty",
+        .qos = drq(true, 0),
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+    try testing.expectEqual(@as(usize, 1), remote.rec.readers_found.items.len);
+    try testing.expect(!remote.rec.called_under_reader_lock);
 }
 
 test "SEDP: ReaderAnnouncement encode/decode round-trip" {

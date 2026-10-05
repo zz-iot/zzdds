@@ -374,6 +374,9 @@ pub const RtpsProtocolReader = struct {
 
     /// See RtpsProtocolWriter's matching field's doc comment.
     ready_pin: ?struct { ctx: *anyopaque, release: *const fn (*anyopaque) void } = null,
+    /// The same pin for the data callback's `ctx` (see
+    /// protocol.DataCallback.quiesce_acquire).
+    data_pin: ?struct { ctx: *anyopaque, release: *const fn (*anyopaque) void } = null,
 
     const Self = @This();
 
@@ -400,6 +403,7 @@ pub const RtpsProtocolReader = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.reader.deinit();
         if (self.ready_pin) |pin| pin.release(pin.ctx);
+        if (self.data_pin) |pin| pin.release(pin.ctx);
         self.alloc.destroy(self);
     }
 
@@ -452,12 +456,18 @@ pub const RtpsProtocolReader = struct {
 
     fn vtSetDataCallback(ctx: *anyopaque, cb: protocol.DataCallback) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.data_pin) |pin| pin.release(pin.ctx);
+        self.data_pin = null;
+        if (cb.quiesce_acquire) |acquire| {
+            if (acquire(cb.ctx)) self.data_pin = .{ .ctx = cb.ctx, .release = cb.quiesce_release.? };
+        }
         self.reader.setCallback(.{
             .ctx = cb.ctx,
             .on_data = cb.on_data,
             .on_sample_lost = cb.on_sample_lost,
             .on_heartbeat = cb.on_heartbeat,
             .on_eoc = cb.on_eoc,
+            .on_flush = cb.on_flush,
         });
     }
 

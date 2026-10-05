@@ -133,6 +133,14 @@ pub const WlpEndpoints = struct {
 
     unsupported_locator_mu: mutex_mod.Mutex = .{},
     unsupported_locator_kinds: std.AutoHashMapUnmanaged(i32, void) = .empty,
+    /// Liveliness assertions decoded by the built-in reader's on_data, which
+    /// runs under that reader's lock, waiting for its on_flush (after the
+    /// lock is released) to report them: reporting reaches application
+    /// liveliness listeners. Appended under the reader's lock, so in order.
+    deferred_mu: mutex_mod.Mutex = .{},
+    deferred: std.ArrayListUnmanaged(Alive) = .empty,
+    /// Held while draining `deferred`, so assertions are reported in order.
+    drain_mu: mutex_mod.Mutex = .{},
 
     const Self = @This();
 
@@ -145,6 +153,7 @@ pub const WlpEndpoints = struct {
     pub fn deinit(self: *Self) void {
         self.pair.deinit();
         self.unsupported_locator_kinds.deinit(self.alloc);
+        self.deferred.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -182,7 +191,7 @@ pub const WlpEndpoints = struct {
             true,
         );
         self.pair.reader.?.setTracer(self.tracer);
-        self.pair.reader.?.setCallback(.{ .ctx = self, .on_data = onPmData });
+        self.pair.reader.?.setCallback(.{ .ctx = self, .on_data = onPmData, .on_flush = onFlush });
 
         // WLP does not open its own transport listener -- it shares SEDP's
         // metatraffic unicast listener (see tryHandleFromSedp / combined.zig's
@@ -232,6 +241,9 @@ pub const WlpEndpoints = struct {
         }
     }
 
+    const Alive = struct { prefix: GuidPrefix, kind: u8 };
+
+    /// Under the built-in reader's lock: decode and queue for onFlush.
     fn onPmData(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const decoded = decodeParticipantMessageData(change.data) orelse return;
@@ -241,7 +253,27 @@ pub const WlpEndpoints = struct {
             LIVELINESS_MANUAL_BY_PARTICIPANT
         else
             return;
-        if (self.callbacks) |cbs| cbs.on_wlp_alive(cbs.ctx, decoded.prefix, kind);
+        self.deferred_mu.lock();
+        defer self.deferred_mu.unlock();
+        self.deferred.append(self.alloc, .{ .prefix = decoded.prefix, .kind = kind }) catch
+            log.wlp.warn("wlp: out of memory queueing a liveliness assertion; dropped", .{});
+    }
+
+    /// The built-in reader's on_flush: reports the queued assertions, in
+    /// arrival order, with no reader lock held.
+    fn onFlush(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.drain_mu.lock();
+        defer self.drain_mu.unlock();
+        while (true) {
+            var batch: std.ArrayListUnmanaged(Alive) = .empty;
+            self.deferred_mu.lock();
+            std.mem.swap(std.ArrayListUnmanaged(Alive), &batch, &self.deferred);
+            self.deferred_mu.unlock();
+            if (batch.items.len == 0) return;
+            defer batch.deinit(self.alloc);
+            if (self.callbacks) |cbs| for (batch.items) |a| cbs.on_wlp_alive(cbs.ctx, a.prefix, a.kind);
+        }
     }
 
     /// Periodic driver (RTPS §8.7.2.2.3), called from participant.zig's
@@ -294,6 +326,62 @@ test "encodeParticipantMessageData / decodeParticipantMessageData round-trip" {
     const decoded = decodeParticipantMessageData(encoded) orelse return error.TestUnexpectedResult;
     try testing.expect(decoded.prefix.eql(prefix));
     try testing.expectEqualSlices(u8, &KIND_MANUAL, &decoded.kind);
+}
+
+test "liveliness assertions are reported from on_flush, in arrival order, not from on_data" {
+    // on_data runs under the built-in reader's lock, and reporting reaches
+    // application liveliness listeners, so on_data only queues.
+    const alloc = testing.allocator;
+    const self = try WlpEndpoints.init(alloc, undefined);
+    defer self.deinit();
+
+    const Probe = struct {
+        seen: std.ArrayListUnmanaged(struct { prefix: GuidPrefix, kind: u8 }) = .empty,
+        fn alive(ctx: *anyopaque, prefix: GuidPrefix, kind: u8) void {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            p.seen.append(testing.allocator, .{ .prefix = prefix, .kind = kind }) catch unreachable;
+        }
+        fn noopP(_: *anyopaque, _: *const iface.ParticipantData) void {}
+        fn noopG(_: *anyopaque, _: Guid) void {}
+        fn noopW(_: *anyopaque, _: *const iface.WriterData) void {}
+        fn noopR(_: *anyopaque, _: *const iface.ReaderData) void {}
+    };
+    var probe: Probe = .{};
+    defer probe.seen.deinit(alloc);
+    const cbs = Callbacks{
+        .ctx = &probe,
+        .on_participant_discovered = Probe.noopP,
+        .on_participant_lost = Probe.noopG,
+        .on_writer_discovered = Probe.noopW,
+        .on_writer_lost = Probe.noopG,
+        .on_reader_discovered = Probe.noopR,
+        .on_reader_lost = Probe.noopG,
+        .on_wlp_alive = Probe.alive,
+    };
+    self.callbacks = &cbs;
+
+    const a = GuidPrefix{ .bytes = [_]u8{0x0A} ** 12 };
+    const b = GuidPrefix{ .bytes = [_]u8{0x0B} ** 12 };
+    const pa = try encodeParticipantMessageData(alloc, a, KIND_AUTOMATIC);
+    defer alloc.free(pa);
+    const pb = try encodeParticipantMessageData(alloc, b, KIND_MANUAL);
+    defer alloc.free(pb);
+    var ch = std.mem.zeroes(history_mod.CacheChange);
+    ch.data = pa;
+    WlpEndpoints.onPmData(self, &ch);
+    ch.data = pb;
+    WlpEndpoints.onPmData(self, &ch);
+    try testing.expectEqual(@as(usize, 0), probe.seen.items.len);
+
+    WlpEndpoints.onFlush(self);
+    try testing.expectEqual(@as(usize, 2), probe.seen.items.len);
+    try testing.expect(probe.seen.items[0].prefix.eql(a));
+    try testing.expectEqual(LIVELINESS_AUTOMATIC, probe.seen.items[0].kind);
+    try testing.expect(probe.seen.items[1].prefix.eql(b));
+    try testing.expectEqual(LIVELINESS_MANUAL_BY_PARTICIPANT, probe.seen.items[1].kind);
+
+    WlpEndpoints.onFlush(self); // nothing queued: nothing reported
+    try testing.expectEqual(@as(usize, 2), probe.seen.items.len);
 }
 
 test "decodeParticipantMessageData rejects a too-short payload" {

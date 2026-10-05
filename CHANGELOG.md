@@ -8,6 +8,47 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-05
+
+- **ContentFilteredTopic filter expressions can be changed in place.** New zzdds extension
+  `zzdds::ContentFilteredTopic::set_filter_expression(expression, parameters)`; DDS only
+  allows changing a CFT's parameters. Readers on the topic keep their matches, history and
+  reliable readiness; the new filter applies to samples received afterwards. A malformed
+  expression returns BAD_PARAMETER and leaves the filter unchanged. Available in every
+  binding: C via `DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic`, C++ by
+  `dynamic_pointer_cast` to `zzdds::ContentFilteredTopicImpl`, Java via
+  `ZzddsRuntime.asZzddsContentFilteredTopic`, and Zig via
+  `zzdds.asZzddsContentFilteredTopic`.
+- **Listeners no longer run while zzdds holds one of its own locks.** A listener that
+  called back into its entity, its parent or its participant could deadlock. Affected:
+  - `on_data_available`, `on_sample_rejected`, `on_sample_lost` and
+    `on_liveliness_changed`, raised while the participant's lock and the protocol reader's
+    lock were held during message processing (DATA, DATA_FRAG, GAP, HEARTBEAT) or while a
+    newly matched writer's buffered samples were delivered;
+  - `on_reliable_reader_ready`, raised from ACKNACK processing under the participant's
+    lock;
+  - `on_requested_incompatible_qos` and `on_offered_incompatible_qos`, raised during
+    discovery under the participant's lock;
+  - `on_publication_matched` for a remote reader that went away, raised under the
+    participant's lock;
+  - `on_data_available` raised by `Subscriber::notify_datareaders`, under the
+    subscriber's lock;
+  - discovery and liveliness callbacks driven by the built-in SEDP and WLP readers, which
+    ran under those readers' locks.
+
+  Each is now collected under the lock and raised after it is released, in the same
+  order as before. Releasing a listener's data during `delete_contained_entities` can
+  still run under the parent's lock; see the roadmap.
+- **Fixed a possible use-after-free when deleting a DataReader.** Deleting a reader
+  could free it while the receive thread was still delivering to it (data,
+  sample-lost, heartbeat or end-of-coherent-set callbacks). The protocol reader now
+  keeps its DataReader alive until it is torn down itself, as it already did for the
+  reliable-readiness callback.
+- **Fixed memory leaks in the filter-expression parser.** A malformed expression that
+  failed after a complete operand (e.g. `x = 1 AND`), or running out of memory while
+  parsing, leaked the part of the expression already parsed. Affected
+  `create_contentfilteredtopic` and QueryCondition creation.
+
 ## 2026-10-03
 
 - **Fixed a writer or reader that could stay at zero matches.** `create_datawriter` and

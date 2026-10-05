@@ -532,6 +532,55 @@ private:
     ::DDS::SubscriberImpl dds_;
 };
 
+class ContentFilteredTopicSupport final : public ContentFilteredTopicImpl {
+public:
+    explicit ContentFilteredTopicSupport(DDS_ContentFilteredTopic handle)
+        : ContentFilteredTopicImpl(DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(handle)),
+          dds_(handle)
+    {}
+
+    // set_filter_expression() is already implemented by ContentFilteredTopicImpl (base).
+
+    std::string get_type_name() override { return dds_.get_type_name(); }
+    std::string get_name() override { return dds_.get_name(); }
+    std::shared_ptr<::DDS::DomainParticipant> get_participant() override { return dds_.get_participant(); }
+    std::string get_filter_expression() override { return dds_.get_filter_expression(); }
+    ::DDS::ReturnCode_t get_expression_parameters(::DDS::StringSeq& expression_parameters) override {
+        return dds_.get_expression_parameters(expression_parameters);
+    }
+    ::DDS::ReturnCode_t set_expression_parameters(::DDS::StringSeq expression_parameters) override {
+        return dds_.set_expression_parameters(std::move(expression_parameters));
+    }
+    std::shared_ptr<::DDS::Topic> get_related_topic() override { return dds_.get_related_topic(); }
+
+    // See TopicSupport's matching comment. A ContentFilteredTopic is not an
+    // Entity, so the wrapper lives in the TopicDescription family cache, as
+    // the generated ::DDS::ContentFilteredTopicImpl does.
+    static std::shared_ptr<ContentFilteredTopicSupport> _getOrCreate(DDS_ContentFilteredTopic h) {
+        if (!h) return nullptr;
+        DDS_TopicDescription _fh = DDS_ContentFilteredTopic_as_DDS_TopicDescription(h);
+        std::lock_guard<std::mutex> _lock(::DDS::TopicDescriptionImpl::_familyMutex());
+        auto& _cache = ::DDS::TopicDescriptionImpl::_familyCache();
+        auto _it = _cache.find(_fh);
+        if (_it != _cache.end()) {
+            if (auto _base = _it->second.lock()) {
+                if (auto _sp = std::dynamic_pointer_cast<ContentFilteredTopicSupport>(_base)) return _sp;
+            }
+        }
+        auto _sp = std::allocate_shared<ContentFilteredTopicSupport>(
+            std::pmr::polymorphic_allocator<ContentFilteredTopicSupport>(std::pmr::get_default_resource()), h);
+        _cache[_fh] = _sp;
+        return _sp;
+    }
+
+private:
+    // See TopicSupport's matching comment.
+    friend DDS_ContentFilteredTopic zidl_concrete_handle(const ContentFilteredTopicSupport& self) noexcept {
+        return self.dds_.native_handle();
+    }
+    ::DDS::ContentFilteredTopicImpl dds_;
+};
+
 class DomainParticipantSupport final : public DomainParticipantImpl {
 public:
     explicit DomainParticipantSupport(DDS_DomainParticipant handle)

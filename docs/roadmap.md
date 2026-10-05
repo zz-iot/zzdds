@@ -225,6 +225,28 @@ Forward-looking only: known gaps, planned features, and open design questions.
      or further investigation) become their own roadmap items, migrated when that code
      is next worked on rather than in one sweep.
 
+- **rmw_zzdds: change content filters in place.** zzdds now offers
+  `zzdds::ContentFilteredTopic::set_filter_expression(expression, parameters)` (DDS only
+  allows changing a CFT's parameters); see `decisions.md`. rmw_zzdds's
+  `rmw_subscription_set_content_filter` still replaces the subscription's DataReader when
+  the expression changes, so the new reader re-matches every publisher (rmw_zzdds offsets
+  its matched status to keep the subscription's continuous), loses samples not yet taken
+  from the old reader, and re-runs the reliable-readiness handshake. Switch it to
+  `set_filter_expression`. To avoid the swap for the first filter and for clearing one too,
+  create every subscription's reader on a CFT from the start, with an empty expression
+  (zzdds treats it as "no filtering"). Then drop the reader replacement and the
+  matched-status continuity code. Other implementations offer the same operation
+  (`set_expression` since one implementation's 5.1.0, `set_filter_expression` in another),
+  and the other ROS 2 RMWs built on them change expressions in place.
+- **Listener release hooks can run under a parent's lock during teardown.**
+  `Subscriber::delete_contained_entities` and `Publisher::delete_contained_entities`
+  deinit their readers/writers while holding their own lock, and dropping a reader's or
+  writer's last listener reference calls the application's `release_listener_data` there.
+  A release hook that calls back into the subscriber or publisher deadlocks. Listener
+  callbacks themselves no longer run under any zzdds lock (2026-10-05); bring teardown in
+  line by detaching the children under the lock and deiniting them after it is released,
+  as `DomainParticipant::delete_contained_entities` already does.
+
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
 zidl v0.3.12 adds a mask-driven selective parser (`deserialize_selected(want)` /
