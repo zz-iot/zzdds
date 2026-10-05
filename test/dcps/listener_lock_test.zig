@@ -307,3 +307,67 @@ test "on_reliable_reader_ready may call into its participant" {
     try testing.expect(probe.ready);
     try testing.expect(probe.participant_ok);
 }
+
+// ── Fan-out and discovery with more endpoints than one batch ────────────────
+
+const MANY = 37; // more than two of the participant's fixed-size batches
+
+test "fan-out without a target list reaches every reader exactly once" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var readers: [MANY]DDS.DataReader = undefined;
+    for (&readers) |*r| r.* = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, null, 0);
+    defer for (readers) |r| {
+        _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, r);
+    };
+
+    // The path taken when the fan-out list cannot be allocated.
+    const dp: *zzdds.dcps.DomainParticipantImpl = @ptrCast(@alignCast(fx.dp_r.ptr));
+    const Seen = struct {
+        protos: std.AutoHashMapUnmanaged(usize, u32) = .empty,
+        pub fn deliver(self: *@This(), t: zzdds.dcps.DomainParticipantImpl.PinnedReader) void {
+            const gop = self.protos.getOrPut(testing.allocator, @intFromPtr(t.proto.ctx)) catch unreachable;
+            gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+        }
+    };
+    var seen: Seen = .{};
+    defer seen.protos.deinit(alloc);
+    dp.dispatchToReadersBatched(null, &seen);
+
+    try testing.expect(seen.protos.count() >= MANY);
+    var it = seen.protos.valueIterator();
+    while (it.next()) |n| try testing.expectEqual(@as(u32, 1), n.*);
+}
+
+const IncompatCount = struct {
+    calls: usize = 0,
+    fn cb(p: *IncompatCount, _: DDS.DataReader, _: DDS.RequestedIncompatibleQosStatus) void {
+        p.calls += 1;
+    }
+};
+
+test "every incompatible reader is notified once, however many there are" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var counts: [MANY]IncompatCount = @splat(.{});
+    var readers: [MANY]DDS.DataReader = undefined;
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    for (&readers, &counts) |*r, *c| r.* = fx.sub_r.create_datareader(topicDesc(fx.topic_r), dr_qos, DDS.dataReaderListener(c, .{
+        .on_requested_incompatible_qos = IncompatCount.cb,
+    }), DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS);
+    defer for (readers) |r| {
+        _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, r);
+    };
+
+    var dw_qos = DDS.DataWriterQos{};
+    dw_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    const dw = fx.pub_w.create_datawriter(fx.topic_w, dw_qos, null, 0);
+    defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw);
+
+    for (counts) |c| try testing.expectEqual(@as(usize, 1), c.calls);
+}

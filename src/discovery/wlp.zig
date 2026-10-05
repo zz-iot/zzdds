@@ -35,6 +35,7 @@ const submessage_mod = @import("../rtps/message/submessage.zig");
 const history_mod = @import("../rtps/history.zig");
 const time_mod = @import("../util/time.zig");
 const mutex_mod = @import("../util/mutex.zig");
+const DrainQueue = @import("../util/drain_queue.zig").DrainQueue;
 const builtin_endpoint_mod = @import("builtin_endpoint.zig");
 
 const Transport = tr_iface.Transport;
@@ -136,11 +137,8 @@ pub const WlpEndpoints = struct {
     /// Liveliness assertions decoded by the built-in reader's on_data, which
     /// runs under that reader's lock, waiting for its on_flush (after the
     /// lock is released) to report them: reporting reaches application
-    /// liveliness listeners. Appended under the reader's lock, so in order.
-    deferred_mu: mutex_mod.Mutex = .{},
-    deferred: std.ArrayListUnmanaged(Alive) = .empty,
-    /// Held while draining `deferred`, so assertions are reported in order.
-    drain_mu: mutex_mod.Mutex = .{},
+    /// liveliness listeners. See DrainQueue.
+    deferred: DrainQueue(Alive) = .{},
 
     const Self = @This();
 
@@ -153,7 +151,7 @@ pub const WlpEndpoints = struct {
     pub fn deinit(self: *Self) void {
         self.pair.deinit();
         self.unsupported_locator_kinds.deinit(self.alloc);
-        self.deferred.deinit(self.alloc);
+        self.deferred.deinit(self.alloc, self);
         self.alloc.destroy(self);
     }
 
@@ -253,9 +251,7 @@ pub const WlpEndpoints = struct {
             LIVELINESS_MANUAL_BY_PARTICIPANT
         else
             return;
-        self.deferred_mu.lock();
-        defer self.deferred_mu.unlock();
-        self.deferred.append(self.alloc, .{ .prefix = decoded.prefix, .kind = kind }) catch
+        self.deferred.push(self.alloc, .{ .prefix = decoded.prefix, .kind = kind }) catch
             log.wlp.warn("wlp: out of memory queueing a liveliness assertion; dropped", .{});
     }
 
@@ -263,18 +259,16 @@ pub const WlpEndpoints = struct {
     /// arrival order, with no reader lock held.
     fn onFlush(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.drain_mu.lock();
-        defer self.drain_mu.unlock();
-        while (true) {
-            var batch: std.ArrayListUnmanaged(Alive) = .empty;
-            self.deferred_mu.lock();
-            std.mem.swap(std.ArrayListUnmanaged(Alive), &batch, &self.deferred);
-            self.deferred_mu.unlock();
-            if (batch.items.len == 0) return;
-            defer batch.deinit(self.alloc);
-            if (self.callbacks) |cbs| for (batch.items) |a| cbs.on_wlp_alive(cbs.ctx, a.prefix, a.kind);
-        }
+        self.deferred.drain(self.alloc, self);
     }
+
+    /// DrainQueue context: called for each queued assertion.
+    pub fn process(self: *Self, a: Alive) void {
+        if (self.callbacks) |cbs| cbs.on_wlp_alive(cbs.ctx, a.prefix, a.kind);
+    }
+
+    /// DrainQueue context: nothing owned.
+    pub fn discard(_: *Self, _: Alive) void {}
 
     /// Periodic driver (RTPS §8.7.2.2.3), called from participant.zig's
     /// checkTimers() via Discovery.Vtable.wlp_tick.

@@ -53,6 +53,7 @@ const CacheChange = history_mod.CacheChange;
 const ChangeKind = history_mod.ChangeKind;
 const RtpsTimestamp = time_mod.RtpsTimestamp;
 const Mutex = mutex_mod.Mutex;
+const DrainQueue = @import("../util/drain_queue.zig").DrainQueue;
 const Callbacks = iface.Callbacks;
 const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 const ParticipantData = iface.ParticipantData;
@@ -323,12 +324,8 @@ pub const SedpEndpoints = struct {
     /// which runs under each reader's lock, waiting for that reader's
     /// on_flush (after the lock is released) to process them: processing
     /// reaches the participant's discovery callbacks and from there
-    /// application listeners. Appended under the reader's lock, so in order.
-    deferred_mu: Mutex = .{},
-    deferred: std.ArrayListUnmanaged(DeferredChange) = .empty,
-    /// Held while draining `deferred`, so announcements are processed one at
-    /// a time and in the order they arrived.
-    drain_mu: Mutex = .{},
+    /// application listeners. See DrainQueue.
+    deferred: DrainQueue(DeferredChange) = .{},
     tracer: trace.Tracer,
 
     // Metatraffic unicast port (where we listen for SEDP data).
@@ -408,8 +405,7 @@ pub const SedpEndpoints = struct {
         if (self.pub_reader) |r| r.deinit();
         if (self.sub_writer) |w| w.deinit();
         if (self.sub_reader) |r| r.deinit();
-        for (self.deferred.items) |d| self.alloc.free(d.data);
-        self.deferred.deinit(self.alloc);
+        self.deferred.deinit(self.alloc, self);
         self.participant_locs_mu.lock();
         var it = self.participant_locs.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit();
@@ -833,9 +829,7 @@ pub const SedpEndpoints = struct {
             log.sedp.warn("sedp: out of memory queueing an endpoint announcement; dropped", .{});
             return;
         };
-        self.deferred_mu.lock();
-        defer self.deferred_mu.unlock();
-        self.deferred.append(self.alloc, .{ .is_writer = is_writer, .kind = ch.kind, .data = data }) catch {
+        self.deferred.push(self.alloc, .{ .is_writer = is_writer, .kind = ch.kind, .data = data }) catch {
             self.alloc.free(data);
             log.sedp.warn("sedp: out of memory queueing an endpoint announcement; dropped", .{});
         };
@@ -845,23 +839,21 @@ pub const SedpEndpoints = struct {
     /// arrival order, with no reader lock held.
     fn onFlush(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.drain_mu.lock();
-        defer self.drain_mu.unlock();
-        while (true) {
-            var batch: std.ArrayListUnmanaged(DeferredChange) = .empty;
-            self.deferred_mu.lock();
-            std.mem.swap(std.ArrayListUnmanaged(DeferredChange), &batch, &self.deferred);
-            self.deferred_mu.unlock();
-            if (batch.items.len == 0) return;
-            defer batch.deinit(self.alloc);
-            for (batch.items) |d| {
-                defer self.alloc.free(d.data);
-                var ch = std.mem.zeroes(CacheChange);
-                ch.kind = d.kind;
-                ch.data = d.data;
-                self.handleEndpointChange(&ch, d.is_writer);
-            }
-        }
+        self.deferred.drain(self.alloc, self);
+    }
+
+    /// DrainQueue context: called for each queued announcement.
+    pub fn process(self: *Self, d: DeferredChange) void {
+        defer self.alloc.free(d.data);
+        var ch = std.mem.zeroes(CacheChange);
+        ch.kind = d.kind;
+        ch.data = d.data;
+        self.handleEndpointChange(&ch, d.is_writer);
+    }
+
+    /// DrainQueue context: called at deinit for each announcement still queued.
+    pub fn discard(self: *Self, d: DeferredChange) void {
+        self.alloc.free(d.data);
     }
 
     fn handleEndpointChange(self: *Self, ch: *const CacheChange, is_writer: bool) void {

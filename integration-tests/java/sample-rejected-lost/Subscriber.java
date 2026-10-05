@@ -178,11 +178,21 @@ public class Subscriber {
                 Thread.sleep(POLL_PERIOD_MS);
             }
         }
-        StatusEventDataReader.Sample[] lostTaken = lostReader.take_n(
-            MAX_SAMPLES, Dcps.DDS.ANY_SAMPLE_STATE.value, Dcps.DDS.ANY_VIEW_STATE.value, Dcps.DDS.ANY_INSTANCE_STATE.value);
+        // The loss is reported from the writer's HEARTBEAT, which can arrive
+        // before the repair that delivers the last sample: keep taking until
+        // it arrives (or the timeout says it never will).
         int maxSeq = -1;
-        for (StatusEventDataReader.Sample s : lostTaken) {
-            if (s.validData && s.data.get_seq() > maxSeq) maxSeq = s.data.get_seq();
+        {
+            long deadline = System.currentTimeMillis() + STATUS_TIMEOUT_MS;
+            while (true) {
+                StatusEventDataReader.Sample[] lostTaken = lostReader.take_n(
+                    MAX_SAMPLES, Dcps.DDS.ANY_SAMPLE_STATE.value, Dcps.DDS.ANY_VIEW_STATE.value, Dcps.DDS.ANY_INSTANCE_STATE.value);
+                for (StatusEventDataReader.Sample s : lostTaken) {
+                    if (s.validData && s.data.get_seq() > maxSeq) maxSeq = s.data.get_seq();
+                }
+                if (maxSeq == 4 || System.currentTimeMillis() > deadline) break;
+                Thread.sleep(POLL_PERIOD_MS);
+            }
         }
         if (maxSeq != 4) {
             System.err.println("FAIL: LostTopic did not deliver the writer's last sample (seq=4) -- last seen=" + maxSeq);

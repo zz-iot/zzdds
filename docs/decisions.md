@@ -109,11 +109,16 @@ the lock, then dispatches and drops the pins. In the protocol reader, `on_data`,
 and `on_heartbeat` only hand changes over under the reader's lock (which keeps them in
 order); the same operation then calls `on_flush` once the lock is released, and the DCPS
 reader raises `on_data_available`/`on_sample_rejected` from there. The built-in SEDP and
-WLP readers queue in `on_data` and process in `on_flush`, draining under their own
-mutex so announcements stay in arrival order. The participant pins the target readers
-or writer under `participant.mu` before handing them DATA, DATA_FRAG, GAP, HEARTBEAT,
-HEARTBEAT_FRAG, ACKNACK or NACK_FRAG. A listener may call any DDS operation without
-deadlocking, which DDS expects. The alternative (documenting "don't call back from a
+WLP readers queue in `on_data` and process in `on_flush` through a `DrainQueue`: one
+caller drains at a time, which keeps arrival order, and a drain that starts while
+another runs (including re-entrantly, from a listener whose endpoint creation is
+delivered straight back) leaves its items to the running one instead of waiting, so no
+lock is held while processing. The participant pins the target readers or writer under
+`participant.mu` before handing them DATA, DATA_FRAG, GAP, HEARTBEAT, HEARTBEAT_FRAG,
+ACKNACK or NACK_FRAG. Collecting never drops a target for lack of memory: a fan-out whose
+target list cannot be allocated goes in fixed-size batches in entity-key order, and
+incompatible-QoS notifications are recorded on the endpoint's own participant entry. A
+listener may call any DDS operation without deadlocking, which DDS expects. The alternative (documenting "don't call back from a
 listener") would rule out ordinary patterns such as `get_matched_publications` from
 `on_data_available`.
 

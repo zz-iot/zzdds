@@ -215,12 +215,22 @@ pub fn main(init: std.process.Init) !void {
             sleepNs(io, POLL_PERIOD_NS);
         }
     }
+    // The loss is reported from the writer's HEARTBEAT, which can arrive
+    // before the repair that delivers the last sample: keep taking until it
+    // arrives (or the timeout says it never will).
     var lost_taken: std.ArrayListUnmanaged(status_event_gen.StatusEventDataReader.SampledValue) = .empty;
     defer lost_taken.deinit(alloc);
-    _ = try lost_reader.take(&lost_taken, -1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
     var max_seq: i32 = -1;
-    for (lost_taken.items) |sv| {
-        if (sv.value.seq > max_seq) max_seq = sv.value.seq;
+    {
+        const deadline = monoNs(io) + STATUS_TIMEOUT_NS;
+        while (true) {
+            _ = try lost_reader.take(&lost_taken, -1, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE);
+            for (lost_taken.items) |sv| {
+                if (sv.value.seq > max_seq) max_seq = sv.value.seq;
+            }
+            if (max_seq == 4 or monoNs(io) > deadline) break;
+            sleepNs(io, POLL_PERIOD_NS);
+        }
     }
     if (max_seq != 4) {
         std.debug.print("FAIL: LostTopic did not deliver the writer's last sample (seq=4) -- last seen={d}\n", .{max_seq});
