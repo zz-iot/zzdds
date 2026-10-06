@@ -41,10 +41,13 @@ pub const Locator = iface.Locator;
 // ── Delivery callback ─────────────────────────────────────────────────────────
 
 /// Called when a change is ready for delivery to the application layer.
-/// Invoked under the state machine's lock; must NOT call back into the SM.
+/// on_data, on_heartbeat and on_eoc are invoked under the state machine's
+/// lock, must NOT call back into the SM, and must not reach application
+/// code: they hand over, and on_flush (after the lock is released) acts.
 pub const DataCallback = struct {
     ctx: *anyopaque,
     on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
+    /// Called after the state machine's lock is released.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
     /// Called when a valid (non-duplicate) HEARTBEAT is received from a writer.
     /// Invoked under the state machine's lock; must NOT call back into the SM.
@@ -53,6 +56,10 @@ pub const DataCallback = struct {
     /// no PID_COHERENT_SET).  The DCPS layer registers this to flush the coherent WIP.
     /// If null, EOC packets are silently dropped — correct for RTPS-level consumers.
     on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
+    /// Called after the state machine's lock is released, by any operation
+    /// that called on_data/on_eoc/on_heartbeat while holding it; see
+    /// protocol.DataCallback.on_flush.
+    on_flush: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 // ── StatelessReader ───────────────────────────────────────────────────────────
@@ -335,6 +342,9 @@ pub const StatefulReader = struct {
     /// Callback fired when a writer proxy's protocol-ready state
     /// transitions. Mirrors StatefulWriter's identical field.
     protocol_ready_fn: ?*const fn (*anyopaque, Guid, bool) void = null,
+    /// Set (under `mu`) whenever on_data/on_eoc/on_heartbeat ran; the entry
+    /// point that then releases `mu` calls on_flush (see takeFlushLocked).
+    flush_pending: bool = false,
     protocol_ready_ctx: ?*anyopaque = null,
 
     const Self = @This();
@@ -398,6 +408,22 @@ pub const StatefulReader = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.callback = cb;
+    }
+
+    /// Under `mu`: if a data callback ran since the last flush, clears the
+    /// flag and returns the callback whose on_flush the caller must run after
+    /// releasing `mu` (via runFlush). The data callbacks hand changes over
+    /// under the lock, which keeps them in order; on_flush is where anything
+    /// that reaches application code (listeners) runs.
+    fn takeFlushLocked(self: *Self) ?DataCallback {
+        if (!self.flush_pending) return null;
+        self.flush_pending = false;
+        const cb = self.callback orelse return null;
+        return if (cb.on_flush != null) cb else null;
+    }
+
+    fn runFlush(flush: ?DataCallback) void {
+        if (flush) |cb| cb.on_flush.?(cb.ctx);
     }
 
     /// Register a callback that fires when a writer proxy's protocol-ready
@@ -524,11 +550,14 @@ pub const StatefulReader = struct {
         // well-defined to read while self.mu is held.
         const ready_fn = self.protocol_ready_fn;
         const ready_ctx = self.protocol_ready_ctx;
+        // Replaying buffered changes above may have delivered data.
+        const flush = self.takeFlushLocked();
         self.mu.unlock();
 
         if (newly_ready_guid) |guid| {
             if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
+        runFlush(flush);
         return true;
     }
 
@@ -595,7 +624,11 @@ pub const StatefulReader = struct {
     /// Silently ignores data from unmatched writers.
     pub fn handleData(self: *Self, writer_guid: Guid, change: CacheChange) !void {
         self.mu.lock();
-        defer self.mu.unlock();
+        defer {
+            const flush = self.takeFlushLocked();
+            self.mu.unlock();
+            runFlush(flush);
+        }
 
         var wp: ?*WriterProxy = null;
         for (self.writer_proxies.items) |*w| {
@@ -740,7 +773,11 @@ pub const StatefulReader = struct {
     /// pending_unmatched_reassembly and migrated to the WriterProxy in addMatchedWriter.
     pub fn handleDataFrag(self: *Self, writer_guid: Guid, source_timestamp: time_mod.RtpsTimestamp, df: msg.submessage.DataFragSubmessage) !void {
         self.mu.lock();
-        defer self.mu.unlock();
+        defer {
+            const flush = self.takeFlushLocked();
+            self.mu.unlock();
+            runFlush(flush);
+        }
 
         var wp: ?*WriterProxy = null;
         for (self.writer_proxies.items) |*w| {
@@ -917,11 +954,15 @@ pub const StatefulReader = struct {
                     try self.cache.addReaderChange(change);
                     if (self.callback) |cb| {
                         if (self.cache.getChangeForWriter(change.writer_guid, sn)) |cached| cb.on_data(cb.ctx, cached);
+                        self.flush_pending = true;
                     }
                 } else {
                     // EOC marker: not cached, but notify the DCPS layer so it can
                     // flush the coherent WIP without adding a data sample to pending.
-                    if (self.callback) |cb| if (cb.on_eoc) |f| f(cb.ctx, &change);
+                    if (self.callback) |cb| if (cb.on_eoc) |f| {
+                        f(cb.ctx, &change);
+                        self.flush_pending = true;
+                    };
                 }
                 self.deliverPendingLocked(wp, sn);
             } else {
@@ -948,6 +989,7 @@ pub const StatefulReader = struct {
                 try self.cache.addReaderChange(change);
                 if (self.callback) |cb| {
                     if (self.cache.getChangeForWriter(change.writer_guid, sn)) |ch| cb.on_data(cb.ctx, ch);
+                    self.flush_pending = true;
                 }
             }
         }
@@ -972,9 +1014,13 @@ pub const StatefulReader = struct {
                             if (self.cache.getChangeForWriter(pending_ch.writer_guid, next_sn)) |cached| {
                                 cb.on_data(cb.ctx, cached);
                             }
+                            self.flush_pending = true;
                         }
                     } else {
-                        if (self.callback) |cb| if (cb.on_eoc) |f| f(cb.ctx, &pending_ch);
+                        if (self.callback) |cb| if (cb.on_eoc) |f| {
+                            f(cb.ctx, &pending_ch);
+                            self.flush_pending = true;
+                        };
                     }
                     break;
                 }
@@ -1010,6 +1056,10 @@ pub const StatefulReader = struct {
         // reaches arbitrary user listener code via DataReaderImpl.
         // notifyWriterProtocolReady, which must never run under this lock.
         var newly_ready_guid: ?Guid = null;
+        // Reported after self.mu is released below, like newly_ready_guid:
+        // on_sample_lost reaches the DCPS reader's listener (application
+        // code), which must not run under this lock.
+        var samples_lost: i32 = 0;
 
         for (self.writer_proxies.items) |*wp| {
             if (!wp.guid.eql(writer_guid)) continue;
@@ -1071,17 +1121,16 @@ pub const StatefulReader = struct {
                     _ = wp.received.insert(self.alloc, sn) catch {};
                 }
                 self.deliverPendingLocked(wp, prev_highest);
-                if (lost_count > 0) {
-                    if (self.callback) |cb| {
-                        if (cb.on_sample_lost) |f| f(cb.ctx, lost_count);
-                    }
-                }
+                samples_lost += lost_count;
             }
 
             // Notify the DDS layer that a valid HB arrived.  Used to flush
             // coherent WIP when no subsequent set will trigger a CS transition.
             if (self.callback) |cb| {
-                if (cb.on_heartbeat) |f| f(cb.ctx, writer_guid, last_sn);
+                if (cb.on_heartbeat) |f| {
+                    f(cb.ctx, writer_guid, last_sn);
+                    self.flush_pending = true;
+                }
             }
 
             // Only RELIABLE readers send ACKNACK; BEST_EFFORT readers ignore HEARTBEATs.
@@ -1097,11 +1146,15 @@ pub const StatefulReader = struct {
         // See addMatchedWriter's matching comment: capture under the lock.
         const ready_fn = self.protocol_ready_fn;
         const ready_ctx = self.protocol_ready_ctx;
+        const lost_cb = if (samples_lost > 0) self.callback else null;
+        const flush = self.takeFlushLocked();
         self.mu.unlock();
 
         if (newly_ready_guid) |guid| {
             if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
+        runFlush(flush);
+        if (lost_cb) |cb| if (cb.on_sample_lost) |f| f(cb.ctx, samples_lost);
     }
 
     /// Handle a received GAP: treat the listed SNs as irreversibly unavailable.
@@ -1112,7 +1165,17 @@ pub const StatefulReader = struct {
         gap_list: SequenceNumberSet,
     ) void {
         self.mu.lock();
-        defer self.mu.unlock();
+        // Reported after self.mu is released: on_sample_lost reaches the DCPS
+        // reader's listener (application code), which must not run under
+        // this lock.
+        var samples_lost: i32 = 0;
+        defer {
+            const lost_cb = if (samples_lost > 0) self.callback else null;
+            const flush = self.takeFlushLocked();
+            self.mu.unlock();
+            runFlush(flush);
+            if (lost_cb) |cb| if (cb.on_sample_lost) |f| f(cb.ctx, samples_lost);
+        }
 
         for (self.writer_proxies.items) |*wp| {
             if (!wp.guid.eql(writer_guid)) continue;
@@ -1142,11 +1205,7 @@ pub const StatefulReader = struct {
             }
             // Deliver any buffered pending changes that are now contiguous.
             if (self.reliable) self.deliverPendingLocked(wp, prev_highest);
-            if (lost_count > 0) {
-                if (self.callback) |cb| {
-                    if (cb.on_sample_lost) |f| f(cb.ctx, lost_count);
-                }
-            }
+            samples_lost += lost_count;
         }
     }
 

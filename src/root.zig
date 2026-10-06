@@ -111,6 +111,7 @@ pub const asZzddsTopic = raw_ops.asZzddsTopic;
 pub const asZzddsDomainParticipant = raw_ops.asZzddsDomainParticipant;
 pub const asZzddsPublisher = raw_ops.asZzddsPublisher;
 pub const asZzddsSubscriber = raw_ops.asZzddsSubscriber;
+pub const asZzddsContentFilteredTopic = raw_ops.asZzddsContentFilteredTopic;
 pub const createWaitSet = raw_ops.createWaitSet;
 pub const createGuardCondition = raw_ops.createGuardCondition;
 
@@ -159,6 +160,7 @@ test {
     _ = @import("util/mutex.zig");
     _ = @import("util/listener_box.zig");
     _ = @import("util/entity_quiesce.zig");
+    _ = @import("util/drain_queue.zig");
     _ = @import("dcps/qos_match.zig");
     _ = @import("dcps/nil.zig");
     _ = @import("dcps/topic.zig");

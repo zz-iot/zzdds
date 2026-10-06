@@ -979,6 +979,24 @@ JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsSubscriber(
     return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zs);
 }
 
+/* Same narrowing as asZzddsDataWriter above, for ContentFilteredTopic
+ * (reaches set_filter_expression). */
+JNIEXPORT jobject JNICALL Java_io_zzdds_runtime_ZzddsRuntime_asZzddsContentFilteredTopic(
+    JNIEnv *env, jclass self_cls, jobject cft)
+{
+    (void)self_cls;
+    static zzdds_java_class_cache type_check_cache = {0};
+    if (!zzdds_java_require_non_null(env, cft, "cft")) return NULL;
+    if (!zzdds_java_require_instance_of(env, cft, &type_check_cache, "io/zzdds/dcps/ContentFilteredTopicImpl", "cft")) return NULL;
+    DDS_ContentFilteredTopic c = (DDS_ContentFilteredTopic)zzdds_java_require_unboxed(env, cft, "cft");
+    if (c == NULL) return NULL;
+    zzdds_ContentFilteredTopic zc = DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(c);
+
+    static zzdds_java_class_cache cache = {0};
+    if (!zzdds_java_get_or_cache_class(env, &cache, "io/zzdds/ext/ContentFilteredTopicImpl")) return NULL;
+    return (*env)->NewObject(env, cache.cls, cache.ctor, (jlong)(intptr_t)zc);
+}
+
 /* Mirrors zzdds_c.h's zzdds_process_configure_from_file -- a plain string-in,
  * retcode-out call, so (unlike create_participant_ex/get_default_participant_
  * config's DomainParticipantConfig struct parameter -- see CHANGELOG.md

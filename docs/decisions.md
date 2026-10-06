@@ -102,6 +102,26 @@ The history cache stores the complete payload. Each `DATA_FRAG` submessage is bu
 send time from a slice into `CacheChange.data`. This keeps the writer cache simple and
 allows retransmit of individual fragments without re-serialization.
 
+**Listeners never run under a zzdds lock: collect under it, dispatch after it.**
+Code that reaches application listeners records what to raise while holding its lock,
+pins each target (`quiesceAcquire` on the protocol endpoint or the DCPS entity), releases
+the lock, then dispatches and drops the pins. In the protocol reader, `on_data`, `on_eoc`
+and `on_heartbeat` only hand changes over under the reader's lock (which keeps them in
+order); the same operation then calls `on_flush` once the lock is released, and the DCPS
+reader raises `on_data_available`/`on_sample_rejected` from there. The built-in SEDP and
+WLP readers queue in `on_data` and process in `on_flush` through a `DrainQueue`: one
+caller drains at a time, which keeps arrival order, and a drain that starts while
+another runs (including re-entrantly, from a listener whose endpoint creation is
+delivered straight back) leaves its items to the running one instead of waiting, so no
+lock is held while processing. The participant pins the target readers or writer under
+`participant.mu` before handing them DATA, DATA_FRAG, GAP, HEARTBEAT, HEARTBEAT_FRAG,
+ACKNACK or NACK_FRAG. Collecting never drops a target for lack of memory: a fan-out whose
+target list cannot be allocated goes in fixed-size batches in entity-key order, and
+incompatible-QoS notifications are recorded on the endpoint's own participant entry. A
+listener may call any DDS operation without deadlocking, which DDS expects. The alternative (documenting "don't call back from a
+listener") would rule out ordinary patterns such as `get_matched_publications` from
+`on_data_available`.
+
 ---
 
 ## DCPS
@@ -127,6 +147,21 @@ reader pending queue when the type has registered `TypeSupport.get_field`; `Quer
 expressions run at `read()` / `take()` time using the same accessor. Without a field
 accessor, expressions pass samples through. Writer-side or transport push-down remains a
 future optimization if per-sample CPU cost becomes measurable.
+
+**ContentFilteredTopic filter expression is changeable in place (extension, 2026-10-05).**
+DDS fixes a CFT's filter expression at creation and only lets its parameters change, so
+changing the expression means replacing every reader on it (re-matching, losing untaken
+samples, repeating the reliable-readiness handshake). `zzdds::ContentFilteredTopic::
+set_filter_expression(expression, parameters)` replaces both in place, as other
+implementations' equivalent extensions do. The new expression is parsed and the
+parameters copied first, so a malformed expression returns BAD_PARAMETER and out of
+memory returns OUT_OF_RESOURCES with the filter unchanged; the swap then happens under the
+CFT's existing lock, so each sample is evaluated against either the old or the new filter.
+It applies to samples received afterwards; samples already in a reader are not
+re-filtered. An empty expression passes every sample. `get_filter_expression` returns a
+borrowed pointer, so replaced expression strings are kept until the CFT is deleted (one
+per change). Filtering is reader-side only, so nothing is re-announced; writer-side
+push-down would have to re-announce the reader's content-filter property.
 
 **`DataReader.read()` semantics: copy first, loan upgrade path preserved.**
 `readRaw()` is non-destructive: marks samples `READ_SAMPLE_STATE` in-place, returns

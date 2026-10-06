@@ -435,6 +435,11 @@ test "get_allocator: extensions-layer C-ABI vtables return the injected custom a
     const zsub_boxed = extensions.DDS_Subscriber_as_zzdds_Subscriber(sub_ent.vtable.get_c_abi_handle(sub_ent.ptr));
     const zsub = zidl_rt.unboxAsView(ZZDDS.Subscriber, zsub_boxed);
     try testing.expectEqual(expected, zsub.vtable.get_allocator(zsub.ptr));
+
+    const cft = dp.create_contentfilteredtopic("GAllocCft", topic, "", &DDS.StringSeq{});
+    const zcft_boxed = extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft.vtable.get_c_abi_handle(cft.ptr));
+    const zcft = zidl_rt.unboxAsView(ZZDDS.ContentFilteredTopic, zcft_boxed);
+    try testing.expectEqual(expected, zcft.vtable.get_allocator(zcft.ptr));
 }
 
 test "get_allocator: every nil singleton returns the fixed nil allocator" {
@@ -807,6 +812,28 @@ test "extensions: DataReader's Entity, DataReader, and ZZDDS.DataReader views al
     try testing.expectEqual(dr_boxed, zdr_boxed);
 }
 
+test "extensions: DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic shares the boxed handle and sets the filter expression" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    const cft = fx.dp_r.create_contentfilteredtopic("BootCft", fx.topic_r, "x > 1", &DDS.StringSeq{});
+    defer _ = fx.dp_r.vtable.delete_contentfilteredtopic(fx.dp_r.ptr, cft);
+    const cft_boxed = cft.vtable.get_c_abi_handle(cft.ptr);
+    const zcft_boxed = extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft_boxed);
+    try testing.expectEqual(cft_boxed, zcft_boxed);
+    const zcft = zidl_rt.unboxAsView(ZZDDS.ContentFilteredTopic, zcft_boxed);
+    try testing.expectEqual(cft.ptr, zcft.ptr);
+    try testing.expectEqual(cft.ptr, zcft.vtable.as_ContentFilteredTopic(zcft.ptr).ptr);
+
+    var p_strs = [1][*:0]const u8{"3"};
+    var p = DDS.StringSeq{ ._buffer = @ptrCast(&p_strs), ._length = 1, ._maximum = 1, ._release = false };
+    try testing.expectEqual(DDS.RETCODE_OK, zcft.vtable.set_filter_expression(zcft.ptr, "x < %0", &p));
+    try testing.expectEqualStrings("x < %0", cft.get_filter_expression());
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, zcft.vtable.set_filter_expression(zcft.ptr, "x < <", null));
+    try testing.expectEqualStrings("x < %0", cft.get_filter_expression());
+}
+
 const ExReaderState = struct {
     matched_current: i32 = 0,
     ready_calls: usize = 0,
@@ -1146,6 +1173,14 @@ test "extensions: as_Base borrowed-view upcasts are safe on nil ZZDDS handles" {
     try testing.expectEqual(std.heap.c_allocator, zsub.vtable.get_allocator(zsub.ptr));
     const dr_qos = DDS.DataReaderQos{};
     try testing.expectEqual(nd.NIL_PTR, zsub.vtable.create_datareader_ex(zsub.ptr, nd.nil_topic_description, &dr_qos, null, 0).ptr);
+
+    const nil_cft_boxed = nd.nil_cft.vtable.get_c_abi_handle(nd.nil_cft.ptr);
+    const zcft_boxed = extensions.DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(nil_cft_boxed);
+    const zcft = zidl_rt.unboxAsView(ZZDDS.ContentFilteredTopic, zcft_boxed);
+    try testing.expectEqual(nd.NIL_PTR, zcft.ptr);
+    try testing.expectEqual(nd.nil_cft.ptr, zcft.vtable.as_ContentFilteredTopic(zcft.ptr).ptr);
+    try testing.expectEqual(std.heap.c_allocator, zcft.vtable.get_allocator(zcft.ptr));
+    try testing.expectEqual(DDS.RETCODE_BAD_PARAMETER, zcft.vtable.set_filter_expression(zcft.ptr, "x = 1", null));
 }
 
 test "extensions: DDS_DomainParticipantFactory_as_zzdds_DomainParticipantFactory rejects foreign handles" {

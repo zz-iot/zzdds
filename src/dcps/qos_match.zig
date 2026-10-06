@@ -51,6 +51,29 @@ pub const PolicyId = enum(u32) {
     data_representation = 23,
 };
 
+/// The policies a compatibility check can fail on: the subset of PolicyId
+/// (same IDs) that checkDiscovered and checkPartition return. Its own type so
+/// code counting incompatibilities per policy (participant.zig's
+/// IncompatQosPending) covers exactly these; a check that fails on another
+/// policy must add it here first.
+pub const IncompatiblePolicy = enum(u32) {
+    durability = 2,
+    presentation = 3,
+    deadline = 4,
+    ownership = 6,
+    liveliness = 8,
+    partition = 10,
+    reliability = 11,
+    destination_order = 12,
+    data_representation = 23,
+
+    comptime {
+        for (@typeInfo(IncompatiblePolicy).@"enum".fields) |f| {
+            if (@intFromEnum(@field(PolicyId, f.name)) != f.value) @compileError("IncompatiblePolicy." ++ f.name ++ " differs from PolicyId");
+        }
+    }
+};
+
 // ── Match result ──────────────────────────────────────────────────────────────
 
 /// Result of a QoS compatibility check.
@@ -58,7 +81,7 @@ pub const MatchResult = union(enum) {
     /// All checked policies are compatible.
     compatible,
     /// The first policy that is not compatible.
-    incompatible: PolicyId,
+    incompatible: IncompatiblePolicy,
 
     pub fn isCompatible(self: MatchResult) bool {
         return self == .compatible;

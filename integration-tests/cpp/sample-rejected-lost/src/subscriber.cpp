@@ -184,11 +184,18 @@ int main(int argc, char **argv) {
         }
         usleep(POLL_PERIOD_MS * 1000);
     }
-    int lost_n = lost_reader.take_n(values.data(), infos.data(), MAX_SAMPLES,
-                                     ::DDS::ANY_SAMPLE_STATE, ::DDS::ANY_VIEW_STATE, ::DDS::ANY_INSTANCE_STATE);
+    // The loss is reported from the writer's HEARTBEAT, which can arrive
+    // before the repair that delivers the last sample: keep taking until it
+    // arrives (or the timeout says it never will).
     int max_seq = -1;
-    for (int i = 0; i < lost_n; i++) {
-        if (infos[i].valid_data && values[i].seq > max_seq) max_seq = values[i].seq;
+    for (int waited_ms = 0;; waited_ms += POLL_PERIOD_MS) {
+        int lost_n = lost_reader.take_n(values.data(), infos.data(), MAX_SAMPLES,
+                                         ::DDS::ANY_SAMPLE_STATE, ::DDS::ANY_VIEW_STATE, ::DDS::ANY_INSTANCE_STATE);
+        for (int i = 0; i < lost_n; i++) {
+            if (infos[i].valid_data && values[i].seq > max_seq) max_seq = values[i].seq;
+        }
+        if (max_seq == 4 || waited_ms >= STATUS_TIMEOUT_MS) break;
+        usleep(POLL_PERIOD_MS * 1000);
     }
     if (max_seq != 4) {
         std::fprintf(stderr, "FAIL: LostTopic did not deliver the writer's last sample (seq=4) -- last seen=%d\n", max_seq);

@@ -142,6 +142,19 @@ module zzdds {
         DDS::TopicDescription as_topic_description();
     };
 
+    // DDS fixes a ContentFilteredTopic's filter expression at creation; only
+    // its parameters can change (set_expression_parameters). This changes
+    // both in place, so readers on the topic keep their matches, history and
+    // reliable-readiness instead of being recreated. It applies to samples
+    // received afterwards; samples already in a reader are not re-filtered.
+    // An empty expression passes every sample. A malformed expression returns
+    // BAD_PARAMETER and leaves the filter unchanged.
+    @shared_c_abi_box interface ContentFilteredTopic : DDS::ContentFilteredTopic {
+        DDS::ReturnCode_t set_filter_expression(
+            in string        filter_expression,
+            in DDS::StringSeq expression_parameters);
+    };
+
     // Protocol-ready RELIABLE readiness signal — deliberately separate from
     // DDS::DataWriterListener::on_publication_matched, which fires on bare
     // SEDP discovery per spec. on_reliable_reader_ready fires once a matched

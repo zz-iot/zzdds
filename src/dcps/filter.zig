@@ -353,9 +353,12 @@ const Parser = struct {
     // or_expr = and_expr ('OR' and_expr)*
     fn parseOr(self: *Parser) anyerror!*AstNode {
         var left = try self.parseAnd();
+        // Frees whatever `left` holds when a later step fails.
+        errdefer freeAst(self.alloc, left);
         while (self.lex.peekKind() == .kw_or) {
             _ = self.lex.nextToken();
             const right = try self.parseAnd();
+            errdefer freeAst(self.alloc, right);
             const node = try self.alloc.create(AstNode);
             node.* = .{ .logical_or = .{ left, right } };
             left = node;
@@ -368,9 +371,12 @@ const Parser = struct {
     // we return here, so no ambiguity arises.
     fn parseAnd(self: *Parser) anyerror!*AstNode {
         var left = try self.parseNot();
+        // Frees whatever `left` holds when a later step fails.
+        errdefer freeAst(self.alloc, left);
         while (self.lex.peekKind() == .kw_and) {
             _ = self.lex.nextToken();
             const right = try self.parseNot();
+            errdefer freeAst(self.alloc, right);
             const node = try self.alloc.create(AstNode);
             node.* = .{ .logical_and = .{ left, right } };
             left = node;
@@ -383,6 +389,7 @@ const Parser = struct {
         if (self.lex.peekKind() == .kw_not) {
             _ = self.lex.nextToken();
             const child = try self.parseNot();
+            errdefer freeAst(self.alloc, child);
             const node = try self.alloc.create(AstNode);
             node.* = .{ .logical_not = child };
             return node;

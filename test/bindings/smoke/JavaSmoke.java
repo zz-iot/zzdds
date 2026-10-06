@@ -191,6 +191,24 @@ public class JavaSmoke {
         check(deleteRc == 0, "delete_datawriter() rc == 0 (would be PRECONDITION_NOT_MET if any loan_raw call above leaked its outstanding-loan count)");
         System.out.println("  delete_datawriter() after loan-backed writes: OK (no outstanding-loan leak)");
 
+        // zzdds::ContentFilteredTopic.set_filter_expression changes the filter
+        // expression in place (DDS only allows changing its parameters).
+        Dcps.DDS.ContentFilteredTopic cft = dpReader.create_contentfilteredtopic(
+            "JavaSmokeFiltered", topicReader, "id > 10", java.util.Collections.emptyList());
+        check(cft != null, "create_contentfilteredtopic() returned non-null");
+        Zzdds.zzdds.ContentFilteredTopic zCft =
+            (Zzdds.zzdds.ContentFilteredTopic) io.zzdds.runtime.ZzddsRuntime.asZzddsContentFilteredTopic(cft);
+        check(zCft != null, "asZzddsContentFilteredTopic() returned non-null");
+        check(zCft.set_filter_expression("id < %0", java.util.Arrays.asList("5")) == 0,
+              "set_filter_expression() rc == 0");
+        check("id < %0".equals(cft.get_filter_expression()), "get_filter_expression() reports the new expression");
+        check(zCft.set_filter_expression("id < < 5", java.util.Collections.emptyList())
+                  == Dcps.DDS.RETCODE_BAD_PARAMETER.value,
+              "malformed expression rejected with BAD_PARAMETER");
+        check("id < %0".equals(cft.get_filter_expression()), "rejected expression left the filter unchanged");
+        check(dpReader.delete_contentfilteredtopic(cft) == 0, "delete_contentfilteredtopic() rc == 0");
+        System.out.println("  ContentFilteredTopic.set_filter_expression: OK");
+
         System.out.println("All Java binding smoke checks passed.");
     }
 }

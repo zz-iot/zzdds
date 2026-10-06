@@ -486,6 +486,51 @@ fn publisherGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
     return impl.c_abi.get(impl.alloc, ctx, &PublisherImpl.views);
 }
 
+pub const cft_vtable = ZZDDS.ContentFilteredTopic.Vtable{
+    .set_filter_expression = cftSetFilterExpression,
+    .deinit = borrowedDeinit,
+    .get_c_abi_handle = cftGetCAbiHandleZzdds,
+    .get_allocator = cftGetAllocator,
+    .as_ContentFilteredTopic = cftAsDds,
+};
+
+fn cftSetFilterExpression(
+    ctx: *anyopaque,
+    filter_expression: [*:0]const u8,
+    expression_parameters: ?*const DDS.StringSeq,
+) DDS.ReturnCode_t {
+    if (ctx == nil.NIL_PTR) return DDS.RETCODE_BAD_PARAMETER;
+    const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(ctx));
+    return impl.setFilterExpression(std.mem.span(filter_expression), expression_parameters);
+}
+
+fn cftGetAllocator(ctx: *anyopaque) std.mem.Allocator {
+    if (ctx == nil.NIL_PTR) return std.heap.c_allocator;
+    const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(ctx));
+    return impl.alloc;
+}
+
+fn cftAsDds(ctx: *anyopaque) DDS.ContentFilteredTopic {
+    if (ctx == nil.NIL_PTR) return nil.nil_cft;
+    const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(ctx));
+    return impl.toDDSContentFilteredTopic();
+}
+
+var nil_zzdds_cft_c_abi: c_abi_handle.CachedCAbiHandle = .{};
+const nil_zzdds_cft_views = ZZDDS.ContentFilteredTopic.CAbiViews{
+    .base = .{
+        .base = .{ .flat_vtable = nil.nil_topic_description.vtable },
+        .flat_vtable = nil.nil_cft.vtable,
+    },
+    .flat_vtable = &cft_vtable,
+};
+
+fn cftGetCAbiHandleZzdds(ctx: *anyopaque) *anyopaque {
+    if (ctx == nil.NIL_PTR) return nil_zzdds_cft_c_abi.get(std.heap.c_allocator, ctx, &nil_zzdds_cft_views);
+    const impl: *ContentFilteredTopicImpl = @ptrCast(@alignCast(ctx));
+    return impl.c_abi.get(impl.alloc, ctx, &ContentFilteredTopicImpl.views);
+}
+
 pub const subscriber_vtable = ZZDDS.Subscriber.Vtable{
     .create_datareader_ex = subscriberCreateDataReaderEx,
     .deinit = borrowedDeinit,
@@ -851,6 +896,16 @@ pub export fn DDS_Topic_as_zzdds_Topic(topic: *anyopaque) callconv(.c) *anyopaqu
     const t = zidl_rt.unboxAsView(DDS.Topic, topic);
     if (t.vtable != &TopicImpl.topic_vtable) return topicGetCAbiHandleZzdds(nil.NIL_PTR);
     const r: ZZDDS.Topic = .{ .ptr = t.ptr, .vtable = &topic_vtable };
+    return r.vtable.get_c_abi_handle(r.ptr);
+}
+
+/// Only valid for content-filtered topics created through a FactoryOwner-owned
+/// participant. Returns a nil handle for any handle not issued by this
+/// implementation.
+pub export fn DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(cft: *anyopaque) callconv(.c) *anyopaque {
+    const c = zidl_rt.unboxAsView(DDS.ContentFilteredTopic, cft);
+    if (c.vtable != &ContentFilteredTopicImpl.cft_vtable) return cftGetCAbiHandleZzdds(nil.NIL_PTR);
+    const r: ZZDDS.ContentFilteredTopic = .{ .ptr = c.ptr, .vtable = &cft_vtable };
     return r.vtable.get_c_abi_handle(r.ptr);
 }
 

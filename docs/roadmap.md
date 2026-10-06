@@ -225,6 +225,61 @@ Forward-looking only: known gaps, planned features, and open design questions.
      or further investigation) become their own roadmap items, migrated when that code
      is next worked on rather than in one sweep.
 
+- **rmw_zzdds: change content filters in place.** zzdds now offers
+  `zzdds::ContentFilteredTopic::set_filter_expression(expression, parameters)` (DDS only
+  allows changing a CFT's parameters); see `decisions.md`. rmw_zzdds's
+  `rmw_subscription_set_content_filter` still replaces the subscription's DataReader when
+  the expression changes, so the new reader re-matches every publisher (rmw_zzdds offsets
+  its matched status to keep the subscription's continuous), loses samples not yet taken
+  from the old reader, and re-runs the reliable-readiness handshake. Switch it to
+  `set_filter_expression`. To avoid the swap for the first filter and for clearing one too,
+  create every subscription's reader on a CFT from the start, with an empty expression
+  (zzdds treats it as "no filtering"). Then drop the reader replacement and the
+  matched-status continuity code. Other implementations offer the same operation
+  (`set_expression` since one implementation's 5.1.0, `set_filter_expression` in another),
+  and the other ROS 2 RMWs built on them change expressions in place.
+- **Listener release hooks can run under a parent's lock during teardown.**
+  `Subscriber::delete_contained_entities` and `Publisher::delete_contained_entities`
+  deinit their readers/writers while holding their own lock, and dropping a reader's or
+  writer's last listener reference calls the application's `release_listener_data` there.
+  A release hook that calls back into the subscriber or publisher deadlocks. Listener
+  callbacks themselves no longer run under any zzdds lock (2026-10-05); bring teardown in
+  line by detaching the children under the lock and deiniting them after it is released,
+  as `DomainParticipant::delete_contained_entities` already does.
+- **Incompatible-QoS status counts an already-known remote endpoint again.** DDS defines
+  `REQUESTED_INCOMPATIBLE_QOS`/`OFFERED_INCOMPATIBLE_QOS` `total_count` as the number of
+  incompatible remote writers/readers discovered. The participant checks a local endpoint
+  against remote ones in two places: when the local endpoint is announced
+  (`subAnnounceProtoReader`/`pubAnnounceProtoWriter`, against everything already
+  discovered) and whenever a remote endpoint is announced (`onWriterDiscovered`/
+  `onReaderDiscovered`, against every local endpoint). A matched pair is not counted
+  twice because the second check finds it already matched, but nothing records an
+  incompatible pair, so each re-announcement of a known incompatible endpoint counts and
+  notifies again. In-process discovery (`discovery/direct.zig`) triggers this every time a
+  reader is created after its writers, since it re-delivers every existing writer to the
+  new reader's participant; over SEDP it needs a re-announcement of an already-known
+  endpoint (a QoS change, for example).
+  Fix: in `onWriterDiscovered`/`onReaderDiscovered`, skip the incompatibility check when
+  the remote endpoint is already in `discovered_writers`/`discovered_readers` with
+  unchanged QoS (`upsertDiscoveredWriter`/`upsertDiscoveredReader` already do the lookup):
+  every local endpoint existing at that point was already checked against it, either at
+  its own announcement or at the remote endpoint's first. Matching is unaffected. This
+  needs no per-pair state, so no allocation (which could fail) and no growth of
+  `ActiveReader`/`ActiveWriter` (whose map allocation must, for now, fit a 4 KiB block; see
+  "Allocator strategy" below). Forgetting
+  comes with the discovery record: SPDP lease expiry, a participant's goodbye, a failed
+  liveness probe and `removePeer` (all via `onParticipantLost`), and SEDP disposes (via
+  `onWriterLost`/`onReaderLost`) remove it, so a later rediscovery counts as new. Not a
+  timeout, which would recount a still-present endpoint, and not WLP: a writer that
+  loses liveliness stays discovered, and DDS reports that only through
+  `liveliness_changed`. Open question: whether a known endpoint whose QoS changes and is
+  still incompatible counts again; the simplest rule is to count only when the result
+  changes (compatible to incompatible, or a different policy). Tests: reader created
+  after its writers (in-process replay), unchanged re-announcement, rediscovery after
+  participant loss, and a QoS change. `listener_lock_test`'s "a reader incompatible with
+  several writers is told each policy" deliberately checks only the first two
+  notifications until this is fixed.
+
 ### Selective CDR parse (`deserialize_selected`) — deferred follow-ups
 
 zidl v0.3.12 adds a mask-driven selective parser (`deserialize_selected(want)` /
@@ -344,19 +399,72 @@ or an optimisation on an already-improved path):
   riskiest item in the allocator plan. Also: zidl's C++ union codegen doesn't emit the
   ctor/dtor that unions with non-trivially-constructible members (`std::string`,
   `std::vector`, …) need.
-- **"Zero malloc" needs an explicit definition** — not defaulted to the strongest reading.
 - **History-cache per-change heap allocation** — future path: slab/pool per topic, or a
   ring-buffer of fixed-size blocks for embedded targets. `decisions.md`,
   `design/history-cache.md`.
-- **Two embedded showcase apps** (`zzdds-embedded-c-example/`, `zzdds-embedded-cpp-example/`)
-  are proposed, not built (M1 = bounded fields; M2 = unbounded string/sequence), along with
-  an `LD_PRELOAD` malloc/new abort shim as a CI acceptance test for them.
 - **Generated-class lifecycle** — the app-owned boxed-buffer allocator match is not
   structurally enforced (correct only while an entity's `_with_allocator` allocator equals
   the process-wide one; closing it needs `{Type}_free()` to take an entity parameter, a
   C-ABI shape change). `--audit-lifecycle` is a diagnostic, not a build gate, and is not
   CI-enforced. A future GC'd binding needs a codegen-generated Category-2 (`GuardCondition`)
   identity-cache registration hook. `design/generated-class-lifecycle-design.md`.
+- **Check the allocation properties embedded targets need, not a 4 KiB block size.**
+  The `custom-allocator` examples (C, C++) exist to show that every zzdds allocation can go
+  through a caller-supplied allocator, with none after setup (`noalloc_guard`). Their pool
+  is 512 fixed 4096-byte blocks (2 MiB), so any single request over 4096 bytes fails. That
+  size was never a design goal (this doc's "zero malloc" definition is about steady-state
+  allocation, not request size), and zzdds does not meet it in general: the participant's
+  `ActiveWriter`/`ActiveReader` maps grow from 8 slots to 16 at the 7th local writer or
+  reader, about 7.4 KiB, so the examples pass only because they have few endpoints. Real
+  pools are not like this either: fixed-block allocators (several RTOSes have them) are
+  used as several pools of different block sizes, or a general allocator such as TLSF runs
+  over a static buffer; a single block size spends a whole 4 KiB block on every 16-byte
+  request. And the pool itself (2 MiB) is larger than the targets in view: an RP2040 has
+  264 KB of SRAM, an RP2350 520 KB, a classic ESP32 roughly 320 KB of usable data RAM.
+  Work, in order:
+  1. Replace the examples' pool with a realistic one: either pools of a few block sizes
+     (RTOS style) or one static buffer with a general allocator (bare-metal style, like
+     Zig's `FixedBufferAllocator`). Keep "no malloc, fixed size, caller-controlled" and
+     `noalloc_guard`, and print peak pool use so the example shows its footprint.
+  2. In the same change, remove the unit test in `dcps/participant.zig` that requires the
+     `ActiveWriter`/`ActiveReader` maps' first allocation to fit 4096 bytes. It exists only
+     to keep these examples passing in CI until then (added for PR #99, when a ~100-byte
+     growth of those records failed them).
+  3. Run both examples under `libnoalloc_guard.so` in CI (Linux; `LD_PRELOAD` has no
+     Windows equivalent). The examples call `noalloc_guard_try_arm()`, but CI never
+     preloads the shim, so today they run unguarded ("noalloc_guard: not preloaded" in the
+     logs) and the zero-allocation property is not enforced anywhere; nothing in this
+     repo's history ever preloaded it. Both pass with it preloaded (checked by hand
+     2026-10-06), so turning it on with today's arming should be straightforward; the
+     larger part is the arming itself. The programs arm only after setup plus a
+     discovery-settling delay, because some allocations happen outside the custom
+     allocator: libc work behind discovery's background threads and the one-time network
+     interface enumeration (`getifaddrs`). That allows any allocation during the delay.
+     Prefer naming the known exceptions instead: first run the shim in a log-only mode
+     (record every allocation with a backtrace, don't abort) to get the inventory, then
+     have zzdds mark each known libc call that allocates with a scope the shim honours
+     (for example a thread-local "allowed" flag set around the call), so the guard can arm
+     right after setup, or from process start, and anything not on the list trips it.
+     Where practical, remove an exception rather than list it (for example, enumerate
+     interfaces into caller-allocated memory instead of `getifaddrs`).
+  4. Report allocation failures instead of swallowing them. Found the same way: when that
+     map allocation failed, `create_datawriter` still returned a writer whose protocol
+     writer was never registered, and the first `write` returned `RETCODE_ERROR`. On a
+     memory-constrained device a failed creation has to fail at creation. Sweep entity
+     creation and discovery paths for `catch {}`-style drops.
+  5. Add a memory-budget check: a test that sets up a known participant (N writers and
+     readers, a fixed topic set) from one static buffer and fails above a set size. This
+     checks what matters for microcontroller targets (total footprint, everything at
+     setup) and can be tightened as that work progresses. Other microcontroller gaps (no
+     threads or sockets; see the single-threaded `drive(timeout)` design task) are separate.
+  6. Bring `design/allocator-strategy.md` up to date. Its showcase section still proposes
+     two standalone apps outside this repo; they were built as `examples/{c,cpp}/
+     custom-allocator` here, covering both milestones (bounded `SensorSample`, unbounded
+     `SensorLog`) and the shim. Its "Definition of 'zero malloc'" section still asks for a
+     decision; record the one made: no allocation after setup, with known libc allocations
+     at startup and in background threads allowed. And its claim that the C++ example can
+     arm the guard from process start contradicts the examples, which arm after a delay
+     (step 3).
 
 ### Testing
 
@@ -484,8 +592,9 @@ non-Zig binding bridge, then TypeLookup integration. `design/thread-model.md`.
 Full plan, inventory, and phase ordering in
 [`design/allocator-strategy.md`](design/allocator-strategy.md). Tier 0 (C-ABI bootstrap
 injection — `zzdds_create_factory_with_allocator`) and Tier 1 (the `get_c_abi_handle` cache)
-are done. Remaining: Tiers 2 & 3 and the C++ generated-binding injection design (see Known
-Gaps above), plus the embedded showcase apps.
+are done, and the embedded showcase apps exist as `examples/{c,cpp}/custom-allocator`.
+Remaining: Tiers 2 & 3, the C++ generated-binding injection design, and the allocation
+checks for embedded targets (see Known Gaps above).
 
 ### Cross-binding DCPS API test-coverage buildout
 

@@ -220,6 +220,10 @@ DDS_Subscriber zzdds_Subscriber_as_DDS_Subscriber(zzdds_Subscriber subscriber);
 /** NOTE: only valid for subscribers owned by a zzdds FactoryOwner participant.
  *  Reaches zzdds_Subscriber_create_datareader_ex. */
 zzdds_Subscriber DDS_Subscriber_as_zzdds_Subscriber(DDS_Subscriber subscriber);
+DDS_ContentFilteredTopic zzdds_ContentFilteredTopic_as_DDS_ContentFilteredTopic(zzdds_ContentFilteredTopic cft);
+/** NOTE: only valid for content-filtered topics owned by a zzdds FactoryOwner
+ *  participant. Reaches zzdds_ContentFilteredTopic_set_filter_expression. */
+zzdds_ContentFilteredTopic DDS_ContentFilteredTopic_as_zzdds_ContentFilteredTopic(DDS_ContentFilteredTopic cft);
 DDS_TopicDescription zzdds_topic_as_description(DDS_Topic topic);
 
 /**

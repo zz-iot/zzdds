@@ -63,6 +63,7 @@ const cpp_impl_override_args = [_][]const u8{
     "--cpp-impl-override", "DDS::DataReader=::zzdds::detail::DataReaderSupport",
     "--cpp-impl-override", "DDS::Publisher=::zzdds::detail::PublisherSupport",
     "--cpp-impl-override", "DDS::Subscriber=::zzdds::detail::SubscriberSupport",
+    "--cpp-impl-override", "DDS::ContentFilteredTopic=::zzdds::detail::ContentFilteredTopicSupport",
     "--cpp-impl-override", "DDS::DomainParticipant=::zzdds::detail::DomainParticipantSupport",
     "--cpp-impl-include",  "zzdds_cpp.hpp",
 };
@@ -227,6 +228,8 @@ pub fn build(b: *std.Build) void {
         \\pub const DataWriterQos = Generated.DataWriterQos;
         \\pub const Publisher = Generated.Publisher;
         \\pub const Subscriber = Generated.Subscriber;
+        \\pub const ContentFilteredTopic = Generated.ContentFilteredTopic;
+        \\pub const StringSeq = Generated.StringSeq;
         \\pub const DomainId_t = Generated.DomainId_t;
         \\pub const DomainParticipant = Generated.DomainParticipant;
         \\pub const DomainParticipantListener = Generated.DomainParticipantListener;
@@ -1318,6 +1321,7 @@ pub fn build(b: *std.Build) void {
                     "DataReaderListenerExImpl.java",
                     "DataWriterImpl.java",
                     "DataWriterListenerExImpl.java",
+                    "ContentFilteredTopicImpl.java",
                     "DomainParticipantFactoryImpl.java",
                     "DomainParticipantImpl.java",
                     "PublisherImpl.java",
@@ -1576,6 +1580,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/read_take_test.zig",
         "test/dcps/cft_test.zig",
         "test/dcps/matched_status_test.zig",
+        "test/dcps/listener_lock_test.zig",
         "test/dcps/listener_fallback_test.zig",
         "test/dcps/sample_rejected_test.zig",
         "test/dcps/type_support_test.zig",

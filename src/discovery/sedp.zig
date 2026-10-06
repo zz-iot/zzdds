@@ -53,6 +53,7 @@ const CacheChange = history_mod.CacheChange;
 const ChangeKind = history_mod.ChangeKind;
 const RtpsTimestamp = time_mod.RtpsTimestamp;
 const Mutex = mutex_mod.Mutex;
+const DrainQueue = @import("../util/drain_queue.zig").DrainQueue;
 const Callbacks = iface.Callbacks;
 const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 const ParticipantData = iface.ParticipantData;
@@ -319,6 +320,12 @@ pub const SedpEndpoints = struct {
     mu: Mutex,
     participant_locs_mu: Mutex,
     callbacks: ?*const Callbacks,
+    /// Endpoint announcements handed over by the built-in readers' on_data,
+    /// which runs under each reader's lock, waiting for that reader's
+    /// on_flush (after the lock is released) to process them: processing
+    /// reaches the participant's discovery callbacks and from there
+    /// application listeners. See DrainQueue.
+    deferred: DrainQueue(DeferredChange) = .{},
     tracer: trace.Tracer,
 
     // Metatraffic unicast port (where we listen for SEDP data).
@@ -398,6 +405,7 @@ pub const SedpEndpoints = struct {
         if (self.pub_reader) |r| r.deinit();
         if (self.sub_writer) |w| w.deinit();
         if (self.sub_reader) |r| r.deinit();
+        self.deferred.deinit(self.alloc, self);
         self.participant_locs_mu.lock();
         var it = self.participant_locs.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit();
@@ -520,7 +528,7 @@ pub const SedpEndpoints = struct {
             true, // SEDP builtin readers are RELIABLE (RTPS §8.5)
         );
         self.pub_reader.?.setTracer(self.tracer);
-        self.pub_reader.?.setCallback(.{ .ctx = self, .on_data = onPubData });
+        self.pub_reader.?.setCallback(.{ .ctx = self, .on_data = onPubData, .on_flush = onFlush });
 
         // Subscriptions writer/reader
         self.sub_writer = try StatefulWriter.init(
@@ -544,7 +552,7 @@ pub const SedpEndpoints = struct {
             true, // SEDP builtin readers are RELIABLE (RTPS §8.5)
         );
         self.sub_reader.?.setTracer(self.tracer);
-        self.sub_reader.?.setCallback(.{ .ctx = self, .on_data = onSubData });
+        self.sub_reader.?.setCallback(.{ .ctx = self, .on_data = onSubData, .on_flush = onFlush });
 
         // Listen on the metatraffic unicast port for SEDP traffic.
         if (self.meta_unicast_port != 0) {
@@ -798,14 +806,54 @@ pub const SedpEndpoints = struct {
 
     // ── SEDP reader data callbacks ────────────────────────────────────────────
 
+    const DeferredChange = struct {
+        is_writer: bool,
+        kind: history_mod.ChangeKind,
+        data: []u8,
+    };
+
     fn onPubData(ctx: *anyopaque, ch: *const CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.handleEndpointChange(ch, true);
+        self.deferChange(ch, true);
     }
 
     fn onSubData(ctx: *anyopaque, ch: *const CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.handleEndpointChange(ch, false);
+        self.deferChange(ch, false);
+    }
+
+    /// Under the built-in reader's lock: keep a copy for onFlush.
+    fn deferChange(self: *Self, ch: *const CacheChange, is_writer: bool) void {
+        if (ch.kind != .alive) return; // handleEndpointChange ignores the rest
+        const data = self.alloc.dupe(u8, ch.data) catch {
+            log.sedp.warn("sedp: out of memory queueing an endpoint announcement; dropped", .{});
+            return;
+        };
+        self.deferred.push(self.alloc, .{ .is_writer = is_writer, .kind = ch.kind, .data = data }) catch {
+            self.alloc.free(data);
+            log.sedp.warn("sedp: out of memory queueing an endpoint announcement; dropped", .{});
+        };
+    }
+
+    /// A built-in reader's on_flush: processes the queued announcements, in
+    /// arrival order, with no reader lock held.
+    fn onFlush(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.deferred.drain(self.alloc, self);
+    }
+
+    /// DrainQueue context: called for each queued announcement.
+    pub fn process(self: *Self, d: DeferredChange) void {
+        defer self.alloc.free(d.data);
+        var ch = std.mem.zeroes(CacheChange);
+        ch.kind = d.kind;
+        ch.data = d.data;
+        self.handleEndpointChange(&ch, d.is_writer);
+    }
+
+    /// DrainQueue context: called at deinit for each announcement still queued.
+    pub fn discard(self: *Self, d: DeferredChange) void {
+        self.alloc.free(d.data);
     }
 
     fn handleEndpointChange(self: *Self, ch: *const CacheChange, is_writer: bool) void {

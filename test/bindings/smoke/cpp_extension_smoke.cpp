@@ -12,7 +12,9 @@
 //   - the entity passed to the matched callback is the same C++ object the
 //     application holds (one wrapper per entity; the extended-listener
 //     bridges once built a separate base wrapper);
-//   - that entity upcasts to zzdds::DataWriterImpl / zzdds::DataReaderImpl.
+//   - that entity upcasts to zzdds::DataWriterImpl / zzdds::DataReaderImpl;
+//   - a ContentFilteredTopic upcasts to zzdds::ContentFilteredTopicImpl, whose
+//     set_filter_expression changes the filter without unmatching its reader.
 #include "zzdds_cpp.hpp"
 
 #include <atomic>
@@ -128,6 +130,33 @@ int main() {
         std::lock_guard<std::mutex> l(rlistener->mu);
         CHECK(rlistener->matched_reader == dr);
     }
+
+    // zzdds::ContentFilteredTopic::set_filter_expression: a reader on the
+    // filtered topic keeps its match across an expression change.
+    auto cft = dp_r->create_contentfilteredtopic("CppExtensionSmokeFiltered", topic_r, "id > 10", {});
+    CHECK(cft);
+    auto zcft = std::dynamic_pointer_cast<::zzdds::ContentFilteredTopicImpl>(cft);
+    CHECK(zcft);
+    auto cft_reader = sub->create_datareader(cft, dr_qos, nullptr, 0);
+    CHECK(cft_reader);
+    CHECK(wait_until([&] {
+        ::DDS::SubscriptionMatchedStatus st{};
+        return cft_reader->get_subscription_matched_status(st) == ::DDS::RETCODE_OK && st.current_count == 1;
+    }));
+    CHECK(zcft->set_filter_expression("id < %0", {"5"}) == ::DDS::RETCODE_OK);
+    CHECK(cft->get_filter_expression() == "id < %0");
+    ::DDS::StringSeq params;
+    CHECK(cft->get_expression_parameters(params) == ::DDS::RETCODE_OK);
+    CHECK(params.size() == 1 && params[0] == "5");
+    CHECK(zcft->set_filter_expression("id < < 5", {}) == ::DDS::RETCODE_BAD_PARAMETER);
+    CHECK(cft->get_filter_expression() == "id < %0");
+    {
+        ::DDS::SubscriptionMatchedStatus st{};
+        CHECK(cft_reader->get_subscription_matched_status(st) == ::DDS::RETCODE_OK);
+        CHECK(st.current_count == 1 && st.total_count == 1);
+    }
+    CHECK(sub->delete_datareader(cft_reader) == ::DDS::RETCODE_OK);
+    CHECK(dp_r->delete_contentfilteredtopic(cft) == ::DDS::RETCODE_OK);
 
     CHECK(pub->delete_datawriter(dw) == ::DDS::RETCODE_OK);
     CHECK(sub->delete_datareader(dr) == ::DDS::RETCODE_OK);

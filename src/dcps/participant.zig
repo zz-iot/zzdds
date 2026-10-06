@@ -548,6 +548,50 @@ const IncompatQosNotify = struct {
     notify: *const fn (ctx: *anyopaque, policy_id: i32) void,
 };
 
+/// Incompatible-QoS notifications for one local endpoint, recorded under
+/// participant.mu and raised after it is released by
+/// DomainParticipantImpl.raiseIncompatQos: they reach
+/// on_requested/offered_incompatible_qos, application code. Kept on the
+/// endpoint's own ActiveReader/ActiveWriter entry, so recording one needs no
+/// memory and cannot fail. Each recorded incompatibility is raised once, with
+/// its own policy, and the most recently recorded policy is raised last, so the
+/// status read afterwards reports it as last_policy_id.
+///
+/// Counted per policy, over only the policies a compatibility check can fail
+/// on (qos_match.IncompatiblePolicy), which keeps this small: it sits in every
+/// ActiveReader/ActiveWriter, and the first allocation of those maps must fit
+/// a 4 KiB block (see the size test at the end of this file). A count cannot
+/// overflow: one discovery event records at most one incompatibility per
+/// discovered remote endpoint.
+const IncompatQosPending = struct {
+    const Policy = qm_mod.IncompatiblePolicy;
+    const policies = std.enums.values(Policy);
+
+    counts: [policies.len]u32 = @splat(0),
+    last: ?u8 = null,
+
+    fn any(self: *const IncompatQosPending) bool {
+        return self.last != null;
+    }
+
+    fn record(self: *IncompatQosPending, policy: Policy) void {
+        const i: u8 = @intCast(std.mem.indexOfScalar(Policy, policies, policy).?);
+        self.counts[i] += 1;
+        self.last = i;
+    }
+
+    /// Calls `notify(ctx, policy_id)` once per recorded incompatibility, the
+    /// most recently recorded policy last.
+    fn raise(self: *const IncompatQosPending, n: IncompatQosNotify) void {
+        const last = self.last orelse return;
+        for (self.counts, policies, 0..) |count, policy, i| {
+            if (i == last) continue;
+            for (0..count) |_| n.notify(n.ctx, @intCast(@intFromEnum(policy)));
+        }
+        for (0..self.counts[last]) |_| n.notify(n.ctx, @intCast(@intFromEnum(policies[last])));
+    }
+};
+
 /// Callback registered by DataWriterImpl / DataReaderImpl so that the participant
 /// can fire on_publication_matched / on_subscription_matched when a remote entity
 /// matches or unmatches.  `added` is true on match, false on unmatch.
@@ -769,6 +813,7 @@ const ActiveWriter = struct {
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
     incompat_qos: ?IncompatQosNotify = null,
+    incompat_pending: IncompatQosPending = .{},
     matched_notify: ?MatchedNotify = null,
     timer_check: ?TimerNotify = null,
     liveliness_assert: ?AssertNotify = null,
@@ -787,6 +832,7 @@ const ActiveReader = struct {
     partition_names: []const []const u8 = &.{}, // heap-owned copy via dupePartitionNames
     presentation: DDS.PresentationQosPolicy = .{},
     incompat_qos: ?IncompatQosNotify = null,
+    incompat_pending: IncompatQosPending = .{},
     matched_notify: ?MatchedNotify = null,
     timer_check: ?TimerNotify = null,
     key_hash_ctx: *anyopaque = undefined,
@@ -1995,6 +2041,171 @@ pub const DomainParticipantImpl = struct {
         return std.mem.zeroes([16]u8);
     }
 
+    /// Raises the incompatible-QoS notifications recorded on local readers or
+    /// writers (see IncompatQosPending), with self.mu released. Each endpoint
+    /// is pinned under self.mu by its matched_notify (registered alongside
+    /// incompat_qos) so a concurrent delete cannot free it meanwhile. Batches
+    /// are fixed-size, so raising them needs no memory either.
+    fn raiseIncompatQos(self: *Self, comptime which: enum { readers, writers }) void {
+        const Job = struct { notify: IncompatQosNotify, pin: MatchedNotify, pending: IncompatQosPending };
+        while (true) {
+            var jobs: [16]Job = undefined;
+            var n: usize = 0;
+            var more = false;
+            self.mu.lock();
+            var it = switch (which) {
+                .readers => self.active_readers.valueIterator(),
+                .writers => self.active_writers.valueIterator(),
+            };
+            while (it.next()) |e| {
+                if (!e.incompat_pending.any()) continue;
+                if (n == jobs.len) {
+                    more = true;
+                    break;
+                }
+                const pending = e.incompat_pending;
+                e.incompat_pending = .{};
+                const notify = e.incompat_qos orelse continue;
+                const pin = e.matched_notify orelse continue;
+                if (!pin.quiesceAcquire()) continue;
+                jobs[n] = .{ .notify = notify, .pin = pin, .pending = pending };
+                n += 1;
+            }
+            self.mu.unlock();
+            for (jobs[0..n]) |job| {
+                job.pending.raise(job.notify);
+                job.pin.quiesceRelease();
+            }
+            if (!more) return;
+        }
+    }
+
+    /// A protocol reader pinned under self.mu for dispatch after it is
+    /// released; see dispatchToReaders.
+    pub const PinnedReader = struct {
+        proto: proto.ProtocolReader,
+        key_hash: [16]u8 = std.mem.zeroes([16]u8),
+    };
+
+    /// What dispatchToReaders needs to resolve each reader's key hash for a DATA.
+    pub const DataKeyArgs = struct {
+        key_hash: ?[16]u8,
+        payload: []const u8,
+        kind: history_mod.ChangeKind,
+    };
+
+    /// Fan-out readers pinned in one go before a heap allocation is needed.
+    const FANOUT_STACK = 16;
+    /// Fan-out batch size when even that allocation fails.
+    const FANOUT_BATCH = 16;
+
+    /// Calls `ctx.deliver(reader)` for each reader a submessage addressed to
+    /// `reader_entity_id` reaches (every active reader for ENTITYID_UNKNOWN),
+    /// with self.mu released: protocol readers raise application listeners
+    /// (on_data_available, on_sample_lost, on_liveliness_changed, ...). Each
+    /// reader is pinned with quiesceAcquire under self.mu so a concurrent
+    /// delete cannot free it meanwhile; a reader already tearing down is
+    /// skipped. With `data`, also resolves each reader's key hash, which needs
+    /// its type support. No reader is ever skipped for lack of memory: when the
+    /// fan-out list cannot be allocated, readers go in fixed-size batches in
+    /// entity-key order (see nextFanoutBatch).
+    fn dispatchToReaders(self: *Self, reader_entity_id: EntityId, data: ?DataKeyArgs, ctx: anytype) void {
+        if (!reader_entity_id.eql(EntityIds.unknown)) {
+            self.mu.lock();
+            const target = if (self.active_readers.getPtr(entityIdKey(reader_entity_id))) |ar| pinReaderLocked(ar, data) else null;
+            self.mu.unlock();
+            if (target) |t| {
+                ctx.deliver(t);
+                t.proto.quiesceRelease();
+            }
+            return;
+        }
+
+        var sfa = std.heap.stackFallback(FANOUT_STACK * @sizeOf(PinnedReader), self.alloc);
+        const a = sfa.get();
+        var targets: std.ArrayListUnmanaged(PinnedReader) = .empty;
+        defer targets.deinit(a);
+        self.mu.lock();
+        if (targets.ensureTotalCapacityPrecise(a, self.active_readers.count())) |_| {
+            var it = self.active_readers.valueIterator();
+            while (it.next()) |ar| if (pinReaderLocked(ar, data)) |t| targets.appendAssumeCapacity(t);
+            self.mu.unlock();
+            for (targets.items) |t| {
+                ctx.deliver(t);
+                t.proto.quiesceRelease();
+            }
+            return;
+        } else |_| {}
+        self.mu.unlock();
+        self.dispatchToReadersBatched(data, ctx);
+    }
+
+    /// dispatchToReaders' fan-out to every active reader when its list cannot
+    /// be allocated: FANOUT_BATCH readers at a time, in entity-key order, with
+    /// no allocation. Public only so tests can drive it directly.
+    pub fn dispatchToReadersBatched(self: *Self, data: ?DataKeyArgs, ctx: anytype) void {
+        var after: ?u32 = null;
+        while (true) {
+            var keys: [FANOUT_BATCH]u32 = undefined;
+            self.mu.lock();
+            const sel = nextFanoutBatch(&self.active_readers, after, &keys);
+            var batch: [FANOUT_BATCH]PinnedReader = undefined;
+            var n: usize = 0;
+            for (keys[0..sel.len]) |k| {
+                if (pinReaderLocked(self.active_readers.getPtr(k).?, data)) |t| {
+                    batch[n] = t;
+                    n += 1;
+                }
+            }
+            self.mu.unlock();
+            for (batch[0..n]) |t| {
+                ctx.deliver(t);
+                t.proto.quiesceRelease();
+            }
+            if (!sel.more) return;
+            after = keys[sel.len - 1];
+        }
+    }
+
+    /// Fills `out` with the smallest keys of `map` greater than `after`, in
+    /// ascending order, and reports whether larger ones remain. Repeated with
+    /// `after` set to the last key returned, it visits every key once without
+    /// allocating, even if the map changes between calls (a key added below
+    /// `after` meanwhile is not visited).
+    fn nextFanoutBatch(map: anytype, after: ?u32, out: []u32) struct { len: usize, more: bool } {
+        var n: usize = 0;
+        var more = false;
+        var it = map.keyIterator();
+        while (it.next()) |kp| {
+            const k = kp.*;
+            if (after) |lo| if (k <= lo) continue;
+            if (n == out.len) {
+                more = true;
+                if (k > out[n - 1]) continue;
+                n -= 1;
+            }
+            var i = n;
+            while (i > 0 and out[i - 1] > k) : (i -= 1) out[i] = out[i - 1];
+            out[i] = k;
+            n += 1;
+        }
+        return .{ .len = n, .more = more };
+    }
+
+    fn pinReaderLocked(ar: *ActiveReader, data: ?DataKeyArgs) ?PinnedReader {
+        if (!ar.proto.quiesceAcquire()) return null;
+        const kh = if (data) |d| resolveKeyHash(d.key_hash, ar, d.payload, d.kind) else std.mem.zeroes([16]u8);
+        return .{ .proto = ar.proto, .key_hash = kh };
+    }
+
+    /// Under self.mu: the active writer with `writer_entity_id`, pinned for
+    /// dispatch after self.mu is released (handleAckNack can raise
+    /// on_reliable_reader_ready). The caller releases the pin.
+    fn pinWriterLocked(self: *Self, writer_entity_id: EntityId) ?proto.ProtocolWriter {
+        const aw = self.active_writers.getPtr(entityIdKey(writer_entity_id)) orelse return null;
+        return if (aw.proto.quiesceAcquire()) aw.proto else null;
+    }
+
     fn dispatchDirectedWrite(
         self: *DomainParticipantImpl,
         dw_bytes: []const u8,
@@ -2012,8 +2223,21 @@ pub const DomainParticipantImpl = struct {
         if (dw_bytes.len < 4) return;
         const endian: std.builtin.Endian = if (little_endian) .little else .big;
         const count = std.mem.readInt(u32, dw_bytes[0..4], endian);
-        self.mu.lock();
-        defer self.mu.unlock();
+        const Deliver = struct {
+            writer_guid: Guid,
+            sn: @TypeOf(sn),
+            ts: time_mod.RtpsTimestamp,
+            payload: []const u8,
+            kind: history_mod.ChangeKind,
+            coherent_set_sn: ?history_mod.SequenceNumber,
+            group_seq_num: ?history_mod.SequenceNumber,
+            lifespan_ns: ?i64,
+            fn deliver(c: @This(), t: PinnedReader) void {
+                t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.lifespan_ns);
+            }
+        };
+        const ctx = Deliver{ .writer_guid = writer_guid, .sn = sn, .ts = ts, .payload = payload, .kind = kind, .coherent_set_sn = coherent_set_sn, .group_seq_num = group_seq_num, .lifespan_ns = lifespan_ns };
+        // One reader per entry, so nothing to collect (or allocate).
         var i: u32 = 0;
         while (i < count) : (i += 1) {
             const offset = 4 + i * 16;
@@ -2025,11 +2249,8 @@ pub const DomainParticipantImpl = struct {
                 .entity_key = dw_bytes[offset + 12 ..][0..3].*,
                 .entity_kind = dw_bytes[offset + 15],
             };
-            const rkey = entityIdKey(eid);
-            if (self.active_readers.getPtr(rkey)) |ar| {
-                const kh = resolveKeyHash(key_hash, ar, payload, kind);
-                ar.proto.handleIncomingChange(writer_guid, sn, ts, kh, payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
-            }
+            if (eid.eql(EntityIds.unknown)) continue;
+            self.dispatchToReaders(eid, .{ .key_hash = key_hash, .payload = payload, .kind = kind }, ctx);
         }
     }
 
@@ -2081,21 +2302,31 @@ pub const DomainParticipantImpl = struct {
                         }
                     }
 
-                    self.mu.lock();
-                    if (d.reader_entity_id.eql(EntityIds.unknown)) {
-                        var fan_it = self.active_readers.valueIterator();
-                        while (fan_it.next()) |ar| {
-                            const kh = resolveKeyHash(key_hash, ar, d.serialized_payload, kind);
-                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
+                    // Delivery raises on_data_available and friends: dispatched
+                    // after self.mu is released (see dispatchToReaders).
+                    const Deliver = struct {
+                        writer_guid: Guid,
+                        sn: @TypeOf(d.writer_sn),
+                        ts: time_mod.RtpsTimestamp,
+                        payload: []const u8,
+                        kind: history_mod.ChangeKind,
+                        coherent_set_sn: ?history_mod.SequenceNumber,
+                        group_seq_num: ?history_mod.SequenceNumber,
+                        lifespan_ns: ?i64,
+                        fn deliver(c: @This(), t: PinnedReader) void {
+                            t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.lifespan_ns);
                         }
-                    } else {
-                        const rkey = entityIdKey(d.reader_entity_id);
-                        if (self.active_readers.getPtr(rkey)) |ar| {
-                            const kh = resolveKeyHash(key_hash, ar, d.serialized_payload, kind);
-                            ar.proto.handleIncomingChange(writer_guid, d.writer_sn, current_ts, kh, d.serialized_payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
-                        }
-                    }
-                    self.mu.unlock();
+                    };
+                    self.dispatchToReaders(d.reader_entity_id, .{ .key_hash = key_hash, .payload = d.serialized_payload, .kind = kind }, Deliver{
+                        .writer_guid = writer_guid,
+                        .sn = d.writer_sn,
+                        .ts = current_ts,
+                        .payload = d.serialized_payload,
+                        .kind = kind,
+                        .coherent_set_sn = coherent_set_sn,
+                        .group_seq_num = group_seq_num,
+                        .lifespan_ns = lifespan_ns,
+                    });
                 },
                 .heartbeat => |hb| {
                     if (!dst_prefix.eql(GuidPrefix.unknown) and
@@ -2106,97 +2337,89 @@ pub const DomainParticipantImpl = struct {
                     // run while self.mu is held (a listener re-entering any
                     // participant API would deadlock). Mirrors onReaderDiscovered/
                     // onWriterDiscovered's quiesce-protected job-list pattern:
-                    // collect protos under the lock, unlock, then dispatch.
-                    var protos: std.ArrayListUnmanaged(proto.ProtocolReader) = .empty;
-                    defer protos.deinit(self.alloc);
-                    self.mu.lock();
-                    if (hb.reader_entity_id.eql(EntityIds.unknown)) {
-                        var fan_it = self.active_readers.valueIterator();
-                        while (fan_it.next()) |ar| {
-                            if (!ar.proto.quiesceAcquire()) continue;
-                            protos.append(self.alloc, ar.proto) catch ar.proto.quiesceRelease();
+                    // pin under the lock, unlock, then dispatch (dispatchToReaders).
+                    const Deliver = struct {
+                        writer_guid: Guid,
+                        hb: @TypeOf(hb),
+                        fn deliver(c: @This(), t: PinnedReader) void {
+                            t.proto.handleHeartbeat(c.writer_guid, c.hb.reader_entity_id, c.hb.first_sn, c.hb.last_sn, c.hb.count, c.hb.isFinal(), c.hb.isLiveliness());
                         }
-                    } else {
-                        const rkey = entityIdKey(hb.reader_entity_id);
-                        if (self.active_readers.getPtr(rkey)) |ar| {
-                            if (ar.proto.quiesceAcquire()) {
-                                protos.append(self.alloc, ar.proto) catch ar.proto.quiesceRelease();
-                            }
-                        }
-                    }
-                    self.mu.unlock();
-                    for (protos.items) |p| {
-                        p.handleHeartbeat(writer_guid, hb.reader_entity_id, hb.first_sn, hb.last_sn, hb.count, hb.isFinal(), hb.isLiveliness());
-                        p.quiesceRelease();
-                    }
+                    };
+                    self.dispatchToReaders(hb.reader_entity_id, null, Deliver{ .writer_guid = writer_guid, .hb = hb });
                 },
                 .acknack => |an| {
                     if (!dst_prefix.eql(GuidPrefix.unknown) and
                         !dst_prefix.eql(self.guid.prefix)) continue;
                     const reader_guid = Guid{ .prefix = src_prefix, .entity_id = an.reader_entity_id };
+                    // handleAckNack can raise on_reliable_reader_ready, which
+                    // must not run under self.mu (see pinWriterLocked).
                     self.mu.lock();
-                    const wkey = entityIdKey(an.writer_entity_id);
-                    if (self.active_writers.getPtr(wkey)) |aw| {
-                        aw.proto.handleAckNack(reader_guid, an.reader_sn_state.base - 1, an.reader_sn_state, an.count, an.isFinal());
-                    }
+                    const target = self.pinWriterLocked(an.writer_entity_id);
                     self.mu.unlock();
+                    if (target) |w| {
+                        w.handleAckNack(reader_guid, an.reader_sn_state.base - 1, an.reader_sn_state, an.count, an.isFinal());
+                        w.quiesceRelease();
+                    }
                 },
                 .data_frag => |df| {
                     if (!dst_prefix.eql(GuidPrefix.unknown) and
                         !dst_prefix.eql(self.guid.prefix)) continue;
                     const writer_guid = Guid{ .prefix = src_prefix, .entity_id = df.writer_entity_id };
-                    self.mu.lock();
-                    if (df.reader_entity_id.eql(EntityIds.unknown)) {
-                        var fan_it = self.active_readers.valueIterator();
-                        while (fan_it.next()) |ar| ar.proto.handleDataFrag(writer_guid, current_ts, df);
-                    } else {
-                        const rkey = entityIdKey(df.reader_entity_id);
-                        if (self.active_readers.getPtr(rkey)) |ar| ar.proto.handleDataFrag(writer_guid, current_ts, df);
-                    }
-                    self.mu.unlock();
+                    // A completed sample is delivered from handleDataFrag, so
+                    // dispatch after self.mu is released (see dispatchToReaders).
+                    const Deliver = struct {
+                        writer_guid: Guid,
+                        ts: time_mod.RtpsTimestamp,
+                        df: @TypeOf(df),
+                        fn deliver(c: @This(), t: PinnedReader) void {
+                            t.proto.handleDataFrag(c.writer_guid, c.ts, c.df);
+                        }
+                    };
+                    self.dispatchToReaders(df.reader_entity_id, null, Deliver{ .writer_guid = writer_guid, .ts = current_ts, .df = df });
                 },
                 .heartbeat_frag => |hbf| {
                     if (!dst_prefix.eql(GuidPrefix.unknown) and
                         !dst_prefix.eql(self.guid.prefix)) continue;
                     const writer_guid = Guid{ .prefix = src_prefix, .entity_id = hbf.writer_entity_id };
-                    self.mu.lock();
-                    if (hbf.reader_entity_id.eql(EntityIds.unknown)) {
-                        var fan_it = self.active_readers.valueIterator();
-                        while (fan_it.next()) |ar| {
-                            ar.proto.handleHeartbeatFrag(writer_guid, hbf.writer_sn, hbf.last_fragment_num, hbf.count);
+                    // No listener here, but the NACK_FRAG it can send is I/O:
+                    // also dispatched after self.mu is released.
+                    const Deliver = struct {
+                        writer_guid: Guid,
+                        hbf: @TypeOf(hbf),
+                        fn deliver(c: @This(), t: PinnedReader) void {
+                            t.proto.handleHeartbeatFrag(c.writer_guid, c.hbf.writer_sn, c.hbf.last_fragment_num, c.hbf.count);
                         }
-                    } else {
-                        const rkey = entityIdKey(hbf.reader_entity_id);
-                        if (self.active_readers.getPtr(rkey)) |ar| {
-                            ar.proto.handleHeartbeatFrag(writer_guid, hbf.writer_sn, hbf.last_fragment_num, hbf.count);
-                        }
-                    }
-                    self.mu.unlock();
+                    };
+                    self.dispatchToReaders(hbf.reader_entity_id, null, Deliver{ .writer_guid = writer_guid, .hbf = hbf });
                 },
                 .nack_frag => |nf| {
                     if (!dst_prefix.eql(GuidPrefix.unknown) and
                         !dst_prefix.eql(self.guid.prefix)) continue;
                     const reader_guid = Guid{ .prefix = src_prefix, .entity_id = nf.reader_entity_id };
+                    // No listener here, but the repair it sends is I/O: also
+                    // dispatched after self.mu is released.
                     self.mu.lock();
-                    const wkey = entityIdKey(nf.writer_entity_id);
-                    if (self.active_writers.getPtr(wkey)) |aw| {
-                        aw.proto.handleNackFrag(reader_guid, nf.writer_sn, nf.fragment_number_state, nf.count);
-                    }
+                    const target = self.pinWriterLocked(nf.writer_entity_id);
                     self.mu.unlock();
+                    if (target) |w| {
+                        w.handleNackFrag(reader_guid, nf.writer_sn, nf.fragment_number_state, nf.count);
+                        w.quiesceRelease();
+                    }
                 },
                 .gap => |g| {
                     if (!dst_prefix.eql(GuidPrefix.unknown) and
                         !dst_prefix.eql(self.guid.prefix)) continue;
                     const writer_guid = Guid{ .prefix = src_prefix, .entity_id = g.writer_entity_id };
-                    self.mu.lock();
-                    if (g.reader_entity_id.eql(EntityIds.unknown)) {
-                        var fan_it = self.active_readers.valueIterator();
-                        while (fan_it.next()) |ar| ar.proto.handleGap(writer_guid, g.gap_start, g.gap_list);
-                    } else {
-                        const rkey = entityIdKey(g.reader_entity_id);
-                        if (self.active_readers.getPtr(rkey)) |ar| ar.proto.handleGap(writer_guid, g.gap_start, g.gap_list);
-                    }
-                    self.mu.unlock();
+                    // handleGap can raise on_sample_lost and deliver buffered
+                    // samples: dispatch after self.mu is released.
+                    const Deliver = struct {
+                        writer_guid: Guid,
+                        g: @TypeOf(g),
+                        fn deliver(c: @This(), t: PinnedReader) void {
+                            t.proto.handleGap(c.writer_guid, c.g.gap_start, c.g.gap_list);
+                        }
+                    };
+                    self.dispatchToReaders(g.reader_entity_id, null, Deliver{ .writer_guid = writer_guid, .g = g });
                 },
                 else => {},
             }
@@ -2530,8 +2753,7 @@ pub const DomainParticipantImpl = struct {
             const local_rd = disc_adapter.readerDiscoveredData(ar.qos, ar.presentation);
             const result = qm_mod.checkDiscovered(data.qos, &local_rd);
             if (!result.isCompatible()) {
-                if (ar.incompat_qos) |cb|
-                    cb.notify(cb.ctx, @as(i32, @intCast(@intFromEnum(result.incompatible))));
+                ar.incompat_pending.record(result.incompatible);
                 continue;
             }
             const part_result = qm_mod.checkPartition(data.partition_names, ar.partition_names);
@@ -2588,6 +2810,7 @@ pub const DomainParticipantImpl = struct {
             if (self.builtin_sub) |bs| push_topic_dr = bs.topic_dr;
         }
         self.mu.unlock();
+        self.raiseIncompatQos(.readers);
         for (jobs.items) |job| {
             // Only a new protocol-level match changes the matched status:
             // discovery can report an already matched pair again, which
@@ -2800,8 +3023,7 @@ pub const DomainParticipantImpl = struct {
             const local_wd = disc_adapter.writerDiscoveredData(aw.qos, aw.presentation);
             const result = qm_mod.checkDiscovered(&local_wd, data.qos);
             if (!result.isCompatible()) {
-                if (aw.incompat_qos) |cb|
-                    cb.notify(cb.ctx, @as(i32, @intCast(@intFromEnum(result.incompatible))));
+                aw.incompat_pending.record(result.incompatible);
                 continue;
             }
             const part_result = qm_mod.checkPartition(aw.partition_names, data.partition_names);
@@ -2851,6 +3073,7 @@ pub const DomainParticipantImpl = struct {
             if (self.builtin_sub) |bs| push_topic_dr = bs.topic_dr;
         }
         self.mu.unlock();
+        self.raiseIncompatQos(.writers);
         for (jobs.items) |job| {
             // Only a new protocol-level match changes the matched status:
             // discovery can report an already matched pair again, which
@@ -2875,24 +3098,56 @@ pub const DomainParticipantImpl = struct {
         });
     }
 
+    const RemovedReaderJob = struct {
+        ready_cb: ?proto.ProtocolReadyCallback,
+        notify: ?MatchedNotify,
+        notify_quiesced: bool = false,
+        /// See RemovedWriterJob.proto_quiesced.
+        proto_quiesced: ?proto.ProtocolWriter = null,
+    };
+
     fn onReaderLost(ctx: *anyopaque, guid: disc.Guid) void {
         const self = cast(ctx);
         var push_dr: ?*reader_mod.DataReaderImpl = null;
+        // As onWriterLost: the protocol-level removal stays under self.mu,
+        // and the callbacks it produces (on_publication_matched,
+        // on_reliable_reader_ready), which reach application code, fire after
+        // it is released. Capacity is reserved first so a decided callback is
+        // never dropped; on that reservation failing nothing is removed.
+        var jobs: std.ArrayListUnmanaged(RemovedReaderJob) = .empty;
+        defer jobs.deinit(self.alloc);
         self.mu.lock();
-        const remote_handle = writer_mod.guidToHandle(guid);
-        var aw_it2 = self.active_writers.valueIterator();
-        while (aw_it2.next()) |aw| {
-            const before = aw.proto.matchedReaderCount();
-            aw.proto.removeMatchedReader(guid);
-            if (aw.proto.matchedReaderCount() < before) {
-                if (aw.matched_notify) |cb|
-                    cb.notify(cb.ctx, remote_handle, false);
+        const swept = if (jobs.ensureTotalCapacityPrecise(self.alloc, self.active_writers.count())) |_| blk: {
+            var aw_it = self.active_writers.valueIterator();
+            while (aw_it.next()) |aw| {
+                const before = aw.proto.matchedReaderCount();
+                const ready_cb = aw.proto.removeMatchedReaderDeferred(guid);
+                const matched_changed = aw.proto.matchedReaderCount() < before;
+                if (ready_cb == null and !matched_changed) continue;
+                const notify: ?MatchedNotify = if (matched_changed) aw.matched_notify else null;
+                const nq = if (notify) |cb| cb.quiesceAcquire() else false;
+                const pq = aw.proto.quiesceAcquire();
+                jobs.appendAssumeCapacity(.{
+                    .ready_cb = ready_cb,
+                    .notify = notify,
+                    .notify_quiesced = nq,
+                    .proto_quiesced = if (pq) aw.proto else null,
+                });
             }
-        }
-        removeDiscoveredReader(self, guid);
+            break :blk true;
+        } else |_| false;
+        if (swept) removeDiscoveredReader(self, guid);
         if (self.builtin_sub) |bs| push_dr = bs.sub_dr;
         self.mu.unlock();
-        if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
+
+        const remote_handle = writer_mod.guidToHandle(guid);
+        for (jobs.items) |job| {
+            if (job.ready_cb) |cb| cb.on_ready(cb.ctx, guid, false);
+            if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
+            if (job.notify_quiesced) job.notify.?.quiesceRelease();
+            if (job.proto_quiesced) |p| p.quiesceRelease();
+        }
+        if (swept) if (push_dr) |dr| pushBuiltinEndpointDisposed(dr, guid);
     }
 
     // ── Discovered writer/reader registry (retroactive matching) ─────────────
@@ -3278,8 +3533,7 @@ pub const DomainParticipantImpl = struct {
                             // this reader, since it only scans readers that already
                             // exist at discovery time -- this retroactive path is the
                             // only place that ever looks at this pairing again).
-                            if (ar.incompat_qos) |cb|
-                                cb.notify(cb.ctx, @as(i32, @intCast(@intFromEnum(result.incompatible))));
+                            ar.incompat_pending.record(result.incompatible);
                             continue;
                         }
                         const part_result = qm_mod.checkPartition(dw.partition_names, ar.partition_names);
@@ -3312,6 +3566,7 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
+        self.raiseIncompatQos(.readers);
         for (jobs.items) |job| {
             // Only a new protocol-level match changes the matched status:
             // discovery can report an already matched pair again, which
@@ -4634,3 +4889,138 @@ pub const DomainParticipantImpl = struct {
         return @ptrCast(@alignCast(ctx));
     }
 };
+
+test "nextFanoutBatch visits every key once, in order, with a fixed buffer" {
+    const testing = std.testing;
+    var map: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer map.deinit(testing.allocator);
+    // 37 keys inserted out of order: more than two full batches of 16.
+    var k: u32 = 0;
+    while (k < 37) : (k += 1) try map.put(testing.allocator, (k * 23) % 37 + 100, {});
+
+    var seen: [40]u32 = undefined;
+    var n_seen: usize = 0;
+    var batches: usize = 0;
+    var after: ?u32 = null;
+    while (true) {
+        var keys: [DomainParticipantImpl.FANOUT_BATCH]u32 = undefined;
+        const sel = DomainParticipantImpl.nextFanoutBatch(&map, after, &keys);
+        batches += 1;
+        for (keys[0..sel.len]) |key| {
+            seen[n_seen] = key;
+            n_seen += 1;
+        }
+        if (batches == 2) {
+            // Keys added meanwhile: one above the last visited, one below.
+            try map.put(testing.allocator, 1000, {});
+            try map.put(testing.allocator, 50, {});
+        }
+        if (!sel.more) break;
+        after = keys[sel.len - 1];
+    }
+    try testing.expectEqual(@as(usize, 3), batches);
+    // All 37 original keys once, in ascending order, then the key added
+    // above the last visited one; the one added below is not visited.
+    try testing.expectEqual(@as(usize, 38), n_seen);
+    for (seen[0..37], 0..) |key, i| try testing.expectEqual(@as(u32, @intCast(100 + i)), key);
+    try testing.expectEqual(@as(u32, 1000), seen[37]);
+}
+
+test "IncompatQosPending raises each recorded policy once, the latest last" {
+    const testing = std.testing;
+    const Rec = struct {
+        ids: [8]i32 = undefined,
+        n: usize = 0,
+        fn notify(ctx: *anyopaque, policy_id: i32) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.ids[r.n] = policy_id;
+            r.n += 1;
+        }
+    };
+    var rec: Rec = .{};
+    var p: IncompatQosPending = .{};
+    p.raise(.{ .ctx = &rec, .notify = Rec.notify }); // nothing recorded
+    try testing.expectEqual(@as(usize, 0), rec.n);
+
+    p.record(.durability);
+    p.record(.reliability);
+    p.record(.durability);
+    p.record(.deadline);
+    p.record(.reliability);
+    p.raise(.{ .ctx = &rec, .notify = Rec.notify });
+    try testing.expectEqualSlices(i32, &.{ 2, 2, 4, 11, 11 }, rec.ids[0..rec.n]);
+}
+
+test "the active endpoint maps' first allocation fits a 4 KiB block" {
+    // A fixed-block allocator (examples/*/custom-allocator use 4096-byte
+    // blocks) cannot serve a larger request: create_datawriter/datareader
+    // would fail to register the endpoint. Keep ActiveWriter/ActiveReader
+    // small enough that the first growth of these maps stays within a block.
+    const testing = std.testing;
+    const Max = struct {
+        child: std.mem.Allocator,
+        max: usize = 0,
+        fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.max = @max(self.max, len);
+            return self.child.rawAlloc(len, al, ra);
+        }
+        fn free(ctx: *anyopaque, buf: []u8, al: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(buf, al, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+    };
+    inline for (.{ ActiveWriter, ActiveReader }) |T| {
+        var m: Max = .{ .child = testing.allocator };
+        var map: std.AutoHashMapUnmanaged(u32, T) = .empty;
+        try map.ensureTotalCapacity(m.allocator(), 1);
+        map.deinit(m.allocator());
+        try testing.expect(m.max <= 4096);
+    }
+}
+
+test "IncompatQosPending reports every policy a check can fail on under its own ID" {
+    const testing = std.testing;
+    const Rec = struct {
+        ids: [32]i32 = undefined,
+        n: usize = 0,
+        fn notify(ctx: *anyopaque, policy_id: i32) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.ids[r.n] = policy_id;
+            r.n += 1;
+        }
+    };
+    var p: IncompatQosPending = .{};
+    // Each policy twice, in reverse order, so the last recorded is the first.
+    const all = std.enums.values(qm_mod.IncompatiblePolicy);
+    for (0..2) |_| {
+        var i = all.len;
+        while (i > 0) {
+            i -= 1;
+            p.record(all[i]);
+        }
+    }
+    var rec: Rec = .{};
+    p.raise(.{ .ctx = &rec, .notify = Rec.notify });
+    try testing.expectEqual(2 * all.len, rec.n);
+    // Ascending, except the last recorded (the first, durability) raised last.
+    var expected: [32]i32 = undefined;
+    var n: usize = 0;
+    for (all[1..]) |pol| for (0..2) |_| {
+        expected[n] = @intCast(@intFromEnum(pol));
+        n += 1;
+    };
+    for (0..2) |_| {
+        expected[n] = @intCast(@intFromEnum(all[0]));
+        n += 1;
+    }
+    try testing.expectEqualSlices(i32, expected[0..n], rec.ids[0..rec.n]);
+}
