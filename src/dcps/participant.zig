@@ -554,49 +554,41 @@ const IncompatQosNotify = struct {
 /// on_requested/offered_incompatible_qos, application code. Kept on the
 /// endpoint's own ActiveReader/ActiveWriter entry, so recording one needs no
 /// memory and cannot fail. Each recorded incompatibility is raised once, with
-/// its own policy; policies are counted per ID (they are few and bounded), and
-/// the most recently recorded one is raised last, so the status read
-/// afterwards reports it as last_policy_id.
+/// its own policy, and the most recently recorded policy is raised last, so the
+/// status read afterwards reports it as last_policy_id.
 ///
-/// Kept small: it sits in every ActiveReader/ActiveWriter, and the first
-/// allocation of those maps must fit a 4 KiB block (see the size test at the
-/// end of this file). Per-policy counts are 16-bit; `total` is not, so no
-/// event is ever lost -- past 65535 of one policy in a single discovery event
-/// the excess is raised under the last policy.
+/// Counted per policy, over only the policies a compatibility check can fail
+/// on (qos_match.IncompatiblePolicy), which keeps this small: it sits in every
+/// ActiveReader/ActiveWriter, and the first allocation of those maps must fit
+/// a 4 KiB block (see the size test at the end of this file). A count cannot
+/// overflow: one discovery event records at most one incompatibility per
+/// discovered remote endpoint.
 const IncompatQosPending = struct {
-    const MAX_ID = blk: {
-        var max: u32 = 0;
-        for (@typeInfo(qm_mod.PolicyId).@"enum".fields) |f| max = @max(max, f.value);
-        break :blk max;
-    };
+    const Policy = qm_mod.IncompatiblePolicy;
+    const policies = std.enums.values(Policy);
 
-    counts: [MAX_ID + 1]u16 = @splat(0),
-    total: u32 = 0,
-    last: u8 = 0,
+    counts: [policies.len]u32 = @splat(0),
+    last: ?u8 = null,
 
     fn any(self: *const IncompatQosPending) bool {
-        return self.total != 0;
+        return self.last != null;
     }
 
-    fn record(self: *IncompatQosPending, policy: qm_mod.PolicyId) void {
-        const id: u8 = @intCast(@intFromEnum(policy));
-        self.counts[id] +|= 1;
-        self.total +|= 1;
-        self.last = id;
+    fn record(self: *IncompatQosPending, policy: Policy) void {
+        const i: u8 = @intCast(std.mem.indexOfScalar(Policy, policies, policy).?);
+        self.counts[i] += 1;
+        self.last = i;
     }
 
     /// Calls `notify(ctx, policy_id)` once per recorded incompatibility, the
     /// most recently recorded policy last.
     fn raise(self: *const IncompatQosPending, n: IncompatQosNotify) void {
-        if (!self.any()) return;
-        var raised: u32 = 0;
-        for (self.counts, 0..) |count, id| {
-            if (id == self.last) continue;
-            var i: u32 = 0;
-            while (i < count) : (i += 1) n.notify(n.ctx, @intCast(id));
-            raised += count;
+        const last = self.last orelse return;
+        for (self.counts, policies, 0..) |count, policy, i| {
+            if (i == last) continue;
+            for (0..count) |_| n.notify(n.ctx, @intCast(@intFromEnum(policy)));
         }
-        while (raised < self.total) : (raised += 1) n.notify(n.ctx, self.last);
+        for (0..self.counts[last]) |_| n.notify(n.ctx, @intCast(@intFromEnum(policies[last])));
     }
 };
 
@@ -4995,28 +4987,40 @@ test "the active endpoint maps' first allocation fits a 4 KiB block" {
     }
 }
 
-test "IncompatQosPending loses no event past a policy's 16-bit count" {
+test "IncompatQosPending reports every policy a check can fail on under its own ID" {
     const testing = std.testing;
     const Rec = struct {
-        durability: u32 = 0,
-        reliability: u32 = 0,
+        ids: [32]i32 = undefined,
+        n: usize = 0,
         fn notify(ctx: *anyopaque, policy_id: i32) void {
             const r: *@This() = @ptrCast(@alignCast(ctx));
-            switch (policy_id) {
-                2 => r.durability += 1,
-                11 => r.reliability += 1,
-                else => unreachable,
-            }
+            r.ids[r.n] = policy_id;
+            r.n += 1;
         }
     };
     var p: IncompatQosPending = .{};
-    var i: u32 = 0;
-    while (i < 65536) : (i += 1) p.record(.durability);
-    p.record(.reliability);
+    // Each policy twice, in reverse order, so the last recorded is the first.
+    const all = std.enums.values(qm_mod.IncompatiblePolicy);
+    for (0..2) |_| {
+        var i = all.len;
+        while (i > 0) {
+            i -= 1;
+            p.record(all[i]);
+        }
+    }
     var rec: Rec = .{};
     p.raise(.{ .ctx = &rec, .notify = Rec.notify });
-    // 65537 events in all; the one durability past the 16-bit count is
-    // raised under the last policy instead of being dropped.
-    try testing.expectEqual(@as(u32, 65537), rec.durability + rec.reliability);
-    try testing.expectEqual(@as(u32, 65535), rec.durability);
+    try testing.expectEqual(2 * all.len, rec.n);
+    // Ascending, except the last recorded (the first, durability) raised last.
+    var expected: [32]i32 = undefined;
+    var n: usize = 0;
+    for (all[1..]) |pol| for (0..2) |_| {
+        expected[n] = @intCast(@intFromEnum(pol));
+        n += 1;
+    };
+    for (0..2) |_| {
+        expected[n] = @intCast(@intFromEnum(all[0]));
+        n += 1;
+    }
+    try testing.expectEqualSlices(i32, expected[0..n], rec.ids[0..rec.n]);
 }
