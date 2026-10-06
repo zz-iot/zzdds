@@ -557,6 +557,12 @@ const IncompatQosNotify = struct {
 /// its own policy; policies are counted per ID (they are few and bounded), and
 /// the most recently recorded one is raised last, so the status read
 /// afterwards reports it as last_policy_id.
+///
+/// Kept small: it sits in every ActiveReader/ActiveWriter, and the first
+/// allocation of those maps must fit a 4 KiB block (see the size test at the
+/// end of this file). Per-policy counts are 16-bit; `total` is not, so no
+/// event is ever lost -- past 65535 of one policy in a single discovery event
+/// the excess is raised under the last policy.
 const IncompatQosPending = struct {
     const MAX_ID = blk: {
         var max: u32 = 0;
@@ -564,28 +570,33 @@ const IncompatQosPending = struct {
         break :blk max;
     };
 
-    counts: [MAX_ID + 1]u32 = @splat(0),
-    any: bool = false,
-    last: qm_mod.PolicyId = undefined,
+    counts: [MAX_ID + 1]u16 = @splat(0),
+    total: u32 = 0,
+    last: u8 = 0,
+
+    fn any(self: *const IncompatQosPending) bool {
+        return self.total != 0;
+    }
 
     fn record(self: *IncompatQosPending, policy: qm_mod.PolicyId) void {
-        self.counts[@intFromEnum(policy)] +|= 1;
-        self.last = policy;
-        self.any = true;
+        const id: u8 = @intCast(@intFromEnum(policy));
+        self.counts[id] +|= 1;
+        self.total +|= 1;
+        self.last = id;
     }
 
     /// Calls `notify(ctx, policy_id)` once per recorded incompatibility, the
     /// most recently recorded policy last.
     fn raise(self: *const IncompatQosPending, n: IncompatQosNotify) void {
-        if (!self.any) return;
-        const last: usize = @intFromEnum(self.last);
+        if (!self.any()) return;
+        var raised: u32 = 0;
         for (self.counts, 0..) |count, id| {
-            if (id == last) continue;
+            if (id == self.last) continue;
             var i: u32 = 0;
             while (i < count) : (i += 1) n.notify(n.ctx, @intCast(id));
+            raised += count;
         }
-        var i: u32 = 0;
-        while (i < self.counts[last]) : (i += 1) n.notify(n.ctx, @intCast(last));
+        while (raised < self.total) : (raised += 1) n.notify(n.ctx, self.last);
     }
 };
 
@@ -2055,7 +2066,7 @@ pub const DomainParticipantImpl = struct {
                 .writers => self.active_writers.valueIterator(),
             };
             while (it.next()) |e| {
-                if (!e.incompat_pending.any) continue;
+                if (!e.incompat_pending.any()) continue;
                 if (n == jobs.len) {
                     more = true;
                     break;
@@ -4946,4 +4957,66 @@ test "IncompatQosPending raises each recorded policy once, the latest last" {
     p.record(.reliability);
     p.raise(.{ .ctx = &rec, .notify = Rec.notify });
     try testing.expectEqualSlices(i32, &.{ 2, 2, 4, 11, 11 }, rec.ids[0..rec.n]);
+}
+
+test "the active endpoint maps' first allocation fits a 4 KiB block" {
+    // A fixed-block allocator (examples/*/custom-allocator use 4096-byte
+    // blocks) cannot serve a larger request: create_datawriter/datareader
+    // would fail to register the endpoint. Keep ActiveWriter/ActiveReader
+    // small enough that the first growth of these maps stays within a block.
+    const testing = std.testing;
+    const Max = struct {
+        child: std.mem.Allocator,
+        max: usize = 0,
+        fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.max = @max(self.max, len);
+            return self.child.rawAlloc(len, al, ra);
+        }
+        fn free(ctx: *anyopaque, buf: []u8, al: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(buf, al, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+    };
+    inline for (.{ ActiveWriter, ActiveReader }) |T| {
+        var m: Max = .{ .child = testing.allocator };
+        var map: std.AutoHashMapUnmanaged(u32, T) = .empty;
+        try map.ensureTotalCapacity(m.allocator(), 1);
+        map.deinit(m.allocator());
+        try testing.expect(m.max <= 4096);
+    }
+}
+
+test "IncompatQosPending loses no event past a policy's 16-bit count" {
+    const testing = std.testing;
+    const Rec = struct {
+        durability: u32 = 0,
+        reliability: u32 = 0,
+        fn notify(ctx: *anyopaque, policy_id: i32) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            switch (policy_id) {
+                2 => r.durability += 1,
+                11 => r.reliability += 1,
+                else => unreachable,
+            }
+        }
+    };
+    var p: IncompatQosPending = .{};
+    var i: u32 = 0;
+    while (i < 65536) : (i += 1) p.record(.durability);
+    p.record(.reliability);
+    var rec: Rec = .{};
+    p.raise(.{ .ctx = &rec, .notify = Rec.notify });
+    // 65537 events in all; the one durability past the 16-bit count is
+    // raised under the last policy instead of being dropped.
+    try testing.expectEqual(@as(u32, 65537), rec.durability + rec.reliability);
+    try testing.expectEqual(@as(u32, 65535), rec.durability);
 }
