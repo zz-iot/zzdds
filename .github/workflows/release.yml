@@ -197,7 +197,7 @@ jobs:
     needs: [prepare, test]
     runs-on: ubuntu-latest
     env:
-      INTEROP_RTPS_REF: zenzen-bdcdd3b
+      INTEROP_RTPS_REF: zenzen-44d6146
 
     steps:
       - name: Check out zzdds

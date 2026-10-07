@@ -57,23 +57,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also run zig build test-tsan.",
     )
+    step_names = (
+        "format",
+        "sleeps",
+        "debug",
+        "feature-minimal",
+        "release-safe",
+        "release-fast",
+        "release-small",
+        "musl",
+        "fuzz",
+        "tsan-self-check",
+        "tsan",
+    )
     parser.add_argument(
         "--only",
-        choices=(
-            "format",
-            "sleeps",
-            "debug",
-            "feature-minimal",
-            "release-safe",
-            "release-fast",
-            "release-small",
-            "musl",
-            "fuzz",
-            "tsan-self-check",
-            "tsan",
-        ),
+        choices=step_names,
         action="append",
         help="Run only the named step. May be passed more than once.",
+    )
+    parser.add_argument(
+        "--skip",
+        choices=step_names,
+        action="append",
+        help="Skip the named step. May be passed more than once.",
     )
     return parser.parse_args()
 
@@ -128,6 +135,8 @@ def run_step(step: Step) -> int:
 def main() -> int:
     args = parse_args()
     selected = steps(args.zig, args.include_tsan)
+    if args.skip:
+        selected = [step for step in selected if step.name not in set(args.skip)]
     if args.only:
         wanted = set(args.only)
         selected = [step for step in selected if step.name in wanted]

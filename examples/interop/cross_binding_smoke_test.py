@@ -5,7 +5,8 @@ binding's subscriber (and vice versa) over real UDP DDS discovery. Both
 examples compile the same idl/sensor.idl to the same wire (CDR) layout and
 use the same domain ID (7) by construction -- this test is what actually
 proves that in both directions, rather than each binding only ever being
-exercised against itself.
+exercised against itself. On Linux it also enforces the examples'
+no-allocation-after-setup check (see GUARD below).
 
 Usage: ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./cross_binding_smoke_test.py
 """
@@ -36,6 +37,14 @@ CPP_DIR = REPO_ROOT / "cpp" / "custom-allocator"
 # count then exit) -- no SIGINT/synchronization needed, just a generous
 # ceiling in case something hangs.
 PROC_TIMEOUT_S = 20
+
+# On Linux each process runs with its own build's noalloc_guard shim
+# preloaded, so the examples' no-allocation-after-setup check is enforced:
+# once armed, any malloc/calloc/realloc/free aborts the process. LD_PRELOAD
+# has no Windows equivalent and is not used on macOS, where the examples run
+# unguarded.
+GUARD = sys.platform.startswith("linux")
+GUARD_ARMED = "noalloc_guard: armed"
 
 
 def build_one(dir_: Path, zig_out: Path) -> bool:
@@ -94,6 +103,16 @@ def find_executable(build_dir: Path, name: str) -> Path:
     return exe
 
 
+def guarded_env(env: dict, build_dir: Path) -> dict:
+    """env with build_dir's noalloc_guard shim preloaded (Linux only)."""
+    if not GUARD:
+        return env
+    shim = build_dir / "libnoalloc_guard.so"
+    if not shim.is_file():
+        raise FileNotFoundError(f"noalloc_guard shim not found: {shim}")
+    return {**env, "LD_PRELOAD": str(shim)}
+
+
 def run_pair(pub_dir: Path, sub_dir: Path, label: str, zig_out: Path) -> bool:
     print(f"== {label} ==")
     env = run_env(zig_out)
@@ -109,14 +128,14 @@ def run_pair(pub_dir: Path, sub_dir: Path, label: str, zig_out: Path) -> bool:
     sub = LiveProcess(
         [str(sub_exe)],
         cwd=sub_exe.parent,
-        env=env,
+        env=guarded_env(env, sub_dir / "build"),
         log_path=sub_exe.parent / "sub.log",
     )
     time.sleep(1)
     pub = LiveProcess(
         [str(pub_exe)],
         cwd=pub_exe.parent,
-        env=env,
+        env=guarded_env(env, pub_dir / "build"),
         log_path=pub_exe.parent / "pub.log",
     )
 
@@ -129,12 +148,18 @@ def run_pair(pub_dir: Path, sub_dir: Path, label: str, zig_out: Path) -> bool:
     sub.wait(PROC_TIMEOUT_S)
     sub_rc = sub.stop()
 
-    if pub_rc == 0 and sub_rc == 0:
-        print(f"OK: {label}")
-        return True
-
-    print_fail(label, f"pub_rc={pub_rc} sub_rc={sub_rc}", ("publisher", pub), ("subscriber", sub))
-    return False
+    if pub_rc != 0 or sub_rc != 0:
+        print_fail(label, f"pub_rc={pub_rc} sub_rc={sub_rc}", ("publisher", pub), ("subscriber", sub))
+        return False
+    # A process that never armed the guard ran unchecked; don't count that as a pass.
+    unarmed = [name for name, proc in (("publisher", pub), ("subscriber", sub))
+               if GUARD and GUARD_ARMED not in proc.log_text()]
+    if unarmed:
+        print_fail(label, f"noalloc_guard never armed in: {', '.join(unarmed)}",
+                   ("publisher", pub), ("subscriber", sub))
+        return False
+    print(f"OK: {label}" + (" (noalloc_guard armed)" if GUARD else ""))
+    return True
 
 
 def main() -> int:

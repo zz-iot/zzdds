@@ -37,7 +37,7 @@ concurrency:
 env:
   INTEROP_RELEASE_TAG: v2.1.2026
   # NOTE: When updating the zenzen branch, bump the fallback below to the new branch name.
-  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-bdcdd3b' }}
+  INTEROP_RTPS_REF: ${{ inputs.dds_rtps_ref || 'zenzen-44d6146' }}
 
 jobs:
   design-validation:
@@ -52,7 +52,13 @@ jobs:
       - name: Schema registry, independent wire vectors and generated codec
         run: zig build test-design-models
 
-  # ── Unit tests: Linux x86_64 (gates interop jobs below) ───────────────────
+  # ── Unit tests: Linux x86_64 (gates the jobs below) ───────────────────────
+  #
+  # The quick part of the deterministic matrix (format, sleep guardrails, Debug
+  # tests) plus the binding smoke tests: enough to know this commit builds and
+  # its unit tests pass before the longer jobs start. The rest of the matrix
+  # runs in test-linux-matrix, alongside those jobs rather than ahead of them:
+  # nothing downstream uses its results, and it takes ~24 min.
   test-linux:
     name: Linux x86_64
     runs-on: ubuntu-latest
@@ -65,14 +71,30 @@ jobs:
         with:
           version: "0.16.0"
 
-      - name: Run deterministic matrix
-        run: python3 scripts/run_deterministic_matrix.py --include-tsan
-
-      - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
-        run: zig build test -Ddebug-allocator=true
+      - name: Run deterministic matrix (format, sleeps, debug)
+        run: python3 scripts/run_deterministic_matrix.py --only format --only sleeps --only debug
 
       - name: C/C++ binding smoke tests
         run: zig build test-bindings -Dc-binding=true -Dcpp-binding=true
+
+  # ── Unit tests: rest of the Linux x86_64 matrix (gates nothing) ───────────
+  test-linux-matrix:
+    name: Linux x86_64 (build matrix)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.16.0"
+
+      - name: Run deterministic matrix (all but test-linux's steps)
+        run: python3 scripts/run_deterministic_matrix.py --include-tsan --skip format --skip sleeps --skip debug
+
+      - name: DebugAllocator lane (default allocator path only, additive to the matrix above)
+        run: zig build test -Ddebug-allocator=true
 
   # ── Unit tests: remaining platforms (independent of interop) ──────────────
   test-other:
@@ -197,7 +219,7 @@ jobs:
     needs: test-linux
     permissions:
       contents: read
-    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@929f5f639c52dce002eb7717b817a24dbae91f8b
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@964d8d8e32550eab5ec3ef8ef2ac1da38e3ca015
     with:
       mode: zzdds-pr
       zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
@@ -1060,10 +1082,25 @@ jobs:
   # vendor release binaries are known to run there. If a vendor binary ever
   # fails to exec on this image, that is the reason to pin the runner back.
 
-  self-interop:
-    name: self-interop (dds-rtps)
+  shape-binaries:
+    name: shape_main (${{ matrix.lane.name }})
     needs: test-linux
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # One zzdds shape_main per interop lane, shared by that lane's
+        # self-interop and vendor-interop jobs. Those jobs need only this
+        # build, not each other: a self-interop failure doesn't make vendor
+        # results meaningless, so they run alongside it instead of after it.
+        lane:
+          - name: normal
+            build_flags: -Doptimize=ReleaseSafe
+          - name: tsan
+            build_flags: -Doptimize=Debug -Dlog-level=info -Dsanitize-thread
+          # See the DebugAllocator lane's comment above vendor-interop-debug-allocator.
+          - name: debug-allocator
+            build_flags: -Doptimize=Debug -Dlog-level=info -Ddebug-allocator=true
 
     steps:
       - name: Check out zzdds
@@ -1102,47 +1139,34 @@ jobs:
         with:
           version: "0.16.0"
 
-      - name: Install Python (match omg-dds/dds-rtps interop workflow)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11.4"
-
-      - name: Install Python dependencies
-        run: pip install --requirement dds-rtps/requirements.txt
-
-      - name: Build shape_main (ReleaseSafe)
+      - name: Build shape_main
         working-directory: dds-rtps/srcZig/zzdds
-        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+        run: zig build -Dtarget=x86_64-linux-gnu ${{ matrix.lane.build_flags }}
 
-      - name: Upload zzdds binary (for vendor-interop jobs)
+      - name: Upload zzdds binary
         uses: actions/upload-artifact@v4
         with:
-          name: zzdds-shape-linux-normal
+          name: zzdds-shape-linux-${{ matrix.lane.name }}
           path: dds-rtps/srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux
           retention-days: 1
 
-      - name: Run self-interop suite
-        working-directory: dds-rtps
-        run: |
-          python3 interoperability_report.py \
-            -P srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
-            -S srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
-            -o /tmp/interop-results.xml
-
-      - name: Check results
-        run: python3 zzdds/scripts/check_interop_results.py /tmp/interop-results.xml
-
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: interop-results
-          path: /tmp/interop-results.xml
-
-  self-interop-tsan:
-    name: self-interop (dds-rtps) + TSAN
-    needs: test-linux
+  self-interop:
+    name: self-interop (dds-rtps)${{ matrix.lane.suffix }}
+    needs: shape-binaries
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          - name: normal
+            suffix: ""
+            report: interop-results
+          - name: tsan
+            suffix: " + TSAN"
+            report: interop-tsan-results
+          - name: debug-allocator
+            suffix: " + DebugAllocator"
+            report: interop-debug-allocator-results
 
     steps:
       - name: Check out zzdds
@@ -1159,22 +1183,6 @@ jobs:
           path: dds-rtps
           persist-credentials: false
 
-      - name: Wire packages/zzdds symlink
-        run: |
-          mkdir -p dds-rtps/srcZig/zzdds/packages
-          ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-          # zzdds re-exports zidl's own artifact/zidl_rt module and
-          # dds-rtps's build.zig.zon no longer declares its own .zidl
-          # dependency, so no separate zidl checkout/symlink is needed here
-          # (see the self-interop job above for the full explanation).
-          rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
-          (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: "0.16.0"
-
       - name: Install Python (match omg-dds/dds-rtps interop workflow)
         uses: actions/setup-python@v5
         with:
@@ -1183,41 +1191,39 @@ jobs:
       - name: Install Python dependencies
         run: pip install --requirement dds-rtps/requirements.txt
 
-      - name: Build shape_main (Debug + ThreadSanitizer)
-        working-directory: dds-rtps/srcZig/zzdds
-        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=Debug -Dlog-level=info -Dsanitize-thread
-
-      - name: Upload zzdds binary (TSan, for vendor-interop-tsan jobs)
-        uses: actions/upload-artifact@v4
+      - name: Download zzdds binary
+        uses: actions/download-artifact@v4
         with:
-          name: zzdds-shape-linux-tsan
-          path: dds-rtps/srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux
-          retention-days: 1
+          name: zzdds-shape-linux-${{ matrix.lane.name }}
+          path: bins/
 
-      - name: Run self-interop suite (TSan)
+      - name: Make binary executable
+        run: chmod +x bins/zzdds_shape_main_linux
+
+      - name: Run self-interop suite
         working-directory: dds-rtps
         env:
-          # TSAN writes its race report to stderr, which pexpect captures via
-          # the pty — so the report ends up inside the JUnit XML failure message
-          # and is displayed by check_interop_results.py below.
+          # TSan lane: TSAN writes its race report to stderr, which pexpect
+          # captures via the pty — so the report ends up inside the JUnit XML
+          # failure message and is displayed by check_interop_results.py below.
           # abort_on_error=1 kills the process on the first race, causing
           # pexpect to see an unexpected exit and mark the test as failed.
+          # Ignored by the other lanes' binaries.
           TSAN_OPTIONS: abort_on_error=1
         run: |
-          python3 interoperability_report.py \
-            -P srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
-            -S srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
-            -o /tmp/interop-tsan-results.xml
+          ZZDDS="$GITHUB_WORKSPACE/bins/zzdds_shape_main_linux"
+          python3 interoperability_report.py -P "$ZZDDS" -S "$ZZDDS" \
+            -o /tmp/${{ matrix.lane.report }}.xml
 
       - name: Check results
-        run: python3 zzdds/scripts/check_interop_results.py /tmp/interop-tsan-results.xml
+        run: python3 zzdds/scripts/check_interop_results.py /tmp/${{ matrix.lane.report }}.xml
 
-      - name: Upload TSan report
+      - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: interop-tsan-results
-          path: /tmp/interop-tsan-results.xml
+          name: ${{ matrix.lane.report }}
+          path: /tmp/${{ matrix.lane.report }}.xml
 
   # ── Interop: Zenzen DDS vs vendor (normal) ────────────────────────────────
   #
@@ -1228,11 +1234,11 @@ jobs:
   # Each combination runs on its own runner so jobs are fully parallel and
   # there are no UDP port conflicts between vendors.
   #
-  # Gated on self-interop so vendor jobs only start when zzdds is self-consistent.
+  # Needs only the zzdds build (shape-binaries), so it runs alongside self-interop.
 
   vendor-interop-normal:
     name: "${{ matrix.vendor.name }} / ${{ matrix.direction }}"
-    needs: [setup-matrix, self-interop]
+    needs: [setup-matrix, shape-binaries]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1314,11 +1320,11 @@ jobs:
   # pexpect sees as EOF; the test is marked failed and the TSAN report is embedded
   # in the JUnit failure message, surfaced by check_interop_results.py.
   #
-  # Gated on self-interop-tsan, which itself must pass first.
+  # Needs only the zzdds build (shape-binaries), so it runs alongside self-interop.
 
   vendor-interop-tsan:
     name: "TSan: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
-    needs: [setup-matrix, self-interop-tsan]
+    needs: [setup-matrix, shape-binaries]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1395,9 +1401,9 @@ jobs:
           name: interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}
           path: /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
 
-  # ── Interop: Zenzen DDS self-interop, DebugAllocator lane ─────────────────
+  # ── Interop: Zenzen DDS (DebugAllocator) vs vendor ────────────────────────
   #
-  # Mirrors self-interop-tsan's exact structure, but proves the *allocator*
+  # Mirrors the TSan lane's structure, but proves the *allocator*
   # side of this repo's safety-net story instead of the threading side:
   # every allocation the factory and everything it creates makes is routed
   # through std.heap.DebugAllocator (see zzdds's -Ddebug-allocator option and
@@ -1409,82 +1415,9 @@ jobs:
   # produce different interop timing, and a purely self-interop-only lane
   # would miss any timing-dependent allocator bug that only manifests
   # against a real second implementation.
-  self-interop-debug-allocator:
-    name: self-interop (dds-rtps) + DebugAllocator
-    needs: test-linux
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Check out zzdds
-        uses: actions/checkout@v4
-        with:
-          path: zzdds
-          persist-credentials: false
-
-      - name: Check out dds-rtps (${{ env.INTEROP_RTPS_REF }})
-        uses: actions/checkout@v4
-        with:
-          repository: zz-iot/dds-rtps
-          ref: ${{ env.INTEROP_RTPS_REF }}
-          path: dds-rtps
-          persist-credentials: false
-
-      - name: Wire packages/zzdds symlink
-        run: |
-          mkdir -p dds-rtps/srcZig/zzdds/packages
-          ln -s ../../../../zzdds dds-rtps/srcZig/zzdds/packages/zzdds
-          # zzdds re-exports zidl's own artifact/zidl_rt module and
-          # dds-rtps's build.zig.zon no longer declares its own .zidl
-          # dependency, so no separate zidl checkout/symlink is needed here
-          # (see the self-interop job above for the full explanation).
-          rm -rf dds-rtps/srcZig/zzdds/zig-pkg/
-          (cd dds-rtps/srcZig/zzdds && python3 point_zon_at_symlinks.py)
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: "0.16.0"
-
-      - name: Install Python (match omg-dds/dds-rtps interop workflow)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11.4"
-
-      - name: Install Python dependencies
-        run: pip install --requirement dds-rtps/requirements.txt
-
-      - name: Build shape_main (Debug + DebugAllocator)
-        working-directory: dds-rtps/srcZig/zzdds
-        run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=Debug -Dlog-level=info -Ddebug-allocator=true
-
-      - name: Upload zzdds binary (DebugAllocator, for vendor-interop-debug-allocator jobs)
-        uses: actions/upload-artifact@v4
-        with:
-          name: zzdds-shape-linux-debug-allocator
-          path: dds-rtps/srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux
-          retention-days: 1
-
-      - name: Run self-interop suite (DebugAllocator)
-        working-directory: dds-rtps
-        run: |
-          python3 interoperability_report.py \
-            -P srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
-            -S srcZig/zzdds/zig-out/bin/zzdds_shape_main_linux \
-            -o /tmp/interop-debug-allocator-results.xml
-
-      - name: Check results
-        run: python3 zzdds/scripts/check_interop_results.py /tmp/interop-debug-allocator-results.xml
-
-      - name: Upload DebugAllocator report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: interop-debug-allocator-results
-          path: /tmp/interop-debug-allocator-results.xml
-
   vendor-interop-debug-allocator:
     name: "DebugAllocator: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
-    needs: [setup-matrix, self-interop-debug-allocator]
+    needs: [setup-matrix, shape-binaries]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

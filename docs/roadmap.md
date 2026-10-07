@@ -225,19 +225,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
      or further investigation) become their own roadmap items, migrated when that code
      is next worked on rather than in one sweep.
 
-- **rmw_zzdds: change content filters in place.** zzdds now offers
-  `zzdds::ContentFilteredTopic::set_filter_expression(expression, parameters)` (DDS only
-  allows changing a CFT's parameters); see `decisions.md`. rmw_zzdds's
-  `rmw_subscription_set_content_filter` still replaces the subscription's DataReader when
-  the expression changes, so the new reader re-matches every publisher (rmw_zzdds offsets
-  its matched status to keep the subscription's continuous), loses samples not yet taken
-  from the old reader, and re-runs the reliable-readiness handshake. Switch it to
-  `set_filter_expression`. To avoid the swap for the first filter and for clearing one too,
-  create every subscription's reader on a CFT from the start, with an empty expression
-  (zzdds treats it as "no filtering"). Then drop the reader replacement and the
-  matched-status continuity code. Other implementations offer the same operation
-  (`set_expression` since one implementation's 5.1.0, `set_filter_expression` in another),
-  and the other ROS 2 RMWs built on them change expressions in place.
 - **Listener release hooks can run under a parent's lock during teardown.**
   `Subscriber::delete_contained_entities` and `Publisher::delete_contained_entities`
   deinit their readers/writers while holding their own lock, and dropping a reader's or
@@ -1146,10 +1133,10 @@ release notes).
 ### Landed
 
 - **DebugAllocator lane on `test-other`** (PR #65) — `zig build test -Ddebug-allocator=true`
-  now runs on Linux ARM64, macOS ARM64, and Windows x86_64, additive to `test-linux`'s
+  now runs on Linux ARM64, macOS ARM64, and Windows x86_64, additive to `test-linux-matrix`'s
   existing step.
 - **`ReleaseFast` built and tested** (PR #65) — `run_deterministic_matrix.py` gained a
-  `release-fast` step (so `test-linux` covers it on Linux x86_64) and `release.yml`'s `test`
+  `release-fast` step (so `test-linux-matrix` covers it on Linux x86_64) and `release.yml`'s `test`
   job runs `zig build test -Doptimize=ReleaseFast` on all four platforms.
 - **C/C++ binding smoke tests everywhere** (PR #65 for `ci.yml`; 2026-08-28 for `release.yml`)
   — `zig build test-bindings -Dc-binding -Dcpp-binding` runs on all `test-other` /
@@ -1172,7 +1159,7 @@ release notes).
   `zzdds-config.cmake` / `zzdds.pc` are POSIX-shaped, so `find_package(ZZDDS)` can't
   configure there yet (see "Still open" below).
 - **musl / static Linux target lane** (2026-09-02) — `zig build test -Dtarget=x86_64-linux-musl`
-  now runs in `run_deterministic_matrix.py` (so `ci.yml`'s `test-linux` covers it) and
+  now runs in `run_deterministic_matrix.py` (so `ci.yml`'s `test-linux-matrix` covers it) and
   `release.yml`'s `test` job (Linux x86_64 only). A `-linux-musl` binary is statically linked
   and runs natively on the glibc runner, so this is full-suite execution coverage
   (1076/1076), not just a build check — closes "`-Dtarget` is never actually cross-compiled".
@@ -1191,7 +1178,7 @@ release notes).
   upstream Zig bugs — revisit deleting them at a Zig bump.**
 - **`ReleaseSmall` lane** (2026-08-29) — new `zig build test-release-small` step runs the
   whole unit suite at `-OReleaseSmall`, wired into `run_deterministic_matrix.py` (so
-  `ci.yml`'s `test-linux` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
+  `ci.yml`'s `test-linux-matrix` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
   The step **forces the LLVM backend** to sidestep a Zig 0.16 self-hosted-x86_64 codegen bug
   (misaligned read-only globals at `-OReleaseSmall` — see the Deferred note below and the
   step's `build.zig` comment). **At the Zig 0.17 bump: delete `test-release-small` and
