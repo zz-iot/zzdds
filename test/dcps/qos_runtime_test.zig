@@ -496,6 +496,56 @@ test "ownership: EXCLUSIVE — only the highest-strength writer delivers" {
     try testing.expectEqualSlices(u8, &PAYLOAD_A, samples[0]);
 }
 
+test "ownership: EXCLUSIVE — an owner that claimed before its strength was known keeps it" {
+    // A writer's sample can be arbitrated before the reader has recorded the
+    // writer's strength (the proxy exists before the match is processed; see
+    // WriterMatchCallback.on_writer_matching). The owner's strength must be
+    // looked up when compared, not kept from when it claimed the instance:
+    // kept, it stayed 0 and a weaker writer took the instance over, so the
+    // reader delivered stronger, weaker, stronger (dds-rtps Test_Ownership_3).
+    const alloc = testing.allocator;
+    var fx = try OwnershipFixture.init(alloc);
+    defer fx.deinit();
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dr_qos.ownership.kind = .EXCLUSIVE_OWNERSHIP_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    var dw_qos_a = DDS.DataWriterQos{};
+    dw_qos_a.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    dw_qos_a.ownership.kind = .EXCLUSIVE_OWNERSHIP_QOS;
+    dw_qos_a.ownership_strength.value = 10;
+    dw_qos_a.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    var dw_qos_b = dw_qos_a;
+    dw_qos_b.ownership_strength.value = 5;
+
+    const dr = fx.makeReader(dr_qos);
+    const dw_a = fx.makeWriterA(dw_qos_a);
+    const dw_b = fx.makeWriterB(dw_qos_b);
+
+    // The stronger writer's sample arrives before its strength is recorded.
+    dr.mu.lock();
+    try testing.expect(dr.writer_strengths.remove(dw_a.guid));
+    dr.mu.unlock();
+    try writeRaw(dw_a, &PAYLOAD_A); // claims the instance
+    dr.mu.lock();
+    try dr.writer_strengths.put(alloc, dw_a.guid, 10);
+    dr.mu.unlock();
+
+    try writeRaw(dw_b, &PAYLOAD_B); // weaker than the owner → dropped
+    try writeRaw(dw_a, &PAYLOAD_A);
+
+    const samples = try drainSamples(alloc, dr);
+    defer {
+        for (samples) |s| alloc.free(s);
+        alloc.free(samples);
+    }
+    try testing.expectEqual(@as(usize, 2), samples.len);
+    for (samples) |sample| try testing.expectEqualSlices(u8, &PAYLOAD_A, sample);
+}
+
 test "ownership: EXCLUSIVE — sole writer becomes owner by default" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

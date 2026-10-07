@@ -513,15 +513,6 @@ or an optimisation on an already-improved path):
   follow-up: process-side discovery visibility is thin (SPDP has three debug log lines
   and SEDP none, and the wire tracer, `-Dwire-trace`, has to be configured in code by
   each application).
-- **`Test_Ownership_3` flakes in the DebugAllocator CoreDX-publisher lane.** The zzdds
-  subscriber reports `RECEIVING_FROM_BOTH` instead of `RECEIVING_FROM_ONE` (two exclusive-
-  ownership publishers, strengths 3 and 4, same instance). Seen twice with identical
-  symptoms (2026-09-14 on `main`, 2026-10-01 on #94) and not in other lanes, so it is
-  timing-sensitive under the slow allocator. Determine whether samples from the weaker
-  writer are accepted before the stronger writer is matched (possibly legitimate transient
-  ownership that the harness check counts) or whether ownership arbitration has a real
-  race, e.g. a strength comparison against a writer whose proxy or strength isn't yet
-  installed.
 - **Stack dumps for hung or unfinished test processes — examples/integration tiers done;
   other harnesses remain.** `examples/_common.py`'s `LiveProcess.stop()` (shared by the
   examples and integration tiers) now prints every thread's stack between "Begin/End

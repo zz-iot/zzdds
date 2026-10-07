@@ -1385,7 +1385,7 @@ const TestNullCtx = struct {
     fn setLocatorChangeHandler(_: *anyopaque, _: ?iface.LocatorChangeHandler) void {}
     fn close(_: *anyopaque) void {}
 };
-const test_null_vtable = Transport.Vtable{
+pub const test_null_vtable = Transport.Vtable{
     .capabilities = .{},
     .can_reach = TestNullCtx.canReach,
     .send = TestNullCtx.send,
