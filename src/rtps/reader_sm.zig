@@ -41,7 +41,7 @@ pub const Locator = iface.Locator;
 // ── Delivery callback ─────────────────────────────────────────────────────────
 
 /// Called when a change is ready for delivery to the application layer.
-/// on_data, on_heartbeat and on_eoc are invoked under the state machine's
+/// on_data and on_eoc are invoked under the state machine's
 /// lock, must NOT call back into the SM, and must not reach application
 /// code: they hand over, and on_flush (after the lock is released) acts.
 pub const DataCallback = struct {
@@ -49,15 +49,12 @@ pub const DataCallback = struct {
     on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
     /// Called after the state machine's lock is released.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
-    /// Called when a valid (non-duplicate) HEARTBEAT is received from a writer.
-    /// Invoked under the state machine's lock; must NOT call back into the SM.
-    on_heartbeat: ?*const fn (ctx: *anyopaque, writer_guid: Guid, last_sn: SequenceNumber) void = null,
     /// Called when an end-of-coherent-set marker arrives (zero-payload alive DATA,
     /// no PID_COHERENT_SET).  The DCPS layer registers this to flush the coherent WIP.
     /// If null, EOC packets are silently dropped — correct for RTPS-level consumers.
     on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
     /// Called after the state machine's lock is released, by any operation
-    /// that called on_data/on_eoc/on_heartbeat while holding it; see
+    /// that called on_data/on_eoc while holding it; see
     /// protocol.DataCallback.on_flush.
     on_flush: ?*const fn (ctx: *anyopaque) void = null,
 };
@@ -342,7 +339,7 @@ pub const StatefulReader = struct {
     /// Callback fired when a writer proxy's protocol-ready state
     /// transitions. Mirrors StatefulWriter's identical field.
     protocol_ready_fn: ?*const fn (*anyopaque, Guid, bool) void = null,
-    /// Set (under `mu`) whenever on_data/on_eoc/on_heartbeat ran; the entry
+    /// Set (under `mu`) whenever on_data/on_eoc ran; the entry
     /// point that then releases `mu` calls on_flush (see takeFlushLocked).
     flush_pending: bool = false,
     protocol_ready_ctx: ?*anyopaque = null,
@@ -972,8 +969,7 @@ pub const StatefulReader = struct {
                 }
                 // Buffer the change (including EOC markers, which have data.len == 0)
                 // so deliverPendingLocked can fire on_eoc when the gap fills.  Without
-                // buffering the EOC, a writer that already appears in coherent_eoc_writers
-                // (HB flushing suppressed) would leave its WIP permanently stuck.
+                // buffering the EOC, the writer's coherent set would never end.
                 const data_copy = try self.alloc.dupe(u8, change.data);
                 var owned = change;
                 owned.data = data_copy;
@@ -1051,9 +1047,8 @@ pub const StatefulReader = struct {
 
         self.mu.lock();
 
-        // Fired after self.mu is released below (never while holding it) --
-        // unlike the internal cb.on_heartbeat callback further down, this
-        // reaches arbitrary user listener code via DataReaderImpl.
+        // Fired after self.mu is released below (never while holding it):
+        // this reaches arbitrary user listener code via DataReaderImpl.
         // notifyWriterProtocolReady, which must never run under this lock.
         var newly_ready_guid: ?Guid = null;
         // Reported after self.mu is released below, like newly_ready_guid:
@@ -1122,15 +1117,6 @@ pub const StatefulReader = struct {
                 }
                 self.deliverPendingLocked(wp, prev_highest);
                 samples_lost += lost_count;
-            }
-
-            // Notify the DDS layer that a valid HB arrived.  Used to flush
-            // coherent WIP when no subsequent set will trigger a CS transition.
-            if (self.callback) |cb| {
-                if (cb.on_heartbeat) |f| {
-                    f(cb.ctx, writer_guid, last_sn);
-                    self.flush_pending = true;
-                }
             }
 
             // Only RELIABLE readers send ACKNACK; BEST_EFFORT readers ignore HEARTBEATs.

@@ -442,7 +442,7 @@ pub const StatefulWriter = struct {
     /// Highest SN actually delivered to readers via sendChangeToAllLocked (i.e. sent
     /// on the wire, not merely buffered in coherent_pending_sns).  Used to cap the
     /// background heartbeat's last_sn during coherent-set buffering so that the HB
-    /// does not advertise unsent SNs that would poison subscriber WIP flush_target_sn.
+    /// does not advertise unsent SNs, which readers would then NACK.
     last_flushed_sn: SequenceNumber,
     /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
     /// Incremented by N after each group coherent set of N samples is flushed.
@@ -1316,12 +1316,11 @@ pub const StatefulWriter = struct {
         // When a coherent set is in progress, coherent_pending_sns holds SNs that
         // have been allocated and added to the cache but NOT yet sent to readers
         // (held until endCoherentSet).  Advertising those SNs in a background HB
-        // causes subscriber WIPs to record a flush_target_sn that exceeds the
-        // current CS's data range, permanently stalling the commit.
+        // would make readers NACK samples this writer will not send yet.
         //
         // Cap last_sn to last_flushed_sn — the highest SN actually delivered to
-        // readers so far.  This ensures the background HB only describes data the
-        // subscriber can achieve as WIP highest_sn (EOC SNs are gapped, not data).
+        // readers so far, so the background HB only describes data readers can
+        // receive (EOC SNs are gapped, not data).
         //
         // After a two-phase GROUP EOC flush (pending_eoc_sn cleared by flushGroupEOCHBOnly),
         // include the sent EOC SN in the advertised range: cache.next_sn - 1 is the EOC

@@ -187,14 +187,6 @@ pub const CoherentWipEntry = struct {
     /// coherent_set_sn of the samples currently buffered (CS = first SN of the set,
     /// per RTI Connext convention).
     cs: history_mod.SequenceNumber,
-    /// Highest RTPS sequence number received into this WIP so far.
-    highest_sn: history_mod.SequenceNumber = 0,
-    /// Minimum last_sn seen from any HEARTBEAT while this WIP is non-empty.
-    /// When non-null, onDataCb flushes as soon as highest_sn >= flush_target_sn.
-    /// Guards against the race where the HB arrives before the last DATA packet
-    /// and subsequent non-coherent writes advance cache.maxSn() past the coherent
-    /// set end — without this field, no future HB ever satisfies the flush condition.
-    flush_target_sn: ?history_mod.SequenceNumber = null,
     samples: std.ArrayListUnmanaged(PendingChange) = .empty,
 };
 
@@ -287,7 +279,7 @@ pub const DataReaderImpl = struct {
     guid: proto.Guid = std.mem.zeroes(proto.Guid),
     status_changes: DDS.StatusMask,
     /// Listeners recorded by the protocol reader's data callbacks (onDataCb,
-    /// onEocCb, onHeartbeatCb), which run under that reader's lock and so
+    /// onEocCb), which run under that reader's lock and so
     /// must not reach application code; onFlushCb dispatches them once the
     /// lock is released. Only DATA_AVAILABLE and SAMPLE_REJECTED.
     pending_listeners: std.atomic.Value(DDS.StatusMask) = .init(0),
@@ -381,12 +373,6 @@ pub const DataReaderImpl = struct {
     /// about to arrive (sequential vtEndCoherent timing).  Cleared on writer departure so
     /// a stale flag never permanently blocks begin_access.  Guarded by `mu`.
     coherent_writer_guids: std.AutoHashMapUnmanaged(Guid, void) = .empty,
-    /// Writers known to use a Connext-style zero-payload alive DATA as end-of-set marker
-    /// (§9.6.4.2 Table 9.22 Example 3).  Once a writer sends its first EOC packet, it is
-    /// added here and HB-based WIP commits are suppressed for that writer — EOC is the
-    /// authoritative flush trigger, and intermediate HBs would otherwise cause premature
-    /// partial commits.  Entries removed on writer departure.  Guarded by `mu`.
-    coherent_eoc_writers: std.AutoHashMapUnmanaged(Guid, void) = .empty,
     /// Timestamp (ns) when the most recent coherent WIP entry was created for any writer.
     /// Reset when a new entry is added; used by Subscriber.begin_access to detect idle
     /// coherent writers that never send a new set (preventing a permanent gate stall).
@@ -551,7 +537,6 @@ pub const DataReaderImpl = struct {
             .ctx = self,
             .on_data = onDataCb,
             .on_sample_lost = onSampleLostCb,
-            .on_heartbeat = onHeartbeatCb,
             .on_eoc = onEocCb,
             .on_flush = onFlushCb,
             .quiesce_acquire = quiesceAcquireFn,
@@ -662,7 +647,6 @@ pub const DataReaderImpl = struct {
         }
         self.coherent_wip.deinit(self.alloc);
         self.coherent_writer_guids.deinit(self.alloc);
-        self.coherent_eoc_writers.deinit(self.alloc);
         for (self.coherent_committed.items) |*s| {
             for (s.items) |p| p.deinit();
             s.deinit(self.alloc);
@@ -890,8 +874,6 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         if (!self.subscriber_presentation.coherent_access) return;
         self.mu.lock();
-        // Remember this writer uses EOC so onHeartbeatCb stops issuing premature commits.
-        self.coherent_eoc_writers.put(self.alloc, change.writer_guid, {}) catch {};
         const committed = if (self.coherent_wip.fetchRemove(change.writer_guid)) |kv|
             self.commitCoherentWipSamplesLocked(kv.value.samples)
         else
@@ -1053,27 +1035,16 @@ pub const DataReaderImpl = struct {
                 self.alloc.free(copy);
                 return;
             };
-            // CS transition: the incoming sample belongs to a new coherent set.
-            // Commit the previous WIP before starting the new one.
+            // CS transition: the incoming sample belongs to a new coherent set,
+            // which ends the previous one (RTPS 2.5 §9.6.4.2). Commit it before
+            // starting the new one. Only a sample ends a set: a HEARTBEAT says
+            // which samples the writer has, not that its set is complete.
             var transition_committed = false;
             if (gop.found_existing and gop.value_ptr.cs != new_cs) {
-                var prev = gop.value_ptr.samples;
-                // If a prior HB told us the set had more samples than we received
-                // (flush_target_sn set but not yet reached), the previous set is
-                // incomplete.  Delivering a partial coherent set violates the coherency
-                // contract, so discard it rather than commit.
-                const prev_complete = gop.value_ptr.flush_target_sn == null or
-                    gop.value_ptr.highest_sn >= gop.value_ptr.flush_target_sn.?;
+                const prev = gop.value_ptr.samples;
                 gop.value_ptr.samples = .empty;
                 gop.value_ptr.cs = new_cs;
-                gop.value_ptr.highest_sn = 0;
-                gop.value_ptr.flush_target_sn = null;
-                if (prev_complete) {
-                    transition_committed = self.commitCoherentWipSamplesLocked(prev);
-                } else {
-                    for (prev.items) |stale| stale.deinit();
-                    prev.deinit(self.alloc);
-                }
+                transition_committed = self.commitCoherentWipSamplesLocked(prev);
                 self.last_coherent_wip_start_ns = time_mod.nanoTimestamp();
             } else if (!gop.found_existing) {
                 gop.value_ptr.* = .{ .cs = new_cs };
@@ -1084,23 +1055,9 @@ pub const DataReaderImpl = struct {
                 self.alloc.free(copy);
                 return;
             };
-            if (change.sequence_number > gop.value_ptr.highest_sn)
-                gop.value_ptr.highest_sn = change.sequence_number;
-            // If a prior HB deferred the flush (highest_sn was < last_sn at HB time),
-            // check whether this DATA packet completes the set.
-            // Skip for EOC writers: their set ends only when the EOC packet arrives.
-            const data_committed = if (gop.value_ptr.flush_target_sn) |target|
-                if (self.coherent_eoc_writers.get(change.writer_guid) == null and
-                    gop.value_ptr.highest_sn >= target)
-                blk2: {
-                    const kv2 = self.coherent_wip.fetchRemove(change.writer_guid).?;
-                    break :blk2 self.commitCoherentWipSamplesLocked(kv2.value.samples);
-                } else false
-            else
-                false;
             self.mu.unlock();
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
-            if (transition_committed or data_committed) {
+            if (transition_committed) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
                 self.deferListener(DDS.DATA_AVAILABLE_STATUS);
             }
@@ -1293,48 +1250,6 @@ pub const DataReaderImpl = struct {
         }
     }
 
-    /// Called when a valid HEARTBEAT arrives from a matched writer.
-    /// Flushes the coherent WIP for that writer only when we have received every
-    /// sample the writer has declared (highest_sn >= last_sn).  Guarding on
-    /// last_sn prevents committing a partial set when the HEARTBEAT arrives before
-    /// all DATA datagrams on a real UDP network where datagrams may reorder.
-    fn onHeartbeatCb(ctx: *anyopaque, writer_guid: Guid, last_sn: history_mod.SequenceNumber) void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        if (!self.quiesce.acquire()) return;
-        defer self.quiesce.release(self, reallyDeinit);
-        if (!self.subscriber_presentation.coherent_access) return;
-        self.mu.lock();
-        const committed = if (self.coherent_wip.getPtr(writer_guid)) |entry| blk: {
-            // Stale HB guard: a HEARTBEAT from the previous coherent set can arrive
-            // after a CS transition has already started the next set.  Such a HB has
-            // last_sn < entry.cs (the first SN of the current set), and committing it
-            // would prematurely flush an in-progress set.  Drop it.
-            if (last_sn < entry.cs) break :blk false;
-            // EOC writers use a zero-payload DATA as the definitive end-of-set signal.
-            // Intermediate HBs from these writers carry a partial last_sn that would
-            // commit the WIP too early.  Skip HB-based flush entirely for them.
-            if (self.coherent_eoc_writers.get(writer_guid) != null) {
-                self.mu.unlock();
-                return;
-            }
-            if (entry.highest_sn < last_sn) {
-                // Missing DATA packets — can't flush yet.  Record the minimum last_sn
-                // we've seen so onDataCb can trigger the flush when the missing packets arrive.
-                const cur = entry.flush_target_sn orelse last_sn;
-                entry.flush_target_sn = if (last_sn < cur) last_sn else cur;
-                self.mu.unlock();
-                return;
-            }
-            const kv = self.coherent_wip.fetchRemove(writer_guid).?;
-            break :blk self.commitCoherentWipSamplesLocked(kv.value.samples);
-        } else false;
-        self.mu.unlock();
-        if (committed) {
-            if (self.status_cond) |sc| sc.notifyWakeup();
-            self.deferListener(DDS.DATA_AVAILABLE_STATUS);
-        }
-    }
-
     // ── Ownership tracking ─────────────────────────────────────────────────────
 
     // Both onWriterMatchedCb and onWriterAliveCb below fire notifyLivelinessChanged()
@@ -1514,7 +1429,6 @@ pub const DataReaderImpl = struct {
         // crashed or was deleted mid-set, the partial wip would otherwise stay
         // in the map indefinitely — one leaked entry per connect/disconnect cycle.
         _ = self.coherent_writer_guids.remove(guid);
-        _ = self.coherent_eoc_writers.remove(guid);
         if (self.coherent_wip.fetchRemove(guid)) |kv| {
             var wip = kv.value;
             for (wip.samples.items) |pc| pc.deinit();
@@ -3934,109 +3848,6 @@ pub const DataReaderImpl = struct {
 const testing = std.testing;
 const time_test = @import("../util/time.zig");
 
-test "coherent WIP: HB before last DATA still flushes via flush_target_sn" {
-    // Reproduces the race: endCoherentSet sends ONE HB with last_sn = N+2 (the
-    // last coherent SN), but the HB arrives before DATA N+2.  The writer then
-    // writes a non-coherent N+3; every subsequent HB has last_sn >= N+3.
-    // Without flush_target_sn the WIP hangs; with it, DATA N+2 triggers the flush.
-    const alloc = testing.allocator;
-
-    var clock = time_test.ManualClock.init(0);
-    const pres = DDS.PresentationQosPolicy{ .coherent_access = true };
-
-    var dr = DataReaderImpl{
-        .alloc = alloc,
-        .topic_desc = nil.nil_topic_description,
-        .subscriber = nil.nil_subscriber,
-        .proto_reader = undefined,
-        .qos = .{},
-        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
-        .listener_mask = 0,
-        .instance_handle = 1,
-        .status_changes = 0,
-        .status_cond = null,
-        .timer_clock = clock.clock(),
-        .last_received_ns = .init(clock.clock().nowNs()),
-        .data_notifiers = .empty,
-        .read_conditions = .empty,
-        .pending = .empty,
-        .coherent_wip = .{},
-        .coherent_committed = .empty,
-        .coherent_committed_ready = false,
-        .mu = .{},
-        .subscriber_presentation = pres,
-        .seen_instances = .empty,
-    };
-    defer {
-        var it = dr.coherent_wip.valueIterator();
-        while (it.next()) |e| {
-            for (e.samples.items) |pc| pc.deinit();
-            e.samples.deinit(alloc);
-        }
-        dr.coherent_wip.deinit(alloc);
-        for (dr.coherent_committed.items) |*set| {
-            for (set.items) |pc| pc.deinit();
-            set.deinit(alloc);
-        }
-        dr.coherent_committed.deinit(alloc);
-        {
-            var _si = dr.seen_instances.valueIterator();
-            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
-        }
-        dr.seen_instances.deinit(alloc);
-        dr.listener_ex_box.releaseRef(alloc);
-    }
-
-    const writer_guid = @import("../rtps/guid.zig").Guid{
-        .prefix = .{ .bytes = [_]u8{0xAA} ** 12 },
-        .entity_id = @import("../rtps/guid.zig").EntityIds.sedp_builtin_publications_writer,
-    };
-
-    // Simulate two coherent samples (SN 1 and 2) in WIP.
-    // highest_sn = 1 (SN 2 DATA hasn't arrived yet).
-    var entry = CoherentWipEntry{ .cs = 1, .highest_sn = 1 };
-    const d1 = try alloc.dupe(u8, &.{0x01});
-    try entry.samples.append(alloc, PendingChange{
-        .data = d1,
-        .alloc = alloc,
-        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
-    });
-    try dr.coherent_wip.put(alloc, writer_guid, entry);
-
-    // HB arrives with last_sn=2 but highest_sn=1 — sets flush_target_sn=2, no flush yet.
-    DataReaderImpl.onHeartbeatCb(@ptrCast(&dr), writer_guid, 2);
-    {
-        const e = dr.coherent_wip.get(writer_guid).?;
-        try testing.expectEqual(@as(?history_mod.SequenceNumber, 2), e.flush_target_sn);
-        try testing.expectEqual(@as(usize, 0), dr.coherent_committed.items.len);
-    }
-
-    // Non-coherent write at SN 3: subsequent HBs carry last_sn=3.
-    // This HB must NOT flush (highest_sn=1 < 3) but must keep flush_target_sn=min(2,3)=2.
-    DataReaderImpl.onHeartbeatCb(@ptrCast(&dr), writer_guid, 3);
-    {
-        const e = dr.coherent_wip.get(writer_guid).?;
-        try testing.expectEqual(@as(?history_mod.SequenceNumber, 2), e.flush_target_sn);
-        try testing.expectEqual(@as(usize, 0), dr.coherent_committed.items.len);
-    }
-
-    // DATA SN 2 arrives — advances highest_sn to 2 which equals flush_target_sn → flush.
-    {
-        const e = dr.coherent_wip.getPtr(writer_guid).?;
-        if (2 > e.highest_sn) e.highest_sn = 2;
-        const data_committed = if (e.flush_target_sn) |target|
-            if (e.highest_sn >= target) blk: {
-                const kv = dr.coherent_wip.fetchRemove(writer_guid).?;
-                break :blk dr.commitCoherentWipSamplesLocked(kv.value.samples);
-            } else false
-        else
-            false;
-        try testing.expect(data_committed);
-    }
-    try testing.expectEqual(@as(usize, 0), dr.coherent_wip.count());
-    try testing.expect(dr.coherent_committed_ready);
-}
-
 test "coherent access: WaitSet trigger survives multiple queued committed sets (regression, hasPendingDataFn)" {
     // hasPendingDataFn backs ReadConditionImpl's has_data_fn -- the only signal a
     // WaitSet-driven wait() -> begin_access() -> take() -> end_access() loop has
@@ -4145,189 +3956,6 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
     }
 
     try testing.expect(!DataReaderImpl.hasPendingDataFn(@ptrCast(&dr)));
-}
-
-test "coherent WIP: CS transition discards incomplete previous WIP" {
-    // Covers the discard branch (lines 606-610): when a new coherent set arrives
-    // while the previous WIP has flush_target_sn set (incomplete), the previous
-    // set is discarded rather than committed to preserve the coherency guarantee.
-    const alloc = testing.allocator;
-    var clock = time_test.ManualClock.init(0);
-    const pres = DDS.PresentationQosPolicy{ .coherent_access = true };
-    var dr = DataReaderImpl{
-        .alloc = alloc,
-        .topic_desc = nil.nil_topic_description,
-        .subscriber = nil.nil_subscriber,
-        .proto_reader = undefined,
-        .qos = .{},
-        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
-        .listener_mask = 0,
-        .instance_handle = 1,
-        .status_changes = 0,
-        .status_cond = null,
-        .timer_clock = clock.clock(),
-        .last_received_ns = .init(clock.clock().nowNs()),
-        .data_notifiers = .empty,
-        .read_conditions = .empty,
-        .pending = .empty,
-        .coherent_wip = .{},
-        .coherent_committed = .empty,
-        .coherent_committed_ready = false,
-        .mu = .{},
-        .subscriber_presentation = pres,
-        .seen_instances = .empty,
-    };
-    defer {
-        var it = dr.coherent_wip.valueIterator();
-        while (it.next()) |e| {
-            for (e.samples.items) |pc| pc.deinit();
-            e.samples.deinit(alloc);
-        }
-        dr.coherent_wip.deinit(alloc);
-        for (dr.coherent_committed.items) |*set| {
-            for (set.items) |pc| pc.deinit();
-            set.deinit(alloc);
-        }
-        dr.coherent_committed.deinit(alloc);
-        {
-            var _si = dr.seen_instances.valueIterator();
-            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
-        }
-        dr.seen_instances.deinit(alloc);
-        dr.listener_ex_box.releaseRef(alloc);
-        dr.coherent_writer_guids.deinit(alloc);
-        var wit = dr.writer_instances.valueIterator();
-        while (wit.next()) |v| v.deinit(alloc);
-        dr.writer_instances.deinit(alloc);
-        dr.publication_guids.deinit(alloc);
-    }
-
-    const guid_mod = @import("../rtps/guid.zig");
-    const writer_guid = guid_mod.Guid{
-        .prefix = .{ .bytes = [_]u8{0xCC} ** 12 },
-        .entity_id = guid_mod.EntityIds.sedp_builtin_publications_writer,
-    };
-
-    // Seed a WIP entry with CS=1, one sample, flush_target_sn=5 (highest_sn=1 < 5 → incomplete).
-    var entry = CoherentWipEntry{ .cs = 1, .highest_sn = 1, .flush_target_sn = 5 };
-    const d1 = try alloc.dupe(u8, &.{0x01});
-    try entry.samples.append(alloc, PendingChange{
-        .data = d1,
-        .alloc = alloc,
-        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
-    });
-    try dr.coherent_wip.put(alloc, writer_guid, entry);
-
-    // CS=10 DATA arrives — triggers CS transition; prev (CS=1) is incomplete → discard.
-    const change = history_mod.CacheChange{
-        .kind = .alive,
-        .writer_guid = writer_guid,
-        .sequence_number = 10,
-        .source_timestamp = .{ .seconds = 0, .fraction = 0 },
-        .instance_handle = std.mem.zeroes(history_mod.InstanceHandle),
-        .key_hash = std.mem.zeroes([16]u8),
-        .data = &.{0x02},
-        .coherent_set_sn = 10,
-    };
-    DataReaderImpl.onDataCb(@ptrCast(&dr), &change);
-
-    try testing.expectEqual(@as(usize, 0), dr.coherent_committed.items.len);
-    const e = dr.coherent_wip.get(writer_guid).?;
-    try testing.expectEqual(@as(history_mod.SequenceNumber, 10), e.cs);
-}
-
-test "coherent WIP: flush_target_sn triggers flush when DATA reaches target SN" {
-    // Covers lines 624-626: onDataCb advances highest_sn and flushes when it
-    // reaches flush_target_sn that was previously set by a HEARTBEAT.
-    const alloc = testing.allocator;
-    var clock = time_test.ManualClock.init(0);
-    const pres = DDS.PresentationQosPolicy{ .coherent_access = true };
-    var dr = DataReaderImpl{
-        .alloc = alloc,
-        .topic_desc = nil.nil_topic_description,
-        .subscriber = nil.nil_subscriber,
-        .proto_reader = undefined,
-        .qos = .{},
-        .listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listenerExFromBase(nil.nil_dr_listener)),
-        .listener_mask = 0,
-        .instance_handle = 1,
-        .status_changes = 0,
-        .status_cond = null,
-        .timer_clock = clock.clock(),
-        .last_received_ns = .init(clock.clock().nowNs()),
-        .data_notifiers = .empty,
-        .read_conditions = .empty,
-        .pending = .empty,
-        .coherent_wip = .{},
-        .coherent_committed = .empty,
-        .coherent_committed_ready = false,
-        .mu = .{},
-        .subscriber_presentation = pres,
-        .seen_instances = .empty,
-    };
-    defer {
-        // dispatchListener() (DDS 1.4 §2.2.4.1.5 fallback) always resolves
-        // this reader's own C-ABI handle before checking whether any level
-        // in the chain has a usable listener -- unlike this test's
-        // `nil.nil_dr_listener`/`listener_mask = 0`, which previously meant
-        // `get_c_abi_handle` was never reached at all. Free the resulting
-        // cached box the same way every real `deinit()` does.
-        dr.c_abi.free(alloc);
-        var it = dr.coherent_wip.valueIterator();
-        while (it.next()) |e| {
-            for (e.samples.items) |pc| pc.deinit();
-            e.samples.deinit(alloc);
-        }
-        dr.coherent_wip.deinit(alloc);
-        for (dr.coherent_committed.items) |*set| {
-            for (set.items) |pc| pc.deinit();
-            set.deinit(alloc);
-        }
-        dr.coherent_committed.deinit(alloc);
-        {
-            var _si = dr.seen_instances.valueIterator();
-            while (_si.next()) |_e| if (_e.key_cdr) |_kc| alloc.free(_kc);
-        }
-        dr.seen_instances.deinit(alloc);
-        dr.listener_ex_box.releaseRef(alloc);
-        dr.coherent_writer_guids.deinit(alloc);
-        var wit = dr.writer_instances.valueIterator();
-        while (wit.next()) |v| v.deinit(alloc);
-        dr.writer_instances.deinit(alloc);
-        dr.publication_guids.deinit(alloc);
-    }
-
-    const guid_mod = @import("../rtps/guid.zig");
-    const writer_guid = guid_mod.Guid{
-        .prefix = .{ .bytes = [_]u8{0xDD} ** 12 },
-        .entity_id = guid_mod.EntityIds.sedp_builtin_publications_writer,
-    };
-
-    // Seed WIP: CS=5, one sample (SN=1) already received, flush_target_sn=2.
-    var entry = CoherentWipEntry{ .cs = 5, .highest_sn = 1, .flush_target_sn = 2 };
-    const d1 = try alloc.dupe(u8, &.{0x01});
-    try entry.samples.append(alloc, PendingChange{
-        .data = d1,
-        .alloc = alloc,
-        .info = .{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true },
-    });
-    try dr.coherent_wip.put(alloc, writer_guid, entry);
-
-    // DATA SN=2 (same CS=5) arrives — highest_sn reaches flush_target_sn → flush.
-    const change = history_mod.CacheChange{
-        .kind = .alive,
-        .writer_guid = writer_guid,
-        .sequence_number = 2,
-        .source_timestamp = .{ .seconds = 0, .fraction = 0 },
-        .instance_handle = std.mem.zeroes(history_mod.InstanceHandle),
-        .key_hash = std.mem.zeroes([16]u8),
-        .data = &.{0x02},
-        .coherent_set_sn = 5,
-    };
-    DataReaderImpl.onDataCb(@ptrCast(&dr), &change);
-
-    try testing.expectEqual(@as(usize, 0), dr.coherent_wip.count());
-    try testing.expectEqual(@as(usize, 1), dr.coherent_committed.items.len);
 }
 
 test "takeRaw: expired LIFESPAN sample is silently discarded" {

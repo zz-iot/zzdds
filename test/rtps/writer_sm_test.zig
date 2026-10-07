@@ -1033,8 +1033,8 @@ test "protocol_ready: a second RELIABLE proxy added after the first is already r
 
 test "sendHeartbeat: coherent_active caps last_sn to last_flushed_sn" {
     // During an active coherent set, write() buffers SNs in coherent_pending_sns
-    // without sending them.  The background HB must not advertise these unsent SNs
-    // or subscriber WIPs will record an unachievable flush_target_sn.
+    // without sending them.  The background HB must not advertise these unsent SNs,
+    // which readers would NACK.
     // Covers writer_sm.zig lines 747-750.
     const writer_guid = makeGuid(0x50, WRITER_EID);
     const reader_guid = makeGuid(0x51, READER_EID);

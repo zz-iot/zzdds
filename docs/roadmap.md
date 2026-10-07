@@ -311,20 +311,19 @@ or an optimisation on an already-improved path):
   for the `_w_condition` family is a separate, not-yet-done retrofit (`idl/dcps.idl:1114`).
 - **`@standalone` interface annotation is inert** — placed so a future validation pass has
   something to check; no codegen reads it (`idl/dcps.idl:283`).
-- **`dds-rtps` `CoherentSets_10/11/12/19/20/21` still flake: the harness check needs
-  re-fixing.** The cause is harness timing, not zzdds: `coherent_sets_w_instances` judges
-  each read iteration, so it depends on how the subscriber's take period lines up with the
-  publisher's writes. The 2026-08-28 campaign (~2,500 runs) found no ordering, loss,
-  duplication or coherent-set-tear faults. Our rewrite, which judged the whole run and
-  removed the flake, was declined upstream in favour of improving the per-iteration
-  assertions (`6d9c01d`, non-GROUP checks only). That reduced the flake but did not remove
-  it: when read and write iterations drift far out of step, the tests still report
-  `DATA_NOT_CORRECT`. This happens on both check variants, non-GROUP (10, 11, 19, 20) and
-  GROUP (12, 21, which still expects exactly 36 samples per set), most often in the
-  DebugAllocator lanes (four failures across #94 and #95). Next: re-fix the check logic and
-  propose it upstream again; if it is not accepted, carry it on the `zz-iot/dds-rtps`
-  branch CI already pins (`INTEROP_RTPS_REF`), merging upstream `master` into it to stay
-  current. See `implementation_status.md` / `decisions.md`.
+- **`dds-rtps` `CoherentSets_10/11/12/19/20/21`: remaining failure modes.** Most failures
+  with zzdds subscribing were a zzdds bug, fixed 2026-10-07 (a HEARTBEAT committed an
+  in-progress coherent set; see `CHANGELOG.md`), not harness timing as the 2026-08-28
+  campaign concluded. The harness check has its own gap: it skips the first two read
+  cycles that have data, assuming every DataWriter matches at once, but a DataReader that
+  matches while a set is being written cannot receive that set whole, so DataWriters
+  matching in more than two steps still fail it. The fix, skipping each topic's first
+  delivery instead, is carried on the `zz-iot/dds-rtps` branch CI pins
+  (`INTEROP_RTPS_REF`); propose it upstream, where the earlier whole-run rewrite was
+  declined. Not yet explained: GROUP-scope failures with zzdds publishing and Connext
+  subscribing (DebugAllocator lane only; Connext holds one topic's part of a set back;
+  0 of 10 local runs failed), and one hdds subscriber that delivered the first sets
+  ~20 read cycles late with zzdds publishing.
 
 ### Bindings
 

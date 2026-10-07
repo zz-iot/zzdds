@@ -8,6 +8,18 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-07
+
+- **A HEARTBEAT no longer ends a coherent set.** With `coherent_access`, a zzdds
+  subscriber committed a writer's in-progress coherent set whenever a HEARTBEAT said it
+  had every sample written so far, until that writer's first end-of-set marker. Writers
+  that send each sample as it is written (zzdds's own writer holds a set until it ends)
+  send HEARTBEATs in the middle of a set, so the first sets from them were split across
+  `begin_access`/`end_access` cycles; in GROUP scope that could also leave one reader a
+  set behind the others. A set now ends only as RTPS 2.5 §9.6.4.2 defines: an end-of-set
+  DATA, a sample of another set, or a sample without `PID_COHERENT_SET`. This was the
+  cause of most `Test_CoherentSets_10`–`12` interop failures with zzdds as the subscriber.
+
 ## 2026-10-05
 
 - **ContentFilteredTopic filter expressions can be changed in place.** New zzdds extension

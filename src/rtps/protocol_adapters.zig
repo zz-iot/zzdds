@@ -465,7 +465,6 @@ pub const RtpsProtocolReader = struct {
             .ctx = cb.ctx,
             .on_data = cb.on_data,
             .on_sample_lost = cb.on_sample_lost,
-            .on_heartbeat = cb.on_heartbeat,
             .on_eoc = cb.on_eoc,
             .on_flush = cb.on_flush,
         });

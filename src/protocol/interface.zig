@@ -107,15 +107,12 @@ pub const DataCallback = struct {
     /// irreversibly lost (never delivered). Called after the protocol
     /// reader's lock is released, since it reaches application listeners.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
-    /// Optional: called when a valid (non-duplicate) HEARTBEAT arrives from a
-    /// writer.  Used to flush coherent WIP when no CS transition follows the set.
-    on_heartbeat: ?*const fn (ctx: *anyopaque, writer_guid: Guid, last_sn: SequenceNumber) void = null,
     /// Optional: called when a Connext-style zero-payload alive DATA arrives with
     /// no PID_COHERENT_SET — the end-of-coherent-set signal.  RTPS-level consumers
     /// leave this null; the DCPS layer registers it to flush the coherent WIP.
     on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
     /// Optional: called after the protocol reader's lock is released, by any
-    /// operation that called on_data/on_eoc/on_heartbeat while holding it.
+    /// operation that called on_data/on_eoc while holding it.
     /// Those hand changes over under the lock (which keeps them in order) and
     /// must not reach application code; anything that does, such as
     /// raising on_data_available, belongs here instead.

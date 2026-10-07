@@ -162,24 +162,19 @@ The constant is present but not yet serialized in SEDP announcements; when GROUP
 is added, confirm that peers expect `0x002D` (not the historical `0x0056` used by some older
 implementations).
 
-**`dds-rtps` `CoherentSets_10/11/12/19/20/21` flakiness — traced to the test harness,
-not zzdds.** These six tests use `coherent_sets_w_instances`, whose original body asserted
-that *exactly* 36 samples arrive between consecutive `Reading coherent sets` lines — a
-property of the phase alignment between the subscriber's `take()` period and the
-publisher's write period, not of the coherent_access contract. A ~2,500-run campaign
-(2026-08-28) against CoreDX / Connext / self, in both directions, across ReleaseSafe /
-ThreadSanitizer / DebugAllocator builds, found **zero** ordering, loss, duplication, or
-coherent-set-tear faults; every failure was the per-poll-cycle count assertion. It is
-direction-specific (vendor publishes, zzdds subscribes), worst against CoreDX (round-robins
-instances) and under the slower sanitizer builds, and the shipped `zzdds-0.2.0` binary
-flakes the same way. Our fix, a `coherent_sets_w_instances` rewrite asserting the real
-invariants (per-instance ordering, no loss/dup, per-instance coherent-set atomic delivery)
-over the whole run, was declined upstream in favour of improved per-iteration assertions
-(`6d9c01d`, non-GROUP checks only). That reduced but did not remove the flake: all six tests
-can still fail when read and write iterations drift out of step, so the check needs
-re-fixing (see the roadmap). `CoherentSets_8` (pure GROUP_PRESENTATION
-compatibility) currently passes. `OrderedAccess_8` was not re-examined in this campaign;
-RTI added timing tolerance to `ordered_access_w_instances` upstream in Aug 2026 (`95b6f62`).
+**`dds-rtps` `CoherentSets_10/11/12/19/20/21` flakiness — mostly a zzdds subscriber bug,
+fixed 2026-10-07.** A zzdds subscriber committed a writer's in-progress coherent set when
+a HEARTBEAT said it had every sample written so far. Vendor writers that send each sample
+as it is written send such HEARTBEATs mid-set, so sets were split across
+`begin_access`/`end_access` cycles, mostly the first sets after matching (later ones were
+protected once the writer's first end-of-set marker arrived). A 2026-08-28 campaign had
+attributed these failures to the harness's per-cycle sample counts; its analysis checked
+whole-run ordering and per-instance atomicity after start-up and missed the split first
+sets. Against CoreDX publishing, 4 of 10 local runs failed before the fix and 0 of 20
+after. The harness check also assumes all DataWriters match at once (see the roadmap,
+which also lists the failure modes not yet explained). `CoherentSets_8` passes.
+`OrderedAccess_8` was not re-examined; RTI added timing tolerance to
+`ordered_access_w_instances` upstream in Aug 2026 (`95b6f62`).
 
 **SPDP liveness probe fires directed HBs on SEDP reliable channels.** When SPDP silence
 exceeds `min(3 × observed_interval, 5 s)`, the SPDP layer triggers a directed non-final

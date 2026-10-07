@@ -105,8 +105,8 @@ allows retransmit of individual fragments without re-serialization.
 **Listeners never run under a zzdds lock: collect under it, dispatch after it.**
 Code that reaches application listeners records what to raise while holding its lock,
 pins each target (`quiesceAcquire` on the protocol endpoint or the DCPS entity), releases
-the lock, then dispatches and drops the pins. In the protocol reader, `on_data`, `on_eoc`
-and `on_heartbeat` only hand changes over under the reader's lock (which keeps them in
+the lock, then dispatches and drops the pins. In the protocol reader, `on_data` and `on_eoc`
+only hand changes over under the reader's lock (which keeps them in
 order); the same operation then calls `on_flush` once the lock is released, and the DCPS
 reader raises `on_data_available`/`on_sample_rejected` from there. The built-in SEDP and
 WLP readers queue in `on_data` and process in `on_flush` through a `DrainQueue`: one
@@ -241,19 +241,13 @@ bases exactly as before (unexercised, matching today's shipped behavior).
 
 **GROUP_PRESENTATION coherent sets: implement to spec.**
 The zzdds implementation emits `PID_COHERENT_SET` (0x0056), `PID_GROUP_SEQ_NUM` (0x0064),
-and `PID_GROUP_COHERENT_SET` (0x0063) inline QoS per RTPS 2.5 §9.6.3.7. The recurring
-`dds-rtps` `CoherentSets_10/11/12/19/20/21` CI failures were investigated end to end
-(2026-08-28, ~2,500 live runs + ~2,300 trace replays across CoreDX/Connext/self, both
-directions, ReleaseSafe/TSan/DebugAllocator): **no zzdds defect.** Every failure is the
-harness's `coherent_sets_w_instances` asserting a per-poll-cycle sample count (exactly 36),
-which depends on the phase alignment of two unsynchronised sleep loops rather than the
-coherent_access contract. The shipped `zzdds-0.2.0` binary flakes identically. Our
-`coherent_sets_w_instances` rewrite (asserting per-instance ordering, no loss/dup, and
-atomic per-instance coherent-set delivery over the whole run, in the spirit of their
-`95b6f62` "Added tolerance to the ordered_access test") was declined upstream in favour of
-improved per-iteration assertions (`6d9c01d`, non-GROUP only). Those reduce but do not
-remove the timing dependence, so residual flakes remain and the check still needs
-re-fixing (roadmap). No zzdds wire-format change was needed. `CoherentSets_8` passes.
+and `PID_GROUP_COHERENT_SET` (0x0063) inline QoS per RTPS 2.5 §9.6.3.7. A coherent set
+ends only on what RTPS 2.5 §9.6.4.2 defines: an end-of-set DATA, a sample of another set,
+or a sample without `PID_COHERENT_SET`. A HEARTBEAT does not end one: it says which
+samples the writer has, and writers that send samples as they are written send
+HEARTBEATs mid-set (committing on them split sets; it caused most `dds-rtps`
+`CoherentSets_10/11/12/19/20/21` failures with zzdds subscribing, see
+`implementation_status.md`). `CoherentSets_8` passes.
 
 **Listener hierarchy fallback (DDS 1.4 §2.2.4.1.5): reader/writer own listener first,
 then Subscriber/Publisher, then DomainParticipant — every level's `listener_mask`

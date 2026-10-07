@@ -1588,6 +1588,7 @@ pub fn build(b: *std.Build) void {
         "test/c_abi/typesupport_test.zig",
         "test/c_abi/bootstrap_test.zig",
         "test/dcps/entity_routing_test.zig",
+        "test/dcps/coherent_heartbeat_test.zig",
         "test/dcps/wait_for_historical_test.zig",
         "test/dcps/waitset_test.zig",
         "test/dcps/waitset_lifecycle_test.zig",
