@@ -1106,6 +1106,9 @@ fn makeCoherentWriter(rec: *Recording, kind: rtps.history.HistoryKind, depth: u3
     errdefer w.deinit();
     const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, true);
     try w.addMatchedReader(rp);
+    // The periodic HEARTBEAT thread would send into `rec` while the test does;
+    // tests send their HEARTBEATs explicitly.
+    w.stopHeartbeat();
     rec.reset();
     return w;
 }
@@ -1294,6 +1297,7 @@ test "endCoherentSet: an empty GROUP writer's marker waits for the combined send
     defer w.deinit();
     const rp = try ReaderProxy.init(testing.allocator, makeGuid(0x53, READER_EID), &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, false);
     try w.addMatchedReader(rp);
+    w.stopHeartbeat();
 
     const group_set = rtps.history.GroupCoherentSet{ .first_gsn = 11, .end_gsn = 14, .writer_group_info = .{ 1, 2, 3, 4 } };
     w.beginCoherentSet(true);
