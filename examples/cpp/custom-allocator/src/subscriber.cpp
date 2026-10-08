@@ -141,8 +141,9 @@ int main() {
                log_dr->get_subscription_matched_status(b) == ::DDS::RETCODE_OK &&
                a.current_count > 0 && b.current_count > 0;
     });
+    // A match arriving later would trip an armed guard, so leave it off then.
     if (!matched)
-        std::fprintf(stderr, "subscriber: no writer matched within %d ms\n", MATCH_TIMEOUT_MS);
+        std::fprintf(stderr, "subscriber: no writer matched within %d ms -- guard not armed\n", MATCH_TIMEOUT_MS);
 
     // WaitSet and GuardCondition are the two condition-family types with no
     // factory operation -- the app constructs them directly. Creating them
@@ -155,7 +156,7 @@ int main() {
     // internal C++ wrapper bookkeeping ever falls back to global
     // operator new instead of the pmr allocator zidl::setCppAllocator
     // installed above.
-    noalloc_guard_try_arm();
+    if (matched) noalloc_guard_try_arm();
 
     auto ws = zzdds::create_waitset(&static_pool_allocator);
     if (!ws) {
@@ -188,7 +189,7 @@ int main() {
     noalloc_guard_try_disarm();
     ::DDS::ConditionSeq active;
     auto wait_rc = ws->wait(active, ::DDS::Duration_t{1, 0});
-    noalloc_guard_try_arm();
+    if (matched) noalloc_guard_try_arm();
 
     std::shared_ptr<::DDS::Condition> gc_cond = gc;
     bool gc_active = false;

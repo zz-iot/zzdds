@@ -81,7 +81,8 @@ Both programs arm the guard after setup, once discovery has matched their
 endpoints — per-matched-peer heartbeat threads still allocate via
 `std.heap.c_allocator`, a Zig stdlib limitation not routable through the
 injected allocator, so arming immediately at startup would be a false
-failure, not a real one.
+failure, not a real one. If nothing matches within 10 s, they leave the
+guard unarmed (a later match would trip it) and say so.
 
 ```sh
 LD_LIBRARY_PATH=/path/to/zzdds/zig-out/lib \

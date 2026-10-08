@@ -159,12 +159,15 @@ int main() {
                log_dw->get_publication_matched_status(b) == ::DDS::RETCODE_OK &&
                a.current_count > 0 && b.current_count > 0;
     });
-    if (!matched)
-        std::fprintf(stderr, "publisher: no reader matched within %d ms -- writing anyway\n", MATCH_TIMEOUT_MS);
-
-    // All one-time/discovery-adjacent allocation is done -- arm the guard so
-    // any further malloc/calloc/realloc/free/operator new aborts the process.
-    noalloc_guard_try_arm();
+    if (matched) {
+        // All one-time/discovery-adjacent allocation is done -- arm the guard
+        // so any further malloc/calloc/realloc/free/operator new aborts the
+        // process.
+        noalloc_guard_try_arm();
+    } else {
+        // A match arriving later would trip an armed guard, so leave it off.
+        std::fprintf(stderr, "publisher: no reader matched within %d ms -- writing anyway, guard not armed\n", MATCH_TIMEOUT_MS);
+    }
 
     for (int i = 0; i < SAMPLE_COUNT; i++) {
         SensorSample sample;

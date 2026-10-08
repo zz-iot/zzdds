@@ -144,10 +144,12 @@ int main(void) {
      * per-newly-discovered-peer cost though, not a per-sample hot-path one,
      * so it belongs before arming, same as factory/entity bootstrap. A fixed
      * delay could arm before a slow discovery finished. */
-    if (!wait_readers_matched(dr, log_dr))
-        fprintf(stderr, "subscriber: no writer matched within %d ms\n", MATCH_TIMEOUT_MS);
-
-    noalloc_guard_try_arm();
+    if (wait_readers_matched(dr, log_dr)) {
+        noalloc_guard_try_arm();
+    } else {
+        /* A match arriving later would trip an armed guard, so leave it off. */
+        fprintf(stderr, "subscriber: no writer matched within %d ms -- guard not armed\n", MATCH_TIMEOUT_MS);
+    }
 
     /* WaitSet and GuardCondition are the two condition-family types with no
      * factory operation (see zzdds_c.h's comment on zzdds_create_waitset) --

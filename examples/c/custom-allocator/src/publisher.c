@@ -149,12 +149,14 @@ int main(void) {
      * is silently ignored there) -- a one-time, bounded, per-newly-matched-peer
      * cost, not a per-sample hot-path one, so it belongs before arming. A
      * fixed delay could arm before a slow discovery finished. */
-    if (!wait_writers_matched(dw, log_dw))
-        fprintf(stderr, "publisher: no reader matched within %d ms -- writing anyway\n", MATCH_TIMEOUT_MS);
-
-    /* All one-time/discovery-adjacent allocation is done -- arm the guard so
-     * any further malloc/calloc/realloc/free aborts the process. */
-    noalloc_guard_try_arm();
+    if (wait_writers_matched(dw, log_dw)) {
+        /* All one-time/discovery-adjacent allocation is done -- arm the guard
+         * so any further malloc/calloc/realloc/free aborts the process. */
+        noalloc_guard_try_arm();
+    } else {
+        /* A match arriving later would trip an armed guard, so leave it off. */
+        fprintf(stderr, "publisher: no reader matched within %d ms -- writing anyway, guard not armed\n", MATCH_TIMEOUT_MS);
+    }
 
     for (int i = 0; i < SAMPLE_COUNT; i++) {
         SensorSample sample;
