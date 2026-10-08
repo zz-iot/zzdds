@@ -160,6 +160,11 @@ pub const SubscriberImpl = struct {
     /// Active DataReader instances owned by this subscriber; guarded by `mu`.
     readers: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl),
     mu: Mutex,
+    /// GROUP-scope coherent access: the id of the last group set delivered or
+    /// discarded, per publisher.  A part of one of these arriving later is
+    /// discarded on sight.  Forgotten once no reader hears from the publisher.
+    /// Guarded by `mu`.
+    group_sets_done: std.AutoArrayHashMapUnmanaged(proto.Guid, proto.SequenceNumber) = .empty,
 
     /// One box for the whole object, shared across every interface view
     /// (Subscriber, Entity) — see `views` below and
@@ -243,6 +248,7 @@ pub const SubscriberImpl = struct {
         self.c_abi.free(self.alloc);
         // Owned DataReaders were torn down synchronously in deinit(); empty here.
         self.readers.deinit(self.alloc);
+        self.group_sets_done.deinit(self.alloc);
         self.qos.deinit(self.alloc);
         self.default_dr_qos.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -793,6 +799,239 @@ pub const SubscriberImpl = struct {
         return .{ .cb = null, .listener_data = null, .owner = .none };
     }
 
+    /// Maximum time a coherent writer may go without starting or ending a set
+    /// before begin_access stops waiting on it.
+    const coherent_idle_gate_ns: i64 = 5 * std.time.ns_per_s;
+
+    const ListenerSnaps = std.ArrayListUnmanaged(ListenerSnap);
+    const ListenerSnap = struct {
+        dr: DDS.DataReader,
+        resolution: DataAvailableResolution,
+    };
+
+    /// With `r.mu` held: if `r` has samples to take, wake its WaitSets and
+    /// queue its on_data_available for after subscriber.mu is released.
+    /// Releases `r.mu`.
+    fn notifyExposedUnlock(self: *Self, r: *reader_mod.DataReaderImpl, listener_snaps: *ListenerSnaps) void {
+        // Only notify if this reader actually has samples -- a reader with
+        // nothing exposed must not generate a spurious on_data_available or
+        // WaitSet wakeup.
+        const has_data = r.pending.items.len > 0;
+        // Fire WaitSet wakeups while subscriber.mu is held to prevent
+        // use-after-free from a concurrent delete_datareader.
+        // data_notifiers are exclusively WaitSet-internal wakeup callbacks
+        // (registered only by ReadConditionImpl/QueryConditionImpl via
+        // addDataNotifier).  They acquire only WaitSet.cv_mu — never
+        // subscriber.mu or reader.mu — so holding both locks here is safe.
+        if (has_data) {
+            for (r.data_notifiers.items) |n| n.on_data(n.ctx);
+        }
+        r.mu.unlock();
+        if (has_data) {
+            r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
+            if (r.status_cond) |sc| sc.notifyWakeup();
+            const resolution = self.resolveDataAvailableFallback(r);
+            listener_snaps.append(self.alloc, .{
+                .dr = r.toDDSDataReader(),
+                .resolution = resolution,
+            }) catch resolution.release();
+        }
+    }
+
+    const GroupSetKey = struct { publisher: proto.Guid, id: proto.SequenceNumber };
+    const GroupSetVerdict = enum { wait, deliver, discard };
+
+    /// GROUP-scope begin_access (RTPS 2.5 §8.7.6): expose whole group coherent
+    /// sets, each assembled from the parts its publisher's writers sent to this
+    /// subscriber's readers.  A group set is ready once every such writer is
+    /// done with it, and is discarded if any part is incomplete.  Exposes at
+    /// most one set per publisher, its oldest.  Called with `mu` held.
+    fn beginGroupCoherentAccessLocked(self: *Self, now_ns: i64, listener_snaps: *ListenerSnaps) void {
+        const exposed = self.alloc.alloc(bool, self.readers.items.len) catch return;
+        defer self.alloc.free(exposed);
+        @memset(exposed, false);
+
+        var settled: std.ArrayListUnmanaged(proto.Guid) = .empty;
+        defer settled.deinit(self.alloc);
+        while (self.oldestGroupSetLocked(settled.items)) |key| {
+            switch (self.groupSetVerdictLocked(key, now_ns)) {
+                .wait => settled.append(self.alloc, key.publisher) catch break,
+                .discard => self.takeGroupSetLocked(key, false, exposed),
+                .deliver => {
+                    self.takeGroupSetLocked(key, true, exposed);
+                    settled.append(self.alloc, key.publisher) catch break;
+                },
+            }
+        }
+        self.beginPositionalCoherentAccessLocked(now_ns, exposed);
+        self.pruneGroupSetsDoneLocked();
+
+        for (self.readers.items, exposed) |r, e| {
+            if (!e) continue;
+            r.mu.lock();
+            self.notifyExposedUnlock(r, listener_snaps);
+        }
+    }
+
+    /// Drop `group_sets_done` entries for publishers no reader has a matched
+    /// writer or a queued part from.
+    fn pruneGroupSetsDoneLocked(self: *Self) void {
+        var i: usize = 0;
+        while (i < self.group_sets_done.count()) {
+            const publisher = self.group_sets_done.keys()[i];
+            const heard = for (self.readers.items) |r| {
+                if (hearsFromPublisher(r, publisher)) break true;
+            } else false;
+            if (heard) {
+                i += 1;
+            } else {
+                self.group_sets_done.swapRemoveAt(i);
+            }
+        }
+    }
+
+    fn hearsFromPublisher(r: *reader_mod.DataReaderImpl, publisher: proto.Guid) bool {
+        r.mu.lock();
+        defer r.mu.unlock();
+        var it = r.coherent_writers.valueIterator();
+        while (it.next()) |cw| {
+            if (cw.publisher.eql(publisher)) return true;
+        }
+        for (r.coherent_committed.items) |part| {
+            if (part.publisher.eql(publisher)) return true;
+        }
+        return false;
+    }
+
+    /// The oldest queued group set of a publisher not in `skip`.
+    fn oldestGroupSetLocked(self: *Self, skip: []const proto.Guid) ?GroupSetKey {
+        var best: ?GroupSetKey = null;
+        for (self.readers.items) |r| {
+            r.mu.lock();
+            defer r.mu.unlock();
+            for (r.coherent_committed.items) |part| {
+                const id = part.group_cs orelse continue;
+                if (best) |b| {
+                    if (part.publisher.eql(b.publisher) and id < b.id) best.?.id = id;
+                    continue;
+                }
+                const skipped = for (skip) |p| {
+                    if (p.eql(part.publisher)) break true;
+                } else false;
+                if (!skipped) best = .{ .publisher = part.publisher, .id = id };
+            }
+        }
+        return best;
+    }
+
+    fn groupSetVerdictLocked(self: *Self, key: GroupSetKey, now_ns: i64) GroupSetVerdict {
+        if (self.group_sets_done.get(key.publisher)) |done| {
+            if (key.id <= done) return .discard;
+        }
+        var verdict: GroupSetVerdict = .deliver;
+        for (self.readers.items) |r| {
+            r.mu.lock();
+            defer r.mu.unlock();
+            for (r.coherent_committed.items) |part| {
+                if (part.group_cs == key.id and part.publisher.eql(key.publisher) and !part.complete)
+                    return .discard;
+            }
+            var it = r.coherent_writers.valueIterator();
+            while (it.next()) |cw| {
+                if (!cw.publisher.eql(key.publisher)) continue;
+                if (cw.group_ids == false) continue;
+                // The writer may have had a part of this set the reader never got.
+                if (cw.complete_from > key.id) return .discard;
+                const done = if (cw.done_through) |d| d >= key.id else false;
+                // An idle writer stops holding the set back.
+                if (!done and now_ns - cw.last_progress_ns < coherent_idle_gate_ns) verdict = .wait;
+            }
+        }
+        return verdict;
+    }
+
+    /// Expose (`deliver`) or drop every reader's parts of group set `key`.
+    fn takeGroupSetLocked(self: *Self, key: GroupSetKey, deliver: bool, exposed: []bool) void {
+        const gop = self.group_sets_done.getOrPut(self.alloc, key.publisher) catch null;
+        if (gop) |g| g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, key.id) else key.id;
+        for (self.readers.items, exposed) |r, *e| {
+            r.mu.lock();
+            defer r.mu.unlock();
+            var i: usize = 0;
+            while (i < r.coherent_committed.items.len) {
+                const part = r.coherent_committed.items[i];
+                if (part.group_cs != key.id or !part.publisher.eql(key.publisher)) {
+                    i += 1;
+                    continue;
+                }
+                if (deliver) {
+                    r.promoteCommittedSetLocked(i);
+                    e.* = true;
+                } else {
+                    r.discardCommittedSetLocked(i);
+                }
+            }
+        }
+    }
+
+    /// GROUP-scope sets from writers that send no group set id (no
+    /// PID_GROUP_COHERENT_SET): with nothing to tell which parts belong
+    /// together, take the oldest from each reader once every reader with such
+    /// a writer has one or nothing in flight, and discard them all if any is
+    /// incomplete.
+    fn beginPositionalCoherentAccessLocked(self: *Self, now_ns: i64, exposed: []bool) void {
+        var any = false;
+        for (self.readers.items) |r| {
+            r.mu.lock();
+            defer r.mu.unlock();
+            if (firstIdlessPart(r) != null) {
+                any = true;
+                continue;
+            }
+            if (r.sub_matched_current == 0) continue;
+            var wip_it = r.coherent_wip.valueIterator();
+            const set_in_flight = while (wip_it.next()) |w| {
+                if (w.group_cs == null) break true;
+            } else false;
+            // A writer's next set may be about to arrive (its writers end their
+            // sets one after another); an idle writer stops holding it back.
+            var cw_it = r.coherent_writers.valueIterator();
+            const idless_writer = while (cw_it.next()) |cw| {
+                if (cw.group_ids != true) break true;
+            } else false;
+            const next_set_due = idless_writer and r.pending.items.len == 0 and
+                now_ns - r.last_coherent_wip_start_ns < coherent_idle_gate_ns;
+            if (set_in_flight or next_set_due) return;
+        }
+        if (!any) return;
+        var complete = true;
+        for (self.readers.items) |r| {
+            r.mu.lock();
+            defer r.mu.unlock();
+            if (firstIdlessPart(r)) |i| {
+                if (!r.coherent_committed.items[i].complete) complete = false;
+            }
+        }
+        for (self.readers.items, exposed) |r, *e| {
+            r.mu.lock();
+            defer r.mu.unlock();
+            const i = firstIdlessPart(r) orelse continue;
+            if (complete) {
+                r.promoteCommittedSetLocked(i);
+                e.* = true;
+            } else {
+                r.discardCommittedSetLocked(i);
+            }
+        }
+    }
+
+    fn firstIdlessPart(r: *reader_mod.DataReaderImpl) ?usize {
+        for (r.coherent_committed.items, 0..) |part, i| {
+            if (part.group_cs == null) return i;
+        }
+        return null;
+    }
+
     fn vtBeginAccess(ctx: *anyopaque) DDS.ReturnCode_t {
         {
             const rc = cast(ctx).checkEnabledPrecondition();
@@ -815,11 +1054,7 @@ pub const SubscriberImpl = struct {
         // user code runs) so the walk itself, like the reader-only box
         // acquire it replaces, doesn't need to touch `r`/`self`/the
         // participant again after the lock below is released.
-        const ListenerSnap = struct {
-            dr: DDS.DataReader,
-            resolution: DataAvailableResolution,
-        };
-        var listener_snaps: std.ArrayListUnmanaged(ListenerSnap) = .empty;
+        var listener_snaps: ListenerSnaps = .empty;
         // Each entry's acquired box reference is released by the dispatch
         // loop below (the normal path) or, if this function returns before
         // reaching it, by this defer instead — never both: the dispatch
@@ -833,88 +1068,24 @@ pub const SubscriberImpl = struct {
         // but still avoids holding the lock longer than necessary.  All readers in
         // the loop are evaluated against the same instant, which is more consistent.
         const now_ns = time_mod.nanoTimestamp();
-        // Maximum time to wait for the first DATA of a new coherent set before
-        // assuming the writer is idle and releasing the begin_access gate.
-        const coherent_idle_gate_ns: i64 = 5 * std.time.ns_per_s;
 
         self.mu.lock();
 
-        // COHERENT ACCESS: commit complete coherent sets so the application sees a
+        // COHERENT ACCESS: expose complete coherent sets so the application sees a
         // consistent view.  Per DDS PRESENTATION QoS (§2.2.3.6), cross-reader
-        // synchronization — waiting for every reader's set before committing any
-        // of them — is only required for GROUP_PRESENTATION.  For INSTANCE/TOPIC
-        // scope, each DataReader's coherent set is independent and must commit as
-        // soon as it is complete, without waiting on sibling readers (which may be
-        // matched to entirely different, independently-paced remote writers).
+        // synchronization is only required for GROUP_PRESENTATION.  For
+        // INSTANCE/TOPIC scope, each DataReader's coherent sets are independent:
+        // expose its oldest complete one without waiting on sibling readers
+        // (which may be matched to entirely different, independently-paced
+        // remote writers).
         if (pres.coherent_access) {
-            const group_scope = pres.access_scope == .GROUP_PRESENTATION_QOS;
-            var all_ready = true;
-            var any_committed = false;
-            for (self.readers.items) |r| {
-                r.mu.lock();
-                const coherent_guids_pending = r.coherent_writer_guids.count() > 0 and
-                    r.pending.items.len == 0 and
-                    (now_ns - r.last_coherent_wip_start_ns < coherent_idle_gate_ns);
-                if (!r.coherent_committed_ready and r.sub_matched_current > 0 and
-                    (r.coherent_wip.count() > 0 or coherent_guids_pending))
-                {
-                    // Block when a coherent set is in-flight for this reader.
-                    // coherent_wip.count() > 0: end-marker hasn't arrived yet.
-                    // coherent_guids_pending: at least one currently-matched writer is
-                    //   coherent but its next set DATA hasn't arrived yet (sequential
-                    //   vtEndCoherent timing).  The 5 s window on last_coherent_wip_start_ns
-                    //   ensures an idle writer that stops sending never permanently stalls
-                    //   begin_access — after 5 s without a new WIP entry the gate opens.
-                    //   coherent_writer_guids is also cleared on writer departure for the
-                    //   same reason.  Requiring pending to be empty avoids stalling when a
-                    //   non-coherent writer has buffered data.
-                    all_ready = false;
-                }
-                if (r.coherent_committed_ready) any_committed = true;
-                r.mu.unlock();
-            }
-            // Nothing to commit if no reader has a complete set ready.
-            if (!any_committed) all_ready = false;
-            if (self.readers.items.len > 0) {
+            if (pres.access_scope == .GROUP_PRESENTATION_QOS) {
+                self.beginGroupCoherentAccessLocked(now_ns, &listener_snaps);
+            } else {
                 for (self.readers.items) |r| {
                     r.mu.lock();
-                    const coherent_guids_pending = r.coherent_writer_guids.count() > 0 and
-                        r.pending.items.len == 0 and
-                        (now_ns - r.last_coherent_wip_start_ns < coherent_idle_gate_ns);
-                    const reader_ready = r.coherent_committed_ready or
-                        !(r.sub_matched_current > 0 and (r.coherent_wip.count() > 0 or coherent_guids_pending));
-                    // GROUP scope: commit only once every reader is ready (all_ready).
-                    // INSTANCE/TOPIC scope: commit this reader independently once it,
-                    // specifically, is ready.
-                    const should_commit = if (group_scope) all_ready else reader_ready;
-                    if (!should_commit) {
-                        r.mu.unlock();
-                        continue;
-                    }
                     r.commitCoherentPendingLocked();
-                    // Only notify if this reader actually has samples after commit — a
-                    // reader with no WIP and no committed data passes the ready check
-                    // but must not generate a spurious on_data_available or WaitSet wakeup.
-                    const has_data = r.pending.items.len > 0;
-                    // Fire WaitSet wakeups while subscriber.mu is held to prevent
-                    // use-after-free from a concurrent delete_datareader.
-                    // data_notifiers are exclusively WaitSet-internal wakeup callbacks
-                    // (registered only by ReadConditionImpl/QueryConditionImpl via
-                    // addDataNotifier).  They acquire only WaitSet.cv_mu — never
-                    // subscriber.mu or reader.mu — so holding both locks here is safe.
-                    if (has_data) {
-                        for (r.data_notifiers.items) |n| n.on_data(n.ctx);
-                    }
-                    r.mu.unlock();
-                    if (has_data) {
-                        r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
-                        if (r.status_cond) |sc| sc.notifyWakeup();
-                        const resolution = self.resolveDataAvailableFallback(r);
-                        listener_snaps.append(self.alloc, .{
-                            .dr = r.toDDSDataReader(),
-                            .resolution = resolution,
-                        }) catch resolution.release();
-                    }
+                    self.notifyExposedUnlock(r, &listener_snaps);
                 }
             }
         }

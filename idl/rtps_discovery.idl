@@ -116,6 +116,7 @@ struct SPDPdiscoveredParticipantData {
 struct DiscoveredWriterData {
     @id(0x005A)           octet             writerGuid[16];     // PID_ENDPOINT_GUID
     @id(0x0052) @optional octet            groupGuid[16];      // PID_GROUP_GUID (GROUP publisher only)
+    @id(0x0053) @optional octet            groupEntityId[4];   // PID_GROUP_ENTITYID (decode only)
     @id(0x0005)           string            topicName;
     @id(0x0007)           string            typeName;
     @id(0x002F) @optional @pl_repeated sequence<Locator_t> unicastLocatorList;   // decode only; zzdds never emits per-endpoint locators

@@ -1057,25 +1057,189 @@ test "sendHeartbeat: coherent_active caps last_sn to last_flushed_sn" {
     try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
 }
 
-// ── EOC SN in periodic HB ─────────────────────────────────────────────────────
+// ── End-of-coherent-set markers ───────────────────────────────────────────────
 
-test "sendHeartbeat: EOC SN advertised in HB lastSN for pull-based recovery" {
-    // After endCoherentSet, the EOC SN is allocated (cache.next_sn advances) but
-    // not stored in the cache.  The background HB must advertise lastSN=eoc_sn so
-    // readers can NACK it if missed; the NACK handler then responds with GAP(eoc_sn).
-    // Sending an inline GAP here would race with Connext processing the EOC DATA.
-    // Covers writer_sm.zig lines 778-789.
-    const writer_guid = makeGuid(0x52, WRITER_EID);
-    const reader_guid = makeGuid(0x53, READER_EID);
-    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+/// What the writer sent in one DATA: whether it carried a payload, and its
+/// coherent-set inline QoS.
+const SentData = struct {
+    has_payload: bool,
+    coherent_set: ?SequenceNumber = null,
+    group_seq_num: ?SequenceNumber = null,
+    group_coherent_set: ?SequenceNumber = null,
+    writer_group_info: ?[4]u8 = null,
+};
 
-    var rec: Recording = .{};
-    const t = rec.makeTransport();
+fn findSentData(rec: *const Recording, sn: SequenceNumber) ?SentData {
+    for (rec.caps[0..rec.n]) |*cap| {
+        var it = MessageIterator.init(cap.buf[0..cap.len]) catch continue;
+        var params: [32]InlineQosParam = undefined;
+        while (it.next(&params) catch null) |sm| {
+            if (sm != .data or sm.data.writer_sn != sn) continue;
+            const d = sm.data;
+            var out = SentData{ .has_payload = d.serialized_payload.len > 0 };
+            if (d.inline_qos) |q| {
+                const le = d.isLittleEndian();
+                out.coherent_set = q.getSequenceNumber(.coherent_set, le);
+                out.group_seq_num = q.getSequenceNumber(.group_seq_num, le);
+                out.group_coherent_set = q.getSequenceNumber(.group_coherent_set, le);
+                if (q.get(.writer_group_info)) |v| {
+                    if (v.len == 4) out.writer_group_info = v[0..4].*;
+                }
+            }
+            return out;
+        }
+    }
+    return null;
+}
 
+fn makeCoherentWriter(rec: *Recording, kind: rtps.history.HistoryKind, depth: u32, reader_guid: Guid) !*StatefulWriter {
     const w = try StatefulWriter.init(
         testing.allocator,
-        writer_guid,
-        t,
+        makeGuid(0x52, WRITER_EID),
+        rec.makeTransport(),
+        kind,
+        depth,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    errdefer w.deinit();
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+    rec.reset();
+    return w;
+}
+
+test "endCoherentSet: the end marker is announced, not GAPed" {
+    // The set's end marker (SN 3) is a DATA without a payload.  The HEARTBEAT
+    // after the set announces it, and nothing GAPs it: a reader that GAPs a
+    // marker can't tell whether the set before it is complete.
+    const reader_guid = makeGuid(0x53, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeCoherentWriter(&rec, .keep_all, 0, reader_guid);
+    defer w.deinit();
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    w.endCoherentSet(.coherent_only, false, null, null, false);
+
+    const marker = findSentData(&rec, 3) orelse return error.NoMarker;
+    try testing.expect(!marker.has_payload);
+    try testing.expectEqual(@as(?SequenceNumber, null), marker.coherent_set);
+    try testing.expectEqual(@as(?SequenceNumber, 1), findSentData(&rec, 1).?.coherent_set);
+    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
+    try testing.expectEqual(null, findGap(&rec));
+
+    // The periodic HEARTBEAT announces it too.
+    rec.reset();
+    w.sendHeartbeat(true, false);
+    try testing.expectEqual(@as(SequenceNumber, 3), (findHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+    try testing.expectEqual(null, findGap(&rec));
+}
+
+test "handleAckNack: a NACKed end marker is sent again, not GAPed" {
+    const reader_guid = makeGuid(0x53, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeCoherentWriter(&rec, .keep_all, 0, reader_guid);
+    defer w.deinit();
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    w.endCoherentSet(.coherent_only, false, null, null, false);
+    rec.reset();
+
+    // The reader has SNs 1-2 and asks for the marker.
+    var nack_set = SequenceNumberSet{ .base = 3, .num_bits = 1, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(3);
+    w.handleAckNack(reader_guid, 2, nack_set, 1, true);
+
+    const marker = findSentData(&rec, 3) orelse return error.MarkerNotResent;
+    try testing.expect(!marker.has_payload);
+    try testing.expectEqual(null, findGap(&rec));
+}
+
+test "handleAckNack: a non-final NACK also resends the end marker" {
+    const reader_guid = makeGuid(0x53, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeCoherentWriter(&rec, .keep_all, 0, reader_guid);
+    defer w.deinit();
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    w.endCoherentSet(.coherent_only, false, null, null, false);
+    rec.reset();
+
+    const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_guid, 0, nack_set, 1, false);
+
+    var sns_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2 }, collectDataSNsSorted(&rec, &sns_buf));
+    try testing.expect(!findSentData(&rec, 2).?.has_payload);
+}
+
+test "end marker: retired once its set's samples are gone and every reader acknowledged it" {
+    const reader_guid = makeGuid(0x53, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeCoherentWriter(&rec, .keep_last, 1, reader_guid);
+    defer w.deinit();
+
+    // Set {SN 1}, marker SN 2; then SN 3 replaces SN 1 (KEEP_LAST depth 1).
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    w.endCoherentSet(.coherent_only, false, null, null, false);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    rec.reset();
+
+    // Not yet acknowledged: still sent on NACK, though its set is gone.
+    var nack_set = SequenceNumberSet{ .base = 2, .num_bits = 1, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(2);
+    w.handleAckNack(reader_guid, 1, nack_set, 1, true);
+    try testing.expect(findSentData(&rec, 2) != null);
+
+    // Acknowledged: retired, so a later NACK gets a GAP.
+    const ack = SequenceNumberSet{ .base = 4, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader_guid, 3, ack, 2, true);
+    rec.reset();
+    w.handleAckNack(reader_guid, 3, nack_set, 3, true);
+    try testing.expectEqual(null, findSentData(&rec, 2));
+    try testing.expect(findGap(&rec) != null);
+}
+
+test "endCoherentSet: a GROUP writer with nothing in the set still ends it" {
+    // RTPS 2.5 §8.7.6: every writer of the publisher sends an End Coherent Set
+    // marker: PID_GROUP_SEQ_NUM one past the set's last sample,
+    // PID_GROUP_COHERENT_SET the set's id, and PID_WRITER_GROUP_INFO.
+    const reader_guid = makeGuid(0x53, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeCoherentWriter(&rec, .keep_all, 0, reader_guid);
+    defer w.deinit();
+
+    const group_set = rtps.history.GroupCoherentSet{ .first_gsn = 11, .end_gsn = 14, .writer_group_info = .{ 1, 2, 3, 4 } };
+    var publisher_gsn: i64 = 13;
+    w.beginCoherentSet(true);
+    w.endCoherentSet(.full, false, &publisher_gsn, group_set, false);
+
+    const ecs = findSentData(&rec, 1) orelse return error.NoEndCoherentSet;
+    try testing.expect(!ecs.has_payload);
+    try testing.expectEqual(@as(?SequenceNumber, null), ecs.coherent_set);
+    try testing.expectEqual(@as(?SequenceNumber, 14), ecs.group_seq_num);
+    try testing.expectEqual(@as(?SequenceNumber, 11), ecs.group_coherent_set);
+    try testing.expectEqual(@as(?[4]u8, .{ 1, 2, 3, 4 }), ecs.writer_group_info);
+    try testing.expectEqual(@as(i64, 13), publisher_gsn);
+}
+
+test "endCoherentSet: a reader whose vendor stalls on group set ids gets them omitted" {
+    // See header.omitsGroupCoherentSet: such a reader gets the set as the
+    // writer's own coherent set, without PID_GROUP_COHERENT_SET, while every
+    // other reader gets the RTPS 2.5 form.
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        makeGuid(0x52, WRITER_EID),
+        rec.makeTransport(),
         .keep_all,
         0,
         READER_EID,
@@ -1083,27 +1247,64 @@ test "sendHeartbeat: EOC SN advertised in HB lastSN for pull-based recovery" {
         false,
     );
     defer w.deinit();
-
-    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, true);
+    var rp = try ReaderProxy.init(testing.allocator, makeGuid(0x53, READER_EID), &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, true);
+    rp.omits_group_coherent_set = true;
     try w.addMatchedReader(rp);
     rec.reset();
 
-    // Write 2 coherent samples then end the set.
-    // endCoherentSet allocates EOC SN=3 (via allocSn) — not stored in cache.
-    // After: cache_last=2, cache.next_sn=4, coherent_active=false.
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    w.endCoherentSet(.full, false, null, null, false);
+
+    const sample = findSentData(&rec, 1) orelse return error.NoSample;
+    try testing.expectEqual(@as(?SequenceNumber, 1), sample.coherent_set);
+    try testing.expectEqual(@as(?SequenceNumber, 1), sample.group_seq_num);
+    try testing.expectEqual(@as(?SequenceNumber, null), sample.group_coherent_set);
+    const ecs = findSentData(&rec, 2) orelse return error.NoEndCoherentSet;
+    try testing.expectEqual(@as(?SequenceNumber, null), ecs.group_coherent_set);
+
+    // The NACK path too.
+    rec.reset();
+    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(1);
+    nack_set.set(2);
+    w.handleAckNack(makeGuid(0x53, READER_EID), 0, nack_set, 1, true);
+    try testing.expectEqual(@as(?SequenceNumber, null), (findSentData(&rec, 1) orelse return error.NoSample).group_coherent_set);
+    try testing.expectEqual(@as(?SequenceNumber, null), (findSentData(&rec, 2) orelse return error.NoEndCoherentSet).group_coherent_set);
+}
+
+test "replay: a best-effort late joiner gets coherent sets with their inline QoS and end markers" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        makeGuid(0x52, WRITER_EID),
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        true,
+    );
+    defer w.deinit();
+
+    // Set {1, 2} + marker 3, then the set {4} + marker 5, before any reader.
     w.beginCoherentSet(true);
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
-    w.endCoherentSet(.coherent_only, false, null, 0, false);
-    rec.reset();
+    w.endCoherentSet(.coherent_only, false, null, null, false);
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "c");
+    w.endCoherentSet(.coherent_only, false, null, null, false);
 
-    // Periodic HB must advertise lastSN=3 (the EOC SN), not just lastSN=2 (cache max).
-    // No inline GAP should be emitted — recovery is NACK-driven via the NACK handler.
-    w.sendHeartbeat(true, false);
+    const rp = try ReaderProxy.init(testing.allocator, makeGuid(0x53, READER_EID), &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, false);
+    try w.addMatchedReader(rp);
 
-    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
-    try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
-    try testing.expectEqual(null, findGap(&rec));
+    var sns_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3, 4, 5 }, collectDataSNsSorted(&rec, &sns_buf));
+    try testing.expectEqual(@as(?SequenceNumber, 1), findSentData(&rec, 2).?.coherent_set);
+    try testing.expectEqual(@as(?SequenceNumber, 4), findSentData(&rec, 4).?.coherent_set);
+    try testing.expect(!findSentData(&rec, 3).?.has_payload);
+    try testing.expect(!findSentData(&rec, 5).?.has_payload);
 }
 
 // ── LocatorSelector: effectiveLocators ranking (via ReaderProxy) ──────────────

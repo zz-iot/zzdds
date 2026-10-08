@@ -204,8 +204,8 @@ pub const ParameterId = enum(u16) {
     coherent_set = 0x0056,
     directed_write = 0x0057,
     original_writer_info = 0x0061,
-    group_coherent_set = 0x0039,
-    group_seq_num = 0x0038,
+    group_coherent_set = 0x0063,
+    group_seq_num = 0x0064,
     writer_group_info = 0x0065,
     secure_writer_group_info = 0x0066,
     key_hash = 0x0070,
@@ -235,6 +235,17 @@ pub const InlineQos = struct {
             if (p.pid == pid) return p.value;
         }
         return null;
+    }
+
+    /// Look up a SequenceNumber_t-valued parameter (RTPS 2.5 §9.3.2):
+    /// PID_COHERENT_SET, PID_GROUP_COHERENT_SET, PID_GROUP_SEQ_NUM.
+    pub fn getSequenceNumber(self: InlineQos, pid: ParameterId, little_endian: bool) ?SequenceNumber {
+        const v = self.get(pid) orelse return null;
+        if (v.len < 8) return null;
+        const order: std.builtin.Endian = if (little_endian) .little else .big;
+        const high = std.mem.readInt(i32, v[0..4], order);
+        const low = std.mem.readInt(u32, v[4..8], order);
+        return (@as(i64, high) << 32) | @as(i64, low);
     }
 };
 
@@ -283,6 +294,10 @@ pub const DataFragSubmessage = struct {
     inline_qos: ?InlineQos,
     /// Fragment data bytes (borrowing from parse buffer).
     serialized_payload: []const u8,
+
+    pub fn isLittleEndian(self: DataFragSubmessage) bool {
+        return (self.flags & DataFragFlags.endianness) != 0;
+    }
 };
 
 /// Parsed HEARTBEAT submessage (§9.4.5.7).

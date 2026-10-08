@@ -703,7 +703,7 @@ test "sub data: a sample delivered when its writer is matched already resolves i
 
     // DATA from a writer this reader has not matched yet: buffered.
     const pr = @as(*zzdds.dcps.DataReaderImpl, @ptrCast(@alignCast(dr.ptr))).proto_reader;
-    pr.handleIncomingChange(writer_guid, 1, .{ .seconds = 0, .fraction = 0 }, std.mem.zeroes([16]u8), &.{ 0x00, 0x01, 0x00, 0x00 }, .alive, null, null, null);
+    pr.handleIncomingChange(writer_guid, 1, .{ .seconds = 0, .fraction = 0 }, std.mem.zeroes([16]u8), &.{ 0x00, 0x01, 0x00, 0x00 }, .alive, null, null, null, null);
     try testing.expectEqual(@as(usize, 0), check.calls);
 
     // Matching the writer delivers it, before the writer-matched callback.

@@ -99,7 +99,47 @@ pub const Guid = extern struct {
     }
 };
 
+/// GroupDigest_t of a set of entities (RTPS 2.5 §9.3.2.5): the leading 4
+/// octets of the MD5 of the big-endian CDR `sequence<EntityId_t>`, the ids
+/// sorted as if each were a little-endian int32.  The empty group is zero.
+/// Sorts `ids` in place.
+pub fn groupDigest(ids: []EntityId) [4]u8 {
+    if (ids.len == 0) return .{ 0, 0, 0, 0 };
+    std.mem.sort(EntityId, ids, {}, struct {
+        fn lessThan(_: void, a: EntityId, b: EntityId) bool {
+            return std.mem.readInt(i32, std.mem.asBytes(&a), .little) <
+                std.mem.readInt(i32, std.mem.asBytes(&b), .little);
+        }
+    }.lessThan);
+    var md5 = std.crypto.hash.Md5.init(.{});
+    var len_be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_be, @intCast(ids.len), .big);
+    md5.update(&len_be);
+    for (ids) |*id| md5.update(std.mem.asBytes(id));
+    var out: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+    md5.final(&out);
+    return out[0..4].*;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+test "groupDigest: MD5 of the sorted big-endian entity id sequence" {
+    // Expected values computed independently from §9.3.2.5's definition.
+    var two = [_]EntityId{
+        .{ .entity_key = .{ 0, 0, 2 }, .entity_kind = 2 },
+        .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 2 },
+    };
+    try std.testing.expectEqual([4]u8{ 0x6f, 0x62, 0x13, 0x62 }, groupDigest(&two));
+    // Sorted as little-endian int32: 000001c2 reads as a negative number, so
+    // it sorts before 80000002.
+    var signed = [_]EntityId{
+        .{ .entity_key = .{ 0x80, 0, 0 }, .entity_kind = 2 },
+        .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0xc2 },
+    };
+    try std.testing.expectEqual([4]u8{ 0xdf, 0xda, 0xa0, 0xef }, groupDigest(&signed));
+    var none = [_]EntityId{};
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, groupDigest(&none));
+}
 
 test "Guid size is 16 bytes" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(Guid));

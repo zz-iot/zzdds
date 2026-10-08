@@ -180,14 +180,64 @@ pub const PendingChange = struct {
     }
 };
 
-/// In-progress coherent set accumulator for one writer (keyed by writer GUID in
-/// `coherent_wip`).  Tracks the coherent_set_sn that all buffered samples share
-/// so that a CS-value transition can be detected and the previous set committed.
+/// The coherent set a writer is in the middle of sending (keyed by writer GUID
+/// in `coherent_wip`).
 pub const CoherentWipEntry = struct {
-    /// coherent_set_sn of the samples currently buffered (CS = first SN of the set,
-    /// per RTI Connext convention).
+    /// PID_COHERENT_SET: the writer SN of the set's first sample.
     cs: history_mod.SequenceNumber,
+    /// PID_GROUP_COHERENT_SET (GROUP scope): the id of the publisher's group
+    /// set this is part of; null if the writer sends none.
+    group_cs: ?history_mod.SequenceNumber = null,
+    /// False once an SN of the set is known missing: its first one (a reader
+    /// that matched mid-set) or one between two received.
+    intact: bool,
     samples: std.ArrayListUnmanaged(PendingChange) = .empty,
+};
+
+/// A writer's coherent set once it has ended, awaiting Subscriber.begin_access().
+pub const CommittedSet = struct {
+    samples: std.ArrayListUnmanaged(PendingChange) = .empty,
+    writer_guid: Guid,
+    /// The writer's publisher (CoherentWriter.publisher).
+    publisher: Guid,
+    /// See CoherentWipEntry.group_cs.
+    group_cs: ?history_mod.SequenceNumber,
+    /// False for an incomplete set, queued (without its samples) only in GROUP
+    /// scope so the subscriber discards the rest of its group set too.
+    complete: bool,
+
+    fn deinit(self: *CommittedSet, alloc: std.mem.Allocator) void {
+        for (self.samples.items) |pc| pc.deinit();
+        self.samples.deinit(alloc);
+    }
+};
+
+/// What the reader knows of one writer's coherent sets (RTPS 2.5 §8.7.6): enough
+/// to tell whether each of its sets arrived complete and, in GROUP scope, for
+/// the subscriber to assemble group sets from its readers' parts.
+pub const CoherentWriter = struct {
+    /// The writer's publisher (MatchedWriterInfo.publisher_guid): group sets,
+    /// and their ids, are per publisher.
+    publisher: Guid,
+    /// The SN after the last one received from the writer; null before any.
+    next_sn: ?history_mod.SequenceNumber = null,
+    /// Whether the writer's sets carry PID_GROUP_COHERENT_SET; null until its
+    /// first set or End Coherent Set marker arrives.
+    group_ids: ?bool = null,
+    /// The writer has nothing more to send for group sets up to this id.
+    done_through: ?history_mod.SequenceNumber = null,
+    /// Group sets before this id may lack a part from this writer: they came
+    /// before the first SN received from it, or before an SN that went
+    /// missing between two of its sets.
+    complete_from: history_mod.SequenceNumber = 0,
+    /// When the writer matched or last started or ended a set.  A writer idle
+    /// for longer than Subscriber's coherent idle gate stops holding back the
+    /// group sets of its publisher.
+    last_progress_ns: i64,
+
+    fn advanceDone(self: *CoherentWriter, through: history_mod.SequenceNumber) void {
+        self.done_through = if (self.done_through) |d| @max(d, through) else through;
+    }
 };
 
 /// Ownership by the caller of data returned from takeRaw().
@@ -352,30 +402,25 @@ pub const DataReaderImpl = struct {
     /// safe to take independently of `mu`, no ordering relationship with it.
     loan_table_mu: Mutex = .{},
     loan_table: std.AutoHashMapUnmanaged(*anyopaque, []*PendingChange) = .empty,
-    /// Working buffer for the currently-receiving coherent set.
-    /// Samples are appended here as they arrive. When the end marker is received
-    /// Keyed by writer GUID so that concurrent coherent sets from different writers
-    /// accumulate independently and commit only when each writer's own set is complete.
+    /// The coherent set each writer is in the middle of sending, keyed by
+    /// writer GUID so that different writers' sets accumulate independently.
     coherent_wip: std.AutoHashMapUnmanaged(Guid, CoherentWipEntry),
-    /// Queue of complete coherent sets awaiting delivery via begin_access().
-    /// Each element is one complete set (filled when its end marker arrives).
-    /// commitCoherentPendingLocked() pops ONLY the first entry per call so that
-    /// each begin_access/end_access cycle exposes exactly one coherent set,
-    /// even when multiple sets accumulated during a late-join history replay.
-    coherent_committed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(PendingChange)),
-    /// True when `coherent_committed` contains at least one complete set.
+    /// Ended coherent sets awaiting Subscriber.begin_access(), oldest first.
+    /// INSTANCE/TOPIC scope queues only complete sets and begin_access exposes
+    /// the oldest one each time, even when several accumulated during a
+    /// late-join history replay.  GROUP scope also queues incomplete ones (see
+    /// CommittedSet.complete) and the subscriber picks the parts of one group
+    /// set across its readers.
+    coherent_committed: std.ArrayListUnmanaged(CommittedSet),
+    /// True when `coherent_committed` holds at least one complete set.
     coherent_committed_ready: bool,
-    /// Set of writer GUIDs that have sent at least one DATA sample with PID_COHERENT_SET
-    /// and are still matched.  Entries are added on first coherent sample from a writer
-    /// and removed in onWriterUnmatchedCb.  Non-empty means "at least one currently-matched
-    /// writer participates in coherent sets," used by Subscriber.begin_access to gate
-    /// commits: when this set is non-empty and pending is empty, a coherent set may be
-    /// about to arrive (sequential vtEndCoherent timing).  Cleared on writer departure so
-    /// a stale flag never permanently blocks begin_access.  Guarded by `mu`.
-    coherent_writer_guids: std.AutoHashMapUnmanaged(Guid, void) = .empty,
+    /// The coherent progress of each matched writer the reader has heard from,
+    /// or, in GROUP scope, that matched with a GROUP-coherent publisher.
+    /// Removed in onWriterUnmatchedCb.  Guarded by `mu`.
+    coherent_writers: std.AutoHashMapUnmanaged(Guid, CoherentWriter) = .empty,
     /// Timestamp (ns) when the most recent coherent WIP entry was created for any writer.
-    /// Reset when a new entry is added; used by Subscriber.begin_access to detect idle
-    /// coherent writers that never send a new set (preventing a permanent gate stall).
+    /// Used by Subscriber.begin_access to detect idle coherent writers that never
+    /// send a new set (preventing a permanent gate stall).
     last_coherent_wip_start_ns: i64 = 0,
     mu: Mutex,
 
@@ -646,11 +691,8 @@ pub const DataReaderImpl = struct {
             v.samples.deinit(self.alloc);
         }
         self.coherent_wip.deinit(self.alloc);
-        self.coherent_writer_guids.deinit(self.alloc);
-        for (self.coherent_committed.items) |*s| {
-            for (s.items) |p| p.deinit();
-            s.deinit(self.alloc);
-        }
+        self.coherent_writers.deinit(self.alloc);
+        for (self.coherent_committed.items) |*cs| cs.deinit(self.alloc);
         self.coherent_committed.deinit(self.alloc);
         self.tbf_map.deinit(self.alloc);
         self.writer_strengths.deinit(self.alloc);
@@ -863,23 +905,31 @@ pub const DataReaderImpl = struct {
         }
     }
 
-    /// Called from the RTPS receive thread when a new sample arrives.
-    /// Matches the DataCallback.on_eoc function pointer signature.
-    /// Called by reader_sm when a Connext-style zero-payload alive DATA arrives (no
-    /// PID_COHERENT_SET) — the end-of-coherent-set signal.  Flushes the coherent WIP
-    /// for this writer without adding a sample to the pending queue.
+    /// Matches the DataCallback.on_eoc function pointer signature.  Called by
+    /// reader_sm, in SN order, when an end-of-coherent-set marker arrives (an
+    /// alive DATA without a payload): ends the writer's coherent set without
+    /// adding a sample.
     fn onEocCb(ctx: *anyopaque, change: *const history_mod.CacheChange) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
         if (!self.subscriber_presentation.coherent_access) return;
         self.mu.lock();
-        const committed = if (self.coherent_wip.fetchRemove(change.writer_guid)) |kv|
-            self.commitCoherentWipSamplesLocked(kv.value.samples)
-        else
-            false;
+        const queued = self.trackCoherentLocked(change, true);
         self.mu.unlock();
-        if (committed) {
+        if (queued) {
+            if (self.status_cond) |sc| sc.notifyWakeup();
+            self.deferListener(DDS.DATA_AVAILABLE_STATUS);
+        }
+    }
+
+    /// Unlocks `mu` and frees `copy` for a sample onDataCb drops (ownership,
+    /// time or content filter, resource limits, OOM), notifying if tracking it
+    /// queued a coherent set.
+    fn dropSampleUnlock(self: *Self, copy: []u8, coherent_queued: bool) void {
+        self.mu.unlock();
+        self.alloc.free(copy);
+        if (coherent_queued) {
             if (self.status_cond) |sc| sc.notifyWakeup();
             self.deferListener(DDS.DATA_AVAILABLE_STATUS);
         }
@@ -908,6 +958,14 @@ pub const DataReaderImpl = struct {
         // still mark the instance as covered (prevents spurious NOT_ALIVE_NO_WRITERS
         // when the owner leaves but another writer is still publishing to the instance).
         if (change.kind == .alive) trackWriterInstanceLocked(self, change.writer_guid, ih);
+
+        // COHERENT SETS: a sample counts toward its writer's set arriving
+        // complete even if a filter below drops it -- RTPS 2.5 §8.7.6 leaves
+        // samples filtered by content or time out of what the reader must
+        // receive -- and a sample of a new set, or outside any set, ends the
+        // writer's previous one.  So track it before filtering.
+        const coherent_queued = self.subscriber_presentation.coherent_access and
+            self.trackCoherentLocked(change, false);
 
         // OWNERSHIP: per-instance exclusive ownership check.
         // A writer owns an instance if it is the highest-strength writer that has
@@ -939,11 +997,7 @@ pub const DataReaderImpl = struct {
                     break :blk true;
                 }
             };
-            if (!accepted) {
-                self.mu.unlock();
-                self.alloc.free(copy);
-                return;
-            }
+            if (!accepted) return self.dropSampleUnlock(copy, coherent_queued);
         }
 
         // TIME_BASED_FILTER: suppress alive samples whose source timestamp is within
@@ -958,11 +1012,7 @@ pub const DataReaderImpl = struct {
         if (tbf_active) {
             const sep_ns = @as(i64, min_sep.sec) * std.time.ns_per_s + @as(i64, min_sep.nanosec);
             if (self.tbf_map.get(ih)) |last| {
-                if (tbf_src_ns - last < sep_ns) {
-                    self.mu.unlock();
-                    self.alloc.free(copy);
-                    return;
-                }
+                if (tbf_src_ns - last < sep_ns) return self.dropSampleUnlock(copy, coherent_queued);
             }
         }
 
@@ -971,27 +1021,20 @@ pub const DataReaderImpl = struct {
         // that the subscriber's instance state machine stays consistent and the
         // per-instance tbf_map/owner_map cleanup below is reached.
         if (self.cft_filter) |*cft| {
-            if (change.kind == .alive and !cft.matches(change.data)) {
-                self.mu.unlock();
-                self.alloc.free(copy);
-                return;
-            }
+            if (change.kind == .alive and !cft.matches(change.data))
+                return self.dropSampleUnlock(copy, coherent_queued);
         }
 
-        // COHERENT SET BUFFERING: when the subscriber has coherent_access and the
-        // change carries PID_COHERENT_SET, buffer until the end marker arrives.
-        // "End marker" = the sample whose own SN equals the set's declared last SN.
-        //
-        // GROUP_PRESENTATION: do NOT auto-commit; mark the set complete and let
-        // Subscriber.begin_access() commit all readers atomically (cross-reader
-        // coordination avoids a race where the subscriber reads between individual
-        // reader commits).
-        // INSTANCE/TOPIC: auto-commit when the end marker arrives (per-reader
-        // coordination is sufficient).
+        // COHERENT SET BUFFERING: a sample of a coherent set waits in its
+        // writer's WIP entry (started by trackCoherentLocked above) until the
+        // set ends, then for Subscriber.begin_access() to expose it.
         if (self.subscriber_presentation.coherent_access and
             change.coherent_set_sn != null)
         {
-            self.coherent_writer_guids.put(self.alloc, change.writer_guid, {}) catch {};
+            // Absent only if starting the set ran out of memory; then the set
+            // is incomplete anyway.
+            const wip = self.coherent_wip.getPtr(change.writer_guid) orelse
+                return self.dropSampleUnlock(copy, coherent_queued);
             const states = self.determineStatesLocked(ih, change.kind);
             if (change.kind == .alive) self.storeKeyIfNeededLocked(ih, copy);
             const src_time = change.source_timestamp.toTime();
@@ -1029,48 +1072,18 @@ pub const DataReaderImpl = struct {
                 _ = self.tbf_map.remove(ih);
                 _ = self.owner_map.remove(ih);
             }
-            const new_cs = change.coherent_set_sn.?;
-            const gop = self.coherent_wip.getOrPut(self.alloc, change.writer_guid) catch {
-                self.mu.unlock();
-                self.alloc.free(copy);
-                return;
-            };
-            // CS transition: the incoming sample belongs to a new coherent set,
-            // which ends the previous one (RTPS 2.5 §9.6.4.2). Commit it before
-            // starting the new one. Only a sample ends a set: a HEARTBEAT says
-            // which samples the writer has, not that its set is complete.
-            var transition_committed = false;
-            if (gop.found_existing and gop.value_ptr.cs != new_cs) {
-                const prev = gop.value_ptr.samples;
-                gop.value_ptr.samples = .empty;
-                gop.value_ptr.cs = new_cs;
-                transition_committed = self.commitCoherentWipSamplesLocked(prev);
-                self.last_coherent_wip_start_ns = time_mod.nanoTimestamp();
-            } else if (!gop.found_existing) {
-                gop.value_ptr.* = .{ .cs = new_cs };
-                self.last_coherent_wip_start_ns = time_mod.nanoTimestamp();
-            }
-            gop.value_ptr.samples.append(self.alloc, pc) catch {
-                self.mu.unlock();
-                self.alloc.free(copy);
-                return;
+            wip.samples.append(self.alloc, pc) catch {
+                // The set can no longer arrive complete.
+                wip.intact = false;
+                return self.dropSampleUnlock(copy, coherent_queued);
             };
             self.mu.unlock();
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
-            if (transition_committed) {
+            if (coherent_queued) {
                 if (self.status_cond) |sc| sc.notifyWakeup();
                 self.deferListener(DDS.DATA_AVAILABLE_STATUS);
             }
             return;
-        }
-
-        // Non-coherent DATA with a pending coherent WIP for this writer: any DATA
-        // without PID_COHERENT_SET signals end-of-coherent-set (RTPS §9.6.4.2).
-        // Flush the WIP now; the notification fires at the end of this path.
-        if (self.subscriber_presentation.coherent_access) {
-            if (self.coherent_wip.fetchRemove(change.writer_guid)) |kv| {
-                _ = self.commitCoherentWipSamplesLocked(kv.value.samples);
-            }
         }
 
         // KEEP_LAST: if history depth is limited, evict the oldest pending sample
@@ -1160,6 +1173,7 @@ pub const DataReaderImpl = struct {
             self.alloc.free(copy);
             if (self.status_cond) |sc| sc.notifyWakeup();
             self.deferListener(DDS.SAMPLE_REJECTED_STATUS);
+            if (coherent_queued) self.deferListener(DDS.DATA_AVAILABLE_STATUS);
             return;
         }
 
@@ -1176,11 +1190,7 @@ pub const DataReaderImpl = struct {
                 null
         else
             null;
-        const pc = self.alloc.create(PendingChange) catch {
-            self.mu.unlock();
-            self.alloc.free(copy);
-            return;
-        };
+        const pc = self.alloc.create(PendingChange) catch return self.dropSampleUnlock(copy, coherent_queued);
         pc.* = .{
             .data = copy,
             .alloc = self.alloc,
@@ -1201,10 +1211,8 @@ pub const DataReaderImpl = struct {
         };
 
         self.pending.append(self.alloc, pc) catch {
-            self.mu.unlock();
             self.alloc.destroy(pc);
-            self.alloc.free(copy);
-            return;
+            return self.dropSampleUnlock(copy, coherent_queued);
         };
         // Stamp the TBF window now that the sample is committed to pending.
         if (tbf_active) self.tbf_map.put(self.alloc, ih, tbf_src_ns) catch {};
@@ -1228,26 +1236,124 @@ pub const DataReaderImpl = struct {
         self.deferListener(DDS.DATA_AVAILABLE_STATUS);
     }
 
-    // ── Coherent set helpers ───────────────────────────────────────────────────
+    // ── Coherent sets (RTPS 2.5 §8.7.6) ───────────────────────────────────────
+    //
+    // A writer's coherent set is complete when every SN from its first sample
+    // up to the change that ends it arrived: a sample of the next set, a sample
+    // outside any set, or an end marker.  A sample the reader drops itself
+    // (ownership, time or content filter, resource limits) still arrived.  An
+    // incomplete set is discarded (§8.7.6), including the partial first set of
+    // a reader that matched in the middle of it.
 
-    /// Enqueue a completed coherent WIP samples list into coherent_committed.
-    /// Must be called with self.mu held.  Takes ownership of `samples`; frees it
-    /// on OOM.  Returns true if the commit succeeded.
-    fn commitCoherentWipSamplesLocked(
-        self: *Self,
-        samples: std.ArrayListUnmanaged(PendingChange),
-    ) bool {
-        if (self.coherent_committed.append(self.alloc, samples)) {
-            self.coherent_committed_ready = true;
-            self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
-            for (self.data_notifiers.items) |n| n.on_data(n.ctx);
-            return true;
-        } else |_| {
-            for (samples.items) |pc| pc.deinit();
-            var s = samples;
-            s.deinit(self.alloc);
-            return false;
+    fn coherentWriterLocked(self: *Self, writer: Guid) ?*CoherentWriter {
+        const gop = self.coherent_writers.getOrPut(self.alloc, writer) catch return null;
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            // Until onWriterMatchedCb says which publisher: the participant.
+            .publisher = .{ .prefix = writer.prefix, .entity_id = std.mem.zeroes(proto.EntityId) },
+            .last_progress_ns = time_mod.nanoTimestamp(),
+        };
+        return gop.value_ptr;
+    }
+
+    /// Track one change from a writer, for a subscriber with coherent_access:
+    /// a sample, in a set or not, or (`is_marker`) an end-of-coherent-set
+    /// marker.  Ends the writer's set when the change does and starts the next
+    /// one for a sample of a new set.  Returns whether a complete set was
+    /// queued for begin_access.
+    fn trackCoherentLocked(self: *Self, change: *const history_mod.CacheChange, is_marker: bool) bool {
+        const writer = change.writer_guid;
+        const sn = change.sequence_number;
+        const cw = self.coherentWriterLocked(writer) orelse return false;
+        // An SN went missing right before this one: it is not the next SN, or,
+        // for the first change received from the writer, not its first SN.
+        const gap_before = if (cw.next_sn) |next| sn != next else sn != 1;
+        cw.next_sn = sn + 1;
+        const group_cs = change.group_coherent_sn;
+        const now = time_mod.nanoTimestamp();
+        const wip_cs: ?history_mod.SequenceNumber = if (self.coherent_wip.getPtr(writer)) |w| w.cs else null;
+
+        if (!is_marker) if (change.coherent_set_sn) |cs| {
+            if (wip_cs == cs) {
+                if (gap_before) self.coherent_wip.getPtr(writer).?.intact = false;
+                return false;
+            }
+            // A sample of a new set ends the writer's previous one.  With no
+            // set in progress, an SN missing before this one may have been
+            // part of an earlier group set.
+            var queued = false;
+            if (wip_cs != null) {
+                queued = self.endCoherentWipLocked(writer, cw, !gap_before);
+            } else if (gap_before) {
+                if (group_cs) |g| cw.complete_from = @max(cw.complete_from, g);
+            }
+            cw.group_ids = group_cs != null;
+            if (group_cs) |g| cw.advanceDone(g - 1);
+            cw.last_progress_ns = now;
+            self.last_coherent_wip_start_ns = now;
+            // On OOM the set's samples are dropped (onDataCb finds no entry)
+            // and, starting over at the next one, it can't be judged intact.
+            self.coherent_wip.put(self.alloc, writer, .{
+                .cs = cs,
+                .group_cs = group_cs,
+                .intact = sn == cs,
+            }) catch {};
+            return queued;
+        };
+
+        // A sample outside any set, or an end marker, ends the writer's set.
+        var queued = false;
+        if (wip_cs != null) {
+            queued = self.endCoherentWipLocked(writer, cw, !gap_before);
+        } else if (is_marker and gap_before) {
+            // The missing SNs may have held this writer's part of the group
+            // set the marker ends.
+            if (group_cs) |g| cw.complete_from = @max(cw.complete_from, g + 1);
         }
+        if (is_marker) if (group_cs) |g| {
+            // A GROUP End Coherent Set marker: the writer is done with set g,
+            // whether or not it wrote anything in it.
+            cw.group_ids = true;
+            cw.advanceDone(g);
+            cw.last_progress_ns = now;
+        };
+        return queued;
+    }
+
+    /// End `writer`'s set in progress; `ended_cleanly` is false when an SN
+    /// went missing right before the change that ended it.  Returns whether a
+    /// complete set was queued.
+    fn endCoherentWipLocked(self: *Self, writer: Guid, cw: *CoherentWriter, ended_cleanly: bool) bool {
+        var wip = (self.coherent_wip.fetchRemove(writer) orelse return false).value;
+        if (wip.group_cs) |g| cw.advanceDone(g);
+        cw.last_progress_ns = time_mod.nanoTimestamp();
+        const complete = wip.intact and ended_cleanly;
+        const group_scope = self.subscriber_presentation.access_scope == .GROUP_PRESENTATION_QOS;
+        if (!complete) {
+            for (wip.samples.items) |pc| pc.deinit();
+            wip.samples.clearRetainingCapacity();
+            // Discarded (RTPS 2.5 §8.7.6).  In GROUP scope the rest of its group
+            // set goes too, so the subscriber hears of it.
+            if (!group_scope) {
+                wip.samples.deinit(self.alloc);
+                return false;
+            }
+        }
+        self.coherent_committed.append(self.alloc, .{
+            .samples = wip.samples,
+            .writer_guid = writer,
+            .publisher = cw.publisher,
+            .group_cs = wip.group_cs,
+            .complete = complete,
+        }) catch {
+            for (wip.samples.items) |pc| pc.deinit();
+            wip.samples.deinit(self.alloc);
+            return false;
+        };
+        if (!complete) return false;
+        self.coherent_committed_ready = true;
+        self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        for (self.data_notifiers.items) |n| n.on_data(n.ctx);
+        return true;
     }
 
     // ── Ownership tracking ─────────────────────────────────────────────────────
@@ -1274,6 +1380,15 @@ pub const DataReaderImpl = struct {
             self.mu.lock();
             defer self.mu.unlock();
             self.rememberPublicationGuidLocked(info.guid);
+            // GROUP scope: the subscriber's group sets wait on this writer from
+            // now on, even before it sends anything, so a part of a group set
+            // still on its way is not mistaken for none.
+            const pres = self.subscriber_presentation;
+            if (pres.coherent_access and pres.access_scope == .GROUP_PRESENTATION_QOS and info.group_coherent) {
+                if (self.coherentWriterLocked(info.guid)) |cw| cw.publisher = info.publisher_guid;
+            } else if (self.coherent_writers.getPtr(info.guid)) |cw| {
+                cw.publisher = info.publisher_guid;
+            }
             self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
             if (info.lifespan_ns > 0)
                 self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
@@ -1428,7 +1543,9 @@ pub const DataReaderImpl = struct {
         // Discard any in-progress coherent set from this writer.  If the writer
         // crashed or was deleted mid-set, the partial wip would otherwise stay
         // in the map indefinitely — one leaked entry per connect/disconnect cycle.
-        _ = self.coherent_writer_guids.remove(guid);
+        // An unmatched writer's changes are no longer part of what the reader
+        // must receive (RTPS 2.5 §8.7.6), so its group sets stop waiting on it.
+        _ = self.coherent_writers.remove(guid);
         if (self.coherent_wip.fetchRemove(guid)) |kv| {
             var wip = kv.value;
             for (wip.samples.items) |pc| pc.deinit();
@@ -1536,31 +1653,36 @@ pub const DataReaderImpl = struct {
         }
     }
 
-    /// Expose the OLDEST committed coherent set to `pending`.
-    /// Called by Subscriber.vtBeginAccess() while self.mu is held.
-    /// Pops exactly one complete set from the front of the queue; if more sets
-    /// remain, coherent_committed_ready stays true so the next begin_access call
-    /// can deliver the next set.  This ensures each begin_access/end_access cycle
-    /// delivers exactly one coherent set regardless of how many accumulated.
-    /// Caller fires data-available callbacks AFTER releasing mu.
+    /// Expose the OLDEST committed coherent set to `pending` (INSTANCE/TOPIC
+    /// scope, where every queued set is complete).  Called by
+    /// Subscriber.vtBeginAccess() while self.mu is held; each begin_access
+    /// exposes one set, so later ones stay queued and coherent_committed_ready
+    /// stays true for the next.  Caller fires data-available callbacks AFTER
+    /// releasing mu.
     pub fn commitCoherentPendingLocked(self: *Self) void {
         if (self.coherent_committed.items.len == 0) return;
-        var first_set = self.coherent_committed.orderedRemove(0);
+        self.promoteCommittedSetLocked(0);
+    }
+
+    /// Move queued set `idx` into `pending` (or, for an incomplete one, just
+    /// drop it).  Called with self.mu held.
+    pub fn promoteCommittedSetLocked(self: *Self, idx: usize) void {
+        var set = self.coherent_committed.orderedRemove(idx);
+        defer self.updateCommittedReadyLocked();
         // Pre-allocate so the append loop is all-or-nothing.  On OOM the entire
         // set is discarded rather than partially committed.
-        self.pending.ensureUnusedCapacity(self.alloc, first_set.items.len) catch {
-            for (first_set.items) |cppc| cppc.deinit();
-            first_set.deinit(self.alloc);
+        self.pending.ensureUnusedCapacity(self.alloc, set.samples.items.len) catch {
+            set.deinit(self.alloc);
             return;
         };
         // Each sample becomes individually heap-allocated only once it's
         // reachable via `pending` (see PendingChange's type doc comment) --
-        // `first_set`'s entries are still by-value up to this point. Keep
-        // the whole-set-discarded-on-OOM semantics above extended to cover
-        // this per-item allocation too: roll back anything already appended
-        // for this set rather than partially committing it.
+        // `set`'s entries are still by-value up to this point. Keep the
+        // whole-set-discarded-on-OOM semantics above extended to cover this
+        // per-item allocation too: roll back anything already appended for
+        // this set rather than partially committing it.
         const start = self.pending.items.len;
-        for (first_set.items, 0..) |cppc, i| {
+        for (set.samples.items, 0..) |cppc, i| {
             const pc = self.alloc.create(PendingChange) catch {
                 // Regression for a real leak (Greptile PR #69 review):
                 // alloc.destroy() alone only frees the *PendingChange
@@ -1578,17 +1700,29 @@ pub const DataReaderImpl = struct {
                 // not load-bearing, just consistent.
                 for (self.pending.items[start..]) |appended| appended.quiesce.beginTeardown(appended, PendingChange.reallyFree);
                 self.pending.items.len = start;
-                for (first_set.items[i..]) |remaining| remaining.deinit();
-                first_set.deinit(self.alloc);
+                for (set.samples.items[i..]) |remaining| remaining.deinit();
+                set.samples.deinit(self.alloc);
                 return;
             };
             pc.* = cppc;
             self.pending.appendAssumeCapacity(pc);
         }
-        first_set.deinit(self.alloc);
-        self.coherent_committed_ready = self.coherent_committed.items.len > 0;
-        self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
+        set.samples.deinit(self.alloc);
+        if (self.pending.items.len > start) self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
         // data_notifiers are fired by the subscriber after releasing all locks.
+    }
+
+    /// Drop queued set `idx` without exposing it.  Called with self.mu held.
+    pub fn discardCommittedSetLocked(self: *Self, idx: usize) void {
+        var set = self.coherent_committed.orderedRemove(idx);
+        set.deinit(self.alloc);
+        self.updateCommittedReadyLocked();
+    }
+
+    fn updateCommittedReadyLocked(self: *Self) void {
+        self.coherent_committed_ready = for (self.coherent_committed.items) |cs| {
+            if (cs.complete) break true;
+        } else false;
     }
 
     /// Returns true if there is at least one pending sample, OR a complete
@@ -3893,10 +4027,7 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
             e.samples.deinit(alloc);
         }
         dr.coherent_wip.deinit(alloc);
-        for (dr.coherent_committed.items) |*set| {
-            for (set.items) |pc| pc.deinit();
-            set.deinit(alloc);
-        }
+        for (dr.coherent_committed.items) |*set| set.deinit(alloc);
         dr.coherent_committed.deinit(alloc);
         for (dr.pending.items) |pc| {
             pc.deinit();
@@ -3913,15 +4044,16 @@ test "coherent access: WaitSet trigger survives multiple queued committed sets (
 
     // Two already-complete coherent sets queued, as if two GROUP-scope
     // begin/end_coherent_changes() brackets had both already arrived and been
-    // fully reassembled -- commitCoherentWipSamplesLocked's own job, covered by
+    // fully reassembled -- endCoherentWipLocked's own job, covered by
     // the other tests in this file, is bypassed here to isolate
     // hasPendingDataFn/commitCoherentPendingLocked's interaction.
     const info = DDS.SampleInfo{ .sample_state = DDS.NOT_READ_SAMPLE_STATE, .view_state = DDS.NEW_VIEW_STATE, .instance_state = DDS.ALIVE_INSTANCE_STATE, .instance_handle = 1, .valid_data = true };
-    var set1: std.ArrayListUnmanaged(PendingChange) = .empty;
-    try set1.append(alloc, PendingChange{ .data = try alloc.dupe(u8, &.{0x01}), .alloc = alloc, .info = info });
+    const writer = std.mem.zeroes(Guid);
+    var set1: CommittedSet = .{ .writer_guid = writer, .publisher = writer, .group_cs = null, .complete = true };
+    try set1.samples.append(alloc, PendingChange{ .data = try alloc.dupe(u8, &.{0x01}), .alloc = alloc, .info = info });
     try dr.coherent_committed.append(alloc, set1);
-    var set2: std.ArrayListUnmanaged(PendingChange) = .empty;
-    try set2.append(alloc, PendingChange{ .data = try alloc.dupe(u8, &.{0x02}), .alloc = alloc, .info = info });
+    var set2: CommittedSet = .{ .writer_guid = writer, .publisher = writer, .group_cs = null, .complete = true };
+    try set2.samples.append(alloc, PendingChange{ .data = try alloc.dupe(u8, &.{0x02}), .alloc = alloc, .info = info });
     try dr.coherent_committed.append(alloc, set2);
     dr.coherent_committed_ready = true;
 

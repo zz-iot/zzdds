@@ -167,6 +167,7 @@ pub const RtpsProtocolWriter = struct {
         );
         proxy.wants_replay = info.durability_kind != 0;
         proxy.needs_pid_coherent_set_marker = info.needs_pid_coherent_set_marker;
+        proxy.omits_group_coherent_set = info.omits_group_coherent_set;
         return self.writer.addOrRefreshMatchedReader(proxy);
     }
 
@@ -251,9 +252,9 @@ pub const RtpsProtocolWriter = struct {
         return self.writer.coherentWindowPendingCount();
     }
 
-    fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
+    fn vtEndCoherentSet(ctx: *anyopaque, mode: protocol.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, group_set: ?protocol.GroupCoherentSet, defer_eoc: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.endCoherentSet(mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
+        self.writer.endCoherentSet(mode, resuspend, publisher_gsn, group_set, defer_eoc);
     }
 
     fn vtTakeEOCProxyInfos(
@@ -265,9 +266,10 @@ pub const RtpsProtocolWriter = struct {
         self.writer.mu.lock();
         defer self.writer.mu.unlock();
         const eoc_sn = self.writer.pending_eoc_sn orelse return;
-        // Do NOT clear pending_eoc_sn here — keep it set so the background HB
-        // thread cannot send a premature GAP before the EOC DATA is delivered.
-        // flushGroupEOCHBOnly() will read and clear it after the combined send.
+        // flushGroupEOCHBOnly() clears pending_eoc_sn after the combined send.
+        const group = for (self.writer.end_markers.items) |m| {
+            if (m.sn == eoc_sn) break m.group;
+        } else null;
         for (self.writer.reader_proxies.items) |*rp| {
             if (rp.suppress_live_data) continue;
             for (rp.effectiveLocators()) |loc| {
@@ -276,7 +278,9 @@ pub const RtpsProtocolWriter = struct {
                     .reader_guid = rp.guid,
                     .writer_guid = self.writer.guid,
                     .eoc_sn = eoc_sn,
+                    .group = group,
                     .needs_pid_coherent_set_marker = rp.needs_pid_coherent_set_marker,
+                    .omits_group_coherent_set = rp.omits_group_coherent_set,
                 });
             }
         }
@@ -317,23 +321,8 @@ pub const RtpsProtocolWriter = struct {
             for (infos_slice) |entry| {
                 if (!entry.locator.eql(entry0.locator)) continue;
                 if (!entry.reader_guid.prefix.eql(entry0.reader_guid.prefix)) continue;
-                // RTPS 2.5 §9.6.4.2 Table 9.22 lists two equivalent spec-legal ways
-                // to signal end-of-coherent-set: "Example 3" (DataFlag=0,
-                // InlineQosFlag=0, no inline QoS at all — the smaller wire form)
-                // and "Example 2" (DataFlag=0, InlineQosFlag=1, PID_COHERENT_SET=
-                // SEQUENCENUMBER_UNKNOWN). Default to Example 3. Readers whose
-                // vendor is known (via needs_pid_coherent_set_marker, set from the
-                // remote participant's discovered VendorId — see
-                // header_mod.needsPidCoherentSetMarker) to reject a bare Example 3
-                // as malformed get Example 2 instead, still with the spec-correct
-                // SEQUENCENUMBER_UNKNOWN value — never a non-compliant one.
-                b.addData(.{
-                    .reader_entity_id = entry.reader_guid.entity_id,
-                    .writer_entity_id = entry.writer_guid.entity_id,
-                    .writer_sn = entry.eoc_sn,
-                    .no_payload = true,
-                    .coherent_set_sn = if (entry.needs_pid_coherent_set_marker) sn_mod.SEQUENCENUMBER_UNKNOWN else null,
-                }, &.{});
+                const marker = writer_sm.EndMarker{ .sn = entry.eoc_sn, .first_sn = 0, .last_sn = 0, .group = entry.group };
+                b.addData(marker.dataParams(entry.reader_guid.entity_id, entry.writer_guid.entity_id, entry.needs_pid_coherent_set_marker, entry.omits_group_coherent_set), &.{});
             }
             writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};
         }
@@ -578,6 +567,7 @@ pub const RtpsProtocolReader = struct {
         kind: history_mod.ChangeKind,
         coherent_set_sn: ?history_mod.SequenceNumber,
         group_seq_num: ?history_mod.SequenceNumber,
+        group_coherent_sn: ?history_mod.SequenceNumber,
         lifespan_ns: ?i64,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -591,6 +581,7 @@ pub const RtpsProtocolReader = struct {
             .data = serialized_payload,
             .coherent_set_sn = coherent_set_sn,
             .group_seq_num = group_seq_num,
+            .group_coherent_sn = group_coherent_sn,
             .inline_lifespan_ns = lifespan_ns,
         };
         // Signal liveliness only for writers already matched; unmatched writers are

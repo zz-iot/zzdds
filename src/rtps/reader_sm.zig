@@ -49,8 +49,8 @@ pub const DataCallback = struct {
     on_data: *const fn (ctx: *anyopaque, change: *const CacheChange) void,
     /// Called after the state machine's lock is released.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
-    /// Called when an end-of-coherent-set marker arrives (zero-payload alive DATA,
-    /// no PID_COHERENT_SET).  The DCPS layer registers this to flush the coherent WIP.
+    /// Called when an end-of-coherent-set marker arrives (see isEndMarker).
+    /// The DCPS layer registers this to end the writer's coherent set.
     /// If null, EOC packets are silently dropped — correct for RTPS-level consumers.
     on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
     /// Called after the state machine's lock is released, by any operation
@@ -94,6 +94,16 @@ pub const StatelessReader = struct {
     }
 };
 
+/// An end-of-coherent-set marker: an alive DATA without a payload that either
+/// carries no PID_COHERENT_SET (RTPS 2.5 §9.6.4.2 Table 9.22, Examples 2 and
+/// 3; SEQUENCENUMBER_UNKNOWN decodes to null) or is a GROUP End Coherent Set
+/// sample, which carries PID_GROUP_COHERENT_SET (§8.7.6) and may also repeat
+/// the set's PID_COHERENT_SET (§9.6.4.3 Table 9.23).
+pub fn isEndMarker(change: *const CacheChange) bool {
+    return change.kind == .alive and change.data.len == 0 and
+        (change.coherent_set_sn == null or change.group_coherent_sn != null);
+}
+
 fn keyHashFromInlineQos(inline_qos: ?msg.submessage.InlineQos) [16]u8 {
     if (inline_qos) |iq| {
         if (iq.get(.key_hash)) |bytes| {
@@ -120,6 +130,12 @@ pub const ReassemblyEntry = struct {
     source_timestamp: time_mod.RtpsTimestamp,
     /// MD5 key hash from PID_KEY_HASH inline QoS, if present in the first fragment.
     key_hash: [16]u8,
+    /// Coherent-set inline QoS, which only fragment 1 carries (RTPS 2.5 §8.7.6).
+    /// Fragments can arrive in any order, so these are captured whenever
+    /// fragment 1 does.
+    coherent_set_sn: ?SequenceNumber = null,
+    group_seq_num: ?SequenceNumber = null,
+    group_coherent_sn: ?SequenceNumber = null,
 
     pub fn deinit(self: *ReassemblyEntry, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
@@ -128,6 +144,22 @@ pub const ReassemblyEntry = struct {
 
     pub fn isComplete(self: *const ReassemblyEntry) bool {
         return self.received.count() == self.total_frags;
+    }
+
+    /// Record fragment 1's coherent-set inline QoS, if `df` carries fragment 1.
+    pub fn captureInlineQos(self: *ReassemblyEntry, df: msg.submessage.DataFragSubmessage) void {
+        if (df.fragment_starting_num != 1) return;
+        const iq = df.inline_qos orelse return;
+        const le = df.isLittleEndian();
+        // Non-positive PID_COHERENT_SET values (SEQUENCENUMBER_UNKNOWN) mark
+        // the end of a set, not membership: same rule as a DATA's.
+        if (iq.getSequenceNumber(.coherent_set, le)) |cs| {
+            if (cs >= 1) self.coherent_set_sn = cs;
+        }
+        self.group_seq_num = iq.getSequenceNumber(.group_seq_num, le);
+        if (iq.getSequenceNumber(.group_coherent_set, le)) |gcs| {
+            if (gcs >= 1) self.group_coherent_sn = gcs;
+        }
     }
 
     /// Copy fragment bytes into the buffer and mark received.
@@ -737,6 +769,7 @@ pub const StatefulReader = struct {
         }
 
         const entry = outer.value_ptr.getPtr(sn).?;
+        entry.captureInlineQos(df);
         entry.receiveFrag(df.fragment_starting_num, df.fragments_in_submessage, df.serialized_payload);
 
         if (!entry.isComplete()) return;
@@ -751,6 +784,9 @@ pub const StatefulReader = struct {
             .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
             .key_hash = entry.key_hash,
             .data = entry.data,
+            .coherent_set_sn = entry.coherent_set_sn,
+            .group_seq_num = entry.group_seq_num,
+            .group_coherent_sn = entry.group_coherent_sn,
         };
         self.bufferUnmatchedLocked(writer_guid, change) catch {};
         var removed = outer.value_ptr.fetchRemove(sn).?;
@@ -814,6 +850,7 @@ pub const StatefulReader = struct {
         }
 
         const entry = wp.?.reassembly.getPtr(sn).?;
+        entry.captureInlineQos(df);
         entry.receiveFrag(df.fragment_starting_num, df.fragments_in_submessage, df.serialized_payload);
 
         if (!entry.isComplete()) return;
@@ -829,6 +866,9 @@ pub const StatefulReader = struct {
             .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
             .key_hash = entry.key_hash,
             .data = assembled_data,
+            .coherent_set_sn = entry.coherent_set_sn,
+            .group_seq_num = entry.group_seq_num,
+            .group_coherent_sn = entry.group_coherent_sn,
         };
         try self.deliverChangeLocked(wp.?, change);
 
@@ -937,11 +977,10 @@ pub const StatefulReader = struct {
             .data_len = @intCast(change.data.len),
         } });
 
-        // EOC marker (§9.6.4.2 Table 9.22 Example 3): alive change with empty
-        // data and no PID_COHERENT_SET.  Track the SN in received (to avoid
-        // perpetual NACKs) but never add to the application-visible cache or
-        // fire the data callback — the DCPS layer handles EOC in onDataCb.
-        const is_eoc = change.kind == .alive and change.data.len == 0 and change.coherent_set_sn == null;
+        // End-of-coherent-set marker: track the SN in received (to avoid
+        // perpetual NACKs) but never add it to the application-visible cache;
+        // the DCPS layer gets it through on_eoc instead of on_data.
+        const is_eoc = isEndMarker(&change);
 
         if (self.reliable) {
             const prev_highest = wp.received.cumulativeAck();
@@ -987,7 +1026,10 @@ pub const StatefulReader = struct {
                     if (self.cache.getChangeForWriter(change.writer_guid, sn)) |ch| cb.on_data(cb.ctx, ch);
                     self.flush_pending = true;
                 }
-            }
+            } else if (self.callback) |cb| if (cb.on_eoc) |f| {
+                f(cb.ctx, &change);
+                self.flush_pending = true;
+            };
         }
     }
 
@@ -1001,9 +1043,7 @@ pub const StatefulReader = struct {
                 if (wp.pending_changes.items[i].sequence_number == next_sn) {
                     const pending_ch = wp.pending_changes.orderedRemove(i);
                     defer self.alloc.free(pending_ch.data);
-                    const is_eoc = pending_ch.kind == .alive and
-                        pending_ch.data.len == 0 and
-                        pending_ch.coherent_set_sn == null;
+                    const is_eoc = isEndMarker(&pending_ch);
                     if (!is_eoc) {
                         self.cache.addReaderChange(pending_ch) catch {};
                         if (self.callback) |cb| {

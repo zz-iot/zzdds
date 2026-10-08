@@ -239,12 +239,18 @@ fn addCommitted(alloc: std.mem.Allocator, dr: *DataReaderImpl, changes: []const 
         set.deinit(alloc);
     }
     for (changes) |ch| try set.append(alloc, try makePending(alloc, ch));
-    try dr.coherent_committed.append(alloc, set);
+    try dr.coherent_committed.append(alloc, .{
+        .samples = set,
+        .writer_guid = GUID_A,
+        .publisher = GUID_A,
+        .group_cs = null,
+        .complete = true,
+    });
     dr.coherent_committed_ready = true;
 }
 
 fn addWip(alloc: std.mem.Allocator, dr: *DataReaderImpl, writer_guid: proto.Guid, changes: []const ModelChange) !void {
-    var entry: CoherentWipEntry = .{ .cs = 1 };
+    var entry: CoherentWipEntry = .{ .cs = 1, .intact = true };
     errdefer {
         for (entry.samples.items) |pc| pc.deinit();
         entry.samples.deinit(alloc);

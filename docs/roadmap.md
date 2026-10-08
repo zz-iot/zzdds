@@ -320,10 +320,19 @@ or an optimisation on an already-improved path):
   matching in more than two steps still fail it. The fix, skipping each topic's first
   delivery instead, is carried on the `zz-iot/dds-rtps` branch CI pins
   (`INTEROP_RTPS_REF`); propose it upstream, where the earlier whole-run rewrite was
-  declined. Not yet explained: GROUP-scope failures with zzdds publishing and Connext
-  subscribing (DebugAllocator lane only; Connext holds one topic's part of a set back;
-  0 of 10 local runs failed), and one hdds subscriber that delivered the first sets
-  ~20 read cycles late with zzdds publishing.
+  declined. To re-check now that zzdds sends the RTPS 2.5 group ids and keeps its end
+  markers: GROUP-scope failures with zzdds publishing to another implementation
+  (DebugAllocator lane only; the subscriber held one topic's part of a set back; 0 of 10
+  local runs failed), and one subscriber that delivered the first sets ~20 read cycles
+  late with zzdds publishing.
+- **Coherent sets: what RTPS 2.5 §8.7.5–8.7.6 has that zzdds doesn't yet.**
+  - A GAP's `filteredCount` (changes the writer filtered out for this reader) is not
+    parsed, so a writer-side-filtered change inside a set makes it incomplete.
+  - Group ordered access's HEARTBEAT and GAP group fields (`currentGSN`, `writerSet`,
+    `gapStartGSN`, …) are neither sent nor read, and `PID_WRITER_GROUP_INFO` is not
+    checked against the discovered writers.
+  - A GROUP subscriber waits up to 5 s (the idle gate) on a writer that sends no End
+    Coherent Set marker for sets it wrote nothing in, before delivering them without it.
 
 ### Bindings
 

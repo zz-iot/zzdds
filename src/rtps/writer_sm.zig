@@ -310,6 +310,8 @@ pub const ReaderProxy = struct {
     /// vtAddMatchedReader; defaults to false (Example 3, the smaller spec-legal
     /// end-of-coherent-set form) for readers with no known quirk.
     needs_pid_coherent_set_marker: bool = false,
+    /// See MatchedReaderInfo.omits_group_coherent_set.
+    omits_group_coherent_set: bool = false,
     /// True when this proxy represents the reader's OWN local participant --
     /// i.e. it exists only to bootstrap same-participant builtin-endpoint
     /// matching (see combined.zig's `self_data` call), not a genuinely remote
@@ -400,6 +402,70 @@ pub const ReaderProxy = struct {
 
 // ── StatefulWriter ────────────────────────────────────────────────────────────
 
+/// An end-of-coherent-set marker (RTPS 2.5 §8.7.6): a DATA without a payload
+/// that ends this writer's part of a coherent set.  The writer keeps it like a
+/// cached sample, so a reader that missed it gets it again on NACK or replay
+/// instead of a GAP, which would leave that reader unable to tell whether the
+/// set is complete.  §8.7.6 keeps an End Coherent Set sample until every
+/// sample of its set is gone from the writer's cache; retireEndMarkersLocked
+/// also waits for every reliable reader to acknowledge it.
+pub const EndMarker = struct {
+    sn: SequenceNumber,
+    /// This writer's samples in the set: [first_sn, last_sn].  Empty
+    /// (first_sn > last_sn) for a GROUP writer that wrote nothing in the set.
+    first_sn: SequenceNumber,
+    last_sn: SequenceNumber,
+    /// GROUP scope (an End Coherent Set marker): the marker's
+    /// PID_GROUP_SEQ_NUM, PID_GROUP_COHERENT_SET and PID_WRITER_GROUP_INFO.
+    group: ?history_mod.GroupCoherentSet = null,
+
+    /// The marker's DATA submessage for one reader.  Readers whose vendor needs
+    /// the explicit PID_COHERENT_SET=SEQUENCENUMBER_UNKNOWN form get it (see
+    /// header_mod.needsPidCoherentSetMarker); everyone else gets no
+    /// PID_COHERENT_SET (RTPS 2.5 §9.6.4.2 Table 9.22).
+    pub fn dataParams(
+        self: EndMarker,
+        reader_entity_id: EntityId,
+        writer_entity_id: EntityId,
+        needs_pid_coherent_set_marker: bool,
+        omits_group_coherent_set: bool,
+    ) msg.builder.MessageBuilder.DataParams {
+        return .{
+            .reader_entity_id = reader_entity_id,
+            .writer_entity_id = writer_entity_id,
+            .writer_sn = self.sn,
+            .no_payload = true,
+            .coherent_set_sn = if (needs_pid_coherent_set_marker) sn_mod.SEQUENCENUMBER_UNKNOWN else null,
+            .group_seq_num = if (self.group) |g| g.end_gsn else null,
+            .group_coherent_sn = if (omits_group_coherent_set) null else if (self.group) |g| g.first_gsn else null,
+            .writer_group_info = if (self.group) |g| g.writer_group_info else null,
+        };
+    }
+};
+
+/// A replay snapshot entry (see replayHistoryToProxyUnlocked) for a retained
+/// end marker.
+fn markerSnapshot(comptime Snapshot: type, m: EndMarker) Snapshot {
+    return .{
+        .data = &.{},
+        .sn = m.sn,
+        .key_hash = std.mem.zeroes([16]u8),
+        .kind = .alive,
+        .source_timestamp = .{ .seconds = 0, .fraction = 0 },
+        .coherent_set_sn = null,
+        .group_seq_num = null,
+        .group_coherent_sn = null,
+        .writer_group_info = null,
+        .marker = m,
+    };
+}
+
+/// Upper bound on retained end markers per writer.  Markers wait for every
+/// reliable reader's acknowledgement; this keeps a reader that never
+/// acknowledges from growing the list without bound.  A reader that misses
+/// a marker dropped this way gets a GAP for it and discards that set.
+const MAX_END_MARKERS: usize = 1024;
+
 /// Reliable writer with per-reader ACK tracking.
 /// Typical use: SEDP publications/subscriptions announcements, user data.
 ///
@@ -447,11 +513,13 @@ pub const StatefulWriter = struct {
     /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
     /// Incremented by N after each group coherent set of N samples is flushed.
     group_seq_num_counter: i64,
-    /// EOC SN allocated by endCoherentSet(defer_eoc=true) but not yet sent.
-    /// Consumed and cleared by flushGroupEOCHBOnly().
-    /// Kept non-null from endCoherentSet() through to flushGroupEOCHBOnly() so
-    /// the background HB thread never sends a premature GAP for the EOC SN.
+    /// End marker allocated by endCoherentSet(defer_eoc=true) whose DATA the
+    /// publisher has yet to send (takeEOCProxyInfos/sendCombinedEOCData).
+    /// Cleared by flushGroupEOCHBOnly().
     pending_eoc_sn: ?SequenceNumber,
+    /// End-of-coherent-set markers this writer still answers NACKs and replays
+    /// with, oldest first (see EndMarker).
+    end_markers: std.ArrayListUnmanaged(EndMarker),
     /// Optional callback fired when a liveness probe resolves.
     /// Called with (ctx, prefix, alive): alive=true means an ACKNACK was received;
     /// alive=false means the probe deadline expired and the proxy was removed.
@@ -513,6 +581,7 @@ pub const StatefulWriter = struct {
             .last_flushed_sn = 0,
             .group_seq_num_counter = 0,
             .pending_eoc_sn = null,
+            .end_markers = .empty,
             .probe_result_fn = null,
             .probe_result_ctx = null,
             .protocol_ready_fn = null,
@@ -611,6 +680,7 @@ pub const StatefulWriter = struct {
         for (self.reader_proxies.items) |*rp| rp.deinit(self.alloc);
         self.reader_proxies.deinit(self.alloc);
         self.coherent_pending_sns.deinit(self.alloc);
+        self.end_markers.deinit(self.alloc);
         self.cache.deinit();
         self.mu.deinit();
         self.alloc.destroy(self);
@@ -731,7 +801,7 @@ pub const StatefulWriter = struct {
         // hbFirstSn). BEST_EFFORT proxies never ACKNACK, so there is no
         // handshake to wait for — they become ready immediately instead,
         // fired after mu is released below (never while holding it).
-        new_rp.first_sent_hb_first_sn = hbFirstSn(self.cache.minSn(), self.cache.maxSn(), new_rp.start_sn, null);
+        new_rp.first_sent_hb_first_sn = hbFirstSn(self.firstAvailableSnLocked(), self.lastAvailableSnLocked(), new_rp.start_sn, null);
         const newly_ready_guid: ?Guid = blk: {
             if (!new_rp.reliable) {
                 new_rp.protocol_ready = true;
@@ -909,7 +979,15 @@ pub const StatefulWriter = struct {
             return;
         }
         var scratch: [SCRATCH_SIZE]u8 = undefined;
+        // Retained end markers go out in SN order with the samples, so a
+        // replayed coherent set ends like a live one.
+        var next_marker: usize = 0;
         for (self.cache.changes.items) |*ch| {
+            while (next_marker < self.end_markers.items.len and
+                self.end_markers.items[next_marker].sn < ch.sequence_number) : (next_marker += 1)
+            {
+                self.sendEndMarkerToProxyLocked(rp, self.end_markers.items[next_marker], &scratch);
+            }
             self.tracer.submit(.{ .send_data = .{
                 .src_prefix = self.guid.prefix,
                 .writer_eid = self.guid.entity_id,
@@ -932,6 +1010,10 @@ pub const StatefulWriter = struct {
                     .key_hash = inlineKeyHash(self.keyed, ch.key_hash),
                     .is_key = ch.kind != .alive,
                     .status_info = statusInfoFromKind(ch.kind),
+                    .coherent_set_sn = ch.coherent_set_sn,
+                    .group_seq_num = ch.group_seq_num,
+                    .group_coherent_sn = if (rp.omits_group_coherent_set) null else ch.group_coherent_sn,
+                    .writer_group_info = ch.writer_group_info,
                     .lifespan = if (ch.kind == .alive) self.lifespan else null,
                 }, ch.data);
                 for (locs) |loc| {
@@ -942,6 +1024,7 @@ pub const StatefulWriter = struct {
                 }
             }
         }
+        for (self.end_markers.items[next_marker..]) |m| self.sendEndMarkerToProxyLocked(rp, m, &scratch);
     }
 
     /// Like replayHistoryToProxyLocked, but for addMatchedReader's
@@ -993,14 +1076,22 @@ pub const StatefulWriter = struct {
         @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
         const rp_guid = rp.guid;
 
+        // A replayed sample, or (`marker` set, `data` empty) a retained end
+        // marker: markers go out in SN order with the samples, so a replayed
+        // coherent set ends like a live one.
         const ChangeSnapshot = struct {
             data: []u8,
             sn: SequenceNumber,
             key_hash: [16]u8,
             kind: ChangeKind,
             source_timestamp: RtpsTimestamp,
+            coherent_set_sn: ?SequenceNumber,
+            group_seq_num: ?SequenceNumber,
+            group_coherent_sn: ?SequenceNumber,
+            writer_group_info: ?[4]u8,
+            marker: ?EndMarker = null,
         };
-        const n_changes = self.cache.changes.items.len;
+        const n_changes = self.cache.changes.items.len + self.end_markers.items.len;
         const changes = self.alloc.alloc(ChangeSnapshot, n_changes) catch {
             // Does NOT fall back to replayHistoryToProxyLocked here (an
             // earlier version of this did): that sends synchronously while
@@ -1027,7 +1118,14 @@ pub const StatefulWriter = struct {
         defer self.alloc.free(changes);
         var n_snap: usize = 0;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
+        var next_marker: usize = 0;
         for (self.cache.changes.items) |*ch| {
+            while (next_marker < self.end_markers.items.len and
+                self.end_markers.items[next_marker].sn < ch.sequence_number) : (next_marker += 1)
+            {
+                changes[n_snap] = markerSnapshot(ChangeSnapshot, self.end_markers.items[next_marker]);
+                n_snap += 1;
+            }
             self.tracer.submit(.{ .send_data = .{
                 .src_prefix = self.guid.prefix,
                 .writer_eid = self.guid.entity_id,
@@ -1061,10 +1159,20 @@ pub const StatefulWriter = struct {
                 .key_hash = ch.key_hash,
                 .kind = ch.kind,
                 .source_timestamp = ch.source_timestamp,
+                .coherent_set_sn = ch.coherent_set_sn,
+                .group_seq_num = ch.group_seq_num,
+                .group_coherent_sn = ch.group_coherent_sn,
+                .writer_group_info = ch.writer_group_info,
             };
             n_snap += 1;
         }
+        for (self.end_markers.items[next_marker..]) |m| {
+            changes[n_snap] = markerSnapshot(ChangeSnapshot, m);
+            n_snap += 1;
+        }
         defer for (changes[0..n_snap]) |c| self.alloc.free(c.data);
+        const rp_needs_marker_pid = rp.needs_pid_coherent_set_marker;
+        const rp_omits_gcs = rp.omits_group_coherent_set;
 
         const self_guid = self.guid;
         const self_lifespan = self.lifespan;
@@ -1078,16 +1186,24 @@ pub const StatefulWriter = struct {
             var b_scratch: [SCRATCH_SIZE]u8 = undefined;
             var b = MessageBuilder.init(&b_scratch, self_guid.prefix);
             b.addInfoDst(rp_guid.prefix);
-            b.addInfoTs(c.source_timestamp);
-            b.addData(.{
-                .reader_entity_id = rp_guid.entity_id,
-                .writer_entity_id = self_guid.entity_id,
-                .writer_sn = c.sn,
-                .key_hash = inlineKeyHash(self_keyed, c.key_hash),
-                .is_key = c.kind != .alive,
-                .status_info = statusInfoFromKind(c.kind),
-                .lifespan = if (c.kind == .alive) self_lifespan else null,
-            }, c.data);
+            if (c.marker) |m| {
+                b.addData(m.dataParams(rp_guid.entity_id, self_guid.entity_id, rp_needs_marker_pid, rp_omits_gcs), &.{});
+            } else {
+                b.addInfoTs(c.source_timestamp);
+                b.addData(.{
+                    .reader_entity_id = rp_guid.entity_id,
+                    .writer_entity_id = self_guid.entity_id,
+                    .writer_sn = c.sn,
+                    .key_hash = inlineKeyHash(self_keyed, c.key_hash),
+                    .is_key = c.kind != .alive,
+                    .status_info = statusInfoFromKind(c.kind),
+                    .coherent_set_sn = c.coherent_set_sn,
+                    .group_seq_num = c.group_seq_num,
+                    .group_coherent_sn = if (rp_omits_gcs) null else c.group_coherent_sn,
+                    .writer_group_info = c.writer_group_info,
+                    .lifespan = if (c.kind == .alive) self_lifespan else null,
+                }, c.data);
+            }
             for (locs_buf[0..n_locs]) |loc| {
                 sendIovecs(self_transport, &loc, b.iovecs()) catch |err| switch (err) {
                     error.UnsupportedLocatorKind => {},
@@ -1108,8 +1224,8 @@ pub const StatefulWriter = struct {
         @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
         const rp_guid = rp.guid;
         const rp_start_sn = rp.start_sn;
-        const cache_last = self.cache.maxSn();
-        const cache_first = self.cache.minSn();
+        const cache_last = self.lastAvailableSnLocked();
+        const cache_first = self.firstAvailableSnLocked();
         self.hb_count += 1;
         const count = self.hb_count;
 
@@ -1125,21 +1241,21 @@ pub const StatefulWriter = struct {
     /// `final=true` tells the reader it need not reply (used to signal
     /// history-delivery completion before live data begins flowing).
     fn sendHeartbeatToProxyLocked(self: *Self, rp: *const ReaderProxy, final: bool) void {
-        const cache_last = self.cache.maxSn();
-        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, cache_last, null);
+        const cache_last = self.lastAvailableSnLocked();
+        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, cache_last);
     }
 
     /// Like sendHeartbeatToProxyLocked but caps last_sn at `last_sn_cap`.
     /// Used while suppress_live_data to avoid revealing live SNs to a reader
     /// whose DataReader has not yet flushed the history replay.
     fn sendHeartbeatToProxyLockedCapped(self: *Self, rp: *const ReaderProxy, final: bool, last_sn_cap: SequenceNumber) void {
-        const cache_last = self.cache.maxSn();
+        const cache_last = self.lastAvailableSnLocked();
         const capped = if (cache_last > 0) @min(cache_last, last_sn_cap) else cache_last;
-        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, capped, null);
+        self.sendHeartbeatToProxyLockedWithLastSn(rp, final, capped);
     }
 
-    fn sendHeartbeatToProxyLockedWithLastSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber, extra_gap_sn: ?SequenceNumber) void {
-        self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, final, last_sn, extra_gap_sn, null);
+    fn sendHeartbeatToProxyLockedWithLastSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber) void {
+        self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, final, last_sn, null);
     }
 
     /// firstSN a Heartbeat to `rp` would carry, given the writer's current
@@ -1155,9 +1271,9 @@ pub const StatefulWriter = struct {
             if (last_sn == 0) @as(SequenceNumber, 1) else @max(if (cache_first == 0) 1 else cache_first, start_sn);
     }
 
-    fn sendHeartbeatToProxyLockedWithLastSnAndFirstSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber, extra_gap_sn: ?SequenceNumber, first_sn_override: ?SequenceNumber) void {
+    fn sendHeartbeatToProxyLockedWithLastSnAndFirstSn(self: *Self, rp: *const ReaderProxy, final: bool, last_sn: SequenceNumber, first_sn_override: ?SequenceNumber) void {
         const locs = rp.effectiveLocators();
-        const cache_first = self.cache.minSn();
+        const cache_first = self.firstAvailableSnLocked();
         const hb_first_sn = hbFirstSn(cache_first, last_sn, rp.start_sn, first_sn_override);
         if (locs.len == 0) return;
         self.hb_count += 1;
@@ -1201,18 +1317,6 @@ pub const StatefulWriter = struct {
                 .bitmap = std.mem.zeroes([8]u32),
             };
             b.addGap(rp.guid.entity_id, self.guid.entity_id, rp.start_sn, gap_list);
-        }
-        // Optional point GAP for the EOC SN (allocated via allocSn but never in
-        // cache).  Reliable readers that miss the EOC DATA packet would otherwise
-        // NACK this SN forever; the GAP lets them retire it and unblock delivery
-        // of all subsequent non-coherent samples buffered in pending_changes.
-        if (extra_gap_sn) |eoc_sn| {
-            const eoc_gap_list = msg.submessage.SequenceNumberSet{
-                .base = eoc_sn + 1,
-                .num_bits = 0,
-                .bitmap = std.mem.zeroes([8]u32),
-            };
-            b.addGap(rp.guid.entity_id, self.guid.entity_id, eoc_sn, eoc_gap_list);
         }
         b.addHeartbeat(
             rp.guid.entity_id,
@@ -1309,8 +1413,7 @@ pub const StatefulWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.hb_count += 1;
-        const cache_first = self.cache.minSn();
-        const cache_last = self.cache.maxSn();
+        const cache_first = self.firstAvailableSnLocked();
         var scratch: [SCRATCH_SIZE]u8 = undefined;
 
         // When a coherent set is in progress, coherent_pending_sns holds SNs that
@@ -1320,20 +1423,12 @@ pub const StatefulWriter = struct {
         //
         // Cap last_sn to last_flushed_sn — the highest SN actually delivered to
         // readers so far, so the background HB only describes data readers can
-        // receive (EOC SNs are gapped, not data).
-        //
-        // After a two-phase GROUP EOC flush (pending_eoc_sn cleared by flushGroupEOCHBOnly),
-        // include the sent EOC SN in the advertised range: cache.next_sn - 1 is the EOC
-        // marker that was sent via sendCombinedEOCData.  This lets readers NACK the EOC SN
-        // if they missed it; the NACK handler then responds with GAP(eoc_sn) — the only
-        // race-free way to retire an uncached EOC SN.
-        const allocated_last = self.cache.next_sn -% 1;
+        // receive.  Otherwise advertise every SN this writer can still send,
+        // retained end markers included, so a reader that missed one NACKs it.
         const adj_last: SequenceNumber = if (self.coherent_active)
             self.last_flushed_sn
-        else if (self.pending_eoc_sn == null and allocated_last > cache_last)
-            allocated_last
         else
-            cache_last;
+            self.lastAvailableSnLocked();
 
         for (self.reader_proxies.items) |*rp| {
             // BEST_EFFORT readers don't participate in the reliable
@@ -1476,6 +1571,7 @@ pub const StatefulWriter = struct {
             }
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
             self.ack_cond.broadcast();
+            self.retireEndMarkersLocked();
             // RELIABLE protocol-ready handshake: the first AckNack whose base
             // (next-expected SN) reaches the firstSN of the Heartbeat we sent
             // this proxy at match time proves the reader processed that
@@ -1580,7 +1676,8 @@ pub const StatefulWriter = struct {
                             .status_info = statusInfoFromKind(ch.kind),
                             .coherent_set_sn = ch.coherent_set_sn,
                             .group_seq_num = ch.group_seq_num,
-                            .group_coherent_sn = ch.group_coherent_sn,
+                            .group_coherent_sn = if (proxy.omits_group_coherent_set) null else ch.group_coherent_sn,
+                            .writer_group_info = ch.writer_group_info,
                             .lifespan = if (ch.kind == .alive) w.lifespan else null,
                         }, ch.data);
                         for (proxy.effectiveLocators()) |loc| sendIovecs(w.transport, &loc, b.iovecs()) catch {};
@@ -1606,24 +1703,23 @@ pub const StatefulWriter = struct {
                     // Don't retransmit changes that are still inside a coherent window.
                     if (self.isCoherentPendingSn(sn)) continue;
                     const ch = self.cache.getChange(sn) orelse {
-                        // SN is allocated but absent from the history cache — it was
-                        // reserved via allocSn() for a wire-only EOC marker.  Reply with
-                        // a GAP so the reader can retire the SN and unblock pending_changes.
-                        // Skip if this is the pending two-phase EOC: sendCombinedEOCData() +
-                        // flushGroupEOCHBOnly() will send the EOC DATA + HB shortly; a premature
-                        // GAP here would cause Connext to discard the EOC and never close the
-                        // coherent set.
-                        if (sn < self.cache.next_sn and sn != (self.pending_eoc_sn orelse 0)) {
-                            const eoc_gap = msg.submessage.SequenceNumberSet{
-                                .base = sn + 1,
-                                .num_bits = 0,
-                                .bitmap = std.mem.zeroes([8]u32),
-                            };
-                            var eg = MessageBuilder.init(&scratch, self.guid.prefix);
-                            eg.addInfoDst(rp.guid.prefix);
-                            eg.addGap(rp.guid.entity_id, self.guid.entity_id, sn, eoc_gap);
-                            for (locs) |loc|
-                                sendIovecs(self.transport, &loc, eg.iovecs()) catch {};
+                        // Not a cached sample: resend it if it is a retained end
+                        // marker, else GAP it so the reader stops asking.
+                        if (sn < self.cache.next_sn) {
+                            if (self.findEndMarkerLocked(sn)) |m| {
+                                self.sendEndMarkerToProxyLocked(rp, m, &scratch);
+                            } else {
+                                const gap_list = msg.submessage.SequenceNumberSet{
+                                    .base = sn + 1,
+                                    .num_bits = 0,
+                                    .bitmap = std.mem.zeroes([8]u32),
+                                };
+                                var eg = MessageBuilder.init(&scratch, self.guid.prefix);
+                                eg.addInfoDst(rp.guid.prefix);
+                                eg.addGap(rp.guid.entity_id, self.guid.entity_id, sn, gap_list);
+                                for (locs) |loc|
+                                    sendIovecs(self.transport, &loc, eg.iovecs()) catch {};
+                            }
                             retransmit_count += 1;
                         }
                         continue;
@@ -1665,6 +1761,15 @@ pub const StatefulWriter = struct {
                     const offset = ch.sequence_number - nack_set.base;
                     if (offset < nack_set.num_bits and nack_set.contains(ch.sequence_number)) continue;
                     retransmitChange(self, rp, ch, &scratch, &nonfinal_frag_budget);
+                    retransmit_count += 1;
+                }
+                for (self.end_markers.items) |m| {
+                    if (m.sn < nack_set.base) continue;
+                    if (m.sn < rp.start_sn) continue;
+                    if (rp.suppress_live_data and m.sn > rp.history_floor_sn) continue;
+                    const offset = m.sn - nack_set.base;
+                    if (offset < nack_set.num_bits and nack_set.contains(m.sn)) continue;
+                    self.sendEndMarkerToProxyLocked(rp, m, &scratch);
                     retransmit_count += 1;
                 }
             }
@@ -1767,9 +1872,10 @@ pub const StatefulWriter = struct {
                 locs: [8]Locator = undefined,
                 n_locs: usize = 0,
                 hb: ?struct { last_sn: SequenceNumber, cache_first: SequenceNumber, count: i32 } = null,
+                omits_group_coherent_set: bool = false,
             };
-            const cache_last = self.cache.maxSn();
-            const cache_first = self.cache.minSn();
+            const cache_last = self.lastAvailableSnLocked();
+            const cache_first = self.firstAvailableSnLocked();
 
             const snaps = self.alloc.alloc(ProxySnapshot, self.reader_proxies.items.len) catch {
                 self.sendChangeToAllNonFragLockedFallback(ch);
@@ -1796,7 +1902,7 @@ pub const StatefulWriter = struct {
                     .data_len = @intCast(ch.data.len),
                 } });
                 var s = &snaps[n_snaps];
-                s.* = .{ .guid = rp.guid, .start_sn = rp.start_sn };
+                s.* = .{ .guid = rp.guid, .start_sn = rp.start_sn, .omits_group_coherent_set = rp.omits_group_coherent_set };
                 s.n_locs = @min(locs.len, s.locs.len);
                 @memcpy(s.locs[0..s.n_locs], locs[0..s.n_locs]);
                 // Follow each DATA with a non-final HEARTBEAT so the reader learns
@@ -1830,6 +1936,7 @@ pub const StatefulWriter = struct {
             const ch_coherent_set_sn = ch.coherent_set_sn;
             const ch_group_seq_num = ch.group_seq_num;
             const ch_group_coherent_sn = ch.group_coherent_sn;
+            const ch_writer_group_info = ch.writer_group_info;
             const ch_source_timestamp = ch.source_timestamp;
             const self_guid = self.guid;
             const self_lifespan = self.lifespan;
@@ -1852,7 +1959,8 @@ pub const StatefulWriter = struct {
                     .status_info = statusInfoFromKind(ch_kind),
                     .coherent_set_sn = ch_coherent_set_sn,
                     .group_seq_num = ch_group_seq_num,
-                    .group_coherent_sn = ch_group_coherent_sn,
+                    .group_coherent_sn = if (s.omits_group_coherent_set) null else ch_group_coherent_sn,
+                    .writer_group_info = ch_writer_group_info,
                     .lifespan = if (ch_kind == .alive) self_lifespan else null,
                 }, data_copy);
                 for (s.locs[0..s.n_locs]) |loc| {
@@ -1910,7 +2018,7 @@ pub const StatefulWriter = struct {
     /// where self.mu has already been released (see sendChangeToAllLocked's
     /// non-fragmented branch): takes already-locked snapshots instead of a
     /// live *const ReaderProxy / self.hb_count / self.cache.minSn(), and
-    /// only implements the extra_gap_sn=null, first_sn_override=null subset
+    /// only implements the first_sn_override=null subset
     /// of that function's GAP logic (the only branch reachable from this
     /// caller). Every other heartbeat call site is unaffected and still
     /// goes through the locked family unchanged.
@@ -1990,7 +2098,8 @@ pub const StatefulWriter = struct {
                 .status_info = if (frag_num == 1) statusInfoFromKind(ch.kind) else null,
                 .coherent_set_sn = if (frag_num == 1) ch.coherent_set_sn else null,
                 .group_seq_num = if (frag_num == 1) ch.group_seq_num else null,
-                .group_coherent_sn = if (frag_num == 1) ch.group_coherent_sn else null,
+                .group_coherent_sn = if (frag_num == 1 and !rp.omits_group_coherent_set) ch.group_coherent_sn else null,
+                .writer_group_info = if (frag_num == 1) ch.writer_group_info else null,
                 .lifespan = if (frag_num == 1 and ch.kind == .alive) self.lifespan else null,
             }, ch.data[offset..][0..this_len]);
             for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
@@ -2039,7 +2148,8 @@ pub const StatefulWriter = struct {
                 .status_info = statusInfoFromKind(ch.kind),
                 .coherent_set_sn = ch.coherent_set_sn,
                 .group_seq_num = ch.group_seq_num,
-                .group_coherent_sn = ch.group_coherent_sn,
+                .group_coherent_sn = if (rp.omits_group_coherent_set) null else ch.group_coherent_sn,
+                .writer_group_info = ch.writer_group_info,
                 .lifespan = if (ch.kind == .alive) self.lifespan else null,
             }, ch.data[0..@min(frag_size, ch.data.len)]);
             for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
@@ -2109,7 +2219,8 @@ pub const StatefulWriter = struct {
                     .status_info = if (frag_num == 1) statusInfoFromKind(ch.kind) else null,
                     .coherent_set_sn = if (frag_num == 1) ch.coherent_set_sn else null,
                     .group_seq_num = if (frag_num == 1) ch.group_seq_num else null,
-                    .group_coherent_sn = if (frag_num == 1) ch.group_coherent_sn else null,
+                    .group_coherent_sn = if (frag_num == 1 and !rp.omits_group_coherent_set) ch.group_coherent_sn else null,
+                    .writer_group_info = if (frag_num == 1) ch.writer_group_info else null,
                     .lifespan = if (frag_num == 1 and ch.kind == .alive) self.lifespan else null,
                 }, ch.data[offset..][0..this_len]);
                 for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
@@ -2123,6 +2234,60 @@ pub const StatefulWriter = struct {
             for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
             return;
         }
+    }
+
+    // ── End-of-coherent-set markers ───────────────────────────────────────────
+
+    fn findEndMarkerLocked(self: *const Self, sn: SequenceNumber) ?EndMarker {
+        for (self.end_markers.items) |m| {
+            if (m.sn == sn) return m;
+        }
+        return null;
+    }
+
+    /// Drop markers whose set's samples are all gone from the cache and that
+    /// every reliable reader has acknowledged; then enforce MAX_END_MARKERS.
+    fn retireEndMarkersLocked(self: *Self) void {
+        var i: usize = 0;
+        while (i < self.end_markers.items.len) {
+            const m = self.end_markers.items[i];
+            const set_cached = for (self.cache.changes.items) |*ch| {
+                if (ch.sequence_number >= m.first_sn and ch.sequence_number <= m.last_sn) break true;
+            } else false;
+            if (!set_cached and self.allProxiesAckedLocked(m.sn)) {
+                _ = self.end_markers.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+        if (self.end_markers.items.len > MAX_END_MARKERS) {
+            const excess = self.end_markers.items.len - MAX_END_MARKERS;
+            self.end_markers.replaceRangeAssumeCapacity(0, excess, &.{});
+        }
+    }
+
+    /// Lowest SN this writer can still send: its oldest cached sample or
+    /// retained end marker.  0 when it has neither.
+    fn firstAvailableSnLocked(self: *const Self) SequenceNumber {
+        const cache_first = self.cache.minSn();
+        if (self.end_markers.items.len == 0) return cache_first;
+        const marker_first = self.end_markers.items[0].sn;
+        return if (cache_first == 0) marker_first else @min(cache_first, marker_first);
+    }
+
+    /// Highest SN this writer can still send: its newest cached sample or
+    /// retained end marker.  0 when it has neither.
+    fn lastAvailableSnLocked(self: *const Self) SequenceNumber {
+        const cache_last = self.cache.maxSn();
+        if (self.end_markers.items.len == 0) return cache_last;
+        return @max(cache_last, self.end_markers.items[self.end_markers.items.len - 1].sn);
+    }
+
+    fn sendEndMarkerToProxyLocked(self: *Self, rp: *const ReaderProxy, m: EndMarker, scratch: *[SCRATCH_SIZE]u8) void {
+        var b = MessageBuilder.init(scratch, self.guid.prefix);
+        b.addInfoDst(rp.guid.prefix);
+        b.addData(m.dataParams(rp.guid.entity_id, self.guid.entity_id, rp.needs_pid_coherent_set_marker, rp.omits_group_coherent_set), &.{});
+        for (rp.effectiveLocators()) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
     }
 
     /// Returns true if `sn` is inside the current coherent window and should
@@ -2163,7 +2328,8 @@ pub const StatefulWriter = struct {
     }
 
     /// Flush a deferred coherent/ordered batch.
-    ///   .full           — PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET (GROUP scope)
+    ///   .full           — PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET
+    ///                     + PID_WRITER_GROUP_INFO (GROUP scope)
     ///   .coherent_only  — PID_COHERENT_SET only (INSTANCE/TOPIC scope coherent_access)
     ///   .group_seq_only — PID_GROUP_SEQ_NUM only (ordered_access without coherent_access)
     ///   .none           — no inline QoS (resume_publications)
@@ -2178,23 +2344,29 @@ pub const StatefulWriter = struct {
     /// from this shared counter, ensuring global write-order across writers in a
     /// GROUP_PRESENTATION coherent set.  When null, the writer uses its own per-writer
     /// counter (standalone writer usage — single-writer publishers or direct tests).
-    /// `global_last_gsn`: the group-wide last GSN across ALL writers in the publisher's
-    /// coherent set.  Written into PID_GROUP_COHERENT_SET on the last sample from this
-    /// writer so the receiver knows when the full group set has arrived.  0 = use the
-    /// per-writer last GSN (standalone/single-writer path where they are equal).
-    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
+    /// `group_set`: mode .full only — the publisher's group coherent set, shared by
+    /// all its writers (RTPS 2.5 §8.7.6).  Every writer, including one that wrote
+    /// nothing in the set, ends it with an End Coherent Set marker.  Null = a
+    /// standalone writer, whose set is its own samples.
+    ///
+    /// The coherent modes end the set with an end marker (EndMarker).  With
+    /// `defer_eoc`, its DATA and HEARTBEATs are left for the publisher's
+    /// takeEOCProxyInfos/sendCombinedEOCData/flushGroupEOCHBOnly.
+    pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, group_set: ?history_mod.GroupCoherentSet, defer_eoc: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.coherent_active = false;
         defer if (resuspend) {
             self.coherent_active = true;
         };
+        defer self.coherent_pending_sns.clearRetainingCapacity();
 
         const window_start = self.coherent_window_start;
         self.coherent_window_start = 0;
 
         const all_sns = self.coherent_pending_sns.items;
-        if (all_sns.len == 0) return;
+        const ends_group_set = mode == .full and group_set != null;
+        if (all_sns.len == 0 and !ends_group_set) return;
 
         // Flush pre-window writes (from suspension before begin_coherent_changes)
         // without coherent QoS — they are not part of the coherent set.
@@ -2203,18 +2375,14 @@ pub const StatefulWriter = struct {
         }
 
         const coherent_sns = all_sns[window_start..];
-        if (coherent_sns.len == 0) {
-            self.coherent_pending_sns.clearRetainingCapacity();
-            return;
-        }
+        if (coherent_sns.len == 0 and !ends_group_set) return;
 
-        const last_sn = coherent_sns[coherent_sns.len - 1];
-        const first_sn = coherent_sns[0];
         const n: i64 = @intCast(coherent_sns.len);
-        if (mode != .none) {
-            // PID_COHERENT_SET: stamp the first SN of the coherent window on all
-            // samples.  RTI Connext groups samples by this value and treats a
-            // CS transition (new value arriving) as the end-of-set signal.
+        // Standalone GROUP writer: its set is its own samples.
+        var group: ?history_mod.GroupCoherentSet = group_set;
+        if (mode != .none and coherent_sns.len > 0) {
+            const first_sn = coherent_sns[0];
+            // PID_COHERENT_SET: the first SN of the set, on every sample.
             if (mode == .full or mode == .coherent_only) {
                 for (coherent_sns) |sn| {
                     for (self.cache.changes.items) |*ch| {
@@ -2225,19 +2393,28 @@ pub const StatefulWriter = struct {
                     }
                 }
             }
-            // PID_GROUP_SEQ_NUM / PID_GROUP_COHERENT_SET: GROUP-scope and ordered-access
-            // only.  Always assign even when no readers are matched — late-joining
-            // KEEP_ALL readers will receive history with correct inline QoS via NACK repair.
+            // PID_GROUP_SEQ_NUM, and for GROUP coherent sets PID_GROUP_COHERENT_SET
+            // and PID_WRITER_GROUP_INFO, on every sample (RTPS 2.5 §8.7.6).  Always
+            // assigned, even with no reader matched: late-joining readers get them
+            // through NACK repair.
             if (mode == .full or mode == .group_seq_only) {
                 const base_gsn = if (publisher_gsn) |pg| pg.* else self.group_seq_num_counter;
-                const last_gsn = base_gsn + n;
-                const group_end_gsn = if (global_last_gsn != 0) global_last_gsn else last_gsn;
+                if (mode == .full and group == null) {
+                    var own = [_]EntityId{self.guid.entity_id};
+                    group = .{
+                        .first_gsn = base_gsn + 1,
+                        .end_gsn = base_gsn + n + 1,
+                        .writer_group_info = guid_mod.groupDigest(&own),
+                    };
+                }
                 for (coherent_sns, 1..) |sn, i| {
-                    const gsn: i64 = base_gsn + @as(i64, @intCast(i));
                     for (self.cache.changes.items) |*ch| {
                         if (ch.sequence_number == sn) {
-                            ch.group_seq_num = gsn;
-                            if (mode == .full and sn == last_sn) ch.group_coherent_sn = group_end_gsn;
+                            ch.group_seq_num = base_gsn + @as(i64, @intCast(i));
+                            if (group) |g| {
+                                ch.group_coherent_sn = g.first_gsn;
+                                ch.writer_group_info = g.writer_group_info;
+                            }
                             break;
                         }
                     }
@@ -2246,100 +2423,88 @@ pub const StatefulWriter = struct {
                     pg.* += n;
                 } else {
                     self.group_seq_num_counter += n;
+                    // The End Coherent Set marker takes the next group sequence
+                    // number (a publisher accounts for its writers' markers itself).
+                    if (group != null) self.group_seq_num_counter += 1;
                 }
             }
         }
         for (coherent_sns) |sn| {
             if (self.cache.getChange(sn)) |ch| {
-                // No per-DATA heartbeat: send one HB after all coherent samples so the
-                // subscriber's coherent WIP is not flushed prematurely on the first sample.
+                // No per-DATA heartbeat: one HB follows the whole set.
                 self.sendChangeToAllLocked(ch, false);
             }
         }
-        // End-of-coherent-set marker: a DATA with DataFlag=0 and no inline QoS.
-        // Per RTPS §9.6.4.2 Table 9.22 (Example 3), this is the minimal explicit
-        // end-of-set signal — any DATA from this writer without PID_COHERENT_SET
-        // tells the receiver the previous coherent set is complete.  Sent before
-        // the per-proxy HEARTBEATs so best-effort readers also get it.
-        // Only meaningful for coherent-access modes; .none and .group_seq_only
-        // do not use PID_COHERENT_SET so there is no coherent set to terminate.
-        if (mode == .coherent_only or mode == .full) {
-            const eoc_sn = self.cache.allocSn();
-            if (defer_eoc) {
-                // Phase 1 of a two-phase flush (all coherent-access scopes): stash the
-                // EOC SN and return.  sendCombinedEOCData() + flushGroupEOCHBOnly() send
-                // EOC DATA + HBs for all writers together so Connext completes all per-reader
-                // coherent sets at roughly the same time, preventing a subscriber poll from
-                // splitting a multi-topic coherent window.
-                self.pending_eoc_sn = eoc_sn;
-                self.coherent_pending_sns.clearRetainingCapacity();
-                return;
-            }
-            var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
-            for (self.reader_proxies.items) |*rp| {
-                if (rp.suppress_live_data) continue;
-                const locs = rp.effectiveLocators();
-                if (locs.len == 0) continue;
-                var b = MessageBuilder.init(&eoc_scratch, self.guid.prefix);
-                b.addInfoDst(rp.guid.prefix);
-                b.addData(.{
-                    .reader_entity_id = rp.guid.entity_id,
-                    .writer_entity_id = self.guid.entity_id,
-                    .writer_sn = eoc_sn,
-                    .no_payload = true,
-                }, &.{});
-                for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
-            }
-            // One heartbeat after all coherent-set samples so reliable readers learn the
-            // full [first_sn, last_sn] range and the subscriber can commit the complete WIP.
-            // Also include a GAP for eoc_sn so readers that missed the EOC DATA can retire
-            // it and unblock delivery of subsequent non-coherent samples.
-            const cache_last = self.cache.maxSn();
+        if (mode != .coherent_only and mode != .full) {
+            // Non-coherent modes (.none, .group_seq_only): no end marker, but still send HB.
+            const cache_last = self.lastAvailableSnLocked();
             for (self.reader_proxies.items) |*rp| {
                 if (!rp.reliable) continue;
-                const proxy_eoc_sn = if (!rp.suppress_live_data) eoc_sn else null;
-                self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, proxy_eoc_sn);
+                self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last);
             }
-        } else {
-            // Non-coherent modes (.none, .group_seq_only): no EOC, but still send HB.
-            const cache_last = self.cache.maxSn();
-            for (self.reader_proxies.items) |*rp| {
-                if (!rp.reliable) continue;
-                self.sendHeartbeatToProxyLockedWithLastSn(rp, false, cache_last, null);
-            }
+            return;
         }
-        self.coherent_pending_sns.clearRetainingCapacity();
+
+        // End the set with an end marker.  Kept (see EndMarker) so readers that
+        // miss it get it again rather than a GAP.
+        const eoc_sn = self.cache.allocSn();
+        const marker = EndMarker{
+            .sn = eoc_sn,
+            .first_sn = if (coherent_sns.len > 0) coherent_sns[0] else eoc_sn,
+            .last_sn = if (coherent_sns.len > 0) coherent_sns[coherent_sns.len - 1] else eoc_sn - 1,
+            .group = if (mode == .full) group else null,
+        };
+        self.retireEndMarkersLocked();
+        // On OOM the marker is still sent once below; a reader that misses it
+        // gets a GAP and discards the set.
+        self.end_markers.append(self.alloc, marker) catch {};
+        if (defer_eoc) {
+            // Phase 1 of a two-phase flush: the publisher sends every writer's
+            // markers together (sendCombinedEOCData) so one receive completes
+            // all of a subscriber's per-reader sets at once.
+            self.pending_eoc_sn = eoc_sn;
+            return;
+        }
+        var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
+        for (self.reader_proxies.items) |*rp| {
+            if (rp.suppress_live_data) continue;
+            if (rp.effectiveLocators().len == 0) continue;
+            self.sendEndMarkerToProxyLocked(rp, marker, &eoc_scratch);
+        }
+        if (eoc_sn > self.last_flushed_sn) self.last_flushed_sn = eoc_sn;
+        // One heartbeat after the whole set, announcing the marker too, so a
+        // reliable reader that missed any of it NACKs.
+        for (self.reader_proxies.items) |*rp| {
+            if (!rp.reliable) continue;
+            self.sendHeartbeatToProxyLockedWithLastSn(rp, false, self.lastAvailableSnLocked());
+        }
     }
 
-    /// Phase 3 of a publisher-level combined EOC flush (all coherent-access scopes).
-    /// Called after the publisher has sent the combined EOC DATA via sendCombinedEOCData().
-    /// Sends per-proxy HBs using the EOC SN stashed by takeEOCProxyInfos(), then clears it.
-    /// No-op if no pending EOC is set.
+    /// Phase 3 of a publisher-level combined end-marker flush (all coherent-access
+    /// scopes).  Called after the publisher sent the markers' DATA through
+    /// sendCombinedEOCData(): sends each reader a HEARTBEAT announcing the marker,
+    /// so one that missed it NACKs and gets it again.  No-op if none is pending.
     pub fn flushGroupEOCHBOnly(self: *Self) void {
         self.mu.lock();
         defer self.mu.unlock();
         const eoc_sn = self.pending_eoc_sn orelse return;
         self.pending_eoc_sn = null;
-        // Advertise lastSN=eoc_sn (not just cache.maxSn()) so Connext learns the full
-        // committed range including the EOC marker.  If Connext missed the EOC DATA
-        // packet it will NACK eoc_sn; the NACK handler responds with GAP(eoc_sn) which
-        // is the only safe time to retire it — after the DATA has been in flight long
-        // enough for Connext to have received it (pull-based recovery, no race).
-        const cache_last = eoc_sn;
-        const cache_first = self.cache.minSn();
-        // Override first_sn to cache.minSn() rather than max(cache.minSn(), rp.start_sn):
-        // all coherent SNs are sent to readers regardless of start_sn (sendChangeToAllLocked
-        // has no start_sn guard), so advertising firstSN=start_sn would make Connext think
-        // the coherent set started after the coherent_set_sn, causing it to reject GROUP delivery.
-        const first_sn_override: ?SequenceNumber = if (cache_first > 0) cache_first else 1;
+        if (eoc_sn > self.last_flushed_sn) self.last_flushed_sn = eoc_sn;
+        const last_sn = self.lastAvailableSnLocked();
+        const first_available = self.firstAvailableSnLocked();
+        // Override first_sn to the first available SN rather than
+        // max(first available, rp.start_sn): all coherent SNs are sent to readers
+        // regardless of start_sn (sendChangeToAllLocked has no start_sn guard), so
+        // advertising firstSN=start_sn would make a reader think the coherent set
+        // started after its coherent_set_sn, and reject it as incomplete.
+        const first_sn_override: ?SequenceNumber = if (first_available > 0) first_available else 1;
         for (self.reader_proxies.items) |*rp| {
             if (!rp.reliable) continue;
-            // Skip history-replaying proxies: they never received the coherent DATA or EOC
-            // (sendChangeToAllLocked and takeEOCProxyInfos both skip suppress_live_data).
-            // Advertising eoc_sn to them would trigger an unnecessary NACK round-trip for an
-            // SN they can never receive.  The background HB handles their history range.
+            // Skip history-replaying proxies: they never received the coherent DATA or
+            // marker (sendChangeToAllLocked and takeEOCProxyInfos both skip
+            // suppress_live_data).  The background HB handles their history range.
             if (rp.suppress_live_data) continue;
-            self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, false, cache_last, null, first_sn_override);
+            self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, false, last_sn, first_sn_override);
         }
     }
 

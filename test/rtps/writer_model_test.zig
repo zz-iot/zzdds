@@ -93,6 +93,10 @@ const Recording = struct {
 const WriterModel = struct {
     cached: [MAX_SN + 1]bool = [_]bool{false} ** (MAX_SN + 1),
     coherent_pending: [MAX_SN + 1]bool = [_]bool{false} ** (MAX_SN + 1),
+    /// End-of-coherent-set markers: never cached, but kept and resent like a
+    /// cached sample (the writer retires them only once their set's samples
+    /// are gone from its cache, never here with KEEP_ALL).
+    end_marker: [MAX_SN + 1]bool = [_]bool{false} ** (MAX_SN + 1),
     next_sn: SequenceNumber = 1,
     coherent_active: bool = false,
     last_acknack_count: ?i32 = null,
@@ -113,7 +117,14 @@ const WriterModel = struct {
 
     fn endCoherent(self: *@This()) void {
         self.coherent_active = false;
+        const had_samples = std.mem.indexOfScalar(bool, &self.coherent_pending, true) != null;
         self.coherent_pending = [_]bool{false} ** (MAX_SN + 1);
+        // A non-empty coherent set ends with an end marker, which takes an SN.
+        if (had_samples) {
+            const sn = self.next_sn;
+            self.next_sn += 1;
+            if (sn <= MAX_SN) self.end_marker[@intCast(sn)] = true;
+        }
     }
 
     fn acknack(
@@ -154,6 +165,7 @@ const WriterModel = struct {
 
     fn canSend(self: *const @This(), sn: SequenceNumber) bool {
         if (sn <= 0 or sn > MAX_SN) return false;
+        if (self.end_marker[@intCast(sn)]) return true;
         return self.cached[@intCast(sn)] and !self.coherent_pending[@intCast(sn)];
     }
 };
@@ -252,7 +264,7 @@ fn runWriterScript(alloc: std.mem.Allocator, ops: []const WriterScriptOp) !void 
             },
             .end_coherent => {
                 if (model.coherent_active) {
-                    writer.endCoherentSet(.full, false, null, 0, false);
+                    writer.endCoherentSet(.full, false, null, null, false);
                     model.endCoherent();
                 }
                 rec.reset();
@@ -391,7 +403,7 @@ test "writer model: AckNack does not retransmit samples still inside coherent wi
     const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 1, false);
 
-    writer.endCoherentSet(.full, false, null, 0, false);
+    writer.endCoherentSet(.full, false, null, null, false);
     model.endCoherent();
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 2, false);
 }

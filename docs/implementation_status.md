@@ -39,9 +39,10 @@ design decisions with rationale.
 | HEARTBEAT / ACKNACK / GAP | Complete | |
 | DATA_FRAG fragmentation + reassembly | Complete | `StatefulWriter` splits, `StatefulReader` reassembles |
 | HEARTBEAT_FRAG / NACK_FRAG | Complete | Fragment ACK/retransmit; per-proxy stale-count suppression (§8.3.8.12–13) |
-| `PID_COHERENT_SET` (0x0056) inline QoS | Complete | Emitted on coherent-set members; parsed on receive for buffering |
+| `PID_COHERENT_SET` (0x0056) inline QoS | Complete | Emitted on coherent-set members; sets end on an end marker, a sample of another set or one outside any set; incomplete sets are discarded (RTPS 2.5 §8.7.6) |
 | `PID_GROUP_SEQ_NUM` (0x0064) inline QoS | Complete | Emitted by Publisher on every write under ordered/coherent access; used to sort on `begin_access` |
-| `PID_GROUP_COHERENT_SET` (0x0063) inline QoS | Complete | Emitted on GROUP_PRESENTATION coherent sets; parsed on receive |
+| `PID_GROUP_COHERENT_SET` (0x0063) inline QoS | Complete | The group set's id, on every sample and End Coherent Set marker of a GROUP coherent set; the subscriber assembles group sets by it. Omitted for readers whose vendor is known to stall on it (`header.omitsGroupCoherentSet`) |
+| `PID_WRITER_GROUP_INFO` (0x0065) inline QoS | Emitted only | On GROUP coherent-set samples and End Coherent Set markers; not checked against discovery on receive |
 | Writer Liveliness Protocol (P2P endpoints) | Implemented (RELIABLE reader only) | `src/discovery/wlp.zig`; advertised via `BUILTIN_ENDPOINTS` in `src/dcps/participant.zig`. BEST_EFFORT reader path (§8.4.13.3) not implemented |
 
 ## DCPS
@@ -170,7 +171,7 @@ as it is written send such HEARTBEATs mid-set, so sets were split across
 protected once the writer's first end-of-set marker arrived). A 2026-08-28 campaign had
 attributed these failures to the harness's per-cycle sample counts; its analysis checked
 whole-run ordering and per-instance atomicity after start-up and missed the split first
-sets. Against CoreDX publishing, 4 of 10 local runs failed before the fix and 0 of 20
+sets. With another implementation publishing, 4 of 10 local runs failed before the fix and 0 of 20
 after. The harness check also assumes all DataWriters match at once (see the roadmap,
 which also lists the failure modes not yet explained). `CoherentSets_8` passes.
 `OrderedAccess_8` was not re-examined; RTI added timing tolerance to
