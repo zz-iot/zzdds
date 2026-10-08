@@ -460,11 +460,13 @@ fn markerSnapshot(comptime Snapshot: type, m: EndMarker) Snapshot {
     };
 }
 
-/// Upper bound on retained end markers per writer.  Markers wait for every
-/// reliable reader's acknowledgement; this keeps a reader that never
-/// acknowledges from growing the list without bound.  A reader that misses
-/// a marker dropped this way gets a GAP for it and discards that set.
-const MAX_END_MARKERS: usize = 1024;
+/// Upper bound on retained end markers whose sets have left the cache and
+/// which wait only for every reliable reader's acknowledgement; this keeps a
+/// reader that never acknowledges from growing the list without bound.  A
+/// reader that misses a marker dropped this way gets a GAP for it and
+/// discards that set.  A marker whose set is still cached is never dropped:
+/// a reader the set is replayed to needs it, and the cache bounds those.
+pub const MAX_END_MARKERS: usize = 1024;
 
 /// Reliable writer with per-reader ACK tracking.
 /// Typical use: SEDP publications/subscriptions announcements, user data.
@@ -2251,18 +2253,24 @@ pub const StatefulWriter = struct {
         var i: usize = 0;
         while (i < self.end_markers.items.len) {
             const m = self.end_markers.items[i];
-            const set_cached = for (self.cache.changes.items) |*ch| {
-                if (ch.sequence_number >= m.first_sn and ch.sequence_number <= m.last_sn) break true;
-            } else false;
+            const set_cached = self.cache.hasWriterChangeIn(m.first_sn, m.last_sn);
             if (!set_cached and self.allProxiesAckedLocked(m.sn)) {
                 _ = self.end_markers.orderedRemove(i);
             } else {
                 i += 1;
             }
         }
-        if (self.end_markers.items.len > MAX_END_MARKERS) {
-            const excess = self.end_markers.items.len - MAX_END_MARKERS;
-            self.end_markers.replaceRangeAssumeCapacity(0, excess, &.{});
+        // Over the cap, drop the oldest markers whose sets have left the cache.
+        var excess = self.end_markers.items.len -| MAX_END_MARKERS;
+        i = 0;
+        while (excess > 0 and i < self.end_markers.items.len) {
+            const m = self.end_markers.items[i];
+            if (self.cache.hasWriterChangeIn(m.first_sn, m.last_sn)) {
+                i += 1;
+            } else {
+                _ = self.end_markers.orderedRemove(i);
+                excess -= 1;
+            }
         }
     }
 
@@ -2454,10 +2462,10 @@ pub const StatefulWriter = struct {
             .last_sn = if (coherent_sns.len > 0) coherent_sns[coherent_sns.len - 1] else eoc_sn - 1,
             .group = if (mode == .full) group else null,
         };
-        self.retireEndMarkersLocked();
         // On OOM the marker is still sent once below; a reader that misses it
         // gets a GAP and discards the set.
         self.end_markers.append(self.alloc, marker) catch {};
+        self.retireEndMarkersLocked();
         if (defer_eoc) {
             // Phase 1 of a two-phase flush: the publisher sends every writer's
             // markers together (sendCombinedEOCData) so one receive completes

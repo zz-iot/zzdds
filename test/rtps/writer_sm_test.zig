@@ -1208,6 +1208,50 @@ test "end marker: retired once its set's samples are gone and every reader ackno
     try testing.expect(findGap(&rec) != null);
 }
 
+test "end marker: the cap never drops a marker whose set is still cached" {
+    // A KEEP_ALL writer keeps every set, so a reader replayed the oldest one
+    // still needs its marker (SN 2) to tell that set is complete.
+    const reader_guid = makeGuid(0x53, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeCoherentWriter(&rec, .keep_all, 0, reader_guid);
+    defer w.deinit();
+
+    const max = rtps.writer_sm.MAX_END_MARKERS;
+    for (0..max + 1) |_| {
+        w.beginCoherentSet(true);
+        _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+        w.endCoherentSet(.coherent_only, false, null, null, false);
+        rec.reset();
+    }
+    try testing.expectEqual(max + 1, w.end_markers.items.len);
+
+    var nack_set = SequenceNumberSet{ .base = 2, .num_bits = 1, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(2);
+    w.handleAckNack(reader_guid, 1, nack_set, 1, true);
+    const marker = findSentData(&rec, 2) orelse return error.NoMarker;
+    try testing.expect(!marker.has_payload);
+}
+
+test "end marker: the cap drops the oldest markers whose sets are gone" {
+    const reader_guid = makeGuid(0x53, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeCoherentWriter(&rec, .keep_last, 1, reader_guid);
+    defer w.deinit();
+
+    // KEEP_LAST depth 1: each set's sample replaces the one before, so only
+    // the last set is cached and the reader never acknowledges.
+    const max = rtps.writer_sm.MAX_END_MARKERS;
+    for (0..max + 5) |_| {
+        w.beginCoherentSet(true);
+        _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+        w.endCoherentSet(.coherent_only, false, null, null, false);
+        rec.reset();
+    }
+    try testing.expectEqual(max, w.end_markers.items.len);
+    // The oldest went: set n is SN 2n-1, its marker SN 2n.
+    try testing.expectEqual(@as(SequenceNumber, 2 * 6), w.end_markers.items[0].sn);
+}
+
 test "endCoherentSet: a GROUP writer with nothing in the set still ends it" {
     // RTPS 2.5 §8.7.6: every writer of the publisher sends an End Coherent Set
     // marker: PID_GROUP_SEQ_NUM one past the set's last sample,

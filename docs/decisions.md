@@ -259,7 +259,8 @@ bases exactly as before (unexercised, matching today's shipped behavior).
 - *End markers are history, not wire-only.* The writer keeps each marker, resends it on
   NACK and replays it, until its set's samples have left the cache (§8.7.6) and every
   reliable reader acknowledged it. A GAP for a marker would leave the reader unable to
-  tell whether the set before it is complete.
+  tell whether the set before it is complete. Markers waiting only on acknowledgements
+  are capped at 1024 per writer; a marker whose set is still cached is never dropped.
 - *Completeness by sequence number.* A writer's set is complete when every SN from its
   first sample to the change that ends it arrived. Samples the reader drops itself count
   as arrived (§8.7.6 removes content- and time-filtered samples from what must arrive), so
@@ -267,8 +268,11 @@ bases exactly as before (unexercised, matching today's shipped behavior).
   including a late joiner's partial first set.
 - *GROUP assembly by id.* The subscriber keys each part by (publisher, group set id) and
   exposes a group set once every writer of that publisher matched to it is done with the
-  set, from match time on, so a part still in flight is not mistaken for none. A writer
-  idle for 5 s stops holding sets back. Writers that send no group set id are paired by
+  set, from match time on, so a part still in flight is not mistaken for none. A part
+  already arriving holds its set back however long it takes (unmatching ends the wait);
+  a writer with nothing in progress stops holding sets back after 5 s idle. Parts that
+  arrived before their writer's match completed are re-keyed to its publisher at match,
+  and every group set waits until then. Writers that send no group set id are paired by
   position, as before. Not implemented: group ordered access's HEARTBEAT and GAP group
   fields (§8.7.5) and checking `PID_WRITER_GROUP_INFO` against discovery.
 `CoherentSets_8` passes.

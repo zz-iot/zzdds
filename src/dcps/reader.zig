@@ -219,6 +219,11 @@ pub const CoherentWriter = struct {
     /// The writer's publisher (MatchedWriterInfo.publisher_guid): group sets,
     /// and their ids, are per publisher.
     publisher: Guid,
+    /// Whether onWriterMatchedCb has set `publisher`.  The writer's samples
+    /// that arrived before its match are delivered just before that callback
+    /// runs; until it does, the subscriber can't tell which publisher's group
+    /// sets they belong to and holds every group set back.
+    publisher_known: bool = false,
     /// The SN after the last one received from the writer; null before any.
     next_sn: ?history_mod.SequenceNumber = null,
     /// Whether the writer's sets carry PID_GROUP_COHERENT_SET; null until its
@@ -230,9 +235,9 @@ pub const CoherentWriter = struct {
     /// before the first SN received from it, or before an SN that went
     /// missing between two of its sets.
     complete_from: history_mod.SequenceNumber = 0,
-    /// When the writer matched or last started or ended a set.  A writer idle
-    /// for longer than Subscriber's coherent idle gate stops holding back the
-    /// group sets of its publisher.
+    /// When the writer matched or last sent a sample of a set or ended one.  A
+    /// writer with no set in progress, idle for longer than Subscriber's
+    /// coherent idle gate, stops holding back the group sets of its publisher.
     last_progress_ns: i64,
 
     fn advanceDone(self: *CoherentWriter, through: history_mod.SequenceNumber) void {
@@ -588,12 +593,7 @@ pub const DataReaderImpl = struct {
             .quiesce_release = quiesceReleaseFn,
         });
         // Register writer-match callback for OWNERSHIP and LIVELINESS tracking.
-        proto_reader.setWriterMatchCallback(.{
-            .ctx = self,
-            .on_writer_matched = onWriterMatchedCb,
-            .on_writer_unmatched = onWriterUnmatchedCb,
-            .on_writer_alive = onWriterAliveCb,
-        });
+        proto_reader.setWriterMatchCallback(self.writerMatchCallback());
         // Lifetime ref on the parent SubscriberImpl (dropped in
         // reallyDeinit): keeps subscriber.zig's `dispatchReaderFallback`
         // from touching a SubscriberImpl freed by a racing
@@ -1275,6 +1275,7 @@ pub const DataReaderImpl = struct {
         if (!is_marker) if (change.coherent_set_sn) |cs| {
             if (wip_cs == cs) {
                 if (gap_before) self.coherent_wip.getPtr(writer).?.intact = false;
+                cw.last_progress_ns = now;
                 return false;
             }
             // A sample of a new set ends the writer's previous one.  With no
@@ -1358,6 +1359,17 @@ pub const DataReaderImpl = struct {
 
     // ── Ownership tracking ─────────────────────────────────────────────────────
 
+    /// The writer-match callbacks this reader registers with its protocol
+    /// reader.  Public so tests can hold a match's callback back.
+    pub fn writerMatchCallback(self: *Self) proto.WriterMatchCallback {
+        return .{
+            .ctx = self,
+            .on_writer_matched = onWriterMatchedCb,
+            .on_writer_unmatched = onWriterUnmatchedCb,
+            .on_writer_alive = onWriterAliveCb,
+        };
+    }
+
     // Both onWriterMatchedCb and onWriterAliveCb below fire notifyLivelinessChanged()
     // themselves, on the "went alive" transition -- previously neither did:
     // they only set status_changes/counts, on the (wrong) assumption that
@@ -1380,14 +1392,20 @@ pub const DataReaderImpl = struct {
             self.mu.lock();
             defer self.mu.unlock();
             self.rememberPublicationGuidLocked(info.guid);
-            // GROUP scope: the subscriber's group sets wait on this writer from
-            // now on, even before it sends anything, so a part of a group set
-            // still on its way is not mistaken for none.
-            const pres = self.subscriber_presentation;
-            if (pres.coherent_access and pres.access_scope == .GROUP_PRESENTATION_QOS and info.group_coherent) {
-                if (self.coherentWriterLocked(info.guid)) |cw| cw.publisher = info.publisher_guid;
-            } else if (self.coherent_writers.getPtr(info.guid)) |cw| {
-                cw.publisher = info.publisher_guid;
+            // Track the writer's coherent sets from now on: in GROUP scope the
+            // subscriber's group sets wait on it even before it sends
+            // anything, so a part of a group set still on its way is not
+            // mistaken for none.
+            if (self.subscriber_presentation.coherent_access) {
+                if (self.coherentWriterLocked(info.guid)) |cw| {
+                    cw.publisher = info.publisher_guid;
+                    cw.publisher_known = true;
+                }
+                // Sets of the writer's samples that arrived before its match
+                // were queued before its publisher was known.
+                for (self.coherent_committed.items) |*part| {
+                    if (part.writer_guid.eql(info.guid)) part.publisher = info.publisher_guid;
+                }
             }
             self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
             if (info.lifespan_ns > 0)

@@ -424,6 +424,124 @@ test "group coherent set: waits for every writer's part, assembled by id, not po
     try testing.expectEqual([_]usize{ 0, 0 }, try fx.access(2));
 }
 
+test "group coherent set: a part still arriving holds the set back past the idle gate" {
+    var fx: Fixture = undefined;
+    try fx.init(testing.allocator, .GROUP_PRESENTATION_QOS, 2, .{}, true);
+    defer fx.deinit();
+
+    // Group set 1: writer 0's part arrives whole; writer 1's first sample
+    // arrives, the rest of its part has yet to.
+    try fx.inject(struct {
+        fn add(alloc: std.mem.Allocator, m: *Msg, w: [MAX_TOPICS][4]u8) !void {
+            try m.data(alloc, w[0], .{ .sn = 1, .cs = 1, .gsn = 1, .gcs = 1 });
+            try m.data(alloc, w[0], .{ .sn = 2, .gsn = 4, .gcs = 1, .payload = false });
+            try m.data(alloc, w[1], .{ .sn = 1, .cs = 1, .gsn = 2, .gcs = 1 });
+        }
+    });
+    // Longer than the idle gate since either writer was last heard from: a
+    // part in progress still holds the set back.
+    for (fx.readers[0..2]) |r| {
+        r.mu.lock();
+        defer r.mu.unlock();
+        var it = r.coherent_writers.valueIterator();
+        while (it.next()) |cw| cw.last_progress_ns -= 10 * std.time.ns_per_s;
+    }
+    try testing.expectEqual([_]usize{ 0, 0 }, try fx.access(2));
+
+    try fx.inject(struct {
+        fn add(alloc: std.mem.Allocator, m: *Msg, w: [MAX_TOPICS][4]u8) !void {
+            try m.data(alloc, w[1], .{ .sn = 2, .cs = 1, .gsn = 3, .gcs = 1 });
+            try m.data(alloc, w[1], .{ .sn = 3, .gsn = 4, .gcs = 1, .payload = false });
+        }
+    });
+    try testing.expectEqual([_]usize{ 1, 2 }, try fx.access(2));
+}
+
+test "group coherent set: a part that arrived before its writer matched joins its publisher's set" {
+    var fx: Fixture = undefined;
+    try fx.init(testing.allocator, .GROUP_PRESENTATION_QOS, 2, .{}, true);
+    defer fx.deinit();
+    const r0 = fx.readers[0];
+    const r1 = fx.readers[1];
+
+    // A third writer of the publisher, on topic 0, not yet discovered.
+    const late_eid = [4]u8{ 0x00, 0x00, 0x77, 0x02 };
+    const late_guid = zzdds.rtps.Guid{
+        .prefix = .{ .bytes = fx.prefix },
+        .entity_id = .{ .entity_key = late_eid[0..3].*, .entity_kind = late_eid[3] },
+    };
+    const w1_guid = zzdds.rtps.Guid{
+        .prefix = .{ .bytes = fx.prefix },
+        .entity_id = .{ .entity_key = fx.writer_eids[1][0..3].*, .entity_kind = fx.writer_eids[1][3] },
+    };
+    const w0_guid = zzdds.rtps.Guid{
+        .prefix = .{ .bytes = fx.prefix },
+        .entity_id = .{ .entity_key = fx.writer_eids[0][0..3].*, .entity_kind = fx.writer_eids[0][3] },
+    };
+    // The publisher announces a group GUID (PID_GROUP_GUID), so its key is not
+    // the participant-only one a writer's parts get before its match completes.
+    const publisher = zzdds.rtps.Guid{
+        .prefix = .{ .bytes = fx.prefix },
+        .entity_id = .{ .entity_key = .{ 0x00, 0x00, 0x55 }, .entity_kind = 0x08 },
+    };
+    for ([_]zzdds.rtps.Guid{ w0_guid, w1_guid }, [_]*DataReaderImpl{ r0, r1 }) |g, r| {
+        const cb = r.writerMatchCallback();
+        cb.on_writer_matched(cb.ctx, &.{
+            .guid = g,
+            .unicast_locators = &.{},
+            .multicast_locators = &.{},
+            .reliability = .reliable,
+            .group_coherent = true,
+            .publisher_guid = publisher,
+        });
+    }
+
+    // Group set 1: the late writer's part arrives whole (and waits for its
+    // writer's match), writer 0 wrote nothing, writer 1's part is in progress.
+    try fx.inject(struct {
+        fn add(alloc: std.mem.Allocator, m: *Msg, w: [MAX_TOPICS][4]u8) !void {
+            try m.data(alloc, late_eid, .{ .sn = 1, .cs = 1, .gsn = 1, .gcs = 1 });
+            try m.data(alloc, late_eid, .{ .sn = 2, .gsn = 3, .gcs = 1, .payload = false });
+            try m.data(alloc, w[0], .{ .sn = 1, .gsn = 3, .gcs = 1, .payload = false });
+            try m.data(alloc, w[1], .{ .sn = 1, .cs = 1, .gsn = 2, .gcs = 1 });
+        }
+    });
+
+    // The late writer matches.  Its early samples are delivered before the
+    // reader hears which publisher it has: held back here, in that window,
+    // the part must not come out on its own.
+    const info = zzdds.protocol.MatchedWriterInfo{
+        .guid = late_guid,
+        .unicast_locators = &.{},
+        .multicast_locators = &.{},
+        .reliability = .reliable,
+        .group_coherent = true,
+        .publisher_guid = publisher,
+    };
+    const real_cb = r0.writerMatchCallback();
+    const Held = struct {
+        fn matched(_: *anyopaque, _: *const zzdds.protocol.MatchedWriterInfo) void {}
+        fn unmatched(_: *anyopaque, _: zzdds.rtps.Guid) void {}
+    };
+    var held_ctx: u8 = 0;
+    r0.proto_reader.setWriterMatchCallback(.{ .ctx = &held_ctx, .on_writer_matched = Held.matched, .on_writer_unmatched = Held.unmatched });
+    _ = try r0.proto_reader.addMatchedWriter(&info);
+    try testing.expectEqual([_]usize{ 0, 0 }, try fx.access(2));
+
+    // Once the match completes, the part joins its publisher's set, which
+    // waits for writer 1's part.
+    r0.proto_reader.setWriterMatchCallback(real_cb);
+    real_cb.on_writer_matched(real_cb.ctx, &info);
+    try testing.expectEqual([_]usize{ 0, 0 }, try fx.access(2));
+
+    try fx.inject(struct {
+        fn add(alloc: std.mem.Allocator, m: *Msg, w: [MAX_TOPICS][4]u8) !void {
+            try m.data(alloc, w[1], .{ .sn = 2, .gsn = 3, .gcs = 1, .payload = false });
+        }
+    });
+    try testing.expectEqual([_]usize{ 1, 1 }, try fx.access(2));
+}
+
 test "group coherent set: a writer with nothing in the set ends it with its marker" {
     var fx: Fixture = undefined;
     try fx.init(testing.allocator, .GROUP_PRESENTATION_QOS, 2, .{}, true);

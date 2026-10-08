@@ -257,6 +257,22 @@ pub const HistoryCache = struct {
         return max;
     }
 
+    /// Whether the cache holds a change with an SN in [first, last].  For a
+    /// writer's cache only: addWriterChange appends in SN order and removals
+    /// keep it, so the changes are sorted by SN.
+    pub fn hasWriterChangeIn(self: *const Self, first: SequenceNumber, last: SequenceNumber) bool {
+        if (first > last) return false;
+        const items = self.changes.items;
+        // The first change with SN >= first.
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].sequence_number < first) lo = mid + 1 else hi = mid;
+        }
+        return lo < items.len and items[lo].sequence_number <= last;
+    }
+
     /// Number of changes currently in the cache.
     pub fn len(self: *const Self) usize {
         return self.changes.items.len;

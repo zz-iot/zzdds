@@ -936,15 +936,29 @@ pub const SubscriberImpl = struct {
                 if (part.group_cs == key.id and part.publisher.eql(key.publisher) and !part.complete)
                     return .discard;
             }
-            var it = r.coherent_writers.valueIterator();
-            while (it.next()) |cw| {
+            var it = r.coherent_writers.iterator();
+            while (it.next()) |e| {
+                const cw = e.value_ptr;
+                // Until its match completes, a writer's parts may belong to any
+                // publisher's sets.
+                if (!cw.publisher_known) {
+                    verdict = .wait;
+                    continue;
+                }
                 if (!cw.publisher.eql(key.publisher)) continue;
                 if (cw.group_ids == false) continue;
                 // The writer may have had a part of this set the reader never got.
                 if (cw.complete_from > key.id) return .discard;
-                const done = if (cw.done_through) |d| d >= key.id else false;
-                // An idle writer stops holding the set back.
-                if (!done and now_ns - cw.last_progress_ns < coherent_idle_gate_ns) verdict = .wait;
+                if (if (cw.done_through) |d| d >= key.id else false) continue;
+                // A part of this set, or of an earlier one, is on its way: wait
+                // for it however long it takes; unmatching the writer ends the
+                // wait.  A writer with nothing in progress stops holding the
+                // set back once idle past the gate.
+                const in_progress = if (r.coherent_wip.get(e.key_ptr.*)) |w|
+                    (if (w.group_cs) |g| g <= key.id else false)
+                else
+                    false;
+                if (in_progress or now_ns - cw.last_progress_ns < coherent_idle_gate_ns) verdict = .wait;
             }
         }
         return verdict;

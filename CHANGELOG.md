@@ -51,7 +51,8 @@ Coherent sets now follow RTPS 2.5 §8.7.6 end to end.
   reader's oldest coherent set, so a reader that matched later than its siblings stayed a
   set out of step with them. It now exposes a publisher's group set once every one of its
   writers matched to the subscriber is done with that set, and discards the whole set if
-  any part is incomplete. Sets from writers that send no group set id are still paired by
+  any part is incomplete. A part still arriving holds its set back however long it
+  takes. Sets from writers that send no group set id are still paired by
   position.
 
 ## 2026-10-05
