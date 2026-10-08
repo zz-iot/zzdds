@@ -1153,6 +1153,10 @@ jobs:
   self-interop:
     name: self-interop (dds-rtps)${{ matrix.lane.suffix }}
     needs: shape-binaries
+    # Each lane needs only its own binary: run even if another lane's build
+    # failed (a missing artifact fails this lane's download step instead), but
+    # not when shape-binaries didn't run at all.
+    if: ${{ !cancelled() && needs.shape-binaries.result != 'skipped' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1239,6 +1243,8 @@ jobs:
   vendor-interop-normal:
     name: "${{ matrix.vendor.name }} / ${{ matrix.direction }}"
     needs: [setup-matrix, shape-binaries]
+    # See self-interop: run even if another lane's build failed.
+    if: ${{ !cancelled() && needs.setup-matrix.result == 'success' && needs.shape-binaries.result != 'skipped' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1325,6 +1331,8 @@ jobs:
   vendor-interop-tsan:
     name: "TSan: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
     needs: [setup-matrix, shape-binaries]
+    # See self-interop: run even if another lane's build failed.
+    if: ${{ !cancelled() && needs.setup-matrix.result == 'success' && needs.shape-binaries.result != 'skipped' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1418,6 +1426,8 @@ jobs:
   vendor-interop-debug-allocator:
     name: "DebugAllocator: ${{ matrix.vendor.name }} / ${{ matrix.direction }}"
     needs: [setup-matrix, shape-binaries]
+    # See self-interop: run even if another lane's build failed.
+    if: ${{ !cancelled() && needs.setup-matrix.result == 'success' && needs.shape-binaries.result != 'skipped' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

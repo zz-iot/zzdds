@@ -45,6 +45,18 @@ char g_stdout_buf[8192];
 
 } // namespace
 
+// Polls `matched` for up to MATCH_TIMEOUT_MS; see the comment before
+// arming the guard in main().
+constexpr int MATCH_TIMEOUT_MS = 10000;
+template <typename Matched>
+static bool wait_matched(Matched matched) {
+    for (int waited = 0; waited < MATCH_TIMEOUT_MS; waited += 50) {
+        if (matched()) return true;
+        sleep_ms(50);
+    }
+    return false;
+}
+
 int main() {
     std::setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
@@ -132,16 +144,23 @@ int main() {
 
     std::printf("publisher: writing %d samples on domain %d...\n", SAMPLE_COUNT, DOMAIN_ID);
 
-    // Give discovery a moment to find a matched reader before writing --
-    // best-effort QoS (the default) drops samples with no matched reader
-    // yet, so a brief wait makes the demo reliably show real delivery. This
-    // also lets SPDP/SEDP matching settle: matching a newly discovered
+    // Wait for discovery to match a reader to both writers before writing --
+    // best-effort QoS (the default) drops samples with no matched reader --
+    // and before arming the guard: matching a newly discovered
     // remote participant spawns a heartbeat thread via std.Thread.spawn,
     // whose bookkeeping allocation Zig's own stdlib hardcodes to
     // std.heap.c_allocator on the libc/pthread backend (SpawnConfig.allocator
     // is silently ignored there) -- a one-time, bounded, per-newly-matched-peer
-    // cost, not a per-sample hot-path one, so it belongs before arming.
-    sleep_ms(2000);
+    // cost, not a per-sample hot-path one, so it belongs before arming. A
+    // fixed delay could arm before a slow discovery finished.
+    const bool matched = wait_matched([&] {
+        ::DDS::PublicationMatchedStatus a{}, b{};
+        return dw->get_publication_matched_status(a) == ::DDS::RETCODE_OK &&
+               log_dw->get_publication_matched_status(b) == ::DDS::RETCODE_OK &&
+               a.current_count > 0 && b.current_count > 0;
+    });
+    if (!matched)
+        std::fprintf(stderr, "publisher: no reader matched within %d ms -- writing anyway\n", MATCH_TIMEOUT_MS);
 
     // All one-time/discovery-adjacent allocation is done -- arm the guard so
     // any further malloc/calloc/realloc/free/operator new aborts the process.

@@ -36,6 +36,23 @@ static void check(DDS_ReturnCode_t rc, const char *what) {
  * never trip the noalloc guard once armed below. */
 static char g_stdout_buf[8192];
 
+/* Wait (bounded) for discovery to match both writers to a reader; see the
+ * comment before arming the guard below. */
+#define MATCH_TIMEOUT_MS 10000
+static int wait_writers_matched(DDS_DataWriter a, DDS_DataWriter b) {
+    for (int waited = 0; waited < MATCH_TIMEOUT_MS; waited += 50) {
+        DDS_PublicationMatchedStatus sa, sb;
+        memset(&sa, 0, sizeof sa);
+        memset(&sb, 0, sizeof sb);
+        if (DDS_DataWriter_get_publication_matched_status(a, &sa) == DDS_RETCODE_OK &&
+            DDS_DataWriter_get_publication_matched_status(b, &sb) == DDS_RETCODE_OK &&
+            sa.current_count > 0 && sb.current_count > 0)
+            return 1;
+        sleep_ms(50);
+    }
+    return 0;
+}
+
 int main(void) {
     setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
@@ -123,16 +140,17 @@ int main(void) {
 
     printf("publisher: writing %d samples on domain %d...\n", SAMPLE_COUNT, DOMAIN_ID);
 
-    /* Give discovery a moment to find a matched reader before writing --
-     * best-effort QoS (the default) drops samples with no matched reader
-     * yet, so a brief wait makes the demo reliably show real delivery. This
-     * also lets SPDP/SEDP matching settle: matching a newly discovered
+    /* Wait for discovery to match a reader to both writers before writing --
+     * best-effort QoS (the default) drops samples with no matched reader --
+     * and before arming the guard: matching a newly discovered
      * remote participant spawns a heartbeat thread via std.Thread.spawn,
      * whose bookkeeping allocation Zig's own stdlib hardcodes to
      * std.heap.c_allocator on the libc/pthread backend (SpawnConfig.allocator
      * is silently ignored there) -- a one-time, bounded, per-newly-matched-peer
-     * cost, not a per-sample hot-path one, so it belongs before arming. */
-    sleep_ms(2000);
+     * cost, not a per-sample hot-path one, so it belongs before arming. A
+     * fixed delay could arm before a slow discovery finished. */
+    if (!wait_writers_matched(dw, log_dw))
+        fprintf(stderr, "publisher: no reader matched within %d ms -- writing anyway\n", MATCH_TIMEOUT_MS);
 
     /* All one-time/discovery-adjacent allocation is done -- arm the guard so
      * any further malloc/calloc/realloc/free aborts the process. */

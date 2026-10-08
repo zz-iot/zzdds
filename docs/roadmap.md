@@ -425,16 +425,13 @@ or an optimisation on an already-improved path):
      `ActiveWriter`/`ActiveReader` maps' first allocation to fit 4096 bytes. It exists only
      to keep these examples passing in CI until then (added for PR #99, when a ~100-byte
      growth of those records failed them).
-  3. Run both examples under `libnoalloc_guard.so` in CI (Linux; `LD_PRELOAD` has no
-     Windows equivalent). The examples call `noalloc_guard_try_arm()`, but CI never
-     preloads the shim, so today they run unguarded ("noalloc_guard: not preloaded" in the
-     logs) and the zero-allocation property is not enforced anywhere; nothing in this
-     repo's history ever preloaded it. Both pass with it preloaded (checked by hand
-     2026-10-06), so turning it on with today's arming should be straightforward; the
-     larger part is the arming itself. The programs arm only after setup plus a
-     discovery-settling delay, because some allocations happen outside the custom
-     allocator: libc work behind discovery's background threads and the one-time network
-     interface enumeration (`getifaddrs`). That allows any allocation during the delay.
+  3. Arm the `noalloc_guard` shim earlier. CI now runs both examples with it preloaded
+     (Linux; `LD_PRELOAD` has no Windows equivalent) through
+     `examples/interop/cross_binding_smoke_test.py`, which fails if a program never
+     arms. The programs arm only after setup and after discovery has matched their
+     endpoints, because some allocations happen outside the custom allocator: libc work
+     behind discovery's background threads and the one-time network interface
+     enumeration (`getifaddrs`). That allows any allocation until then.
      Prefer naming the known exceptions instead: first run the shim in a log-only mode
      (record every allocation with a backtrace, don't abort) to get the inventory, then
      have zzdds mark each known libc call that allocates with a scope the shim honours
@@ -458,8 +455,8 @@ or an optimisation on an already-improved path):
      `SensorLog`) and the shim. Its "Definition of 'zero malloc'" section still asks for a
      decision; record the one made: no allocation after setup, with known libc allocations
      at startup and in background threads allowed. And its claim that the C++ example can
-     arm the guard from process start contradicts the examples, which arm after a delay
-     (step 3).
+     arm the guard from process start contradicts the examples, which arm once discovery
+     has matched (step 3).
 
 ### Testing
 

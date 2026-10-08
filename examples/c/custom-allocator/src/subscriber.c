@@ -36,6 +36,23 @@ static void check(DDS_ReturnCode_t rc, const char *what) {
  * never trip the noalloc guard once armed below. */
 static char g_stdout_buf[8192];
 
+/* Wait (bounded) for discovery to match both readers to a writer; see the
+ * comment before arming the guard below. */
+#define MATCH_TIMEOUT_MS 10000
+static int wait_readers_matched(DDS_DataReader a, DDS_DataReader b) {
+    for (int waited = 0; waited < MATCH_TIMEOUT_MS; waited += 50) {
+        DDS_SubscriptionMatchedStatus sa, sb;
+        memset(&sa, 0, sizeof sa);
+        memset(&sb, 0, sizeof sb);
+        if (DDS_DataReader_get_subscription_matched_status(a, &sa) == DDS_RETCODE_OK &&
+            DDS_DataReader_get_subscription_matched_status(b, &sb) == DDS_RETCODE_OK &&
+            sa.current_count > 0 && sb.current_count > 0)
+            return 1;
+        sleep_ms(50);
+    }
+    return 0;
+}
+
 int main(void) {
     setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
@@ -117,7 +134,7 @@ int main(void) {
     SensorLogDataReader log_reader;
     SensorLogDataReader_init(&log_reader, log_dr);
 
-    /* Give discovery/matching a moment to settle before arming the guard:
+    /* Wait for discovery to match both readers before arming the guard:
      * SPDP/SEDP built-in discovery endpoints spawn a heartbeat thread per
      * newly matched remote participant (via std.Thread.spawn), and Zig's
      * own stdlib hardcodes std.heap.c_allocator for that spawn's bookkeeping
@@ -125,8 +142,10 @@ int main(void) {
      * ignored there, so this allocation isn't something zzdds can route
      * through the injected allocator. It's a one-time, bounded,
      * per-newly-discovered-peer cost though, not a per-sample hot-path one,
-     * so it belongs before arming, same as factory/entity bootstrap. */
-    sleep_ms(2000);
+     * so it belongs before arming, same as factory/entity bootstrap. A fixed
+     * delay could arm before a slow discovery finished. */
+    if (!wait_readers_matched(dr, log_dr))
+        fprintf(stderr, "subscriber: no writer matched within %d ms\n", MATCH_TIMEOUT_MS);
 
     noalloc_guard_try_arm();
 

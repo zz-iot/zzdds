@@ -104,12 +104,16 @@ def find_executable(build_dir: Path, name: str) -> Path:
 
 
 def guarded_env(env: dict, build_dir: Path) -> dict:
-    """env with build_dir's noalloc_guard shim preloaded (Linux only)."""
+    """env with build_dir's noalloc_guard shim preloaded (Linux only).
+
+    Looks in build_dir and, for multi-config generators, build_dir/Debug (the
+    --config this script builds), like find_executable."""
     if not GUARD:
         return env
-    shim = build_dir / "libnoalloc_guard.so"
-    if not shim.is_file():
-        raise FileNotFoundError(f"noalloc_guard shim not found: {shim}")
+    candidates = [build_dir / "libnoalloc_guard.so", build_dir / "Debug" / "libnoalloc_guard.so"]
+    shim = next((c for c in candidates if c.is_file()), None)
+    if shim is None:
+        raise FileNotFoundError(f"noalloc_guard shim not found in: {', '.join(map(str, candidates))}")
     return {**env, "LD_PRELOAD": str(shim)}
 
 
