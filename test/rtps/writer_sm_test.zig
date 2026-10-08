@@ -1275,6 +1275,43 @@ test "endCoherentSet: a GROUP writer with nothing in the set still ends it" {
     try testing.expectEqual(@as(i64, 13), publisher_gsn);
 }
 
+test "endCoherentSet: an empty GROUP writer's marker waits for the combined send" {
+    // The publisher sends every writer's End Coherent Set marker together:
+    // takeEOCProxyInfos looks each one up for its group fields.  A writer that
+    // wrote nothing in the set, with only best-effort readers, has nothing to
+    // wait for before retiring its marker -- except that send.
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(
+        testing.allocator,
+        makeGuid(0x52, WRITER_EID),
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        false,
+    );
+    defer w.deinit();
+    const rp = try ReaderProxy.init(testing.allocator, makeGuid(0x53, READER_EID), &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+
+    const group_set = rtps.history.GroupCoherentSet{ .first_gsn = 11, .end_gsn = 14, .writer_group_info = .{ 1, 2, 3, 4 } };
+    w.beginCoherentSet(true);
+    w.endCoherentSet(.full, false, null, group_set, true);
+
+    const pending = w.pending_eoc_sn orelse return error.NoPendingMarker;
+    const marker = for (w.end_markers.items) |m| {
+        if (m.sn == pending) break m;
+    } else return error.MarkerRetired;
+    try testing.expectEqual(@as(?rtps.history.GroupCoherentSet, group_set), marker.group);
+
+    // Once sent, it retires like any other.
+    w.flushGroupEOCHBOnly();
+    w.beginCoherentSet(true);
+    w.endCoherentSet(.full, false, null, group_set, false);
+    for (w.end_markers.items) |m| try testing.expect(m.sn != pending);
+}
+
 test "endCoherentSet: a reader whose vendor stalls on group set ids gets them omitted" {
     // See header.omitsGroupCoherentSet: such a reader gets the set as the
     // writer's own coherent set, without PID_GROUP_COHERENT_SET, while every

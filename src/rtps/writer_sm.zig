@@ -2249,12 +2249,16 @@ pub const StatefulWriter = struct {
 
     /// Drop markers whose set's samples are all gone from the cache and that
     /// every reliable reader has acknowledged; then enforce MAX_END_MARKERS.
+    /// A marker still waiting for the publisher's combined send
+    /// (pending_eoc_sn) stays: takeEOCProxyInfos reads its group fields, and a
+    /// GROUP writer that wrote nothing in the set, with only best-effort
+    /// readers, would otherwise lose it as soon as it was added.
     fn retireEndMarkersLocked(self: *Self) void {
         var i: usize = 0;
         while (i < self.end_markers.items.len) {
             const m = self.end_markers.items[i];
             const set_cached = self.cache.hasWriterChangeIn(m.first_sn, m.last_sn);
-            if (!set_cached and self.allProxiesAckedLocked(m.sn)) {
+            if (!set_cached and m.sn != self.pending_eoc_sn and self.allProxiesAckedLocked(m.sn)) {
                 _ = self.end_markers.orderedRemove(i);
             } else {
                 i += 1;
@@ -2265,7 +2269,7 @@ pub const StatefulWriter = struct {
         i = 0;
         while (excess > 0 and i < self.end_markers.items.len) {
             const m = self.end_markers.items[i];
-            if (self.cache.hasWriterChangeIn(m.first_sn, m.last_sn)) {
+            if (self.cache.hasWriterChangeIn(m.first_sn, m.last_sn) or m.sn == self.pending_eoc_sn) {
                 i += 1;
             } else {
                 _ = self.end_markers.orderedRemove(i);
@@ -2465,14 +2469,13 @@ pub const StatefulWriter = struct {
         // On OOM the marker is still sent once below; a reader that misses it
         // gets a GAP and discards the set.
         self.end_markers.append(self.alloc, marker) catch {};
+        // Phase 1 of a two-phase flush: the publisher sends every writer's
+        // markers together (sendCombinedEOCData) so one receive completes all
+        // of a subscriber's per-reader sets at once.  Set before retiring, which
+        // keeps the pending marker.
+        if (defer_eoc) self.pending_eoc_sn = eoc_sn;
         self.retireEndMarkersLocked();
-        if (defer_eoc) {
-            // Phase 1 of a two-phase flush: the publisher sends every writer's
-            // markers together (sendCombinedEOCData) so one receive completes
-            // all of a subscriber's per-reader sets at once.
-            self.pending_eoc_sn = eoc_sn;
-            return;
-        }
+        if (defer_eoc) return;
         var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.reader_proxies.items) |*rp| {
             if (rp.suppress_live_data) continue;
