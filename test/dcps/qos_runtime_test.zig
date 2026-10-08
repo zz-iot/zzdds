@@ -526,13 +526,17 @@ test "ownership: EXCLUSIVE — an owner that claimed before its strength was kno
     const dw_b = fx.makeWriterB(dw_qos_b);
 
     // The stronger writer's sample arrives before its strength is recorded.
-    dr.mu.lock();
-    try testing.expect(dr.writer_strengths.remove(dw_a.guid));
-    dr.mu.unlock();
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        try testing.expect(dr.writer_strengths.remove(dw_a.guid));
+    }
     try writeRaw(dw_a, &PAYLOAD_A); // claims the instance
-    dr.mu.lock();
-    try dr.writer_strengths.put(alloc, dw_a.guid, 10);
-    dr.mu.unlock();
+    {
+        dr.mu.lock();
+        defer dr.mu.unlock();
+        try dr.writer_strengths.put(alloc, dw_a.guid, 10);
+    }
 
     try writeRaw(dw_b, &PAYLOAD_B); // weaker than the owner → dropped
     try writeRaw(dw_a, &PAYLOAD_A);
