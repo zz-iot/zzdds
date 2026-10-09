@@ -426,3 +426,127 @@ test "subscriber model: ordered access sorts pending by presentation scope" {
     try modelBeginAccess(alloc, instance_presentation, &.{&m_instance});
     try expectReaderMatchesModel(dr_instance, &m_instance);
 }
+
+// ── A writer matched while create_datareader is still running ────────────────
+
+const MATCHED_WRITER = proto.Guid{
+    .prefix = .{ .bytes = [_]u8{0xB2} ** 12 },
+    .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
+};
+const MATCHED_PUBLISHER = proto.Guid{
+    .prefix = .{ .bytes = [_]u8{0xB2} ** 12 },
+    .entity_id = .{ .entity_key = .{ 0, 0, 0x55 }, .entity_kind = 0x08 },
+};
+
+var match_on_register_ctx: u8 = 0;
+
+/// A protocol reader whose writer is matched the moment the DataReader
+/// registers for matches: SEDP discovery runs on its own thread, so a match
+/// can arrive anywhere in create_datareader after the reader is registered.
+const match_on_register_vtable = proto.ProtocolReader.Vtable{
+    .set_data_callback = struct {
+        fn f(_: *anyopaque, _: proto.DataCallback) void {}
+    }.f,
+    .set_writer_match_callback = struct {
+        fn f(_: *anyopaque, cb: proto.WriterMatchCallback) void {
+            const info = proto.MatchedWriterInfo{
+                .guid = MATCHED_WRITER,
+                .unicast_locators = &.{},
+                .multicast_locators = &.{},
+                .reliability = .reliable,
+                .group_coherent = true,
+                .publisher_guid = MATCHED_PUBLISHER,
+            };
+            cb.on_writer_matched(cb.ctx, &info);
+        }
+    }.f,
+    .add_matched_writer = struct {
+        fn f(_: *anyopaque, _: *const proto.MatchedWriterInfo) anyerror!bool {
+            return false;
+        }
+    }.f,
+    .remove_matched_writer = struct {
+        fn f(_: *anyopaque, _: proto.Guid) void {}
+    }.f,
+    .remove_matched_writer_deferred = struct {
+        fn f(_: *anyopaque, _: proto.Guid) proto.DeferredUnmatchCallbacks {
+            return .{};
+        }
+    }.f,
+    .matched_writer_count = struct {
+        fn f(_: *anyopaque) usize {
+            return 1;
+        }
+    }.f,
+    .list_matched_writers = struct {
+        fn f(_: *anyopaque, _: std.mem.Allocator, _: *std.ArrayListUnmanaged(proto.Guid)) anyerror!void {}
+    }.f,
+    .handle_incoming_change = struct {
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber, _: ?i64) void {}
+    }.f,
+    .handle_heartbeat = struct {
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.EntityId, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool, _: bool) void {}
+    }.f,
+    .handle_data_frag = struct {
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.RtpsTimestamp, _: proto.DataFragSubmessage) void {}
+    }.f,
+    .handle_heartbeat_frag = struct {
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: u32, _: i32) void {}
+    }.f,
+    .handle_gap = struct {
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.SequenceNumberSet) void {}
+    }.f,
+    .historical_delivered = struct {
+        fn f(_: *anyopaque) bool {
+            return true;
+        }
+    }.f,
+    .has_matched_writers = struct {
+        fn f(_: *anyopaque) bool {
+            return true;
+        }
+    }.f,
+    .deinit = struct {
+        fn f(_: *anyopaque) void {}
+    }.f,
+    .set_protocol_ready_callback = struct {
+        fn f(_: *anyopaque, _: proto.ProtocolReadyCallback) void {}
+    }.f,
+};
+
+fn createMatchOnRegisterReader(
+    _: *anyopaque,
+    _: []const u8,
+    _: []const u8,
+    _: DDS.DataReaderQos,
+    _: DDS.PresentationQosPolicy,
+    handle: *DDS.InstanceHandle_t,
+    guid: *proto.Guid,
+) anyerror!proto.ProtocolReader {
+    handle.* = 7;
+    guid.* = std.mem.zeroes(proto.Guid);
+    return .{ .ctx = @ptrCast(&match_on_register_ctx), .vtable = &match_on_register_vtable };
+}
+
+test "create_datareader: a writer matched while the reader is being created joins its publisher's group sets" {
+    // The reader needs the subscriber's PRESENTATION before it can match
+    // anything: a GROUP coherent subscriber records each matched writer's
+    // publisher, and a group set waits on a writer whose publisher it
+    // doesn't know.
+    const alloc = testing.allocator;
+    var presentation = DDS.PresentationQosPolicy{};
+    presentation.coherent_access = true;
+    presentation.access_scope = .GROUP_PRESENTATION_QOS;
+    var h = try Harness.init(alloc, presentation);
+    defer h.deinit();
+    h.sub.cbs.create_proto_reader = createMatchOnRegisterReader;
+
+    const dr = h.sub.toDDSSubscriber().create_datareader(dcps.nil_topic_description, .{}, null, 0);
+    const r: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+
+    r.mu.lock();
+    defer r.mu.unlock();
+    const cw = r.coherent_writers.get(MATCHED_WRITER) orelse return error.WriterNotTracked;
+    try testing.expect(cw.publisher_known);
+    try testing.expect(cw.publisher.eql(MATCHED_PUBLISHER));
+}

@@ -406,6 +406,7 @@ pub const SubscriberImpl = struct {
             subscription_handle,
             guid,
             self.cbs.timer_clock,
+            presentation,
         ) catch {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
             return nil.nil_datareader;
@@ -430,8 +431,6 @@ pub const SubscriberImpl = struct {
             reader_mod.DataReaderImpl.quiesceAcquireFn,
             reader_mod.DataReaderImpl.quiesceReleaseFn,
         );
-        // Store subscriber's presentation QoS for coherent-set buffering decisions.
-        dr.subscriber_presentation = presentation;
         // Record the ContentFilteredTopic association (if any) before the
         // get_field registration below, so its synchronous initial refresh
         // (which runs refreshGetFieldFn) can build cft_filter from it.

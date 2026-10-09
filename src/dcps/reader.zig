@@ -542,6 +542,9 @@ pub const DataReaderImpl = struct {
         instance_handle: DDS.InstanceHandle_t,
         guid: proto.Guid,
         timer_clock: time_mod.Clock,
+        /// The subscriber's PRESENTATION. Set here, before the reader can
+        /// match anything: the match and data callbacks read it.
+        subscriber_presentation: DDS.PresentationQosPolicy,
     ) !*Self {
         const self = try alloc.create(Self);
         self.* = .{
@@ -565,6 +568,7 @@ pub const DataReaderImpl = struct {
             .mu = .{},
             .timer_clock = timer_clock,
             .last_received_ns = .init(timer_clock.nowNs()),
+            .subscriber_presentation = subscriber_presentation,
             .seen_instances = .empty,
         };
         errdefer alloc.destroy(self);

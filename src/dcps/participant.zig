@@ -305,6 +305,7 @@ const BuiltinSubscriberState = struct {
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
             std.mem.zeroes(Guid),
             participant.timer_clock,
+            .{},
         );
         n_ok = 1;
         readers[1] = try reader_mod.DataReaderImpl.init(
@@ -318,6 +319,7 @@ const BuiltinSubscriberState = struct {
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
             std.mem.zeroes(Guid),
             participant.timer_clock,
+            .{},
         );
         n_ok = 2;
         readers[2] = try reader_mod.DataReaderImpl.init(
@@ -331,6 +333,7 @@ const BuiltinSubscriberState = struct {
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
             std.mem.zeroes(Guid),
             participant.timer_clock,
+            .{},
         );
         n_ok = 3;
         readers[3] = try reader_mod.DataReaderImpl.init(
@@ -344,6 +347,7 @@ const BuiltinSubscriberState = struct {
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
             std.mem.zeroes(Guid),
             participant.timer_clock,
+            .{},
         );
         n_ok = 4;
 
