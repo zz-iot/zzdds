@@ -10,6 +10,15 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-10-07
 
+- **Exclusive ownership no longer switches to a weaker writer right after matching.** A
+  DataReader with `EXCLUSIVE` ownership recorded a writer's strength only after the
+  writer's samples could already arrive, and kept the owner's strength from when it
+  claimed an instance. A stronger writer whose first sample came first claimed the
+  instance at strength 0, lost it to a weaker writer, then took it back, so the reader
+  delivered samples from both (the intermittent dds-rtps `Test_Ownership_3` failure). The
+  strength (and lifespan) is now recorded before the writer's samples can arrive, and the
+  owner's current strength is used when comparing.
+
 Coherent sets now follow RTPS 2.5 §8.7.6 end to end.
 
 - **A HEARTBEAT no longer ends a coherent set.** With `coherent_access`, a zzdds

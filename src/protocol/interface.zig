@@ -499,6 +499,11 @@ pub const AliveEvidence = enum { data, heartbeat, manual_heartbeat };
 /// DCPS DataReader to track per-writer ownership strength.
 pub const WriterMatchCallback = struct {
     ctx: *anyopaque,
+    /// Optional: called before the writer's proxy is added, so what the reader
+    /// needs to accept the writer's samples (its ownership strength, lifespan)
+    /// is in place before the first of them can arrive. Called again when a
+    /// match is refreshed. Not undone if adding the proxy then fails.
+    on_writer_matching: ?*const fn (ctx: *anyopaque, info: *const MatchedWriterInfo) void = null,
     on_writer_matched: *const fn (ctx: *anyopaque, info: *const MatchedWriterInfo) void,
     on_writer_unmatched: *const fn (ctx: *anyopaque, guid: Guid) void,
     /// Optional: called when a DATA or HEARTBEAT is received from the writer,

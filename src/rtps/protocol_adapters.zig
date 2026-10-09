@@ -491,13 +491,15 @@ pub const RtpsProtocolReader = struct {
         // Mark the proxy as awaiting history delivery when the remote writer offers
         // TRANSIENT_LOCAL (or stronger) history with RELIABLE reliability.
         proxy.history_established = !info.history_expected;
+        self.reader.mu.lock();
+        const cb = self.writer_match_cb;
+        self.reader.mu.unlock();
+        // Before the proxy exists: once it does, the writer's samples can arrive.
+        if (cb) |c| if (c.on_writer_matching) |f| f(c.ctx, info);
         const added = try self.reader.addOrRefreshMatchedWriter(proxy);
         // on_writer_matched first (DDS spec: subscription_matched precedes liveliness_changed),
         // then on_writer_alive — a newly matched writer is alive by definition.
         // Both fire only after addMatchedWriter succeeds so no callback leaks on OOM.
-        self.reader.mu.lock();
-        const cb = self.writer_match_cb;
-        self.reader.mu.unlock();
         if (cb) |c| {
             c.on_writer_matched(c.ctx, info);
             if (c.on_writer_alive) |f| f(c.ctx, info.guid, .data);
@@ -681,3 +683,55 @@ pub const RtpsProtocolReader = struct {
         self.deinit();
     }
 };
+
+test "RtpsProtocolReader: on_writer_matching runs before the writer's proxy exists" {
+    // A writer's samples can arrive as soon as its proxy exists, and the DCPS
+    // reader needs the writer's ownership strength to arbitrate them: a sample
+    // arbitrated before the strength was recorded counted as strength 0.
+    const testing = std.testing;
+    var null_ctx: u8 = 0;
+    const transport = reader_sm.Transport{ .ctx = &null_ctx, .vtable = &reader_sm.test_null_vtable };
+    const reader_guid = Guid{ .prefix = .{ .bytes = [_]u8{0x11} ** 12 }, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x07 } };
+    const writer_guid = Guid{ .prefix = .{ .bytes = [_]u8{0x22} ** 12 }, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 } };
+
+    const adapter = try RtpsProtocolReader.init(testing.allocator, reader_guid, transport, .keep_all, 0, true);
+    defer adapter.deinit();
+
+    const Seen = struct {
+        adapter: *RtpsProtocolReader,
+        proxies_when_matching: ?usize = null,
+        proxies_when_matched: ?usize = null,
+        fn proxies(self: *@This()) usize {
+            self.adapter.reader.mu.lock();
+            defer self.adapter.reader.mu.unlock();
+            return self.adapter.reader.writer_proxies.items.len;
+        }
+        fn matching(ctx: *anyopaque, _: *const MatchedWriterInfo) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.proxies_when_matching = self.proxies();
+        }
+        fn matched(ctx: *anyopaque, _: *const MatchedWriterInfo) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.proxies_when_matched = self.proxies();
+        }
+        fn unmatched(_: *anyopaque, _: Guid) void {}
+    };
+    var seen = Seen{ .adapter = adapter };
+    adapter.toProtocolReader().setWriterMatchCallback(.{
+        .ctx = &seen,
+        .on_writer_matching = Seen.matching,
+        .on_writer_matched = Seen.matched,
+        .on_writer_unmatched = Seen.unmatched,
+    });
+
+    const info = MatchedWriterInfo{
+        .guid = writer_guid,
+        .unicast_locators = &.{},
+        .multicast_locators = &.{},
+        .reliability = .reliable,
+        .ownership_strength = 4,
+    };
+    try testing.expect(try adapter.toProtocolReader().addMatchedWriter(&info));
+    try testing.expectEqual(@as(?usize, 0), seen.proxies_when_matching);
+    try testing.expectEqual(@as(?usize, 1), seen.proxies_when_matched);
+}

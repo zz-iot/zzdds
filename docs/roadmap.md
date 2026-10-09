@@ -128,6 +128,18 @@ Forward-looking only: known gaps, planned features, and open design questions.
   implementation would pre-allocate the instance's history-cache entry, pre-warm SEDP
   discovery state, and add a `zzdds_write_raw_kind_w_handle` variant that takes a
   pre-registered handle to skip the MD5 key-hash recompute on the write hot path.
+- **A remote writer's match and loss are not ordered.** `onWriterDiscovered` adds the
+  writer's proxy after releasing `participant.mu`, so the same writer's loss
+  (`onWriterLost`) can run first: the add then restores a proxy for a writer already gone.
+  The reader records the writer's strength and lifespan both before the add and after it,
+  so a loss in between can't leave the proxy without them; the stale proxy itself remains.
+  Fix with the concurrency contract's
+  [coordination rules](design/concurrency/architecture.md#coordination-rules) 1 and 4:
+  install a match (the proxy and the reader's per-writer state) as one update tagged with
+  the remote writer's discovery generation, and make a removal or refresh from an older
+  generation a no-op. The same applies to remote readers on the writer side. Tracked as
+  the "Remote endpoint match versus loss"
+  [open design item](design/concurrency-broker-status.md#open-design-items).
 - **`PID_GROUP_DATA` (0x002D)** is defined but not serialized in SEDP announcements.
 - **SPDP liveness probe has no retry** — a participant that goes silent while a probe is in
   flight is evicted on the first probe deadline.
@@ -497,15 +509,6 @@ or an optimisation on an already-improved path):
   follow-up: process-side discovery visibility is thin (SPDP has three debug log lines
   and SEDP none, and the wire tracer, `-Dwire-trace`, has to be configured in code by
   each application).
-- **`Test_Ownership_3` flakes in the DebugAllocator CoreDX-publisher lane.** The zzdds
-  subscriber reports `RECEIVING_FROM_BOTH` instead of `RECEIVING_FROM_ONE` (two exclusive-
-  ownership publishers, strengths 3 and 4, same instance). Seen twice with identical
-  symptoms (2026-09-14 on `main`, 2026-10-01 on #94) and not in other lanes, so it is
-  timing-sensitive under the slow allocator. Determine whether samples from the weaker
-  writer are accepted before the stronger writer is matched (possibly legitimate transient
-  ownership that the harness check counts) or whether ownership arbitration has a real
-  race, e.g. a strength comparison against a writer whose proxy or strength isn't yet
-  installed.
 - **Stack dumps for hung or unfinished test processes — examples/integration tiers done;
   other harnesses remain.** `examples/_common.py`'s `LiveProcess.stop()` (shared by the
   examples and integration tiers) now prints every thread's stack between "Begin/End

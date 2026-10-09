@@ -483,11 +483,12 @@ pub const DataReaderImpl = struct {
 
     /// Ownership strength of each matched writer.
     writer_strengths: std.AutoHashMapUnmanaged(Guid, i32) = .empty,
-    /// Per-instance ownership: maps instance handle → {guid, strength} of the
-    /// current owner.  Ownership is per-instance: two writers with different
-    /// key values (different instances) are each the sole owner of their own
-    /// instance, even if one has lower strength than the other.
-    owner_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, OwnerEntry) = .empty,
+    /// Per-instance ownership: maps instance handle → GUID of the current owner,
+    /// whose strength is looked up in writer_strengths when compared, so it is
+    /// never older than the writer's.  Ownership is per-instance: two writers
+    /// with different key values (different instances) are each the sole owner
+    /// of their own instance, even if one has lower strength than the other.
+    owner_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, Guid) = .empty,
 
     /// Per-writer set of instance handles written to via alive changes.
     /// Guarded by `mu`. Used in onWriterUnmatchedCb to synthesize NOT_ALIVE_NO_WRITERS
@@ -519,7 +520,6 @@ pub const DataReaderImpl = struct {
     /// — see `views` below and `zidl/docs/design/binding-c-abi-identity.md`.
     c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
-    const OwnerEntry = struct { guid: Guid, strength: i32 };
     /// A collision remains ambiguous for this reader's lifetime. Unmatching
     /// either writer is not enough to clear it: an already-queued or loaned
     /// SampleInfo may still carry the shared handle and originate from that
@@ -979,14 +979,13 @@ pub const DataReaderImpl = struct {
         if (self.qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) {
             const incoming_strength = self.writer_strengths.get(change.writer_guid) orelse 0;
             const accepted = blk: {
-                if (self.owner_map.getPtr(ih)) |entry| {
-                    if (entry.guid.eql(change.writer_guid)) {
-                        // Same writer — always accept; refresh cached strength.
-                        entry.strength = incoming_strength;
+                if (self.owner_map.getPtr(ih)) |owner| {
+                    if (owner.eql(change.writer_guid)) {
+                        // Same writer — always accept.
                         break :blk true;
-                    } else if (incoming_strength > entry.strength) {
+                    } else if (incoming_strength > (self.writer_strengths.get(owner.*) orelse 0)) {
                         // Higher strength — take ownership of this instance.
-                        entry.* = .{ .guid = change.writer_guid, .strength = incoming_strength };
+                        owner.* = change.writer_guid;
                         break :blk true;
                     } else {
                         // Lower or equal strength from a different writer — drop.
@@ -994,10 +993,7 @@ pub const DataReaderImpl = struct {
                     }
                 } else {
                     // No owner yet for this instance — first writer claims it.
-                    self.owner_map.put(self.alloc, ih, .{
-                        .guid = change.writer_guid,
-                        .strength = incoming_strength,
-                    }) catch {};
+                    self.owner_map.put(self.alloc, ih, change.writer_guid) catch {};
                     break :blk true;
                 }
             };
@@ -1368,10 +1364,32 @@ pub const DataReaderImpl = struct {
     pub fn writerMatchCallback(self: *Self) proto.WriterMatchCallback {
         return .{
             .ctx = self,
+            .on_writer_matching = onWriterMatchingCb,
             .on_writer_matched = onWriterMatchedCb,
             .on_writer_unmatched = onWriterUnmatchedCb,
             .on_writer_alive = onWriterAliveCb,
         };
+    }
+
+    /// Records the writer's ownership strength and lifespan before its proxy is
+    /// added (see WriterMatchCallback.on_writer_matching): a sample arriving
+    /// before they were recorded was arbitrated at strength 0, so a stronger
+    /// writer could claim an instance and then lose it to a weaker one.
+    fn onWriterMatchingCb(ctx: *anyopaque, info: *const proto.MatchedWriterInfo) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.recordWriterQosLocked(info);
+    }
+
+    fn recordWriterQosLocked(self: *Self, info: *const proto.MatchedWriterInfo) void {
+        self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch {};
+        if (info.lifespan_ns > 0)
+            self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
+        else
+            _ = self.writer_lifespans.remove(info.guid);
     }
 
     // Both onWriterMatchedCb and onWriterAliveCb below fire notifyLivelinessChanged()
@@ -1396,6 +1414,10 @@ pub const DataReaderImpl = struct {
             self.mu.lock();
             defer self.mu.unlock();
             self.rememberPublicationGuidLocked(info.guid);
+            // Again, after the proxy is added: the writer's loss reported
+            // between onWriterMatchingCb and the add removes them
+            // (onWriterUnmatchedCb), though the add then goes ahead.
+            self.recordWriterQosLocked(info);
             // Track the writer's coherent sets from now on: in GROUP scope the
             // subscriber's group sets wait on it even before it sends
             // anything, so a part of a group set still on its way is not
@@ -1411,11 +1433,6 @@ pub const DataReaderImpl = struct {
                     if (part.writer_guid.eql(info.guid)) part.publisher = info.publisher_guid;
                 }
             }
-            self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch return;
-            if (info.lifespan_ns > 0)
-                self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
-            else
-                _ = self.writer_lifespans.remove(info.guid);
             // Track liveliness for writers with a finite lease.
             if (info.liveliness_lease_ns > 0) {
                 const prev = self.writer_liveliness.get(info.guid);
@@ -1593,7 +1610,7 @@ pub const DataReaderImpl = struct {
         {
             var it = self.owner_map.iterator();
             while (it.next()) |entry| {
-                if (entry.value_ptr.guid.eql(guid)) {
+                if (entry.value_ptr.eql(guid)) {
                     to_remove.append(self.alloc, entry.key_ptr.*) catch {};
                 }
             }
