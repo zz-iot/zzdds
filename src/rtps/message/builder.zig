@@ -237,15 +237,18 @@ pub const MessageBuilder = struct {
         /// 0x00000001 = NOT_ALIVE_DISPOSED, 0x00000002 = NOT_ALIVE_UNREGISTERED.
         /// null = omit (normal alive DATA).
         status_info: ?u32 = null,
-        /// PID_COHERENT_SET inline QoS (RTPS §9.6.3.7).
-        /// Value = last writer SN in this coherent set.  null = not part of a coherent set.
+        /// PID_COHERENT_SET inline QoS (RTPS 2.5 §8.7.6): the writer SN of the
+        /// first sample in this coherent set.  null = not part of a coherent set.
         coherent_set_sn: ?SequenceNumber = null,
         /// PID_GROUP_SEQ_NUM: per-publisher monotonically-increasing group counter.
         /// null = omit (non-GROUP coherent, or no coherent set).
         group_seq_num: ?SequenceNumber = null,
-        /// PID_GROUP_COHERENT_SET: last group sequence number in this group coherent set.
-        /// null = omit.
+        /// PID_GROUP_COHERENT_SET: the group sequence number of the first sample
+        /// in this group coherent set, which identifies the set.  null = omit.
         group_coherent_sn: ?SequenceNumber = null,
+        /// PID_WRITER_GROUP_INFO: digest of the writers in the publisher
+        /// (RTPS 2.5 §9.3.2.5).  null = omit.
+        writer_group_info: ?[4]u8 = null,
         /// PID_LIFESPAN inline QoS (RTPS §9.6.3.4): this sample's expiration duration,
         /// relative to its source timestamp. Sent per-sample (not just via SEDP writer
         /// announcement) since some readers only apply LIFESPAN-based expiry to samples
@@ -263,7 +266,8 @@ pub const MessageBuilder = struct {
     ) void {
         const has_iqos = params.key_hash != null or params.status_info != null or
             params.coherent_set_sn != null or params.group_seq_num != null or
-            params.group_coherent_sn != null or params.lifespan != null;
+            params.group_coherent_sn != null or params.writer_group_info != null or
+            params.lifespan != null;
         // D and K are mutually exclusive (RTPS §9.4.5.3): set D for data, K for key-only.
         // no_payload leaves both clear (end-of-coherent-set marker, RTPS §9.6.4.2).
         var flags: u8 = sub.FLAG_ENDIANNESS;
@@ -282,6 +286,7 @@ pub const MessageBuilder = struct {
         //   PID_GROUP_SEQ_NUM:       4 hdr + 8 value  = 12 bytes
         //   PID_COHERENT_SET:        4 hdr + 8 value  = 12 bytes
         //   PID_GROUP_COHERENT_SET:  4 hdr + 8 value  = 12 bytes
+        //   PID_WRITER_GROUP_INFO:   4 hdr + 4 value  = 8 bytes
         //   PID_LIFESPAN:            4 hdr + 8 value  = 12 bytes
         //   PID_SENTINEL:            4 bytes
         if (params.key_hash != null) fixed_len += 20;
@@ -289,6 +294,7 @@ pub const MessageBuilder = struct {
         if (params.group_seq_num != null) fixed_len += 12; // PID_GROUP_SEQ_NUM
         if (params.coherent_set_sn != null) fixed_len += 12; // PID_COHERENT_SET
         if (params.group_coherent_sn != null) fixed_len += 12; // PID_GROUP_COHERENT_SET
+        if (params.writer_group_info != null) fixed_len += 8; // PID_WRITER_GROUP_INFO
         if (params.lifespan != null) fixed_len += 12; // PID_LIFESPAN
         if (has_iqos) fixed_len += 4; // PID_SENTINEL
 
@@ -331,6 +337,11 @@ pub const MessageBuilder = struct {
             self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_coherent_set));
             self.scratch.writeU16Le(8);
             self.scratch.writeSequenceNumber(gcs);
+        }
+        if (params.writer_group_info) |wgi| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.writer_group_info));
+            self.scratch.writeU16Le(4);
+            self.scratch.writeBytes(&wgi);
         }
         if (params.lifespan) |ls| {
             self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.lifespan));
@@ -442,6 +453,7 @@ pub const MessageBuilder = struct {
         coherent_set_sn: ?SequenceNumber = null,
         group_seq_num: ?SequenceNumber = null,
         group_coherent_sn: ?SequenceNumber = null,
+        writer_group_info: ?[4]u8 = null,
         lifespan: ?RtpsDuration = null,
     };
 
@@ -453,7 +465,8 @@ pub const MessageBuilder = struct {
     ) void {
         const has_iqos = params.key_hash != null or params.status_info != null or
             params.coherent_set_sn != null or params.group_seq_num != null or
-            params.group_coherent_sn != null or params.lifespan != null;
+            params.group_coherent_sn != null or params.writer_group_info != null or
+            params.lifespan != null;
 
         var flags: u8 = sub.FLAG_ENDIANNESS;
         if (params.is_key) flags |= sub.DataFragFlags.key_flag;
@@ -470,6 +483,7 @@ pub const MessageBuilder = struct {
         if (params.group_seq_num != null) fixed_len += 12;
         if (params.coherent_set_sn != null) fixed_len += 12;
         if (params.group_coherent_sn != null) fixed_len += 12;
+        if (params.writer_group_info != null) fixed_len += 8;
         if (params.lifespan != null) fixed_len += 12;
         if (has_iqos) fixed_len += 4; // PID_SENTINEL
 
@@ -512,6 +526,11 @@ pub const MessageBuilder = struct {
             self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_coherent_set));
             self.scratch.writeU16Le(8);
             self.scratch.writeSequenceNumber(gcs);
+        }
+        if (params.writer_group_info) |wgi| {
+            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.writer_group_info));
+            self.scratch.writeU16Le(4);
+            self.scratch.writeBytes(&wgi);
         }
         if (params.lifespan) |ls| {
             self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.lifespan));
@@ -650,6 +669,36 @@ test "MessageBuilder.addData produces two iovecs" {
     // Second iovec is the payload.
     try std.testing.expectEqual(@as(usize, payload.len), ios[1].len);
     try std.testing.expectEqual(@as([*]const u8, @ptrCast(&payload[0])), ios[1].base);
+}
+
+test "MessageBuilder.addData: GROUP coherent-set inline QoS uses the RTPS 2.5 parameter ids" {
+    // Pinned to the wire, not to ParameterId: a round trip through the parser
+    // passes with any value, and these once drifted from RTPS 2.5 Table 9.20
+    // (PID_GROUP_COHERENT_SET 0x0063, PID_GROUP_SEQ_NUM 0x0064,
+    // PID_WRITER_GROUP_INFO 0x0065) unnoticed.
+    var scratch: [SCRATCH_SIZE]u8 = undefined;
+    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = .{0} ** 12 });
+    b.addData(.{
+        .reader_entity_id = EntityId{ .entity_key = .{ 0, 0, 0 }, .entity_kind = 0 },
+        .writer_entity_id = EntityId{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 2 },
+        .writer_sn = 9,
+        .no_payload = true,
+        .group_seq_num = 14,
+        .group_coherent_sn = 11,
+        .writer_group_info = .{ 0xA1, 0xB2, 0xC3, 0xD4 },
+    }, &.{});
+
+    // DATA header (4) + extraFlags/octetsToInlineQos (4) + entity ids (8) + SN (8).
+    const iqos = 20 + 24;
+    try std.testing.expectEqual(@as(u8, 0x15), scratch[20]);
+    try std.testing.expectEqual(@as(u8, 0x03), scratch[21]); // E|Q, no payload
+    const expected = [_]u8{
+        0x64, 0x00, 0x08, 0x00, 0, 0, 0, 0, 14, 0, 0, 0, // PID_GROUP_SEQ_NUM
+        0x63, 0x00, 0x08, 0x00, 0, 0, 0, 0, 11, 0, 0, 0, // PID_GROUP_COHERENT_SET
+        0x65, 0x00, 0x04, 0x00, 0xA1, 0xB2, 0xC3, 0xD4, // PID_WRITER_GROUP_INFO
+        0x01, 0x00, 0x00, 0x00, // PID_SENTINEL
+    };
+    try std.testing.expectEqualSlices(u8, &expected, scratch[iqos..][0..expected.len]);
 }
 
 test "MessageBuilder.addHeartbeat is single iovec" {

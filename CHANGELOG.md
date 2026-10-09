@@ -8,6 +8,53 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-07
+
+Coherent sets now follow RTPS 2.5 §8.7.6 end to end.
+
+- **A HEARTBEAT no longer ends a coherent set.** With `coherent_access`, a zzdds
+  subscriber committed a writer's in-progress coherent set whenever a HEARTBEAT said it
+  had every sample written so far, until that writer's first end-of-set marker. Writers
+  that send each sample as it is written (zzdds's own writer holds a set until it ends)
+  send HEARTBEATs in the middle of a set, so the first sets from them were split across
+  `begin_access`/`end_access` cycles; in GROUP scope that could also leave one reader a
+  set behind the others. A set now ends only as RTPS 2.5 §9.6.4.2 defines: an end-of-set
+  DATA, a sample of another set, or a sample without `PID_COHERENT_SET`. This was the
+  cause of most `Test_CoherentSets_10`–`12` interop failures with zzdds as the subscriber.
+- **Incomplete coherent sets are discarded.** A subscriber now checks that every sequence
+  number from a set's first sample up to the change that ends it arrived, and discards the
+  set otherwise, as §8.7.6 requires. That includes the partial set a reader receives when
+  it matches in the middle of one, which used to be delivered. A sample the reader drops
+  itself (ownership, time or content filter, resource limits) still counts as arrived.
+- **End-of-set markers are kept and sent again.** When a reader NACKed a set's end
+  marker, the writer GAPed it, and it announced that GAP with every set, so a reader that
+  missed the marker could not tell whether the set was complete. Writers now keep each
+  marker until its set's samples are gone from the writer's cache and every reliable
+  reader acknowledged it, resend it on NACK, and include it in history replay. Best-effort
+  history replay also left out the samples' coherent-set inline QoS, best-effort readers
+  ignored end markers, and a fragmented sample lost its coherent-set inline QoS on
+  reassembly; all three are fixed.
+- **GROUP coherent sets use the RTPS 2.5 wire format.** `PID_GROUP_COHERENT_SET` and
+  `PID_GROUP_SEQ_NUM` are sent as `0x0063` and `0x0064` again. Since 2026-06-20 they had
+  been sent as `0x0039` and `0x0038`, values RTPS 2.5 does not define, so other
+  implementations ignored zzdds's and zzdds ignored theirs. Every sample of a group set now
+  carries the set's id (the group sequence number of its first sample, where zzdds used
+  to send the last one on the last sample only) and `PID_WRITER_GROUP_INFO`. Every writer
+  of the publisher, including one that wrote nothing in the set, ends it with an End
+  Coherent Set marker. zzdds v0.3.6 and earlier don't read the new ids and keep pairing
+  sets by position. Subscribers from two other implementations were observed to deliver
+  nothing at all from GROUP sets carrying `PID_GROUP_COHERENT_SET` that end with these
+  markers; readers from those vendors get the sets without it, as each writer's own
+  coherent set, which is how they handled zzdds sets before
+  (`header.omitsGroupCoherentSet`, keyed by vendor id like the existing end-marker quirk).
+- **GROUP-scope subscribers assemble group sets by id.** `begin_access` used to pair each
+  reader's oldest coherent set, so a reader that matched later than its siblings stayed a
+  set out of step with them. It now exposes a publisher's group set once every one of its
+  writers matched to the subscriber is done with that set, and discards the whole set if
+  any part is incomplete. A part still arriving holds its set back however long it
+  takes. Sets from writers that send no group set id are still paired by
+  position.
+
 ## 2026-10-05
 
 - **ContentFilteredTopic filter expressions can be changed in place.** New zzdds extension

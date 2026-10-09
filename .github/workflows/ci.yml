@@ -992,12 +992,9 @@ jobs:
           #
           # toc_coredx_dds is promoted (2026-07-14): full suite is clean in one
           # direction (105/105) and 103/105 in the other. The Test_CoherentSets
-          # flakes seen against it (and against connext under the sanitizer
-          # lanes) were run to ground 2026-08-28 — ~2,500 live runs, zero
-          # ordering/loss/tear faults in any direction or build. The cause is
-          # the dds-rtps harness's coherent_sets_w_instances judging each read
-          # iteration. Upstream's per-iteration improvement (6d9c01d) reduced but
-          # did not remove it; re-fixing the check is on the roadmap.
+          # failures seen with it publishing were mostly a zzdds subscriber bug
+          # (a HEARTBEAT committed an in-progress coherent set), fixed
+          # 2026-10-07; see docs/roadmap.md for the remaining failure modes.
           #
           # zzdds is included so the pinned RELEASE binary runs against the
           # freshly-built HEAD binary every CI run (both directions, in the

@@ -14,6 +14,7 @@ const msg = rtps.message;
 const StatefulWriter = rtps.StatefulWriter;
 const ReaderProxy = rtps.ReaderProxy;
 const CoherentFlushMode = rtps.history.CoherentFlushMode;
+const GroupCoherentSet = rtps.history.GroupCoherentSet;
 const Guid = rtps.Guid;
 const SequenceNumber = rtps.SequenceNumber;
 const Locator = rtps.Locator;
@@ -143,37 +144,36 @@ const ModelWriter = struct {
         mode: CoherentFlushMode,
         resuspend: bool,
         shared_gsn: ?*i64,
-        global_last_gsn: i64,
+        group_set: ?GroupCoherentSet,
     ) void {
         self.coherent_active = false;
         defer if (resuspend) {
             self.coherent_active = true;
         };
+        defer self.pending_sns.clearRetainingCapacity();
 
         const window_start = self.coherent_window_start;
         self.coherent_window_start = 0;
         const all_sns = self.pending_sns.items;
-        if (all_sns.len == 0) return;
+        // Every writer of a GROUP publisher ends the group set, even with no samples in it.
+        const ends_group_set = mode == .full and group_set != null;
+        if (all_sns.len == 0 and !ends_group_set) return;
 
         for (all_sns[0..window_start]) |sn| self.markSent(sn);
         const coherent_sns = all_sns[window_start..];
-        if (coherent_sns.len == 0) {
-            self.pending_sns.clearRetainingCapacity();
-            return;
-        }
+        if (coherent_sns.len == 0 and !ends_group_set) return;
 
-        if (mode != .none) {
+        if (mode != .none and coherent_sns.len > 0) {
             const base_gsn = if (shared_gsn) |g| g.* else 0;
-            const last_gsn = base_gsn + @as(i64, @intCast(coherent_sns.len));
-            const group_end_gsn = if (global_last_gsn != 0) global_last_gsn else last_gsn;
-            const last_sn = coherent_sns[coherent_sns.len - 1];
+            // A standalone writer's group set is its own samples.
+            const group_id = if (group_set) |g| g.first_gsn else base_gsn + 1;
             const first_sn = coherent_sns[0];
             for (coherent_sns, 1..) |sn, i| {
                 const gsn = base_gsn + @as(i64, @intCast(i));
                 if (self.changePtr(sn)) |ch| {
                     if (mode == .full) {
                         ch.coherent_set_sn = first_sn;
-                        if (sn == last_sn) ch.group_coherent_sn = group_end_gsn;
+                        ch.group_coherent_sn = group_id;
                     }
                     ch.group_seq_num = gsn;
                 }
@@ -181,9 +181,8 @@ const ModelWriter = struct {
             if (shared_gsn) |g| g.* += @intCast(coherent_sns.len);
         }
         for (coherent_sns) |sn| self.markSent(sn);
-        // Mirror allocSn() for the EOC marker sent by the real writer.
+        // Mirror allocSn() for the end marker sent by the real writer.
         if (mode == .coherent_only or mode == .full) self.next_sn += 1;
-        self.pending_sns.clearRetainingCapacity();
     }
 
     fn markSent(self: *@This(), sn: SequenceNumber) void {
@@ -290,8 +289,8 @@ test "presentation model: suspend before coherent keeps pre-window write out of 
     try testing.expectEqual(@as(usize, 1), model.coherentWindowCount());
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.full, true, null, 0, false);
-    model.end(.full, true, null, 0);
+    writer.endCoherentSet(.full, true, null, null, false);
+    model.end(.full, true, null, null);
     try expectModelMatchesImpl(&model, writer);
     // SN 1 ("A", pre-window), SN 2 ("B", coherent), SN 3 (EOC marker).
     try expectDataSns(&rec, &.{ 1, 2, 3 });
@@ -301,8 +300,8 @@ test "presentation model: suspend before coherent keeps pre-window write out of 
     _ = try model.write(alloc);
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.none, false, null, 0, false);
-    model.end(.none, false, null, 0);
+    writer.endCoherentSet(.none, false, null, null, false);
+    model.end(.none, false, null, null);
     try expectModelMatchesImpl(&model, writer);
     // "C" is SN 4: EOC for the previous set consumed SN 3 via allocSn().
     try expectDataSns(&rec, &.{4});
@@ -324,8 +323,8 @@ test "presentation model: ordered-only flush assigns GSN without coherent marker
     _ = try model.write(alloc);
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.group_seq_only, false, null, 0, false);
-    model.end(.group_seq_only, false, null, 0);
+    writer.endCoherentSet(.group_seq_only, false, null, null, false);
+    model.end(.group_seq_only, false, null, null);
     try expectModelMatchesImpl(&model, writer);
     try expectDataSns(&rec, &.{ 1, 2 });
 }
@@ -349,8 +348,8 @@ test "presentation model: empty coherent window flushes pre-window samples only"
     try testing.expectEqual(@as(usize, 0), model.coherentWindowCount());
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.full, false, null, 0, false);
-    model.end(.full, false, null, 0);
+    writer.endCoherentSet(.full, false, null, null, false);
+    model.end(.full, false, null, null);
     try expectModelMatchesImpl(&model, writer);
     try expectDataSns(&rec, &.{1});
 }
@@ -366,7 +365,7 @@ test "presentation model: readerless coherent set records metadata without DATA 
     _ = try writeImpl(writer, "B");
     try expectDataSns(&rec, &.{});
 
-    writer.endCoherentSet(.full, false, null, 0, false);
+    writer.endCoherentSet(.full, false, null, null, false);
     try expectDataSns(&rec, &.{});
 
     writer.mu.lock();
@@ -376,11 +375,12 @@ test "presentation model: readerless coherent set records metadata without DATA 
     try testing.expectEqual(@as(?SequenceNumber, 1), writer.cache.changes.items[1].coherent_set_sn);
     try testing.expectEqual(@as(?i64, 1), writer.cache.changes.items[0].group_seq_num);
     try testing.expectEqual(@as(?i64, 2), writer.cache.changes.items[1].group_seq_num);
-    try testing.expectEqual(@as(?i64, null), writer.cache.changes.items[0].group_coherent_sn);
-    try testing.expectEqual(@as(?i64, 2), writer.cache.changes.items[1].group_coherent_sn);
+    // Every sample carries the group set's id: its first group sequence number.
+    try testing.expectEqual(@as(?i64, 1), writer.cache.changes.items[0].group_coherent_sn);
+    try testing.expectEqual(@as(?i64, 1), writer.cache.changes.items[1].group_coherent_sn);
 }
 
-test "presentation model: shared publisher GSN gives group-wide coherent end marker" {
+test "presentation model: shared publisher GSN gives every sample the group set id" {
     const alloc = testing.allocator;
     var rec1: Recording = .{};
     var rec2: Recording = .{};
@@ -409,12 +409,13 @@ test "presentation model: shared publisher GSN gives group-wide coherent end mar
     const model_total_n: i64 = @intCast(m1.coherentWindowCount() + m2.coherentWindowCount());
     try testing.expectEqual(model_total_n, total_n);
 
+    const group_set = GroupCoherentSet{ .first_gsn = 1, .end_gsn = total_n + 1, .writer_group_info = .{ 0, 0, 0, 1 } };
     var impl_shared_gsn: i64 = 0;
     var model_shared_gsn: i64 = 0;
-    w1.endCoherentSet(.full, false, &impl_shared_gsn, total_n, false);
-    m1.end(.full, false, &model_shared_gsn, model_total_n);
-    w2.endCoherentSet(.full, false, &impl_shared_gsn, total_n, false);
-    m2.end(.full, false, &model_shared_gsn, model_total_n);
+    w1.endCoherentSet(.full, false, &impl_shared_gsn, group_set, false);
+    m1.end(.full, false, &model_shared_gsn, group_set);
+    w2.endCoherentSet(.full, false, &impl_shared_gsn, group_set, false);
+    m2.end(.full, false, &model_shared_gsn, group_set);
 
     try testing.expectEqual(model_shared_gsn, impl_shared_gsn);
     try expectModelMatchesImpl(&m1, w1);

@@ -78,6 +78,21 @@ pub fn needsPidCoherentSetMarker(vendor_id: VendorId) bool {
     return vendor_id.eql(VENDOR_ID_ECLIPSE_CYCLONE);
 }
 
+/// True for remote vendors whose GROUP-scope reader is known, by direct
+/// empirical testing, to never deliver a group coherent set whose samples
+/// carry PID_GROUP_COHERENT_SET and which ends with RTPS 2.5 §8.7.6 End
+/// Coherent Set markers: their subscribers received no data at all.  Sent
+/// without PID_GROUP_COHERENT_SET, the same sets are delivered as each
+/// writer's own coherent set, which is how these readers treated zzdds sets
+/// before it sent the parameter id RTPS 2.5 defines.  Both observed with
+/// the dds-rtps CoherentSets GROUP tests (vendor ids 01.01 and 01.26);
+/// this list should only grow when another vendor is concretely observed
+/// to stall the same way.
+pub fn omitsGroupCoherentSet(vendor_id: VendorId) bool {
+    return vendor_id.eql(.{ .bytes = .{ 0x01, 0x01 } }) or
+        vendor_id.eql(.{ .bytes = .{ 0x01, 0x1A } });
+}
+
 /// RTPS Message Header (§9.4.1).
 /// Serialized layout: 20 bytes, no padding.
 pub const Header = extern struct {

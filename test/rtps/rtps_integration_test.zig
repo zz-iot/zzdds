@@ -1309,7 +1309,7 @@ test "coherent_set: writes deferred until endCoherentSet" {
     writer.mu.unlock();
 
     // End coherent set with .full: patch all 3 changes and flush DATA.
-    writer.endCoherentSet(.full, false, null, 0, false);
+    writer.endCoherentSet(.full, false, null, null, false);
 
     // Verify coherent_set_sn is patched to first SN (1) on all 3 changes.
     writer.mu.lock();
@@ -1376,7 +1376,7 @@ test "coherent_set: mode=none sends without PID_COHERENT_SET" {
     try write(writer, "y");
 
     // End with .none: changes sent but coherent_set_sn stays null.
-    writer.endCoherentSet(.none, false, null, 0, false);
+    writer.endCoherentSet(.none, false, null, null, false);
 
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
@@ -1438,7 +1438,7 @@ test "coherent_set: mode=group_seq_only emits group_seq_num but not coherent_set
     try write(writer, "y");
 
     // .group_seq_only: group_seq_num is assigned, coherent_set_sn stays null.
-    writer.endCoherentSet(.group_seq_only, false, null, 0, false);
+    writer.endCoherentSet(.group_seq_only, false, null, null, false);
 
     writer.mu.lock();
     for (writer.cache.changes.items) |*ch| {
@@ -1493,36 +1493,44 @@ test "coherent_set: multi-writer publisher shares GSN counter for global orderin
     _ = try w2.write(.alive, NIL_TS, NIL_IH, NIL_KH, "B");
     _ = try w1.write(.alive, NIL_TS, NIL_IH, NIL_KH, "C");
 
-    // Pre-count total pending samples across both writers to compute global_last_gsn,
-    // mirroring what the publisher's vtEndCoherent does.
+    // The publisher's group set, as its vtEndCoherent computes it: its id is
+    // the first sample's GSN, and the End Coherent Set markers take the GSN
+    // after the last sample's (RTPS 2.5 §8.7.6).
     const total_n: i64 = @intCast(w1.coherentWindowPendingCount() + w2.coherentWindowPendingCount());
-    const global_last_gsn: i64 = 0 + total_n; // shared_gsn starts at 0
+    const group_set = rtps.history.GroupCoherentSet{ .first_gsn = 1, .end_gsn = total_n + 1, .writer_group_info = .{ 1, 2, 3, 4 } };
 
     // Flush both writers with a shared publisher counter (simulating vtEndCoherent).
     var shared_gsn: i64 = 0;
-    w1.endCoherentSet(.full, false, &shared_gsn, global_last_gsn, false); // W1: A=GSN1, C=GSN2; shared_gsn=2
-    w2.endCoherentSet(.full, false, &shared_gsn, global_last_gsn, false); // W2: B=GSN3; shared_gsn=3
+    w1.endCoherentSet(.full, false, &shared_gsn, group_set, false); // W1: A=GSN1, C=GSN2; shared_gsn=2
+    w2.endCoherentSet(.full, false, &shared_gsn, group_set, false); // W2: B=GSN3; shared_gsn=3
 
-    // Verify W1's samples got globally-unique GSNs 1 and 2.
+    // W1's samples got globally-unique GSNs 1 and 2, and every sample carries
+    // the group set's id (its first GSN) and the writer group digest.
     w1.mu.lock();
-    var gsns_w1: [2]?i64 = .{ null, null };
-    var group_coherent_w1: ?i64 = null;
-    for (w1.cache.changes.items, 0..) |*ch, i| {
-        if (i < 2) gsns_w1[i] = ch.group_seq_num;
-        if (ch.group_coherent_sn != null) group_coherent_w1 = ch.group_coherent_sn;
-    }
+    var w1_changes: [2]rtps.history.CacheChange = undefined;
+    @memcpy(&w1_changes, w1.cache.changes.items[0..2]);
+    const w1_marker = w1.end_markers.items[0];
     w1.mu.unlock();
-    try testing.expectEqual(@as(?i64, 1), gsns_w1[0]);
-    try testing.expectEqual(@as(?i64, 2), gsns_w1[1]);
-    // W1's last sample must carry the GROUP-WIDE last GSN (3), not just its own (2).
-    try testing.expectEqual(@as(?i64, 3), group_coherent_w1);
+    try testing.expectEqual(@as(?i64, 1), w1_changes[0].group_seq_num);
+    try testing.expectEqual(@as(?i64, 2), w1_changes[1].group_seq_num);
+    for (w1_changes) |ch| {
+        try testing.expectEqual(@as(?i64, 1), ch.group_coherent_sn);
+        try testing.expectEqual(@as(?[4]u8, .{ 1, 2, 3, 4 }), ch.writer_group_info);
+    }
 
-    // Verify W2's sample got GSN 3 (continuing from W1's range, not restarting at 1).
+    // W2's sample got GSN 3 (continuing from W1's range, not restarting at 1).
     w2.mu.lock();
     const gsn_w2 = w2.cache.changes.items[0].group_seq_num;
     const group_coherent_w2 = w2.cache.changes.items[0].group_coherent_sn;
+    const w2_marker = w2.end_markers.items[0];
     w2.mu.unlock();
     try testing.expectEqual(@as(?i64, 3), gsn_w2);
-    // W2's last sample also carries the group-wide last GSN.
-    try testing.expectEqual(@as(?i64, 3), group_coherent_w2);
+    try testing.expectEqual(@as(?i64, 1), group_coherent_w2);
+
+    // Each writer ends the set with an End Coherent Set marker carrying GSN 4
+    // and the set's id.
+    try testing.expectEqual(@as(i64, 3), w1_marker.sn);
+    try testing.expectEqual(@as(i64, 2), w2_marker.sn);
+    try testing.expectEqual(group_set, w1_marker.group.?);
+    try testing.expectEqual(group_set, w2_marker.group.?);
 }

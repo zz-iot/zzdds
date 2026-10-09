@@ -23,12 +23,14 @@ const submsg_mod = @import("../rtps/message/submessage.zig");
 pub const Guid = guid_mod.Guid;
 pub const GuidPrefix = guid_mod.GuidPrefix;
 pub const EntityId = guid_mod.EntityId;
+pub const groupDigest = guid_mod.groupDigest;
 pub const ChangeKind = history_mod.ChangeKind;
 pub const InstanceHandle = history_mod.InstanceHandle;
 pub const RtpsTimestamp = history_mod.RtpsTimestamp;
 pub const SequenceNumber = history_mod.SequenceNumber;
 pub const CacheChange = history_mod.CacheChange;
 pub const CoherentFlushMode = history_mod.CoherentFlushMode;
+pub const GroupCoherentSet = history_mod.GroupCoherentSet;
 pub const Locator = iface.Locator;
 pub const SequenceNumberSet = submsg_mod.SequenceNumberSet;
 pub const FragmentNumberSet = submsg_mod.FragmentNumberSet;
@@ -36,16 +38,20 @@ pub const DataFragSubmessage = submsg_mod.DataFragSubmessage;
 
 // ── Combined EOC types ────────────────────────────────────────────────────────
 
-/// One entry for a publisher-level combined EOC send.
+/// One entry for a publisher-level combined end-marker send.
 /// Collected per (reader proxy, locator) by take_eoc_proxy_infos() before the
-/// publisher sends all writers' EOC DATAs in a single UDP datagram per group.
+/// publisher sends all writers' end markers in a single UDP datagram per group.
 pub const EOCProxyInfo = struct {
     locator: Locator,
     reader_guid: Guid,
     writer_guid: Guid,
     eoc_sn: SequenceNumber,
+    /// GROUP scope: the End Coherent Set marker's group coherent set.
+    group: ?GroupCoherentSet = null,
     /// See MatchedReaderInfo.needs_pid_coherent_set_marker.
     needs_pid_coherent_set_marker: bool = false,
+    /// See MatchedReaderInfo.omits_group_coherent_set.
+    omits_group_coherent_set: bool = false,
 };
 
 // ── Matched endpoint information ──────────────────────────────────────────────
@@ -71,6 +77,10 @@ pub const MatchedReaderInfo = struct {
     /// ("Example 2") instead. Both are spec-legal; see
     /// header_mod.needsPidCoherentSetMarker for the empirical basis.
     needs_pid_coherent_set_marker: bool = false,
+    /// True when this remote reader's vendor is known to stall GROUP coherent
+    /// sets that carry PID_GROUP_COHERENT_SET; it gets them without it, as
+    /// each writer's own coherent set.  See header_mod.omitsGroupCoherentSet.
+    omits_group_coherent_set: bool = false,
 };
 
 /// What SEDP tells the protocol layer about a newly-matched remote writer.
@@ -93,6 +103,14 @@ pub const MatchedWriterInfo = struct {
     /// reliability.  The reader must wait for history delivery before signalling completion
     /// of wait_for_historical_data.
     history_expected: bool = false,
+    /// True when the writer's publisher has PRESENTATION coherent_access with
+    /// GROUP access_scope: its coherent sets span the publisher's writers.
+    group_coherent: bool = false,
+    /// Identifies the writer's publisher, whose writers share one group sequence
+    /// number space (RTPS 2.5 §8.7.5): its PID_GROUP_GUID, else the writer's
+    /// participant prefix with its PID_GROUP_ENTITYID, else the participant
+    /// prefix alone.
+    publisher_guid: Guid = std.mem.zeroes(Guid),
 };
 
 // ── Data delivery callback ────────────────────────────────────────────────────
@@ -107,15 +125,13 @@ pub const DataCallback = struct {
     /// irreversibly lost (never delivered). Called after the protocol
     /// reader's lock is released, since it reaches application listeners.
     on_sample_lost: ?*const fn (ctx: *anyopaque, count: i32) void = null,
-    /// Optional: called when a valid (non-duplicate) HEARTBEAT arrives from a
-    /// writer.  Used to flush coherent WIP when no CS transition follows the set.
-    on_heartbeat: ?*const fn (ctx: *anyopaque, writer_guid: Guid, last_sn: SequenceNumber) void = null,
-    /// Optional: called when a Connext-style zero-payload alive DATA arrives with
-    /// no PID_COHERENT_SET — the end-of-coherent-set signal.  RTPS-level consumers
-    /// leave this null; the DCPS layer registers it to flush the coherent WIP.
+    /// Optional: called, in sequence-number order, when an end-of-coherent-set
+    /// marker arrives: an alive DATA without a payload (see
+    /// reader_sm.isEndMarker).  RTPS-level consumers leave this null; the DCPS
+    /// layer registers it to end the writer's coherent set.
     on_eoc: ?*const fn (ctx: *anyopaque, change: *const CacheChange) void = null,
     /// Optional: called after the protocol reader's lock is released, by any
-    /// operation that called on_data/on_eoc/on_heartbeat while holding it.
+    /// operation that called on_data/on_eoc while holding it.
     /// Those hand changes over under the lock (which keeps them in order) and
     /// must not reach application code; anything that does, such as
     /// raising on_data_available, belongs here instead.
@@ -276,16 +292,16 @@ pub const ProtocolWriter = struct {
 
         /// Flush a deferred coherent/ordered batch.  `mode` controls which
         /// inline QoS PIDs are emitted (see CoherentFlushMode).
-        /// `global_last_gsn`: group-wide last GSN across all writers; 0 = per-writer.
-        /// When `defer_eoc` is true, the EOC DATA and HB are stashed (not sent) so the
-        /// caller can follow with sendCombinedEOCData() + flush_group_eoc_hb_only() across
-        /// all writers atomically.
-        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void,
+        /// `group_set`: mode .full — the publisher's group coherent set, which
+        /// every one of its writers ends with an End Coherent Set marker, even
+        /// one that wrote nothing in it.  Null = a standalone writer.
+        /// When `defer_eoc` is true, the end marker's DATA and HB are stashed (not
+        /// sent) so the caller can follow with sendCombinedEOCData() +
+        /// flush_group_eoc_hb_only() across all writers atomically.
+        end_coherent_set: *const fn (ctx: *anyopaque, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, group_set: ?GroupCoherentSet, defer_eoc: bool) void,
 
-        /// Collect EOC proxy infos for a publisher-level combined EOC send.
-        /// Leaves pending_eoc_sn set so the background HB thread cannot send a
-        /// premature GAP before the caller delivers the combined EOC DATA.
-        /// flush_group_eoc_hb_only() will clear it after the combined send.
+        /// Collect end-marker proxy infos for a publisher-level combined send.
+        /// flush_group_eoc_hb_only() clears the pending marker after the send.
         /// Appends one EOCProxyInfo per (reader proxy, effective locator) pair.
         /// No-op if no EOC is pending.
         take_eoc_proxy_infos: *const fn (
@@ -414,8 +430,8 @@ pub const ProtocolWriter = struct {
         return self.vtable.coherent_window_count(self.ctx);
     }
 
-    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, global_last_gsn: i64, defer_eoc: bool) void {
-        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, global_last_gsn, defer_eoc);
+    pub fn endCoherentSet(self: ProtocolWriter, mode: CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, group_set: ?GroupCoherentSet, defer_eoc: bool) void {
+        self.vtable.end_coherent_set(self.ctx, mode, resuspend, publisher_gsn, group_set, defer_eoc);
     }
 
     pub fn takeEOCProxyInfos(
@@ -553,6 +569,7 @@ pub const ProtocolReader = struct {
             kind: ChangeKind,
             coherent_set_sn: ?SequenceNumber,
             group_seq_num: ?SequenceNumber,
+            group_coherent_sn: ?SequenceNumber,
             lifespan_ns: ?i64,
         ) void,
 
@@ -683,6 +700,7 @@ pub const ProtocolReader = struct {
         kind: ChangeKind,
         coherent_set_sn: ?SequenceNumber,
         group_seq_num: ?SequenceNumber,
+        group_coherent_sn: ?SequenceNumber,
         lifespan_ns: ?i64,
     ) void {
         self.vtable.handle_incoming_change(
@@ -695,6 +713,7 @@ pub const ProtocolReader = struct {
             kind,
             coherent_set_sn,
             group_seq_num,
+            group_coherent_sn,
             lifespan_ns,
         );
     }

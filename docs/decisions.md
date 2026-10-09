@@ -105,8 +105,8 @@ allows retransmit of individual fragments without re-serialization.
 **Listeners never run under a zzdds lock: collect under it, dispatch after it.**
 Code that reaches application listeners records what to raise while holding its lock,
 pins each target (`quiesceAcquire` on the protocol endpoint or the DCPS entity), releases
-the lock, then dispatches and drops the pins. In the protocol reader, `on_data`, `on_eoc`
-and `on_heartbeat` only hand changes over under the reader's lock (which keeps them in
+the lock, then dispatches and drops the pins. In the protocol reader, `on_data` and `on_eoc`
+only hand changes over under the reader's lock (which keeps them in
 order); the same operation then calls `on_flush` once the lock is released, and the DCPS
 reader raises `on_data_available`/`on_sample_rejected` from there. The built-in SEDP and
 WLP readers queue in `on_data` and process in `on_flush` through a `DrainQueue`: one
@@ -239,21 +239,43 @@ the same flattening code, which would have required unrelated new work in
 cross-module content for `@callback` interfaces, leaving entity interfaces' cross-module
 bases exactly as before (unexercised, matching today's shipped behavior).
 
-**GROUP_PRESENTATION coherent sets: implement to spec.**
-The zzdds implementation emits `PID_COHERENT_SET` (0x0056), `PID_GROUP_SEQ_NUM` (0x0064),
-and `PID_GROUP_COHERENT_SET` (0x0063) inline QoS per RTPS 2.5 §9.6.3.7. The recurring
-`dds-rtps` `CoherentSets_10/11/12/19/20/21` CI failures were investigated end to end
-(2026-08-28, ~2,500 live runs + ~2,300 trace replays across CoreDX/Connext/self, both
-directions, ReleaseSafe/TSan/DebugAllocator): **no zzdds defect.** Every failure is the
-harness's `coherent_sets_w_instances` asserting a per-poll-cycle sample count (exactly 36),
-which depends on the phase alignment of two unsynchronised sleep loops rather than the
-coherent_access contract. The shipped `zzdds-0.2.0` binary flakes identically. Our
-`coherent_sets_w_instances` rewrite (asserting per-instance ordering, no loss/dup, and
-atomic per-instance coherent-set delivery over the whole run, in the spirit of their
-`95b6f62` "Added tolerance to the ordered_access test") was declined upstream in favour of
-improved per-iteration assertions (`6d9c01d`, non-GROUP only). Those reduce but do not
-remove the timing dependence, so residual flakes remain and the check still needs
-re-fixing (roadmap). No zzdds wire-format change was needed. `CoherentSets_8` passes.
+**Coherent sets: implement RTPS 2.5 §8.7.6 as written.**
+- *Wire format.* Each sample of a set carries `PID_COHERENT_SET` (0x0056), the writer SN of
+  the set's first sample. In GROUP scope each also carries `PID_GROUP_SEQ_NUM` (0x0064),
+  `PID_GROUP_COHERENT_SET` (0x0063, the group sequence number of the group set's first
+  sample, which identifies the set) and `PID_WRITER_GROUP_INFO` (0x0065). The parameter
+  ids are pinned by a byte-level builder test: from 2026-06-20 to 2026-10-07 they were
+  0x0039/0x0038 and nothing noticed, since a round trip through zzdds's own parser passes
+  with any value. Readers from vendors observed to stall on group sets that carry
+  `PID_GROUP_COHERENT_SET` (`header.omitsGroupCoherentSet`: their subscribers delivered
+  nothing) get the sets without it, as each writer's own coherent set.
+- *End of a set.* A set ends only on what §9.6.4.2 defines: an end marker (a DATA without
+  a payload), a sample of another set, or a sample without `PID_COHERENT_SET`. A HEARTBEAT
+  does not end one: it says which samples the writer has, and writers that send samples as
+  they are written send HEARTBEATs mid-set (committing on them split sets; it caused most
+  `dds-rtps` `CoherentSets_10/11/12/19/20/21` failures with zzdds subscribing, see
+  `implementation_status.md`). In GROUP scope every writer of the publisher sends an End
+  Coherent Set marker, even one with nothing in the set.
+- *End markers are history, not wire-only.* The writer keeps each marker, resends it on
+  NACK and replays it, until its set's samples have left the cache (§8.7.6) and every
+  reliable reader acknowledged it. A GAP for a marker would leave the reader unable to
+  tell whether the set before it is complete. Markers waiting only on acknowledgements
+  are capped at 1024 per writer; a marker whose set is still cached is never dropped.
+- *Completeness by sequence number.* A writer's set is complete when every SN from its
+  first sample to the change that ends it arrived. Samples the reader drops itself count
+  as arrived (§8.7.6 removes content- and time-filtered samples from what must arrive), so
+  the reader tracks each change before filtering it. Incomplete sets are discarded,
+  including a late joiner's partial first set.
+- *GROUP assembly by id.* The subscriber keys each part by (publisher, group set id) and
+  exposes a group set once every writer of that publisher matched to it is done with the
+  set, from match time on, so a part still in flight is not mistaken for none. A part
+  already arriving holds its set back however long it takes (unmatching ends the wait);
+  a writer with nothing in progress stops holding sets back after 5 s idle. Parts that
+  arrived before their writer's match completed are re-keyed to its publisher at match,
+  and every group set waits until then. Writers that send no group set id are paired by
+  position, as before. Not implemented: group ordered access's HEARTBEAT and GAP group
+  fields (§8.7.5) and checking `PID_WRITER_GROUP_INFO` against discovery.
+`CoherentSets_8` passes.
 
 **Listener hierarchy fallback (DDS 1.4 §2.2.4.1.5): reader/writer own listener first,
 then Subscriber/Publisher, then DomainParticipant — every level's `listener_mask`

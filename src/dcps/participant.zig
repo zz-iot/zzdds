@@ -110,7 +110,7 @@ const noop_pr_vtable = proto.ProtocolReader.Vtable{
         fn f(_: *anyopaque, _: std.mem.Allocator, _: *std.ArrayListUnmanaged(proto.Guid)) anyerror!void {}
     }.f,
     .handle_incoming_change = struct {
-        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber, _: ?i64) void {}
+        fn f(_: *anyopaque, _: proto.Guid, _: proto.SequenceNumber, _: proto.RtpsTimestamp, _: [16]u8, _: []const u8, _: proto.ChangeKind, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber, _: ?proto.SequenceNumber, _: ?i64) void {}
     }.f,
     .handle_heartbeat = struct {
         fn f(_: *anyopaque, _: proto.Guid, _: proto.EntityId, _: proto.SequenceNumber, _: proto.SequenceNumber, _: i32, _: bool, _: bool) void {}
@@ -305,6 +305,7 @@ const BuiltinSubscriberState = struct {
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
             std.mem.zeroes(Guid),
             participant.timer_clock,
+            .{},
         );
         n_ok = 1;
         readers[1] = try reader_mod.DataReaderImpl.init(
@@ -318,6 +319,7 @@ const BuiltinSubscriberState = struct {
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
             std.mem.zeroes(Guid),
             participant.timer_clock,
+            .{},
         );
         n_ok = 2;
         readers[2] = try reader_mod.DataReaderImpl.init(
@@ -331,6 +333,7 @@ const BuiltinSubscriberState = struct {
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
             std.mem.zeroes(Guid),
             participant.timer_clock,
+            .{},
         );
         n_ok = 3;
         readers[3] = try reader_mod.DataReaderImpl.init(
@@ -344,6 +347,7 @@ const BuiltinSubscriberState = struct {
             DomainParticipantImpl.nextHandle(@ptrCast(participant)),
             std.mem.zeroes(Guid),
             participant.timer_clock,
+            .{},
         );
         n_ok = 4;
 
@@ -1944,40 +1948,24 @@ pub const DomainParticipantImpl = struct {
     }
 
     fn decodeCoherentSetSn(iq: ?submsg_mod.InlineQos, little_endian: bool) ?history_mod.SequenceNumber {
-        if (iq) |q| {
-            if (q.get(.coherent_set)) |cs| {
-                if (cs.len >= 8) {
-                    const order: std.builtin.Endian = if (little_endian) .little else .big;
-                    const high = std.mem.readInt(i32, cs[0..4], order);
-                    const low = std.mem.readInt(u32, cs[4..8], order);
-                    const h: i64 = @as(i64, high) << 32;
-                    const l: i64 = @as(i64, low);
-                    const sn = h | l;
-                    // Valid RTPS SNs start at 1.  SEQUENCENUMBER_UNKNOWN ({high=-1,low=MAX})
-                    // and any other non-positive value are end-of-coherent-set signals
-                    // (RTPS §9.6.4.2 Table 9.22 Example 2) — treat as non-coherent DATA.
-                    if (sn < 1) return null;
-                    return sn;
-                }
-            }
-        }
-        return null;
+        const sn = (iq orelse return null).getSequenceNumber(.coherent_set, little_endian) orelse return null;
+        // Valid RTPS SNs start at 1.  SEQUENCENUMBER_UNKNOWN ({high=-1,low=MAX})
+        // and any other non-positive value are end-of-coherent-set signals
+        // (RTPS §9.6.4.2 Table 9.22 Example 2) — treat as non-coherent DATA.
+        if (sn < 1) return null;
+        return sn;
     }
 
     fn decodeGroupSeqNum(iq: ?submsg_mod.InlineQos, little_endian: bool) ?history_mod.SequenceNumber {
-        if (iq) |q| {
-            if (q.get(.group_seq_num)) |gs| {
-                if (gs.len >= 8) {
-                    const order: std.builtin.Endian = if (little_endian) .little else .big;
-                    const high = std.mem.readInt(i32, gs[0..4], order);
-                    const low = std.mem.readInt(u32, gs[4..8], order);
-                    const h: i64 = @as(i64, high) << 32;
-                    const l: i64 = @as(i64, low);
-                    return h | l;
-                }
-            }
-        }
-        return null;
+        return (iq orelse return null).getSequenceNumber(.group_seq_num, little_endian);
+    }
+
+    /// PID_GROUP_COHERENT_SET: the group sequence number of the first sample
+    /// in the group coherent set, which identifies the set (RTPS 2.5 §8.7.6).
+    fn decodeGroupCoherentSn(iq: ?submsg_mod.InlineQos, little_endian: bool) ?history_mod.SequenceNumber {
+        const sn = (iq orelse return null).getSequenceNumber(.group_coherent_set, little_endian) orelse return null;
+        if (sn < 1) return null;
+        return sn;
     }
 
     /// Decode this sample's PID_LIFESPAN inline QoS (RTPS §8.7.2 Table 8.85), if
@@ -2218,6 +2206,7 @@ pub const DomainParticipantImpl = struct {
         kind: history_mod.ChangeKind,
         coherent_set_sn: ?history_mod.SequenceNumber,
         group_seq_num: ?history_mod.SequenceNumber,
+        group_coherent_sn: ?history_mod.SequenceNumber,
         lifespan_ns: ?i64,
     ) void {
         if (dw_bytes.len < 4) return;
@@ -2231,12 +2220,13 @@ pub const DomainParticipantImpl = struct {
             kind: history_mod.ChangeKind,
             coherent_set_sn: ?history_mod.SequenceNumber,
             group_seq_num: ?history_mod.SequenceNumber,
+            group_coherent_sn: ?history_mod.SequenceNumber,
             lifespan_ns: ?i64,
             fn deliver(c: @This(), t: PinnedReader) void {
-                t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.lifespan_ns);
+                t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.group_coherent_sn, c.lifespan_ns);
             }
         };
-        const ctx = Deliver{ .writer_guid = writer_guid, .sn = sn, .ts = ts, .payload = payload, .kind = kind, .coherent_set_sn = coherent_set_sn, .group_seq_num = group_seq_num, .lifespan_ns = lifespan_ns };
+        const ctx = Deliver{ .writer_guid = writer_guid, .sn = sn, .ts = ts, .payload = payload, .kind = kind, .coherent_set_sn = coherent_set_sn, .group_seq_num = group_seq_num, .group_coherent_sn = group_coherent_sn, .lifespan_ns = lifespan_ns };
         // One reader per entry, so nothing to collect (or allocate).
         var i: u32 = 0;
         while (i < count) : (i += 1) {
@@ -2293,11 +2283,12 @@ pub const DomainParticipantImpl = struct {
                     const key_hash = decodeKeyHash(d.inline_qos);
                     const coherent_set_sn = decodeCoherentSetSn(d.inline_qos, d.isLittleEndian());
                     const group_seq_num = decodeGroupSeqNum(d.inline_qos, d.isLittleEndian());
+                    const group_coherent_sn = decodeGroupCoherentSn(d.inline_qos, d.isLittleEndian());
                     const lifespan_ns = decodeLifespan(d.inline_qos, d.isLittleEndian());
 
                     if (d.inline_qos) |iq| {
                         if (iq.get(.directed_write)) |dw_bytes| {
-                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind, coherent_set_sn, group_seq_num, lifespan_ns);
+                            dispatchDirectedWrite(self, dw_bytes, d.isLittleEndian(), writer_guid, d.writer_sn, current_ts, key_hash, d.serialized_payload, kind, coherent_set_sn, group_seq_num, group_coherent_sn, lifespan_ns);
                             continue;
                         }
                     }
@@ -2312,9 +2303,10 @@ pub const DomainParticipantImpl = struct {
                         kind: history_mod.ChangeKind,
                         coherent_set_sn: ?history_mod.SequenceNumber,
                         group_seq_num: ?history_mod.SequenceNumber,
+                        group_coherent_sn: ?history_mod.SequenceNumber,
                         lifespan_ns: ?i64,
                         fn deliver(c: @This(), t: PinnedReader) void {
-                            t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.lifespan_ns);
+                            t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.group_coherent_sn, c.lifespan_ns);
                         }
                     };
                     self.dispatchToReaders(d.reader_entity_id, .{ .key_hash = key_hash, .payload = d.serialized_payload, .kind = kind }, Deliver{
@@ -2325,6 +2317,7 @@ pub const DomainParticipantImpl = struct {
                         .kind = kind,
                         .coherent_set_sn = coherent_set_sn,
                         .group_seq_num = group_seq_num,
+                        .group_coherent_sn = group_coherent_sn,
                         .lifespan_ns = lifespan_ns,
                     });
                 },
@@ -2697,7 +2690,20 @@ pub const DomainParticipantImpl = struct {
             .liveliness_kind = if (qos.liveliness) |l| @intCast(l.kind) else 0,
             .lifespan_ns = lifespan_ns,
             .history_expected = qos.durabilityKind > 0 and reliable,
+            .group_coherent = if (qos.presentation) |pr| pr.coherent_access and pr.access_scope == 2 else false,
+            .publisher_guid = publisherGuid(guid, qos),
         };
+    }
+
+    /// See MatchedWriterInfo.publisher_guid.
+    fn publisherGuid(writer: Guid, qos: *const disc.DiscoveredWriterData) Guid {
+        if (qos.groupGuid) |gg| return .{
+            .prefix = .{ .bytes = gg[0..12].* },
+            .entity_id = .{ .entity_key = gg[12..15].*, .entity_kind = gg[15] },
+        };
+        var g = Guid{ .prefix = writer.prefix, .entity_id = std.mem.zeroes(guid_mod.EntityId) };
+        if (qos.groupEntityId) |ge| g.entity_id = .{ .entity_key = ge[0..3].*, .entity_kind = ge[3] };
+        return g;
     }
 
     const MatchedWriterJob = struct {
@@ -2950,10 +2956,8 @@ pub const DomainParticipantImpl = struct {
         unicast_locators: []const Locator,
         multicast_locators: []const Locator,
     ) proto.MatchedReaderInfo {
-        const needs_marker = if (self.vendorIdForPrefixLocked(guid.prefix)) |vid|
-            header_mod.needsPidCoherentSetMarker(vid)
-        else
-            false;
+        const vendor = self.vendorIdForPrefixLocked(guid.prefix);
+        const needs_marker = if (vendor) |vid| header_mod.needsPidCoherentSetMarker(vid) else false;
         return .{
             .guid = guid,
             .unicast_locators = unicast_locators,
@@ -2962,6 +2966,7 @@ pub const DomainParticipantImpl = struct {
             .reliability = if (qos.reliability.kind >= 2) .reliable else .best_effort,
             .durability_kind = @intCast(qos.durabilityKind),
             .needs_pid_coherent_set_marker = needs_marker,
+            .omits_group_coherent_set = if (vendor) |vid| header_mod.omitsGroupCoherentSet(vid) else false,
         };
     }
 

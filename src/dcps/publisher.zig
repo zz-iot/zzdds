@@ -723,7 +723,7 @@ pub const PublisherImpl = struct {
         // writes — don't flush them here; end_coherent_changes will do it correctly.
         // Only flush with .none when there is no open coherent window.
         if (self.coherent_depth == 0) {
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null, 0, false);
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(.none, false, null, null, false);
         }
         return DDS.RETCODE_OK;
     }
@@ -758,26 +758,33 @@ pub const PublisherImpl = struct {
                 if (self.qos.presentation.access_scope == .GROUP_PRESENTATION_QOS) .full else .coherent_only
             else
                 .group_seq_only;
-            // Pre-count total coherent-window samples across all writers to compute
-            // the group-wide last GSN for PID_GROUP_COHERENT_SET.  This lets the
-            // initial DATA send (and retransmits) carry the correct group end marker.
-            // The TOCTOU window between count and flush is negligible in practice:
+            // GROUP scope: the set spans every writer (RTPS 2.5 §8.7.6).  Its id is
+            // the group sequence number of its first sample; the End Coherent Set
+            // markers every writer sends take the one after its last.  The TOCTOU
+            // window between counting and flushing is negligible in practice:
             // concurrent writes during end_coherent_changes are application-level
             // misuse that the DDS spec does not require implementations to handle.
             var total_n: i64 = 0;
             for (self.writers.items) |w| total_n += @intCast(w.proto_writer.coherentWindowCount());
-            const global_last_gsn = self.group_seq_num_counter + total_n;
+            const group_set: ?proto.GroupCoherentSet = if (mode == .full and total_n > 0) .{
+                .first_gsn = self.group_seq_num_counter + 1,
+                .end_gsn = self.group_seq_num_counter + total_n + 1,
+                .writer_group_info = self.writerGroupInfo(),
+            } else null;
             // Pass suspend_active as `resuspend` so the flush and re-arm happen
             // atomically inside writer.mu — no window where coherent_active=false.
             // Pass &group_seq_num_counter so all writers share a monotone GSN space.
             //
             // Two-phase flush for any coherent-access mode (INSTANCE, TOPIC, GROUP):
-            // send DATA for all writers first (defer_eoc=true), then send EOC+HB for
-            // all writers together.  This keeps per-writer EOC packets close together
-            // on the wire so Connext completes all per-reader coherent sets at the same
-            // time, preventing a subscriber poll from splitting a multi-topic set.
+            // send DATA for all writers first (defer_eoc=true), then send every
+            // writer's end marker and HB together.  This keeps the markers close
+            // together on the wire so a subscriber completes all its per-reader
+            // coherent sets at the same time, preventing a subscriber poll from
+            // splitting a multi-topic set.
             const defer_eoc = mode == .full or mode == .coherent_only;
-            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, global_last_gsn, defer_eoc);
+            for (self.writers.items) |w| w.proto_writer.endCoherentSet(mode, self.suspend_active, &self.group_seq_num_counter, group_set, defer_eoc);
+            // The End Coherent Set markers took group sequence number end_gsn.
+            if (group_set != null) self.group_seq_num_counter += 1;
             if (defer_eoc) {
                 // Send all writers' EOC DATAs in a single UDP datagram per destination
                 // so Connext's subscriber poll cannot split a multi-topic coherent window
@@ -795,6 +802,15 @@ pub const PublisherImpl = struct {
             }
         }
         return DDS.RETCODE_OK;
+    }
+
+    /// PID_WRITER_GROUP_INFO: digest of this publisher's writers (RTPS 2.5
+    /// §9.3.2.5).  Caller holds `mu`.
+    fn writerGroupInfo(self: *Self) [4]u8 {
+        var ids = self.alloc.alloc(proto.EntityId, self.writers.items.len) catch return .{ 0, 0, 0, 0 };
+        defer self.alloc.free(ids);
+        for (self.writers.items, 0..) |w, i| ids[i] = w.guid.entity_id;
+        return proto.groupDigest(ids);
     }
 
     fn vtWaitForAck(ctx: *anyopaque, timeout: *const DDS.Duration_t) DDS.ReturnCode_t {

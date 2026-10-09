@@ -49,14 +49,18 @@ pub const CacheChange = struct {
     /// Serialized payload (encap header + CDR). Empty for NOT_ALIVE_* changes.
     data: []const u8,
     /// When non-null, this change is part of a coherent set.
-    /// Value = last writer SN in the coherent set; emitted as PID_COHERENT_SET.
+    /// Value = the writer SN of the set's first sample; emitted as PID_COHERENT_SET.
     coherent_set_sn: ?SequenceNumber = null,
     /// Per-publisher monotonically-increasing group sequence number for this
     /// sample; emitted as PID_GROUP_SEQ_NUM.  null = not part of a group coherent set.
     group_seq_num: ?SequenceNumber = null,
-    /// Last group sequence number in this group coherent set; emitted as
-    /// PID_GROUP_COHERENT_SET.  Equals group_seq_num for the last sample in the set.
+    /// The group sequence number of the first sample in this group coherent
+    /// set, which identifies the set (RTPS 2.5 §8.7.6); emitted as
+    /// PID_GROUP_COHERENT_SET on every sample of the set.
     group_coherent_sn: ?SequenceNumber = null,
+    /// Writer side only: digest of the publisher's writers when the set was
+    /// written (RTPS 2.5 §9.3.2.5); emitted as PID_WRITER_GROUP_INFO.
+    writer_group_info: ?[4]u8 = null,
     /// Reader side only: this sample's PID_LIFESPAN inline QoS, if the writer sent
     /// one (RTPS §8.7.2 Table 8.85 lists LIFESPAN as eligible for in-line QoS).
     /// null = not present on this sample; the reader falls back to whatever
@@ -79,6 +83,19 @@ pub const CoherentFlushMode = enum(u2) {
     coherent_only,
     /// coherent_access with GROUP scope: emit PID_COHERENT_SET + PID_GROUP_SEQ_NUM + PID_GROUP_COHERENT_SET.
     full,
+};
+
+/// One GROUP coherent set across the writers of a publisher (RTPS 2.5 §8.7.6),
+/// computed by the publisher before it flushes any of its writers.
+pub const GroupCoherentSet = struct {
+    /// Group sequence number of the set's first sample, which identifies the
+    /// set: every sample's and End Coherent Set marker's PID_GROUP_COHERENT_SET.
+    first_gsn: SequenceNumber,
+    /// Group sequence number of the End Coherent Set markers: one past the
+    /// set's last sample.
+    end_gsn: SequenceNumber,
+    /// Digest of the publisher's writers (PID_WRITER_GROUP_INFO).
+    writer_group_info: [4]u8,
 };
 
 pub const HistoryCache = struct {
@@ -238,6 +255,22 @@ pub const HistoryCache = struct {
             if (ch.sequence_number > max) max = ch.sequence_number;
         }
         return max;
+    }
+
+    /// Whether the cache holds a change with an SN in [first, last].  For a
+    /// writer's cache only: addWriterChange appends in SN order and removals
+    /// keep it, so the changes are sorted by SN.
+    pub fn hasWriterChangeIn(self: *const Self, first: SequenceNumber, last: SequenceNumber) bool {
+        if (first > last) return false;
+        const items = self.changes.items;
+        // The first change with SN >= first.
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].sequence_number < first) lo = mid + 1 else hi = mid;
+        }
+        return lo < items.len and items[lo].sequence_number <= last;
     }
 
     /// Number of changes currently in the cache.
