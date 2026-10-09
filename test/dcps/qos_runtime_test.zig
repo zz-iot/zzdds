@@ -550,6 +550,41 @@ test "ownership: EXCLUSIVE — an owner that claimed before its strength was kno
     for (samples) |sample| try testing.expectEqualSlices(u8, &PAYLOAD_A, sample);
 }
 
+test "ownership: a writer lost while it is being matched keeps its strength once matched" {
+    // Discovery records the writer's strength and lifespan (on_writer_matching)
+    // before adding its proxy, outside participant.mu. The writer's loss
+    // reported in between removes them (on_writer_unmatched), though the add
+    // still goes ahead; on_writer_matched must record them again.
+    const alloc = testing.allocator;
+    var fx = try OwnershipFixture.init(alloc);
+    defer fx.deinit();
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.ownership.kind = .EXCLUSIVE_OWNERSHIP_QOS;
+    const dr = fx.makeReader(dr_qos);
+
+    const info = zzdds.protocol.MatchedWriterInfo{
+        .guid = .{
+            .prefix = .{ .bytes = [_]u8{0x5A} ** 12 },
+            .entity_id = .{ .entity_key = .{ 0, 0, 9 }, .entity_kind = 0x02 },
+        },
+        .unicast_locators = &.{},
+        .multicast_locators = &.{},
+        .reliability = .reliable,
+        .ownership_strength = 7,
+        .lifespan_ns = 5 * std.time.ns_per_s,
+    };
+    const cb = dr.writerMatchCallback();
+    cb.on_writer_matching.?(cb.ctx, &info);
+    cb.on_writer_unmatched(cb.ctx, info.guid);
+    cb.on_writer_matched(cb.ctx, &info);
+
+    dr.mu.lock();
+    defer dr.mu.unlock();
+    try testing.expectEqual(@as(?i32, 7), dr.writer_strengths.get(info.guid));
+    try testing.expectEqual(@as(?i64, 5 * std.time.ns_per_s), dr.writer_lifespans.get(info.guid));
+}
+
 test "ownership: EXCLUSIVE — sole writer becomes owner by default" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

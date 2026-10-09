@@ -1381,6 +1381,10 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
+        self.recordWriterQosLocked(info);
+    }
+
+    fn recordWriterQosLocked(self: *Self, info: *const proto.MatchedWriterInfo) void {
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch {};
         if (info.lifespan_ns > 0)
             self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
@@ -1410,6 +1414,10 @@ pub const DataReaderImpl = struct {
             self.mu.lock();
             defer self.mu.unlock();
             self.rememberPublicationGuidLocked(info.guid);
+            // Again, after the proxy is added: the writer's loss reported
+            // between onWriterMatchingCb and the add removes them
+            // (onWriterUnmatchedCb), though the add then goes ahead.
+            self.recordWriterQosLocked(info);
             // Track the writer's coherent sets from now on: in GROUP scope the
             // subscriber's group sets wait on it even before it sends
             // anything, so a part of a group set still on its way is not

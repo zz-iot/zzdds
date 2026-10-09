@@ -128,6 +128,18 @@ Forward-looking only: known gaps, planned features, and open design questions.
   implementation would pre-allocate the instance's history-cache entry, pre-warm SEDP
   discovery state, and add a `zzdds_write_raw_kind_w_handle` variant that takes a
   pre-registered handle to skip the MD5 key-hash recompute on the write hot path.
+- **A remote writer's match and loss are not ordered.** `onWriterDiscovered` adds the
+  writer's proxy after releasing `participant.mu`, so the same writer's loss
+  (`onWriterLost`) can run first: the add then restores a proxy for a writer already gone.
+  The reader records the writer's strength and lifespan both before the add and after it,
+  so a loss in between can't leave the proxy without them; the stale proxy itself remains.
+  Fix with the concurrency contract's
+  [coordination rules](design/concurrency/architecture.md#coordination-rules) 1 and 4:
+  install a match (the proxy and the reader's per-writer state) as one update tagged with
+  the remote writer's discovery generation, and make a removal or refresh from an older
+  generation a no-op. The same applies to remote readers on the writer side. Tracked as
+  the "Remote endpoint match versus loss"
+  [open design item](design/concurrency-broker-status.md#open-design-items).
 - **`PID_GROUP_DATA` (0x002D)** is defined but not serialized in SEDP announcements.
 - **SPDP liveness probe has no retry** — a participant that goes silent while a probe is in
   flight is evicted on the first probe deadline.
