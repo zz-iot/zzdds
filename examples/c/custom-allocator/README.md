@@ -56,12 +56,14 @@ sample leaks from the pool.
 `LD_PRELOAD` shim that interposes `malloc`/`calloc`/`realloc`/`free`
 process-wide (including calls from inside `libzzdds.so` itself) and aborts
 with a backtrace the moment any of them fire while armed. Both programs call
-`noalloc_guard_try_arm()` after setup and a short discovery-settling delay —
+`noalloc_guard_try_arm()` after setup, once discovery has matched their endpoints —
 DDS participant discovery spawns some background threads and does a
 one-time network-interface enumeration that aren't yet routed through the
 custom allocator, so arming immediately at process start would report a
-false failure. Without `LD_PRELOAD` set, the arm/disarm calls are no-ops and
-the binaries run exactly as above.
+false failure. If nothing matches within 10 s, they leave the guard unarmed
+(a later match would trip it) and say so. Without `LD_PRELOAD` set, the arm/disarm calls are no-ops and
+the binaries run exactly as above. On Linux, `examples/interop/cross_binding_smoke_test.py`
+runs both programs with the shim preloaded and fails if it never arms.
 
 ```sh
 LD_LIBRARY_PATH=/path/to/zzdds/zig-out/lib \

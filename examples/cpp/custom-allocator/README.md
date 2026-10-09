@@ -77,11 +77,12 @@ overriding `operator new`/`delete` directly is what makes this a real test
 of "no C++ allocation at all," not just "no libc allocation that C++
 happens to route through."
 
-Both programs arm the guard after setup and a short discovery-settling
-delay — per-matched-peer heartbeat threads still allocate via
+Both programs arm the guard after setup, once discovery has matched their
+endpoints — per-matched-peer heartbeat threads still allocate via
 `std.heap.c_allocator`, a Zig stdlib limitation not routable through the
 injected allocator, so arming immediately at startup would be a false
-failure, not a real one.
+failure, not a real one. If nothing matches within 10 s, they leave the
+guard unarmed (a later match would trip it) and say so.
 
 ```sh
 LD_LIBRARY_PATH=/path/to/zzdds/zig-out/lib \

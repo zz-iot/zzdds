@@ -225,19 +225,6 @@ Forward-looking only: known gaps, planned features, and open design questions.
      or further investigation) become their own roadmap items, migrated when that code
      is next worked on rather than in one sweep.
 
-- **rmw_zzdds: change content filters in place.** zzdds now offers
-  `zzdds::ContentFilteredTopic::set_filter_expression(expression, parameters)` (DDS only
-  allows changing a CFT's parameters); see `decisions.md`. rmw_zzdds's
-  `rmw_subscription_set_content_filter` still replaces the subscription's DataReader when
-  the expression changes, so the new reader re-matches every publisher (rmw_zzdds offsets
-  its matched status to keep the subscription's continuous), loses samples not yet taken
-  from the old reader, and re-runs the reliable-readiness handshake. Switch it to
-  `set_filter_expression`. To avoid the swap for the first filter and for clearing one too,
-  create every subscription's reader on a CFT from the start, with an empty expression
-  (zzdds treats it as "no filtering"). Then drop the reader replacement and the
-  matched-status continuity code. Other implementations offer the same operation
-  (`set_expression` since one implementation's 5.1.0, `set_filter_expression` in another),
-  and the other ROS 2 RMWs built on them change expressions in place.
 - **Listener release hooks can run under a parent's lock during teardown.**
   `Subscriber::delete_contained_entities` and `Publisher::delete_contained_entities`
   deinit their readers/writers while holding their own lock, and dropping a reader's or
@@ -438,16 +425,13 @@ or an optimisation on an already-improved path):
      `ActiveWriter`/`ActiveReader` maps' first allocation to fit 4096 bytes. It exists only
      to keep these examples passing in CI until then (added for PR #99, when a ~100-byte
      growth of those records failed them).
-  3. Run both examples under `libnoalloc_guard.so` in CI (Linux; `LD_PRELOAD` has no
-     Windows equivalent). The examples call `noalloc_guard_try_arm()`, but CI never
-     preloads the shim, so today they run unguarded ("noalloc_guard: not preloaded" in the
-     logs) and the zero-allocation property is not enforced anywhere; nothing in this
-     repo's history ever preloaded it. Both pass with it preloaded (checked by hand
-     2026-10-06), so turning it on with today's arming should be straightforward; the
-     larger part is the arming itself. The programs arm only after setup plus a
-     discovery-settling delay, because some allocations happen outside the custom
-     allocator: libc work behind discovery's background threads and the one-time network
-     interface enumeration (`getifaddrs`). That allows any allocation during the delay.
+  3. Arm the `noalloc_guard` shim earlier. CI now runs both examples with it preloaded
+     (Linux; `LD_PRELOAD` has no Windows equivalent) through
+     `examples/interop/cross_binding_smoke_test.py`, which fails if a program never
+     arms. The programs arm only after setup and after discovery has matched their
+     endpoints, because some allocations happen outside the custom allocator: libc work
+     behind discovery's background threads and the one-time network interface
+     enumeration (`getifaddrs`). That allows any allocation until then.
      Prefer naming the known exceptions instead: first run the shim in a log-only mode
      (record every allocation with a backtrace, don't abort) to get the inventory, then
      have zzdds mark each known libc call that allocates with a scope the shim honours
@@ -471,8 +455,8 @@ or an optimisation on an already-improved path):
      `SensorLog`) and the shim. Its "Definition of 'zero malloc'" section still asks for a
      decision; record the one made: no allocation after setup, with known libc allocations
      at startup and in background threads allowed. And its claim that the C++ example can
-     arm the guard from process start contradicts the examples, which arm after a delay
-     (step 3).
+     arm the guard from process start contradicts the examples, which arm once discovery
+     has matched (step 3).
 
 ### Testing
 
@@ -1146,10 +1130,10 @@ release notes).
 ### Landed
 
 - **DebugAllocator lane on `test-other`** (PR #65) — `zig build test -Ddebug-allocator=true`
-  now runs on Linux ARM64, macOS ARM64, and Windows x86_64, additive to `test-linux`'s
+  now runs on Linux ARM64, macOS ARM64, and Windows x86_64, additive to `test-linux-matrix`'s
   existing step.
 - **`ReleaseFast` built and tested** (PR #65) — `run_deterministic_matrix.py` gained a
-  `release-fast` step (so `test-linux` covers it on Linux x86_64) and `release.yml`'s `test`
+  `release-fast` step (so `test-linux-matrix` covers it on Linux x86_64) and `release.yml`'s `test`
   job runs `zig build test -Doptimize=ReleaseFast` on all four platforms.
 - **C/C++ binding smoke tests everywhere** (PR #65 for `ci.yml`; 2026-08-28 for `release.yml`)
   — `zig build test-bindings -Dc-binding -Dcpp-binding` runs on all `test-other` /
@@ -1172,7 +1156,7 @@ release notes).
   `zzdds-config.cmake` / `zzdds.pc` are POSIX-shaped, so `find_package(ZZDDS)` can't
   configure there yet (see "Still open" below).
 - **musl / static Linux target lane** (2026-09-02) — `zig build test -Dtarget=x86_64-linux-musl`
-  now runs in `run_deterministic_matrix.py` (so `ci.yml`'s `test-linux` covers it) and
+  now runs in `run_deterministic_matrix.py` (so `ci.yml`'s `test-linux-matrix` covers it) and
   `release.yml`'s `test` job (Linux x86_64 only). A `-linux-musl` binary is statically linked
   and runs natively on the glibc runner, so this is full-suite execution coverage
   (1076/1076), not just a build check — closes "`-Dtarget` is never actually cross-compiled".
@@ -1191,7 +1175,7 @@ release notes).
   upstream Zig bugs — revisit deleting them at a Zig bump.**
 - **`ReleaseSmall` lane** (2026-08-29) — new `zig build test-release-small` step runs the
   whole unit suite at `-OReleaseSmall`, wired into `run_deterministic_matrix.py` (so
-  `ci.yml`'s `test-linux` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
+  `ci.yml`'s `test-linux-matrix` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
   The step **forces the LLVM backend** to sidestep a Zig 0.16 self-hosted-x86_64 codegen bug
   (misaligned read-only globals at `-OReleaseSmall` — see the Deferred note below and the
   step's `build.zig` comment). **At the Zig 0.17 bump: delete `test-release-small` and

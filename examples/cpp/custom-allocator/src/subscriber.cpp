@@ -41,6 +41,18 @@ char g_stdout_buf[8192];
 
 } // namespace
 
+// Polls `matched` for up to MATCH_TIMEOUT_MS; see the comment before
+// arming the guard in main().
+constexpr int MATCH_TIMEOUT_MS = 10000;
+template <typename Matched>
+static bool wait_matched(Matched matched) {
+    for (int waited = 0; waited < MATCH_TIMEOUT_MS; waited += 50) {
+        if (matched()) return true;
+        sleep_ms(50);
+    }
+    return false;
+}
+
 int main() {
     std::setvbuf(stdout, g_stdout_buf, _IOFBF, sizeof(g_stdout_buf));
     static_pool_allocator_reset();
@@ -113,7 +125,7 @@ int main() {
 
     SensorLogDataReader log_reader(log_dr_handle);
 
-    // Give discovery/matching a moment to settle before arming the guard:
+    // Wait for discovery to match both readers before arming the guard:
     // SPDP/SEDP built-in discovery endpoints spawn a heartbeat thread per
     // newly matched remote participant (via std.Thread.spawn), and Zig's own
     // stdlib hardcodes std.heap.c_allocator for that spawn's bookkeeping on
@@ -121,8 +133,17 @@ int main() {
     // there, so this allocation isn't something zzdds can route through the
     // injected allocator. It's a one-time, bounded, per-newly-matched-peer
     // cost though, not a per-sample hot-path one, so it belongs before
-    // arming, same as factory/entity bootstrap.
-    sleep_ms(2000);
+    // arming, same as factory/entity bootstrap. A fixed delay could arm
+    // before a slow discovery finished.
+    const bool matched = wait_matched([&] {
+        ::DDS::SubscriptionMatchedStatus a{}, b{};
+        return dr->get_subscription_matched_status(a) == ::DDS::RETCODE_OK &&
+               log_dr->get_subscription_matched_status(b) == ::DDS::RETCODE_OK &&
+               a.current_count > 0 && b.current_count > 0;
+    });
+    // A match arriving later would trip an armed guard, so leave it off then.
+    if (!matched)
+        std::fprintf(stderr, "subscriber: no writer matched within %d ms -- guard not armed\n", MATCH_TIMEOUT_MS);
 
     // WaitSet and GuardCondition are the two condition-family types with no
     // factory operation -- the app constructs them directly. Creating them
@@ -135,7 +156,7 @@ int main() {
     // internal C++ wrapper bookkeeping ever falls back to global
     // operator new instead of the pmr allocator zidl::setCppAllocator
     // installed above.
-    noalloc_guard_try_arm();
+    if (matched) noalloc_guard_try_arm();
 
     auto ws = zzdds::create_waitset(&static_pool_allocator);
     if (!ws) {
@@ -168,7 +189,7 @@ int main() {
     noalloc_guard_try_disarm();
     ::DDS::ConditionSeq active;
     auto wait_rc = ws->wait(active, ::DDS::Duration_t{1, 0});
-    noalloc_guard_try_arm();
+    if (matched) noalloc_guard_try_arm();
 
     std::shared_ptr<::DDS::Condition> gc_cond = gc;
     bool gc_active = false;
