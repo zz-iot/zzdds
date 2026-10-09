@@ -255,8 +255,9 @@ pub const ReaderProxy = struct {
     /// Highest SN the reader has cumulatively acknowledged.
     highest_acked_sn: SequenceNumber,
     /// First SN this reader is eligible to receive. Set to 1 for
-    /// TRANSIENT_LOCAL+ (gets full history). Set to cache.next_sn at match
-    /// time for VOLATILE writers (late joiners skip historical data).
+    /// TRANSIENT_LOCAL+ (gets full history). For VOLATILE, the first SN not
+    /// yet sent at match time (firstUnsentSnLocked): late joiners skip
+    /// historical data, but get a coherent set still open whole.
     start_sn: SequenceNumber,
     /// Last accepted ACKNACK count for stale-submessage suppression (§8.3.7.1).
     /// Null until the first ACKNACK that causes a retransmit is accepted.
@@ -274,9 +275,11 @@ pub const ReaderProxy = struct {
     /// A final NACK means "I'm satisfied" — not "send me live data" — so it
     /// must not clear this flag.
     suppress_live_data: bool,
-    /// cache.maxSn() at the time this proxy was created with suppress_live_data.
-    /// Threshold for clearing suppress_live_data: the reader's cumulative ack
-    /// must reach this SN on a non-final NACK before live data is unblocked.
+    /// Last SN of the history this proxy was matched with (lastSentSnLocked at
+    /// match time), when created with suppress_live_data.  Threshold for
+    /// clearing suppress_live_data: the reader's cumulative ack must reach this
+    /// SN on a non-final NACK before live data is unblocked.  A coherent set
+    /// still open at match time is not history: it lies above this floor.
     history_floor_sn: SequenceNumber,
     /// Non-zero while a liveness probe is active for this reader proxy.
     /// Monotonic deadline (ns): if no ACKNACK arrives before this time, the
@@ -743,8 +746,8 @@ pub const StatefulWriter = struct {
     ///
     /// For new readers: when `replay_on_match` is true (TRANSIENT_LOCAL+), the
     /// full history cache is replayed.  For VOLATILE writers `start_sn` is set to
-    /// the writer's next SN so the reader only sees future data, and a Heartbeat
-    /// is sent to communicate this range.
+    /// the first SN not yet sent so the reader only sees future data, and a
+    /// Heartbeat is sent to communicate this range.
     ///
     /// Returns true when the reader is newly matched, false for a lease refresh
     /// of an existing match.
@@ -797,13 +800,13 @@ pub const StatefulWriter = struct {
         // no use for history and must not be held back waiting for an ACKNACK
         // it has no spec-driven reason to send.
         const should_replay = self.replay_on_match and new_rp.wants_replay;
-        if (!should_replay) new_rp.start_sn = self.cache.next_sn;
+        if (!should_replay) new_rp.start_sn = self.firstUnsentSnLocked();
         // Record the correlating floor for the RELIABLE readiness handshake,
         // matching whatever firstSN the HB sent below will actually carry (see
         // hbFirstSn). BEST_EFFORT proxies never ACKNACK, so there is no
         // handshake to wait for — they become ready immediately instead,
         // fired after mu is released below (never while holding it).
-        new_rp.first_sent_hb_first_sn = hbFirstSn(self.firstAvailableSnLocked(), self.lastAvailableSnLocked(), new_rp.start_sn, null);
+        new_rp.first_sent_hb_first_sn = hbFirstSn(self.firstAvailableSnLocked(), self.lastSentSnLocked(), new_rp.start_sn, null);
         const newly_ready_guid: ?Guid = blk: {
             if (!new_rp.reliable) {
                 new_rp.protocol_ready = true;
@@ -821,9 +824,19 @@ pub const StatefulWriter = struct {
         // the reader caught up, but BEST_EFFORT readers never ACKNACK, so a replayed
         // history can race with concurrent live writes for them. That's acceptable —
         // BEST_EFFORT already permits gaps and reordering — not a bug to fix here.
-        if (new_rp.reliable and should_replay and self.cache.changes.items.len > 0) {
+        //
+        // History is what readers have already been sent.  A coherent set still
+        // open now is not history: it reaches this reader at set end like any
+        // live data (samples, end marker, HEARTBEAT), so the floor stops below
+        // it, and with no committed sample below it there's nothing to protect.
+        // Suppressing on it instead left this reader out of the set-end sends
+        // and refused its NACKs (isCoherentPendingSn), so the set reached it
+        // only through the periodic HEARTBEAT, a set late.
+        const history_last = self.lastSentSnLocked();
+        const cache_first = self.cache.minSn();
+        if (new_rp.reliable and should_replay and cache_first > 0 and cache_first <= history_last) {
             new_rp.suppress_live_data = true;
-            new_rp.history_floor_sn = self.cache.maxSn();
+            new_rp.history_floor_sn = history_last;
         }
         if (should_replay) self.replayHistoryToProxyUnlocked(new_rp) else if (new_rp.reliable) self.sendInitialHeartbeatUnlocked(new_rp);
         // Start the periodic heartbeat thread on the first matched reader so
@@ -1062,7 +1075,7 @@ pub const StatefulWriter = struct {
         if (locs.len == 0) return;
 
         if (rp.reliable) {
-            self.sendHeartbeatToProxyLocked(rp, false);
+            self.sendHeartbeatToProxyLockedWithLastSn(rp, false, self.lastSentSnLocked());
             var scratch: [SCRATCH_SIZE]u8 = undefined;
             for (self.cache.changes.items) |*ch| {
                 if (ch.data.len <= self.frag_size) continue;
@@ -1226,7 +1239,7 @@ pub const StatefulWriter = struct {
         @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
         const rp_guid = rp.guid;
         const rp_start_sn = rp.start_sn;
-        const cache_last = self.lastAvailableSnLocked();
+        const cache_last = self.lastSentSnLocked();
         const cache_first = self.firstAvailableSnLocked();
         self.hb_count += 1;
         const count = self.hb_count;
@@ -1427,10 +1440,7 @@ pub const StatefulWriter = struct {
         // readers so far, so the background HB only describes data readers can
         // receive.  Otherwise advertise every SN this writer can still send,
         // retained end markers included, so a reader that missed one NACKs it.
-        const adj_last: SequenceNumber = if (self.coherent_active)
-            self.last_flushed_sn
-        else
-            self.lastAvailableSnLocked();
+        const adj_last = self.lastSentSnLocked();
 
         for (self.reader_proxies.items) |*rp| {
             // BEST_EFFORT readers don't participate in the reliable
@@ -2295,6 +2305,27 @@ pub const StatefulWriter = struct {
         return @max(cache_last, self.end_markers.items[self.end_markers.items.len - 1].sn);
     }
 
+    /// First SN readers have not been sent: the start of a coherent set still
+    /// open (its SNs, and any written while publications were suspended, go
+    /// out when it ends), else the next SN to be written.  A VOLATILE reader
+    /// matching now starts here, so it gets an open set whole: the set is
+    /// published when it ends, after the match.  Starting it at the next SN
+    /// instead put its floor inside the set, whose samples it then received
+    /// below that floor.
+    fn firstUnsentSnLocked(self: *const Self) SequenceNumber {
+        if (self.coherent_active and self.coherent_pending_sns.items.len > 0)
+            return self.coherent_pending_sns.items[0];
+        return self.cache.next_sn;
+    }
+
+    /// Highest SN readers have been sent: lastAvailableSnLocked, short of a
+    /// coherent set still open, whose SNs go out only when it ends.  What a
+    /// HEARTBEAT may announce without drawing NACKs the writer must refuse.
+    fn lastSentSnLocked(self: *const Self) SequenceNumber {
+        const last = self.lastAvailableSnLocked();
+        return if (self.coherent_active) @min(last, self.last_flushed_sn) else last;
+    }
+
     fn sendEndMarkerToProxyLocked(self: *Self, rp: *const ReaderProxy, m: EndMarker, scratch: *[SCRATCH_SIZE]u8) void {
         var b = MessageBuilder.init(scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
@@ -2511,10 +2542,12 @@ pub const StatefulWriter = struct {
         const first_sn_override: ?SequenceNumber = if (first_available > 0) first_available else 1;
         for (self.reader_proxies.items) |*rp| {
             if (!rp.reliable) continue;
-            // Skip history-replaying proxies: they never received the coherent DATA or
-            // marker (sendChangeToAllLocked and takeEOCProxyInfos both skip
-            // suppress_live_data).  The background HB handles their history range.
-            if (rp.suppress_live_data) continue;
+            // History-replaying proxies (suppress_live_data) were sent neither the
+            // set nor its marker, but get this HEARTBEAT too, as they do from a
+            // non-deferred endCoherentSet: it announces the set, and the NACK it
+            // draws is non-final, so it clears the suppression once the reader
+            // holds its history and repairs the set now, not at the next
+            // periodic HEARTBEAT.
             self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, false, last_sn, first_sn_override);
         }
     }
