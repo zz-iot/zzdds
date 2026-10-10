@@ -8,6 +8,24 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-09
+
+- **A DataReader that matches while a coherent set is being written gets that set
+  whole.** The set isn't published until `end_coherent_changes`, after the match, but a
+  zzdds writer treated it as already written:
+  - A `TRANSIENT_LOCAL` reader was held back as though the set were history, so the
+    set's samples, end marker and HEARTBEAT skipped it, and its NACKs for the set were
+    refused. The set reached it only through the periodic HEARTBEAT, two sets per burst:
+    the late topic ran a set behind (the intermittent dds-rtps `Test_CoherentSets_21`
+    failure with zzdds publishing). A reader is now held back only for samples already
+    sent, and is sent the set-end HEARTBEAT even while held back.
+  - A `VOLATILE` reader started at the writer's next sequence number, inside the set,
+    and then received the set's samples below that start. It now starts at the set's
+    first sample.
+  - HEARTBEATs answering an ACKNACK no longer announce an open set's samples. A reader
+    NACKed them, the writer refused, and each NACK drew the same HEARTBEAT until the set
+    ended.
+
 ## 2026-10-07
 
 - **Exclusive ownership no longer switches to a weaker writer right after matching.** A

@@ -1392,6 +1392,168 @@ test "replay: a best-effort late joiner gets coherent sets with their inline QoS
     try testing.expect(!findSentData(&rec, 5).?.has_payload);
 }
 
+// ── A reader matching while a coherent set is open ────────────────────────────
+
+const LATE_READER_GUID = makeGuid(0x53, READER_EID);
+
+/// A KEEP_ALL writer, TRANSIENT_LOCAL (`replay_on_match`) or VOLATILE, with no
+/// reader yet.
+fn makeLateMatchWriter(rec: *Recording, replay_on_match: bool) !*StatefulWriter {
+    return StatefulWriter.init(
+        testing.allocator,
+        makeGuid(0x52, WRITER_EID),
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        replay_on_match,
+    );
+}
+
+/// Match a reliable reader at 127.0.0.1:7100, then stop the periodic
+/// HEARTBEAT thread, which would otherwise send into `rec` as the test does.
+fn matchLateReader(w: *StatefulWriter) !void {
+    const rp = try ReaderProxy.init(testing.allocator, LATE_READER_GUID, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+    w.stopHeartbeat();
+}
+
+/// The last HEARTBEAT in captures.
+fn findLastHeartbeat(rec: *const Recording) ?msg.submessage.HeartbeatSubmessage {
+    var last: ?msg.submessage.HeartbeatSubmessage = null;
+    for (rec.caps[0..rec.n]) |*cap| {
+        var it = MessageIterator.init(cap.buf[0..cap.len]) catch continue;
+        var params: [32]InlineQosParam = undefined;
+        while (it.next(&params) catch null) |sm| {
+            if (sm == .heartbeat) last = sm.heartbeat;
+        }
+    }
+    return last;
+}
+
+test "late match: a TRANSIENT_LOCAL reader matching mid-set gets the set live" {
+    // An open coherent set is not history: the reader isn't held back for it,
+    // and gets its samples, end marker and HEARTBEAT when it ends, with no
+    // ACKNACK round-trip.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, true);
+    defer w.deinit();
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    try matchLateReader(w);
+    try testing.expect(!w.reader_proxies.items[0].suppress_live_data);
+    // The match HEARTBEAT doesn't announce the open set: the writer would
+    // refuse the NACK it drew.
+    try testing.expectEqual(@as(SequenceNumber, 0), (findHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+
+    rec.reset();
+    w.endCoherentSet(.full, false, null, null, false);
+    var sns_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3 }, collectDataSNsSorted(&rec, &sns_buf));
+    try testing.expectEqual(@as(SequenceNumber, 3), (findLastHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+}
+
+test "late match: ACKNACKs while the set is open draw no HEARTBEAT announcing it" {
+    // A HEARTBEAT offering the open set's SNs draws NACKs the writer refuses
+    // while the set is open, each answered by the same HEARTBEAT: a
+    // HEARTBEAT/NACK loop until the set ends.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, true);
+    defer w.deinit();
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    try matchLateReader(w);
+
+    // The reader's initial ACKNACK: nothing received, next expected SN 1.
+    rec.reset();
+    const empty = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(LATE_READER_GUID, 0, empty, 1, false);
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    try testing.expect(findHeartbeat(&rec) == null);
+
+    // A NACK naming the set's SNs.
+    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(1);
+    nack_set.set(2);
+    w.handleAckNack(LATE_READER_GUID, 0, nack_set, 2, false);
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    try testing.expect(findHeartbeat(&rec) == null);
+}
+
+test "late match: a TRANSIENT_LOCAL reader with history before the open set is re-prompted at set end" {
+    // Committed history (SN 1) is protected as before: the reader is held back
+    // until it has it.  The set-end HEARTBEAT reaches it too, so its NACK
+    // releases it and repairs the set without waiting for the periodic one.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, true);
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "h");
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    try matchLateReader(w);
+    try testing.expect(w.reader_proxies.items[0].suppress_live_data);
+    try testing.expectEqual(@as(SequenceNumber, 1), w.reader_proxies.items[0].history_floor_sn);
+    try testing.expectEqual(@as(SequenceNumber, 1), (findHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+
+    // The GROUP flush: marker deferred to the publisher's combined send.
+    rec.reset();
+    w.endCoherentSet(.full, false, null, null, true);
+    w.flushGroupEOCHBOnly();
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    try testing.expectEqual(@as(SequenceNumber, 3), (findHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+
+    // The reader holds SN 1 and NACKs the set.
+    rec.reset();
+    var nack_set = SequenceNumberSet{ .base = 2, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(2);
+    nack_set.set(3);
+    w.handleAckNack(LATE_READER_GUID, 1, nack_set, 1, false);
+    try testing.expect(!w.reader_proxies.items[0].suppress_live_data);
+    var sns_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 2, 3 }, collectDataSNsSorted(&rec, &sns_buf));
+}
+
+test "late match: a VOLATILE reader matching mid-set gets the set whole" {
+    // SN 1 was sent before the match: not for this reader.  The open set {2, 3}
+    // is published when it ends, after the match, so the reader starts at 2 and
+    // gets it whole: samples, end marker, and a HEARTBEAT whose firstSN is the
+    // set's first SN, not one inside it.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, false);
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "h");
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    try matchLateReader(w);
+    try testing.expectEqual(@as(SequenceNumber, 2), w.reader_proxies.items[0].start_sn);
+    // The match HEARTBEAT offers nothing yet: [2, 1].
+    const match_hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 2), match_hb.first_sn);
+    try testing.expectEqual(@as(SequenceNumber, 1), match_hb.last_sn);
+
+    rec.reset();
+    w.endCoherentSet(.full, false, null, null, false);
+    var sns_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 2, 3, 4 }, collectDataSNsSorted(&rec, &sns_buf));
+    const set_hb = findLastHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 2), set_hb.first_sn);
+    try testing.expectEqual(@as(SequenceNumber, 4), set_hb.last_sn);
+
+    // A reader that missed the set NACKs it and gets it again; SN 1 never.
+    rec.reset();
+    const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(LATE_READER_GUID, 0, nack_set, 1, false);
+    try testing.expectEqualSlices(SequenceNumber, &.{ 2, 3, 4 }, collectDataSNsSorted(&rec, &sns_buf));
+}
+
 // ── LocatorSelector: effectiveLocators ranking (via ReaderProxy) ──────────────
 
 fn v6Public(last: u8) [16]u8 {

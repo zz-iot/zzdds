@@ -315,15 +315,23 @@ or an optimisation on an already-improved path):
   in-progress coherent set; see `CHANGELOG.md`), not harness timing as the 2026-08-28
   campaign concluded. The harness check has its own gap: it skips the first two read
   cycles that have data, assuming every DataWriter matches at once, but a DataReader that
-  matches while a set is being written cannot receive that set whole, so DataWriters
+  matches while a set is being written may not receive that set whole, so DataWriters
   matching in more than two steps still fail it. The fix, skipping each topic's first
   delivery instead, is carried on the `zz-iot/dds-rtps` branch CI pins
   (`INTEROP_RTPS_REF`); propose it upstream, where the earlier whole-run rewrite was
-  declined. To re-check now that zzdds sends the RTPS 2.5 group ids and keeps its end
-  markers: GROUP-scope failures with zzdds publishing to another implementation
-  (DebugAllocator lane only; the subscriber held one topic's part of a set back; 0 of 10
-  local runs failed), and one subscriber that delivered the first sets ~20 read cycles
-  late with zzdds publishing.
+  declined. The GROUP-scope failures with zzdds publishing (DebugAllocator lane) were
+  mostly a zzdds writer bug, fixed 2026-10-09 (a reader matching mid-set was held back
+  or started inside the set; see `CHANGELOG.md`). Still open, with zzdds publishing:
+  - One implementation's subscriber occasionally (about 1 local run in 30) delivers one
+    topic's part of a GROUP set in a different read from the rest, though every
+    writer's end marker arrived in one datagram. zzdds omits `PID_GROUP_COHERENT_SET`
+    for that implementation (see `header.omitsGroupCoherentSet`), so it sees per-writer
+    sets.
+  - One CI run had a topic deliver nothing at all, though the subscriber reported the
+    match on time. A mid-set match loses at most one set, so this looks like zzdds
+    matching the subscriber's DataReader late (only the first DataWriter's match gates
+    the publisher); unconfirmed, no capture.
+  - One subscriber that delivered the first sets ~20 read cycles late.
 - **Coherent sets: what RTPS 2.5 §8.7.5–8.7.6 has that zzdds doesn't yet.**
   - A GAP's `filteredCount` (changes the writer filtered out for this reader) is not
     parsed, so a writer-side-filtered change inside a set makes it incomplete.
