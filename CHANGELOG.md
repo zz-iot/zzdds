@@ -22,6 +22,9 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   - A `VOLATILE` reader started at the writer's next sequence number, inside the set,
     and then received the set's samples below that start. It now starts at the set's
     first sample.
+  - HEARTBEATs answering an ACKNACK no longer announce an open set's samples. A reader
+    NACKed them, the writer refused, and each NACK drew the same HEARTBEAT until the set
+    ended.
 
 ## 2026-10-07
 

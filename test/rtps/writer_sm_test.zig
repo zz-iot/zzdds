@@ -1456,6 +1456,35 @@ test "late match: a TRANSIENT_LOCAL reader matching mid-set gets the set live" {
     try testing.expectEqual(@as(SequenceNumber, 3), (findLastHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
 }
 
+test "late match: ACKNACKs while the set is open draw no HEARTBEAT announcing it" {
+    // A HEARTBEAT offering the open set's SNs draws NACKs the writer refuses
+    // while the set is open, each answered by the same HEARTBEAT: a
+    // HEARTBEAT/NACK loop until the set ends.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, true);
+    defer w.deinit();
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    try matchLateReader(w);
+
+    // The reader's initial ACKNACK: nothing received, next expected SN 1.
+    rec.reset();
+    const empty = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(LATE_READER_GUID, 0, empty, 1, false);
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    try testing.expect(findHeartbeat(&rec) == null);
+
+    // A NACK naming the set's SNs.
+    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(1);
+    nack_set.set(2);
+    w.handleAckNack(LATE_READER_GUID, 0, nack_set, 2, false);
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    try testing.expect(findHeartbeat(&rec) == null);
+}
+
 test "late match: a TRANSIENT_LOCAL reader with history before the open set is re-prompted at set end" {
     // Committed history (SN 1) is protected as before: the reader is held back
     // until it has it.  The set-end HEARTBEAT reaches it too, so its NACK

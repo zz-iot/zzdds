@@ -1255,8 +1255,9 @@ pub const StatefulWriter = struct {
     /// the correct range and do not NACK data written before they matched.
     /// `final=true` tells the reader it need not reply (used to signal
     /// history-delivery completion before live data begins flowing).
+    /// Announces only what readers have been sent (lastSentSnLocked).
     fn sendHeartbeatToProxyLocked(self: *Self, rp: *const ReaderProxy, final: bool) void {
-        const cache_last = self.lastAvailableSnLocked();
+        const cache_last = self.lastSentSnLocked();
         self.sendHeartbeatToProxyLockedWithLastSn(rp, final, cache_last);
     }
 
@@ -1264,7 +1265,7 @@ pub const StatefulWriter = struct {
     /// Used while suppress_live_data to avoid revealing live SNs to a reader
     /// whose DataReader has not yet flushed the history replay.
     fn sendHeartbeatToProxyLockedCapped(self: *Self, rp: *const ReaderProxy, final: bool, last_sn_cap: SequenceNumber) void {
-        const cache_last = self.lastAvailableSnLocked();
+        const cache_last = self.lastSentSnLocked();
         const capped = if (cache_last > 0) @min(cache_last, last_sn_cap) else cache_last;
         self.sendHeartbeatToProxyLockedWithLastSn(rp, final, capped);
     }
@@ -1750,9 +1751,13 @@ pub const StatefulWriter = struct {
                 // the HB sent during replayHistoryToProxyLocked; re-announcing
                 // the full live range here would prompt the reader to NACK for
                 // live data before its DataReader has flushed history.
+                // Nor one when all that's left at or above the base is a
+                // coherent set still open: the reader would NACK SNs this
+                // writer won't send until the set ends, and each NACK would
+                // draw the same HEARTBEAT again.
                 if (!rp.suppress_live_data) {
                     const effective_base = @max(nack_set.base, rp.start_sn);
-                    if (self.cache.maxSn() >= effective_base and rp.reliable)
+                    if (@min(self.cache.maxSn(), self.lastSentSnLocked()) >= effective_base and rp.reliable)
                         self.sendHeartbeatToProxyLocked(rp, false);
                 }
                 // For fragmented samples outside the explicit NACK bitmap, send
