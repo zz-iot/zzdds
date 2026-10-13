@@ -144,12 +144,11 @@ def check_junit(path, known):
     real_failures = []
     known_failures = []
     vendor_skipped = []
-    seen = []
+    known_passed = []
     for suite in xml:
         for case in suite:
             total += 1
             name = test_name(case)
-            seen.append(name)
             if case.result:
                 detail = failure_detail(case)
                 if is_vendor_limitation(detail):
@@ -158,8 +157,8 @@ def check_junit(path, known):
                     known_failures.append(case)
                 else:
                     real_failures.append(case)
-    failed = {test_name(c) for c in known_failures}
-    known_passed = [n for n in seen if n in known and n not in failed]
+            elif name in known:
+                known_passed.append(name)
     return total, real_failures, known_failures, known_passed, vendor_skipped
 
 

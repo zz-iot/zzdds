@@ -474,8 +474,9 @@ pub const MAX_END_MARKERS: usize = 1024;
 
 /// Upper bound on the catch-up rounds of a BEST_EFFORT history replay (see
 /// replayHistoryToProxyUnlocked): each round sends what was published while
-/// the previous one went out.
-const MAX_BEST_EFFORT_REPLAY_ROUNDS: usize = 16;
+/// the previous one went out.  The history retained when the replay starts
+/// is not counted against it.
+pub const MAX_BEST_EFFORT_REPLAY_ROUNDS: usize = 16;
 
 /// Reliable writer with per-reader ACK tracking.
 /// Typical use: SEDP publications/subscriptions announcements, user data.
@@ -1103,19 +1104,28 @@ pub const StatefulWriter = struct {
         // published while it went out, has been sent in SN order.
         rp.suppress_live_data = true;
         const rp_guid = rp.guid;
+        // The history retained when the replay starts always goes out whole,
+        // however many batches it takes (each fragmented sample is one): the
+        // cache bounds it, and every batch advances sent_through.
+        const history_through = self.lastSentSnLocked();
         var sent_through: SequenceNumber = 0;
-        var rounds: usize = 0;
-        while (true) : (rounds += 1) {
+        var catch_up_rounds: usize = 0;
+        while (true) {
             // Re-found by GUID each round: replayBatchUnlocked releases
             // self.mu, during which self.reader_proxies can be reallocated
             // or the proxy removed.
             const cur = self.findReaderProxyLocked(rp_guid) orelse return;
-            // Bounded so a writer publishing faster than this catches up
-            // can't hold the match here: past the bound, live data resumes
-            // and what was not replayed is lost, as best-effort allows.
-            if (rounds == MAX_BEST_EFFORT_REPLAY_ROUNDS) {
-                cur.suppress_live_data = false;
-                return;
+            // Catch-up rounds, for what was published while the replay went
+            // out, are bounded so a writer publishing faster than this
+            // catches up can't hold the match here: past the bound, live
+            // data resumes and what was not replayed is lost, as best-effort
+            // allows.
+            if (sent_through >= history_through) {
+                if (catch_up_rounds == MAX_BEST_EFFORT_REPLAY_ROUNDS) {
+                    cur.suppress_live_data = false;
+                    return;
+                }
+                catch_up_rounds += 1;
             }
             const last = self.replayBatchUnlocked(cur, sent_through) catch {
                 // Live data stays held, so the retry (the next

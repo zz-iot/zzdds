@@ -50,7 +50,7 @@ fn makeGuid(prefix_byte: u8, eid: rtps.EntityId) Guid {
 
 /// Captures every send() call so tests can assert on what was transmitted.
 /// One Capture per send() invocation; stores the destination locator and raw bytes.
-const MAX_CAPS = 32;
+const MAX_CAPS = 64;
 const MAX_BYTES = 512;
 
 const Capture = struct {
@@ -2162,6 +2162,34 @@ test "BEST_EFFORT replay: a fragmented sample goes out in its place in SN order"
 
     var sn_buf: [8]SequenceNumber = undefined;
     try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3 }, collectSentSnsInOrder(&rec, &sn_buf));
+}
+
+test "BEST_EFFORT replay: the retained history goes out whole, however many batches it takes" {
+    const writer_guid = makeGuid(0x8a, WRITER_EID);
+    const reader_guid = makeGuid(0x8b, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7534);
+
+    var rec: Recording = .{};
+    const frag_size = 64;
+    const w = try StatefulWriter.init(testing.allocator, writer_guid, rec.makeTransport(), .keep_all, 0, READER_EID, frag_size, true);
+    defer w.deinit();
+    // Small and fragmented samples alternate, so each is a batch of its own:
+    // more batches than the catch-up bound, with nothing written meanwhile.
+    const pairs = rtps.writer_sm.MAX_BEST_EFFORT_REPLAY_ROUNDS / 2 + 1;
+    comptime std.debug.assert(pairs * 4 <= MAX_CAPS); // a DATA, 2 DATA_FRAGs and a HEARTBEAT_FRAG a pair
+    const big = [_]u8{0xAB} ** (frag_size + 1);
+    for (0..pairs) |_| {
+        _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "small");
+        _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &big);
+    }
+
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+
+    var expected: [pairs * 2]SequenceNumber = undefined;
+    for (&expected, 1..) |*sn, i| sn.* = @intCast(i);
+    var sn_buf: [pairs * 2 + 1]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &expected, collectSentSnsInOrder(&rec, &sn_buf));
 }
 
 test "handleAckNack: an ACKNACK from a BEST_EFFORT reader is ignored" {
