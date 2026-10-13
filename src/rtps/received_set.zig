@@ -70,6 +70,12 @@ pub const ReceivedSet = struct {
         if (first.lo > 1) return 0;
         return first.hi;
     }
+
+    /// The highest SN inserted, or 0 when the set is empty.
+    pub fn max(self: *const ReceivedSet) SequenceNumber {
+        if (self.ranges.items.len == 0) return 0;
+        return self.ranges.items[self.ranges.items.len - 1].hi;
+    }
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -81,6 +87,18 @@ test "ReceivedSet empty" {
     defer rs.deinit(testing.allocator);
 
     try testing.expect(!rs.contains(1));
+    try testing.expectEqual(@as(SequenceNumber, 0), rs.cumulativeAck());
+}
+
+test "ReceivedSet max is the highest SN inserted, across gaps" {
+    var rs = ReceivedSet.empty;
+    defer rs.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(SequenceNumber, 0), rs.max());
+    _ = try rs.insert(testing.allocator, 47);
+    try testing.expectEqual(@as(SequenceNumber, 47), rs.max());
+    _ = try rs.insert(testing.allocator, 3);
+    try testing.expectEqual(@as(SequenceNumber, 47), rs.max());
     try testing.expectEqual(@as(SequenceNumber, 0), rs.cumulativeAck());
 }
 

@@ -34,6 +34,7 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const adapters = @import("../rtps/protocol_adapters.zig");
 const history_mod = @import("../rtps/history.zig");
 const guid_mod = @import("../rtps/guid.zig");
+const unmatched_mod = @import("../rtps/unmatched_cache.zig");
 const disc = @import("../discovery/interface.zig");
 const transport_if = @import("../transport/interface.zig");
 const TcpTransport = @import("../transport/tcp.zig").TcpTransport;
@@ -684,7 +685,22 @@ const DiscoveredParticipant = struct {
     /// VendorId from this participant's SPDP announcement. Used to work around
     /// known per-vendor RTPS wire-format quirks (see header_mod.needsPidCoherentSetMarker).
     vendor_id: header_mod.VendorId,
+    /// Its lease duration, from its latest SPDP announcement.
+    lease_ms: u32,
 };
+
+/// Bounds on the data the participant holds, for every local reader, from
+/// writers no local reader has matched yet (see rtps/unmatched_cache.zig).
+const UNMATCHED_LIMITS = unmatched_mod.Limits{
+    .max_bytes = 16 * 1024 * 1024,
+    .max_writers = 256,
+    .max_samples_per_writer = 64,
+    .max_partials_per_writer = 8,
+};
+
+/// The longest data from a writer discovery has not announced is held (see
+/// unmatchedTtlNsLocked).
+const UNMATCHED_MAX_TTL_NS: i64 = 300 * std.time.ns_per_s;
 
 const DiscoveredTopic = struct {
     topic_name: []const u8, // owned (heap-allocated)
@@ -954,6 +970,19 @@ pub const DomainParticipantImpl = struct {
     discovered_writers: std.ArrayListUnmanaged(DiscoveredWriter),
     discovered_readers: std.ArrayListUnmanaged(DiscoveredReader),
 
+    /// Data from writers that discovery has not yet announced and matched
+    /// with local readers, held for each reader that then matches one (see
+    /// holdIfUnmatchedLocked).  Has its own lock, taken under self.mu or a
+    /// reader's.
+    unmatched: unmatched_mod.UnmatchedCache,
+    /// Writers whose announcement has been matched against every local
+    /// reader (see settleWriterLocked), until they are lost: nothing from
+    /// them is held.  Guarded by mu.
+    settled_writers: std.AutoHashMapUnmanaged(Guid, void) = .empty,
+    /// Writers being matched against local readers, with how many
+    /// onWriterDiscovered calls are at it.  Guarded by mu.
+    matching_writers: std.AutoHashMapUnmanaged(Guid, u32) = .empty,
+
     /// Built-in subscriber (DCPSParticipant / DCPSTopic / DCPSPublication /
     /// DCPSSubscription DataReaders). Created in init(); null on OOM.
     builtin_sub: ?*BuiltinSubscriberState,
@@ -1097,6 +1126,7 @@ pub const DomainParticipantImpl = struct {
             .discovered_topics = .empty,
             .discovered_writers = .empty,
             .discovered_readers = .empty,
+            .unmatched = unmatched_mod.UnmatchedCache.init(alloc, UNMATCHED_LIMITS),
             .builtin_sub = null,
             .type_info_registry = .empty,
             .type_support_registry = .empty,
@@ -1520,6 +1550,9 @@ pub const DomainParticipantImpl = struct {
         self.discovered_writers.deinit(self.alloc);
         for (self.discovered_readers.items) |*dr| dr.deinit(self.alloc);
         self.discovered_readers.deinit(self.alloc);
+        self.unmatched.deinit();
+        self.settled_writers.deinit(self.alloc);
+        self.matching_writers.deinit(self.alloc);
 
         self.qos.deinit(self.alloc);
         self.default_pub_qos.deinit(self.alloc);
@@ -2097,10 +2130,14 @@ pub const DomainParticipantImpl = struct {
     /// its type support. No reader is ever skipped for lack of memory: when the
     /// fan-out list cannot be allocated, readers go in fixed-size batches in
     /// entity-key order (see nextFanoutBatch).
+    ///
+    /// Data (a `ctx` with `hold`) from a writer not matched yet is held for
+    /// the readers first (see holdIfUnmatchedLocked).
     fn dispatchToReaders(self: *Self, reader_entity_id: EntityId, data: ?DataKeyArgs, ctx: anytype) void {
         if (!reader_entity_id.eql(EntityIds.unknown)) {
             self.mu.lock();
             const target = if (self.active_readers.getPtr(entityIdKey(reader_entity_id))) |ar| pinReaderLocked(ar, data) else null;
+            if (target != null) self.holdIfUnmatchedLocked(reader_entity_id, ctx);
             self.mu.unlock();
             if (target) |t| {
                 ctx.deliver(t);
@@ -2114,6 +2151,7 @@ pub const DomainParticipantImpl = struct {
         var targets: std.ArrayListUnmanaged(PinnedReader) = .empty;
         defer targets.deinit(a);
         self.mu.lock();
+        if (self.active_readers.count() > 0) self.holdIfUnmatchedLocked(reader_entity_id, ctx);
         if (targets.ensureTotalCapacityPrecise(a, self.active_readers.count())) |_| {
             var it = self.active_readers.valueIterator();
             while (it.next()) |ar| if (pinReaderLocked(ar, data)) |t| targets.appendAssumeCapacity(t);
@@ -2126,6 +2164,49 @@ pub const DomainParticipantImpl = struct {
         } else |_| {}
         self.mu.unlock();
         self.dispatchToReadersBatched(data, ctx);
+    }
+
+    /// Holds `ctx`'s sample or fragment, sent to `target` (ENTITYID_UNKNOWN
+    /// for every reader), when its writer is not settled: discovery has not
+    /// yet announced it and matched it against local readers.  A reader
+    /// that then matches the writer takes it (see onWriterDiscovered's
+    /// prematch).  Held before any reader sees it, so a reader matching the
+    /// writer meanwhile gets it from one or the other.  Nothing is held from
+    /// a writer once settled: a reader that has not matched it by then never
+    /// will on that announcement.  Caller holds self.mu.
+    fn holdIfUnmatchedLocked(self: *Self, target: EntityId, ctx: anytype) void {
+        if (!@hasDecl(@TypeOf(ctx), "hold")) return;
+        const writer = ctx.writer_guid;
+        // Only a user-defined writer can match a DataReader: not a built-in
+        // or vendor-specific one, whose entityKind's top two bits are not 00
+        // (RTPS 2.5 §9.3.1.2), and which discovery never announces as one.
+        if (writer.entity_id.entity_kind & 0xC0 != 0) return;
+        if (self.settled_writers.contains(writer)) return;
+        for (self.ignored_prefixes.items) |p| {
+            if (p.eql(writer.prefix)) return;
+        }
+        const handle = writer_mod.guidToHandle(writer);
+        for (self.ignored_publication_handles.items) |h| {
+            if (h == handle) return;
+        }
+        ctx.hold(&self.unmatched, target, self.timer_clock.nowNs(), self.unmatchedTtlNsLocked(writer.prefix));
+    }
+
+    /// How long data from a writer of participant `prefix` is held for a
+    /// match: one lease duration of that participant (of this one, while
+    /// that one is undiscovered), at most UNMATCHED_MAX_TTL_NS.  A live
+    /// participant announces itself at least once per lease, and announces
+    /// its endpoints reliably, so a writer still unannounced after a lease
+    /// is not about to be.  Caller holds self.mu.
+    fn unmatchedTtlNsLocked(self: *Self, prefix: GuidPrefix) i64 {
+        var lease_ms = self.config.participant.lease_duration_ms;
+        for (self.discovered_participants.items) |e| {
+            if (e.guid.prefix.eql(prefix)) {
+                if (e.lease_ms != 0) lease_ms = e.lease_ms;
+                break;
+            }
+        }
+        return @min(@as(i64, lease_ms) * std.time.ns_per_ms, UNMATCHED_MAX_TTL_NS);
     }
 
     /// dispatchToReaders' fan-out to every active reader when its list cannot
@@ -2194,6 +2275,26 @@ pub const DomainParticipantImpl = struct {
         return if (aw.proto.quiesceAcquire()) aw.proto else null;
     }
 
+    /// The `hold` of a DATA's dispatchToReaders context (see
+    /// holdIfUnmatchedLocked): its fields, as protocol_adapters makes them
+    /// into a CacheChange.
+    fn holdData(c: anytype, cache: *unmatched_mod.UnmatchedCache, target: EntityId, now_ns: i64, ttl_ns: i64) void {
+        const change = history_mod.CacheChange{
+            .kind = c.kind,
+            .writer_guid = c.writer_guid,
+            .sequence_number = c.sn,
+            .source_timestamp = c.ts,
+            .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
+            .key_hash = c.key_hash orelse std.mem.zeroes([16]u8),
+            .data = c.payload,
+            .coherent_set_sn = c.coherent_set_sn,
+            .group_seq_num = c.group_seq_num,
+            .group_coherent_sn = c.group_coherent_sn,
+            .inline_lifespan_ns = c.lifespan_ns,
+        };
+        cache.put(c.writer_guid, target, &change, c.key_hash != null, now_ns, ttl_ns);
+    }
+
     fn dispatchDirectedWrite(
         self: *DomainParticipantImpl,
         dw_bytes: []const u8,
@@ -2222,11 +2323,13 @@ pub const DomainParticipantImpl = struct {
             group_seq_num: ?history_mod.SequenceNumber,
             group_coherent_sn: ?history_mod.SequenceNumber,
             lifespan_ns: ?i64,
+            key_hash: ?[16]u8,
             fn deliver(c: @This(), t: PinnedReader) void {
                 t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.group_coherent_sn, c.lifespan_ns);
             }
+            const hold = holdData;
         };
-        const ctx = Deliver{ .writer_guid = writer_guid, .sn = sn, .ts = ts, .payload = payload, .kind = kind, .coherent_set_sn = coherent_set_sn, .group_seq_num = group_seq_num, .group_coherent_sn = group_coherent_sn, .lifespan_ns = lifespan_ns };
+        const ctx = Deliver{ .writer_guid = writer_guid, .sn = sn, .ts = ts, .payload = payload, .kind = kind, .coherent_set_sn = coherent_set_sn, .group_seq_num = group_seq_num, .group_coherent_sn = group_coherent_sn, .lifespan_ns = lifespan_ns, .key_hash = key_hash };
         // One reader per entry, so nothing to collect (or allocate).
         var i: u32 = 0;
         while (i < count) : (i += 1) {
@@ -2305,9 +2408,11 @@ pub const DomainParticipantImpl = struct {
                         group_seq_num: ?history_mod.SequenceNumber,
                         group_coherent_sn: ?history_mod.SequenceNumber,
                         lifespan_ns: ?i64,
+                        key_hash: ?[16]u8,
                         fn deliver(c: @This(), t: PinnedReader) void {
                             t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.group_coherent_sn, c.lifespan_ns);
                         }
+                        const hold = holdData;
                     };
                     self.dispatchToReaders(d.reader_entity_id, .{ .key_hash = key_hash, .payload = d.serialized_payload, .kind = kind }, Deliver{
                         .writer_guid = writer_guid,
@@ -2319,6 +2424,7 @@ pub const DomainParticipantImpl = struct {
                         .group_seq_num = group_seq_num,
                         .group_coherent_sn = group_coherent_sn,
                         .lifespan_ns = lifespan_ns,
+                        .key_hash = key_hash,
                     });
                 },
                 .heartbeat => |hb| {
@@ -2366,6 +2472,9 @@ pub const DomainParticipantImpl = struct {
                         df: @TypeOf(df),
                         fn deliver(c: @This(), t: PinnedReader) void {
                             t.proto.handleDataFrag(c.writer_guid, c.ts, c.df);
+                        }
+                        fn hold(c: @This(), cache: *unmatched_mod.UnmatchedCache, target: EntityId, now_ns: i64, ttl_ns: i64) void {
+                            cache.putFrag(c.writer_guid, target, c.df, c.ts, now_ns, ttl_ns);
                         }
                     };
                     self.dispatchToReaders(df.reader_entity_id, null, Deliver{ .writer_guid = writer_guid, .ts = current_ts, .df = df });
@@ -2437,8 +2546,9 @@ pub const DomainParticipantImpl = struct {
                 }
             }
             var is_dup = false;
-            for (self.discovered_participants.items) |e| {
+            for (self.discovered_participants.items) |*e| {
                 if (e.guid.eql(data.guid)) {
+                    e.lease_ms = data.lease_duration_ms;
                     is_dup = true;
                     break;
                 }
@@ -2447,7 +2557,7 @@ pub const DomainParticipantImpl = struct {
                 const handle = writer_mod.guidToHandle(data.guid);
                 self.discovered_participants.append(
                     self.alloc,
-                    .{ .guid = data.guid, .handle = handle, .vendor_id = data.vendor_id },
+                    .{ .guid = data.guid, .handle = handle, .vendor_id = data.vendor_id, .lease_ms = data.lease_duration_ms },
                 ) catch {};
                 if (self.builtin_sub) |bs| push_dr = bs.part_dr;
             }
@@ -2491,6 +2601,15 @@ pub const DomainParticipantImpl = struct {
                 break;
             }
         }
+        // As in onWriterLost, for each of its writers.
+        while (true) {
+            var sw_it = self.settled_writers.keyIterator();
+            const settled = while (sw_it.next()) |k| {
+                if (k.prefix.eql(guid.prefix)) break k.*;
+            } else break;
+            _ = self.settled_writers.remove(settled);
+        }
+        self.unmatched.dropPrefix(guid.prefix);
         for (self.discovered_writers.items) |entry| {
             if (entry.guid.prefix.eql(guid.prefix)) lost_writers.append(self.alloc, entry.guid) catch {};
         }
@@ -2713,6 +2832,44 @@ pub const DomainParticipantImpl = struct {
         notify_quiesced: bool = false,
     };
 
+    /// Marks `writer` as being matched against local readers, unless it is
+    /// settled already: data from it is held meanwhile (see
+    /// holdIfUnmatchedLocked).  True when marked, for settleWriterLocked.
+    /// Caller holds self.mu.
+    fn beginMatchingWriterLocked(self: *Self, writer: Guid) bool {
+        if (self.settled_writers.contains(writer)) return false;
+        const gop = self.matching_writers.getOrPut(self.alloc, writer) catch return false;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        return true;
+    }
+
+    /// Ends a beginMatchingWriterLocked (when `counted`).  Once no other is
+    /// under way, `writer` is settled: every local reader that matches it
+    /// has, and has taken what was held from it, so that is dropped and
+    /// nothing more is held.  Caller holds self.mu.
+    fn settleWriterLocked(self: *Self, writer: Guid, counted: bool) void {
+        if (counted) {
+            const n = self.matching_writers.getPtr(writer).?;
+            n.* -= 1;
+            if (n.* > 0) return;
+            _ = self.matching_writers.remove(writer);
+        } else if (self.matching_writers.contains(writer)) return;
+        // Out of memory, it stays unsettled: what is held from it expires.
+        self.settled_writers.put(self.alloc, writer, {}) catch {};
+        self.unmatched.dropWriter(writer);
+    }
+
+    /// Where `ar` takes what a writer it matches sent before the match.
+    fn prematchFor(self: *Self, ar: *const ActiveReader) unmatched_mod.Prematch {
+        return .{
+            .cache = &self.unmatched,
+            .key_hash_ctx = ar.key_hash_ctx,
+            .key_hash_fn = ar.key_hash_fn,
+            .key_hash_only_fn = ar.key_hash_only_fn,
+        };
+    }
+
     fn onWriterDiscovered(ctx: *anyopaque, data: *const disc.WriterData) void {
         const self = cast(ctx);
         var push_dr: ?*reader_mod.DataReaderImpl = null;
@@ -2721,6 +2878,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         for (self.ignored_prefixes.items) |p| {
             if (p.eql(data.guid.prefix)) {
+                self.settleWriterLocked(data.guid, false);
                 self.mu.unlock();
                 return;
             }
@@ -2728,16 +2886,21 @@ pub const DomainParticipantImpl = struct {
         const pub_handle = writer_mod.guidToHandle(data.guid);
         for (self.ignored_publication_handles.items) |h| {
             if (h == pub_handle) {
+                self.settleWriterLocked(data.guid, false);
                 self.mu.unlock();
                 return;
             }
         }
         for (self.ignored_topic_names.items) |n| {
             if (std.mem.eql(u8, n, data.topic_name)) {
+                self.settleWriterLocked(data.guid, false);
                 self.mu.unlock();
                 return;
             }
         }
+        // Data from it is held until every match below is made (see
+        // settleWriterLocked).
+        const counted = self.beginMatchingWriterLocked(data.guid);
         var ar_it = self.active_readers.valueIterator();
         while (ar_it.next()) |ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
@@ -2775,7 +2938,8 @@ pub const DomainParticipantImpl = struct {
             // that unlocked window even if a concurrent delete_datareader
             // races it; see protocol/interface.zig's quiesce_acquire doc.
             if (!ar.proto.quiesceAcquire()) continue;
-            const info = buildMatchedWriterInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
+            var info = buildMatchedWriterInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
+            info.prematch = self.prematchFor(ar);
             const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
             jobs.append(self.alloc, .{ .proto = ar.proto, .info = info, .notify = ar.matched_notify, .notify_quiesced = nq }) catch {
                 ar.proto.quiesceRelease();
@@ -2828,6 +2992,9 @@ pub const DomainParticipantImpl = struct {
             };
             job.proto.quiesceRelease();
         }
+        self.mu.lock();
+        self.settleWriterLocked(data.guid, counted);
+        self.mu.unlock();
         if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
             .key = topicNameToKey(dt.topic_name),
@@ -2926,6 +3093,10 @@ pub const DomainParticipantImpl = struct {
             break :blk true;
         } else |_| false;
         if (swept) removeDiscoveredWriter(self, guid);
+        // Should it come back, data from it is held again until it is
+        // matched again.
+        _ = self.settled_writers.remove(guid);
+        self.unmatched.dropWriter(guid);
         if (self.builtin_sub) |bs| push_dr = bs.pub_dr;
         self.mu.unlock();
 
@@ -2966,7 +3137,6 @@ pub const DomainParticipantImpl = struct {
             .reliability = if (qos.reliability.kind >= 2) .reliable else .best_effort,
             .durability_kind = @intCast(qos.durabilityKind),
             .needs_pid_coherent_set_marker = needs_marker,
-            .omits_group_coherent_set = if (vendor) |vid| header_mod.omitsGroupCoherentSet(vid) else false,
         };
     }
 
@@ -3550,7 +3720,8 @@ pub const DomainParticipantImpl = struct {
                         if (!ar.proto.quiesceAcquire()) continue;
                         const uloc = dupeLocators(self.alloc, dw.unicast_locators);
                         const mloc = dupeLocators(self.alloc, dw.multicast_locators);
-                        const info = buildMatchedWriterInfo(dw.guid, &dw.qos, uloc, mloc);
+                        var info = buildMatchedWriterInfo(dw.guid, &dw.qos, uloc, mloc);
+                        info.prematch = self.prematchFor(ar);
                         const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
                         jobs.append(self.alloc, .{
                             .proto = ar.proto,
@@ -3920,6 +4091,7 @@ pub const DomainParticipantImpl = struct {
             }
         }
         self.discovery.wlpTick(now_ns, wlp_info);
+        self.unmatched.expire(now_ns);
         for (due.items) |cb| {
             cb.check(cb.ctx, now_ns);
             cb.quiesce_release(cb.ctx);

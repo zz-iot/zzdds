@@ -1,8 +1,9 @@
 //! StatefulWriter model tests.
 //!
 //! The model here deliberately ignores packet encoding and transport details. It
-//! predicts which DATA sequence numbers may be sent for ACKNACK inputs, including
-//! final/non-final rules, stale count suppression, and coherent-pending skips.
+//! predicts which DATA sequence numbers may be sent for ACKNACK inputs: only
+//! the SNs the bitmap requests, final or not, with stale count suppression and
+//! coherent-pending skips.
 
 const std = @import("std");
 const zzdds = @import("zzdds");
@@ -132,7 +133,6 @@ const WriterModel = struct {
         alloc: std.mem.Allocator,
         nack_set: SequenceNumberSet,
         count: i32,
-        final: bool,
     ) !std.ArrayListUnmanaged(SequenceNumber) {
         var sent: std.ArrayListUnmanaged(SequenceNumber) = .empty;
         if (self.last_acknack_count) |last| {
@@ -147,16 +147,6 @@ const WriterModel = struct {
             bit += 1;
         }) {
             if (nack_set.contains(sn) and self.canSend(sn)) try sent.append(alloc, sn);
-        }
-
-        if (!final) {
-            sn = nack_set.base;
-            while (sn < self.next_sn) : (sn += 1) {
-                if (!self.canSend(sn)) continue;
-                const offset = sn - nack_set.base;
-                if (offset >= 0 and offset < nack_set.num_bits and nack_set.contains(sn)) continue;
-                try sent.append(alloc, sn);
-            }
         }
 
         if (sent.items.len > 0) self.last_acknack_count = count;
@@ -227,7 +217,7 @@ fn expectAckNackMatchesModel(
 ) !void {
     rec.reset();
     writer.handleAckNack(READER_GUID, highest_sn, nack_set, count, final);
-    var expected = try model.acknack(alloc, nack_set, count, final);
+    var expected = try model.acknack(alloc, nack_set, count);
     defer expected.deinit(alloc);
     try expectDataSns(rec, expected.items);
 }
@@ -237,8 +227,17 @@ const WriterScriptOp = enum {
     begin_coherent,
     end_coherent,
     ack_nonfinal_empty,
+    ack_nonfinal_all,
     ack_final_first,
 };
+
+/// A NACK of every SN the model tracks, 1 through MAX_SN.
+fn requestAll() SequenceNumberSet {
+    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = MAX_SN, .bitmap = std.mem.zeroes([8]u32) };
+    var sn: SequenceNumber = 1;
+    while (sn <= MAX_SN) : (sn += 1) nack_set.set(sn);
+    return nack_set;
+}
 
 fn runWriterScript(alloc: std.mem.Allocator, ops: []const WriterScriptOp) !void {
     errdefer std.debug.print("writer script failed: {any}\n", .{ops});
@@ -274,6 +273,10 @@ fn runWriterScript(alloc: std.mem.Allocator, ops: []const WriterScriptOp) !void 
                 try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, ack_count, false);
                 ack_count += 1;
             },
+            .ack_nonfinal_all => {
+                try expectAckNackMatchesModel(alloc, writer, &model, &rec, requestAll(), 0, ack_count, false);
+                ack_count += 1;
+            },
             .ack_final_first => {
                 var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 1, .bitmap = std.mem.zeroes([8]u32) };
                 nack_set.set(1);
@@ -284,7 +287,7 @@ fn runWriterScript(alloc: std.mem.Allocator, ops: []const WriterScriptOp) !void 
     }
 }
 
-test "writer model: non-final empty AckNack sends every cached change from base" {
+test "writer model: non-final empty AckNack resends nothing" {
     const alloc = testing.allocator;
     var rec: Recording = .{};
     const writer = try makeWriter(alloc, &rec);
@@ -315,7 +318,7 @@ test "writer model: final AckNack sends only explicitly NACKed changes" {
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 1, true);
 }
 
-test "writer model: non-final sparse AckNack sends NACKed and implicit >= base changes" {
+test "writer model: non-final sparse AckNack sends only NACKed changes" {
     const alloc = testing.allocator;
     var rec: Recording = .{};
     const writer = try makeWriter(alloc, &rec);
@@ -330,7 +333,7 @@ test "writer model: non-final sparse AckNack sends NACKed and implicit >= base c
     var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 3, .bitmap = std.mem.zeroes([8]u32) };
     nack_set.set(2);
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 1, false);
-    try expectDataSns(&rec, &.{ 1, 2, 3, 4 });
+    try expectDataSns(&rec, &.{2});
 }
 
 test "writer model: duplicate AckNack count is suppressed after a retransmit" {
@@ -344,8 +347,9 @@ test "writer model: duplicate AckNack count is suppressed after a retransmit" {
     try writeBoth(writer, &model, "two");
     try writeBoth(writer, &model, "three");
 
-    const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    const nack_set = requestAll();
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 7, false);
+    try expectDataSns(&rec, &.{ 1, 2, 3 });
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 7, false);
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 6, false);
 }
@@ -382,7 +386,7 @@ test "writer model: AckNack count rollover is accepted then duplicate suppressed
     writer.mu.unlock();
     model.last_acknack_count = std.math.maxInt(i32);
 
-    const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    const nack_set = requestAll();
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, std.math.minInt(i32), false);
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, std.math.minInt(i32), false);
 }
@@ -400,8 +404,9 @@ test "writer model: AckNack does not retransmit samples still inside coherent wi
     try writeBoth(writer, &model, "two");
     try writeBoth(writer, &model, "three");
 
-    const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    const nack_set = requestAll();
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 1, false);
+    try expectDataSns(&rec, &.{1});
 
     writer.endCoherentSet(.full, false, null, null, false);
     model.endCoherent();
@@ -415,6 +420,7 @@ test "writer model: bounded write/coherent/AckNack scripts match implementation"
         .begin_coherent,
         .end_coherent,
         .ack_nonfinal_empty,
+        .ack_nonfinal_all,
         .ack_final_first,
     };
 

@@ -507,9 +507,9 @@ test "group coherent set: a part that arrived before its writer matched joins it
         }
     });
 
-    // The late writer matches.  Its early samples are delivered before the
-    // reader hears which publisher it has: held back here, in that window,
-    // the part must not come out on its own.
+    // The late writer matches.  Its early samples, held by the participant,
+    // are delivered before the reader hears which publisher it has: held
+    // back here, in that window, the part must not come out on its own.
     const info = zzdds.protocol.MatchedWriterInfo{
         .guid = late_guid,
         .unicast_locators = &.{},
@@ -517,6 +517,7 @@ test "group coherent set: a part that arrived before its writer matched joins it
         .reliability = .reliable,
         .group_coherent = true,
         .publisher_guid = publisher,
+        .prematch = .{ .cache = &@as(*DomainParticipantImpl, @ptrCast(@alignCast(fx.dp_r.ptr))).unmatched },
     };
     const real_cb = r0.writerMatchCallback();
     const Held = struct {

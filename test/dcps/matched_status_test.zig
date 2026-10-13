@@ -689,8 +689,6 @@ test "sub data: a sample delivered when its writer is matched already resolves i
         .entity_id = .{ .entity_key = .{ 0, 0, 9 }, .entity_kind = 0x03 },
     };
     var check = GuidCheck{ .dr = undefined, .zdr = undefined };
-    // RELIABLE: only a reliable reader buffers DATA from a writer it has not
-    // matched yet.
     var dr_qos = DDS.DataReaderQos{};
     dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
     const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), dr_qos, DDS.dataReaderListener(&check, .{
@@ -701,10 +699,22 @@ test "sub data: a sample delivered when its writer is matched already resolves i
     check.dr = dr;
     check.zdr = zzdds.asZzddsDataReader(dr) orelse return error.TestUnexpectedResult;
 
-    // DATA from a writer this reader has not matched yet: buffered.
+    // DATA from a writer this reader has not matched yet: ignored by the
+    // reader, held (as the participant would) for the match.
     const pr = @as(*zzdds.dcps.DataReaderImpl, @ptrCast(@alignCast(dr.ptr))).proto_reader;
     pr.handleIncomingChange(writer_guid, 1, .{ .seconds = 0, .fraction = 0 }, std.mem.zeroes([16]u8), &.{ 0x00, 0x01, 0x00, 0x00 }, .alive, null, null, null, null);
     try testing.expectEqual(@as(usize, 0), check.calls);
+    var held = zzdds.rtps.unmatched_cache.UnmatchedCache.init(alloc, .{ .max_bytes = 1 << 20, .max_writers = 8, .max_samples_per_writer = 64, .max_partials_per_writer = 4 });
+    defer held.deinit();
+    held.put(writer_guid, zzdds.rtps.EntityIds.unknown, &.{
+        .kind = .alive,
+        .writer_guid = writer_guid,
+        .sequence_number = 1,
+        .source_timestamp = .{ .seconds = 0, .fraction = 0 },
+        .instance_handle = zzdds.rtps.history.INSTANCE_HANDLE_NIL,
+        .key_hash = std.mem.zeroes([16]u8),
+        .data = &.{ 0x00, 0x01, 0x00, 0x00 },
+    }, true, 0, std.time.ns_per_s);
 
     // Matching the writer delivers it, before the writer-matched callback.
     _ = try pr.addMatchedWriter(&.{
@@ -712,6 +722,7 @@ test "sub data: a sample delivered when its writer is matched already resolves i
         .unicast_locators = &.{},
         .multicast_locators = &.{},
         .reliability = .reliable,
+        .prematch = .{ .cache = &held },
     });
     try testing.expectEqual(@as(usize, 1), check.calls);
     try testing.expectEqual(@as(u32, 1), check.taken);

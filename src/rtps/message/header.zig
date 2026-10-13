@@ -74,23 +74,12 @@ pub const VENDOR_ID_ECLIPSE_CYCLONE: VendorId = .{ .bytes = .{ 0x01, 0x10 } };
 /// default (smaller, and what every other tested vendor — RTI Connext 7.7.0 —
 /// correctly accepts); this list should only grow when a new vendor is
 /// concretely observed to have the same defect.
+///
+/// Applies only to TOPIC/INSTANCE-scope end markers: a GROUP End Coherent Set
+/// marker always carries the RTPS 2.5 §8.7.6 group parameters, so it is never
+/// fully bare, and the same reader accepts it without PID_COHERENT_SET.
 pub fn needsPidCoherentSetMarker(vendor_id: VendorId) bool {
     return vendor_id.eql(VENDOR_ID_ECLIPSE_CYCLONE);
-}
-
-/// True for remote vendors whose GROUP-scope reader is known, by direct
-/// empirical testing, to never deliver a group coherent set whose samples
-/// carry PID_GROUP_COHERENT_SET and which ends with RTPS 2.5 §8.7.6 End
-/// Coherent Set markers: their subscribers received no data at all.  Sent
-/// without PID_GROUP_COHERENT_SET, the same sets are delivered as each
-/// writer's own coherent set, which is how these readers treated zzdds sets
-/// before it sent the parameter id RTPS 2.5 defines.  Both observed with
-/// the dds-rtps CoherentSets GROUP tests (vendor ids 01.01 and 01.26);
-/// this list should only grow when another vendor is concretely observed
-/// to stall the same way.
-pub fn omitsGroupCoherentSet(vendor_id: VendorId) bool {
-    return vendor_id.eql(.{ .bytes = .{ 0x01, 0x01 } }) or
-        vendor_id.eql(.{ .bytes = .{ 0x01, 0x1A } });
 }
 
 /// RTPS Message Header (§9.4.1).

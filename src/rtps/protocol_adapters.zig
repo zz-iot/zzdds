@@ -167,7 +167,6 @@ pub const RtpsProtocolWriter = struct {
         );
         proxy.wants_replay = info.durability_kind != 0;
         proxy.needs_pid_coherent_set_marker = info.needs_pid_coherent_set_marker;
-        proxy.omits_group_coherent_set = info.omits_group_coherent_set;
         return self.writer.addOrRefreshMatchedReader(proxy);
     }
 
@@ -280,7 +279,6 @@ pub const RtpsProtocolWriter = struct {
                     .eoc_sn = eoc_sn,
                     .group = group,
                     .needs_pid_coherent_set_marker = rp.needs_pid_coherent_set_marker,
-                    .omits_group_coherent_set = rp.omits_group_coherent_set,
                 });
             }
         }
@@ -321,8 +319,10 @@ pub const RtpsProtocolWriter = struct {
             for (infos_slice) |entry| {
                 if (!entry.locator.eql(entry0.locator)) continue;
                 if (!entry.reader_guid.prefix.eql(entry0.reader_guid.prefix)) continue;
+                // first_sn/last_sn aren't carried in EOCProxyInfo: these zeros are
+                // placeholders, fine only while dataParams doesn't read them.
                 const marker = writer_sm.EndMarker{ .sn = entry.eoc_sn, .first_sn = 0, .last_sn = 0, .group = entry.group };
-                b.addData(marker.dataParams(entry.reader_guid.entity_id, entry.writer_guid.entity_id, entry.needs_pid_coherent_set_marker, entry.omits_group_coherent_set), &.{});
+                b.addData(marker.dataParams(entry.reader_guid.entity_id, entry.writer_guid.entity_id, entry.needs_pid_coherent_set_marker), &.{});
             }
             writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};
         }
@@ -496,7 +496,7 @@ pub const RtpsProtocolReader = struct {
         self.reader.mu.unlock();
         // Before the proxy exists: once it does, the writer's samples can arrive.
         if (cb) |c| if (c.on_writer_matching) |f| f(c.ctx, info);
-        const added = try self.reader.addOrRefreshMatchedWriter(proxy);
+        const added = try self.reader.addOrRefreshMatchedWriterWith(proxy, if (info.prematch) |*pm| pm else null);
         // on_writer_matched first (DDS spec: subscription_matched precedes liveliness_changed),
         // then on_writer_alive — a newly matched writer is alive by definition.
         // Both fire only after addMatchedWriter succeeds so no callback leaks on OOM.
@@ -586,15 +586,15 @@ pub const RtpsProtocolReader = struct {
             .group_coherent_sn = group_coherent_sn,
             .inline_lifespan_ns = lifespan_ns,
         };
-        // Signal liveliness only for writers already matched; unmatched writers are
-        // handled by StatefulReader.handleData (buffered for reliable readers so the
-        // SEDP race — data arriving before the writer proxy is established — is recovered).
+        // Signal liveliness only for writers already matched: data from a writer
+        // not matched yet is held by the participant until it is (see
+        // rtps/unmatched_cache.zig).
         if (self.reader.isWriterMatched(writer_guid)) {
             if (self.writer_match_cb) |cb| {
                 if (cb.on_writer_alive) |f| f(cb.ctx, writer_guid, .data);
             }
         }
-        // handleData stores a copy; unmatched reliable-reader data is buffered for replay.
+        // handleData stores a copy.
         self.reader.handleData(writer_guid, change) catch {};
     }
 

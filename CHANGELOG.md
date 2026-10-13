@@ -8,6 +8,73 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-13
+
+- **GROUP End Coherent Set markers never carry `PID_COHERENT_SET`.** Readers of one other
+  implementation, which rejects a DATA with neither payload nor inline QoS, get end markers
+  with `PID_COHERENT_SET = SEQUENCENUMBER_UNKNOWN` (RTPS 2.5 §9.6.4.2 Table 9.22, Example
+  2). They now get it only on TOPIC/INSTANCE-scope markers: a GROUP marker always carries
+  the §8.7.6 group parameters, and that reader accepts it without `PID_COHERENT_SET`.
+- **CI: known interop failures don't fail the vendor-interop jobs.**
+  `.github/interop-known-failures.toml` lists dds-rtps tests by vendor, direction and
+  reason; `scripts/check_interop_results.py` reports a listed failure as a warning and in
+  the job summary instead of failing the job, unless its output shows a sanitizer report
+  or a crash, and flags a listed test that passed so the entry can be removed. The first
+  entry is the four GROUP-publisher, GROUP-subscriber `CoherentSets` tests with zzdds
+  publishing to one other implementation, whose subscriber delivers nothing from the
+  RTPS 2.5 form (see `docs/implementation_status.md`).
+
+## 2026-10-12
+
+- **Data that arrives before its writer is matched is held once per participant, and
+  only until discovery settles that writer.** Each reliable reader used to keep its own
+  copies of data from writers it had not matched. That was up to 64 samples from each of
+  32 writers, with no limit on partly reassembled samples and no expiry. Data sent to
+  every reader, as multicast data is, includes writers on other topics, and stayed in
+  every reader until the reader was deleted. Now the participant holds one copy for all
+  its readers, and only from writers discovery has not yet announced and matched against
+  them. Each reader that then matches the writer takes the data, in sequence-number
+  order, ahead of anything the writer sends next; best-effort readers now get it too.
+  - **When it is dropped:** once discovery has matched the writer against every local
+    reader, when the writer or its participant is lost, or one lease duration of the
+    writer's participant after it arrived. While that participant is undiscovered, this
+    participant's lease is used. Either way it is at most 5 minutes.
+  - **Bounds:** 16 MiB, 256 writers, and 64 samples plus 8 partly reassembled samples per
+    writer.
+  - **Built-in discovery readers no longer hold it:** a discovery announcement that
+    arrives before its sender's participant is discovered is dropped, and a reliable
+    discovery reader gets it by repair once matched.
+- **GROUP coherent sets carry `PID_GROUP_COHERENT_SET` to every reader.** Since
+  2026-10-09, readers from two other implementations got GROUP sets without it, picked by
+  vendor id, because their subscribers delivered nothing from sets carrying it. RTPS 2.5
+  §8.7.6 requires it on every sample and End Coherent Set marker of a group set, so zzdds
+  now sends it to them too. Those subscribers deliver nothing from zzdds GROUP sets again;
+  before, they took each writer's part as its own set, and a group set could be split
+  across two reads.
+
+## 2026-10-10
+
+- **A reliable writer resends only the sequence numbers an ACKNACK requests.** A
+  non-final ACKNACK used to make it resend every cached sample and end marker from the
+  ACKNACK's base up, whether the reader had asked for them or not. Against a reader that
+  kept asking for an SN it would never accept, that meant resending the whole history
+  on every ACKNACK. An ACKNACK requests exactly the SNs in its bitmap; a non-final one
+  that requests none now draws a HEARTBEAT (capped at the history floor while a
+  `TRANSIENT_LOCAL` reader's live data is held back), and the reader NACKs what it lacks
+  from that.
+- **A `BEST_EFFORT` DataReader never delivers a sample out of order, and sends no
+  ACKNACKs.** It used to drop only exact duplicates, so a sample older than one it had
+  already delivered was still delivered. It now drops any sample at or below the highest
+  sequence number it has received from that writer (RTPS 2.5 §8.4.12.1.4). It also used
+  to send one ACKNACK on matching, which made a `TRANSIENT_LOCAL` writer replay its
+  history a second time; a best-effort reader sends none (§8.4.2.3), and a writer ignores
+  any that arrive. To keep that history from being dropped as out of order, a
+  `TRANSIENT_LOCAL` writer now sends a newly matched best-effort reader its history in
+  sequence-number order, holding live samples to that reader until the history has gone
+  out. A best-effort reader that matches the writer after the writer has sent its history
+  no longer gets a second chance at it, but gets what arrived before the match (see
+  2026-10-12).
+
 ## 2026-10-09
 
 - **A DataReader that matches while a coherent set is being written gets that set
@@ -71,9 +138,8 @@ Coherent sets now follow RTPS 2.5 §8.7.6 end to end.
   Coherent Set marker. zzdds v0.3.6 and earlier don't read the new ids and keep pairing
   sets by position. Subscribers from two other implementations were observed to deliver
   nothing at all from GROUP sets carrying `PID_GROUP_COHERENT_SET` that end with these
-  markers; readers from those vendors get the sets without it, as each writer's own
-  coherent set, which is how they handled zzdds sets before
-  (`header.omitsGroupCoherentSet`, keyed by vendor id like the existing end-marker quirk).
+  markers; readers from those vendors got the sets without it, as each writer's own
+  coherent set, which is how they handled zzdds sets before (removed 2026-10-12).
 - **GROUP-scope subscribers assemble group sets by id.** `begin_access` used to pair each
   reader's oldest coherent set, so a reader that matched later than its siblings stayed a
   set out of step with them. It now exposes a publisher's group set once every one of its

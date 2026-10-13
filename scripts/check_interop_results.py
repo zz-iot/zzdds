@@ -3,15 +3,24 @@
 
 Usage:
     check_interop_results.py <report.xml> [--tsan-log-dir <dir>]
+        [--known-failures <file.toml> --vendor <name> --direction pub|sub]
 
 Failure output from each test (the pexpect-captured shape_main output, which
 includes any ThreadSanitizer warnings when the binary is built with
 sanitize_thread) is extracted from the JUnit XML and printed in full.
 
+With --known-failures, a failing test listed there for this vendor and
+direction is a known failure: reported, but not a failure of this check,
+unless its output shows a sanitizer report or a crash. A listed test that
+passes is reported too, so the entry can be removed. See
+.github/interop-known-failures.toml for the format.
+
 When run under GitHub Actions (GITHUB_ACTIONS=true):
   - Each failing test's detail is wrapped in a collapsible ::group:: section.
-  - Failed test names are emitted as ::error:: annotations.
+  - Failed test names are emitted as ::error:: annotations, known failures
+    and listed tests that passed as ::warning:: annotations.
   - Any TSAN log files found in --tsan-log-dir are printed the same way.
+  - A results table is appended to the job summary ($GITHUB_STEP_SUMMARY).
 """
 
 import sys
@@ -19,6 +28,7 @@ import os
 import re
 import html as html_mod
 import argparse
+import tomllib
 import junitparser
 
 IN_GHA = os.environ.get("GITHUB_ACTIONS") == "true"
@@ -37,6 +47,18 @@ def gha_endgroup():
 def gha_error(msg):
     if IN_GHA:
         print(f"::error::{msg}", flush=True)
+
+
+def gha_warning(msg):
+    if IN_GHA:
+        print(f"::warning::{msg}", flush=True)
+
+
+def gha_summary(lines):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if IN_GHA and path:
+        with open(path, "a") as f:
+            f.write("\n".join(lines) + "\n")
 
 
 def strip_html(text):
@@ -86,22 +108,59 @@ def is_vendor_limitation(detail):
     return bool(re.search(r'UNSUPPORTED_FEATURE', detail))
 
 
-def check_junit(path):
-    """Return (total, real_failures, vendor_skipped) as lists of TestCase."""
+# Output that marks a failure as a sanitizer report or crash: never a known
+# failure, whatever the list says (ThreadSanitizer, the DebugAllocator's leak
+# and double-free reports, Zig panics, signals).
+SANITIZER_OR_CRASH = re.compile(
+    r'ThreadSanitizer|AddressSanitizer|error\(gpa\)|panic:|Segmentation fault|SIGSEGV|SIGABRT')
+
+
+def test_name(case):
+    """The dds-rtps test name (Test_<Group>_<N>) at the end of a case name."""
+    m = re.search(r'(Test_\w+)$', case.name)
+    return m.group(1) if m else case.name
+
+
+def load_known_failures(path, vendor, direction):
+    """Return {test name: reason} listed in `path` for this vendor (matched as
+    a prefix of the CI vendor matrix name) and direction."""
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    known = {}
+    for entry in data.get("known_failure", []):
+        if entry["direction"] not in ("pub", "sub"):
+            sys.exit(f"{path}: direction must be pub or sub, got {entry['direction']!r}")
+        if vendor.startswith(entry["vendor"]) and entry["direction"] == direction:
+            for name in entry["tests"]:
+                known[name] = entry["reason"]
+    return known
+
+
+def check_junit(path, known):
+    """Return (total, real_failures, known_failures, known_passed,
+    vendor_skipped); known_passed holds test names, the rest TestCases."""
     xml = junitparser.JUnitXml.fromfile(path)
     total = 0
     real_failures = []
+    known_failures = []
     vendor_skipped = []
+    seen = []
     for suite in xml:
         for case in suite:
             total += 1
+            name = test_name(case)
+            seen.append(name)
             if case.result:
                 detail = failure_detail(case)
                 if is_vendor_limitation(detail):
                     vendor_skipped.append(case)
+                elif name in known and not SANITIZER_OR_CRASH.search(detail or ""):
+                    known_failures.append(case)
                 else:
                     real_failures.append(case)
-    return total, real_failures, vendor_skipped
+    failed = {test_name(c) for c in known_failures}
+    known_passed = [n for n in seen if n in known and n not in failed]
+    return total, real_failures, known_failures, known_passed, vendor_skipped
 
 
 def print_tsan_logs(log_dir):
@@ -126,19 +185,55 @@ def main():
     ap.add_argument("report", help="JUnit XML report file")
     ap.add_argument("--tsan-log-dir", metavar="DIR",
                     help="directory of TSAN log files (for log_path= style capture)")
+    ap.add_argument("--known-failures", metavar="FILE",
+                    help="TOML list of known failures (needs --vendor and --direction)")
+    ap.add_argument("--vendor", help="CI vendor matrix name (release asset name without _shape_main_linux.zip)")
+    ap.add_argument("--direction", choices=("pub", "sub"),
+                    help="pub: zzdds publishes; sub: zzdds subscribes")
     args = ap.parse_args()
+    if args.known_failures and not (args.vendor and args.direction):
+        ap.error("--known-failures needs --vendor and --direction")
 
     ok = True
 
-    total, real_failures, vendor_skipped = check_junit(args.report)
-    passed = total - len(real_failures) - len(vendor_skipped)
+    known = (load_known_failures(args.known_failures, args.vendor, args.direction)
+             if args.known_failures else {})
+    total, real_failures, known_failures, known_passed, vendor_skipped = \
+        check_junit(args.report, known)
+    passed = total - len(real_failures) - len(known_failures) - len(vendor_skipped)
     print(f"Interop results: {passed}/{total} passed"
+          + (f", {len(known_failures)} known failures" if known_failures else "")
           + (f", {len(vendor_skipped)} vendor-skipped" if vendor_skipped else ""))
 
     if vendor_skipped:
         print("VENDOR LIMITATION (not a zzdds failure):")
         for case in vendor_skipped:
             print(f"  SKIP  {case.name}")
+
+    if known_failures:
+        print(f"KNOWN FAILURES (listed in {args.known_failures}; not a failure of this check):")
+        for case in known_failures:
+            name = test_name(case)
+            print(f"  KNOWN {case.name}: {known[name]}")
+            gha_warning(f"Known interop failure: {case.name}")
+
+    if known_passed:
+        print(f"LISTED AS KNOWN FAILURES BUT PASSED (remove from {args.known_failures} once reliable):")
+        for name in known_passed:
+            print(f"  PASS  {name}")
+            gha_warning(f"{name} passed but is listed as a known failure")
+
+    title = f"{args.vendor} / {args.direction}" if args.vendor else os.path.basename(args.report)
+    summary = [f"### Interop: {title}", "",
+               f"{passed}/{total} passed, {len(real_failures)} failed, "
+               f"{len(known_failures)} known failures, {len(vendor_skipped)} vendor-skipped", ""]
+    rows = ([("❌ failed", test_name(c)) for c in real_failures]
+            + [("⚠️ known failure", test_name(c)) for c in known_failures]
+            + [("ℹ️ listed as known, passed", n) for n in known_passed]
+            + [("⏭️ vendor-skipped", test_name(c)) for c in vendor_skipped])
+    if rows:
+        summary += ["| Result | Test |", "|---|---|"] + [f"| {r} | {n} |" for r, n in rows]
+    gha_summary(summary + [""])
 
     if real_failures:
         ok = False

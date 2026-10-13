@@ -246,9 +246,9 @@ bases exactly as before (unexercised, matching today's shipped behavior).
   sample, which identifies the set) and `PID_WRITER_GROUP_INFO` (0x0065). The parameter
   ids are pinned by a byte-level builder test: from 2026-06-20 to 2026-10-07 they were
   0x0039/0x0038 and nothing noticed, since a round trip through zzdds's own parser passes
-  with any value. Readers from vendors observed to stall on group sets that carry
-  `PID_GROUP_COHERENT_SET` (`header.omitsGroupCoherentSet`: their subscribers delivered
-  nothing) get the sets without it, as each writer's own coherent set.
+  with any value. Every reader gets this form, whatever its vendor: §8.7.6 makes the
+  three parameters mandatory, and a reader that stalls on them is not accommodated by
+  leaving one out (see `implementation_status.md`).
 - *End of a set.* A set ends only on what §9.6.4.2 defines: an end marker (a DATA without
   a payload), a sample of another set, or a sample without `PID_COHERENT_SET`. A HEARTBEAT
   does not end one: it says which samples the writer has, and writers that send samples as

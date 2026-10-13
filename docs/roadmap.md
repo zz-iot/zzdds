@@ -117,6 +117,23 @@ Forward-looking only: known gaps, planned features, and open design questions.
   / `handleHeartbeat`'s proxy-loop path (`reader_sm.zig`) and fragmented-change sends
   (`sendFragsToProxyLocked`, `writer_sm.zig`) still send under lock. Out of scope for the
   original fix; a mirror pass is needed.
+- **Writer send pacing (flow control), for history replay and repair** — nothing paces what
+  a writer sends.
+  - **Best-effort history replay.** A `TRANSIENT_LOCAL` writer sends a newly matched
+    `BEST_EFFORT` reader its whole history at once (`replayHistoryToProxyUnlocked`). It
+    copies every unfragmented sample up to the next fragmented one, then sends the copies;
+    each fragmented sample goes out whole, under the writer lock (see the bullet above).
+  - **Repair.** A reliable writer resends everything an ACKNACK or NACK_FRAG requests,
+    immediately.
+
+  A large history or a large fragmented sample therefore goes out as one burst. Revisit
+  together, once there is tooling to measure throughput and loss under load: a per-writer
+  send budget or rate, an asynchronous publish mode, and delayed, batched repair (see
+  `nack_response_delay` under LocatorSelector above).
+
+  Smaller, independent improvements to the best-effort replay:
+  - Send in fixed-size batches, so its copy is bounded by the batch rather than the history.
+  - After an allocation failure, resume where it stopped rather than from the start.
 - **`orderedRemove` / `swapRemove` audit** — several hot paths do O(N) middle-of-list
   removal (O(N²) in loops). Sweep all call sites before scaling; `commitCoherentPendingLocked`
   in `reader.zig` (`coherent_committed.orderedRemove(0)`) should become a head-index or ring
@@ -322,11 +339,12 @@ or an optimisation on an already-improved path):
   declined. The GROUP-scope failures with zzdds publishing (DebugAllocator lane) were
   mostly a zzdds writer bug, fixed 2026-10-09 (a reader matching mid-set was held back
   or started inside the set; see `CHANGELOG.md`). Still open, with zzdds publishing:
-  - One implementation's subscriber occasionally (about 1 local run in 30) delivers one
-    topic's part of a GROUP set in a different read from the rest, though every
-    writer's end marker arrived in one datagram. zzdds omits `PID_GROUP_COHERENT_SET`
-    for that implementation (see `header.omitsGroupCoherentSet`), so it sees per-writer
-    sets.
+  - Two implementations' subscribers deliver nothing from GROUP sets in the RTPS 2.5
+    form, which zzdds sends to every reader since 2026-10-12 (see
+    `implementation_status.md`; CI lists the affected tests in
+    `.github/interop-known-failures.toml`). Before that, zzdds left `PID_GROUP_COHERENT_SET` out
+    for them, and one of them occasionally (about 1 local run in 30) delivered one
+    topic's part of a set in a different read from the rest.
   - One CI run had a topic deliver nothing at all, though the subscriber reported the
     match on time. A mid-set match loses at most one set, so this looks like zzdds
     matching the subscriber's DataReader late (only the first DataWriter's match gates

@@ -34,6 +34,11 @@ const testing = std.testing;
 const ZERO_TS: RtpsTimestamp = .{ .seconds = 0, .fraction = 0 };
 const NIL_IH = std.mem.zeroes(InstanceHandle);
 const NIL_KH = std.mem.zeroes([16]u8);
+const UnmatchedCache = rtps.unmatched_cache.UnmatchedCache;
+/// Bounds for a test's own stand-in for the participant's cache of data
+/// from writers not matched yet.
+const HELD_LIMITS = rtps.unmatched_cache.Limits{ .max_bytes = 1 << 20, .max_writers = 8, .max_samples_per_writer = 64, .max_partials_per_writer = 4 };
+const HELD_TTL_NS: i64 = std.time.ns_per_s;
 
 const WRITER_EID = rtps.EntityIds.sedp_builtin_publications_writer;
 const READER_EID = rtps.EntityIds.sedp_builtin_publications_reader;
@@ -157,13 +162,33 @@ fn countSendsToV6Port(rec: *const Recording, port: u16) usize {
 
 // ── Shared reader setup ───────────────────────────────────────────────────────
 
-/// Set up a StatefulReader with one matched writer proxy (writer_loc = where
-/// the reader sends AckNacks).
+/// Set up a RELIABLE StatefulReader with one matched writer proxy
+/// (writer_loc = where the reader sends AckNacks).
 fn makeReader(
     rec: *Recording,
     reader_guid: Guid,
     writer_guid: Guid,
     writer_loc: Locator,
+) !*StatefulReader {
+    return makeReaderWith(rec, reader_guid, writer_guid, writer_loc, true);
+}
+
+/// Like makeReader, but BEST_EFFORT.
+fn makeBestEffortReader(
+    rec: *Recording,
+    reader_guid: Guid,
+    writer_guid: Guid,
+    writer_loc: Locator,
+) !*StatefulReader {
+    return makeReaderWith(rec, reader_guid, writer_guid, writer_loc, false);
+}
+
+fn makeReaderWith(
+    rec: *Recording,
+    reader_guid: Guid,
+    writer_guid: Guid,
+    writer_loc: Locator,
+    reliable: bool,
 ) !*StatefulReader {
     const r = try StatefulReader.init(
         testing.allocator,
@@ -171,9 +196,9 @@ fn makeReader(
         rec.makeTransport(),
         .keep_all,
         0,
-        false,
+        reliable,
     );
-    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true);
+    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, reliable);
     try r.addMatchedWriter(wp);
     return r;
 }
@@ -263,7 +288,7 @@ test "data callbacks run under the reader's lock and on_flush after it is releas
     var probe = FlushProbe{ .reader = r };
     r.setCallback(.{ .ctx = &probe, .on_data = FlushProbe.onData, .on_flush = FlushProbe.onFlush });
 
-    // Buffered before the match, then delivered by addOrRefreshMatchedWriter.
+    // Held before the match, then delivered by addOrRefreshMatchedWriterWith.
     const early = rtps.history.CacheChange{
         .kind = .alive,
         .writer_guid = writer_guid,
@@ -273,9 +298,11 @@ test "data callbacks run under the reader's lock and on_flush after it is releas
         .key_hash = std.mem.zeroes([16]u8),
         .data = &.{ 0, 1, 0, 0, 1 },
     };
-    try r.handleData(writer_guid, early);
+    var held = UnmatchedCache.init(testing.allocator, HELD_LIMITS);
+    defer held.deinit();
+    held.put(writer_guid, rtps.EntityIds.unknown, &early, true, 0, HELD_TTL_NS);
     try testing.expectEqual(@as(usize, 0), probe.data_calls);
-    try testing.expect(try r.addOrRefreshMatchedWriter(try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true)));
+    try testing.expect(try r.addOrRefreshMatchedWriterWith(try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true), &.{ .cache = &held }));
     try testing.expectEqual(@as(usize, 1), probe.data_calls);
     try testing.expectEqual(@as(usize, 1), probe.flush_calls);
 
@@ -836,11 +863,11 @@ test "RELIABLE: duplicate out-of-order SN buffered only once" {
     try testing.expectEqual(@as(usize, 0), r.writer_proxies.items[0].pending_changes.items.len);
 }
 
-test "BEST_EFFORT: out-of-order changes delivered immediately (no reorder)" {
+test "BEST_EFFORT: a change below the highest received is dropped (RTPS 2.5 §8.4.12.1.4 T2)" {
     const reader_guid = makeGuid(0x28, READER_EID);
     const writer_guid = makeGuid(0x29, WRITER_EID);
     var rec: Recording = .{};
-    const r = try makeReader(&rec, reader_guid, writer_guid, Locator.udp4(.{ 127, 0, 0, 1 }, 7400));
+    const r = try makeBestEffortReader(&rec, reader_guid, writer_guid, Locator.udp4(.{ 127, 0, 0, 1 }, 7400));
     defer r.deinit();
 
     var recorder = Recorder.init(testing.allocator);
@@ -850,10 +877,52 @@ test "BEST_EFFORT: out-of-order changes delivered immediately (no reorder)" {
     const ch2 = CacheChange{ .kind = .alive, .writer_guid = writer_guid, .sequence_number = 2, .source_timestamp = ZERO_TS, .instance_handle = NIL_IH, .key_hash = NIL_KH, .data = "second" };
     const ch1 = CacheChange{ .kind = .alive, .writer_guid = writer_guid, .sequence_number = 1, .source_timestamp = ZERO_TS, .instance_handle = NIL_IH, .key_hash = NIL_KH, .data = "first" };
 
+    const ch3 = CacheChange{ .kind = .alive, .writer_guid = writer_guid, .sequence_number = 3, .source_timestamp = ZERO_TS, .instance_handle = NIL_IH, .key_hash = NIL_KH, .data = "third" };
+
     try r.handleData(writer_guid, ch2);
     try r.handleData(writer_guid, ch1);
-    // BEST_EFFORT: both delivered in arrival order (2 then 1).
-    try testing.expectEqualSlices(SequenceNumber, &.{ 2, 1 }, recorder.sns.items);
+    try r.handleData(writer_guid, ch3);
+    // BEST_EFFORT: 2 is delivered at once, with no wait for 1; 1 then arrives
+    // late and is dropped, never delivered out of order; 3 is next.
+    try testing.expectEqualSlices(SequenceNumber, &.{ 2, 3 }, recorder.sns.items);
+}
+
+test "BEST_EFFORT: no ACKNACK on matching a writer" {
+    const reader_guid = makeGuid(0x2A, READER_EID);
+    const writer_guid = makeGuid(0x2B, WRITER_EID);
+    var rec: Recording = .{};
+    const r = try makeBestEffortReader(&rec, reader_guid, writer_guid, Locator.udp4(.{ 127, 0, 0, 1 }, 7400));
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 0), rec.n);
+}
+
+test "BEST_EFFORT: data from a writer not yet matched is delivered in SN order once it is" {
+    const reader_guid = makeGuid(0x2C, READER_EID);
+    const writer_guid = makeGuid(0x2D, WRITER_EID);
+    var rec: Recording = .{};
+    const r = try StatefulReader.init(testing.allocator, reader_guid, rec.makeTransport(), .keep_all, 0, false);
+    defer r.deinit();
+
+    var recorder = Recorder.init(testing.allocator);
+    defer recorder.deinit();
+    r.setCallback(.{ .ctx = &recorder, .on_data = Recorder.onData });
+
+    // A writer that matched this reader first replays its history before the
+    // reader has matched it; the datagrams can also arrive out of order.  The
+    // reader ignores them; the participant holds them (here, `held`).
+    const ch2 = CacheChange{ .kind = .alive, .writer_guid = writer_guid, .sequence_number = 2, .source_timestamp = ZERO_TS, .instance_handle = NIL_IH, .key_hash = NIL_KH, .data = "second" };
+    const ch1 = CacheChange{ .kind = .alive, .writer_guid = writer_guid, .sequence_number = 1, .source_timestamp = ZERO_TS, .instance_handle = NIL_IH, .key_hash = NIL_KH, .data = "first" };
+    var held = UnmatchedCache.init(testing.allocator, HELD_LIMITS);
+    defer held.deinit();
+    for ([_]CacheChange{ ch2, ch1 }) |ch| {
+        try r.handleData(writer_guid, ch);
+        held.put(writer_guid, rtps.EntityIds.unknown, &ch, true, 0, HELD_TTL_NS);
+    }
+    try testing.expectEqual(@as(usize, 0), recorder.sns.items.len);
+
+    const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7400)}, &.{}, false);
+    _ = try r.addOrRefreshMatchedWriterWith(wp, &.{ .cache = &held });
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2 }, recorder.sns.items);
 }
 
 // ── LocatorSelector: effectiveLocators ranking (via WriterProxy) ──────────────

@@ -235,8 +235,9 @@ test "BEST_EFFORT: write after proxy → delivered in one round" {
 
 test "RELIABLE KEEP_ALL: write before proxy → all samples replayed on match" {
     // Write three samples before the proxy is established. When addProxies()
-    // is called (simulating SEDP completing), the writer replays its full cache.
-    // One deliverAll() delivers all three in sequence-number order.
+    // is called (simulating SEDP completing), the writer announces its cache
+    // with a HEARTBEAT; the reader NACKs it and gets all three, in
+    // sequence-number order, in the second deliverAll().
     const alloc = testing.allocator;
 
     const net = try MockNetwork.init(alloc);
@@ -286,10 +287,12 @@ test "RELIABLE KEEP_ALL: write before proxy → all samples replayed on match" {
     // Verify nothing has been delivered yet.
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Simulate SEDP completing: add proxies → writer immediately replays cache.
+    // Simulate SEDP completing: add proxies → writer announces its cache.
     try addProxies(alloc, writer, reader);
 
-    // One deliverAll delivers all three replayed samples.
+    // Round 1: the reader NACKs SNs 1-3. Round 2: they arrive.
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 0), col.samples.items.len);
     net.deliverAll();
 
     try testing.expectEqual(@as(usize, 3), col.samples.items.len);
@@ -345,6 +348,8 @@ test "RELIABLE KEEP_LAST depth=1: write before proxy → only last sample replay
     try writePayload(writer, "last");
 
     try addProxies(alloc, writer, reader);
+    // Round 1: the reader NACKs the one SN announced. Round 2: it arrives.
+    net.deliverAll();
     net.deliverAll();
 
     // KEEP_LAST depth=1 evicts the first two; only "last" survives in the cache.
