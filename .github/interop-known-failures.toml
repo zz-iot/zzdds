@@ -40,3 +40,17 @@ reason = """GROUP publisher and GROUP subscriber: the subscriber drops every \
 RTPS 2.5 §8.7.6 End Coherent Set marker that lacks PID_COHERENT_SET, so it \
 never ends a GROUP coherent set and delivers none (docs/implementation_status.md, \
 "GROUP coherent sets to subscribers of two other implementations")."""
+
+[[known_failure]]
+vendor = "hdds"
+direction = "pub"
+tests = [
+    "Test_CoherentSets_11",
+    "Test_CoherentSets_19",
+    "Test_CoherentSets_20",
+]
+reason = """Intermittent, multi-topic TOPIC and INSTANCE sets: the subscriber \
+drops every payload-less end-of-coherent-set marker (RTPS 2.5 §9.6.4.2), so it \
+ends a set only when the next set starts, and a repaired sample that arrives \
+out of order is delivered outside its set (docs/implementation_status.md, \
+"TOPIC and INSTANCE coherent sets to one other implementation")."""

@@ -197,6 +197,19 @@ Until 2026-10-12 zzdds left `PID_GROUP_COHERENT_SET` out
 for those two (by vendor id, which §8.7.6 does not allow), so they took each writer's part
 as a set of its own: data arrived, but a group set could be split across two reads.
 
+**TOPIC and INSTANCE coherent sets to one other implementation.** zzdds ends each
+TOPIC- or INSTANCE-scope set with a DATA that has no payload (§9.6.4.2 Table 9.22). The
+subscriber of one other implementation drops that marker, with or without
+`PID_COHERENT_SET`=SEQUENCENUMBER_UNKNOWN. Its reliable reader therefore never records the
+marker's sequence number, its ACKNACK base stops at the first marker for the rest of the
+session, and zzdds resends every marker on each ACKNACK. Nothing from that sequence
+number on is ever acknowledged. The subscriber ends a set only when the next set's first
+sample arrives, and commits whatever it holds at that point. A repaired sample that
+arrives after a later one in the same set is left out of its set, which happens
+intermittently in the multi-topic CoherentSets tests. Leaving out the marker for that
+reader isn't possible on its own, because the marker's sequence number belongs to the
+writer and is shared by every reader.
+
 **SPDP liveness probe fires directed HBs on SEDP reliable channels.** When SPDP silence
 exceeds `min(3 × observed_interval, 5 s)`, the SPDP layer triggers a directed non-final
 HEARTBEAT to the peer's SEDP reader proxies. If no ACKNACK arrives before the probe deadline

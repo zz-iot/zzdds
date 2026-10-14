@@ -413,25 +413,47 @@ test "writer model: AckNack does not retransmit samples still inside coherent wi
     try expectAckNackMatchesModel(alloc, writer, &model, &rec, nack_set, 0, 2, false);
 }
 
-test "writer model: bounded write/coherent/AckNack scripts match implementation" {
+/// Every four-op script that starts with `first`.  The exhaustive run is split
+/// by first op, one test each, to keep every test well inside CI's per-test
+/// timeout: each script's teardown joins the writer's heartbeat thread.
+fn runScriptsStartingWith(first: WriterScriptOp) !void {
     const alloc = testing.allocator;
-    const alphabet = [_]WriterScriptOp{
-        .write,
-        .begin_coherent,
-        .end_coherent,
-        .ack_nonfinal_empty,
-        .ack_nonfinal_all,
-        .ack_final_first,
-    };
-
-    for (alphabet) |a| {
-        for (alphabet) |b| {
-            for (alphabet) |c| {
-                for (alphabet) |d| {
-                    const script = [_]WriterScriptOp{ a, b, c, d };
-                    try runWriterScript(alloc, &script);
-                }
+    const alphabet = std.enums.values(WriterScriptOp);
+    for (alphabet) |b| {
+        for (alphabet) |c| {
+            for (alphabet) |d| {
+                const script = [_]WriterScriptOp{ first, b, c, d };
+                try runWriterScript(alloc, &script);
             }
         }
     }
+}
+
+test "writer model: bounded scripts starting with write match implementation" {
+    try runScriptsStartingWith(.write);
+}
+
+test "writer model: bounded scripts starting with begin_coherent match implementation" {
+    try runScriptsStartingWith(.begin_coherent);
+}
+
+test "writer model: bounded scripts starting with end_coherent match implementation" {
+    try runScriptsStartingWith(.end_coherent);
+}
+
+test "writer model: bounded scripts starting with ack_nonfinal_empty match implementation" {
+    try runScriptsStartingWith(.ack_nonfinal_empty);
+}
+
+test "writer model: bounded scripts starting with ack_nonfinal_all match implementation" {
+    try runScriptsStartingWith(.ack_nonfinal_all);
+}
+
+test "writer model: bounded scripts starting with ack_final_first match implementation" {
+    try runScriptsStartingWith(.ack_final_first);
+}
+
+comptime {
+    // One test above per op: a new op needs a test of its own.
+    std.debug.assert(std.enums.values(WriterScriptOp).len == 6);
 }
