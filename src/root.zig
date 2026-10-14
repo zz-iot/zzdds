@@ -154,6 +154,8 @@ test {
     _ = @import("rtps/history.zig");
     _ = @import("rtps/writer_sm.zig");
     _ = @import("rtps/reader_sm.zig");
+    _ = @import("rtps/reassembly.zig");
+    _ = @import("rtps/unmatched_cache.zig");
     _ = @import("util/time.zig");
     _ = @import("util/clock_registry.zig");
     _ = @import("util/guid_gen.zig");

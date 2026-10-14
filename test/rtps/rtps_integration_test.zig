@@ -224,7 +224,9 @@ test "fan_out: one writer, two readers — both receive all samples" {
     const wp2 = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
     try reader2.addMatchedWriter(wp2);
 
-    // One round: both readers' queues drain (DATA + HEARTBEAT per reader).
+    // Round 1: each reader NACKs SNs 1-3 from its replay HEARTBEAT.
+    // Round 2: the writer resends them; both readers deliver.
+    net.deliverAll();
     net.deliverAll();
 
     try testing.expectEqual(@as(usize, 3), col1.samples.items.len);
@@ -308,7 +310,9 @@ test "fan_in: two writers, one reader — per-proxy ReceivedSet independent" {
     const wp2 = try WriterProxy.init(alloc, W2_GUID, &.{W2_LOC}, &.{}, true);
     try reader.addMatchedWriter(wp2);
 
-    // Both replays arrive in one round.
+    // Round 1: the reader NACKs each writer's replay HEARTBEAT.
+    // Round 2: both writers resend; the reader delivers all six.
+    net.deliverAll();
     net.deliverAll();
 
     // Reader must receive all 6 samples (3 from each writer).
@@ -318,12 +322,10 @@ test "fan_in: two writers, one reader — per-proxy ReceivedSet independent" {
 test "late_join: KEEP_LAST-2 writer fills firstSN virtual gap on HEARTBEAT" {
     // A TRANSIENT_LOCAL writer has published 5 samples but the cache only
     // retains the last 2 (SNs 4 and 5).  When the reader joins late:
-    //   1. Writer replays cached DATA(4) and DATA(5).
-    //   2. Writer sends HEARTBEAT(firstSN=4, lastSN=5).
-    //   3. Reader's handleHeartbeat sees firstSN=4 > cumulativeAck(0)+1=1 and
-    //      inserts virtual GAPs for SNs 1-3, coalescing with the already-received
-    //      [4,5] range to produce ReceivedSet=[1,5].
-    //   4. deliverPendingLocked then delivers the buffered SNs 4 and 5.
+    //   1. Writer sends HEARTBEAT(firstSN=4, lastSN=5).
+    //   2. Reader's handleHeartbeat sees firstSN=4 > cumulativeAck(0)+1=1 and
+    //      inserts virtual GAPs for SNs 1-3, then NACKs SNs 4 and 5.
+    //   3. Writer resends DATA(4) and DATA(5); the reader delivers them.
     //
     // This exercises the evicted-history path: reader never NACKs for SNs 1-3
     // (they're gone from the cache) and still converges to cumulativeAck=5.
@@ -368,16 +370,17 @@ test "late_join: KEEP_LAST-2 writer fills firstSN virtual gap on HEARTBEAT" {
     try write(writer, "sn4");
     try write(writer, "sn5");
 
-    // Late reader joins. Writer replays {SN4, SN5} then sends HEARTBEAT(4, 5).
+    // Late reader joins. Writer sends HEARTBEAT(4, 5).
     const rp = try ReaderProxy.init(alloc, R1_GUID, &.{R1_LOC}, &.{}, false, true);
     try writer.addMatchedReader(rp);
     const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
     try reader.addMatchedWriter(wp);
 
-    // Round 1: DATA(4), DATA(5) — buffered (out-of-order from empty ReceivedSet).
-    //          HEARTBEAT(4,5)   — firstSN gap triggers virtual fill of SNs 1-3,
-    //                             ReceivedSet coalesces to [1,5], pending SNs 4-5
-    //                             are delivered.
+    // Round 1: HEARTBEAT(4,5) — firstSN gap triggers virtual fill of SNs 1-3;
+    //          the reader NACKs SNs 4-5.
+    // Round 2: DATA(4), DATA(5) arrive and are delivered.
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 0), col.samples.items.len);
     net.deliverAll();
 
     // Only the two live samples should arrive; evicted SNs 1-3 are never delivered.
@@ -386,21 +389,22 @@ test "late_join: KEEP_LAST-2 writer fills firstSN virtual gap on HEARTBEAT" {
     try testing.expectEqualSlices(u8, "sn5", col.samples.items[1]);
 }
 
-test "loss_recovery: initial HB dropped, initial NACK from addMatchedWriter triggers retransmit" {
+test "loss_recovery: initial HB dropped, initial NACK from addMatchedWriter draws a new one" {
     // Reliable history replay is NACK-driven: addMatchedReader sends only a
     // HEARTBEAT (announcing the range); DATA follows when the reader NACKs.
     // Here the initial HB is dropped by LossyTransport(1), so the reader
     // never learns the range from the HB.  addMatchedWriter fires an initial
-    // NACK(base=1, num_bits=0, final=false) which is enough to trigger the
-    // writer's non-final NACK handler to send HB+DATA(1,2,3).
+    // NACK(base=1, num_bits=0, final=false), which requests no SN but asks
+    // for a HEARTBEAT; that one announces the range.
     //
     // addMatchedReader : HB(c=1) dropped (seq 1).  suppress_live_data=true.
     // addMatchedWriter : initial NACK(base=1, empty bitmap) → mt_w queue.
-    // Round 1          : NACK (empty bitmap) → non-final tail loop sends DATA(1,2,3)
-    //                    + trailing HB(c=2) capped at floor=3; pre-burst HB skipped
+    // Round 1          : NACK (empty bitmap) → HB(1,3,c=2) capped at floor=3
     //                    (suppress_live_data=true). suppress_live_data unchanged
     //                    (highest_sn=0 < floor=3).
-    // Round 2          : DATA(1,2,3) arrive → all three delivered.
+    // Round 2          : reader gets HB(1,3) → NACKs SNs 1-3 → writer sends
+    //                    DATA(1,2,3) + capped HB.
+    // Round 3          : DATA(1,2,3) arrive → all three delivered.
     const alloc = testing.allocator;
 
     const net = try MockNetwork.init(alloc);
@@ -458,12 +462,15 @@ test "loss_recovery: initial HB dropped, initial NACK from addMatchedWriter trig
     const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
     try reader.addMatchedWriter(wp);
 
-    // Round 1: NACK (empty bitmap) → tail loop sends DATA(1,2,3) + trailing HB(c=2).
-    //          (pre-burst HB skipped: suppress_live_data=true). No delivery yet.
+    // Round 1: NACK (empty bitmap) → capped HB(1,3,c=2). No delivery yet.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Round 2: reader gets DATA(1,2,3) + trailing HB → all three delivered.
+    // Round 2: reader NACKs SNs 1-3; writer sends DATA(1,2,3). No delivery yet.
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 0), col.samples.items.len);
+
+    // Round 3: reader gets DATA(1,2,3) + trailing HB → all three delivered.
     net.deliverAll();
 
     try testing.expectEqual(@as(usize, 3), col.samples.items.len);
@@ -808,11 +815,13 @@ test "suppress_live_data: live write during history replay is ordered after hist
     // addMatchedReader : suppress=true. HB(1,3,c=1) dropped.
     // addMatchedWriter : NACK-1(base=1, empty, non-final) queued.
     // write("four")   : SN=4 added to cache; suppressed for the reader.
-    // Round 1         : NACK-1 → non-final tail sends DATA(1,2,3) + capped HB(1,3,c=2).
-    //                   SN=4 skipped by Guard 2 (4 > floor=3).
-    // Round 2         : reader gets DATA(1,2,3)+HB → delivers "one","two","three";
-    //                   sends FINAL NACK(base=4) → suppress not cleared (final).
-    // Round 3         : writer gets FINAL NACK → no DATA (suppress, final, nothing sent).
+    // Round 1         : NACK-1 → capped HB(1,3,c=2); SN=4 not announced.
+    // Round 2         : reader gets HB(1,3) → NON-FINAL NACK(base=1,{1,2,3});
+    //                   highest_sn=0 < floor=3 → suppress not cleared.
+    //                   Writer sends DATA(1,2,3) + capped HB(1,3).
+    // Round 3         : reader gets DATA(1,2,3)+HB → delivers "one","two","three";
+    //                   sends FINAL NACK(base=4); writer: suppress not cleared
+    //                   (final), nothing sent.
     // sendHeartbeat   : HB(1,4,c=3) to reader (periodic HB reveals live range).
     // Round 4         : reader gets HB(1,4) → missing {4}; sends NON-FINAL NACK(base=4,{4}).
     //                   Writer: !is_final, highest_sn=3 >= floor=3 → suppress cleared.
@@ -871,15 +880,16 @@ test "suppress_live_data: live write during history replay is ordered after hist
     // Live write while suppress is active; sendChangeToAllLocked skips the reader.
     try write(writer, "four");
 
-    // Round 1: NACK-1 → tail loop sends DATA(1,2,3) + capped HB(1,3). SN=4 blocked.
+    // Round 1: NACK-1 → capped HB(1,3). SN=4 not announced.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Round 2: reader delivers "one","two","three"; sends FINAL NACK(base=4).
+    // Round 2: reader NACKs SNs 1-3 → writer sends DATA(1,2,3). SN=4 blocked.
     net.deliverAll();
-    try testing.expectEqual(@as(usize, 3), col.samples.items.len);
+    try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Round 3: FINAL NACK → suppress not cleared, nothing sent.
+    // Round 3: reader delivers "one","two","three"; its FINAL NACK(base=4)
+    //          leaves suppress set, so nothing is sent.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 3), col.samples.items.len);
 
@@ -910,8 +920,11 @@ test "suppress_live_data: KEEP_LAST eviction past floor clears flag, no malforme
     // addMatchedWriter: NACK-1(base=1, empty, non-final) queued.
     // write("new"): KEEP_LAST-1 evicts SN=1 → cache={SN=2}. cache_first=2 > floor=1.
     // Round 1: NACK-1 arrives → evicted_past_floor=true → suppress cleared.
-    //          Non-final tail sends DATA(SN=2); trailing HB is uncapped (first=2,last=2).
-    // Round 2: reader gets DATA(2) → delivers "new".
+    //          It requests no SN, so the writer answers with an uncapped,
+    //          well-formed HB (first=2, last=2).
+    // Round 2: reader gets HB(2,2) → virtual GAP for SN=1, NACKs SN=2 →
+    //          writer sends DATA(SN=2).
+    // Round 3: reader gets DATA(2) → delivers "new".
     const alloc = testing.allocator;
 
     const net = try MockNetwork.init(alloc);
@@ -964,12 +977,15 @@ test "suppress_live_data: KEEP_LAST eviction past floor clears flag, no malforme
     try write(writer, "new");
 
     // Round 1: NACK(base=1, non-final) → evicted_past_floor → suppress cleared.
-    //          DATA(SN=2) sent (tail loop, SN=2 > base=1, not in empty bitmap).
-    //          Trailing HB uses uncapped last_sn=2 (well-formed: first=2, last=2).
+    //          HB uses uncapped last_sn=2 (well-formed: first=2, last=2).
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.samples.items.len);
 
-    // Round 2: DATA(2) arrives → delivers "new". "old" (SN=1) was evicted and lost.
+    // Round 2: reader NACKs SN=2 → writer sends DATA(2).
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 0), col.samples.items.len);
+
+    // Round 3: DATA(2) arrives → delivers "new". "old" (SN=1) was evicted and lost.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 1), col.samples.items.len);
     try testing.expectEqualSlices(u8, "new", col.samples.items[0]);
@@ -1104,11 +1120,15 @@ test "dispose_survives_nack_replay: not_alive_disposed replayed with correct STA
     const wp = try WriterProxy.init(alloc, W1_GUID, &.{W1_LOC}, &.{}, true);
     try reader.addMatchedWriter(wp);
 
-    // Round 1: NACK-1(empty bitmap) → tail sends DATA(1,2,3) + capped HB(1,3).
+    // Round 1: NACK-1(empty bitmap) → capped HB(1,3).
     net.deliverAll();
     try testing.expectEqual(@as(usize, 0), col.items.items.len);
 
-    // Round 2: all three arrive and are delivered.
+    // Round 2: reader NACKs SNs 1-3 → writer sends DATA(1,2,3).
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 0), col.items.items.len);
+
+    // Round 3: all three arrive and are delivered.
     net.deliverAll();
     try testing.expectEqual(@as(usize, 3), col.items.items.len);
     try testing.expect(col.items.items[0].kind == .alive);

@@ -6,6 +6,8 @@ pub const sequence_number = @import("sequence_number.zig");
 pub const message = @import("message/root.zig");
 pub const history = @import("history.zig");
 pub const received_set = @import("received_set.zig");
+pub const reassembly = @import("reassembly.zig");
+pub const unmatched_cache = @import("unmatched_cache.zig");
 pub const writer_sm = @import("writer_sm.zig");
 pub const reader_sm = @import("reader_sm.zig");
 

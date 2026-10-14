@@ -117,6 +117,23 @@ Forward-looking only: known gaps, planned features, and open design questions.
   / `handleHeartbeat`'s proxy-loop path (`reader_sm.zig`) and fragmented-change sends
   (`sendFragsToProxyLocked`, `writer_sm.zig`) still send under lock. Out of scope for the
   original fix; a mirror pass is needed.
+- **Writer send pacing (flow control), for history replay and repair** — nothing paces what
+  a writer sends.
+  - **Best-effort history replay.** A `TRANSIENT_LOCAL` writer sends a newly matched
+    `BEST_EFFORT` reader its whole history at once (`replayHistoryToProxyUnlocked`). It
+    copies every unfragmented sample up to the next fragmented one, then sends the copies;
+    each fragmented sample goes out whole, under the writer lock (see the bullet above).
+  - **Repair.** A reliable writer resends everything an ACKNACK or NACK_FRAG requests,
+    immediately.
+
+  A large history or a large fragmented sample therefore goes out as one burst. Revisit
+  together, once there is tooling to measure throughput and loss under load: a per-writer
+  send budget or rate, an asynchronous publish mode, and delayed, batched repair (see
+  `nack_response_delay` under LocatorSelector above).
+
+  Smaller, independent improvements to the best-effort replay:
+  - Send in fixed-size batches, so its copy is bounded by the batch rather than the history.
+  - After an allocation failure, resume where it stopped rather than from the start.
 - **`orderedRemove` / `swapRemove` audit** — several hot paths do O(N) middle-of-list
   removal (O(N²) in loops). Sweep all call sites before scaling; `commitCoherentPendingLocked`
   in `reader.zig` (`coherent_committed.orderedRemove(0)`) should become a head-index or ring
@@ -315,15 +332,24 @@ or an optimisation on an already-improved path):
   in-progress coherent set; see `CHANGELOG.md`), not harness timing as the 2026-08-28
   campaign concluded. The harness check has its own gap: it skips the first two read
   cycles that have data, assuming every DataWriter matches at once, but a DataReader that
-  matches while a set is being written cannot receive that set whole, so DataWriters
+  matches while a set is being written may not receive that set whole, so DataWriters
   matching in more than two steps still fail it. The fix, skipping each topic's first
   delivery instead, is carried on the `zz-iot/dds-rtps` branch CI pins
   (`INTEROP_RTPS_REF`); propose it upstream, where the earlier whole-run rewrite was
-  declined. To re-check now that zzdds sends the RTPS 2.5 group ids and keeps its end
-  markers: GROUP-scope failures with zzdds publishing to another implementation
-  (DebugAllocator lane only; the subscriber held one topic's part of a set back; 0 of 10
-  local runs failed), and one subscriber that delivered the first sets ~20 read cycles
-  late with zzdds publishing.
+  declined. The GROUP-scope failures with zzdds publishing (DebugAllocator lane) were
+  mostly a zzdds writer bug, fixed 2026-10-09 (a reader matching mid-set was held back
+  or started inside the set; see `CHANGELOG.md`). Still open, with zzdds publishing:
+  - Two implementations' subscribers deliver nothing from GROUP sets in the RTPS 2.5
+    form, which zzdds sends to every reader since 2026-10-12 (see
+    `implementation_status.md`; CI lists the affected tests in
+    `.github/interop-known-failures.toml`). Before that, zzdds left `PID_GROUP_COHERENT_SET` out
+    for them, and one of them occasionally (about 1 local run in 30) delivered one
+    topic's part of a set in a different read from the rest.
+  - One CI run had a topic deliver nothing at all, though the subscriber reported the
+    match on time. A mid-set match loses at most one set, so this looks like zzdds
+    matching the subscriber's DataReader late (only the first DataWriter's match gates
+    the publisher); unconfirmed, no capture.
+  - One subscriber that delivered the first sets ~20 read cycles late.
 - **Coherent sets: what RTPS 2.5 §8.7.5–8.7.6 has that zzdds doesn't yet.**
   - A GAP's `filteredCount` (changes the writer filtered out for this reader) is not
     parsed, so a writer-side-filtered change inside a set makes it incomplete.

@@ -50,7 +50,7 @@ fn makeGuid(prefix_byte: u8, eid: rtps.EntityId) Guid {
 
 /// Captures every send() call so tests can assert on what was transmitted.
 /// One Capture per send() invocation; stores the destination locator and raw bytes.
-const MAX_CAPS = 32;
+const MAX_CAPS = 64;
 const MAX_BYTES = 512;
 
 const Capture = struct {
@@ -72,6 +72,10 @@ const Recording = struct {
     /// send-error handling (UnsupportedLocatorKind silently ignored as
     /// defence-in-depth vs. any other error logged and otherwise swallowed).
     send_error: ?anyerror = null,
+    /// When set, the next send() writes one sample to this writer (once),
+    /// as another thread could while the writer has released its lock to
+    /// send.
+    write_on_send: ?*StatefulWriter = null,
 
     pub fn reset(self: *@This()) void {
         self.n = 0;
@@ -90,6 +94,10 @@ const Recording = struct {
         c.len = @min(data.len, MAX_BYTES);
         @memcpy(c.buf[0..c.len], data[0..c.len]);
         self.n += 1;
+        if (self.write_on_send) |w| {
+            self.write_on_send = null;
+            _ = w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "written mid-send") catch {};
+        }
     }
 
     fn canReach(_: *anyopaque, _: *const Locator) bool {
@@ -146,6 +154,30 @@ fn collectDataSNsSorted(rec: *const Recording, buf: []SequenceNumber) []Sequence
         }
     }
     std.mem.sort(SequenceNumber, buf[0..n], {}, std.sort.asc(SequenceNumber));
+    return buf[0..n];
+}
+
+/// The writer_sn of each DATA and DATA_FRAG sent, in send order, with a
+/// fragmented sample's run of DATA_FRAGs counted once.  Returns a slice into
+/// `buf`.
+fn collectSentSnsInOrder(rec: *const Recording, buf: []SequenceNumber) []SequenceNumber {
+    var n: usize = 0;
+    for (rec.caps[0..rec.n]) |*cap| {
+        var it = MessageIterator.init(cap.buf[0..cap.len]) catch continue;
+        var params: [32]InlineQosParam = undefined;
+        while (it.next(&params) catch null) |sm| {
+            const sn = switch (sm) {
+                .data => |d| d.writer_sn,
+                .data_frag => |df| df.writer_sn,
+                else => continue,
+            };
+            if (sm == .data_frag and n > 0 and buf[n - 1] == sn) continue;
+            if (n < buf.len) {
+                buf[n] = sn;
+                n += 1;
+            }
+        }
+    }
     return buf[0..n];
 }
 
@@ -290,7 +322,7 @@ test "addOrRefreshMatchedReader: true for a new match, false for a refresh, true
     try testing.expect(try w.addOrRefreshMatchedReader(try ReaderProxy.init(testing.allocator, reader_guid, &.{reader_loc}, &.{}, false, true)));
 }
 
-test "handleAckNack: non-final + empty bitmap retransmits all changes >= base" {
+test "handleAckNack: non-final + empty bitmap resends nothing and draws a HEARTBEAT" {
     const writer_guid = makeGuid(0x01, WRITER_EID);
     const reader_guid = makeGuid(0x02, READER_EID);
     const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
@@ -299,19 +331,21 @@ test "handleAckNack: non-final + empty bitmap retransmits all changes >= base" {
     const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
     defer w.deinit();
 
-    // Non-final AckNack, empty bitmap (base=1, num_bits=0).
-    // §8.3.7.1.2: non-final → writer MUST send all changes with SN >= base.
+    // Non-final AckNack, empty bitmap (base=1, num_bits=0): it requests no
+    // SN, so nothing is resent; it asks for a HEARTBEAT, which offers 1-3.
     const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
     w.handleAckNack(reader_guid, 0, nack_set, 1, false);
 
     var sns_buf: [8]SequenceNumber = undefined;
-    const sent = collectDataSNsSorted(&rec, &sns_buf);
-    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3 }, sent);
+    try testing.expectEqual(@as(usize, 0), collectDataSNsSorted(&rec, &sns_buf).len);
+    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 1), hb.first_sn);
+    try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
 }
 
 // ── AckNack: non-final + bitmap ──────────────────────────────────────────────
 
-test "handleAckNack: non-final + bitmap retransmits NACKed and all >= base not in bitmap" {
+test "handleAckNack: non-final + bitmap retransmits only NACKed SNs" {
     const writer_guid = makeGuid(0x03, WRITER_EID);
     const reader_guid = makeGuid(0x04, READER_EID);
     const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
@@ -320,9 +354,8 @@ test "handleAckNack: non-final + bitmap retransmits NACKed and all >= base not i
     const w = try makeWriterWithReader(&rec, loc_a, reader_guid, writer_guid);
     defer w.deinit();
 
-    // Bitmap: only SN 2 is explicitly NACKed (bit set).
-    // Non-final → loop 1 sends SN 2 (explicit NACK).
-    //           → loop 2 sends SN 1 and SN 3 (in-range, not in NACK bitmap).
+    // Bitmap: only SN 2 is NACKed. SN 1 and SN 3 are in the bitmap's range
+    // but not requested, so the reader has them: only SN 2 is resent.
     var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 3, .bitmap = std.mem.zeroes([8]u32) };
     nack_set.set(2); // NACK SN 2
 
@@ -330,7 +363,7 @@ test "handleAckNack: non-final + bitmap retransmits NACKed and all >= base not i
 
     var sns_buf: [8]SequenceNumber = undefined;
     const sent = collectDataSNsSorted(&rec, &sns_buf);
-    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3 }, sent);
+    try testing.expectEqualSlices(SequenceNumber, &.{2}, sent);
 }
 
 // ── AckNack: final + bitmap ───────────────────────────────────────────────────
@@ -1164,7 +1197,7 @@ test "handleAckNack: a NACKed end marker is sent again, not GAPed" {
     try testing.expectEqual(null, findGap(&rec));
 }
 
-test "handleAckNack: a non-final NACK also resends the end marker" {
+test "handleAckNack: a non-final NACK for the end marker resends it" {
     const reader_guid = makeGuid(0x53, READER_EID);
     var rec: Recording = .{};
     const w = try makeCoherentWriter(&rec, .keep_all, 0, reader_guid);
@@ -1175,7 +1208,9 @@ test "handleAckNack: a non-final NACK also resends the end marker" {
     w.endCoherentSet(.coherent_only, false, null, null, false);
     rec.reset();
 
-    const nack_set = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(1);
+    nack_set.set(2);
     w.handleAckNack(reader_guid, 0, nack_set, 1, false);
 
     var sns_buf: [8]SequenceNumber = undefined;
@@ -1278,6 +1313,38 @@ test "endCoherentSet: a GROUP writer with nothing in the set still ends it" {
     try testing.expectEqual(@as(i64, 13), publisher_gsn);
 }
 
+test "endCoherentSet: a reader that rejects bare markers gets SEQUENCENUMBER_UNKNOWN on TOPIC-scope ones only" {
+    // A TOPIC/INSTANCE-scope marker is otherwise a DATA with neither payload
+    // nor inline QoS (RTPS 2.5 §9.6.4.2 Table 9.22, Example 3); such a reader
+    // gets the equivalent PID_COHERENT_SET=SEQUENCENUMBER_UNKNOWN form.  A GROUP
+    // End Coherent Set marker carries the §8.7.6 group parameters, so it is
+    // never bare and keeps the plain form.
+    const reader_guid = makeGuid(0x53, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeCoherentWriter(&rec, .keep_all, 0, reader_guid);
+    defer w.deinit();
+    w.reader_proxies.items[0].needs_pid_coherent_set_marker = true;
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    w.endCoherentSet(.coherent_only, false, null, null, false);
+    const topic_marker = findSentData(&rec, 2) orelse return error.NoEndMarker;
+    try testing.expect(!topic_marker.has_payload);
+    // SEQUENCENUMBER_UNKNOWN on the wire is {high = -1, low = 0}; findSentData
+    // reads the raw value.
+    try testing.expectEqual(@as(?SequenceNumber, -1 << 32), topic_marker.coherent_set);
+
+    rec.reset();
+    const group_set = rtps.history.GroupCoherentSet{ .first_gsn = 11, .end_gsn = 12, .writer_group_info = .{ 1, 2, 3, 4 } };
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    w.endCoherentSet(.full, false, null, group_set, false);
+    const ecs = findSentData(&rec, 4) orelse return error.NoEndCoherentSet;
+    try testing.expect(!ecs.has_payload);
+    try testing.expectEqual(@as(?SequenceNumber, null), ecs.coherent_set);
+    try testing.expectEqual(@as(?SequenceNumber, 11), ecs.group_coherent_set);
+}
+
 test "endCoherentSet: an empty GROUP writer's marker waits for the combined send" {
     // The publisher sends every writer's End Coherent Set marker together:
     // takeEOCProxyInfos looks each one up for its group fields.  A writer that
@@ -1316,48 +1383,6 @@ test "endCoherentSet: an empty GROUP writer's marker waits for the combined send
     for (w.end_markers.items) |m| try testing.expect(m.sn != pending);
 }
 
-test "endCoherentSet: a reader whose vendor stalls on group set ids gets them omitted" {
-    // See header.omitsGroupCoherentSet: such a reader gets the set as the
-    // writer's own coherent set, without PID_GROUP_COHERENT_SET, while every
-    // other reader gets the RTPS 2.5 form.
-    var rec: Recording = .{};
-    const w = try StatefulWriter.init(
-        testing.allocator,
-        makeGuid(0x52, WRITER_EID),
-        rec.makeTransport(),
-        .keep_all,
-        0,
-        READER_EID,
-        rtps.writer_sm.DEFAULT_FRAG_SIZE,
-        false,
-    );
-    defer w.deinit();
-    var rp = try ReaderProxy.init(testing.allocator, makeGuid(0x53, READER_EID), &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, true);
-    rp.omits_group_coherent_set = true;
-    try w.addMatchedReader(rp);
-    rec.reset();
-
-    w.beginCoherentSet(true);
-    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
-    w.endCoherentSet(.full, false, null, null, false);
-
-    const sample = findSentData(&rec, 1) orelse return error.NoSample;
-    try testing.expectEqual(@as(?SequenceNumber, 1), sample.coherent_set);
-    try testing.expectEqual(@as(?SequenceNumber, 1), sample.group_seq_num);
-    try testing.expectEqual(@as(?SequenceNumber, null), sample.group_coherent_set);
-    const ecs = findSentData(&rec, 2) orelse return error.NoEndCoherentSet;
-    try testing.expectEqual(@as(?SequenceNumber, null), ecs.group_coherent_set);
-
-    // The NACK path too.
-    rec.reset();
-    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
-    nack_set.set(1);
-    nack_set.set(2);
-    w.handleAckNack(makeGuid(0x53, READER_EID), 0, nack_set, 1, true);
-    try testing.expectEqual(@as(?SequenceNumber, null), (findSentData(&rec, 1) orelse return error.NoSample).group_coherent_set);
-    try testing.expectEqual(@as(?SequenceNumber, null), (findSentData(&rec, 2) orelse return error.NoEndCoherentSet).group_coherent_set);
-}
-
 test "replay: a best-effort late joiner gets coherent sets with their inline QoS and end markers" {
     var rec: Recording = .{};
     const w = try StatefulWriter.init(
@@ -1390,6 +1415,169 @@ test "replay: a best-effort late joiner gets coherent sets with their inline QoS
     try testing.expectEqual(@as(?SequenceNumber, 4), findSentData(&rec, 4).?.coherent_set);
     try testing.expect(!findSentData(&rec, 3).?.has_payload);
     try testing.expect(!findSentData(&rec, 5).?.has_payload);
+}
+
+// ── A reader matching while a coherent set is open ────────────────────────────
+
+const LATE_READER_GUID = makeGuid(0x53, READER_EID);
+
+/// A KEEP_ALL writer, TRANSIENT_LOCAL (`replay_on_match`) or VOLATILE, with no
+/// reader yet.
+fn makeLateMatchWriter(rec: *Recording, replay_on_match: bool) !*StatefulWriter {
+    return StatefulWriter.init(
+        testing.allocator,
+        makeGuid(0x52, WRITER_EID),
+        rec.makeTransport(),
+        .keep_all,
+        0,
+        READER_EID,
+        rtps.writer_sm.DEFAULT_FRAG_SIZE,
+        replay_on_match,
+    );
+}
+
+/// Match a reliable reader at 127.0.0.1:7100, then stop the periodic
+/// HEARTBEAT thread, which would otherwise send into `rec` as the test does.
+fn matchLateReader(w: *StatefulWriter) !void {
+    const rp = try ReaderProxy.init(testing.allocator, LATE_READER_GUID, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, true);
+    try w.addMatchedReader(rp);
+    w.stopHeartbeat();
+}
+
+/// The last HEARTBEAT in captures.
+fn findLastHeartbeat(rec: *const Recording) ?msg.submessage.HeartbeatSubmessage {
+    var last: ?msg.submessage.HeartbeatSubmessage = null;
+    for (rec.caps[0..rec.n]) |*cap| {
+        var it = MessageIterator.init(cap.buf[0..cap.len]) catch continue;
+        var params: [32]InlineQosParam = undefined;
+        while (it.next(&params) catch null) |sm| {
+            if (sm == .heartbeat) last = sm.heartbeat;
+        }
+    }
+    return last;
+}
+
+test "late match: a TRANSIENT_LOCAL reader matching mid-set gets the set live" {
+    // An open coherent set is not history: the reader isn't held back for it,
+    // and gets its samples, end marker and HEARTBEAT when it ends, with no
+    // ACKNACK round-trip.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, true);
+    defer w.deinit();
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    try matchLateReader(w);
+    try testing.expect(!w.reader_proxies.items[0].suppress_live_data);
+    // The match HEARTBEAT doesn't announce the open set: the writer would
+    // refuse the NACK it drew.
+    try testing.expectEqual(@as(SequenceNumber, 0), (findHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+
+    rec.reset();
+    w.endCoherentSet(.full, false, null, null, false);
+    var sns_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3 }, collectDataSNsSorted(&rec, &sns_buf));
+    try testing.expectEqual(@as(SequenceNumber, 3), (findLastHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+}
+
+test "late match: ACKNACKs while the set is open draw no HEARTBEAT announcing it" {
+    // A HEARTBEAT offering the open set's SNs draws NACKs the writer refuses
+    // while the set is open, each answered by the same HEARTBEAT: a
+    // HEARTBEAT/NACK loop until the set ends.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, true);
+    defer w.deinit();
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    try matchLateReader(w);
+
+    // The reader's initial ACKNACK: nothing received, next expected SN 1.
+    rec.reset();
+    const empty = SequenceNumberSet{ .base = 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(LATE_READER_GUID, 0, empty, 1, false);
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    try testing.expect(findHeartbeat(&rec) == null);
+
+    // A NACK naming the set's SNs.
+    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(1);
+    nack_set.set(2);
+    w.handleAckNack(LATE_READER_GUID, 0, nack_set, 2, false);
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    try testing.expect(findHeartbeat(&rec) == null);
+}
+
+test "late match: a TRANSIENT_LOCAL reader with history before the open set is re-prompted at set end" {
+    // Committed history (SN 1) is protected as before: the reader is held back
+    // until it has it.  The set-end HEARTBEAT reaches it too, so its NACK
+    // releases it and repairs the set without waiting for the periodic one.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, true);
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "h");
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    try matchLateReader(w);
+    try testing.expect(w.reader_proxies.items[0].suppress_live_data);
+    try testing.expectEqual(@as(SequenceNumber, 1), w.reader_proxies.items[0].history_floor_sn);
+    try testing.expectEqual(@as(SequenceNumber, 1), (findHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+
+    // The GROUP flush: marker deferred to the publisher's combined send.
+    rec.reset();
+    w.endCoherentSet(.full, false, null, null, true);
+    w.flushGroupEOCHBOnly();
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+    try testing.expectEqual(@as(SequenceNumber, 3), (findHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
+
+    // The reader holds SN 1 and NACKs the set.
+    rec.reset();
+    var nack_set = SequenceNumberSet{ .base = 2, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
+    nack_set.set(2);
+    nack_set.set(3);
+    w.handleAckNack(LATE_READER_GUID, 1, nack_set, 1, false);
+    try testing.expect(!w.reader_proxies.items[0].suppress_live_data);
+    var sns_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 2, 3 }, collectDataSNsSorted(&rec, &sns_buf));
+}
+
+test "late match: a VOLATILE reader matching mid-set gets the set whole" {
+    // SN 1 was sent before the match: not for this reader.  The open set {2, 3}
+    // is published when it ends, after the match, so the reader starts at 2 and
+    // gets it whole: samples, end marker, and a HEARTBEAT whose firstSN is the
+    // set's first SN, not one inside it.
+    var rec: Recording = .{};
+    const w = try makeLateMatchWriter(&rec, false);
+    defer w.deinit();
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "h");
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    try matchLateReader(w);
+    try testing.expectEqual(@as(SequenceNumber, 2), w.reader_proxies.items[0].start_sn);
+    // The match HEARTBEAT offers nothing yet: [2, 1].
+    const match_hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 2), match_hb.first_sn);
+    try testing.expectEqual(@as(SequenceNumber, 1), match_hb.last_sn);
+
+    rec.reset();
+    w.endCoherentSet(.full, false, null, null, false);
+    var sns_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 2, 3, 4 }, collectDataSNsSorted(&rec, &sns_buf));
+    const set_hb = findLastHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 2), set_hb.first_sn);
+    try testing.expectEqual(@as(SequenceNumber, 4), set_hb.last_sn);
+
+    // A reader that missed the set NACKs it and gets it again; SN 1 never.
+    rec.reset();
+    var nack_set = SequenceNumberSet{ .base = 1, .num_bits = 4, .bitmap = std.mem.zeroes([8]u32) };
+    for (1..5) |sn| nack_set.set(@intCast(sn));
+    w.handleAckNack(LATE_READER_GUID, 0, nack_set, 1, false);
+    try testing.expectEqualSlices(SequenceNumber, &.{ 2, 3, 4 }, collectDataSNsSorted(&rec, &sns_buf));
 }
 
 // ── LocatorSelector: effectiveLocators ranking (via ReaderProxy) ──────────────
@@ -1847,8 +2035,8 @@ test "addMatchedReader: replay-snapshot OOM skips history replay instead of send
     // Force the second allocation through w.alloc to fail: the first
     // (alloc_index 0) is reader_proxies.append growing from empty, which
     // must succeed for the proxy to be matched at all; the second
-    // (alloc_index 1) is the replay snapshot array in
-    // replayHistoryToProxyUnlocked.
+    // (alloc_index 1) is the first allocation of the replay snapshot in
+    // replayBatchUnlocked.
     var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
     w.alloc = fa.allocator();
     defer w.alloc = testing.allocator;
@@ -1900,6 +2088,8 @@ test "checkConnectionGenerations: retries a BEST_EFFORT proxy's OOM-skipped init
     {
         // Same calibration as the OOM test above: alloc_index 0 is
         // reader_proxies.append, alloc_index 1 is the replay snapshot.
+        // Live data to the proxy is held until the retry, so a sample
+        // written now must not reach it ahead of the history.
         var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
         w.alloc = fa.allocator();
         defer w.alloc = testing.allocator;
@@ -1908,15 +2098,120 @@ test "checkConnectionGenerations: retries a BEST_EFFORT proxy's OOM-skipped init
         try w.addMatchedReader(rp);
         try testing.expectEqual(@as(usize, 0), countAllData(&rec));
     }
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "three");
+    try testing.expectEqual(@as(usize, 0), countAllData(&rec));
 
-    // w.alloc is back to the real allocator now -- the retry should succeed.
+    // w.alloc is back to the real allocator now -- the retry should succeed,
+    // and send the history, then the held sample, in SN order.
     w.checkConnectionGenerations();
-    try testing.expectEqual(@as(usize, 2), countAllData(&rec));
+    var sn_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3 }, collectSentSnsInOrder(&rec, &sn_buf));
 
     // A second tick with nothing pending must not resend.
     rec.reset();
     w.checkConnectionGenerations();
     try testing.expectEqual(@as(usize, 0), countAllData(&rec));
+}
+
+// ── BEST_EFFORT history replay order ─────────────────────────────────────────
+//
+// A BEST_EFFORT reader drops any SN at or below the highest it has received
+// (RTPS 2.5 §8.4.12.1.4, T2), so a replayed history must reach it in SN order
+// and ahead of any live sample.
+
+test "BEST_EFFORT replay: a sample written while the history goes out follows it" {
+    const writer_guid = makeGuid(0x84, WRITER_EID);
+    const reader_guid = makeGuid(0x85, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7531);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, writer_guid, rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, true);
+    defer w.deinit();
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+
+    // The first replay send writes SN 3 while the writer's lock is released.
+    rec.write_on_send = w;
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+
+    var sn_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3 }, collectSentSnsInOrder(&rec, &sn_buf));
+
+    // Once the replay is done, live data flows again.
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "four");
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3, 4 }, collectSentSnsInOrder(&rec, &sn_buf));
+}
+
+test "BEST_EFFORT replay: a fragmented sample goes out in its place in SN order" {
+    const writer_guid = makeGuid(0x86, WRITER_EID);
+    const reader_guid = makeGuid(0x87, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7532);
+
+    var rec: Recording = .{};
+    const frag_size = 64;
+    const w = try StatefulWriter.init(testing.allocator, writer_guid, rec.makeTransport(), .keep_all, 0, READER_EID, frag_size, true);
+    defer w.deinit();
+    const big = [_]u8{0xAB} ** (frag_size * 2 + 1);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &big);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "three");
+
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+
+    var sn_buf: [8]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2, 3 }, collectSentSnsInOrder(&rec, &sn_buf));
+}
+
+test "BEST_EFFORT replay: the retained history goes out whole, however many batches it takes" {
+    const writer_guid = makeGuid(0x8a, WRITER_EID);
+    const reader_guid = makeGuid(0x8b, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7534);
+
+    var rec: Recording = .{};
+    const frag_size = 64;
+    const w = try StatefulWriter.init(testing.allocator, writer_guid, rec.makeTransport(), .keep_all, 0, READER_EID, frag_size, true);
+    defer w.deinit();
+    // Small and fragmented samples alternate, so each is a batch of its own:
+    // more batches than the catch-up bound, with nothing written meanwhile.
+    const pairs = rtps.writer_sm.MAX_BEST_EFFORT_REPLAY_ROUNDS / 2 + 1;
+    comptime std.debug.assert(pairs * 4 <= MAX_CAPS); // a DATA, 2 DATA_FRAGs and a HEARTBEAT_FRAG a pair
+    const big = [_]u8{0xAB} ** (frag_size + 1);
+    for (0..pairs) |_| {
+        _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "small");
+        _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &big);
+    }
+
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+
+    var expected: [pairs * 2]SequenceNumber = undefined;
+    for (&expected, 1..) |*sn, i| sn.* = @intCast(i);
+    var sn_buf: [pairs * 2 + 1]SequenceNumber = undefined;
+    try testing.expectEqualSlices(SequenceNumber, &expected, collectSentSnsInOrder(&rec, &sn_buf));
+}
+
+test "handleAckNack: an ACKNACK from a BEST_EFFORT reader is ignored" {
+    const writer_guid = makeGuid(0x88, WRITER_EID);
+    const reader_guid = makeGuid(0x89, READER_EID);
+    const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7533);
+
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, writer_guid, rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, true);
+    defer w.deinit();
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "two");
+    const rp = try ReaderProxy.init(testing.allocator, reader_guid, &.{loc_a}, &.{}, false, false);
+    try w.addMatchedReader(rp);
+    rec.reset();
+
+    // Non-final, requesting both SNs: a RELIABLE reader would get both again
+    // and a HEARTBEAT.
+    var set = SequenceNumberSet{ .base = 1, .num_bits = 2, .bitmap = std.mem.zeroes([8]u32) };
+    set.bitmap[0] = 0xC000_0000;
+    w.handleAckNack(reader_guid, 0, set, 1, false);
+    try testing.expectEqual(@as(usize, 0), rec.n);
 }
 
 // ── Transport send-error handling ────────────────────────────────────────────

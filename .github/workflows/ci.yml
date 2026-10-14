@@ -1310,7 +1310,9 @@ jobs:
       - name: Check results
         run: |
           python3 zzdds/scripts/check_interop_results.py \
-            /tmp/interop-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+            /tmp/interop-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
+            --known-failures zzdds/.github/interop-known-failures.toml \
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
 
       - name: Upload report
         if: always()
@@ -1400,7 +1402,9 @@ jobs:
       - name: Check results
         run: |
           python3 zzdds/scripts/check_interop_results.py \
-            /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+            /tmp/interop-tsan-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
+            --known-failures zzdds/.github/interop-known-failures.toml \
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
 
       - name: Upload TSan report
         if: always()
@@ -1493,7 +1497,9 @@ jobs:
       - name: Check results
         run: |
           python3 zzdds/scripts/check_interop_results.py \
-            /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml
+            /tmp/interop-debug-allocator-${{ matrix.vendor.name }}-${{ matrix.direction }}.xml \
+            --known-failures zzdds/.github/interop-known-failures.toml \
+            --vendor "${{ matrix.vendor.name }}" --direction ${{ matrix.direction }}
 
       - name: Upload DebugAllocator report
         if: always()

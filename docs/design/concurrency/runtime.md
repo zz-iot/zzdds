@@ -564,6 +564,31 @@ no live executor replacement in v1. Live executor replacement and detach before 
 supported in v1. Concrete platform ABI and backend fixtures remain
 implementation gates. Owner release and automatic retirement suffice for ordinary use.
 
+<a id="deterministic-simulation-consumer"></a>
+### Deterministic simulation consumer
+
+Manual progress is the intended substrate for a deterministic simulation executor (the
+zzest test framework's planned replay mode): one thread hosts several participants,
+each in its own manual runtime, over an in-process transport and a virtual clock, and
+a seeded scheduler chooses driving order, clock advances and packet delivery/loss.
+Replaying the same seed must reproduce the same interleaving. This is not a v1
+implementation gate, but manual-mode design must not preclude it:
+
+* Every protocol progress source (ingress dispatch, SPDP announce/lease, heartbeat and
+  ACKNACK timing, deadline/liveliness timers, retirement) is reachable through manual
+  driving. A manual runtime starts no hidden hosted threads.
+* One thread may drive several distinct runtimes in sequence; this is not recursive or
+  concurrent driving of one runtime.
+* A virtual scheduling clock advanced by the simulator is supported through the
+  advance/change notification above; its deadlines are never host sleeps.
+* Transport ingress and output completion can be supplied by an injected in-process
+  transport whose delivery timing the simulator controls.
+* Given identical inputs, driving order and clock advances, ready-work selection is
+  deterministic: no ordering from hash iteration, addresses or host timing. Entropy
+  consumers (GUID generation, jitter) accept an injected seeded source.
+
+Simulation results establish correctness and reproducibility only, never performance.
+
 <a id="runtime-retirement-progress-and-backend-shutdown"></a>
 ## Runtime retirement progress and backend shutdown
 

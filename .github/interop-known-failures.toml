@@ -1,0 +1,56 @@
+# dds-rtps interop tests whose failure is known and does not fail CI.
+#
+# scripts/check_interop_results.py reads this in the vendor-interop jobs. A
+# listed test that fails is reported as a known failure (a warning annotation
+# and a line in the job summary), not an error; one that passes is reported
+# too, so a fixed entry gets noticed and removed.
+#
+# Each entry:
+#   vendor    - prefix of the CI vendor matrix name (the dds-rtps release
+#               asset name without "_shape_main_linux.zip"), as in
+#               DEFAULT_PREFIXES in .github/workflows/ci.yml
+#   direction - "pub" (zzdds publishes, the vendor subscribes) or "sub"
+#   tests     - dds-rtps test names
+#   reason    - why, with a pointer to where it is tracked
+
+[[known_failure]]
+vendor = "connext_dds"
+direction = "pub"
+tests = [
+    "Test_CoherentSets_8",
+    "Test_CoherentSets_12",
+    "Test_CoherentSets_18",
+    "Test_CoherentSets_21",
+]
+reason = """GROUP publisher and GROUP subscriber: the subscriber acknowledges \
+every sample of a GROUP coherent set in the RTPS 2.5 §8.7.6 form and delivers \
+none (docs/implementation_status.md, "GROUP coherent sets to subscribers of \
+two other implementations")."""
+
+[[known_failure]]
+vendor = "hdds"
+direction = "pub"
+tests = [
+    "Test_CoherentSets_8",
+    "Test_CoherentSets_12",
+    "Test_CoherentSets_18",
+    "Test_CoherentSets_21",
+]
+reason = """GROUP publisher and GROUP subscriber: the subscriber drops every \
+RTPS 2.5 §8.7.6 End Coherent Set marker that lacks PID_COHERENT_SET, so it \
+never ends a GROUP coherent set and delivers none (docs/implementation_status.md, \
+"GROUP coherent sets to subscribers of two other implementations")."""
+
+[[known_failure]]
+vendor = "hdds"
+direction = "pub"
+tests = [
+    "Test_CoherentSets_11",
+    "Test_CoherentSets_19",
+    "Test_CoherentSets_20",
+]
+reason = """Intermittent, multi-topic TOPIC and INSTANCE sets: the subscriber \
+drops every payload-less end-of-coherent-set marker (RTPS 2.5 §9.6.4.2), so it \
+ends a set only when the next set starts, and a repaired sample that arrives \
+out of order is delivered outside its set (docs/implementation_status.md, \
+"TOPIC and INSTANCE coherent sets to one other implementation")."""

@@ -18,6 +18,7 @@ const std = @import("std");
 const iface = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const history_mod = @import("../rtps/history.zig");
+const unmatched_mod = @import("../rtps/unmatched_cache.zig");
 const submsg_mod = @import("../rtps/message/submessage.zig");
 
 pub const Guid = guid_mod.Guid;
@@ -50,8 +51,6 @@ pub const EOCProxyInfo = struct {
     group: ?GroupCoherentSet = null,
     /// See MatchedReaderInfo.needs_pid_coherent_set_marker.
     needs_pid_coherent_set_marker: bool = false,
-    /// See MatchedReaderInfo.omits_group_coherent_set.
-    omits_group_coherent_set: bool = false,
 };
 
 // ── Matched endpoint information ──────────────────────────────────────────────
@@ -77,10 +76,6 @@ pub const MatchedReaderInfo = struct {
     /// ("Example 2") instead. Both are spec-legal; see
     /// header_mod.needsPidCoherentSetMarker for the empirical basis.
     needs_pid_coherent_set_marker: bool = false,
-    /// True when this remote reader's vendor is known to stall GROUP coherent
-    /// sets that carry PID_GROUP_COHERENT_SET; it gets them without it, as
-    /// each writer's own coherent set.  See header_mod.omitsGroupCoherentSet.
-    omits_group_coherent_set: bool = false,
 };
 
 /// What SEDP tells the protocol layer about a newly-matched remote writer.
@@ -111,6 +106,9 @@ pub const MatchedWriterInfo = struct {
     /// participant prefix with its PID_GROUP_ENTITYID, else the participant
     /// prefix alone.
     publisher_guid: Guid = std.mem.zeroes(Guid),
+    /// Where the writer's data that reached this participant before the
+    /// match is held, for the reader to take on a new match.
+    prematch: ?unmatched_mod.Prematch = null,
 };
 
 // ── Data delivery callback ────────────────────────────────────────────────────
@@ -244,7 +242,7 @@ pub const ProtocolWriter = struct {
         ) anyerror!void,
 
         /// Incoming ACKNACK from a matched reader. Updates proxy ACK state and
-        /// retransmits requested changes per RTPS §8.3.7.1.2.
+        /// resends the SNs its bitmap requests (RTPS 2.5 §8.4.9.2, T8).
         handle_ack_nack: *const fn (
             ctx: *anyopaque,
             reader_guid: Guid,

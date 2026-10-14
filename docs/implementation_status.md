@@ -41,7 +41,7 @@ design decisions with rationale.
 | HEARTBEAT_FRAG / NACK_FRAG | Complete | Fragment ACK/retransmit; per-proxy stale-count suppression (§8.3.8.12–13) |
 | `PID_COHERENT_SET` (0x0056) inline QoS | Complete | Emitted on coherent-set members; sets end on an end marker, a sample of another set or one outside any set; incomplete sets are discarded (RTPS 2.5 §8.7.6) |
 | `PID_GROUP_SEQ_NUM` (0x0064) inline QoS | Complete | Emitted by Publisher on every write under ordered/coherent access; used to sort on `begin_access` |
-| `PID_GROUP_COHERENT_SET` (0x0063) inline QoS | Complete | The group set's id, on every sample and End Coherent Set marker of a GROUP coherent set; the subscriber assembles group sets by it. Omitted for readers whose vendor is known to stall on it (`header.omitsGroupCoherentSet`) |
+| `PID_GROUP_COHERENT_SET` (0x0063) inline QoS | Complete | The group set's id, on every sample and End Coherent Set marker of a GROUP coherent set; the subscriber assembles group sets by it. Sent to every reader, whatever its vendor |
 | `PID_WRITER_GROUP_INFO` (0x0065) inline QoS | Emitted only | On GROUP coherent-set samples and End Coherent Set markers; not checked against discovery on receive |
 | Writer Liveliness Protocol (P2P endpoints) | Implemented (RELIABLE reader only) | `src/discovery/wlp.zig`; advertised via `BUILTIN_ENDPOINTS` in `src/dcps/participant.zig`. BEST_EFFORT reader path (§8.4.13.3) not implemented |
 
@@ -176,6 +176,39 @@ after. The harness check also assumes all DataWriters match at once (see the roa
 which also lists the failure modes not yet explained). `CoherentSets_8` passes.
 `OrderedAccess_8` was not re-examined; RTI added timing tolerance to
 `ordered_access_w_instances` upstream in Aug 2026 (`95b6f62`).
+
+**GROUP coherent sets to subscribers of two other implementations.** zzdds sends GROUP
+sets as RTPS 2.5 §8.7.6 defines them to every reader: each sample carries
+`PID_GROUP_COHERENT_SET`, and every writer ends the set with an End Coherent Set marker.
+Subscribers of two other implementations deliver nothing from such sets.
+- One receives and acknowledges every sample and delivers none. It ends its own group sets
+  with vendor-specific parameters, not the §8.7.6 marker, and numbers them through
+  `PID_ORIGINAL_WRITER_INFO`. Adding that parameter, or `PID_COHERENT_SET` (either the
+  writer's set or SEQUENCENUMBER_UNKNOWN) on the marker, doesn't help; leaving
+  `PID_GROUP_COHERENT_SET` off the samples is the only change seen to make it deliver.
+- The other drops every End Coherent Set marker, as a DATA with no payload, unless it
+  carries `PID_COHERENT_SET` naming the writer's part of the set (as §9.6.4.3 Table 9.23
+  shows), so it never acknowledges the markers and never ends a group set. Sent that form,
+  it delivered single-topic group sets but not three-topic ones, while another
+  implementation took the same marker as a member of the open set (§9.6.4.2 Table 9.22);
+  zzdds doesn't send it.
+
+Until 2026-10-12 zzdds left `PID_GROUP_COHERENT_SET` out
+for those two (by vendor id, which §8.7.6 does not allow), so they took each writer's part
+as a set of its own: data arrived, but a group set could be split across two reads.
+
+**TOPIC and INSTANCE coherent sets to one other implementation.** zzdds ends each
+TOPIC- or INSTANCE-scope set with a DATA that has no payload (§9.6.4.2 Table 9.22). The
+subscriber of one other implementation drops that marker, with or without
+`PID_COHERENT_SET`=SEQUENCENUMBER_UNKNOWN. Its reliable reader therefore never records the
+marker's sequence number, its ACKNACK base stops at the first marker for the rest of the
+session, and zzdds resends every marker on each ACKNACK. Nothing from that sequence
+number on is ever acknowledged. The subscriber ends a set only when the next set's first
+sample arrives, and commits whatever it holds at that point. A repaired sample that
+arrives after a later one in the same set is left out of its set, which happens
+intermittently in the multi-topic CoherentSets tests. Leaving out the marker for that
+reader isn't possible on its own, because the marker's sequence number belongs to the
+writer and is shared by every reader.
 
 **SPDP liveness probe fires directed HBs on SEDP reliable channels.** When SPDP silence
 exceeds `min(3 × observed_interval, 5 s)`, the SPDP layer triggers a directed non-final

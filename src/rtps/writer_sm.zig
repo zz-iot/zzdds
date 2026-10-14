@@ -255,8 +255,9 @@ pub const ReaderProxy = struct {
     /// Highest SN the reader has cumulatively acknowledged.
     highest_acked_sn: SequenceNumber,
     /// First SN this reader is eligible to receive. Set to 1 for
-    /// TRANSIENT_LOCAL+ (gets full history). Set to cache.next_sn at match
-    /// time for VOLATILE writers (late joiners skip historical data).
+    /// TRANSIENT_LOCAL+ (gets full history). For VOLATILE, the first SN not
+    /// yet sent at match time (firstUnsentSnLocked): late joiners skip
+    /// historical data, but get a coherent set still open whole.
     start_sn: SequenceNumber,
     /// Last accepted ACKNACK count for stale-submessage suppression (§8.3.7.1).
     /// Null until the first ACKNACK that causes a retransmit is accepted.
@@ -272,11 +273,14 @@ pub const ReaderProxy = struct {
     /// on a non-final NACK so that RTI Connext has time to flush its durability
     /// history buffer to the DataReader before the first live sample arrives.
     /// A final NACK means "I'm satisfied" — not "send me live data" — so it
-    /// must not clear this flag.
+    /// must not clear this flag.  A BEST_EFFORT proxy has it set only while
+    /// its history replay is going out (see replayHistoryToProxyUnlocked).
     suppress_live_data: bool,
-    /// cache.maxSn() at the time this proxy was created with suppress_live_data.
-    /// Threshold for clearing suppress_live_data: the reader's cumulative ack
-    /// must reach this SN on a non-final NACK before live data is unblocked.
+    /// Last SN of the history this proxy was matched with (lastSentSnLocked at
+    /// match time), when created with suppress_live_data.  Threshold for
+    /// clearing suppress_live_data: the reader's cumulative ack must reach this
+    /// SN on a non-final NACK before live data is unblocked.  A coherent set
+    /// still open at match time is not history: it lies above this floor.
     history_floor_sn: SequenceNumber,
     /// Non-zero while a liveness probe is active for this reader proxy.
     /// Monotonic deadline (ns): if no ACKNACK arrives before this time, the
@@ -310,8 +314,6 @@ pub const ReaderProxy = struct {
     /// vtAddMatchedReader; defaults to false (Example 3, the smaller spec-legal
     /// end-of-coherent-set form) for readers with no known quirk.
     needs_pid_coherent_set_marker: bool = false,
-    /// See MatchedReaderInfo.omits_group_coherent_set.
-    omits_group_coherent_set: bool = false,
     /// True when this proxy represents the reader's OWN local participant --
     /// i.e. it exists only to bootstrap same-participant builtin-endpoint
     /// matching (see combined.zig's `self_data` call), not a genuinely remote
@@ -329,9 +331,10 @@ pub const ReaderProxy = struct {
     /// periodically from the heartbeat thread — see checkConnectionGenerations.
     last_seen_connection_generation: u32 = 0,
     /// Set when replayHistoryToProxyUnlocked's BEST_EFFORT branch couldn't
-    /// build its unlocked-send snapshot (OOM) and had to skip the initial
-    /// history replay entirely -- this proxy's only history-delivery path,
-    /// since BEST_EFFORT never ACKNACKs. Retried on the next heartbeat-thread
+    /// build its unlocked-send snapshot (OOM) and had to stop the history
+    /// replay -- this proxy's only history-delivery path, since BEST_EFFORT
+    /// never ACKNACKs. Live data to the proxy stays held until the retry, so
+    /// the history still arrives ahead of it. Retried on the next heartbeat-thread
     /// tick (see checkConnectionGenerations) rather than left permanently
     /// lost: the retry reuses the same deadlock-safe unlocked replay path,
     /// just re-invoked later once the transient OOM has likely cleared
@@ -419,25 +422,26 @@ pub const EndMarker = struct {
     /// PID_GROUP_SEQ_NUM, PID_GROUP_COHERENT_SET and PID_WRITER_GROUP_INFO.
     group: ?history_mod.GroupCoherentSet = null,
 
-    /// The marker's DATA submessage for one reader.  Readers whose vendor needs
-    /// the explicit PID_COHERENT_SET=SEQUENCENUMBER_UNKNOWN form get it (see
-    /// header_mod.needsPidCoherentSetMarker); everyone else gets no
-    /// PID_COHERENT_SET (RTPS 2.5 §9.6.4.2 Table 9.22).
+    /// The marker's DATA submessage for one reader.  It has no PID_COHERENT_SET
+    /// (RTPS 2.5 §9.6.4.2 Table 9.22), except that a TOPIC/INSTANCE-scope marker
+    /// gets PID_COHERENT_SET=SEQUENCENUMBER_UNKNOWN for readers whose vendor
+    /// rejects a DATA with neither payload nor inline QoS (see
+    /// header_mod.needsPidCoherentSetMarker).  A GROUP End Coherent Set marker
+    /// always carries inline QoS (§8.7.6), so it never needs it.
     pub fn dataParams(
         self: EndMarker,
         reader_entity_id: EntityId,
         writer_entity_id: EntityId,
         needs_pid_coherent_set_marker: bool,
-        omits_group_coherent_set: bool,
     ) msg.builder.MessageBuilder.DataParams {
         return .{
             .reader_entity_id = reader_entity_id,
             .writer_entity_id = writer_entity_id,
             .writer_sn = self.sn,
             .no_payload = true,
-            .coherent_set_sn = if (needs_pid_coherent_set_marker) sn_mod.SEQUENCENUMBER_UNKNOWN else null,
+            .coherent_set_sn = if (needs_pid_coherent_set_marker and self.group == null) sn_mod.SEQUENCENUMBER_UNKNOWN else null,
             .group_seq_num = if (self.group) |g| g.end_gsn else null,
-            .group_coherent_sn = if (omits_group_coherent_set) null else if (self.group) |g| g.first_gsn else null,
+            .group_coherent_sn = if (self.group) |g| g.first_gsn else null,
             .writer_group_info = if (self.group) |g| g.writer_group_info else null,
         };
     }
@@ -467,6 +471,12 @@ fn markerSnapshot(comptime Snapshot: type, m: EndMarker) Snapshot {
 /// discards that set.  A marker whose set is still cached is never dropped:
 /// a reader the set is replayed to needs it, and the cache bounds those.
 pub const MAX_END_MARKERS: usize = 1024;
+
+/// Upper bound on the catch-up rounds of a BEST_EFFORT history replay (see
+/// replayHistoryToProxyUnlocked): each round sends what was published while
+/// the previous one went out.  The history retained when the replay starts
+/// is not counted against it.
+pub const MAX_BEST_EFFORT_REPLAY_ROUNDS: usize = 16;
 
 /// Reliable writer with per-reader ACK tracking.
 /// Typical use: SEDP publications/subscriptions announcements, user data.
@@ -743,8 +753,8 @@ pub const StatefulWriter = struct {
     ///
     /// For new readers: when `replay_on_match` is true (TRANSIENT_LOCAL+), the
     /// full history cache is replayed.  For VOLATILE writers `start_sn` is set to
-    /// the writer's next SN so the reader only sees future data, and a Heartbeat
-    /// is sent to communicate this range.
+    /// the first SN not yet sent so the reader only sees future data, and a
+    /// Heartbeat is sent to communicate this range.
     ///
     /// Returns true when the reader is newly matched, false for a lease refresh
     /// of an existing match.
@@ -797,13 +807,13 @@ pub const StatefulWriter = struct {
         // no use for history and must not be held back waiting for an ACKNACK
         // it has no spec-driven reason to send.
         const should_replay = self.replay_on_match and new_rp.wants_replay;
-        if (!should_replay) new_rp.start_sn = self.cache.next_sn;
+        if (!should_replay) new_rp.start_sn = self.firstUnsentSnLocked();
         // Record the correlating floor for the RELIABLE readiness handshake,
         // matching whatever firstSN the HB sent below will actually carry (see
         // hbFirstSn). BEST_EFFORT proxies never ACKNACK, so there is no
         // handshake to wait for — they become ready immediately instead,
         // fired after mu is released below (never while holding it).
-        new_rp.first_sent_hb_first_sn = hbFirstSn(self.firstAvailableSnLocked(), self.lastAvailableSnLocked(), new_rp.start_sn, null);
+        new_rp.first_sent_hb_first_sn = hbFirstSn(self.firstAvailableSnLocked(), self.lastSentSnLocked(), new_rp.start_sn, null);
         const newly_ready_guid: ?Guid = blk: {
             if (!new_rp.reliable) {
                 new_rp.protocol_ready = true;
@@ -816,14 +826,22 @@ pub const StatefulWriter = struct {
         // directly to the proxy (not through sendChangeToAllLocked) so it is
         // unaffected by the flag itself.
         //
-        // BEST_EFFORT readers are excluded here even when should_replay is true:
-        // suppress_live_data exists to hold live data back until an ACKNACK proves
-        // the reader caught up, but BEST_EFFORT readers never ACKNACK, so a replayed
-        // history can race with concurrent live writes for them. That's acceptable —
-        // BEST_EFFORT already permits gaps and reordering — not a bug to fix here.
-        if (new_rp.reliable and should_replay and self.cache.changes.items.len > 0) {
+        // For a BEST_EFFORT reader, which never ACKNACKs, the replay itself
+        // sets and clears the flag, holding live data only while the history
+        // goes out (see replayHistoryToProxyUnlocked).
+        //
+        // History is what readers have already been sent.  A coherent set still
+        // open now is not history: it reaches this reader at set end like any
+        // live data (samples, end marker, HEARTBEAT), so the floor stops below
+        // it, and with no committed sample below it there's nothing to protect.
+        // Suppressing on it instead left this reader out of the set-end sends
+        // and refused its NACKs (isCoherentPendingSn), so the set reached it
+        // only through the periodic HEARTBEAT, a set late.
+        const history_last = self.lastSentSnLocked();
+        const cache_first = self.cache.minSn();
+        if (new_rp.reliable and should_replay and cache_first > 0 and cache_first <= history_last) {
             new_rp.suppress_live_data = true;
-            new_rp.history_floor_sn = self.cache.maxSn();
+            new_rp.history_floor_sn = history_last;
         }
         if (should_replay) self.replayHistoryToProxyUnlocked(new_rp) else if (new_rp.reliable) self.sendInitialHeartbeatUnlocked(new_rp);
         // Start the periodic heartbeat thread on the first matched reader so
@@ -1014,7 +1032,7 @@ pub const StatefulWriter = struct {
                     .status_info = statusInfoFromKind(ch.kind),
                     .coherent_set_sn = ch.coherent_set_sn,
                     .group_seq_num = ch.group_seq_num,
-                    .group_coherent_sn = if (rp.omits_group_coherent_set) null else ch.group_coherent_sn,
+                    .group_coherent_sn = ch.group_coherent_sn,
                     .writer_group_info = ch.writer_group_info,
                     .lifespan = if (ch.kind == .alive) self.lifespan else null,
                 }, ch.data);
@@ -1055,14 +1073,18 @@ pub const StatefulWriter = struct {
     /// mirror-image trigger of the one sendChangeToAllLocked's
     /// non-fragmented branch closes for live writes; see that comment for
     /// the other half. Fragmented changes here are still sent under lock via
-    /// the existing sendFragsToProxyLocked, unchanged -- out of scope, same
-    /// as sendChangeToAllLocked's fragmented branch.
+    /// sendFragsToProxyLocked, in their place in SN order -- same as
+    /// sendChangeToAllLocked's fragmented branch.
+    ///
+    /// The BEST_EFFORT replay holds live data to the proxy until it is done,
+    /// so the reader gets the history in SN order ahead of any live sample
+    /// (see replayBatchUnlocked).
     fn replayHistoryToProxyUnlocked(self: *Self, rp: *ReaderProxy) void {
         const locs = rp.effectiveLocators();
         if (locs.len == 0) return;
 
         if (rp.reliable) {
-            self.sendHeartbeatToProxyLocked(rp, false);
+            self.sendHeartbeatToProxyLockedWithLastSn(rp, false, self.lastSentSnLocked());
             var scratch: [SCRATCH_SIZE]u8 = undefined;
             for (self.cache.changes.items) |*ch| {
                 if (ch.data.len <= self.frag_size) continue;
@@ -1073,10 +1095,76 @@ pub const StatefulWriter = struct {
             return;
         }
 
-        var locs_buf: [8]Locator = undefined;
-        const n_locs = @min(locs.len, locs_buf.len);
-        @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
+        // BEST_EFFORT: this push is the reader's only way to get the
+        // history.  A best-effort reader discards any SN at or below the
+        // highest it has received from this writer (RTPS 2.5 §8.4.12.1.4,
+        // T2), so the history must reach it before any live sample does:
+        // live data to this proxy is held (suppress_live_data, which every
+        // live send path skips) until the history, and whatever was
+        // published while it went out, has been sent in SN order.
+        rp.suppress_live_data = true;
         const rp_guid = rp.guid;
+        // The history retained when the replay starts always goes out whole,
+        // however many batches it takes (each fragmented sample is one): the
+        // cache bounds it, and every batch advances sent_through.
+        const history_through = self.lastSentSnLocked();
+        var sent_through: SequenceNumber = 0;
+        var catch_up_rounds: usize = 0;
+        while (true) {
+            // Re-found by GUID each round: replayBatchUnlocked releases
+            // self.mu, during which self.reader_proxies can be reallocated
+            // or the proxy removed.
+            const cur = self.findReaderProxyLocked(rp_guid) orelse return;
+            // Catch-up rounds, for what was published while the replay went
+            // out, are bounded so a writer publishing faster than this
+            // catches up can't hold the match here: past the bound, live
+            // data resumes and what was not replayed is lost, as best-effort
+            // allows.
+            if (sent_through >= history_through) {
+                if (catch_up_rounds == MAX_BEST_EFFORT_REPLAY_ROUNDS) {
+                    cur.suppress_live_data = false;
+                    return;
+                }
+                catch_up_rounds += 1;
+            }
+            const last = self.replayBatchUnlocked(cur, sent_through) catch {
+                // Live data stays held, so the retry (the next
+                // heartbeat-thread tick, see checkConnectionGenerations)
+                // still reaches the reader ahead of it.
+                if (self.findReaderProxyLocked(rp_guid)) |p| p.pending_replay_retry = true;
+                log.rtps.warn("StatefulWriter({x}): OOM replaying history to a BEST_EFFORT proxy -- live data to it is held until the replay is retried on the next heartbeat tick", .{
+                    self.guid.entity_id.entity_key,
+                });
+                return;
+            };
+            // null: nothing left, and self.mu was not released, so `cur`
+            // is still valid.
+            sent_through = last orelse {
+                cur.suppress_live_data = false;
+                return;
+            };
+        }
+    }
+
+    fn findReaderProxyLocked(self: *Self, guid: Guid) ?*ReaderProxy {
+        for (self.reader_proxies.items) |*rp| {
+            if (rp.guid.eql(guid)) return rp;
+        }
+        return null;
+    }
+
+    /// One step of a BEST_EFFORT history replay: sends `rp`, in SN order,
+    /// the samples and retained end markers above `after`, up to
+    /// lastSentSnLocked (a coherent set still open goes out when it ends,
+    /// as live data), and returns the last SN sent, or null when there is
+    /// none.  The run stops before a fragmented sample; one at the head of
+    /// the run is sent on its own, under self.mu, as sendChangeToAllLocked's
+    /// fragmented branch is.  Otherwise self.mu is released while sending
+    /// (see replayHistoryToProxyUnlocked), so `rp` is invalid on return.
+    fn replayBatchUnlocked(self: *Self, rp: *ReaderProxy, after: SequenceNumber) !?SequenceNumber {
+        const locs = rp.effectiveLocators();
+        if (locs.len == 0) return null;
+        const through = self.lastSentSnLocked();
 
         // A replayed sample, or (`marker` set, `data` empty) a retained end
         // marker: markers go out in SN order with the samples, so a replayed
@@ -1093,69 +1181,41 @@ pub const StatefulWriter = struct {
             writer_group_info: ?[4]u8,
             marker: ?EndMarker = null,
         };
-        const n_changes = self.cache.changes.items.len + self.end_markers.items.len;
-        const changes = self.alloc.alloc(ChangeSnapshot, n_changes) catch {
-            // Does NOT fall back to replayHistoryToProxyLocked here (an
-            // earlier version of this did): that sends synchronously while
-            // self.mu is still held, reintroducing the exact writer.mu <->
-            // reader.mu lock-order-inversion this function's own doc
-            // comment above describes -- a confirmed deadlock, not a
-            // theoretical one (Greptile PR #64 review). For a BEST_EFFORT
-            // proxy this is its only history-delivery path (no ACKNACK
-            // recovery), so simply giving up here would silently and
-            // permanently lose the initial replay. Instead, flag it for a
-            // retry on the next heartbeat-thread tick (see
-            // checkConnectionGenerations) -- that retry calls back into this
-            // same unlocked, deadlock-safe path, just later, once the
-            // transient OOM has likely cleared (Greptile PR #64 review,
-            // round 2: log-and-skip-forever traded the deadlock for
-            // unconditional, unrecoverable data loss -- this closes that
-            // gap without reintroducing the lock-order-inversion).
-            rp.pending_replay_retry = true;
-            log.rtps.warn("StatefulWriter({x}): OOM building the unlocked-replay snapshot for a newly-matched BEST_EFFORT proxy -- initial history replay skipped for this match, will retry on next heartbeat tick", .{
-                self.guid.entity_id.entity_key,
-            });
-            return;
-        };
-        defer self.alloc.free(changes);
-        var n_snap: usize = 0;
-        var scratch: [SCRATCH_SIZE]u8 = undefined;
+        var changes: std.ArrayListUnmanaged(ChangeSnapshot) = .empty;
+        defer {
+            for (changes.items) |c| self.alloc.free(c.data);
+            changes.deinit(self.alloc);
+        }
+        const markers = self.end_markers.items;
         var next_marker: usize = 0;
+        while (next_marker < markers.len and markers[next_marker].sn <= after) next_marker += 1;
+        var stopped_at_frag = false;
         for (self.cache.changes.items) |*ch| {
-            while (next_marker < self.end_markers.items.len and
-                self.end_markers.items[next_marker].sn < ch.sequence_number) : (next_marker += 1)
-            {
-                changes[n_snap] = markerSnapshot(ChangeSnapshot, self.end_markers.items[next_marker]);
-                n_snap += 1;
+            if (ch.sequence_number <= after) continue;
+            if (ch.sequence_number > through) break;
+            while (next_marker < markers.len and markers[next_marker].sn < ch.sequence_number) : (next_marker += 1) {
+                try changes.append(self.alloc, markerSnapshot(ChangeSnapshot, markers[next_marker]));
             }
-            self.tracer.submit(.{ .send_data = .{
-                .src_prefix = self.guid.prefix,
-                .writer_eid = self.guid.entity_id,
-                .reader_eid = rp_guid.entity_id,
-                .sn = ch.sequence_number,
-                .key_hash = ch.key_hash,
-                .data_len = @intCast(ch.data.len),
-            } });
             if (ch.data.len > self.frag_size) {
+                if (changes.items.len > 0) {
+                    stopped_at_frag = true;
+                    break;
+                }
+                self.tracer.submit(.{ .send_data = .{
+                    .src_prefix = self.guid.prefix,
+                    .writer_eid = self.guid.entity_id,
+                    .reader_eid = rp.guid.entity_id,
+                    .sn = ch.sequence_number,
+                    .key_hash = ch.key_hash,
+                    .data_len = @intCast(ch.data.len),
+                } });
+                var scratch: [SCRATCH_SIZE]u8 = undefined;
                 self.hb_count += 1;
                 self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch);
-                continue;
+                return ch.sequence_number;
             }
-            const data_copy = self.alloc.dupe(u8, ch.data) catch {
-                // OOM copying this one change: skip it for this pass, but
-                // (unlike a plain `catch continue`, an earlier version of
-                // this) flag a retry -- checkConnectionGenerations' next
-                // tick re-invokes this whole function from scratch, so a
-                // successful retry re-copies every change, including this
-                // one, not just the ones that failed this time (Greptile
-                // PR #64 review, round 3: a mid-loop per-change failure
-                // here was the one remaining OOM path in this function that
-                // still silently dropped delivery without scheduling the
-                // retry the array-allocation OOM path above already got).
-                rp.pending_replay_retry = true;
-                continue;
-            };
-            changes[n_snap] = .{
+            const data_copy = try self.alloc.dupe(u8, ch.data);
+            changes.append(self.alloc, .{
                 .data = data_copy,
                 .sn = ch.sequence_number,
                 .key_hash = ch.key_hash,
@@ -1165,17 +1225,32 @@ pub const StatefulWriter = struct {
                 .group_seq_num = ch.group_seq_num,
                 .group_coherent_sn = ch.group_coherent_sn,
                 .writer_group_info = ch.writer_group_info,
+            }) catch |err| {
+                self.alloc.free(data_copy);
+                return err;
             };
-            n_snap += 1;
+            self.tracer.submit(.{ .send_data = .{
+                .src_prefix = self.guid.prefix,
+                .writer_eid = self.guid.entity_id,
+                .reader_eid = rp.guid.entity_id,
+                .sn = ch.sequence_number,
+                .key_hash = ch.key_hash,
+                .data_len = @intCast(ch.data.len),
+            } });
         }
-        for (self.end_markers.items[next_marker..]) |m| {
-            changes[n_snap] = markerSnapshot(ChangeSnapshot, m);
-            n_snap += 1;
+        if (!stopped_at_frag) {
+            while (next_marker < markers.len and markers[next_marker].sn <= through) : (next_marker += 1) {
+                try changes.append(self.alloc, markerSnapshot(ChangeSnapshot, markers[next_marker]));
+            }
         }
-        defer for (changes[0..n_snap]) |c| self.alloc.free(c.data);
-        const rp_needs_marker_pid = rp.needs_pid_coherent_set_marker;
-        const rp_omits_gcs = rp.omits_group_coherent_set;
+        if (changes.items.len == 0) return null;
+        const last_sn = changes.items[changes.items.len - 1].sn;
 
+        var locs_buf: [8]Locator = undefined;
+        const n_locs = @min(locs.len, locs_buf.len);
+        @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
+        const rp_guid = rp.guid;
+        const rp_needs_marker_pid = rp.needs_pid_coherent_set_marker;
         const self_guid = self.guid;
         const self_lifespan = self.lifespan;
         const self_transport = self.transport;
@@ -1184,12 +1259,12 @@ pub const StatefulWriter = struct {
         self.mu.unlock();
         defer self.mu.lock();
 
-        for (changes[0..n_snap]) |c| {
+        for (changes.items) |c| {
             var b_scratch: [SCRATCH_SIZE]u8 = undefined;
             var b = MessageBuilder.init(&b_scratch, self_guid.prefix);
             b.addInfoDst(rp_guid.prefix);
             if (c.marker) |m| {
-                b.addData(m.dataParams(rp_guid.entity_id, self_guid.entity_id, rp_needs_marker_pid, rp_omits_gcs), &.{});
+                b.addData(m.dataParams(rp_guid.entity_id, self_guid.entity_id, rp_needs_marker_pid), &.{});
             } else {
                 b.addInfoTs(c.source_timestamp);
                 b.addData(.{
@@ -1201,7 +1276,7 @@ pub const StatefulWriter = struct {
                     .status_info = statusInfoFromKind(c.kind),
                     .coherent_set_sn = c.coherent_set_sn,
                     .group_seq_num = c.group_seq_num,
-                    .group_coherent_sn = if (rp_omits_gcs) null else c.group_coherent_sn,
+                    .group_coherent_sn = c.group_coherent_sn,
                     .writer_group_info = c.writer_group_info,
                     .lifespan = if (c.kind == .alive) self_lifespan else null,
                 }, c.data);
@@ -1213,6 +1288,7 @@ pub const StatefulWriter = struct {
                 };
             }
         }
+        return last_sn;
     }
 
     /// Sends the initial HEARTBEAT to a newly-matched reader proxy that
@@ -1226,7 +1302,7 @@ pub const StatefulWriter = struct {
         @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
         const rp_guid = rp.guid;
         const rp_start_sn = rp.start_sn;
-        const cache_last = self.lastAvailableSnLocked();
+        const cache_last = self.lastSentSnLocked();
         const cache_first = self.firstAvailableSnLocked();
         self.hb_count += 1;
         const count = self.hb_count;
@@ -1242,8 +1318,9 @@ pub const StatefulWriter = struct {
     /// the correct range and do not NACK data written before they matched.
     /// `final=true` tells the reader it need not reply (used to signal
     /// history-delivery completion before live data begins flowing).
+    /// Announces only what readers have been sent (lastSentSnLocked).
     fn sendHeartbeatToProxyLocked(self: *Self, rp: *const ReaderProxy, final: bool) void {
-        const cache_last = self.lastAvailableSnLocked();
+        const cache_last = self.lastSentSnLocked();
         self.sendHeartbeatToProxyLockedWithLastSn(rp, final, cache_last);
     }
 
@@ -1251,7 +1328,7 @@ pub const StatefulWriter = struct {
     /// Used while suppress_live_data to avoid revealing live SNs to a reader
     /// whose DataReader has not yet flushed the history replay.
     fn sendHeartbeatToProxyLockedCapped(self: *Self, rp: *const ReaderProxy, final: bool, last_sn_cap: SequenceNumber) void {
-        const cache_last = self.lastAvailableSnLocked();
+        const cache_last = self.lastSentSnLocked();
         const capped = if (cache_last > 0) @min(cache_last, last_sn_cap) else cache_last;
         self.sendHeartbeatToProxyLockedWithLastSn(rp, final, capped);
     }
@@ -1427,10 +1504,7 @@ pub const StatefulWriter = struct {
         // readers so far, so the background HB only describes data readers can
         // receive.  Otherwise advertise every SN this writer can still send,
         // retained end markers included, so a reader that missed one NACKs it.
-        const adj_last: SequenceNumber = if (self.coherent_active)
-            self.last_flushed_sn
-        else
-            self.lastAvailableSnLocked();
+        const adj_last = self.lastSentSnLocked();
 
         for (self.reader_proxies.items) |*rp| {
             // BEST_EFFORT readers don't participate in the reliable
@@ -1529,8 +1603,10 @@ pub const StatefulWriter = struct {
     /// Handle an incoming ACKNACK from a reader.
     /// Updates the proxy's ACK state and retransmits requested changes.
     ///
-    /// Per RTPS §8.3.7.1.2: if `is_final` is false, the writer MUST send all
-    /// cached changes with SN > (nack_set.base − 1), even if the bitmap is empty.
+    /// Only the SNs set in the bitmap are resent: an ACKNACK acknowledges
+    /// everything below its base and requests exactly the SNs in its bitmap
+    /// (RTPS 2.5 §8.4.9.2, transition T8). A non-final ACKNACK that requests
+    /// nothing draws a HEARTBEAT, so the reader can say which SNs it lacks.
     pub fn handleAckNack(
         self: *Self,
         reader_guid: Guid,
@@ -1553,6 +1629,9 @@ pub const StatefulWriter = struct {
 
         for (self.reader_proxies.items) |*rp| {
             if (!rp.guid.eql(reader_guid)) continue;
+            // A BEST_EFFORT reader has no ACKNACK transition (RTPS 2.5
+            // §8.4.9.1): an ACKNACK claiming to come from one is ignored.
+            if (!rp.reliable) break;
             // Any ACKNACK confirms the reader is alive — clear the probe immediately
             // regardless of whether this ACKNACK is stale or duplicate.
             if (rp.probe_deadline_ns > 0) {
@@ -1678,7 +1757,7 @@ pub const StatefulWriter = struct {
                             .status_info = statusInfoFromKind(ch.kind),
                             .coherent_set_sn = ch.coherent_set_sn,
                             .group_seq_num = ch.group_seq_num,
-                            .group_coherent_sn = if (proxy.omits_group_coherent_set) null else ch.group_coherent_sn,
+                            .group_coherent_sn = ch.group_coherent_sn,
                             .writer_group_info = ch.writer_group_info,
                             .lifespan = if (ch.kind == .alive) w.lifespan else null,
                         }, ch.data);
@@ -1731,48 +1810,24 @@ pub const StatefulWriter = struct {
                 }
             }
 
-            // Per §8.3.7.1.2: non-final AckNack requires sending ALL changes
-            // with SN >= nack_set.base not yet acknowledged by this proxy.
+            // A non-final ACKNACK asks for a HEARTBEAT (§8.3.7.1.2 FinalFlag):
+            // send one so the reader can NACK what it lacks by SN.
             if (!is_final) {
-                // While suppress_live_data: do NOT send the pre-burst HB that
-                // would reveal the live range (last_sn > history_floor_sn).
-                // The reader already knows [first_sn, history_floor_sn] from
-                // the HB sent during replayHistoryToProxyLocked; re-announcing
-                // the full live range here would prompt the reader to NACK for
-                // live data before its DataReader has flushed history.
-                if (!rp.suppress_live_data) {
-                    const effective_base = @max(nack_set.base, rp.start_sn);
-                    if (self.cache.maxSn() >= effective_base and rp.reliable)
+                // While suppress_live_data, the HB is capped at
+                // history_floor_sn, and sent only if there is history left at
+                // the base: announcing the live range would prompt the reader
+                // to NACK for live data before its DataReader has flushed
+                // history.  No HB either when all that's left at or above the
+                // base is a coherent set still open: the reader would NACK SNs
+                // this writer won't send until the set ends, and each NACK
+                // would draw the same HEARTBEAT again.
+                const effective_base = @max(nack_set.base, rp.start_sn);
+                const announce_to = @min(self.cache.maxSn(), self.lastSentSnLocked());
+                if (rp.reliable and !rp.suppress_live_data) {
+                    if (announce_to >= effective_base)
                         self.sendHeartbeatToProxyLocked(rp, false);
-                }
-                // For fragmented samples outside the explicit NACK bitmap, send
-                // HEARTBEAT_FRAG only (budget=0): the reader either has partial
-                // fragments (and will NACK_FRAG the missing ones after the
-                // HEARTBEAT_FRAG) or will get a full retransmit on the next
-                // ACKNACK cycle once its base advances to that SN.
-                var nonfinal_frag_budget: usize = 0;
-                for (self.cache.changes.items) |*ch| {
-                    if (ch.sequence_number < nack_set.base) continue;
-                    if (ch.sequence_number < rp.start_sn) continue;
-                    // Don't retransmit changes that are still inside a coherent window.
-                    if (self.isCoherentPendingSn(ch.sequence_number)) continue;
-                    // While suppress_live_data: skip live SNs beyond history_floor_sn.
-                    // Sending live data here races with the DataReader's history flush.
-                    if (rp.suppress_live_data and ch.sequence_number > rp.history_floor_sn) continue;
-                    // Skip if already covered by the NACK bitmap above.
-                    const offset = ch.sequence_number - nack_set.base;
-                    if (offset < nack_set.num_bits and nack_set.contains(ch.sequence_number)) continue;
-                    retransmitChange(self, rp, ch, &scratch, &nonfinal_frag_budget);
-                    retransmit_count += 1;
-                }
-                for (self.end_markers.items) |m| {
-                    if (m.sn < nack_set.base) continue;
-                    if (m.sn < rp.start_sn) continue;
-                    if (rp.suppress_live_data and m.sn > rp.history_floor_sn) continue;
-                    const offset = m.sn - nack_set.base;
-                    if (offset < nack_set.num_bits and nack_set.contains(m.sn)) continue;
-                    self.sendEndMarkerToProxyLocked(rp, m, &scratch);
-                    retransmit_count += 1;
+                } else if (rp.reliable and @min(announce_to, rp.history_floor_sn) >= effective_base) {
+                    self.sendHeartbeatToProxyLockedCapped(rp, false, rp.history_floor_sn);
                 }
             }
             // When data was retransmitted, follow with a Heartbeat so the reader
@@ -1874,7 +1929,6 @@ pub const StatefulWriter = struct {
                 locs: [8]Locator = undefined,
                 n_locs: usize = 0,
                 hb: ?struct { last_sn: SequenceNumber, cache_first: SequenceNumber, count: i32 } = null,
-                omits_group_coherent_set: bool = false,
             };
             const cache_last = self.lastAvailableSnLocked();
             const cache_first = self.firstAvailableSnLocked();
@@ -1904,7 +1958,7 @@ pub const StatefulWriter = struct {
                     .data_len = @intCast(ch.data.len),
                 } });
                 var s = &snaps[n_snaps];
-                s.* = .{ .guid = rp.guid, .start_sn = rp.start_sn, .omits_group_coherent_set = rp.omits_group_coherent_set };
+                s.* = .{ .guid = rp.guid, .start_sn = rp.start_sn };
                 s.n_locs = @min(locs.len, s.locs.len);
                 @memcpy(s.locs[0..s.n_locs], locs[0..s.n_locs]);
                 // Follow each DATA with a non-final HEARTBEAT so the reader learns
@@ -1961,7 +2015,7 @@ pub const StatefulWriter = struct {
                     .status_info = statusInfoFromKind(ch_kind),
                     .coherent_set_sn = ch_coherent_set_sn,
                     .group_seq_num = ch_group_seq_num,
-                    .group_coherent_sn = if (s.omits_group_coherent_set) null else ch_group_coherent_sn,
+                    .group_coherent_sn = ch_group_coherent_sn,
                     .writer_group_info = ch_writer_group_info,
                     .lifespan = if (ch_kind == .alive) self_lifespan else null,
                 }, data_copy);
@@ -2100,7 +2154,7 @@ pub const StatefulWriter = struct {
                 .status_info = if (frag_num == 1) statusInfoFromKind(ch.kind) else null,
                 .coherent_set_sn = if (frag_num == 1) ch.coherent_set_sn else null,
                 .group_seq_num = if (frag_num == 1) ch.group_seq_num else null,
-                .group_coherent_sn = if (frag_num == 1 and !rp.omits_group_coherent_set) ch.group_coherent_sn else null,
+                .group_coherent_sn = if (frag_num == 1) ch.group_coherent_sn else null,
                 .writer_group_info = if (frag_num == 1) ch.writer_group_info else null,
                 .lifespan = if (frag_num == 1 and ch.kind == .alive) self.lifespan else null,
             }, ch.data[offset..][0..this_len]);
@@ -2150,7 +2204,7 @@ pub const StatefulWriter = struct {
                 .status_info = statusInfoFromKind(ch.kind),
                 .coherent_set_sn = ch.coherent_set_sn,
                 .group_seq_num = ch.group_seq_num,
-                .group_coherent_sn = if (rp.omits_group_coherent_set) null else ch.group_coherent_sn,
+                .group_coherent_sn = ch.group_coherent_sn,
                 .writer_group_info = ch.writer_group_info,
                 .lifespan = if (ch.kind == .alive) self.lifespan else null,
             }, ch.data[0..@min(frag_size, ch.data.len)]);
@@ -2221,7 +2275,7 @@ pub const StatefulWriter = struct {
                     .status_info = if (frag_num == 1) statusInfoFromKind(ch.kind) else null,
                     .coherent_set_sn = if (frag_num == 1) ch.coherent_set_sn else null,
                     .group_seq_num = if (frag_num == 1) ch.group_seq_num else null,
-                    .group_coherent_sn = if (frag_num == 1 and !rp.omits_group_coherent_set) ch.group_coherent_sn else null,
+                    .group_coherent_sn = if (frag_num == 1) ch.group_coherent_sn else null,
                     .writer_group_info = if (frag_num == 1) ch.writer_group_info else null,
                     .lifespan = if (frag_num == 1 and ch.kind == .alive) self.lifespan else null,
                 }, ch.data[offset..][0..this_len]);
@@ -2295,10 +2349,31 @@ pub const StatefulWriter = struct {
         return @max(cache_last, self.end_markers.items[self.end_markers.items.len - 1].sn);
     }
 
+    /// First SN readers have not been sent: the start of a coherent set still
+    /// open (its SNs, and any written while publications were suspended, go
+    /// out when it ends), else the next SN to be written.  A VOLATILE reader
+    /// matching now starts here, so it gets an open set whole: the set is
+    /// published when it ends, after the match.  Starting it at the next SN
+    /// instead put its floor inside the set, whose samples it then received
+    /// below that floor.
+    fn firstUnsentSnLocked(self: *const Self) SequenceNumber {
+        if (self.coherent_active and self.coherent_pending_sns.items.len > 0)
+            return self.coherent_pending_sns.items[0];
+        return self.cache.next_sn;
+    }
+
+    /// Highest SN readers have been sent: lastAvailableSnLocked, short of a
+    /// coherent set still open, whose SNs go out only when it ends.  What a
+    /// HEARTBEAT may announce without drawing NACKs the writer must refuse.
+    fn lastSentSnLocked(self: *const Self) SequenceNumber {
+        const last = self.lastAvailableSnLocked();
+        return if (self.coherent_active) @min(last, self.last_flushed_sn) else last;
+    }
+
     fn sendEndMarkerToProxyLocked(self: *Self, rp: *const ReaderProxy, m: EndMarker, scratch: *[SCRATCH_SIZE]u8) void {
         var b = MessageBuilder.init(scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
-        b.addData(m.dataParams(rp.guid.entity_id, self.guid.entity_id, rp.needs_pid_coherent_set_marker, rp.omits_group_coherent_set), &.{});
+        b.addData(m.dataParams(rp.guid.entity_id, self.guid.entity_id, rp.needs_pid_coherent_set_marker), &.{});
         for (rp.effectiveLocators()) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
     }
 
@@ -2511,10 +2586,12 @@ pub const StatefulWriter = struct {
         const first_sn_override: ?SequenceNumber = if (first_available > 0) first_available else 1;
         for (self.reader_proxies.items) |*rp| {
             if (!rp.reliable) continue;
-            // Skip history-replaying proxies: they never received the coherent DATA or
-            // marker (sendChangeToAllLocked and takeEOCProxyInfos both skip
-            // suppress_live_data).  The background HB handles their history range.
-            if (rp.suppress_live_data) continue;
+            // History-replaying proxies (suppress_live_data) were sent neither the
+            // set nor its marker, but get this HEARTBEAT too, as they do from a
+            // non-deferred endCoherentSet: it announces the set, and the NACK it
+            // draws is non-final, so it clears the suppression once the reader
+            // holds its history and repairs the set now, not at the next
+            // periodic HEARTBEAT.
             self.sendHeartbeatToProxyLockedWithLastSnAndFirstSn(rp, false, last_sn, first_sn_override);
         }
     }
