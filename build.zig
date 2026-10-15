@@ -1641,7 +1641,9 @@ pub fn build(b: *std.Build) void {
     // empirically for Valgrind specifically: a self-hosted-backend
     // api_test binary produced 250k+ "DWARF2 reader: Badly formed extended
     // line op" warning lines under `valgrind --quiet`; the identical
-    // source rebuilt with use_llvm=true produced zero. This is the same
+    // source rebuilt with use_llvm=true produced zero. Rechecked with Zig
+    // 0.17.0 and Valgrind 3.24.0: api_test still emits 162k+ DWARF warnings
+    // with the default backend and none with LLVM. This is the same
     // root cause the coverage job's kcov step already works around by
     // patching elfutils from source (see that job's comments) -- rebuilding
     // with LLVM instead is the fix at the source for tools that read this
@@ -1719,27 +1721,6 @@ pub fn build(b: *std.Build) void {
 
     const emit_tests_llvm_step = b.step("emit-tests-llvm", "Build test binaries (LLVM backend, baseline CPU) for external DWARF-reading tools like Valgrind");
 
-    // `zig build test-release-small -Doptimize=ReleaseSmall` — run the whole
-    // unit suite at ReleaseSmall. It reuses the LLVM-backend / baseline-CPU
-    // module graph above (the same `.use_llvm = true` artifacts emit-tests-llvm
-    // installs) rather than the normal self-hosted `test` step, purely to dodge
-    // an upstream Zig bug: Zig 0.16.0's self-hosted x86_64 backend, *only* at
-    // -OReleaseSmall, emits read-only global constants (vtable structs,
-    // `CAbiViews` values) with no alignment -- `&SomeImpl.views` lands at an odd
-    // address and `zidl_rt`'s `@alignCast(box.vtable)` traps it (`panic:
-    // incorrect alignment`), crashing ~37 C-ABI tests. The LLVM backend aligns
-    // rodata correctly in every mode; Debug/ReleaseSafe/ReleaseFast on the
-    // self-hosted backend are also fine -- ReleaseSmall is the only broken cell.
-    // The bug is fixed on Zig master (0.17.0-dev.1902+); it is not in any stable
-    // release (0.16.0, tagged 2026-04-13, is latest). Minimal repro + full trail:
-    // `zz-dev/releasesmall-misaligned-rodata-investigation.md`.
-    //
-    // AT THE ZIG 0.17 BUMP: delete this step and its run-artifact deps below,
-    // and add a plain `release-small` entry to scripts/run_deterministic_matrix.py
-    // and release.yml, mirroring `release-fast` (`zig build test
-    // -Doptimize=ReleaseSmall` on the normal self-hosted backend).
-    const test_release_small_step = b.step("test-release-small", "Run the unit suite at ReleaseSmall (LLVM backend -- see comment: works around a Zig 0.16 self-hosted-backend rodata-alignment bug)");
-
     const zzdds_tests_llvm = b.addTest(.{
         .name = "zzdds_lib",
         .root_module = zzdds_mod_llvm_safe,
@@ -1748,7 +1729,6 @@ pub fn build(b: *std.Build) void {
     emit_tests_llvm_step.dependOn(&b.addInstallArtifact(zzdds_tests_llvm, .{
         .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
     }).step);
-    test_release_small_step.dependOn(&b.addRunArtifact(zzdds_tests_llvm).step);
 
     for (fuzz_test_files) |src| {
         const t = b.addTest(.{
@@ -1766,7 +1746,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (transport_test_files) |src| {
@@ -1785,7 +1764,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (discovery_test_files) |src| {
@@ -1804,7 +1782,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (rtps_test_files) |src| {
@@ -1823,7 +1800,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     const mock_dcps_fixture_mod_llvm_safe = b.createModule(.{
@@ -1834,7 +1810,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    var rs_dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -1856,7 +1831,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&addTestRun(b, t, &rs_dcps_test_domain).step);
     }
 
     // ── TSan test step ────────────────────────────────────────────────────────

@@ -120,15 +120,8 @@ jobs:
       - name: Test (ReleaseFast)
         run: zig build test -Doptimize=ReleaseFast
 
-      # Linux x86_64 only: `test-release-small` forces the LLVM backend to work
-      # around a Zig 0.16 self-hosted-x86_64 bug that mis-aligns read-only
-      # globals at -OReleaseSmall (see the step's comment in build.zig). That
-      # workaround path has only been exercised on Linux; broaden this to the
-      # whole matrix -- as a plain `zig build test -Doptimize=ReleaseSmall` --
-      # at the Zig 0.17 bump, when the underlying bug is gone.
-      - name: Test (ReleaseSmall, LLVM backend)
-        if: matrix.os == 'ubuntu-latest'
-        run: zig build test-release-small -Doptimize=ReleaseSmall
+      - name: Test (ReleaseSmall)
+        run: zig build test -Doptimize=ReleaseSmall
 
       # musl / fully-static Linux target. `-Dtarget` was never actually
       # cross-compiled anywhere in CI before -- every lane built the native

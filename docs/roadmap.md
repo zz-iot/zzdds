@@ -1202,15 +1202,10 @@ release notes).
   (`scripts/fix_macos_dylib_exports.sh`; ziglang/zig#24370). macOS builds also default to a
   13.0 deployment floor instead of the build host's OS version. **Both workarounds are
   upstream Zig bugs — revisit deleting them at a Zig bump.**
-- **`ReleaseSmall` lane** (2026-08-29) — new `zig build test-release-small` step runs the
-  whole unit suite at `-OReleaseSmall`, wired into `run_deterministic_matrix.py` (so
-  `ci.yml`'s `test-linux-matrix` covers it) and `release.yml`'s `test` job (Linux x86_64 only).
-  The step **forces the LLVM backend** to sidestep a Zig 0.16 self-hosted-x86_64 codegen bug
-  (misaligned read-only globals at `-OReleaseSmall` — see the Deferred note below and the
-  step's `build.zig` comment). **At the Zig 0.17 bump: delete `test-release-small` and
-  replace it with a plain `zig build test -Doptimize=ReleaseSmall` step on the normal
-  self-hosted backend, broadened to the whole `release.yml` matrix** — the bug is fixed on
-  0.17.
+- **`ReleaseSmall` lane** — runs the normal `zig build test -Doptimize=ReleaseSmall`
+  command in the deterministic matrix and across the release platform matrix.
+  The Zig 0.16 LLVM workaround was removed after the full 1,230-test suite passed
+  on Zig 0.17.0's normal Linux x86_64 backend.
 
 ### Deferred (investigation trails exist)
 
@@ -1219,16 +1214,6 @@ release notes).
   drift). Revisit when Zig bundles a newer LLVM. Trail:
   `zz-dev/macos-tsan-crash-investigation.md`. (TSan on Windows: Clang/LLVM has no supported
   target. Extending `examples-tsan` to macOS is a separate follow-up.)
-- **Self-hosted `-OReleaseSmall` on Zig 0.16 — upstream codegen bug, worked around above.**
-  Zig 0.17.0's self-hosted x86_64 backend, *only* at `-OReleaseSmall`, emits read-only
-  global constants with no alignment: `&SomeImpl.views` (an `extern struct` `CAbiViews`,
-  `@alignOf` 8) and every `*_vtable` global land at odd `.rodata` addresses, and `zidl-rt`'s
-  `@alignCast(box.vtable)` traps it (`panic: incorrect alignment`, ~37 C-ABI tests).
-  `-OReleaseFast`, the LLVM backend, and Debug/ReleaseSafe are all fine. Not a zzdds/zidl
-  defect; **fixed on `zig-0.17.0-dev.1902`**, not in any stable release (0.16.0, tagged
-  2026-04-13, is latest; no matching upstream issue found). The `ReleaseSmall` lane
-  (see *Landed*) sidesteps it by forcing the LLVM backend until the 0.17 bump. Minimal repro
-  + full trail: `zz-dev/releasesmall-misaligned-rodata-investigation.md`.
 
 ### Still open, ranked
 

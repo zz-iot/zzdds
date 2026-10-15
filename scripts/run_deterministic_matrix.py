@@ -8,10 +8,6 @@ tests, ReleaseFast tests, ReleaseSmall tests, a musl static-target build+run
 available as an opt-in because it is slower and can be noisy on some local
 systems.
 
-The ReleaseSmall step runs via `zig build test-release-small`, which forces the
-LLVM backend: Zig 0.16's self-hosted x86_64 backend mis-aligns read-only globals
-at -OReleaseSmall (see that step's comment in build.zig). Drop back to a plain
-`zig build test -Doptimize=ReleaseSmall` step at the Zig 0.17 bump.
 """
 
 from __future__ import annotations
@@ -93,10 +89,7 @@ def steps(zig: str, include_tsan: bool) -> list[Step]:
         Step("feature-minimal", [zig, "build", "test", "-Dipv6=false", "-Dinterface-monitor=false"]),
         Step("release-safe", [zig, "build", "test", "-Doptimize=ReleaseSafe"]),
         Step("release-fast", [zig, "build", "test", "-Doptimize=ReleaseFast"]),
-        # LLVM backend forced by the `test-release-small` step itself -- see its
-        # build.zig comment. Switch to `["test", "-Doptimize=ReleaseSmall"]` at
-        # the Zig 0.17 bump.
-        Step("release-small", [zig, "build", "test-release-small", "-Doptimize=ReleaseSmall"]),
+        Step("release-small", [zig, "build", "test", "-Doptimize=ReleaseSmall"]),
     ]
     # musl / fully-static Linux target. `-Dtarget` is otherwise never
     # cross-compiled in the matrix. A `-linux-musl` binary is statically linked
