@@ -1,12 +1,12 @@
 .{
     .name = .zzdds,
-    .version = "0.3.6-zig.0.16.0-dev",
+    .version = "0.3.6-zig.0.17.0-dev",
     .fingerprint = 0xf681a2529addceb1,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zidl = .{
-            .url = "https://github.com/zz-iot/zidl/archive/refs/tags/v0.3.20-zig.0.16.0.tar.gz",
-            .hash = "zidl-0.3.20-zig.0.16.0-H6NwLpjZLwBlE-yU2FGn3VLnm7uTr_VELrBczP85Yqfd",
+            .url = "https://github.com/zz-iot/zidl/archive/refs/tags/v0.3.21-zig.0.17.0.tar.gz",
+            .hash = "zidl-0.3.21-zig.0.17.0-H6NwLifoLwApXo4JO2G9PTgiMqExxddtA-79SISqto93",
         },
     },
     .paths = .{
@@ -21,5 +21,6 @@
         "scripts",
         // Windows C-ABI builds generate DLL exports from generated C sources.
         "tools/gen_windows_def.zig",
+        "tools/run_with_library_path.zig",
     },
 }

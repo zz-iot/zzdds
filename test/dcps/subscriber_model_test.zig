@@ -22,7 +22,7 @@ const CoherentWipEntry = dcps.CoherentWipEntry;
 const SubscriberImpl = dcps.SubscriberImpl;
 
 const GUID_A = proto.Guid{
-    .prefix = .{ .bytes = [_]u8{0xA1} ** 12 },
+    .prefix = .{ .bytes = @as([12]u8, @splat(0xA1)) },
     .entity_id = rtps.EntityIds.sedp_builtin_publications_writer,
 };
 
@@ -430,11 +430,11 @@ test "subscriber model: ordered access sorts pending by presentation scope" {
 // ── A writer matched while create_datareader is still running ────────────────
 
 const MATCHED_WRITER = proto.Guid{
-    .prefix = .{ .bytes = [_]u8{0xB2} ** 12 },
+    .prefix = .{ .bytes = @as([12]u8, @splat(0xB2)) },
     .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 },
 };
 const MATCHED_PUBLISHER = proto.Guid{
-    .prefix = .{ .bytes = [_]u8{0xB2} ** 12 },
+    .prefix = .{ .bytes = @as([12]u8, @splat(0xB2)) },
     .entity_id = .{ .entity_key = .{ 0, 0, 0x55 }, .entity_kind = 0x08 },
 };
 

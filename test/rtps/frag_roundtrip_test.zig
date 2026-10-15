@@ -42,7 +42,7 @@ const testing = std.testing;
 // ── Fixed test GUIDs and locators ─────────────────────────────────────────────
 
 fn prefix(b: u8) GuidPrefix {
-    return .{ .bytes = [_]u8{b} ** 12 };
+    return .{ .bytes = @as([12]u8, @splat(b)) };
 }
 
 const WRITER_GUID = Guid{ .prefix = prefix(0xAA), .entity_id = EntityIds.sedp_builtin_publications_writer };
@@ -195,7 +195,7 @@ fn noopTransport() Transport {
 }
 
 test "sendIovecs: returns MessageTooLarge for payload > MAX_SEND_BYTES" {
-    var large: [writer_sm_mod.MAX_SEND_BYTES + 1]u8 = .{0xAB} ** (writer_sm_mod.MAX_SEND_BYTES + 1);
+    var large: [writer_sm_mod.MAX_SEND_BYTES + 1]u8 = @splat(0xAB);
     const iov = IoVec{ .base = &large, .len = large.len };
     const loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7410);
     try testing.expectError(
@@ -205,7 +205,7 @@ test "sendIovecs: returns MessageTooLarge for payload > MAX_SEND_BYTES" {
 }
 
 test "sendIovecs: succeeds for payload == MAX_SEND_BYTES" {
-    var exact: [writer_sm_mod.MAX_SEND_BYTES]u8 = .{0xCD} ** writer_sm_mod.MAX_SEND_BYTES;
+    var exact: [writer_sm_mod.MAX_SEND_BYTES]u8 = @splat(0xCD);
     const iov = IoVec{ .base = &exact, .len = exact.len };
     const loc = Locator.udp4(.{ 127, 0, 0, 1 }, 7410);
     try writer_sm_mod.sendIovecs(noopTransport(), &loc, &.{iov});
@@ -326,7 +326,7 @@ test "DATA_FRAG: payload exactly one fragment delivered as single DATA_FRAG" {
     // This test verifies the boundary: len <= frag_size stays as DATA.
     const alloc = testing.allocator;
 
-    var payload: [TEST_FRAG_SIZE]u8 = .{0x42} ** TEST_FRAG_SIZE;
+    var payload: [TEST_FRAG_SIZE]u8 = @splat(0x42);
 
     const net = try MockNetwork.init(alloc);
     defer net.deinit();

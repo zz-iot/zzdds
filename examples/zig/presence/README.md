@@ -60,5 +60,5 @@ full online -> offline -> online cycle.` Both exit 0. Total runtime ~13s
 
 ## Prerequisites
 
-Same as `zig/hello_world`: Zig 0.16.0, a local `zzdds` checkout built as a
+Same as `zig/hello_world`: Zig 0.17.0, a local `zzdds` checkout built as a
 sibling of `zzdds-examples` (`../../../zzdds`).

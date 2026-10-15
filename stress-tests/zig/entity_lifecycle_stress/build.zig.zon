@@ -2,7 +2,7 @@
     .name = .zzdds_stress_entity_lifecycle,
     .version = "0.0.0",
     .fingerprint = 0x7d11fdd8ab1c1646,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Point at the zzdds repo root (this app lives at
         // stress-tests/zig/entity_lifecycle_stress within it). No direct

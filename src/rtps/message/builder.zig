@@ -121,7 +121,7 @@ const ScratchWriter = struct {
 /// Write a submessage header with the given id, flags, and content length.
 /// All submessages are written little-endian (flags bit 0 = 1).
 fn writeSmHeader(w: *ScratchWriter, id: SubMessageId, flags: u8, content_len: usize) void {
-    w.writeU8(@intFromEnum(id));
+    w.writeU8(@backingInt(id));
     w.writeU8(flags | sub.FLAG_ENDIANNESS); // always LE
     w.writeU16Le(@intCast(content_len));
 }
@@ -309,12 +309,12 @@ pub const MessageBuilder = struct {
         self.scratch.writeSequenceNumber(params.writer_sn);
 
         if (params.key_hash) |kh| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.key_hash));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.key_hash));
             self.scratch.writeU16Le(16);
             self.scratch.writeBytes(&kh);
         }
         if (params.status_info) |si| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.status_info));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.status_info));
             self.scratch.writeU16Le(4);
             // StatusInfo_t is {unused,unused,unused,status} (RTPS §9.4.5.11).
             // The status byte is always at offset 3 — write as an octet array.
@@ -324,33 +324,33 @@ pub const MessageBuilder = struct {
             self.scratch.writeU8(@truncate(si));
         }
         if (params.group_seq_num) |gsn| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_seq_num));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.group_seq_num));
             self.scratch.writeU16Le(8);
             self.scratch.writeSequenceNumber(gsn);
         }
         if (params.coherent_set_sn) |csn| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.coherent_set));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.coherent_set));
             self.scratch.writeU16Le(8);
             self.scratch.writeSequenceNumber(csn);
         }
         if (params.group_coherent_sn) |gcs| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_coherent_set));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.group_coherent_set));
             self.scratch.writeU16Le(8);
             self.scratch.writeSequenceNumber(gcs);
         }
         if (params.writer_group_info) |wgi| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.writer_group_info));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.writer_group_info));
             self.scratch.writeU16Le(4);
             self.scratch.writeBytes(&wgi);
         }
         if (params.lifespan) |ls| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.lifespan));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.lifespan));
             self.scratch.writeU16Le(8);
             self.scratch.writeI32Le(ls.seconds);
             self.scratch.writeU32Le(ls.fraction);
         }
         if (has_iqos) {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.sentinel));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.sentinel));
             self.scratch.writeU16Le(0);
         }
 
@@ -500,12 +500,12 @@ pub const MessageBuilder = struct {
         self.scratch.writeU32Le(params.data_size);
 
         if (params.key_hash) |kh| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.key_hash));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.key_hash));
             self.scratch.writeU16Le(16);
             self.scratch.writeBytes(&kh);
         }
         if (params.status_info) |si| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.status_info));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.status_info));
             self.scratch.writeU16Le(4);
             self.scratch.writeU8(0);
             self.scratch.writeU8(0);
@@ -513,33 +513,33 @@ pub const MessageBuilder = struct {
             self.scratch.writeU8(@truncate(si));
         }
         if (params.group_seq_num) |gsn| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_seq_num));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.group_seq_num));
             self.scratch.writeU16Le(8);
             self.scratch.writeSequenceNumber(gsn);
         }
         if (params.coherent_set_sn) |csn| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.coherent_set));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.coherent_set));
             self.scratch.writeU16Le(8);
             self.scratch.writeSequenceNumber(csn);
         }
         if (params.group_coherent_sn) |gcs| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.group_coherent_set));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.group_coherent_set));
             self.scratch.writeU16Le(8);
             self.scratch.writeSequenceNumber(gcs);
         }
         if (params.writer_group_info) |wgi| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.writer_group_info));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.writer_group_info));
             self.scratch.writeU16Le(4);
             self.scratch.writeBytes(&wgi);
         }
         if (params.lifespan) |ls| {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.lifespan));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.lifespan));
             self.scratch.writeU16Le(8);
             self.scratch.writeI32Le(ls.seconds);
             self.scratch.writeU32Le(ls.fraction);
         }
         if (has_iqos) {
-            self.scratch.writeU16Le(@intFromEnum(sub.ParameterId.sentinel));
+            self.scratch.writeU16Le(@backingInt(sub.ParameterId.sentinel));
             self.scratch.writeU16Le(0);
         }
 
@@ -633,7 +633,7 @@ test "MessageBuilder init produces valid RTPS header iovec" {
 
 test "MessageBuilder.addInfoTs produces correct wire bytes" {
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    const prefix = GuidPrefix{ .bytes = .{0} ** 12 };
+    const prefix = GuidPrefix{ .bytes = @splat(0) };
     var b = MessageBuilder.init(&scratch, prefix);
     b.addInfoTs(.{ .seconds = 1700000000, .fraction = 500000000 });
 
@@ -654,7 +654,7 @@ test "MessageBuilder.addInfoTs produces correct wire bytes" {
 
 test "MessageBuilder.addData produces two iovecs" {
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    const prefix = GuidPrefix{ .bytes = .{0} ** 12 };
+    const prefix = GuidPrefix{ .bytes = @splat(0) };
     var b = MessageBuilder.init(&scratch, prefix);
 
     const payload = [_]u8{ 0x00, 0x07, 0x00, 0x00, 0xAA, 0xBB }; // encap + 2 bytes
@@ -677,7 +677,7 @@ test "MessageBuilder.addData: GROUP coherent-set inline QoS uses the RTPS 2.5 pa
     // (PID_GROUP_COHERENT_SET 0x0063, PID_GROUP_SEQ_NUM 0x0064,
     // PID_WRITER_GROUP_INFO 0x0065) unnoticed.
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = .{0} ** 12 });
+    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = @splat(0) });
     b.addData(.{
         .reader_entity_id = EntityId{ .entity_key = .{ 0, 0, 0 }, .entity_kind = 0 },
         .writer_entity_id = EntityId{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 2 },
@@ -703,7 +703,7 @@ test "MessageBuilder.addData: GROUP coherent-set inline QoS uses the RTPS 2.5 pa
 
 test "MessageBuilder.addHeartbeat is single iovec" {
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    const prefix = GuidPrefix{ .bytes = .{0} ** 12 };
+    const prefix = GuidPrefix{ .bytes = @splat(0) };
     var b = MessageBuilder.init(&scratch, prefix);
     const eid = @import("../guid.zig").EntityIds;
 
@@ -727,7 +727,7 @@ test "MessageBuilder.addHeartbeat is single iovec" {
 
 test "MessageBuilder.totalLen" {
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    const prefix = GuidPrefix{ .bytes = .{0} ** 12 };
+    const prefix = GuidPrefix{ .bytes = @splat(0) };
     var b = MessageBuilder.init(&scratch, prefix);
     const payload = [_]u8{ 0xDE, 0xAD };
     const eid = @import("../guid.zig").EntityIds;
@@ -760,8 +760,8 @@ fn flatten(iovs: []const IoVec, buf: []u8) []const u8 {
 test "builder/parser round-trip: ACKNACK" {
     const eid = @import("../guid.zig").EntityIds;
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = .{0xAA} ** 12 });
-    const sns = sub.SequenceNumberSet{ .base = 5, .num_bits = 3, .bitmap = .{0xE000_0000} ++ .{0} ** 7 };
+    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = @splat(0xAA) });
+    const sns = sub.SequenceNumberSet{ .base = 5, .num_bits = 3, .bitmap = .{0xE000_0000} ++ @as([7]u32, @splat(0)) };
     b.addAckNack(eid.unknown, eid.unknown, sns, 42, true);
 
     var flat: [SCRATCH_SIZE]u8 = undefined;
@@ -784,8 +784,8 @@ test "builder/parser round-trip: ACKNACK" {
 test "builder/parser round-trip: GAP" {
     const eid = @import("../guid.zig").EntityIds;
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = .{0} ** 12 });
-    const gap_list = sub.SequenceNumberSet{ .base = 10, .num_bits = 0, .bitmap = .{0} ** 8 };
+    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = @splat(0) });
+    const gap_list = sub.SequenceNumberSet{ .base = 10, .num_bits = 0, .bitmap = @splat(0) };
     b.addGap(eid.unknown, eid.unknown, 7, gap_list);
 
     var flat: [SCRATCH_SIZE]u8 = undefined;
@@ -806,7 +806,7 @@ test "builder/parser round-trip: GAP" {
 test "builder/parser round-trip: DATA (no inline QoS)" {
     const eid = @import("../guid.zig").EntityIds;
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = .{0} ** 12 });
+    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = @splat(0) });
     const payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0xCA, 0xFE }; // CDR LE encap + 2 bytes
     b.addData(.{
         .reader_entity_id = eid.unknown,
@@ -831,7 +831,7 @@ test "builder/parser round-trip: DATA (no inline QoS)" {
 
 test "builder/parser round-trip: INFO_DST" {
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = .{0} ** 12 });
+    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = @splat(0) });
     const dst_prefix = GuidPrefix{ .bytes = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC } };
     b.addInfoDst(dst_prefix);
 
@@ -849,7 +849,7 @@ test "builder/parser round-trip: INFO_DST" {
 
 test "MessageBuilder.addInfoTsInvalidate: INFO_TS with INVALIDATE flag" {
     var scratch: [SCRATCH_SIZE]u8 = undefined;
-    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = .{0} ** 12 });
+    var b = MessageBuilder.init(&scratch, GuidPrefix{ .bytes = @splat(0) });
     b.addInfoTsInvalidate();
 
     const ios = b.iovecs();

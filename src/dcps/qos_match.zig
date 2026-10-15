@@ -68,8 +68,9 @@ pub const IncompatiblePolicy = enum(u32) {
     data_representation = 23,
 
     comptime {
-        for (@typeInfo(IncompatiblePolicy).@"enum".fields) |f| {
-            if (@intFromEnum(@field(PolicyId, f.name)) != f.value) @compileError("IncompatiblePolicy." ++ f.name ++ " differs from PolicyId");
+        const info = @typeInfo(IncompatiblePolicy).@"enum";
+        for (info.field_names, info.field_values) |name, value| {
+            if (@backingInt(@field(PolicyId, name)) != value) @compileError("IncompatiblePolicy." ++ name ++ " differs from PolicyId");
         }
     }
 };

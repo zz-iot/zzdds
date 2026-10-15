@@ -32,10 +32,10 @@ const ZERO_TS: RtpsTimestamp = .{ .seconds = 0, .fraction = 0 };
 const NIL_IH = std.mem.zeroes([16]u8);
 const NIL_KH = std.mem.zeroes([16]u8);
 
-const W1_GUID = Guid{ .prefix = .{ .bytes = [_]u8{0xA1} ** 12 }, .entity_id = rtps.EntityIds.sedp_builtin_publications_writer };
-const W2_GUID = Guid{ .prefix = .{ .bytes = [_]u8{0xA2} ** 12 }, .entity_id = rtps.EntityIds.sedp_builtin_subscriptions_writer };
-const R1_GUID = Guid{ .prefix = .{ .bytes = [_]u8{0xB1} ** 12 }, .entity_id = rtps.EntityIds.sedp_builtin_publications_reader };
-const R2_GUID = Guid{ .prefix = .{ .bytes = [_]u8{0xB2} ** 12 }, .entity_id = rtps.EntityIds.sedp_builtin_subscriptions_reader };
+const W1_GUID = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0xA1)) }, .entity_id = rtps.EntityIds.sedp_builtin_publications_writer };
+const W2_GUID = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0xA2)) }, .entity_id = rtps.EntityIds.sedp_builtin_subscriptions_writer };
+const R1_GUID = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0xB1)) }, .entity_id = rtps.EntityIds.sedp_builtin_publications_reader };
+const R2_GUID = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0xB2)) }, .entity_id = rtps.EntityIds.sedp_builtin_subscriptions_reader };
 
 const W1_LOC = Locator.udp4(.{ 127, 0, 0, 10 }, 7411);
 const W2_LOC = Locator.udp4(.{ 127, 0, 0, 11 }, 7411);

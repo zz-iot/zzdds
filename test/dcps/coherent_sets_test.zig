@@ -262,7 +262,7 @@ const Fixture = struct {
     /// begin_access, then the number of samples each reader exposes.
     fn access(self: *Fixture, n_topics: usize) ![MAX_TOPICS]usize {
         try testing.expectEqual(DDS.RETCODE_OK, self.sub_r.begin_access());
-        var out = [_]usize{0} ** MAX_TOPICS;
+        var out = @as([MAX_TOPICS]usize, @splat(0));
         for (0..n_topics) |i| {
             const r = self.readers[i];
             r.mu.lock();

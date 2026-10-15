@@ -565,7 +565,7 @@ test "ownership: a writer lost while it is being matched keeps its strength once
 
     const info = zzdds.protocol.MatchedWriterInfo{
         .guid = .{
-            .prefix = .{ .bytes = [_]u8{0x5A} ** 12 },
+            .prefix = .{ .bytes = @as([12]u8, @splat(0x5A)) },
             .entity_id = .{ .entity_key = .{ 0, 0, 9 }, .entity_kind = 0x02 },
         },
         .unicast_locators = &.{},

@@ -66,11 +66,11 @@ pub fn build(b: *std.Build) void {
 
     const run_publisher_step = b.step("run-publisher", "Run source_timestamp_publisher (pass extra flags via -- ...)");
     const run_publisher_cmd = b.addRunArtifact(publisher_exe);
-    if (b.args) |args| run_publisher_cmd.addArgs(args);
+    run_publisher_cmd.addPassthruArgs();
     run_publisher_step.dependOn(&run_publisher_cmd.step);
 
     const run_subscriber_step = b.step("run-subscriber", "Run source_timestamp_subscriber (pass extra flags via -- ...)");
     const run_subscriber_cmd = b.addRunArtifact(subscriber_exe);
-    if (b.args) |args| run_subscriber_cmd.addArgs(args);
+    run_subscriber_cmd.addPassthruArgs();
     run_subscriber_step.dependOn(&run_subscriber_cmd.step);
 }

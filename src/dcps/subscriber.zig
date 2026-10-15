@@ -637,8 +637,9 @@ pub const SubscriberImpl = struct {
         // Listeners run after self.mu is released (a listener may call back
         // into this Subscriber); each reader is pinned so a concurrent
         // delete_datareader cannot free it meanwhile.
-        var sfa = std.heap.stackFallback(16 * @sizeOf(*reader_mod.DataReaderImpl), self.alloc);
-        const a = sfa.get();
+        var stack_buf: [16]*reader_mod.DataReaderImpl = undefined;
+        var sfa = std.heap.BufferFirstAllocator.init(std.mem.sliceAsBytes(&stack_buf), self.alloc);
+        const a = sfa.allocator();
         var pinned: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl) = .empty;
         defer pinned.deinit(a);
         self.mu.lock();

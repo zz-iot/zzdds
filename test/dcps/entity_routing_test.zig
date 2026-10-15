@@ -502,7 +502,7 @@ test "entity_routing: INFO_DST for different participant drops the message" {
 
     const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
     const w_eid = fx.writerEid();
-    const other_prefix = [_]u8{0xBB} ** 12;
+    const other_prefix = @as([12]u8, @splat(0xBB));
 
     var msg = Msg{};
     defer msg.deinit(alloc);
@@ -548,7 +548,7 @@ test "entity_routing: INFO_SRC overrides src_prefix for subsequent submessages" 
     // the real writer prefix — which the reader has matched against.
     const real_prefix = fx.dp_w_impl.guid.prefix.bytes;
     const w_eid = fx.writerEid();
-    const fake_header_prefix = [_]u8{0xFF} ** 12;
+    const fake_header_prefix = @as([12]u8, @splat(0xFF));
 
     var msg = Msg{};
     defer msg.deinit(alloc);
@@ -615,7 +615,7 @@ test "entity_routing: dispatchDirectedWrite prefix mismatch delivers nothing" {
 
     const src_prefix = fx.dp_w_impl.guid.prefix.bytes;
     const w_eid = fx.writerEid();
-    const other_prefix = [_]u8{0xDD} ** 12;
+    const other_prefix = @as([12]u8, @splat(0xDD));
     const some_eid = [_]u8{ 0x00, 0x00, 0x01, EntityKind.user_reader_with_key };
 
     var msg = Msg{};

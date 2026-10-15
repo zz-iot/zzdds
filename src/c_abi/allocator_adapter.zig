@@ -53,16 +53,18 @@ pub fn fromAllocator(alloc: *const std.mem.Allocator) ZidlAllocator {
 const testing = std.testing;
 
 test "fromAllocator: alloc/resize/free round-trip through the ZidlAllocator vtable" {
-    const alloc = testing.allocator;
+    // Use a backend with deterministic in-place resizing. SafeAllocator may
+    // decline even a same-size rawResize, which is permitted by the vtable API.
+    var storage: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fba.allocator();
     const c_alloc = fromAllocator(&alloc);
 
     const via_c = c_alloc.alloc(c_alloc.ctx, 32, 1) orelse return error.OutOfMemory;
     defer c_alloc.free(c_alloc.ctx, via_c, 32, 1);
     @memset(via_c[0..32], 0xCD);
 
-    // A same-size "resize" is always a valid no-op resize for any conforming
-    // allocator (unlike a real shrink/grow, whose success is allocator- and
-    // size-class-dependent and not something this adapter should assert on).
+    // FixedBufferAllocator accepts a same-size resize of this allocation.
     try testing.expect(c_alloc.resize(c_alloc.ctx, via_c, 32, 32, 1));
 }
 

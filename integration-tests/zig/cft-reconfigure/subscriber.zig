@@ -52,7 +52,7 @@ fn freeStringSeq(seq: *DDS.StringSeq) void {
 
 const ReaderState = struct {
     reader: cft_event_gen.CftEventDataReader = undefined,
-    received: [TOTAL_COUNT]std.atomic.Value(bool) = .{std.atomic.Value(bool).init(false)} ** TOTAL_COUNT,
+    received: [TOTAL_COUNT]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
     count: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
 };
 

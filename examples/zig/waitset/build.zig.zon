@@ -2,7 +2,7 @@
     .name = .zzdds_examples_waitset_zig,
     .version = "0.0.0",
     .fingerprint = 0xe65782da75c147c6,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Same convention as zig/hello_world and zig/shape: point straight at
         // zzdds's own repo root (this example lives at examples/zig/waitset

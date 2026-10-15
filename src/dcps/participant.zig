@@ -411,10 +411,10 @@ fn qosReliability(kind: u8) DDS.ReliabilityQosPolicy {
     return .{ .kind = if (kind == 1) .RELIABLE_RELIABILITY_QOS else .BEST_EFFORT_RELIABILITY_QOS };
 }
 fn qosDurability(kind: u8) DDS.DurabilityQosPolicy {
-    return .{ .kind = @enumFromInt(kind) };
+    return .{ .kind = @fromBackingInt(@intCast(kind)) };
 }
 fn qosLiveliness(kind: u8) DDS.LivelinessQosPolicy {
-    return .{ .kind = @enumFromInt(kind) };
+    return .{ .kind = @fromBackingInt(@intCast(kind)) };
 }
 fn qosOwnership(kind: u8) DDS.OwnershipQosPolicy {
     return .{ .kind = if (kind == 1) .EXCLUSIVE_OWNERSHIP_QOS else .SHARED_OWNERSHIP_QOS };
@@ -591,9 +591,9 @@ const IncompatQosPending = struct {
         const last = self.last orelse return;
         for (self.counts, policies, 0..) |count, policy, i| {
             if (i == last) continue;
-            for (0..count) |_| n.notify(n.ctx, @intCast(@intFromEnum(policy)));
+            for (0..count) |_| n.notify(n.ctx, @intCast(@backingInt(policy)));
         }
-        for (0..self.counts[last]) |_| n.notify(n.ctx, @intCast(@intFromEnum(policies[last])));
+        for (0..self.counts[last]) |_| n.notify(n.ctx, @intCast(@backingInt(policies[last])));
     }
 };
 
@@ -2146,8 +2146,9 @@ pub const DomainParticipantImpl = struct {
             return;
         }
 
-        var sfa = std.heap.stackFallback(FANOUT_STACK * @sizeOf(PinnedReader), self.alloc);
-        const a = sfa.get();
+        var stack_buf: [FANOUT_STACK]PinnedReader = undefined;
+        var sfa = std.heap.BufferFirstAllocator.init(std.mem.sliceAsBytes(&stack_buf), self.alloc);
+        const a = sfa.allocator();
         var targets: std.ArrayListUnmanaged(PinnedReader) = .empty;
         defer targets.deinit(a);
         self.mu.lock();
@@ -2327,7 +2328,7 @@ pub const DomainParticipantImpl = struct {
             fn deliver(c: @This(), t: PinnedReader) void {
                 t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.group_coherent_sn, c.lifespan_ns);
             }
-            const hold = holdData;
+            pub const hold = holdData;
         };
         const ctx = Deliver{ .writer_guid = writer_guid, .sn = sn, .ts = ts, .payload = payload, .kind = kind, .coherent_set_sn = coherent_set_sn, .group_seq_num = group_seq_num, .group_coherent_sn = group_coherent_sn, .lifespan_ns = lifespan_ns, .key_hash = key_hash };
         // One reader per entry, so nothing to collect (or allocate).
@@ -2412,7 +2413,7 @@ pub const DomainParticipantImpl = struct {
                         fn deliver(c: @This(), t: PinnedReader) void {
                             t.proto.handleIncomingChange(c.writer_guid, c.sn, c.ts, t.key_hash, c.payload, c.kind, c.coherent_set_sn, c.group_seq_num, c.group_coherent_sn, c.lifespan_ns);
                         }
-                        const hold = holdData;
+                        pub const hold = holdData;
                     };
                     self.dispatchToReaders(d.reader_entity_id, .{ .key_hash = key_hash, .payload = d.serialized_payload, .kind = kind }, Deliver{
                         .writer_guid = writer_guid,
@@ -2473,7 +2474,7 @@ pub const DomainParticipantImpl = struct {
                         fn deliver(c: @This(), t: PinnedReader) void {
                             t.proto.handleDataFrag(c.writer_guid, c.ts, c.df);
                         }
-                        fn hold(c: @This(), cache: *unmatched_mod.UnmatchedCache, target: EntityId, now_ns: i64, ttl_ns: i64) void {
+                        pub fn hold(c: @This(), cache: *unmatched_mod.UnmatchedCache, target: EntityId, now_ns: i64, ttl_ns: i64) void {
                             cache.putFrag(c.writer_guid, target, c.df, c.ts, now_ns, ttl_ns);
                         }
                     };
@@ -4430,8 +4431,8 @@ pub const DomainParticipantImpl = struct {
                 .type_name = tt,
                 .handle = topicToHandle(tn_s, tt_s),
                 .reliability_kind = if (qos.reliability.kind == .RELIABLE_RELIABILITY_QOS) @as(u8, 1) else 0,
-                .durability_kind = @as(u8, @intCast(@intFromEnum(qos.durability.kind))),
-                .liveliness_kind = @as(u8, @intCast(@intFromEnum(qos.liveliness.kind))),
+                .durability_kind = @as(u8, @intCast(@backingInt(qos.durability.kind))),
+                .liveliness_kind = @as(u8, @intCast(@backingInt(qos.liveliness.kind))),
                 .ownership_kind = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS) @as(u8, 1) else 0,
                 .dest_order_kind = if (qos.destination_order.kind == .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS) @as(u8, 1) else 0,
             };
@@ -5192,11 +5193,11 @@ test "IncompatQosPending reports every policy a check can fail on under its own 
     var expected: [32]i32 = undefined;
     var n: usize = 0;
     for (all[1..]) |pol| for (0..2) |_| {
-        expected[n] = @intCast(@intFromEnum(pol));
+        expected[n] = @intCast(@backingInt(pol));
         n += 1;
     };
     for (0..2) |_| {
-        expected[n] = @intCast(@intFromEnum(all[0]));
+        expected[n] = @intCast(@backingInt(all[0]));
         n += 1;
     }
     try testing.expectEqualSlices(i32, expected[0..n], rec.ids[0..rec.n]);

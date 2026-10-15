@@ -43,7 +43,7 @@ const testing = std.testing;
 // ── Fixed test GUIDs and locators ─────────────────────────────────────────────
 
 fn prefix(b: u8) GuidPrefix {
-    return .{ .bytes = [_]u8{b} ** 12 };
+    return .{ .bytes = @as([12]u8, @splat(b)) };
 }
 
 const WRITER_GUID = Guid{ .prefix = prefix(0xAA), .entity_id = EntityIds.sedp_builtin_publications_writer };

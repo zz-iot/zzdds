@@ -67,11 +67,11 @@ pub fn build(b: *std.Build) void {
 
     const run_configurer_step = b.step("run-configurer", "Run enable_defer_configurer (pass extra flags via -- ...)");
     const run_configurer_cmd = b.addRunArtifact(configurer_exe);
-    if (b.args) |args| run_configurer_cmd.addArgs(args);
+    run_configurer_cmd.addPassthruArgs();
     run_configurer_step.dependOn(&run_configurer_cmd.step);
 
     const run_peer_step = b.step("run-peer", "Run enable_defer_peer (pass extra flags via -- ...)");
     const run_peer_cmd = b.addRunArtifact(peer_exe);
-    if (b.args) |args| run_peer_cmd.addArgs(args);
+    run_peer_cmd.addPassthruArgs();
     run_peer_step.dependOn(&run_peer_cmd.step);
 }

@@ -33,7 +33,7 @@ const JniIncludeDirs = struct { base: []const u8, platform: []const u8 };
 fn findJniIncludeDir(b: *std.Build, java_path: []const u8) ?JniIncludeDirs {
     const io = b.graph.io;
     const resolved = std.Io.Dir.realPathFileAbsoluteAlloc(io, java_path, b.allocator) catch
-        (b.allocator.dupeZ(u8, java_path) catch return null);
+        (b.allocator.dupeSentinel(u8, java_path, 0) catch return null);
     const bin_dir = std.fs.path.dirname(resolved) orelse return null;
     const java_home = std.fs.path.dirname(bin_dir) orelse return null;
     const base = std.fs.path.join(b.allocator, &.{ java_home, "include" }) catch return null;
@@ -696,10 +696,8 @@ pub fn build(b: *std.Build) void {
             // installed dylib to its existing exports minus that private
             // runtime symbol. Keep the compile artifact unchanged for Zig's
             // own in-tree linking.
-            const fix_exports = b.addSystemCommand(&.{
-                "sh",
-                b.pathFromRoot("scripts/fix_macos_dylib_exports.sh"),
-            });
+            const fix_exports = b.addSystemCommand(&.{"sh"});
+            fix_exports.addFileArg(b.path("scripts/fix_macos_dylib_exports.sh"));
             fix_exports.addArtifactArg(zzdds_lib);
             const fixed_dylib = fix_exports.addOutputFileArg("libzzdds.dylib");
             break :blk &b.addInstallFileWithDir(fixed_dylib, .lib, "libzzdds.dylib").step;
@@ -1240,7 +1238,7 @@ pub fn build(b: *std.Build) void {
         // library, linked against libzzdds. Needs a real JDK (for jni.h) —
         // skipped with a warning if one isn't found, same as zidl's own
         // Java JNI integration test.
-        const maybe_java_for_jni = b.findProgram(&.{"java"}, &.{}) catch null;
+        const maybe_java_for_jni = b.findProgram(.{ .names = &.{"java"} });
         const jni_include = if (maybe_java_for_jni) |java_path| findJniIncludeDir(b, java_path) else null;
         if (jni_include) |jni_inc| {
             const zzdds_jni_mod = b.createModule(.{
@@ -1280,7 +1278,7 @@ pub fn build(b: *std.Build) void {
             // for why this one is a real end-to-end run (two participants,
             // real discovery, a firing listener) rather than the shallow
             // CDR-only check the other languages' smoke tests do.
-            if (b.findProgram(&.{"javac"}, &.{}) catch null) |javac| {
+            if (b.findProgram(.{ .names = &.{"javac"} })) |javac| {
                 const gen_smoke_java = b.addRunArtifact(zidl_exe);
                 gen_smoke_java.addArgs(&.{ "-b", "java", "--generate-zzdds-wrappers", "--java-import-package", "DDS=io.zzdds.dcps", "-o" });
                 const gen_smoke_java_dir = gen_smoke_java.addOutputDirectoryArg("zzdds-java-binding-smoke");
@@ -1348,16 +1346,27 @@ pub fn build(b: *std.Build) void {
                 // (both libraries install to the same dest_dir -- `bin` on
                 // Windows since .dll counts as isDll(), `lib` elsewhere, see
                 // InstallArtifact's own default dest_dir logic) and adding it
-                // to PATH via addPathDir fixes this on Windows and is a
+                // to PATH in the launcher fixes this on Windows and is a
                 // harmless no-op on Linux/macOS (their loader never
                 // consults PATH for this).
-                const zzdds_dll_install_dir: std.Build.InstallDir = if (target.result.os.tag == .windows) .bin else .lib;
-                const zzdds_dll_install_path = b.getInstallPath(zzdds_dll_install_dir, "");
 
-                // Native config parsing needs more than the JVM's default Windows thread stack.
-                const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
-                run_java_smoke.addArg(b.fmt("-Djava.library.path={s}", .{zzdds_dll_install_path}));
-                run_java_smoke.addPathDir(zzdds_dll_install_path);
+                // Resolve installed paths during make, then set PATH in the launcher.
+                // The JVM also needs PATH for transitive DLL loads on Windows.
+                const launcher = b.addExecutable(.{
+                    .name = "run-with-library-path",
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path("tools/run_with_library_path.zig"),
+                        .target = b.graph.host,
+                        .optimize = .ReleaseSafe,
+                    }),
+                });
+                const library_dir: std.Build.LazyPath = .{ .relative = .{
+                    .base = if (target.result.os.tag == .windows) .install_bin else .install_lib,
+                } };
+                const run_java_smoke = b.addRunArtifact(launcher);
+                run_java_smoke.addDirectoryArg2(library_dir, .{ .make_absolute = true });
+                run_java_smoke.addArgs(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
+                run_java_smoke.addDirectoryArg2(library_dir, .{ .prefix = "-Djava.library.path=", .make_absolute = true });
                 run_java_smoke.addArg("JavaSmoke");
                 run_java_smoke.step.dependOn(&compile_java_smoke.step);
                 run_java_smoke.step.dependOn(&install_zzdds_jni_lib.step);

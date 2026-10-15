@@ -87,7 +87,7 @@ fn countSendsToPort(rec: *const Recording, port: u16) usize {
 
 fn writerGuid() Guid {
     return .{
-        .prefix = .{ .bytes = [_]u8{0x01} ** 12 },
+        .prefix = .{ .bytes = @as([12]u8, @splat(0x01)) },
         .entity_id = rtps.EntityIds.spdp_builtin_participant_writer,
     };
 }

@@ -2076,7 +2076,7 @@ test "parseIpv4" {
 
 test "parseIpv6 loopback" {
     const ip = try parseIpv6("::1");
-    const expected = [_]u8{0} ** 15 ++ [_]u8{1};
+    const expected = @as([15]u8, @splat(0)) ++ [_]u8{1};
     try std.testing.expectEqual(expected, ip);
 }
 

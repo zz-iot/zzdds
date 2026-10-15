@@ -70,11 +70,11 @@ pub fn build(b: *std.Build) void {
 
     const run_pub_step = b.step("run-pub", "Run coherent_sets_pub (pass extra flags via -- ...)");
     const run_pub_cmd = b.addRunArtifact(pub_exe);
-    if (b.args) |args| run_pub_cmd.addArgs(args);
+    run_pub_cmd.addPassthruArgs();
     run_pub_step.dependOn(&run_pub_cmd.step);
 
     const run_sub_step = b.step("run-sub", "Run coherent_sets_sub (pass extra flags via -- ...)");
     const run_sub_cmd = b.addRunArtifact(sub_exe);
-    if (b.args) |args| run_sub_cmd.addArgs(args);
+    run_sub_cmd.addPassthruArgs();
     run_sub_step.dependOn(&run_sub_cmd.step);
 }

@@ -1220,7 +1220,7 @@ release notes).
   `zz-dev/macos-tsan-crash-investigation.md`. (TSan on Windows: Clang/LLVM has no supported
   target. Extending `examples-tsan` to macOS is a separate follow-up.)
 - **Self-hosted `-OReleaseSmall` on Zig 0.16 — upstream codegen bug, worked around above.**
-  Zig 0.16.0's self-hosted x86_64 backend, *only* at `-OReleaseSmall`, emits read-only
+  Zig 0.17.0's self-hosted x86_64 backend, *only* at `-OReleaseSmall`, emits read-only
   global constants with no alignment: `&SomeImpl.views` (an `extern struct` `CAbiViews`,
   `@alignOf` 8) and every `*_vtable` global land at odd `.rodata` addresses, and `zidl-rt`'s
   `@alignCast(box.vtable)` traps it (`panic: incorrect alignment`, ~37 C-ABI tests).

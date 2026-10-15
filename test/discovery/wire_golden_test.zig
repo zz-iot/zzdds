@@ -36,7 +36,7 @@ const alloc = testing.allocator;
 
 fn guid(prefix_b: u8, ekind: u8) Guid {
     return .{
-        .prefix = .{ .bytes = [_]u8{prefix_b} ** 12 },
+        .prefix = .{ .bytes = @as([12]u8, @splat(prefix_b)) },
         .entity_id = .{ .entity_key = .{ 0x00, 0x00, ekind }, .entity_kind = ekind },
     };
 }
@@ -98,9 +98,9 @@ test "golden: DiscoveredWriterData, every conditional PID" {
         .type_name = "Ty",
         .qos = .{
             .reliability = .{ .kind = .RELIABLE_RELIABILITY_QOS, .max_blocking_time = .{} },
-            .durability = .{ .kind = @enumFromInt(2) }, // TRANSIENT
+            .durability = .{ .kind = @fromBackingInt(@intCast(2)) }, // TRANSIENT
             .history = .{ .kind = .KEEP_ALL_HISTORY_QOS, .depth = 5 },
-            .liveliness = .{ .kind = @enumFromInt(1), .lease_duration = dur(3) }, // MANUAL_BY_PARTICIPANT
+            .liveliness = .{ .kind = @fromBackingInt(@intCast(1)), .lease_duration = dur(3) }, // MANUAL_BY_PARTICIPANT
             .ownership = .{ .kind = .EXCLUSIVE_OWNERSHIP_QOS },
             .ownership_strength = .{ .value = 7 },
             .destination_order = .{ .kind = .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS },
@@ -109,7 +109,7 @@ test "golden: DiscoveredWriterData, every conditional PID" {
             .lifespan = .{ .duration = dur(9) },
             .user_data = userDataPolicy("ud"),
         },
-        .presentation = .{ .access_scope = @enumFromInt(2), .coherent_access = true, .ordered_access = true }, // GROUP
+        .presentation = .{ .access_scope = @fromBackingInt(@intCast(2)), .coherent_access = true, .ordered_access = true }, // GROUP
         .partition_names = &.{ "A", "BB" },
         .type_object = &.{},
         .type_info_cdr = &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF },
@@ -141,15 +141,15 @@ test "golden: DiscoveredReaderData, partition + non-default QoS" {
         .type_name = "Ty",
         .qos = .{
             .reliability = .{ .kind = .RELIABLE_RELIABILITY_QOS, .max_blocking_time = .{} },
-            .durability = .{ .kind = @enumFromInt(1) },
+            .durability = .{ .kind = @fromBackingInt(@intCast(1)) },
             .ownership = .{ .kind = .EXCLUSIVE_OWNERSHIP_QOS },
             .destination_order = .{ .kind = .BY_SOURCE_TIMESTAMP_DESTINATIONORDER_QOS },
             .data_representation = reprPolicy(2),
             .deadline = .{ .period = dur(4) },
-            .liveliness = .{ .kind = @enumFromInt(2), .lease_duration = dur(1) },
+            .liveliness = .{ .kind = @fromBackingInt(@intCast(2)), .lease_duration = dur(1) },
             .user_data = userDataPolicy("x"),
         },
-        .presentation = .{ .access_scope = @enumFromInt(1), .coherent_access = false, .ordered_access = false },
+        .presentation = .{ .access_scope = @fromBackingInt(@intCast(1)), .coherent_access = false, .ordered_access = false },
         .partition_names = &.{"part"},
         .type_info_cdr = &.{},
     });
@@ -207,6 +207,11 @@ test "SPDP decode round-trips locators, name, lease, and builtin endpoint set" {
 }
 
 test "SPDP decode trusts the RTPS header guid_prefix over a mismatched payload participantGuid" {
+    // This malformed fixture deliberately triggers the production warning.
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
+
     // The payload's participantGuid PID is self-asserted by the sender; the
     // guid_prefix passed to decodeSpdpParticipant is what our own receive path
     // extracted from the RTPS message header of the datagram that actually

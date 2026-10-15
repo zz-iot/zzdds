@@ -123,7 +123,7 @@ fn parseInlineQos(
     var count: usize = 0;
     while (true) {
         const pid_raw = try r.readU16();
-        const pid: sub.ParameterId = @enumFromInt(pid_raw);
+        const pid: sub.ParameterId = @fromBackingInt(@intCast(pid_raw));
         const length = try r.readU16();
         if (pid == .sentinel) break;
         const value = try r.readBytes(length);
@@ -143,7 +143,7 @@ fn parseSequenceNumberSet(r: *Reader) ParseError!sub.SequenceNumberSet {
     const base = try r.readSequenceNumber(); // 8 bytes
     const num_bits = try r.readU32();
     if (num_bits > 256) return error.MalformedSubmessage;
-    var bitmap = [_]u32{0} ** 8;
+    var bitmap = @as([8]u32, @splat(0));
     const num_words = (num_bits + 31) / 32;
     for (bitmap[0..num_words]) |*w| w.* = try r.readU32();
     return .{ .base = base, .num_bits = num_bits, .bitmap = bitmap };
@@ -155,7 +155,7 @@ fn parseFragmentNumberSet(r: *Reader) ParseError!sub.FragmentNumberSet {
     const base = try r.readU32();
     const num_bits = try r.readU32();
     if (num_bits > 256) return error.MalformedSubmessage;
-    var bitmap = [_]u32{0} ** 8;
+    var bitmap = @as([8]u32, @splat(0));
     const num_words = (num_bits + 31) / 32;
     for (bitmap[0..num_words]) |*w| w.* = try r.readU32();
     return .{ .base = base, .num_bits = num_bits, .bitmap = bitmap };
@@ -431,19 +431,19 @@ pub const MessageIterator = struct {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "MessageIterator rejects short buffer" {
-    const buf: [10]u8 = .{0} ** 10;
+    const buf: [10]u8 = @splat(0);
     try std.testing.expectError(error.TooShort, MessageIterator.init(&buf));
 }
 
 test "MessageIterator rejects bad magic" {
-    var buf: [20]u8 = .{0} ** 20;
+    var buf: [20]u8 = @splat(0);
     buf[0] = 'X';
     try std.testing.expectError(error.BadProtocolId, MessageIterator.init(&buf));
 }
 
 test "MessageIterator parses header-only message (no submessages)" {
     // Build a valid RTPS header with no submessages.
-    var buf: [20]u8 = .{0} ** 20;
+    var buf: [20]u8 = @splat(0);
     @memcpy(buf[0..4], "RTPS");
     buf[4] = 2;
     buf[5] = 5; // version 2.5
@@ -459,7 +459,7 @@ test "MessageIterator parses header-only message (no submessages)" {
 
 test "MessageIterator parses INFO_TS submessage" {
     // Craft: RTPS header (20) + INFO_TS with timestamp (4 hdr + 8 content = 12).
-    var buf: [32]u8 = .{0} ** 32;
+    var buf: [32]u8 = @splat(0);
     // Header
     @memcpy(buf[0..4], "RTPS");
     buf[4] = 2;
@@ -489,7 +489,7 @@ test "MessageIterator parses INFO_TS submessage" {
 
 test "MessageIterator parses HEARTBEAT submessage" {
     // 20 header + 4 smh + 4+4+8+8+4 = 20 content = 44 bytes total
-    var buf: [44]u8 = .{0} ** 44;
+    var buf: [44]u8 = @splat(0);
     @memcpy(buf[0..4], "RTPS");
     buf[4] = 2;
     buf[5] = 3;
@@ -515,7 +515,7 @@ test "MessageIterator parses HEARTBEAT submessage" {
 
 test "SequenceNumberSet MSB-first ordering" {
     // Verify that bit 0 = base, bit 1 = base+1, etc.
-    var sns = sub.SequenceNumberSet{ .base = 100, .num_bits = 64, .bitmap = .{0} ** 8 };
+    var sns = sub.SequenceNumberSet{ .base = 100, .num_bits = 64, .bitmap = @splat(0) };
     // Set bit 0 = SN 100: MSB of bitmap[0]
     sns.bitmap[0] = 0x8000_0000;
     try std.testing.expect(sns.contains(100));

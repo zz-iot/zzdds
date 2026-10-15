@@ -66,11 +66,11 @@ pub fn build(b: *std.Build) void {
 
     const run_session_step = b.step("run-session", "Run delete_contained_entities_session (pass extra flags via -- ...)");
     const run_session_cmd = b.addRunArtifact(session_exe);
-    if (b.args) |args| run_session_cmd.addArgs(args);
+    run_session_cmd.addPassthruArgs();
     run_session_step.dependOn(&run_session_cmd.step);
 
     const run_peer_step = b.step("run-peer", "Run delete_contained_entities_peer (pass extra flags via -- ...)");
     const run_peer_cmd = b.addRunArtifact(peer_exe);
-    if (b.args) |args| run_peer_cmd.addArgs(args);
+    run_peer_cmd.addPassthruArgs();
     run_peer_step.dependOn(&run_peer_cmd.step);
 }

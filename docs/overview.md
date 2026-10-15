@@ -12,7 +12,7 @@
 | Document | Contents |
 |---|---|
 | [`testing.md`](testing.md) | How to run the test suite (all tiers) |
-| [`dev-notes.md`](dev-notes.md) | Zig 0.16.0 API notes, build dependency layout, generated code table |
+| [`dev-notes.md`](dev-notes.md) | Zig 0.17.0 API notes, build dependency layout, generated code table |
 | [`roadmap.md`](roadmap.md) | Forward-looking: known gaps, planned features, design tasks, deferred items |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | Change history (dated) |
 | [`decisions.md`](decisions.md) | Stable design decisions with rationale |
@@ -67,7 +67,7 @@ docs/
   architecture.md         # Layer model, plugin interfaces, config, logging, wire trace
   implementation_status.md# What is and isn't implemented; known limitations
   testing.md              # How to run the test suite
-  dev-notes.md            # Zig 0.16.0 API notes, developer gotchas
+  dev-notes.md            # Zig 0.17.0 API notes, developer gotchas
   roadmap.md              # Planned work + deferred items
   decisions.md            # Stable design decisions with rationale
   reference/

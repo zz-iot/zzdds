@@ -41,7 +41,7 @@ const testing = std.testing;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn prefix(b: u8) GuidPrefix {
-    return .{ .bytes = [_]u8{b} ** 12 };
+    return .{ .bytes = @as([12]u8, @splat(b)) };
 }
 
 fn makeGuid(p: u8, eid_key: u8) Guid {
@@ -58,17 +58,17 @@ const ALL_SEDP_ENDPOINTS: u32 = BES_PUB_ANNOUNCER | BES_PUB_DETECTOR | BES_SUB_A
 fn dwq(reliable: bool, durability: u8) DDS.DataWriterQos {
     return .{
         .reliability = .{ .kind = if (reliable) .RELIABLE_RELIABILITY_QOS else .BEST_EFFORT_RELIABILITY_QOS, .max_blocking_time = .{} },
-        .durability = .{ .kind = @enumFromInt(durability) },
+        .durability = .{ .kind = @fromBackingInt(@intCast(durability)) },
     };
 }
 fn drq(reliable: bool, durability: u8) DDS.DataReaderQos {
     return .{
         .reliability = .{ .kind = if (reliable) .RELIABLE_RELIABILITY_QOS else .BEST_EFFORT_RELIABILITY_QOS, .max_blocking_time = .{} },
-        .durability = .{ .kind = @enumFromInt(durability) },
+        .durability = .{ .kind = @fromBackingInt(@intCast(durability)) },
     };
 }
 fn pres(scope: u32, coherent: bool, ordered: bool) DDS.PresentationQosPolicy {
-    return .{ .access_scope = @enumFromInt(scope), .coherent_access = coherent, .ordered_access = ordered };
+    return .{ .access_scope = @fromBackingInt(@intCast(scope)), .coherent_access = coherent, .ordered_access = ordered };
 }
 fn udPolicy(bytes: []const u8) DDS.UserDataQosPolicy {
     return .{ .value = .{ ._maximum = @intCast(bytes.len), ._length = @intCast(bytes.len), ._buffer = @constCast(bytes.ptr), ._release = false } };

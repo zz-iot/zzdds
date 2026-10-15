@@ -66,7 +66,7 @@ const hdr = [_]u8{
     'R', 'T', 'P', 'S', // protocol ID
     0x02, 0x05, // version 2.5
     0x01, 0x0F, // vendor ID
-} ++ [_]u8{0xAA} ** 12; // GUID prefix
+} ++ @as([12]u8, @splat(0xAA)); // GUID prefix
 
 // ── Submessage payloads ───────────────────────────────────────────────────────
 
@@ -211,11 +211,11 @@ test "unknown submessage ID: skipped without crash" {
 }
 
 test "all-zeros after header: no crash" {
-    const pkt = hdr ++ [_]u8{0x00} ** 64;
+    const pkt = hdr ++ @as([64]u8, @splat(0x00));
     fuzzOne(&pkt);
 }
 
 test "all-ones after header: no crash" {
-    const pkt = hdr ++ [_]u8{0xFF} ** 64;
+    const pkt = hdr ++ @as([64]u8, @splat(0xFF));
     fuzzOne(&pkt);
 }

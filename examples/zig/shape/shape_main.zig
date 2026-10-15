@@ -577,7 +577,7 @@ fn runSubscriber(
     const effective_cft_expr: ?[:0]const u8 = if (opts.cft_expression) |e|
         e
     else if (opts.color) |c|
-        std.fmt.bufPrintZ(&synth_cft_buf, "color = '{s}'", .{c}) catch null
+        std.fmt.bufPrintSentinel(&synth_cft_buf, "color = '{s}'", .{c}, 0) catch null
     else
         null;
 

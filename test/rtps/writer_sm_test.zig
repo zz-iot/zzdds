@@ -41,7 +41,7 @@ const READER_EID = rtps.EntityIds.sedp_builtin_publications_reader;
 
 fn makeGuid(prefix_byte: u8, eid: rtps.EntityId) Guid {
     return .{
-        .prefix = .{ .bytes = [_]u8{prefix_byte} ** 12 },
+        .prefix = .{ .bytes = @as([12]u8, @splat(prefix_byte)) },
         .entity_id = eid,
     };
 }
@@ -1583,7 +1583,7 @@ test "late match: a VOLATILE reader matching mid-set gets the set whole" {
 // ── LocatorSelector: effectiveLocators ranking (via ReaderProxy) ──────────────
 
 fn v6Public(last: u8) [16]u8 {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     addr[0] = 0x20;
     addr[1] = 0x01;
     addr[15] = last;
@@ -2152,7 +2152,7 @@ test "BEST_EFFORT replay: a fragmented sample goes out in its place in SN order"
     const frag_size = 64;
     const w = try StatefulWriter.init(testing.allocator, writer_guid, rec.makeTransport(), .keep_all, 0, READER_EID, frag_size, true);
     defer w.deinit();
-    const big = [_]u8{0xAB} ** (frag_size * 2 + 1);
+    const big = @as([(frag_size * 2 + 1)]u8, @splat(0xAB));
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "one");
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &big);
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "three");
@@ -2177,7 +2177,7 @@ test "BEST_EFFORT replay: the retained history goes out whole, however many batc
     // more batches than the catch-up bound, with nothing written meanwhile.
     const pairs = rtps.writer_sm.MAX_BEST_EFFORT_REPLAY_ROUNDS / 2 + 1;
     comptime std.debug.assert(pairs * 4 <= MAX_CAPS); // a DATA, 2 DATA_FRAGs and a HEARTBEAT_FRAG a pair
-    const big = [_]u8{0xAB} ** (frag_size + 1);
+    const big = @as([(frag_size + 1)]u8, @splat(0xAB));
     for (0..pairs) |_| {
         _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "small");
         _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &big);
@@ -2286,7 +2286,7 @@ test "addMatchedReader: replay primes a RELIABLE proxy with DATA_FRAG for an alr
 
     // Larger than small_frag_size, written before any reader is matched so
     // it's already sitting in the cache when addMatchedReader triggers replay.
-    const big_payload = [_]u8{0xAB} ** 64;
+    const big_payload = @as([64]u8, @splat(0xAB));
     _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &big_payload);
 
     // RELIABLE proxy: only the RELIABLE branch of replayHistoryToProxyUnlocked

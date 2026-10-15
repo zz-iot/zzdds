@@ -86,9 +86,9 @@ pub const TopicImpl = struct {
     ) !*Self {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
-        const tn = try alloc.dupeZ(u8, topic_name);
+        const tn = try alloc.dupeSentinel(u8, topic_name, 0);
         errdefer alloc.free(tn);
-        const tt = try alloc.dupeZ(u8, type_name);
+        const tt = try alloc.dupeSentinel(u8, type_name, 0);
         errdefer alloc.free(tt);
         var qos_clone = try qos.clone(alloc);
         errdefer qos_clone.deinit(alloc);
@@ -399,9 +399,9 @@ pub const ContentFilteredTopicImpl = struct {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
 
-        const name_copy = try alloc.dupeZ(u8, name);
+        const name_copy = try alloc.dupeSentinel(u8, name, 0);
         errdefer alloc.free(name_copy);
-        const expr_copy = try alloc.dupeZ(u8, filter_expr);
+        const expr_copy = try alloc.dupeSentinel(u8, filter_expr, 0);
         errdefer alloc.free(expr_copy);
 
         var params: std.ArrayListUnmanaged([]u8) = .empty;
@@ -471,7 +471,7 @@ pub const ContentFilteredTopicImpl = struct {
         filter_expression: []const u8,
         expression_parameters: ?*const DDS.StringSeq,
     ) DDS.ReturnCode_t {
-        const expr_copy = self.alloc.dupeZ(u8, filter_expression) catch return DDS.RETCODE_OUT_OF_RESOURCES;
+        const expr_copy = self.alloc.dupeSentinel(u8, filter_expression, 0) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         var expr_owned = true;
         defer if (expr_owned) self.alloc.free(expr_copy);
         const parsed = filter_mod.parse(self.alloc, expr_copy) catch |err| return switch (err) {
@@ -618,7 +618,7 @@ pub const ContentFilteredTopicImpl = struct {
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc([*:0]const u8, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         for (self.expr_params.items, 0..) |p, i| {
-            buf[i] = (self.alloc.dupeZ(u8, p) catch {
+            buf[i] = (self.alloc.dupeSentinel(u8, p, 0) catch {
                 for (buf[0..i]) |s| self.alloc.free(std.mem.span(s));
                 self.alloc.free(buf);
                 return DDS.RETCODE_OUT_OF_RESOURCES;

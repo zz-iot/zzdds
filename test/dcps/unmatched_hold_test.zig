@@ -205,7 +205,7 @@ fn delivered(r: *DataReaderImpl) usize {
 }
 
 fn writerGuid(seed: u8, key: u8) Guid {
-    return .{ .prefix = .{ .bytes = .{seed} ** 12 }, .entity_id = .{ .entity_key = .{ 0, 0, key }, .entity_kind = 0x02 } };
+    return .{ .prefix = .{ .bytes = @splat(seed) }, .entity_id = .{ .entity_key = .{ 0, 0, key }, .entity_kind = 0x02 } };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -360,7 +360,7 @@ test "nothing is held from a built-in or vendor-specific writer" {
     defer h.deinit();
     _ = h.reader("Held", .BEST_EFFORT_RELIABILITY_QOS);
 
-    const prefix = GuidPrefix{ .bytes = .{0x5A} ** 12 };
+    const prefix = GuidPrefix{ .bytes = @splat(0x5A) };
     try h.inject(.{ .prefix = prefix, .entity_id = EntityIds.sedp_builtin_publications_writer }, ANY_READER, &.{1});
     try h.inject(.{ .prefix = prefix, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x42 } }, ANY_READER, &.{1});
     try testing.expectEqual(@as(usize, 0), h.held());

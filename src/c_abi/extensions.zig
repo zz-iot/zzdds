@@ -1377,7 +1377,7 @@ fn participantRegisterTypeSupport(ctx: *anyopaque, type_name: [*:0]const u8) DDS
 var keyless_type_support_ctx: u8 = 0;
 
 fn keylessComputeKeyHash(_: *anyopaque, _: []const u8) [16]u8 {
-    return [_]u8{0} ** 16;
+    return @as([16]u8, @splat(0));
 }
 
 fn topicAsTopicDescription(ctx: *anyopaque) DDS.TopicDescription {
