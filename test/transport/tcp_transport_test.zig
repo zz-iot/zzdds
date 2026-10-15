@@ -805,9 +805,23 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
     // reliably observable — on Windows, a same-process send() on a socket
     // that process just shut down itself can still report success.
     {
-        server.conn_mu.lock();
-        for (server.all_connections.items) |co| _ = std.c.shutdown(co.fd, 2); // SHUT_RDWR
-        server.conn_mu.unlock();
+        // recvLoop starts before acceptLoop registers the connection. Receiving
+        // "again" therefore does not prove all_connections is populated yet:
+        // shutting down an empty list would leave the connection alive forever.
+        const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+        while (true) {
+            server.conn_mu.lock();
+            if (server.all_connections.items.len != 0) {
+                defer server.conn_mu.unlock();
+                for (server.all_connections.items) |co| {
+                    try testing.expectEqual(@as(c_int, 0), std.c.shutdown(co.fd, 2)); // SHUT_RDWR
+                }
+                break;
+            }
+            server.conn_mu.unlock();
+            if (time_mod.nanoTimestamp() >= deadline) return error.AcceptRegistrationNeverObserved;
+            sleepMs(20);
+        }
     }
     // The transport detects a dead connection lazily, on the next write
     // failure — there's no disconnect event for a send-only connection. After
