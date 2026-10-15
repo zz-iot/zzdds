@@ -1573,7 +1573,11 @@ test "mock_loopback: disabled DataWriter never announces or matches until enable
     // itself was broken in this test.
     const dw_control = pub_w.create_datawriter(topic_w, dw_qos, null, 0);
     _ = dw_control;
-    const control_deadline = time_mod.nanoTimestamp() + 2 * std.time.ns_per_s;
+    // Valgrind on a shared runner can take longer than two seconds to
+    // complete SPDP/SEDP delivery. Match loopback_test's instrumented-run
+    // budget; both positive waits still return immediately when matched.
+    const match_timeout_ns = 20 * std.time.ns_per_s;
+    const control_deadline = time_mod.nanoTimestamp() + match_timeout_ns;
     while (dr_impl.sub_matched_current < 1 and time_mod.nanoTimestamp() < control_deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
@@ -1584,7 +1588,7 @@ test "mock_loopback: disabled DataWriter never announces or matches until enable
     // match too.
     try std.testing.expectEqual(DDS.RETCODE_OK, dw.enable());
     try std.testing.expect(dw_impl.enabled.load(.acquire));
-    const enable_deadline = time_mod.nanoTimestamp() + 2 * std.time.ns_per_s;
+    const enable_deadline = time_mod.nanoTimestamp() + match_timeout_ns;
     while (dr_impl.sub_matched_current < 2 and time_mod.nanoTimestamp() < enable_deadline) {
         net.deliverAll();
         time_mod.sleepNs(20 * std.time.ns_per_ms);
