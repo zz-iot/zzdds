@@ -229,7 +229,7 @@ var test_null_ctx: TestNullCtx = .{};
 const test_null_transport = tr_iface.Transport{ .ctx = &test_null_ctx, .vtable = &test_null_vtable };
 
 fn testPrefix(b: u8) GuidPrefix {
-    return .{ .bytes = [_]u8{b} ** 12 };
+    return .{ .bytes = @as([12]u8, @splat(b)) };
 }
 
 const TEST_WRITER_BIT: u32 = 0x1000;

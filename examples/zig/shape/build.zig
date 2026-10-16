@@ -92,18 +92,18 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run shape_main (pass mode/flags via -- -P/-S ...)");
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
     const run_pub_step = b.step("run-pub", "Run shape_main -P (pass extra flags via -- ...)");
     const run_pub_cmd = b.addRunArtifact(exe);
     run_pub_cmd.addArg("-P");
-    if (b.args) |args| run_pub_cmd.addArgs(args);
+    run_pub_cmd.addPassthruArgs();
     run_pub_step.dependOn(&run_pub_cmd.step);
 
     const run_sub_step = b.step("run-sub", "Run shape_main -S (pass extra flags via -- ...)");
     const run_sub_cmd = b.addRunArtifact(exe);
     run_sub_cmd.addArg("-S");
-    if (b.args) |args| run_sub_cmd.addArgs(args);
+    run_sub_cmd.addPassthruArgs();
     run_sub_step.dependOn(&run_sub_cmd.step);
 }

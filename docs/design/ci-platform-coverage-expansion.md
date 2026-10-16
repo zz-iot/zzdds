@@ -247,9 +247,12 @@ unit suite at `-OReleaseSmall` **on the LLVM backend** — it reuses the baselin
 `b.addRunArtifact` for each test binary. Wired into `run_deterministic_matrix.py` as the
 `release-small` step (so `ci.yml`'s `test-linux` runs it) and into `release.yml`'s `test`
 job as `Test (ReleaseSmall, LLVM backend)`, gated to `ubuntu-latest` (the workaround path is
-Linux-exercised only). **At the Zig 0.17 bump:** delete `test-release-small` + its run-deps,
-replace the matrix/release.yml entries with a plain `zig build test -Doptimize=ReleaseSmall`
-on the normal self-hosted backend, and broaden the `release.yml` step to the whole matrix.
+Linux-exercised only). **Retired at the Zig 0.17 migration:** the normal
+`zig build test -Doptimize=ReleaseSmall` passed all 1,230 tests on Linux x86_64.
+The dedicated LLVM ReleaseSmall step and its run dependencies were removed;
+the deterministic matrix now uses the normal test step and the release workflow
+checks ReleaseSmall across its platform matrix. The independent LLVM/baseline
+`emit-tests-llvm` path remains for Valgrind.
 
 ## Cross-cutting implementation notes
 

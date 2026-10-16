@@ -79,16 +79,16 @@ pub fn build(b: *std.Build) void {
 
     const run_ignorer_step = b.step("run-ignorer", "Run ignore_entities_ignorer (pass extra flags via -- ...)");
     const run_ignorer_cmd = b.addRunArtifact(ignorer_exe);
-    if (b.args) |args| run_ignorer_cmd.addArgs(args);
+    run_ignorer_cmd.addPassthruArgs();
     run_ignorer_step.dependOn(&run_ignorer_cmd.step);
 
     const run_peer_step = b.step("run-peer", "Run ignore_entities_peer (pass extra flags via -- ...)");
     const run_peer_cmd = b.addRunArtifact(peer_exe);
-    if (b.args) |args| run_peer_cmd.addArgs(args);
+    run_peer_cmd.addPassthruArgs();
     run_peer_step.dependOn(&run_peer_cmd.step);
 
     const run_bystander_step = b.step("run-bystander", "Run ignore_entities_bystander (pass extra flags via -- ...)");
     const run_bystander_cmd = b.addRunArtifact(bystander_exe);
-    if (b.args) |args| run_bystander_cmd.addArgs(args);
+    run_bystander_cmd.addPassthruArgs();
     run_bystander_step.dependOn(&run_bystander_cmd.step);
 }

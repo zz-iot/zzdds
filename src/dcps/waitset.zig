@@ -90,7 +90,7 @@ pub const DataNotifyFn = struct {
 /// Supports up to WAKEUP_SLOTS concurrent WaitSets per condition.
 const WAKEUP_SLOTS = 4;
 pub const WakeupList = struct {
-    slots: [WAKEUP_SLOTS]?WakeupHandle = [_]?WakeupHandle{null} ** WAKEUP_SLOTS,
+    slots: [WAKEUP_SLOTS]?WakeupHandle = @splat(null),
     mu: Mutex = .{},
 
     pub fn register(self: *WakeupList, h: WakeupHandle) bool {
@@ -168,7 +168,7 @@ pub const WakeupList = struct {
     pub fn drain(self: *WakeupList) [WAKEUP_SLOTS]?WakeupHandle {
         self.mu.lock();
         defer self.mu.unlock();
-        var out: [WAKEUP_SLOTS]?WakeupHandle = [_]?WakeupHandle{null} ** WAKEUP_SLOTS;
+        var out: [WAKEUP_SLOTS]?WakeupHandle = @splat(null);
         for (&self.slots, 0..) |*s, i| {
             if (s.*) |h| {
                 if (h.acquire(h.ctx)) out[i] = h;
@@ -1330,7 +1330,7 @@ pub const QueryConditionImpl = struct {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
 
-        const expr_copy = try alloc.dupeZ(u8, query_expression);
+        const expr_copy = try alloc.dupeSentinel(u8, query_expression, 0);
         errdefer alloc.free(expr_copy);
 
         var params: std.ArrayListUnmanaged([]u8) = .empty;
@@ -1569,7 +1569,7 @@ pub const QueryConditionImpl = struct {
         if (n == 0) return DDS.RETCODE_OK;
         const buf = self.alloc.alloc([*:0]const u8, n) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         for (self.query_parameters.items, 0..) |p, i| {
-            buf[i] = (self.alloc.dupeZ(u8, p) catch {
+            buf[i] = (self.alloc.dupeSentinel(u8, p, 0) catch {
                 for (buf[0..i]) |s| self.alloc.free(std.mem.span(s));
                 self.alloc.free(buf);
                 return DDS.RETCODE_OUT_OF_RESOURCES;

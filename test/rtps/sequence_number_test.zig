@@ -21,7 +21,7 @@ const testing = std.testing;
 
 fn makeGuid(b: u8) Guid {
     return .{
-        .prefix = .{ .bytes = [_]u8{b} ** 12 },
+        .prefix = .{ .bytes = @as([12]u8, @splat(b)) },
         .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0xC2 },
     };
 }
@@ -81,7 +81,7 @@ test "SequenceNumberSet.contains(UNKNOWN) is always false" {
     const sns = SequenceNumberSet{
         .base = 1,
         .num_bits = 256,
-        .bitmap = [_]u32{0xFFFF_FFFF} ** 8,
+        .bitmap = @as([8]u32, @splat(0xFFFF_FFFF)),
     };
     try testing.expect(!sns.contains(UNKNOWN)); // -1 < base=1
 }

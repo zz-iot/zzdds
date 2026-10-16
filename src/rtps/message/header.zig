@@ -111,15 +111,19 @@ pub const Header = extern struct {
     }
 
     /// Serialize to bytes (for transmission).
-    /// The header is written in the same byte order it occupies in memory
-    /// because all fields are either magic bytes or explicitly sized.
+    /// Write the RTPS wire layout explicitly, independent of struct padding.
     pub fn toBytes(self: Header) [20]u8 {
-        return @bitCast(self);
+        return self.protocol_id ++ .{ self.protocol_version.major, self.protocol_version.minor } ++ self.vendor_id.bytes ++ self.guid_prefix.bytes;
     }
 
     /// Parse from raw bytes. Returns null if protocol magic is wrong.
     pub fn fromBytes(bytes: *const [20]u8) ?Header {
-        const h: Header = @bitCast(bytes.*);
+        const h: Header = .{
+            .protocol_id = bytes[0..4].*,
+            .protocol_version = .{ .major = bytes[4], .minor = bytes[5] },
+            .vendor_id = .{ .bytes = bytes[6..8].* },
+            .guid_prefix = .{ .bytes = bytes[8..20].* },
+        };
         if (!h.isValid()) return null;
         return h;
     }
@@ -132,7 +136,7 @@ test "Header size is 20 bytes" {
 }
 
 test "Header.init sets protocol magic and version" {
-    const prefix = GuidPrefix{ .bytes = .{1} ++ .{0} ** 11 };
+    const prefix = GuidPrefix{ .bytes = .{1} ++ @as([11]u8, @splat(0)) };
     const h = Header.init(prefix);
     try std.testing.expect(std.mem.eql(u8, &h.protocol_id, "RTPS"));
     try std.testing.expectEqual(@as(u8, 2), h.protocol_version.major);
@@ -143,12 +147,13 @@ test "Header round-trip via bytes" {
     const prefix = GuidPrefix{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 } };
     const h = Header.init(prefix);
     const bytes = h.toBytes();
+    try std.testing.expectEqualSlices(u8, &.{ 'R', 'T', 'P', 'S', 2, 5, 0x01, 0x1B, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &bytes);
     const h2 = Header.fromBytes(&bytes) orelse return error.ParseFailed;
     try std.testing.expect(std.mem.eql(u8, &h.guid_prefix.bytes, &h2.guid_prefix.bytes));
 }
 
 test "Header.fromBytes rejects bad magic" {
-    var bytes = [_]u8{0} ** 20;
+    var bytes = @as([20]u8, @splat(0));
     bytes[0] = 'X'; // corrupt magic
     try std.testing.expectEqual(@as(?Header, null), Header.fromBytes(&bytes));
 }

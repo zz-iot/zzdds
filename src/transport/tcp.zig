@@ -176,11 +176,11 @@ fn parseIpv6(s: []const u8) ![16]u8 {
 }
 
 fn isZeroV4(addr: [4]u8) bool {
-    return std.mem.eql(u8, &addr, &[_]u8{0} ** 4);
+    return std.mem.eql(u8, &addr, &@as([4]u8, @splat(0)));
 }
 
 fn isZeroV6(addr: [16]u8) bool {
-    return std.mem.eql(u8, &addr, &[_]u8{0} ** 16);
+    return std.mem.eql(u8, &addr, &@as([16]u8, @splat(0)));
 }
 
 // ── RemoteKey ─────────────────────────────────────────────────────────────────

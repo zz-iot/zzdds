@@ -691,8 +691,8 @@ test "RtpsProtocolReader: on_writer_matching runs before the writer's proxy exis
     const testing = std.testing;
     var null_ctx: u8 = 0;
     const transport = reader_sm.Transport{ .ctx = &null_ctx, .vtable = &reader_sm.test_null_vtable };
-    const reader_guid = Guid{ .prefix = .{ .bytes = [_]u8{0x11} ** 12 }, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x07 } };
-    const writer_guid = Guid{ .prefix = .{ .bytes = [_]u8{0x22} ** 12 }, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 } };
+    const reader_guid = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0x11)) }, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x07 } };
+    const writer_guid = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0x22)) }, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 } };
 
     const adapter = try RtpsProtocolReader.init(testing.allocator, reader_guid, transport, .keep_all, 0, true);
     defer adapter.deinit();

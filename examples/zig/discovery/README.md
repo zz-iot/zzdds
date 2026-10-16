@@ -65,5 +65,5 @@ samples in order.`). Both exit 0.
 
 ## Prerequisites
 
-Same as `zig/hello_world`: Zig 0.16.0, a local `zzdds` checkout built as a
+Same as `zig/hello_world`: Zig 0.17.0, a local `zzdds` checkout built as a
 sibling of `zzdds-examples` (`../../../zzdds`).

@@ -111,8 +111,8 @@ test "unknown must-understand PID: strict rejects, lenient retains, no crash" {
 }
 
 test "all-zeros / all-ones payloads: no crash" {
-    fuzzOne(&([_]u8{0} ** 128));
-    fuzzOne(&([_]u8{0xFF} ** 128));
+    fuzzOne(&(@as([128]u8, @splat(0))));
+    fuzzOne(&(@as([128]u8, @splat(0xFF))));
 }
 
 test "corpus files replay without crash" {

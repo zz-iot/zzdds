@@ -327,8 +327,8 @@ test "takeFiltered: empty queue returns zero results" {
 
 // ── readNextInstanceRaw ───────────────────────────────────────────────────────
 
-const KEY_A: [16]u8 = .{1} ++ .{0} ** 15;
-const KEY_B: [16]u8 = .{2} ++ .{0} ** 15;
+const KEY_A: [16]u8 = .{1} ++ @as([15]u8, @splat(0));
+const KEY_B: [16]u8 = .{2} ++ @as([15]u8, @splat(0));
 
 test "readNextInstanceRaw: returns one sample from the first instance" {
     const alloc = testing.allocator;

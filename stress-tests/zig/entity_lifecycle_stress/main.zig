@@ -261,7 +261,7 @@ fn runPub(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !void {
     var from_buf: [32]u8 = undefined;
     msg.from = @TypeOf(msg.from).fromSlice(std.fmt.bufPrint(&from_buf, "{d}", .{pid()}) catch "pub") catch .{};
     msg.subject = @TypeOf(msg.subject).fromSlice("Review") catch .{};
-    const large_text = [_]u8{'Z'} ** 4000;
+    const large_text = @as([4000]u8, @splat('Z'));
     msg.text = @TypeOf(msg.text).fromSlice(if (cfg.large) large_text[0..] else "Wash. Rinse. Repeat.") catch .{};
 
     const handle = writer.register_instance(msg);

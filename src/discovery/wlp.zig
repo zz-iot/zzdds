@@ -312,7 +312,7 @@ const testing = std.testing;
 
 test "encodeParticipantMessageData / decodeParticipantMessageData round-trip" {
     const alloc = testing.allocator;
-    const prefix = GuidPrefix{ .bytes = [_]u8{0xAB} ** 12 };
+    const prefix = GuidPrefix{ .bytes = @as([12]u8, @splat(0xAB)) };
 
     const encoded = try encodeParticipantMessageData(alloc, prefix, KIND_MANUAL);
     defer alloc.free(encoded);
@@ -354,8 +354,8 @@ test "liveliness assertions are reported from on_flush, in arrival order, not fr
     };
     self.callbacks = &cbs;
 
-    const a = GuidPrefix{ .bytes = [_]u8{0x0A} ** 12 };
-    const b = GuidPrefix{ .bytes = [_]u8{0x0B} ** 12 };
+    const a = GuidPrefix{ .bytes = @as([12]u8, @splat(0x0A)) };
+    const b = GuidPrefix{ .bytes = @as([12]u8, @splat(0x0B)) };
     const pa = try encodeParticipantMessageData(alloc, a, KIND_AUTOMATIC);
     defer alloc.free(pa);
     const pb = try encodeParticipantMessageData(alloc, b, KIND_MANUAL);
@@ -391,7 +391,7 @@ test "automaticSendPeriodNs floors at the 100ms timer-tick granularity" {
 }
 
 test "instanceKey packs prefix and kind directly with no hashing" {
-    const prefix = GuidPrefix{ .bytes = [_]u8{0x11} ** 12 };
+    const prefix = GuidPrefix{ .bytes = @as([12]u8, @splat(0x11)) };
     const kh = instanceKey(prefix, KIND_AUTOMATIC);
     try testing.expectEqualSlices(u8, &prefix.bytes, kh[0..12]);
     try testing.expectEqualSlices(u8, &KIND_AUTOMATIC, kh[12..16]);

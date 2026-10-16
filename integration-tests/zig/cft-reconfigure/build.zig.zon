@@ -2,7 +2,7 @@
     .name = .zzdds_it_cft_reconfigure_zig,
     .version = "0.0.0",
     .fingerprint = 0x3d4793874a05ca02,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zzdds = .{
             .path = "../../..",

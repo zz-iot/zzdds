@@ -17,7 +17,7 @@ module, built at `zig build` time from `idl/shape.idl`.
 
 ## Prerequisites
 
-- Zig 0.16.0.
+- Zig 0.17.0.
 - A local `zzdds` checkout as a sibling of `zzdds-examples`
   (`../../../zzdds` relative to this directory) — matches this repo's own
   convention of always building against a local zzdds checkout (see the

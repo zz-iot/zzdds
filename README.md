@@ -19,7 +19,7 @@ A Zig implementation of the DDS specification (v1.4) and RTPS 2.5 wire interoper
 
 ## Build
 
-Requires Zig 0.16.0.
+Requires Zig 0.17.0.
 
 ```sh
 zig build       # generate DCPS interfaces + compile

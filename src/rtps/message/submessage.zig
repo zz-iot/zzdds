@@ -105,7 +105,7 @@ pub const SubMessageHeader = extern struct {
     }
 
     pub fn id(self: SubMessageHeader) SubMessageId {
-        return @enumFromInt(self.submessage_id);
+        return @fromBackingInt(@intCast(self.submessage_id));
     }
 
     pub fn isLittleEndian(self: SubMessageHeader) bool {
@@ -455,7 +455,7 @@ test "SequenceNumberSet.contains and set" {
     var sns = SequenceNumberSet{
         .base = 10,
         .num_bits = 32,
-        .bitmap = .{0} ** 8,
+        .bitmap = @splat(0),
     };
     sns.set(10); // bit 0
     sns.set(13); // bit 3
@@ -467,7 +467,7 @@ test "SequenceNumberSet.contains and set" {
 }
 
 test "SequenceNumberSet.wireSize" {
-    const sns = SequenceNumberSet{ .base = 1, .num_bits = 32, .bitmap = .{0} ** 8 };
+    const sns = SequenceNumberSet{ .base = 1, .num_bits = 32, .bitmap = @splat(0) };
     // 8 (SN wire) + 4 (numBits) + 1*4 (one 32-bit word) = 16
     try std.testing.expectEqual(@as(usize, 16), sns.wireSize());
 }

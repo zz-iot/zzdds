@@ -83,7 +83,7 @@ test "filterReachableLocators: silently drops opaque custom locators" {
 
     // A custom locator with unknown kind — no transport claims it, treated as opaque.
     const locators = [_]Locator{
-        Locator{ .custom = .{ .kind = 0x00FF_0000, .port = 1, .address = [_]u8{0} ** 16 } },
+        Locator{ .custom = .{ .kind = 0x00FF_0000, .port = 1, .address = @as([16]u8, @splat(0)) } },
         Locator{ .udp_v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 7400 } },
     };
 
@@ -101,8 +101,8 @@ test "filterReachableLocators: warns for non-opaque unreachable locators" {
 
     // udp_v6 is a known kind but this transport doesn't support it.
     const locators = [_]Locator{
-        Locator{ .udp_v6 = .{ .addr = [_]u8{0} ** 16, .port = 7400 } },
-        Locator{ .udp_v6 = .{ .addr = [_]u8{1} ** 16, .port = 7401 } },
+        Locator{ .udp_v6 = .{ .addr = @as([16]u8, @splat(0)), .port = 7400 } },
+        Locator{ .udp_v6 = .{ .addr = @as([16]u8, @splat(1)), .port = 7401 } },
     };
 
     const result = filterReachableLocators(testing.allocator, &locators, tr, "test", &warn);

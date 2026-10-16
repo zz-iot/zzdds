@@ -18,7 +18,7 @@ test "LocatorWire.toLocator: udp_v4" {
     const w = LocatorWire{
         .kind = LocatorKind.udp_v4,
         .port = 7400,
-        .address = [_]u8{0} ** 12 ++ [_]u8{ 192, 168, 1, 1 },
+        .address = @as([12]u8, @splat(0)) ++ [_]u8{ 192, 168, 1, 1 },
     };
     const loc = w.toLocator();
     try testing.expectEqual(
@@ -28,7 +28,7 @@ test "LocatorWire.toLocator: udp_v4" {
 }
 
 test "LocatorWire.toLocator: udp_v6" {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     addr[0] = 0xFE;
     addr[15] = 1;
     const w = LocatorWire{ .kind = LocatorKind.udp_v6, .port = 7400, .address = addr };
@@ -40,7 +40,7 @@ test "LocatorWire.toLocator: udp_v6" {
 }
 
 test "LocatorWire.toLocator: shmem" {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     std.mem.writeInt(u64, addr[0..8], 0xDEAD_BEEF_1234_5678, .little);
     const w = LocatorWire{ .kind = LocatorKind.shmem, .port = 42, .address = addr };
     try testing.expectEqual(
@@ -50,7 +50,7 @@ test "LocatorWire.toLocator: shmem" {
 }
 
 test "LocatorWire.toLocator: shmem_zc" {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     std.mem.writeInt(u64, addr[0..8], 0x1122_3344_5566_7788, .little);
     addr[8] = 0xAA;
     addr[9] = 0xBB;
@@ -67,7 +67,7 @@ test "LocatorWire.toLocator: shmem_zc" {
 }
 
 test "LocatorWire.toLocator: custom (unknown kind)" {
-    const w = LocatorWire{ .kind = 99, .port = 7, .address = [_]u8{0xDE} ** 16 };
+    const w = LocatorWire{ .kind = 99, .port = 7, .address = @as([16]u8, @splat(0xDE)) };
     const loc = w.toLocator();
     const c = switch (loc) {
         .custom => |c| c,
@@ -135,26 +135,26 @@ test "Locator.tier: udp_v4 public" {
 }
 
 test "Locator.tier: udp_v6 loopback (::1)" {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     addr[15] = 1;
     try testing.expectEqual(LocatorTier.loopback, Locator.udp6(addr, 7400).tier());
 }
 
 test "Locator.tier: udp_v6 link-local (fe80::/10)" {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     addr[0] = 0xFE;
     addr[1] = 0x80;
     try testing.expectEqual(LocatorTier.link_local, Locator.udp6(addr, 7400).tier());
 }
 
 test "Locator.tier: udp_v6 ULA (fc00::/7)" {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     addr[0] = 0xFD;
     try testing.expectEqual(LocatorTier.private, Locator.udp6(addr, 7400).tier());
 }
 
 test "Locator.tier: udp_v6 public" {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     addr[0] = 0x20;
     addr[1] = 0x01; // 2001:: — a real public documentation prefix range
     try testing.expectEqual(LocatorTier.public, Locator.udp6(addr, 7400).tier());
@@ -169,7 +169,7 @@ test "Locator.tier: shmem and shmem_zc are loopback" {
 
 test "Locator.tier: custom and invalid are public" {
     const inv: Locator = .invalid;
-    const custom = Locator{ .custom = .{ .kind = 99, .port = 0, .address = [_]u8{0} ** 16 } };
+    const custom = Locator{ .custom = .{ .kind = 99, .port = 0, .address = @as([16]u8, @splat(0)) } };
     try testing.expectEqual(LocatorTier.public, inv.tier());
     try testing.expectEqual(LocatorTier.public, custom.tier());
 }
@@ -192,17 +192,17 @@ test "Locator.wireKind: all variants" {
     const inv: Locator = .invalid;
     try testing.expectEqual(LocatorKind.invalid, inv.wireKind());
     try testing.expectEqual(LocatorKind.udp_v4, (Locator{ .udp_v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 1 } }).wireKind());
-    try testing.expectEqual(LocatorKind.udp_v6, (Locator{ .udp_v6 = .{ .addr = [_]u8{0} ** 16, .port = 1 } }).wireKind());
+    try testing.expectEqual(LocatorKind.udp_v6, (Locator{ .udp_v6 = .{ .addr = @as([16]u8, @splat(0)), .port = 1 } }).wireKind());
     try testing.expectEqual(LocatorKind.shmem, (Locator{ .shmem = .{ .host_id = 0, .channel_id = 0 } }).wireKind());
-    try testing.expectEqual(LocatorKind.shmem_zc, (Locator{ .shmem_zc = .{ .host_id = 0, .writer_entity = .{0} ** 4 } }).wireKind());
-    try testing.expectEqual(@as(i32, 77), (Locator{ .custom = .{ .kind = 77, .port = 0, .address = [_]u8{0} ** 16 } }).wireKind());
+    try testing.expectEqual(LocatorKind.shmem_zc, (Locator{ .shmem_zc = .{ .host_id = 0, .writer_entity = @splat(0) } }).wireKind());
+    try testing.expectEqual(@as(i32, 77), (Locator{ .custom = .{ .kind = 77, .port = 0, .address = @as([16]u8, @splat(0)) } }).wireKind());
 }
 
 // ── Locator.isOpaqueCustom ───────────────────────────────────────────────────
 
 test "Locator.isOpaqueCustom: custom is opaque, others are not" {
     const inv: Locator = .invalid;
-    try testing.expect((Locator{ .custom = .{ .kind = 99, .port = 0, .address = [_]u8{0} ** 16 } }).isOpaqueCustom());
+    try testing.expect((Locator{ .custom = .{ .kind = 99, .port = 0, .address = @as([16]u8, @splat(0)) } }).isOpaqueCustom());
     try testing.expect(!inv.isOpaqueCustom());
     try testing.expect(!(Locator{ .udp_v4 = .{ .addr = .{ 0, 0, 0, 0 }, .port = 0 } }).isOpaqueCustom());
 }
@@ -210,11 +210,11 @@ test "Locator.isOpaqueCustom: custom is opaque, others are not" {
 // ── Locator.isInvalidOrReserved ───────────────────────────────────────────────
 
 test "Locator.isInvalidOrReserved: custom with reserved kind" {
-    const reserved = Locator{ .custom = .{ .kind = LocatorKind.reserved, .port = 0, .address = [_]u8{0} ** 16 } };
+    const reserved = Locator{ .custom = .{ .kind = LocatorKind.reserved, .port = 0, .address = @as([16]u8, @splat(0)) } };
     try testing.expect(reserved.isInvalidOrReserved());
 }
 
 test "Locator.isInvalidOrReserved: custom with non-reserved kind is not reserved" {
-    const custom = Locator{ .custom = .{ .kind = 99, .port = 0, .address = [_]u8{0} ** 16 } };
+    const custom = Locator{ .custom = .{ .kind = 99, .port = 0, .address = @as([16]u8, @splat(0)) } };
     try testing.expect(!custom.isInvalidOrReserved());
 }

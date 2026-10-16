@@ -33,7 +33,7 @@ const JniIncludeDirs = struct { base: []const u8, platform: []const u8 };
 fn findJniIncludeDir(b: *std.Build, java_path: []const u8) ?JniIncludeDirs {
     const io = b.graph.io;
     const resolved = std.Io.Dir.realPathFileAbsoluteAlloc(io, java_path, b.allocator) catch
-        (b.allocator.dupeZ(u8, java_path) catch return null);
+        (b.allocator.dupeSentinel(u8, java_path, 0) catch return null);
     const bin_dir = std.fs.path.dirname(resolved) orelse return null;
     const java_home = std.fs.path.dirname(bin_dir) orelse return null;
     const base = std.fs.path.join(b.allocator, &.{ java_home, "include" }) catch return null;
@@ -696,10 +696,8 @@ pub fn build(b: *std.Build) void {
             // installed dylib to its existing exports minus that private
             // runtime symbol. Keep the compile artifact unchanged for Zig's
             // own in-tree linking.
-            const fix_exports = b.addSystemCommand(&.{
-                "sh",
-                b.pathFromRoot("scripts/fix_macos_dylib_exports.sh"),
-            });
+            const fix_exports = b.addSystemCommand(&.{"sh"});
+            fix_exports.addFileArg(b.path("scripts/fix_macos_dylib_exports.sh"));
             fix_exports.addArtifactArg(zzdds_lib);
             const fixed_dylib = fix_exports.addOutputFileArg("libzzdds.dylib");
             break :blk &b.addInstallFileWithDir(fixed_dylib, .lib, "libzzdds.dylib").step;
@@ -1240,7 +1238,7 @@ pub fn build(b: *std.Build) void {
         // library, linked against libzzdds. Needs a real JDK (for jni.h) —
         // skipped with a warning if one isn't found, same as zidl's own
         // Java JNI integration test.
-        const maybe_java_for_jni = b.findProgram(&.{"java"}, &.{}) catch null;
+        const maybe_java_for_jni = b.findProgram(.{ .names = &.{"java"} });
         const jni_include = if (maybe_java_for_jni) |java_path| findJniIncludeDir(b, java_path) else null;
         if (jni_include) |jni_inc| {
             const zzdds_jni_mod = b.createModule(.{
@@ -1280,7 +1278,7 @@ pub fn build(b: *std.Build) void {
             // for why this one is a real end-to-end run (two participants,
             // real discovery, a firing listener) rather than the shallow
             // CDR-only check the other languages' smoke tests do.
-            if (b.findProgram(&.{"javac"}, &.{}) catch null) |javac| {
+            if (b.findProgram(.{ .names = &.{"javac"} })) |javac| {
                 const gen_smoke_java = b.addRunArtifact(zidl_exe);
                 gen_smoke_java.addArgs(&.{ "-b", "java", "--generate-zzdds-wrappers", "--java-import-package", "DDS=io.zzdds.dcps", "-o" });
                 const gen_smoke_java_dir = gen_smoke_java.addOutputDirectoryArg("zzdds-java-binding-smoke");
@@ -1348,16 +1346,27 @@ pub fn build(b: *std.Build) void {
                 // (both libraries install to the same dest_dir -- `bin` on
                 // Windows since .dll counts as isDll(), `lib` elsewhere, see
                 // InstallArtifact's own default dest_dir logic) and adding it
-                // to PATH via addPathDir fixes this on Windows and is a
+                // to PATH in the launcher fixes this on Windows and is a
                 // harmless no-op on Linux/macOS (their loader never
                 // consults PATH for this).
-                const zzdds_dll_install_dir: std.Build.InstallDir = if (target.result.os.tag == .windows) .bin else .lib;
-                const zzdds_dll_install_path = b.getInstallPath(zzdds_dll_install_dir, "");
 
-                // Native config parsing needs more than the JVM's default Windows thread stack.
-                const run_java_smoke = b.addSystemCommand(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
-                run_java_smoke.addArg(b.fmt("-Djava.library.path={s}", .{zzdds_dll_install_path}));
-                run_java_smoke.addPathDir(zzdds_dll_install_path);
+                // Resolve installed paths during make, then set PATH in the launcher.
+                // The JVM also needs PATH for transitive DLL loads on Windows.
+                const launcher = b.addExecutable(.{
+                    .name = "run-with-library-path",
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path("tools/run_with_library_path.zig"),
+                        .target = b.graph.host,
+                        .optimize = .ReleaseSafe,
+                    }),
+                });
+                const library_dir: std.Build.LazyPath = .{ .relative = .{
+                    .base = if (target.result.os.tag == .windows) .install_bin else .install_lib,
+                } };
+                const run_java_smoke = b.addRunArtifact(launcher);
+                run_java_smoke.addDirectoryArg2(library_dir, .{ .make_absolute = true });
+                run_java_smoke.addArgs(&.{ maybe_java_for_jni.?, "--enable-native-access=ALL-UNNAMED", "-Xss8m", "-cp", "build-tmp/java-binding-smoke" });
+                run_java_smoke.addDirectoryArg2(library_dir, .{ .prefix = "-Djava.library.path=", .make_absolute = true });
                 run_java_smoke.addArg("JavaSmoke");
                 run_java_smoke.step.dependOn(&compile_java_smoke.step);
                 run_java_smoke.step.dependOn(&install_zzdds_jni_lib.step);
@@ -1632,7 +1641,9 @@ pub fn build(b: *std.Build) void {
     // empirically for Valgrind specifically: a self-hosted-backend
     // api_test binary produced 250k+ "DWARF2 reader: Badly formed extended
     // line op" warning lines under `valgrind --quiet`; the identical
-    // source rebuilt with use_llvm=true produced zero. This is the same
+    // source rebuilt with use_llvm=true produced zero. Rechecked with Zig
+    // 0.17.0 and Valgrind 3.24.0: api_test still emits 162k+ DWARF warnings
+    // with the default backend and none with LLVM. This is the same
     // root cause the coverage job's kcov step already works around by
     // patching elfutils from source (see that job's comments) -- rebuilding
     // with LLVM instead is the fix at the source for tools that read this
@@ -1710,27 +1721,6 @@ pub fn build(b: *std.Build) void {
 
     const emit_tests_llvm_step = b.step("emit-tests-llvm", "Build test binaries (LLVM backend, baseline CPU) for external DWARF-reading tools like Valgrind");
 
-    // `zig build test-release-small -Doptimize=ReleaseSmall` — run the whole
-    // unit suite at ReleaseSmall. It reuses the LLVM-backend / baseline-CPU
-    // module graph above (the same `.use_llvm = true` artifacts emit-tests-llvm
-    // installs) rather than the normal self-hosted `test` step, purely to dodge
-    // an upstream Zig bug: Zig 0.16.0's self-hosted x86_64 backend, *only* at
-    // -OReleaseSmall, emits read-only global constants (vtable structs,
-    // `CAbiViews` values) with no alignment -- `&SomeImpl.views` lands at an odd
-    // address and `zidl_rt`'s `@alignCast(box.vtable)` traps it (`panic:
-    // incorrect alignment`), crashing ~37 C-ABI tests. The LLVM backend aligns
-    // rodata correctly in every mode; Debug/ReleaseSafe/ReleaseFast on the
-    // self-hosted backend are also fine -- ReleaseSmall is the only broken cell.
-    // The bug is fixed on Zig master (0.17.0-dev.1902+); it is not in any stable
-    // release (0.16.0, tagged 2026-04-13, is latest). Minimal repro + full trail:
-    // `zz-dev/releasesmall-misaligned-rodata-investigation.md`.
-    //
-    // AT THE ZIG 0.17 BUMP: delete this step and its run-artifact deps below,
-    // and add a plain `release-small` entry to scripts/run_deterministic_matrix.py
-    // and release.yml, mirroring `release-fast` (`zig build test
-    // -Doptimize=ReleaseSmall` on the normal self-hosted backend).
-    const test_release_small_step = b.step("test-release-small", "Run the unit suite at ReleaseSmall (LLVM backend -- see comment: works around a Zig 0.16 self-hosted-backend rodata-alignment bug)");
-
     const zzdds_tests_llvm = b.addTest(.{
         .name = "zzdds_lib",
         .root_module = zzdds_mod_llvm_safe,
@@ -1739,7 +1729,6 @@ pub fn build(b: *std.Build) void {
     emit_tests_llvm_step.dependOn(&b.addInstallArtifact(zzdds_tests_llvm, .{
         .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
     }).step);
-    test_release_small_step.dependOn(&b.addRunArtifact(zzdds_tests_llvm).step);
 
     for (fuzz_test_files) |src| {
         const t = b.addTest(.{
@@ -1757,7 +1746,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (transport_test_files) |src| {
@@ -1776,7 +1764,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (discovery_test_files) |src| {
@@ -1795,7 +1782,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     for (rtps_test_files) |src| {
@@ -1814,7 +1800,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     const mock_dcps_fixture_mod_llvm_safe = b.createModule(.{
@@ -1825,7 +1810,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    var rs_dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -1847,7 +1831,6 @@ pub fn build(b: *std.Build) void {
         emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
         }).step);
-        test_release_small_step.dependOn(&addTestRun(b, t, &rs_dcps_test_domain).step);
     }
 
     // ── TSan test step ────────────────────────────────────────────────────────

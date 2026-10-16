@@ -782,7 +782,7 @@ fn cftChurn(ctx: CftCtx) void {
         }
 
         // (b) full CFT + reader lifecycle, uniquely named.
-        const name = std.fmt.bufPrintZ(&name_buf, "cft_{d}_{d}", .{ ctx.idx, local }) catch {
+        const name = std.fmt.bufPrintSentinel(&name_buf, "cft_{d}_{d}", .{ ctx.idx, local }, 0) catch {
             fail("cft: name format");
             return;
         };

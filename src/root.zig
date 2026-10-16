@@ -25,7 +25,7 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(level) > @intFromEnum(std.testing.log_level)) return;
+    if (@backingInt(level) > @backingInt(std.testing.log_level)) return;
     std.log.defaultLog(level, scope, format, args);
 }
 

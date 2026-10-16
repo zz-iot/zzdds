@@ -103,7 +103,7 @@ fn octetSeq(comptime FT: type, bytes: []const u8) OptChild(FT) {
 }
 
 fn presentationWire(p: DDS.PresentationQosPolicy) ?wire.PresentationWire {
-    const scope: u32 = @intCast(@intFromEnum(p.access_scope));
+    const scope: u32 = @intCast(@backingInt(p.access_scope));
     if (scope == 0 and !p.coherent_access and !p.ordered_access) return null;
     return .{
         .access_scope = scope,
@@ -144,7 +144,7 @@ pub fn writerDiscoveredData(
             .kind = if (reliable) 2 else 1,
             .max_blocking_time = .{ .seconds = 0, .fraction = 0 },
         },
-        .durabilityKind = @intFromEnum(qos.durability.kind),
+        .durabilityKind = @backingInt(qos.durability.kind),
         .userData = if (ud.len > 0) octetSeq(@FieldType(wire.DiscoveredWriterData, "userData"), ud) else null,
         .presentation = presentationWire(presentation),
         .deadline = if (durUnset(qos.deadline.period.sec, qos.deadline.period.nanosec))
@@ -152,16 +152,16 @@ pub fn writerDiscoveredData(
         else
             rtpsDur(qos.deadline.period.sec, qos.deadline.period.nanosec),
         .liveliness = livelinessWire(
-            @intFromEnum(qos.liveliness.kind),
+            @backingInt(qos.liveliness.kind),
             qos.liveliness.lease_duration.sec,
             qos.liveliness.lease_duration.nanosec,
         ),
-        .ownershipKind = @intFromEnum(qos.ownership.kind),
+        .ownershipKind = @backingInt(qos.ownership.kind),
         .ownershipStrength = if (qos.ownership.kind == .EXCLUSIVE_OWNERSHIP_QOS)
             qos.ownership_strength.value
         else
             null,
-        .destinationOrder = @intFromEnum(qos.destination_order.kind),
+        .destinationOrder = @backingInt(qos.destination_order.kind),
         .history = .{
             .kind = if (keep_all) 1 else 0,
             // KEEP_LAST depth must be >= 1; codegen default 0 → clamp.
@@ -196,11 +196,11 @@ pub fn readerDiscoveredData(
             .kind = if (reliable) 2 else 1,
             .max_blocking_time = .{ .seconds = 0, .fraction = 0 },
         },
-        .durabilityKind = @intFromEnum(qos.durability.kind),
-        .ownershipKind = @intFromEnum(qos.ownership.kind),
+        .durabilityKind = @backingInt(qos.durability.kind),
+        .ownershipKind = @backingInt(qos.ownership.kind),
         // MATCH ONLY: `encodeReaderData` nulls this before serialize so the
         // reader wire is unchanged (readers historically never emit it).
-        .destinationOrder = @intFromEnum(qos.destination_order.kind),
+        .destinationOrder = @backingInt(qos.destination_order.kind),
         .userData = if (ud.len > 0) octetSeq(@FieldType(wire.DiscoveredReaderData, "userData"), ud) else null,
         .presentation = presentationWire(presentation),
         .deadline = if (durUnset(qos.deadline.period.sec, qos.deadline.period.nanosec))
@@ -208,7 +208,7 @@ pub fn readerDiscoveredData(
         else
             rtpsDur(qos.deadline.period.sec, qos.deadline.period.nanosec),
         .liveliness = livelinessWire(
-            @intFromEnum(qos.liveliness.kind),
+            @backingInt(qos.liveliness.kind),
             qos.liveliness.lease_duration.sec,
             qos.liveliness.lease_duration.nanosec,
         ),

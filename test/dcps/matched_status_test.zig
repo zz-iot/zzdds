@@ -685,7 +685,7 @@ test "sub data: a sample delivered when its writer is matched already resolves i
     defer fx.deinit();
 
     const writer_guid = zzdds.protocol.Guid{
-        .prefix = .{ .bytes = [_]u8{0x5a} ** 12 },
+        .prefix = .{ .bytes = @as([12]u8, @splat(0x5a)) },
         .entity_id = .{ .entity_key = .{ 0, 0, 9 }, .entity_kind = 0x03 },
     };
     var check = GuidCheck{ .dr = undefined, .zdr = undefined };
@@ -769,7 +769,7 @@ test "sample lost: listener may call back into its reader for GAP and Heartbeat 
     check.dr = dr;
 
     const writer_guid = zzdds.protocol.Guid{
-        .prefix = .{ .bytes = [_]u8{0x6b} ** 12 },
+        .prefix = .{ .bytes = @as([12]u8, @splat(0x6b)) },
         .entity_id = .{ .entity_key = .{ 0, 0, 7 }, .entity_kind = 0x03 },
     };
     const pr = @as(*zzdds.dcps.DataReaderImpl, @ptrCast(@alignCast(dr.ptr))).proto_reader;

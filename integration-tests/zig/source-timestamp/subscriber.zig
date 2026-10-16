@@ -33,7 +33,7 @@ fn sleepNs(io: std.Io, ns: u64) void {
 
 const SubState = struct {
     reader: timestamp_event_gen.TimestampEventDataReader = undefined,
-    alive_received: [SAMPLE_COUNT]std.atomic.Value(bool) = .{std.atomic.Value(bool).init(false)} ** SAMPLE_COUNT,
+    alive_received: [SAMPLE_COUNT]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
     alive_count: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     dispose_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     dispose_timestamp_ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),

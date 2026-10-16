@@ -31,8 +31,8 @@ const ZERO_TS: RtpsTimestamp = .{ .seconds = 0, .fraction = 0 };
 const NIL_IH = std.mem.zeroes([16]u8);
 const NIL_KH = std.mem.zeroes([16]u8);
 
-const WRITER_GUID = Guid{ .prefix = .{ .bytes = [_]u8{0xC1} ** 12 }, .entity_id = rtps.EntityIds.sedp_builtin_publications_writer };
-const READER_GUID = Guid{ .prefix = .{ .bytes = [_]u8{0xD1} ** 12 }, .entity_id = rtps.EntityIds.sedp_builtin_publications_reader };
+const WRITER_GUID = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0xC1)) }, .entity_id = rtps.EntityIds.sedp_builtin_publications_writer };
+const READER_GUID = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0xD1)) }, .entity_id = rtps.EntityIds.sedp_builtin_publications_reader };
 const WRITER_LOC = Locator.udp4(.{ 127, 0, 0, 20 }, 7411);
 
 const MAX_CAPS = 32;
@@ -116,8 +116,8 @@ const Collector = struct {
 };
 
 const ReaderModel = struct {
-    received: [MAX_SN + 1]bool = [_]bool{false} ** (MAX_SN + 1),
-    pending: [MAX_SN + 1]bool = [_]bool{false} ** (MAX_SN + 1),
+    received: [MAX_SN + 1]bool = @as([(MAX_SN + 1)]bool, @splat(false)),
+    pending: [MAX_SN + 1]bool = @as([(MAX_SN + 1)]bool, @splat(false)),
     delivered: std.ArrayListUnmanaged(SequenceNumber) = .empty,
     last_hb_count: ?i32 = null,
     lost_count: i32 = 0,

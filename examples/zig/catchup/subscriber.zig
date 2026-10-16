@@ -41,8 +41,8 @@ const State = struct {
     // happen through zzdds's own internal locking -- establishes a real
     // happens-before relationship. Kept atomic anyway for defensiveness/
     // TSan-cleanliness regardless of that internal guarantee.
-    historical_received: [10]std.atomic.Value(bool) = .{std.atomic.Value(bool).init(false)} ** 10,
-    live_received: [5]std.atomic.Value(bool) = .{std.atomic.Value(bool).init(false)} ** 5,
+    historical_received: [10]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
+    live_received: [5]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
     all_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     historical_confirmed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     alloc: std.mem.Allocator,

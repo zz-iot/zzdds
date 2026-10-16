@@ -31,8 +31,8 @@ const NIL_IH = std.mem.zeroes([16]u8);
 const NIL_KH = std.mem.zeroes([16]u8);
 const MAX_SN = 16;
 
-const WRITER_GUID = Guid{ .prefix = .{ .bytes = [_]u8{0xE1} ** 12 }, .entity_id = rtps.EntityIds.sedp_builtin_publications_writer };
-const READER_GUID = Guid{ .prefix = .{ .bytes = [_]u8{0xE2} ** 12 }, .entity_id = rtps.EntityIds.sedp_builtin_publications_reader };
+const WRITER_GUID = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0xE1)) }, .entity_id = rtps.EntityIds.sedp_builtin_publications_writer };
+const READER_GUID = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0xE2)) }, .entity_id = rtps.EntityIds.sedp_builtin_publications_reader };
 const READER_LOC = Locator.udp4(.{ 127, 0, 0, 30 }, 7413);
 
 const MAX_CAPS = 64;
@@ -92,12 +92,12 @@ const Recording = struct {
 };
 
 const WriterModel = struct {
-    cached: [MAX_SN + 1]bool = [_]bool{false} ** (MAX_SN + 1),
-    coherent_pending: [MAX_SN + 1]bool = [_]bool{false} ** (MAX_SN + 1),
+    cached: [MAX_SN + 1]bool = @as([(MAX_SN + 1)]bool, @splat(false)),
+    coherent_pending: [MAX_SN + 1]bool = @as([(MAX_SN + 1)]bool, @splat(false)),
     /// End-of-coherent-set markers: never cached, but kept and resent like a
     /// cached sample (the writer retires them only once their set's samples
     /// are gone from its cache, never here with KEEP_ALL).
-    end_marker: [MAX_SN + 1]bool = [_]bool{false} ** (MAX_SN + 1),
+    end_marker: [MAX_SN + 1]bool = @as([(MAX_SN + 1)]bool, @splat(false)),
     next_sn: SequenceNumber = 1,
     coherent_active: bool = false,
     last_acknack_count: ?i32 = null,
@@ -119,7 +119,7 @@ const WriterModel = struct {
     fn endCoherent(self: *@This()) void {
         self.coherent_active = false;
         const had_samples = std.mem.indexOfScalar(bool, &self.coherent_pending, true) != null;
-        self.coherent_pending = [_]bool{false} ** (MAX_SN + 1);
+        self.coherent_pending = @as([(MAX_SN + 1)]bool, @splat(false));
         // A non-empty coherent set ends with an end marker, which takes an SN.
         if (had_samples) {
             const sn = self.next_sn;

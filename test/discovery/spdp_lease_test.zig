@@ -30,7 +30,7 @@ const testing = std.testing;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn prefix(b: u8) GuidPrefix {
-    return .{ .bytes = [_]u8{b} ** 12 };
+    return .{ .bytes = @as([12]u8, @splat(b)) };
 }
 
 /// Build a minimal PL-CDR-LE SPDP participant payload with the given GUID

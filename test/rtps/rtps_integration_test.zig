@@ -48,7 +48,7 @@ const testing = std.testing;
 // ── GUIDs ─────────────────────────────────────────────────────────────────────
 
 fn prefix(b: u8) GuidPrefix {
-    return .{ .bytes = [_]u8{b} ** 12 };
+    return .{ .bytes = @as([12]u8, @splat(b)) };
 }
 
 const W1_GUID = Guid{ .prefix = prefix(0xAA), .entity_id = EntityIds.sedp_builtin_publications_writer };

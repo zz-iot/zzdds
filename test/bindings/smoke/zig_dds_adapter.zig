@@ -32,13 +32,13 @@ pub const OwnedRawSample = struct {
 
 var pending: ?OwnedRawSample = null;
 var last_kind: ?WriteKind = null;
-var last_key_hash: [16]u8 = [_]u8{0} ** 16;
+var last_key_hash: [16]u8 = @as([16]u8, @splat(0));
 
 pub fn reset() void {
     if (pending) |s| s.deinit();
     pending = null;
     last_kind = null;
-    last_key_hash = [_]u8{0} ** 16;
+    last_key_hash = @as([16]u8, @splat(0));
 }
 
 pub fn writerUsesXcdr2(_: DDS.DataWriter) bool {

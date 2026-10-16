@@ -54,8 +54,8 @@ fn sleepNs(io: std.Io, ns: u64) void {
 }
 
 const State = struct {
-    historical_received: [8]std.atomic.Value(bool) = .{std.atomic.Value(bool).init(false)} ** 8,
-    live_received: [4]std.atomic.Value(bool) = .{std.atomic.Value(bool).init(false)} ** 4,
+    historical_received: [8]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
+    live_received: [4]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
     all_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     historical_confirmed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     alloc: std.mem.Allocator,

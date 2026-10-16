@@ -45,7 +45,7 @@ const READER_EID = rtps.EntityIds.sedp_builtin_publications_reader;
 
 fn makeGuid(prefix_byte: u8, eid: rtps.EntityId) Guid {
     return .{
-        .prefix = .{ .bytes = [_]u8{prefix_byte} ** 12 },
+        .prefix = .{ .bytes = @as([12]u8, @splat(prefix_byte)) },
         .entity_id = eid,
     };
 }
@@ -928,7 +928,7 @@ test "BEST_EFFORT: data from a writer not yet matched is delivered in SN order o
 // ── LocatorSelector: effectiveLocators ranking (via WriterProxy) ──────────────
 
 fn v6Public(last: u8) [16]u8 {
-    var addr = [_]u8{0} ** 16;
+    var addr = @as([16]u8, @splat(0));
     addr[0] = 0x20;
     addr[1] = 0x01;
     addr[15] = last;

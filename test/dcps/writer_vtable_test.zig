@@ -241,7 +241,7 @@ test "enable: a DataWriter created under a disabled Publisher starts disabled, r
 
     var payload = [_]u8{ 0x00, 0x01, 0x00, 0x00 };
     var payload_seq = DDS.OctetSeq{ ._buffer = &payload, ._length = payload.len, ._maximum = payload.len, ._release = false };
-    var key_hash = [_]u8{0} ** 16;
+    var key_hash = @as([16]u8, @splat(0));
     var key_hash_seq = DDS.OctetSeq{ ._buffer = &key_hash, ._length = key_hash.len, ._maximum = key_hash.len, ._release = false };
     const ts = DDS.Time_t{ .sec = DDS.TIME_INVALID_SEC, .nanosec = DDS.TIME_INVALID_NSEC };
     try testing.expectEqual(
@@ -681,7 +681,7 @@ test "write_raw: valid key_hash + payload lands in the cache" {
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
     const dw_impl: *DataWriterImpl = @ptrCast(@alignCast(dw.ptr));
 
-    var key_hash_bytes = [_]u8{1} ** 16;
+    var key_hash_bytes = @as([16]u8, @splat(1));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     var payload_bytes = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
     const payload = DDS.OctetSeq{ ._buffer = &payload_bytes, ._length = 4, ._maximum = 4, ._release = false };
@@ -698,7 +698,7 @@ test "write_raw: wrong-length key_hash is BAD_PARAMETER" {
     const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
-    var short_bytes = [_]u8{1} ** 4;
+    var short_bytes = @as([4]u8, @splat(1));
     const short_key_hash = DDS.OctetSeq{ ._buffer = &short_bytes, ._length = 4, ._maximum = 4, ._release = false };
     var payload_bytes = [_]u8{0x01};
     const payload = DDS.OctetSeq{ ._buffer = &payload_bytes, ._length = 1, ._maximum = 1, ._release = false };
@@ -720,7 +720,7 @@ test "loan_raw + publish_loan_raw: round trip through the real vtable lands the 
     try testing.expect(cdr_payload._buffer != null);
     cdr_payload._buffer.?[0..4].* = .{ 0x01, 0x02, 0x03, 0x04 };
 
-    var key_hash_bytes = [_]u8{2} ** 16;
+    var key_hash_bytes = @as([16]u8, @splat(2));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
 
     const before = dw_impl.proto_writer.cacheLen();
@@ -811,7 +811,7 @@ test "loan_raw: outstanding loan defers real protocol-writer teardown until the 
     // the proof here is publish_loan_raw succeeding at all, not crashing on
     // a use-after-free while it's still writing through the (correctly
     // still-alive) protocol writer.
-    var key_hash_bytes = [_]u8{3} ** 16;
+    var key_hash_bytes = @as([16]u8, @splat(3));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
@@ -961,7 +961,7 @@ test "delete_publisher: a loan racing the TOCTOU window before the real deinit c
     // but dw_impl survives, kept alive solely by the loan's transferred
     // quiesce refs. Publishing the loan must still succeed: the proof this
     // scenario is actually safe.
-    var key_hash_bytes = [_]u8{4} ** 16;
+    var key_hash_bytes = @as([16]u8, @splat(4));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     const rc = dw.vtable.publish_loan_raw(dw.ptr, &cdr_payload, &key_hash, DDS.HANDLE_NIL, .ALIVE_WRITE_KIND);
     try testing.expectEqual(DDS.RETCODE_OK, rc);
@@ -1018,7 +1018,7 @@ test "changeKindFromWriteKind: UNREGISTER_WRITE_KIND maps through autodispose_un
     const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
-    var key_hash_bytes = [_]u8{5} ** 16;
+    var key_hash_bytes = @as([16]u8, @splat(5));
     var key_hash_seq = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     var payload_buf = [_]u8{0x01};
     var payload_seq = DDS.OctetSeq{ ._buffer = &payload_buf, ._length = payload_buf.len, ._maximum = payload_buf.len, ._release = false };
@@ -1037,7 +1037,7 @@ test "write_raw: an explicit instance_handle that doesn't match the key hash is 
     const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
-    var key_hash_bytes = [_]u8{6} ** 16;
+    var key_hash_bytes = @as([16]u8, @splat(6));
     var key_hash_seq = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     var payload_buf = [_]u8{0x02};
     var payload_seq = DDS.OctetSeq{ ._buffer = &payload_buf, ._length = payload_buf.len, ._maximum = payload_buf.len, ._release = false };
@@ -1059,7 +1059,7 @@ test "publish_loan_raw: an explicit instance_handle that doesn't match the key h
     var cdr_payload = DDS.OctetSeq{};
     try testing.expectEqual(DDS.RETCODE_OK, dw.vtable.loan_raw(dw.ptr, 4, &cdr_payload));
 
-    var key_hash_bytes = [_]u8{7} ** 16;
+    var key_hash_bytes = @as([16]u8, @splat(7));
     const key_hash = DDS.OctetSeq{ ._buffer = &key_hash_bytes, ._length = 16, ._maximum = 16, ._release = false };
     const real_handle = DataWriterImpl.registerInstanceRaw(key_hash_bytes);
     const wrong_handle = real_handle + 1;

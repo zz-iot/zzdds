@@ -18,7 +18,7 @@ const spdp_mod = zzdds.spdp_discovery;
 const rtps = zzdds.rtps;
 const GuidPrefix = rtps.GuidPrefix;
 
-const FAKE_PREFIX = GuidPrefix{ .bytes = [_]u8{0xAA} ** 12 };
+const FAKE_PREFIX = GuidPrefix{ .bytes = @as([12]u8, @splat(0xAA)) };
 
 pub fn fuzzOne(data: []const u8) void {
     var buf: [8192]u8 = undefined;
@@ -67,7 +67,7 @@ const SENTINEL = [_]u8{ 0x01, 0x00, 0x00, 0x00 };
 // PID_PARTICIPANT_GUID (0x0050), length=16, with FAKE_PREFIX + participant entity_id
 const PID_GUID = [_]u8{
     0x50, 0x00, 0x10, 0x00, // PID + length
-} ++ [_]u8{0xAA} ** 12 ++ [_]u8{ 0x00, 0x00, 0x01, 0xC1 };
+} ++ @as([12]u8, @splat(0xAA)) ++ [_]u8{ 0x00, 0x00, 0x01, 0xC1 };
 
 // PID_PARTICIPANT_LEASE_DURATION (0x0002), length=8, 10 seconds
 const PID_LEASE_10S = [_]u8{
@@ -184,9 +184,9 @@ test "repeated known PIDs: last value wins" {
 }
 
 test "all-zeros payload: no crash" {
-    fuzzOne(&([_]u8{0} ** 64));
+    fuzzOne(&(@as([64]u8, @splat(0))));
 }
 
 test "all-ones payload: no crash" {
-    fuzzOne(&([_]u8{0xFF} ** 64));
+    fuzzOne(&(@as([64]u8, @splat(0xFF))));
 }

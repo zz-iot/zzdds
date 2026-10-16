@@ -458,7 +458,7 @@ fn sample(writer: Guid, sn: SequenceNumber, data: []const u8) CacheChange {
         .sequence_number = sn,
         .source_timestamp = .{ .seconds = 0, .fraction = 0 },
         .instance_handle = history_mod.INSTANCE_HANDLE_NIL,
-        .key_hash = .{0xAB} ** 16,
+        .key_hash = @splat(0xAB),
         .data = data,
     };
 }
@@ -645,17 +645,17 @@ test "Prematch: a held sample without PID_KEY_HASH gets the reader's key hash" {
     const H = struct {
         var unused: u8 = 0;
         fn full(_: *anyopaque, _: []const u8) [16]u8 {
-            return .{1} ** 16;
+            return @splat(1);
         }
         fn keyOnly(_: *anyopaque, _: []const u8) [16]u8 {
-            return .{2} ** 16;
+            return @splat(2);
         }
     };
     const pm = Prematch{ .cache = &c, .key_hash_ctx = &H.unused, .key_hash_fn = H.full, .key_hash_only_fn = H.keyOnly };
     var out: Collected = .{};
     defer out.deinit(testing.allocator);
     try pm.collect(testing.allocator, W1, R1, &out);
-    try testing.expectEqual(@as([16]u8, .{1} ** 16), out.samples.items[0].key_hash);
-    try testing.expectEqual(@as([16]u8, .{2} ** 16), out.samples.items[1].key_hash);
-    try testing.expectEqual(@as([16]u8, .{0xAB} ** 16), out.samples.items[2].key_hash);
+    try testing.expectEqual(@as([16]u8, @splat(1)), out.samples.items[0].key_hash);
+    try testing.expectEqual(@as([16]u8, @splat(2)), out.samples.items[1].key_hash);
+    try testing.expectEqual(@as([16]u8, @splat(0xAB)), out.samples.items[2].key_hash);
 }

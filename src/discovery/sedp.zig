@@ -99,7 +99,7 @@ pub fn encodeWriterData(alloc: std.mem.Allocator, ann: *const WriterAnnouncement
     }
     if (ann.partition_names.len > 0) {
         for (ann.partition_names) |name| {
-            const z = try alloc.dupeZ(u8, name);
+            const z = try alloc.dupeSentinel(u8, name, 0);
             part_ptrs.append(alloc, z.ptr) catch |e| {
                 alloc.free(z);
                 return e;
@@ -146,7 +146,7 @@ pub fn encodeReaderData(alloc: std.mem.Allocator, ann: *const ReaderAnnouncement
     }
     if (ann.partition_names.len > 0) {
         for (ann.partition_names) |name| {
-            const z = try alloc.dupeZ(u8, name);
+            const z = try alloc.dupeSentinel(u8, name, 0);
             part_ptrs.append(alloc, z.ptr) catch |e| {
                 alloc.free(z);
                 return e;

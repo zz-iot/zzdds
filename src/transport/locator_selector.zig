@@ -48,7 +48,7 @@ pub fn selectInto(
     var best_tier: LocatorTier = .public;
     for (chosen) |loc| {
         const t = loc.tier();
-        if (@intFromEnum(t) < @intFromEnum(best_tier)) best_tier = t;
+        if (@backingInt(t) < @backingInt(best_tier)) best_tier = t;
     }
 
     var winning_family: ?std.meta.Tag(Locator) = null;
@@ -113,7 +113,7 @@ test "selectInto: loopback tier wins over public tier" {
 test "selectInto: dual-stack same-tier collapses to one family (first-wins)" {
     var out: std.ArrayListUnmanaged(Locator) = .empty;
     defer out.deinit(std.testing.allocator);
-    var v6addr = [_]u8{0} ** 16;
+    var v6addr = @as([16]u8, @splat(0));
     v6addr[0] = 0x20;
     v6addr[1] = 0x01;
     const v4 = Locator.udp4(.{ 8, 8, 8, 8 }, 7400);
@@ -146,14 +146,14 @@ test "selectInto: OOM partway through append leaves out empty, not partial" {
     var ties: [6]Locator = undefined;
     for (&ties, 0..) |*loc, i| loc.* = Locator.udp4(.{ 10, 0, 0, @intCast(i + 1) }, 7400);
 
-    // Six same-tier/same-family ties so the append loop needs a second
-    // capacity-growth allocation (ArrayList's first growth from empty jumps
-    // straight to capacity 5 for this element size). fail_index=1 lets the
-    // first 5 ties land in `out` via the first growth allocation (alloc 0),
-    // then fails the 6th tie's growth allocation (alloc 1) — proves the
-    // errdefer clears entries already appended before the failure, not just
-    // a no-op on an already-empty list.
-    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    // Reserve room for all but the last tie. Fail both in-place growth and
+    // replacement allocation so this does not depend on ArrayList's growth
+    // factor or the backing allocator's ability to resize.
+    try out.ensureTotalCapacityPrecise(std.testing.allocator, ties.len - 1);
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
     try std.testing.expectError(error.OutOfMemory, selectInto(&out, fa.allocator(), &ties, &.{}));
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }

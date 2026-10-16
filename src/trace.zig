@@ -623,7 +623,7 @@ pub const TraceConfig = if (enabled) TraceConfigActive else TraceConfigInert;
 const testing = std.testing;
 
 // Convenience: an all-zero GuidPrefix and EntityId for use in tests.
-const zero_prefix = GuidPrefix{ .bytes = .{0} ** 12 };
+const zero_prefix = GuidPrefix{ .bytes = @splat(0) };
 const zero_eid = EntityId{ .entity_key = .{ 0, 0, 0 }, .entity_kind = 0 };
 
 fn testDataEvent() TraceEvent {
@@ -641,19 +641,19 @@ fn testDataEvent() TraceEvent {
 test "GuidFilter: empty prefixes list accepts all" {
     const f = GuidFilter{};
     try testing.expect(f.matches(zero_prefix));
-    const other = GuidPrefix{ .bytes = .{1} ** 12 };
+    const other = GuidPrefix{ .bytes = @splat(1) };
     try testing.expect(f.matches(other));
 }
 
 test "GuidFilter: non-empty list accepts matching prefix" {
-    const target = GuidPrefix{ .bytes = .{0xAB} ** 12 };
+    const target = GuidPrefix{ .bytes = @splat(0xAB) };
     const f = GuidFilter{ .prefixes = &.{target} };
     try testing.expect(f.matches(target));
 }
 
 test "GuidFilter: non-empty list rejects non-matching prefix" {
-    const target = GuidPrefix{ .bytes = .{0xAB} ** 12 };
-    const other = GuidPrefix{ .bytes = .{0xCD} ** 12 };
+    const target = GuidPrefix{ .bytes = @splat(0xAB) };
+    const other = GuidPrefix{ .bytes = @splat(0xCD) };
     const f = GuidFilter{ .prefixes = &.{target} };
     try testing.expect(!f.matches(other));
 }
@@ -788,7 +788,7 @@ fn checkFmt(fmt: Format, event: TraceEvent, needle: []const u8) !void {
 // ── TraceEvent.srcPrefix ──────────────────────────────────────────────────────
 
 test "TraceEvent.srcPrefix: all variants" {
-    const p = GuidPrefix{ .bytes = .{0xAB} ** 12 };
+    const p = GuidPrefix{ .bytes = @splat(0xAB) };
     const mk_data = TraceEvent{ .recv_data = .{ .src_prefix = p, .writer_eid = zero_eid, .reader_eid = zero_eid, .sn = 1, .data_len = 0 } };
     try testing.expect(mk_data.srcPrefix().eql(p));
     const mk_hb = TraceEvent{ .send_heartbeat = .{ .src_prefix = p, .writer_eid = zero_eid, .reader_eid = zero_eid, .first_sn = 1, .last_sn = 1, .count = 1, .flags = 0 } };

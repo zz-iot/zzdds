@@ -44,6 +44,6 @@ correctly.` Both exit 0.
 
 ## Prerequisites
 
-Same as `zig/hello_world`: Zig 0.16.0, a local `zzdds` checkout built (any
+Same as `zig/hello_world`: Zig 0.17.0, a local `zzdds` checkout built (any
 binding flags are fine — this example only needs the native Zig API) as a
 sibling of `zzdds-examples` (`../../../zzdds`).

@@ -178,7 +178,7 @@ const Harness = struct {
 };
 
 fn makePrefix(seed: u8) GuidPrefix {
-    return .{ .bytes = .{seed} ** 12 };
+    return .{ .bytes = @splat(seed) };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
