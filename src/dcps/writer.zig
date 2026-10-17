@@ -265,6 +265,10 @@ pub const DataWriterImpl = struct {
         // writer's discovery-driven `notifyPublicationMatched` -- from
         // ever touching a PublisherImpl freed by a racing delete_publisher.
         self.parent_pinned = !nil.isNil(publisher) and publisher_mod.PublisherImpl.quiesceAcquireFn(publisher.ptr);
+        // Before the publisher registers this writer with the participant:
+        // discovery can match it from then on, and a match installed
+        // without this callback would never be counted.
+        proto_writer.setReaderMatchCallback(self.readerMatchCallback());
         return self;
     }
 
@@ -519,8 +523,8 @@ pub const DataWriterImpl = struct {
     /// The protocol writer's callback as a remote reader is matched or
     /// unmatched (see proto.ReaderMatchCallback): the matched status
     /// changes with the reader's proxy, under the protocol writer's lock.
-    /// Registered before the writer can match anything; pinned by the
-    /// protocol-ready callback registration.
+    /// Registered by `init`, before the writer can match anything; pinned
+    /// by the protocol-ready callback registration.
     pub fn readerMatchCallback(self: *Self) proto.ReaderMatchCallback {
         return .{
             .ctx = self,

@@ -483,11 +483,10 @@ pub const PublisherImpl = struct {
             dw,
             writer_mod.DataWriterImpl.livelinessLastNsFn,
         );
-        // Direct ProtocolWriter registrations (not routed through ParticipantCbs
-        // like the callbacks above). The matched status changes with the
-        // reader's proxy; `dw` is pinned by the registration below.
-        pw.setReaderMatchCallback(dw.readerMatchCallback());
-        // This signal is purely RTPS-internal
+        // Direct ProtocolWriter registration (not routed through ParticipantCbs
+        // like the callbacks above; the reader-match callback is installed by
+        // DataWriterImpl.init, before matched_notify exposes `dw` to
+        // discovery). This signal is purely RTPS-internal
         // (AckNack/Heartbeat correlation), unlike matched_notify which needs
         // SEDP bookkeeping in the participant's active_writers map.
         pw.setProtocolReadyCallback(.{

@@ -456,3 +456,48 @@ test "a live writer's loss raises on_liveliness_changed" {
     try testing.expectEqual(@as(i32, 0), seen.last.alive_count);
     try testing.expectEqual(@as(i32, -1), seen.last.alive_count_change);
 }
+
+test "a reader discovered while its writer is being created is counted" {
+    var clock = ManualClock.init(0);
+    var h: Harness = undefined;
+    try h.init(&clock);
+    defer h.deinit();
+    // Discovery can match a writer from the moment the publisher registers
+    // its matched notify, before create_datawriter returns: announce a
+    // reader right then.
+    const Window = struct {
+        const Cbs = @FieldType(dcps.PublisherImpl, "cbs");
+        var harness: *Harness = undefined;
+        var original: @FieldType(Cbs, "register_matched_notify") = undefined;
+        var reader_guid: Guid = undefined;
+
+        fn registerMatchedNotify(
+            ctx: *anyopaque,
+            handle: DDS.InstanceHandle_t,
+            notify_ctx: *anyopaque,
+            notify_fn: *const fn (*anyopaque, DDS.InstanceHandle_t, bool) void,
+        ) void {
+            original(ctx, handle, notify_ctx, notify_fn);
+            harness.announceReader(reader_guid);
+        }
+    };
+    const pub_impl: *dcps.PublisherImpl = @ptrCast(@alignCast(h.pub_.ptr));
+    const rd = endpointGuid(0x67, 1, READER_KIND);
+    Window.harness = &h;
+    Window.original = pub_impl.cbs.register_matched_notify;
+    Window.reader_guid = rd;
+    pub_impl.cbs.register_matched_notify = Window.registerMatchedNotify;
+    var reliable = DDS.DataWriterQos{};
+    reliable.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const w = h.writer(reliable, null);
+    pub_impl.cbs.register_matched_notify = Window.original;
+
+    try testing.expectEqual(@as(usize, 1), w.proto_writer.matchedReaderCount());
+    var s = pubMatched(w);
+    try testing.expectEqual(@as(i32, 1), s.total_count);
+    try testing.expectEqual(@as(i32, 1), s.current_count);
+
+    h.loseReader(rd);
+    s = pubMatched(w);
+    try testing.expectEqual(@as(i32, 0), s.current_count);
+}
