@@ -335,6 +335,30 @@ of the four tests fail with the expected `.none` result, before restoring. Full
 `zig build test`/`test-tsan`/`test-bindings -Dc-binding=true -Dcpp-binding=true
 -Djava-binding=true` green throughout.
 
+*Superseded in part (2026-10-14): a plain status is claimed before its callback, not reset
+after it.* The ten status notifiers above no longer dispatch and then reset the change
+fields when the dispatch returned `true`: an update that landed during the callback was
+erased by that reset, and a getter called inside the callback saw the status not yet
+reset, against DDS 1.4 §2.2.4.2.1 ("the status is reset prior to calling the listener").
+Each notifier now resolves the callback first (`resolveListener`, walking the same chain
+through `resolveReaderFallback`/`resolveWriterFallback`/`resolveFallback`, returning a
+`listener_fallback.Resolved` that holds the winning level's listener box and, from a
+Subscriber or Publisher, that entity's `quiesce` until released). Then, under the
+entity's `mu`, it updates the status, snapshots it, and, if a callback was resolved and
+the status is still changed, resets it (`claimStatusLocked`); it invokes the callback
+after unlocking. That is the claim boundary of
+`design/concurrency/listeners.md#status-ordering-requirements`. Where the update and the
+claim are separate critical sections (`on_liveliness_changed`, whose callers update the
+counts; `on_sample_rejected`, deferred to the reader's flush), the changed bit decides:
+a getter in between has reset it, so nothing is claimed. Every liveliness update site
+therefore sets the bit itself. `PublisherImpl.dispatchWriterFallback` and the writer's
+`dispatchListener` were removed; `on_data_available` still uses `dispatchListener`, since
+DATA_AVAILABLE resets on read/take rather than on dispatch. The listener resolved is the
+one installed when the notifier started; a `set_listener` racing it is not yet withdrawn
+(listeners.md's replacement rules are shared-runtime work). Tests:
+`test/dcps/status_claim_test.zig`, one per status, each failing against the previous
+code.
+
 **SPDP liveness probe: EMA interval + 3× silence threshold, directed SEDP HBs.**
 When `FinalInstanceState_2` requires detecting participant exit without a BYE (e.g.,
 RTI Connext announces `lease_duration=100s` and exits silently), a poll-based lease

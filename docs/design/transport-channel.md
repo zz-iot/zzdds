@@ -1,6 +1,10 @@
 # Transport channel / ingress-context abstraction
 
-Status: DRAFT, revision 0.3, 2026-09-11. MUST / SHOULD / MAY express requirements of the
+Status: revision 0.3, 2026-09-11; implemented in zzdds PR #84 (transport layer only). Nothing
+above the transport uses channels yet: the broker session layer is the first planned user,
+and the TCP reply to a peer behind NAT (§1) is a `docs/roadmap.md` entry. The shared
+runtime's [channel integration requirements](concurrency/runtime.md#channel-integration-requirements)
+govern how channels change once they have users. MUST / SHOULD / MAY express requirements of the
 change, not additional OMG requirements.
 
 One-line goal: give the `Transport` interface an optional notion of "the channel this

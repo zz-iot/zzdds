@@ -486,14 +486,14 @@ test "group coherent set: a part that arrived before its writer matched joins it
     };
     for ([_]zzdds.rtps.Guid{ w0_guid, w1_guid }, [_]*DataReaderImpl{ r0, r1 }) |g, r| {
         const cb = r.writerMatchCallback();
-        cb.on_writer_matched(cb.ctx, &.{
+        cb.on_writer_matching.?(cb.ctx, &.{
             .guid = g,
             .unicast_locators = &.{},
             .multicast_locators = &.{},
             .reliability = .reliable,
             .group_coherent = true,
             .publisher_guid = publisher,
-        });
+        }, true);
     }
 
     // Group set 1: the late writer's part arrives whole (and waits for its
@@ -508,8 +508,9 @@ test "group coherent set: a part that arrived before its writer matched joins it
     });
 
     // The late writer matches.  Its early samples, held by the participant,
-    // are delivered before the reader hears which publisher it has: held
-    // back here, in that window, the part must not come out on its own.
+    // are delivered with the match, which first tells the reader which
+    // publisher it has.  With that held back here, the part must not come
+    // out on its own.
     const info = zzdds.protocol.MatchedWriterInfo{
         .guid = late_guid,
         .unicast_locators = &.{},
@@ -532,7 +533,7 @@ test "group coherent set: a part that arrived before its writer matched joins it
     // Once the match completes, the part joins its publisher's set, which
     // waits for writer 1's part.
     r0.proto_reader.setWriterMatchCallback(real_cb);
-    real_cb.on_writer_matched(real_cb.ctx, &info);
+    real_cb.on_writer_matching.?(real_cb.ctx, &info, false);
     try testing.expectEqual([_]usize{ 0, 0 }, try fx.access(2));
 
     try fx.inject(struct {

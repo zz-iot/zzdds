@@ -59,6 +59,22 @@ pub const EOCProxyInfo = struct {
 /// kept here to avoid a circular dependency on qos.zig.
 pub const ReliabilityKind = enum(u8) { best_effort = 0, reliable = 1 };
 
+/// A remote endpoint's discovery generation, carried by a match decision so
+/// the decision is committed only while it is current: an older match
+/// cannot restore an endpoint a newer loss removed, nor overwrite a newer
+/// refresh (docs/design/concurrency/architecture.md#remote-endpoint-match-and-loss).
+pub const MatchCurrency = struct {
+    ctx: *anyopaque,
+    generation: u64,
+    /// Whether `generation` is still `guid`'s current one. Called under the
+    /// protocol endpoint's lock, so takes only leaf locks.
+    is_current: *const fn (ctx: *anyopaque, guid: Guid, generation: u64) bool,
+
+    pub fn check(self: MatchCurrency, guid: Guid) bool {
+        return self.is_current(self.ctx, guid, self.generation);
+    }
+};
+
 /// What SEDP tells the protocol layer about a newly-matched remote reader.
 pub const MatchedReaderInfo = struct {
     guid: Guid,
@@ -76,6 +92,8 @@ pub const MatchedReaderInfo = struct {
     /// ("Example 2") instead. Both are spec-legal; see
     /// header_mod.needsPidCoherentSetMarker for the empirical basis.
     needs_pid_coherent_set_marker: bool = false,
+    /// When set, the match is made only while this generation is current.
+    currency: ?MatchCurrency = null,
 };
 
 /// What SEDP tells the protocol layer about a newly-matched remote writer.
@@ -109,6 +127,8 @@ pub const MatchedWriterInfo = struct {
     /// Where the writer's data that reached this participant before the
     /// match is held, for the reader to take on a new match.
     prematch: ?unmatched_mod.Prematch = null,
+    /// When set, the match is made only while this generation is current.
+    currency: ?MatchCurrency = null,
 };
 
 // ── Data delivery callback ────────────────────────────────────────────────────
@@ -189,6 +209,7 @@ pub const ProtocolReadyCallback = struct {
 /// so the caller must fire both only after releasing whatever external lock
 /// (e.g. DomainParticipantImpl.mu) protects the removal itself.
 pub const DeferredUnmatchCallbacks = struct {
+    /// Set only when a proxy was removed.
     ready: ?ProtocolReadyCallback = null,
     unmatched_ctx: ?*anyopaque = null,
     unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
@@ -330,6 +351,12 @@ pub const ProtocolWriter = struct {
         /// proxies are added.
         set_protocol_ready_callback: *const fn (ctx: *anyopaque, cb: ProtocolReadyCallback) void,
 
+        /// Register the callback invoked as a remote reader is matched or
+        /// unmatched. Must be called before any reader proxies are added.
+        /// No-op default for implementations that never match remote
+        /// readers (test doubles).
+        set_reader_match_callback: *const fn (ctx: *anyopaque, cb: ReaderMatchCallback) void = defaultSetReaderMatchCallback,
+
         /// Take a reference keeping this writer alive across a window where
         /// the caller releases whatever lock ordinarily serializes it against
         /// concurrent deinit() (e.g. participant.mu around an unlocked
@@ -373,6 +400,10 @@ pub const ProtocolWriter = struct {
 
     pub fn removeMatchedReaderDeferred(self: ProtocolWriter, guid: Guid) ?ProtocolReadyCallback {
         return self.vtable.remove_matched_reader_deferred(self.ctx, guid);
+    }
+
+    pub fn setReaderMatchCallback(self: ProtocolWriter, cb: ReaderMatchCallback) void {
+        self.vtable.set_reader_match_callback(self.ctx, cb);
     }
 
     pub fn matchedReaderCount(self: ProtocolWriter) usize {
@@ -493,21 +524,44 @@ fn defaultSendLivelinessHeartbeat(_: *anyopaque) void {}
 pub const AliveEvidence = enum { data, heartbeat, manual_heartbeat };
 
 /// Invoked by the protocol reader when a remote writer is matched or unmatched.
-/// Carries the same MatchedWriterInfo used to create the proxy; allows the
-/// DCPS DataReader to track per-writer ownership strength.
+/// Carries the same MatchedWriterInfo used to create the proxy; lets the DCPS
+/// DataReader keep its per-writer state (ownership strength, lifespan,
+/// liveliness, coherent sets) and matched status. The `-ing` callbacks run
+/// under the protocol reader's lock, in the same critical section as adding
+/// or removing the writer's proxy, so the proxy and that state change as
+/// one update; they must not reach application code. The `-ed` callbacks
+/// run after it is released, only for a match or removal that was made,
+/// and raise what it changed.
 pub const WriterMatchCallback = struct {
     ctx: *anyopaque,
-    /// Optional: called before the writer's proxy is added, so what the reader
-    /// needs to accept the writer's samples (its ownership strength, lifespan)
-    /// is in place before the first of them can arrive. Called again when a
-    /// match is refreshed. Not undone if adding the proxy then fails.
-    on_writer_matching: ?*const fn (ctx: *anyopaque, info: *const MatchedWriterInfo) void = null,
+    /// Optional: installs the reader's state for the writer, `is_new` unless
+    /// the match refreshes an existing one. For a new writer, before
+    /// anything held from before the match is taken.
+    on_writer_matching: ?*const fn (ctx: *anyopaque, info: *const MatchedWriterInfo, is_new: bool) void = null,
     on_writer_matched: *const fn (ctx: *anyopaque, info: *const MatchedWriterInfo) void,
+    /// Optional: removes the reader's state for a writer whose proxy is
+    /// being removed.
+    on_writer_unmatching: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
     on_writer_unmatched: *const fn (ctx: *anyopaque, guid: Guid) void,
     /// Optional: called when a DATA or HEARTBEAT is received from the writer,
     /// indicating the writer is still alive. Used for LIVELINESS tracking.
     on_writer_alive: ?*const fn (ctx: *anyopaque, guid: Guid, evidence: AliveEvidence) void = null,
 };
+
+/// Invoked by the protocol writer as a remote reader is matched or
+/// unmatched, under its lock and in the same critical section as adding or
+/// removing the reader's proxy (see WriterMatchCallback): lets the DCPS
+/// DataWriter keep its matched status with the proxies. Must not reach
+/// application code. `ctx` must outlive the protocol writer, or be pinned
+/// by its protocol-ready callback registration.
+pub const ReaderMatchCallback = struct {
+    ctx: *anyopaque,
+    /// `is_new` unless the match refreshes an existing one.
+    on_reader_matching: *const fn (ctx: *anyopaque, guid: Guid, is_new: bool) void,
+    on_reader_unmatching: *const fn (ctx: *anyopaque, guid: Guid) void,
+};
+
+fn defaultSetReaderMatchCallback(_: *anyopaque, _: ReaderMatchCallback) void {}
 
 // ── ProtocolReader ────────────────────────────────────────────────────────────
 

@@ -57,6 +57,10 @@ pub const RtpsProtocolWriter = struct {
     /// See protocol/interface.zig's ProtocolReadyCallback doc comment.
     ready_pin: ?struct { ctx: *anyopaque, release: *const fn (*anyopaque) void } = null,
 
+    /// Set once by `vtSetReaderMatchCallback`, before any reader can match;
+    /// guarded by `self.writer.mu`, as RtpsProtocolReader's writer_match_cb.
+    reader_match_cb: ?protocol.ReaderMatchCallback = null,
+
     const Self = @This();
 
     pub fn init(
@@ -133,6 +137,7 @@ pub const RtpsProtocolWriter = struct {
         .flush_group_eoc_hb_only = vtFlushGroupEOCHBOnly,
         .deinit = vtDeinit,
         .set_protocol_ready_callback = vtSetProtocolReadyCallback,
+        .set_reader_match_callback = vtSetReaderMatchCallback,
         .quiesce_acquire = vtQuiesceAcquire,
         .quiesce_release = vtQuiesceRelease,
         .send_liveliness_heartbeat = vtSendLivelinessHeartbeat,
@@ -167,7 +172,48 @@ pub const RtpsProtocolWriter = struct {
         );
         proxy.wants_replay = info.durability_kind != 0;
         proxy.needs_pid_coherent_set_marker = info.needs_pid_coherent_set_marker;
-        return self.writer.addOrRefreshMatchedReader(proxy);
+        self.writer.mu.lock();
+        const cb = self.reader_match_cb;
+        self.writer.mu.unlock();
+        var commit: ReaderCommit = .{ .info = info, .cb = cb };
+        const result = try self.writer.addOrRefreshMatchedReaderWith(proxy, .{
+            .ctx = &commit,
+            .is_current = ReaderCommit.isCurrent,
+            .install = ReaderCommit.install,
+        });
+        return result == .added;
+    }
+
+    /// A reader match's MatchCommit: whether its discovery generation is
+    /// still current, and the DataWriter's matched status.
+    const ReaderCommit = struct {
+        info: *const MatchedReaderInfo,
+        cb: ?protocol.ReaderMatchCallback,
+
+        fn isCurrent(ctx: *anyopaque) bool {
+            const c: *ReaderCommit = @ptrCast(@alignCast(ctx));
+            const currency = c.info.currency orelse return true;
+            return currency.check(c.info.guid);
+        }
+
+        fn install(ctx: *anyopaque, is_new: bool) void {
+            const c: *ReaderCommit = @ptrCast(@alignCast(ctx));
+            if (c.cb) |cb| cb.on_reader_matching(cb.ctx, c.info.guid, is_new);
+        }
+    };
+
+    fn readerUnmatchCommit(self: *Self) ?writer_sm.UnmatchCommit {
+        self.writer.mu.lock();
+        defer self.writer.mu.unlock();
+        const cb = self.reader_match_cb orelse return null;
+        return .{ .ctx = cb.ctx, .remove = cb.on_reader_unmatching };
+    }
+
+    fn vtSetReaderMatchCallback(ctx: *anyopaque, cb: protocol.ReaderMatchCallback) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writer.mu.lock();
+        defer self.writer.mu.unlock();
+        self.reader_match_cb = cb;
     }
 
     fn vtAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber) bool {
@@ -182,12 +228,12 @@ pub const RtpsProtocolWriter = struct {
 
     fn vtRemoveMatchedReader(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.removeMatchedReader(guid);
+        if (self.writer.removeMatchedReaderDeferred(guid, self.readerUnmatchCommit()).ready) |d| d.fn_ptr(d.ctx, guid, false);
     }
 
     fn vtRemoveMatchedReaderDeferred(ctx: *anyopaque, guid: Guid) ?protocol.ProtocolReadyCallback {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const d = self.writer.removeMatchedReaderDeferred(guid) orelse return null;
+        const d = self.writer.removeMatchedReaderDeferred(guid, self.readerUnmatchCommit()).ready orelse return null;
         return .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
     }
 
@@ -494,9 +540,13 @@ pub const RtpsProtocolReader = struct {
         self.reader.mu.lock();
         const cb = self.writer_match_cb;
         self.reader.mu.unlock();
-        // Before the proxy exists: once it does, the writer's samples can arrive.
-        if (cb) |c| if (c.on_writer_matching) |f| f(c.ctx, info);
-        const added = try self.reader.addOrRefreshMatchedWriterWith(proxy, if (info.prematch) |*pm| pm else null);
+        var commit: WriterCommit = .{ .info = info, .cb = cb };
+        const result = try self.reader.addOrRefreshMatchedWriterWith(proxy, if (info.prematch) |*pm| pm else null, .{
+            .ctx = &commit,
+            .is_current = WriterCommit.isCurrent,
+            .install = WriterCommit.install,
+        });
+        if (result == .superseded) return false;
         // on_writer_matched first (DDS spec: subscription_matched precedes liveliness_changed),
         // then on_writer_alive — a newly matched writer is alive by definition.
         // Both fire only after addMatchedWriter succeeds so no callback leaks on OOM.
@@ -504,36 +554,62 @@ pub const RtpsProtocolReader = struct {
             c.on_writer_matched(c.ctx, info);
             if (c.on_writer_alive) |f| f(c.ctx, info.guid, .data);
         }
-        return added;
+        return result == .added;
+    }
+
+    /// A writer match's MatchCommit: whether its discovery generation is
+    /// still current, and the DataReader's per-writer state.
+    const WriterCommit = struct {
+        info: *const MatchedWriterInfo,
+        cb: ?protocol.WriterMatchCallback,
+
+        fn isCurrent(ctx: *anyopaque) bool {
+            const c: *WriterCommit = @ptrCast(@alignCast(ctx));
+            const currency = c.info.currency orelse return true;
+            return currency.check(c.info.guid);
+        }
+
+        fn install(ctx: *anyopaque, is_new: bool) void {
+            const c: *WriterCommit = @ptrCast(@alignCast(ctx));
+            if (c.cb) |cb| if (cb.on_writer_matching) |f| f(cb.ctx, c.info, is_new);
+        }
+    };
+
+    /// Removes `guid`'s proxy and, in the same critical section, the
+    /// DataReader's state for it.
+    fn removeWriter(self: *Self, guid: Guid) struct { removed: reader_sm.StatefulReader.Removed, cb: ?protocol.WriterMatchCallback } {
+        self.reader.mu.lock();
+        const cb = self.writer_match_cb;
+        self.reader.mu.unlock();
+        const unmatch: ?writer_sm.UnmatchCommit = if (cb) |c|
+            if (c.on_writer_unmatching) |f| .{ .ctx = c.ctx, .remove = f } else null
+        else
+            null;
+        return .{ .removed = self.reader.removeMatchedWriterDeferred(guid, unmatch), .cb = cb };
     }
 
     fn vtRemoveMatchedWriter(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.reader.removeMatchedWriter(guid);
-        self.reader.mu.lock();
-        const cb = self.writer_match_cb;
-        self.reader.mu.unlock();
-        if (cb) |c| c.on_writer_unmatched(c.ctx, guid);
+        const r = self.removeWriter(guid);
+        if (r.removed.ready) |d| d.fn_ptr(d.ctx, guid, false);
+        if (r.removed.removed) if (r.cb) |c| c.on_writer_unmatched(c.ctx, guid);
     }
 
     fn vtRemoveMatchedWriterDeferred(ctx: *anyopaque, guid: Guid) protocol.DeferredUnmatchCallbacks {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const deferred = self.reader.removeMatchedWriterDeferred(guid);
-        // on_writer_unmatched (onWriterUnmatchedCb) can itself synthesize a
-        // NOT_ALIVE_NO_WRITERS sample and dispatch on_data_available to
-        // arbitrary application listener code (confirmed: PR #90 review) --
-        // just as unsafe to fire under an external lock as
-        // on_reliable_writer_ready, so this returns both instead of firing
-        // either.
-        self.reader.mu.lock();
-        const cb = self.writer_match_cb;
-        self.reader.mu.unlock();
+        const r = self.removeWriter(guid);
+        // on_writer_unmatched (DataReaderImpl.onWriterUnmatchedCb) can dispatch
+        // on_data_available for the NOT_ALIVE_NO_WRITERS samples the removal
+        // synthesized, reaching arbitrary application listener code
+        // (confirmed: PR #90 review) -- just as unsafe to fire under an
+        // external lock as on_reliable_writer_ready, so this returns both
+        // instead of firing either.
         var result: protocol.DeferredUnmatchCallbacks = .{};
-        if (deferred) |d| result.ready = .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
-        if (cb) |c| {
+        if (r.removed.ready) |d| result.ready = .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
+        if (r.removed.removed) if (r.cb) |c| {
             result.unmatched_ctx = c.ctx;
             result.unmatched_fn = c.on_writer_unmatched;
-        }
+        };
         return result;
     }
 
@@ -684,10 +760,11 @@ pub const RtpsProtocolReader = struct {
     }
 };
 
-test "RtpsProtocolReader: on_writer_matching runs before the writer's proxy exists" {
+test "RtpsProtocolReader: on_writer_matching installs with the proxy, and a superseded match installs nothing" {
     // A writer's samples can arrive as soon as its proxy exists, and the DCPS
-    // reader needs the writer's ownership strength to arbitrate them: a sample
-    // arbitrated before the strength was recorded counted as strength 0.
+    // reader needs the writer's ownership strength to arbitrate them, so its
+    // state is installed in the same critical section as the proxy. A match
+    // whose discovery generation is no longer current makes neither.
     const testing = std.testing;
     var null_ctx: u8 = 0;
     const transport = reader_sm.Transport{ .ctx = &null_ctx, .vtable = &reader_sm.test_null_vtable };
@@ -699,28 +776,33 @@ test "RtpsProtocolReader: on_writer_matching runs before the writer's proxy exis
 
     const Seen = struct {
         adapter: *RtpsProtocolReader,
+        current: bool = false,
+        matching: usize = 0,
+        matched: usize = 0,
+        is_new: ?bool = null,
         proxies_when_matching: ?usize = null,
-        proxies_when_matched: ?usize = null,
-        fn proxies(self: *@This()) usize {
-            self.adapter.reader.mu.lock();
-            defer self.adapter.reader.mu.unlock();
-            return self.adapter.reader.writer_proxies.items.len;
-        }
-        fn matching(ctx: *anyopaque, _: *const MatchedWriterInfo) void {
+        fn isCurrent(ctx: *anyopaque, _: Guid, _: u64) bool {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.proxies_when_matching = self.proxies();
+            return self.current;
         }
-        fn matched(ctx: *anyopaque, _: *const MatchedWriterInfo) void {
+        fn onMatching(ctx: *anyopaque, _: *const MatchedWriterInfo, is_new: bool) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.proxies_when_matched = self.proxies();
+            self.matching += 1;
+            self.is_new = is_new;
+            // Under the reader's lock already.
+            self.proxies_when_matching = self.adapter.reader.writer_proxies.items.len;
+        }
+        fn onMatched(ctx: *anyopaque, _: *const MatchedWriterInfo) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.matched += 1;
         }
         fn unmatched(_: *anyopaque, _: Guid) void {}
     };
     var seen = Seen{ .adapter = adapter };
     adapter.toProtocolReader().setWriterMatchCallback(.{
         .ctx = &seen,
-        .on_writer_matching = Seen.matching,
-        .on_writer_matched = Seen.matched,
+        .on_writer_matching = Seen.onMatching,
+        .on_writer_matched = Seen.onMatched,
         .on_writer_unmatched = Seen.unmatched,
     });
 
@@ -730,8 +812,23 @@ test "RtpsProtocolReader: on_writer_matching runs before the writer's proxy exis
         .multicast_locators = &.{},
         .reliability = .reliable,
         .ownership_strength = 4,
+        .currency = .{ .ctx = &seen, .generation = 1, .is_current = Seen.isCurrent },
     };
+    try testing.expect(!try adapter.toProtocolReader().addMatchedWriter(&info));
+    try testing.expectEqual(@as(usize, 0), adapter.toProtocolReader().matchedWriterCount());
+    try testing.expectEqual(@as(usize, 0), seen.matching);
+    try testing.expectEqual(@as(usize, 0), seen.matched);
+
+    seen.current = true;
     try testing.expect(try adapter.toProtocolReader().addMatchedWriter(&info));
-    try testing.expectEqual(@as(?usize, 0), seen.proxies_when_matching);
-    try testing.expectEqual(@as(?usize, 1), seen.proxies_when_matched);
+    try testing.expectEqual(@as(usize, 1), seen.matching);
+    try testing.expectEqual(@as(?bool, true), seen.is_new);
+    try testing.expectEqual(@as(?usize, 1), seen.proxies_when_matching);
+    try testing.expectEqual(@as(usize, 1), seen.matched);
+
+    // A refresh: installed again, not new.
+    try testing.expect(!try adapter.toProtocolReader().addMatchedWriter(&info));
+    try testing.expectEqual(@as(usize, 2), seen.matching);
+    try testing.expectEqual(@as(?bool, false), seen.is_new);
+    try testing.expectEqual(@as(usize, 2), seen.matched);
 }

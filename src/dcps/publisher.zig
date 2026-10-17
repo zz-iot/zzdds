@@ -131,7 +131,7 @@ pub const PublisherImpl = struct {
     /// Guards `listener_box` swaps/acquires only — never held across a
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
-    /// See `writer.zig`'s matching field: `dispatchWriterFallback` (called
+    /// See `writer.zig`'s matching field: `resolveWriterFallback` (called
     /// from a discovery/timer thread) reads it while an application
     /// `set_listener` may be writing it, so both go through
     /// `@atomicLoad`/`@atomicStore` `.monotonic`; initialisers stay plain.
@@ -166,7 +166,7 @@ pub const PublisherImpl = struct {
 
     /// Deferred teardown, like DataWriterImpl's. A DataWriterImpl holds a
     /// reference on its parent PublisherImpl for its whole (possibly
-    /// quiesce-deferred) lifetime, so `dispatchWriterFallback` -- reached
+    /// quiesce-deferred) lifetime, so `resolveWriterFallback` -- reached
     /// from a writer's discovery-driven `notifyPublicationMatched` after
     /// `participant.mu` is released -- can never read a freed PublisherImpl
     /// even if `delete_publisher` races it (DDS 1.4 listener-fallback chain).
@@ -483,8 +483,11 @@ pub const PublisherImpl = struct {
             dw,
             writer_mod.DataWriterImpl.livelinessLastNsFn,
         );
-        // Direct ProtocolWriter registration (not routed through ParticipantCbs
-        // like the callbacks above): this signal is purely RTPS-internal
+        // Direct ProtocolWriter registrations (not routed through ParticipantCbs
+        // like the callbacks above). The matched status changes with the
+        // reader's proxy; `dw` is pinned by the registration below.
+        pw.setReaderMatchCallback(dw.readerMatchCallback());
+        // This signal is purely RTPS-internal
         // (AckNack/Heartbeat correlation), unlike matched_notify which needs
         // SEDP bookkeeping in the participant's active_writers map.
         pw.setProtocolReadyCallback(.{
@@ -670,31 +673,42 @@ pub const PublisherImpl = struct {
     /// Second link in the DDS 1.4 §2.2.4.1.5 "nearest enclosing non-null
     /// listener" fallback chain for a contained DataWriter's status events —
     /// consulted only after the writer itself had no usable listener for
-    /// `field`. `handle` remains the originating writer's own handle (per
+    /// `field`. The writer invokes the callback with its own handle (per
     /// spec — the callback that runs still receives the entity whose status
     /// actually changed). Safe to downcast `self.participant.ptr`: every
     /// `DDS.Publisher` in this codebase is backed by a `PublisherImpl`,
     /// which is always constructed with a real `DomainParticipantImpl` (see
     /// `DomainParticipantImpl.vtCreatePublisher`) — and per
     /// `docs/decisions.md`'s "Listener hierarchy fallback" entry, this
-    /// publisher's own participant is guaranteed alive for the whole of
-    /// this call (participant teardown cascades through publishers
+    /// publisher's own participant is guaranteed alive while this
+    /// publisher is pinned (participant teardown cascades through publishers
     /// synchronously and never frees itself until every publisher's own
     /// `deinit()`, including this one if it were mid-fallback, has
     /// returned).
-    pub fn dispatchWriterFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
+    ///
+    /// Resolves without invoking (see `listener_fallback.Resolved`): the
+    /// callback from this level, else the participant's, else null. A
+    /// resolution keeps this entity's lifetime pinned until released.
+    pub fn resolveWriterFallback(self: *Self, comptime Cb: type, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(Cb) {
         // A child DataWriterImpl holds a lifetime ref (see `quiesce`), so
         // reaching here means the struct is live; acquire keeps it so
-        // across the callback and refuses once teardown has begun.
-        if (!self.quiesce.acquire()) return false;
-        defer self.quiesce.release(self, reallyDeinit);
-        const box = self.acquireListener();
-        defer box.releaseRef(self.alloc);
+        // until the resolution is released, and refuses once teardown has
+        // begun.
+        if (!self.quiesce.acquire()) return null;
         const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
-        if (listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args)) return true;
-        if (nil.isNil(self.participant)) return false;
-        const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
-        return p.dispatchFallback(field, bit, handle, args);
+        const resolved = listener_fallback.resolveBox(Cb, field, mask, bit, self.acquireListener(), self.alloc) orelse blk: {
+            if (nil.isNil(self.participant)) break :blk null;
+            const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
+            break :blk p.resolveFallback(Cb, field, bit);
+        };
+        if (resolved) |r| return r.pinned(self, releasePin);
+        self.quiesce.release(self, reallyDeinit);
+        return null;
+    }
+
+    fn releasePin(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
     }
 
     fn vtSuspendPublications(ctx: *anyopaque) DDS.ReturnCode_t {

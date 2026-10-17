@@ -979,9 +979,17 @@ pub const DomainParticipantImpl = struct {
     /// reader (see settleWriterLocked), until they are lost: nothing from
     /// them is held.  Guarded by mu.
     settled_writers: std.AutoHashMapUnmanaged(Guid, void) = .empty,
-    /// Writers being matched against local readers, with how many
-    /// onWriterDiscovered calls are at it.  Guarded by mu.
-    matching_writers: std.AutoHashMapUnmanaged(Guid, u32) = .empty,
+
+    /// Each known remote endpoint's current discovery generation: a match
+    /// decision for it is made only while the generation it carries is
+    /// current (docs/design/concurrency/architecture.md#remote-endpoint-match-and-loss).
+    /// Written under mu and discovery_gens_mu; read under either.
+    /// discovery_gens_mu is a leaf lock, taken by a local endpoint under its
+    /// protocol lock to check a match it is installing (isDiscoveryGenCurrent).
+    discovery_gens: std.AutoHashMapUnmanaged(Guid, u64) = .empty,
+    discovery_gens_mu: Mutex = .{},
+    /// The last generation assigned.  Guarded by mu.
+    last_discovery_gen: u64 = 0,
 
     /// Built-in subscriber (DCPSParticipant / DCPSTopic / DCPSPublication /
     /// DCPSSubscription DataReaders). Created in init(); null on OOM.
@@ -1552,7 +1560,7 @@ pub const DomainParticipantImpl = struct {
         self.discovered_readers.deinit(self.alloc);
         self.unmatched.deinit();
         self.settled_writers.deinit(self.alloc);
-        self.matching_writers.deinit(self.alloc);
+        self.discovery_gens.deinit(self.alloc);
 
         self.qos.deinit(self.alloc);
         self.default_pub_qos.deinit(self.alloc);
@@ -2602,7 +2610,8 @@ pub const DomainParticipantImpl = struct {
                 break;
             }
         }
-        // As in onWriterLost, for each of its writers.
+        // As in onWriterLost and onReaderLost, for each of its endpoints.
+        self.withdrawDiscoveryGensOfLocked(guid.prefix);
         while (true) {
             var sw_it = self.settled_writers.keyIterator();
             const settled = while (sw_it.next()) |k| {
@@ -2833,29 +2842,72 @@ pub const DomainParticipantImpl = struct {
         notify_quiesced: bool = false,
     };
 
-    /// Marks `writer` as being matched against local readers, unless it is
-    /// settled already: data from it is held meanwhile (see
-    /// holdIfUnmatchedLocked).  True when marked, for settleWriterLocked.
-    /// Caller holds self.mu.
-    fn beginMatchingWriterLocked(self: *Self, writer: Guid) bool {
-        if (self.settled_writers.contains(writer)) return false;
-        const gop = self.matching_writers.getOrPut(self.alloc, writer) catch return false;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
-        return true;
+    /// Assigns remote endpoint `guid` a new discovery generation, for the
+    /// match decisions an announcement of it makes.  Null out of memory: it
+    /// then has none, and no match of it is made until it is announced
+    /// again.  Caller holds self.mu.
+    fn newDiscoveryGenLocked(self: *Self, guid: Guid) ?u64 {
+        self.last_discovery_gen += 1;
+        const gen = self.last_discovery_gen;
+        self.discovery_gens_mu.lock();
+        defer self.discovery_gens_mu.unlock();
+        self.discovery_gens.put(self.alloc, guid, gen) catch {
+            _ = self.discovery_gens.remove(guid);
+            return null;
+        };
+        return gen;
     }
 
-    /// Ends a beginMatchingWriterLocked (when `counted`).  Once no other is
-    /// under way, `writer` is settled: every local reader that matches it
-    /// has, and has taken what was held from it, so that is dropped and
-    /// nothing more is held.  Caller holds self.mu.
-    fn settleWriterLocked(self: *Self, writer: Guid, counted: bool) void {
-        if (counted) {
-            const n = self.matching_writers.getPtr(writer).?;
-            n.* -= 1;
-            if (n.* > 0) return;
-            _ = self.matching_writers.remove(writer);
-        } else if (self.matching_writers.contains(writer)) return;
+    /// Withdraws the discovery generation of remote endpoint `guid`, lost:
+    /// a match of it decided before is not installed.  Caller holds self.mu.
+    fn withdrawDiscoveryGenLocked(self: *Self, guid: Guid) void {
+        self.discovery_gens_mu.lock();
+        defer self.discovery_gens_mu.unlock();
+        _ = self.discovery_gens.remove(guid);
+    }
+
+    /// withdrawDiscoveryGenLocked for every endpoint of participant `prefix`.
+    fn withdrawDiscoveryGensOfLocked(self: *Self, prefix: GuidPrefix) void {
+        self.discovery_gens_mu.lock();
+        defer self.discovery_gens_mu.unlock();
+        while (true) {
+            var it = self.discovery_gens.keyIterator();
+            const lost = while (it.next()) |k| {
+                if (k.prefix.eql(prefix)) break k.*;
+            } else break;
+            _ = self.discovery_gens.remove(lost);
+        }
+    }
+
+    /// Remote endpoint `guid`'s current discovery generation, if any.
+    /// Caller holds self.mu.
+    fn currentDiscoveryGenLocked(self: *Self, guid: Guid) ?u64 {
+        self.discovery_gens_mu.lock();
+        defer self.discovery_gens_mu.unlock();
+        return self.discovery_gens.get(guid);
+    }
+
+    fn isDiscoveryGenCurrent(ctx: *anyopaque, guid: Guid, gen: u64) bool {
+        const self = cast(ctx);
+        self.discovery_gens_mu.lock();
+        defer self.discovery_gens_mu.unlock();
+        return self.discovery_gens.get(guid) == gen;
+    }
+
+    /// A match decision's currency: made only while `gen` is current.
+    fn matchCurrency(self: *Self, gen: u64) proto.MatchCurrency {
+        return .{ .ctx = self, .generation = gen, .is_current = isDiscoveryGenCurrent };
+    }
+
+    /// `writer` is settled, if `gen` (its announcement's discovery
+    /// generation; null when it decided no match) is still current:
+    /// every local reader that matches it has, and has taken what was held
+    /// from it, so that is dropped and nothing more is held.  An older
+    /// announcement finishing after a newer one, or after the writer's loss,
+    /// settles nothing: the newer one, or the writer's return, does.
+    /// Caller holds self.mu.
+    fn settleWriterLocked(self: *Self, writer: Guid, gen: ?u64) void {
+        if (gen) |g| if (self.currentDiscoveryGenLocked(writer) != g) return;
         // Out of memory, it stays unsettled: what is held from it expires.
         self.settled_writers.put(self.alloc, writer, {}) catch {};
         self.unmatched.dropWriter(writer);
@@ -2879,7 +2931,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.lock();
         for (self.ignored_prefixes.items) |p| {
             if (p.eql(data.guid.prefix)) {
-                self.settleWriterLocked(data.guid, false);
+                self.settleWriterLocked(data.guid, null);
                 self.mu.unlock();
                 return;
             }
@@ -2887,21 +2939,22 @@ pub const DomainParticipantImpl = struct {
         const pub_handle = writer_mod.guidToHandle(data.guid);
         for (self.ignored_publication_handles.items) |h| {
             if (h == pub_handle) {
-                self.settleWriterLocked(data.guid, false);
+                self.settleWriterLocked(data.guid, null);
                 self.mu.unlock();
                 return;
             }
         }
         for (self.ignored_topic_names.items) |n| {
             if (std.mem.eql(u8, n, data.topic_name)) {
-                self.settleWriterLocked(data.guid, false);
+                self.settleWriterLocked(data.guid, null);
                 self.mu.unlock();
                 return;
             }
         }
-        // Data from it is held until every match below is made (see
-        // settleWriterLocked).
-        const counted = self.beginMatchingWriterLocked(data.guid);
+        // Each match below is installed only while this is the writer's
+        // current generation. Unless settled already, data from the writer
+        // is held until every match below is made (see settleWriterLocked).
+        const gen = self.newDiscoveryGenLocked(data.guid);
         var ar_it = self.active_readers.valueIterator();
         while (ar_it.next()) |ar| {
             if (!std.mem.eql(u8, ar.topic_name, data.topic_name)) continue;
@@ -2928,6 +2981,7 @@ pub const DomainParticipantImpl = struct {
             }
             const part_result = qm_mod.checkPartition(data.partition_names, ar.partition_names);
             if (!part_result.isCompatible()) continue;
+            const g = gen orelse continue;
             // Defer the actual addMatchedWriter (and its initial ACKNACK/
             // replay send) until after self.mu is released below: it
             // reenters into transport I/O, which can synchronously deliver
@@ -2941,6 +2995,7 @@ pub const DomainParticipantImpl = struct {
             if (!ar.proto.quiesceAcquire()) continue;
             var info = buildMatchedWriterInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
             info.prematch = self.prematchFor(ar);
+            info.currency = self.matchCurrency(g);
             const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
             jobs.append(self.alloc, .{ .proto = ar.proto, .info = info, .notify = ar.matched_notify, .notify_quiesced = nq }) catch {
                 ar.proto.quiesceRelease();
@@ -2985,7 +3040,8 @@ pub const DomainParticipantImpl = struct {
         for (jobs.items) |job| {
             // Only a new protocol-level match changes the matched status:
             // discovery can report an already matched pair again, which
-            // just refreshes the proxy.
+            // just refreshes the proxy. A match superseded since (by the
+            // writer's loss or a newer announcement) is not made.
             const added = job.proto.addMatchedWriter(&job.info) catch false;
             if (job.notify) |cb| if (job.notify_quiesced) {
                 if (added) cb.notify(cb.ctx, writer_mod.guidToHandle(data.guid), true);
@@ -2994,7 +3050,7 @@ pub const DomainParticipantImpl = struct {
             job.proto.quiesceRelease();
         }
         self.mu.lock();
-        self.settleWriterLocked(data.guid, counted);
+        self.settleWriterLocked(data.guid, gen);
         self.mu.unlock();
         if (push_dr) |dr| pushBuiltinPublicationCdr(self.alloc, dr, data);
         if (push_topic_dr) |dr| if (new_topic) |dt| pushBuiltinTopicCdr(self.alloc, dr, .{
@@ -3048,6 +3104,8 @@ pub const DomainParticipantImpl = struct {
         var jobs: std.ArrayListUnmanaged(RemovedWriterJob) = .empty;
         defer jobs.deinit(self.alloc);
         self.mu.lock();
+        // First, so a match of it made before but not yet installed is not.
+        self.withdrawDiscoveryGenLocked(guid);
         // Reserve capacity for every possible job *before* mutating any
         // state below: removeMatchedWriterDeferred's removal is not
         // reversible, so an append failing partway through the loop would
@@ -3173,6 +3231,8 @@ pub const DomainParticipantImpl = struct {
                 return;
             }
         }
+        // As in onWriterDiscovered.
+        const gen = self.newDiscoveryGenLocked(data.guid);
         var aw_it = self.active_writers.valueIterator();
         while (aw_it.next()) |aw| {
             if (!std.mem.eql(u8, aw.topic_name, data.topic_name)) continue;
@@ -3204,11 +3264,13 @@ pub const DomainParticipantImpl = struct {
             }
             const part_result = qm_mod.checkPartition(aw.partition_names, data.partition_names);
             if (!part_result.isCompatible()) continue;
+            const g = gen orelse continue;
             // See onWriterDiscovered's matching comment: defer the actual
             // addMatchedReader (and its initial HEARTBEAT/replay send)
             // until after self.mu is released below.
             if (!aw.proto.quiesceAcquire()) continue;
-            const info = self.buildMatchedReaderInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
+            var info = self.buildMatchedReaderInfo(data.guid, data.qos, data.unicast_locators, data.multicast_locators);
+            info.currency = self.matchCurrency(g);
             const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
             jobs.append(self.alloc, .{ .proto = aw.proto, .info = info, .notify = aw.matched_notify, .notify_quiesced = nq }) catch {
                 aw.proto.quiesceRelease();
@@ -3293,6 +3355,8 @@ pub const DomainParticipantImpl = struct {
         var jobs: std.ArrayListUnmanaged(RemovedReaderJob) = .empty;
         defer jobs.deinit(self.alloc);
         self.mu.lock();
+        // As onWriterLost.
+        self.withdrawDiscoveryGenLocked(guid);
         const swept = if (jobs.ensureTotalCapacityPrecise(self.alloc, self.active_writers.count())) |_| blk: {
             var aw_it = self.active_writers.valueIterator();
             while (aw_it.next()) |aw| {
@@ -3548,6 +3612,9 @@ pub const DomainParticipantImpl = struct {
                         if (!result.isCompatible()) continue;
                         const part_result = qm_mod.checkPartition(aw.partition_names, dr.partition_names);
                         if (!part_result.isCompatible()) continue;
+                        // Installed only while the reader's current generation
+                        // is, as for a match made by its announcement.
+                        const g = self.currentDiscoveryGenLocked(dr.guid) orelse continue;
                         // See onWriterDiscovered's matching comment: defer the
                         // actual addMatchedReader send until after self.mu is
                         // released below. dr.unicast_locators/multicast_locators
@@ -3558,7 +3625,8 @@ pub const DomainParticipantImpl = struct {
                         if (!aw.proto.quiesceAcquire()) continue;
                         const uloc = dupeLocators(self.alloc, dr.unicast_locators);
                         const mloc = dupeLocators(self.alloc, dr.multicast_locators);
-                        const info = self.buildMatchedReaderInfo(dr.guid, &dr.qos, uloc, mloc);
+                        var info = self.buildMatchedReaderInfo(dr.guid, &dr.qos, uloc, mloc);
+                        info.currency = self.matchCurrency(g);
                         const nq = if (aw.matched_notify) |cb| cb.quiesceAcquire() else false;
                         jobs.append(self.alloc, .{
                             .proto = aw.proto,
@@ -3714,6 +3782,9 @@ pub const DomainParticipantImpl = struct {
                         }
                         const part_result = qm_mod.checkPartition(dw.partition_names, ar.partition_names);
                         if (!part_result.isCompatible()) continue;
+                        // Installed only while the writer's current generation
+                        // is, as for a match made by its announcement.
+                        const g = self.currentDiscoveryGenLocked(dw.guid) orelse continue;
                         // See onWriterDiscovered's matching comment: defer the
                         // actual addMatchedWriter send until after self.mu is
                         // released below, duping dw's locators (borrowed from
@@ -3723,6 +3794,7 @@ pub const DomainParticipantImpl = struct {
                         const mloc = dupeLocators(self.alloc, dw.multicast_locators);
                         var info = buildMatchedWriterInfo(dw.guid, &dw.qos, uloc, mloc);
                         info.prematch = self.prematchFor(ar);
+                        info.currency = self.matchCurrency(g);
                         const nq = if (ar.matched_notify) |cb| cb.quiesceAcquire() else false;
                         jobs.append(self.alloc, .{
                             .proto = ar.proto,
@@ -4714,14 +4786,19 @@ pub const DomainParticipantImpl = struct {
     /// If this level has no usable listener for `field` either, the event
     /// is simply not delivered (matches this codebase's pre-existing
     /// behavior for "nobody installed a listener for this status" at the
-    /// origin entity) and `false` is returned so the caller knows not to
-    /// reset its own change-counters (see `dispatchListener`'s doc comment
-    /// in `reader.zig`/`writer.zig` for why that matters).
+    /// origin entity) and `false` is returned.
     pub fn dispatchFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
         const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
         return listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args);
+    }
+
+    /// `dispatchFallback`'s resolution step alone: this level's callback for
+    /// `field`, not yet invoked (see `listener_fallback.Resolved`), or null.
+    pub fn resolveFallback(self: *Self, comptime Cb: type, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(Cb) {
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        return listener_fallback.resolveBox(Cb, field, mask, bit, self.acquireListener(), self.alloc);
     }
 
     fn vtIgnoreParticipant(ctx: *anyopaque, handle: DDS.InstanceHandle_t) DDS.ReturnCode_t {

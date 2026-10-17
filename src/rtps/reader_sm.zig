@@ -42,6 +42,9 @@ pub const Locator = iface.Locator;
 pub const ReassemblyEntry = reassembly_mod.ReassemblyEntry;
 pub const UnmatchedCache = unmatched_mod.UnmatchedCache;
 pub const Prematch = unmatched_mod.Prematch;
+pub const MatchCommit = writer_sm.MatchCommit;
+pub const UnmatchCommit = writer_sm.UnmatchCommit;
+pub const MatchResult = writer_sm.MatchResult;
 const keyHashFromInlineQos = reassembly_mod.keyHashFromInlineQos;
 
 // ── Delivery callback ─────────────────────────────────────────────────────────
@@ -371,9 +374,10 @@ pub const StatefulReader = struct {
         _ = try self.addOrRefreshMatchedWriter(proxy);
     }
 
-    /// addOrRefreshMatchedWriterWith, with nothing held from before the match.
+    /// addOrRefreshMatchedWriterWith, with nothing held from before the match
+    /// and nothing installed alongside: true when the writer is newly matched.
     pub fn addOrRefreshMatchedWriter(self: *Self, proxy: WriterProxy) !bool {
-        return self.addOrRefreshMatchedWriterWith(proxy, null);
+        return try self.addOrRefreshMatchedWriterWith(proxy, null, null) == .added;
     }
 
     /// Add a matched writer. For a new RELIABLE writer, sends an initial
@@ -389,10 +393,17 @@ pub const StatefulReader = struct {
     /// A newly matched writer's data that arrived before the match is taken
     /// from `prematch` (see unmatched_cache.zig), if given.
     ///
-    /// Returns true when the writer is newly matched, false for a lease refresh
-    /// of an existing match.
-    pub fn addOrRefreshMatchedWriterWith(self: *Self, proxy: WriterProxy, prematch: ?*const Prematch) !bool {
+    /// With `commit`, the match is made only while `commit.is_current`, and
+    /// `commit.install` runs with it, in the same critical section (see
+    /// MatchCommit): for a new writer, before anything held from it is taken.
+    pub fn addOrRefreshMatchedWriterWith(self: *Self, proxy: WriterProxy, prematch: ?*const Prematch, commit: ?MatchCommit) !MatchResult {
         self.mu.lock();
+        if (commit) |c| if (!c.is_current(c.ctx)) {
+            var discarded = proxy;
+            discarded.deinit(self.alloc);
+            self.mu.unlock();
+            return .superseded;
+        };
         for (self.writer_proxies.items) |*wp| {
             if (wp.guid.eql(proxy.guid)) {
                 // Lease refresh: update locators/metadata, preserve sequence state
@@ -414,14 +425,16 @@ pub const StatefulReader = struct {
                 discarded.multicast_locators = .empty;
                 discarded.selected_locators = .empty;
                 discarded.deinit(self.alloc);
+                if (commit) |c| c.install(c.ctx, false);
                 self.mu.unlock();
-                return false;
+                return .refreshed;
             }
         }
         self.writer_proxies.append(self.alloc, proxy) catch |err| {
             self.mu.unlock();
             return err;
         };
+        if (commit) |c| c.install(c.ctx, true);
         self.ever_matched_writer = true;
         const new_wp = &self.writer_proxies.items[self.writer_proxies.items.len - 1];
 
@@ -466,7 +479,7 @@ pub const StatefulReader = struct {
             if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
         runFlush(flush);
-        return true;
+        return .added;
     }
 
     /// A pending on_reliable_writer_ready(false) transition, returned instead
@@ -474,6 +487,13 @@ pub const StatefulReader = struct {
     pub const DeferredReady = struct {
         fn_ptr: *const fn (*anyopaque, Guid, bool) void,
         ctx: *anyopaque,
+    };
+
+    /// What removeMatchedWriterDeferred did.
+    pub const Removed = struct {
+        /// A proxy was removed.
+        removed: bool = false,
+        ready: ?DeferredReady = null,
     };
 
     /// Like removeMatchedWriter, but performs the removal immediately (under
@@ -486,9 +506,12 @@ pub const StatefulReader = struct {
     /// call actually running, and the stale removal would wrongly undo the
     /// fresh match) while still firing the callback only once that external
     /// lock is released. Caller must fire the returned transition itself.
-    pub fn removeMatchedWriterDeferred(self: *Self, guid: Guid) ?DeferredReady {
+    /// When a proxy is removed, `unmatch` (if given) removes the caller's own
+    /// state for the writer in the same critical section.
+    pub fn removeMatchedWriterDeferred(self: *Self, guid: Guid, unmatch: ?UnmatchCommit) Removed {
         self.mu.lock();
         defer self.mu.unlock();
+        var out: Removed = .{};
         var was_ready = false;
         var i: usize = self.writer_proxies.items.len;
         while (i > 0) {
@@ -497,11 +520,14 @@ pub const StatefulReader = struct {
                 was_ready = was_ready or self.writer_proxies.items[i].protocol_ready;
                 self.writer_proxies.items[i].deinit(self.alloc);
                 _ = self.writer_proxies.swapRemove(i);
+                out.removed = true;
             }
         }
-        if (!was_ready) return null;
-        const f = self.protocol_ready_fn orelse return null;
-        return .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
+        if (out.removed) if (unmatch) |u| u.remove(u.ctx, guid);
+        if (!was_ready) return out;
+        const f = self.protocol_ready_fn orelse return out;
+        out.ready = .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
+        return out;
     }
 
     pub fn removeMatchedWriter(self: *Self, guid: Guid) void {
@@ -510,7 +536,7 @@ pub const StatefulReader = struct {
         // application using on_reliable_writer_ready know a writer it was
         // told is ready has gone away, rather than staying convinced it's
         // still ready indefinitely.
-        if (self.removeMatchedWriterDeferred(guid)) |d| d.fn_ptr(d.ctx, guid, false);
+        if (self.removeMatchedWriterDeferred(guid, null).ready) |d| d.fn_ptr(d.ctx, guid, false);
     }
 
     /// Returns true if the given GUID is currently in the writer proxy list.
@@ -1562,9 +1588,23 @@ test "StatefulReader takes data held from before the match on addOrRefreshMatche
     defer held.deinit();
     held.put(writer_guid, guid_mod.EntityIds.unknown, &change, true, 0, std.time.ns_per_s);
 
-    // The match takes SN=1 from the cache, in order → delivered.
+    // The match takes SN=1 from the cache, in order → delivered, after the
+    // caller's state for the writer is installed.
+    const Install = struct {
+        delivered: *usize,
+        delivered_at_install: ?usize = null,
+        fn isCurrent(_: *anyopaque) bool {
+            return true;
+        }
+        fn install(ctx: *anyopaque, _: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.delivered_at_install = self.delivered.*;
+        }
+    };
+    var install: Install = .{ .delivered = &delivered };
     const proxy = try WriterProxy.init(testing.allocator, writer_guid, &.{}, &.{}, true);
-    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held });
+    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held }, .{ .ctx = &install, .is_current = Install.isCurrent, .install = Install.install });
+    try testing.expectEqual(@as(?usize, 0), install.delivered_at_install);
     try testing.expectEqual(@as(usize, 1), delivered);
     // Left for any other reader that matches the writer.
     try testing.expectEqual(@as(usize, 1), held.writerCount());
@@ -1611,7 +1651,7 @@ test "StatefulReader held data from before the match: out-of-order SN delivered 
 
     // The match takes SN=30, out of order (cumAck=0, need SN=1 first).
     const proxy = try WriterProxy.init(testing.allocator, writer_guid, &.{}, &.{}, true);
-    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held });
+    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held }, null);
     try testing.expectEqual(@as(usize, 0), delivered); // still waiting for gap fill
 
     // Empty HEARTBEAT (first_sn=30, last_sn=29): writer history starts at SN=30,
@@ -1755,7 +1795,7 @@ test "StatefulReader DATA_FRAG: source_timestamp and key_hash preserved through 
 
     // The match takes SN=1, in order → delivered immediately.
     const proxy = try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, true);
-    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held });
+    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held }, null);
 
     try testing.expectEqual(expected_ts, ctx.ts);
     try testing.expectEqual(expected_kh, ctx.kh);
@@ -1799,7 +1839,7 @@ test "StatefulReader DATA_FRAG: a reassembly started before the match finishes a
     held.putFrag(wguid, guid_mod.EntityIds.unknown, frag, ZERO_TS, 0, std.time.ns_per_s);
 
     const proxy = try WriterProxy.init(testing.allocator, wguid, &.{}, &.{}, false);
-    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held });
+    _ = try reader.addOrRefreshMatchedWriterWith(proxy, &.{ .cache = &held }, null);
     try testing.expectEqual(@as(usize, 0), ctx.n);
 
     frag.fragment_starting_num = 2;
