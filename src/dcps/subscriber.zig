@@ -720,7 +720,7 @@ pub const SubscriberImpl = struct {
     /// `field`. `handle` remains the originating reader's own handle (per
     /// spec — the callback that runs still receives the entity whose status
     /// actually changed). Safe to downcast `self.participant.ptr`: see
-    /// `publisher.zig`'s `dispatchWriterFallback` doc comment for why the
+    /// `publisher.zig`'s `resolveWriterFallback` doc comment for why the
     /// parent is guaranteed alive for the whole of this call — the same
     /// reasoning applies symmetrically here.
     pub fn dispatchReaderFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
@@ -733,6 +733,29 @@ pub const SubscriberImpl = struct {
         if (nil.isNil(self.participant)) return false;
         const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
         return p.dispatchFallback(field, bit, handle, args);
+    }
+
+    /// `dispatchReaderFallback`'s resolution step alone: the callback for `field`
+    /// from this level or the participant's, not yet invoked (see
+    /// `listener_fallback.Resolved`), or null. A resolution keeps this
+    /// entity's lifetime pinned until released, as `dispatchReaderFallback` does
+    /// across its callback.
+    pub fn resolveReaderFallback(self: *Self, comptime Cb: type, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(Cb) {
+        if (!self.quiesce.acquire()) return null;
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        const resolved = listener_fallback.resolveBox(Cb, field, mask, bit, self.acquireListener(), self.alloc) orelse blk: {
+            if (nil.isNil(self.participant)) break :blk null;
+            const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
+            break :blk p.resolveFallback(Cb, field, bit);
+        };
+        if (resolved) |r| return r.pinned(self, releasePin);
+        self.quiesce.release(self, reallyDeinit);
+        return null;
+    }
+
+    fn releasePin(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.quiesce.release(self, reallyDeinit);
     }
 
     /// The outcome of resolving (but not yet firing) `on_data_available`'s
@@ -774,7 +797,7 @@ pub const SubscriberImpl = struct {
     /// pre-acquiring `r`'s own box before deferring the fire). Call with
     /// `subscriber.mu` held (matches the call site; `self`/`self`'s
     /// participant are therefore guaranteed alive per `publisher.zig`'s
-    /// `dispatchWriterFallback` doc comment).
+    /// `resolveWriterFallback` doc comment).
     fn resolveDataAvailableFallback(self: *Self, r: *reader_mod.DataReaderImpl) DataAvailableResolution {
         const rbox = r.acquireListener();
         if (listener_fallback.peek("on_data_available", @atomicLoad(DDS.StatusMask, &r.listener_mask, .monotonic), DDS.DATA_AVAILABLE_STATUS, rbox.listener)) |cb| {

@@ -411,7 +411,7 @@ test "get_publication_matched_status: initially zero" {
 
 // ── Tests: notification fire paths ───────────────────────────────────────────
 
-test "notifyPublicationMatched: fires listener and sets status_changes" {
+test "a match fires on_publication_matched and leaves status_changes clear" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     var counts = Counts{};
@@ -419,19 +419,19 @@ test "notifyPublicationMatched: fires listener and sets status_changes" {
     const dw = fx.makeWriter(.{}, listener, DDS.PUBLICATION_MATCHED_STATUS);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
-    DataWriterImpl.notifyPublicationMatched(dw.ptr, 42, true);
+    @as(*DataWriterImpl, @ptrCast(@alignCast(dw.ptr))).recordPublicationMatched(42, true);
     try testing.expectEqual(@as(i32, 1), counts.pub_matched);
     // Listener clears the change on fire; status_changes should be clear too.
     try testing.expectEqual(@as(DDS.StatusMask, 0), dw.vtable.get_status_changes(dw.ptr));
 }
 
-test "notifyPublicationMatched: accumulates in status when no listener" {
+test "a match accumulates in the publication matched status when no listener" {
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
     const dw = fx.makeWriter(.{}, null, 0);
     defer _ = fx.pub_.vtable.delete_datawriter(fx.pub_.ptr, dw);
 
-    DataWriterImpl.notifyPublicationMatched(dw.ptr, 7, true);
+    @as(*DataWriterImpl, @ptrCast(@alignCast(dw.ptr))).recordPublicationMatched(7, true);
     try testing.expect(dw.vtable.get_status_changes(dw.ptr) & DDS.PUBLICATION_MATCHED_STATUS != 0);
 
     var s: DDS.PublicationMatchedStatus = .{};

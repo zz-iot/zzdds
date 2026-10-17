@@ -1,7 +1,7 @@
 //! DataReader vtable and notification coverage tests.
 //!
 //! Covers all DDS.DataReader vtable methods, direct pub notify functions
-//! (notifyIncompatibleQos, notifySubscriptionMatched, notifySampleLost,
+//! (notifyIncompatibleQos, recordSubscriptionMatched, notifySampleLost,
 //! notifyDeadlineMissed), pushCdr resource-limit behaviour, hasPendingData,
 //! matchedWriterCount, and matched-publication queries.
 
@@ -500,7 +500,7 @@ test "DataReader: notifyIncompatibleQos fires listener when mask set" {
     try testing.expectEqual(@as(i32, 1), counts.incompat);
 }
 
-test "DataReader: notifySubscriptionMatched fires listener when mask set" {
+test "DataReader: a match fires on_subscription_matched when mask set" {
     const alloc = testing.allocator;
     var fx = try SingleFixture.init(alloc);
     defer fx.deinit();
@@ -510,7 +510,7 @@ test "DataReader: notifySubscriptionMatched fires listener when mask set" {
     defer _ = fx.sub.vtable.delete_datareader(fx.sub.ptr, dr_dds);
     const dr: *DataReaderImpl = @ptrCast(@alignCast(dr_dds.ptr));
 
-    DataReaderImpl.notifySubscriptionMatched(dr, 42, true);
+    dr.recordSubscriptionMatched(42, true);
     try testing.expectEqual(@as(i32, 1), counts.sub_matched);
 }
 

@@ -219,11 +219,15 @@ jobs:
     needs: test-linux
     permissions:
       contents: read
-    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@cd9df3afd202627ae52c19faabca62f3cbc145bf
+    uses: zz-iot/rmw_zzdds/.github/workflows/ci.yml@cff7837fe8e3d0255e9b1faa407ba24e3a05b6e3
     with:
       mode: zzdds-pr
       zzdds_repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       zzdds_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The rmw_zzdds source to build (empty: its default branch). Pinned to
+      # the `uses:` commit while that commit is not yet on rmw_zzdds's main;
+      # drop it once it is.
+      rmw_zzdds_ref: cff7837fe8e3d0255e9b1faa407ba24e3a05b6e3
 
   # ── examples smoke test ──────────────────────────────────────────────────
   #

@@ -302,7 +302,7 @@ test "data callbacks run under the reader's lock and on_flush after it is releas
     defer held.deinit();
     held.put(writer_guid, rtps.EntityIds.unknown, &early, true, 0, HELD_TTL_NS);
     try testing.expectEqual(@as(usize, 0), probe.data_calls);
-    try testing.expect(try r.addOrRefreshMatchedWriterWith(try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true), &.{ .cache = &held }));
+    try testing.expect(try r.addOrRefreshMatchedWriterWith(try WriterProxy.init(testing.allocator, writer_guid, &.{writer_loc}, &.{}, true), &.{ .cache = &held }, null) == .added);
     try testing.expectEqual(@as(usize, 1), probe.data_calls);
     try testing.expectEqual(@as(usize, 1), probe.flush_calls);
 
@@ -921,7 +921,7 @@ test "BEST_EFFORT: data from a writer not yet matched is delivered in SN order o
     try testing.expectEqual(@as(usize, 0), recorder.sns.items.len);
 
     const wp = try WriterProxy.init(testing.allocator, writer_guid, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7400)}, &.{}, false);
-    _ = try r.addOrRefreshMatchedWriterWith(wp, &.{ .cache = &held });
+    _ = try r.addOrRefreshMatchedWriterWith(wp, &.{ .cache = &held }, null);
     try testing.expectEqualSlices(SequenceNumber, &.{ 1, 2 }, recorder.sns.items);
 }
 

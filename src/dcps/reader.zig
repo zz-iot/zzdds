@@ -219,10 +219,11 @@ pub const CoherentWriter = struct {
     /// The writer's publisher (MatchedWriterInfo.publisher_guid): group sets,
     /// and their ids, are per publisher.
     publisher: Guid,
-    /// Whether onWriterMatchedCb has set `publisher`.  The writer's samples
-    /// that arrived before its match are delivered just before that callback
-    /// runs; until it does, the subscriber can't tell which publisher's group
-    /// sets they belong to and holds every group set back.
+    /// Whether onWriterMatchingCb has set `publisher`.  It runs with the
+    /// writer's match, before even the writer's samples held from before the
+    /// match are delivered; until it has, the subscriber can't tell which
+    /// publisher's group sets the writer's samples belong to and holds every
+    /// group set back.
     publisher_known: bool = false,
     /// The SN after the last one received from the writer; null before any.
     next_sn: ?history_mod.SequenceNumber = null,
@@ -357,6 +358,11 @@ pub const DataReaderImpl = struct {
     sub_matched_current_change: i32 = 0,
     sub_matched_last_handle: DDS.InstanceHandle_t = 0,
 
+    /// A writer's removal synthesized NOT_ALIVE_NO_WRITERS samples that
+    /// on_data_available has yet to be raised for (see
+    /// onWriterUnmatchingCb). Guarded by `mu`.
+    no_writers_pending: bool = false,
+
     /// SampleRejected status counters. Guarded by `mu`.
     sample_rejected_total: i32 = 0,
     sample_rejected_total_change: i32 = 0,
@@ -421,7 +427,7 @@ pub const DataReaderImpl = struct {
     coherent_committed_ready: bool,
     /// The coherent progress of each matched writer the reader has heard from,
     /// or, in GROUP scope, that matched with a GROUP-coherent publisher.
-    /// Removed in onWriterUnmatchedCb.  Guarded by `mu`.
+    /// Removed in onWriterUnmatchingCb.  Guarded by `mu`.
     coherent_writers: std.AutoHashMapUnmanaged(Guid, CoherentWriter) = .empty,
     /// Timestamp (ns) when the most recent coherent WIP entry was created for any writer.
     /// Used by Subscriber.begin_access to detect idle coherent writers that never
@@ -491,7 +497,7 @@ pub const DataReaderImpl = struct {
     owner_map: std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, Guid) = .empty,
 
     /// Per-writer set of instance handles written to via alive changes.
-    /// Guarded by `mu`. Used in onWriterUnmatchedCb to synthesize NOT_ALIVE_NO_WRITERS
+    /// Guarded by `mu`. Used in onWriterUnmatchingCb to synthesize NOT_ALIVE_NO_WRITERS
     /// when a writer disappears without an explicit unregister.
     writer_instances: std.AutoHashMapUnmanaged(Guid, std.AutoHashMapUnmanaged(DDS.InstanceHandle_t, void)) = .empty,
 
@@ -843,7 +849,7 @@ pub const DataReaderImpl = struct {
     // ── Data delivery ─────────────────────────────────────────────────────────
 
     /// Record that `guid` has published an alive sample for instance `ih`.
-    /// Must be called with `mu` held.  Used by onWriterUnmatchedCb.
+    /// Must be called with `mu` held.  Used by onWriterUnmatchingCb.
     fn trackWriterInstanceLocked(self: *Self, guid: Guid, ih: DDS.InstanceHandle_t) void {
         const gop = self.writer_instances.getOrPut(self.alloc, guid) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -883,6 +889,10 @@ pub const DataReaderImpl = struct {
         defer self.quiesce.release(self, reallyDeinit);
         const pending = self.pending_listeners.swap(0, .acq_rel);
         if (pending & DDS.SAMPLE_REJECTED_STATUS != 0) {
+            // Resolved first, then claimed under `mu` -- see resolveListener.
+            // The rejection was counted when the data callback deferred it.
+            const target = self.resolveListener("on_sample_rejected", DDS.SAMPLE_REJECTED_STATUS);
+            defer if (target) |t| t.release();
             self.mu.lock();
             const status = DDS.SampleRejectedStatus{
                 .total_count = self.sample_rejected_total,
@@ -890,19 +900,10 @@ pub const DataReaderImpl = struct {
                 .last_reason = self.sample_rejected_last_reason,
                 .last_instance_handle = self.sample_rejected_last_handle,
             };
+            const claimed = self.claimStatusLocked(DDS.SAMPLE_REJECTED_STATUS, target != null);
+            if (claimed) self.sample_rejected_total_change = 0;
             self.mu.unlock();
-            // Always attempt dispatch -- DDS 1.4 §2.2.4.1.5's fallback chain
-            // means a delivery can happen even when this reader's own
-            // `listener_mask` doesn't include the bit. Only reset the
-            // change-counters (under `mu`, matching `vtGetSampleRejected`'s
-            // own locking) if delivery actually happened somewhere in the
-            // chain.
-            if (self.dispatchListener("on_sample_rejected", DDS.SAMPLE_REJECTED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
-                self.mu.lock();
-                self.sample_rejected_total_change = 0;
-                self.status_changes &= ~DDS.SAMPLE_REJECTED_STATUS;
-                self.mu.unlock();
-            }
+            if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
         }
         if (pending & DDS.DATA_AVAILABLE_STATUS != 0) {
             _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
@@ -1248,7 +1249,7 @@ pub const DataReaderImpl = struct {
     fn coherentWriterLocked(self: *Self, writer: Guid) ?*CoherentWriter {
         const gop = self.coherent_writers.getOrPut(self.alloc, writer) catch return null;
         if (!gop.found_existing) gop.value_ptr.* = .{
-            // Until onWriterMatchedCb says which publisher: the participant.
+            // Until onWriterMatchingCb says which publisher: the participant.
             .publisher = .{ .prefix = writer.prefix, .entity_id = std.mem.zeroes(proto.EntityId) },
             .last_progress_ns = time_mod.nanoTimestamp(),
         };
@@ -1366,103 +1367,92 @@ pub const DataReaderImpl = struct {
             .ctx = self,
             .on_writer_matching = onWriterMatchingCb,
             .on_writer_matched = onWriterMatchedCb,
+            .on_writer_unmatching = onWriterUnmatchingCb,
             .on_writer_unmatched = onWriterUnmatchedCb,
             .on_writer_alive = onWriterAliveCb,
         };
     }
 
-    /// Records the writer's ownership strength and lifespan before its proxy is
-    /// added (see WriterMatchCallback.on_writer_matching): a sample arriving
-    /// before they were recorded was arbitrated at strength 0, so a stronger
-    /// writer could claim an instance and then lose it to a weaker one.
-    fn onWriterMatchingCb(ctx: *anyopaque, info: *const proto.MatchedWriterInfo) void {
+    /// Installs the writer's state with its proxy, under the protocol
+    /// reader's lock (see WriterMatchCallback): its ownership strength and
+    /// lifespan, in place before any sample from it is arbitrated or
+    /// expired; its coherent-set tracking and liveliness lease; and, for a
+    /// new writer, the matched status. A match superseded by a newer
+    /// discovery decision never gets here, and the writer's loss removes all
+    /// of it with the proxy (onWriterUnmatchingCb), so none of it outlives
+    /// the match. onWriterMatchedCb raises what changed.
+    fn onWriterMatchingCb(ctx: *anyopaque, info: *const proto.MatchedWriterInfo, is_new: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
         defer self.mu.unlock();
-        self.recordWriterQosLocked(info);
-    }
-
-    fn recordWriterQosLocked(self: *Self, info: *const proto.MatchedWriterInfo) void {
+        self.rememberPublicationGuidLocked(info.guid);
         self.writer_strengths.put(self.alloc, info.guid, info.ownership_strength) catch {};
         if (info.lifespan_ns > 0)
             self.writer_lifespans.put(self.alloc, info.guid, info.lifespan_ns) catch {}
         else
             _ = self.writer_lifespans.remove(info.guid);
+        // Track the writer's coherent sets from now on: in GROUP scope the
+        // subscriber's group sets wait on it even before it sends anything,
+        // so a part of a group set still on its way is not mistaken for none.
+        if (self.subscriber_presentation.coherent_access) {
+            if (self.coherentWriterLocked(info.guid)) |cw| {
+                cw.publisher = info.publisher_guid;
+                cw.publisher_known = true;
+            }
+            // Any of the writer's sets queued before its publisher was
+            // known now have it.
+            for (self.coherent_committed.items) |*part| {
+                if (part.writer_guid.eql(info.guid)) part.publisher = info.publisher_guid;
+            }
+        }
+        // Track liveliness for writers with a finite lease.
+        if (info.liveliness_lease_ns > 0) {
+            const prev = self.writer_liveliness.get(info.guid);
+            self.writer_liveliness.put(self.alloc, info.guid, .{
+                .lease_ns = info.liveliness_lease_ns,
+                .last_alive_ns = self.timer_clock.nowNs(),
+                .is_alive = true,
+                .kind = info.liveliness_kind,
+            }) catch {};
+            if (prev == null) {
+                // Newly matched writer.
+                self.liveliness_alive_count += 1;
+                self.liveliness_alive_count_change += 1;
+                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            } else if (!prev.?.is_alive) {
+                // Re-announced after lease expiry — same transition as onWriterAliveCb.
+                self.liveliness_alive_count += 1;
+                self.liveliness_alive_count_change += 1;
+                self.liveliness_not_alive_count -= 1;
+                self.liveliness_not_alive_count_change -= 1;
+                self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
+                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
+            }
+            // else: re-announcement of an already-alive writer; update lease/timestamp only.
+        }
+        if (is_new) self.subscriptionMatchedLocked(writer_mod.guidToHandle(info.guid), true);
     }
 
-    // Both onWriterMatchedCb and onWriterAliveCb below fire notifyLivelinessChanged()
-    // themselves, on the "went alive" transition -- previously neither did:
-    // they only set status_changes/counts, on the (wrong) assumption that
-    // participant.checkTimers()'s own LIVELINESS lease-expiry loop would
-    // eventually surface it. It never does -- that loop only scans for
-    // currently-alive writers whose lease just expired (the opposite
-    // direction), so a reader's on_liveliness_changed listener never fired
-    // at all for a writer's initial match or its recovery after an expired
-    // lease, only for expiry itself. Found building zzdds-examples'
-    // `presence` example (MANUAL_BY_TOPIC liveliness, first real end-to-end
-    // exercise of this path in any binding). notifyLivelinessChanged() takes
-    // self.mu itself, so it must be called with the lock already released --
-    // same reason checkTimersFn's own call site unlocks first.
+    /// Raises what onWriterMatchingCb changed, once the protocol reader's
+    /// lock is released: on_subscription_matched, then on_liveliness_changed
+    /// (DDS orders them so). Each fires only if its status is still changed.
+    ///
+    /// on_liveliness_changed must be raised here, for the writer's initial
+    /// match and its re-announcement after its lease expired: the
+    /// lease-expiry loop in checkTimersFn raises only expiry itself. Found
+    /// building zzdds-examples' `presence` example (MANUAL_BY_TOPIC
+    /// liveliness, first real end-to-end exercise of this path in any
+    /// binding).
     fn onWriterMatchedCb(ctx: *anyopaque, info: *const proto.MatchedWriterInfo) void {
+        _ = info;
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        var liveliness_changed = false;
-        {
-            self.mu.lock();
-            defer self.mu.unlock();
-            self.rememberPublicationGuidLocked(info.guid);
-            // Again, after the proxy is added: the writer's loss reported
-            // between onWriterMatchingCb and the add removes them
-            // (onWriterUnmatchedCb), though the add then goes ahead.
-            self.recordWriterQosLocked(info);
-            // Track the writer's coherent sets from now on: in GROUP scope the
-            // subscriber's group sets wait on it even before it sends
-            // anything, so a part of a group set still on its way is not
-            // mistaken for none.
-            if (self.subscriber_presentation.coherent_access) {
-                if (self.coherentWriterLocked(info.guid)) |cw| {
-                    cw.publisher = info.publisher_guid;
-                    cw.publisher_known = true;
-                }
-                // Sets of the writer's samples that arrived before its match
-                // were queued before its publisher was known.
-                for (self.coherent_committed.items) |*part| {
-                    if (part.writer_guid.eql(info.guid)) part.publisher = info.publisher_guid;
-                }
-            }
-            // Track liveliness for writers with a finite lease.
-            if (info.liveliness_lease_ns > 0) {
-                const prev = self.writer_liveliness.get(info.guid);
-                self.writer_liveliness.put(self.alloc, info.guid, .{
-                    .lease_ns = info.liveliness_lease_ns,
-                    .last_alive_ns = self.timer_clock.nowNs(),
-                    .is_alive = true,
-                    .kind = info.liveliness_kind,
-                }) catch {};
-                if (prev == null) {
-                    // Newly matched writer.
-                    self.liveliness_alive_count += 1;
-                    self.liveliness_alive_count_change += 1;
-                    self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
-                    self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
-                    liveliness_changed = true;
-                } else if (!prev.?.is_alive) {
-                    // Re-announced after lease expiry — same transition as onWriterAliveCb.
-                    self.liveliness_alive_count += 1;
-                    self.liveliness_alive_count_change += 1;
-                    self.liveliness_not_alive_count -= 1;
-                    self.liveliness_not_alive_count_change -= 1;
-                    self.liveliness_last_handle = writer_mod.guidToHandle(info.guid);
-                    self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
-                    liveliness_changed = true;
-                }
-                // else: re-announcement of an already-alive writer; update lease/timestamp only.
-            }
-        }
-        if (liveliness_changed) self.notifyLivelinessChanged();
+        self.dispatchSubscriptionMatched();
+        self.notifyLivelinessChanged();
     }
 
     // DDS LivelinessQosPolicyKind enum ordinal order (dcps.idl).
@@ -1571,11 +1561,18 @@ pub const DataReaderImpl = struct {
         }
     }
 
-    fn onWriterUnmatchedCb(ctx: *anyopaque, guid: Guid) void {
+    /// Removes the writer's state with its proxy, under the protocol
+    /// reader's lock (see WriterMatchCallback): what onWriterMatchingCb
+    /// installed, the instances it owned, and the matched status; an
+    /// instance it leaves with no writer gets a NOT_ALIVE_NO_WRITERS sample.
+    /// onWriterUnmatchedCb raises what changed.
+    fn onWriterUnmatchingCb(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
         self.mu.lock();
+        defer self.mu.unlock();
+        self.subscriptionMatchedLocked(writer_mod.guidToHandle(guid), false);
         self.rememberPublicationGuidLocked(guid);
         _ = self.writer_strengths.remove(guid);
         _ = self.writer_lifespans.remove(guid);
@@ -1683,10 +1680,27 @@ pub const DataReaderImpl = struct {
         if (had_synthetic) {
             self.status_changes |= DDS.DATA_AVAILABLE_STATUS;
             for (self.data_notifiers.items) |n| n.on_data(n.ctx);
-        }
-        self.mu.unlock();
-        if (had_synthetic) {
             self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
+            self.no_writers_pending = true;
+        }
+    }
+
+    /// Raises what onWriterUnmatchingCb changed, once the protocol reader's
+    /// lock is released: on_subscription_matched and on_liveliness_changed,
+    /// each only if its status is still changed, then on_data_available for
+    /// any NOT_ALIVE_NO_WRITERS samples.
+    fn onWriterUnmatchedCb(ctx: *anyopaque, guid: Guid) void {
+        _ = guid;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
+        self.dispatchSubscriptionMatched();
+        self.notifyLivelinessChanged();
+        self.mu.lock();
+        const no_writers = self.no_writers_pending;
+        self.no_writers_pending = false;
+        self.mu.unlock();
+        if (no_writers) {
             if (self.status_cond) |sc| sc.notifyWakeup();
             _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
         }
@@ -2647,11 +2661,14 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        // Capture the fields status needs while still holding the lock --
-        // reading self.incompat_total/incompat_total_change again after
+        // Resolved first, then updated and claimed under `mu` -- see
+        // resolveListener. The snapshot is taken under the lock too:
+        // reading self.incompat_total/incompat_total_change after
         // unlocking would race a concurrent call to this same function
         // (e.g. two incompatible remote writers discovered around the same
         // time) doing its own locked increment (confirmed via TSan).
+        const target = self.resolveListener("on_requested_incompatible_qos", DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS);
+        defer if (target) |t| t.release();
         self.mu.lock();
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
@@ -2665,61 +2682,76 @@ pub const DataReaderImpl = struct {
         status.total_count = new_total;
         status.total_count_change = self.incompat_total_change;
         status.last_policy_id = policy_id;
+        const claimed = self.claimStatusLocked(DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS, target != null);
+        if (claimed) self.incompat_total_change = 0;
         self.mu.unlock();
 
         if (self.status_cond) |sc| sc.notifyWakeup();
-
-        // Always attempt dispatch -- DDS 1.4 §2.2.4.1.5's fallback chain
-        // means a delivery can happen even when this reader's own
-        // `listener_mask` doesn't include the bit. Only reset the
-        // change-counters if delivery actually happened somewhere in the
-        // chain.
-        if (self.dispatchListener("on_requested_incompatible_qos", DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
-            self.mu.lock();
-            self.incompat_total_change = 0;
-            self.status_changes &= ~DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS;
-            self.mu.unlock();
-        }
+        if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
-    /// Called by participant when a remote DataWriter matches or unmatches this reader.
-    /// Updates SubscriptionMatched counters and fires on_subscription_matched if registered.
-    /// May be called while participant.mu is held; must not re-enter participant.
-    pub fn notifySubscriptionMatched(ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        if (!self.quiesce.acquire()) return;
-        defer self.quiesce.release(self, reallyDeinit);
+    /// The matched status update for a writer matched (`added`) or
+    /// unmatched, made with its proxy (onWriterMatchingCb,
+    /// onWriterUnmatchingCb). Caller holds `mu`.
+    fn subscriptionMatchedLocked(self: *Self, remote_handle: DDS.InstanceHandle_t, added: bool) void {
         const delta: i32 = if (added) 1 else -1;
-        self.mu.lock();
-        if (added) self.sub_matched_total += 1;
-        self.sub_matched_total_change += if (added) 1 else 0;
+        if (added) {
+            self.sub_matched_total += 1;
+            self.sub_matched_total_change += 1;
+        }
         self.sub_matched_current += delta;
         self.sub_matched_current_change += delta;
         self.sub_matched_last_handle = remote_handle;
         self.status_changes |= DDS.SUBSCRIPTION_MATCHED_STATUS;
-        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
-        // why this can't be gated on this reader's own `listener_mask`.
+    }
+
+    /// Raises on_subscription_matched, if the status is still changed. The
+    /// participant's matched notification for this reader, registered after
+    /// a match or removal it made: the status itself changed with the
+    /// writer's proxy (subscriptionMatchedLocked), so `remote_handle` and
+    /// `added` are not needed. Must not be called with participant.mu held.
+    pub fn notifySubscriptionMatched(ctx: *anyopaque, remote_handle: DDS.InstanceHandle_t, added: bool) void {
+        _ = remote_handle;
+        _ = added;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (!self.quiesce.acquire()) return;
+        defer self.quiesce.release(self, reallyDeinit);
+        self.dispatchSubscriptionMatched();
+    }
+
+    /// For tests: a writer matched or unmatched, without its proxy, then
+    /// raised.
+    pub fn recordSubscriptionMatched(self: *Self, remote_handle: DDS.InstanceHandle_t, added: bool) void {
+        self.mu.lock();
+        self.subscriptionMatchedLocked(remote_handle, added);
+        self.mu.unlock();
+        self.dispatchSubscriptionMatched();
+    }
+
+    fn dispatchSubscriptionMatched(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        const target = self.resolveListener("on_subscription_matched", DDS.SUBSCRIPTION_MATCHED_STATUS);
+        defer if (target) |t| t.release();
+        self.mu.lock();
         // Snapshot while still locked -- building this from self.* after
-        // unlocking (the previous shape here) races vtGetSubMatched, which
+        // unlocking (an earlier shape here) races vtGetSubMatched, which
         // reads/mutates the same fields under the lock (confirmed via TSan).
         const status = DDS.SubscriptionMatchedStatus{
             .total_count = self.sub_matched_total,
             .total_count_change = self.sub_matched_total_change,
             .current_count = self.sub_matched_current,
             .current_count_change = self.sub_matched_current_change,
-            .last_publication_handle = remote_handle,
+            .last_publication_handle = self.sub_matched_last_handle,
         };
+        const claimed = self.claimStatusLocked(DDS.SUBSCRIPTION_MATCHED_STATUS, target != null);
+        if (claimed) {
+            self.sub_matched_total_change = 0;
+            self.sub_matched_current_change = 0;
+        }
         self.mu.unlock();
 
         if (self.status_cond) |sc| sc.notifyWakeup();
-
-        if (self.dispatchListener("on_subscription_matched", DDS.SUBSCRIPTION_MATCHED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
-            self.mu.lock();
-            self.status_changes &= ~DDS.SUBSCRIPTION_MATCHED_STATUS;
-            self.sub_matched_total_change = 0;
-            self.sub_matched_current_change = 0;
-            self.mu.unlock();
-        }
+        if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
     /// Called by the on_sample_lost DataCallback when GAP processing marks SNs as lost.
@@ -2731,35 +2763,37 @@ pub const DataReaderImpl = struct {
     pub fn notifySampleLost(self: *Self, count: i32) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        // Resolved first, then updated and claimed under `mu` -- see
+        // resolveListener.
+        const target = self.resolveListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS);
+        defer if (target) |t| t.release();
         self.mu.lock();
         self.sample_lost_total += count;
         self.sample_lost_total_change += count;
         self.status_changes |= DDS.SAMPLE_LOST_STATUS;
-        // Snapshot while still locked -- see notifySubscriptionMatched's
+        // Snapshot while still locked -- see dispatchSubscriptionMatched's
         // matching comment (same bug, same fix, confirmed via TSan).
         const status = DDS.SampleLostStatus{
             .total_count = self.sample_lost_total,
             .total_count_change = self.sample_lost_total_change,
         };
+        const claimed = self.claimStatusLocked(DDS.SAMPLE_LOST_STATUS, target != null);
+        if (claimed) self.sample_lost_total_change = 0;
         self.mu.unlock();
         if (self.status_cond) |sc| sc.notifyWakeup();
-        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
-        // why this can't be gated on this reader's own `listener_mask`.
-        const delivered = self.dispatchListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS, vtable.get_c_abi_handle(self), .{&status});
-        if (delivered) {
-            self.mu.lock();
-            self.sample_lost_total_change = 0;
-            self.status_changes &= ~DDS.SAMPLE_LOST_STATUS;
-            self.mu.unlock();
-        }
+        if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
+    /// Dispatches LIVELINESS_CHANGED after a caller updated it under `mu`
+    /// (setting the changed bit there) and released the lock. Claims it only
+    /// if still changed: a getter in between consumed it.
     fn notifyLivelinessChanged(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        const target = self.resolveListener("on_liveliness_changed", DDS.LIVELINESS_CHANGED_STATUS);
+        defer if (target) |t| t.release();
         self.mu.lock();
-        self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
-        // Snapshot while still locked -- see notifySubscriptionMatched's
-        // matching comment (same bug, same fix, confirmed via TSan). This
-        // function previously took no lock at all.
+        // Snapshot while still locked -- see dispatchSubscriptionMatched's
+        // matching comment (same bug, same fix, confirmed via TSan).
         const status = DDS.LivelinessChangedStatus{
             .alive_count = self.liveliness_alive_count,
             .not_alive_count = self.liveliness_not_alive_count,
@@ -2767,17 +2801,14 @@ pub const DataReaderImpl = struct {
             .not_alive_count_change = self.liveliness_not_alive_count_change,
             .last_publication_handle = self.liveliness_last_handle,
         };
-        self.mu.unlock();
-        if (self.status_cond) |sc| sc.notifyWakeup();
-        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
-        // why this can't be gated on this reader's own `listener_mask`.
-        if (self.dispatchListener("on_liveliness_changed", DDS.LIVELINESS_CHANGED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
-            self.mu.lock();
+        const claimed = self.claimStatusLocked(DDS.LIVELINESS_CHANGED_STATUS, target != null);
+        if (claimed) {
             self.liveliness_alive_count_change = 0;
             self.liveliness_not_alive_count_change = 0;
-            self.status_changes &= ~DDS.LIVELINESS_CHANGED_STATUS;
-            self.mu.unlock();
         }
+        self.mu.unlock();
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
     /// Fire on_requested_deadline_missed if the listener is registered for it.
@@ -2786,26 +2817,24 @@ pub const DataReaderImpl = struct {
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        // Resolved first, then updated and claimed under `mu` -- see
+        // resolveListener.
+        const target = self.resolveListener("on_requested_deadline_missed", DDS.REQUESTED_DEADLINE_MISSED_STATUS);
+        defer if (target) |t| t.release();
         self.mu.lock();
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.REQUESTED_DEADLINE_MISSED_STATUS;
-        // Snapshot while still locked -- see notifySubscriptionMatched's
-        // matching comment (same bug, same fix, confirmed via TSan). This
-        // function previously took no lock at all.
+        // Snapshot while still locked -- see dispatchSubscriptionMatched's
+        // matching comment (same bug, same fix, confirmed via TSan).
         var status = DDS.RequestedDeadlineMissedStatus{};
         status.total_count = self.deadline_missed_total;
         status.total_count_change = self.deadline_missed_total_change;
+        const claimed = self.claimStatusLocked(DDS.REQUESTED_DEADLINE_MISSED_STATUS, target != null);
+        if (claimed) self.deadline_missed_total_change = 0;
         self.mu.unlock();
         if (self.status_cond) |sc| sc.notifyWakeup();
-        // Always attempt dispatch -- see notifyIncompatibleQos's comment on
-        // why this can't be gated on this reader's own `listener_mask`.
-        if (self.dispatchListener("on_requested_deadline_missed", DDS.REQUESTED_DEADLINE_MISSED_STATUS, vtable.get_c_abi_handle(self), .{&status})) {
-            self.mu.lock();
-            self.deadline_missed_total_change = 0;
-            self.status_changes &= ~DDS.REQUESTED_DEADLINE_MISSED_STATUS;
-            self.mu.unlock();
-        }
+        if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
     /// Registered alongside checkTimersFn so that participant.checkTimers()
@@ -2867,6 +2896,7 @@ pub const DataReaderImpl = struct {
                 self.liveliness_not_alive_count += 1;
                 self.liveliness_not_alive_count_change += 1;
                 self.liveliness_last_handle = writer_mod.guidToHandle(kv.key_ptr.*);
+                self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
                 liveliness_changed = true;
             }
         }
@@ -3284,12 +3314,9 @@ pub const DataReaderImpl = struct {
     /// usable `on_data_available` listener" question.
     ///
     /// Returns `true` iff some level in the chain actually had a usable
-    /// listener and it was invoked — callers that reset per-status change-
-    /// counters (`_total_change`/`status_changes`) on delivery must gate
-    /// that reset on this return value, not on `self.listener_mask` alone:
-    /// a reader with no listener installed can still have its event
-    /// consumed by its Subscriber's or DomainParticipant's listener, and
-    /// *that* delivery is what the change-counters need to track.
+    /// listener and it was invoked. Used for `on_data_available` only,
+    /// whose status read/take resets: the plain statuses are claimed before
+    /// their callback instead (see `resolveListener`).
     pub fn dispatchListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: *anyopaque, args: anytype) bool {
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
@@ -3298,6 +3325,38 @@ pub const DataReaderImpl = struct {
         if (nil.isNil(self.subscriber)) return false;
         const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
         return sub.dispatchReaderFallback(field, bit, handle, args);
+    }
+
+    fn StatusCb(comptime field: []const u8) type {
+        return listener_fallback.Callback(DDS.DataReaderListener, field);
+    }
+
+    /// `dispatchListener`'s resolution step alone, for a plain status: the
+    /// callback for `field` from the nearest level of the fallback chain,
+    /// not yet invoked, or null when no level has one. The status notifiers
+    /// resolve first, then update the status and, when resolved, claim it
+    /// under `mu` (`claimStatusLocked`) and invoke after unlocking, so the
+    /// claim snapshots and resets the status at one boundary
+    /// (`docs/design/concurrency/listeners.md#status-ordering-requirements`):
+    /// an update during the callback stays pending, and a getter that runs
+    /// first takes the change instead of the listener. Release the result
+    /// with no lock held. The caller holds this reader's `quiesce`.
+    fn resolveListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(StatusCb(field)) {
+        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
+        if (listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListener(), self.alloc)) |r| return r;
+        if (nil.isNil(self.subscriber)) return null;
+        const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
+        return sub.resolveReaderFallback(StatusCb(field), field, bit);
+    }
+
+    /// With `mu` held: claims status `bit` for a listener `resolved`, if it
+    /// is still changed (a getter may have consumed it since the update).
+    /// The caller snapshots the status and, when this returns true, resets
+    /// its change fields before unlocking. Clears the changed bit.
+    fn claimStatusLocked(self: *Self, bit: DDS.StatusMask, resolved: bool) bool {
+        if (!resolved or self.status_changes & bit == 0) return false;
+        self.status_changes &= ~bit;
+        return true;
     }
 
     // Neither navigational getter below is gated on enabled state -- see

@@ -8,6 +8,35 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-17
+
+- **A remote endpoint lost while its match was being made is no longer matched.**
+  Discovery decided a match under the participant's lock and added the proxy after
+  releasing it, so the same remote endpoint's loss, or a newer announcement of it, could
+  come first. The match then went ahead anyway: a reader kept a proxy (and per-writer
+  state) for a writer already gone, or a writer for a reader already gone, and an older
+  announcement could overwrite a newer one's ownership strength, lifespan or liveliness
+  lease. A writer lost that way was also marked as matched for the pre-match hold, so if it
+  came back, what it sent before being matched again was not held for the readers that then
+  matched it. Each announcement of a remote endpoint now gets a discovery generation, and
+  its matches are installed only while that generation is current; a loss withdraws it
+  (`docs/design/concurrency/architecture.md#remote-endpoint-match-and-loss`). A reader's
+  per-writer state, and both sides' matched status, now change in the same step as the
+  proxy, so `current_count` follows the proxies exactly. `on_liveliness_changed` now fires
+  when a live writer is unmatched.
+- **A plain status change can no longer be lost while its listener runs.** DataReader and
+  DataWriter status listeners (`on_subscription_matched`, `on_publication_matched`,
+  `on_requested_incompatible_qos`, `on_offered_incompatible_qos`, `on_sample_lost`,
+  `on_sample_rejected`, `on_liveliness_changed`, `on_liveliness_lost`,
+  `on_requested_deadline_missed`, `on_offered_deadline_missed`, whichever level of the
+  listener chain handles them) reset the status's change counts and changed flag after the
+  callback returned. A change that arrived during the callback was therefore lost: no
+  getter, StatusCondition or later callback ever saw it. The status is now taken and reset
+  together, before the callback runs, as DDS 1.4 §2.2.4.2.1 specifies. A change during the
+  callback stays pending, so the `*_change` fields are exact. A getter called inside the
+  callback now sees the status already reset, and a StatusCondition is no longer briefly
+  triggered by a status a listener takes.
+
 ## 2026-10-13
 
 - **GROUP End Coherent Set markers never carry `PID_COHERENT_SET`.** Readers of one other

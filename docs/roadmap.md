@@ -145,24 +145,23 @@ Forward-looking only: known gaps, planned features, and open design questions.
   implementation would pre-allocate the instance's history-cache entry, pre-warm SEDP
   discovery state, and add a `zzdds_write_raw_kind_w_handle` variant that takes a
   pre-registered handle to skip the MD5 key-hash recompute on the write hot path.
-- **A remote writer's match and loss are not ordered.** `onWriterDiscovered` adds the
-  writer's proxy after releasing `participant.mu`, so the same writer's loss
-  (`onWriterLost`) can run first: the add then restores a proxy for a writer already gone.
-  The reader records the writer's strength and lifespan both before the add and after it,
-  so a loss in between can't leave the proxy without them; the stale proxy itself remains.
-  Fix with the concurrency contract's
-  [coordination rules](design/concurrency/architecture.md#coordination-rules) 1 and 4:
-  install a match (the proxy and the reader's per-writer state) as one update tagged with
-  the remote writer's discovery generation, and make a removal or refresh from an older
-  generation a no-op. The same applies to remote readers on the writer side. Tracked as
-  the "Remote endpoint match versus loss"
-  [open design item](design/concurrency-broker-status.md#open-design-items).
 - **`PID_GROUP_DATA` (0x002D)** is defined but not serialized in SEDP announcements.
 - **SPDP liveness probe has no retry** — a participant that goes silent while a probe is in
   flight is evicted on the first probe deadline.
 - **TCP transport has no multicast** (`vtJoinMulticast` → `error.UnsupportedOperation`), and
   there is no "TCP for discovery too" mode — SPDP/SEDP stay on UDP even when the user-data
   transport is TCP.
+- **TCP user data cannot reply to a peer behind NAT.** A DataWriter or DataReader replying
+  to a remote endpoint over TCP dials the endpoint's advertised locator, which a peer behind
+  NAT does not accept connections on. The transport layer can already reply on the
+  connection a message arrived on (`Transport.sendOnChannel`, `design/transport-channel.md`),
+  but nothing above the transport uses it: the receive handlers ignore the `Channel` they
+  are given. Using it means recording, per remote proxy, the channel its traffic arrives on
+  and sending to it when the advertised locators are unreachable, with the channel's close
+  and reconnect handled. It matters only once a peer behind NAT can be discovered at all,
+  so it waits on a "TCP for discovery too" mode (above) or the discovery broker; do it
+  after the shared runtime's channel ownership exists
+  ([channel integration requirements](design/concurrency/runtime.md#channel-integration-requirements)).
 - **Transport scatter-gather (`sendmsg`)** — the `Transport` vtable has no vectored-send
   entry point; `MessageBuilder`'s iovec list is flattened into a single `[65536]u8` stack
   buffer at the transport boundary before every send. See

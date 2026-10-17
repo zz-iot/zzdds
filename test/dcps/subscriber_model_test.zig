@@ -457,6 +457,7 @@ const match_on_register_vtable = proto.ProtocolReader.Vtable{
                 .group_coherent = true,
                 .publisher_guid = MATCHED_PUBLISHER,
             };
+            cb.on_writer_matching.?(cb.ctx, &info, true);
             cb.on_writer_matched(cb.ctx, &info);
         }
     }.f,

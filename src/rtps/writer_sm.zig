@@ -69,6 +69,32 @@ fn inlineKeyHash(keyed: bool, kh: [16]u8) ?[16]u8 {
 /// RTPS message exceeds 65536 bytes — that is the correct safety net.
 pub const MAX_SEND_BYTES: usize = 65536;
 
+/// What a caller installs with a match of a remote endpoint, in the same
+/// critical section as its proxy, so the two are one update (see
+/// docs/design/concurrency/architecture.md#remote-endpoint-match-and-loss).
+/// Called under the endpoint's lock: must take only leaf locks and the
+/// caller's own entity lock, and must not reach application code.
+pub const MatchCommit = struct {
+    ctx: *anyopaque,
+    /// False when a newer discovery decision has superseded this match:
+    /// nothing is then added, refreshed or installed.
+    is_current: *const fn (ctx: *anyopaque) bool,
+    /// Installs the caller's own state for the remote endpoint; `is_new`
+    /// unless the match refreshes an existing one.
+    install: *const fn (ctx: *anyopaque, is_new: bool) void,
+};
+
+/// Removes a caller's own state for a remote endpoint whose proxy is being
+/// removed, in the same critical section. Called under the endpoint's lock,
+/// as MatchCommit.
+pub const UnmatchCommit = struct {
+    ctx: *anyopaque,
+    remove: *const fn (ctx: *anyopaque, guid: Guid) void,
+};
+
+/// What adding a match did.
+pub const MatchResult = enum { added, refreshed, superseded };
+
 /// Default fragment size used when no explicit value is provided.
 pub const DEFAULT_FRAG_SIZE: u16 = 16384;
 
@@ -745,6 +771,12 @@ pub const StatefulWriter = struct {
         _ = try self.addOrRefreshMatchedReader(proxy);
     }
 
+    /// addOrRefreshMatchedReaderWith, with nothing installed alongside: true
+    /// when the reader is newly matched.
+    pub fn addOrRefreshMatchedReader(self: *Self, proxy: ReaderProxy) !bool {
+        return try self.addOrRefreshMatchedReaderWith(proxy, null) == .added;
+    }
+
     /// Add a matched reader. When a proxy with the same GUID already exists,
     /// acts as a lease refresh: updates locators and metadata but preserves
     /// `highest_acked_sn` and `start_sn`.  History replay and heartbeats are
@@ -756,10 +788,17 @@ pub const StatefulWriter = struct {
     /// the first SN not yet sent so the reader only sees future data, and a
     /// Heartbeat is sent to communicate this range.
     ///
-    /// Returns true when the reader is newly matched, false for a lease refresh
-    /// of an existing match.
-    pub fn addOrRefreshMatchedReader(self: *Self, proxy: ReaderProxy) !bool {
+    /// With `commit`, the match is made only while `commit.is_current`, and
+    /// `commit.install` runs with it, in the same critical section (see
+    /// MatchCommit).
+    pub fn addOrRefreshMatchedReaderWith(self: *Self, proxy: ReaderProxy, commit: ?MatchCommit) !MatchResult {
         self.mu.lock();
+        if (commit) |c| if (!c.is_current(c.ctx)) {
+            var discarded = proxy;
+            discarded.deinit(self.alloc);
+            self.mu.unlock();
+            return .superseded;
+        };
         for (self.reader_proxies.items) |*rp| {
             if (rp.guid.eql(proxy.guid)) {
                 // Lease refresh: update locators/metadata, preserve ack state.
@@ -792,14 +831,16 @@ pub const StatefulWriter = struct {
                 discarded.multicast_locators = .empty;
                 discarded.selected_locators = .empty;
                 discarded.deinit(self.alloc);
+                if (commit) |c| c.install(c.ctx, false);
                 self.mu.unlock();
-                return false;
+                return .refreshed;
             }
         }
         self.reader_proxies.append(self.alloc, proxy) catch |err| {
             self.mu.unlock();
             return err;
         };
+        if (commit) |c| c.install(c.ctx, true);
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
         new_rp.last_seen_connection_generation = self.connectionGenerationSumLocked(new_rp);
         // Replay only applies when BOTH the writer offers TRANSIENT_LOCAL+ AND
@@ -860,7 +901,7 @@ pub const StatefulWriter = struct {
         if (newly_ready_guid) |guid| {
             if (ready_fn) |f| f(ready_ctx.?, guid, true);
         }
-        return true;
+        return .added;
     }
 
     /// Send all cached changes to a single reader proxy (called under mu).
@@ -1421,6 +1462,13 @@ pub const StatefulWriter = struct {
         ctx: *anyopaque,
     };
 
+    /// What removeMatchedReaderDeferred did.
+    pub const Removed = struct {
+        /// A proxy was removed.
+        removed: bool = false,
+        ready: ?DeferredReady = null,
+    };
+
     /// Like removeMatchedReader, but performs the removal immediately (under
     /// self.mu, as normal) and returns the resulting ready=false transition
     /// instead of firing it -- for callers that need this removal kept
@@ -1430,10 +1478,13 @@ pub const StatefulWriter = struct {
     /// being released and a deferred plain removeMatchedReader call actually
     /// running, and the stale removal would wrongly undo the fresh match)
     /// while still firing the callback only once that external lock is
-    /// released. Caller must fire the returned transition itself.
-    pub fn removeMatchedReaderDeferred(self: *Self, guid: Guid) ?DeferredReady {
+    /// released. Caller must fire the returned transition itself. When a
+    /// proxy is removed, `unmatch` (if given) removes the caller's own state
+    /// for the reader in the same critical section.
+    pub fn removeMatchedReaderDeferred(self: *Self, guid: Guid, unmatch: ?UnmatchCommit) Removed {
         self.mu.lock();
         defer self.mu.unlock();
+        var out: Removed = .{};
         var was_ready = false;
         var i: usize = self.reader_proxies.items.len;
         while (i > 0) {
@@ -1442,18 +1493,21 @@ pub const StatefulWriter = struct {
                 was_ready = was_ready or self.reader_proxies.items[i].protocol_ready;
                 self.reader_proxies.items[i].deinit(self.alloc);
                 _ = self.reader_proxies.swapRemove(i);
+                out.removed = true;
             }
         }
+        if (out.removed) if (unmatch) |u| u.remove(u.ctx, guid);
         // Wake any thread blocked in waitAllAcked: removing a reliable reader
         // may satisfy the all-acked condition even without an explicit ACKNACK.
         self.ack_cond.broadcast();
-        if (!was_ready) return null;
-        const f = self.protocol_ready_fn orelse return null;
-        return .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
+        if (!was_ready) return out;
+        const f = self.protocol_ready_fn orelse return out;
+        out.ready = .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
+        return out;
     }
 
     pub fn removeMatchedReader(self: *Self, guid: Guid) void {
-        if (self.removeMatchedReaderDeferred(guid)) |d| d.fn_ptr(d.ctx, guid, false);
+        if (self.removeMatchedReaderDeferred(guid, null).ready) |d| d.fn_ptr(d.ctx, guid, false);
     }
 
     /// Store a new change and send it immediately to all matched readers.
