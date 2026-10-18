@@ -6,9 +6,8 @@
 //! written its full historical batch (enforced by the harness, not this
 //! app -- see the reference doc). Immediately after creating the reader,
 //! calls wait_for_historical_data() -- the API this whole example exists
-//! to exercise -- before taking anything, then confirms the full historical
-//! batch was in fact replayed by the time that call returns, then continues
-//! taking live samples as they arrive.
+//! to exercise -- before taking anything, then takes and confirms the full
+//! historical batch, then attaches a listener for the live samples.
 //!
 //! Required stdout markers (see the spec doc): "Create topic:", "Create
 //! reader for topic:", "Subscriber: wait_for_historical_data() returned",
@@ -36,11 +35,8 @@ fn sleepNs(io: std.Io, ns: u64) void {
 }
 
 const State = struct {
-    // Written by the listener-dispatch thread; read by main() only after
-    // wait_for_historical_data() has returned, which -- since both sides
-    // happen through zzdds's own internal locking -- establishes a real
-    // happens-before relationship. Kept atomic anyway for defensiveness/
-    // TSan-cleanliness regardless of that internal guarantee.
+    // Written by main() for the historical batch, then by the
+    // listener-dispatch thread for the live batch, which main() polls.
     historical_received: [10]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
     live_received: [5]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
     all_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -63,16 +59,11 @@ fn readyToFinish(state: *State) bool {
     return true;
 }
 
-fn onDataAvailable(state: *State, dr: DDS.DataReader) void {
-    _ = dr;
-    // main() can also independently decide it's done (see readyToFinish()
-    // right after wait_for_historical_data() returns below) and call
-    // delete_datareader() while this invocation is still draining. That's
-    // still fine: zzdds's core EntityQuiesce mechanism (not anything in
-    // this file) guarantees a delete_datareader() racing an in-flight
-    // take_next_sample() call is memory-safe -- the racing call either
-    // completes normally (started before teardown) or cleanly sees "no
-    // data" (started after), never a crash or use-after-free.
+/// Takes every sample available now, recording each, and returns whether
+/// this call saw the last live sample the subscriber was waiting for. Run
+/// by main() to drain the historical batch before any listener is
+/// attached, then by onDataAvailable for the live batch.
+fn takeAvailable(state: *State) bool {
     var became_done = false;
     while (true) {
         var value: catchup_gen.HistoryEvent = .{};
@@ -97,8 +88,20 @@ fn onDataAvailable(state: *State, dr: DDS.DataReader) void {
             std.process.exit(1);
         }
     }
+    return became_done;
+}
 
-    if (became_done) {
+fn onDataAvailable(state: *State, dr: DDS.DataReader) void {
+    _ = dr;
+    // main() can also independently decide it's done (see readyToFinish()
+    // right after set_listener() below) and call delete_datareader() while
+    // this invocation is still draining. That's still fine: zzdds's core
+    // EntityQuiesce mechanism (not anything in this file) guarantees a
+    // delete_datareader() racing an in-flight take_next_sample() call is
+    // memory-safe -- the racing call either completes normally (started
+    // before teardown) or cleanly sees "no data" (started after), never a
+    // crash or use-after-free.
+    if (takeAvailable(state)) {
         state.all_done.store(true, .release);
     }
 }
@@ -172,13 +175,11 @@ pub fn main(init: std.process.Init) !void {
         .on_data_available = onDataAvailable,
     });
 
-    // Create with no listener attached yet: on_data_available fires on a
-    // zzdds-internal dispatch thread as soon as the reader matches the
-    // publisher's already-written historical batch, which can race
-    // state.reader's own initialization below (a real, not hypothetical,
-    // race given this example's whole point is data being ready before the
-    // reader even exists). Attach the listener only once state.reader is
-    // set, via set_listener() below, closing the window entirely.
+    // Create with no listener attached: the historical batch is taken
+    // below, on this thread, after wait_for_historical_data() returns. A
+    // listener attached now would take it on a zzdds receive thread
+    // instead, and wait_for_historical_data() waits for the samples to
+    // reach the reader, not for a listener to have taken them.
     const topic_desc = dp.lookup_topicdescription("HistoryEvent");
     const dr = subscriber.create_datareader(topic_desc, dr_qos, null, 0);
     if (dr.ptr == zzdds.dcps.NIL_PTR) {
@@ -187,11 +188,6 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.print("Create reader for topic: HistoryEvent\n", .{});
     state.reader = catchup_gen.HistoryEventDataReader.init(dr, alloc);
-    const set_rc = dr.set_listener(dr_listener, DDS.DATA_AVAILABLE_STATUS);
-    if (set_rc != DDS.RETCODE_OK) {
-        std.debug.print("FAIL: set_listener() returned {d}\n", .{set_rc});
-        std.process.exit(1);
-    }
 
     // The API this whole example exists to exercise: block until the
     // TRANSIENT_LOCAL historical replay has actually landed, before taking
@@ -205,7 +201,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Subscriber: wait_for_historical_data() returned\n", .{});
 
     // Confirm the real guarantee, not just the return code: every
-    // historical sample must already have been delivered by now.
+    // historical sample must be in the reader by now.
+    _ = takeAvailable(&state);
     var historical_count: i32 = 0;
     for (&state.historical_received) |*v| {
         if (v.load(.acquire)) historical_count += 1;
@@ -216,6 +213,14 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.print("HISTORICAL BATCH COMPLETE ({d} samples)\n", .{HISTORICAL_COUNT});
     state.historical_confirmed.store(true, .release);
+
+    // The live batch arrives through the listener. A sample that arrived
+    // since the take above is delivered by set_listener() itself.
+    const set_rc = dr.set_listener(dr_listener, DDS.DATA_AVAILABLE_STATUS);
+    if (set_rc != DDS.RETCODE_OK) {
+        std.debug.print("FAIL: set_listener() returned {d}\n", .{set_rc});
+        std.process.exit(1);
+    }
     if (readyToFinish(&state)) {
         state.all_done.store(true, .release);
     }

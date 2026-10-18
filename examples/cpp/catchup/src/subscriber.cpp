@@ -5,9 +5,8 @@
  * written its full historical batch (enforced by the harness, not this
  * app). Immediately after creating the reader, calls
  * wait_for_historical_data() -- the API this whole example exists to
- * exercise -- before taking anything, then confirms the full historical
- * batch was in fact replayed by the time that call returns, then continues
- * taking live samples as they arrive.
+ * exercise -- before taking anything, then takes and confirms the full
+ * historical batch, then attaches a listener for the live samples.
  *
  * Required stdout markers (see the spec doc): "Create topic:", "Create
  * reader for topic:", "Subscriber: wait_for_historical_data() returned",
@@ -66,51 +65,58 @@ struct SubState {
     }
 };
 
+// Takes every sample available now, recording each, and returns whether
+// this call saw the last live sample the subscriber was waiting for. Run by
+// main() to drain the historical batch before any listener is attached,
+// then by on_data_available for the live batch.
+bool take_available(SubState *state) {
+    bool became_done = false;
+
+    for (;;) {
+        HistoryEventDataReader::Sample sample{};
+        uint8_t buf[512];
+        size_t cdr_len = 0;
+
+        int rc = state->reader->take(sample, buf, sizeof(buf), &cdr_len);
+        if (rc == DDS_RETCODE_NO_DATA) break;
+        if (rc != DDS_RETCODE_OK) {
+            std::fprintf(stderr, "FAIL: take() CDR error (rc=%d)\n", rc);
+            std::exit(1);
+        }
+        if (!sample.info.valid_data) continue;
+
+        int32_t seq_num = sample.value.seq_num;
+        if (seq_num >= 0 && seq_num < HISTORICAL_COUNT) {
+            state->historical_received[seq_num].store(true);
+        } else if (seq_num >= HISTORICAL_COUNT && seq_num < HISTORICAL_COUNT + LIVE_COUNT) {
+            std::printf("LIVE SAMPLE seq_num=%d\n", seq_num);
+            state->live_received[seq_num - HISTORICAL_COUNT].store(true);
+            if (!state->all_done.load() && !became_done && state->ready_to_finish()) {
+                became_done = true;
+            }
+        } else {
+            std::fprintf(stderr, "FAIL: unexpected seq_num=%d\n", seq_num);
+            std::exit(1);
+        }
+    }
+
+    return became_done;
+}
+
 class SubListener : public ::DDS::DataReaderListenerBase {
 public:
     explicit SubListener(SubState *state) : state_(state) {}
 
     void on_data_available(std::shared_ptr<::DDS::DataReader> /*the_reader*/) override {
         // main() can also independently decide it's done (see the
-        // ready_to_finish() call right after wait_for_historical_data()
-        // returns below) and call delete_datareader() while this invocation
-        // is still draining. That's still fine: zzdds's core EntityQuiesce
-        // mechanism (not anything in this file) guarantees a
-        // delete_datareader() racing an in-flight take() call is
-        // memory-safe -- the racing take() either completes normally
-        // (started before teardown) or cleanly sees "no data" (started
-        // after), never a crash or use-after-free.
-        bool became_done = false;
-
-        for (;;) {
-            HistoryEventDataReader::Sample sample{};
-            uint8_t buf[512];
-            size_t cdr_len = 0;
-
-            int rc = state_->reader->take(sample, buf, sizeof(buf), &cdr_len);
-            if (rc == DDS_RETCODE_NO_DATA) break;
-            if (rc != DDS_RETCODE_OK) {
-                std::fprintf(stderr, "FAIL: take() CDR error (rc=%d)\n", rc);
-                std::exit(1);
-            }
-            if (!sample.info.valid_data) continue;
-
-            int32_t seq_num = sample.value.seq_num;
-            if (seq_num >= 0 && seq_num < HISTORICAL_COUNT) {
-                state_->historical_received[seq_num].store(true);
-            } else if (seq_num >= HISTORICAL_COUNT && seq_num < HISTORICAL_COUNT + LIVE_COUNT) {
-                std::printf("LIVE SAMPLE seq_num=%d\n", seq_num);
-                state_->live_received[seq_num - HISTORICAL_COUNT].store(true);
-                if (!state_->all_done.load() && !became_done && state_->ready_to_finish()) {
-                    became_done = true;
-                }
-            } else {
-                std::fprintf(stderr, "FAIL: unexpected seq_num=%d\n", seq_num);
-                std::exit(1);
-            }
-        }
-
-        if (became_done) {
+        // ready_to_finish() call right after set_listener() below) and call
+        // delete_datareader() while this invocation is still draining.
+        // That's still fine: zzdds's core EntityQuiesce mechanism (not
+        // anything in this file) guarantees a delete_datareader() racing an
+        // in-flight take() call is memory-safe -- the racing take() either
+        // completes normally (started before teardown) or cleanly sees "no
+        // data" (started after), never a crash or use-after-free.
+        if (take_available(state_)) {
             state_->all_done.store(true);
         }
     }
@@ -172,13 +178,11 @@ int main(int argc, char **argv) {
     SubState state;
     auto listener = std::make_shared<SubListener>(&state);
 
-    // Create with no listener attached yet: on_data_available fires on a
-    // zzdds-internal dispatch thread as soon as the reader matches the
-    // publisher's already-written historical batch, which can race
-    // state.reader's own initialization below (a real, not hypothetical,
-    // race given this example's whole point is data being ready before the
-    // reader even exists). Attach the listener only once state.reader is
-    // set, via set_listener() below, closing the window entirely.
+    // Create with no listener attached: the historical batch is taken
+    // below, on this thread, after wait_for_historical_data() returns. A
+    // listener attached now would take it on a zzdds receive thread
+    // instead, and wait_for_historical_data() waits for the samples to
+    // reach the reader, not for a listener to have taken them.
     auto ztopic = std::static_pointer_cast<::zzdds::TopicImpl>(topic);
     auto topic_desc = ztopic->as_topic_description();
     auto dr = sub->create_datareader(topic_desc, dr_qos, nullptr, 0);
@@ -191,11 +195,6 @@ int main(int argc, char **argv) {
     auto dr_handle = dr->native_handle();
     HistoryEventDataReader reader(dr_handle);
     state.reader = &reader;
-
-    if (dr->set_listener(listener, DDS_DATA_AVAILABLE_STATUS) != ::DDS::RETCODE_OK) {
-        std::fprintf(stderr, "FAIL: set_listener() failed\n");
-        return 1;
-    }
 
     // The API this whole example exists to exercise: block until the
     // TRANSIENT_LOCAL historical replay has actually landed, before taking
@@ -211,7 +210,8 @@ int main(int argc, char **argv) {
     std::printf("Subscriber: wait_for_historical_data() returned\n");
 
     // Confirm the real guarantee, not just the return code: every
-    // historical sample must already have been delivered by now.
+    // historical sample must be in the reader by now.
+    take_available(&state);
     int historical_count = 0;
     for (auto &v : state.historical_received) {
         if (v.load()) historical_count++;
@@ -222,6 +222,13 @@ int main(int argc, char **argv) {
     }
     std::printf("HISTORICAL BATCH COMPLETE (%d samples)\n", HISTORICAL_COUNT);
     state.historical_confirmed.store(true);
+
+    // The live batch arrives through the listener. A sample that arrived
+    // since the take above is delivered by set_listener() itself.
+    if (dr->set_listener(listener, DDS_DATA_AVAILABLE_STATUS) != ::DDS::RETCODE_OK) {
+        std::fprintf(stderr, "FAIL: set_listener() failed\n");
+        return 1;
+    }
     if (state.ready_to_finish()) {
         state.all_done.store(true);
     }

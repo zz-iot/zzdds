@@ -60,6 +60,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   `enable` call that enables an endpoint announces it. In-process discovery
   (`DirectDiscovery`) now keeps its own copy of the announcements it stores rather than
   the caller's.
+- **Fixed an intermittent "only 9/10 historical samples" failure in the catchup example.**
+  Each subscriber counted the samples its listener had taken as soon as
+  `wait_for_historical_data` returned, but that call waits for the samples to reach the
+  reader, not for a listener to take them. The subscribers now take the historical batch
+  themselves after the call returns, then attach the listener for the live batch.
 - **DATA_AVAILABLE now resets as DDS specifies.** A reader's DATA_AVAILABLE status stayed
   set until a read or take left its cache empty, and `on_data_available` never reset it.
   So a StatusCondition on DATA_AVAILABLE stayed triggered while samples remained, and one

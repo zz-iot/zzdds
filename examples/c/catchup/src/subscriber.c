@@ -5,9 +5,8 @@
  * written its full historical batch (enforced by the harness, not this
  * app). Immediately after creating the reader, calls
  * wait_for_historical_data() -- the API this whole example exists to
- * exercise -- before taking anything, then confirms the full historical
- * batch was in fact replayed by the time that call returns, then continues
- * taking live samples as they arrive.
+ * exercise -- before taking anything, then takes and confirms the full
+ * historical batch, then attaches a listener for the live samples.
  *
  * Required stdout markers (see the spec doc): "Create topic:", "Create
  * reader for topic:", "Subscriber: wait_for_historical_data() returned",
@@ -79,17 +78,11 @@ static bool ready_to_finish(SubState *state) {
     return true;
 }
 
-static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
-    (void)the_reader;
-    SubState *state = (SubState *)listener_data;
-    /* main() can also independently decide it's done (see the
-     * ready_to_finish() call right after wait_for_historical_data()
-     * returns below) and call delete_datareader() while this invocation is
-     * still draining. That's still fine: zzdds's core EntityQuiesce
-     * mechanism (not anything in this file) guarantees a delete_datareader()
-     * racing an in-flight take() call is memory-safe -- the racing take()
-     * either completes normally (started before teardown) or cleanly sees
-     * "no data" (started after), never a crash or use-after-free. */
+/* Takes every sample available now, recording each, and returns whether
+ * this call saw the last live sample the subscriber was waiting for. Run
+ * by main() to drain the historical batch before any listener is attached,
+ * then by on_data_available for the live batch. */
+static bool take_available(SubState *state) {
     bool became_done = false;
 
     for (;;) {
@@ -123,7 +116,21 @@ static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
         }
     }
 
-    if (became_done) {
+    return became_done;
+}
+
+static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
+    (void)the_reader;
+    SubState *state = (SubState *)listener_data;
+    /* main() can also independently decide it's done (see the
+     * ready_to_finish() call right after set_listener() below) and call
+     * delete_datareader() while this invocation is still draining. That's
+     * still fine: zzdds's core EntityQuiesce mechanism (not anything in
+     * this file) guarantees a delete_datareader() racing an in-flight
+     * take() call is memory-safe -- the racing take() either completes
+     * normally (started before teardown) or cleanly sees "no data"
+     * (started after), never a crash or use-after-free. */
+    if (take_available(state)) {
         patomic_store(&state->all_done, true);
     }
 }
@@ -184,18 +191,11 @@ int main(int argc, char **argv) {
     state.historical_confirmed = false;
     state.all_done = false;
 
-    DDS_DataReaderListener listener;
-    memset(&listener, 0, sizeof(listener));
-    listener.listener_data = &state;
-    listener.on_data_available = on_data_available;
-
-    /* Create with no listener attached yet: on_data_available fires on a
-     * zzdds-internal dispatch thread as soon as the reader matches the
-     * publisher's already-written historical batch, which can race
-     * state.reader's own initialization below (a real, not hypothetical,
-     * race given this example's whole point is data being ready before the
-     * reader even exists). Attach the listener only once state.reader is
-     * set, via set_listener() below, closing the window entirely. */
+    /* Create with no listener attached: the historical batch is taken
+     * below, on this thread, after wait_for_historical_data() returns. A
+     * listener attached now would take it on a zzdds receive thread
+     * instead, and wait_for_historical_data() waits for the samples to
+     * reach the reader, not for a listener to have taken them. */
     DDS_TopicDescription topic_desc = zzdds_topic_as_description(topic);
     DDS_DataReader dr = DDS_Subscriber_create_datareader(sub, topic_desc, &dr_qos, NULL, 0);
     if (!dr) {
@@ -207,11 +207,6 @@ int main(int argc, char **argv) {
     HistoryEventDataReader reader;
     HistoryEventDataReader_init(&reader, dr);
     state.reader = &reader;
-
-    if (DDS_DataReader_set_listener(dr, &listener, DDS_DATA_AVAILABLE_STATUS) != DDS_RETCODE_OK) {
-        fprintf(stderr, "FAIL: set_listener() failed\n");
-        return 1;
-    }
 
     /* The API this whole example exists to exercise: block until the
      * TRANSIENT_LOCAL historical replay has actually landed, before
@@ -227,7 +222,8 @@ int main(int argc, char **argv) {
     printf("Subscriber: wait_for_historical_data() returned\n");
 
     /* Confirm the real guarantee, not just the return code: every
-     * historical sample must already have been delivered by now. */
+     * historical sample must be in the reader by now. */
+    take_available(&state);
     int historical_count = 0;
     for (int i = 0; i < HISTORICAL_COUNT; i++) {
         if (patomic_load(&state.historical_received[i])) historical_count++;
@@ -238,6 +234,17 @@ int main(int argc, char **argv) {
     }
     printf("HISTORICAL BATCH COMPLETE (%d samples)\n", HISTORICAL_COUNT);
     patomic_store(&state.historical_confirmed, true);
+
+    /* The live batch arrives through the listener. A sample that arrived
+     * since the take above is delivered by set_listener() itself. */
+    DDS_DataReaderListener listener;
+    memset(&listener, 0, sizeof(listener));
+    listener.listener_data = &state;
+    listener.on_data_available = on_data_available;
+    if (DDS_DataReader_set_listener(dr, &listener, DDS_DATA_AVAILABLE_STATUS) != DDS_RETCODE_OK) {
+        fprintf(stderr, "FAIL: set_listener() failed\n");
+        return 1;
+    }
     if (ready_to_finish(&state)) {
         patomic_store(&state.all_done, true);
     }
