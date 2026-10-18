@@ -587,8 +587,36 @@ status-observation boundary, not an obligation to deliver every arrival as a cal
 
 Polling get_status_changes is not the same operation as consuming a plain status via
 its specific getter. Do not generalize the existing plain-status getter discussion
-into a rule that every inspection clears DATA_AVAILABLE. The reader read/take and
-callback paths need their own exact reset audit, including unsuccessful access cases.
+into a rule that every inspection clears DATA_AVAILABLE. The reader's own reset rule
+follows. zzdds has no DATA_ON_READERS yet; the Subscriber half above applies when it
+is added.
+
+<a id="reader-data-available-reset"></a>
+### Reader DATA_AVAILABLE reset
+
+A reader's DATA_AVAILABLE follows [OMG DDS 1.4, section 2.2.4.2.2](https://www.omg.org/spec/DDS/1.4/PDF):
+it means data has arrived since the status was last reset, not that the cache holds
+samples.
+
+* Admitting a change to the reader's cache sets it and makes on_data_available
+  eligible.
+* Invoking on_data_available resets it at the claim boundary, as for a plain status:
+  under the reader's lock, if it is still changed, before the callback runs. A change
+  during the callback stays pending, and a callback whose change a read or take has
+  already consumed does not run. This applies to every dispatch path, including
+  Subscriber `notify_datareaders`, coherent-set exposure in `begin_access` and the
+  catch-up raise when a listener is installed while the status is changed.
+* Every read and take variant (including loans and conditions) resets it when called,
+  whatever it returns, once the operation is admitted. One rejected before it reaches
+  the reader, such as NOT_ENABLED or BAD_PARAMETER, leaves it unchanged.
+* get_status_changes never resets it.
+* Ending an ordered access period sets it again if samples remain, since samples held
+  back by the period become available then.
+
+Samples left in the cache therefore don't keep a StatusCondition on DATA_AVAILABLE
+triggered. An application that takes part of what is available and waits again
+should wait on a ReadCondition (for NOT_READ samples, say), as with any DDS
+implementation.
 
 <a id="explicit-delegation-listener-selection-audit"></a>
 ## Explicit delegation callback selection

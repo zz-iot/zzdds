@@ -138,6 +138,35 @@ pub const WriterAnnouncement = struct {
     /// CDR-encoded XTypes TypeInformation blob (PID_TYPE_INFORMATION = 0x0075).
     /// Empty slice if not available; SEDP will omit the PID in that case.
     type_info_cdr: []const u8,
+
+    /// A copy owning every slice, and the QoS fields that own heap storage,
+    /// for a holder that keeps the announcement past the call. Free with
+    /// `deinit`.
+    pub fn clone(self: WriterAnnouncement, alloc: std.mem.Allocator) !WriterAnnouncement {
+        var out = self;
+        out.topic_name = try alloc.dupe(u8, self.topic_name);
+        errdefer alloc.free(out.topic_name);
+        out.type_name = try alloc.dupe(u8, self.type_name);
+        errdefer alloc.free(out.type_name);
+        out.partition_names = try dupeNames(alloc, self.partition_names);
+        errdefer freeNames(alloc, out.partition_names);
+        out.type_object = try alloc.dupe(u8, self.type_object);
+        errdefer alloc.free(out.type_object);
+        out.type_info_cdr = try alloc.dupe(u8, self.type_info_cdr);
+        errdefer alloc.free(out.type_info_cdr);
+        out.qos = try cloneEndpointQos(alloc, self.qos);
+        return out;
+    }
+
+    /// Frees a `clone`.
+    pub fn deinit(self: *WriterAnnouncement, alloc: std.mem.Allocator) void {
+        alloc.free(self.topic_name);
+        alloc.free(self.type_name);
+        freeNames(alloc, self.partition_names);
+        alloc.free(self.type_object);
+        alloc.free(self.type_info_cdr);
+        deinitEndpointQos(alloc, &self.qos);
+    }
 };
 
 /// Information about a local DataReader endpoint.
@@ -152,7 +181,94 @@ pub const ReaderAnnouncement = struct {
     /// CDR-encoded XTypes TypeInformation blob (PID_TYPE_INFORMATION = 0x0075).
     /// Empty slice if not available; SEDP will omit the PID in that case.
     type_info_cdr: []const u8,
+
+    /// As `WriterAnnouncement.clone`.
+    pub fn clone(self: ReaderAnnouncement, alloc: std.mem.Allocator) !ReaderAnnouncement {
+        var out = self;
+        out.topic_name = try alloc.dupe(u8, self.topic_name);
+        errdefer alloc.free(out.topic_name);
+        out.type_name = try alloc.dupe(u8, self.type_name);
+        errdefer alloc.free(out.type_name);
+        out.partition_names = try dupeNames(alloc, self.partition_names);
+        errdefer freeNames(alloc, out.partition_names);
+        out.type_info_cdr = try alloc.dupe(u8, self.type_info_cdr);
+        errdefer alloc.free(out.type_info_cdr);
+        out.qos = try cloneEndpointQos(alloc, self.qos);
+        return out;
+    }
+
+    /// Frees a `clone`.
+    pub fn deinit(self: *ReaderAnnouncement, alloc: std.mem.Allocator) void {
+        alloc.free(self.topic_name);
+        alloc.free(self.type_name);
+        freeNames(alloc, self.partition_names);
+        alloc.free(self.type_info_cdr);
+        deinitEndpointQos(alloc, &self.qos);
+    }
 };
+
+fn dupeNames(alloc: std.mem.Allocator, names: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, names.len);
+    var copied: usize = 0;
+    errdefer {
+        for (out[0..copied]) |n| alloc.free(n);
+        alloc.free(out);
+    }
+    for (names) |n| {
+        out[copied] = try alloc.dupe(u8, n);
+        copied += 1;
+    }
+    return out;
+}
+
+fn freeNames(alloc: std.mem.Allocator, names: []const []const u8) void {
+    for (names) |n| alloc.free(n);
+    alloc.free(names);
+}
+
+/// A copy of an endpoint QoS owning its heap fields: the ones the
+/// participant clones for its own endpoint records (USER_DATA and
+/// DATA_REPRESENTATION).
+fn cloneEndpointQos(alloc: std.mem.Allocator, qos: anytype) !@TypeOf(qos) {
+    var out = qos;
+    out.data_representation.value = try qos.data_representation.value.clone(alloc);
+    errdefer out.data_representation.value.deinit(alloc);
+    out.user_data = try cloneUserData(alloc, qos.user_data);
+    return out;
+}
+
+fn deinitEndpointQos(alloc: std.mem.Allocator, qos: anytype) void {
+    qos.data_representation.value.deinit(alloc);
+    freeUserData(alloc, qos.user_data);
+}
+
+/// A copy of USER_DATA owning its buffer; free with `freeUserData`.
+pub fn cloneUserData(
+    alloc: std.mem.Allocator,
+    source: DDS.UserDataQosPolicy,
+) !DDS.UserDataQosPolicy {
+    var result = source;
+    const len = source.value._length;
+    if (len == 0) {
+        result.value = .{};
+        return result;
+    }
+    const buffer = try alloc.alloc(u8, len);
+    @memcpy(buffer, source.value._buffer.?[0..len]);
+    result.value = .{
+        ._maximum = len,
+        ._length = len,
+        ._buffer = buffer.ptr,
+        ._release = true,
+    };
+    return result;
+}
+
+pub fn freeUserData(alloc: std.mem.Allocator, value: DDS.UserDataQosPolicy) void {
+    if (value.value._release and value.value._buffer != null) {
+        alloc.free(value.value._buffer.?[0..value.value._maximum]);
+    }
+}
 
 /// Data about a discovered remote participant.
 pub const ParticipantData = struct {

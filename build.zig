@@ -1641,6 +1641,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/ignore_test.zig",
         "test/dcps/unmatched_hold_test.zig",
         "test/dcps/match_generation_test.zig",
+        "test/dcps/local_announcement_test.zig",
         "test/dcps/intraprocess_test.zig",
         "test/dcps/qos_runtime_test.zig",
         "test/dcps/instance_lifecycle_test.zig",

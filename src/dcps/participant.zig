@@ -869,32 +869,8 @@ const ActiveReader = struct {
     wlp_alive: ?WlpAliveNotify = null,
 };
 
-fn cloneUserData(
-    alloc: std.mem.Allocator,
-    source: DDS.UserDataQosPolicy,
-) !DDS.UserDataQosPolicy {
-    var result = source;
-    const len = source.value._length;
-    if (len == 0) {
-        result.value = .{};
-        return result;
-    }
-    const buffer = try alloc.alloc(u8, len);
-    @memcpy(buffer, source.value._buffer.?[0..len]);
-    result.value = .{
-        ._maximum = len,
-        ._length = len,
-        ._buffer = buffer.ptr,
-        ._release = true,
-    };
-    return result;
-}
-
-fn freeUserData(alloc: std.mem.Allocator, value: DDS.UserDataQosPolicy) void {
-    if (value.value._release and value.value._buffer != null) {
-        alloc.free(value.value._buffer.?[0..value.value._maximum]);
-    }
-}
+const cloneUserData = disc.cloneUserData;
+const freeUserData = disc.freeUserData;
 
 // ── DomainParticipantImpl ────────────────────────────────────────────────────
 
@@ -3609,14 +3585,31 @@ pub const DomainParticipantImpl = struct {
 
     fn pubAnnounceProtoWriter(ctx: *anyopaque, handle: DDS.InstanceHandle_t, publisher_handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
-        // Find the writer and snapshot its announcement fields outside the lock.
-        var ann_opt: ?struct {
-            guid: Guid,
-            topic_name: []const u8,
-            type_name: []const u8,
-            qos: DDS.DataWriterQos,
-            presentation: DDS.PresentationQosPolicy,
-        } = null;
+        // Derive group GUID for GROUP-scope coherent publishers (PID_GROUP_GUID).
+        // All writers in the same publisher share this GUID so that remote GROUP
+        // subscribers can associate them into the same coherent group.
+        const group_guid: ?Guid = if (presentation.coherent_access and
+            presentation.access_scope == .GROUP_PRESENTATION_QOS)
+        blk: {
+            const h: u32 = @bitCast(publisher_handle);
+            break :blk Guid{
+                .prefix = self.guid.prefix,
+                .entity_id = .{
+                    .entity_key = .{
+                        @truncate(h >> 16),
+                        @truncate(h >> 8),
+                        @truncate(h),
+                    },
+                    .entity_kind = guid_mod.EntityKind.writer_group,
+                },
+            };
+        } else null;
+        // Find the writer and copy its announcement, for writing after the
+        // lock is released: a deletion in between frees the writer's own
+        // storage (pubDestroyProtoWriter) and can let its topic be deleted.
+        var guid_opt: ?Guid = null;
+        var ann_opt: ?disc.WriterAnnouncement = null;
+        defer if (ann_opt) |*a| a.deinit(self.alloc);
         const owned_names = dupePartitionNames(self.alloc, partition_names);
         var jobs: std.ArrayListUnmanaged(AnnounceMatchedReaderJob) = .empty;
         defer jobs.deinit(self.alloc);
@@ -3629,12 +3622,22 @@ pub const DomainParticipantImpl = struct {
                     freePartitionNames(self.alloc, aw.partition_names);
                     aw.partition_names = owned_names;
                     aw.presentation = presentation;
-                    ann_opt = .{
+                    guid_opt = aw.guid;
+                    const ann: disc.WriterAnnouncement = .{
                         .guid = aw.guid,
+                        .participant_guid = self.guid,
+                        .group_guid = group_guid,
                         .topic_name = aw.topic_name,
                         .type_name = aw.type_name,
                         .qos = aw.qos,
                         .presentation = presentation,
+                        .partition_names = owned_names,
+                        .type_object = &.{},
+                        .type_info_cdr = self.type_info_registry.get(aw.type_name) orelse &.{},
+                    };
+                    ann_opt = ann.clone(self.alloc) catch |err| blk: {
+                        log_mod.dcps.warn("participant: failed to announce writer through SEDP: {s}", .{@errorName(err)});
+                        break :blk null;
                     };
                     // Retroactively match against readers discovered before this
                     // writer existed (or before it announced final partition/
@@ -3714,44 +3717,32 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(job.unicast_locs);
             self.alloc.free(job.multicast_locs);
         }
-        const ann = ann_opt orelse {
+        const guid = guid_opt orelse {
             freePartitionNames(self.alloc, owned_names);
             return;
         };
-        // Derive group GUID for GROUP-scope coherent publishers (PID_GROUP_GUID).
-        // All writers in the same publisher share this GUID so that remote GROUP
-        // subscribers can associate them into the same coherent group.
-        const group_guid: ?Guid = if (presentation.coherent_access and
-            presentation.access_scope == .GROUP_PRESENTATION_QOS)
-        blk: {
-            const h: u32 = @bitCast(publisher_handle);
-            break :blk Guid{
-                .prefix = self.guid.prefix,
-                .entity_id = .{
-                    .entity_key = .{
-                        @truncate(h >> 16),
-                        @truncate(h >> 8),
-                        @truncate(h),
-                    },
-                    .entity_kind = guid_mod.EntityKind.writer_group,
-                },
-            };
-        } else null;
-        const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
-        self.discovery.announceWriter(&disc.WriterAnnouncement{
-            .guid = ann.guid,
-            .participant_guid = self.guid,
-            .group_guid = group_guid,
-            .topic_name = ann.topic_name,
-            .type_name = ann.type_name,
-            .qos = ann.qos,
-            .presentation = ann.presentation,
-            .partition_names = owned_names,
-            .type_object = &.{},
-            .type_info_cdr = type_info_cdr,
-        }) catch |err| {
+        const ann = ann_opt orelse return;
+        self.discovery.announceWriter(&ann) catch |err| {
             log_mod.dcps.warn("participant: failed to announce writer through SEDP: {s}", .{@errorName(err)});
         };
+        // A deletion while this was written may have disposed of the writer
+        // first; dispose again so the announcement doesn't outlive it.
+        if (!self.hasActiveWriter(guid)) self.discovery.retractWriter(guid);
+    }
+
+    /// Whether the local writer `guid` is still in `active_writers`, i.e.
+    /// not yet deleted (`pubDestroyProtoWriter` removes it before disposing).
+    fn hasActiveWriter(self: *Self, guid: Guid) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.active_writers.contains(entityIdKey(guid.entity_id));
+    }
+
+    /// The reader counterpart of `hasActiveWriter`.
+    fn hasActiveReader(self: *Self, guid: Guid) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.active_readers.contains(entityIdKey(guid.entity_id));
     }
 
     const AnnounceMatchedWriterJob = struct {
@@ -3766,13 +3757,10 @@ pub const DomainParticipantImpl = struct {
 
     fn subAnnounceProtoReader(ctx: *anyopaque, handle: DDS.InstanceHandle_t, partition_names: []const []const u8, presentation: DDS.PresentationQosPolicy) void {
         const self = cast(ctx);
-        var ann_opt: ?struct {
-            guid: Guid,
-            topic_name: []const u8,
-            type_name: []const u8,
-            qos: DDS.DataReaderQos,
-            presentation: DDS.PresentationQosPolicy,
-        } = null;
+        // As in pubAnnounceProtoWriter.
+        var guid_opt: ?Guid = null;
+        var ann_opt: ?disc.ReaderAnnouncement = null;
+        defer if (ann_opt) |*a| a.deinit(self.alloc);
         const owned_names = dupePartitionNames(self.alloc, partition_names);
         var jobs: std.ArrayListUnmanaged(AnnounceMatchedWriterJob) = .empty;
         defer jobs.deinit(self.alloc);
@@ -3785,12 +3773,20 @@ pub const DomainParticipantImpl = struct {
                     freePartitionNames(self.alloc, ar.partition_names);
                     ar.partition_names = owned_names;
                     ar.presentation = presentation;
-                    ann_opt = .{
+                    guid_opt = ar.guid;
+                    const ann: disc.ReaderAnnouncement = .{
                         .guid = ar.guid,
+                        .participant_guid = self.guid,
                         .topic_name = ar.topic_name,
                         .type_name = ar.type_name,
                         .qos = ar.qos,
                         .presentation = presentation,
+                        .partition_names = owned_names,
+                        .type_info_cdr = self.type_info_registry.get(ar.type_name) orelse &.{},
+                    };
+                    ann_opt = ann.clone(self.alloc) catch |err| blk: {
+                        log_mod.dcps.warn("participant: failed to announce reader through SEDP: {s}", .{@errorName(err)});
+                        break :blk null;
                     };
                     // Retroactively match against writers discovered before this
                     // reader existed (or before it announced final partition/
@@ -3883,23 +3879,16 @@ pub const DomainParticipantImpl = struct {
             self.alloc.free(job.unicast_locs);
             self.alloc.free(job.multicast_locs);
         }
-        const ann = ann_opt orelse {
+        const guid = guid_opt orelse {
             freePartitionNames(self.alloc, owned_names);
             return;
         };
-        const type_info_cdr = self.type_info_registry.get(ann.type_name) orelse &.{};
-        self.discovery.announceReader(&disc.ReaderAnnouncement{
-            .guid = ann.guid,
-            .participant_guid = self.guid,
-            .topic_name = ann.topic_name,
-            .type_name = ann.type_name,
-            .qos = ann.qos,
-            .presentation = ann.presentation,
-            .partition_names = owned_names,
-            .type_info_cdr = type_info_cdr,
-        }) catch |err| {
+        const ann = ann_opt orelse return;
+        self.discovery.announceReader(&ann) catch |err| {
             log_mod.dcps.warn("participant: failed to announce reader through SEDP: {s}", .{@errorName(err)});
         };
+        // As in pubAnnounceProtoWriter.
+        if (!self.hasActiveReader(guid)) self.discovery.retractReader(guid);
     }
 
     fn pubRegisterWriterIncompatQos(
@@ -4833,23 +4822,15 @@ pub const DomainParticipantImpl = struct {
     /// DomainParticipant's own `DomainParticipantListener` (widened over
     /// `TopicListener`/`PublisherListener`/`SubscriberListener` in
     /// `dcps.idl`) shares one box/mask for every status kind, so one
-    /// function serves both chains. `handle` is always the entity whose
-    /// status actually changed (the originating DataReader/DataWriter),
+    /// function serves both chains. The callback is always invoked with the
+    /// entity whose status actually changed (the originating DataReader/DataWriter),
     /// never `self` — matches the spec's own framing: a "more specific"
     /// listener's absence doesn't change which entity the callback reports.
     /// If this level has no usable listener for `field` either, the event
     /// is simply not delivered (matches this codebase's pre-existing
     /// behavior for "nobody installed a listener for this status" at the
-    /// origin entity) and `false` is returned.
-    pub fn dispatchFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
-        const box = self.acquireListener();
-        defer box.releaseRef(self.alloc);
-        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
-        return listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args);
-    }
-
-    /// `dispatchFallback`'s resolution step alone: this level's callback for
-    /// `field`, not yet invoked (see `listener_fallback.Resolved`), or null.
+    /// origin entity): this returns null. Otherwise it returns this level's
+    /// callback for `field`, not yet invoked (see `listener_fallback.Resolved`).
     pub fn resolveFallback(self: *Self, comptime Cb: type, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(Cb) {
         const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
         return listener_fallback.resolveBox(Cb, field, mask, bit, self.acquireListener(), self.alloc);

@@ -260,8 +260,18 @@ test "listeners raised by notify_datareaders may call into their subscriber" {
     var probe = NotifyProbe{ .sub = fx.sub_r };
     const dr = fx.sub_r.create_datareader(topicDesc(fx.topic_r), .{}, DDS.dataReaderListener(&probe, .{
         .on_data_available = notifyProbeOnDataAvailable,
-    }), DDS.DATA_AVAILABLE_STATUS);
+    }), 0);
     defer _ = fx.sub_r.vtable.delete_datareader(fx.sub_r.ptr, dr);
+    const dw_raw = fx.pub_w.create_datawriter(fx.topic_w, .{}, null, 0);
+    defer _ = fx.pub_w.vtable.delete_datawriter(fx.pub_w.ptr, dw_raw);
+    const dw: *DataWriterImpl = @ptrCast(@alignCast(dw_raw.ptr));
+
+    // Data arrives while the listener is masked out, leaving a change for
+    // notify_datareaders to claim.
+    _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), NIL_IH, NIL_KEY, &PAYLOAD);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr.ptr));
+    @atomicStore(DDS.StatusMask, &dr_impl.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
+    try testing.expectEqual(@as(usize, 0), probe.calls);
 
     try testing.expectEqual(DDS.RETCODE_OK, fx.sub_r.vtable.notify_datareaders(fx.sub_r.ptr));
     try testing.expectEqual(@as(usize, 1), probe.calls);

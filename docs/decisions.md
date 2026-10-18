@@ -352,8 +352,9 @@ claim are separate critical sections (`on_liveliness_changed`, whose callers upd
 counts; `on_sample_rejected`, deferred to the reader's flush), the changed bit decides:
 a getter in between has reset it, so nothing is claimed. Every liveliness update site
 therefore sets the bit itself. `PublisherImpl.dispatchWriterFallback` and the writer's
-`dispatchListener` were removed; `on_data_available` still uses `dispatchListener`, since
-DATA_AVAILABLE resets on read/take rather than on dispatch. The listener resolved is the
+`dispatchListener` were removed. `on_data_available` is claimed the same way since
+2026-10-18 (`DataReaderImpl.dispatchDataAvailable`; see the CHANGELOG), and the reader's
+`dispatchListener` is gone too. The listener resolved is the
 one installed when the notifier started; a `set_listener` racing it is not yet withdrawn
 (listeners.md's replacement rules are shared-runtime work). Tests:
 `test/dcps/status_claim_test.zig`, one per status, each failing against the previous

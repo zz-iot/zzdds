@@ -57,7 +57,9 @@ pub const DiscoveryBus = struct {
 
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             alloc.free(self.data_locators);
+            for (self.writers.items) |*w| w.deinit(alloc);
             self.writers.deinit(alloc);
+            for (self.readers.items) |*r| r.deinit(alloc);
             self.readers.deinit(alloc);
         }
     };
@@ -194,9 +196,8 @@ pub const DiscoveryBus = struct {
         }
         if (found_idx) |idx| {
             var e = self.entries.swapRemove(idx);
-            e.writers.deinit(self.alloc);
-            e.readers.deinit(self.alloc);
-            self.alloc.free(entry_data_locs);
+            // Only the lost endpoints' GUIDs are used below.
+            e.deinit(self.alloc);
         }
         self.mu.unlock();
 
@@ -232,7 +233,17 @@ pub const DiscoveryBus = struct {
         self.mu.lock();
         for (self.entries.items) |*e| {
             if (e.participant_guid.eql(participant_guid)) {
-                try e.writers.append(self.alloc, info.*);
+                // Kept until retracted: the announcement's slices are only
+                // borrowed for this call.
+                var owned = info.clone(self.alloc) catch |err| {
+                    self.mu.unlock();
+                    return err;
+                };
+                e.writers.append(self.alloc, owned) catch |err| {
+                    self.mu.unlock();
+                    owned.deinit(self.alloc);
+                    return err;
+                };
                 writer_data_locs = e.data_locators;
                 own_callbacks = e.callbacks;
                 own_domain_id = e.domain_id;
@@ -287,7 +298,8 @@ pub const DiscoveryBus = struct {
                 while (i > 0) {
                     i -= 1;
                     if (e.writers.items[i].guid.eql(guid)) {
-                        _ = e.writers.swapRemove(i);
+                        var removed = e.writers.swapRemove(i);
+                        removed.deinit(self.alloc);
                         break;
                     }
                 }
@@ -324,7 +336,16 @@ pub const DiscoveryBus = struct {
         self.mu.lock();
         for (self.entries.items) |*e| {
             if (e.participant_guid.eql(participant_guid)) {
-                try e.readers.append(self.alloc, info.*);
+                // As in busAnnounceWriter.
+                var owned = info.clone(self.alloc) catch |err| {
+                    self.mu.unlock();
+                    return err;
+                };
+                e.readers.append(self.alloc, owned) catch |err| {
+                    self.mu.unlock();
+                    owned.deinit(self.alloc);
+                    return err;
+                };
                 reader_data_locs = e.data_locators;
                 own_callbacks = e.callbacks;
                 own_domain_id = e.domain_id;
@@ -381,7 +402,8 @@ pub const DiscoveryBus = struct {
                 while (i > 0) {
                     i -= 1;
                     if (e.readers.items[i].guid.eql(guid)) {
-                        _ = e.readers.swapRemove(i);
+                        var removed = e.readers.swapRemove(i);
+                        removed.deinit(self.alloc);
                         break;
                     }
                 }

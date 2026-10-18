@@ -63,7 +63,13 @@ help; GROUP-only Publisher tickets; retained TOPIC seal work with per-set comple
 capacity; optional profiles remove exclusive machinery; standard DDS APIs keep useful
 defaults and automatic last-owner runtime cleanup; participant-owned discovery generations
 that an endpoint checks when it commits a remote match
-([remote endpoint match and loss](concurrency/architecture.md#remote-endpoint-match-and-loss)).
+([remote endpoint match and loss](concurrency/architecture.md#remote-endpoint-match-and-loss));
+local endpoints announced only after local publication, with disposal fencing every earlier
+announcement ([local endpoint publication, announcement and disposal](concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal));
+reader DATA_AVAILABLE reset by every read/take and claimed by on_data_available, as DDS
+specifies ([reader DATA_AVAILABLE reset](concurrency/listeners.md#reader-data-available-reset));
+the runtime replaces the threaded implementation, behind a temporary build option while
+endpoints migrate ([migration](concurrency/runtime.md#migration-from-the-threaded-implementation)).
 Non-OMG public controls belong in zzdds.idl. Broker WLP and user traffic remain direct in v1.
 
 Draft 3 uses ordered STATE transactions/aggregate freshness, final established bodies,
@@ -76,7 +82,6 @@ bounded independently of these wire simplifications.
 
 | Item | Required resolution | Boundary already fixed |
 | --- | --- | --- |
-| Local entity publication versus discovery announcement/disposal | Specify ordering when creation, asynchronous announcement and deletion race, including retained disposal work and failure reporting; place the result in architecture/operations | No usable entity before local publication, no stale generation mutation, no callback before corresponding state commit; broker announcement failure never retroactively undoes local creation |
 | Listener bridge ABI and resource-failure results | Select/version the generated identity/ownership/invocation-outcome descriptor and document permitted set_listener resource-exhaustion results and per-binding mappings | Preserve original dispatch pointer, canonicalize identity at registration, retain old registration on preparation failure, no exception crosses core frames, no new standard setter timeout |
 | External-loop platform ABI | Define clock-domain conversion, wake representation and platform-specific adapter descriptor/version validation | One outer driver, atomic arm/recheck, attach before participants/I/O, no live executor replacement or premature detach in v1 |
 
