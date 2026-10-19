@@ -82,6 +82,33 @@ Protocol code and the runtime see one transport contract. Adapters implement it:
   the runtime core, the contract and the manual and MCU adapters do not depend on `std.Io`
   ([platform boundaries](architecture.md#platform-boundaries)).
 
+<a id="adopting-other-std-io-backends"></a>
+### Adopting other `std.Io` backends
+
+Zig defines the `std.Io` interface ahead of most of its implementations: the
+[0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html) call
+Evented "work-in-progress, experimental" without networking, its io_uring backend a
+proof of concept and its kqueue backend proof-of-concept only, and only Threaded
+"feature-complete and well-tested". The initial adapters therefore rely on Threaded
+alone, while keeping room for the others:
+
+* The runtime core and the transport contract never name a `std.Io` type. A backend built
+  on another `Io` is one more adapter behind the progress backend.
+* Use another backend only once it compiles, is tested upstream, implements the networking
+  operations the adapter needs and has been measured against Threaded.
+* Application threads in the bindings are outside any Evented pool. An Evented-based
+  backend therefore accepts `wake()` through a mechanism any thread may trigger, and a
+  blocking DDS call from an application thread waits on zzdds's own primitive, never on
+  that `Io`.
+* Protocol work must not block an Evented thread: execution rights are never waited for
+  (take-turns admission queues instead), internal locks go through `src/util/mutex.zig` so
+  they can move to `Io.Mutex`, and protocol paths make no blocking syscalls.
+
+**Conforming approach.** Until Evented offers a way for outside threads to wake it, an
+Evented backend keeps a read on an `eventfd` posted in its ring, and `wake()` writes the
+`eventfd`. Each Zig release should be checked for an official cross-thread wake or
+callback mechanism to replace it.
+
 <a id="socket-setup-and-data-path"></a>
 ### Socket setup and data path
 

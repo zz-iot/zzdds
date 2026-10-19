@@ -1022,8 +1022,11 @@ would post receives and sends ahead and consume their results, instead of servic
 readiness. It could be written directly against io_uring or built on `std.Io.Evented`,
 but in Zig 0.17.0 none of Evented's backends compile, and a thread outside an Evented
 pool cannot call into it, which application threads in the C, C++ and Java bindings
-would need to do. Revisit when Evented builds and supports that, or when measurements
-show the readiness adapter is the bottleneck.
+would need to do. Check each Zig release for Evented's status, including an official way
+for outside threads to wake it (until then an Evented backend would wake through an
+`eventfd`; see [adopting other `std.Io` backends](design/concurrency/transport-adapters.md#adopting-other-std-io-backends)).
+Revisit when Evented builds and supports that, or when measurements show the readiness
+adapter is the bottleneck.
 
 ### CDR-layer allocator scoping vs. the entity layer
 
