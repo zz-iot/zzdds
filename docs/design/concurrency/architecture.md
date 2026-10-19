@@ -247,6 +247,17 @@ A small batch may retain the executor between turns within a finite budget, alwa
 
 Runtime queue publication must itself be allocation-free after admission. A design may use an embedded ready node or an explicit publication handshake; context-gate/runtime-gate ordering and the precise handshake must be specified before implementation. Do not assume two independent queue/flag stores establish the invariant.
 
+<a id="ready-queue-publication"></a>
+**Selected handshake.** Each context has a short context gate and an embedded ready node; the runtime has a short runtime gate over its ready queue and timers. A path holding a context gate may take the runtime gate; no path holding the runtime gate takes a context gate.
+
+* A context's node is linked in the runtime ready queue exactly while the context is SCHEDULED and unclaimed. Only a transition into SCHEDULED links it, and that transition links the node under the runtime gate before releasing the context gate. The node is embedded, so publication never allocates.
+* Queued submission, waking a waiting request, and turn finish with a nonempty FIFO each change state under the context gate and, on entering SCHEDULED, link the node as above; the producer then signals the progress backend.
+* A driver claim unlinks the oldest context under the runtime gate, releases it, then takes the context gate, sets RUNNING and removes the oldest READY request. Between the two gates the context stays SCHEDULED and unlinked, and only the claiming driver can move it, so a newcomer sees SCHEDULED and queues behind it.
+* Direct submission takes the context gate and claims RUNNING only when the context is OPEN and IDLE with an empty FIFO.
+* A wake that arrives while its request is still RUNNING is recorded on the request under the context gate; a turn that then reports waiting makes the request READY instead.
+* Due timers are removed under the runtime gate one at a time and submitted after releasing it.
+* Admissions and turns in progress are counted before the runtime's lifecycle state is read, and retirement checks that count before checking the ready queue, so a submission admitted just before retirement is never lost. A retirement check that finds one in progress does not stop the runtime, so the last admission or turn to end during retirement checks again; otherwise an idle hosted runtime waits forever.
+
 <a id="resource-waits-and-reservations"></a>
 ### Resource waits and reservations
 

@@ -58,6 +58,7 @@ pub const process_config = @import("config/process.zig");
 pub const factory = @import("factory.zig");
 pub const rtps = @import("rtps/root.zig");
 pub const dcps = @import("dcps/root.zig");
+pub const runtime = @import("runtime/root.zig");
 pub const c_abi = @import("c_abi/root.zig");
 
 // Force c_abi files to be compiled into the binary so their pub export
@@ -135,6 +136,7 @@ test {
     _ = @import("config/resolve.zig");
     _ = @import("config/process.zig");
     _ = @import("factory.zig");
+    _ = @import("runtime/core.zig");
     _ = @import("transport/interface.zig");
     _ = @import("transport/udp.zig");
     _ = @import("transport/tcp.zig");

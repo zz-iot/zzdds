@@ -988,6 +988,11 @@ now define the behavioral baseline (take-turns participant/endpoint contexts, on
 manual/hosted progress engine, listener exclusion with inline eligibility, operation
 results/waits, runtime ownership/retirement and the transport boundary). Their open
 design items, implementation gates and acceptance criteria are listed in that index.
+The runtime core is in `src/runtime/`: take-turns contexts, the ready queue
+([publication handshake](design/concurrency/architecture.md#ready-queue-publication)),
+timers, the progress backend, the manual `drive` and hosted workers on `std.Io.Threaded`,
+and retirement. No entity uses it yet, and it does not yet carry the operation effect
+states (commit and cancellation), resource waits or listener dispatch.
 Remaining work is implementation: the first vertical slice (one reliable reader/writer
 pair under manual and hosted drivers, listeners, timed waits and automatic retirement),
 then broader endpoint migration, thread consolidation onto the shared runtime timers,

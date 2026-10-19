@@ -1581,6 +1581,29 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
 
+    // Shared runtime tests (docs/design/concurrency/runtime.md). Also run under
+    // TSan below: the hosted tests are where its gates are exercised.
+    const runtime_test_files = [_][]const u8{
+        "test/runtime/runtime_core_test.zig",
+    };
+    for (runtime_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(t).step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
+    }
+
     // Discovery-layer tests.
     const discovery_test_files = [_][]const u8{
         "test/discovery/spdp_lease_test.zig",
@@ -1964,6 +1987,20 @@ pub fn build(b: *std.Build) void {
 
     // RTPS tests (TSan) — writer_sm, reader_sm exercise concurrent send/recv
     for (rtps_test_files) |src| {
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = target,
+            .sanitize_thread = true,
+            .imports = &.{
+                .{ .name = "zzdds", .module = zzdds_mod_tsan },
+            },
+        }), .use_llvm = true });
+        t.root_module.link_libc = true;
+        tsan_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // Shared runtime tests (TSan) — hosted workers and submitting threads
+    for (runtime_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src),
             .target = target,
