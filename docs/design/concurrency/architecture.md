@@ -32,9 +32,9 @@ retained lifetimes below constrain both manual and hosted implementations.
 
 Callback placement is another policy above these axes: inline when eligible, designated executor, or explicit application dispatch. Avoid one `evented` boolean that silently changes thread safety, callback placement and blocking semantics together.
 
-Zig 0.16 introduces `std.Io` implementations, but its release notes describe `Io.Evented` as experimental and single-threaded `Io.Threaded` as lacking task-level concurrency. Those facilities do not automatically transform blocking protocol loops into a manually driven state machine. [Zig 0.16 release notes](https://ziglang.org/download/0.16.0/release-notes.html).
+Zig 0.17's `std.Io` offers `Io.Threaded`, a thread pool that any thread may call, and `Io.Evented`, fibers over io_uring, kqueue or Dispatch. In 0.17.0 the Evented backends do not compile, and a thread outside an Evented pool cannot call into it ([`std.Io` in 0.17.0](transport-adapters.md#zig-std-io-in-0-17)). Neither turns blocking protocol loops into a manually driven state machine.
 
-Use `std.Io` where useful in hosted adapters. Do not make bare-metal support depend on a particular stackful coroutine backend. A MicroZig adapter needs the selected network driver/stack, clock, wakeup and interrupt ownership contract. No working adapter or version compatibility is asserted here. [MicroZig project](https://github.com/ZigEmbeddedGroup/microzig).
+Use `std.Io` where useful in hosted adapters ([adapter model](transport-adapters.md#adapter-model)). Do not make bare-metal support depend on a particular stackful coroutine backend. A MicroZig adapter needs the selected network driver/stack, clock, wakeup and interrupt ownership contract. No working adapter or version compatibility is asserted here. [MicroZig project](https://github.com/ZigEmbeddedGroup/microzig).
 
 <a id="core-progress-boundary"></a>
 ### Core progress boundary
@@ -208,7 +208,7 @@ Budget histories, command queues, callback pending state, fragments, timer entri
 
 Hosted TLS/DTLS, DNS and transport connection setup need bounded/cancellable integration; an adapter that blocks the sole driver can stop every lease and writer on that driver. Either use incremental/non-blocking APIs or isolate unavoidable blocking work where OS threads exist. Do not assume those hosted choices carry to an MCU.
 
-Current `src/util/mutex.zig` uses pthread/Windows primitives, and transports use direct platform sockets. Supporting `std.Io` or a freestanding backend requires explicit adapter/synchronization changes; selecting a Zig build option is insufficient.
+Current `src/util/mutex.zig` uses pthread/Windows primitives, and transports use direct platform sockets. Supporting `std.Io` or a freestanding backend requires explicit adapter/synchronization changes; selecting a Zig build option is insufficient. Under an Evented `Io`, a blocking lock or syscall stalls every fiber on that thread. [Transport adapters](transport-adapters.md) defines the transport side of that boundary.
 
 <a id="admission-and-request-state-transitions"></a>
 ## Admission and request state transitions

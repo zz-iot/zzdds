@@ -165,7 +165,9 @@ Forward-looking only: known gaps, planned features, and open design questions.
 - **Transport scatter-gather (`sendmsg`)** — the `Transport` vtable has no vectored-send
   entry point; `MessageBuilder`'s iovec list is flattened into a single `[65536]u8` stack
   buffer at the transport boundary before every send. See
-  `design/rtps-message-builder.md`.
+  `design/rtps-message-builder.md`. Planned with the readiness adapter, whose submissions
+  carry the gather list
+  ([output submission](design/concurrency/transport-adapters.md#output-submission)).
 - **A local endpoint's announcement is not ordered against its creation and deletion.**
   The rules are in
   [local endpoint publication, announcement and disposal](design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
@@ -977,7 +979,7 @@ what RTOS and bare-metal targets use (see the next entry). The threaded model is
 as a second option: during migration the runtime sits behind a temporary build option,
 and the threaded path is deleted once the runtime replaces it
 ([migration](design/concurrency/runtime.md#migration-from-the-threaded-implementation),
-which also maps each of today's threads onto runtime timers or I/O sources). Correctness
+which also maps each of today's threads onto runtime timers or the transport adapter). Correctness
 (ordering, liveliness, teardown, no races) must be verified in both modes; today's TSan lane
 covers only the threaded model.
 
@@ -1002,16 +1004,26 @@ needs a `DomainParticipant.drive(timeout)` that pumps transport polling + `check
 from the caller's loop with no threads spawned. Nothing implements it, and the transport
 seam it needs doesn't exist yet: `Transport.listen` registers a handler that the UDP and
 TCP transports call from their own receive threads, and there is no entry a driver could
-call to service ready sockets without blocking. Manual mode over a real network needs one,
-a nonblocking readiness/service entry per transport
-([thread mapping](design/concurrency/runtime.md#thread-mapping)), so the shared runtime's
-first slice runs manual mode over the in-process transport only; the UDP entry comes with
-the endpoint migration that follows it (it is also what the cooperative measurement
-profile's UDP needs). Now specified as the
+call to service ready sockets without blocking. Manual mode over a real network needs the
+readiness adapter in [transport adapters](design/concurrency/transport-adapters.md), so the
+shared runtime's first slice runs manual mode over the in-process transport only; the
+readiness adapter, UDP then TCP, comes with the endpoint migration that follows it (it is
+also what the cooperative measurement profile's UDP needs). Hosted mode uses the same
+adapter on its own I/O threads, replacing the thread per socket. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
 measurement profile in the concurrency architecture; implementation follows the
 concurrency task above.
+
+### Completion-based transport adapter (io_uring)
+
+Not scheduled. A [completion adapter](design/concurrency/transport-adapters.md#adapter-model)
+would post receives and sends ahead and consume their results, instead of servicing
+readiness. It could be written directly against io_uring or built on `std.Io.Evented`,
+but in Zig 0.17.0 none of Evented's backends compile, and a thread outside an Evented
+pool cannot call into it, which application threads in the C, C++ and Java bindings
+would need to do. Revisit when Evented builds and supports that, or when measurements
+show the readiness adapter is the bottleneck.
 
 ### CDR-layer allocator scoping vs. the entity layer
 

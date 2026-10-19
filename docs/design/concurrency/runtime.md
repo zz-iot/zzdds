@@ -697,6 +697,10 @@ channel ownership follow the bootstrap and transport sections below.
 <a id="transportruntime-ownership-and-backpressure"></a>
 ## Transport/runtime ownership and backpressure
 
+[Transport adapters](transport-adapters.md) gives this contract its code shape: the
+progress backend that supplies the runtime's wait, and the readiness, completion,
+in-process and MCU adapters that implement it.
+
 <a id="ingress"></a>
 ### Ingress
 
@@ -807,7 +811,8 @@ release them. A retained stopped runtime identity is not a live channel owner.
 Preserve received-channel routing from the implemented Channel/sendOnChannel API.
 Retained queued work must also retain or safely resolve the owning transport lifetime;
 a copied pointer token plus generation is not a resource lease. Replace unbounded
-dead-channel retention with bounded safe identity reclamation for the evented backend.
+dead-channel retention with bounded safe identity reclamation
+([channels and lifetimes](transport-adapters.md#channels-and-lifetimes)).
 Correlate broadcast close notifications against known channel generations and retain
 reserved completion/cleanup capacity; never treat every notification as session loss.
 The existing API does not yet supply asynchronous send ownership or completion.
@@ -829,15 +834,15 @@ migrate.
 | Writer heartbeat thread (`StatefulWriter.heartbeatThread`), one per writer once a reader matches, ticking every 200 ms | Periodic HEARTBEAT, reader-proxy liveness-probe deadlines, connection-generation resync and replay retry | A writer-local recurring timer, run under writer rights. Armed when a reliable reader matches and cancelled when none remain. |
 | Participant timer thread (`DomainParticipantImpl.timerThreadFn`), polling `checkTimers()` every 100 ms | DEADLINE and LIVELINESS expiry for every local endpoint; the WLP assertion tick | Endpoint-local timers armed at each endpoint's next deadline or lease expiry, under that endpoint's rights, instead of a participant-wide poll. WLP assertion is a participant-control timer. |
 | SPDP timer thread (`SpdpSedpDiscovery.timerFn`), ticking every 100 ms | Periodic (and initial fast) SPDP announcement; remote participant lease expiry and liveness probes | Participant-control timers: one for the next announcement, one at the earliest lease or probe deadline. |
-| UDP receive threads (one per socket); TCP accept thread and one receive thread per connection | Blocking receive, then inline `on_receive` dispatch: protocol processing and application listeners run on the receive thread | Hosted mode keeps blocking receive as an I/O source owned by the transport channel owner, but what it receives follows [ingress](#ingress): processed inline only under eligible bounded admission, otherwise retained and queued to the destination owner. Listeners run under the listener contract, not on the receive stack under protocol rights. Manual mode has no receive threads: the transport supplies a nonblocking readiness/service entry that the driver calls. |
+| UDP receive threads (one per socket); TCP accept thread and one receive thread per connection | Blocking receive, then inline `on_receive` dispatch: protocol processing and application listeners run on the receive thread | The transport's [adapter](transport-adapters.md#adapter-model) services nonblocking sockets: a configured number of I/O threads run it in hosted mode, and `drive()` runs it in manual mode, which has no receive threads. What it receives follows [ingress](#ingress): processed inline only under eligible bounded admission, otherwise retained and queued to the destination owner. Listeners run under the listener contract, not on the receive stack under protocol rights. |
 | Interface poll thread (polling `InterfaceMonitor`), ticking at its configured interval | Re-enumerates interfaces and reports a change | A runtime timer in either mode. A platform monitor with change events may wake the runtime instead. |
 | Trace flush thread (`trace.AsyncRingSink`), optional and started by the application | Drains the trace ring to its sink | Not runtime work: diagnostics are never required for DDS progress. It stays an application-started helper; a manual-only build uses a synchronous sink. |
 
 Requirements that follow from the table:
 
-* Thread count is independent of endpoint count. A hosted runtime's threads are its
-  configured workers plus the transport's I/O sources; no thread is created per writer,
-  reader or participant. A manual runtime creates none.
+* Thread count is independent of endpoint and socket count. A hosted runtime's threads
+  are its configured workers plus its configured I/O threads; no thread is created per
+  writer, reader, participant or socket. A manual runtime creates none.
 * Recurring timers are armed at their actual next deadline, not polled at a fixed tick.
   Each runs under the rights of the context that owns its state and identifies that
   context's generation (coordination rule 4); a timer for a closed endpoint is cancelled,

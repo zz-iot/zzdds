@@ -13,6 +13,7 @@ and MCU footprint. This index defines scope, requirement conventions and the rem
 | Listener identity, ordering, preparation, delegation and quiescence | [Listeners](concurrency/listeners.md) |
 | Read/take, effects/results, ACK/history/WaitSet waits and variants | [Operations](concurrency/operations.md) |
 | Runtime ownership, bootstrap, resources, driving, retirement and transport | [Runtime](concurrency/runtime.md) |
+| Transport contract code shape, progress backend and readiness/completion/in-process/MCU adapters | [Transport adapters](concurrency/transport-adapters.md) |
 | Non-OMG concurrency configuration and API declarations | [Extension API](concurrency/extension-api.md) |
 | Broker purpose, deployment scope and implementation sequence | [Broker overview](broker/overview.md) |
 | Bootstrap, admission, transactions, freshness, retirement and operation legality | [Broker protocol](broker/protocol.md) |
@@ -69,7 +70,10 @@ announcement ([local endpoint publication, announcement and disposal](concurrenc
 reader DATA_AVAILABLE reset by every read/take and claimed by on_data_available, as DDS
 specifies ([reader DATA_AVAILABLE reset](concurrency/listeners.md#reader-data-available-reset));
 the runtime replaces the threaded implementation, behind a temporary build option while
-endpoints migrate ([migration](concurrency/runtime.md#migration-from-the-threaded-implementation)).
+endpoints migrate ([migration](concurrency/runtime.md#migration-from-the-threaded-implementation));
+one transport contract implemented by readiness, completion, in-process and MCU adapters,
+with the runtime's wait supplied by the adapter and no thread per socket
+([transport adapters](concurrency/transport-adapters.md)).
 Non-OMG public controls belong in zzdds.idl. Broker WLP and user traffic remain direct in v1.
 
 Draft 3 uses ordered STATE transactions/aggregate freshness, final established bodies,
