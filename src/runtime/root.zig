@@ -34,3 +34,4 @@ pub const ServiceResult = backend.ServiceResult;
 pub const ScriptedBackend = backend.ScriptedBackend;
 pub const IoBackend = @import("io_backend.zig").IoBackend;
 pub const Hosted = @import("hosted.zig").Hosted;
+pub const default_registry = @import("default_registry.zig");

@@ -47,6 +47,8 @@ const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
 const Runtime = @import("../runtime/core.zig").Runtime;
+const default_registry = @import("../runtime/default_registry.zig");
+const build_opts = @import("build_options");
 
 // ── Push-notification types ───────────────────────────────────────────────────
 
@@ -219,8 +221,12 @@ pub const WaitSetImpl = struct {
     notified: bool,
     /// The manual runtime a wait helps, chosen at construction
     /// (docs/design/concurrency/operations.md#stable-helping-policy). Null:
-    /// a wait only observes, and progress comes from elsewhere.
+    /// a wait helps the default runtime when that is a manual one, resolved
+    /// for each wait (docs/design/concurrency/runtime.md#selected-selection-hierarchy),
+    /// and otherwise only observes while progress comes from elsewhere.
     helping: ?*Runtime = null,
+    /// Waits in progress that help the default runtime; guarded by `cv_mu`.
+    default_waits: ?*DefaultWait = null,
     ws_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     // Guards against a genuine use-after-free: WakeupList.invalidateAll()
     // (a condition's own teardown path) deliberately copies out its
@@ -260,6 +266,12 @@ pub const WaitSetImpl = struct {
     quiesce: EntityQuiesce = .{},
 
     const Self = @This();
+
+    /// A wait helping the runtime that was the default when it began.
+    const DefaultWait = struct {
+        runtime: *Runtime,
+        next: ?*DefaultWait = null,
+    };
 
     pub fn init(alloc: std.mem.Allocator) !*Self {
         const self = try alloc.create(Self);
@@ -382,6 +394,9 @@ pub const WaitSetImpl = struct {
             if (seq._buffer) |ob| self.alloc.free(ob[0..seq._maximum]);
         }
         seq.* = .{};
+        var default_wait: DefaultWait = undefined;
+        const helping = self.helping orelse self.beginDefaultWait(&default_wait);
+        defer if (self.helping == null and helping != null) self.endDefaultWait(&default_wait);
         const deadline_ns: ?i64 = blk: {
             if (timeout.sec == DDS.DURATION_INFINITE_SEC and
                 timeout.nanosec == DDS.DURATION_INFINITE_NSEC)
@@ -389,7 +404,7 @@ pub const WaitSetImpl = struct {
                 break :blk null;
             }
             // A helping wait's deadline is on its runtime's clock.
-            const now = if (self.helping) |r| r.clock.nowNs() else time_mod.nanoTimestamp();
+            const now = if (helping) |r| r.clock.nowNs() else time_mod.nanoTimestamp();
             break :blk now +
                 @as(i64, timeout.sec) * std.time.ns_per_s +
                 @as(i64, timeout.nanosec);
@@ -436,7 +451,7 @@ pub const WaitSetImpl = struct {
                 return DDS.RETCODE_OK;
             }
 
-            if (self.helping) |r| {
+            if (helping) |r| {
                 if (!r.helpUntil(deadline_ns, self, takeNotified)) return DDS.RETCODE_TIMEOUT;
                 continue;
             }
@@ -640,8 +655,36 @@ pub const WaitSetImpl = struct {
         self.cv_mu.lock();
         self.notified = true;
         self.cv_cond.broadcast();
+        // Under `cv_mu`: a default runtime is used only while its wait is listed.
+        var next = self.default_waits;
+        while (next) |w| : (next = w.next) w.runtime.wakeHelpers();
         self.cv_mu.unlock();
         if (self.helping) |r| r.wakeHelpers();
+    }
+
+    /// The default runtime when a wait may help it, listed for `wakeNotify`
+    /// until `endDefaultWait`.
+    fn beginDefaultWait(self: *Self, w: *DefaultWait) ?*Runtime {
+        if (!build_opts.shared_runtime) return null;
+        const r = default_registry.global.helping() orelse return null;
+        self.cv_mu.lock();
+        w.* = .{ .runtime = r, .next = self.default_waits };
+        self.default_waits = w;
+        self.cv_mu.unlock();
+        return r;
+    }
+
+    fn endDefaultWait(self: *Self, w: *DefaultWait) void {
+        self.cv_mu.lock();
+        defer self.cv_mu.unlock();
+        var link = &self.default_waits;
+        while (link.*) |l| : (link = &l.next) {
+            if (l == w) {
+                link.* = w.next;
+                return;
+            }
+        }
+        unreachable;
     }
 
     /// Consumes a pending notification.

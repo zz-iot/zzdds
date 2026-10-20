@@ -1,7 +1,8 @@
 //! Participants on the shared runtime, in the `-Dshared-runtime` migration
 //! build (docs/design/concurrency/runtime.md#coexistence-during-migration):
-//! runtime selection, operational ownership and automatic retirement
-//! (#selected-selection-hierarchy,
+//! runtime selection, the default runtime, operational ownership and
+//! automatic retirement (#selected-selection-hierarchy,
+//! #default-registry-and-implicit-construction,
 //! #operational-ownership-versus-storage-retention), and in-process delivery
 //! through each receiving participant's ingress context (#ingress), timed
 //! work on the runtime clock, and listeners run apart from the work that
@@ -122,26 +123,34 @@ fn quietRefusals() std.log.Level {
     return prev;
 }
 
-test "participant creation fails until a runtime is selected" {
-    const prev_log_level = quietRefusals();
-    defer std.testing.log_level = prev_log_level;
-    var delivery = try IntraProcessDelivery.init(alloc);
-    defer delivery.deinit();
-    var node = try Node.init(&delivery);
-    defer node.deinit();
-
-    try testing.expectEqual(nil_participant.ptr, node.create().ptr);
+test "a factory's selected runtime overrides the default" {
+    defer resetDefault();
+    var set: Nodes(2) = undefined;
+    try set.init();
+    defer set.deinit();
+    const selecting = &set.nodes[0];
+    const following = &set.nodes[1];
 
     var m: Manual = undefined;
     m.init();
     defer m.runtime.deinit();
-    try node.factory.selectRuntime(&m.runtime);
+    try selecting.factory.selectRuntime(&m.runtime);
     m.runtime.releaseOwner();
-    const dp = node.create();
-    try testing.expect(dp.ptr != nil_participant.ptr);
-    try node.delete(dp);
-    try node.factory.selectRuntime(null);
+    const before = registry.generations;
+    const dp = selecting.create();
+    try testing.expectEqual(&m.runtime, runtimeOf(dp) orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(before, registry.generations);
+
+    // Without a selection, creation resolves the default.
+    const implicit = following.create();
+    const implicit_rt = runtimeOf(implicit) orelse return error.TestUnexpectedResult;
+    try testing.expect(implicit_rt != &m.runtime);
+    try testing.expectEqual(before + 1, registry.generations);
+
+    try selecting.factory.selectRuntime(null);
+    try selecting.delete(dp);
     try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    try following.delete(implicit);
 }
 
 test "a transport or discovery plugin with threads of its own fails creation" {
@@ -222,6 +231,253 @@ test "a retiring runtime cannot be selected, and a selected one keeps operating"
     try testing.expectEqual(rt.State.backend_stopped, kept.runtime.getState());
 }
 
+// ── The default runtime ───────────────────────────────────────────────────────
+
+const registry = &rt.default_registry.global;
+
+/// Empties the default slot and reclaims every implicit runtime, for the next
+/// test.
+fn resetDefault() void {
+    registry.clear();
+    registry.reap(true);
+}
+
+fn runtimeOf(dp: DDS.DomainParticipant) ?*rt.Runtime {
+    if (dp.ptr == nil_participant.ptr) return null;
+    return @as(*DomainParticipantImpl, @ptrCast(@alignCast(dp.ptr))).runtime;
+}
+
+/// `n` nodes on one delivery, each with room for one participant at a time.
+/// Must not move after `init`.
+fn Nodes(comptime n: usize) type {
+    return struct {
+        delivery: IntraProcessDelivery,
+        nodes: [n]Node,
+
+        fn init(self: *@This()) !void {
+            self.delivery = try IntraProcessDelivery.init(alloc);
+            errdefer self.delivery.deinit();
+            for (&self.nodes, 0..) |*node, i| {
+                errdefer for (self.nodes[0..i]) |*done| done.deinit();
+                node.* = try Node.init(&self.delivery);
+            }
+        }
+
+        fn deinit(self: *@This()) void {
+            for (&self.nodes) |*node| node.deinit();
+            self.delivery.deinit();
+        }
+    };
+}
+
+test "creation without a selection starts a hosted default, and a fresh one after it retires" {
+    defer resetDefault();
+    var set: Nodes(2) = undefined;
+    try set.init();
+    defer set.deinit();
+
+    const before = registry.generations;
+    const a = set.nodes[0].create();
+    const b = set.nodes[1].create();
+    const first = runtimeOf(a) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(first, runtimeOf(b) orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(before + 1, registry.generations);
+    // Hosted: its workers make progress, and waits only observe it.
+    try testing.expect(!first.canHelp());
+
+    try set.nodes[0].delete(a);
+    try testing.expectEqual(rt.State.running, first.getState());
+    try set.nodes[1].delete(b);
+    // The registry kept no operational reference.
+    try testing.expect(first.getState() != .running);
+
+    const c = set.nodes[0].create();
+    const second = runtimeOf(c) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(before + 2, registry.generations);
+    try testing.expectEqual(rt.State.running, second.getState());
+    try set.nodes[0].delete(c);
+
+    resetDefault();
+    try testing.expectEqual(registry.generations, registry.reclaimed);
+}
+
+test "concurrent first creations share one default runtime" {
+    defer resetDefault();
+    var set: Nodes(4) = undefined;
+    try set.init();
+    defer set.deinit();
+
+    const Creator = struct {
+        fn run(n: *Node, out: *DDS.DomainParticipant) void {
+            out.* = n.create();
+        }
+    };
+    const before = registry.generations;
+    var dps: [4]DDS.DomainParticipant = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (&threads, &dps, &set.nodes) |*t, *dp, *node| t.* = try std.Thread.spawn(.{}, Creator.run, .{ node, dp });
+    for (threads) |t| t.join();
+
+    try testing.expectEqual(before + 1, registry.generations);
+    const shared = runtimeOf(dps[0]) orelse return error.TestUnexpectedResult;
+    for (dps) |dp| try testing.expectEqual(shared, runtimeOf(dp) orelse return error.TestUnexpectedResult);
+    for (dps, &set.nodes) |dp, *node| try node.delete(dp);
+}
+
+test "an installed runtime is the default until it retires, and nothing replaces it" {
+    const prev_log_level = quietRefusals();
+    defer std.testing.log_level = prev_log_level;
+    defer resetDefault();
+    var set: Nodes(2) = undefined;
+    try set.init();
+    defer set.deinit();
+    const node = &set.nodes[0];
+
+    var retired: Manual = undefined;
+    retired.init();
+    defer retired.runtime.deinit();
+    retired.runtime.releaseOwner();
+    try testing.expectError(error.Retiring, registry.install(&retired.runtime));
+
+    // Installing does not move a participant already on an implicit runtime.
+    const implicit = set.nodes[1].create();
+    const implicit_rt = runtimeOf(implicit) orelse return error.TestUnexpectedResult;
+    var m: Manual = undefined;
+    m.init();
+    defer m.runtime.deinit();
+    try registry.install(&m.runtime);
+    const before = registry.generations;
+    const dp = node.create();
+    try testing.expectEqual(&m.runtime, runtimeOf(dp) orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(implicit_rt, runtimeOf(implicit) orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(rt.State.running, implicit_rt.getState());
+    try set.nodes[1].delete(implicit);
+
+    m.runtime.releaseOwner();
+    try node.delete(dp);
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    // Creation fails rather than falling back to an implicit runtime...
+    try testing.expectEqual(nil_participant.ptr, node.create().ptr);
+    try testing.expectEqual(before, registry.generations);
+    // ...until the slot is cleared.
+    registry.clear();
+    const fresh = node.create();
+    try testing.expect(fresh.ptr != nil_participant.ptr);
+    try testing.expectEqual(before + 1, registry.generations);
+    try node.delete(fresh);
+
+    resetDefault();
+    try testing.expectEqual(registry.generations, registry.reclaimed);
+}
+
+test "a disabled default fails creation until the slot is cleared" {
+    const prev_log_level = quietRefusals();
+    defer std.testing.log_level = prev_log_level;
+    defer resetDefault();
+    var delivery = try IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+    var node = try Node.init(&delivery);
+    defer node.deinit();
+
+    registry.disable();
+    const before = registry.generations;
+    try testing.expectEqual(nil_participant.ptr, node.create().ptr);
+    try testing.expectEqual(before, registry.generations);
+    registry.clear();
+    const dp = node.create();
+    try testing.expect(dp.ptr != nil_participant.ptr);
+    try node.delete(dp);
+}
+
+test "a WaitSet's wait never starts a default runtime" {
+    defer resetDefault();
+    const gc = try GuardConditionImpl.init(alloc);
+    const ws = try WaitSetImpl.init(alloc);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(gc.toCondition()));
+    const before = registry.generations;
+    var active: DDS.ConditionSeq = .{};
+    defer freeActive(&active);
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, ws.toDDSWaitSet().wait(&active, .{ .sec = 0, .nanosec = 0 }));
+    try testing.expectEqual(before, registry.generations);
+    try testing.expectEqual(.unconfigured, std.meta.activeTag(registry.slot));
+
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().detach_condition(gc.toCondition()));
+    ws.deinit();
+    gc.deinit();
+}
+
+test "a WaitSet made without a runtime helps an installed manual default, on its clock" {
+    defer resetDefault();
+    var m: Manual = undefined;
+    m.init();
+    try registry.install(&m.runtime);
+    var pair: Pair = undefined;
+    try pair.init(null, .RELIABLE_RELIABILITY_QOS, null);
+    try testing.expectEqual(&m.runtime, runtimeOf(pair.dp_w) orelse return error.TestUnexpectedResult);
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    const gc = try GuardConditionImpl.init(alloc);
+    const ws = try WaitSetImpl.init(alloc);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(gc.toCondition()));
+    const start = m.now();
+    const first_hb = m.runtime.nextDeadline() orelse return error.TestUnexpectedResult;
+
+    var active: DDS.ConditionSeq = .{};
+    defer freeActive(&active);
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, ws.toDDSWaitSet().wait(&active, seconds(1)));
+    try testing.expectEqual(start + SEC, m.now());
+    const next_hb = m.runtime.nextDeadline() orelse return error.TestUnexpectedResult;
+    try testing.expect(next_hb > first_hb + StatefulWriter.HB_INTERVAL_NS);
+    try testing.expectEqual(@as(u32, 0), m.sb.unbounded_waits);
+
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().detach_condition(gc.toCondition()));
+    ws.deinit();
+    gc.deinit();
+    registry.clear();
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "a GuardCondition set on another thread ends a wait helping the default" {
+    defer resetDefault();
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    var backend = rt.IoBackend.init(threaded.io());
+    var runtime = rt.Runtime.init(backend.clock(), backend.backend(), .{ .mode = .manual });
+    try registry.install(&runtime);
+    const gc = try GuardConditionImpl.init(alloc);
+    const ws = try WaitSetImpl.init(alloc);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(gc.toCondition()));
+
+    const Waiter = struct {
+        fn run(w: DDS.WaitSet, rc: *DDS.ReturnCode_t) void {
+            var active: DDS.ConditionSeq = .{};
+            defer freeActive(&active);
+            // Gives up after 10 s rather than hanging.
+            rc.* = w.wait(&active, seconds(10));
+        }
+    };
+    var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    const start = runtime.clock.nowNs();
+    const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ ws.toDDSWaitSet(), &rc });
+    // Waiting in the runtime's backend: it is helping.
+    while (backend.waiters.load(.seq_cst) == 0) std.Thread.yield() catch {};
+    try testing.expectEqual(DDS.RETCODE_OK, gc.toDDSGuardCondition().set_trigger_value(true));
+    waiter.join();
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expect(runtime.clock.nowNs() - start < 10 * SEC);
+
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().detach_condition(gc.toCondition()));
+    ws.deinit();
+    gc.deinit();
+    registry.clear();
+    runtime.releaseOwner();
+    try testing.expectEqual(rt.State.backend_stopped, (try runtime.drive(1, 0)).state);
+    runtime.deinit();
+}
+
 // ── In-process delivery ───────────────────────────────────────────────────────
 
 const samples_n = 20;
@@ -257,7 +513,8 @@ const Pair = struct {
     dr: *DataReaderImpl,
 
     /// KEEP_ALL endpoints of `reliability`.
-    fn init(self: *Pair, runtime: *rt.Runtime, reliability: DDS.ReliabilityQosPolicyKind, listener: ?*const DDS.DataReaderListener) !void {
+    /// A null `runtime`: the participants resolve the default.
+    fn init(self: *Pair, runtime: ?*rt.Runtime, reliability: DDS.ReliabilityQosPolicyKind, listener: ?*const DDS.DataReaderListener) !void {
         var o: PairOptions = .{};
         o.dw_qos.reliability.kind = reliability;
         o.dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
@@ -270,13 +527,13 @@ const Pair = struct {
         return self.initWith(runtime, o);
     }
 
-    fn initWith(self: *Pair, runtime: *rt.Runtime, o: PairOptions) !void {
+    fn initWith(self: *Pair, runtime: ?*rt.Runtime, o: PairOptions) !void {
         self.delivery = try IntraProcessDelivery.init(alloc);
         self.w = try Node.init(&self.delivery);
         self.r = try Node.init(&self.delivery);
         // Only the participants keep the runtime operating.
-        try self.w.factory.selectRuntime(runtime);
-        try self.r.factory.selectRuntime(runtime);
+        if (runtime) |r| try self.w.factory.selectRuntime(r);
+        if (runtime) |r| try self.r.factory.selectRuntime(r);
         self.dp_w = self.w.create();
         self.dp_r = self.r.create();
         try self.w.factory.selectRuntime(null);

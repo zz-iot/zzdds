@@ -21,6 +21,7 @@ const trace_mod = @import("../trace.zig");
 const clock_registry_mod = @import("../util/clock_registry.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const runtime_mod = @import("../runtime/core.zig");
+const default_registry = @import("../runtime/default_registry.zig");
 const log_mod = @import("../log.zig");
 const build_opts = @import("build_options");
 
@@ -51,8 +52,8 @@ pub const DomainParticipantFactoryImpl = struct {
     mu: Mutex,
 
     /// The runtime new participants use in a `-Dshared-runtime` build, with
-    /// the factory's own owner reference; guarded by `mu`. There is no
-    /// default runtime yet, so creation fails until one is selected
+    /// the factory's own owner reference; guarded by `mu`. Null: each
+    /// creation resolves the default runtime
     /// (docs/design/concurrency/runtime.md#selected-selection-hierarchy).
     runtime: ?*runtime_mod.Runtime = null,
 
@@ -118,10 +119,11 @@ pub const DomainParticipantFactoryImpl = struct {
         if (old) |o| o.releaseOwner();
     }
 
-    /// Takes an owner reference to the selected runtime for a new participant,
-    /// after checking the participant's transports and discovery can run on
-    /// it; null (with a diagnostic) when creation must fail. The migration
-    /// build never falls back to the threaded path
+    /// Takes an owner reference to the selected runtime, or else the default
+    /// one, for a new participant, after checking the participant's
+    /// transports and discovery can run on it; null (with a diagnostic) when
+    /// creation must fail. The migration build never falls back to the
+    /// threaded path
     /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
     fn acquireRuntimeFor(self: *Self, config: config_mod.Config) ?*runtime_mod.Runtime {
         if (!self.transport.vtable.shared_runtime_ready or config.transport.tcp.enabled) {
@@ -133,16 +135,18 @@ pub const DomainParticipantFactoryImpl = struct {
             return null;
         }
         self.mu.lock();
-        defer self.mu.unlock();
-        const rt = self.runtime orelse {
-            log_mod.dcps.warn("create_participant: no runtime selected", .{});
+        const selected = self.runtime;
+        const retained = if (selected) |rt| rt.tryRetainOwner() else false;
+        self.mu.unlock();
+        if (selected == null) return default_registry.global.acquire() catch |err| {
+            log_mod.dcps.warn("create_participant: no default runtime ({s})", .{@errorName(err)});
             return null;
         };
-        if (!rt.tryRetainOwner()) {
+        if (!retained) {
             log_mod.dcps.warn("create_participant: the selected runtime is retiring", .{});
             return null;
         }
-        return rt;
+        return selected;
     }
 
     pub fn toDDSFactory(self: *Self) DDS.DomainParticipantFactory {

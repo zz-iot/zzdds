@@ -992,7 +992,7 @@ The runtime core is in `src/runtime/`: take-turns contexts, the ready queue
 ([publication handshake](design/concurrency/architecture.md#ready-queue-publication)),
 timers, the progress backend, the manual `drive` and hosted workers on `std.Io.Threaded`,
 and retirement. Participants use it only in a `-Dshared-runtime` build (a contributor
-migration switch, off by default): a factory selects the runtime, each participant holds
+migration switch, off by default): a factory may select the runtime, each participant holds
 an owner reference, and creation fails for transports or discovery plugins that run their
 own threads (only the in-process memory transport and direct discovery qualify so far).
 Received datagrams are copied into each participant's ingress context, bounded by count
@@ -1014,8 +1014,15 @@ run inline, and a participant's listeners run one at a time. On a manual runtime
 created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
 `wait_for_historical_data` run internal turns and due timers until they are satisfied or
 their deadline (on the runtime clock) passes, never listener turns, including when called
-from a listener; on a hosted runtime they only observe. A WaitSet chooses its runtime
-explicitly in Zig; there is no default runtime yet. A RELIABLE write blocked on resource
+from a listener; on a hosted runtime they only observe. Without a selection, creation
+uses the process's default runtime: a hosted one with two workers, started at the first
+such creation and retired with its last participant (the next creation starts another),
+unless the application installs a runtime of its own (creation then fails once that one
+retires, until it is replaced) or disables the default. A WaitSet created without a
+runtime helps the default for each wait when it is an installed manual runtime, and never
+starts one. The default's options are fixed (no configuration yet), and installation is
+a Zig call: an installed runtime is an unretained pointer, which the application keeps
+valid while it is installed and its waits run. A RELIABLE write blocked on resource
 limits still polls. It does not yet carry the operation effect states (commit and
 cancellation) or resource waits.
 The first vertical slice runs one reliable reader/writer pair through the same trace
