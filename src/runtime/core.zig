@@ -42,6 +42,9 @@ pub const Request = struct {
     wake_pending: bool = false,
     /// Admitted with reserved internal credit rather than pending credit.
     internal: bool = false,
+    /// Runs once the runtime is finished with a turn that ended `.done`, so
+    /// it may free the request.
+    on_done: ?*const fn (req: *Request) void = null,
 
     pub fn init(run: *const fn (req: *Request, turn: *Turn) Outcome) Request {
         return .{ .run = run };
@@ -79,6 +82,29 @@ pub const Turn = struct {
 pub const Lifecycle = enum { open, draining, closed };
 pub const Execution = enum { idle, scheduled, running };
 
+/// Whether a context's turns may run application listeners. A wait that helps
+/// with work runs internal turns only
+/// (docs/design/concurrency/runtime.md#simple-driver-operation).
+pub const Lane = enum { internal, listener };
+
+/// The context whose turn this thread is running, if any.
+threadlocal var running_context: ?*Context = null;
+
+/// A callback with its state.
+pub const Hook = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque) void,
+};
+
+/// Requests taken out of a closing context, unrun.
+pub const Discarded = struct {
+    /// Linked through `Request.next`; each is DONE and back with its owner.
+    requests: ?*Request,
+    /// The context is CLOSED. Otherwise a turn is still ending, and
+    /// `Context.on_closed` runs when it does.
+    closed: bool,
+};
+
 /// An execution context: at most one executor runs its requests at a time,
 /// oldest ready request first.
 pub const Context = struct {
@@ -93,8 +119,14 @@ pub const Context = struct {
     /// External requests admitted and not yet done.
     pending: u32 = 0,
     pending_limit: u32,
+    /// Set before the context is used.
+    lane: Lane = .internal,
     // Guarded by the runtime gate: the embedded ready-queue node.
     ready_next: ?*Context = null,
+    /// Runs when the end of a turn closes the context. The runtime does not
+    /// touch the context afterwards, so the hook may free it; its owner must
+    /// still hold a runtime owner reference. Set before the context is used.
+    on_closed: ?Hook = null,
 
     pub fn init(runtime: *Runtime, pending_limit: u32) Context {
         return .{ .runtime = runtime, .pending_limit = pending_limit };
@@ -113,7 +145,36 @@ pub const Context = struct {
         self.gate.lock();
         defer self.gate.unlock();
         if (self.lifecycle == .open) self.lifecycle = .draining;
-        self.closeIfDrainedLocked();
+        _ = self.closeIfDrainedLocked();
+    }
+
+    /// Closes external admission and takes every queued request out unrun,
+    /// for work its owner may drop, such as datagrams. Waiting requests stay.
+    pub fn closeDiscarding(self: *Context) Discarded {
+        const rt = self.runtime;
+        _ = rt.busy.fetchAdd(1, .seq_cst);
+        defer rt.endBusy();
+        self.gate.lock();
+        defer self.gate.unlock();
+        if (self.lifecycle == .open) self.lifecycle = .draining;
+        const list = self.head;
+        var it = self.head;
+        while (it) |req| : (it = req.next) {
+            req.placement = .done;
+            req.wake_pending = false;
+            if (!req.internal) self.pending -= 1;
+        }
+        self.head = null;
+        self.tail = null;
+        // A claim already in flight finds nothing to run and releases it.
+        if (self.execution == .scheduled and rt.unlinkReady(self)) self.execution = .idle;
+        _ = self.closeIfDrainedLocked();
+        return .{ .requests = list, .closed = self.lifecycle == .closed };
+    }
+
+    /// Whether this thread is running one of the context's turns.
+    pub fn isRunningHere(self: *const Context) bool {
+        return running_context == self;
     }
 
     pub fn getLifecycle(self: *Context) Lifecycle {
@@ -122,9 +183,15 @@ pub const Context = struct {
         return self.lifecycle;
     }
 
-    fn closeIfDrainedLocked(self: *Context) void {
+    /// Returns whether this closed it.
+    fn closeIfDrainedLocked(self: *Context) bool {
         if (self.lifecycle == .draining and self.execution == .idle and
-            self.head == null and self.waiting == 0) self.lifecycle = .closed;
+            self.head == null and self.waiting == 0)
+        {
+            self.lifecycle = .closed;
+            return true;
+        }
+        return false;
     }
 
     fn appendLocked(self: *Context, req: *Request) void {
@@ -167,6 +234,8 @@ pub const Timer = struct {
     gen: u32 = 0,
     fire_gen: u32 = 0,
     armed: bool = false,
+    /// A fire has been submitted and has not started.
+    fire_pending: bool = false,
     heap_child: ?*Timer = null,
     heap_sibling: ?*Timer = null,
     heap_prev: ?*Timer = null,
@@ -180,6 +249,7 @@ pub const Timer = struct {
         const rt = turn.runtime;
         rt.gate.lock();
         const current = self.gen == self.fire_gen;
+        self.fire_pending = false;
         rt.gate.unlock();
         if (current) self.callback(self, turn);
         return .done;
@@ -331,6 +401,8 @@ pub const Runtime = struct {
     timers: TimerHeap = .{},
     armed_timers: u32 = 0,
     timer_order: u64 = 0,
+    /// Blocking calls in `helpUntil`.
+    helpers: u32 = 0,
     /// Admissions and turns in progress. Incremented before the lifecycle
     /// state is read, so retirement cannot miss an admission.
     busy: std.atomic.Value(u32) = .init(0),
@@ -346,6 +418,9 @@ pub const Runtime = struct {
         /// Runs once in `submit`, after the lifecycle state is read and before
         /// the request is published.
         after_state_check: ?*const fn (runtime: *Runtime) void = null,
+        /// Runs once in `runNext`, after a context is unlinked from the ready
+        /// queue and before it is claimed RUNNING.
+        after_unlink: ?*const fn (runtime: *Runtime, ctx: *Context) void = null,
     };
 
     /// The creator holds the first operational-owner reference.
@@ -371,6 +446,14 @@ pub const Runtime = struct {
     pub fn retainOwner(self: *Runtime) void {
         const prev = self.owners.fetchAdd(1, .acq_rel);
         std.debug.assert(prev > 0 and self.state.load(.acquire) == .running);
+    }
+
+    /// Takes another owner reference unless the final one is already gone:
+    /// once retirement begins, nothing attaches to this runtime again.
+    pub fn tryRetainOwner(self: *Runtime) bool {
+        var n = self.owners.load(.acquire);
+        while (n != 0) n = self.owners.cmpxchgWeak(n, n + 1, .acq_rel, .acquire) orelse return true;
+        return false;
     }
 
     /// Releasing the final owner retires the runtime: ordinary admission
@@ -523,45 +606,111 @@ pub const Runtime = struct {
         self.ready_tail = ctx;
     }
 
+    /// Unlinks a SCHEDULED context from the ready queue, if no claim has
+    /// unlinked it already. Called with its context gate held.
+    fn unlinkReady(self: *Runtime, ctx: *Context) bool {
+        self.gate.lock();
+        defer self.gate.unlock();
+        var prev: ?*Context = null;
+        var it = self.ready_head;
+        while (it) |c| : ({
+            prev = c;
+            it = c.ready_next;
+        }) {
+            if (c != ctx) continue;
+            if (prev) |p| p.ready_next = c.ready_next else self.ready_head = c.ready_next;
+            if (self.ready_tail == c) self.ready_tail = prev;
+            c.ready_next = null;
+            return true;
+        }
+        return false;
+    }
+
+    /// Unlinks the oldest ready context in `lane` (any lane when null).
+    /// Called with the runtime gate held.
+    fn takeReadyLocked(self: *Runtime, lane: ?Lane) ?*Context {
+        var prev: ?*Context = null;
+        var it = self.ready_head;
+        while (it) |c| : ({
+            prev = c;
+            it = c.ready_next;
+        }) {
+            if (lane) |l| if (c.lane != l) continue;
+            if (prev) |p| p.ready_next = c.ready_next else self.ready_head = c.ready_next;
+            if (self.ready_tail == c) self.ready_tail = prev;
+            c.ready_next = null;
+            return c;
+        }
+        return null;
+    }
+
     // ── Execution ────────────────────────────────────────────────────────────
 
     /// Claims the oldest scheduled context and runs one turn of its oldest
     /// ready request. Returns false when nothing was ready.
     pub fn runNext(self: *Runtime) bool {
-        _ = self.busy.fetchAdd(1, .seq_cst);
-        self.gate.lock();
-        const ctx = self.ready_head orelse {
-            self.gate.unlock();
-            self.endBusy();
-            return false;
-        };
-        self.ready_head = ctx.ready_next;
-        if (self.ready_head == null) self.ready_tail = null;
-        ctx.ready_next = null;
-        self.gate.unlock();
+        return self.runNextIn(null);
+    }
 
-        ctx.gate.lock();
-        std.debug.assert(ctx.execution == .scheduled);
-        ctx.execution = .running;
-        const req = ctx.popLocked().?;
-        req.placement = .running;
-        ctx.gate.unlock();
-        self.runTurn(ctx, req);
-        return true;
+    /// Like `runNext`, but claims only internal-lane contexts, leaving
+    /// listener work queued in its place: for a wait that helps.
+    pub fn runNextInternal(self: *Runtime) bool {
+        return self.runNextIn(.internal);
+    }
+
+    fn runNextIn(self: *Runtime, lane: ?Lane) bool {
+        while (true) {
+            _ = self.busy.fetchAdd(1, .seq_cst);
+            self.gate.lock();
+            const ctx = self.takeReadyLocked(lane) orelse {
+                self.gate.unlock();
+                self.endBusy();
+                return false;
+            };
+            self.gate.unlock();
+            if (builtin.is_test) {
+                if (self.test_hooks.after_unlink) |hook| {
+                    self.test_hooks.after_unlink = null;
+                    hook(self, ctx);
+                }
+            }
+
+            ctx.gate.lock();
+            std.debug.assert(ctx.execution == .scheduled);
+            const req = ctx.popLocked() orelse {
+                // Its queued work was discarded while this claim was in flight.
+                ctx.execution = .idle;
+                const hook = if (ctx.closeIfDrainedLocked()) ctx.on_closed else null;
+                ctx.gate.unlock();
+                self.endBusy();
+                if (hook) |h| h.run(h.ctx);
+                continue;
+            };
+            ctx.execution = .running;
+            req.placement = .running;
+            ctx.gate.unlock();
+            self.runTurn(ctx, req);
+            return true;
+        }
     }
 
     /// Runs one turn of `req`, which the caller has claimed RUNNING and counted
     /// busy, then finishes the turn and releases the context.
     fn runTurn(self: *Runtime, ctx: *Context, req: *Request) void {
         var turn = Turn{ .runtime = self, .context = ctx, .request = req, .now_ns = self.clock.nowNs() };
+        const outer = running_context;
+        running_context = ctx;
         const outcome = req.run(req, &turn);
+        running_context = outer;
 
+        var on_done: ?*const fn (req: *Request) void = null;
         ctx.gate.lock();
         switch (outcome) {
             .done => {
                 req.placement = .done;
                 req.wake_pending = false;
                 if (!req.internal) ctx.pending -= 1;
+                on_done = req.on_done;
             },
             .yield => ctx.appendLocked(req),
             .wait => if (req.wake_pending) {
@@ -576,10 +725,15 @@ pub const Runtime = struct {
         }
         ctx.execution = .idle;
         const scheduled = ctx.scheduleIfIdleLocked();
-        ctx.closeIfDrainedLocked();
+        const on_closed = if (ctx.closeIfDrainedLocked()) ctx.on_closed else null;
         ctx.gate.unlock();
         self.endBusy();
         if (scheduled) self.backend.wake();
+        // What the turn changed may end a helper's wait.
+        if (self.options.mode == .manual) self.wakeHelpers();
+        // Neither the request nor the context is touched after these.
+        if (on_done) |f| f(req);
+        if (on_closed) |h| h.run(h.ctx);
     }
 
     // ── Timers ───────────────────────────────────────────────────────────────
@@ -587,10 +741,28 @@ pub const Runtime = struct {
     /// Arms `t` for `deadline_ns` on the runtime clock, replacing any earlier
     /// arming. Returns false once the runtime is retiring: recurrence stops.
     pub fn armTimer(self: *Runtime, t: *Timer, deadline_ns: i64) bool {
+        return self.arm(t, deadline_ns, false);
+    }
+
+    /// Like `armTimer`, but leaves `t` alone when it is already armed for
+    /// `deadline_ns` or earlier, or has a current fire queued: for a timer
+    /// that several events may each need to bring forward.
+    pub fn armTimerNoLater(self: *Runtime, t: *Timer, deadline_ns: i64) bool {
+        return self.arm(t, deadline_ns, true);
+    }
+
+    fn arm(self: *Runtime, t: *Timer, deadline_ns: i64, no_later: bool) bool {
         self.gate.lock();
         if (self.state.load(.seq_cst) != .running) {
             self.gate.unlock();
             return false;
+        }
+        if (no_later) {
+            const queued = t.fire_pending and t.gen == t.fire_gen;
+            if (queued or (t.armed and t.deadline_ns <= deadline_ns)) {
+                self.gate.unlock();
+                return true;
+            }
         }
         if (t.armed) self.timers.remove(t) else self.armed_timers += 1;
         t.gen +%= 1;
@@ -637,8 +809,13 @@ pub const Runtime = struct {
             t.armed = false;
             self.armed_timers -= 1;
             t.fire_gen = t.gen;
+            t.fire_pending = true;
             self.gate.unlock();
-            self.submitInternal(t.context, &t.request) catch {};
+            self.submitInternal(t.context, &t.request) catch {
+                self.gate.lock();
+                t.fire_pending = false;
+                self.gate.unlock();
+            };
         }
     }
 
@@ -653,6 +830,16 @@ pub const Runtime = struct {
         self.gate.lock();
         defer self.gate.unlock();
         return self.ready_head != null;
+    }
+
+    fn hasReadyInternal(self: *Runtime) bool {
+        self.gate.lock();
+        defer self.gate.unlock();
+        var it = self.ready_head;
+        while (it) |c| : (it = c.ready_next) {
+            if (c.lane == .internal) return true;
+        }
+        return false;
     }
 
     fn workDue(self: *Runtime, now_ns: i64) bool {
@@ -697,6 +884,64 @@ pub const Runtime = struct {
         result.state = self.state.load(.acquire);
         result.retirement_pending = result.state == .retiring;
         return result;
+    }
+
+    // ── Helping ──────────────────────────────────────────────────────────────
+
+    /// Whether a blocking call may help this runtime. Hosted workers supply
+    /// progress, so callers on a hosted runtime only observe
+    /// (docs/design/concurrency/operations.md#stable-helping-policy).
+    pub fn canHelp(self: *const Runtime) bool {
+        return self.options.mode == .manual;
+    }
+
+    /// For a blocking call on a manual runtime: waits until `done(ctx)` or
+    /// until the runtime clock reaches `deadline_ns` (null: no deadline),
+    /// running due timers and internal turns meanwhile, never listener turns
+    /// (docs/design/concurrency/runtime.md#simple-driver-operation). Unlike
+    /// `drive`, any number of callers may help at once, alongside a driver.
+    /// A turn of this runtime ends the wait to recheck `done`; whatever else
+    /// can make it true calls `wakeHelpers`. Returns `done`'s last result.
+    pub fn helpUntil(self: *Runtime, deadline_ns: ?i64, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool) bool {
+        std.debug.assert(self.canHelp());
+        // Counted before `done` is first checked, under `gate` as
+        // `wakeHelpers` reads it: a change made before a waker's check is
+        // seen by that first check.
+        self.gate.lock();
+        self.helpers += 1;
+        self.gate.unlock();
+        defer {
+            self.gate.lock();
+            self.helpers -= 1;
+            self.gate.unlock();
+        }
+        while (true) {
+            if (done(ctx)) return true;
+            self.fireDueTimers(self.clock.nowNs());
+            _ = self.backend.service(self.options.inline_turns);
+            var turns: u32 = 0;
+            while (turns < self.options.inline_turns and self.runNextInternal()) turns += 1;
+            if (turns > 0) continue;
+
+            const token = self.backend.prepareWait();
+            if (done(ctx)) return true;
+            const now = self.clock.nowNs();
+            if (self.hasReadyInternal()) continue;
+            if (deadline_ns) |d| if (now >= d) return false;
+            const timer = self.nextDeadline();
+            if (timer) |t| if (t <= now) continue;
+            const until = if (timer) |t| (if (deadline_ns) |d| @min(t, d) else t) else deadline_ns;
+            self.backend.wait(until, token);
+        }
+    }
+
+    /// Ends the waits of callers in `helpUntil`, for a change made outside
+    /// this runtime's turns that may satisfy one.
+    pub fn wakeHelpers(self: *Runtime) void {
+        self.gate.lock();
+        const helping = self.helpers > 0;
+        self.gate.unlock();
+        if (helping) self.backend.wakeAll();
     }
 
     /// One hosted worker's loop: run ready work, otherwise wait for it, until

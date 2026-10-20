@@ -991,11 +991,37 @@ design items, implementation gates and acceptance criteria are listed in that in
 The runtime core is in `src/runtime/`: take-turns contexts, the ready queue
 ([publication handshake](design/concurrency/architecture.md#ready-queue-publication)),
 timers, the progress backend, the manual `drive` and hosted workers on `std.Io.Threaded`,
-and retirement. No entity uses it yet, and it does not yet carry the operation effect
-states (commit and cancellation), resource waits or listener dispatch.
-Remaining work is implementation: the first vertical slice (one reliable reader/writer
-pair under manual and hosted drivers, listeners, timed waits and automatic retirement),
-then broader endpoint migration, thread consolidation onto the shared runtime timers,
+and retirement. Participants use it only in a `-Dshared-runtime` build (a contributor
+migration switch, off by default): a factory selects the runtime, each participant holds
+an owner reference, and creation fails for transports or discovery plugins that run their
+own threads (only the in-process memory transport and direct discovery qualify so far).
+Received datagrams are copied into each participant's ingress context, bounded by count
+and bytes, and processed in runtime turns (which is what makes a RELIABLE pair over the
+memory transport work there); deleting a participant drops what is still queued. A
+writer's periodic HEARTBEAT is a runtime timer on the runtime clock rather than a thread,
+armed while a reliable reader is matched. The participant's DEADLINE, LIVELINESS and
+held-data expiry checks are one timer armed for the earliest time anything is due (no
+100 ms poll thread), and timed QoS runs on the runtime clock. Reader and writer
+listeners run as turns of the participant's listener context, never on the stack that
+changed their status: the change wakes conditions and queues one request per endpoint,
+each status kind ordered by when it first became pending and claimed when the turn runs,
+and progress that runs internal work only passes them over. Direct discovery still
+matches synchronously on the caller's thread, but the listeners that follow run on the
+runtime. Builtin-topic reader listeners still run inline, a participant's listeners run
+one at a time, and deleting an endpoint from outside a callback does not yet wait for
+its running listener to return. On a manual runtime, blocking calls help: a WaitSet
+created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
+`wait_for_historical_data` run internal turns and due timers until they are satisfied or
+their deadline (on the runtime clock) passes, never listener turns, including when called
+from a listener; on a hosted runtime they only observe. A WaitSet chooses its runtime
+explicitly in Zig; there is no default runtime yet. A RELIABLE write blocked on resource
+limits still polls. It does not yet carry the operation effect states (commit and
+cancellation) or resource waits.
+The first vertical slice runs one reliable reader/writer pair through the same trace
+under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a
+missed deadline, and retirement begun from listeners, with the runtime's last owner
+deleted inside its own listener. Remaining work is implementation: the gaps above, then
+broader endpoint migration, thread consolidation onto the shared runtime timers,
 optional-profile builds and the measured latency/footprint work. The review-era
 synchronization prototype and bounded models stay on the `concurrency-broker-specs` branch
 (see the [evidence inventory](design/probes/README.md)). Advanced extension objects (explicit runtime owners/refs, listener groups, resource

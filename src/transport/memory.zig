@@ -18,13 +18,16 @@
 //!   HEARTBEAT only to RELIABLE reader proxies (writer_sm.zig guards the call
 //!   with `if (rp.reliable)`). For BEST_EFFORT QoS, delivery is deadlock-free.
 //!   RELIABLE QoS tests should use MockTransport until writer_sm locking is
-//!   refactored to release the lock before calling transport.send().
+//!   refactored to release the lock before calling transport.send(). On the
+//!   shared runtime (-Dshared-runtime) the receiving participant queues each
+//!   message for its runtime instead, so RELIABLE works there.
 //!
 //! See also: discovery/direct.zig, delivery/intraprocess.zig
 
 const std = @import("std");
 const iface = @import("interface.zig");
 const mutex_mod = @import("../util/mutex.zig");
+const build_opts = @import("build_options");
 
 pub const Locator = iface.Locator;
 pub const Transport = iface.Transport;
@@ -131,8 +134,13 @@ pub const MemoryTransport = struct {
     }
 
     /// Deliver synchronously: look up the destination port in the bus handler
-    /// map, copy the handler reference (lock released before calling), then
-    /// invoke on_receive. No queueing, no threads.
+    /// map and invoke on_receive. No queueing, no threads.
+    ///
+    /// On the shared runtime the handler only queues a copy for the receiving
+    /// participant, so it runs under the bus lock and `unlisten` cannot return
+    /// while a delivery to its handler is in progress. Otherwise the handler
+    /// processes the message inline and may send, so the lock is released
+    /// first.
     fn vtSend(ctx: *anyopaque, loc: *const Locator, data: []const u8) anyerror!void {
         const self: *MemoryTransport = @ptrCast(@alignCast(ctx));
         const port: u32 = switch (loc.*) {
@@ -140,19 +148,16 @@ pub const MemoryTransport = struct {
             .udp_v6 => |u| u.port,
             else => return,
         };
-        // Copy handler under lock so we can release before calling on_receive.
+        const src: Locator = if (self.unicast_locs.items.len > 0) self.unicast_locs.items[0] else .invalid;
         self.bus.mu.lock();
         const handler: ?ReceiveHandler = self.bus.handlers.get(port);
-        self.bus.mu.unlock();
-
-        if (handler) |h| {
-            const src: Locator = blk: {
-                if (self.unicast_locs.items.len > 0)
-                    break :blk self.unicast_locs.items[0];
-                break :blk .invalid;
-            };
-            h.on_receive(h.ctx, data, src, iface.Channel.none);
+        if (build_opts.shared_runtime) {
+            defer self.bus.mu.unlock();
+            if (handler) |h| h.on_receive(h.ctx, data, src, iface.Channel.none);
+            return;
         }
+        self.bus.mu.unlock();
+        if (handler) |h| h.on_receive(h.ctx, data, src, iface.Channel.none);
     }
 
     fn vtListen(ctx: *anyopaque, locator: *const Locator, handler: ReceiveHandler) anyerror!void {
@@ -201,6 +206,7 @@ pub const MemoryTransport = struct {
 
 const mem_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = false },
+    .shared_runtime_ready = true,
     .can_reach = MemoryTransport.vtCanReach,
     .send = MemoryTransport.vtSend,
     .listen = MemoryTransport.vtListen,

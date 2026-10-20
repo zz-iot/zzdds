@@ -48,6 +48,9 @@ const qm_mod = @import("qos_match.zig");
 const disc_adapter = @import("../discovery/qos_adapter.zig");
 const reader_mod = @import("reader.zig");
 const writer_mod = @import("writer.zig");
+const runtime_mod = @import("../runtime/core.zig");
+const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
+const listener_lane = @import("listener_lane.zig");
 const zidl_rt = @import("zidl_rt");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
@@ -259,7 +262,7 @@ const BuiltinSubscriberState = struct {
             }.f,
             .timer_clock = participant.timer_clock,
             .register_timer_notify = struct {
-                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void, _: *const fn (*anyopaque) bool, _: *const fn (*anyopaque) void) void {}
+                fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: *anyopaque, _: *const fn (*anyopaque, i64) void, _: *const fn (*anyopaque) ?i64, _: *const fn (*anyopaque) bool, _: *const fn (*anyopaque) void) void {}
             }.f,
             .register_get_field_refresh = struct {
                 fn f(_: *anyopaque, _: DDS.InstanceHandle_t, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, ?filter_mod.CdrFieldGetter) void) void {}
@@ -644,9 +647,18 @@ const MatchedNotify = struct {
 const TimerNotify = struct {
     ctx: *anyopaque,
     check: *const fn (ctx: *anyopaque, now_ns: i64) void,
+    /// The earliest time `check` has anything to do, or null.
+    next_due: *const fn (ctx: *anyopaque) ?i64,
     quiesce_acquire: *const fn (ctx: *anyopaque) bool,
     quiesce_release: *const fn (ctx: *anyopaque) void,
 };
+
+/// The earlier of two times, either of which may be never (null).
+fn earlier(a: ?i64, b: ?i64) ?i64 {
+    const x = a orelse return b;
+    const y = b orelse return x;
+    return @min(x, y);
+}
 
 /// Callback registered by DataReaderImpl so that registerTypeSupport()'s
 /// replacement path can push a freshly-registered get_field getter into a
@@ -1030,6 +1042,33 @@ pub const DomainParticipantImpl = struct {
     /// objects -- see docs/roadmap.md's "Concurrency model" design-task entry
     /// for why that matters here specifically).
     timer_thread: ?std.Thread = null,
+    /// The shared runtime this participant holds an owner reference to, set
+    /// by `attachRuntime` before `start` in a `-Dshared-runtime` build and
+    /// released last in `deinit`
+    /// (docs/design/concurrency/runtime.md#operational-ownership-versus-storage-retention).
+    runtime: ?*runtime_mod.Runtime = null,
+    /// With a runtime: the context that processes received datagrams, one
+    /// at a time (docs/design/concurrency/runtime.md#ingress).
+    ingress: runtime_mod.Context = undefined,
+    ingress_latch: CloseLatch = .{},
+    /// Bytes of the datagrams queued for ingress and not yet processed.
+    ingress_bytes: std.atomic.Value(usize) = .init(0),
+    /// Datagrams dropped at ingress: a bound reached, or no memory.
+    ingress_drops: std.atomic.Value(u64) = .init(0),
+    /// With a runtime: `checkTimers` runs as one timer in this context,
+    /// armed for the earliest time anything is due rather than polled by
+    /// the timer thread.
+    timers: runtime_mod.Context = undefined,
+    timers_latch: CloseLatch = .{},
+    check_timer: runtime_mod.Timer = undefined,
+    /// Set by deinit under `check_mu`; nothing arms `check_timer` after.
+    check_mu: Mutex = .{},
+    check_stopping: bool = false,
+    /// With a runtime: where this participant's readers and writers run
+    /// their listeners, one at a time, apart from the work that changed
+    /// their statuses (listener_lane.zig).
+    listeners: runtime_mod.Context = undefined,
+    listeners_latch: CloseLatch = .{},
     /// Set by timerThreadFn as its first action, read by deinit() to detect
     /// a self-join (see deinit()'s doc comment). 0 = not yet set; real
     /// std.Thread.Id values are never 0 in practice on any supported
@@ -1156,6 +1195,120 @@ pub const DomainParticipantImpl = struct {
         generated_config_mod.applyQosDefaults(&self.default_topic_qos, &self.config.qos);
         self.builtin_sub = BuiltinSubscriberState.init(alloc, self) catch null;
         return self;
+    }
+
+    /// Bounds on the datagrams queued for ingress and not yet processed, by
+    /// count and by bytes. Past either they are dropped, as a full socket
+    /// receive buffer drops them (docs/design/concurrency/runtime.md#ingress).
+    /// Placeholders until measured and made configurable.
+    pub const ingress_pending_limit: u32 = 256;
+    pub const ingress_byte_limit: usize = 4 * 1024 * 1024;
+
+    /// Puts the participant on `rt`, whose owner reference the caller has
+    /// taken for it. Call once, before `start`.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) void {
+        self.runtime = rt;
+        self.ingress = runtime_mod.Context.init(rt, ingress_pending_limit);
+        self.ingress.on_closed = self.ingress_latch.hook();
+        // Only timer fires run here, with internal credit.
+        self.timers = runtime_mod.Context.init(rt, 0);
+        self.timers.on_closed = self.timers_latch.hook();
+        self.check_timer = runtime_mod.Timer.init(&self.timers, onCheckTimer);
+        // Each endpoint has at most one listener request admitted.
+        self.listeners = runtime_mod.Context.init(rt, std.math.maxInt(u32));
+        self.listeners.lane = .listener;
+        self.listeners.on_closed = self.listeners_latch.hook();
+    }
+
+    fn listenerLane(self: *Self) ?*runtime_mod.Context {
+        return if (self.runtime != null) &self.listeners else null;
+    }
+
+    fn userDataHandler(self: *Self) transport_if.ReceiveHandler {
+        return .{
+            .ctx = self,
+            .on_receive = if (self.runtime != null) ingressOnReceive else userDataOnReceive,
+        };
+    }
+
+    /// A received datagram, copied and queued for the ingress context.
+    const Ingress = struct {
+        req: runtime_mod.Request = runtime_mod.Request.init(run),
+        alloc: std.mem.Allocator,
+        participant: *Self,
+        src: Locator,
+        data: []u8,
+
+        fn of(req: *runtime_mod.Request) *Ingress {
+            return @fieldParentPtr("req", req);
+        }
+
+        fn run(req: *runtime_mod.Request, _: *runtime_mod.Turn) runtime_mod.Outcome {
+            const item = of(req);
+            const p = item.participant;
+            userDataOnReceive(p, item.data, item.src, transport_if.Channel.none);
+            // Accounted while the participant is certainly alive; the buffer
+            // itself is freed by `destroy` after the turn.
+            _ = p.ingress_bytes.fetchSub(item.data.len, .monotonic);
+            return .done;
+        }
+
+        /// Does not touch the participant, which may already be gone.
+        fn destroy(req: *runtime_mod.Request) void {
+            const item = of(req);
+            item.alloc.free(item.data);
+            item.alloc.destroy(item);
+        }
+
+        /// Drops a datagram that was queued and never processed.
+        fn discard(req: *runtime_mod.Request) void {
+            const item = of(req);
+            _ = item.participant.ingress_bytes.fetchSub(item.data.len, .monotonic);
+            destroy(req);
+        }
+    };
+
+    /// Queues a copy of `raw` for the ingress context. Never processes it on
+    /// the sender's stack: an in-process sender may hold its writer's lock.
+    fn ingressOnReceive(ctx: *anyopaque, raw: []const u8, src: Locator, _: transport_if.Channel) void {
+        const self = cast(ctx);
+        if (self.ingress_bytes.fetchAdd(raw.len, .monotonic) + raw.len > ingress_byte_limit) {
+            _ = self.ingress_bytes.fetchSub(raw.len, .monotonic);
+            _ = self.ingress_drops.fetchAdd(1, .monotonic);
+            return;
+        }
+        const item = self.alloc.create(Ingress) catch return self.dropIngress(raw.len);
+        const data = self.alloc.dupe(u8, raw) catch {
+            self.alloc.destroy(item);
+            return self.dropIngress(raw.len);
+        };
+        item.* = .{ .alloc = self.alloc, .participant = self, .src = src, .data = data };
+        item.req.on_done = Ingress.destroy;
+        self.runtime.?.submit(null, &self.ingress, &item.req) catch {
+            Ingress.discard(&item.req);
+            _ = self.ingress_drops.fetchAdd(1, .monotonic);
+        };
+    }
+
+    fn dropIngress(self: *Self, len: usize) void {
+        _ = self.ingress_bytes.fetchSub(len, .monotonic);
+        _ = self.ingress_drops.fetchAdd(1, .monotonic);
+    }
+
+    fn finishDestroyHook(ctx: *anyopaque) void {
+        cast(ctx).finishDestroy();
+    }
+
+    /// The last of `deinit`: releases the runtime and frees the participant.
+    fn finishDestroy(self: *Self) void {
+        const alloc = self.alloc;
+        if (self.runtime) |rt| {
+            self.ingress.deinit();
+            self.timers.deinit();
+            self.listeners.deinit();
+            rt.releaseOwner();
+        }
+        alloc.destroy(self);
     }
 
     /// Start discovery. Call once after init(). The discovery plugin begins
@@ -1298,10 +1451,7 @@ pub const DomainParticipantImpl = struct {
         // early, to learn the real address/port before announcing it).
         if (!self.config.transport.tcp.enabled and self.data_listen_port != 0) {
             const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
-            try self.transport.listen(&listen_loc, transport_if.ReceiveHandler{
-                .ctx = self,
-                .on_receive = userDataOnReceive,
-            });
+            try self.transport.listen(&listen_loc, self.userDataHandler());
         }
 
         // Also register userDataOnReceive on the metatraffic unicast port,
@@ -1354,10 +1504,7 @@ pub const DomainParticipantImpl = struct {
                 // by this point. Failing participant start() over a transport
                 // not supporting an extra safety net would be worse than not
                 // having the safety net; just skip it.
-                if (self.discovery_transport.listen(&meta_listen_loc, transport_if.ReceiveHandler{
-                    .ctx = self,
-                    .on_receive = userDataOnReceive,
-                })) |_| {
+                if (self.discovery_transport.listen(&meta_listen_loc, self.userDataHandler())) |_| {
                     // Only record success: deinit() unlistens iff this is
                     // nonzero, and must mirror exactly what got registered.
                     self.meta_userdata_listen_port = meta_port;
@@ -1366,6 +1513,9 @@ pub const DomainParticipantImpl = struct {
                 }
             }
         }
+
+        // On a runtime the checks are armed as they become due instead.
+        if (self.runtime != null) return;
 
         // Last step, deliberately: no thread exists yet at this point, so a
         // spawn failure here needs no stop/join cleanup of its own. Without
@@ -1386,14 +1536,6 @@ pub const DomainParticipantImpl = struct {
     /// Stopped by setting timer_stopping before calling timer_thread.join()
     /// (see deinit()) -- same shape as writer_sm.zig's heartbeatThread.
     fn timerThreadFn(self: *Self) void {
-        // Captured before the loop, and used only after the loop below has
-        // genuinely exited -- see the pending_self_destroy branch at the
-        // end of this function and deinit()'s matching comment. Reading
-        // self.alloc directly at that point would also be safe (self isn't
-        // freed until this exact line runs), but capturing it up front
-        // keeps that safety argument local to this function instead of
-        // depending on deinit() never having touched the field.
-        const alloc = self.alloc;
         self.timer_thread_id.store(std.Thread.getCurrentId(), .release);
         while (!self.timer_stopping.load(.acquire)) {
             var slept_ms: u64 = 0;
@@ -1409,7 +1551,7 @@ pub const DomainParticipantImpl = struct {
         // under this still-running function. The loop above has now
         // genuinely exited (timer_stopping is true either way), so it's
         // safe to do now -- nothing below touches `self` again.
-        if (self.pending_self_destroy) alloc.destroy(self);
+        if (self.pending_self_destroy) self.finishDestroy();
     }
 
     pub fn deinit(self: *Self) void {
@@ -1429,6 +1571,9 @@ pub const DomainParticipantImpl = struct {
         // executing further up this very call stack (see the
         // pending_self_destroy branch at the end of this function).
         const self_reentrant = std.Thread.getCurrentId() == self.timer_thread_id.load(.acquire);
+        // On a runtime: from inside a check, the participant is freed once
+        // that turn ends instead.
+        const timers_deferred = self.runtime != null and !self.stopCheckTimer();
         if (self.timer_thread) |t| {
             if (self_reentrant) {
                 // A thread joining itself deadlocks, so detach instead --
@@ -1447,10 +1592,7 @@ pub const DomainParticipantImpl = struct {
         // Stop receiving user data before tearing down readers.
         if (self.data_listen_port != 0) {
             const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
-            self.transport.unlisten(&loc, transport_if.ReceiveHandler{
-                .ctx = self,
-                .on_receive = userDataOnReceive,
-            });
+            self.transport.unlisten(&loc, self.userDataHandler());
         }
         // Mirror start()'s metatraffic-port fallback registration, if any --
         // otherwise a packet arriving on that port after this point calls
@@ -1459,11 +1601,17 @@ pub const DomainParticipantImpl = struct {
         // handles that side).
         if (self.meta_userdata_listen_port != 0) {
             const meta_loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.meta_userdata_listen_port);
-            self.discovery_transport.unlisten(&meta_loc, transport_if.ReceiveHandler{
-                .ctx = self,
-                .on_receive = userDataOnReceive,
-            });
+            self.discovery_transport.unlisten(&meta_loc, self.userDataHandler());
         }
+        // Nothing is delivered after the unlistens above; what was is dropped,
+        // and a turn processing it finishes before entities are torn down,
+        // unless this is that turn: then the participant is freed after it.
+        const ingress_deferred = self.runtime != null and
+            !self.ingress_latch.close(&self.ingress, Ingress.discard);
+        // Likewise for listeners: those queued never start, and one running
+        // elsewhere returns before entities are torn down.
+        const listeners_deferred = self.runtime != null and
+            !self.listeners_latch.close(&self.listeners, listener_lane.PendingListeners.discard);
 
         if (self.status_cond) |sc| sc.deinit();
         if (self.builtin_sub) |bs| bs.deinit();
@@ -1561,6 +1709,20 @@ pub const DomainParticipantImpl = struct {
         // their own deinit.
         if (self.owned_tcp_transport) |t| t.deinit();
 
+        // One thread runs one turn at a time: at most one of these is set.
+        if (timers_deferred) {
+            self.timers_latch.finishWith(.{ .ctx = self, .run = finishDestroyHook });
+            return;
+        }
+        if (ingress_deferred) {
+            self.ingress_latch.finishWith(.{ .ctx = self, .run = finishDestroyHook });
+            return;
+        }
+        if (listeners_deferred) {
+            self.listeners_latch.finishWith(.{ .ctx = self, .run = finishDestroyHook });
+            return;
+        }
+
         // Every step above only touches self's own fields and owned
         // sub-resources, so it's safe to run reentrantly regardless of
         // which thread called deinit(). Freeing `self` itself is the one
@@ -1573,7 +1735,7 @@ pub const DomainParticipantImpl = struct {
         if (self_reentrant) {
             self.pending_self_destroy = true;
         } else {
-            self.alloc.destroy(self);
+            self.finishDestroy();
         }
     }
 
@@ -1777,6 +1939,7 @@ pub const DomainParticipantImpl = struct {
         );
         errdefer adapter.deinit();
         adapter.setTracer(self.tracer);
+        if (self.runtime) |rt| adapter.attachRuntime(rt);
         // {0,0} from codegen means unset → infinite (no lifespan enforcement),
         // matching the convention used by discovery/qos_adapter.zig for SEDP announcement.
         const ls_zero = qos.lifespan.duration.sec == 0 and qos.lifespan.duration.nanosec == 0;
@@ -2228,7 +2391,10 @@ pub const DomainParticipantImpl = struct {
         for (self.ignored_publication_handles.items) |h| {
             if (h == handle) return;
         }
-        ctx.hold(&self.unmatched, target, self.timer_clock.nowNs(), self.unmatchedTtlNsLocked(writer.prefix));
+        const now_ns = self.timer_clock.nowNs();
+        const ttl_ns = self.unmatchedTtlNsLocked(writer.prefix);
+        ctx.hold(&self.unmatched, target, now_ns, ttl_ns);
+        self.armCheck(now_ns + ttl_ns);
     }
 
     /// How long data from a writer of participant `prefix` is held for a
@@ -3968,6 +4134,7 @@ pub const DomainParticipantImpl = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (*anyopaque, i64) void,
+        next_due_fn: *const fn (*anyopaque) ?i64,
         quiesce_acquire: *const fn (*anyopaque) bool,
         quiesce_release: *const fn (*anyopaque) void,
     ) void {
@@ -3977,10 +4144,11 @@ pub const DomainParticipantImpl = struct {
         var aw_it6 = self.active_writers.valueIterator();
         while (aw_it6.next()) |aw| {
             if (aw.handle == handle) {
-                aw.timer_check = .{ .ctx = notify_ctx, .check = notify_fn, .quiesce_acquire = quiesce_acquire, .quiesce_release = quiesce_release };
+                aw.timer_check = .{ .ctx = notify_ctx, .check = notify_fn, .next_due = next_due_fn, .quiesce_acquire = quiesce_acquire, .quiesce_release = quiesce_release };
                 break;
             }
         }
+        timersChanged(self);
     }
 
     fn pubRegisterWriterLivelinessAssert(
@@ -4024,6 +4192,7 @@ pub const DomainParticipantImpl = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (*anyopaque, i64) void,
+        next_due_fn: *const fn (*anyopaque) ?i64,
         quiesce_acquire: *const fn (*anyopaque) bool,
         quiesce_release: *const fn (*anyopaque) void,
     ) void {
@@ -4033,10 +4202,11 @@ pub const DomainParticipantImpl = struct {
         var ar_it6 = self.active_readers.valueIterator();
         while (ar_it6.next()) |ar| {
             if (ar.handle == handle) {
-                ar.timer_check = .{ .ctx = notify_ctx, .check = notify_fn, .quiesce_acquire = quiesce_acquire, .quiesce_release = quiesce_release };
+                ar.timer_check = .{ .ctx = notify_ctx, .check = notify_fn, .next_due = next_due_fn, .quiesce_acquire = quiesce_acquire, .quiesce_release = quiesce_release };
                 break;
             }
         }
+        timersChanged(self);
     }
 
     fn subRegisterReaderGetFieldRefresh(
@@ -4101,6 +4271,8 @@ pub const DomainParticipantImpl = struct {
             .announce_writer = pubAnnounceProtoWriter,
             .timer_clock = self.timer_clock,
             .register_timer_notify = pubRegisterWriterTimerNotify,
+            .timers_changed = .{ .ctx = self, .run = timersChanged },
+            .listener_lane = self.listenerLane(),
             .register_liveliness_assert = pubRegisterWriterLivelinessAssert,
             .register_liveliness_query = pubRegisterWriterLivelinessQuery,
         };
@@ -4117,6 +4289,8 @@ pub const DomainParticipantImpl = struct {
             .announce_reader = subAnnounceProtoReader,
             .timer_clock = self.timer_clock,
             .register_timer_notify = subRegisterReaderTimerNotify,
+            .timers_changed = .{ .ctx = self, .run = timersChanged },
+            .listener_lane = self.listenerLane(),
             .register_get_field_refresh = subRegisterReaderGetFieldRefresh,
             .register_wlp_alive_notify = subRegisterReaderWlpAliveNotify,
         };
@@ -4147,9 +4321,17 @@ pub const DomainParticipantImpl = struct {
     /// returns, guaranteeing the entity can't be freed out from under the
     /// call. If acquire fails, teardown is already underway; skip it.
     pub fn checkTimers(self: *Self) void {
-        const now_ns = self.timer_clock.nowNs();
+        _ = self.checkTimersAt(self.timer_clock.nowNs());
+    }
+
+    /// `checkTimers` at `now_ns`. Returns the earliest time anything checked
+    /// here is next due, or null when nothing is timed.
+    fn checkTimersAt(self: *Self, now_ns: i64) ?i64 {
         var due: std.ArrayListUnmanaged(TimerNotify) = .empty;
         defer due.deinit(self.alloc);
+        // An endpoint left out for want of memory is checked again a poll
+        // interval later.
+        var skipped = false;
         // WLP driver input (RTPS §8.7.2.2.3), accumulated in the same
         // active_writers pass below rather than a second lock/iteration.
         var wlp_info = disc.WlpTickInfo{
@@ -4166,7 +4348,10 @@ pub const DomainParticipantImpl = struct {
             while (aw_it8.next()) |aw| {
                 if (aw.timer_check) |cb| {
                     if (cb.quiesce_acquire(cb.ctx)) {
-                        due.append(self.alloc, cb) catch cb.quiesce_release(cb.ctx);
+                        due.append(self.alloc, cb) catch {
+                            cb.quiesce_release(cb.ctx);
+                            skipped = true;
+                        };
                     }
                 }
                 const ll = aw.qos.liveliness.lease_duration;
@@ -4201,18 +4386,63 @@ pub const DomainParticipantImpl = struct {
             while (ar_it7.next()) |ar| {
                 if (ar.timer_check) |cb| {
                     if (cb.quiesce_acquire(cb.ctx)) {
-                        due.append(self.alloc, cb) catch cb.quiesce_release(cb.ctx);
+                        due.append(self.alloc, cb) catch {
+                            cb.quiesce_release(cb.ctx);
+                            skipped = true;
+                        };
                     }
                 }
             }
         }
         self.discovery.wlpTick(now_ns, wlp_info);
         self.unmatched.expire(now_ns);
+        // Read before the checks: a listener they call may delete this
+        // participant.
+        var next = self.unmatched.nextExpiry();
         for (due.items) |cb| {
             cb.check(cb.ctx, now_ns);
+            next = earlier(next, cb.next_due(cb.ctx));
             cb.quiesce_release(cb.ctx);
         }
+        if (skipped) next = earlier(next, now_ns + @as(i64, TIMER_CHECK_INTERVAL_MS) * std.time.ns_per_ms);
+        return next;
     }
+
+    /// The runtime counterpart of `timerThreadFn`'s loop body.
+    fn onCheckTimer(t: *runtime_mod.Timer, turn: *runtime_mod.Turn) void {
+        const self: *Self = @fieldParentPtr("check_timer", t);
+        if (self.checkTimersAt(turn.now_ns)) |due_ns| self.armCheck(due_ns);
+    }
+
+    /// Brings the checks forward to `due_ns`, unless they are armed for then
+    /// or earlier. Without a runtime the timer thread polls instead.
+    fn armCheck(self: *Self, due_ns: i64) void {
+        const rt = self.runtime orelse return;
+        self.check_mu.lock();
+        defer self.check_mu.unlock();
+        if (!self.check_stopping) _ = rt.armTimerNoLater(&self.check_timer, due_ns);
+    }
+
+    /// Something may now be due sooner than the checks are armed for: an
+    /// endpoint created, a deadline changed, a writer's liveliness tracked
+    /// again. Checks now, which arms them for whatever is due next.
+    fn timersChanged(ctx: *anyopaque) void {
+        const self = cast(ctx);
+        if (self.runtime) |rt| self.armCheck(rt.clock.nowNs());
+    }
+
+    /// Stops the checks for good and closes their context. Returns false
+    /// from inside a check: the context closes when that turn ends.
+    fn stopCheckTimer(self: *Self) bool {
+        self.check_mu.lock();
+        self.check_stopping = true;
+        self.check_mu.unlock();
+        self.runtime.?.cancelTimer(&self.check_timer);
+        return self.timers_latch.close(&self.timers, discardCheck);
+    }
+
+    /// A queued check is the timer's own embedded request: nothing to free.
+    fn discardCheck(_: *runtime_mod.Request) void {}
 
     // ── Entity vtable ─────────────────────────────────────────────────────────
 
@@ -4708,33 +4938,39 @@ pub const DomainParticipantImpl = struct {
         // contained entity's own outstanding preconditions -- check every
         // subscriber (read-loans) and publisher (write-loans) before
         // touching anything. Topics have no loan-related precondition, so
-        // that branch needs no check.
-        self.mu.lock();
-        for (self.subscribers.items) |s| {
-            const precondition = s.checkDeleteContainedPrecondition();
-            if (precondition != DDS.RETCODE_OK) {
-                self.mu.unlock();
-                return precondition;
-            }
-        }
-        for (self.publishers.items) |p| {
-            const precondition = p.checkDeleteContainedPrecondition();
-            if (precondition != DDS.RETCODE_OK) {
-                self.mu.unlock();
-                return precondition;
-            }
-        }
-        self.mu.unlock();
-        // Take ownership of entity lists under the lock.
+        // that branch needs no check. The lists are taken first, so no
+        // concurrent delete frees one mid-check, and checked without `mu`:
+        // a publisher's or subscriber's own mu comes before it
+        // (delete_datawriter holds it while destroying the protocol writer).
         var pubs: std.ArrayListUnmanaged(*publisher_mod.PublisherImpl) = undefined;
         var subs: std.ArrayListUnmanaged(*subscriber_mod.SubscriberImpl) = undefined;
-        var tops: std.ArrayListUnmanaged(*topic_mod.TopicImpl) = undefined;
-        var cfts: std.ArrayListUnmanaged(*topic_mod.ContentFilteredTopicImpl) = undefined;
         self.mu.lock();
         pubs = self.publishers;
         self.publishers = .empty;
         subs = self.subscribers;
         self.subscribers = .empty;
+        self.mu.unlock();
+        const precondition = check: {
+            for (subs.items) |s| {
+                const rc = s.checkDeleteContainedPrecondition();
+                if (rc != DDS.RETCODE_OK) break :check rc;
+            }
+            for (pubs.items) |p| {
+                const rc = p.checkDeleteContainedPrecondition();
+                if (rc != DDS.RETCODE_OK) break :check rc;
+            }
+            break :check DDS.RETCODE_OK;
+        };
+        if (precondition != DDS.RETCODE_OK) {
+            self.mu.lock();
+            defer self.mu.unlock();
+            restoreTaken(*publisher_mod.PublisherImpl, self.alloc, &self.publishers, &pubs);
+            restoreTaken(*subscriber_mod.SubscriberImpl, self.alloc, &self.subscribers, &subs);
+            return precondition;
+        }
+        var tops: std.ArrayListUnmanaged(*topic_mod.TopicImpl) = undefined;
+        var cfts: std.ArrayListUnmanaged(*topic_mod.ContentFilteredTopicImpl) = undefined;
+        self.mu.lock();
         tops = self.topics;
         self.topics = .empty;
         // ContentFilteredTopics were never drained here (only by the
@@ -4757,6 +4993,19 @@ pub const DomainParticipantImpl = struct {
         for (cfts.items) |c| c.deinit();
         cfts.deinit(self.alloc);
         return DDS.RETCODE_OK;
+    }
+
+    /// Puts `taken` back into `list` under `mu`, keeping entities created
+    /// since it was taken.
+    fn restoreTaken(
+        comptime T: type,
+        alloc: std.mem.Allocator,
+        list: *std.ArrayListUnmanaged(T),
+        taken: *std.ArrayListUnmanaged(T),
+    ) void {
+        taken.appendSlice(alloc, list.items) catch @panic("zzdds: out of memory restoring entity list");
+        list.deinit(alloc);
+        list.* = taken.*;
     }
 
     fn vtSetQos(ctx: *anyopaque, qos: *const DDS.DomainParticipantQos) DDS.ReturnCode_t {

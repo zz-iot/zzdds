@@ -289,10 +289,10 @@ pub const ProtocolWriter = struct {
         all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber) bool,
 
         /// Block until every RELIABLE matched reader has acknowledged all changes
-        /// up to and including `target_sn`, or until `deadline_ns` (monotonic ns)
-        /// is reached.  Null `deadline_ns` waits indefinitely.
+        /// up to and including `target_sn`, or for `timeout_ns`, on the clock
+        /// the writer schedules by.  Null `timeout_ns` waits indefinitely.
         /// Returns true on success, false on timeout.
-        wait_all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber, deadline_ns: ?i64) bool,
+        wait_all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber, timeout_ns: ?i64) bool,
 
         /// Return the current number of samples in the writer's history cache.
         /// Used to enforce RESOURCE_LIMITS.max_samples before writing.
@@ -443,8 +443,8 @@ pub const ProtocolWriter = struct {
         return self.vtable.all_acked(self.ctx, target_sn);
     }
 
-    pub fn waitAllAcked(self: ProtocolWriter, target_sn: SequenceNumber, deadline_ns: ?i64) bool {
-        return self.vtable.wait_all_acked(self.ctx, target_sn, deadline_ns);
+    pub fn waitAllAcked(self: ProtocolWriter, target_sn: SequenceNumber, timeout_ns: ?i64) bool {
+        return self.vtable.wait_all_acked(self.ctx, target_sn, timeout_ns);
     }
 
     pub fn cacheLen(self: ProtocolWriter) usize {

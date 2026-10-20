@@ -35,6 +35,7 @@
 //!   mu and calls out afterward with no lock held, specifically so it can
 //!   call into WaitSet.mu without inverting the WaitSet.mu → WakeupList.mu
 //!   order above.
+//!   A helping runtime's gate is a leaf, taken by wakeups after cv_mu.
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
@@ -45,6 +46,7 @@ const Condvar = @import("../util/condvar.zig").Condvar;
 const time_mod = @import("../util/time.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
+const Runtime = @import("../runtime/core.zig").Runtime;
 
 // ── Push-notification types ───────────────────────────────────────────────────
 
@@ -215,6 +217,10 @@ pub const WaitSetImpl = struct {
     cv_mu: Mutex, // protects `notified`
     cv_cond: Condvar,
     notified: bool,
+    /// The manual runtime a wait helps, chosen at construction
+    /// (docs/design/concurrency/operations.md#stable-helping-policy). Null:
+    /// a wait only observes, and progress comes from elsewhere.
+    helping: ?*Runtime = null,
     ws_c_abi: c_abi_handle.CachedCAbiHandle = .{},
     // Guards against a genuine use-after-free: WakeupList.invalidateAll()
     // (a condition's own teardown path) deliberately copies out its
@@ -265,6 +271,18 @@ pub const WaitSetImpl = struct {
             .cv_cond = .{},
             .notified = false,
         };
+        return self;
+    }
+
+    /// A WaitSet whose waits run `runtime`'s internal work (protocol, timers,
+    /// conditions; never listeners) until a condition triggers, so a manual
+    /// runtime makes progress while the application waits. `runtime` must
+    /// outlive the WaitSet. A hosted runtime's workers already make progress,
+    /// so it is refused.
+    pub fn initHelping(alloc: std.mem.Allocator, runtime: *Runtime) error{ OutOfMemory, HostedRuntime }!*Self {
+        if (!runtime.canHelp()) return error.HostedRuntime;
+        const self = try init(alloc);
+        self.helping = runtime;
         return self;
     }
 
@@ -370,7 +388,8 @@ pub const WaitSetImpl = struct {
             {
                 break :blk null;
             }
-            const now = time_mod.nanoTimestamp();
+            // A helping wait's deadline is on its runtime's clock.
+            const now = if (self.helping) |r| r.clock.nowNs() else time_mod.nanoTimestamp();
             break :blk now +
                 @as(i64, timeout.sec) * std.time.ns_per_s +
                 @as(i64, timeout.nanosec);
@@ -415,6 +434,11 @@ pub const WaitSetImpl = struct {
                 seq._maximum = @intCast(buf.len);
                 seq._release = true;
                 return DDS.RETCODE_OK;
+            }
+
+            if (self.helping) |r| {
+                if (!r.helpUntil(deadline_ns, self, takeNotified)) return DDS.RETCODE_TIMEOUT;
+                continue;
             }
 
             // Block until notification or deadline.
@@ -617,6 +641,16 @@ pub const WaitSetImpl = struct {
         self.notified = true;
         self.cv_cond.broadcast();
         self.cv_mu.unlock();
+        if (self.helping) |r| r.wakeHelpers();
+    }
+
+    /// Consumes a pending notification.
+    fn takeNotified(self: *Self) bool {
+        self.cv_mu.lock();
+        defer self.cv_mu.unlock();
+        const notified = self.notified;
+        self.notified = false;
+        return notified;
     }
 
     /// Called from a condition's own teardown path (via WakeupHandle.invalidate)

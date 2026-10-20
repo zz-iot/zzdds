@@ -19,6 +19,7 @@ const history_mod = @import("history.zig");
 const guid_mod = @import("guid.zig");
 const trace_mod = @import("../trace.zig");
 const time_mod = @import("../util/time.zig");
+const runtime_mod = @import("../runtime/core.zig");
 const submsg_mod = @import("message/submessage.zig");
 const msg_builder = @import("message/builder.zig");
 const sn_mod = @import("sequence_number.zig");
@@ -107,6 +108,10 @@ pub const RtpsProtocolWriter = struct {
 
     pub fn setLifespan(self: *Self, ls: ?time_mod.RtpsDuration) void {
         self.writer.setLifespan(ls);
+    }
+
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) void {
+        self.writer.attachRuntime(rt);
     }
 
     pub fn setKeyed(self: *Self, keyed: bool) void {
@@ -221,9 +226,9 @@ pub const RtpsProtocolWriter = struct {
         return self.writer.allProxiesAcked(target_sn);
     }
 
-    fn vtWaitAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber, deadline_ns: ?i64) bool {
+    fn vtWaitAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber, timeout_ns: ?i64) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.writer.waitAllAcked(target_sn, deadline_ns);
+        return self.writer.waitAllAcked(target_sn, timeout_ns);
     }
 
     fn vtRemoveMatchedReader(ctx: *anyopaque, guid: Guid) void {

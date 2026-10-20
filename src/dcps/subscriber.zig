@@ -16,6 +16,8 @@ const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
+const Hook = @import("../runtime/core.zig").Hook;
+const RuntimeContext = @import("../runtime/core.zig").Context;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
@@ -77,6 +79,14 @@ pub const ParticipantCbs = struct {
     /// Clock passed to DataReaderImpl for DEADLINE interval timers.
     timer_clock: time_mod.Clock,
 
+    /// Given to each DataReaderImpl: run when something may fall due sooner than
+    /// the participant's timer checks are armed for.
+    timers_changed: ?Hook = null,
+
+    /// The participant's listener context on a shared runtime, where each
+    /// DataReaderImpl queues its listener invocations; null runs them inline.
+    listener_lane: ?*RuntimeContext = null,
+
     /// Register a timer-check callback (DEADLINE) for a reader.
     /// Called once per DataReader after create_proto_reader succeeds.
     /// quiesce_acquire/quiesce_release let checkTimers() hold the reader's
@@ -87,6 +97,7 @@ pub const ParticipantCbs = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (notify_ctx: *anyopaque, now_ns: i64) void,
+        next_due_fn: *const fn (notify_ctx: *anyopaque) ?i64,
         quiesce_acquire: *const fn (notify_ctx: *anyopaque) bool,
         quiesce_release: *const fn (notify_ctx: *anyopaque) void,
     ) void,
@@ -411,6 +422,8 @@ pub const SubscriberImpl = struct {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
             return nil.nil_datareader;
         };
+        dr.timers_changed = self.cbs.timers_changed;
+        dr.listeners.lane = self.cbs.listener_lane;
         self.cbs.register_incompat_qos(
             self.cbs.ctx,
             subscription_handle,
@@ -428,6 +441,7 @@ pub const SubscriberImpl = struct {
             subscription_handle,
             dr,
             reader_mod.DataReaderImpl.checkTimersFn,
+            reader_mod.DataReaderImpl.nextTimerDueFn,
             reader_mod.DataReaderImpl.quiesceAcquireFn,
             reader_mod.DataReaderImpl.quiesceReleaseFn,
         );
@@ -840,6 +854,7 @@ pub const SubscriberImpl = struct {
         if (has_data) {
             r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
             if (r.status_cond) |sc| sc.notifyWakeup();
+            if (r.listeners.post(DDS.DATA_AVAILABLE_STATUS)) return;
             const resolution = self.resolveDataAvailableFallback(r);
             // Reserved before the claim, so a failed allocation leaves the
             // status changed for a later notification instead of consumed.

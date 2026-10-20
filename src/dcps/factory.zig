@@ -20,6 +20,9 @@ const generated_config_mod = @import("../config/generated.zig");
 const trace_mod = @import("../trace.zig");
 const clock_registry_mod = @import("../util/clock_registry.zig");
 const c_abi_handle = @import("../util/c_abi_handle.zig");
+const runtime_mod = @import("../runtime/core.zig");
+const log_mod = @import("../log.zig");
+const build_opts = @import("build_options");
 
 pub const ClockRegistry = clock_registry_mod.ClockRegistry;
 
@@ -46,6 +49,12 @@ pub const DomainParticipantFactoryImpl = struct {
     next_handle: DDS.InstanceHandle_t,
 
     mu: Mutex,
+
+    /// The runtime new participants use in a `-Dshared-runtime` build, with
+    /// the factory's own owner reference; guarded by `mu`. There is no
+    /// default runtime yet, so creation fails until one is selected
+    /// (docs/design/concurrency/runtime.md#selected-selection-hierarchy).
+    runtime: ?*runtime_mod.Runtime = null,
 
     fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
@@ -84,6 +93,7 @@ pub const DomainParticipantFactoryImpl = struct {
         self.fac_c_abi.free(self.alloc);
         for (self.participants.items) |p| p.deinit();
         self.participants.deinit(self.alloc);
+        if (self.runtime) |rt| rt.releaseOwner();
         self.clock_registry.deinit();
         self.default_dp_qos.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -93,6 +103,46 @@ pub const DomainParticipantFactoryImpl = struct {
     /// Call before `create_participant`; has no effect on already-created participants.
     pub fn setTraceConfig(self: *Self, tc: trace_mod.TraceConfig) void {
         self.trace_config = tc;
+    }
+
+    /// Selects the runtime for participants created from now on, taking an
+    /// owner reference to it and releasing the previous selection's.
+    /// Existing participants keep theirs. Fails if `rt` is already retiring.
+    pub fn selectRuntime(self: *Self, rt: ?*runtime_mod.Runtime) error{ SharedRuntimeDisabled, Retiring }!void {
+        if (!build_opts.shared_runtime) return error.SharedRuntimeDisabled;
+        if (rt) |r| if (!r.tryRetainOwner()) return error.Retiring;
+        self.mu.lock();
+        const old = self.runtime;
+        self.runtime = rt;
+        self.mu.unlock();
+        if (old) |o| o.releaseOwner();
+    }
+
+    /// Takes an owner reference to the selected runtime for a new participant,
+    /// after checking the participant's transports and discovery can run on
+    /// it; null (with a diagnostic) when creation must fail. The migration
+    /// build never falls back to the threaded path
+    /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
+    fn acquireRuntimeFor(self: *Self, config: config_mod.Config) ?*runtime_mod.Runtime {
+        if (!self.transport.vtable.shared_runtime_ready or config.transport.tcp.enabled) {
+            log_mod.dcps.warn("create_participant: the transport is not supported on the shared runtime yet", .{});
+            return null;
+        }
+        if (!self.discovery.vtable.shared_runtime_ready) {
+            log_mod.dcps.warn("create_participant: the discovery plugin is not supported on the shared runtime yet", .{});
+            return null;
+        }
+        self.mu.lock();
+        defer self.mu.unlock();
+        const rt = self.runtime orelse {
+            log_mod.dcps.warn("create_participant: no runtime selected", .{});
+            return null;
+        };
+        if (!rt.tryRetainOwner()) {
+            log_mod.dcps.warn("create_participant: the selected runtime is retiring", .{});
+            return null;
+        }
+        return rt;
     }
 
     pub fn toDDSFactory(self: *Self) DDS.DomainParticipantFactory {
@@ -172,6 +222,11 @@ pub const DomainParticipantFactoryImpl = struct {
 
         const timer_clock = self.clock_registry.get(config.participant.timer_clock_name);
 
+        const rt: ?*runtime_mod.Runtime = if (build_opts.shared_runtime)
+            self.acquireRuntimeFor(config) orelse return null
+        else
+            null;
+
         const p = participant_mod.DomainParticipantImpl.init(
             self.alloc,
             domain_id,
@@ -185,8 +240,13 @@ pub const DomainParticipantFactoryImpl = struct {
             mask,
             handle,
             self.trace_config.tracer(),
-            timer_clock,
-        ) catch return null;
+            // On a runtime, timed QoS runs on its clock.
+            if (rt) |r| r.clock else timer_clock,
+        ) catch {
+            if (rt) |r| r.releaseOwner();
+            return null;
+        };
+        if (rt) |r| p.attachRuntime(r);
         // config_deinit_allocator is set AFTER participants.append so that p.deinit()
         // on any failure path below doesn't free config — the caller retains ownership
         // and handles cleanup on error.

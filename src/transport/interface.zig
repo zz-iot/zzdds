@@ -458,6 +458,12 @@ pub const Transport = struct {
         /// Read directly; does not go through a function call.
         capabilities: Capabilities,
 
+        /// The transport runs no thread of its own, so a participant on the
+        /// shared runtime may use it. Removed with the `-Dshared-runtime`
+        /// migration option
+        /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
+        shared_runtime_ready: bool = false,
+
         /// Returns true if this transport can send to / receive from the given locator.
         can_reach: *const fn (ctx: *anyopaque, locator: *const Locator) bool,
 

@@ -115,6 +115,178 @@ test "ready contexts are served round robin, one turn per claim" {
     try m.retire();
 }
 
+test "internal progress passes over listener work, which keeps its place" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var a = rt.Context.init(&m.runtime, 16);
+    var l = rt.Context.init(&m.runtime, 16);
+    l.lane = .listener;
+    var b = rt.Context.init(&m.runtime, 16);
+    var log: Log = .{};
+    var a1 = Step{ .id = 11, .log = &log };
+    var l1 = Step{ .id = 21, .log = &log };
+    var b1 = Step{ .id = 31, .log = &log };
+    var b2 = Step{ .id = 32, .log = &log };
+    try m.runtime.submit(null, &a, &a1.req);
+    try m.runtime.submit(null, &l, &l1.req);
+    try m.runtime.submit(null, &b, &b1.req);
+    try m.runtime.submit(null, &b, &b2.req);
+
+    while (m.runtime.runNextInternal()) {}
+    try testing.expectEqualSlices(u32, &.{ 11, 31, 32 }, log.slice());
+
+    // The listener context is still first in line for ordinary progress.
+    var a2 = Step{ .id = 12, .log = &log };
+    try m.runtime.submit(null, &a, &a2.req);
+    try testing.expect(m.runtime.runNext());
+    try testing.expectEqualSlices(u32, &.{ 11, 31, 32, 21 }, log.slice());
+    _ = try m.runtime.drive(10, 0);
+    try testing.expectEqualSlices(u32, &.{ 11, 31, 32, 21, 12 }, log.slice());
+    a.deinit();
+    l.deinit();
+    b.deinit();
+    try m.retire();
+}
+
+// ── Helping ───────────────────────────────────────────────────────────────────
+
+fn logged(comptime id: u32) fn (*Log) bool {
+    return struct {
+        fn f(log: *Log) bool {
+            return std.mem.indexOfScalar(u32, log.slice(), id) != null;
+        }
+    }.f;
+}
+
+test "a helping wait runs internal turns and due timers, never listener turns" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var a = rt.Context.init(&m.runtime, 16);
+    var l = rt.Context.init(&m.runtime, 16);
+    l.lane = .listener;
+    var log: Log = .{};
+    var l1 = Step{ .id = 21, .log = &log };
+    var a1 = Step{ .id = 11, .log = &log };
+    var tick = Tick.init(&a, 3, &log);
+    const t0 = m.now();
+    try m.runtime.submit(null, &l, &l1.req);
+    try m.runtime.submit(null, &a, &a1.req);
+    try testing.expect(m.runtime.armTimer(&tick.timer, t0 + 500));
+
+    // The wait sleeps on the scripted clock only until the timer is due.
+    try testing.expect(m.runtime.helpUntil(t0 + 1_000, &log, logged(3)));
+    try testing.expectEqualSlices(u32, &.{ 11, 3 }, log.slice());
+    try testing.expectEqual(t0 + 500, m.now());
+
+    _ = try m.runtime.drive(10, 0);
+    try testing.expectEqualSlices(u32, &.{ 11, 3, 21 }, log.slice());
+    a.deinit();
+    l.deinit();
+    try m.retire();
+}
+
+test "a helping wait ends at its deadline on the runtime clock" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var l = rt.Context.init(&m.runtime, 16);
+    l.lane = .listener;
+    var log: Log = .{};
+    var l1 = Step{ .id = 21, .log = &log };
+    try m.runtime.submit(null, &l, &l1.req);
+    const t0 = m.now();
+
+    // Queued listener work is not work for a helper: it waits, not spins.
+    try testing.expect(!m.runtime.helpUntil(t0 + 700, &log, logged(21)));
+    try testing.expectEqual(t0 + 700, m.now());
+    try testing.expectEqual(@as(usize, 0), log.n);
+    try testing.expectEqual(@as(u32, 0), m.sb.unbounded_waits);
+    _ = try m.runtime.drive(10, 0);
+    l.deinit();
+    try m.retire();
+}
+
+/// Sets `flag` when its turn runs.
+const Flag = struct {
+    req: rt.Request = rt.Request.init(run),
+    flag: std.atomic.Value(bool) = .init(false),
+
+    fn run(req: *rt.Request, _: *rt.Turn) rt.Outcome {
+        @as(*Flag, @fieldParentPtr("req", req)).flag.store(true, .release);
+        return .done;
+    }
+
+    fn isSet(self: *Flag) bool {
+        return self.flag.load(.acquire);
+    }
+};
+
+/// A manual runtime on real threads, with one thread in `helpUntil`.
+const Helped = struct {
+    threaded: std.Io.Threaded,
+    backend: rt.IoBackend,
+    runtime: rt.Runtime,
+    helped: std.atomic.Value(bool) = .init(false),
+
+    fn init(self: *Helped) void {
+        self.threaded = .init(testing.allocator, .{});
+        self.backend = rt.IoBackend.init(self.threaded.io());
+        self.runtime = rt.Runtime.init(self.backend.clock(), self.backend.backend(), .{ .mode = .manual });
+        self.helped = .init(false);
+    }
+
+    /// Helps until `flag` is set, giving up after 10 s rather than hanging.
+    /// `helped`: the flag was seen before then, so a wake ended the wait.
+    fn help(self: *Helped, flag: *Flag) void {
+        const deadline = self.runtime.clock.nowNs() + 10 * std.time.ns_per_s;
+        const done = self.runtime.helpUntil(deadline, flag, Flag.isSet);
+        self.helped.store(done and self.runtime.clock.nowNs() < deadline, .release);
+    }
+
+    fn untilWaiting(self: *Helped) void {
+        while (self.backend.waiters.load(.seq_cst) == 0) std.Thread.yield() catch {};
+    }
+
+    fn deinit(self: *Helped) !void {
+        self.runtime.releaseOwner();
+        const r = try self.runtime.drive(1000, 0);
+        try testing.expectEqual(rt.State.backend_stopped, r.state);
+        self.runtime.deinit();
+        self.threaded.deinit();
+    }
+};
+
+test "a turn run by another thread ends a helper's wait" {
+    var h: Helped = undefined;
+    h.init();
+    var l = rt.Context.init(&h.runtime, 16);
+    l.lane = .listener;
+    var flag: Flag = .{};
+    // Queued before the helper starts: the helper leaves the listener turn
+    // to this thread and waits, and only the turn's end can wake it.
+    try h.runtime.submit(null, &l, &flag.req);
+    const helper = try std.Thread.spawn(.{}, Helped.help, .{ &h, &flag });
+    h.untilWaiting();
+    try testing.expect(h.runtime.runNext());
+    helper.join();
+    try testing.expect(h.helped.load(.acquire));
+    l.deinit();
+    try h.deinit();
+}
+
+test "wakeHelpers ends a helper's wait for a change made outside a turn" {
+    var h: Helped = undefined;
+    h.init();
+    var flag: Flag = .{};
+    const helper = try std.Thread.spawn(.{}, Helped.help, .{ &h, &flag });
+    h.untilWaiting();
+
+    flag.flag.store(true, .release);
+    h.runtime.wakeHelpers();
+    helper.join();
+    try testing.expect(h.helped.load(.acquire));
+    try h.deinit();
+}
+
 test "a yielding request rejoins its context behind newer requests" {
     var m: Manual = undefined;
     m.init(.{ .mode = .manual });
@@ -344,6 +516,37 @@ test "a recurring timer re-arms itself until the runtime retires" {
     m.runtime.deinit();
 }
 
+test "arming no later only ever brings a timer forward" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var log: Log = .{};
+    const t0 = m.now();
+    var t = Tick.init(&ctx, 1, &log);
+    try testing.expect(m.runtime.armTimerNoLater(&t.timer, t0 + 300));
+    try testing.expect(m.runtime.armTimerNoLater(&t.timer, t0 + 500));
+    try testing.expectEqual(@as(?i64, t0 + 300), m.runtime.nextDeadline());
+    try testing.expect(m.runtime.armTimerNoLater(&t.timer, t0 + 100));
+    try testing.expectEqual(@as(?i64, t0 + 100), m.runtime.nextDeadline());
+
+    // A fire queued and not yet run counts as due now: a later arming
+    // neither replaces it nor makes it stale.
+    m.sb.clock_state.advance(100);
+    m.runtime.fireDueTimers(m.now());
+    try testing.expect(m.runtime.armTimerNoLater(&t.timer, t0 + 500));
+    try testing.expectEqual(@as(?i64, null), m.runtime.nextDeadline());
+    _ = try m.runtime.drive(10, 0);
+    try testing.expectEqualSlices(u32, &.{1}, log.slice());
+    try testing.expectEqual(t0 + 100, t.fired_at);
+
+    // Once that fire has run, the next arming sets whatever time it asks.
+    try testing.expect(m.runtime.armTimerNoLater(&t.timer, t0 + 900));
+    try testing.expectEqual(@as(?i64, t0 + 900), m.runtime.nextDeadline());
+    m.runtime.cancelTimer(&t.timer);
+    ctx.deinit();
+    try m.retire();
+}
+
 // ── Driving ───────────────────────────────────────────────────────────────────
 
 test "drive rejects a zero budget, nested driving and a hosted runtime" {
@@ -492,6 +695,17 @@ test "releasing the final owner retires the runtime once admitted work drains" {
     try testing.expect(!r.retirement_pending);
     try testing.expectEqualSlices(u32, &.{ 1, 1 }, log.slice());
     ctx.deinit();
+    m.runtime.deinit();
+}
+
+test "no owner attaches once the final owner is released" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    try testing.expect(m.runtime.tryRetainOwner());
+    m.runtime.releaseOwner();
+    m.runtime.releaseOwner();
+    try testing.expect(!m.runtime.tryRetainOwner());
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
     m.runtime.deinit();
 }
 
@@ -664,6 +878,181 @@ test "a hosted timer fires on its context, and its callback may release the fina
     try testing.expectEqual(rt.State.backend_stopped, runtime.getState());
     ctx.deinit();
     runtime.deinit();
+}
+
+// ── Discarding close and completion hooks ─────────────────────────────────────
+
+/// Counts `on_closed` calls and logs `id` for each.
+const Closed = struct {
+    log: *Log,
+    id: u32,
+    calls: u32 = 0,
+
+    fn hook(self: *Closed) rt.Hook {
+        return .{ .ctx = self, .run = run };
+    }
+
+    fn run(ctx: *anyopaque) void {
+        const self: *Closed = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.log.add(self.id);
+    }
+};
+
+fn discardedIds(d: rt.Discarded, out: *Log) void {
+    var it = d.requests;
+    while (it) |req| : (it = req.next) {
+        const step: *Step = @fieldParentPtr("req", req);
+        out.add(step.id);
+    }
+}
+
+test "closing with discard takes queued requests out unrun and unlinks the context" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var other = rt.Context.init(&m.runtime, 16);
+    var log: Log = .{};
+    var a = Step{ .id = 1, .log = &log };
+    var b = Step{ .id = 2, .log = &log };
+    var c = Step{ .id = 3, .log = &log };
+    try m.runtime.submit(null, &ctx, &a.req);
+    try m.runtime.submit(null, &ctx, &b.req);
+    try m.runtime.submit(null, &other, &c.req);
+
+    const d = ctx.closeDiscarding();
+    try testing.expect(d.closed);
+    var discarded: Log = .{};
+    discardedIds(d, &discarded);
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, discarded.slice());
+    try testing.expectEqual(rt.Placement.done, a.req.placement);
+    try testing.expectEqual(@as(u32, 0), ctx.pending);
+    try testing.expectError(error.Closed, m.runtime.submit(null, &ctx, &a.req));
+
+    const r = try m.runtime.drive(10, 0);
+    try testing.expectEqual(@as(u32, 1), r.turns);
+    try testing.expectEqualSlices(u32, &.{3}, log.slice());
+    ctx.deinit();
+    other.deinit();
+    try m.retire();
+}
+
+test "a claim in flight when the queue is discarded releases the context and closes it" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var other = rt.Context.init(&m.runtime, 16);
+    var log: Log = .{};
+    var closed = Closed{ .log = &log, .id = 9 };
+    ctx.on_closed = closed.hook();
+    var a = Step{ .id = 1, .log = &log };
+    var c = Step{ .id = 3, .log = &log };
+    try m.runtime.submit(null, &ctx, &a.req);
+    try m.runtime.submit(null, &other, &c.req);
+
+    // The discard lands after a claim has unlinked the context and before it
+    // is claimed RUNNING: the claim finds nothing to run.
+    const Discard = struct {
+        var result: ?rt.Discarded = null;
+        fn hook(_: *rt.Runtime, claimed: *rt.Context) void {
+            result = claimed.closeDiscarding();
+        }
+    };
+    Discard.result = null;
+    m.runtime.test_hooks.after_unlink = Discard.hook;
+    const r = try m.runtime.drive(10, 0);
+    try testing.expect(!Discard.result.?.closed);
+    try testing.expectEqual(@as(?*rt.Request, &a.req), Discard.result.?.requests);
+    try testing.expectEqual(@as(u32, 1), r.turns);
+    try testing.expectEqual(@as(u32, 1), closed.calls);
+    try testing.expectEqual(rt.Lifecycle.closed, ctx.getLifecycle());
+    try testing.expectEqualSlices(u32, &.{ 9, 3 }, log.slice());
+    ctx.deinit();
+    other.deinit();
+    try m.retire();
+}
+
+/// Discards its own context during its turn.
+const SelfClose = struct {
+    req: rt.Request = rt.Request.init(run),
+    log: *Log,
+    result: ?rt.Discarded = null,
+    running_here: bool = false,
+
+    fn run(req: *rt.Request, turn: *rt.Turn) rt.Outcome {
+        const self: *SelfClose = @fieldParentPtr("req", req);
+        self.running_here = turn.context.isRunningHere();
+        self.result = turn.context.closeDiscarding();
+        self.log.add(1);
+        return .done;
+    }
+
+    fn done(req: *rt.Request) void {
+        const self: *SelfClose = @fieldParentPtr("req", req);
+        self.log.add(2);
+    }
+};
+
+test "a turn that discards its own context closes it when the turn ends" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var log: Log = .{};
+    var closed = Closed{ .log = &log, .id = 3 };
+    ctx.on_closed = closed.hook();
+    var s = SelfClose{ .log = &log };
+    s.req.on_done = SelfClose.done;
+    var queued = Step{ .id = 7, .log = &log };
+    try m.runtime.submit(null, &ctx, &s.req);
+    try m.runtime.submit(null, &ctx, &queued.req);
+
+    const r = try m.runtime.drive(10, 0);
+    try testing.expectEqual(@as(u32, 1), r.turns);
+    try testing.expect(s.running_here);
+    try testing.expect(!ctx.isRunningHere());
+    try testing.expect(!s.result.?.closed);
+    try testing.expectEqual(@as(?*rt.Request, &queued.req), s.result.?.requests);
+    // The turn, then its completion hook, then the context's.
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, log.slice());
+    try testing.expectEqual(rt.Lifecycle.closed, ctx.getLifecycle());
+    ctx.deinit();
+    try m.retire();
+}
+
+/// Heap-allocated, and freed by its completion hook.
+const Owned = struct {
+    req: rt.Request = rt.Request.init(run),
+    turns: u32 = 0,
+    freed: *u32,
+
+    fn run(req: *rt.Request, _: *rt.Turn) rt.Outcome {
+        const self: *Owned = @fieldParentPtr("req", req);
+        self.turns += 1;
+        return if (self.turns == 1) .yield else .done;
+    }
+
+    fn done(req: *rt.Request) void {
+        const self: *Owned = @fieldParentPtr("req", req);
+        self.freed.* += 1;
+        testing.allocator.destroy(self);
+    }
+};
+
+test "a completion hook runs once the request is done, and may free it" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var freed: u32 = 0;
+    const o = try testing.allocator.create(Owned);
+    o.* = .{ .freed = &freed };
+    o.req.on_done = Owned.done;
+    try m.runtime.submit(null, &ctx, &o.req);
+
+    const r = try m.runtime.drive(10, 0);
+    try testing.expectEqual(@as(u32, 2), r.turns);
+    try testing.expectEqual(@as(u32, 1), freed);
+    ctx.deinit();
+    try m.retire();
 }
 
 // ── Retirement and timer races ────────────────────────────────────────────────
