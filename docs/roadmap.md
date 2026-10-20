@@ -1007,9 +1007,10 @@ changed their status: the change wakes conditions and queues one request per end
 each status kind ordered by when it first became pending and claimed when the turn runs,
 and progress that runs internal work only passes them over. Direct discovery still
 matches synchronously on the caller's thread, but the listeners that follow run on the
-runtime. Builtin-topic reader listeners still run inline, a participant's listeners run
-one at a time, and deleting an endpoint from outside a callback does not yet wait for
-its running listener to return. On a manual runtime, blocking calls help: a WaitSet
+runtime. Deleting a reader or writer from application code waits for a listener
+running through it (as a runtime turn, or inline from `notify_datareaders`) to return;
+deleting it from any callback chain does not wait. Builtin-topic reader listeners still
+run inline, and a participant's listeners run one at a time. On a manual runtime, blocking calls help: a WaitSet
 created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
 `wait_for_historical_data` run internal turns and due timers until they are satisfied or
 their deadline (on the runtime clock) passes, never listener turns, including when called

@@ -540,21 +540,26 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.readers.items, 0..) |r, i| {
-            if (r.toDDSDataReader().ptr == a_datareader.ptr) {
-                // Spec §2.2.2.5.2.6: PRECONDITION_NOT_MET if the reader has
-                // outstanding loans -- check before touching anything.
-                const precondition = r.checkDeletePrecondition();
-                if (precondition != DDS.RETCODE_OK) return precondition;
-                _ = self.readers.swapRemove(i);
-                self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
-                r.deinit();
-                return DDS.RETCODE_OK;
+        const r = found: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (self.readers.items, 0..) |r, i| {
+                if (r.toDDSDataReader().ptr == a_datareader.ptr) {
+                    // Spec §2.2.2.5.2.6: PRECONDITION_NOT_MET if the reader has
+                    // outstanding loans -- check before touching anything.
+                    const precondition = r.checkDeletePrecondition();
+                    if (precondition != DDS.RETCODE_OK) return precondition;
+                    _ = self.readers.swapRemove(i);
+                    break :found r;
+                }
             }
-        }
-        return DDS.RETCODE_BAD_PARAMETER;
+            return DDS.RETCODE_BAD_PARAMETER;
+        };
+        // Torn down without `mu`: deinit waits for a running listener,
+        // which may call back into this Subscriber.
+        self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
+        r.deinit();
+        return DDS.RETCODE_OK;
     }
 
     /// Checks every reader's delete precondition without tearing anything
@@ -577,15 +582,23 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        const precondition = self.checkDeleteContainedPrecondition();
-        if (precondition != DDS.RETCODE_OK) return precondition;
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.readers.items) |r| {
+        var taken: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl) = undefined;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (self.readers.items) |r| {
+                const precondition = r.checkDeletePrecondition();
+                if (precondition != DDS.RETCODE_OK) return precondition;
+            }
+            taken = self.readers;
+            self.readers = .empty;
+        }
+        // Torn down without `mu`, as in delete_datareader.
+        for (taken.items) |r| {
             self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
             r.deinit();
         }
-        self.readers.clearRetainingCapacity();
+        taken.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }
 
@@ -673,7 +686,11 @@ pub const SubscriberImpl = struct {
         }
         self.mu.unlock();
         for (pinned.items) |r| {
-            _ = r.dispatchDataAvailable();
+            // Tracked, so a deletion of `r` from outside a callback waits for it.
+            if (r.listeners.enter()) {
+                _ = r.dispatchDataAvailable();
+                r.listeners.leave();
+            }
             r.releaseQuiesce();
         }
         return DDS.RETCODE_OK;

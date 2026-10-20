@@ -11,11 +11,17 @@
 //! listener claims the status when its turn runs, so a getter called in
 //! between consumes the change instead. Reliable-ready events carry
 //! arguments, so they are kept in order as one pending kind.
+//!
+//! Deleting the owner from ordinary application code waits for a listener
+//! running through it to return; deleting it from any callback chain does
+//! not wait
+//! (docs/design/concurrency/listeners.md#datareader-deletion-callback-and-return-boundary).
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
 const proto = @import("../protocol/interface.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
+const Condvar = @import("../util/condvar.zig").Condvar;
 const runtime = @import("../runtime/core.zig");
 
 const Guid = proto.Guid;
@@ -24,6 +30,15 @@ const Guid = proto.Guid;
 pub const READY: DDS.StatusMask = 1 << 31;
 
 pub const ReadyEvent = struct { guid: Guid, ready: bool };
+
+/// Listener invocations tracked here on this thread's stack.
+threadlocal var invoking: u32 = 0;
+
+/// Whether this thread is inside a callback chain: a tracked listener
+/// invocation or any runtime turn, which runs no application code otherwise.
+pub fn inCallbackChain() bool {
+    return invoking > 0 or runtime.inTurn();
+}
 
 /// Embedded in its owner, which keeps it until the owner is freed.
 pub const PendingListeners = struct {
@@ -43,6 +58,11 @@ pub const PendingListeners = struct {
     kinds: [max_kinds]DDS.StatusMask = undefined,
     n_kinds: u8 = 0,
     events: std.ArrayListUnmanaged(ReadyEvent) = .empty,
+    /// Invocations in progress through the owner, on any thread.
+    active: u32 = 0,
+    idle: Condvar = .{},
+    /// Deletions waiting in `awaitIdle`; read by tests.
+    waiting: std.atomic.Value(u32) = .init(0),
 
     const max_kinds = 16;
 
@@ -65,7 +85,7 @@ pub const PendingListeners = struct {
 
     /// The owner is being freed, so nothing is queued.
     pub fn deinit(self: *PendingListeners) void {
-        std.debug.assert(!self.queued);
+        std.debug.assert(!self.queued and self.active == 0);
         self.events.deinit(self.alloc);
         self.mu.deinit();
     }
@@ -102,6 +122,40 @@ pub const PendingListeners = struct {
         self.closed = true;
         self.n_kinds = 0;
         self.events.clearRetainingCapacity();
+    }
+
+    /// For the owner's deletion, after `close`: waits for invocations in
+    /// progress to return, unless this thread is inside a callback chain,
+    /// where waiting could wait on itself or on a listener waiting for it.
+    /// Without a lane, listeners run inline and nothing waits.
+    pub fn awaitIdle(self: *PendingListeners) void {
+        if (self.lane == null or inCallbackChain()) return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.active == 0) return;
+        _ = self.waiting.fetchAdd(1, .seq_cst);
+        while (self.active > 0) self.idle.wait(&self.mu);
+        _ = self.waiting.fetchSub(1, .seq_cst);
+    }
+
+    /// Begins an invocation through the owner on this thread, outside the
+    /// lane. False once the owner is deleted: the invocation must not start.
+    pub fn enter(self: *PendingListeners) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.closed) return false;
+        self.active += 1;
+        invoking += 1;
+        return true;
+    }
+
+    /// Ends an invocation begun by `enter`.
+    pub fn leave(self: *PendingListeners) void {
+        invoking -= 1;
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.active -= 1;
+        if (self.active == 0) self.idle.broadcast();
     }
 
     /// For the lane's `CloseLatch`: drops a request queued and never run.
@@ -146,7 +200,10 @@ pub const PendingListeners = struct {
         self.n_kinds = 0;
         var events = self.events;
         self.events = .empty;
+        self.active += 1;
         self.mu.unlock();
+        invoking += 1;
+        defer self.leave();
         defer events.deinit(self.alloc);
         // A listener may delete the owner; what it has not started then never does.
         for (kinds[0..n]) |kind| {

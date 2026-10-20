@@ -90,6 +90,11 @@ pub const Lane = enum { internal, listener };
 /// The context whose turn this thread is running, if any.
 threadlocal var running_context: ?*Context = null;
 
+/// Whether this thread is running a turn of any context.
+pub fn inTurn() bool {
+    return running_context != null;
+}
+
 /// A callback with its state.
 pub const Hook = struct {
     ctx: *anyopaque,

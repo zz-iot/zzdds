@@ -576,21 +576,26 @@ pub const PublisherImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.writers.items, 0..) |w, i| {
-            if (w.toDDSDataWriter().ptr == a_datawriter.ptr) {
-                // PRECONDITION_NOT_MET if the writer has outstanding
-                // write-loans -- check before touching anything.
-                const precondition = w.checkDeletePrecondition();
-                if (precondition != DDS.RETCODE_OK) return precondition;
-                _ = self.writers.swapRemove(i);
-                self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
-                w.deinit();
-                return DDS.RETCODE_OK;
+        const w = found: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (self.writers.items, 0..) |w, i| {
+                if (w.toDDSDataWriter().ptr == a_datawriter.ptr) {
+                    // PRECONDITION_NOT_MET if the writer has outstanding
+                    // write-loans -- check before touching anything.
+                    const precondition = w.checkDeletePrecondition();
+                    if (precondition != DDS.RETCODE_OK) return precondition;
+                    _ = self.writers.swapRemove(i);
+                    break :found w;
+                }
             }
-        }
-        return DDS.RETCODE_BAD_PARAMETER;
+            return DDS.RETCODE_BAD_PARAMETER;
+        };
+        // Torn down without `mu`: deinit waits for a running listener,
+        // which may call back into this Publisher.
+        self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
+        w.deinit();
+        return DDS.RETCODE_OK;
     }
 
     /// Checks every writer's delete precondition without tearing anything
@@ -630,15 +635,23 @@ pub const PublisherImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        const precondition = self.checkDeleteContainedPrecondition();
-        if (precondition != DDS.RETCODE_OK) return precondition;
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.writers.items) |w| {
+        var taken: std.ArrayListUnmanaged(*writer_mod.DataWriterImpl) = undefined;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (self.writers.items) |w| {
+                const precondition = w.checkDeletePrecondition();
+                if (precondition != DDS.RETCODE_OK) return precondition;
+            }
+            taken = self.writers;
+            self.writers = .empty;
+        }
+        // Torn down without `mu`, as in delete_datawriter.
+        for (taken.items) |w| {
             self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
             w.deinit();
         }
-        self.writers.clearRetainingCapacity();
+        taken.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }
 

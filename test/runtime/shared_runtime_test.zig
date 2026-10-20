@@ -8,7 +8,8 @@
 //! changes their statuses
 //! (docs/design/concurrency/listeners.md#inline-path-and-pending-work), and
 //! blocking calls that help a manual runtime
-//! (docs/design/concurrency/operations.md#stable-helping-policy). The last
+//! (docs/design/concurrency/operations.md#stable-helping-policy), and deletion
+//! that waits for a running listener. The last
 //! section runs the whole slice, the same way, under each driver.
 //!
 //! Built against a second library graph with the switch on, so these run in
@@ -1363,6 +1364,289 @@ test "a wait from a listener helps internal work and runs no other listener" {
     try pair.deinit();
     try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
     m.runtime.deinit();
+}
+
+// ── Deletion and running listeners ────────────────────────────────────────────
+
+/// A hosted runtime and its workers. Must not move after `init`.
+const HostedRuntime = struct {
+    threaded: std.Io.Threaded,
+    backend: rt.IoBackend,
+    runtime: rt.Runtime,
+    hosted: rt.Hosted,
+
+    fn init(self: *HostedRuntime, workers: u32) !void {
+        self.threaded = .init(alloc, .{});
+        self.backend = rt.IoBackend.init(self.threaded.io());
+        self.runtime = rt.Runtime.init(self.backend.clock(), self.backend.backend(), .{ .mode = .hosted });
+        self.hosted = try rt.Hosted.init(alloc, self.threaded.io(), &self.runtime, workers);
+        self.hosted.start() catch |err| {
+            self.runtime.releaseOwner();
+            self.hosted.join();
+            return err;
+        };
+    }
+
+    fn io(self: *HostedRuntime) std.Io {
+        return self.threaded.io();
+    }
+
+    /// Once the runtime's owners are released: waits for its workers to exit.
+    fn deinit(self: *HostedRuntime) !void {
+        self.hosted.join();
+        try testing.expectEqual(rt.State.backend_stopped, self.runtime.getState());
+        self.runtime.deinit();
+        self.threaded.deinit();
+    }
+};
+
+const ten_seconds: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } };
+
+/// A listener whose first call holds until released, then calls back into
+/// its entity's parent, as application code may.
+const Held = struct {
+    io: std.Io,
+    entered: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+    returned: std.Io.Event = .unset,
+    calls: u32 = 0,
+    release_timed_out: bool = false,
+    /// Set once the deletion of the listener's entity has returned.
+    deleted: std.atomic.Value(bool) = .init(false),
+    /// The deletion deletes the parent's contents rather than the entity.
+    contained: bool = false,
+    deleted_before_return: bool = false,
+    dr: DDS.DataReader = undefined,
+    dw: DDS.DataWriter = undefined,
+
+    fn readerListener(self: *Held) DDS.DataReaderListener {
+        return .{ .listener_data = self, .on_data_available = onData };
+    }
+
+    fn writerListener(self: *Held) DDS.DataWriterListener {
+        return .{ .listener_data = self, .on_offered_deadline_missed = onDeadlineMissed };
+    }
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *Held = @ptrCast(@alignCast(ld.?));
+        if (!self.hold()) return;
+        _ = self.dr.get_subscriber().lookup_datareader("SliceTopic");
+        self.returned.set(self.io);
+    }
+
+    fn onDeadlineMissed(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+        const self: *Held = @ptrCast(@alignCast(ld.?));
+        if (!self.hold()) return;
+        _ = self.dw.get_publisher().lookup_datawriter("SliceTopic");
+        self.returned.set(self.io);
+    }
+
+    /// False for calls after the first.
+    fn hold(self: *Held) bool {
+        self.calls += 1;
+        if (self.calls > 1) return false;
+        self.entered.set(self.io);
+        self.release.waitTimeout(self.io, ten_seconds) catch {
+            self.release_timed_out = true;
+        };
+        self.deleted_before_return = self.deleted.load(.acquire);
+        return true;
+    }
+
+    fn deleteReader(self: *Held, rc: *DDS.ReturnCode_t) void {
+        const sub = self.dr.get_subscriber();
+        rc.* = if (self.contained) sub.delete_contained_entities() else sub.delete_datareader(self.dr);
+        self.deleted.store(true, .release);
+    }
+
+    fn deleteWriter(self: *Held, rc: *DDS.ReturnCode_t) void {
+        const publisher = self.dw.get_publisher();
+        rc.* = if (self.contained) publisher.delete_contained_entities() else publisher.delete_datawriter(self.dw);
+        self.deleted.store(true, .release);
+    }
+
+    /// Releases the listener once `pending`'s deletion is waiting for it, or
+    /// has returned without waiting.
+    fn releaseOnceWaitedFor(self: *Held, pending: anytype) void {
+        while (pending.waiting.load(.seq_cst) == 0 and !self.deleted.load(.acquire)) std.Thread.yield() catch {};
+        self.release.set(self.io);
+    }
+};
+
+const Endpoint = enum { reader, writer };
+
+/// Deletes an endpoint from another application thread while its listener
+/// runs on a hosted worker, by deleting it or its parent's contents.
+fn expectDeletionWaitsForListener(endpoint: Endpoint, contained: bool) !void {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var held: Held = .{ .io = h.io(), .contained = contained };
+    var o = PairOptions.bestEffort();
+    switch (endpoint) {
+        .reader => {
+            o.dr_listener = held.readerListener();
+            o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+        },
+        .writer => {
+            o.dw_listener = held.writerListener();
+            o.dw_mask = DDS.OFFERED_DEADLINE_MISSED_STATUS;
+        },
+    }
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+    held.dr = pair.dr.toDDSDataReader();
+    held.dw = pair.dw_h;
+
+    switch (endpoint) {
+        .reader => try pair.write(0),
+        .writer => {
+            var qos: DDS.DataWriterQos = undefined;
+            try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.get_qos(&qos));
+            qos.deadline.period = Slice.deadline;
+            try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.set_qos(qos));
+        },
+    }
+    try held.entered.waitTimeout(h.io(), ten_seconds);
+    var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    const deleter = switch (endpoint) {
+        .reader => try std.Thread.spawn(.{}, Held.deleteReader, .{ &held, &rc }),
+        .writer => try std.Thread.spawn(.{}, Held.deleteWriter, .{ &held, &rc }),
+    };
+    // The listener holds the endpoint's storage until it returns.
+    switch (endpoint) {
+        .reader => held.releaseOnceWaitedFor(&pair.dr.listeners),
+        .writer => held.releaseOnceWaitedFor(&pair.dw.listeners),
+    }
+    deleter.join();
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expect(!held.release_timed_out);
+    try testing.expect(!held.deleted_before_return);
+    // It called back into the parent while the deletion waited.
+    try testing.expect(held.returned.isSet());
+
+    try pair.deinit();
+    try h.deinit();
+}
+
+test "deleting a reader from outside a callback waits for its running listener to return" {
+    try expectDeletionWaitsForListener(.reader, false);
+}
+
+test "deleting a writer from outside a callback waits for its running listener to return" {
+    try expectDeletionWaitsForListener(.writer, false);
+}
+
+test "deleting a subscriber's contents from outside a callback waits for a reader's running listener" {
+    try expectDeletionWaitsForListener(.reader, true);
+}
+
+test "deleting a publisher's contents from outside a callback waits for a writer's running listener" {
+    try expectDeletionWaitsForListener(.writer, true);
+}
+
+test "deleting a reader from outside a callback waits for its listener called by notify_datareaders" {
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    var backend = rt.IoBackend.init(threaded.io());
+    var runtime = rt.Runtime.init(backend.clock(), backend.backend(), .{ .mode = .manual });
+    var held: Held = .{ .io = threaded.io() };
+    var o: PairOptions = .{};
+    o.dr_listener = held.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&runtime, o);
+    runtime.releaseOwner();
+    held.dr = pair.dr.toDDSDataReader();
+
+    // The helping wait commits the sample and leaves its listener queued.
+    const ws = try WaitSetImpl.initHelping(alloc, &runtime);
+    const sc = held.dr.get_statuscondition();
+    try testing.expectEqual(DDS.RETCODE_OK, sc.set_enabled_statuses(DDS.DATA_AVAILABLE_STATUS));
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(sc.as_Condition()));
+    try pair.write(0);
+    var active: DDS.ConditionSeq = .{};
+    defer freeActive(&active);
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().wait(&active, seconds(10)));
+    try testing.expectEqual(DDS.RETCODE_OK, ws.toDDSWaitSet().detach_condition(sc.as_Condition()));
+    ws.deinit();
+
+    // Another application thread delivers it inline instead.
+    const Notifier = struct {
+        fn run(sub: DDS.Subscriber) void {
+            _ = sub.notify_datareaders();
+        }
+    };
+    const notifier = try std.Thread.spawn(.{}, Notifier.run, .{held.dr.get_subscriber()});
+    try held.entered.waitTimeout(held.io, ten_seconds);
+    var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    const deleter = try std.Thread.spawn(.{}, Held.deleteReader, .{ &held, &rc });
+    held.releaseOnceWaitedFor(&pair.dr.listeners);
+    deleter.join();
+    notifier.join();
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expect(!held.release_timed_out);
+    try testing.expect(!held.deleted_before_return);
+
+    // The queued listener turn finds its reader deleted.
+    while ((try runtime.drive(64, 0)).immediate_work) {}
+    try testing.expectEqual(@as(u32, 1), held.calls);
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, runtime.getState());
+    runtime.deinit();
+}
+
+/// Deletes `held`'s reader from its own reader's listener, then releases
+/// `held`.
+const DeleteFromListener = struct {
+    held: *Held,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    done: std.Io.Event = .unset,
+
+    fn listener(self: *DeleteFromListener) DDS.DataReaderListener {
+        return .{ .listener_data = self, .on_data_available = onData };
+    }
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *DeleteFromListener = @ptrCast(@alignCast(ld.?));
+        if (self.done.isSet()) return;
+        self.held.deleteReader(&self.rc);
+        self.held.release.set(self.held.io);
+        self.done.set(self.held.io);
+    }
+};
+
+test "deleting a reader from another participant's listener does not wait for the reader's listener" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var held: Held = .{ .io = h.io() };
+    var deleting: DeleteFromListener = .{ .held = &held };
+
+    var o: PairOptions = .{};
+    o.dr_listener = held.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var target: Pair = undefined;
+    try target.initWith(&h.runtime, o);
+    held.dr = target.dr.toDDSDataReader();
+    o.dr_listener = deleting.listener();
+    var other: Pair = undefined;
+    try other.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+
+    try target.write(0);
+    try held.entered.waitTimeout(h.io(), ten_seconds);
+    // If the deletion waited, the held listener would wait for it in turn
+    // until its release timed out.
+    try other.write(0);
+    try deleting.done.waitTimeout(h.io(), ten_seconds);
+    try held.returned.waitTimeout(h.io(), ten_seconds);
+    try testing.expectEqual(DDS.RETCODE_OK, deleting.rc);
+    try testing.expect(!held.release_timed_out);
+    try testing.expect(held.deleted_before_return);
+
+    try target.deinit();
+    try other.deinit();
+    try h.deinit();
 }
 
 // ── The slice under each driver ───────────────────────────────────────────────
