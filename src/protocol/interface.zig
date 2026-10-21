@@ -298,6 +298,11 @@ pub const ProtocolWriter = struct {
         /// Used to enforce RESOURCE_LIMITS.max_samples before writing.
         cache_len: *const fn (ctx: *anyopaque) usize,
 
+        /// Block until the writer's history cache holds fewer than `limit`
+        /// samples, or for `timeout_ns`, on the clock the writer schedules
+        /// by. Null `timeout_ns` waits indefinitely. Returns false on timeout.
+        wait_cache_below: *const fn (ctx: *anyopaque, limit: usize, timeout_ns: ?i64) bool,
+
         /// Begin a coherent set: subsequent write() calls are deferred until
         /// end_coherent_set().  `is_coherent_window` must be true when called from
         /// begin_coherent_changes (records the buffer depth as the coherent window
@@ -449,6 +454,10 @@ pub const ProtocolWriter = struct {
 
     pub fn cacheLen(self: ProtocolWriter) usize {
         return self.vtable.cache_len(self.ctx);
+    }
+
+    pub fn waitCacheBelow(self: ProtocolWriter, limit: usize, timeout_ns: ?i64) bool {
+        return self.vtable.wait_cache_below(self.ctx, limit, timeout_ns);
     }
 
     pub fn beginCoherentSet(self: ProtocolWriter, is_coherent_window: bool) void {

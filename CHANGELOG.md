@@ -62,6 +62,17 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - Fix C-ABI typesupport adapter cleanup on registration allocation failure: the
   participant already consumes the adapter, so the shim must not destroy it again.
   Run legacy typesupport cleanup outside the participant lock.
+- **A RELIABLE write blocked on RESOURCE_LIMITS can now succeed, and blocks for
+  `max_blocking_time`.** A writer never dropped acknowledged samples from its history, so a
+  RELIABLE KEEP_ALL writer that reached `max_samples` stayed full: each later write polled
+  for a fixed 10 s and returned TIMEOUT however quickly its readers acknowledged. A RELIABLE
+  VOLATILE writer now drops a sample once every matched reliable reader has acknowledged it
+  (a TRANSIENT_LOCAL writer keeps its history for readers that match later, and a
+  BEST_EFFORT writer is unchanged). A write that finds the history full waits, without
+  polling, for acknowledgments to free space, for up to `reliability.max_blocking_time`,
+  then returns TIMEOUT. A Publisher's default DataWriter QoS now has the DDS default
+  `max_blocking_time` of 100 ms (it was 0, which the write ignored). Code that builds a
+  `DataWriterQos` from scratch gets 0: such a write fails at once when the history is full.
 
 ## 2026-10-18
 

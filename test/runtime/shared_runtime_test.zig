@@ -8,7 +8,8 @@
 //! work on the runtime clock, and listeners run apart from the work that
 //! changes their statuses
 //! (docs/design/concurrency/listeners.md#inline-path-and-pending-work), and
-//! blocking calls that help a manual runtime
+//! blocking calls that help a manual runtime, a write blocked on resource
+//! limits among them
 //! (docs/design/concurrency/operations.md#stable-helping-policy), and deletion
 //! that waits for a running listener. The last
 //! section runs the whole slice, the same way, under each driver.
@@ -1566,6 +1567,70 @@ test "waiting for acknowledgments helps the runtime until the reader has acknowl
     try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.get_publisher().wait_for_acknowledgments(seconds(1)));
     try takeInto(pair.dr, &got);
     try expectInOrder(got.items, 2 * samples_n);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+/// RELIABLE KEEP_ALL endpoints whose writer holds at most two samples and
+/// blocks up to a second for space.
+fn limitedWriter(durability: DDS.DurabilityQosPolicyKind) PairOptions {
+    var o: PairOptions = .{};
+    o.dw_qos.reliability = .{ .kind = .RELIABLE_RELIABILITY_QOS, .max_blocking_time = seconds(1) };
+    o.dw_qos.durability.kind = durability;
+    o.dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    o.dw_qos.resource_limits.max_samples = 2;
+    o.dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    o.dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    return o;
+}
+
+test "a write blocked on resource limits helps the runtime until the reader acknowledges" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, limitedWriter(.VOLATILE_DURABILITY_QOS));
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    // Nothing drives the runtime between writes: the third finds the cache
+    // full, and its wait runs the delivery and the acknowledgment.
+    try pair.write(0);
+    try pair.write(1);
+    try testing.expectEqual(@as(usize, 2), pair.dw.proto_writer.cacheLen());
+    const start = m.now();
+    try pair.write(2);
+    try testing.expectEqual(start, m.now());
+    try testing.expectEqual(@as(u32, 0), m.sb.unbounded_waits);
+
+    try settle(&m);
+    var got: std.ArrayListUnmanaged(u8) = .empty;
+    defer got.deinit(alloc);
+    try takeInto(pair.dr, &got);
+    try expectInOrder(got.items, 3);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "a write blocked on resource limits times out on the runtime clock when nothing can free space" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    // TRANSIENT_LOCAL keeps acknowledged samples for later readers.
+    try pair.initWith(&m.runtime, limitedWriter(.TRANSIENT_LOCAL_DURABILITY_QOS));
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    try pair.write(0);
+    try pair.write(1);
+    try settle(&m);
+    const start = m.now();
+    try testing.expectError(error.Timeout, pair.write(2));
+    try testing.expectEqual(start + SEC, m.now());
+    try testing.expectEqual(@as(u32, 0), m.sb.unbounded_waits);
 
     try pair.deinit();
     try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());

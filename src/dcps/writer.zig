@@ -375,13 +375,11 @@ pub const DataWriterImpl = struct {
                 if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) {
                     return error.OutOfResources;
                 }
-                // RELIABLE: poll until space frees up (1 ms sleep, 10 s timeout).
-                const deadline_ns = time_mod.nanoTimestamp() + 10 * std.time.ns_per_s;
-                while (self.proto_writer.cacheLen() >= limit) {
-                    if (time_mod.nanoTimestamp() >= deadline_ns)
-                        return error.Timeout;
-                    time_mod.sleepNs(1 * std.time.ns_per_ms);
-                }
+                // RELIABLE: block for up to max_blocking_time while readers
+                // acknowledge (the DDS RELIABILITY QoS).
+                const mbt = self.qos.reliability.max_blocking_time;
+                const timeout_ns: ?i64 = if (mbt.sec == DDS.DURATION_INFINITE_SEC and mbt.nanosec == DDS.DURATION_INFINITE_NSEC) null else durationNs(mbt);
+                if (!self.proto_writer.waitCacheBelow(limit, timeout_ns)) return error.Timeout;
             }
         }
 

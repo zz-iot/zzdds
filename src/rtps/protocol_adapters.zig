@@ -110,6 +110,11 @@ pub const RtpsProtocolWriter = struct {
         self.writer.setLifespan(ls);
     }
 
+    /// See `StatefulWriter.drop_acked`. Call before any reader matches.
+    pub fn setDropAcked(self: *Self, drop: bool) void {
+        self.writer.drop_acked = drop;
+    }
+
     pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) void {
         self.writer.attachRuntime(rt);
     }
@@ -134,6 +139,7 @@ pub const RtpsProtocolWriter = struct {
         .all_acked = vtAllAcked,
         .wait_all_acked = vtWaitAllAcked,
         .cache_len = vtCacheLen,
+        .wait_cache_below = vtWaitCacheBelow,
         .begin_coherent_set = vtBeginCoherentSet,
         .coherent_window_count = vtCoherentWindowCount,
         .end_coherent_set = vtEndCoherentSet,
@@ -229,6 +235,11 @@ pub const RtpsProtocolWriter = struct {
     fn vtWaitAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber, timeout_ns: ?i64) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
         return self.writer.waitAllAcked(target_sn, timeout_ns);
+    }
+
+    fn vtWaitCacheBelow(ctx: *anyopaque, limit: usize, timeout_ns: ?i64) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.writer.waitCacheBelow(limit, timeout_ns);
     }
 
     fn vtRemoveMatchedReader(ctx: *anyopaque, guid: Guid) void {

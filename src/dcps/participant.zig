@@ -1948,6 +1948,7 @@ pub const DomainParticipantImpl = struct {
         errdefer adapter.deinit();
         adapter.setTracer(self.tracer);
         if (self.runtime) |rt| adapter.attachRuntime(rt);
+        adapter.setDropAcked(qos.reliability.kind == .RELIABLE_RELIABILITY_QOS and !replay_on_match);
         // {0,0} from codegen means unset → infinite (no lifespan enforcement),
         // matching the convention used by discovery/qos_adapter.zig for SEDP announcement.
         const ls_zero = qos.lifespan.duration.sec == 0 and qos.lifespan.duration.nanosec == 0;

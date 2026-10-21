@@ -562,6 +562,14 @@ pub const StatefulWriter = struct {
     /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
     /// Incremented by N after each group coherent set of N samples is flushed.
     group_seq_num_counter: i64,
+    /// Drop each change once every reliable reader has acknowledged it: set
+    /// for a RELIABLE VOLATILE writer, which replays nothing to readers
+    /// matched later, so acknowledged changes only take RESOURCE_LIMITS space
+    /// (the DDS HISTORY QoS). Set once, before any reader matches.
+    drop_acked: bool = false,
+    /// Highest SN dropped as acknowledged; guarded by `mu`. With an empty
+    /// cache, HEARTBEATs announce up to it.
+    trimmed_through: SequenceNumber = 0,
     /// End marker allocated by endCoherentSet(defer_eoc=true) whose DATA the
     /// publisher has yet to send (takeEOCProxyInfos/sendCombinedEOCData).
     /// Cleared by flushGroupEOCHBOnly().
@@ -807,6 +815,58 @@ pub const StatefulWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
         return self.allProxiesAckedLocked(target_sn);
+    }
+
+    /// Waits until the cache holds fewer than `limit` changes, for a write
+    /// blocked on RESOURCE_LIMITS, or for `timeout_ns` (null: no limit). Space
+    /// frees as readers acknowledge (`drop_acked`) or KEEP_LAST evicts. On a
+    /// manual runtime the wait runs the runtime's internal work meanwhile, on
+    /// its clock. Returns false on timeout.
+    pub fn waitCacheBelow(self: *Self, limit: usize, timeout_ns: ?i64) bool {
+        if (self.runtime) |rt| if (rt.canHelp()) {
+            const Wait = struct {
+                writer: *Self,
+                limit: usize,
+                fn done(w: *const @This()) bool {
+                    w.writer.mu.lock();
+                    defer w.writer.mu.unlock();
+                    return w.writer.cache.len() < w.limit;
+                }
+            };
+            const deadline_ns = if (timeout_ns) |t| rt.clock.nowNs() +| t else null;
+            return rt.helpUntil(deadline_ns, &Wait{ .writer = self, .limit = limit }, Wait.done);
+        };
+        const deadline_ns = if (timeout_ns) |t| time_mod.nanoTimestamp() +| t else null;
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (self.cache.len() >= limit) {
+            if (deadline_ns) |dl| {
+                const now = time_mod.nanoTimestamp();
+                if (now >= dl) return false;
+                self.ack_cond.timedWaitNs(&self.mu, @intCast(dl - now)) catch {};
+            } else {
+                self.ack_cond.wait(&self.mu);
+            }
+        }
+        return true;
+    }
+
+    /// With `drop_acked`, drops the changes every reliable reader has
+    /// acknowledged, never one not yet sent (the last flushed SN caps it: an
+    /// open coherent set's changes, or one being sent with `mu` released).
+    /// Caller must hold `mu`.
+    fn trimAckedLocked(self: *Self) void {
+        if (!self.drop_acked) return;
+        var floor = self.last_flushed_sn;
+        for (self.reader_proxies.items) |rp| {
+            if (rp.reliable) floor = @min(floor, rp.highest_acked_sn);
+        }
+        if (floor <= self.trimmed_through) return;
+        self.cache.removeWriterChangesUpTo(floor);
+        self.trimmed_through = floor;
+        // A write blocked on RESOURCE_LIMITS may proceed.
+        self.ack_cond.broadcast();
+        if (self.runtime) |rt| rt.wakeHelpers();
     }
 
     /// Block until every RELIABLE matched reader has cumulatively acked all
@@ -1578,6 +1638,8 @@ pub const StatefulWriter = struct {
             }
         }
         if (out.removed) if (unmatch) |u| u.remove(u.ctx, guid);
+        // The removed reader may have been the last to acknowledge.
+        if (out.removed) self.trimAckedLocked();
         // Wake any thread blocked in waitAllAcked: removing a reliable reader
         // may satisfy the all-acked condition even without an explicit ACKNACK.
         // The removal may come from an application call rather than a turn.
@@ -1617,6 +1679,8 @@ pub const StatefulWriter = struct {
             };
         } else if (self.cache.getChange(sn)) |ch| {
             self.sendChangeToAllLocked(ch, true);
+            // With no reliable reader to wait for, it is already acknowledged.
+            self.trimAckedLocked();
         }
         return sn;
     }
@@ -1789,6 +1853,7 @@ pub const StatefulWriter = struct {
             }
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
             self.ack_cond.broadcast();
+            self.trimAckedLocked();
             self.retireEndMarkersLocked();
             // RELIABLE protocol-ready handshake: the first AckNack whose base
             // (next-expected SN) reaches the firstSN of the Heartbeat we sent
@@ -2470,18 +2535,20 @@ pub const StatefulWriter = struct {
     }
 
     /// Lowest SN this writer can still send: its oldest cached sample or
-    /// retained end marker.  0 when it has neither.
+    /// retained end marker.  With neither, one past the last change dropped
+    /// as acknowledged, or else 0.
     fn firstAvailableSnLocked(self: *const Self) SequenceNumber {
-        const cache_first = self.cache.minSn();
+        const min = self.cache.minSn();
+        const cache_first = if (min == 0 and self.trimmed_through > 0) self.trimmed_through + 1 else min;
         if (self.end_markers.items.len == 0) return cache_first;
         const marker_first = self.end_markers.items[0].sn;
         return if (cache_first == 0) marker_first else @min(cache_first, marker_first);
     }
 
-    /// Highest SN this writer can still send: its newest cached sample or
-    /// retained end marker.  0 when it has neither.
+    /// Highest SN this writer can still send, or has dropped as acknowledged:
+    /// its newest cached sample or retained end marker.  0 when it has neither.
     fn lastAvailableSnLocked(self: *const Self) SequenceNumber {
-        const cache_last = self.cache.maxSn();
+        const cache_last = @max(self.cache.maxSn(), self.trimmed_through);
         if (self.end_markers.items.len == 0) return cache_last;
         return @max(cache_last, self.end_markers.items[self.end_markers.items.len - 1].sn);
     }
@@ -2579,6 +2646,8 @@ pub const StatefulWriter = struct {
     pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, group_set: ?history_mod.GroupCoherentSet, defer_eoc: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
+        // Last before unlocking: what the set sent may already be acknowledged.
+        defer self.trimAckedLocked();
         self.coherent_active = false;
         defer if (resuspend) {
             self.coherent_active = true;

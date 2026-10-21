@@ -1014,7 +1014,9 @@ the same way. A participant's listeners run one at a time. On a manual runtime, 
 created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
 `wait_for_historical_data` run internal turns and due timers until they are satisfied or
 their deadline (on the runtime clock) passes, never listener turns, including when called
-from a listener; on a hosted runtime they only observe. Without a selection, creation
+from a listener; on a hosted runtime they only observe. A RELIABLE write that finds its
+history full (RESOURCE_LIMITS) waits the same way, for up to `max_blocking_time`, while
+readers acknowledge. Without a selection, creation
 uses the process's default runtime: a hosted one with two workers, started at the first
 such creation and retired with its last participant (the next creation starts another),
 unless the application installs a runtime of its own (creation then fails once that one
@@ -1022,8 +1024,7 @@ retires, until it is replaced) or disables the default. A WaitSet created withou
 runtime helps the default for each wait when it is an installed manual runtime, and never
 starts one. The default's options are fixed (no configuration yet), and installation is
 a Zig call: an installed runtime is an unretained pointer, which the application keeps
-valid while it is installed and its waits run. A RELIABLE write blocked on resource
-limits still polls. It does not yet carry the operation effect states (commit and
+valid while it is installed and its waits run. It does not yet carry the operation effect states (commit and
 cancellation) or resource waits.
 The first vertical slice runs one reliable reader/writer pair through the same trace
 under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a

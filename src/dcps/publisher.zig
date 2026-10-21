@@ -208,7 +208,8 @@ pub const PublisherImpl = struct {
             .instance_handle = handle,
             .status_changes = 0,
             .status_cond = null,
-            .default_dw_qos = .{},
+            // The DDS RELIABILITY QoS default: a writer blocks up to 100 ms.
+            .default_dw_qos = .{ .reliability = .{ .max_blocking_time = .{ .sec = 0, .nanosec = 100 * std.time.ns_per_ms } } },
             .writers = .empty,
             .mu = .{},
             .coherent_depth = 0,

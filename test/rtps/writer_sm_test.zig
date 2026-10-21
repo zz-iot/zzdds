@@ -2356,3 +2356,147 @@ test "checkConnectionGenerations: retries after a mid-loop per-change copy OOM d
     // The retry re-copies everything from scratch -- both changes arrive.
     try testing.expectEqual(@as(usize, 2), countAllData(&rec));
 }
+
+// ── Dropping acknowledged changes ─────────────────────────────────────────────
+//
+// A RELIABLE VOLATILE writer (`drop_acked`) keeps a change only until every
+// reliable reader has acknowledged it, so RESOURCE_LIMITS count what is still
+// unacknowledged.
+
+fn pureAck(w: *StatefulWriter, reader: Guid, through: SequenceNumber, count: i32) void {
+    const nack_set = SequenceNumberSet{ .base = through + 1, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) };
+    w.handleAckNack(reader, through, nack_set, count, true);
+}
+
+fn cacheLen(w: *StatefulWriter) usize {
+    w.mu.lock();
+    defer w.mu.unlock();
+    return w.cache.len();
+}
+
+/// A VOLATILE writer with two reliable readers matched and three changes sent.
+fn makeDroppingWriter(rec: *Recording, a: Guid, b: Guid, drop: bool) !*StatefulWriter {
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x60, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    errdefer w.deinit();
+    w.drop_acked = drop;
+    try w.addMatchedReader(try ReaderProxy.init(testing.allocator, a, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, true));
+    try w.addMatchedReader(try ReaderProxy.init(testing.allocator, b, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7101)}, &.{}, false, true));
+    for ([_][]const u8{ "one", "two", "three" }) |d| _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, d);
+    rec.reset();
+    return w;
+}
+
+test "drop_acked: a change leaves the cache once every reliable reader has acknowledged it" {
+    const a = makeGuid(0x61, READER_EID);
+    const b = makeGuid(0x62, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeDroppingWriter(&rec, a, b, true);
+    defer w.deinit();
+
+    pureAck(w, a, 3, 1);
+    try testing.expectEqual(@as(usize, 3), cacheLen(w));
+    pureAck(w, b, 2, 1);
+    try testing.expectEqual(@as(usize, 1), cacheLen(w));
+    pureAck(w, b, 3, 2);
+    try testing.expectEqual(@as(usize, 0), cacheLen(w));
+
+    // An empty cache still announces what was written: nothing is available
+    // below the next SN.
+    w.sendHeartbeat(true, false);
+    const hb = findHeartbeat(&rec) orelse return error.NoHeartbeatFound;
+    try testing.expectEqual(@as(SequenceNumber, 4), hb.first_sn);
+    try testing.expectEqual(@as(SequenceNumber, 3), hb.last_sn);
+}
+
+test "drop_acked: removing the reader that had not acknowledged drops what the others had" {
+    const a = makeGuid(0x63, READER_EID);
+    const b = makeGuid(0x64, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeDroppingWriter(&rec, a, b, true);
+    defer w.deinit();
+
+    pureAck(w, a, 3, 1);
+    w.removeMatchedReader(b);
+    try testing.expectEqual(@as(usize, 0), cacheLen(w));
+}
+
+test "drop_acked: unset, acknowledged changes stay" {
+    const a = makeGuid(0x65, READER_EID);
+    const b = makeGuid(0x66, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeDroppingWriter(&rec, a, b, false);
+    defer w.deinit();
+
+    pureAck(w, a, 3, 1);
+    pureAck(w, b, 3, 1);
+    try testing.expectEqual(@as(usize, 3), cacheLen(w));
+}
+
+test "drop_acked: with no reliable reader a sent change goes at once, and an open coherent set's when it ends" {
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x67, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer w.deinit();
+    w.drop_acked = true;
+    const best_effort = makeGuid(0x68, READER_EID);
+    try w.addMatchedReader(try ReaderProxy.init(testing.allocator, best_effort, &.{Locator.udp4(.{ 127, 0, 0, 1 }, 7100)}, &.{}, false, false));
+
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "sent");
+    try testing.expectEqual(@as(usize, 0), cacheLen(w));
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    // Nothing unsent goes, whatever drops the rest.
+    w.removeMatchedReader(best_effort);
+    try testing.expectEqual(@as(usize, 2), cacheLen(w));
+    w.endCoherentSet(.coherent_only, false, null, null, false);
+    try testing.expectEqual(@as(usize, 0), cacheLen(w));
+}
+
+test "drop_acked: space freed by a coherent set's end wakes a wait helping a manual runtime" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var backend = zzdds.runtime.IoBackend.init(threaded.io());
+    var runtime = zzdds.runtime.Runtime.init(backend.clock(), backend.backend(), .{ .mode = .manual });
+    var rec: Recording = .{};
+    const w = try StatefulWriter.init(testing.allocator, makeGuid(0x6B, WRITER_EID), rec.makeTransport(), .keep_all, 0, READER_EID, rtps.writer_sm.DEFAULT_FRAG_SIZE, false);
+    w.drop_acked = true;
+    w.attachRuntime(&runtime);
+
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "a");
+    _ = try w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, "b");
+    const Waiter = struct {
+        fn run(writer: *StatefulWriter, freed: *bool) void {
+            // Gives up after 10 s rather than hanging.
+            freed.* = writer.waitCacheBelow(2, 10 * std.time.ns_per_s);
+        }
+    };
+    var freed = false;
+    const start = runtime.clock.nowNs();
+    const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ w, &freed });
+    while (backend.waiters.load(.seq_cst) == 0) std.Thread.yield() catch {};
+    w.endCoherentSet(.coherent_only, false, null, null, false);
+    waiter.join();
+    try testing.expect(freed);
+    // Woken by the end of the set, not ended by the deadline.
+    try testing.expect(runtime.clock.nowNs() - start < 10 * std.time.ns_per_s);
+
+    w.deinit();
+    runtime.releaseOwner();
+    try testing.expectEqual(zzdds.runtime.State.backend_stopped, (try runtime.drive(1, 0)).state);
+    runtime.deinit();
+}
+
+test "waitCacheBelow: true once acknowledgments free space, false at its timeout otherwise" {
+    const a = makeGuid(0x69, READER_EID);
+    const b = makeGuid(0x6A, READER_EID);
+    var rec: Recording = .{};
+    const w = try makeDroppingWriter(&rec, a, b, true);
+    defer w.deinit();
+
+    try testing.expect(!w.waitCacheBelow(3, 0));
+    pureAck(w, a, 1, 1);
+    pureAck(w, b, 1, 1);
+    try testing.expect(w.waitCacheBelow(3, 0));
+}
