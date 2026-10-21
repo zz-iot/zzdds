@@ -1009,8 +1009,8 @@ and progress that runs internal work only passes them over. Direct discovery sti
 matches synchronously on the caller's thread, but the listeners that follow run on the
 runtime. Deleting a reader or writer from application code waits for a listener
 running through it (as a runtime turn, or inline from `notify_datareaders`) to return;
-deleting it from any callback chain does not wait. Builtin-topic reader listeners still
-run inline, and a participant's listeners run one at a time. On a manual runtime, blocking calls help: a WaitSet
+deleting it from any callback chain does not wait. Builtin-topic readers' listeners run
+the same way. A participant's listeners run one at a time. On a manual runtime, blocking calls help: a WaitSet
 created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
 `wait_for_historical_data` run internal turns and due timers until they are satisfied or
 their deadline (on the runtime clock) passes, never listener turns, including when called

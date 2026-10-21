@@ -375,6 +375,12 @@ const BuiltinSubscriberState = struct {
         return self;
     }
 
+    /// Runs the builtin readers' listeners as turns of `lane`, like any
+    /// other reader's. Call before the participant starts.
+    fn attachLane(self: *@This(), lane: *runtime_mod.Context) void {
+        for ([_]*reader_mod.DataReaderImpl{ self.part_dr, self.topic_dr, self.pub_dr, self.sub_dr }) |r| r.listeners.lane = lane;
+    }
+
     fn deinit(self: *@This()) void {
         // sub.deinit() calls destroy_proto_reader (noop) + r.deinit() for each
         // reader in sub.readers, which covers our four DataReaderImpls.
@@ -1218,6 +1224,8 @@ pub const DomainParticipantImpl = struct {
         self.listeners = runtime_mod.Context.init(rt, std.math.maxInt(u32));
         self.listeners.lane = .listener;
         self.listeners.on_closed = self.listeners_latch.hook();
+        // The builtin readers were made before the runtime was known.
+        if (self.builtin_sub) |bs| bs.attachLane(&self.listeners);
     }
 
     fn listenerLane(self: *Self) ?*runtime_mod.Context {

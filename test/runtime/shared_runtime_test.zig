@@ -1318,6 +1318,35 @@ test "deleting a writer raises the reader's listeners on the runtime, not on the
     m.runtime.deinit();
 }
 
+test "a builtin reader's listener runs on the runtime, not on the thread that deleted the endpoint" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, PairOptions.bestEffort());
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    const publications = @as(*DomainParticipantImpl, @ptrCast(@alignCast(pair.dp_r.ptr))).builtin_sub.?.pub_dr;
+    var rr: Recorder = .{ .lane = listenersOf(pair.dp_r) };
+    try testing.expectEqual(DDS.RETCODE_OK, publications.toDDSDataReader().set_listener(rr.readerListener(), DDS.DATA_AVAILABLE_STATUS));
+    try settle(&m);
+    while (publications.takeRaw()) |sample| alloc.free(sample.data);
+    const before = rr.n;
+
+    // In-process discovery reports the writer's disposal on this thread.
+    rr.quiet = true;
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.get_publisher().delete_datawriter(pair.dw_h));
+    rr.quiet = false;
+    try settle(&m);
+    try testing.expect(!rr.called_while_quiet);
+    try testing.expectEqualSlices(Recorder.Call, &.{.data}, rr.slice()[before..]);
+    try testing.expect(rr.all_in_lane);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
 test "a reader deleted while its listeners are queued never hears them, and is freed" {
     var m: Manual = undefined;
     m.init();
