@@ -375,10 +375,10 @@ const BuiltinSubscriberState = struct {
         return self;
     }
 
-    /// Runs the builtin readers' listeners as turns of `lane`, like any
-    /// other reader's. Call before the participant starts.
-    fn attachLane(self: *@This(), lane: *runtime_mod.Context) void {
-        for ([_]*reader_mod.DataReaderImpl{ self.part_dr, self.topic_dr, self.pub_dr, self.sub_dr }) |r| r.listeners.lane = lane;
+    /// Runs the builtin readers' listeners in `group`, like any other
+    /// reader's. Call before the participant starts.
+    fn attachGroup(self: *@This(), group: *listener_lane.Group) void {
+        for ([_]*reader_mod.DataReaderImpl{ self.part_dr, self.topic_dr, self.pub_dr, self.sub_dr }) |r| r.listeners.attach(group);
     }
 
     fn deinit(self: *@This()) void {
@@ -1070,11 +1070,10 @@ pub const DomainParticipantImpl = struct {
     /// Set by deinit under `check_mu`; nothing arms `check_timer` after.
     check_mu: Mutex = .{},
     check_stopping: bool = false,
-    /// With a runtime: where this participant's readers and writers run
-    /// their listeners, one at a time, apart from the work that changed
-    /// their statuses (listener_lane.zig).
-    listeners: runtime_mod.Context = undefined,
-    listeners_latch: CloseLatch = .{},
+    /// With a runtime: the contexts where this participant's readers and
+    /// writers run their listeners, apart from the work that changed their
+    /// statuses (listener_lane.zig).
+    listener_group: listener_lane.Group = undefined,
     /// Set by timerThreadFn as its first action, read by deinit() to detect
     /// a self-join (see deinit()'s doc comment). 0 = not yet set; real
     /// std.Thread.Id values are never 0 in practice on any supported
@@ -1220,16 +1219,13 @@ pub const DomainParticipantImpl = struct {
         self.timers = runtime_mod.Context.init(rt, 0);
         self.timers.on_closed = self.timers_latch.hook();
         self.check_timer = runtime_mod.Timer.init(&self.timers, onCheckTimer);
-        // Each endpoint has at most one listener request admitted.
-        self.listeners = runtime_mod.Context.init(rt, std.math.maxInt(u32));
-        self.listeners.lane = .listener;
-        self.listeners.on_closed = self.listeners_latch.hook();
+        self.listener_group = listener_lane.Group.init(rt);
         // The builtin readers were made before the runtime was known.
-        if (self.builtin_sub) |bs| bs.attachLane(&self.listeners);
+        if (self.builtin_sub) |bs| bs.attachGroup(&self.listener_group);
     }
 
-    fn listenerLane(self: *Self) ?*runtime_mod.Context {
-        return if (self.runtime != null) &self.listeners else null;
+    fn listenerGroup(self: *Self) ?*listener_lane.Group {
+        return if (self.runtime != null) &self.listener_group else null;
     }
 
     fn userDataHandler(self: *Self) transport_if.ReceiveHandler {
@@ -1313,7 +1309,7 @@ pub const DomainParticipantImpl = struct {
         if (self.runtime) |rt| {
             self.ingress.deinit();
             self.timers.deinit();
-            self.listeners.deinit();
+            self.listener_group.deinit();
             rt.releaseOwner();
         }
         alloc.destroy(self);
@@ -1616,11 +1612,30 @@ pub const DomainParticipantImpl = struct {
         // unless this is that turn: then the participant is freed after it.
         const ingress_deferred = self.runtime != null and
             !self.ingress_latch.close(&self.ingress, Ingress.discard);
-        // Likewise for listeners: those queued never start, and one running
-        // elsewhere returns before entities are torn down.
-        const listeners_deferred = self.runtime != null and
-            !self.listeners_latch.close(&self.listeners, listener_lane.PendingListeners.discard);
+        // Likewise for listeners: those queued or parked never start, and
+        // those running elsewhere return before entities are torn down. From
+        // inside one, the rest follows the last of them, so no listener of
+        // this participant runs while its entities are torn down.
+        if (self.runtime != null and !self.listener_group.close()) {
+            self.listener_group.finishWith(.{ .ctx = self, .run = teardownHook });
+            return;
+        }
+        self.teardown(.{ .timers = timers_deferred, .ingress = ingress_deferred, .self_reentrant = self_reentrant });
+    }
 
+    /// What `deinit` hands to a turn that will free the participant.
+    const Deferred = struct {
+        timers: bool = false,
+        ingress: bool = false,
+        self_reentrant: bool = false,
+    };
+
+    fn teardownHook(ctx: *anyopaque) void {
+        cast(ctx).teardown(.{});
+    }
+
+    /// The rest of `deinit`, once no listener of this participant runs.
+    fn teardown(self: *Self, deferred: Deferred) void {
         if (self.status_cond) |sc| sc.deinit();
         if (self.builtin_sub) |bs| bs.deinit();
         self.c_abi.free(self.alloc);
@@ -1718,16 +1733,12 @@ pub const DomainParticipantImpl = struct {
         if (self.owned_tcp_transport) |t| t.deinit();
 
         // One thread runs one turn at a time: at most one of these is set.
-        if (timers_deferred) {
+        if (deferred.timers) {
             self.timers_latch.finishWith(.{ .ctx = self, .run = finishDestroyHook });
             return;
         }
-        if (ingress_deferred) {
+        if (deferred.ingress) {
             self.ingress_latch.finishWith(.{ .ctx = self, .run = finishDestroyHook });
-            return;
-        }
-        if (listeners_deferred) {
-            self.listeners_latch.finishWith(.{ .ctx = self, .run = finishDestroyHook });
             return;
         }
 
@@ -1740,7 +1751,7 @@ pub const DomainParticipantImpl = struct {
         // above) to unwind safely. Defer the actual free to timerThreadFn,
         // which performs it as the very last thing it does once its own
         // loop has genuinely exited -- see timerThreadFn.
-        if (self_reentrant) {
+        if (deferred.self_reentrant) {
             self.pending_self_destroy = true;
         } else {
             self.finishDestroy();
@@ -4281,7 +4292,7 @@ pub const DomainParticipantImpl = struct {
             .timer_clock = self.timer_clock,
             .register_timer_notify = pubRegisterWriterTimerNotify,
             .timers_changed = .{ .ctx = self, .run = timersChanged },
-            .listener_lane = self.listenerLane(),
+            .listener_group = self.listenerGroup(),
             .register_liveliness_assert = pubRegisterWriterLivelinessAssert,
             .register_liveliness_query = pubRegisterWriterLivelinessQuery,
         };
@@ -4299,7 +4310,7 @@ pub const DomainParticipantImpl = struct {
             .timer_clock = self.timer_clock,
             .register_timer_notify = subRegisterReaderTimerNotify,
             .timers_changed = .{ .ctx = self, .run = timersChanged },
-            .listener_lane = self.listenerLane(),
+            .listener_group = self.listenerGroup(),
             .register_get_field_refresh = subRegisterReaderGetFieldRefresh,
             .register_wlp_alive_notify = subRegisterReaderWlpAliveNotify,
         };

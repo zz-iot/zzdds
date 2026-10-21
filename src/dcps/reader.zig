@@ -3316,6 +3316,7 @@ pub const DataReaderImpl = struct {
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
         if (box.listener.on_reliable_writer_ready) |cb| {
+            if (!listener_lane.admit(box)) return;
             cb(writer_mod.guidToHandle(event.guid), event.ready, box.listener.listener_data);
         }
     }
@@ -3351,7 +3352,8 @@ pub const DataReaderImpl = struct {
     /// The callback for `field` (a `DDS.DataReaderListener` callback) from
     /// the nearest level of the DDS 1.4 §2.2.4.1.5 "nearest enclosing
     /// non-null listener" chain: this reader, its Subscriber, then its
-    /// DomainParticipant. Not yet invoked, or null when no level has one;
+    /// DomainParticipant. Not yet invoked, or null when no level has one or
+    /// its identity is running elsewhere (`listener_lane.admit`);
     /// whichever level runs, it is invoked with this reader's own handle. The status notifiers
     /// update the status under `mu` and `raise` it; its dispatch resolves,
     /// then claims it under `mu` (`claimStatusLocked`) and invokes after
@@ -3362,10 +3364,17 @@ pub const DataReaderImpl = struct {
     /// with no lock held. The caller holds this reader's `quiesce`.
     fn resolveListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(StatusCb(field)) {
         const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
-        if (listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListener(), self.alloc)) |r| return r;
-        if (nil.isNil(self.subscriber)) return null;
-        const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
-        return sub.resolveReaderFallback(StatusCb(field), field, bit);
+        const r = listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListener(), self.alloc) orelse blk: {
+            if (nil.isNil(self.subscriber)) return null;
+            const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
+            break :blk sub.resolveReaderFallback(StatusCb(field), field, bit) orelse return null;
+        };
+        // Its identity running elsewhere parks this turn: nothing to invoke.
+        if (!listener_lane.admit(r)) {
+            r.release();
+            return null;
+        }
+        return r;
     }
 
     /// With `mu` held: claims status `bit` for a listener `resolved`, if it
@@ -3553,8 +3562,8 @@ pub const DataReaderImpl = struct {
 
         // On a manual runtime, nothing else may be running it. A zero wait
         // only checks.
-        if (self.listeners.lane) |lane| if (!is_zero_wait and lane.runtime.canHelp()) {
-            return if (lane.runtime.helpUntil(deadline_ns, self, historicalReady)) DDS.RETCODE_OK else DDS.RETCODE_TIMEOUT;
+        if (self.listeners.runtimeOf()) |rt| if (!is_zero_wait and rt.canHelp()) {
+            return if (rt.helpUntil(deadline_ns, self, historicalReady)) DDS.RETCODE_OK else DDS.RETCODE_TIMEOUT;
         };
         while (true) {
             if (self.proto_reader.historicalDelivered()) {

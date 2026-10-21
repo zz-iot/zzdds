@@ -17,7 +17,7 @@ const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
-const RuntimeContext = @import("../runtime/core.zig").Context;
+const ListenerGroup = @import("listener_lane.zig").Group;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
@@ -83,9 +83,10 @@ pub const ParticipantCbs = struct {
     /// the participant's timer checks are armed for.
     timers_changed: ?Hook = null,
 
-    /// The participant's listener context on a shared runtime, where each
-    /// DataReaderImpl queues its listener invocations; null runs them inline.
-    listener_lane: ?*RuntimeContext = null,
+    /// The participant's listener group on a shared runtime: each
+    /// DataReaderImpl runs its listeners on its own context in it. Null runs them
+    /// inline.
+    listener_group: ?*ListenerGroup = null,
 
     /// Register a timer-check callback (DEADLINE) for a reader.
     /// Called once per DataReader after create_proto_reader succeeds.
@@ -423,7 +424,7 @@ pub const SubscriberImpl = struct {
             return nil.nil_datareader;
         };
         dr.timers_changed = self.cbs.timers_changed;
-        dr.listeners.lane = self.cbs.listener_lane;
+        if (self.cbs.listener_group) |g| dr.listeners.attach(g);
         self.cbs.register_incompat_qos(
             self.cbs.ctx,
             subscription_handle,

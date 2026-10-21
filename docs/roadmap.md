@@ -423,6 +423,35 @@ or an optimisation on an already-improved path):
   tests migrated to it. Keep public `TypeSupport`, `filter` (`FilterValue`/`CdrFieldGetter`,
   used by generated `getFieldFromCdr`) and the `nil_*`/`NIL_PTR` sentinels. Verify with
   `zig build test`, the strict examples suite and a `dds-rtps` rebuild.
+- **Listener identity in the C++ and Java bindings.** On a shared runtime, one listener
+  runs one call at a time wherever it is installed, and the core recognizes one listener
+  by its registration's `listener_data` (`src/util/listener_identity.zig`). C and Zig
+  callers pass one pointer per listener; the bindings do not yet
+  ([design](design/concurrency/listeners.md#binding-identity-and-ownership), and the
+  index's "Listener bridge ABI" open item):
+  - **C++** passes `this` as the specific `FooListenerBase*`, so an object deriving from
+    two listener bases registers under two addresses. Plan: a zidl annotation
+    `@shared_base` on a base interface, meaning its direct inheritors share one copy of
+    it. The C++ backend maps it to `public virtual` inheritance and rejects it on an
+    interface that declares operations (the generated `Base` classes' default overrides
+    would have no unique final overrider); other backends decide for themselves and
+    ignore it for now. `dcps.idl` marks `Listener` with it, and `c_listener()` passes
+    `static_cast<::DDS::Listener*>(this)` as a new identity field in the C listener
+    struct, which the core prefers over `listener_data`; dispatch keeps the base pointer.
+    The virtual base also gives a partly constructed object its final identity.
+  - **Java** allocates a native context with a new global reference per registration, so
+    one Java object set on two entities is two listeners. Plan: a binding-owned registry,
+    consulted only at `set_listener`/`create_*`, never per callback, mapping a Java object
+    (bucketed by `System.identityHashCode`, matched with `IsSameObject`) to one
+    reference-counted native context released through `release_listener_data`. An
+    optional generated base class holding the native handle could later skip the lookup
+    for applications that register often.
+  - **C++ listener lifetime (suspected, not reproduced).** `c_listener()` does not set
+    `release_listener_data`: the listener stays alive only through the entity wrapper's
+    stored `shared_ptr`, which `set_listener` overwrites at once, so replacing a listener
+    the application holds no other reference to may free it while a call is running or
+    queued. Fix: each registration owns a heap copy of the `shared_ptr`, deleted in
+    `release_listener_data`. Write the failing test first.
 - **Java: a few DCPS ops taking a bare `sequence<T>` parameter** (not inside a struct) throw
   `UnsupportedOperationException` (`get_datareaders`, some batch ops). `zzdds.idl`
   vendor-extension / cross-file type refs in zidl's Java backend may be partly stale versus
@@ -1002,7 +1031,7 @@ writer's periodic HEARTBEAT is a runtime timer on the runtime clock rather than 
 armed while a reliable reader is matched. The participant's DEADLINE, LIVELINESS and
 held-data expiry checks are one timer armed for the earliest time anything is due (no
 100 ms poll thread), and timed QoS runs on the runtime clock. Reader and writer
-listeners run as turns of the participant's listener context, never on the stack that
+listeners run as turns of the endpoint's own listener context, never on the stack that
 changed their status: the change wakes conditions and queues one request per endpoint,
 each status kind ordered by when it first became pending and claimed when the turn runs,
 and progress that runs internal work only passes them over. Direct discovery still
@@ -1010,7 +1039,14 @@ matches synchronously on the caller's thread, but the listeners that follow run 
 runtime. Deleting a reader or writer from application code waits for a listener
 running through it (as a runtime turn, or inline from `notify_datareaders`) to return;
 deleting it from any callback chain does not wait. Builtin-topic readers' listeners run
-the same way. A participant's listeners run one at a time. On a manual runtime, blocking calls help: a WaitSet
+the same way. One endpoint's listeners run one at a time, and different endpoints' may
+run at once on hosted workers, except that one listener runs one call at a time wherever
+it is installed, including as a parent's listener: the core identifies it by its
+`listener_data` (or the registration, when that is null), and a turn whose listener is
+running elsewhere leaves the runtime until it returns. The C++ and Java bindings do not yet
+pass one `listener_data` per application object (see [Bindings](#bindings)). Deleting a
+participant from one of its listeners finishes once its other listeners in progress
+return. On a manual runtime, blocking calls help: a WaitSet
 created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
 `wait_for_historical_data` run internal turns and due timers until they are satisfied or
 their deadline (on the runtime clock) passes, never listener turns, including when called

@@ -15,6 +15,7 @@
 //! see dcps.idl's widening chain (SubscriberListener : DataReaderListener,
 //! DomainParticipantListener : ... SubscriberListener, ...).
 const std = @import("std");
+const Identity = @import("listener_identity.zig").Identity;
 
 /// If `mask & bit != 0` and `listener`'s `field` is a non-null callback,
 /// invokes it as `cb(handle, args..., listener.listener_data)` — matching
@@ -77,6 +78,7 @@ pub fn Resolved(comptime Cb: type) type {
         box: *anyopaque,
         box_alloc: std.mem.Allocator,
         box_release: *const fn (box: *anyopaque, alloc: std.mem.Allocator) void,
+        box_identity: *const fn (box: *anyopaque) ?*Identity,
         pin_ctx: ?*anyopaque = null,
         pin_release: ?*const fn (ctx: *anyopaque) void = null,
 
@@ -84,6 +86,11 @@ pub fn Resolved(comptime Cb: type) type {
         /// `tryDispatch` does.
         pub fn invoke(self: Self, handle: anytype, args: anytype) void {
             @call(.auto, self.cb, .{handle} ++ args ++ .{self.listener_data});
+        }
+
+        /// The listener's exclusion identity; null without memory for it.
+        pub fn identity(self: Self) ?*Identity {
+            return self.box_identity(self.box);
         }
 
         pub fn release(self: Self) void {
@@ -129,6 +136,12 @@ pub fn resolveBox(
             fn f(b: *anyopaque, a: std.mem.Allocator) void {
                 const typed: Box = @ptrCast(@alignCast(b));
                 typed.releaseRef(a);
+            }
+        }.f,
+        .box_identity = struct {
+            fn f(b: *anyopaque) ?*Identity {
+                const typed: Box = @ptrCast(@alignCast(b));
+                return typed.identity();
             }
         }.f,
     };

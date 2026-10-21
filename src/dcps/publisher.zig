@@ -20,7 +20,7 @@ const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
-const RuntimeContext = @import("../runtime/core.zig").Context;
+const ListenerGroup = @import("listener_lane.zig").Group;
 const Runtime = @import("../runtime/core.zig").Runtime;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
@@ -89,9 +89,10 @@ pub const ParticipantCbs = struct {
     /// the participant's timer checks are armed for.
     timers_changed: ?Hook = null,
 
-    /// The participant's listener context on a shared runtime, where each
-    /// DataWriterImpl queues its listener invocations; null runs them inline.
-    listener_lane: ?*RuntimeContext = null,
+    /// The participant's listener group on a shared runtime: each
+    /// DataWriterImpl runs its listeners on its own context in it. Null runs them
+    /// inline.
+    listener_group: ?*ListenerGroup = null,
 
     /// Register a timer-check callback (DEADLINE + LIVELINESS) for a writer.
     /// Called once per DataWriter after create_proto_writer succeeds.
@@ -465,7 +466,7 @@ pub const PublisherImpl = struct {
             return nil.nil_datawriter;
         };
         dw.timers_changed = self.cbs.timers_changed;
-        dw.listeners.lane = self.cbs.listener_lane;
+        if (self.cbs.listener_group) |g| dw.listeners.attach(g);
         self.cbs.register_incompat_qos(
             self.cbs.ctx,
             publication_handle,
@@ -903,8 +904,8 @@ pub const PublisherImpl = struct {
 
     /// The manual runtime a blocking call helps, if the participant is on one.
     fn helpingRuntime(self: *Self) ?*Runtime {
-        const lane = self.cbs.listener_lane orelse return null;
-        return if (lane.runtime.canHelp()) lane.runtime else null;
+        const group = self.cbs.listener_group orelse return null;
+        return if (group.runtime.canHelp()) group.runtime else null;
     }
 
     // NOT gated on enabled state: a pure navigational getter (no side effect,

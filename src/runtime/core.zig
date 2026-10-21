@@ -257,7 +257,10 @@ pub const Timer = struct {
         self.fire_pending = false;
         rt.gate.unlock();
         if (current) self.callback(self, turn);
-        return .done;
+        // Fired again during this turn, finding its request busy: run again.
+        rt.gate.lock();
+        defer rt.gate.unlock();
+        return if (self.fire_pending) .yield else .done;
     }
 };
 
@@ -816,10 +819,14 @@ pub const Runtime = struct {
             t.fire_gen = t.gen;
             t.fire_pending = true;
             self.gate.unlock();
-            self.submitInternal(t.context, &t.request) catch {
-                self.gate.lock();
-                t.fire_pending = false;
-                self.gate.unlock();
+            self.submitInternal(t.context, &t.request) catch |err| switch (err) {
+                // Its request is queued, or running a turn that runs it again.
+                error.Busy => {},
+                error.Closed => {
+                    self.gate.lock();
+                    t.fire_pending = false;
+                    self.gate.unlock();
+                },
             };
         }
     }

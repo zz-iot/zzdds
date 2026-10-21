@@ -744,6 +744,7 @@ pub const DataWriterImpl = struct {
         const box = self.acquireListenerEx();
         defer box.releaseRef(self.alloc);
         if (box.listener.on_reliable_reader_ready) |cb| {
+            if (!listener_lane.admit(box)) return;
             cb(guidToHandle(event.guid), event.ready, box.listener.listener_data);
         }
     }
@@ -818,10 +819,17 @@ pub const DataWriterImpl = struct {
     /// result with no lock held. The caller holds this writer's `quiesce`.
     fn resolveListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(StatusCb(field)) {
         const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
-        if (listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListenerEx(), self.alloc)) |r| return r;
-        if (nil.isNil(self.publisher)) return null;
-        const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
-        return pub_.resolveWriterFallback(StatusCb(field), field, bit);
+        const r = listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListenerEx(), self.alloc) orelse blk: {
+            if (nil.isNil(self.publisher)) return null;
+            const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
+            break :blk pub_.resolveWriterFallback(StatusCb(field), field, bit) orelse return null;
+        };
+        // Its identity running elsewhere parks this turn: nothing to invoke.
+        if (!listener_lane.admit(r)) {
+            r.release();
+            return null;
+        }
+        return r;
     }
 
     /// With `mu` held: claims status `bit` for a listener `resolved`, if it

@@ -516,6 +516,35 @@ test "a recurring timer re-arms itself until the runtime retires" {
     m.runtime.deinit();
 }
 
+/// On its first fire, is armed and fired again during its own turn, as
+/// another thread may, and does not re-arm itself.
+const Refired = struct {
+    timer: rt.Timer,
+    fires: u32 = 0,
+
+    fn fire(timer: *rt.Timer, turn: *rt.Turn) void {
+        const self: *Refired = @fieldParentPtr("timer", timer);
+        self.fires += 1;
+        if (self.fires > 1) return;
+        _ = turn.runtime.armTimerNoLater(timer, turn.now_ns);
+        turn.runtime.fireDueTimers(turn.now_ns);
+    }
+};
+
+test "a timer fired again while its own turn runs runs again once the turn ends" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var t: Refired = .{ .timer = rt.Timer.init(&ctx, Refired.fire) };
+    _ = m.runtime.armTimer(&t.timer, m.now() + 100);
+    m.sb.clock_state.advance(100);
+    _ = try m.runtime.drive(10, 0);
+    try testing.expectEqual(@as(u32, 2), t.fires);
+    try testing.expectEqual(@as(?i64, null), m.runtime.nextDeadline());
+    ctx.deinit();
+    try m.retire();
+}
+
 test "arming no later only ever brings a timer forward" {
     var m: Manual = undefined;
     m.init(.{ .mode = .manual });

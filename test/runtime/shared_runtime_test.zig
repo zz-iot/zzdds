@@ -10,9 +10,11 @@
 //! (docs/design/concurrency/listeners.md#inline-path-and-pending-work), and
 //! blocking calls that help a manual runtime, a write blocked on resource
 //! limits among them
-//! (docs/design/concurrency/operations.md#stable-helping-policy), and deletion
-//! that waits for a running listener. The last
-//! section runs the whole slice, the same way, under each driver.
+//! (docs/design/concurrency/operations.md#stable-helping-policy), deletion
+//! that waits for a running listener, and listener exclusion: per endpoint,
+//! and per listener wherever it is installed
+//! (docs/design/concurrency/listeners.md#default-behavior). The last section
+//! runs the whole slice, the same way, under each driver.
 //!
 //! Built against a second library graph with the switch on, so these run in
 //! every `zig build test` while the switch exists.
@@ -29,6 +31,7 @@ const DomainParticipantFactoryImpl = zzdds.dcps.DomainParticipantFactoryImpl;
 const DomainParticipantImpl = zzdds.dcps.DomainParticipantImpl;
 const DataWriterImpl = zzdds.dcps.DataWriterImpl;
 const DataReaderImpl = zzdds.dcps.DataReaderImpl;
+const SubscriberImpl = zzdds.dcps.SubscriberImpl;
 const TopicImpl = zzdds.dcps.TopicImpl;
 const WaitSetImpl = zzdds.dcps.WaitSetImpl;
 const GuardConditionImpl = zzdds.dcps.GuardConditionImpl;
@@ -550,6 +553,13 @@ const Pair = struct {
         const publisher = self.dp_w.create_publisher(.{}, null, 0);
         self.dw_h = publisher.create_datawriter(topic_w, o.dw_qos, o.dw_listener, o.dw_mask);
         self.dw = @ptrCast(@alignCast(self.dw_h.ptr));
+    }
+
+    /// Another reader of the pair's topic, in its reader's subscriber.
+    fn addReader(self: *Pair, o: PairOptions) *DataReaderImpl {
+        const first = self.dr.toDDSDataReader();
+        const dr = first.get_subscriber().create_datareader(first.get_topicdescription(), o.dr_qos, o.dr_listener, o.dr_mask);
+        return @ptrCast(@alignCast(dr.ptr));
     }
 
     fn write(self: *Pair, i: usize) !void {
@@ -1113,7 +1123,7 @@ test "a participant deleted from its own deadline listener is freed after that t
 // ── Listener separation ───────────────────────────────────────────────────────
 
 /// Records the listener calls it receives, in order, and whether each ran as
-/// a turn of `lane`: its entity's participant's listener context.
+/// a turn of `lane`: its entity's listener context.
 const Recorder = struct {
     lane: ?*rt.Context = null,
     calls: [16]Call = undefined,
@@ -1197,10 +1207,6 @@ const Recorder = struct {
     }
 };
 
-fn listenersOf(dp: DDS.DomainParticipant) *rt.Context {
-    return &@as(*DomainParticipantImpl, @ptrCast(@alignCast(dp.ptr))).listeners;
-}
-
 test "listeners run as listener turns, oldest change first, and internal work runs none" {
     var m: Manual = undefined;
     m.init();
@@ -1214,8 +1220,8 @@ test "listeners run as listener turns, oldest change first, and internal work ru
     var pair: Pair = undefined;
     try pair.initWith(&m.runtime, o);
     m.runtime.releaseOwner();
-    rr.lane = listenersOf(pair.dp_r);
-    wr.lane = listenersOf(pair.dp_w);
+    rr.lane = &pair.dr.listeners.ctx;
+    wr.lane = &pair.dw.listeners.ctx;
     // Matching ran on this thread and only queued its listeners.
     try testing.expectEqual(@as(usize, 0), rr.n + wr.n);
 
@@ -1296,7 +1302,7 @@ test "deleting a writer raises the reader's listeners on the runtime, not on the
     var pair: Pair = undefined;
     try pair.initWith(&m.runtime, o);
     m.runtime.releaseOwner();
-    rr.lane = listenersOf(pair.dp_r);
+    rr.lane = &pair.dr.listeners.ctx;
     try pair.write(0);
     try settle(&m);
     var got: std.ArrayListUnmanaged(u8) = .empty;
@@ -1328,7 +1334,7 @@ test "a builtin reader's listener runs on the runtime, not on the thread that de
     try settle(&m);
 
     const publications = @as(*DomainParticipantImpl, @ptrCast(@alignCast(pair.dp_r.ptr))).builtin_sub.?.pub_dr;
-    var rr: Recorder = .{ .lane = listenersOf(pair.dp_r) };
+    var rr: Recorder = .{ .lane = &publications.listeners.ctx };
     try testing.expectEqual(DDS.RETCODE_OK, publications.toDDSDataReader().set_listener(rr.readerListener(), DDS.DATA_AVAILABLE_STATUS));
     try settle(&m);
     while (publications.takeRaw()) |sample| alloc.free(sample.data);
@@ -1384,7 +1390,7 @@ test "a reader deleted from its own listener hears nothing after that call" {
     try pair.initWith(&m.runtime, o);
     m.runtime.releaseOwner();
     rr.dr = pair.dr.toDDSDataReader();
-    rr.lane = listenersOf(pair.dp_r);
+    rr.lane = &pair.dr.listeners.ctx;
     try pair.write(0);
     while (m.runtime.runNextInternal()) {}
     try settle(&m);
@@ -1404,7 +1410,7 @@ test "a reliable-ready event reaches the reader's extension listener as a listen
     var pair: Pair = undefined;
     try pair.init(&m.runtime, .RELIABLE_RELIABILITY_QOS, null);
     m.runtime.releaseOwner();
-    var rr: Recorder = .{ .lane = listenersOf(pair.dp_r) };
+    var rr: Recorder = .{ .lane = &pair.dr.listeners.ctx };
     pair.dr.setListenerEx(.{ .listener_data = &rr, .on_reliable_writer_ready = Recorder.onWriterReady }, 0);
 
     var drives: usize = 0;
@@ -1967,6 +1973,67 @@ const DeleteFromListener = struct {
     }
 };
 
+/// Deletes a reader from another thread once a worker has claimed its
+/// listener context, before the claim finds the turn: the deletion discards
+/// it while the claim is still in flight.
+const DeleteWhileClaimed = struct {
+    var target: *rt.Context = undefined;
+    var lane: *@FieldType(DataReaderImpl, "listeners") = undefined;
+    var dr: DDS.DataReader = undefined;
+    var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+    var deleter: ?std.Thread = null;
+    var done: std.atomic.Value(bool) = .init(false);
+
+    fn hook(runtime: *rt.Runtime, claimed: *rt.Context) void {
+        if (claimed != target) {
+            runtime.test_hooks.after_unlink = hook;
+            return;
+        }
+        deleter = std.Thread.spawn(.{}, delete, .{}) catch return;
+        // Holds the claim until the deletion waits for it, or has freed the
+        // reader without waiting.
+        while (lane.claim_waits.load(.seq_cst) == 0 and !done.load(.seq_cst)) std.Thread.yield() catch {};
+    }
+
+    fn delete() void {
+        rc = dr.get_subscriber().delete_datareader(dr);
+        done.store(true, .seq_cst);
+    }
+};
+
+test "deleting a reader while a worker's claim on its listener turn is in flight frees it only after the claim" {
+    var m: Manual = undefined;
+    m.init();
+    var rr: Recorder = .{};
+    const l = rr.readerListener();
+    var pair: Pair = undefined;
+    try pair.init(&m.runtime, .BEST_EFFORT_RELIABILITY_QOS, &l);
+    m.runtime.releaseOwner();
+
+    DeleteWhileClaimed.target = &pair.dr.listeners.ctx;
+    DeleteWhileClaimed.lane = &pair.dr.listeners;
+    DeleteWhileClaimed.dr = pair.dr.toDDSDataReader();
+    DeleteWhileClaimed.rc = DDS.RETCODE_ERROR;
+    DeleteWhileClaimed.deleter = null;
+    DeleteWhileClaimed.done.store(false, .seq_cst);
+    m.runtime.test_hooks.after_unlink = DeleteWhileClaimed.hook;
+    try pair.write(0);
+    var drives: usize = 0;
+    while (DeleteWhileClaimed.deleter == null and drives < 20) : (drives += 1) {
+        _ = try m.runtime.drive(64, std.time.ns_per_s);
+    }
+    m.runtime.test_hooks.after_unlink = null;
+    const deleter = DeleteWhileClaimed.deleter orelse return error.NeverClaimed;
+    deleter.join();
+    try testing.expectEqual(DDS.RETCODE_OK, DeleteWhileClaimed.rc);
+    // The discarded turn never ran.
+    try testing.expectEqual(@as(usize, 0), rr.n);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
 test "deleting a reader from another participant's listener does not wait for the reader's listener" {
     var h: HostedRuntime = undefined;
     try h.init(2);
@@ -1998,6 +2065,368 @@ test "deleting a reader from another participant's listener does not wait for th
     try target.deinit();
     try other.deinit();
     try h.deinit();
+}
+
+// ── Listener exclusion ────────────────────────────────────────────────────────
+
+/// A listener whose first call waits, up to ten seconds, for its peer's first
+/// call: both only return in time if they run at once.
+const Meet = struct {
+    io: std.Io,
+    peer: *Meet = undefined,
+    in: std.Io.Event = .unset,
+    timed_out: bool = false,
+    calls: std.atomic.Value(u32) = .init(0),
+
+    fn readerListener(self: *Meet) DDS.DataReaderListener {
+        return .{ .listener_data = self, .on_data_available = onData };
+    }
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *Meet = @ptrCast(@alignCast(ld.?));
+        self.meet();
+    }
+
+    fn meet(self: *Meet) void {
+        if (self.calls.fetchAdd(1, .seq_cst) > 0) return;
+        self.in.set(self.io);
+        self.peer.in.waitTimeout(self.io, ten_seconds) catch {
+            self.timed_out = true;
+        };
+    }
+
+    fn pair(a: *Meet, b: *Meet) void {
+        a.peer = b;
+        b.peer = a;
+    }
+};
+
+/// Two readers of one participant with listeners `a` and `b`, given one
+/// sample.
+fn expectListenersMeet(h: *HostedRuntime, a: DDS.DataReaderListener, b: DDS.DataReaderListener, sides: *[2]Meet) !void {
+    var o = PairOptions.bestEffort();
+    o.dr_listener = a;
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+    o.dr_listener = b;
+    _ = pair.addReader(o);
+
+    try pair.write(0);
+    for (sides) |*side| try side.in.waitTimeout(h.io(), ten_seconds);
+    // Deleting the readers waits for both calls to return.
+    try pair.deinit();
+    try h.deinit();
+    for (sides) |*side| try testing.expect(!side.timed_out);
+}
+
+test "different listeners on two readers of one participant run at once on hosted workers" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var sides: [2]Meet = .{ .{ .io = h.io() }, .{ .io = h.io() } };
+    Meet.pair(&sides[0], &sides[1]);
+    try expectListenersMeet(&h, sides[0].readerListener(), sides[1].readerListener(), &sides);
+}
+
+/// Listeners without `listener_data`, which find their state here.
+const Unnamed = struct {
+    var sides: [2]Meet = undefined;
+
+    fn onFirst(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
+        sides[0].meet();
+    }
+
+    fn onSecond(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
+        sides[1].meet();
+    }
+};
+
+test "registrations without listener_data are separate listeners, which run at once" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    Unnamed.sides = .{ .{ .io = h.io() }, .{ .io = h.io() } };
+    Meet.pair(&Unnamed.sides[0], &Unnamed.sides[1]);
+    try expectListenersMeet(
+        &h,
+        .{ .listener_data = null, .on_data_available = Unnamed.onFirst },
+        .{ .listener_data = null, .on_data_available = Unnamed.onSecond },
+        &Unnamed.sides,
+    );
+}
+
+/// A listener that counts how many of its calls overlap. Its first call
+/// holds until released.
+const Overlap = struct {
+    io: std.Io,
+    inside: std.atomic.Value(u32) = .init(0),
+    max_inside: std.atomic.Value(u32) = .init(0),
+    calls: std.atomic.Value(u32) = .init(0),
+    entered: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+    release_timed_out: bool = false,
+
+    fn readerListener(self: *Overlap) DDS.DataReaderListener {
+        return .{ .listener_data = self, .on_data_available = onData };
+    }
+
+    fn writerListener(self: *Overlap) DDS.DataWriterListener {
+        return .{ .listener_data = self, .on_offered_deadline_missed = onDeadlineMissed };
+    }
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *Overlap = @ptrCast(@alignCast(ld.?));
+        self.call();
+    }
+
+    fn onDeadlineMissed(_: *anyopaque, _: *const DDS.OfferedDeadlineMissedStatus, ld: ?*anyopaque) callconv(.c) void {
+        const self: *Overlap = @ptrCast(@alignCast(ld.?));
+        self.call();
+    }
+
+    fn onWriterReady(_: DDS.InstanceHandle_t, _: bool, ld: ?*anyopaque) callconv(.c) void {
+        const self: *Overlap = @ptrCast(@alignCast(ld.?));
+        self.call();
+    }
+
+    fn call(self: *Overlap) void {
+        _ = self.max_inside.fetchMax(self.inside.fetchAdd(1, .seq_cst) + 1, .seq_cst);
+        if (self.calls.fetchAdd(1, .seq_cst) == 0) {
+            self.entered.set(self.io);
+            self.release.waitTimeout(self.io, ten_seconds) catch {
+                self.release_timed_out = true;
+            };
+        }
+        _ = self.inside.fetchSub(1, .seq_cst);
+    }
+};
+
+/// Of two readers, the one whose turn is parked on its listener's identity.
+fn awaitParked(a: *DataReaderImpl, b: *DataReaderImpl) *DataReaderImpl {
+    while (true) {
+        if (a.listeners.isParked()) return a;
+        if (b.listeners.isParked()) return b;
+        std.Thread.yield() catch {};
+    }
+}
+
+const Installed = enum { readers, subscriber };
+
+/// One listener reached by two readers of one participant, installed on
+/// each reader or on their subscriber.
+fn expectSharedListenerExcluded(installed: Installed) !void {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    const live = zzdds.util.listener_identity.global.live.load(.seq_cst);
+    var ov: Overlap = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    if (installed == .readers) {
+        o.dr_listener = ov.readerListener();
+        o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    }
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+    const dr2 = pair.addReader(o);
+    if (installed == .subscriber) {
+        const sub = pair.dr.toDDSDataReader().get_subscriber();
+        try testing.expectEqual(DDS.RETCODE_OK, sub.set_listener(.{ .listener_data = &ov, .on_data_available = Overlap.onData }, DDS.DATA_AVAILABLE_STATUS));
+    }
+
+    try pair.write(0);
+    try ov.entered.waitTimeout(h.io(), ten_seconds);
+    // The other reader's turn parks rather than call it again.
+    _ = awaitParked(pair.dr, dr2);
+    ov.release.set(h.io());
+    while (ov.calls.load(.seq_cst) < 2) std.Thread.yield() catch {};
+
+    try pair.deinit();
+    try h.deinit();
+    try testing.expect(!ov.release_timed_out);
+    try testing.expectEqual(@as(u32, 1), ov.max_inside.load(.seq_cst));
+    // Freed with the last registration naming it.
+    try testing.expectEqual(live, zzdds.util.listener_identity.global.live.load(.seq_cst));
+}
+
+test "one listener on two readers runs one call at a time: the second reader's turn parks until it returns" {
+    try expectSharedListenerExcluded(.readers);
+}
+
+test "a subscriber's listener reached by two readers runs one call at a time" {
+    try expectSharedListenerExcluded(.subscriber);
+}
+
+test "one listener on a reader and a writer runs one call at a time" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var ov: Overlap = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    o.dr_listener = ov.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    o.dw_listener = ov.writerListener();
+    o.dw_mask = DDS.OFFERED_DEADLINE_MISSED_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+
+    try pair.write(0);
+    try ov.entered.waitTimeout(h.io(), ten_seconds);
+    // A deadline the writer then misses parks its turn.
+    var qos: DDS.DataWriterQos = undefined;
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.get_qos(&qos));
+    qos.deadline.period = Slice.deadline;
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.set_qos(qos));
+    while (!pair.dw.listeners.isParked()) std.Thread.yield() catch {};
+    ov.release.set(h.io());
+    while (ov.calls.load(.seq_cst) < 2) std.Thread.yield() catch {};
+
+    try pair.deinit();
+    try h.deinit();
+    try testing.expect(!ov.release_timed_out);
+    try testing.expectEqual(@as(u32, 1), ov.max_inside.load(.seq_cst));
+}
+
+test "a reliable-ready event for a listener running elsewhere waits for its call" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var ov: Overlap = .{ .io = h.io() };
+    var o: PairOptions = .{};
+    o.dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    o.dr_qos.reliability.kind = .BEST_EFFORT_RELIABILITY_QOS;
+    o.dr_listener = ov.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+
+    try pair.write(0);
+    try ov.entered.waitTimeout(h.io(), ten_seconds);
+    // A reliable reader matched now hears the writer is ready from its
+    // first HEARTBEAT, through the same listener: installed as it is
+    // created, since that HEARTBEAT can be handled before a later install.
+    var qos = o.dr_qos;
+    qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    const first = pair.dr.toDDSDataReader();
+    const sub: *SubscriberImpl = @ptrCast(@alignCast(first.get_subscriber().ptr));
+    const dr2_h = sub.createDataReader(first.get_topicdescription(), &qos, .{ .listener_data = &ov, .on_reliable_writer_ready = Overlap.onWriterReady }, 0);
+    const dr2: *DataReaderImpl = @ptrCast(@alignCast(dr2_h.ptr));
+    while (!dr2.listeners.isParked()) std.Thread.yield() catch {};
+    ov.release.set(h.io());
+    while (ov.calls.load(.seq_cst) < 2) std.Thread.yield() catch {};
+
+    try pair.deinit();
+    try h.deinit();
+    try testing.expect(!ov.release_timed_out);
+    try testing.expectEqual(@as(u32, 1), ov.max_inside.load(.seq_cst));
+}
+
+test "deleting a participant whose reader is parked on a listener held elsewhere does not wait for that listener" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var ov: Overlap = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    o.dr_listener = ov.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var holding: Pair = undefined;
+    try holding.initWith(&h.runtime, o);
+    var parked: Pair = undefined;
+    try parked.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+
+    try holding.write(0);
+    try ov.entered.waitTimeout(h.io(), ten_seconds);
+    try parked.write(0);
+    while (!parked.dr.listeners.isParked()) std.Thread.yield() catch {};
+    // Waiting for its parked turn would wait for the listener held through
+    // the other participant, which is not released until this returns.
+    try parked.deinit();
+    try testing.expectEqual(@as(u32, 1), ov.inside.load(.seq_cst));
+    ov.release.set(h.io());
+
+    try holding.deinit();
+    try h.deinit();
+    try testing.expect(!ov.release_timed_out);
+}
+
+/// Deletes the participant of the reader it listens to.
+const DeleteParticipantFromListener = struct {
+    io: std.Io,
+    node: *Node = undefined,
+    dp: DDS.DomainParticipant = undefined,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+    done: std.Io.Event = .unset,
+
+    fn readerListener(self: *DeleteParticipantFromListener) DDS.DataReaderListener {
+        return .{ .listener_data = self, .on_data_available = onData };
+    }
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *DeleteParticipantFromListener = @ptrCast(@alignCast(ld.?));
+        if (self.done.isSet()) return;
+        self.rc = Slice.deleteParticipant(self.node, self.dp);
+        self.done.set(self.io);
+    }
+};
+
+test "a participant deleted from one reader's listener is torn down after another's running listener returns" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var ov: Overlap = .{ .io = h.io() };
+    var del: DeleteParticipantFromListener = .{ .io = h.io() };
+    var o = PairOptions.bestEffort();
+    o.dr_listener = ov.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+    del.node = &pair.r;
+    del.dp = pair.dp_r;
+    o.dr_listener = del.readerListener();
+    _ = pair.addReader(o);
+
+    try pair.write(0);
+    try ov.entered.waitTimeout(h.io(), ten_seconds);
+    // From a callback, deleting the readers and the participant waits for
+    // no other listener.
+    try del.done.waitTimeout(h.io(), ten_seconds);
+    try testing.expectEqual(DDS.RETCODE_OK, del.rc);
+    // Its reader is retained until it returns; the participant after that.
+    ov.release.set(h.io());
+
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_w.delete_contained_entities());
+    try pair.w.delete(pair.dp_w);
+    // The workers exit once the runtime stops.
+    h.hosted.join();
+    try testing.expectEqual(rt.State.backend_stopped, h.runtime.getState());
+    pair.freeNodes();
+    h.runtime.deinit();
+    h.threaded.deinit();
+    try testing.expect(!ov.release_timed_out);
+    try testing.expectEqual(@as(u32, 1), ov.calls.load(.seq_cst));
+}
+
+test "deleting a participant drops its builtin readers' queued listener turns without driving" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, PairOptions.bestEffort());
+    m.runtime.releaseOwner();
+    try settle(&m);
+
+    const publications = @as(*DomainParticipantImpl, @ptrCast(@alignCast(pair.dp_r.ptr))).builtin_sub.?.pub_dr;
+    var rr: Recorder = .{};
+    try testing.expectEqual(DDS.RETCODE_OK, publications.toDDSDataReader().set_listener(rr.readerListener(), DDS.DATA_AVAILABLE_STATUS));
+    try settle(&m);
+    const before = rr.n;
+    // The writer's disposal queues the builtin reader's listener.
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dw_h.get_publisher().delete_datawriter(pair.dw_h));
+
+    rr.quiet = true;
+    try pair.deinit();
+    try testing.expect(!rr.called_while_quiet);
+    try testing.expectEqual(before, rr.n);
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
 }
 
 // ── The slice under each driver ───────────────────────────────────────────────
@@ -2096,7 +2525,7 @@ const Slice = struct {
         self.deadline_calls += 1;
         if (self.deadline_calls > 1) return;
         self.deadline_total = st.total_count;
-        self.writer_in_lane = listenersOf(self.pair.dp_w).isRunningHere();
+        self.writer_in_lane = self.pair.dw.listeners.ctx.isRunningHere();
         self.writer_delete_rc = deleteParticipant(&self.pair.w, self.pair.dp_w);
     }
 
@@ -2105,7 +2534,7 @@ const Slice = struct {
         if (self.reader_calls < self.reader_matched.len) self.reader_matched[self.reader_calls] = st.current_count;
         self.reader_calls += 1;
         if (st.current_count != 0) return;
-        self.reader_in_lane = listenersOf(self.pair.dp_r).isRunningHere();
+        self.reader_in_lane = self.pair.dr.listeners.ctx.isRunningHere();
         self.reader_delete_rc = deleteParticipant(&self.pair.r, self.pair.dp_r);
         if (self.io) |io| self.done.set(io);
     }
