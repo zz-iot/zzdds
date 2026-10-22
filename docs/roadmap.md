@@ -1034,10 +1034,19 @@ timers, the progress backend, the manual `drive` and hosted workers on `std.Io.T
 and retirement. Participants use it only in a `-Dshared-runtime` build (a contributor
 migration switch, off by default): a factory may select the runtime, each participant holds
 an owner reference, and creation fails for transports or discovery plugins that run their
-own threads (only the in-process memory transport and direct discovery qualify so far).
-Received datagrams are copied into each participant's ingress context, bounded by count
-and bytes, and processed in runtime turns (which is what makes a RELIABLE pair over the
-memory transport work there); deleting a participant drops what is still queued. A
+own threads (the in-process memory transport, direct discovery and, on POSIX, UDP
+qualify so far). Received datagrams are copied into each participant's ingress context,
+bounded by count and bytes, and processed in runtime turns (which is what makes a RELIABLE
+pair over the memory transport work there); deleting a participant drops what is still
+queued. On POSIX the default runtime, and any runtime built on the readiness backend
+(`PollBackend`), waits on sockets as well as for work: a UDP transport's sockets become
+sources of its participant's runtime instead of running receive threads. One waiter polls
+them with the runtime's wake descriptor and hands polling to another waiter when it stops,
+and servicing receives what is ready without blocking, round robin across sockets within
+its budget. A transport's sockets belong to one runtime, so creation on a second runtime,
+or on one whose backend waits on no sockets, fails. On the runtime, UDP does not yet
+re-poll interfaces (no poll thread is started), and sends are still synchronous `sendto`s
+of a flattened buffer. A
 writer's periodic HEARTBEAT is a runtime timer on the runtime clock rather than a thread,
 armed while a reliable reader is matched. The participant's DEADLINE, LIVELINESS and
 held-data expiry checks are one timer armed for the earliest time anything is due (no
@@ -1091,15 +1100,15 @@ support; the first shipped subset does not.
 
 Even a minimal two-participant setup runs several background threads. An embedded target
 needs a `DomainParticipant.drive(timeout)` that pumps transport polling + `checkTimers()`
-from the caller's loop with no threads spawned. Nothing implements it, and the transport
-seam it needs doesn't exist yet: `Transport.listen` registers a handler that the UDP and
-TCP transports call from their own receive threads, and there is no entry a driver could
-call to service ready sockets without blocking. Manual mode over a real network needs the
-readiness adapter in [transport adapters](design/concurrency/transport-adapters.md), so the
-shared runtime's first slice runs manual mode over the in-process transport only; the
-readiness adapter, UDP then TCP, comes with the endpoint migration that follows it (it is
-also what the cooperative measurement profile's UDP needs). Hosted mode uses the same
-adapter on its own I/O threads, replacing the thread per socket. Now specified as the
+from the caller's loop with no threads spawned. In the `-Dshared-runtime` build the
+readiness adapter in [transport adapters](design/concurrency/transport-adapters.md) now
+exists for UDP on POSIX: a manual runtime over `PollBackend` runs a reliable pair over
+loopback UDP through `drive()` alone, with no thread started by zzdds, and hosted workers
+service the same sockets in place of a thread per socket. Discovery in that test is still
+in-process: RTPS discovery (SPDP announcements and leases on runtime timers) is the next
+step, then gather-list sends with output outcomes, channel slots in place of the
+retained socket graveyards, TCP, and Windows. Outside that build, the UDP and TCP
+transports still call their handlers from their own receive threads. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
 measurement profile in the concurrency architecture; implementation follows the

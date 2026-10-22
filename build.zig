@@ -1680,6 +1680,7 @@ pub fn build(b: *std.Build) void {
     zzdds_mod_shared_runtime.link_libc = true;
     const shared_runtime_test_files = [_][]const u8{
         "test/runtime/shared_runtime_test.zig",
+        "test/runtime/readiness_test.zig",
     };
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{
@@ -1690,11 +1691,16 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zzdds", .module = zzdds_mod_shared_runtime },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                    .{ .name = "test_domain", .module = test_domain_mod },
                 },
             }),
         });
         t.root_module.link_libc = true;
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        // Clear of the domains `addTestRun` counts up from 1 (and 230,
+        // below): the readiness tests open real sockets.
+        const run = b.addRunArtifact(t);
+        run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "231");
+        test_step.dependOn(&run.step);
         emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
@@ -2349,10 +2355,13 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zzdds", .module = zzdds_mod_tsan_shared_runtime },
                 .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
+                .{ .name = "test_domain", .module = test_domain_mod },
             },
         }), .use_llvm = true });
         t.root_module.link_libc = true;
-        tsan_step.dependOn(&b.addRunArtifact(t).step);
+        const run = b.addRunArtifact(t);
+        run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "232");
+        tsan_step.dependOn(&run.step);
     }
 
     // DCPS tests (TSan) — WaitSet thread test, loopback

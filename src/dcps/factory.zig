@@ -138,15 +138,20 @@ pub const DomainParticipantFactoryImpl = struct {
         const selected = self.runtime;
         const retained = if (selected) |rt| rt.tryRetainOwner() else false;
         self.mu.unlock();
-        if (selected == null) return default_registry.global.acquire() catch |err| {
+        const rt = selected orelse default_registry.global.acquire() catch |err| {
             log_mod.dcps.warn("create_participant: no default runtime ({s})", .{@errorName(err)});
             return null;
         };
-        if (!retained) {
+        if (selected != null and !retained) {
             log_mod.dcps.warn("create_participant: the selected runtime is retiring", .{});
             return null;
         }
-        return selected;
+        self.transport.attachBackend(rt.backend) catch |err| {
+            log_mod.dcps.warn("create_participant: the transport cannot run on this runtime ({s})", .{@errorName(err)});
+            rt.releaseOwner();
+            return null;
+        };
+        return rt;
     }
 
     pub fn toDDSFactory(self: *Self) DDS.DomainParticipantFactory {
