@@ -1,0 +1,5 @@
+module LoadedDemo {
+    // Independently generated equivalent export; selection stays explicit.
+    struct Pulse { unsigned long count; };
+    struct Command { @key unsigned long target; unsigned long action; };
+};

@@ -63,7 +63,8 @@ fn toChangeKind(kind: WriteKind, impl: *DataWriterImpl) history_mod.ChangeKind {
 /// that shim does this same handle-to-impl unboxing internally for C/C++/Java
 /// callers; this gives Zig callers the same one-call surface instead of
 /// requiring them to downcast `participant.ptr` to `*DomainParticipantImpl`
-/// themselves.  Returns false if the participant is being torn down.
+/// themselves. Consumes the supplied context on both success and failure.
+/// Returns false on allocation failure or if a pinned library owns the name.
 pub fn registerTypeSupport(
     participant: DDS.DomainParticipant,
     type_name: []const u8,

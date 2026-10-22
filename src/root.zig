@@ -81,6 +81,8 @@ pub const createFactoryWithAllocator = factory.createFactoryWithAllocator;
 
 /// Module-level raw operations called by zidl-generated typed wrappers.
 pub const raw_ops = @import("raw_ops.zig");
+/// Opt-in experimental loaded/static provider management and immutable registration.
+pub const typesupport = if (@import("build_options").typesupport_library) @import("typesupport.zig") else struct {};
 
 // Flat re-exports from raw_ops so callers can write _zzdds.writeRaw(...) directly.
 pub const writerUsesXcdr2 = raw_ops.writerUsesXcdr2;

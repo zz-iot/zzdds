@@ -8,6 +8,36 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-22
+
+- Pin zidl v0.3.22-zig.0.17.0 and use its released generator and ABI helpers with
+  `-Dtypesupport-library=true`. Native qualification no longer needs a separate
+  zidl checkout; explicit local overrides remain available for development.
+- Collect coverage from the LLVM test builds using stock elfutils, and fail CI
+  on collector errors or empty reports instead of uploading partial results.
+
+## 2026-10-20
+
+- Add opt-in experimental typesupport library loading, explicit export selection,
+  immutable participant registration and reference-counted generation retirement.
+  Existing readers retain their provider through deferred teardown; candidate
+  replacement affects future selections. Include checked sample/key processing for
+  complete DATA, reassembly and prematch input, and validated registered writes.
+  See `docs/typesupport-libraries.md` for opt-in usage and limits.
+- Add a runnable two-library inspection/pub/sub example with separate-process UDP
+  checks and an optional independent Fast DDS subscriber. Derive registered
+  writer/reader RTPS entity kinds from type keyedness, so keyless topics match
+  peers that enforce the endpoint kind.
+- Separate provider ownership from OS loading, add macOS/Windows backends and a
+  static-only build option. Require absolute artifact paths and restrict Windows
+  DLL dependency search. Add linked-provider C ABI, allocation-failure and native
+  unload checks plus a native platform qualification workflow. Non-Linux
+  native qualification remains pending. Build IDL generators for the build host
+  when cross-compiling DDS.
+- Fix C-ABI typesupport adapter cleanup on registration allocation failure: the
+  participant already consumes the adapter, so the shim must not destroy it again.
+  Run legacy typesupport cleanup outside the participant lock.
+
 ## 2026-10-17
 
 - **A remote endpoint lost while its match was being made is no longer matched.**

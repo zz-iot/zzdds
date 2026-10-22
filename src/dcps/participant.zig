@@ -772,6 +772,11 @@ const DiscoveredReader = struct {
 /// carries no inline-QoS key_hash.  Keyed types should register this to
 /// enable per-instance OWNERSHIP, TIME_BASED_FILTER, and SampleInfo tracking.
 pub const TypeSupport = struct {
+    /// Optional immutable wire-library registration. Provider code is pinned until
+    /// after every endpoint and its pending protocol work have been destroyed.
+    provider_generation: u64 = 0,
+    minimal_identifier: [15]u8 = @splat(0),
+    sample_processor: ?@import("../rtps/reader_sm.zig").SampleProcessor = null,
     /// Opaque context passed as the first argument to all function pointers.
     /// Follows the same convention as Transport and Security plugin vtables.
     /// Zig-native implementations that need no state may pass `undefined`.
@@ -1519,12 +1524,6 @@ pub const DomainParticipantImpl = struct {
         self.listener_box.releaseRef(self.alloc);
 
         self.type_info_registry.deinit(self.alloc);
-        var ts_it = self.type_support_registry.iterator();
-        while (ts_it.next()) |entry| {
-            if (entry.value_ptr.deinit) |f| f(entry.value_ptr.ctx);
-            self.alloc.free(entry.key_ptr.*);
-        }
-        self.type_support_registry.deinit(self.alloc);
 
         // Any remaining active writers/readers (normally all removed by pub/sub deinit).
         var wit = self.active_writers.valueIterator();
@@ -1543,6 +1542,15 @@ pub const DomainParticipantImpl = struct {
             freeUserData(self.alloc, ar.qos.user_data);
         }
         self.active_readers.deinit(self.alloc);
+
+        // Drop participant-owned provider pins outside the lock. Protocol
+        // readers hold independent pins through deferred/quiescent teardown.
+        var ts_it = self.type_support_registry.iterator();
+        while (ts_it.next()) |entry| {
+            if (entry.value_ptr.deinit) |f| f(entry.value_ptr.ctx);
+            self.alloc.free(entry.key_ptr.*);
+        }
+        self.type_support_registry.deinit(self.alloc);
         self.discovered_participants.deinit(self.alloc);
         self.ignored_prefixes.deinit(self.alloc);
         for (self.ignored_topic_names.items) |n| self.alloc.free(n);
@@ -1599,22 +1607,36 @@ pub const DomainParticipantImpl = struct {
     /// The caller owns `cdr`; it must remain valid for the lifetime of the participant.
     /// Called before creating DataWriters/DataReaders for the type.
     /// Register TypeSupport callbacks for a type name.
-    /// Call before creating DataReaders for the type.  The caller must ensure
-    /// `type_name` remains valid for the lifetime of the participant.
+    /// Call before creating DataReaders for the type. The registry owns a copy
+    /// of `type_name`; this legacy API consumes the supplied support on every outcome.
     pub fn registerTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) bool {
+        // This legacy API consumes ts on every outcome. Cleanup after unlocking:
+        // a provider's final release must not unload code under participant.mu.
+        var cleanup: ?TypeSupport = null;
+        defer if (cleanup) |old| if (old.deinit) |f| f(old.ctx);
+        // Pinned/checked registrations must use the immutable install path.
+        if (ts.provider_generation != 0 or ts.sample_processor != null) {
+            cleanup = ts;
+            return false;
+        }
         // Heap-copy the key so the map owns it regardless of caller lifetime.
         const owned_key = self.alloc.dupe(u8, type_name) catch {
-            if (ts.deinit) |f| f(ts.ctx);
+            cleanup = ts;
             return false;
         };
         self.mu.lock();
         defer self.mu.unlock();
         const gop = self.type_support_registry.getOrPut(self.alloc, owned_key) catch {
             self.alloc.free(owned_key);
-            if (ts.deinit) |f| f(ts.ctx);
+            cleanup = ts;
             return false;
         };
         if (gop.found_existing) {
+            if (gop.value_ptr.provider_generation != 0) {
+                self.alloc.free(owned_key);
+                cleanup = ts;
+                return false;
+            }
             // Replacing: propagate new ctx/fn to active readers that cached
             // the old pointers BEFORE freeing the old TypeSupport's ctx
             // below -- this must run first. refresh_get_field's swap is
@@ -1652,11 +1674,37 @@ pub const DomainParticipantImpl = struct {
             // reader.mu lock/unlock happened-before this point, so any
             // subsequent reader.mu-protected read observes the new getter,
             // never the old one), so it can be freed and swapped in.
-            if (gop.value_ptr.deinit) |f| f(gop.value_ptr.ctx);
+            cleanup = gop.value_ptr.*;
             self.alloc.free(gop.key_ptr.*);
             gop.key_ptr.* = owned_key;
         }
         gop.value_ptr.* = ts;
+        return true;
+    }
+
+    /// New immutable registration. Transfers ts only when true is returned;
+    /// false means the same generation/type is already installed. Failures and
+    /// false leave cleanup with the caller. Install before any topic of this type
+    /// exists, which also closes the endpoint-construction snapshot race.
+    pub fn installPinnedTypeSupport(self: *Self, type_name: []const u8, ts: TypeSupport) !bool {
+        std.debug.assert(ts.provider_generation != 0 and ts.sample_processor != null);
+        const owned_key = try self.alloc.dupe(u8, type_name);
+        errdefer self.alloc.free(owned_key);
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.type_support_registry.get(type_name)) |old| {
+            if (old.provider_generation == ts.provider_generation and std.mem.eql(u8, &old.minimal_identifier, &ts.minimal_identifier)) {
+                self.alloc.free(owned_key);
+                return false;
+            }
+            if (old.provider_generation == 0) return error.TypeAlreadyRegistered;
+            if (std.mem.eql(u8, &old.minimal_identifier, &ts.minimal_identifier)) return error.EquivalentProviderAlreadyRegistered;
+            return error.ConflictingTypeRegistration;
+        }
+        for (self.topics.items) |topic| if (std.mem.eql(u8, topic.type_name, type_name)) return error.TypeInUse;
+        const entry = try self.type_support_registry.getOrPut(self.alloc, owned_key);
+        std.debug.assert(!entry.found_existing);
+        entry.value_ptr.* = ts;
         return true;
     }
 
@@ -1712,13 +1760,15 @@ pub const DomainParticipantImpl = struct {
 
         self.mu.lock();
         const key = self.nextEntityKeyLocked();
+        const registered_keyed: ?bool = if (self.type_support_registry.get(type_name)) |support| support.has_key else null;
         self.mu.unlock();
 
         const guid = Guid{
             .prefix = self.guid.prefix,
             .entity_id = .{
                 .entity_key = key,
-                .entity_kind = EntityKind.user_writer_with_key,
+                // Preserve the legacy kind when no type metadata is registered.
+                .entity_kind = if (registered_keyed orelse true) EntityKind.user_writer_with_key else EntityKind.user_writer_no_key,
             },
         };
         guid_out.* = guid;
@@ -1758,12 +1808,7 @@ pub const DomainParticipantImpl = struct {
         // (RTPS §8.7.9; see resolveKeyHash). Requires the type's TypeSupport to
         // be registered before this writer is created — the same ordering
         // constraint readers already have for key_hash_fn.
-        {
-            self.mu.lock();
-            const is_keyed = if (self.type_support_registry.get(type_name)) |ts| ts.has_key else false;
-            self.mu.unlock();
-            adapter.setKeyed(is_keyed);
-        }
+        adapter.setKeyed(registered_keyed orelse false);
 
         const pw = adapter.toProtocolWriter();
 
@@ -1844,13 +1889,14 @@ pub const DomainParticipantImpl = struct {
 
         self.mu.lock();
         const key = self.nextEntityKeyLocked();
+        const is_keyed = if (self.type_support_registry.get(type_name)) |support| support.has_key else true;
         self.mu.unlock();
 
         const guid = Guid{
             .prefix = self.guid.prefix,
             .entity_id = .{
                 .entity_key = key,
-                .entity_kind = EntityKind.user_reader_with_key,
+                .entity_kind = if (is_keyed) EntityKind.user_reader_with_key else EntityKind.user_reader_no_key,
             },
         };
         guid_out.* = guid;
@@ -1891,6 +1937,8 @@ pub const DomainParticipantImpl = struct {
         {
             self.mu.lock();
             defer self.mu.unlock();
+            // Not yet published/matched, so no reader lock is needed here.
+            if (self.type_support_registry.get(type_name)) |support| adapter.reader.setSampleProcessor(support.sample_processor);
             try self.active_readers.put(self.alloc, entityIdKey(guid.entity_id), .{
                 .handle = subscription_handle.*,
                 .guid = guid,
