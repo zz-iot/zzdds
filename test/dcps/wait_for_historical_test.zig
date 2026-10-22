@@ -503,3 +503,90 @@ test "wait_for_historical_data: history the writer no longer has is reported los
     try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.get_sample_lost_status(dr_raw.ptr, &lost));
     try testing.expectEqual(@as(i32, 3), lost.total_count);
 }
+
+test "wait_for_historical_data: a writer lost before delivering its history leaves the shortfall reported lost" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const td = tp_impl.toTopicDescription();
+
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+
+    const writer_guid = h.fireWriter(dp_impl, makePrefix(0x61), "TestTopic", 1, 1);
+
+    const ts = zzdds.util.time.RtpsTimestamp.zero;
+    const kh = std.mem.zeroes([16]u8);
+    var payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0xAB, 0xCD };
+
+    // History is SNs 1-4: 1 arrives, a GAP drops 3, 4 arrives out of
+    // order, 2 never does.
+    dr_impl.proto_reader.handleHeartbeat(writer_guid, EntityIds.unknown, 1, 4, 1, true, false);
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 1, ts, kh, &payload, .alive, null, null, null, null);
+    dr_impl.proto_reader.handleGap(writer_guid, 3, .{ .base = 4, .num_bits = 0, .bitmap = std.mem.zeroes([8]u32) });
+    dr_impl.proto_reader.handleIncomingChange(writer_guid, 4, ts, kh, &payload, .alive, null, null, null, null);
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO));
+    var lost: DDS.SampleLostStatus = undefined;
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.get_sample_lost_status(dr_raw.ptr, &lost));
+    try testing.expectEqual(@as(i32, 1), lost.total_count);
+
+    dp_impl.disc_callbacks.on_writer_lost(dp_impl.disc_callbacks.ctx, writer_guid);
+
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO));
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.get_sample_lost_status(dr_raw.ptr, &lost));
+    // SN 2, and SN 4, held waiting for it; SN 3 was counted at the GAP.
+    try testing.expectEqual(@as(i32, 2), lost.total_count_change);
+    try testing.expectEqual(@as(i32, 3), lost.total_count);
+}
+
+test "wait_for_historical_data: a writer's participant lost before it delivers reports its history lost" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const td = tp_impl.toTopicDescription();
+
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
+
+    const prefix = makePrefix(0x62);
+    const writer_guid = h.fireWriter(dp_impl, prefix, "TestTopic", 1, 1);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+    dr_impl.proto_reader.handleHeartbeat(writer_guid, EntityIds.unknown, 1, 2, 1, true, false);
+
+    dp_impl.disc_callbacks.on_participant_lost(dp_impl.disc_callbacks.ctx, .{ .prefix = prefix, .entity_id = EntityIds.participant });
+
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO));
+    try testing.expectEqual(@as(usize, 0), available(dr_impl));
+    var lost: DDS.SampleLostStatus = undefined;
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.get_sample_lost_status(dr_raw.ptr, &lost));
+    try testing.expectEqual(@as(i32, 2), lost.total_count);
+}

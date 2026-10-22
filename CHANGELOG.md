@@ -40,6 +40,15 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   zidl checkout; explicit local overrides remain available for development.
 - Collect coverage from the LLVM test builds using stock elfutils, and fail CI
   on collector errors or empty reports instead of uploading partial results.
+- **History a lost writer never delivered is now reported in SAMPLE_LOST.** When a
+  TRANSIENT_LOCAL writer (or its participant) went away before a late-joining reader
+  had all of its history, `wait_for_historical_data` returned OK, since that history can
+  no longer arrive, but nothing recorded the shortfall. The samples its first HEARTBEAT
+  announced and the reader never received, including any held back behind a missing
+  one, are now added to the reader's SAMPLE_LOST status, as they already are when a
+  writer reports history it no longer has. A writer lost before its first HEARTBEAT
+  reaches the reader still reports nothing, since the reader never learned how much
+  history it had.
 
 ## 2026-10-20
 

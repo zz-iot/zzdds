@@ -607,6 +607,7 @@ pub const RtpsProtocolReader = struct {
     fn vtRemoveMatchedWriter(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const r = self.removeWriter(guid);
+        if (r.removed.lost) |l| l.fn_ptr(l.ctx, l.count);
         if (r.removed.ready) |d| d.fn_ptr(d.ctx, guid, false);
         if (r.removed.removed) if (r.cb) |c| c.on_writer_unmatched(c.ctx, guid);
     }
@@ -622,6 +623,7 @@ pub const RtpsProtocolReader = struct {
         // instead of firing either.
         var result: protocol.DeferredUnmatchCallbacks = .{};
         if (r.removed.ready) |d| result.ready = .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
+        if (r.removed.lost) |l| result.lost = .{ .ctx = l.ctx, .on_lost = l.fn_ptr, .count = l.count };
         if (r.removed.removed) if (r.cb) |c| {
             result.unmatched_ctx = c.ctx;
             result.unmatched_fn = c.on_writer_unmatched;

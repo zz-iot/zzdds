@@ -201,16 +201,27 @@ pub const ProtocolReadyCallback = struct {
     quiesce_release: ?*const fn (ctx: *anyopaque) void = null,
 };
 
+/// A pending SAMPLE_LOST report from a writer removal: `count` SNs of the
+/// writer's history that never arrived (see DeferredUnmatchCallbacks.lost).
+pub const DeferredSampleLost = struct {
+    ctx: *anyopaque,
+    on_lost: *const fn (ctx: *anyopaque, count: i32) void,
+    count: i32,
+};
+
 /// Bundle of callbacks pending from a *_matched_*_deferred removal call,
-/// none of them fired yet -- both can reach arbitrary application listener
+/// none of them fired yet -- all can reach arbitrary application listener
 /// code (on_reliable_writer_ready/on_reliable_reader_ready, and
 /// on_writer_unmatched/on_reader_unmatched can themselves synthesize a
 /// NOT_ALIVE_NO_WRITERS/NO_READERS sample and dispatch on_data_available),
-/// so the caller must fire both only after releasing whatever external lock
+/// so the caller must fire them only after releasing whatever external lock
 /// (e.g. DomainParticipantImpl.mu) protects the removal itself.
 pub const DeferredUnmatchCallbacks = struct {
     /// Set only when a proxy was removed.
     ready: ?ProtocolReadyCallback = null,
+    /// History the removed writer announced but never delivered, for
+    /// SAMPLE_LOST. Fired before the other two.
+    lost: ?DeferredSampleLost = null,
     unmatched_ctx: ?*anyopaque = null,
     unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
 };

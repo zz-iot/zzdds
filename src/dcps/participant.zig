@@ -2800,6 +2800,7 @@ pub const DomainParticipantImpl = struct {
         // doc comment. Always null for the writer-sweep (reader removal) side.
         unmatched_ctx: ?*anyopaque = null,
         unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
+        lost: ?proto.DeferredSampleLost = null,
         // Exactly one of these two is set (matching which sweep produced
         // this entry), held from collection (under self.mu) through firing
         // (after self.mu is released) so `ready_cb`/`unmatched_fn`'s ctx --
@@ -2903,7 +2904,7 @@ pub const DomainParticipantImpl = struct {
                 const before = ar.proto.matchedWriterCount();
                 const deferred = ar.proto.removeMatchedWriterDeferred(w_guid);
                 const matched_changed = ar.proto.matchedWriterCount() < before;
-                if (deferred.ready == null and deferred.unmatched_fn == null and !matched_changed) continue;
+                if (deferred.ready == null and deferred.unmatched_fn == null and deferred.lost == null and !matched_changed) continue;
                 const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
                 const nq = if (notify) |cb| cb.quiesceAcquire() else false;
                 // See RemovedWriterJob.proto_quiesced's comment in onWriterLost.
@@ -2915,6 +2916,7 @@ pub const DomainParticipantImpl = struct {
                     .notify_quiesced = nq,
                     .unmatched_ctx = deferred.unmatched_ctx,
                     .unmatched_fn = deferred.unmatched_fn,
+                    .lost = deferred.lost,
                     .reader_proto_quiesced = if (pq) ar.proto else null,
                 });
             }
@@ -2960,6 +2962,7 @@ pub const DomainParticipantImpl = struct {
         self.mu.unlock();
 
         for (reader_fires.items) |fire| {
+            if (fire.lost) |l| l.on_lost(l.ctx, l.count);
             if (fire.ready_cb) |cb| cb.on_ready(cb.ctx, fire.guid, false);
             if (fire.unmatched_fn) |f| f(fire.unmatched_ctx.?, fire.guid);
             if (fire.notify) |cb| if (fire.notify_quiesced) cb.notify(cb.ctx, writer_mod.guidToHandle(fire.guid), false);
@@ -3287,6 +3290,7 @@ pub const DomainParticipantImpl = struct {
         notify_quiesced: bool = false,
         unmatched_ctx: ?*anyopaque = null,
         unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
+        lost: ?proto.DeferredSampleLost = null,
         /// Held from collection (still under self.mu, so `ar.proto` -- and,
         /// via its `ready_pin`, the DataReaderImpl `ready_cb`/`unmatched_fn`
         /// resolve into -- are both provably alive) through firing below
@@ -3346,7 +3350,7 @@ pub const DomainParticipantImpl = struct {
                 const before = ar.proto.matchedWriterCount();
                 const deferred = ar.proto.removeMatchedWriterDeferred(guid);
                 const matched_changed = ar.proto.matchedWriterCount() < before;
-                if (deferred.ready == null and deferred.unmatched_fn == null and !matched_changed) continue;
+                if (deferred.ready == null and deferred.unmatched_fn == null and deferred.lost == null and !matched_changed) continue;
                 const notify: ?MatchedNotify = if (matched_changed) ar.matched_notify else null;
                 const nq = if (notify) |cb| cb.quiesceAcquire() else false;
                 // ar.proto is provably still alive and not yet tearing
@@ -3362,6 +3366,7 @@ pub const DomainParticipantImpl = struct {
                     .notify_quiesced = nq,
                     .unmatched_ctx = deferred.unmatched_ctx,
                     .unmatched_fn = deferred.unmatched_fn,
+                    .lost = deferred.lost,
                     .proto_quiesced = if (pq) ar.proto else null,
                 });
             }
@@ -3377,6 +3382,7 @@ pub const DomainParticipantImpl = struct {
 
         const remote_handle = writer_mod.guidToHandle(guid);
         for (jobs.items) |job| {
+            if (job.lost) |l| l.on_lost(l.ctx, l.count);
             if (job.ready_cb) |cb| cb.on_ready(cb.ctx, guid, false);
             if (job.unmatched_fn) |f| f(job.unmatched_ctx.?, guid);
             if (job.notify) |cb| if (job.notify_quiesced) cb.notify(cb.ctx, remote_handle, false);
