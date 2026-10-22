@@ -235,6 +235,23 @@ fn keepAllDrQos() DDS.DataReaderQos {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+test "TypeSupport: legacy registration without keyedness preserves RTPS endpoint kinds" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    // Older adapters supply key callbacks but omit the optional has_key field.
+    // Such registrations must not silently start advertising keyless endpoints.
+    for ([_]DDS.DomainParticipant{ fx.dp_a, fx.dp_r }) |dp| {
+        try testing.expect(fx.dpImpl(dp).registerTypeSupport("TSType", .{
+            .ctx = undefined,
+            .compute_key_hash = testKeyHash,
+        }));
+    }
+    const writer = fx.makeWriterA(.{});
+    const reader = fx.makeReader(.{});
+    try testing.expectEqual(zzdds.rtps.guid.EntityKind.user_writer_with_key, writer.guid.entity_id.entity_kind);
+    try testing.expectEqual(zzdds.rtps.guid.EntityKind.user_reader_with_key, reader.guid.entity_id.entity_kind);
+}
+
 test "TypeSupport: registerTypeSupport stores callback" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

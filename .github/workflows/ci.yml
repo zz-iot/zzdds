@@ -351,6 +351,7 @@ jobs:
           path: |
             ${{ runner.temp }}/net-diagnostics
             examples/interop/.smoke-logs
+            examples/**/build/**/*.log
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 14

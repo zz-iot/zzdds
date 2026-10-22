@@ -92,6 +92,12 @@ APIs does not gain its sender-side validation.
 
 ## Registration and conflicts
 
+Handwritten native `TypeSupport` registrations should supply `.has_key = Type.has_key`
+from their generated type for key-hash handling. Legacy registrations retain their
+previous RTPS endpoint kinds for compatibility with older adapters that omit this
+field. Checked provider registrations use their explicit descriptor keyedness to
+choose keyed/keyless endpoint kinds.
+
 A provider export is not automatically registered in every participant. Registration
 copies the name and pins the chosen provider. It must precede any topic with that
 type name; this closes the race with endpoint construction taking keyedness and
@@ -134,10 +140,13 @@ Existing views, selections, registrations and protocol readers keep the old gene
 A newly selected provider may be registered with a new participant, but it cannot
 silently replace an existing participant registration. A caller may deliberately
 continue using a previously acquired selection. Removing a provider prevents new
-manager acquisitions; unload occurs on the final reference release. `liveGenerations`
+manager acquisitions; the OS library handle is closed on the final reference release.
+The loader may retain an image after that close (macOS dyld does so for these
+providers); physical unmapping is not guaranteed. `liveGenerations`
 includes retired but still referenced generations, which count against the configured
 limit along with candidates. Thus old users cannot bypass the resource bound by
-repeatedly removing/reloading libraries.
+repeatedly removing/reloading libraries. This bounds owned generations, not memory
+that the OS loader chooses to retain after closing a handle.
 
 Manager load/acquire/select/replace/remove operations are synchronized. Manager
 `deinit` requires concurrent manager operations to have stopped; existing independent
@@ -194,9 +203,12 @@ It checks genuine linked providers (also with dynamic loading compiled out), C
 layout and C-to-provider callbacks, multiple libraries, candidate failures,
 allocation failures, generation pinning, native module retirement, and UDP exchange
 with spaces/Unicode in installed artifact paths. The native module observation
-check is skipped for musl's separate static ELF loader. Compile-only target checks
+check verifies residency while pinned on every native OS and immediate unmapping
+for the Linux/Windows fixtures. It does not require dyld to unmap a closed image;
+[Apple documents loader-controlled image removal](https://developer.apple.com/library/archive/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/DynamicLibraryUsageGuidelines.html).
+The residency probe is skipped for musl's separate static ELF loader. Compile-only target checks
 are also available through `zig build check-typesupport-library -Dtarget=...` with
-the package/generator options above; code generation runs on the build host.
+`-Dtypesupport-library=true`; code generation runs on the build host.
 
 ## Receive processing and limitations
 

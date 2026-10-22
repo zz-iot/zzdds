@@ -10,6 +10,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-10-22
 
+- Keep a writer operation reference across typesupport validation and hashing;
+  concurrent deletion now leaves the in-flight write safe to return AlreadyDeleted.
+- Preserve legacy RTPS endpoint kinds for registrations that omit keyedness,
+  including the pinned dds-rtps adapter. Use explicit generated keyedness in the
+  handwritten Zig examples, and retain descriptor-based kinds for loaded providers.
+- Quiesce allocator-injection test fixtures before replacing their allocator and
+  distinguish generation retirement from OS image residency in the macOS checks.
+
 - Pin zidl v0.3.22-zig.0.17.0 and use its released generator and ABI helpers with
   `-Dtypesupport-library=true`. Native qualification no longer needs a separate
   zidl checkout; explicit local overrides remain available for development.

@@ -799,8 +799,10 @@ pub const TypeSupport = struct {
     /// through (`zzdds_register_type_support`/`_ctx`'s
     /// `compute_key_hash_key_only_fn` parameter, `c_abi/typesupport.zig`).
     compute_key_hash_key_only: ?*const fn (ctx: *anyopaque, payload: []const u8) [16]u8 = null,
-    /// True when the type has one or more `@key` members. Consulted by
-    /// `pubCreateProtoWriter` so a keyed writer emits inline `PID_KEY_HASH` on
+    /// True when the type has one or more `@key` members. Native registrations
+    /// should use the generated type's `has_key` constant. Pinned providers use it
+    /// for endpoint kinds; legacy registrations retain their previous wire kinds.
+    /// A keyed writer emits inline `PID_KEY_HASH` on
     /// every sample (RTPS §8.7.9), including a zero-valued key — otherwise a
     /// subscriber would have to reconstruct the per-instance hash from the
     /// payload (see `resolveKeyHash`). Must be registered before the writer is
@@ -1760,15 +1762,19 @@ pub const DomainParticipantImpl = struct {
 
         self.mu.lock();
         const key = self.nextEntityKeyLocked();
-        const registered_keyed: ?bool = if (self.type_support_registry.get(type_name)) |support| support.has_key else null;
+        const support = self.type_support_registry.get(type_name);
+        const registered_keyed: ?bool = if (support) |s| s.has_key else null;
+        // Legacy native callers may leave has_key at its historical default,
+        // even for keyed types (including the pinned dds-rtps adapter). Only a
+        // checked provider registration guarantees explicit endpoint keyedness.
+        const endpoint_keyed = if (support) |s| s.provider_generation == 0 or s.has_key else true;
         self.mu.unlock();
 
         const guid = Guid{
             .prefix = self.guid.prefix,
             .entity_id = .{
                 .entity_key = key,
-                // Preserve the legacy kind when no type metadata is registered.
-                .entity_kind = if (registered_keyed orelse true) EntityKind.user_writer_with_key else EntityKind.user_writer_no_key,
+                .entity_kind = if (endpoint_keyed) EntityKind.user_writer_with_key else EntityKind.user_writer_no_key,
             },
         };
         guid_out.* = guid;
@@ -1889,7 +1895,7 @@ pub const DomainParticipantImpl = struct {
 
         self.mu.lock();
         const key = self.nextEntityKeyLocked();
-        const is_keyed = if (self.type_support_registry.get(type_name)) |support| support.has_key else true;
+        const is_keyed = if (self.type_support_registry.get(type_name)) |support| support.provider_generation == 0 or support.has_key else true;
         self.mu.unlock();
 
         const guid = Guid{

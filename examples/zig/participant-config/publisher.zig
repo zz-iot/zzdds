@@ -161,6 +161,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "ConfigPing", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = ping_gen.ConfigPing.computeKeyHashFromCdr,
+        .has_key = ping_gen.ConfigPing.has_key,
         .compute_key_hash_key_only = ping_gen.ConfigPing.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});

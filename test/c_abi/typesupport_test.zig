@@ -479,6 +479,12 @@ test "typesupport C ABI: registration allocation failure destroys each adapter e
         for ([_]usize{ 1, 2 }) |fail_index| {
             var fx = try Fixture.init(testing.allocator);
             defer fx.deinit();
+            // Allocator injection requires a quiescent fixture: the timer thread
+            // captures/uses the allocator independently of participant.mu.
+            fx.impl().timer_stopping.store(true, .release);
+            if (fx.impl().timer_thread) |thread| thread.join();
+            fx.impl().timer_thread = null;
+            fx.impl().timer_thread_id.store(0, .release);
             var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
             fx.impl().alloc = failing.allocator();
             const Cleanup = struct {

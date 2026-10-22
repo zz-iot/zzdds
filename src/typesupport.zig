@@ -9,6 +9,7 @@ pub const wire = library.wire;
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
 const participant_mod = @import("dcps/participant.zig");
+const DataWriterImpl = @import("dcps/writer.zig").DataWriterImpl;
 const reader_sm = @import("rtps/reader_sm.zig");
 const raw = @import("raw_ops.zig");
 const nil = @import("dcps/nil.zig");
@@ -76,11 +77,17 @@ pub const Registration = struct {
     }
     pub fn write(self: Registration, writer: DDS.DataWriter, kind: raw.WriteKind, data: []const u8) !void {
         if (nil.isNil(writer) or raw.asZzddsDataWriter(writer) == null) return error.InvalidWriter;
+        // Provider callbacks can overlap writer deletion. Keep the writer and
+        // its parent pins alive through metadata access and the final write.
+        const impl: *DataWriterImpl = @ptrCast(@alignCast(writer.ptr));
+        if (!impl.acquireQuiesce()) return error.AlreadyDeleted;
+        defer impl.releaseQuiesce();
         const topic = writer.get_topic();
         if (nil.isNil(topic) or topic.get_participant().ptr != self.participant.ptr or !std.mem.eql(u8, topic.get_type_name(), self.selection.name())) return error.WrongRegisteredWriter;
+        const xcdr2 = raw.writerUsesXcdr2(writer);
         if (kind == .alive) try self.selection.validate(data);
         const hash = try self.selection.keyHash(data, kind != .alive);
-        if (raw.writerUsesXcdr2(writer) != (data[1] >= 6)) return error.UnsupportedRepresentation;
+        if (xcdr2 != (data[1] >= 6)) return error.UnsupportedRepresentation;
         try raw.writeRaw(writer, kind, hash, data);
     }
 };

@@ -199,6 +199,12 @@ test "participant pin drops only at teardown and registration OOM transfers no o
     defer delivery.deinit();
     for (0..4) |failure_index| {
         const side = try Side.init(&delivery);
+        // Allocator injection requires a quiescent fixture: the timer thread
+        // captures/uses the allocator independently of participant.mu.
+        side.impl().timer_stopping.store(true, .release);
+        if (side.impl().timer_thread) |thread| thread.join();
+        side.impl().timer_thread = null;
+        side.impl().timer_thread_id.store(0, .release);
         const before = a.generation.refs.load(.acquire);
         var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = failure_index });
         side.impl().alloc = failing.allocator();
@@ -327,6 +333,70 @@ test "registered writes honor full validation independently of key-hash success"
     try testing.expectError(error.InvalidSample, registration.write(writer, .alive, &sample));
 }
 
+test "registered write pins its writer through provider validation and hashing" {
+    const Delete = struct {
+        var publisher: DDS.Publisher = undefined;
+        var writer: DDS.DataWriter = undefined;
+        var in_validate: bool = false;
+        var result: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+        fn validate(_: [*c]const u8, _: u64) callconv(.c) u32 {
+            if (in_validate) result = publisher.delete_datawriter(writer);
+            return ts.wire.ok;
+        }
+        fn hash(_: [*c]const u8, _: u64, out: [*c][16]u8) callconv(.c) u32 {
+            if (!in_validate) result = publisher.delete_datawriter(writer);
+            out.* = @splat(0);
+            return ts.wire.ok;
+        }
+    };
+    var source_manager = try ts.Manager.init(testing.allocator, 1);
+    defer source_manager.deinit();
+    try source_manager.load("source", paths.a);
+    const source = try source_manager.select("source", type_name);
+    defer source.deinit();
+    var descriptor = source.generation.descriptor.*;
+    var exported = [_]ts.wire.Type{source.descriptor().*};
+    exported[0].validate = Delete.validate;
+    exported[0].key_hash = Delete.hash;
+    descriptor.types = &exported;
+    descriptor.type_count = 1;
+    var manager = try ts.Manager.init(testing.allocator, 1);
+    defer manager.deinit();
+    try manager.addStatic("deleting", &descriptor);
+    const selected = try manager.select("deleting", type_name);
+    defer selected.deinit();
+    var delivery = try zzdds.intraprocess.IntraProcessDelivery.init(testing.allocator);
+    defer delivery.deinit();
+    // Reentrant deletion deterministically exercises the same lifetime gap as
+    // another thread deleting the writer while a provider callback is running.
+    for ([_]bool{ false, true }) |in_validate| {
+        for ([_]i16{ 0, 2 }) |representation| {
+            const side = try Side.init(&delivery);
+            defer side.deinit();
+            const registration = try ts.register(side.dp, selected);
+            defer registration.deinit();
+            const topic = side.dp.create_topic("DeleteDuringWrite", type_name, .{}, null, 0);
+            const publisher = side.dp.create_publisher(.{}, null, 0);
+            var representations = [_]i16{representation};
+            const writer = publisher.create_datawriter(topic, .{ .data_representation = .{ .value = .{
+                ._maximum = 1,
+                ._length = 1,
+                ._buffer = &representations,
+                ._release = false,
+            } } }, null, 0);
+            try testing.expect(!isNil(writer));
+            Delete.publisher = publisher;
+            Delete.writer = writer;
+            Delete.in_validate = in_validate;
+            Delete.result = DDS.RETCODE_ERROR;
+            var bytes = sample;
+            bytes[1] = if (representation == 2) 7 else 1;
+            try testing.expectError(error.AlreadyDeleted, registration.write(writer, .alive, &bytes));
+            try testing.expectEqual(DDS.RETCODE_OK, Delete.result);
+        }
+    }
+}
+
 // A peer derives topic kind from the GUID, before receiving any payload. Both
 // local sides previously used WITH_KEY unconditionally, hiding this mismatch.
 test "registered keyedness determines writer and reader RTPS entity kinds" {
@@ -380,14 +450,18 @@ test "dynamic candidates require explicit NUL-free absolute artifact paths" {
 }
 
 extern fn zidl_ts_module_loaded([*:0]const u8) callconv(.c) c_int;
-test "native modules unload only after retired generation users release" {
+test "native module pins survive retirement and release generation ownership" {
     // musl's static ELF loader is not represented in dlopen's module table.
     if (@import("builtin").abi == .musl) return error.SkipZigTest;
+    // dyld may retain an image after dlclose releases its final reference.
+    // Keep strict unmapping checks on Linux/Windows, and check live pins and
+    // generation retirement on every native loader.
+    const eager_unload = @import("builtin").os.tag != .macos;
     const a_path = try testing.allocator.dupeSentinel(u8, paths.a, 0);
     defer testing.allocator.free(a_path);
     const b_path = try testing.allocator.dupeSentinel(u8, paths.b, 0);
     defer testing.allocator.free(b_path);
-    try testing.expectEqual(@as(c_int, 0), zidl_ts_module_loaded(a_path));
+    if (eager_unload) try testing.expectEqual(@as(c_int, 0), zidl_ts_module_loaded(a_path));
     var manager = try ts.Manager.init(testing.allocator, 2);
     defer manager.deinit();
     try manager.load("project", paths.a);
@@ -397,12 +471,13 @@ test "native modules unload only after retired generation users release" {
     try testing.expectEqual(@as(c_int, 1), zidl_ts_module_loaded(a_path));
     try testing.expectEqual(@as(c_int, 1), zidl_ts_module_loaded(b_path));
     try manager.remove("project");
-    try testing.expectEqual(@as(c_int, 0), zidl_ts_module_loaded(b_path));
+    try testing.expectEqual(@as(usize, 1), manager.liveGenerations());
+    if (eager_unload) try testing.expectEqual(@as(c_int, 0), zidl_ts_module_loaded(b_path));
     try testing.expectEqual(@as(c_int, 1), zidl_ts_module_loaded(a_path));
     try old.?.validate(&sample);
     old.?.deinit();
     old = null;
-    try testing.expectEqual(@as(c_int, 0), zidl_ts_module_loaded(a_path));
+    if (eager_unload) try testing.expectEqual(@as(c_int, 0), zidl_ts_module_loaded(a_path));
     try testing.expectEqual(@as(usize, 0), manager.liveGenerations());
 }
 
