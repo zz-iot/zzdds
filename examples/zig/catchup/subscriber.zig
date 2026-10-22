@@ -25,6 +25,7 @@ const LIVE_COUNT: i32 = 5;
 const HISTORICAL_WAIT_TIMEOUT_S: i32 = 10;
 const RECEIVE_TIMEOUT_NS: i64 = 30 * std.time.ns_per_s;
 const POLL_PERIOD_NS: u64 = 20 * std.time.ns_per_ms;
+const SHORTFALL_RECHECK_NS: i64 = 2 * std.time.ns_per_s;
 
 fn monoNs(io: std.Io) i64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
@@ -89,6 +90,36 @@ fn takeAvailable(state: *State) bool {
         }
     }
     return became_done;
+}
+
+fn countHistorical(state: *State) i32 {
+    var n: i32 = 0;
+    for (&state.historical_received) |*v| {
+        if (v.load(.acquire)) n += 1;
+    }
+    return n;
+}
+
+/// After a historical shortfall: prints what the reader reports, then keeps
+/// taking for SHORTFALL_RECHECK_NS. Samples that turn up late mean the wait
+/// returned too early; lost ones mean the writer never sent them.
+fn reportShortfall(state: *State, dr: DDS.DataReader, io: std.Io) void {
+    var matched: DDS.SubscriptionMatchedStatus = undefined;
+    var lost: DDS.SampleLostStatus = undefined;
+    var rejected: DDS.SampleRejectedStatus = undefined;
+    _ = dr.get_subscription_matched_status(&matched);
+    _ = dr.get_sample_lost_status(&lost);
+    _ = dr.get_sample_rejected_status(&rejected);
+    std.debug.print("DIAG: matched current={d} total={d}, lost={d}, rejected={d}\n", .{
+        matched.current_count, matched.total_count, lost.total_count, rejected.total_count,
+    });
+    const before = countHistorical(state);
+    const deadline = monoNs(io) + SHORTFALL_RECHECK_NS;
+    while (monoNs(io) < deadline and countHistorical(state) < HISTORICAL_COUNT) {
+        sleepNs(io, POLL_PERIOD_NS);
+        _ = takeAvailable(state);
+    }
+    std.debug.print("DIAG: {d} more historical samples arrived after the wait returned\n", .{countHistorical(state) - before});
 }
 
 fn onDataAvailable(state: *State, dr: DDS.DataReader) void {
@@ -203,12 +234,10 @@ pub fn main(init: std.process.Init) !void {
     // Confirm the real guarantee, not just the return code: every
     // historical sample must be in the reader by now.
     _ = takeAvailable(&state);
-    var historical_count: i32 = 0;
-    for (&state.historical_received) |*v| {
-        if (v.load(.acquire)) historical_count += 1;
-    }
+    const historical_count = countHistorical(&state);
     if (historical_count != HISTORICAL_COUNT) {
         std.debug.print("FAIL: wait_for_historical_data() returned OK but only {d}/{d} historical samples were actually received\n", .{ historical_count, HISTORICAL_COUNT });
+        reportShortfall(&state, dr, io);
         std.process.exit(1);
     }
     std.debug.print("HISTORICAL BATCH COMPLETE ({d} samples)\n", .{HISTORICAL_COUNT});

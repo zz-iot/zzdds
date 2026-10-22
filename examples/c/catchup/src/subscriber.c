@@ -56,6 +56,7 @@ static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
 #define HISTORICAL_WAIT_TIMEOUT_S 10
 #define RECEIVE_TIMEOUT_MS 30000
 #define POLL_PERIOD_MS 20
+#define SHORTFALL_RECHECK_MS 2000
 
 typedef struct {
     HistoryEventDataReader *reader;
@@ -117,6 +118,37 @@ static bool take_available(SubState *state) {
     }
 
     return became_done;
+}
+
+static int count_historical(SubState *state) {
+    int n = 0;
+    for (int i = 0; i < HISTORICAL_COUNT; i++) {
+        if (patomic_load(&state->historical_received[i])) n++;
+    }
+    return n;
+}
+
+/* After a historical shortfall: prints what the reader reports, then keeps
+ * taking for SHORTFALL_RECHECK_MS. Samples that turn up late mean the wait
+ * returned too early; lost ones mean the writer never sent them. */
+static void report_shortfall(SubState *state, DDS_DataReader dr) {
+    DDS_SubscriptionMatchedStatus matched;
+    DDS_SampleLostStatus lost;
+    DDS_SampleRejectedStatus rejected;
+    memset(&matched, 0, sizeof(matched));
+    memset(&lost, 0, sizeof(lost));
+    memset(&rejected, 0, sizeof(rejected));
+    DDS_DataReader_get_subscription_matched_status(dr, &matched);
+    DDS_DataReader_get_sample_lost_status(dr, &lost);
+    DDS_DataReader_get_sample_rejected_status(dr, &rejected);
+    fprintf(stderr, "DIAG: matched current=%d total=%d, lost=%d, rejected=%d\n",
+            matched.current_count, matched.total_count, lost.total_count, rejected.total_count);
+    int before = count_historical(state);
+    for (int waited_ms = 0; waited_ms < SHORTFALL_RECHECK_MS && count_historical(state) < HISTORICAL_COUNT; waited_ms += POLL_PERIOD_MS) {
+        sleep_ms(POLL_PERIOD_MS);
+        take_available(state);
+    }
+    fprintf(stderr, "DIAG: %d more historical samples arrived after the wait returned\n", count_historical(state) - before);
 }
 
 static void on_data_available(DDS_DataReader the_reader, void *listener_data) {
@@ -224,12 +256,10 @@ int main(int argc, char **argv) {
     /* Confirm the real guarantee, not just the return code: every
      * historical sample must be in the reader by now. */
     take_available(&state);
-    int historical_count = 0;
-    for (int i = 0; i < HISTORICAL_COUNT; i++) {
-        if (patomic_load(&state.historical_received[i])) historical_count++;
-    }
+    int historical_count = count_historical(&state);
     if (historical_count != HISTORICAL_COUNT) {
         fprintf(stderr, "FAIL: wait_for_historical_data() returned OK but only %d/%d historical samples were actually received\n", historical_count, HISTORICAL_COUNT);
+        report_shortfall(&state, dr);
         return 1;
     }
     printf("HISTORICAL BATCH COMPLETE (%d samples)\n", HISTORICAL_COUNT);

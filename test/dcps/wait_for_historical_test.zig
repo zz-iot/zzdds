@@ -143,6 +143,13 @@ fn makePrefix(seed: u8) GuidPrefix {
     return .{ .bytes = @splat(seed) };
 }
 
+/// Samples in the reader, ready to take.
+fn available(dr: *DataReaderImpl) usize {
+    dr.mu.lock();
+    defer dr.mu.unlock();
+    return dr.pending.items.len;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "wait_for_historical_data: VOLATILE returns OK immediately" {
@@ -407,6 +414,7 @@ test "wait_for_historical_data: returns OK after history fully delivered (data b
 
     const rc2 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc2);
+    try testing.expectEqual(@as(usize, 3), available(dr_impl));
 }
 
 test "wait_for_historical_data: returns OK once pending data fills history floor (HB before data)" {
@@ -456,4 +464,42 @@ test "wait_for_historical_data: returns OK once pending data fills history floor
     dr_impl.proto_reader.handleIncomingChange(writer_guid, 2, ts, kh, &payload, .alive, null, null, null, null);
     const rc3 = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
     try testing.expectEqual(DDS.RETCODE_OK, rc3);
+    try testing.expectEqual(@as(usize, 2), available(dr_impl));
+}
+
+test "wait_for_historical_data: history the writer no longer has is reported lost, not waited for" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const dpf = h.factory.toDDSFactory();
+    const dp = dpf.create_participant(test_domain.get(), .{}, null, 0);
+    defer _ = dpf.delete_participant(dp);
+
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    const topic = dp.create_topic("TestTopic", "TestType", .{}, null, 0);
+    const tp_impl: *dcps.TopicImpl = @ptrCast(@alignCast(topic.ptr));
+    const td = tp_impl.toTopicDescription();
+
+    const sub = dp.create_subscriber(.{}, null, 0);
+    defer _ = dp.vtable.delete_subscriber(dp.ptr, sub);
+
+    var dr_qos = DDS.DataReaderQos{};
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    const dr_raw = sub.create_datareader(td, dr_qos, null, 0);
+    const dr_impl: *DataReaderImpl = @ptrCast(@alignCast(dr_raw.ptr));
+
+    const writer_guid = h.fireWriter(dp_impl, makePrefix(0x60), "TestTopic", 1, 1);
+
+    // The first HEARTBEAT offers nothing below SN 4: SNs 1-3 are gone.
+    dr_impl.proto_reader.handleHeartbeat(writer_guid, EntityIds.unknown, 4, 3, 1, true, false);
+
+    const rc = dr_raw.vtable.wait_for_historical_data(dr_raw.ptr, &DURATION_ZERO);
+    try testing.expectEqual(DDS.RETCODE_OK, rc);
+    try testing.expectEqual(@as(usize, 0), available(dr_impl));
+    var lost: DDS.SampleLostStatus = undefined;
+    try testing.expectEqual(DDS.RETCODE_OK, dr_raw.vtable.get_sample_lost_status(dr_raw.ptr, &lost));
+    try testing.expectEqual(@as(i32, 3), lost.total_count);
 }
