@@ -38,6 +38,8 @@ const mutex_mod = @import("../util/mutex.zig");
 const time_mod = @import("../util/time.zig");
 const build_opts = @import("build_options");
 const header_mod = @import("../rtps/message/header.zig");
+const runtime_mod = @import("../runtime/core.zig");
+const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
 
 const Transport = tr_iface.Transport;
 const Locator = tr_iface.Locator;
@@ -365,6 +367,11 @@ pub const SedpEndpoints = struct {
     // this discovery transport.
     data_reachable: ?iface.DataLocatorReachability,
 
+    /// With a runtime (`attachRuntime`), received datagrams are queued for a
+    /// runtime context, and the writers' heartbeats are runtime timers.
+    runtime: ?*runtime_mod.Runtime = null,
+    rx: QueuedReceive = undefined,
+
     const Self = @This();
 
     pub fn init(alloc: std.mem.Allocator, transport: Transport) !*Self {
@@ -415,6 +422,18 @@ pub const SedpEndpoints = struct {
         self.unsupported_locator_kinds.deinit();
         self.unsupported_locator_mu.unlock();
         self.alloc.destroy(self);
+    }
+
+    /// Runs on `rt`: received datagrams are processed in `ingress`. Call
+    /// once, before `start`.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime, ingress: *runtime_mod.Context) void {
+        self.runtime = rt;
+        self.rx = QueuedReceive.init(self.alloc, ingress, .{ .ctx = self, .on_receive = onReceive });
+    }
+
+    fn receiveHandler(self: *Self) ReceiveHandler {
+        if (self.runtime != null) return self.rx.handler();
+        return .{ .ctx = self, .on_receive = onReceive };
     }
 
     /// Override the wire tracer used by all SEDP state machines.
@@ -518,6 +537,7 @@ pub const SedpEndpoints = struct {
             true, // SEDP always replays to late-joining participants
         );
         self.pub_writer.?.setTracer(self.tracer);
+        if (self.runtime) |rt| self.pub_writer.?.attachRuntime(rt);
         if (self.probe_result_fn) |f| self.pub_writer.?.setProbeResult(self.probe_result_ctx.?, f);
         self.pub_reader = try StatefulReader.init(
             self.alloc,
@@ -542,6 +562,7 @@ pub const SedpEndpoints = struct {
             true, // SEDP always replays to late-joining participants
         );
         self.sub_writer.?.setTracer(self.tracer);
+        if (self.runtime) |rt| self.sub_writer.?.attachRuntime(rt);
         if (self.probe_result_fn) |f| self.sub_writer.?.setProbeResult(self.probe_result_ctx.?, f);
         self.sub_reader = try StatefulReader.init(
             self.alloc,
@@ -557,10 +578,7 @@ pub const SedpEndpoints = struct {
         // Listen on the metatraffic unicast port for SEDP traffic.
         if (self.meta_unicast_port != 0) {
             const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.meta_unicast_port);
-            self.transport.listen(&loc, ReceiveHandler{
-                .ctx = self,
-                .on_receive = onReceive,
-            }) catch |err| log.sedp.warn("sedp: listen error: {}", .{err});
+            self.transport.listen(&loc, self.receiveHandler()) catch |err| log.sedp.warn("sedp: listen error: {}", .{err});
         }
     }
 
@@ -576,10 +594,7 @@ pub const SedpEndpoints = struct {
         if (self.sub_writer) |w| w.stopHeartbeat();
         if (self.meta_unicast_port != 0) {
             const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.meta_unicast_port);
-            self.transport.unlisten(&loc, ReceiveHandler{
-                .ctx = self,
-                .on_receive = onReceive,
-            });
+            self.transport.unlisten(&loc, self.receiveHandler());
         }
     }
 

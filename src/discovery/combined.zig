@@ -19,6 +19,9 @@ const wlp_mod = @import("wlp.zig");
 const tr = @import("../transport/interface.zig");
 const trace = @import("../trace.zig");
 const header_mod = @import("../rtps/message/header.zig");
+const runtime_mod = @import("../runtime/core.zig");
+const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
+const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
 
 pub const Discovery = iface.Discovery;
 pub const Callbacks = iface.Callbacks;
@@ -56,6 +59,20 @@ pub const SpdpSedpDiscovery = struct {
     sedp: *sedp.SedpEndpoints,
     wlp: *wlp_mod.WlpEndpoints,
     disc_fanout: DiscoveredFanout,
+
+    /// With a runtime (`attachRuntime`): the contexts that process received
+    /// datagrams, one at a time, and run the SPDP timers. Writers'
+    /// heartbeats run in contexts of their own.
+    runtime: ?*runtime_mod.Runtime = null,
+    ingress: runtime_mod.Context = undefined,
+    ingress_latch: CloseLatch = .{},
+    timers: runtime_mod.Context = undefined,
+    timers_latch: CloseLatch = .{},
+    started: bool = false,
+
+    /// Bound on the datagrams queued for ingress and not yet processed. A
+    /// placeholder, as the participant's own.
+    pub const ingress_pending_limit: u32 = 256;
 
     const Self = @This();
 
@@ -120,7 +137,34 @@ pub const SpdpSedpDiscovery = struct {
         self.wlp.deinit();
         self.sedp.deinit();
         self.spdp.deinit();
+        if (self.runtime != null) {
+            self.ingress.deinit();
+            self.timers.deinit();
+        }
         self.alloc.destroy(self);
+    }
+
+    /// Runs discovery on `rt` instead of threads of its own: SPDP's
+    /// announcements and lease checks and the built-in writers' heartbeats
+    /// are timers on its clock, and what discovery receives is queued for
+    /// its ingress context (docs/design/concurrency/runtime.md#thread-mapping).
+    /// Call before `start`; attaching the runtime already attached is a
+    /// no-op.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) error{ AttachedElsewhere, AlreadyStarted }!void {
+        if (self.runtime) |cur| {
+            if (cur != rt) return error.AttachedElsewhere;
+            return;
+        }
+        if (self.started) return error.AlreadyStarted;
+        self.runtime = rt;
+        self.ingress = runtime_mod.Context.init(rt, ingress_pending_limit);
+        self.ingress.on_closed = self.ingress_latch.hook();
+        // Only timer fires run here, with internal credit.
+        self.timers = runtime_mod.Context.init(rt, 0);
+        self.timers.on_closed = self.timers_latch.hook();
+        self.spdp.attachRuntime(rt, &self.ingress, &self.timers);
+        self.sedp.attachRuntime(rt, &self.ingress);
+        self.wlp.attachRuntime(rt);
     }
 
     /// Set the wire tracer on SPDP, SEDP, and WLP state machines.
@@ -138,6 +182,7 @@ pub const SpdpSedpDiscovery = struct {
     // ── Discovery vtable ──────────────────────────────────────────────────────
 
     const vtable = Discovery.Vtable{
+        .shared_runtime_ready = true,
         .start = vtStart,
         .stop = vtStop,
         .announce_writer = vtAnnounceWriter,
@@ -146,7 +191,13 @@ pub const SpdpSedpDiscovery = struct {
         .retract_reader = vtRetractReader,
         .deinit = vtDeinit,
         .wlp_tick = vtWlpTick,
+        .attach_runtime = vtAttachRuntime,
     };
+
+    fn vtAttachRuntime(ctx: *anyopaque, rt: *runtime_mod.Runtime) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.attachRuntime(rt);
+    }
 
     fn vtWlpTick(ctx: *anyopaque, now_ns: i64, info: iface.WlpTickInfo) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -159,6 +210,7 @@ pub const SpdpSedpDiscovery = struct {
         cbs: *const Callbacks,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.started = true;
         // SEDP must be started first so its metatraffic unicast listen is active
         // before SPDP fires its initial announcement and the remote peer begins
         // sending SEDP traffic. WLP follows the same requirement for the same
@@ -225,7 +277,19 @@ pub const SpdpSedpDiscovery = struct {
         self.spdp.stop();
         self.wlp.stop();
         self.sedp.stop();
+        if (self.runtime != null) {
+            // Unlistened and disarmed above: what is queued is dropped, and a
+            // turn running elsewhere finishes first. Never stopped from
+            // inside one of these turns: participant deletion does not run
+            // in discovery's work.
+            const ingress_closed = self.ingress_latch.close(&self.ingress, QueuedReceive.discard);
+            const timers_closed = self.timers_latch.close(&self.timers, discardTimer);
+            std.debug.assert(ingress_closed and timers_closed);
+        }
     }
+
+    /// A queued fire is the timer's own embedded request: nothing to free.
+    fn discardTimer(_: *runtime_mod.Request) void {}
 
     fn vtAnnounceWriter(ctx: *anyopaque, info: *const iface.WriterAnnouncement) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));

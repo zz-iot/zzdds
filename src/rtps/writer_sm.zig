@@ -759,9 +759,12 @@ pub const StatefulWriter = struct {
         if (self.runtime) |rt| {
             // Under `mu`, so no arming site can re-arm after the cancel.
             self.mu.lock();
-            self.hb_stopping.store(true, .release);
+            const stopped = self.hb_stopping.swap(true, .acq_rel);
             self.hb_armed = false;
             self.mu.unlock();
+            // A second call, from `deinit`, may come after the owner has
+            // released the runtime, so it must not touch it.
+            if (stopped) return;
             rt.cancelTimer(&self.hb_timer);
             // A fire never runs code that deletes this writer.
             const closed = self.hb_latch.close(&self.hb_ctx, discardFire);
@@ -2827,7 +2830,9 @@ pub const StatefulWriter = struct {
     /// removes the proxy (see BuiltinPair.unmatchRemote).
     /// Called under no lock; acquires and releases self.mu internally.
     pub fn checkProbeDeadlines(self: *Self) void {
-        const now_ns = time_mod.monotonicClock().nowNs();
+        // Deadlines come from discovery's clock, which is the runtime's when
+        // the writer has one.
+        const now_ns = if (self.runtime) |rt| rt.clock.nowNs() else time_mod.monotonicClock().nowNs();
 
         var expired: std.ArrayListUnmanaged(GuidPrefix) = .empty;
         defer expired.deinit(self.alloc);

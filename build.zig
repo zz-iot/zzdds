@@ -1681,6 +1681,7 @@ pub fn build(b: *std.Build) void {
     const shared_runtime_test_files = [_][]const u8{
         "test/runtime/shared_runtime_test.zig",
         "test/runtime/readiness_test.zig",
+        "test/runtime/rtps_discovery_test.zig",
     };
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{

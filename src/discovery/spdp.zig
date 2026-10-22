@@ -10,7 +10,10 @@
 //!   2. Register the SPDP multicast locator as the writer's reader-locator.
 //!   3. Call transport.listen + joinMulticast on the SPDP multicast port.
 //!   4. Spawn a timer thread that periodically calls reannounce() (bumping the SN
-//!      before resending) and checks leases.
+//!      before resending) and checks leases. On a runtime (`attachRuntime`),
+//!      arm timers instead: one for the next announcement, one for the
+//!      earliest lease expiry or liveness probe
+//!      (docs/design/concurrency/runtime.md#thread-mapping).
 //!
 //! PL-CDR encoding is hand-written (no dependency on zidl-generated code here).
 
@@ -30,6 +33,8 @@ const mutex_mod = @import("../util/mutex.zig");
 const time_mod = @import("../util/time.zig");
 const sn_mod = @import("../rtps/sequence_number.zig");
 const header_mod = @import("../rtps/message/header.zig");
+const runtime_mod = @import("../runtime/core.zig");
+const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
 const zidl_rt = @import("zidl_rt");
 const Disc = @import("zzdds_disc_generated");
 
@@ -61,6 +66,12 @@ const BuiltinEndpointSet = pid_mod.BuiltinEndpointSet;
 /// several local interfaces), not a legitimately fast announcer.
 const MIN_PLAUSIBLE_INTERVAL_NS: i64 = 50_000_000; // 50ms
 
+/// Cap on the announcement silence that starts a liveness probe. The trigger
+/// is min(3x the observed interval, this), so a peer announcing frequently
+/// (every 100 ms, say: a 300 ms trigger) is probed quickly, and one whose
+/// interval is unknown or very long still is within 5 s.
+const MAX_PROBE_TRIGGER_NS: i64 = 5_000_000_000;
+
 // ── State for one known remote participant ────────────────────────────────────
 
 pub const KnownParticipant = struct {
@@ -86,6 +97,24 @@ pub const KnownParticipant = struct {
     /// decode always starts false). See the SEDP-traffic-seen heuristic in
     /// processSpdpPayload.
     sedp_seen: bool,
+
+    /// When this participant's silence starts a liveness probe, unless one
+    /// is outstanding or no announcement has been timed yet.
+    fn probeDueNs(self: *const KnownParticipant) ?i64 {
+        if (self.probe_active or self.last_seen_ns <= 0) return null;
+        const trigger = if (self.observed_interval_ns > 0)
+            @min(3 * self.observed_interval_ns, MAX_PROBE_TRIGGER_NS)
+        else
+            MAX_PROBE_TRIGGER_NS;
+        return self.last_seen_ns + trigger;
+    }
+
+    /// When this participant next needs a lease check: its expiry or its
+    /// probe, whichever is first.
+    fn checkDueNs(self: *const KnownParticipant) i64 {
+        const probe = self.probeDueNs() orelse return self.expires_ns;
+        return @min(probe, self.expires_ns);
+    }
 
     pub fn deinit(self: *KnownParticipant) void {
         self.alloc.free(self.data.name);
@@ -131,6 +160,18 @@ pub const SpdpEndpoints = struct {
     timer_thread: ?std.Thread,
     shutdown: std.atomic.Value(bool),
     announcement_period_ms: u32,
+
+    /// With a runtime (`attachRuntime`), received datagrams are queued for a
+    /// runtime context, and timers replace the timer thread. The timers run
+    /// in their own context, as the thread ran apart from receiving.
+    runtime: ?*runtime_mod.Runtime = null,
+    rx: QueuedReceive = undefined,
+    announce_timer: runtime_mod.Timer = undefined,
+    lease_timer: runtime_mod.Timer = undefined,
+    /// Guarded by `mu`. When the last periodic announcement went out.
+    last_announce_ns: i64 = 0,
+    /// Guarded by `mu`. Set by `stop`, after which nothing re-arms.
+    timers_stopping: bool = false,
 
     // Set in start()
     callbacks: ?*const Callbacks,
@@ -250,6 +291,22 @@ pub const SpdpEndpoints = struct {
         self.clock = c;
     }
 
+    /// Runs on `rt`, on its clock: received datagrams are processed in
+    /// `ingress`, and announcements and lease checks are timers in `timers`.
+    /// Call once, before `start`.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime, ingress: *runtime_mod.Context, timers: *runtime_mod.Context) void {
+        self.runtime = rt;
+        self.clock = rt.clock;
+        self.rx = QueuedReceive.init(self.alloc, ingress, .{ .ctx = self, .on_receive = onReceive });
+        self.announce_timer = runtime_mod.Timer.init(timers, onAnnounceTimer);
+        self.lease_timer = runtime_mod.Timer.init(timers, onLeaseTimer);
+    }
+
+    fn receiveHandler(self: *Self) ReceiveHandler {
+        if (self.runtime != null) return self.rx.handler();
+        return .{ .ctx = self, .on_receive = onReceive };
+    }
+
     /// Optionally wire in the SEDP layer to be notified when participants change.
     pub fn setSedp(
         self: *Self,
@@ -305,6 +362,8 @@ pub const SpdpEndpoints = struct {
             const now_ns = self.clock.nowNs();
             kp_ptr.expires_ns = now_ns + @as(i64, @intCast(kp_ptr.data.lease_duration_ms)) * std.time.ns_per_ms;
             kp_ptr.last_seen_ns = now_ns;
+            // Its next probe may be due before the checks are armed for.
+            self.armLeaseLocked(kp_ptr.checkDueNs());
             self.mu.unlock();
         } else {
             var kp = self.known.fetchRemove(prefix).?;
@@ -413,10 +472,7 @@ pub const SpdpEndpoints = struct {
         // Listen on SPDP multicast port and join the multicast group.
         const listen_locator = Locator.udp4(.{ 0, 0, 0, 0 }, self.spdp_multicast_port);
         // Non-fatal: writer still sends and unicast paths remain open if this fails.
-        self.transport.listen(&listen_locator, ReceiveHandler{
-            .ctx = self,
-            .on_receive = onReceive,
-        }) catch |err| log.spdp.warn("spdp: listen failed: {}", .{err});
+        self.transport.listen(&listen_locator, self.receiveHandler()) catch |err| log.spdp.warn("spdp: listen failed: {}", .{err});
         for (local.metatraffic_multicast_locators) |loc| {
             self.transport.joinMulticast(&loc) catch |err| {
                 log.spdp.warn("spdp: joinMulticast failed: {}", .{err});
@@ -427,6 +483,14 @@ pub const SpdpEndpoints = struct {
         // there's no window where the timer's first cycle could race this send
         // and both end up transmitting the same SN.
         new_writer.sendAll();
+
+        if (self.runtime) |rt| {
+            self.mu.lock();
+            defer self.mu.unlock();
+            self.last_announce_ns = rt.clock.nowNs();
+            if (!self.timers_stopping) _ = rt.armTimer(&self.announce_timer, self.nextAnnounceNs(self.last_announce_ns));
+            return;
+        }
 
         // Spawn the timer thread.
         self.shutdown.store(false, .release);
@@ -458,6 +522,14 @@ pub const SpdpEndpoints = struct {
     }
 
     pub fn stop(self: *Self) void {
+        if (self.runtime) |rt| {
+            // Under `mu`, so no arming site can re-arm after the cancels.
+            self.mu.lock();
+            self.timers_stopping = true;
+            self.mu.unlock();
+            rt.cancelTimer(&self.announce_timer);
+            rt.cancelTimer(&self.lease_timer);
+        }
         self.shutdown.store(true, .release);
         if (self.timer_thread) |t| {
             t.join();
@@ -465,10 +537,7 @@ pub const SpdpEndpoints = struct {
         }
         // Unlisten from transport.
         const listen_locator = Locator.udp4(.{ 0, 0, 0, 0 }, self.spdp_multicast_port);
-        self.transport.unlisten(&listen_locator, ReceiveHandler{
-            .ctx = self,
-            .on_receive = onReceive,
-        });
+        self.transport.unlisten(&listen_locator, self.receiveHandler());
     }
 
     // ── Transport receive callback ────────────────────────────────────────────
@@ -659,6 +728,7 @@ pub const SpdpEndpoints = struct {
                 gop.value_ptr.deinit();
             }
             gop.value_ptr.* = kp;
+            self.armLeaseLocked(kp.checkDueNs());
 
             // Fire callbacks and unicast reply only for genuinely new participants.
             // Re-announcements from known participants refresh expires_ns and locator
@@ -684,6 +754,9 @@ pub const SpdpEndpoints = struct {
                 }
                 const until_ns = self.clock.nowNs() + 2 * @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
                 self.fast_announce_until_ns.store(until_ns, .release);
+                if (self.runtime) |rt| {
+                    if (!self.timers_stopping) _ = rt.armTimerNoLater(&self.announce_timer, self.nextAnnounceNs(self.last_announce_ns));
+                }
             }
         } // spdp.mu released here by defer
 
@@ -791,17 +864,52 @@ pub const SpdpEndpoints = struct {
                 self.reannounce();
             }
 
-            self.checkLeases();
+            _ = self.checkLeases();
         }
     }
 
-    pub fn checkLeases(self: *Self) void {
+    /// When the announcement after one sent at `last_ns` is due: half a
+    /// period later while announcing fast, else a whole one, as the timer
+    /// thread decides. At least 1 ms later, so a zero period cannot spin.
+    fn nextAnnounceNs(self: *Self, last_ns: i64) i64 {
+        const half_ns = @divTrunc(@as(i64, self.announcement_period_ms), 2) * std.time.ns_per_ms;
+        const fast = last_ns + half_ns < self.fast_announce_until_ns.load(.acquire);
+        const period_ns = if (fast) half_ns else @as(i64, self.announcement_period_ms) * std.time.ns_per_ms;
+        return last_ns + @max(period_ns, std.time.ns_per_ms);
+    }
+
+    /// The runtime counterpart of the timer thread's announcement.
+    fn onAnnounceTimer(t: *runtime_mod.Timer, turn: *runtime_mod.Turn) void {
+        const self: *Self = @fieldParentPtr("announce_timer", t);
+        self.reannounce();
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.last_announce_ns = turn.now_ns;
+        if (!self.timers_stopping) _ = self.runtime.?.armTimer(&self.announce_timer, self.nextAnnounceNs(turn.now_ns));
+    }
+
+    /// The runtime counterpart of the timer thread's lease checks.
+    fn onLeaseTimer(t: *runtime_mod.Timer, _: *runtime_mod.Turn) void {
+        const self: *Self = @fieldParentPtr("lease_timer", t);
+        const due_ns = self.checkLeases() orelse return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.armLeaseLocked(due_ns);
+    }
+
+    /// Brings the lease checks forward to `due_ns`, unless they are armed
+    /// for then or earlier. Without a runtime the timer thread polls
+    /// instead. Caller holds `mu`.
+    fn armLeaseLocked(self: *Self, due_ns: i64) void {
+        const rt = self.runtime orelse return;
+        if (!self.timers_stopping) _ = rt.armTimerNoLater(&self.lease_timer, due_ns);
+    }
+
+    /// Evicts participants whose lease expired and starts liveness probes
+    /// for those silent too long. Returns when the next check is due, if
+    /// any participant remains.
+    pub fn checkLeases(self: *Self) ?i64 {
         const now_ns = self.clock.nowNs();
-        // Probe trigger: start a liveness probe when silence exceeds this threshold.
-        // Use min(3× observed interval, 5 s) so we respond quickly for peers that
-        // announce frequently (e.g. every 100 ms → threshold 300 ms) while still
-        // catching peers whose interval is unknown or very long (cap at 5 s).
-        const max_probe_trigger_ns: i64 = 5_000_000_000; // 5 seconds
 
         const ProbeEntry = struct { prefix: GuidPrefix, deadline_ns: i64 };
         var to_remove: std.ArrayListUnmanaged(GuidPrefix) = .empty;
@@ -815,18 +923,21 @@ pub const SpdpEndpoints = struct {
         defer self.lifecycle_mu.unlock();
         self.mu.lock();
 
+        // After a failed append, the check is retried when the timer
+        // thread's next cycle would run it.
+        const retry_ns = now_ns + 100 * std.time.ns_per_ms;
+        var next_due_ns: ?i64 = null;
         var it = self.known.iterator();
         while (it.next()) |entry| {
             const kp = entry.value_ptr;
             if (now_ns >= kp.expires_ns) {
-                to_remove.append(self.alloc, entry.key_ptr.*) catch {};
-            } else if (!kp.probe_active and kp.last_seen_ns > 0) {
-                const silence = now_ns - kp.last_seen_ns;
-                const trigger = if (kp.observed_interval_ns > 0)
-                    @min(3 * kp.observed_interval_ns, max_probe_trigger_ns)
-                else
-                    max_probe_trigger_ns;
-                if (silence >= trigger) {
+                to_remove.append(self.alloc, entry.key_ptr.*) catch {
+                    next_due_ns = if (next_due_ns) |n| @min(n, retry_ns) else retry_ns;
+                };
+                continue;
+            }
+            if (kp.probeDueNs()) |probe_ns| {
+                if (now_ns >= probe_ns) {
                     kp.probe_active = true;
                     to_probe.append(self.alloc, .{
                         .prefix = entry.key_ptr.*,
@@ -836,6 +947,10 @@ pub const SpdpEndpoints = struct {
                     };
                 }
             }
+            const check_ns = if (kp.probe_active) kp.expires_ns else kp.checkDueNs();
+            // Due already only when its probe failed to start.
+            const due_ns = if (check_ns > now_ns) check_ns else retry_ns;
+            next_due_ns = if (next_due_ns) |n| @min(n, due_ns) else due_ns;
         }
 
         for (to_remove.items) |prefix| {
@@ -859,6 +974,7 @@ pub const SpdpEndpoints = struct {
         for (to_probe.items) |pe| {
             if (self.begin_probe_fn) |f| f(self.begin_probe_ctx.?, pe.prefix, pe.deadline_ns);
         }
+        return next_due_ns;
     }
 
     // ── Discovery vtable ──────────────────────────────────────────────────────

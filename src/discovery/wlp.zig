@@ -37,6 +37,7 @@ const time_mod = @import("../util/time.zig");
 const mutex_mod = @import("../util/mutex.zig");
 const DrainQueue = @import("../util/drain_queue.zig").DrainQueue;
 const builtin_endpoint_mod = @import("builtin_endpoint.zig");
+const runtime_mod = @import("../runtime/core.zig");
 
 const Transport = tr_iface.Transport;
 const Locator = tr_iface.Locator;
@@ -139,6 +140,9 @@ pub const WlpEndpoints = struct {
     /// lock is released) to report them: reporting reaches application
     /// liveliness listeners. See DrainQueue.
     deferred: DrainQueue(Alive) = .{},
+    /// With a runtime (`attachRuntime`), the writer's heartbeat is a runtime
+    /// timer.
+    runtime: ?*runtime_mod.Runtime = null,
 
     const Self = @This();
 
@@ -159,6 +163,11 @@ pub const WlpEndpoints = struct {
         self.tracer = t;
     }
 
+    /// Runs the writer's heartbeat on `rt`. Call once, before `start`.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) void {
+        self.runtime = rt;
+    }
+
     pub fn start(self: *Self, local: *const ParticipantAnnouncement, callbacks: *const Callbacks) !void {
         self.callbacks = callbacks;
         self.local_prefix = local.guid.prefix;
@@ -174,6 +183,7 @@ pub const WlpEndpoints = struct {
             true, // TRANSIENT_LOCAL (§8.4.13.3) -- replay to late joiners.
         );
         self.pair.writer.?.setTracer(self.tracer);
+        if (self.runtime) |rt| self.pair.writer.?.attachRuntime(rt);
 
         self.pair.reader = try StatefulReader.init(
             self.alloc,

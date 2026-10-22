@@ -151,6 +151,11 @@ pub const DomainParticipantFactoryImpl = struct {
             rt.releaseOwner();
             return null;
         };
+        self.discovery.attachRuntime(rt) catch |err| {
+            log_mod.dcps.warn("create_participant: the discovery plugin cannot run on this runtime ({s})", .{@errorName(err)});
+            rt.releaseOwner();
+            return null;
+        };
         return rt;
     }
 

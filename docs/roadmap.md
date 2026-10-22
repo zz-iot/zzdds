@@ -1034,8 +1034,8 @@ timers, the progress backend, the manual `drive` and hosted workers on `std.Io.T
 and retirement. Participants use it only in a `-Dshared-runtime` build (a contributor
 migration switch, off by default): a factory may select the runtime, each participant holds
 an owner reference, and creation fails for transports or discovery plugins that run their
-own threads (the in-process memory transport, direct discovery and, on POSIX, UDP
-qualify so far). Received datagrams are copied into each participant's ingress context,
+own threads (the in-process memory transport, direct discovery, RTPS discovery and, on
+POSIX, UDP qualify so far). Received datagrams are copied into each participant's ingress context,
 bounded by count and bytes, and processed in runtime turns (which is what makes a RELIABLE
 pair over the memory transport work there); deleting a participant drops what is still
 queued. On POSIX the default runtime, and any runtime built on the readiness backend
@@ -1046,7 +1046,13 @@ and servicing receives what is ready without blocking, round robin across socket
 its budget. A transport's sockets belong to one runtime, so creation on a second runtime,
 or on one whose backend waits on no sockets, fails. On the runtime, UDP does not yet
 re-poll interfaces (no poll thread is started), and sends are still synchronous `sendto`s
-of a flattened buffer. A
+of a flattened buffer. RTPS discovery runs on the participant's runtime too: SPDP's
+announcements and its lease and liveness-probe checks are timers on the runtime clock,
+armed for when each is next due (one for the next announcement, one for the earliest
+expiry or probe), the SEDP and WLP writers' heartbeats are writer timers, and what
+SPDP and SEDP receive is copied into a discovery ingress context, as user data is, rather
+than processed on the transport's stack. A discovery plugin belongs to the runtime it
+first ran on. A
 writer's periodic HEARTBEAT is a runtime timer on the runtime clock rather than a thread,
 armed while a reliable reader is matched. The participant's DEADLINE, LIVELINESS and
 held-data expiry checks are one timer armed for the earliest time anything is due (no
@@ -1104,10 +1110,10 @@ from the caller's loop with no threads spawned. In the `-Dshared-runtime` build 
 readiness adapter in [transport adapters](design/concurrency/transport-adapters.md) now
 exists for UDP on POSIX: a manual runtime over `PollBackend` runs a reliable pair over
 loopback UDP through `drive()` alone, with no thread started by zzdds, and hosted workers
-service the same sockets in place of a thread per socket. Discovery in that test is still
-in-process: RTPS discovery (SPDP announcements and leases on runtime timers) is the next
-step, then gather-list sends with output outcomes, channel slots in place of the
-retained socket graveyards, TCP, and Windows. Outside that build, the UDP and TCP
+service the same sockets in place of a thread per socket, and RTPS discovery runs there
+too, its announcements, lease checks and heartbeats on runtime timers. Next are
+gather-list sends with output outcomes, channel slots in place of the retained socket
+graveyards, TCP, and Windows. Outside that build, the UDP and TCP
 transports still call their handlers from their own receive threads. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
