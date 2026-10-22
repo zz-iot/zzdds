@@ -159,3 +159,10 @@ ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/shape_cross_binding_smoke_test.py
 ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./interop/hello_world_cross_binding_smoke_test.py
 ZZDDS_ZIG_OUT=/path/to/zzdds/zig-out ./cpp/opencv_zzdds/smoke_test.py
 ```
+
+## Experimental loadable typesupport
+
+[Loadable typesupport](zig/typesupport-library/README.md): experimental typesupport
+inspection/pub/sub host, two independent providers and an optional Fast DDS peer.
+Build and run it explicitly using the linked instructions; it requires the
+experimental zidl package and is separate from the normal example runner.

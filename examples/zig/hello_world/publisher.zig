@@ -111,6 +111,7 @@ pub fn main(init: std.process.Init) !void {
     if (!zzdds.registerTypeSupport(dp, "HelloWorld", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = hello_gen.HelloWorld.computeKeyHashFromCdr,
+        .has_key = hello_gen.HelloWorld.has_key,
         .compute_key_hash_key_only = hello_gen.HelloWorld.computeKeyHashFromCdrKeyOnly,
     })) {
         std.debug.print("FAIL: registerTypeSupport() failed\n", .{});

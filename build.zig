@@ -68,6 +68,21 @@ const cpp_impl_override_args = [_][]const u8{
     "--cpp-impl-include",  "zzdds_cpp.hpp",
 };
 
+fn typesupportModule(b: *std.Build, package: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, rt: *std.Build.Module) *std.Build.Module {
+    const header = b.addTranslateC(.{
+        .root_source_file = package.path(b, "include/zidl_typesupport.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+    return b.createModule(.{
+        .root_source_file = package.path(b, "src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "zidl_rt", .module = rt }, .{ .name = "zidl_typesupport_c", .module = header.createModule() } },
+    });
+}
+
 pub fn build(b: *std.Build) void {
     // A native macOS target otherwise inherits the build host's current OS
     // version (for example 26.6.2), making release dylibs unusable to consumers
@@ -91,7 +106,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .@"sanitize-thread" = sanitize_thread,
     });
-    const zidl_exe = zidl_dep.artifact("zidl");
+    // Code generation runs on the build host, even when DDS targets another OS.
+    // Keep the target runtime from zidl_dep; the compiler has its own host graph.
+    const zidl_tool_dep = b.dependency("zidl", .{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .@"sanitize-thread" = sanitize_thread,
+    });
+    const zidl_exe = zidl_tool_dep.artifact("zidl");
     const zidl_rt_mod = zidl_dep.module("zidl_rt");
 
     // Re-expose zidl's own executable and `zidl_rt` module as zzdds's own, so
@@ -341,6 +363,22 @@ pub fn build(b: *std.Build) void {
 
     // ── Zenzen DDS library ──────────────────────────────────────────────────────
 
+    // Opt in to the ABI helpers from the pinned zidl release. Local overrides
+    // remain available for cross-project development, sharing the host runtime.
+    const typesupport_override = b.option([]const u8, "typesupport-package", "Absolute path to an alternate zidl-typesupport package");
+    const typesupport_enabled = b.option(bool, "typesupport-library", "Enable experimental loadable typesupport") orelse (typesupport_override != null);
+    const typesupport_package: std.Build.LazyPath = if (typesupport_override) |path| blk: {
+        if (!std.fs.path.isAbsolute(path)) @panic("-Dtypesupport-package must be absolute");
+        break :blk .{ .cwd_relative = path };
+    } else zidl_dep.path("packages/zidl-typesupport");
+    build_options.addOption(bool, "typesupport_library", typesupport_enabled);
+    const typesupport_dynamic = b.option(bool, "typesupport-dynamic", "Include OS dynamic loading (disable for static providers only)") orelse true;
+    build_options.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
+    const typesupport_mod = if (typesupport_enabled)
+        typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod)
+    else
+        null;
+
     const zzdds_mod = b.addModule("zzdds", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -354,6 +392,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod.addOptions("build_options", build_options);
+    if (typesupport_mod) |ts| zzdds_mod.addImport("zidl_typesupport", ts);
     zzdds_mod.link_libc = true;
     if (need_c_abi) {
         zzdds_mod.addCSourceFile(.{
@@ -1404,6 +1443,23 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
+    if (typesupport_mod) |ts| {
+        const generator_override = b.option([]const u8, "typesupport-generator", "Absolute path to an alternate zidl generator");
+        const generator: std.Build.LazyPath = if (generator_override) |path| blk: {
+            if (!std.fs.path.isAbsolute(path)) @panic("-Dtypesupport-generator must be absolute");
+            break :blk .{ .cwd_relative = path };
+        } else zidl_exe.getEmittedBin();
+        const library_test_step = b.step("test-typesupport-library", "Check immutable provider registration and generation retirement");
+        if (typesupport_dynamic) {
+            @import("examples/zig/typesupport-library/build.zig").addExample(b, zzdds_mod, generated_dcps_mod, generated_zzdds_mod, zidl_rt_mod, ts, generator, target, optimize);
+        } else {
+            const fail = b.addFail("typesupport-example requires -Dtypesupport-dynamic=true");
+            b.step("typesupport-example", "Build the dynamic typesupport example").dependOn(&fail.step);
+        }
+        const integration = @import("test/typesupport/build.zig").addTests(b, zzdds_mod, generated_dcps_mod, zidl_rt_mod, ts, generator, target, optimize, typesupport_dynamic, typesupport_package);
+        library_test_step.dependOn(integration);
+        test_step.dependOn(integration);
+    }
 
     // Broker design evidence (docs/design/probes/README.md): the Python check re-derives the
     // independent wire vectors; the codec probe compiles the draft schema with the pinned
@@ -1434,8 +1490,8 @@ pub fn build(b: *std.Build) void {
     });
     design_step.dependOn(&b.addRunArtifact(broker_codec_test).step);
 
-    // emit-tests: compile all test binaries to zig-out/tests/ for kcov coverage analysis.
-    const emit_tests_step = b.step("emit-tests", "Build test binaries for kcov coverage analysis");
+    // emit-tests: compile standalone test binaries using the default backend.
+    const emit_tests_step = b.step("emit-tests", "Build standalone test binaries (default compiler backend)");
 
     // Library self-tests
     const zzdds_tests = b.addTest(.{
@@ -1646,16 +1702,10 @@ pub fn build(b: *std.Build) void {
     // source rebuilt with use_llvm=true produced zero. Rechecked with Zig
     // 0.17.0 and Valgrind 3.24.0: api_test still emits 162k+ DWARF warnings
     // with the default backend and none with LLVM. This is the same
-    // root cause the coverage job's kcov step already works around by
-    // patching elfutils from source (see that job's comments) -- rebuilding
-    // with LLVM instead is the fix at the source for tools that read this
-    // step's binaries directly, which is Valgrind's case. Kept as a
-    // separate step (not applied to emit_tests_step itself) rather than
-    // switching that shared step wholesale: emit_tests_step also feeds the
-    // already-working, separately-tuned kcov pipeline, and changing what it
-    // produces was not what this step was added to fix. Installs to
-    // zig-out/tests-llvm/ (not tests/) so it can't collide with a
-    // previously-run emit-tests' self-hosted-backend binaries.
+    // parsing issue seen by kcov with stock libdw. Both Valgrind and the
+    // coverage job now use this LLVM step; kcov no longer needs a patched
+    // elfutils build. Installs to zig-out/tests-llvm/ (not tests/) so it
+    // cannot collide with emit-tests' default-backend binaries.
     //
     // Also uses a "baseline" CPU model, not the plain `target` (native) used
     // everywhere else -- confirmed empirically that LLVM's default
@@ -1716,12 +1766,13 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_llvm_safe.addOptions("build_options", build_options);
+    if (typesupport_enabled) zzdds_mod_llvm_safe.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, zidl_rt_mod_llvm_safe));
     zzdds_mod_llvm_safe.link_libc = true;
     if (target_llvm_safe.result.os.tag == .windows) {
         zzdds_mod_llvm_safe.linkSystemLibrary("ws2_32", .{});
     }
 
-    const emit_tests_llvm_step = b.step("emit-tests-llvm", "Build test binaries (LLVM backend, baseline CPU) for external DWARF-reading tools like Valgrind");
+    const emit_tests_llvm_step = b.step("emit-tests-llvm", "Build test binaries (LLVM backend, baseline CPU) for Valgrind and kcov");
 
     const zzdds_tests_llvm = b.addTest(.{
         .name = "zzdds_lib",
@@ -1889,6 +1940,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_tsan.addOptions("build_options", build_options);
+    if (typesupport_enabled) zzdds_mod_tsan.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod_tsan));
     zzdds_mod_tsan.link_libc = true;
 
     // Library self-tests (TSan)

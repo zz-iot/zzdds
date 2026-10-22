@@ -1,0 +1,45 @@
+name: Experimental typesupport platforms
+
+# Qualify the generator and ABI helpers from zzdds's pinned zidl release.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/typesupport-platforms.yml'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'src/typesupport.zig'
+      - 'src/typesupport/**'
+      - 'src/dcps/participant.zig'
+      - 'src/rtps/reader_sm.zig'
+      - 'src/c_abi/typesupport.zig'
+      - 'src/raw_ops.zig'
+      - 'src/root.zig'
+      - 'test/typesupport/**'
+      - 'test/c_abi/typesupport_test.zig'
+      - 'examples/zig/typesupport-library/**'
+      - 'scripts/check_typesupport_platform.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.optimize }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        optimize: [Debug, ReleaseSafe]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.0'
+      - name: Allow inbound UDP (Windows)
+        if: runner.os == 'Windows'
+        run: netsh advfirewall firewall add rule name="zzdds-typesupport-udp" protocol=UDP dir=in action=allow
+      - name: Native C ABI, linked providers, dynamic retirement and UDP
+        run: python scripts/check_typesupport_platform.py --optimize ${{ matrix.optimize }}

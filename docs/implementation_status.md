@@ -217,3 +217,20 @@ HEARTBEAT to the peer's SEDP reader proxies. If no ACKNACK arrives before the pr
 works correctly, but sets `probe_active` on the `KnownParticipant` record, which prevents a
 second probe from firing before the first resolves. A participant that goes silent while a
 probe is in flight will be evicted on the first probe deadline — there is no probe retry.
+
+### Experimental typesupport library management
+
+The opt-in `-Dtypesupport-library=true` option uses pinned zidl v0.3.22 and exposes
+the native Zig loader, export inspection/selection, immutable participant registration and
+generation replacement/retirement. Readers retain providers through physical
+teardown, and complete samples use checked provider processing before protocol
+admission. Linux has native validation; macOS/Windows backends are implemented and
+cross-compiled but still await native qualification. The API uses the restricted
+experimental zidl wire ABI;
+it does not provide TypeLookup, general assignability or live schema migration.
+See [typesupport libraries](typesupport-libraries.md) for ownership, build flags,
+validation coverage and the exact supported scope. A runnable two-provider
+example checks separate-process UDP delivery and independent Fast DDS reception
+for keyed and keyless types using explicit XCDR1 QoS. Static provider registration
+can be built without OS dynamic loading. A PR-triggered and manually dispatchable native platform workflow uses
+the pinned release, with C ABI, retirement and UDP checks.

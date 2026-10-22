@@ -196,6 +196,10 @@ int main(void) {
     sleep_ms(1000);
 
     noalloc_guard_try_disarm();
+    /* Flush the buffered sample log before shutdown so a teardown timeout
+     * (notably on Windows CI) retains the last completed application phase. */
+    printf("publisher: destroying factory...\n");
+    fflush(stdout);
     zzdds_destroy_factory(factory);
     printf("publisher: done\n");
     return 0;

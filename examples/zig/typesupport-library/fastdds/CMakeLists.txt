@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.22)
+project(typesupport_peer LANGUAGES CXX)
+find_package(fastdds 3 REQUIRED)
+add_executable(typesupport-fastdds-sub subscriber.cpp)
+target_compile_features(typesupport-fastdds-sub PRIVATE cxx_std_17)
+target_link_libraries(typesupport-fastdds-sub PRIVATE fastdds)

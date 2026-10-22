@@ -931,28 +931,11 @@ work items — revisit only if we upstream fixes or need the coverage for our ow
 
 ---
 
-## Design Tasks — not yet scoped
+## Design and Implementation Tasks
 
 ### Concurrency model
 
-zzdds has never stated an overall concurrency strategy — one-thread-per-concern has been the
-default every time a new periodic need came up (the DEADLINE/LIVELINESS timer thread is the
-tenth `std.Thread.spawn` site; five of the ten are pure periodic-tick threads with no
-socket). The intended direction, to be validated by this task: support **both** a
-direct-threading model and an evented model, user-selectable (build-time configuration is
-acceptable if a runtime switch proves impractical). The design must account for:
-
-- **RTOS and bare-metal embedded targets** — no OS threads; the evented path degrades to a
-  single-threaded `drive(timeout)` pump (see the next entry — the embedded face of this
-  same decision).
-- **Test strategy across build configurations** — correctness (ordering, liveliness,
-  teardown, no races) must be verified for every supported concurrency config; today's TSan
-  lane assumes the threaded model.
-- **Thread consolidation** as a sub-item — whether the periodic-tick threads
-  (DEADLINE/LIVELINESS, interface-change poll, wire-trace flush; possibly heartbeat and
-  SPDP) collapse onto one scheduler regardless of the model chosen.
-
-Specified: the [concurrency and broker contracts](design/concurrency-broker-status.md)
+The [concurrency and broker contracts](design/concurrency-broker-status.md)
 now define the behavioral baseline (take-turns participant/endpoint contexts, one shared
 manual/hosted progress engine, listener exclusion with inline eligibility, operation
 results/waits, runtime ownership/retirement and the transport boundary). Their open

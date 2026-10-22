@@ -472,3 +472,38 @@ test "c_abi TypeSupport: NULL get_field_from_cdr leaves TypeSupport.get_field un
     try testing.expect(ts != null);
     try testing.expect(ts.?.get_field == null);
 }
+
+test "typesupport C ABI: registration allocation failure destroys each adapter exactly once" {
+    for ([_]bool{ false, true }) |with_context| {
+        // Adapter succeeds; fail either the owned type-name copy or map growth.
+        for ([_]usize{ 1, 2 }) |fail_index| {
+            var fx = try Fixture.init(testing.allocator);
+            defer fx.deinit();
+            // Allocator injection requires a quiescent fixture: the timer thread
+            // captures/uses the allocator independently of participant.mu.
+            fx.impl().timer_stopping.store(true, .release);
+            if (fx.impl().timer_thread) |thread| thread.join();
+            fx.impl().timer_thread = null;
+            fx.impl().timer_thread_id.store(0, .release);
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            fx.impl().alloc = failing.allocator();
+            const Cleanup = struct {
+                calls: usize = 0,
+                fn destroy(ctx: ?*anyopaque) callconv(.c) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    self.calls += 1;
+                }
+            };
+            var cleanup = Cleanup{};
+            const result = if (with_context)
+                c_abi_ts.zzdds_register_type_support_ctx(fx.dp_boxed, "FailedRegistration", null, null, null, &cleanup, Cleanup.destroy)
+            else
+                c_abi_ts.zzdds_register_type_support(fx.dp_boxed, "FailedRegistration", null, null, null);
+            fx.impl().alloc = testing.allocator;
+            try testing.expectEqual(@as(c_int, -1), result);
+            try testing.expectEqual(@as(u32, 0), fx.impl().type_support_registry.count());
+            try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            try testing.expectEqual(@as(usize, if (with_context) 1 else 0), cleanup.calls);
+        }
+    }
+}

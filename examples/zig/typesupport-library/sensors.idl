@@ -1,0 +1,4 @@
+module LoadedDemo {
+    struct Reading { @key unsigned long id; unsigned long value; };
+    struct Pulse { unsigned long count; };
+};

@@ -178,7 +178,7 @@ pub export fn zzdds_register_type_support(
         .get_field = if (get_field_fn != null) CTypeSupportAdapter.getField else null,
         .deinit = CTypeSupportAdapter.deinitAdapter,
     })) {
-        impl.alloc.destroy(adapter);
+        // registerTypeSupport consumes the adapter on failure as well.
         return -1;
     }
 
@@ -318,7 +318,7 @@ pub export fn zzdds_register_type_support_ctx(
         .get_field = if (get_field_fn != null) CtxTypeSupportAdapter.getField else null,
         .deinit = CtxTypeSupportAdapter.deinitAdapter,
     })) {
-        impl.alloc.destroy(adapter);
+        // registerTypeSupport consumes the adapter on failure as well.
         return -1;
     }
 

@@ -1081,6 +1081,7 @@ pub fn main(init: std.process.Init) !void {
     if (!dds.registerTypeSupport(dp, "ShapeType", .{
         .ctx = @ptrCast(&ts_alloc),
         .compute_key_hash = shape_gen.ShapeType.computeKeyHashFromCdr,
+        .has_key = shape_gen.ShapeType.has_key,
         .compute_key_hash_key_only = shape_gen.ShapeType.computeKeyHashFromCdrKeyOnly,
         .get_field = shape_gen.ShapeType.getFieldFromCdr,
     })) {

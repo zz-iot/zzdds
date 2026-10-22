@@ -43,6 +43,20 @@ python3 scripts/run_deterministic_matrix.py
 - RTPS reliability: inject DATA → advance clock → Heartbeat → NACK → verify retransmit
 - Packet loss, reorder, partition/rejoin scenarios
 
+## Coverage
+
+CI collects coverage from `zig build emit-tests-llvm -Doptimize=Debug`, using the
+same LLVM/baseline-CPU test binaries as Valgrind in `zig-out/tests-llvm/`.
+Zig 0.17's default x86 backend still emits debug information that stock libdw
+misparses; LLVM allows kcov to use Ubuntu 24.04's unpatched elfutils. Only
+unmodified kcov is built and cached, because Ubuntu 24.04 has no kcov package.
+
+The coverage job fails on missing test binaries, collector/test failures, empty
+coverage data, and upload errors. It preserves the report artifact on failure
+for diagnosis. See [the CI workflow](../.github/workflows/ci.yml) for tool setup
+and collection commands. This covers the default emitted suite; optional
+features require their corresponding enabled tests as well.
+
 ## ThreadSanitizer
 
 ```sh

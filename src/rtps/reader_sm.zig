@@ -262,9 +262,18 @@ pub const WriterProxy = struct {
 
 // ── StatefulReader ────────────────────────────────────────────────────────────
 
+/// Bounded, synchronous wire transform, installed before publication. It may not
+/// call DDS APIs, block, retain buffers or run cleanup. The participant owns ctx
+/// through reader retirement. Failure precedes sequence/history admission.
+pub const SampleProcessor = struct {
+    ctx: *anyopaque,
+    process: *const fn (*anyopaque, []const u8, ChangeKind, [16]u8) anyerror![16]u8,
+    retain: ?*const fn (*anyopaque) void = null,
+    release: ?*const fn (*anyopaque) void = null,
+};
+
 /// Reliable reader with per-writer tracking and ACKNACK generation.
 /// Typical use: SEDP endpoint discovery reception.
-///
 /// Thread-safe: all public methods lock `mu`.
 pub const StatefulReader = struct {
     alloc: std.mem.Allocator,
@@ -273,6 +282,7 @@ pub const StatefulReader = struct {
     cache: HistoryCache,
     writer_proxies: std.ArrayListUnmanaged(WriterProxy),
     callback: ?DataCallback,
+    sample_processor: ?SampleProcessor = null,
     mu: mutex_mod.Mutex,
     tracer: trace.Tracer,
     /// When true, out-of-order changes are buffered per WriterProxy and
@@ -320,11 +330,23 @@ pub const StatefulReader = struct {
         self.tracer = t;
     }
 
+    /// Install before the protocol reader is published. Its independent pin
+    /// survives deferred adapter teardown and a participant's own release.
+    pub fn setSampleProcessor(self: *Self, processor: ?SampleProcessor) void {
+        std.debug.assert(self.sample_processor == null);
+        if (processor) |p| {
+            std.debug.assert((p.retain == null) == (p.release == null));
+            if (p.retain) |retain| retain(p.ctx);
+        }
+        self.sample_processor = processor;
+    }
+
     pub fn deinit(self: *Self) void {
         for (self.writer_proxies.items) |*wp| wp.deinit(self.alloc);
         self.writer_proxies.deinit(self.alloc);
         self.cache.deinit();
         self.mu.deinit();
+        if (self.sample_processor) |p| if (p.release) |release| release(p.ctx);
         self.alloc.destroy(self);
     }
 
@@ -660,12 +682,14 @@ pub const StatefulReader = struct {
             .group_seq_num = entry.group_seq_num,
             .group_coherent_sn = entry.group_coherent_sn,
         };
+        // Retire the completed buffer even when validation/admission fails. A
+        // retransmission may rebuild it; no stale completed buffer pins memory.
+        defer {
+            var removed = wp.?.reassembly.fetchRemove(sn).?;
+            removed.value.received.deinit();
+            self.alloc.free(removed.value.data);
+        }
         try self.deliverChangeLocked(wp.?, change);
-
-        // Remove the reassembly entry; cache already holds its own copy of data.
-        var removed = wp.?.reassembly.fetchRemove(sn).?;
-        removed.value.received.deinit();
-        self.alloc.free(removed.value.data);
     }
 
     /// Handle a HEARTBEAT_FRAG from a matched writer.
@@ -755,7 +779,13 @@ pub const StatefulReader = struct {
     /// Deliver a complete change (DATA or fully-assembled DATA_FRAG) to the cache
     /// and callback.  Handles RELIABLE ordering and BEST_EFFORT immediate delivery.
     /// Called under self.mu.  Does NOT check for duplicates — callers must guard.
-    fn deliverChangeLocked(self: *Self, wp: *WriterProxy, change: CacheChange) !void {
+    fn deliverChangeLocked(self: *Self, wp: *WriterProxy, incoming: CacheChange) !void {
+        var change = incoming;
+        // Applies to DATA, reassembled DATA_FRAG and prematch replay alike.
+        // End markers are protocol metadata, not application samples.
+        if (!isEndMarker(&change)) if (self.sample_processor) |processor| {
+            change.key_hash = try processor.process(processor.ctx, change.data, change.kind, change.key_hash);
+        };
         const sn = change.sequence_number;
 
         // A BEST_EFFORT reader takes only SNs above the highest it has had
@@ -1847,4 +1877,109 @@ test "StatefulReader DATA_FRAG: a reassembly started before the match finishes a
     try reader.handleDataFrag(wguid, ZERO_TS, frag);
     try testing.expectEqual(@as(usize, 1), ctx.n);
     try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &ctx.data);
+}
+
+test "checked sample processing precedes sequence accounting for DATA and fragments" {
+    const Processor = struct {
+        calls: usize = 0,
+        deliveries: usize = 0,
+        fn process(ctx: *anyopaque, data: []const u8, _: ChangeKind, _: [16]u8) anyerror![16]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (data.len == 0 or data[0] != 1) return error.InvalidSample;
+            var hash: [16]u8 = @splat(0);
+            hash[0] = 42;
+            return hash;
+        }
+        fn onData(ctx: *anyopaque, change: *const CacheChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(change.key_hash[0] == 42);
+            self.deliveries += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |reliable| {
+        var null_ctx = TestNullCtx{};
+        const transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
+        const reader = try StatefulReader.init(testing.allocator, makeGuid(71, 0x07), transport, .keep_all, 0, reliable);
+        defer reader.deinit();
+        var processor = Processor{};
+        reader.sample_processor = .{ .ctx = &processor, .process = Processor.process };
+        reader.setCallback(.{ .ctx = &processor, .on_data = Processor.onData });
+        const writer = makeGuid(72, 0x02);
+        try reader.addMatchedWriter(try WriterProxy.init(testing.allocator, writer, &.{}, &.{}, reliable));
+        var change = CacheChange{
+            .kind = .alive,
+            .writer_guid = writer,
+            .sequence_number = 1,
+            .source_timestamp = ZERO_TS,
+            .instance_handle = NIL_IH,
+            .key_hash = NIL_KH,
+            .data = &.{0xff},
+        };
+        try testing.expectError(error.InvalidSample, reader.handleData(writer, change));
+        try testing.expect(!reader.writer_proxies.items[0].received.contains(1));
+        try testing.expectEqual(@as(usize, 0), processor.deliveries);
+        change.data = &.{1};
+        try reader.handleData(writer, change);
+        try testing.expect(reader.writer_proxies.items[0].received.contains(1));
+        try testing.expectEqual(@as(usize, 1), processor.deliveries);
+        var first = msg.submessage.DataFragSubmessage{
+            .flags = 0,
+            .reader_entity_id = guid_mod.EntityIds.unknown,
+            .writer_entity_id = writer.entity_id,
+            .writer_sn = 2,
+            .fragment_starting_num = 1,
+            .fragments_in_submessage = 1,
+            .fragment_size = 1,
+            .data_size = 2,
+            .inline_qos = null,
+            .serialized_payload = &.{0xff},
+        };
+        var second = first;
+        second.fragment_starting_num = 2;
+        second.serialized_payload = &.{0};
+        try reader.handleDataFrag(writer, ZERO_TS, first);
+        try testing.expectError(error.InvalidSample, reader.handleDataFrag(writer, ZERO_TS, second));
+        try testing.expect(!reader.writer_proxies.items[0].received.contains(2));
+        try testing.expectEqual(@as(u32, 0), reader.writer_proxies.items[0].reassembly.count());
+        first.serialized_payload = &.{1};
+        try reader.handleDataFrag(writer, ZERO_TS, first);
+        try reader.handleDataFrag(writer, ZERO_TS, second);
+        try testing.expectEqual(@as(usize, 2), processor.deliveries);
+        try testing.expect(reader.writer_proxies.items[0].received.contains(2));
+    }
+}
+
+test "checked sample processing also rejects malformed data held before matching" {
+    const Processor = struct {
+        calls: usize = 0,
+        fn process(ctx: *anyopaque, _: []const u8, _: ChangeKind, _: [16]u8) anyerror![16]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.InvalidSample;
+        }
+    };
+    var null_ctx = TestNullCtx{};
+    const transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
+    const reader = try StatefulReader.init(testing.allocator, makeGuid(73, 0x07), transport, .keep_all, 0, true);
+    defer reader.deinit();
+    var processor = Processor{};
+    reader.sample_processor = .{ .ctx = &processor, .process = Processor.process };
+    var cache = unmatched_mod.UnmatchedCache.init(testing.allocator, .{ .max_bytes = 1024, .max_writers = 4, .max_samples_per_writer = 4, .max_partials_per_writer = 4 });
+    defer cache.deinit();
+    const writer = makeGuid(74, 0x02);
+    const change = CacheChange{
+        .kind = .alive,
+        .writer_guid = writer,
+        .sequence_number = 1,
+        .source_timestamp = ZERO_TS,
+        .instance_handle = NIL_IH,
+        .key_hash = NIL_KH,
+        .data = &.{0xff},
+    };
+    cache.put(writer, guid_mod.EntityIds.unknown, &change, true, 0, 1000000);
+    const prematch = Prematch{ .cache = &cache };
+    _ = try reader.addOrRefreshMatchedWriterWith(try WriterProxy.init(testing.allocator, writer, &.{}, &.{}, true), &prematch, null);
+    try testing.expectEqual(@as(usize, 1), processor.calls);
+    try testing.expect(!reader.writer_proxies.items[0].received.contains(1));
 }
