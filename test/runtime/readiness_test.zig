@@ -289,6 +289,117 @@ test "service handles ready sources round robin, within its budget" {
     try testing.expectEqual(@as(u32, 0), b.backend().service(4).serviced);
 }
 
+/// A connected pair of Unix datagram sockets whose sender's output stops
+/// being writable once the receiver's queue fills: a UDP socket over
+/// loopback never fills that way. Linux only: elsewhere a full queue is
+/// reported differently.
+const FullPair = struct {
+    tx: posix.socket_t,
+    rx: posix.socket_t,
+    source: rt.Source = undefined,
+    writable: u32 = 0,
+
+    fn init(self: *FullPair) !void {
+        var fds: [2]posix.socket_t = undefined;
+        if (c.socketpair(posix.AF.UNIX, posix.SOCK.DGRAM, 0, &fds) != 0) return error.SocketFailed;
+        self.* = .{ .tx = fds[0], .rx = fds[1] };
+        self.source = .{ .handle = self.tx, .ctx = self, .service = noInput, .input = false, .writable = onWritable };
+    }
+
+    fn deinit(self: *FullPair) void {
+        _ = c.close(self.tx);
+        _ = c.close(self.rx);
+    }
+
+    /// Sends until the sender would block.
+    fn fill(self: *FullPair) !void {
+        var sent: usize = 0;
+        while (sent < 100_000) : (sent += 1) {
+            if (c.send(self.tx, "x", 1, posix.MSG.DONTWAIT) < 0) return;
+        }
+        return error.NeverFull;
+    }
+
+    fn drain(self: *FullPair) void {
+        var buf: [16]u8 = undefined;
+        while (c.recv(self.rx, &buf, buf.len, posix.MSG.DONTWAIT) >= 0) {}
+    }
+
+    fn noInput(_: *anyopaque, _: u32) u32 {
+        unreachable;
+    }
+
+    fn onWritable(ctx: *anyopaque) void {
+        const self: *FullPair = @ptrCast(@alignCast(ctx));
+        self.writable += 1;
+    }
+};
+
+test "an output-only source is waited on only while armed, and writable runs once per arming" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var b: Backend = undefined;
+    try b.init();
+    defer b.deinit();
+    var pair: FullPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    try b.backend().register(&pair.source);
+    defer b.backend().unregister(&pair.source);
+
+    // Writable but not armed: nothing to wait for, and service never takes
+    // input from it.
+    try testing.expectEqual(@as(u32, 0), b.backend().service(4).serviced);
+    try testing.expectEqual(@as(u32, 0), pair.writable);
+
+    // Armed while full: no output yet.
+    try pair.fill();
+    b.backend().armOutput(&pair.source);
+    b.backend().armOutput(&pair.source);
+    try testing.expectEqual(@as(u32, 0), b.backend().service(4).serviced);
+
+    // Once drained, writable runs once, however often it was armed and
+    // however often service runs after.
+    pair.drain();
+    try testing.expectEqual(@as(u32, 1), b.backend().service(4).serviced);
+    try testing.expectEqual(@as(u32, 1), pair.writable);
+    try testing.expectEqual(@as(u32, 0), b.backend().service(4).serviced);
+    try testing.expectEqual(@as(u32, 1), pair.writable);
+
+    // Armed while writable: it runs on the next service.
+    b.backend().armOutput(&pair.source);
+    try testing.expectEqual(@as(u32, 1), b.backend().service(4).serviced);
+    try testing.expectEqual(@as(u32, 2), pair.writable);
+}
+
+test "a poller waits for armed output, and the socket draining ends its wait" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var b: Backend = undefined;
+    try b.init();
+    defer b.deinit();
+    var pair: FullPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    try b.backend().register(&pair.source);
+    defer b.backend().unregister(&pair.source);
+    try pair.fill();
+    b.backend().armOutput(&pair.source);
+
+    const Waiter = struct {
+        fn run(backend: rt.ProgressBackend, deadline_ns: i64) void {
+            backend.wait(deadline_ns, backend.prepareWait());
+        }
+    };
+    const deadline = b.now() + 30 * SEC;
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ b.backend(), deadline });
+    // Nothing wakes the poller: only the output it waits for can end its wait.
+    while (!b.pb.polling.load(.seq_cst)) std.Thread.yield() catch {};
+    pair.drain();
+    t.join();
+    try testing.expect(b.now() < deadline);
+    try testing.expectEqual(@as(u32, 1), b.backend().service(4).serviced);
+    try testing.expectEqual(@as(u32, 1), pair.writable);
+}
+
 test "unregistering a source returns only once a running service of it has" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
     var b: Backend = undefined;
@@ -376,6 +487,11 @@ const UdpPair = struct {
     /// The participants take `runtime`'s only owner references. A null
     /// `runtime`: they resolve the default.
     fn init(self: *UdpPair, runtime: ?*rt.Runtime, pid_base: u32) !void {
+        return self.initWith(runtime, pid_base, .RELIABLE_RELIABILITY_QOS);
+    }
+
+    /// With both endpoints of `reliability`.
+    fn initWith(self: *UdpPair, runtime: ?*rt.Runtime, pid_base: u32, reliability: DDS.ReliabilityQosPolicyKind) !void {
         self.delivery = try IntraProcessDelivery.init(alloc);
         for (0..2) |i| {
             self.udp[i] = try UdpTransport.init(alloc, .{ .participant_id = pid_base + @as(u32, @intCast(i)) }, test_domain.get(), null);
@@ -389,10 +505,10 @@ const UdpPair = struct {
         if (runtime) |r| r.releaseOwner();
 
         var dw_qos: DDS.DataWriterQos = .{};
-        dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+        dw_qos.reliability.kind = reliability;
         dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
         var dr_qos: DDS.DataReaderQos = .{};
-        dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+        dr_qos.reliability.kind = reliability;
         dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
         const topic_w = self.dp[0].create_topic("UdpTopic", "UdpType", .{}, null, 0);
         const topic_r = self.dp[1].create_topic("UdpTopic", "UdpType", .{}, null, 0);
@@ -683,6 +799,74 @@ test "a multicast datagram that would block on one interface is not reported sen
     try testing.expectEqual(@as(u64, 1), udp.sends_would_block.load(.monotonic));
 }
 
+/// Counts the runs of its waiter.
+const Waited = struct {
+    waiter: transport_iface.WritableWaiter = .{ .on_writable = run },
+    runs: u32 = 0,
+
+    fn run(w: *transport_iface.WritableWaiter) void {
+        const self: *Waited = @fieldParentPtr("waiter", w);
+        self.runs += 1;
+    }
+};
+
+test "a waiter queued after a send would block runs once the send socket can take output, and at once when none blocked" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var b: Backend = undefined;
+    try b.init();
+    defer b.deinit();
+    var sock: Sock = undefined;
+    try sock.init();
+    defer sock.deinit();
+    const to = transport_iface.Locator.udp4(.{ 127, 0, 0, 1 }, sock.port);
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 49 }, test_domain.get(), null);
+    defer udp.deinit();
+    const t = udp.transport();
+    try t.attachBackend(b.backend());
+    try testing.expect(t.canNotifyWritable());
+
+    var ctx: u8 = 0;
+    const handler: transport_iface.ReceiveHandler = .{ .ctx = &ctx, .on_receive = ignoreReceive };
+    const port: u16 = @intCast(7400 + 250 * test_domain.get() + 3);
+    const any = transport_iface.Locator.udp4(.{ 0, 0, 0, 0 }, port);
+    try t.listen(&any, handler);
+    const receiving = b.pb.sourceCount();
+
+    // Nothing has blocked: it runs at once.
+    var w: Waited = .{};
+    t.notifyWritable(&w.waiter);
+    try testing.expectEqual(@as(u32, 1), w.runs);
+    try testing.expectEqual(receiving, b.pb.sourceCount());
+
+    // After a send that would block, it waits for the backend to find the
+    // send socket writable, which it is, and runs once, however often queued.
+    SendSpy.reset();
+    udp.test_hooks.before_send = SendSpy.hook;
+    SendSpy.substitute[0] = .would_block;
+    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&to, &gather));
+    t.notifyWritable(&w.waiter);
+    t.notifyWritable(&w.waiter);
+    try testing.expectEqual(@as(u32, 1), w.runs);
+    // The send socket joined the backend to be waited for.
+    try testing.expectEqual(receiving + 1, b.pb.sourceCount());
+    try testing.expectEqual(@as(u32, 1), b.backend().service(16).serviced);
+    try testing.expectEqual(@as(u32, 2), w.runs);
+    try testing.expectEqual(@as(u32, 0), b.backend().service(16).serviced);
+
+    // Cancelled before the socket drains: it does not run.
+    SendSpy.reset();
+    SendSpy.substitute[0] = .would_block;
+    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&to, &gather));
+    t.notifyWritable(&w.waiter);
+    t.cancelWritable(&w.waiter);
+    _ = b.backend().service(16);
+    try testing.expectEqual(@as(u32, 2), w.runs);
+
+    // The send socket leaves the backend with the last port.
+    t.unlisten(&any, handler);
+    try testing.expectEqual(@as(usize, 0), b.pb.sourceCount());
+}
+
 /// Substitutes `would_block` for the first `drop_limit` datagrams carrying
 /// user DATA, as a full send buffer would.
 const DataDropper = struct {
@@ -721,7 +905,7 @@ const DataDropper = struct {
     }
 };
 
-test "user data whose sends would block is repaired by the reliable protocol, and the write still succeeds" {
+test "reliable user data whose sends would block still arrives in order, and the write still succeeds" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
     var b: Backend = undefined;
     try b.init();
@@ -749,5 +933,42 @@ test "user data whose sends would block is repaired by the reliable protocol, an
     try testing.expectEqual(@as(u64, 5), pair.udp[0].sends_would_block.load(.monotonic));
 
     try pair.deleteParticipants();
+    while (runtime.getState() != .backend_stopped) _ = try runtime.drive(64, 0);
+}
+
+test "best-effort user data whose sends would block waits for the socket and arrives in order, with nothing lost" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var b: Backend = undefined;
+    try b.init();
+    defer b.deinit();
+    var runtime = rt.Runtime.init(b.pb.clock(), b.backend(), .{ .mode = .manual });
+    defer runtime.deinit();
+
+    var pair: UdpPair = undefined;
+    try pair.initWith(&runtime, 50, .BEST_EFFORT_RELIABILITY_QOS);
+    defer pair.deinit();
+    // Best effort has no repair: what a send that would block did not carry
+    // arrives only because the writer waits for the socket and sends it
+    // again. More would-blocks than samples: the writer waits several times.
+    DataDropper.dropped = 0;
+    DataDropper.drop_limit = 30;
+    pair.udp[0].test_hooks.before_send = DataDropper.hook;
+
+    // Matched both ways before writing: a best-effort writer sends nothing
+    // to a reader it has yet to match.
+    const deadline = b.now() + 10 * SEC;
+    while (pair.dw.matchedReaderCount() == 0 and b.now() < deadline) _ = try runtime.drive(64, 10 * std.time.ns_per_ms);
+    for (0..samples_n) |i| try pair.write(i);
+    var got: std.ArrayListUnmanaged(u8) = .empty;
+    defer got.deinit(alloc);
+    while (got.items.len < samples_n and b.now() < deadline) {
+        _ = try runtime.drive(64, 100 * std.time.ns_per_ms);
+        try pair.takeInto(&got);
+    }
+    try expectInOrder(got.items);
+    try testing.expectEqual(@as(u32, 30), DataDropper.dropped);
+
+    try pair.deleteParticipants();
+    try testing.expectEqual(@as(usize, 0), b.pb.sourceCount());
     while (runtime.getState() != .backend_stopped) _ = try runtime.drive(64, 0);
 }

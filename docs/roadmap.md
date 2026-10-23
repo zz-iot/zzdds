@@ -168,12 +168,17 @@ Forward-looking only: known gaps, planned features, and open design questions.
   `[65536]u8` stack buffer (`Transport.sendGather` does that for a transport without
   `send_gather`). See `design/rtps-message-builder.md` and
   [output submission](design/concurrency/transport-adapters.md#output-submission).
-- **A writer whose send would block does not resume when the socket drains.** On the
-  shared runtime a UDP send that finds the send buffer full is dropped and counted, and
-  reliable readers get the data through HEARTBEAT/ACKNACK repair; a best-effort burst
-  loses it. The [output contract](design/concurrency/runtime.md#output-submission-and-completion)
-  has the producer register for output readiness and resume instead, which needs
-  per-proxy unsent state in `writer_sm` (today it sends inline from `write`).
+- **A writer resumes when a full send buffer drains** — done for UDP on POSIX, on the
+  shared runtime, as the
+  [output contract](design/concurrency/runtime.md#output-submission-and-completion)
+  has it. A reader whose DATA would block is held (`ReaderProxy.unsent_from_sn`): live
+  data to it waits, the history keeps what it has yet to be sent, and the writer waits
+  for the transport's output (`Transport.notifyWritable`, which UDP serves by waiting
+  for `POLLOUT` on its send socket) and then sends it everything it missed, in SN order,
+  end markers included. A best-effort history replay that would block finishes the same
+  way. HEARTBEAT, GAP and repair replies are not held: a lost one is regenerated from
+  current state. Left: TCP, whose partial frame is accepted-pending rather than would-block,
+  and Windows, whose UDP sends still block.
 - **A local endpoint's announcement is not ordered against its creation and deletion.**
   The rules are in
   [local endpoint publication, announcement and disposal](design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
@@ -1056,8 +1061,9 @@ runtime takes over. On the runtime, UDP does not yet
 re-poll interfaces (no poll thread is started). RTPS messages go to the transport as the
 builder's gather list, which UDP passes to `sendmsg` without copying it into one buffer,
 and on the runtime a UDP send never blocks: a full send buffer drops the datagram, counts
-it (`sends_would_block`) and reports `would_block`, and the reliable protocol repairs it
-as any lost datagram. A writer does not yet wait for the socket to drain and resume. RTPS discovery runs on the participant's runtime too: SPDP's
+it (`sends_would_block`) and reports `would_block`. A writer then holds that reader's
+DATA and sends it once the socket drains, best effort included, so nothing is lost to a
+full buffer; protocol messages that would block are lost and regenerated. RTPS discovery runs on the participant's runtime too: SPDP's
 announcements and its lease and liveness-probe checks are timers on the runtime clock,
 armed for when each is next due (one for the next announcement, one for the earliest
 expiry or probe), the SEDP and WLP writers' heartbeats are writer timers, and what
@@ -1125,8 +1131,9 @@ exists for UDP on POSIX: a manual runtime over `PollBackend` runs a reliable pai
 loopback UDP through `drive()` alone, with no thread started by zzdds, and hosted workers
 service the same sockets in place of a thread per socket, and RTPS discovery runs there
 too, its announcements, lease checks and heartbeats on runtime timers. Sends take the
-builder's gather list and never block there. Next are a writer resuming when a full send
-buffer drains, channel slots in place of the retained socket graveyards, TCP, and Windows. Outside that build, the UDP and TCP
+builder's gather list and never block there, and a writer whose send would block resumes
+once the socket drains. Next are channel slots in place of the retained socket
+graveyards, TCP, and Windows. Outside that build, the UDP and TCP
 transports still call their handlers from their own receive threads. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative

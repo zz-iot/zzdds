@@ -424,9 +424,24 @@ pub const SendOutcome = enum {
     /// The adapter has finished with the bytes. Not proof of receipt.
     completed,
     /// Nothing was sent: the socket's send buffer is full and the transport
-    /// does not block. The caller keeps its data; RTPS treats the message as
-    /// lost, and a reliable writer repairs it as for any lost datagram.
+    /// does not block. The caller keeps its data and may wait with
+    /// `Transport.notifyWritable` to send it again; otherwise RTPS treats
+    /// the message as lost, and a reliable writer repairs it as for any lost
+    /// datagram.
     would_block,
+};
+
+/// A producer waiting for a transport's sends to stop blocking
+/// (docs/design/concurrency/transport-adapters.md#output-submission).
+pub const WritableWaiter = struct {
+    /// Runs once per `Transport.notifyWritable`, on whatever thread finds the
+    /// output ready, possibly inside `notifyWritable` itself. Must not block
+    /// or call into the transport; it hands the event to the producer's own
+    /// context.
+    on_writable: *const fn (waiter: *WritableWaiter) void,
+    // The transport's, under its lock.
+    next: ?*WritableWaiter = null,
+    queued: bool = false,
 };
 
 // ── Transport callbacks ───────────────────────────────────────────────────────
@@ -509,6 +524,17 @@ pub const Transport = struct {
         /// blocks: a full send buffer is `would_block`. Null: `sendGather`
         /// flattens the list and calls `send`.
         send_gather: ?*const fn (ctx: *anyopaque, locator: *const Locator, iovecs: []const IoVec) anyerror!SendOutcome = null,
+
+        /// Runs `waiter.on_writable` once a send that returned `would_block`
+        /// could go ahead: when a socket that blocked can take output, or at
+        /// once if none is blocked now. Queuing a queued waiter does
+        /// nothing. Null: the transport cannot tell, and the caller treats
+        /// a send that would block as lost.
+        notify_writable: ?*const fn (ctx: *anyopaque, waiter: *WritableWaiter) void = null,
+
+        /// Dequeues `waiter`, returning once its `on_writable` is not running.
+        /// Required with `notify_writable`.
+        cancel_writable: ?*const fn (ctx: *anyopaque, waiter: *WritableWaiter) void = null,
 
         /// Send `data` on the specific local socket/connection identified by
         /// `channel`, to `locator`, bypassing normal locator->connection
@@ -602,6 +628,16 @@ pub const Transport = struct {
             else => return err,
         };
         return .completed;
+    }
+    /// Whether `notifyWritable` can report when a blocked send could go ahead.
+    pub fn canNotifyWritable(self: Transport) bool {
+        return self.vtable.notify_writable != null;
+    }
+    pub fn notifyWritable(self: Transport, waiter: *WritableWaiter) void {
+        self.vtable.notify_writable.?(self.ctx, waiter);
+    }
+    pub fn cancelWritable(self: Transport, waiter: *WritableWaiter) void {
+        if (self.vtable.cancel_writable) |f| f(self.ctx, waiter);
     }
     /// Returns error.ChannelUnsupported if this transport has no channel
     /// concept (send_on_channel is null).

@@ -19,12 +19,24 @@ pub const ServiceResult = struct {
 /// transport has set up, with the transport's handler for it
 /// (docs/design/concurrency/transport-adapters.md#socket-setup-and-data-path).
 pub const Source = struct {
-    /// The OS handle to wait on for input.
+    /// The OS handle to wait on.
     handle: std.posix.socket_t,
     ctx: *anyopaque,
     /// Nonblocking: handles at most `budget` inputs that are ready now and
-    /// returns how many it handled, 0 once none is ready.
+    /// returns how many it handled, 0 once none is ready. Not called for a
+    /// source without `input`.
     service: *const fn (ctx: *anyopaque, budget: u32) u32,
+    /// Whether the backend waits on `handle` for input. False for a socket
+    /// that is only written: the backend then waits on it only while output
+    /// is armed.
+    input: bool = true,
+    /// Runs once per `armOutput`, from `service`, when `handle` can take
+    /// output, or reports an error the next send will see
+    /// (docs/design/concurrency/transport-adapters.md#output-submission).
+    /// Never runs DDS work: it hands the event to whoever waits for it.
+    writable: ?*const fn (ctx: *anyopaque) void = null,
+    /// The backend's: output is armed and `writable` has not run since.
+    output_armed: bool = false,
 };
 
 pub const ProgressBackend = struct {
@@ -52,6 +64,11 @@ pub const ProgressBackend = struct {
         /// Stops waiting on `source`, returning once no `service` of it is
         /// running. Never from inside that service.
         unregister: ?*const fn (ctx: *anyopaque, source: *Source) void = null,
+        /// Readiness backends only: runs `source.writable` once, the next
+        /// time its handle can take output. `source` is registered and has
+        /// `writable`. Callable from any thread; arming an armed source
+        /// does nothing.
+        arm_output: ?*const fn (ctx: *anyopaque, source: *Source) void = null,
     };
 
     pub fn wake(self: ProgressBackend) void {
@@ -79,6 +96,9 @@ pub const ProgressBackend = struct {
     }
     pub fn unregister(self: ProgressBackend, source: *Source) void {
         self.vtable.unregister.?(self.ctx, source);
+    }
+    pub fn armOutput(self: ProgressBackend, source: *Source) void {
+        self.vtable.arm_output.?(self.ctx, source);
     }
 };
 

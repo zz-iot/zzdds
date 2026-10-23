@@ -1,6 +1,6 @@
 //! The readiness progress backend for hosted POSIX platforms: waits on the
-//! registered I/O sources and a wake descriptor with `poll`, and services the
-//! ready sources
+//! registered I/O sources (for input, and for output where armed) and a wake
+//! descriptor with `poll`, and services the ready sources
 //! (docs/design/concurrency/transport-adapters.md#progress-backend).
 //!
 //! One waiter at a time polls. The others wait on a futex, and a poller that
@@ -48,9 +48,9 @@ pub const PollBackend = struct {
     wake_wr: posix.fd_t,
 
     mu: Mutex = .{},
-    // Guarded by `mu`.
+    // Guarded by `mu`, with each source's `output_armed`.
     sources: std.ArrayListUnmanaged(*Source) = .empty,
-    /// Advances on every change to `sources`.
+    /// Advances on every change to `sources` or to what they wait for.
     version: u64 = 0,
 
     // The poller's: rebuilt from `sources` when `version` moves.
@@ -136,6 +136,7 @@ pub const PollBackend = struct {
         .service = vtService,
         .register = vtRegister,
         .unregister = vtUnregister,
+        .arm_output = vtArmOutput,
     };
 
     const clock_vtable: Clock.Vtable = .{ .now_ns = vtNow, .sleep_ns = vtSleep };
@@ -229,11 +230,21 @@ pub const PollBackend = struct {
             self.wait_fds.clearRetainingCapacity();
             self.wait_fds.appendAssumeCapacity(.{ .fd = self.wake_rd, .events = posix.POLL.IN, .revents = 0 });
             for (self.sources.items) |s| {
-                self.wait_fds.appendAssumeCapacity(.{ .fd = s.handle, .events = posix.POLL.IN, .revents = 0 });
+                const events = waitEvents(s);
+                if (events != 0) self.wait_fds.appendAssumeCapacity(.{ .fd = s.handle, .events = events, .revents = 0 });
             }
             self.wait_version = self.version;
         }
         return self.wait_fds.items;
+    }
+
+    /// What to wait on `s` for, under `mu`. A source waiting for nothing is
+    /// left out, since poll would still report its errors.
+    fn waitEvents(s: *const Source) i16 {
+        var events: i16 = 0;
+        if (s.input) events |= posix.POLL.IN;
+        if (s.output_armed) events |= posix.POLL.OUT;
+        return events;
     }
 
     /// Milliseconds until `deadline_ns`, rounded up so a wait never ends
@@ -258,6 +269,30 @@ pub const PollBackend = struct {
         }
         // A poller already waiting starts polling the new source.
         if (self.polling.load(.seq_cst)) self.signal();
+    }
+
+    fn vtArmOutput(ctx: *anyopaque, source: *Source) void {
+        const self = of(ctx);
+        std.debug.assert(source.writable != null);
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (source.output_armed) return;
+            source.output_armed = true;
+            self.version += 1;
+        }
+        // A poller already waiting starts waiting for the output.
+        if (self.polling.load(.seq_cst)) self.signal();
+    }
+
+    /// Under `service_mu`: whether `s` was armed, disarming it.
+    fn disarmOutput(self: *PollBackend, s: *Source) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (!s.output_armed) return false;
+        s.output_armed = false;
+        self.version += 1;
+        return true;
     }
 
     fn vtUnregister(ctx: *anyopaque, source: *Source) void {
@@ -314,6 +349,15 @@ pub const PollBackend = struct {
                     return result;
                 }
                 const s = self.service_sources.items[i];
+                // Without input, an error or hangup also ends the wait for
+                // output: the next send reports it.
+                if (fds[i].revents & posix.POLL.OUT != 0 or !s.input) {
+                    fds[i].revents = if (s.input) fds[i].revents & ~@as(i16, posix.POLL.OUT) else 0;
+                    if (self.disarmOutput(s)) s.writable.?(s.ctx);
+                    result.serviced += 1;
+                    progressed = true;
+                    continue;
+                }
                 if (fds[i].revents & posix.POLL.NVAL != 0 or s.service(s.ctx, 1) == 0) {
                     fds[i].revents = 0;
                     continue;
@@ -337,8 +381,10 @@ pub const PollBackend = struct {
         self.service_sources.clearRetainingCapacity();
         self.service_fds.clearRetainingCapacity();
         for (self.sources.items) |s| {
+            const events = waitEvents(s);
+            if (events == 0) continue;
             self.service_sources.appendAssumeCapacity(s);
-            self.service_fds.appendAssumeCapacity(.{ .fd = s.handle, .events = posix.POLL.IN, .revents = 0 });
+            self.service_fds.appendAssumeCapacity(.{ .fd = s.handle, .events = events, .revents = 0 });
         }
         self.service_version = self.version;
         return true;

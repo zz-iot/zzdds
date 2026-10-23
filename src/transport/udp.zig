@@ -85,6 +85,7 @@ pub const LocatorChangeHandler = iface.LocatorChangeHandler;
 pub const Channel = iface.Channel;
 pub const InterfaceMonitor = iface.InterfaceMonitor;
 pub const IoVec = iface.IoVec;
+const WritableWaiter = iface.WritableWaiter;
 pub const SendOutcome = iface.SendOutcome;
 const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
@@ -744,6 +745,16 @@ pub const UdpTransport = struct {
     /// Datagrams not sent because the send buffer was full; one per
     /// interface for a multicast send.
     sends_would_block: std.atomic.Value(u64) = .init(0),
+    /// The send sockets as output-only sources of `backend`, so a producer
+    /// whose send would block can wait for them to drain
+    /// (vtNotifyWritable). Set up with `backend`; each is registered with
+    /// it on the first wait for it, and unregistered with the last port.
+    send_sources: [2]SendSource = @splat(.{}),
+    /// Guards `writable_waiters` and each send source's `registered`.
+    /// `on_writable` runs under it, so a waiter cancelled under it is not
+    /// running.
+    writable_mu: mutex_mod.Mutex = .{},
+    writable_waiters: ?*WritableWaiter = null,
     test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
 
     /// Seams for deterministic tests; absent outside test builds.
@@ -881,6 +892,9 @@ pub const UdpTransport = struct {
 
         if (self.reserved_meta_fd) |fd| socketClose(fd);
         if (self.reserved_data_fd) |fd| socketClose(fd);
+
+        self.unregisterSendSources();
+        self.writable_mu.deinit();
 
         // Close the init-time send sockets. These are the sole send sockets for
         // the lifetime of this transport; Option B never promotes send_fd to a
@@ -1373,9 +1387,85 @@ pub const UdpTransport = struct {
         const outcome = hooked orelse try socketSendMsg(fd, iovecs, addr, len, flags);
         if (outcome == .would_block) {
             _ = self.sends_would_block.fetchAdd(1, .monotonic);
-            log.transport.debug("udp: send buffer full on fd={}, datagram dropped", .{fd});
+            log.transport.debug("udp: send buffer full on fd={}, datagram not sent", .{fd});
+            for (&self.send_sources) |*ss| {
+                if (ss.fd == fd) ss.blocked.store(true, .seq_cst);
+            }
         }
         return outcome;
+    }
+
+    /// Queues `waiter` and waits for the send sockets that blocked to drain.
+    /// With none blocked, whatever blocked has drained already, so it runs
+    /// now. A would-block on a socket that is not a send source (a channel's,
+    /// or a temporary one) is not waited for: the waiter runs at once and
+    /// tries again.
+    fn vtNotifyWritable(ctx: *anyopaque, waiter: *WritableWaiter) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writable_mu.lock();
+        defer self.writable_mu.unlock();
+        if (!waiter.queued) {
+            waiter.next = self.writable_waiters;
+            self.writable_waiters = waiter;
+            waiter.queued = true;
+        }
+        var blocked = false;
+        for (&self.send_sources) |*ss| {
+            if (!ss.blocked.load(.seq_cst)) continue;
+            if (!ss.registered) {
+                // Without memory to wait for it, the waiter tries again now.
+                self.backend.?.register(&ss.source) catch continue;
+                ss.registered = true;
+            }
+            blocked = true;
+            self.backend.?.armOutput(&ss.source);
+        }
+        if (!blocked) self.runWritableLocked();
+    }
+
+    /// Takes the send sources off the backend: once the last port is
+    /// unlistened, as no producer of the transport waits any longer, and on
+    /// deinit. Not under `writable_mu`, which their `writable` takes.
+    fn unregisterSendSources(self: *Self) void {
+        var registered: [2]bool = undefined;
+        {
+            self.writable_mu.lock();
+            defer self.writable_mu.unlock();
+            for (&self.send_sources, &registered) |*ss, *r| {
+                r.* = ss.registered;
+                ss.registered = false;
+            }
+        }
+        for (&self.send_sources, registered) |*ss, r| if (r) self.backend.?.unregister(&ss.source);
+    }
+
+    fn vtCancelWritable(ctx: *anyopaque, waiter: *WritableWaiter) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writable_mu.lock();
+        defer self.writable_mu.unlock();
+        if (!waiter.queued) return;
+        var link = &self.writable_waiters;
+        while (link.*) |w| : (link = &w.next) {
+            if (w == waiter) {
+                link.* = w.next;
+                break;
+            }
+        }
+        waiter.next = null;
+        waiter.queued = false;
+    }
+
+    /// Runs and dequeues every waiter: a send socket drained, and each tries
+    /// again, queuing itself again if it still blocks.
+    fn runWritableLocked(self: *Self) void {
+        var it = self.writable_waiters;
+        self.writable_waiters = null;
+        while (it) |w| {
+            it = w.next;
+            w.next = null;
+            w.queued = false;
+            w.on_writable(w);
+        }
     }
 
     fn vtSendGather(ctx: *anyopaque, loc: *const Locator, iovecs: []const IoVec) anyerror!SendOutcome {
@@ -1821,6 +1911,12 @@ pub const UdpTransport = struct {
                 self.publishMcSendIfacesLocked();
             }
         }
+        if (fully_empty and self.backend != null) {
+            self.mu.lock();
+            const last = self.port_entries.count() == 0;
+            self.mu.unlock();
+            if (last) self.unregisterSendSources();
+        }
 
         // Outside `mu`: wait for any on_channel_closed notification a
         // *different*, concurrent caller already captured from this port's
@@ -1898,11 +1994,49 @@ pub const UdpTransport = struct {
             if (self.backend) |b| if (b.ctx == backend.ctx) return;
             return if (self.backend != null) error.AttachedElsewhere else error.AlreadyListening;
         }
-        // With no socket open, nothing receives on an earlier backend, whose
-        // runtime may have retired: the next participant's replaces it.
+        // With no socket open, nothing receives or waits to send on an
+        // earlier backend, whose runtime may have retired: the next
+        // participant's replaces it.
         if (!backend.hasSources()) return error.BackendHasNoSources;
+        const fds = [2]posix.socket_t{ self.owned_send_fd_v4, self.owned_send_fd_v6 };
+        for (&self.send_sources, fds) |*ss, fd| {
+            if (fd == INVALID_SOCKET) continue;
+            ss.* = .{ .transport = self, .fd = fd, .source = .{
+                .handle = fd,
+                .ctx = ss,
+                .service = SendSource.noInput,
+                .input = false,
+                .writable = SendSource.onWritable,
+            } };
+        }
         self.backend = backend;
+        // Publishes the send sources to sendMsg along with nonblocking sends.
         self.send_nonblocking.store(true, .release);
+    }
+};
+
+/// A send socket as an output-only source of the transport's backend.
+const SendSource = struct {
+    transport: *UdpTransport = undefined,
+    /// The send socket, once the transport has a backend.
+    fd: posix.socket_t = INVALID_SOCKET,
+    source: Source = undefined,
+    /// Under the transport's `writable_mu`.
+    registered: bool = false,
+    /// A send on it would have blocked since it last drained.
+    blocked: std.atomic.Value(bool) = .init(false),
+
+    fn onWritable(ctx: *anyopaque) void {
+        const self: *SendSource = @ptrCast(@alignCast(ctx));
+        self.blocked.store(false, .seq_cst);
+        const t = self.transport;
+        t.writable_mu.lock();
+        defer t.writable_mu.unlock();
+        t.runWritableLocked();
+    }
+
+    fn noInput(_: *anyopaque, _: u32) u32 {
+        unreachable;
     }
 };
 
@@ -1915,6 +2049,8 @@ const udp_vtable = Transport.Vtable{
     .can_reach = UdpTransport.vtCanReach,
     .send = UdpTransport.vtSend,
     .send_gather = UdpTransport.vtSendGather,
+    .notify_writable = UdpTransport.vtNotifyWritable,
+    .cancel_writable = UdpTransport.vtCancelWritable,
     .send_on_channel = UdpTransport.vtSendOnChannel,
     .listen = UdpTransport.vtListen,
     .join_multicast = UdpTransport.vtJoinMulticast,
@@ -2745,6 +2881,9 @@ test "socketSendMsg sends a gather list as one datagram, and with MSG_DONTWAIT a
     // Unix datagram sockets: the receiver's queue fills when it does not
     // read, which a UDP socket over loopback never does. The receiver has an
     // abstract name, so the sender addresses it as UDP sends address peers.
+    // Linux only: abstract names are, and elsewhere a full queue is reported
+    // differently.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const rx = c.socket(posix.AF.UNIX, posix.SOCK.DGRAM, 0);
     try std.testing.expect(rx >= 0);
     defer socketClose(rx);

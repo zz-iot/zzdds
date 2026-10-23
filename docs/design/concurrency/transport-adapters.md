@@ -209,10 +209,16 @@ Sending becomes a submission with one of the four outcomes in
 **Implemented so far.** `Transport.send_gather` takes the gather list and returns
 `completed` or `would_block`, or fails (rejected); UDP on POSIX sends it with `sendmsg`,
 nonblocking once its sockets are a backend's. The caller's bytes are lent for the call
-only, so accepted-pending is not offered yet. On `would_block` the protocol does not yet
-register for output readiness: the transport counts the datagram and RTPS treats it as
-lost, which reliable endpoints repair and best-effort ones do not. Registering and
-resuming is the next step ([roadmap](../../roadmap.md)).
+only, so accepted-pending is not offered yet. The owner registers for output readiness
+with `Transport.notifyWritable`: its waiter runs once a send socket that blocked can take
+output, or at once if none is blocked, so a drain between the send and the registration
+is not lost. UDP adds the blocked send socket to the backend as an output-only source,
+which the readiness backend polls for `POLLOUT` only while armed, once per arming. A
+`StatefulWriter` holds a reader whose DATA would block and keeps the bytes in its history
+rather than a lease: on the waiter it arms a timer in its own context, which sends the
+reader what it was not sent, in SN order, releasing the writer's lock for each batch as
+the live path does. Protocol messages that would block are lost, as their content is
+sent again from current state.
 
 <a id="channels-and-lifetimes"></a>
 ### Channels and lifetimes

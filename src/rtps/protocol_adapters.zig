@@ -332,7 +332,8 @@ pub const RtpsProtocolWriter = struct {
             if (m.sn == eoc_sn) break m.group;
         } else null;
         for (self.writer.reader_proxies.items) |*rp| {
-            if (rp.suppress_live_data) continue;
+            // A held proxy gets the retained marker from its resume.
+            if (rp.suppress_live_data or rp.unsent_from_sn != null) continue;
             for (rp.effectiveLocators()) |loc| {
                 try out.append(alloc, .{
                     .locator = loc,
