@@ -64,12 +64,12 @@ fn inlineKeyHash(keyed: bool, kh: [16]u8) ?[16]u8 {
 
 // ── Message send helper ───────────────────────────────────────────────────────
 
-/// Maximum flat buffer size for a single send. Each DATA_FRAG fragment is
-/// sized by `StatefulWriter.frag_size` (default 16384) which is well under
-/// this limit, so fragmented writes never hit it. Unfragmented sends
-/// (payload ≤ frag_size) still return error.MessageTooLarge if the total
-/// RTPS message exceeds 65536 bytes — that is the correct safety net.
-pub const MAX_SEND_BYTES: usize = 65536;
+/// Largest RTPS message sent. Each DATA_FRAG fragment is sized by
+/// `StatefulWriter.frag_size` (default 16384) which is well under this limit,
+/// so fragmented writes never hit it. Unfragmented sends (payload ≤
+/// frag_size) still return error.MessageTooLarge if the total RTPS message
+/// exceeds 65536 bytes — that is the correct safety net.
+pub const MAX_SEND_BYTES: usize = Transport.max_flattened_send;
 
 /// What a caller installs with a match of a remote endpoint, in the same
 /// critical section as its proxy, so the two are one update (see
@@ -100,17 +100,11 @@ pub const MatchResult = enum { added, refreshed, superseded };
 /// Default fragment size used when no explicit value is provided.
 pub const DEFAULT_FRAG_SIZE: u16 = 16384;
 
-/// Flatten scatter-gather iovecs into a stack buffer and deliver via transport.
+/// Sends one message given as a gather list. A send that would block is a
+/// lost datagram, counted by the transport; reliable endpoints repair it as
+/// any other (docs/design/concurrency/transport-adapters.md#output-submission).
 pub fn sendIovecs(transport: Transport, locator: *const Locator, iovecs: []const IoVec) !void {
-    var buf: [MAX_SEND_BYTES]u8 = undefined;
-    var pos: usize = 0;
-    for (iovecs) |iov| {
-        const src = iov.base[0..iov.len];
-        if (pos + src.len > buf.len) return error.MessageTooLarge;
-        @memcpy(buf[pos..][0..src.len], src);
-        pos += src.len;
-    }
-    try transport.send(locator, buf[0..pos]);
+    _ = try transport.sendGather(locator, iovecs);
 }
 
 // ── StatelessWriter ───────────────────────────────────────────────────────────

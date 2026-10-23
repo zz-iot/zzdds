@@ -5,7 +5,9 @@
 //! budget, and unregistering a source while it is being serviced
 //! (#progress-backend); then a reliable pair over loopback UDP under a manual
 //! driver, with no thread started by zzdds, and under hosted workers
-//! (#validation).
+//! (#validation); and output: gather lists, sends that do not block on the
+//! runtime, and a send that would block counted and repaired
+//! (#output-submission).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -564,4 +566,188 @@ test "a UDP transport refuses a runtime whose backend waits on no sockets, and a
         r.releaseOwner();
         while (r.getState() != .backend_stopped) _ = try r.drive(64, 0);
     }
+}
+
+// ── Output on the runtime ─────────────────────────────────────────────────────
+
+const transport_iface = zzdds.transport;
+const IoVec = transport_iface.IoVec;
+const SendOutcome = transport_iface.SendOutcome;
+
+/// What `before_send` saw, and the outcome it substitutes for the next
+/// sends (null: the send goes ahead).
+const SendSpy = struct {
+    var calls: u32 = 0;
+    var last_flags: u32 = 0;
+    var last_iovecs: usize = 0;
+    var substitute: [4]?SendOutcome = @splat(null);
+
+    fn reset() void {
+        calls = 0;
+        last_flags = 0;
+        last_iovecs = 0;
+        substitute = @splat(null);
+    }
+
+    fn hook(_: *UdpTransport, iovecs: []const IoVec, flags: u32) ?SendOutcome {
+        defer calls += 1;
+        last_flags = flags;
+        last_iovecs = iovecs.len;
+        return if (calls < substitute.len) substitute[calls] else null;
+    }
+};
+
+const gather = [_]IoVec{
+    .{ .base = "ab", .len = 2 },
+    .{ .base = "c", .len = 1 },
+    .{ .base = "de", .len = 2 },
+};
+
+test "a UDP transport sends a gather list as one datagram without flattening it, and once on a runtime it does not block" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var b: Backend = undefined;
+    try b.init();
+    defer b.deinit();
+    var sock: Sock = undefined;
+    try sock.init();
+    defer sock.deinit();
+    const to = transport_iface.Locator.udp4(.{ 127, 0, 0, 1 }, sock.port);
+
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 46 }, test_domain.get(), null);
+    defer udp.deinit();
+    const t = udp.transport();
+    SendSpy.reset();
+    udp.test_hooks.before_send = SendSpy.hook;
+
+    // Not on a runtime: a blocking send, as on the threaded path.
+    try testing.expectEqual(SendOutcome.completed, try t.sendGather(&to, &gather));
+    try testing.expectEqual(@as(u32, 0), SendSpy.last_flags & posix.MSG.DONTWAIT);
+
+    try t.attachBackend(b.backend());
+    try testing.expectEqual(SendOutcome.completed, try t.sendGather(&to, &gather));
+    try testing.expect(SendSpy.last_flags & posix.MSG.DONTWAIT != 0);
+    // The list reached the syscall as given.
+    try testing.expectEqual(gather.len, SendSpy.last_iovecs);
+    try awaitReadable(&sock);
+    var buf: [16]u8 = undefined;
+    for (0..2) |_| {
+        const n = c.recv(sock.fd, &buf, buf.len, posix.MSG.DONTWAIT);
+        try testing.expectEqualStrings("abcde", buf[0..@intCast(n)]);
+    }
+    try testing.expectEqual(@as(u64, 0), udp.sends_would_block.load(.monotonic));
+
+    // A full send buffer: the datagram is dropped and counted, and not
+    // retried on another socket.
+    SendSpy.reset();
+    SendSpy.substitute[0] = .would_block;
+    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&to, &gather));
+    try testing.expectEqual(@as(u32, 1), SendSpy.calls);
+    try testing.expectEqual(@as(u64, 1), udp.sends_would_block.load(.monotonic));
+    // The flat send reports it as an error.
+    SendSpy.reset();
+    SendSpy.substitute[0] = .would_block;
+    try testing.expectError(error.WouldBlock, t.send(&to, "abcde"));
+    try testing.expectEqual(@as(u64, 2), udp.sends_would_block.load(.monotonic));
+}
+
+fn ignoreReceive(_: *anyopaque, _: []const u8, _: transport_iface.Locator, _: transport_iface.Channel) void {}
+
+test "a multicast datagram that would block on one interface is not reported sent, though the others carried it" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var b: Backend = undefined;
+    try b.init();
+    defer b.deinit();
+    const udp = try UdpTransport.init(alloc, .{ .participant_id = 47 }, test_domain.get(), null);
+    defer udp.deinit();
+    const t = udp.transport();
+    try t.attachBackend(b.backend());
+
+    var ctx: u8 = 0;
+    const handler: transport_iface.ReceiveHandler = .{ .ctx = &ctx, .on_receive = ignoreReceive };
+    const port: u16 = @intCast(7400 + 250 * test_domain.get() + 1);
+    const any = transport_iface.Locator.udp4(.{ 0, 0, 0, 0 }, port);
+    const group = transport_iface.Locator.udp4(.{ 239, 255, 0, 1 }, port);
+    try t.listen(&any, handler);
+    defer t.unlisten(&any, handler);
+    t.joinMulticast(&group) catch return error.SkipZigTest; // no multicast-capable interface
+    defer t.leaveMulticast(&group);
+    const ifaces = (udp.mc_send_ifaces.load(.acquire) orelse return error.SkipZigTest).ifaces.len;
+
+    SendSpy.reset();
+    udp.test_hooks.before_send = SendSpy.hook;
+    // Nothing goes out: every interface's send is substituted.
+    SendSpy.substitute = .{ .would_block, .completed, .completed, .completed };
+    if (ifaces > SendSpy.substitute.len) return error.SkipZigTest;
+    try testing.expectEqual(SendOutcome.would_block, try t.sendGather(&group, &gather));
+    try testing.expectEqual(@as(u32, @intCast(ifaces)), SendSpy.calls);
+    try testing.expectEqual(@as(u64, 1), udp.sends_would_block.load(.monotonic));
+}
+
+/// Substitutes `would_block` for the first `drop_limit` datagrams carrying
+/// user DATA, as a full send buffer would.
+const DataDropper = struct {
+    var dropped: u32 = 0;
+    var drop_limit: u32 = 0;
+
+    fn hook(_: *UdpTransport, iovecs: []const IoVec, _: u32) ?SendOutcome {
+        if (dropped >= drop_limit or !carriesUserData(iovecs)) return null;
+        dropped += 1;
+        return .would_block;
+    }
+
+    fn carriesUserData(iovecs: []const IoVec) bool {
+        var buf: [transport_iface.Transport.max_flattened_send]u8 = undefined;
+        var len: usize = 0;
+        for (iovecs) |iov| {
+            @memcpy(buf[len..][0..iov.len], iov.base[0..iov.len]);
+            len += iov.len;
+        }
+        const msg = buf[0..len];
+        if (msg.len < 20 or !std.mem.eql(u8, msg[0..4], "RTPS")) return false;
+        var o: usize = 20;
+        while (o + 4 <= msg.len) {
+            const id = msg[o];
+            const little = msg[o + 1] & 1 != 0;
+            const sub_len: usize = std.mem.readInt(u16, msg[o + 2 ..][0..2], if (little) .little else .big);
+            // DATA or DATA_FRAG: the writer's entity kind ends its id.
+            if ((id == 0x15 or id == 0x16) and o + 16 <= msg.len) {
+                const kind = msg[o + 15];
+                if (kind == 0x02 or kind == 0x03) return true;
+            }
+            if (sub_len == 0) break;
+            o += 4 + sub_len;
+        }
+        return false;
+    }
+};
+
+test "user data whose sends would block is repaired by the reliable protocol, and the write still succeeds" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    var b: Backend = undefined;
+    try b.init();
+    defer b.deinit();
+    var runtime = rt.Runtime.init(b.pb.clock(), b.backend(), .{ .mode = .manual });
+    defer runtime.deinit();
+
+    var pair: UdpPair = undefined;
+    try pair.init(&runtime, 48);
+    defer pair.deinit();
+    DataDropper.dropped = 0;
+    DataDropper.drop_limit = 5;
+    pair.udp[0].test_hooks.before_send = DataDropper.hook;
+
+    for (0..samples_n) |i| try pair.write(i);
+    var got: std.ArrayListUnmanaged(u8) = .empty;
+    defer got.deinit(alloc);
+    const deadline = b.now() + 10 * SEC;
+    while (got.items.len < samples_n and b.now() < deadline) {
+        _ = try runtime.drive(64, 100 * std.time.ns_per_ms);
+        try pair.takeInto(&got);
+    }
+    try expectInOrder(got.items);
+    try testing.expectEqual(@as(u32, 5), DataDropper.dropped);
+    try testing.expectEqual(@as(u64, 5), pair.udp[0].sends_would_block.load(.monotonic));
+
+    try pair.deleteParticipants();
+    while (runtime.getState() != .backend_stopped) _ = try runtime.drive(64, 0);
 }

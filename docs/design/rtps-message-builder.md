@@ -5,7 +5,7 @@
 DATA headers are ~24 bytes and trivial to generate. The expensive thing is the payload,
 which is already in the history cache. Build headers on the fly at send time.
 
-## Iovec assembly with transport-boundary flattening
+## Iovec assembly and gather-list sends
 
 The send path assembles an RTPS message as a list of `iovec` entries pointing into static
 buffers and the history cache:
@@ -21,17 +21,20 @@ iov[3] → CacheChange.data  ← direct pointer into history cache
 message builder.** The cache entry can be referenced by multiple in-flight iovec lists
 (retransmit to multiple readers at once).
 
-At the transport boundary, `sendIovecs()` copies the iovec slices into a `[65536]u8`
-stack buffer and calls `Transport.send(locator, flat_data)`. The `Transport` vtable has
-no vectored-send method. Full scatter-gather (`sendmsg()`) is a planned optimization
-once the transport vtable gains a vectored-send entry point.
+`sendIovecs()` hands the list to `Transport.sendGather(locator, iovecs)`. A transport
+with `send_gather` takes the list as is: UDP on POSIX passes it to `sendmsg()`, so the
+payload is not copied before the kernel. For a transport without it (TCP, the in-process
+transports) and for UDP on Windows, the list is copied into a `[65536]u8` stack buffer and
+sent flat. Either way a message over 65536 bytes is refused with `MessageTooLarge`. The
+outcomes are in
+[output submission](concurrency/transport-adapters.md#output-submission).
 
 ## Fragmentation (DATA_FRAG)
 
 Fragmentation happens at send time, not write time. The cache stores the complete payload.
 Each DATA_FRAG submessage is built with a header on the stack and an iovec slice into
 `CacheChange.data[offset..offset+frag_size]`. The iovec list is still assembled without
-copying; the flattening occurs at the transport call site as described above.
+copying, and is sent as described above.
 
 The reader's `StatefulReader` accumulates DATA_FRAG payloads into a reassembly buffer
 (indexed by writerSN + received-fragment bitmap). Only when all fragments arrive is a

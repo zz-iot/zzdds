@@ -206,6 +206,14 @@ Sending becomes a submission with one of the four outcomes in
 * A TCP dial is nonblocking: the connection completes on output readiness, so a dial
   never blocks the executor that requested it.
 
+**Implemented so far.** `Transport.send_gather` takes the gather list and returns
+`completed` or `would_block`, or fails (rejected); UDP on POSIX sends it with `sendmsg`,
+nonblocking once its sockets are a backend's. The caller's bytes are lent for the call
+only, so accepted-pending is not offered yet. On `would_block` the protocol does not yet
+register for output readiness: the transport counts the datagram and RTPS treats it as
+lost, which reliable endpoints repair and best-effort ones do not. Registering and
+resuming is the next step ([roadmap](../../roadmap.md)).
+
 <a id="channels-and-lifetimes"></a>
 ### Channels and lifetimes
 

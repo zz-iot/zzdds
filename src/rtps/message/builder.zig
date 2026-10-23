@@ -27,12 +27,8 @@ const RtpsDuration = @import("../../util/time.zig").RtpsDuration;
 
 // ── iovec ─────────────────────────────────────────────────────────────────────
 
-/// Minimal iovec compatible with POSIX sendmsg / writev.
-/// On Linux this matches `struct iovec` exactly.
-pub const IoVec = extern struct {
-    base: [*]const u8,
-    len: usize,
-};
+/// One piece of a message's gather list, as transports take it.
+pub const IoVec = @import("../../transport/interface.zig").IoVec;
 
 // ── Limits ────────────────────────────────────────────────────────────────────
 
