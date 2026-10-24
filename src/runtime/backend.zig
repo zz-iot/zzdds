@@ -62,7 +62,9 @@ pub const ProgressBackend = struct {
         /// `source` from now on. It stays valid until `unregister` returns.
         register: ?*const fn (ctx: *anyopaque, source: *Source) error{OutOfMemory}!void = null,
         /// Stops waiting on `source`, returning once no `service` of it is
-        /// running. Never from inside that service.
+        /// running. From inside a `service` of this backend (a source's
+        /// `service` or `writable` closing it) it returns at once, and that
+        /// service does not touch `source` again.
         unregister: ?*const fn (ctx: *anyopaque, source: *Source) void = null,
         /// Readiness backends only: runs `source.writable` once, the next
         /// time its handle can take output. `source` is registered and has

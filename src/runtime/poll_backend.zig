@@ -297,7 +297,6 @@ pub const PollBackend = struct {
 
     fn vtUnregister(ctx: *anyopaque, source: *Source) void {
         const self = of(ctx);
-        std.debug.assert(servicing != self);
         {
             self.mu.lock();
             defer self.mu.unlock();
@@ -310,6 +309,18 @@ pub const PollBackend = struct {
             }
         }
         if (self.polling.load(.seq_cst)) self.signal();
+        if (servicing == self) {
+            // This thread runs the service: once out of its list, `source`
+            // is not touched again, so its owner may free it at once.
+            for (self.service_sources.items, self.service_fds.items) |*s, *fd| {
+                if (s.* == source) {
+                    s.* = undefined;
+                    fd.revents = 0;
+                    fd.fd = -1;
+                }
+            }
+            return;
+        }
         // A service that saw `source` began before the removal: wait for it.
         // One that begins later rebuilds its list without it.
         self.service_mu.lock();

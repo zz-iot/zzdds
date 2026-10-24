@@ -222,8 +222,19 @@ fragment that would block. While a send to a reader runs with the lock released,
 else is sent to it, so a concurrent write cannot overtake it: that write's change waits in
 the history, and the send resumes the reader when it ends. A send ends for the match it
 began with: a reader removed and matched again meanwhile is a new match, which that send
-neither holds nor resumes. Protocol messages that would
-block are lost, as their content is sent again from current state.
+neither holds nor resumes. Protocol messages that would block are lost, as their content
+is sent again from current state.
+
+TCP on POSIX does the same on a backend, framing the gather list with its length prefix
+in one `sendmsg`. A frame the socket takes only part of is copied: the transport keeps
+the unwritten rest as the connection's tail and returns `completed`, so the caller's
+bytes are still lent for the call only. While a connection has a tail, a send on it is
+`would_block`, so frames never interleave; the tail is written when the socket reports
+output readiness, and then the waiters run. A dial is nonblocking: a frame sent while
+it is in progress becomes the tail, and the dial completes or fails on output readiness.
+A failed dial or write closes the connection, dropping its tail, and its waiters run so
+that their next send dials again. Waiters run when any connection that blocked drains or
+closes, so a producer may try again and find its own connection still blocked.
 
 <a id="channels-and-lifetimes"></a>
 ### Channels and lifetimes
@@ -245,7 +256,9 @@ the owner's reference until it closes the socket or connection, and `sendOnChann
 one for the send. A closed item is freed by whoever drops its last reference, and its
 slot's generation moves on before reuse, so a stale channel fails with `ChannelClosed`. A
 TCP connection whose peer hangs up is joined and freed by the next dial or accept rather
-than at transport close; under the shared runtime TCP still receives on its own threads.
+than at transport close; on a backend, by the service that reads the end of its stream,
+which unregisters it from inside that service (`PollBackend` allows this, and does not
+touch the source again).
 UDP port entries are freed by their last reference (unlisten, or a closure not yet
 delivered), and the multicast send-interface list is replaced under the lock its senders
 hold, so neither is retained either.
