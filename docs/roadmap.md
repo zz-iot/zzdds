@@ -1135,8 +1135,9 @@ loopback UDP through `drive()` alone, with no thread started by zzdds, and hoste
 service the same sockets in place of a thread per socket, and RTPS discovery runs there
 too, its announcements, lease checks and heartbeats on runtime timers. Sends take the
 builder's gather list and never block there, and a writer whose send would block resumes
-once the socket drains. Next are channel slots in place of the retained socket
-graveyards, TCP, and Windows. Outside that build, the UDP and TCP
+once the socket drains. In every build, a UDP socket or TCP connection that closes is
+freed once nothing uses it, rather than kept until its transport closes, and a channel
+naming it fails as closed. Next are TCP and Windows. Outside that build, the UDP and TCP
 transports still call their handlers from their own receive threads. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative

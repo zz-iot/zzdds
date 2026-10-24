@@ -806,14 +806,14 @@ test "tcp transport: connectionGeneration increments on reconnect, not on ordina
     // that process just shut down itself can still report success.
     {
         // recvLoop starts before acceptLoop registers the connection. Receiving
-        // "again" therefore does not prove all_connections is populated yet:
+        // "again" therefore does not prove live_connections is populated yet:
         // shutting down an empty list would leave the connection alive forever.
         const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
         while (true) {
             server.conn_mu.lock();
-            if (server.all_connections.items.len != 0) {
+            if (server.live_connections.items.len != 0) {
                 defer server.conn_mu.unlock();
-                for (server.all_connections.items) |co| {
+                for (server.live_connections.items) |co| {
                     try testing.expectEqual(@as(c_int, 0), std.c.shutdown(co.fd, 2)); // SHUT_RDWR
                 }
                 break;
@@ -1028,6 +1028,149 @@ test "tcp transport: sendOnChannel returns ChannelClosed after the connection cl
     try testing.expectEqual(lifecycle.channel.generation, lifecycle.closed_channel.generation);
 
     try testing.expectError(error.ChannelClosed, st.sendOnChannel(lifecycle.channel, &lifecycle.src, "too late"));
+}
+
+/// Waits until `tr` has a connection whose recv thread exited and that the
+/// next dial or accept will reap.
+fn waitExited(tr: *TcpTransport) !void {
+    const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (true) {
+        tr.conn_mu.lock();
+        const queued = tr.exited != null;
+        tr.conn_mu.unlock();
+        if (queued) return;
+        if (time_mod.nanoTimestamp() >= deadline) return error.ConnectionNeverExited;
+        sleepMs(5);
+    }
+}
+
+test "tcp transport: accepted connections that close are freed by the next accept, and a stale channel after slot reuse fails" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    const st = server.transport();
+
+    var lifecycle = ChannelLifecycle{};
+    const port = try listenAndGetPort(st, lifecycle.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), lifecycle.handler());
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+
+    const rounds = 6;
+    var seen: [rounds]iface.Channel = undefined;
+    for (0..rounds) |i| {
+        const client = try TcpTransport.init(alloc, .{});
+        try client.transport().send(&dest, "ping");
+        lifecycle.recv_latch.waitFor(i + 1);
+        seen[i] = lifecycle.channel;
+        client.deinit();
+        lifecycle.closed_latch.waitFor(i + 1);
+        try waitExited(server);
+    }
+
+    // Each accept reaped the connection before it, so two slots served
+    // every round, and only the last connection is left.
+    try testing.expectEqual(@as(usize, 2), server.channels.slotCount());
+    try testing.expectEqual(@as(usize, 1), server.channels.liveCount());
+    try testing.expectEqual(seen[0].token, seen[2].token);
+    try testing.expect(seen[0].generation != seen[2].generation);
+    for (seen) |ch| {
+        try testing.expectError(error.ChannelClosed, st.sendOnChannel(ch, &lifecycle.src, "stale"));
+    }
+}
+
+test "tcp transport: dialed connections that close are freed by the next dial" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    const st = server.transport();
+
+    var latch = Latch{};
+    var counter = LatchCounter{ .latch = &latch };
+    const port = try listenAndGetPort(st, counter.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), counter.handler());
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+
+    const client = try TcpTransport.init(alloc, .{});
+    defer client.deinit();
+    const ct = client.transport();
+
+    for (0..5) |i| {
+        try ct.send(&dest, "ping");
+        latch.waitFor(i + 1);
+        // The server hangs up; the client's recv thread sees it and exits.
+        // The server's recv thread delivers before its accept registers the
+        // connection, so wait for it to appear.
+        const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+        while (true) {
+            var hung_up = false;
+            {
+                server.conn_mu.lock();
+                defer server.conn_mu.unlock();
+                for (server.live_connections.items) |co| {
+                    co.send_mu.lock();
+                    defer co.send_mu.unlock();
+                    if (co.fd_open.load(.acquire)) {
+                        _ = std.c.shutdown(co.fd, 2); // SHUT_RDWR
+                        hung_up = true;
+                    }
+                }
+            }
+            if (hung_up) break;
+            if (time_mod.nanoTimestamp() >= deadline) return error.AcceptRegistrationNeverObserved;
+            sleepMs(5);
+        }
+        try waitExited(client);
+    }
+
+    // Each dial reaped the connection before it ahead of taking a slot, so
+    // one slot served every round, and only the last connection is left.
+    try testing.expectEqual(@as(usize, 1), client.channels.slotCount());
+    try testing.expectEqual(@as(usize, 1), client.channels.liveCount());
+}
+
+test "tcp transport: a dialed connection whose recv thread exits before it is registered is still freed by the next dial" {
+    const alloc = testing.allocator;
+
+    const server = try TcpTransport.init(alloc, .{ .bind_address = "127.0.0.1" });
+    defer server.deinit();
+    const st = server.transport();
+
+    var latch = Latch{};
+    var counter = LatchCounter{ .latch = &latch };
+    const port = try listenAndGetPort(st, counter.handler(), alloc);
+    defer st.unlisten(&Locator.tcp4(.{ 127, 0, 0, 1 }, port), counter.handler());
+    const dest = Locator.tcp4(.{ 127, 0, 0, 1 }, port);
+
+    const client = try TcpTransport.init(alloc, .{});
+    defer client.deinit();
+
+    const Hook = struct {
+        var exited = false;
+        // The first dial's connection fails before the dial registers it,
+        // and its recv thread exits.
+        fn f(tr: *TcpTransport, conn: *tcp_mod.TcpConnection) void {
+            tr.test_hooks.before_register = null;
+            _ = std.c.shutdown(conn.fd, 2); // SHUT_RDWR
+            const deadline = time_mod.nanoTimestamp() + 5 * std.time.ns_per_s;
+            while (time_mod.nanoTimestamp() < deadline) {
+                tr.conn_mu.lock();
+                exited = conn.exited;
+                tr.conn_mu.unlock();
+                if (exited) return;
+                sleepMs(1);
+            }
+        }
+    };
+    client.test_hooks.before_register = Hook.f;
+
+    // The send finds that connection closed and dials again; that dial reaps
+    // the first connection, which is freed once the send releases it.
+    try client.transport().send(&dest, "ping");
+    latch.waitFor(1);
+    try testing.expect(Hook.exited);
+    try testing.expectEqual(@as(usize, 1), client.channels.liveCount());
 }
 
 test "tcp transport: deinit fires on_channel_closed for every still-open channel" {

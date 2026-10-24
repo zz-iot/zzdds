@@ -787,7 +787,7 @@ test "a multicast datagram that would block on one interface is not reported sen
     defer t.unlisten(&any, handler);
     t.joinMulticast(&group) catch return error.SkipZigTest; // no multicast-capable interface
     defer t.leaveMulticast(&group);
-    const ifaces = (udp.mc_send_ifaces.load(.acquire) orelse return error.SkipZigTest).ifaces.len;
+    const ifaces = (udp.mc_send_ifaces orelse return error.SkipZigTest).ifaces.len;
 
     SendSpy.reset();
     udp.test_hooks.before_send = SendSpy.hook;

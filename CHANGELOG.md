@@ -66,6 +66,13 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   cleanup. Includes generated-type writer/reader acceptance fixtures and native CI;
   configuration frontends, provider libraries and XRCE integration remain follow-ons.
 
+## 2026-10-23
+
+- Free a UDP socket or TCP connection that closes once nothing uses it, rather than
+  keeping it until its transport closes, so a long-running process no longer grows with
+  interface changes or reconnecting TCP peers. A channel naming a freed socket or
+  connection still fails with `ChannelClosed`, also after its slot is reused.
+
 ## 2026-10-22
 
 - Keep a writer operation reference across typesupport validation and hashing;

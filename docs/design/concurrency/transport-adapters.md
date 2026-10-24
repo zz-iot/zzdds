@@ -239,6 +239,17 @@ block are lost, as their content is sent again from current state.
   and registers or unregisters them with the adapter. Shutdown follows
   [close and retirement](runtime.md#close-and-retirement).
 
+**Implemented so far.** UDP sockets and TCP connections take their channels from a
+`ChannelTable` (`src/transport/channel_table.zig`), in every build: the transport holds
+the owner's reference until it closes the socket or connection, and `sendOnChannel` holds
+one for the send. A closed item is freed by whoever drops its last reference, and its
+slot's generation moves on before reuse, so a stale channel fails with `ChannelClosed`. A
+TCP connection whose peer hangs up is joined and freed by the next dial or accept rather
+than at transport close; under the shared runtime TCP still receives on its own threads.
+UDP port entries are freed by their last reference (unlisten, or a closure not yet
+delivered), and the multicast send-interface list is replaced under the lock its senders
+hold, so neither is retained either.
+
 <a id="in-process-and-mcu-adapters"></a>
 ### In-process and MCU adapters
 
