@@ -56,10 +56,12 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   with a deleted endpoint they took for alive. The announcement now has its own copy, and
   one overtaken by a deletion is followed by another disposal. An endpoint also joins its
   Publisher or Subscriber before it is announced, so a matched callback raised during
-  creation gets an endpoint `lookup_datawriter`/`delete_datawriter` can find, and only the
+  creation gets an endpoint `lookup_datawriter`/`delete_datawriter` can find; if that
+  callback deletes it, creation returns nil rather than the freed endpoint. Only the
   `enable` call that enables an endpoint announces it. In-process discovery
   (`DirectDiscovery`) now keeps its own copy of the announcements it stores rather than
-  the caller's.
+  the caller's, and each announcement works from copies of the peers' endpoints, so a
+  retraction meanwhile cannot free what it is reporting.
 - **Fixed an intermittent "only 9/10 historical samples" failure in the catchup example.**
   Each subscriber counted the samples its listener had taken as soon as
   `wait_for_historical_data` returned, but that call waits for the samples to reach the

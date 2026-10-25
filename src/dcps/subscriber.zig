@@ -488,8 +488,10 @@ pub const SubscriberImpl = struct {
         // Subscriber's own current enabled state -- see publisher.zig's
         // identical DataWriter gate (PR #91 Greptile finding).
         dr.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
-        // Joins this Subscriber before it is announced; see
-        // PublisherImpl.finishDataWriter.
+        // Joins this Subscriber before it is announced, held until creation
+        // returns; see PublisherImpl.finishDataWriter.
+        _ = dr.acquireQuiesce();
+        defer dr.releaseQuiesce();
         self.mu.lock();
         self.readers.append(self.alloc, dr) catch {
             self.mu.unlock();
@@ -499,6 +501,7 @@ pub const SubscriberImpl = struct {
         };
         self.mu.unlock();
         if (dr.enabled.load(.acquire)) self.announceDataReader(subscription_handle);
+        if (dr.quiesce.tearingDown()) return nil.nil_datareader;
         return dr.toDDSDataReader();
     }
 
@@ -838,6 +841,12 @@ pub const SubscriberImpl = struct {
             r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
             if (r.status_cond) |sc| sc.notifyWakeup();
             const resolution = self.resolveDataAvailableFallback(r);
+            // Reserved before the claim, so a failed allocation leaves the
+            // status changed for a later notification instead of consumed.
+            listener_snaps.ensureUnusedCapacity(self.alloc, 1) catch {
+                resolution.release();
+                return;
+            };
             // Claimed now, while subscriber.mu keeps `r` alive: a callback
             // resets DATA_AVAILABLE before it runs (see
             // DataReaderImpl.dispatchDataAvailable), and one with nothing
@@ -846,10 +855,10 @@ pub const SubscriberImpl = struct {
                 resolution.release();
                 return;
             }
-            listener_snaps.append(self.alloc, .{
+            listener_snaps.appendAssumeCapacity(.{
                 .dr = r.toDDSDataReader(),
                 .resolution = resolution,
-            }) catch resolution.release();
+            });
         }
     }
 

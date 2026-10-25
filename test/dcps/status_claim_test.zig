@@ -627,3 +627,41 @@ test "DATA_AVAILABLE: a listener whose change was consumed does not run" {
     _ = dds.vtable.set_listener(dds.ptr, &listener, DDS.DATA_AVAILABLE_STATUS);
     try testing.expectEqual(@as(u32, 1), calls);
 }
+
+test "DATA_AVAILABLE: begin_access that cannot queue on_data_available leaves it changed" {
+    var mc = ManualClock.init(0);
+    var fx = try Fixture.init(testing.allocator, mc.clock());
+    defer fx.deinit();
+
+    // PRESENTATION must be offered as requested for the pair to match.
+    var pub_qos = DDS.PublisherQos{};
+    pub_qos.presentation.coherent_access = true;
+    const pub_ = fx.dp_w.create_publisher(pub_qos, null, 0);
+    const dw: *DataWriterImpl = @ptrCast(@alignCast(pub_.create_datawriter(fx.topic_w, .{}, null, 0).ptr));
+    var sub_qos = DDS.SubscriberQos{};
+    sub_qos.presentation.coherent_access = true;
+    const sub = fx.dp_r.create_subscriber(sub_qos, null, 0);
+    var calls: u32 = 0;
+    const listener = DDS.DataReaderListener{ .listener_data = &calls, .on_data_available = countDataAvailable };
+    const td = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
+    // Hidden while the sample arrives, so only begin_access raises it.
+    const dds_dr = sub.create_datareader(td, keepAllReaderQos(), listener, 0);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dds_dr.ptr));
+    try write(dw);
+    try testing.expectEqual(@as(u32, 0), calls);
+    @atomicStore(DDS.StatusMask, &dr.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
+
+    // The Subscriber cannot allocate the callback's entry.
+    const impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(sub.ptr));
+    const saved = impl.alloc;
+    impl.alloc = testing.failing_allocator;
+    _ = sub.begin_access();
+    impl.alloc = saved;
+    try testing.expectEqual(@as(u32, 0), calls);
+    try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0);
+
+    // So a later notification still runs it.
+    _ = sub.notify_datareaders();
+    try testing.expectEqual(@as(u32, 1), calls);
+    _ = sub.end_access();
+}

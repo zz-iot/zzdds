@@ -281,3 +281,47 @@ test "a writer is in its Publisher when its announcement's matches are reported"
     try testing.expectEqual(@as(u32, 1), Probe.calls);
     try testing.expect(Probe.found);
 }
+
+test "a writer its announcement's match callback deletes is not returned by create_datawriter" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    _ = fx.sub_b.create_datareader(topicDesc(fx.topic_b), .{}, null, 0);
+
+    const Probe = struct {
+        var publisher: DDS.Publisher = undefined;
+        var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+        fn onMatched(_: *anyopaque, _: *const DDS.PublicationMatchedStatus, _: ?*anyopaque) callconv(.c) void {
+            rc = publisher.delete_datawriter(publisher.lookup_datawriter(TOPIC));
+        }
+    };
+    const pub_ = fx.dp_a.create_publisher(.{}, null, 0);
+    Probe.publisher = pub_;
+    Probe.rc = DDS.RETCODE_ERROR;
+    const dw = pub_.create_datawriter(fx.topic_a, .{}, .{ .on_publication_matched = Probe.onMatched }, DDS.PUBLICATION_MATCHED_STATUS);
+    try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
+    try testing.expect(dw.ptr == zzdds.dcps.NIL_PTR);
+}
+
+test "a reader its announcement's match callback deletes is not returned by create_datareader" {
+    var rec: Recorder = undefined;
+    var fx = try Fixture.init(testing.allocator, &rec);
+    defer fx.deinit();
+
+    _ = fx.pub_b.create_datawriter(fx.topic_b, .{}, null, 0);
+
+    const Probe = struct {
+        var subscriber: DDS.Subscriber = undefined;
+        var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+        fn onMatched(_: *anyopaque, _: *const DDS.SubscriptionMatchedStatus, _: ?*anyopaque) callconv(.c) void {
+            rc = subscriber.delete_datareader(subscriber.lookup_datareader(TOPIC));
+        }
+    };
+    const sub = fx.dp_a.create_subscriber(.{}, null, 0);
+    Probe.subscriber = sub;
+    Probe.rc = DDS.RETCODE_ERROR;
+    const dr = sub.create_datareader(topicDesc(fx.topic_a), .{}, .{ .on_subscription_matched = Probe.onMatched }, DDS.SUBSCRIPTION_MATCHED_STATUS);
+    try testing.expectEqual(DDS.RETCODE_OK, Probe.rc);
+    try testing.expect(dr.ptr == zzdds.dcps.NIL_PTR);
+}

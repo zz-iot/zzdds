@@ -109,6 +109,12 @@ pub const EntityQuiesce = struct {
         if (prev & count_mask == 1) on_last(ctx);
     }
 
+    /// Whether `beginTeardown()` has run. Only meaningful to a caller holding
+    /// a reference, which keeps the entity from being freed meanwhile.
+    pub fn tearingDown(self: *const EntityQuiesce) bool {
+        return self.state.load(.acquire) & tearing_down_bit != 0;
+    }
+
     /// Call once, from `deinit()`: marks the entity as no longer accepting
     /// new acquires, then drops its own "alive" reference exactly like
     /// `release()` would. The flag-set and the refcount-drop are still two
