@@ -18,7 +18,9 @@ def main():
     parser.add_argument("--zidl", type=Path, help="Optional development checkout override")
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--optimize", choices=("Debug", "ReleaseSafe"), default="Debug")
-    parser.add_argument("--domain", type=int, default=187)
+    # Below 102: its ports (7400 + 250*domain up) stay below the OS ephemeral
+    # ranges (Linux from 32768, Windows and macOS from 49152).
+    parser.add_argument("--domain", type=int, default=98)
     args = parser.parse_args()
     if not 0 <= args.domain <= 232:
         parser.error("expected UDP domain 0..232")

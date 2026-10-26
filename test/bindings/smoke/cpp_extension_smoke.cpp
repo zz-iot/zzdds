@@ -77,7 +77,7 @@ bool wait_until(Pred pred) {
 
 int main() {
     const char *base = std::getenv("ZZDDS_TEST_DOMAIN_BASE");
-    const ::DDS::DomainId_t domain = base ? std::atoi(base) : 230;
+    const ::DDS::DomainId_t domain = base ? std::atoi(base) : 100;
 
     auto factory = zzdds::create_factory();
     CHECK(factory);

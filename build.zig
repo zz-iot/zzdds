@@ -13,9 +13,12 @@ const zzdds_version = @import("build.zig.zon").version;
 /// participant-creating ones would otherwise all bind domain-0 RTPS ports
 /// (SPDP multicast 7400, …) and race for them — a real CI flake, worst on the
 /// slow ARM64 / DebugAllocator / TSan lanes. `next` is a per-lane counter
-/// (each `zig build <step>` runs one lane's binaries at once); domains stay in
-/// `1..232` (`7400 + 250*domain < 65536`). See `test/support/domain.zig`.
+/// (each `zig build <step>` runs one lane's binaries at once). Domains stay
+/// below 102: their ports (`7400 + 250*domain` up) then stay below the OS
+/// ephemeral ranges (Linux from 32768, Windows and macOS from 49152), where
+/// any socket on the machine can take one first. See `test/support/domain.zig`.
 fn addTestRun(b: *std.Build, t: *std.Build.Step.Compile, next: *u32) *std.Build.Step.Run {
+    if (next.* > 101) @panic("addTestRun: out of test domains below 102");
     const r = b.addRunArtifact(t);
     r.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", b.fmt("{d}", .{next.*}));
     next.* += 1;
@@ -967,8 +970,11 @@ pub fn build(b: *std.Build) void {
             const cpp_ext_smoke_run = b.addRunArtifact(cpp_ext_smoke);
             // Own domain: binding smoke binaries run in parallel with each other
             // (the Java smoke uses domain 0) and with `zig build test` lanes,
-            // whose addTestRun domains count up from 1.
-            cpp_ext_smoke_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "230");
+            // whose addTestRun domains count up from 1. Its ports (7400 +
+            // 250*100 = 32400 up) stay below the OS ephemeral ranges (Linux
+            // from 32768, Windows from 49152): a port in that range can be
+            // taken by any socket on the machine first.
+            cpp_ext_smoke_run.setEnvironmentVariable("ZZDDS_TEST_DOMAIN_BASE", "100");
             binding_smoke_step.dependOn(&cpp_ext_smoke_run.step);
         }
 

@@ -50,7 +50,7 @@ def main() -> int:
     ap.add_argument("--samples", type=int, default=400)
     ap.add_argument("--large", action="store_true")
     ap.add_argument("--churn", action="store_true")
-    ap.add_argument("--domain", type=int, default=0, help="0 = pick a random high domain")
+    ap.add_argument("--domain", type=int, default=0, help="0 = pick a random domain")
     ap.add_argument("--timeout", type=int, default=120, help="per-process wall-clock ceiling (s)")
     ap.add_argument("--teardown-hard-limit-ms", type=int, default=15000)
     ap.add_argument("--seed", type=int, default=0)
@@ -59,8 +59,10 @@ def main() -> int:
     binary = build()
     seed = args.seed or random.randrange(1, 2**31)
     rng = random.Random(seed)
-    # 1..232 keeps every derived RTPS port < 65536; steer clear of 0.
-    domain = args.domain or rng.randint(2, 230)
+    # Clear of 0 and of the `zig build test` lanes' 1..36, and below 102:
+    # its ports (7400 + 250*domain up) then stay below the OS ephemeral
+    # ranges (Linux from 32768, Windows and macOS from 49152).
+    domain = args.domain or rng.randint(37, 101)
     logdir = _common.mktemp_logdir("elc-stress-run")
     print(f"domain={domain} seed={seed} pubs={args.publishers} subs={args.subscribers} "
           f"samples={args.samples} large={args.large} churn={args.churn} logs={logdir}")

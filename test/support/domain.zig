@@ -20,8 +20,11 @@
 const std = @import("std");
 
 /// Fallback for invocations with no `ZZDDS_TEST_DOMAIN_BASE` (a direct
-/// `zig test <file>` rather than `zig build test`).
-pub const FALLBACK: u32 = 199;
+/// `zig test <file>` rather than `zig build test`). Below 102, as every test
+/// domain should be: its ports (`7400 + 250*domain` up) then stay below the
+/// OS ephemeral ranges (Linux from 32768, Windows and macOS from 49152),
+/// where any socket on the machine can take one first.
+pub const FALLBACK: u32 = 99;
 
 /// Upper bound: `7400 + 250*domain` must stay below 65536, so `domain < 233`.
 const MAX_DOMAIN: u32 = 232;
