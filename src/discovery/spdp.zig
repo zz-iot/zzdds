@@ -144,13 +144,21 @@ pub const SpdpEndpoints = struct {
     // Wire trace (zero-size when disabled).
     tracer: trace.Tracer,
 
-    // SEDP callback: called when a participant is (re-)discovered,
-    // so SEDP can wire up the RTPS proxies.
+    // SEDP callbacks: called when a participant is (re-)discovered, so SEDP
+    // can wire up the RTPS proxies, and when it is lost, so SEDP can drop them.
     on_participant_discovered_sedp: ?*const fn (
         ctx: *anyopaque,
         data: *const ParticipantData,
     ) void,
+    on_participant_lost_sedp: ?*const fn (ctx: *anyopaque, prefix: GuidPrefix) void,
     sedp_ctx: ?*anyopaque,
+
+    // Held from a participant's addition to or removal from `known` until
+    // the callbacks reporting it have returned, so those reports reach
+    // DCPS and SEDP in the order the changes happened: a loss reported
+    // after the rediscovery that followed it would undo the rediscovery's
+    // matches. Taken before `mu`.
+    lifecycle_mu: Mutex,
 
     // Fast-announce: when a new participant is discovered, halve the announcement
     // period for 2× the normal period instead of blasting an immediate unicast
@@ -201,7 +209,9 @@ pub const SpdpEndpoints = struct {
             .clock = time_mod.monotonicClock(),
             .tracer = trace.Tracer.noop(),
             .on_participant_discovered_sedp = null,
+            .on_participant_lost_sedp = null,
             .sedp_ctx = null,
+            .lifecycle_mu = .{},
             .fast_announce_until_ns = std.atomic.Value(i64).init(0),
             .begin_probe_fn = null,
             .begin_probe_ctx = null,
@@ -244,10 +254,19 @@ pub const SpdpEndpoints = struct {
     pub fn setSedp(
         self: *Self,
         ctx: *anyopaque,
-        cb: *const fn (*anyopaque, *const ParticipantData) void,
+        discovered: *const fn (*anyopaque, *const ParticipantData) void,
+        lost: *const fn (*anyopaque, GuidPrefix) void,
     ) void {
-        self.on_participant_discovered_sedp = cb;
+        self.on_participant_discovered_sedp = discovered;
+        self.on_participant_lost_sedp = lost;
         self.sedp_ctx = ctx;
+    }
+
+    /// With lifecycle_mu held: reports a participant removed from `known`.
+    /// SEDP first, so no more of its endpoints are delivered, then DCPS.
+    fn notifyLostLocked(self: *Self, guid: Guid) void {
+        if (self.on_participant_lost_sedp) |cb| cb(self.sedp_ctx.?, guid.prefix);
+        if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, guid);
     }
 
     /// Wire the SEDP liveness-probe initiator.  When SPDP detects announcement
@@ -267,6 +286,9 @@ pub const SpdpEndpoints = struct {
     ///   alive=false → evict the participant and fire on_participant_lost.
     pub fn onProbeResult(ctx: *anyopaque, prefix: GuidPrefix, alive: bool) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // Only a failed probe can remove the participant.
+        if (!alive) self.lifecycle_mu.lock();
+        defer if (!alive) self.lifecycle_mu.unlock();
         self.mu.lock();
         const kp_ptr = self.known.getPtr(prefix) orelse {
             self.mu.unlock();
@@ -289,7 +311,7 @@ pub const SpdpEndpoints = struct {
             self.mu.unlock();
             const guid = kp.value.data.guid;
             kp.value.deinit();
-            if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, guid);
+            self.notifyLostLocked(guid);
         }
     }
 
@@ -477,15 +499,7 @@ pub const SpdpEndpoints = struct {
                         break :blk false;
                     };
                     if (is_bye) {
-                        // Participant is leaving — remove and notify.
-                        self.mu.lock();
-                        const kp_opt = self.known.fetchRemove(src_prefix);
-                        self.mu.unlock();
-                        if (kp_opt) |kp| {
-                            var kp2 = kp;
-                            if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, kp2.value.data.guid);
-                            kp2.value.deinit();
-                        }
+                        removePeer(self, src_prefix);
                         continue;
                     }
                     const payload = d.serialized_payload;
@@ -514,12 +528,14 @@ pub const SpdpEndpoints = struct {
     /// Removes the participant from the known map and fires on_participant_lost.
     pub fn removePeer(ctx: *anyopaque, prefix: GuidPrefix) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         self.mu.lock();
         const kp_opt = self.known.fetchRemove(prefix);
         self.mu.unlock();
         if (kp_opt) |kp| {
             var kp2 = kp;
-            if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, kp2.value.data.guid);
+            self.notifyLostLocked(kp2.value.data.guid);
             kp2.value.deinit();
         }
     }
@@ -562,8 +578,8 @@ pub const SpdpEndpoints = struct {
 
         // was_probing: true when a re-announcement arrives while a liveness probe is
         // in flight for this participant.  We must cancel the SEDP probe deadline
-        // after releasing spdp.mu so that checkProbeDeadlines does not evict the
-        // SEDP reader proxy for a participant that is demonstrably alive.
+        // after releasing spdp.mu so that checkProbeDeadlines does not report a
+        // participant that is demonstrably alive as failing its probe.
         // (Calling begin_probe_fn acquires writer.mu; spdp.mu must not be held.)
         //
         // Implementation note: discovery callbacks (on_participant_discovered, SEDP
@@ -582,6 +598,8 @@ pub const SpdpEndpoints = struct {
         // was_probing/begin_probe_fn — no network I/O while holding self.mu).
         var retransmit_locators: []Locator = &.{};
         {
+            self.lifecycle_mu.lock();
+            defer self.lifecycle_mu.unlock();
             self.mu.lock();
             defer self.mu.unlock();
 
@@ -793,6 +811,8 @@ pub const SpdpEndpoints = struct {
         var evict_guids: std.ArrayListUnmanaged(Guid) = .empty;
         defer evict_guids.deinit(self.alloc);
 
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
         self.mu.lock();
 
         var it = self.known.iterator();
@@ -828,11 +848,10 @@ pub const SpdpEndpoints = struct {
 
         self.mu.unlock();
 
-        // Fire eviction callbacks outside the lock to avoid spdp.mu → participant.mu
-        // → writer.mu → spdp.mu inversion with the probe result path.
-        for (evict_guids.items) |guid| {
-            if (self.callbacks) |cbs| cbs.on_participant_lost(cbs.ctx, guid);
-        }
+        // Fire eviction callbacks outside `mu` (lifecycle_mu stays held) to avoid
+        // spdp.mu → participant.mu → writer.mu → spdp.mu inversion with the probe
+        // result path.
+        for (evict_guids.items) |guid| self.notifyLostLocked(guid);
 
         // Start probes outside the lock: beginProbe acquires SEDP writer locks,
         // and the probe result callback acquires spdp.mu — holding it here would

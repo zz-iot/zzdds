@@ -8,6 +8,23 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-26
+
+- Recover endpoint discovery after a participant is lost and rediscovered. A
+  lost participant's SEDP and WLP built-in proxies are now dropped with it, so
+  its endpoint announcements are delivered again when it returns; before, they
+  counted as already received and its endpoints stayed unmatched.
+- A liveness probe that times out no longer drops the peer's SEDP built-in
+  proxy itself: SPDP decides whether the participant is lost. A peer that
+  re-announced meanwhile kept its participant but lost that proxy, so endpoints
+  created later on this side never reached it.
+- Report each participant's discovery and loss to DCPS and SEDP in the order
+  they happened, so a loss reported late cannot undo the rediscovery after it.
+- A reader's ACKNACK count no longer restarts when a writer is matched again.
+  A writer ignores counts no higher than the last one it acted on, so after a
+  rematch that only this side saw, the writer ignored the reader until its
+  count climbed back past the old one, which could take hours.
+
 ## 2026-10-22
 
 - Keep a writer operation reference across typesupport validation and hashing;

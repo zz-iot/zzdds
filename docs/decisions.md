@@ -367,8 +367,18 @@ timeout is too slow. The probe design: SPDP tracks inter-announcement intervals 
 EMA (`observed_interval_ns`); silence ≥ `min(3 × observed_interval, 5s)` triggers a
 directed non-final HEARTBEAT to the peer's SEDP reader proxies via the SEDP reliable
 channel. An ACKNACK within the probe deadline (~1s) confirms liveness; no response
-triggers eviction and `on_participant_lost`. Lock ordering: `spdp.mu` → `writer.mu`
-(sequentially, never nested); probe callbacks are fired after releasing `writer.mu`.
+triggers eviction and `on_participant_lost`. The SEDP writer only reports the timeout:
+SPDP evicts the participant if the probe is still outstanding, so a re-announcement that
+answered it first keeps both the participant and its proxies. Losing a participant, by
+probe, lease expiry or BYE, drops its SEDP and WLP built-in proxies too, so a rediscovery
+matches them afresh and its endpoints are announced again. A peer that did not lose this
+side keeps its record of the last ACKNACK count it acted on, so a reader's ACKNACK count is
+one counter for the whole reader, as a writer's HEARTBEAT count is, and does not restart
+when a writer is matched again. Lock ordering:
+`spdp.lifecycle_mu` → `spdp.mu` → `writer.mu`; `lifecycle_mu` is held from a participant's
+addition to or removal from the known set until the callbacks reporting it return, so
+DCPS and SEDP see discoveries and losses in order. Probe callbacks are fired after
+releasing `writer.mu`.
 
 ---
 

@@ -39,16 +39,16 @@ python3 examples/zig/typesupport-library/smoke_test.py
 The smoke check rejects a missing library and runs publisher/subscriber as separate
 processes over UDP, with bounded readiness/reception/acknowledgment waits. It
 requires Python 3 and permission to open DDS UDP sockets. No external DDS package
-is needed for this check. Use `--domain 190` to choose an unused domain; keep other
+is needed for this check. Use `--domain 97` to choose an unused domain; keep other
 applications off the example topics in that domain.
 
 For manual execution, start these in separate terminals:
 
 ```sh
 zig-out/bin/typesupport-demo sub \
-  "$PWD/zig-out/lib/libdemo_sensors.so" "$PWD/zig-out/lib/libdemo_control.so" 187
+  "$PWD/zig-out/lib/libdemo_sensors.so" "$PWD/zig-out/lib/libdemo_control.so" 98
 zig-out/bin/typesupport-demo pub \
-  "$PWD/zig-out/lib/libdemo_sensors.so" "$PWD/zig-out/lib/libdemo_control.so" 187
+  "$PWD/zig-out/lib/libdemo_sensors.so" "$PWD/zig-out/lib/libdemo_control.so" 98
 ```
 
 Library paths may point to separately built artifacts. The example build generates

@@ -28,11 +28,11 @@ pub const ParticipantAnnouncement = iface.ParticipantAnnouncement;
 pub const WriterAnnouncement = iface.WriterAnnouncement;
 pub const ReaderAnnouncement = iface.ReaderAnnouncement;
 
-/// Fans a single SPDP "participant discovered" notification out to both SEDP
-/// and WLP. SpdpEndpoints only supports one downstream listener (a single
-/// `sedp_ctx`/fn slot, see spdp.zig's setSedp) -- this shim lets that one
-/// slot reach two builtin-endpoint modules instead of hand-modifying SPDP
-/// itself for a second listener.
+/// Fans a single SPDP "participant discovered" or "participant lost"
+/// notification out to both SEDP and WLP. SpdpEndpoints only supports one
+/// downstream listener (a single `sedp_ctx` slot, see spdp.zig's setSedp) --
+/// this shim lets that one slot reach two builtin-endpoint modules instead
+/// of hand-modifying SPDP itself for a second listener.
 const DiscoveredFanout = struct {
     sedp: *sedp.SedpEndpoints,
     wlp: *wlp_mod.WlpEndpoints,
@@ -41,6 +41,12 @@ const DiscoveredFanout = struct {
         const self: *DiscoveredFanout = @ptrCast(@alignCast(ctx));
         sedp.SedpEndpoints.onParticipantDiscovered(self.sedp, data);
         wlp_mod.WlpEndpoints.onParticipantDiscovered(self.wlp, data);
+    }
+
+    fn onParticipantLost(ctx: *anyopaque, prefix: iface.GuidPrefix) void {
+        const self: *DiscoveredFanout = @ptrCast(@alignCast(ctx));
+        sedp.SedpEndpoints.onParticipantLost(self.sedp, prefix);
+        wlp_mod.WlpEndpoints.onParticipantLost(self.wlp, prefix);
     }
 };
 
@@ -85,8 +91,9 @@ pub const SpdpSedpDiscovery = struct {
         };
 
         // Wire SPDP → SEDP+WLP fanout: on each participant discovery event,
-        // both create proxy state machines so they can exchange traffic.
-        sp.setSedp(&self.disc_fanout, DiscoveredFanout.onParticipantDiscovered);
+        // both create proxy state machines so they can exchange traffic, and
+        // on each loss both drop them.
+        sp.setSedp(&self.disc_fanout, DiscoveredFanout.onParticipantDiscovered, DiscoveredFanout.onParticipantLost);
 
         // WLP shares SEDP's metatraffic unicast listener rather than opening
         // a second one on the same port (see sedp.zig's setWlpDispatch).

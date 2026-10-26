@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     if (!std.mem.eql(u8, mode, "inspect") and !std.mem.eql(u8, mode, "pub") and !std.mem.eql(u8, mode, "sub")) return error.ExpectedInspectPubOrSub;
     const sensors = args.next() orelse return error.ExpectedSensorsLibraryPath;
     const control = args.next() orelse return error.ExpectedControlLibraryPath;
-    const domain = if (args.next()) |s| try std.fmt.parseInt(u32, s, 10) else 187;
+    const domain = if (args.next()) |s| try std.fmt.parseInt(u32, s, 10) else 98;
     if (domain > 232) return error.ExpectedUdpDomainZeroThrough232;
     if (args.next() != null) return error.UnexpectedArgument;
     var libraries = try ts.Manager.init(init.gpa, 4);

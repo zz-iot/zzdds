@@ -127,6 +127,18 @@ pub const BuiltinPair = struct {
         }
     }
 
+    /// Undo matchRemote for a remote participant that has been lost. Its
+    /// proxies go with everything they recorded (what our reader received
+    /// from it, what it acknowledged of our writer), so a rediscovery
+    /// matches afresh: our writer replays its history to it, and our reader
+    /// asks it for everything again. Kept instead, the reader's record would
+    /// count the peer's announcements as already received, and they would
+    /// never be delivered again.
+    pub fn unmatchRemote(self: *Self, prefix: GuidPrefix) void {
+        if (self.reader) |r| r.removeMatchedWriter(.{ .prefix = prefix, .entity_id = self.writer_entity_id });
+        if (self.writer) |w| w.removeMatchedReader(.{ .prefix = prefix, .entity_id = self.reader_entity_id });
+    }
+
     /// Route one already-parsed submessage to this pair if its writer/reader
     /// entity ID matches; returns true if handled (caller should stop trying
     /// other pairs). Only covers the plain alive-data/heartbeat/gap/acknack
