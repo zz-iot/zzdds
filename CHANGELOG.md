@@ -24,6 +24,10 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   A writer ignores counts no higher than the last one it acted on, so after a
   rematch that only this side saw, the writer ignored the reader until its
   count climbed back past the old one, which could take hours.
+- Add opt-in experimental programmatic resource plans and whole-graph construction
+  with static type bindings, bounded validation, reentrant cancellation and retryable
+  cleanup. Includes generated-type writer/reader acceptance fixtures and native CI;
+  configuration frontends, provider libraries and XRCE integration remain follow-ons.
 
 ## 2026-10-22
 

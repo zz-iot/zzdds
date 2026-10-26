@@ -1,0 +1,4 @@
+// Static type for the programmatic resource-construction acceptance fixture.
+struct Probe {
+    unsigned long value;
+};

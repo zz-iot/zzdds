@@ -368,6 +368,8 @@ pub fn build(b: *std.Build) void {
         break :blk .{ .cwd_relative = path };
     } else zidl_dep.path("packages/zidl-typesupport");
     build_options.addOption(bool, "typesupport_library", typesupport_enabled);
+    const resources_enabled = b.option(bool, "resource-construction", "Enable experimental programmatic DDS resource construction") orelse false;
+    build_options.addOption(bool, "resource_construction", resources_enabled);
     const typesupport_dynamic = b.option(bool, "typesupport-dynamic", "Include OS dynamic loading (disable for static providers only)") orelse true;
     build_options.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
     const typesupport_mod = if (typesupport_enabled)
@@ -1730,6 +1732,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/discovery_race_test.zig",
     };
     var dcps_test_domain: u32 = 1;
+    const resource_test_step = b.step("test-resource-construction", "Test programmatic resource resolution and construction (requires -Dresource-construction=true)");
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -1751,6 +1754,47 @@ pub fn build(b: *std.Build) void {
         emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
+    }
+
+    if (resources_enabled) {
+        const gen_probe = b.addRunArtifact(zidl_exe);
+        gen_probe.addArgs(&.{ "-b", "zig", "--generate-zzdds-wrappers", "-o" });
+        const probe_dir = gen_probe.addOutputDirectoryArg("resource-probe");
+        gen_probe.addFileArg(b.path("test/resources/resource_probe.idl"));
+        const probe_mod = b.createModule(.{
+            .root_source_file = probe_dir.path(b, "resource_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .imports = &.{
+                .{ .name = "zzdds", .module = zzdds_mod },
+                .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            },
+        });
+        const t = b.addTest(.{
+            .name = "resource_construction_test",
+            .use_llvm = if (sanitize_thread) true else null,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/dcps/resource_construction_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                    .{ .name = "test_domain", .module = test_domain_mod },
+                    .{ .name = "resource_probe", .module = probe_mod },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        const run = addTestRun(b, t, &dcps_test_domain);
+        resource_test_step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
+    } else {
+        resource_test_step.dependOn(&b.addFail("Pass -Dresource-construction=true to run resource construction tests").step);
     }
 
     // `zig build emit-tests-llvm` — like emit-tests above, but every binary
