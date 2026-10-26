@@ -835,16 +835,27 @@ test "SEDP: a peer lost and rediscovered on one side has its endpoints delivered
     try testing.expectEqual(@as(usize, 1), local.rec.readers_found.items.len);
     try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
 
+    // A long session: local has sent many ACKNACKs, and the peer last
+    // retransmitted for one with a high count. The peer ignores counts no
+    // higher than that one.
+    const local_reader = local.sedp.sub_reader.?;
+    local_reader.ack_count += 100_000;
+    remote.sedp.sub_writer.?.sendHeartbeat(false, false);
+    net.deliverAll();
+    const peer_writer = remote.sedp.sub_writer.?;
+    try testing.expectEqual(@as(usize, 1), peer_writer.reader_proxies.items.len);
+    peer_writer.reader_proxies.items[0].last_ack_nack_count = local_reader.ack_count;
+
     // Only local loses the peer, as when its lease runs out on one side.
     SedpEndpoints.onParticipantLost(local.sedp, prefix(0x1C));
     local.discoverPeer(0x1C);
 
     // The peer kept its proxies, so its periodic heartbeat (fired here by
-    // hand) is what tells local to ask for its announcements again. A few
-    // rounds: local's re-created proxy restarts its ACKNACK count, and the
-    // peer ignores counts no higher than the last one it retransmitted for.
+    // hand) is what tells local to ask for its announcements again.
+    // Local's next ACKNACK counts on from that session's, so the peer acts
+    // on it.
     var round: usize = 0;
-    while (local.rec.readers_found.items.len < 2 and round < 10) : (round += 1) {
+    while (local.rec.readers_found.items.len < 2 and round < 2) : (round += 1) {
         remote.sedp.sub_writer.?.sendHeartbeat(false, false);
         net.deliverAll();
         net.deliverAll();

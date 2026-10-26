@@ -132,8 +132,6 @@ pub const WriterProxy = struct {
     /// Out-of-order changes held for RELIABLE readers pending in-order delivery.
     /// Each entry owns its `data` slice; freed on deinit or on delivery.
     pending_changes: std.ArrayListUnmanaged(CacheChange),
-    /// Monotonically increasing count for ACKNACK submessages.
-    ack_count: i32,
     /// Last accepted heartbeat count for duplicate suppression (§8.3.5.10).
     /// Null until the first heartbeat from this writer is accepted.
     last_hb_count: ?i32,
@@ -187,7 +185,6 @@ pub const WriterProxy = struct {
             .selected_locators = .empty,
             .received = .empty,
             .pending_changes = .empty,
-            .ack_count = 0,
             .last_hb_count = null,
             .last_hb_frag_count = null,
             .reassembly = .empty,
@@ -289,6 +286,14 @@ pub const StatefulReader = struct {
     /// delivered only when the sequence is contiguous (RTPS §8.4.8 RELIABLE semantics).
     /// When false, changes are delivered immediately on arrival (BEST_EFFORT).
     reliable: bool,
+    /// Monotonically increasing count for ACKNACK / NACK_FRAG submessages,
+    /// shared by every writer this reader sends them to, as hb_count is in
+    /// StatefulWriter. A writer drops counts no higher than the last it
+    /// acted on from this reader, and keeps that record when only this
+    /// side unmatches it: a count kept per WriterProxy would restart on
+    /// rematch, and the writer would ignore this reader until it climbed
+    /// back past the old one. Wraps: writers compare counts modulo 2^32.
+    ack_count: i32 = 0,
     /// Sticky: true once any writer has ever matched, never reset back to
     /// false on unmatch. See hasMatchedWriters()'s own doc comment for why
     /// this needs to be "ever", not "currently".
@@ -408,7 +413,7 @@ pub const StatefulReader = struct {
     ///
     /// Re-announcements from an already-matched writer act as lease refreshes:
     /// locators and metadata are updated but the received set, pending_changes,
-    /// ack_count, last_hb_count, and reassembly state are preserved.  This prevents
+    /// last_hb_count, and reassembly state are preserved.  This prevents
     /// spurious retransmit bursts caused by re-discovery (e.g. dual network interfaces
     /// presenting the same participant twice).
     ///
@@ -768,11 +773,11 @@ pub const StatefulReader = struct {
 
         if (first_missing == null) return; // nothing missing
 
-        wp.ack_count += 1;
+        self.ack_count +%= 1;
         var scratch: [SCRATCH_SIZE]u8 = undefined;
         var b = MessageBuilder.init(&scratch, self.guid.prefix);
         b.addInfoDst(wp.guid.prefix);
-        b.addNackFrag(self.guid.entity_id, wp.guid.entity_id, writer_sn, frag_set, wp.ack_count);
+        b.addNackFrag(self.guid.entity_id, wp.guid.entity_id, writer_sn, frag_set, self.ack_count);
         for (locs) |loc| writer_sm.sendIovecs(self.transport, &loc, b.iovecs()) catch {};
     }
 
@@ -1140,7 +1145,7 @@ pub const StatefulReader = struct {
     fn sendAckNackLocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber, final: bool) void {
         const locs = wp.effectiveLocators();
         if (locs.len == 0) return;
-        wp.ack_count += 1;
+        self.ack_count +%= 1;
         const sns = wp.missingSnSet(last_sn);
         self.tracer.submit(.{ .send_acknack = .{
             .src_prefix = self.guid.prefix,
@@ -1148,7 +1153,7 @@ pub const StatefulReader = struct {
             .writer_eid = wp.guid.entity_id,
             .base_sn = sns.base,
             .bitmap = sns,
-            .count = wp.ack_count,
+            .count = self.ack_count,
             .final = final,
         } });
         var scratch: [SCRATCH_SIZE]u8 = undefined;
@@ -1158,7 +1163,7 @@ pub const StatefulReader = struct {
             self.guid.entity_id,
             wp.guid.entity_id,
             sns,
-            wp.ack_count,
+            self.ack_count,
             final,
         );
         for (locs) |loc| {
@@ -1187,9 +1192,9 @@ pub const StatefulReader = struct {
     fn sendAckNackUnlocked(self: *Self, wp: *WriterProxy, last_sn: SequenceNumber, final: bool) void {
         const locs = wp.effectiveLocators();
         if (locs.len == 0) return;
-        wp.ack_count += 1;
+        self.ack_count +%= 1;
         const sns = wp.missingSnSet(last_sn);
-        const count = wp.ack_count;
+        const count = self.ack_count;
         self.tracer.submit(.{ .send_acknack = .{
             .src_prefix = self.guid.prefix,
             .reader_eid = self.guid.entity_id,
