@@ -108,7 +108,9 @@ test "lookup_participant: returns nil for unknown domain_id" {
     const dp = f.create_participant(test_domain.get(), .{}, null, 0);
     defer _ = f.vtable.delete_participant(f.ptr, dp);
 
-    const found = f.vtable.lookup_participant(f.ptr, 99);
+    // Any domain but the participant's (test_domain.get() is the fallback
+    // domain when a test binary runs without ZZDDS_TEST_DOMAIN_BASE).
+    const found = f.vtable.lookup_participant(f.ptr, test_domain.get() + 1);
     try testing.expect(found.ptr == dcps.NIL_PTR);
 }
 
