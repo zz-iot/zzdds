@@ -668,6 +668,25 @@ pub const SedpEndpoints = struct {
         sub_pair.matchRemote(self.alloc, data, uc, mc);
     }
 
+    /// Called by SpdpEndpoints when a remote participant is lost (lease
+    /// expiry, failed liveness probe, or BYE). The DCPS layer forgets its
+    /// endpoints; this drops the built-in proxies that carried them, so a
+    /// rediscovery delivers them again (see BuiltinPair.unmatchRemote).
+    pub fn onParticipantLost(ctx: *anyopaque, prefix: GuidPrefix) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        var pub_pair = self.pubPair();
+        pub_pair.unmatchRemote(prefix);
+        var sub_pair = self.subPair();
+        sub_pair.unmatchRemote(prefix);
+        // Its default locators too: a rediscovery records them again.
+        self.participant_locs_mu.lock();
+        defer self.participant_locs_mu.unlock();
+        if (self.participant_locs.fetchRemove(prefix)) |kv| {
+            var locs = kv.value;
+            locs.deinit();
+        }
+    }
+
     // ── Local endpoint announcement ───────────────────────────────────────────
 
     pub fn announceWriter(self: *Self, ann: *const WriterAnnouncement) !void {

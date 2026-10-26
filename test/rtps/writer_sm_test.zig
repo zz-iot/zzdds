@@ -709,10 +709,12 @@ const GuidPrefix = rtps.GuidPrefix;
 const ProbeResult = struct {
     prefix: ?GuidPrefix = null,
     alive: ?bool = null,
+    calls: usize = 0,
     fn callback(ctx: *anyopaque, pfx: GuidPrefix, a: bool) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.prefix = pfx;
         self.alive = a;
+        self.calls += 1;
     }
 };
 
@@ -738,7 +740,7 @@ test "beginProbe: sets deadline on matching reliable proxy" {
     try testing.expect(found);
 }
 
-test "checkProbeDeadlines: evicts expired proxy and fires dead callback" {
+test "checkProbeDeadlines: reports an expired probe once and keeps the proxy" {
     const writer_guid = makeGuid(0x22, WRITER_EID);
     const reader_guid = makeGuid(0x23, READER_EID);
     const loc_a = Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
@@ -754,16 +756,22 @@ test "checkProbeDeadlines: evicts expired proxy and fires dead callback" {
     w.beginProbe(reader_guid.prefix, 1);
     w.checkProbeDeadlines();
 
-    // Proxy should be evicted and callback fired with alive=false.
     try testing.expect(pr.prefix != null);
     try testing.expect(pr.prefix.?.eql(reader_guid.prefix));
     try testing.expect(pr.alive == false);
 
-    // Proxy is gone: no more reader proxies.
+    // The proxy stays: whether its participant is lost is the callback's
+    // decision, and a re-announcement may already have answered the probe.
     w.mu.lock();
     const proxy_count = w.reader_proxies.items.len;
+    const deadline: ?i64 = if (proxy_count > 0) w.reader_proxies.items[0].probe_deadline_ns else null;
     w.mu.unlock();
-    try testing.expectEqual(@as(usize, 0), proxy_count);
+    try testing.expectEqual(@as(usize, 1), proxy_count);
+    try testing.expectEqual(@as(?i64, 0), deadline);
+
+    // The probe is over: a later check doesn't report it again.
+    w.checkProbeDeadlines();
+    try testing.expectEqual(@as(usize, 1), pr.calls);
 }
 
 test "checkProbeDeadlines: all proxies beyond original 8-slot cap fire dead callback" {
@@ -813,7 +821,7 @@ test "checkProbeDeadlines: all proxies beyond original 8-slot cap fire dead call
     w.mu.lock();
     const remaining = w.reader_proxies.items.len;
     w.mu.unlock();
-    try testing.expectEqual(@as(usize, 0), remaining);
+    try testing.expectEqual(@as(usize, N), remaining);
 }
 
 test "handleAckNack: ACKNACK clears probe and fires alive callback" {

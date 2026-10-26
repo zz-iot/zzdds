@@ -654,9 +654,9 @@ test "SEDP: ReaderAnnouncement with non-default PRESENTATION round-trips correct
 }
 
 test "SEDP: second onParticipantDiscovered replaces proxy without adding a duplicate" {
-    // A second onParticipantDiscovered for the same peer (e.g. after SPDP lease
-    // re-expiry) replaces the existing proxy in place rather than appending a new
-    // one.  The proxy count must remain 1, not grow to 2.
+    // A second onParticipantDiscovered for the same peer (a rediscovery whose
+    // loss was never reported) replaces the existing proxy in place rather than
+    // appending a new one.  The proxy count must remain 1, not grow to 2.
     // Note: re-discovery intentionally replays cached history so the peer gets the
     // latest state — only the proxy LIST size is the invariant here.
     const net = try MockNetwork.init(testing.allocator);
@@ -798,4 +798,109 @@ test "SEDP: a writer with >32 PARTITION names delivers all of them (no truncatio
     const got = remote.rec.writers_found.items[0].partitions;
     try testing.expectEqual(@as(usize, 40), got.len);
     for (0..40) |i| try testing.expectEqualStrings(names[i], got[i]);
+}
+
+test "SEDP: a peer lost and rediscovered on one side has its endpoints delivered again" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var local = try Participant.init(net, 0x1B);
+    var remote = try Participant.init(net, 0x1C);
+    defer local.deinit();
+    defer remote.deinit();
+
+    local.discoverPeer(0x1C);
+    remote.discoverPeer(0x1B);
+
+    const reader_guid = makeGuid(0x1C, 0x20);
+    try remote.sedp.announceReader(&.{
+        .guid = reader_guid,
+        .participant_guid = makeGuid(0x1C, 0x01),
+        .topic_name = "Again",
+        .type_name = "AgainT",
+        .qos = .{},
+        .type_info_cdr = &.{},
+    });
+    const writer_guid = makeGuid(0x1B, 0x10);
+    try local.sedp.announceWriter(&.{
+        .guid = writer_guid,
+        .participant_guid = makeGuid(0x1B, 0x01),
+        .topic_name = "Again",
+        .type_name = "AgainT",
+        .qos = .{},
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 1), local.rec.readers_found.items.len);
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+
+    // Only local loses the peer, as when its lease runs out on one side.
+    SedpEndpoints.onParticipantLost(local.sedp, prefix(0x1C));
+    local.discoverPeer(0x1C);
+
+    // The peer kept its proxies, so its periodic heartbeat (fired here by
+    // hand) is what tells local to ask for its announcements again. A few
+    // rounds: local's re-created proxy restarts its ACKNACK count, and the
+    // peer ignores counts no higher than the last one it retransmitted for.
+    var round: usize = 0;
+    while (local.rec.readers_found.items.len < 2 and round < 10) : (round += 1) {
+        remote.sedp.sub_writer.?.sendHeartbeat(false, false);
+        net.deliverAll();
+        net.deliverAll();
+    }
+    try testing.expectEqual(@as(usize, 2), local.rec.readers_found.items.len);
+    try testing.expect(local.rec.readers_found.items[1].guid.eql(reader_guid));
+    // The peer never lost local: local's replay to it is all duplicates.
+    try testing.expectEqual(@as(usize, 1), remote.rec.writers_found.items.len);
+}
+
+test "SEDP: peers that lose and rediscover each other exchange their endpoints again" {
+    const net = try MockNetwork.init(testing.allocator);
+    defer net.deinit();
+
+    var a = try Participant.init(net, 0x1D);
+    var b = try Participant.init(net, 0x1E);
+    defer a.deinit();
+    defer b.deinit();
+
+    a.discoverPeer(0x1E);
+    b.discoverPeer(0x1D);
+
+    try a.sedp.announceWriter(&.{
+        .guid = makeGuid(0x1D, 0x10),
+        .participant_guid = makeGuid(0x1D, 0x01),
+        .topic_name = "Both",
+        .type_name = "BothT",
+        .qos = .{},
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    try b.sedp.announceReader(&.{
+        .guid = makeGuid(0x1E, 0x20),
+        .participant_guid = makeGuid(0x1E, 0x01),
+        .topic_name = "Both",
+        .type_name = "BothT",
+        .qos = .{},
+        .type_info_cdr = &.{},
+    });
+    net.deliverAll();
+    try testing.expectEqual(@as(usize, 1), b.rec.writers_found.items.len);
+    try testing.expectEqual(@as(usize, 1), a.rec.readers_found.items.len);
+
+    SedpEndpoints.onParticipantLost(a.sedp, prefix(0x1E));
+    SedpEndpoints.onParticipantLost(b.sedp, prefix(0x1D));
+    try testing.expectEqual(@as(usize, 0), a.sedp.pub_writer.?.reader_proxies.items.len);
+    try testing.expectEqual(@as(usize, 0), a.sedp.sub_reader.?.writer_proxies.items.len);
+
+    a.discoverPeer(0x1E);
+    b.discoverPeer(0x1D);
+    // Both sides matched afresh: each replays its history to the other.
+    var round: usize = 0;
+    while ((a.rec.readers_found.items.len < 2 or b.rec.writers_found.items.len < 2) and round < 10) : (round += 1) {
+        net.deliverAll();
+        net.deliverAll();
+    }
+    try testing.expectEqual(@as(usize, 2), b.rec.writers_found.items.len);
+    try testing.expectEqual(@as(usize, 2), a.rec.readers_found.items.len);
 }

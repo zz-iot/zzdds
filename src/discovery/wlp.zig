@@ -218,6 +218,13 @@ pub const WlpEndpoints = struct {
         self.pair.matchRemote(self.alloc, data, uc, mc);
     }
 
+    /// Called by SpdpEndpoints (via combined.zig's DiscoveredFanout) when a
+    /// remote participant is lost; see SedpEndpoints.onParticipantLost.
+    pub fn onParticipantLost(ctx: *anyopaque, prefix: GuidPrefix) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.pair.unmatchRemote(prefix);
+    }
+
     /// Wired into SEDP via setWlpDispatch (combined.zig) as its receive-side
     /// fallback once SEDP's own pub/sub routing fails to match a submessage.
     pub fn tryHandleFromSedp(ctx: *anyopaque, sm: submessage_mod.SubMessage, src_prefix: GuidPrefix) bool {

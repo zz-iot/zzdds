@@ -217,6 +217,8 @@ HEARTBEAT to the peer's SEDP reader proxies. If no ACKNACK arrives before the pr
 works correctly, but sets `probe_active` on the `KnownParticipant` record, which prevents a
 second probe from firing before the first resolves. A participant that goes silent while a
 probe is in flight will be evicted on the first probe deadline — there is no probe retry.
+Losing a participant drops its SEDP and WLP built-in proxies, so if it returns its endpoints
+are announced and matched again.
 
 ### Experimental typesupport library management
 

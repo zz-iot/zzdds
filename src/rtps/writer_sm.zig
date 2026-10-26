@@ -310,7 +310,7 @@ pub const ReaderProxy = struct {
     history_floor_sn: SequenceNumber,
     /// Non-zero while a liveness probe is active for this reader proxy.
     /// Monotonic deadline (ns): if no ACKNACK arrives before this time, the
-    /// heartbeat thread evicts the proxy and fires the probe-result callback.
+    /// heartbeat thread fires the probe-result callback (checkProbeDeadlines).
     /// Cleared immediately on any incoming ACKNACK (reader is alive).
     probe_deadline_ns: i64,
     /// firstSN of the first Heartbeat actually sent to this proxy (set once,
@@ -676,7 +676,8 @@ pub const StatefulWriter = struct {
 
     /// Start a liveness probe for all reader proxies matching `prefix`.
     /// The heartbeat thread will send periodic non-final HBs (as it already does)
-    /// and evict the proxy if no ACKNACK arrives before `deadline_ns` (monotonic ns).
+    /// and report the probe failed if no ACKNACK arrives before `deadline_ns`
+    /// (monotonic ns); see checkProbeDeadlines.
     pub fn beginProbe(self: *Self, prefix: GuidPrefix, deadline_ns: i64) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -2652,7 +2653,7 @@ pub const StatefulWriter = struct {
 
     /// Background thread: sends a non-final HEARTBEAT every HB_INTERVAL_MS ms.
     /// Readers reply with ACKNACK; writer retransmits any missing data.
-    /// Also checks probe deadlines: evicts proxies that haven't ACK'd in time.
+    /// Also checks probe deadlines: reports proxies that haven't ACK'd in time.
     /// Stopped by setting hb_stopping before calling hb_thread.join().
     fn heartbeatThread(self: *Self) void {
         while (!self.hb_stopping.load(.acquire)) {
@@ -2668,29 +2669,29 @@ pub const StatefulWriter = struct {
         }
     }
 
-    /// Evict any reader proxies whose liveness-probe deadline has passed.
-    /// Fires the probe_result_fn callback (alive=false) for each evicted proxy.
+    /// Reports each reader proxy whose liveness-probe deadline has passed to
+    /// probe_result_fn (alive=false), once, and ends its probe. The proxy
+    /// stays: whether the participant is lost is the callback's decision (a
+    /// re-announcement may already have answered the probe), and losing it
+    /// removes the proxy (see BuiltinPair.unmatchRemote).
     /// Called under no lock; acquires and releases self.mu internally.
     pub fn checkProbeDeadlines(self: *Self) void {
         const now_ns = time_mod.monotonicClock().nowNs();
 
-        var evicted: std.ArrayListUnmanaged(GuidPrefix) = .empty;
-        defer evicted.deinit(self.alloc);
+        var expired: std.ArrayListUnmanaged(GuidPrefix) = .empty;
+        defer expired.deinit(self.alloc);
 
         self.mu.lock();
-        var i: usize = self.reader_proxies.items.len;
-        while (i > 0) {
-            i -= 1;
-            const rp = &self.reader_proxies.items[i];
+        for (self.reader_proxies.items) |*rp| {
             if (rp.probe_deadline_ns > 0 and now_ns >= rp.probe_deadline_ns) {
-                evicted.append(self.alloc, rp.guid.prefix) catch {};
-                rp.deinit(self.alloc);
-                _ = self.reader_proxies.swapRemove(i);
+                // Left set on OOM, so the next tick reports it instead.
+                expired.append(self.alloc, rp.guid.prefix) catch continue;
+                rp.probe_deadline_ns = 0;
             }
         }
         self.mu.unlock();
 
-        for (evicted.items) |prefix| {
+        for (expired.items) |prefix| {
             if (self.probe_result_fn) |f| f(self.probe_result_ctx.?, prefix, false);
         }
     }

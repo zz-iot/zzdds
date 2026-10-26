@@ -835,3 +835,132 @@ test "SPDP: foreign explicit domain neither installs nor refreshes a participant
     try testing.expectEqual(@as(i64, 1), spdp.known.get(peer).?.last_writer_sn);
     try testing.expectEqual(@as(u32, 1), tr.discovered);
 }
+
+test "SPDP: every way of losing a participant reports it to SEDP, then to DCPS, in order" {
+    const alloc = testing.allocator;
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+
+    // Both layers append to one log, so the order they hear it in shows.
+    // Every report must also come with lifecycle_mu held, which is what keeps
+    // a loss and the rediscovery after it from reaching them out of order.
+    const Log = struct {
+        buf: [8]u8 = undefined,
+        len: usize = 0,
+        sedp_prefix: ?GuidPrefix = null,
+        spdp: *SpdpEndpoints,
+        reported_unordered: bool = false,
+        fn add(self: *@This(), c: u8) void {
+            if (self.spdp.lifecycle_mu.tryLock()) {
+                self.spdp.lifecycle_mu.unlock();
+                self.reported_unordered = true;
+            }
+            self.buf[self.len] = c;
+            self.len += 1;
+        }
+        fn discovered(ctx: *anyopaque, _: *const ParticipantData) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.add('+');
+        }
+        fn sedpLost(ctx: *anyopaque, pfx: GuidPrefix) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.sedp_prefix = pfx;
+            self.add('S');
+        }
+        fn dcpsLost(ctx: *anyopaque, _: Guid) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.add('D');
+        }
+        fn take(self: *@This()) []const u8 {
+            defer self.len = 0;
+            return self.buf[0..self.len];
+        }
+    };
+    var log = Log{ .spdp = spdp };
+    var tr = Tracker{};
+    var c = tr.cbs();
+    c.ctx = &log;
+    c.on_participant_lost = Log.dcpsLost;
+    c.on_participant_discovered = Log.discovered;
+    spdp.callbacks = &c;
+    spdp.setSedp(&log, Log.discovered, Log.sedpLost);
+    const NoProbe = struct {
+        fn start(_: *anyopaque, _: GuidPrefix, _: i64) void {}
+    };
+    var no_probe: u8 = 0;
+    spdp.setBeginProbeFn(&no_probe, NoProbe.start);
+
+    const peer = prefix(0xE1);
+    const payload = try buildPayload(alloc, peer, 1_000);
+    defer alloc.free(payload);
+
+    // Lease expiry.
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    try testing.expectEqualStrings("++", log.take());
+    clock.set(2_000 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expectEqualStrings("SD", log.take());
+    try testing.expect(log.sedp_prefix.?.eql(peer));
+
+    // BYE.
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    _ = log.take();
+    SpdpEndpoints.removePeer(spdp, peer);
+    try testing.expectEqualStrings("SD", log.take());
+
+    // A liveness probe that fails. Marked outstanding directly: with this
+    // 1s lease, the lease would run out before checkLeases' 5s probe
+    // fallback (no interval observed yet) started one.
+    spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    _ = log.take();
+    spdp.known.getPtr(peer).?.probe_active = true;
+    SpdpEndpoints.onProbeResult(spdp, peer, false);
+    try testing.expectEqualStrings("SD", log.take());
+
+    try testing.expect(!log.reported_unordered);
+}
+
+test "SPDP: a failed probe that a re-announcement already answered loses nothing" {
+    const alloc = testing.allocator;
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+    var clock = ManualClock.init(std.time.ns_per_ms);
+    spdp.setClock(clock.clock());
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+    const NoProbe = struct {
+        fn start(_: *anyopaque, _: GuidPrefix, _: i64) void {}
+    };
+    var no_probe: u8 = 0;
+    spdp.setBeginProbeFn(&no_probe, NoProbe.start);
+
+    const peer = prefix(0xE2);
+    const payload = try buildPayload(alloc, peer, 60_000);
+    defer alloc.free(payload);
+    spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    clock.set(1001 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 2, payload, .{ .bytes = .{ 0x00, 0x00 } });
+
+    // Silence starts a probe; the peer re-announces before the SEDP writers'
+    // probe deadline passes, and their failure report arrives afterwards.
+    clock.set(4001 * std.time.ns_per_ms);
+    spdp.checkLeases();
+    try testing.expect(spdp.known.get(peer).?.probe_active);
+    clock.set(4100 * std.time.ns_per_ms);
+    spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
+    SpdpEndpoints.onProbeResult(spdp, peer, false);
+
+    try testing.expectEqual(@as(u32, 0), tr.lost);
+    try testing.expect(spdp.known.contains(peer));
+}
