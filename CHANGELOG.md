@@ -46,6 +46,39 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   participant already consumes the adapter, so the shim must not destroy it again.
   Run legacy typesupport cleanup outside the participant lock.
 
+## 2026-10-18
+
+- **Deleting an endpoint while it is being announced no longer reads freed memory.**
+  `enable` on a disabled DataWriter or DataReader captured its SEDP announcement under the
+  participant's lock and wrote it after releasing it, still reading the endpoint's QoS,
+  partition and topic storage. A `delete_datawriter`/`delete_datareader` in between freed
+  that storage, and its disposal could reach peers before the announcement, leaving them
+  with a deleted endpoint they took for alive. The announcement now has its own copy, and
+  one overtaken by a deletion is followed by another disposal. An endpoint also joins its
+  Publisher or Subscriber before it is announced, so a matched callback raised during
+  creation gets an endpoint `lookup_datawriter`/`delete_datawriter` can find; if that
+  callback deletes it, creation returns nil rather than the freed endpoint. Only the
+  `enable` call that enables an endpoint announces it. In-process discovery
+  (`DirectDiscovery`) now keeps its own copy of the announcements it stores rather than
+  the caller's, and each announcement works from copies of the peers' endpoints, so a
+  retraction meanwhile cannot free what it is reporting.
+- **Fixed an intermittent "only 9/10 historical samples" failure in the catchup example.**
+  Each subscriber counted the samples its listener had taken as soon as
+  `wait_for_historical_data` returned, but that call waits for the samples to reach the
+  reader, not for a listener to take them. The subscribers now take the historical batch
+  themselves after the call returns, then attach the listener for the live batch.
+- **DATA_AVAILABLE now resets as DDS specifies.** A reader's DATA_AVAILABLE status stayed
+  set until a read or take left its cache empty, and `on_data_available` never reset it.
+  So a StatusCondition on DATA_AVAILABLE stayed triggered while samples remained, and one
+  whose application read without taking woke immediately on every wait. Every read and
+  take variant now resets it, and `on_data_available` claims it before running, as the
+  other statuses are claimed: a change during the callback stays pending, and a callback
+  whose change a read or take already consumed doesn't run (including from
+  `Subscriber::notify_datareaders`, which no longer calls readers with nothing new). An
+  application that takes only part of what is available and waits on DATA_AVAILABLE again
+  now waits for new data; it should wait on a ReadCondition instead
+  (`docs/design/concurrency/listeners.md#reader-data-available-reset`).
+
 ## 2026-10-17
 
 - **A remote endpoint lost while its match was being made is no longer matched.**

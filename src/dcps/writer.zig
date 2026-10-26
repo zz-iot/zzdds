@@ -920,7 +920,8 @@ pub const DataWriterImpl = struct {
         if (nil.isNil(self.publisher)) return DDS.RETCODE_PRECONDITION_NOT_MET;
         const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
         if (!pub_.enabled.load(.acquire)) return DDS.RETCODE_PRECONDITION_NOT_MET;
-        self.enabled.store(true, .release);
+        // Only the call that enables it announces it.
+        if (self.enabled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return DDS.RETCODE_OK;
         pub_.announceDataWriter(self.instance_handle);
         return DDS.RETCODE_OK;
     }

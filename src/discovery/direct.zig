@@ -57,7 +57,9 @@ pub const DiscoveryBus = struct {
 
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             alloc.free(self.data_locators);
+            for (self.writers.items) |*w| w.deinit(alloc);
             self.writers.deinit(alloc);
+            for (self.readers.items) |*r| r.deinit(alloc);
             self.readers.deinit(alloc);
         }
     };
@@ -91,6 +93,8 @@ pub const DiscoveryBus = struct {
         errdefer self.alloc.free(locs_copy);
 
         // Snapshot existing entries in the same domain before adding the new one.
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
         var snapshots: [64]EntrySnapshot = undefined;
         var snap_count: usize = 0;
         {
@@ -99,7 +103,7 @@ pub const DiscoveryBus = struct {
             for (self.entries.items) |*e| {
                 if (e.domain_id != local.domain_id) continue;
                 if (snap_count < snapshots.len) {
-                    snapshots[snap_count] = EntrySnapshot.from(e);
+                    snapshots[snap_count] = try EntrySnapshot.copy(e, arena.allocator(), .{ .writers = true, .readers = true });
                     snap_count += 1;
                 }
             }
@@ -131,12 +135,12 @@ pub const DiscoveryBus = struct {
             };
             new_callbacks.on_participant_discovered(new_callbacks.ctx, &pd);
 
-            for (snap.writers[0..snap.writer_count]) |w| {
+            for (snap.writers) |w| {
                 var wq = disc_adapter.writerDiscoveredData(w.qos, w.presentation);
                 const wd = makeWriterData(&w, &wq, snap.data_locators);
                 new_callbacks.on_writer_discovered(new_callbacks.ctx, &wd);
             }
-            for (snap.readers[0..snap.reader_count]) |r| {
+            for (snap.readers) |r| {
                 var rq = disc_adapter.readerDiscoveredData(r.qos, r.presentation);
                 const rd = makeReaderData(&r, &rq, snap.data_locators);
                 new_callbacks.on_reader_discovered(new_callbacks.ctx, &rd);
@@ -187,16 +191,15 @@ pub const DiscoveryBus = struct {
                 entry_data_locs = e.data_locators;
             } else {
                 if (other_count < other_entries.len) {
-                    other_entries[other_count] = EntrySnapshot.from(e);
+                    other_entries[other_count] = EntrySnapshot.identity(e);
                     other_count += 1;
                 }
             }
         }
         if (found_idx) |idx| {
             var e = self.entries.swapRemove(idx);
-            e.writers.deinit(self.alloc);
-            e.readers.deinit(self.alloc);
-            self.alloc.free(entry_data_locs);
+            // Only the lost endpoints' GUIDs are used below.
+            e.deinit(self.alloc);
         }
         self.mu.unlock();
 
@@ -223,37 +226,39 @@ pub const DiscoveryBus = struct {
     }
 
     fn busAnnounceWriter(self: *DiscoveryBus, participant_guid: Guid, info: *const WriterAnnouncement) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
         var snapshots: [64]EntrySnapshot = undefined;
         var snap_count: usize = 0;
         var writer_data_locs: []const Locator = &.{};
         var own_callbacks: ?Callbacks = null;
-        var own_domain_id: u32 = 0;
 
-        self.mu.lock();
-        for (self.entries.items) |*e| {
-            if (e.participant_guid.eql(participant_guid)) {
-                try e.writers.append(self.alloc, info.*);
-                writer_data_locs = e.data_locators;
-                own_callbacks = e.callbacks;
-                own_domain_id = e.domain_id;
-            } else {
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const own = self.findLocked(participant_guid);
+            const own_domain_id = if (own) |e| e.domain_id else 0;
+            // Same-domain peers, copied before the writer is stored so a
+            // failed copy stores nothing.
+            for (self.entries.items) |*e| {
+                if (e == own or e.domain_id != own_domain_id) continue;
                 if (snap_count < snapshots.len) {
-                    snapshots[snap_count] = EntrySnapshot.from(e);
+                    snapshots[snap_count] = try EntrySnapshot.copy(e, arena.allocator(), .{ .writers = false, .readers = true });
                     snap_count += 1;
                 }
             }
-        }
-        self.mu.unlock();
-
-        // Filter to same-domain peers.
-        var filtered: usize = 0;
-        for (snapshots[0..snap_count]) |snap| {
-            if (snap.domain_id == own_domain_id) {
-                snapshots[filtered] = snap;
-                filtered += 1;
+            if (own) |e| {
+                writer_data_locs = try arena.allocator().dupe(Locator, e.data_locators);
+                // Kept until retracted: the announcement's slices are only
+                // borrowed for this call.
+                var owned = try info.clone(self.alloc);
+                e.writers.append(self.alloc, owned) catch |err| {
+                    owned.deinit(self.alloc);
+                    return err;
+                };
+                own_callbacks = e.callbacks;
             }
         }
-        snap_count = filtered;
 
         // Tell other participants about this new writer.
         var wq = disc_adapter.writerDiscoveredData(info.qos, info.presentation);
@@ -265,7 +270,7 @@ pub const DiscoveryBus = struct {
         // participants so it can add reader proxies to the new writer.
         if (own_callbacks) |cb| {
             for (snapshots[0..snap_count]) |snap| {
-                for (snap.readers[0..snap.reader_count]) |r| {
+                for (snap.readers) |r| {
                     var rq = disc_adapter.readerDiscoveredData(r.qos, r.presentation);
                     const rd = makeReaderData(&r, &rq, snap.data_locators);
                     cb.on_reader_discovered(cb.ctx, &rd);
@@ -287,13 +292,14 @@ pub const DiscoveryBus = struct {
                 while (i > 0) {
                     i -= 1;
                     if (e.writers.items[i].guid.eql(guid)) {
-                        _ = e.writers.swapRemove(i);
+                        var removed = e.writers.swapRemove(i);
+                        removed.deinit(self.alloc);
                         break;
                     }
                 }
             } else {
                 if (snap_count < snapshots.len) {
-                    snapshots[snap_count] = EntrySnapshot.from(e);
+                    snapshots[snap_count] = EntrySnapshot.identity(e);
                     snap_count += 1;
                 }
             }
@@ -315,37 +321,36 @@ pub const DiscoveryBus = struct {
     }
 
     fn busAnnounceReader(self: *DiscoveryBus, participant_guid: Guid, info: *const ReaderAnnouncement) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
         var snapshots: [64]EntrySnapshot = undefined;
         var snap_count: usize = 0;
         var reader_data_locs: []const Locator = &.{};
         var own_callbacks: ?Callbacks = null;
-        var own_domain_id: u32 = 0;
 
-        self.mu.lock();
-        for (self.entries.items) |*e| {
-            if (e.participant_guid.eql(participant_guid)) {
-                try e.readers.append(self.alloc, info.*);
-                reader_data_locs = e.data_locators;
-                own_callbacks = e.callbacks;
-                own_domain_id = e.domain_id;
-            } else {
+        // As in busAnnounceWriter.
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const own = self.findLocked(participant_guid);
+            const own_domain_id = if (own) |e| e.domain_id else 0;
+            for (self.entries.items) |*e| {
+                if (e == own or e.domain_id != own_domain_id) continue;
                 if (snap_count < snapshots.len) {
-                    snapshots[snap_count] = EntrySnapshot.from(e);
+                    snapshots[snap_count] = try EntrySnapshot.copy(e, arena.allocator(), .{ .writers = true, .readers = false });
                     snap_count += 1;
                 }
             }
-        }
-        self.mu.unlock();
-
-        // Filter to same-domain peers.
-        var filtered: usize = 0;
-        for (snapshots[0..snap_count]) |snap| {
-            if (snap.domain_id == own_domain_id) {
-                snapshots[filtered] = snap;
-                filtered += 1;
+            if (own) |e| {
+                reader_data_locs = try arena.allocator().dupe(Locator, e.data_locators);
+                var owned = try info.clone(self.alloc);
+                e.readers.append(self.alloc, owned) catch |err| {
+                    owned.deinit(self.alloc);
+                    return err;
+                };
+                own_callbacks = e.callbacks;
             }
         }
-        snap_count = filtered;
 
         // Tell the announcing participant about all existing writers on other
         // participants FIRST so it has WriterProxies in place before the writer
@@ -353,7 +358,7 @@ pub const DiscoveryBus = struct {
         // replay via MemoryTransport — the reader must pass isWriterMatched).
         if (own_callbacks) |cb| {
             for (snapshots[0..snap_count]) |snap| {
-                for (snap.writers[0..snap.writer_count]) |w| {
+                for (snap.writers) |w| {
                     var wq = disc_adapter.writerDiscoveredData(w.qos, w.presentation);
                     const wd = makeWriterData(&w, &wq, snap.data_locators);
                     cb.on_writer_discovered(cb.ctx, &wd);
@@ -381,13 +386,14 @@ pub const DiscoveryBus = struct {
                 while (i > 0) {
                     i -= 1;
                     if (e.readers.items[i].guid.eql(guid)) {
-                        _ = e.readers.swapRemove(i);
+                        var removed = e.readers.swapRemove(i);
+                        removed.deinit(self.alloc);
                         break;
                     }
                 }
             } else {
                 if (snap_count < snapshots.len) {
-                    snapshots[snap_count] = EntrySnapshot.from(e);
+                    snapshots[snap_count] = EntrySnapshot.identity(e);
                     snap_count += 1;
                 }
             }
@@ -410,33 +416,50 @@ pub const DiscoveryBus = struct {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Small snapshot of an entry taken under the bus lock.
-    /// Borrows writer/reader slices — valid while the entry exists in the bus.
+    fn findLocked(self: *DiscoveryBus, participant_guid: Guid) ?*Entry {
+        for (self.entries.items) |*e| {
+            if (e.participant_guid.eql(participant_guid)) return e;
+        }
+        return null;
+    }
+
+    /// An entry as a bus call uses it after releasing the bus lock, taken
+    /// under the lock. A retract or stop on another thread may free the
+    /// entry's own locators and announcements once the lock is released, so
+    /// a snapshot never borrows them: `copy` puts its own copies in the
+    /// call's arena, and `identity` takes none.
     const EntrySnapshot = struct {
         participant_guid: Guid,
         domain_id: u32,
         callbacks: Callbacks,
-        data_locators: []const Locator,
-        writers: [32]WriterAnnouncement,
-        writer_count: usize,
-        readers: [32]ReaderAnnouncement,
-        reader_count: usize,
+        data_locators: []const Locator = &.{},
+        writers: []const WriterAnnouncement = &.{},
+        readers: []const ReaderAnnouncement = &.{},
 
-        fn from(e: *const Entry) EntrySnapshot {
-            var snap = EntrySnapshot{
+        fn identity(e: *const Entry) EntrySnapshot {
+            return .{
                 .participant_guid = e.participant_guid,
                 .domain_id = e.domain_id,
                 .callbacks = e.callbacks,
-                .data_locators = e.data_locators,
-                .writers = undefined,
-                .writer_count = 0,
-                .readers = undefined,
-                .reader_count = 0,
             };
-            snap.writer_count = @min(e.writers.items.len, snap.writers.len);
-            @memcpy(snap.writers[0..snap.writer_count], e.writers.items[0..snap.writer_count]);
-            snap.reader_count = @min(e.readers.items.len, snap.readers.len);
-            @memcpy(snap.readers[0..snap.reader_count], e.readers.items[0..snap.reader_count]);
+        }
+
+        /// The endpoint lists a `copy` takes; the others stay empty.
+        const Endpoints = struct { writers: bool, readers: bool };
+
+        fn copy(e: *const Entry, arena: std.mem.Allocator, comptime endpoints: Endpoints) !EntrySnapshot {
+            var snap = identity(e);
+            snap.data_locators = try arena.dupe(Locator, e.data_locators);
+            if (endpoints.writers) {
+                const writers = try arena.alloc(WriterAnnouncement, e.writers.items.len);
+                for (writers, e.writers.items) |*w, src| w.* = try src.clone(arena);
+                snap.writers = writers;
+            }
+            if (endpoints.readers) {
+                const readers = try arena.alloc(ReaderAnnouncement, e.readers.items.len);
+                for (readers, e.readers.items) |*r, src| r.* = try src.clone(arena);
+                snap.readers = readers;
+            }
             return snap;
         }
     };
@@ -1000,4 +1023,151 @@ test "stop retracts all local endpoints from peers" {
 
     try testing.expectEqual(@as(usize, 1), cb2.writers_lost.items.len);
     try testing.expectEqual(@as(usize, 1), cb2.readers_lost.items.len);
+}
+
+test "a peer's reader retracted from an announcement's callback is still reported from the call's own copy" {
+    const alloc = testing.allocator;
+    const bus = try DiscoveryBus.init(alloc);
+    defer bus.deinit();
+    const disc1 = try DirectDiscovery.init(alloc, bus);
+    defer disc1.deinit();
+    const disc2 = try DirectDiscovery.init(alloc, bus);
+    defer disc2.deinit();
+
+    // Once armed, participant 1's first on_reader_discovered retracts
+    // participant 2's second reader, so the bus frees its copy while the
+    // announcement that reported the first is still reporting the rest.
+    const Probe = struct {
+        disc2: *DirectDiscovery,
+        retract: Guid,
+        armed: bool = false,
+        topics: [2][8]u8 = undefined,
+        lens: [2]usize = .{ 0, 0 },
+        n: usize = 0,
+
+        fn onReaderDisc(ctx: *anyopaque, data: *const ReaderData) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.armed) return;
+            if (self.n < 2) {
+                const len = @min(data.topic_name.len, 8);
+                @memcpy(self.topics[self.n][0..len], data.topic_name[0..len]);
+                self.lens[self.n] = len;
+            }
+            self.n += 1;
+            if (self.n == 1) self.disc2.toDiscovery().retractReader(self.retract);
+        }
+        fn onWriterDisc(_: *anyopaque, _: *const WriterData) void {}
+        fn onLost(_: *anyopaque, _: Guid) void {}
+    };
+    var probe = Probe{ .disc2 = disc2, .retract = makeReaderGuid(2, 2) };
+    var cbs1 = Callbacks{
+        .ctx = &probe,
+        .on_participant_discovered = TestCallbacks.onPart,
+        .on_participant_lost = TestCallbacks.onPartLost,
+        .on_writer_discovered = Probe.onWriterDisc,
+        .on_writer_lost = Probe.onLost,
+        .on_reader_discovered = Probe.onReaderDisc,
+        .on_reader_lost = Probe.onLost,
+        .on_wlp_alive = TestCallbacks.onWlpAlive,
+    };
+    var cb2 = TestCallbacks.init(alloc);
+    defer cb2.deinit();
+    var cbs2 = cb2.callbacks();
+    const ann = ParticipantAnnouncement{
+        .guid = makeGuid(1),
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &.{},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 30000,
+        .builtin_endpoint_set = 0,
+    };
+    try disc1.toDiscovery().start(&ann, &cbs1);
+    var ann2 = ann;
+    ann2.guid = makeGuid(2);
+    try disc2.toDiscovery().start(&ann2, &cbs2);
+
+    for ([_][]const u8{ "TopicA", "TopicB" }, 1..) |topic, key| {
+        try disc2.toDiscovery().announceReader(&ReaderAnnouncement{
+            .guid = makeReaderGuid(2, @intCast(key)),
+            .participant_guid = makeGuid(2),
+            .topic_name = topic,
+            .type_name = "M",
+            .qos = .{},
+            .partition_names = &.{"P"},
+            .type_info_cdr = &.{},
+        });
+    }
+
+    probe.armed = true;
+    try disc1.toDiscovery().announceWriter(&WriterAnnouncement{
+        .guid = makeWriterGuid(1, 1),
+        .participant_guid = makeGuid(1),
+        .topic_name = "TopicA",
+        .type_name = "M",
+        .qos = .{},
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+
+    try testing.expectEqual(@as(usize, 2), probe.n);
+    try testing.expectEqualStrings("TopicA", probe.topics[0][0..probe.lens[0]]);
+    try testing.expectEqualStrings("TopicB", probe.topics[1][0..probe.lens[1]]);
+}
+
+test "an announcement's snapshot copies only the peer endpoint list it reports" {
+    const alloc = testing.allocator;
+    const bus = try DiscoveryBus.init(alloc);
+    defer bus.deinit();
+    const disc = try DirectDiscovery.init(alloc, bus);
+    defer disc.deinit();
+
+    var cb = TestCallbacks.init(alloc);
+    defer cb.deinit();
+    var cbs = cb.callbacks();
+    const ann = ParticipantAnnouncement{
+        .guid = makeGuid(2),
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &.{},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 30000,
+        .builtin_endpoint_set = 0,
+    };
+    try disc.toDiscovery().start(&ann, &cbs);
+    try disc.toDiscovery().announceWriter(&WriterAnnouncement{
+        .guid = makeWriterGuid(2, 1),
+        .participant_guid = makeGuid(2),
+        .topic_name = "T",
+        .type_name = "M",
+        .qos = .{},
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    try disc.toDiscovery().announceReader(&ReaderAnnouncement{
+        .guid = makeReaderGuid(2, 1),
+        .participant_guid = makeGuid(2),
+        .topic_name = "T",
+        .type_name = "M",
+        .qos = .{},
+        .type_info_cdr = &.{},
+    });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    bus.mu.lock();
+    defer bus.mu.unlock();
+    const e = bus.findLocked(makeGuid(2)).?;
+    // As busAnnounceWriter takes it: the peer's readers only.
+    const for_writer = try DiscoveryBus.EntrySnapshot.copy(e, arena.allocator(), .{ .writers = false, .readers = true });
+    try testing.expectEqual(@as(usize, 0), for_writer.writers.len);
+    try testing.expectEqual(@as(usize, 1), for_writer.readers.len);
+    // As busAnnounceReader takes it: the peer's writers only.
+    const for_reader = try DiscoveryBus.EntrySnapshot.copy(e, arena.allocator(), .{ .writers = true, .readers = false });
+    try testing.expectEqual(@as(usize, 1), for_reader.writers.len);
+    try testing.expectEqual(@as(usize, 0), for_reader.readers.len);
 }

@@ -165,7 +165,41 @@ Forward-looking only: known gaps, planned features, and open design questions.
 - **Transport scatter-gather (`sendmsg`)** — the `Transport` vtable has no vectored-send
   entry point; `MessageBuilder`'s iovec list is flattened into a single `[65536]u8` stack
   buffer at the transport boundary before every send. See
-  `design/rtps-message-builder.md`.
+  `design/rtps-message-builder.md`. Planned with the readiness adapter, whose submissions
+  carry the gather list
+  ([output submission](design/concurrency/transport-adapters.md#output-submission)).
+- **A local endpoint's announcement is not ordered against its creation and deletion.**
+  The rules are in
+  [local endpoint publication, announcement and disposal](design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
+  Fixed on 2026-10-18: an endpoint joins its parent before it is announced, an
+  announcement is written from its own copy (a deletion meanwhile used to free what it
+  read), only the `enable` call that enables an endpoint announces it, and in-process
+  discovery keeps its own copy of what it stores. Two departures remain on the threaded
+  path, for the shared runtime to close:
+  - An announcement captured before a deletion and written after the deletion's disposal
+    is followed by a second disposal (`pubAnnounceProtoWriter`/`subAnnounceProtoReader`
+    check that the endpoint still exists once the announcement is written). Peers end
+    with the endpoint disposed, but can briefly see it announced again. Ordering it
+    strictly means holding a lock across the SEDP write, which synchronous in-process
+    delivery can re-enter from a listener.
+  - Announcement storage isn't reserved: a failed SEDP announcement is only logged, and
+    the endpoint is never announced; a disposal whose payload can't be encoded is dropped
+    silently.
+- **A remote endpoint that becomes incompatible stays matched.** When a matched remote
+  endpoint is announced again with QoS or partitions that no longer match a local
+  endpoint, `onWriterDiscovered`/`onReaderDiscovered` record the incompatibility (or, for a
+  partition, skip the pair) and `continue`: they never remove the existing match. The
+  reader keeps receiving from the writer, and `current_count` still counts it. Since the
+  match-generation work (2026-10-17), each announcement gets a new discovery generation,
+  so a refresh that no longer matches should unmatch with that generation, as a loss
+  does for that one local endpoint, then report `*_INCOMPATIBLE_QOS` as for a first
+  announcement. Both sides need it, and so do the retroactive matches in
+  `pubAnnounceProtoWriter`/`subAnnounceProtoReader` once local QoS and partition changes
+  re-announce (today `set_qos` doesn't re-announce, so only a remote change reaches this).
+  The QoS that can change this way are the mutable ones DDS checks: DEADLINE and
+  LATENCY_BUDGET, plus PARTITION. Tests: a writer refreshed with a longer deadline period
+  than its reader requests, and one moved to a non-matching partition, are both unmatched;
+  the first is counted once as incompatible.
 
 ### DCPS / QoS
 
@@ -935,7 +969,21 @@ work items — revisit only if we upstream fixes or need the coverage for our ow
 
 ### Concurrency model
 
-The [concurrency and broker contracts](design/concurrency-broker-status.md)
+zzdds grew one thread per concern: each new periodic need got its own
+`std.Thread.spawn` site (the DEADLINE/LIVELINESS timer thread was the tenth; five of the ten
+are pure periodic-tick threads with no socket). The settled direction replaces that model
+with one shared runtime that has two progress modes: **hosted**, where the runtime's own
+workers make progress, and **manual**, where the application drives it (`drive(budget,
+max_wait)`, or an external loop). Hosted is the default in an ordinary build; manual is
+what RTOS and bare-metal targets use (see the next entry). The threaded model is not kept
+as a second option: during migration the runtime sits behind a temporary build option,
+and the threaded path is deleted once the runtime replaces it
+([migration](design/concurrency/runtime.md#migration-from-the-threaded-implementation),
+which also maps each of today's threads onto runtime timers or the transport adapter). Correctness
+(ordering, liveliness, teardown, no races) must be verified in both modes; today's TSan lane
+covers only the threaded model.
+
+Specified: the [concurrency and broker contracts](design/concurrency-broker-status.md)
 now define the behavioral baseline (take-turns participant/endpoint contexts, one shared
 manual/hosted progress engine, listener exclusion with inline eligibility, operation
 results/waits, runtime ownership/retirement and the transport boundary). Their open
@@ -953,12 +1001,32 @@ support; the first shipped subset does not.
 
 Even a minimal two-participant setup runs several background threads. An embedded target
 needs a `DomainParticipant.drive(timeout)` that pumps transport polling + `checkTimers()`
-from the caller's loop with no threads spawned. The design keeps this possible (non-blocking
-transport seams, explicit `checkTimers()`) but nothing implements it. Now specified as the
+from the caller's loop with no threads spawned. Nothing implements it, and the transport
+seam it needs doesn't exist yet: `Transport.listen` registers a handler that the UDP and
+TCP transports call from their own receive threads, and there is no entry a driver could
+call to service ready sockets without blocking. Manual mode over a real network needs the
+readiness adapter in [transport adapters](design/concurrency/transport-adapters.md), so the
+shared runtime's first slice runs manual mode over the in-process transport only; the
+readiness adapter, UDP then TCP, comes with the endpoint migration that follows it (it is
+also what the cooperative measurement profile's UDP needs). Hosted mode uses the same
+adapter on its own I/O threads, replacing the thread per socket. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)
 (`drive(budget, max_wait)` plus prepare-to-wait integration) and the cooperative
 measurement profile in the concurrency architecture; implementation follows the
 concurrency task above.
+
+### Completion-based transport adapter (io_uring)
+
+Not scheduled. A [completion adapter](design/concurrency/transport-adapters.md#adapter-model)
+would post receives and sends ahead and consume their results, instead of servicing
+readiness. It could be written directly against io_uring or built on `std.Io.Evented`,
+but in Zig 0.17.0 none of Evented's backends compile, and a thread outside an Evented
+pool cannot call into it, which application threads in the C, C++ and Java bindings
+would need to do. Check each Zig release for Evented's status, including an official way
+for outside threads to wake it (until then an Evented backend would wake through an
+`eventfd`; see [adopting other `std.Io` backends](design/concurrency/transport-adapters.md#adopting-other-std-io-backends)).
+Revisit when Evented builds and supports that, or when measurements show the readiness
+adapter is the bottleneck.
 
 ### CDR-layer allocator scoping vs. the entity layer
 

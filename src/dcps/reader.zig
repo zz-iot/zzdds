@@ -326,7 +326,7 @@ pub const DataReaderImpl = struct {
     /// entity_quiesce.zig.
     quiesce: EntityQuiesce = .{},
     /// See the matching field in `writer.zig`: runtime reads (in
-    /// `dispatchListener`, and cross-entity in `subscriber.zig`'s
+    /// `resolveListener`, and cross-entity in `subscriber.zig`'s
     /// `on_data_available` fan-out) and writes (`vtSetListener`) go
     /// through `@atomicLoad`/`@atomicStore` `.monotonic`; struct-literal
     /// initialisers stay plain.
@@ -605,7 +605,7 @@ pub const DataReaderImpl = struct {
         // Register writer-match callback for OWNERSHIP and LIVELINESS tracking.
         proto_reader.setWriterMatchCallback(self.writerMatchCallback());
         // Lifetime ref on the parent SubscriberImpl (dropped in
-        // reallyDeinit): keeps subscriber.zig's `dispatchReaderFallback`
+        // reallyDeinit): keeps subscriber.zig's `resolveReaderFallback`
         // from touching a SubscriberImpl freed by a racing
         // delete_subscriber. See DataWriterImpl.init's mirror.
         self.parent_pinned = !nil.isNil(subscriber) and subscriber_mod.SubscriberImpl.quiesceAcquireFn(subscriber.ptr);
@@ -843,7 +843,7 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
         if (self.status_cond) |sc| sc.notifyWakeup();
-        _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+        _ = self.dispatchDataAvailable();
     }
 
     // ── Data delivery ─────────────────────────────────────────────────────────
@@ -906,7 +906,7 @@ pub const DataReaderImpl = struct {
             if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
         }
         if (pending & DDS.DATA_AVAILABLE_STATUS != 0) {
-            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+            _ = self.dispatchDataAvailable();
         }
     }
 
@@ -1702,7 +1702,7 @@ pub const DataReaderImpl = struct {
         self.mu.unlock();
         if (no_writers) {
             if (self.status_cond) |sc| sc.notifyWakeup();
-            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+            _ = self.dispatchDataAvailable();
         }
     }
 
@@ -1886,17 +1886,14 @@ pub const DataReaderImpl = struct {
     pub fn takeRaw(self: *Self) ?TakenSample {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         while (self.pending.items.len > 0) {
             // Honour the ordered-access window set by Subscriber.begin_access().
             // Samples appended after the sort (new network arrivals during the window
-            // between begin_access and end_access) must not leak into the sorted batch.
-            // Clear DATA_AVAILABLE_STATUS so StatusCondition users don't busy-spin
-            // while waiting for end_access() to open the next window.
-            if (self.ordered_access_watermark) |wm| if (wm == 0) {
-                self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
-                return null;
-            };
+            // between begin_access and end_access) must not leak into the sorted batch;
+            // end_access() raises DATA_AVAILABLE again for them.
+            if (self.ordered_access_watermark) |wm| if (wm == 0) return null;
             const pc = self.pending.orderedRemove(0);
             if (self.ordered_access_watermark) |*wm| wm.* -= 1;
             if (pc.expiry_ns) |exp| {
@@ -1905,15 +1902,11 @@ pub const DataReaderImpl = struct {
                     continue;
                 }
             }
-            if (self.pending.items.len == 0) {
-                self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
-            }
             var result = [1]TakenSample{.{ .data = pc.data, .info = pc.info }};
             self.alloc.destroy(pc);
             self.finalizeGenerationRanksLocked(&result);
             return result[0];
         }
-        self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         return null;
     }
 
@@ -1926,6 +1919,7 @@ pub const DataReaderImpl = struct {
     pub fn takeNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
 
         const now_ns = time_mod.nanoTimestamp();
 
@@ -1953,19 +1947,13 @@ pub const DataReaderImpl = struct {
                 if (target_ih == null or ih < target_ih.?) target_ih = ih;
             }
         }
-        const tgt = target_ih orelse {
-            if (self.pending.items.len == 0) self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
-            return null;
-        };
+        const tgt = target_ih orelse return null;
 
         for (self.pending.items, 0..) |pc, idx| {
             if (pc.info.instance_handle == tgt) {
                 var result = [1]TakenSample{.{ .data = pc.data, .info = pc.info }};
                 _ = self.pending.orderedRemove(idx);
                 self.alloc.destroy(pc);
-                if (self.pending.items.len == 0) {
-                    self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
-                }
                 self.finalizeGenerationRanksLocked(&result);
                 return result[0];
             }
@@ -1981,6 +1969,7 @@ pub const DataReaderImpl = struct {
     pub fn readNextInstanceRaw(self: *Self, prev_instance_handle: DDS.InstanceHandle_t) ?TakenSample {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
 
         const now_ns = time_mod.nanoTimestamp();
 
@@ -2044,6 +2033,7 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
 
         var ei: usize = 0;
@@ -2056,9 +2046,6 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
-        }
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
 
         // Smallest instance_handle > prev (or overall smallest if prev == 0)
@@ -2102,9 +2089,6 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
-        }
         self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
@@ -2123,6 +2107,7 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
 
         var ei: usize = 0;
@@ -2135,9 +2120,6 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
-        }
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
 
         var target_ih: ?DDS.InstanceHandle_t = null;
@@ -2210,6 +2192,7 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
         while (ei < self.pending.items.len) {
@@ -2221,9 +2204,6 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
-        }
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
         const start = out.items.len;
@@ -2295,6 +2275,7 @@ pub const DataReaderImpl = struct {
     ) ![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
         while (ei < self.pending.items.len) {
@@ -2306,9 +2287,6 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
-        }
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
         var out: std.ArrayListUnmanaged(*PendingChange) = .empty;
@@ -2373,6 +2351,7 @@ pub const DataReaderImpl = struct {
     ) ![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
         while (ei < self.pending.items.len) {
@@ -2384,9 +2363,6 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
-        }
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
 
@@ -2415,9 +2391,6 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
-        }
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
         return out.toOwnedSlice(self.alloc);
@@ -2441,6 +2414,7 @@ pub const DataReaderImpl = struct {
     ) ![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
         while (ei < self.pending.items.len) {
@@ -2452,9 +2426,6 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
-        }
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
 
         var target_ih: ?DDS.InstanceHandle_t = null;
@@ -2507,6 +2478,7 @@ pub const DataReaderImpl = struct {
     ) ![]*PendingChange {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
         while (ei < self.pending.items.len) {
@@ -2518,9 +2490,6 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
-        }
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
 
         var target_ih: ?DDS.InstanceHandle_t = null;
@@ -2561,9 +2530,6 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
-        }
         self.finalizeGenerationRanksLockedPinned(out.items);
         _ = self.outstanding_loans.fetchAdd(out.items.len, .monotonic);
         return out.toOwnedSlice(self.alloc);
@@ -2595,6 +2561,7 @@ pub const DataReaderImpl = struct {
     ) anyerror!void {
         self.mu.lock();
         defer self.mu.unlock();
+        self.resetDataAvailableLocked();
         const now_ns = time_mod.nanoTimestamp();
         var ei: usize = 0;
         while (ei < self.pending.items.len) {
@@ -2606,9 +2573,6 @@ pub const DataReaderImpl = struct {
                 }
             }
             ei += 1;
-        }
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
         }
         const limit: usize = if (max_samples < 0) std.math.maxInt(usize) else @intCast(max_samples);
 
@@ -2639,9 +2603,6 @@ pub const DataReaderImpl = struct {
             }
         }
         self.pending.items.len = write;
-        if (self.pending.items.len == 0) {
-            self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
-        }
         self.finalizeGenerationRanksLocked(out.items[start..]);
     }
 
@@ -3019,7 +2980,8 @@ pub const DataReaderImpl = struct {
         if (nil.isNil(self.subscriber)) return DDS.RETCODE_PRECONDITION_NOT_MET;
         const sub_: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
         if (!sub_.enabled.load(.acquire)) return DDS.RETCODE_PRECONDITION_NOT_MET;
-        self.enabled.store(true, .release);
+        // Only the call that enables it announces it.
+        if (self.enabled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return DDS.RETCODE_OK;
         sub_.announceDataReader(self.instance_handle);
         return DDS.RETCODE_OK;
     }
@@ -3232,7 +3194,7 @@ pub const DataReaderImpl = struct {
         const data_available_now = self.status_changes & DDS.DATA_AVAILABLE_STATUS != 0;
         self.mu.unlock();
         if (mask & DDS.DATA_AVAILABLE_STATUS != 0 and data_available_now) {
-            _ = self.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, vtable.get_c_abi_handle(self), .{});
+            _ = self.dispatchDataAvailable();
         }
         return DDS.RETCODE_OK;
     }
@@ -3300,40 +3262,15 @@ pub const DataReaderImpl = struct {
         }
     }
 
-    /// Dispatches `field` (a `DDS.DataReaderListener` callback) if this
-    /// reader's own listener has one installed and `self.listener_mask`
-    /// includes `bit`; otherwise walks the DDS 1.4 §2.2.4.1.5 "nearest
-    /// enclosing non-null listener" chain: this reader's Subscriber, then
-    /// its DomainParticipant (see `subscriber.zig`'s
-    /// `dispatchReaderFallback`). `handle` is always this reader's own
-    /// C-ABI handle, regardless of which level's listener actually ends up
-    /// running (per spec — the callback receives the entity whose status
-    /// changed, not the entity whose listener happened to fire). `pub`:
-    /// also used by `subscriber.zig`'s `notify_datareaders()`, which is a
-    /// different spec operation but the identical "does this reader have a
-    /// usable `on_data_available` listener" question.
-    ///
-    /// Returns `true` iff some level in the chain actually had a usable
-    /// listener and it was invoked. Used for `on_data_available` only,
-    /// whose status read/take resets: the plain statuses are claimed before
-    /// their callback instead (see `resolveListener`).
-    pub fn dispatchListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: *anyopaque, args: anytype) bool {
-        const box = self.acquireListener();
-        defer box.releaseRef(self.alloc);
-        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
-        if (listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args)) return true;
-        if (nil.isNil(self.subscriber)) return false;
-        const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
-        return sub.dispatchReaderFallback(field, bit, handle, args);
-    }
-
     fn StatusCb(comptime field: []const u8) type {
         return listener_fallback.Callback(DDS.DataReaderListener, field);
     }
 
-    /// `dispatchListener`'s resolution step alone, for a plain status: the
-    /// callback for `field` from the nearest level of the fallback chain,
-    /// not yet invoked, or null when no level has one. The status notifiers
+    /// The callback for `field` (a `DDS.DataReaderListener` callback) from
+    /// the nearest level of the DDS 1.4 §2.2.4.1.5 "nearest enclosing
+    /// non-null listener" chain: this reader, its Subscriber, then its
+    /// DomainParticipant. Not yet invoked, or null when no level has one;
+    /// whichever level runs, it is invoked with this reader's own handle. The status notifiers
     /// resolve first, then update the status and, when resolved, claim it
     /// under `mu` (`claimStatusLocked`) and invoke after unlocking, so the
     /// claim snapshots and resets the status at one boundary
@@ -3357,6 +3294,37 @@ pub const DataReaderImpl = struct {
         if (!resolved or self.status_changes & bit == 0) return false;
         self.status_changes &= ~bit;
         return true;
+    }
+
+    /// With `mu` held: resets DATA_AVAILABLE for a read or take (any
+    /// variant), which DDS 1.4 §2.2.4.2.2 resets on every call, whatever it
+    /// returns. Samples left in the cache don't keep it set; a ReadCondition
+    /// is how to wait on those
+    /// (`docs/design/concurrency/listeners.md#reader-data-available-reset`).
+    fn resetDataAvailableLocked(self: *Self) void {
+        self.status_changes &= ~DDS.DATA_AVAILABLE_STATUS;
+    }
+
+    /// Invokes `on_data_available` from the nearest level of the fallback
+    /// chain if DATA_AVAILABLE is still changed, resetting it first, as the
+    /// plain statuses are claimed (see `resolveListener`): a read or take
+    /// since the change has consumed it, and a change during the callback
+    /// stays pending. Returns whether a callback ran. The caller holds this
+    /// reader's `quiesce`, or is an application call on it.
+    pub fn dispatchDataAvailable(self: *Self) bool {
+        const target = self.resolveListener("on_data_available", DDS.DATA_AVAILABLE_STATUS) orelse return false;
+        defer target.release();
+        if (!self.claimDataAvailable()) return false;
+        target.invoke(vtable.get_c_abi_handle(self), .{});
+        return true;
+    }
+
+    /// Claims DATA_AVAILABLE for an `on_data_available` the caller has
+    /// resolved: resets it and returns true if it is still changed.
+    pub fn claimDataAvailable(self: *Self) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.claimStatusLocked(DDS.DATA_AVAILABLE_STATUS, true);
     }
 
     // Neither navigational getter below is gated on enabled state -- see

@@ -5,9 +5,8 @@
 // already written its full historical batch (enforced by the harness, not
 // this app). Immediately after creating the reader, calls
 // wait_for_historical_data() -- the API this whole example exists to
-// exercise -- before taking anything, then confirms the full historical
-// batch was in fact replayed by the time that call returns, then continues
-// taking live samples as they arrive.
+// exercise -- before taking anything, then takes and confirms the full
+// historical batch, then attaches a listener for the live samples.
 //
 // Required stdout markers (see the spec doc): "Create topic:", "Create
 // reader for topic:", "Subscriber: wait_for_historical_data() returned",
@@ -37,6 +36,34 @@ public class Subscriber {
             if (!v.get()) return false;
         }
         return true;
+    }
+
+    // Takes every sample available now, recording each, and returns whether
+    // this call saw the last live sample the subscriber was waiting for. Run
+    // by main() to drain the historical batch before any listener is
+    // attached, then by on_data_available for the live batch.
+    static boolean takeAvailable(HistoryEventDataReader reader, AtomicBoolean[] historicalReceived,
+                                 AtomicBoolean[] liveReceived, AtomicBoolean historicalConfirmed,
+                                 AtomicBoolean allDone) {
+        boolean becameDone = false;
+        HistoryEventDataReader.Sample sample;
+        while ((sample = reader.take()) != null) {
+            if (!sample.validData) continue;
+            int seqNum = sample.data.get_seq_num();
+            if (seqNum >= 0 && seqNum < HISTORICAL_COUNT) {
+                historicalReceived[seqNum].set(true);
+            } else if (seqNum >= HISTORICAL_COUNT && seqNum < HISTORICAL_COUNT + LIVE_COUNT) {
+                System.out.println("LIVE SAMPLE seq_num=" + seqNum);
+                liveReceived[seqNum - HISTORICAL_COUNT].set(true);
+                if (!allDone.get() && !becameDone && readyToFinish(historicalConfirmed, liveReceived)) {
+                    becameDone = true;
+                }
+            } else {
+                System.err.println("FAIL: unexpected seq_num=" + seqNum);
+                System.exit(1);
+            }
+        }
+        return becameDone;
     }
 
     static int parseDomain(String[] args) {
@@ -89,12 +116,10 @@ public class Subscriber {
         drQos.get_history().set_kind(Dcps.DDS.HistoryQosPolicyKind.KEEP_ALL_HISTORY_QOS);
 
         final Object[] readerBox = new Object[1]; // set right after create_datareader
-        // AtomicBoolean, not plain boolean[] -- these are written by the
-        // listener-dispatch thread and read by main() (after
-        // wait_for_historical_data() returns) and by the listener thread
-        // itself (checkAllDone()); plain array elements have no Java Memory
-        // Model visibility guarantee across threads without real
-        // synchronization, unlike a mutex-backed native call.
+        // AtomicBoolean, not plain boolean[] -- the live flags are written
+        // by the listener-dispatch thread and read by main(); plain array
+        // elements have no Java Memory Model visibility guarantee across
+        // threads without real synchronization.
         final AtomicBoolean[] historicalReceived = new AtomicBoolean[HISTORICAL_COUNT];
         final AtomicBoolean[] liveReceived = new AtomicBoolean[LIVE_COUNT];
         for (int i = 0; i < HISTORICAL_COUNT; i++) historicalReceived[i] = new AtomicBoolean(false);
@@ -112,7 +137,7 @@ public class Subscriber {
 
             public void on_data_available(Dcps.DDS.DataReader r) {
                 HistoryEventDataReader reader = (HistoryEventDataReader) readerBox[0];
-                // Deferred, not set directly inside the loop below: main()
+                // Deferred, not set inside takeAvailable()'s loop: main()
                 // deletes the reader as soon as it observes allDone, so
                 // setting it mid-loop would let main()'s
                 // delete_datareader() race this same invocation's next
@@ -121,58 +146,33 @@ public class Subscriber {
                 // again.
                 //
                 // main() can also independently reach the same conclusion
-                // (see readyToFinish() right after wait_for_historical_data()
-                // returns below) and call delete_datareader() while this
-                // invocation is still draining regardless. That's still
-                // fine: zzdds's core EntityQuiesce mechanism (not anything
-                // in this file) guarantees a delete_datareader() racing an
-                // in-flight take() call is memory-safe -- the racing take()
-                // either completes normally (started before teardown) or
-                // cleanly sees "no data" (started after), never a crash.
-                boolean becameDone = false;
-                HistoryEventDataReader.Sample sample;
-                while ((sample = reader.take()) != null) {
-                    if (!sample.validData) continue;
-                    int seqNum = sample.data.get_seq_num();
-                    if (seqNum >= 0 && seqNum < HISTORICAL_COUNT) {
-                        historicalReceived[seqNum].set(true);
-                    } else if (seqNum >= HISTORICAL_COUNT && seqNum < HISTORICAL_COUNT + LIVE_COUNT) {
-                        System.out.println("LIVE SAMPLE seq_num=" + seqNum);
-                        liveReceived[seqNum - HISTORICAL_COUNT].set(true);
-                        if (!allDone.get() && !becameDone && readyToFinish(historicalConfirmed, liveReceived)) {
-                            becameDone = true;
-                        }
-                    } else {
-                        System.err.println("FAIL: unexpected seq_num=" + seqNum);
-                        System.exit(1);
-                    }
-                }
-                if (becameDone) {
+                // (see readyToFinish() right after set_listener() below)
+                // and call delete_datareader() while this invocation is
+                // still draining regardless. That's still fine: zzdds's
+                // core EntityQuiesce mechanism (not anything in this file)
+                // guarantees a delete_datareader() racing an in-flight
+                // take() call is memory-safe -- the racing take() either
+                // completes normally (started before teardown) or cleanly
+                // sees "no data" (started after), never a crash.
+                if (takeAvailable(reader, historicalReceived, liveReceived, historicalConfirmed, allDone)) {
                     allDone.set(true);
                 }
             }
         };
 
-        // Create with no listener attached yet: on_data_available fires on
-        // a zzdds-internal dispatch thread as soon as the reader matches
-        // the publisher's already-written historical batch, which can race
-        // readerBox[0]'s own assignment below (a real, not hypothetical,
-        // race given this example's whole point is data being ready before
-        // the reader even exists). Attach the listener only once
-        // readerBox[0] is set, via set_listener() below, closing the
-        // window entirely.
+        // Create with no listener attached: the historical batch is taken
+        // below, on this thread, after wait_for_historical_data() returns. A
+        // listener attached now would take it on a zzdds receive thread
+        // instead, and wait_for_historical_data() waits for the samples to
+        // reach the reader, not for a listener to have taken them.
         Dcps.DDS.DataReader rawReader = sub.create_datareader(topic, drQos, null, 0);
         if (rawReader == null) {
             System.err.println("FAIL: create_datareader() failed");
             System.exit(1);
         }
         System.out.println("Create reader for topic: HistoryEvent");
-
-        readerBox[0] = new HistoryEventDataReader(rawReader);
-        if (rawReader.set_listener(listener, Dcps.DDS.DATA_AVAILABLE_STATUS.value) != 0) {
-            System.err.println("FAIL: set_listener() failed");
-            System.exit(1);
-        }
+        HistoryEventDataReader reader = new HistoryEventDataReader(rawReader);
+        readerBox[0] = reader;
 
         // The API this whole example exists to exercise: block until the
         // TRANSIENT_LOCAL historical replay has actually landed, before
@@ -188,10 +188,8 @@ public class Subscriber {
         System.out.println("Subscriber: wait_for_historical_data() returned");
 
         // Confirm the real guarantee, not just the return code: every
-        // historical sample must already have been delivered by now.
-        // (Read on the main thread only after wait_for_historical_data()
-        // returned -- zzdds's own internal locking on that call path
-        // establishes a real happens-before with the listener's writes.)
+        // historical sample must be in the reader by now.
+        takeAvailable(reader, historicalReceived, liveReceived, historicalConfirmed, allDone);
         int historicalCount = 0;
         for (AtomicBoolean v : historicalReceived) {
             if (v.get()) historicalCount++;
@@ -202,11 +200,17 @@ public class Subscriber {
         }
         System.out.println("HISTORICAL BATCH COMPLETE (" + HISTORICAL_COUNT + " samples)");
         historicalConfirmed.set(true);
+
+        // The live batch arrives through the listener. A sample that arrived
+        // since the take above is delivered by set_listener() itself.
+        if (rawReader.set_listener(listener, Dcps.DDS.DATA_AVAILABLE_STATUS.value) != 0) {
+            System.err.println("FAIL: set_listener() failed");
+            System.exit(1);
+        }
         // readyToFinish() only gets re-evaluated when a *new* live sample
-        // arrives on the listener thread -- if every live sample already
-        // arrived (and each check found historicalConfirmed still false)
-        // before this line ran, nothing would ever re-check again. Mirror
-        // the same check here.
+        // arrives on the listener thread -- if every live sample was taken
+        // above, nothing would ever re-check again. Mirror the same check
+        // here.
         if (readyToFinish(historicalConfirmed, liveReceived)) {
             allDone.set(true);
         }

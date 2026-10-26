@@ -145,7 +145,7 @@ pub const SubscriberImpl = struct {
     /// dispatch or any other call (see listener_box.zig).
     listener_mu: Mutex = .{},
     /// See `writer.zig`'s matching field. Read from discovery/timer
-    /// threads in `dispatchReaderFallback` and (cross-entity, for the
+    /// threads in `resolveReaderFallback` and (cross-entity, for the
     /// reader's and participant's masks too) in
     /// `resolveDataAvailableFallback`, concurrently with an application
     /// `set_listener`; all runtime reads/writes are
@@ -173,7 +173,7 @@ pub const SubscriberImpl = struct {
 
     /// Deferred teardown, mirroring PublisherImpl: a DataReaderImpl holds a
     /// lifetime reference on its parent SubscriberImpl so
-    /// `dispatchReaderFallback` -- reached from a reader's discovery-driven
+    /// `resolveReaderFallback` -- reached from a reader's discovery-driven
     /// `notifySubscriptionMatched` after `participant.mu` is released --
     /// never reads a SubscriberImpl freed by a racing delete_subscriber.
     quiesce: EntityQuiesce = .{},
@@ -488,7 +488,10 @@ pub const SubscriberImpl = struct {
         // Subscriber's own current enabled state -- see publisher.zig's
         // identical DataWriter gate (PR #91 Greptile finding).
         dr.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
-        if (dr.enabled.load(.acquire)) self.announceDataReader(subscription_handle);
+        // Joins this Subscriber before it is announced, held until creation
+        // returns; see PublisherImpl.finishDataWriter.
+        _ = dr.acquireQuiesce();
+        defer dr.releaseQuiesce();
         self.mu.lock();
         self.readers.append(self.alloc, dr) catch {
             self.mu.unlock();
@@ -497,6 +500,8 @@ pub const SubscriberImpl = struct {
             return nil.nil_datareader;
         };
         self.mu.unlock();
+        if (dr.enabled.load(.acquire)) self.announceDataReader(subscription_handle);
+        if (dr.quiesce.tearingDown()) return nil.nil_datareader;
         return dr.toDDSDataReader();
     }
 
@@ -654,8 +659,7 @@ pub const SubscriberImpl = struct {
         }
         self.mu.unlock();
         for (pinned.items) |r| {
-            const dr = r.toDDSDataReader();
-            _ = r.dispatchListener("on_data_available", DDS.DATA_AVAILABLE_STATUS, dr.vtable.get_c_abi_handle(dr.ptr), .{});
+            _ = r.dispatchDataAvailable();
             r.releaseQuiesce();
         }
         return DDS.RETCODE_OK;
@@ -715,31 +719,14 @@ pub const SubscriberImpl = struct {
     }
 
     /// Second link in the DDS 1.4 §2.2.4.1.5 "nearest enclosing non-null
-    /// listener" fallback chain for a contained DataReader's status events —
+    /// listener" fallback chain for a contained DataReader's status events,
     /// consulted only after the reader itself had no usable listener for
-    /// `field`. `handle` remains the originating reader's own handle (per
-    /// spec — the callback that runs still receives the entity whose status
-    /// actually changed). Safe to downcast `self.participant.ptr`: see
-    /// `publisher.zig`'s `resolveWriterFallback` doc comment for why the
-    /// parent is guaranteed alive for the whole of this call — the same
-    /// reasoning applies symmetrically here.
-    pub fn dispatchReaderFallback(self: *Self, comptime field: []const u8, bit: DDS.StatusMask, handle: anytype, args: anytype) bool {
-        if (!self.quiesce.acquire()) return false;
-        defer self.quiesce.release(self, reallyDeinit);
-        const box = self.acquireListener();
-        defer box.releaseRef(self.alloc);
-        const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
-        if (listener_fallback.tryDispatch(field, mask, bit, box.listener, handle, args)) return true;
-        if (nil.isNil(self.participant)) return false;
-        const p: *participant_mod.DomainParticipantImpl = @ptrCast(@alignCast(self.participant.ptr));
-        return p.dispatchFallback(field, bit, handle, args);
-    }
-
-    /// `dispatchReaderFallback`'s resolution step alone: the callback for `field`
-    /// from this level or the participant's, not yet invoked (see
-    /// `listener_fallback.Resolved`), or null. A resolution keeps this
-    /// entity's lifetime pinned until released, as `dispatchReaderFallback` does
-    /// across its callback.
+    /// `field`: the callback from this level or the participant's, not yet
+    /// invoked (see `listener_fallback.Resolved`), or null. A resolution
+    /// keeps this entity's lifetime pinned until released. Safe to downcast
+    /// `self.participant.ptr`: see `publisher.zig`'s `resolveWriterFallback`
+    /// doc comment for why the parent is guaranteed alive for the whole of
+    /// this call; the same reasoning applies symmetrically here.
     pub fn resolveReaderFallback(self: *Self, comptime Cb: type, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(Cb) {
         if (!self.quiesce.acquire()) return null;
         const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
@@ -854,10 +841,24 @@ pub const SubscriberImpl = struct {
             r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
             if (r.status_cond) |sc| sc.notifyWakeup();
             const resolution = self.resolveDataAvailableFallback(r);
-            listener_snaps.append(self.alloc, .{
+            // Reserved before the claim, so a failed allocation leaves the
+            // status changed for a later notification instead of consumed.
+            listener_snaps.ensureUnusedCapacity(self.alloc, 1) catch {
+                resolution.release();
+                return;
+            };
+            // Claimed now, while subscriber.mu keeps `r` alive: a callback
+            // resets DATA_AVAILABLE before it runs (see
+            // DataReaderImpl.dispatchDataAvailable), and one with nothing
+            // left to claim doesn't run.
+            if (resolution.cb != null and !r.claimDataAvailable()) {
+                resolution.release();
+                return;
+            }
+            listener_snaps.appendAssumeCapacity(.{
                 .dr = r.toDDSDataReader(),
                 .resolution = resolution,
-            }) catch resolution.release();
+            });
         }
     }
 

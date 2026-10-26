@@ -32,9 +32,9 @@ retained lifetimes below constrain both manual and hosted implementations.
 
 Callback placement is another policy above these axes: inline when eligible, designated executor, or explicit application dispatch. Avoid one `evented` boolean that silently changes thread safety, callback placement and blocking semantics together.
 
-Zig 0.16 introduces `std.Io` implementations, but its release notes describe `Io.Evented` as experimental and single-threaded `Io.Threaded` as lacking task-level concurrency. Those facilities do not automatically transform blocking protocol loops into a manually driven state machine. [Zig 0.16 release notes](https://ziglang.org/download/0.16.0/release-notes.html).
+Zig 0.17's `std.Io` offers `Io.Threaded`, a thread pool that any thread may call, and `Io.Evented`, fibers over io_uring, kqueue or Dispatch. In 0.17.0 the Evented backends do not compile, and a thread outside an Evented pool cannot call into it ([`std.Io` in 0.17.0](transport-adapters.md#zig-std-io-in-0-17)). Neither turns blocking protocol loops into a manually driven state machine.
 
-Use `std.Io` where useful in hosted adapters. Do not make bare-metal support depend on a particular stackful coroutine backend. A MicroZig adapter needs the selected network driver/stack, clock, wakeup and interrupt ownership contract. No working adapter or version compatibility is asserted here. [MicroZig project](https://github.com/ZigEmbeddedGroup/microzig).
+Use `std.Io` where useful in hosted adapters ([adapter model](transport-adapters.md#adapter-model)). Do not make bare-metal support depend on a particular stackful coroutine backend. A MicroZig adapter needs the selected network driver/stack, clock, wakeup and interrupt ownership contract. No working adapter or version compatibility is asserted here. [MicroZig project](https://github.com/ZigEmbeddedGroup/microzig).
 
 <a id="core-progress-boundary"></a>
 ### Core progress boundary
@@ -145,6 +145,19 @@ With today's threads, the participant lock orders the discovery events. The reco
 
 Use bounded pending storage and explicit overload handling. These rules do not authorize dropping admitted commands or treating queue admission as successful DDS history admission. The accepted short group-commit gate is a narrow exception, permitting bounded sequencing/history installation while holding writer execution rights. Its acquisition graph and preparation requirements are specified in the admission draft; it does not authorize entering general Publisher execution under writer rights. Other multi-owner operations need a separate lock-order and boundedness proof.
 
+<a id="local-endpoint-publication-announcement-and-disposal"></a>
+##### Local endpoint publication, announcement and disposal
+
+The participant control context owns each local endpoint's announcement state and processes its enablement, refreshes and disposal in one order, as it does for remote endpoints. A local endpoint is *published* once its parent's creation commit makes it usable: it can be looked up, used and deleted through its parent. It is *announced* once its announcement is committed to the participant's outbound discovery record (today the built-in SEDP writer's history; with a broker, the session's inventory). It is *disposed* once deletion's disposal is committed there.
+
+* **Publication first.** Nothing about an endpoint reaches discovery before it is published: not its announcement, and not a match against an already-discovered remote endpoint. Creation reserves every fallible resource before the publication commit, including the storage its announcement and disposal will need, so a failed creation is never announced and never needs disposing. A callback for the endpoint becomes eligible only after its publication (rule 5); an application handed the endpoint in a callback can use or delete it even before the creating call returns.
+* **Announcement.** Only enablement triggers the first announcement, at creation when the parent's ENTITY_FACTORY QoS enables it or at a later `enable`. Exactly one enable transition wins, and only the winner announces. A QoS or partition change that alters what is announced is a refresh: it reserves the new announcement before the change commits, so a failed reservation fails the setter with OUT_OF_RESOURCES and leaves both the QoS and the announcement unchanged. Each announcement or refresh carries the endpoint's announcement generation.
+* **Disposal.** Deletion first closes the endpoint to new admission (rule 4), which includes enablement, refresh and new matches. It then withdraws the announcement generation and commits the disposal as one step. An announcement or refresh decided before the disposal commits nothing after it, so no peer is told the endpoint exists again after its disposal. Currency is checked when the announcement is committed to the discovery record, not when its contents are captured. An endpoint never announced has nothing to dispose. Deletion then removes local proxies and reclaims under the [lifecycle rules](#lifecycle-and-validation).
+* **Failure reporting.** Once an endpoint is published, its announcement, refresh and disposal cannot fail for lack of local resources, because their storage is reserved. Reaching peers belongs to the discovery path. Reliable SEDP repairs a lost announcement, and a peer that misses a disposal drops the endpoint when its participant's lease expires. A broker's rejection or loss is reported as the [broker API](../broker/api.md#status-and-asynchronous-failures) specifies, with disposal retained as bounded removal state until the broker confirms it. None of these fails or undoes creation after it returned, and deletion never waits for a peer.
+* **Matches made by announcement.** A match decided because the local endpoint was announced, against remote endpoints already discovered, follows [remote endpoint match and loss](#remote-endpoint-match-and-loss). It also commits only while the local endpoint is still open, so a match decided before deletion closed the endpoint installs nothing.
+
+With today's threads, the participant lock orders these events and currency is checked under it at the commit into the SEDP writer; in the runtime, they are participant-control commands that carry the endpoint's lifecycle and announcement generations. The current code departs from these rules in the ways the roadmap lists under "A local endpoint's announcement is not ordered against its creation and deletion".
+
 <a id="publisher-operations-spanning-writers"></a>
 ##### Publisher operations spanning writers
 
@@ -168,7 +181,7 @@ The agreed access brackets in the shared-access section above reference the elig
 <a id="lifecycle-and-validation"></a>
 ##### Lifecycle and validation
 
-Creation reserves child identity/membership under parent control, initializes child state, then publishes a usable endpoint under a defined commit boundary. Failure before publication rolls back reservations. Deletion closes new admission, resolves retained work and detaches membership before eventual reclamation, subject to API preconditions. Do not destroy a child while a coordinator contribution, ticket, callback, loan or transport completion still references it. The local-publication/announcement/disposal ordering for concurrent entity creation and deletion is an [open design item](../concurrency-broker-status.md#open-design-items).
+Creation reserves child identity/membership under parent control, initializes child state, then publishes a usable endpoint under a defined commit boundary. Failure before publication rolls back reservations. Deletion closes new admission, resolves retained work and detaches membership before eventual reclamation, subject to API preconditions. Do not destroy a child while a coordinator contribution, ticket, callback, loan or transport completion still references it. [Local endpoint publication, announcement and disposal](#local-endpoint-publication-announcement-and-disposal) orders an endpoint's creation and deletion against discovery.
 
 Validate at least: discovery removal racing with queued input; write admission racing with coherent close/deletion; a busy writer needed by a closing Publisher; a group whose last reader contribution fails preparation; final access end racing with a callback guard; and one-thread progress through each sequence. Compare uncontended inline work and contended admission, including allocation count, handoffs and fairness. These fixtures must precede treating the ownership map as an implemented guarantee.
 
@@ -195,7 +208,7 @@ Budget histories, command queues, callback pending state, fragments, timer entri
 
 Hosted TLS/DTLS, DNS and transport connection setup need bounded/cancellable integration; an adapter that blocks the sole driver can stop every lease and writer on that driver. Either use incremental/non-blocking APIs or isolate unavoidable blocking work where OS threads exist. Do not assume those hosted choices carry to an MCU.
 
-Current `src/util/mutex.zig` uses pthread/Windows primitives, and transports use direct platform sockets. Supporting `std.Io` or a freestanding backend requires explicit adapter/synchronization changes; selecting a Zig build option is insufficient.
+Current `src/util/mutex.zig` uses pthread/Windows primitives, and transports use direct platform sockets. Supporting `std.Io` or a freestanding backend requires explicit adapter/synchronization changes; selecting a Zig build option is insufficient. Under an Evented `Io`, a blocking lock or syscall stalls every fiber on that thread. [Transport adapters](transport-adapters.md) defines the transport side of that boundary.
 
 <a id="admission-and-request-state-transitions"></a>
 ## Admission and request state transitions

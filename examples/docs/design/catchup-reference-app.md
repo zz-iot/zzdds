@@ -79,7 +79,7 @@ live batch`, `Publisher: wrote live seq_num=`, `Publisher: done.`
    getting a genuinely late subscriber needs an explicit ordering step in
    the harness, the app pattern itself is simple.
 2. Create participant → TypeSupport → topic → subscriber → DataReader with
-   the same TRANSIENT_LOCAL/KEEP_ALL QoS, listener on `on_data_available`.
+   the same TRANSIENT_LOCAL/KEEP_ALL QoS and no listener yet.
 3. **Immediately after creating the reader, call
    `wait_for_historical_data(max_wait)` — before taking anything.** This is
    the API this whole example exists to exercise. Blocks until the cached
@@ -89,9 +89,14 @@ live batch`, `Publisher: wrote live seq_num=`, `Publisher: done.`
    (`seq_num` 0–9, in order) — printing a `HISTORICAL BATCH COMPLETE`
    marker only after confirming the count and order, not just that the call
    returned.
-5. Continue taking as live data arrives (`seq_num` 10–14), printing a
-   distinct `LIVE SAMPLE` marker per item, until all 15 total samples have
-   been seen.
+   The subscriber takes the batch on its own thread: `wait_for_historical_data`
+   waits for the samples to reach the reader, not for a listener to have
+   taken them, so counting what a listener took right after the call
+   returns races the listener's last take.
+5. Attach the `on_data_available` listener (`set_listener` delivers
+   anything that arrived since the take) and continue taking as live data
+   arrives (`seq_num` 10–14), printing a distinct `LIVE SAMPLE` marker per
+   item, until all 15 total samples have been seen.
 6. Exit successfully once both the historical batch and the live batch have
    been fully and correctly observed, *in that order* (the one thing this
    example actually asserts programmatically: a sample never counted as

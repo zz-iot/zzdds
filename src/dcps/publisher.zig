@@ -519,7 +519,14 @@ pub const PublisherImpl = struct {
         // already-enabled DataWriter that could announce/match before its
         // own parent is operational.
         dw.enabled.store(self.enabled.load(.acquire) and self.qos.entity_factory.autoenable_created_entities, .release);
-        if (dw.enabled.load(.acquire)) self.announceDataWriter(publication_handle);
+        // Held until creation returns: once the writer is in the Publisher,
+        // a callback the announcement's matches raise may delete it, and
+        // creation then returns nil rather than a freed writer.
+        _ = dw.acquireQuiesce();
+        defer dw.releaseQuiesce();
+        // Joins this Publisher before it is announced, so a failed append
+        // announces nothing, and a callback the announcement's matches raise
+        // gets a writer delete_datawriter can find.
         self.mu.lock();
         self.writers.append(self.alloc, dw) catch {
             self.mu.unlock();
@@ -528,6 +535,8 @@ pub const PublisherImpl = struct {
             return nil.nil_datawriter;
         };
         self.mu.unlock();
+        if (dw.enabled.load(.acquire)) self.announceDataWriter(publication_handle);
+        if (dw.quiesce.tearingDown()) return nil.nil_datawriter;
         return dw.toDDSDataWriter();
     }
 

@@ -697,6 +697,10 @@ channel ownership follow the bootstrap and transport sections below.
 <a id="transportruntime-ownership-and-backpressure"></a>
 ## Transport/runtime ownership and backpressure
 
+[Transport adapters](transport-adapters.md) gives this contract its code shape: the
+progress backend that supplies the runtime's wait, and the readiness, completion,
+in-process and MCU adapters that implement it.
+
 <a id="ingress"></a>
 ### Ingress
 
@@ -807,7 +811,67 @@ release them. A retained stopped runtime identity is not a live channel owner.
 Preserve received-channel routing from the implemented Channel/sendOnChannel API.
 Retained queued work must also retain or safely resolve the owning transport lifetime;
 a copied pointer token plus generation is not a resource lease. Replace unbounded
-dead-channel retention with bounded safe identity reclamation for the evented backend.
+dead-channel retention with bounded safe identity reclamation
+([channels and lifetimes](transport-adapters.md#channels-and-lifetimes)).
 Correlate broadcast close notifications against known channel generations and retain
 reserved completion/cleanup capacity; never treat every notification as session loss.
 The existing API does not yet supply asynchronous send ownership or completion.
+
+<a id="migration-from-the-threaded-implementation"></a>
+## Migration from the threaded implementation
+
+The shared runtime replaces today's one-thread-per-concern implementation (described
+in [the thread model](../thread-model.md)); it is not a second model kept alongside it.
+The lasting user choice is hosted or manual progress, as above. This section fixes where
+each existing thread's work goes and how the old and new paths coexist while endpoints
+migrate.
+
+<a id="thread-mapping"></a>
+### Thread mapping
+
+| Today | Work it does | In the runtime |
+| --- | --- | --- |
+| Writer heartbeat thread (`StatefulWriter.heartbeatThread`), one per writer once a reader matches, ticking every 200 ms | Periodic HEARTBEAT, reader-proxy liveness-probe deadlines, connection-generation resync and replay retry | A writer-local recurring timer, run under writer rights. Armed when a reliable reader matches and cancelled when none remain. |
+| Participant timer thread (`DomainParticipantImpl.timerThreadFn`), polling `checkTimers()` every 100 ms | DEADLINE and LIVELINESS expiry for every local endpoint; the WLP assertion tick | Endpoint-local timers armed at each endpoint's next deadline or lease expiry, under that endpoint's rights, instead of a participant-wide poll. WLP assertion is a participant-control timer. |
+| SPDP timer thread (`SpdpSedpDiscovery.timerFn`), ticking every 100 ms | Periodic (and initial fast) SPDP announcement; remote participant lease expiry and liveness probes | Participant-control timers: one for the next announcement, one at the earliest lease or probe deadline. |
+| UDP receive threads (one per socket); TCP accept thread and one receive thread per connection | Blocking receive, then inline `on_receive` dispatch: protocol processing and application listeners run on the receive thread | The transport's [adapter](transport-adapters.md#adapter-model) services nonblocking sockets: a configured number of I/O threads run it in hosted mode, and `drive()` runs it in manual mode, which has no receive threads. What it receives follows [ingress](#ingress): processed inline only under eligible bounded admission, otherwise retained and queued to the destination owner. Listeners run under the listener contract, not on the receive stack under protocol rights. |
+| Interface poll thread (polling `InterfaceMonitor`), ticking at its configured interval | Re-enumerates interfaces and reports a change | A runtime timer in either mode. A platform monitor with change events may wake the runtime instead. |
+| Trace flush thread (`trace.AsyncRingSink`), optional and started by the application | Drains the trace ring to its sink | Not runtime work: diagnostics are never required for DDS progress. It stays an application-started helper; a manual-only build uses a synchronous sink. |
+
+Requirements that follow from the table:
+
+* Thread count is independent of endpoint and socket count. A hosted runtime's threads
+  are its configured workers plus its configured I/O threads; no thread is created per
+  writer, reader, participant or socket. A manual runtime creates none.
+* Recurring timers are armed at their actual next deadline, not polled at a fixed tick.
+  Each runs under the rights of the context that owns its state and identifies that
+  context's generation (coordination rule 4); a timer for a closed endpoint is cancelled,
+  and a stale fire retires itself. Recurrence never keeps a retiring runtime operational.
+* Every timer uses the runtime's scheduling clock. Today the heartbeat, interface poll
+  and participant timer threads sleep on the host monotonic clock, so tests must stop
+  them; on the runtime, a fake clock drives all of them.
+* In-process delivery (the memory transport and direct discovery) hands work to the
+  receiving participant's runtime. It runs the receiver's protocol work on the sender's
+  stack only when both participants share that runtime and admission permits it, as for
+  any other caller.
+
+<a id="coexistence-during-migration"></a>
+### Coexistence during migration
+
+The runtime lands incrementally, starting with the first vertical slice, so the threaded
+path stays the default until the runtime can replace it:
+
+* A build option (`-Dshared-runtime`, off by default) selects the runtime. It is a
+  migration switch, not a supported configuration: it is not part of `zzdds.idl`, the
+  configuration file or the C ABI, and it is documented only for contributors.
+* With the option on, every participant in the build uses the runtime. There is no
+  mixing within a build: an entity or QoS the runtime does not yet support fails creation
+  visibly (the constructor's ordinary nil result, with a diagnostic) and never falls back
+  to the threaded path.
+* With the option off, the build is today's threaded implementation, and releases ship
+  it until the default flips.
+* CI builds and tests both settings while the option exists. The option build runs the
+  runtime's own tests and every existing test whose features it supports; that set grows
+  with each migrated endpoint kind.
+* Once the runtime passes the full test, interoperability and examples suites, the default
+  flips to the runtime. The threaded path and the option are then deleted together.

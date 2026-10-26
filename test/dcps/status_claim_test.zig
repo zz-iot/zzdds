@@ -500,3 +500,168 @@ test "status claim: a status a listener received is consumed, a later one is not
     try testing.expectEqual(@as(i32, 1), st.total_count_change);
     try testing.expectEqual(@as(i32, 0x200), st.last_subscription_handle);
 }
+
+// ── DATA_AVAILABLE ────────────────────────────────────────────────────────────
+//
+// DDS 1.4 §2.2.4.2.2: every read or take resets DATA_AVAILABLE, and so does
+// on_data_available, claimed like a plain status
+// (docs/design/concurrency/listeners.md#reader-data-available-reset).
+
+fn freeTaken(dr: *DataReaderImpl, samples: []const zzdds.dcps.TakenSample) void {
+    for (samples) |s| dr.alloc.free(s.data);
+}
+
+fn readAll(dr: *DataReaderImpl, out: *std.ArrayListUnmanaged(zzdds.dcps.TakenSample)) !void {
+    try dr.readRaw(out, DDS.ANY_SAMPLE_STATE, DDS.ANY_VIEW_STATE, DDS.ANY_INSTANCE_STATE, -1, null, null);
+}
+
+/// Keeps every sample written to the fixture's one (NIL) instance.
+fn keepAllReaderQos() DDS.DataReaderQos {
+    var qos = DDS.DataReaderQos{};
+    qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    return qos;
+}
+
+fn countDataAvailable(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+    @as(*u32, @ptrCast(@alignCast(ld))).* += 1;
+}
+
+test "DATA_AVAILABLE: a read resets it, though the samples stay" {
+    var mc = ManualClock.init(0);
+    var fx = try Fixture.init(testing.allocator, mc.clock());
+    defer fx.deinit();
+
+    const dw = fx.makeWriter(.{}, null, 0);
+    const dr = fx.makeReader(keepAllReaderQos(), null, 0);
+    try write(dw);
+    try write(dw);
+    try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0);
+
+    var out: std.ArrayListUnmanaged(zzdds.dcps.TakenSample) = .empty;
+    defer out.deinit(testing.allocator);
+    defer freeTaken(dr, out.items);
+    try readAll(dr, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS == 0);
+
+    // A new sample sets it again.
+    try write(dw);
+    try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0);
+}
+
+test "DATA_AVAILABLE: a take resets it while samples remain" {
+    var mc = ManualClock.init(0);
+    var fx = try Fixture.init(testing.allocator, mc.clock());
+    defer fx.deinit();
+
+    const dw = fx.makeWriter(.{}, null, 0);
+    const dr = fx.makeReader(keepAllReaderQos(), null, 0);
+    try write(dw);
+    try write(dw);
+
+    const taken = dr.takeRaw() orelse return error.TestExpectedNonNull;
+    dr.alloc.free(taken.data);
+    try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS == 0);
+    const rest = dr.takeRaw() orelse return error.TestExpectedNonNull;
+    dr.alloc.free(rest.data);
+}
+
+test "DATA_AVAILABLE: on_data_available resets it, and data arriving during the callback stays pending" {
+    var mc = ManualClock.init(0);
+    var fx = try Fixture.init(testing.allocator, mc.clock());
+    defer fx.deinit();
+
+    const Probe = struct {
+        var dr: *DataReaderImpl = undefined;
+        var dw: *DataWriterImpl = undefined;
+        var calls: u32 = 0;
+        var set_in_callback: bool = true;
+
+        fn cb(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
+            calls += 1;
+            if (calls > 1) return;
+            set_in_callback = drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0;
+            // Hidden, so the arrival below is not claimed by a nested call.
+            @atomicStore(DDS.StatusMask, &dr.listener_mask, 0, .monotonic);
+            write(dw) catch unreachable;
+        }
+    };
+    Probe.calls = 0;
+    Probe.dw = fx.makeWriter(.{}, null, 0);
+    Probe.dr = fx.makeReader(.{}, .{ .on_data_available = Probe.cb }, DDS.DATA_AVAILABLE_STATUS);
+
+    try write(Probe.dw);
+    try testing.expectEqual(@as(u32, 1), Probe.calls);
+    try testing.expect(!Probe.set_in_callback);
+    try testing.expect(drStatusChanges(Probe.dr) & DDS.DATA_AVAILABLE_STATUS != 0);
+}
+
+test "DATA_AVAILABLE: a listener whose change was consumed does not run" {
+    var mc = ManualClock.init(0);
+    var fx = try Fixture.init(testing.allocator, mc.clock());
+    defer fx.deinit();
+
+    var calls: u32 = 0;
+    const listener = DDS.DataReaderListener{ .listener_data = &calls, .on_data_available = countDataAvailable };
+    const dw = fx.makeWriter(.{}, null, 0);
+    const dr = fx.makeReader(keepAllReaderQos(), listener, DDS.DATA_AVAILABLE_STATUS);
+
+    // The arrival's callback claims the change, leaving nothing for
+    // notify_datareaders.
+    try write(dw);
+    try testing.expectEqual(@as(u32, 1), calls);
+    _ = fx.sub_.notify_datareaders();
+    try testing.expectEqual(@as(u32, 1), calls);
+
+    // Two more arrive unclaimed; a take consumes the change first, so
+    // neither notify_datareaders nor the catch-up of a reinstalled listener
+    // runs, though a sample remains.
+    @atomicStore(DDS.StatusMask, &dr.listener_mask, 0, .monotonic);
+    try write(dw);
+    try write(dw);
+    const taken = dr.takeRaw() orelse return error.TestExpectedNonNull;
+    dr.alloc.free(taken.data);
+    @atomicStore(DDS.StatusMask, &dr.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
+    _ = fx.sub_.notify_datareaders();
+    const dds = dr.toDDSDataReader();
+    _ = dds.vtable.set_listener(dds.ptr, &listener, DDS.DATA_AVAILABLE_STATUS);
+    try testing.expectEqual(@as(u32, 1), calls);
+}
+
+test "DATA_AVAILABLE: begin_access that cannot queue on_data_available leaves it changed" {
+    var mc = ManualClock.init(0);
+    var fx = try Fixture.init(testing.allocator, mc.clock());
+    defer fx.deinit();
+
+    // PRESENTATION must be offered as requested for the pair to match.
+    var pub_qos = DDS.PublisherQos{};
+    pub_qos.presentation.coherent_access = true;
+    const pub_ = fx.dp_w.create_publisher(pub_qos, null, 0);
+    const dw: *DataWriterImpl = @ptrCast(@alignCast(pub_.create_datawriter(fx.topic_w, .{}, null, 0).ptr));
+    var sub_qos = DDS.SubscriberQos{};
+    sub_qos.presentation.coherent_access = true;
+    const sub = fx.dp_r.create_subscriber(sub_qos, null, 0);
+    var calls: u32 = 0;
+    const listener = DDS.DataReaderListener{ .listener_data = &calls, .on_data_available = countDataAvailable };
+    const td = @as(*TopicImpl, @ptrCast(@alignCast(fx.topic_r.ptr))).toTopicDescription();
+    // Hidden while the sample arrives, so only begin_access raises it.
+    const dds_dr = sub.create_datareader(td, keepAllReaderQos(), listener, 0);
+    const dr: *DataReaderImpl = @ptrCast(@alignCast(dds_dr.ptr));
+    try write(dw);
+    try testing.expectEqual(@as(u32, 0), calls);
+    @atomicStore(DDS.StatusMask, &dr.listener_mask, DDS.DATA_AVAILABLE_STATUS, .monotonic);
+
+    // The Subscriber cannot allocate the callback's entry.
+    const impl: *zzdds.dcps.SubscriberImpl = @ptrCast(@alignCast(sub.ptr));
+    const saved = impl.alloc;
+    impl.alloc = testing.failing_allocator;
+    _ = sub.begin_access();
+    impl.alloc = saved;
+    try testing.expectEqual(@as(u32, 0), calls);
+    try testing.expect(drStatusChanges(dr) & DDS.DATA_AVAILABLE_STATUS != 0);
+
+    // So a later notification still runs it.
+    _ = sub.notify_datareaders();
+    try testing.expectEqual(@as(u32, 1), calls);
+    _ = sub.end_access();
+}
