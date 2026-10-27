@@ -128,6 +128,11 @@ pub const Context = struct {
     lane: Lane = .internal,
     // Guarded by the runtime gate: the embedded ready-queue node.
     ready_next: ?*Context = null,
+    /// Timer fires taken from the heap and not yet submitted here. Raised
+    /// under the runtime gate, lowered under `gate`. Holds the context open,
+    /// so an owner that cancels its timer and then waits for the close
+    /// cannot free either under a fire still on its way.
+    firing: std.atomic.Value(u32) = .init(0),
     /// Runs when the end of a turn closes the context. The runtime does not
     /// touch the context afterwards, so the hook may free it; its owner must
     /// still hold a runtime owner reference. Set before the context is used.
@@ -140,6 +145,7 @@ pub const Context = struct {
     pub fn deinit(self: *Context) void {
         self.gate.lock();
         std.debug.assert(self.execution == .idle and self.head == null and self.waiting == 0);
+        std.debug.assert(self.firing.load(.seq_cst) == 0);
         self.gate.unlock();
         self.gate.deinit();
     }
@@ -191,7 +197,7 @@ pub const Context = struct {
     /// Returns whether this closed it.
     fn closeIfDrainedLocked(self: *Context) bool {
         if (self.lifecycle == .draining and self.execution == .idle and
-            self.head == null and self.waiting == 0)
+            self.head == null and self.waiting == 0 and self.firing.load(.seq_cst) == 0)
         {
             self.lifecycle = .closed;
             return true;
@@ -429,6 +435,9 @@ pub const Runtime = struct {
         /// Runs once in `runNext`, after a context is unlinked from the ready
         /// queue and before it is claimed RUNNING.
         after_unlink: ?*const fn (runtime: *Runtime, ctx: *Context) void = null,
+        /// Runs once in `fireDueTimers`, after a due timer leaves the heap and
+        /// before its fire is submitted.
+        after_timer_pop: ?*const fn (runtime: *Runtime, timer: *Timer) void = null,
     };
 
     /// The creator holds the first operational-owner reference.
@@ -818,8 +827,18 @@ pub const Runtime = struct {
             self.armed_timers -= 1;
             t.fire_gen = t.gen;
             t.fire_pending = true;
+            // Before the gate is released, as `cancelTimer` takes it: an
+            // owner's close after its cancel waits for this fire.
+            const ctx = t.context;
+            _ = ctx.firing.fetchAdd(1, .seq_cst);
             self.gate.unlock();
-            self.submitInternal(t.context, &t.request) catch |err| switch (err) {
+            if (builtin.is_test) {
+                if (self.test_hooks.after_timer_pop) |hook| {
+                    self.test_hooks.after_timer_pop = null;
+                    hook(self, t);
+                }
+            }
+            self.submitInternal(ctx, &t.request) catch |err| switch (err) {
                 // Its request is queued, or running a turn that runs it again.
                 error.Busy => {},
                 error.Closed => {
@@ -828,7 +847,18 @@ pub const Runtime = struct {
                     self.gate.unlock();
                 },
             };
+            endFire(ctx);
         }
+    }
+
+    /// Ends a fire's hold on its context, closing the context if nothing
+    /// else keeps it open. Neither the timer nor the context is touched after.
+    fn endFire(ctx: *Context) void {
+        ctx.gate.lock();
+        _ = ctx.firing.fetchSub(1, .seq_cst);
+        const on_closed = if (ctx.closeIfDrainedLocked()) ctx.on_closed else null;
+        ctx.gate.unlock();
+        if (on_closed) |h| h.run(h.ctx);
     }
 
     /// The earliest armed deadline, if any.
@@ -933,7 +963,11 @@ pub const Runtime = struct {
             _ = self.backend.service(self.options.inline_turns);
             var turns: u32 = 0;
             while (turns < self.options.inline_turns and self.runNextInternal()) turns += 1;
-            if (turns > 0) continue;
+            if (turns > 0) {
+                // Checked between batches too: a busy runtime always has more.
+                if (deadline_ns) |d| if (self.clock.nowNs() >= d) return done(ctx);
+                continue;
+            }
 
             const token = self.backend.prepareWait();
             if (done(ctx)) return true;

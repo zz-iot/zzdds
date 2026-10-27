@@ -18,6 +18,7 @@ const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
 const Hook = @import("../runtime/core.zig").Hook;
 const ListenerGroup = @import("listener_lane.zig").Group;
+const ListenerCall = @import("listener_lane.zig").Call;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
@@ -687,12 +688,15 @@ pub const SubscriberImpl = struct {
         }
         self.mu.unlock();
         for (pinned.items) |r| {
-            // Tracked, so a deletion of `r` from outside a callback waits for it.
-            if (r.listeners.enter()) {
+            // Tracked, so a deletion of `r` from outside a callback waits for
+            // it, and its participant's deletion waits for it or follows it.
+            var call: ListenerCall = .{};
+            if (r.listeners.enter(&call, DDS.DATA_AVAILABLE_STATUS)) {
                 _ = r.dispatchDataAvailable();
-                r.listeners.leave();
+                r.listeners.leave(&call);
             }
             r.releaseQuiesce();
+            call.end();
         }
         return DDS.RETCODE_OK;
     }

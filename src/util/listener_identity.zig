@@ -72,6 +72,15 @@ pub const Identity = struct {
         return false;
     }
 
+    /// Takes the execution right if it is free, queueing nothing.
+    pub fn tryTake(self: *Identity) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.held) return false;
+        self.held = true;
+        return true;
+    }
+
     /// Gives up the execution right: to the oldest waiter, if any.
     pub fn releaseRight(self: *Identity) void {
         self.mu.lock();

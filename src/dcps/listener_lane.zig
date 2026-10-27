@@ -21,13 +21,20 @@
 //! between consumes the change instead. Reliable-ready events carry
 //! arguments, so they are kept in order as one pending kind.
 //!
+//! An explicit invocation (`notify_datareaders`) runs inline on the
+//! caller's thread. Begun outside any callback chain, it takes its
+//! listener's identity right like a turn, or, finding the listener running
+//! elsewhere, queues the status for the owner's next turn instead. Nested
+//! in a callback chain, it runs under that chain's rights.
+//!
 //! Deleting the owner from ordinary application code waits for a listener
 //! running through it to return; deleting it from any callback chain does
 //! not wait
 //! (docs/design/concurrency/listeners.md#datareader-deletion-callback-and-return-boundary).
 //! A participant's entities form a `Group`, which deleting the participant
 //! closes: nothing queued or parked starts, and the rest of the deletion
-//! waits for the turns in flight or, from inside one, follows the last.
+//! waits for the turns and explicit invocations in flight or, from inside
+//! one, follows the last.
 
 const std = @import("std");
 const DDS = @import("zzdds_generated").DDS;
@@ -51,8 +58,26 @@ threadlocal var invoking: u32 = 0;
 /// The entity whose turn is resolving a listener on this thread.
 threadlocal var admitting: ?*PendingListeners = null;
 
-/// The group whose member's turn this thread is running.
-threadlocal var current_group: ?*Group = null;
+/// The invocations counted in a group on this thread, innermost first.
+threadlocal var frames: ?*Frame = null;
+
+/// The explicit invocation begun outside any callback chain on this
+/// thread, until its listener is resolved.
+threadlocal var explicit: ?*Call = null;
+
+/// A turn of a member's context, or an explicit invocation through a
+/// member, on this thread's stack.
+const Frame = struct {
+    group: *Group,
+    outer: ?*Frame,
+};
+
+/// Whether this thread is inside an invocation counted in `group`.
+fn inGroup(group: *Group) bool {
+    var it = frames;
+    while (it) |f| : (it = f.outer) if (f.group == group) return true;
+    return false;
+}
 
 /// Whether this thread is inside a callback chain: a tracked listener
 /// invocation or any runtime turn, which runs no application code otherwise.
@@ -64,15 +89,54 @@ pub fn inCallbackChain() bool {
 /// `source` (a resolution or listener box) has `identity() ?*Identity`. In
 /// an entity's turn, takes the identity's execution right for the turn, or
 /// parks the turn on it and returns false, and the caller releases what it
-/// resolved without claiming the status. Elsewhere it is always true: inline
-/// dispatch, or a call nested in a listener, which runs under that
-/// listener's rights. An identity there is no memory to record runs
+/// resolved without claiming the status. In an explicit invocation begun
+/// outside any callback chain, takes the right for the invocation, or queues
+/// the status for the owner's turn and returns false. Elsewhere it is always
+/// true: inline dispatch, or a call nested in a listener, which runs under
+/// that listener's rights. An identity there is no memory to record runs
 /// unexcluded.
 pub fn admit(source: anytype) bool {
-    const self = admitting orelse return true;
-    admitting = null;
-    return self.take(source.identity() orelse return true);
+    if (admitting) |self| {
+        admitting = null;
+        return self.take(source.identity() orelse return true);
+    }
+    if (explicit) |call| {
+        explicit = null;
+        return call.take(source.identity() orelse return true);
+    }
+    return true;
 }
+
+/// An explicit invocation through an owner, outside its context: begun by
+/// `PendingListeners.enter` and ended by `leave`, then `end`.
+pub const Call = struct {
+    lane: *PendingListeners = undefined,
+    kind: DDS.StatusMask = 0,
+    /// Counted in the owner's group: `end` ends it.
+    counted: bool = false,
+    frame: Frame = undefined,
+    /// The identity right taken for its listener.
+    held: ?*Identity = null,
+
+    /// Takes `id`'s execution right for this invocation if it is free.
+    /// Otherwise the listener is running elsewhere: queues the status for
+    /// the owner's turn, which runs it once the right is handed over.
+    fn take(self: *Call, id: *Identity) bool {
+        if (!id.tryTake()) {
+            _ = self.lane.post(self.kind);
+            return false;
+        }
+        id.retain();
+        self.held = id;
+        return true;
+    }
+
+    /// Call once the caller no longer holds the owner: the participant's
+    /// deletion may then finish.
+    pub fn end(self: *Call) void {
+        if (self.counted) self.frame.group.end();
+    }
+};
 
 /// A participant's listener contexts, closed together by its deletion.
 pub const Group = struct {
@@ -82,7 +146,8 @@ pub const Group = struct {
     mu: Mutex = .{},
     cv: Condvar = .{},
     // Guarded by `mu`.
-    /// Requests between submission and the end of their last turn.
+    /// Requests between submission and the end of their last turn, and
+    /// explicit invocations between `enter` and `Call.end`.
     inflight: u32 = 0,
     members: ?*PendingListeners = null,
     rest: ?runtime.Hook = null,
@@ -122,7 +187,7 @@ pub const Group = struct {
             drops = p.drop_next;
             p.drop();
         }
-        if (current_group == self) return false;
+        if (inGroup(self)) return false;
         self.mu.lock();
         defer self.mu.unlock();
         while (self.inflight > 0) self.cv.wait(&self.mu);
@@ -156,8 +221,8 @@ pub const Group = struct {
         if (p.member_next) |next| next.member_prev = p.member_prev;
     }
 
-    /// Counts a request about to be submitted. False once the group is
-    /// closed: it must not be.
+    /// Counts a request about to be submitted, or an explicit invocation.
+    /// False once the group is closed: it must not start.
     fn begin(self: *Group) bool {
         self.mu.lock();
         defer self.mu.unlock();
@@ -339,20 +404,48 @@ pub const PendingListeners = struct {
         _ = self.waiting.fetchSub(1, .seq_cst);
     }
 
-    /// Begins an invocation through the owner on this thread, outside its
-    /// context. False once the owner is deleted: the invocation must not
-    /// start.
-    pub fn enter(self: *PendingListeners) bool {
+    /// Begins an explicit invocation through the owner on this thread,
+    /// outside its context, of the listener for status `kind`. False once
+    /// the owner or its participant is deleted: the invocation must not
+    /// start. Either way the caller then releases the owner and calls
+    /// `call.end()`; after true, it calls `leave` first.
+    pub fn enter(self: *PendingListeners, call: *Call, kind: DDS.StatusMask) bool {
+        call.* = .{ .lane = self, .kind = kind };
+        const root = !inCallbackChain();
+        if (self.group) |g| {
+            if (!g.begin()) return false;
+            call.counted = true;
+            call.frame = .{ .group = g, .outer = frames };
+        }
         self.mu.lock();
-        defer self.mu.unlock();
-        if (self.closed) return false;
+        if (self.closed) {
+            self.mu.unlock();
+            return false;
+        }
         self.active += 1;
+        self.mu.unlock();
         invoking += 1;
+        if (call.counted) {
+            frames = &call.frame;
+            if (root) explicit = call;
+        }
         return true;
     }
 
     /// Ends an invocation begun by `enter`.
-    pub fn leave(self: *PendingListeners) void {
+    pub fn leave(self: *PendingListeners, call: *Call) void {
+        if (call.counted) {
+            frames = call.frame.outer;
+            if (explicit == call) explicit = null;
+            if (call.held) |h| {
+                call.held = null;
+                giveUp(h);
+            }
+        }
+        self.endInvocation();
+    }
+
+    fn endInvocation(self: *PendingListeners) void {
         invoking -= 1;
         self.mu.lock();
         defer self.mu.unlock();
@@ -495,10 +588,10 @@ pub const PendingListeners = struct {
         self.active += 1;
         self.mu.unlock();
         invoking += 1;
-        defer self.leave();
-        const outer = current_group;
-        current_group = group;
-        defer current_group = outer;
+        defer self.endInvocation();
+        var frame: Frame = .{ .group = group, .outer = frames };
+        frames = &frame;
+        defer frames = frame.outer;
         // A listener may delete the owner or its participant; what has not
         // started then never does.
         while (left > 0) {

@@ -205,6 +205,41 @@ test "a helping wait ends at its deadline on the runtime clock" {
     try m.retire();
 }
 
+/// Yields, advancing the scripted clock each turn: a runtime that has
+/// internal work ready far past any deadline in a test. Finishes after
+/// 1000 turns, so a wait that ignores its deadline fails rather than hangs.
+const Busy = struct {
+    req: rt.Request = rt.Request.init(run),
+    clock: *@FieldType(rt.ScriptedBackend, "clock_state"),
+    turns: u32 = 0,
+
+    fn run(req: *rt.Request, _: *rt.Turn) rt.Outcome {
+        const self: *Busy = @fieldParentPtr("req", req);
+        self.turns += 1;
+        self.clock.advance(10);
+        return if (self.turns < 1000) .yield else .done;
+    }
+};
+
+test "a helping wait ends at its deadline while internal work stays ready" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var a = rt.Context.init(&m.runtime, 16);
+    var busy = Busy{ .clock = &m.sb.clock_state };
+    try m.runtime.submit(null, &a, &busy.req);
+    var log: Log = .{};
+    const t0 = m.now();
+
+    try testing.expect(!m.runtime.helpUntil(t0 + 100, &log, logged(1)));
+    // Ends within the batch that crosses the deadline.
+    try testing.expect(m.now() >= t0 + 100);
+    try testing.expect(busy.turns <= 10 + m.runtime.options.inline_turns);
+
+    _ = a.closeDiscarding();
+    a.deinit();
+    try m.retire();
+}
+
 /// Sets `flag` when its turn runs.
 const Flag = struct {
     req: rt.Request = rt.Request.init(run),
@@ -541,6 +576,42 @@ test "a timer fired again while its own turn runs runs again once the turn ends"
     _ = try m.runtime.drive(10, 0);
     try testing.expectEqual(@as(u32, 2), t.fires);
     try testing.expectEqual(@as(?i64, null), m.runtime.nextDeadline());
+    ctx.deinit();
+    try m.retire();
+}
+
+test "a fire on its way to a context holds it open past the timer's cancel and close" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var log: Log = .{};
+    var closed = Closed{ .log = &log, .id = 9 };
+    ctx.on_closed = closed.hook();
+    var t = Tick.init(&ctx, 1, &log);
+    _ = m.runtime.armTimer(&t.timer, m.now() + 100);
+
+    // The owner tears down between the fire leaving the heap and reaching
+    // the context, as a deleting thread may on a hosted runtime.
+    const Teardown = struct {
+        var result: ?rt.Discarded = null;
+        fn hook(runtime: *rt.Runtime, timer: *rt.Timer) void {
+            runtime.cancelTimer(timer);
+            result = timer.context.closeDiscarding();
+        }
+    };
+    Teardown.result = null;
+    m.runtime.test_hooks.after_timer_pop = Teardown.hook;
+    m.sb.clock_state.advance(100);
+    m.runtime.fireDueTimers(m.now());
+    try testing.expect(!Teardown.result.?.closed);
+    try testing.expectEqual(rt.Lifecycle.draining, ctx.getLifecycle());
+
+    // The stale fire runs without its callback, and its turn closes the context.
+    const r = try m.runtime.drive(10, 0);
+    try testing.expectEqual(@as(u32, 1), r.turns);
+    try testing.expectEqual(@as(u32, 1), closed.calls);
+    try testing.expectEqualSlices(u32, &.{9}, log.slice());
+    try testing.expectEqual(rt.Lifecycle.closed, ctx.getLifecycle());
     ctx.deinit();
     try m.retire();
 }

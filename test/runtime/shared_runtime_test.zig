@@ -1953,6 +1953,75 @@ test "deleting a reader from outside a callback waits for its listener called by
     runtime.deinit();
 }
 
+test "a participant deleted from a listener called by notify_datareaders is freed after it returns" {
+    var m: Manual = undefined;
+    m.init();
+    var sd: SelfDelete = undefined;
+    var o = PairOptions.bestEffort();
+    o.dr_listener = sd.listener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, o);
+    m.runtime.releaseOwner();
+    sd = .{ .node = &pair.r, .dp = pair.dp_r };
+
+    // Internal work commits the sample and leaves its listener queued.
+    try pair.write(0);
+    while (m.runtime.runNextInternal()) {}
+    try testing.expect(!sd.deleted);
+
+    // The listener deletes its participant inline, while notify_datareaders
+    // still holds the reader: the participant is freed only once it lets go.
+    const sub = pair.dr.toDDSDataReader().get_subscriber();
+    try testing.expectEqual(DDS.RETCODE_OK, sub.notify_datareaders());
+    try testing.expect(sd.deleted);
+    try testing.expectEqual(DDS.RETCODE_OK, sd.rc);
+    try settle(&m);
+    try testing.expectEqual(rt.State.running, m.runtime.getState());
+
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_w.delete_contained_entities());
+    try pair.w.delete(pair.dp_w);
+    pair.freeNodes();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "notify_datareaders from outside a callback leaves a listener running elsewhere to the reader's turn" {
+    var m: Manual = undefined;
+    m.init();
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, PairOptions.bestEffort());
+    m.runtime.releaseOwner();
+    try pair.write(0);
+    try settle(&m);
+
+    // Installed on the subscriber after the sample arrived, so no turn of
+    // the reader's calls it unless one is queued for it.
+    var rr: Recorder = .{ .lane = &pair.dr.listeners.ctx };
+    const dr = pair.dr.toDDSDataReader();
+    const sub = dr.get_subscriber();
+    try testing.expectEqual(DDS.RETCODE_OK, sub.set_listener(.{ .listener_data = &rr, .on_data_available = Recorder.onData }, DDS.DATA_AVAILABLE_STATUS));
+    try settle(&m);
+    try testing.expect(dr.get_status_changes() & DDS.DATA_AVAILABLE_STATUS != 0);
+
+    // The listener is running elsewhere, as through another entity.
+    const identity = zzdds.util.listener_identity;
+    const id = try identity.global.retain(.{ .ptr = @intFromPtr(&rr), .kind = .context });
+    try testing.expect(id.tryTake());
+    try testing.expectEqual(DDS.RETCODE_OK, sub.notify_datareaders());
+    try testing.expectEqual(@as(usize, 0), rr.n);
+
+    id.releaseRight();
+    identity.global.release(id);
+    try settle(&m);
+    try testing.expectEqualSlices(Recorder.Call, &.{.data}, rr.slice());
+    try testing.expect(rr.all_in_lane);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
 /// Deletes `held`'s reader from its own reader's listener, then releases
 /// `held`.
 const DeleteFromListener = struct {

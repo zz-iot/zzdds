@@ -1043,10 +1043,12 @@ the same way. One endpoint's listeners run one at a time, and different endpoint
 run at once on hosted workers, except that one listener runs one call at a time wherever
 it is installed, including as a parent's listener: the core identifies it by its
 `listener_data` (or the registration, when that is null), and a turn whose listener is
-running elsewhere leaves the runtime until it returns. The C++ and Java bindings do not yet
+running elsewhere leaves the runtime until it returns. `notify_datareaders` called outside
+any callback runs a reader's listener inline only when it is not running elsewhere, and
+otherwise leaves it to the reader's turn. The C++ and Java bindings do not yet
 pass one `listener_data` per application object (see [Bindings](#bindings)). Deleting a
-participant from one of its listeners finishes once its other listeners in progress
-return. On a manual runtime, blocking calls help: a WaitSet
+participant from one of its listeners, including one called by `notify_datareaders`,
+finishes once its other listeners in progress return. On a manual runtime, blocking calls help: a WaitSet
 created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
 `wait_for_historical_data` run internal turns and due timers until they are satisfied or
 their deadline (on the runtime clock) passes, never listener turns, including when called
