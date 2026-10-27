@@ -1119,6 +1119,96 @@ test "a turn that discards its own context closes it when the turn ends" {
     try m.retire();
 }
 
+/// Closes its own context through a latch from inside its turn, handing
+/// the rest of teardown to the context's close.
+const LatchFromTurn = struct {
+    req: rt.Request = rt.Request.init(run),
+    latch: *rt.CloseLatch,
+    ctx: *rt.Context,
+    log: *Log,
+    closed_inline: ?bool = null,
+
+    fn run(req: *rt.Request, _: *rt.Turn) rt.Outcome {
+        const self: *LatchFromTurn = @fieldParentPtr("req", req);
+        self.log.add(1);
+        self.closed_inline = self.latch.close(self.ctx, discardStep);
+        if (!self.closed_inline.?) self.latch.finishWith(.{ .ctx = self, .run = rest });
+        return .done;
+    }
+
+    fn rest(ctx: *anyopaque) void {
+        const self: *LatchFromTurn = @ptrCast(@alignCast(ctx));
+        self.log.add(3);
+    }
+};
+
+/// Logs a discarded step's id plus 100.
+fn discardStep(req: *rt.Request) void {
+    const s: *Step = @fieldParentPtr("req", req);
+    s.log.add(100 + s.id);
+}
+
+test "a latch closing its context from inside a turn runs the rest of teardown when the turn ends" {
+    var m: Manual = undefined;
+    m.init(.{ .mode = .manual });
+    var ctx = rt.Context.init(&m.runtime, 16);
+    var latch: rt.CloseLatch = .{};
+    ctx.on_closed = latch.hook();
+    var log: Log = .{};
+    var t = LatchFromTurn{ .latch = &latch, .ctx = &ctx, .log = &log };
+    var queued = Step{ .id = 7, .log = &log };
+    try m.runtime.submit(null, &ctx, &t.req);
+    try m.runtime.submit(null, &ctx, &queued.req);
+
+    _ = try m.runtime.drive(10, 0);
+    try testing.expectEqual(@as(?bool, false), t.closed_inline);
+    // The queued request is discarded unrun, and the rest runs after the turn.
+    try testing.expectEqualSlices(u32, &.{ 1, 107, 3 }, log.slice());
+    try testing.expectEqual(rt.Lifecycle.closed, ctx.getLifecycle());
+    // A closed context refuses even internal work.
+    var late = Step{ .id = 9, .log = &log };
+    try testing.expectError(error.Closed, m.runtime.submitInternal(&ctx, &late.req));
+    ctx.deinit();
+    try m.retire();
+}
+
+/// Holds its turn until its context starts closing.
+const HoldUntilClosing = struct {
+    req: rt.Request = rt.Request.init(run),
+    ctx: *rt.Context,
+    entered: std.atomic.Value(bool) = .init(false),
+
+    fn run(req: *rt.Request, _: *rt.Turn) rt.Outcome {
+        const self: *HoldUntilClosing = @fieldParentPtr("req", req);
+        self.entered.store(true, .seq_cst);
+        while (self.ctx.getLifecycle() == .open) std.Thread.yield() catch {};
+        return .done;
+    }
+
+    fn runOne(runtime: *rt.Runtime) void {
+        _ = runtime.runNext();
+    }
+};
+
+test "a latch closing a context waits for a turn running on another thread" {
+    var h: Helped = undefined;
+    h.init();
+    var ctx = rt.Context.init(&h.runtime, 16);
+    var latch: rt.CloseLatch = .{};
+    ctx.on_closed = latch.hook();
+    var hold = HoldUntilClosing{ .ctx = &ctx };
+    try h.runtime.submit(null, &ctx, &hold.req);
+    const runner = try std.Thread.spawn(.{}, HoldUntilClosing.runOne, .{&h.runtime});
+    while (!hold.entered.load(.seq_cst)) std.Thread.yield() catch {};
+
+    // Returns once the turn has ended and the context closed.
+    try testing.expect(latch.close(&ctx, discardStep));
+    try testing.expectEqual(rt.Lifecycle.closed, ctx.getLifecycle());
+    runner.join();
+    ctx.deinit();
+    try h.deinit();
+}
+
 /// Heap-allocated, and freed by its completion hook.
 const Owned = struct {
     req: rt.Request = rt.Request.init(run),

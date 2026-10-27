@@ -1947,6 +1947,59 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
 
+    for (runtime_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target_llvm_safe,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+    }
+
+    // Shared-runtime build tests, on their own library graph with the
+    // migration switch on, as in `test`: without them coverage misses the
+    // listener lanes and most of the runtime core.
+    const zzdds_mod_llvm_safe_shared_runtime = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target_llvm_safe,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe },
+            .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+            .{ .name = "zzdds_ext_generated", .module = generated_zzdds_mod_llvm_safe },
+            .{ .name = "zzdds_disc_generated", .module = generated_rtps_disc_mod_llvm_safe },
+        },
+    });
+    zzdds_mod_llvm_safe_shared_runtime.addOptions("build_options", build_options_shared_runtime);
+    zzdds_mod_llvm_safe_shared_runtime.link_libc = true;
+    for (shared_runtime_test_files) |src| {
+        const t = b.addTest(.{
+            .name = std.fs.path.stem(src),
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target_llvm_safe,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod_llvm_safe_shared_runtime },
+                    .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+    }
+
     // ── TSan test step ────────────────────────────────────────────────────────
     // `zig build test-tsan` — compile and run tests with ThreadSanitizer enabled.
     // Covers concurrency in state machines, WaitSet, and discovery code.

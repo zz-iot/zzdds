@@ -728,6 +728,41 @@ test "datagrams past the ingress bound are dropped, as a full receive buffer dro
     m.runtime.deinit();
 }
 
+test "datagrams past the ingress byte bound are dropped, as a full receive buffer drops them" {
+    var m: Manual = undefined;
+    m.init();
+    var delivery = try IntraProcessDelivery.init(alloc);
+    defer delivery.deinit();
+    var node = try Node.init(&delivery);
+    defer node.deinit();
+    try node.factory.selectRuntime(&m.runtime);
+    const dp = node.create();
+    try node.factory.selectRuntime(null);
+    m.runtime.releaseOwner();
+    const dp_impl: *DomainParticipantImpl = @ptrCast(@alignCast(dp.ptr));
+
+    // Few enough to stay under the count bound, large enough to reach the
+    // byte bound first.
+    const big = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(big);
+    @memset(big, 0);
+    const fit = DomainParticipantImpl.ingress_byte_limit / big.len;
+    try testing.expect(fit < DomainParticipantImpl.ingress_pending_limit);
+    const to = Locator.udp4(.{ 127, 0, 0, 1 }, dp_impl.data_listen_port);
+    for (0..fit + 3) |_| try node.transport.transport().send(&to, big);
+    try testing.expectEqual(@as(u64, 3), dp_impl.ingress_drops.load(.monotonic));
+    try testing.expectEqual(fit * big.len, dp_impl.ingress_bytes.load(.monotonic));
+
+    // Not RTPS, so each is discarded as it is processed.
+    try settle(&m);
+    try testing.expectEqual(@as(usize, 0), dp_impl.ingress_bytes.load(.monotonic));
+
+    try testing.expectEqual(DDS.RETCODE_OK, dp.delete_contained_entities());
+    try node.delete(dp);
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
 /// Deletes its participant from inside a listener: the final deletion runs
 /// in one of the participant's own listener turns.
 const SelfDelete = struct {
@@ -2016,6 +2051,81 @@ test "notify_datareaders from outside a callback leaves a listener running elsew
     try settle(&m);
     try testing.expectEqualSlices(Recorder.Call, &.{.data}, rr.slice());
     try testing.expect(rr.all_in_lane);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+/// Deletes the reader a traversal is about to reach.
+const DeleteBeforeEnter = struct {
+    var dr: DDS.DataReader = undefined;
+    var rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR;
+
+    fn hook(lane: *@FieldType(DataReaderImpl, "listeners")) void {
+        lane.test_before_enter = null;
+        rc = dr.get_subscriber().delete_datareader(dr);
+    }
+};
+
+test "notify_datareaders skips a reader deleted after it was pinned" {
+    var m: Manual = undefined;
+    m.init();
+    var rr: Recorder = .{};
+    var o = PairOptions.bestEffort();
+    o.dr_listener = rr.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, o);
+    m.runtime.releaseOwner();
+    try pair.write(0);
+    while (m.runtime.runNextInternal()) {}
+
+    // Deleted from outside any callback once the traversal holds it: freed
+    // when the traversal lets go, without its listener running.
+    const dr = pair.dr.toDDSDataReader();
+    DeleteBeforeEnter.dr = dr;
+    pair.dr.listeners.test_before_enter = DeleteBeforeEnter.hook;
+    try testing.expectEqual(DDS.RETCODE_OK, dr.get_subscriber().notify_datareaders());
+    try testing.expectEqual(DDS.RETCODE_OK, DeleteBeforeEnter.rc);
+    try settle(&m);
+    try testing.expectEqual(@as(usize, 0), rr.n);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "a reader's turn parked on a replaced listener runs the new one once granted" {
+    var m: Manual = undefined;
+    m.init();
+    var old: Recorder = .{};
+    var o = PairOptions.bestEffort();
+    o.dr_listener = old.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, o);
+    m.runtime.releaseOwner();
+
+    // The old listener is running elsewhere, so the reader's turn parks on it.
+    const identity = zzdds.util.listener_identity;
+    const id = try identity.global.retain(.{ .ptr = @intFromPtr(&old), .kind = .context });
+    try testing.expect(id.tryTake());
+    try pair.write(0);
+    try settle(&m);
+    try testing.expect(pair.dr.listeners.isParked());
+
+    // Replaced while parked: the turn is granted the old listener's right,
+    // gives it up, and runs the new one.
+    var new: Recorder = .{ .lane = &pair.dr.listeners.ctx };
+    const dr = pair.dr.toDDSDataReader();
+    try testing.expectEqual(DDS.RETCODE_OK, dr.set_listener(new.readerListener(), DDS.DATA_AVAILABLE_STATUS));
+    id.releaseRight();
+    identity.global.release(id);
+    try settle(&m);
+    try testing.expectEqualSlices(Recorder.Call, &.{.data}, new.slice());
+    try testing.expect(new.all_in_lane);
+    try testing.expectEqual(@as(usize, 0), old.n);
 
     try pair.deinit();
     try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
