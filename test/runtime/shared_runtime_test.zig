@@ -2022,6 +2022,196 @@ test "notify_datareaders from outside a callback leaves a listener running elsew
     m.runtime.deinit();
 }
 
+/// Drives the runtime as a traversal reaches its reader, and records how
+/// far an earlier reader listener's deletion of the participant had got.
+const DriveBeforeEnter = struct {
+    var m: *Manual = undefined;
+    var sd: *SelfDelete = undefined;
+    var deleted = false;
+    var owners: u32 = 0;
+
+    fn hook(_: *@FieldType(DataReaderImpl, "listeners")) void {
+        deleted = sd.deleted;
+        settle(m) catch {};
+        owners = m.runtime.owners.load(.seq_cst);
+    }
+};
+
+test "a participant deleted from one reader's listener called by notify_datareaders is freed after the traversal" {
+    var m: Manual = undefined;
+    m.init();
+    var sd: SelfDelete = undefined;
+    var o = PairOptions.bestEffort();
+    o.dr_listener = sd.listener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, o);
+    m.runtime.releaseOwner();
+    sd = .{ .node = &pair.r, .dp = pair.dp_r };
+    const second = pair.addReader(PairOptions.bestEffort());
+    second.listeners.test_before_enter = DriveBeforeEnter.hook;
+    DriveBeforeEnter.m = &m;
+    DriveBeforeEnter.sd = &sd;
+
+    try pair.write(0);
+    while (m.runtime.runNextInternal()) {}
+    try testing.expectEqual(@as(u32, 2), m.runtime.owners.load(.seq_cst));
+
+    // The first reader's listener deletes the participant while the
+    // traversal still holds the second reader, which it then reaches.
+    const sub = pair.dr.toDDSDataReader().get_subscriber();
+    try testing.expectEqual(DDS.RETCODE_OK, sub.notify_datareaders());
+    try testing.expectEqual(DDS.RETCODE_OK, sd.rc);
+    try testing.expect(DriveBeforeEnter.deleted);
+    try testing.expectEqual(@as(u32, 2), DriveBeforeEnter.owners);
+    try settle(&m);
+    try testing.expectEqual(@as(u32, 1), m.runtime.owners.load(.seq_cst));
+
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_w.delete_contained_entities());
+    try pair.w.delete(pair.dp_w);
+    pair.freeNodes();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+/// Calls its reader's subscriber's notify_datareaders from its first call.
+const NotifyFromListener = struct {
+    sub: DDS.Subscriber = undefined,
+    called: bool = false,
+    rc: DDS.ReturnCode_t = DDS.RETCODE_ERROR,
+
+    fn listener(self: *NotifyFromListener) DDS.DataReaderListener {
+        return .{ .listener_data = self, .on_data_available = onData };
+    }
+
+    fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *NotifyFromListener = @ptrCast(@alignCast(ld.?));
+        if (self.called) return;
+        self.called = true;
+        self.rc = self.sub.notify_datareaders();
+    }
+};
+
+test "notify_datareaders from another reader's listener leaves a listener running elsewhere to its reader's turn" {
+    var m: Manual = undefined;
+    m.init();
+    var rr: Recorder = .{};
+    var o = PairOptions.bestEffort();
+    o.dr_listener = rr.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&m.runtime, o);
+    m.runtime.releaseOwner();
+    rr.lane = &pair.dr.listeners.ctx;
+    const sub = pair.dr.toDDSDataReader().get_subscriber();
+    var nl: NotifyFromListener = .{ .sub = sub };
+    o.dr_listener = nl.listener();
+    _ = pair.addReader(o);
+
+    // The first reader's listener is running elsewhere, as through another
+    // entity, when the second's calls notify_datareaders.
+    const identity = zzdds.util.listener_identity;
+    const id = try identity.global.retain(.{ .ptr = @intFromPtr(&rr), .kind = .context });
+    try testing.expect(id.tryTake());
+    try pair.write(0);
+    try settle(&m);
+    try testing.expect(nl.called);
+    try testing.expectEqual(DDS.RETCODE_OK, nl.rc);
+    try testing.expectEqual(@as(usize, 0), rr.n);
+
+    id.releaseRight();
+    identity.global.release(id);
+    try settle(&m);
+    try testing.expectEqualSlices(Recorder.Call, &.{.data}, rr.slice());
+    try testing.expect(rr.all_in_lane);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, m.runtime.getState());
+    m.runtime.deinit();
+}
+
+test "notify_datareaders leaves a reader's listener to its turn while the turn runs another listener" {
+    var h: HostedRuntime = undefined;
+    try h.init(2);
+    var data: Overlap = .{ .io = h.io() };
+    data.release.set(h.io());
+    var o = PairOptions.bestEffort();
+    o.dr_listener = data.readerListener();
+    o.dr_mask = DDS.DATA_AVAILABLE_STATUS;
+    var pair: Pair = undefined;
+    try pair.initWith(&h.runtime, o);
+    h.runtime.releaseOwner();
+
+    // The subscriber's listener holds the reader's turn for a match.
+    var matched: Overlap = .{ .io = h.io() };
+    const dr = pair.dr.toDDSDataReader();
+    const sub = dr.get_subscriber();
+    try testing.expectEqual(DDS.RETCODE_OK, sub.set_listener(matched.subscriberListener(), DDS.SUBSCRIPTION_MATCHED_STATUS));
+    _ = pair.dw_h.get_publisher().create_datawriter(pair.dw_h.get_topic(), o.dw_qos, null, 0);
+    try matched.entered.waitTimeout(h.io(), ten_seconds);
+
+    try pair.write(0);
+    while (dr.get_status_changes() & DDS.DATA_AVAILABLE_STATUS == 0) std.Thread.yield() catch {};
+    try testing.expectEqual(DDS.RETCODE_OK, sub.notify_datareaders());
+    try testing.expectEqual(@as(u32, 0), data.calls.load(.seq_cst));
+
+    matched.release.set(h.io());
+    try data.entered.waitTimeout(h.io(), ten_seconds);
+    try pair.deinit();
+    try h.deinit();
+    try testing.expect(!matched.release_timed_out);
+}
+
+test "a reader's turn waits for its listener called by notify_datareaders to return" {
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var backend = rt.IoBackend.init(io);
+    var runtime = rt.Runtime.init(backend.clock(), backend.backend(), .{ .mode = .manual });
+    var pair: Pair = undefined;
+    try pair.initWith(&runtime, PairOptions.bestEffort());
+    runtime.releaseOwner();
+    const settleIo = struct {
+        fn run(r: *rt.Runtime) !void {
+            while ((try r.drive(64, 0)).immediate_work) {}
+        }
+    }.run;
+    try pair.write(0);
+    try settleIo(&runtime);
+
+    // Installed after the sample arrived, so only notify_datareaders calls
+    // the subscriber's, and the participant's for the reader's next match.
+    var data: Overlap = .{ .io = io };
+    var matched: Overlap = .{ .io = io };
+    matched.release.set(io);
+    const sub = pair.dr.toDDSDataReader().get_subscriber();
+    try testing.expectEqual(DDS.RETCODE_OK, sub.set_listener(.{ .listener_data = &data, .on_data_available = Overlap.onData }, DDS.DATA_AVAILABLE_STATUS));
+    try testing.expectEqual(DDS.RETCODE_OK, pair.dp_r.set_listener(matched.participantListener(), DDS.SUBSCRIPTION_MATCHED_STATUS));
+
+    const Notifier = struct {
+        fn run(s: DDS.Subscriber) void {
+            _ = s.notify_datareaders();
+        }
+    };
+    const notifier = try std.Thread.spawn(.{}, Notifier.run, .{sub});
+    try data.entered.waitTimeout(io, ten_seconds);
+
+    // The match's turn runs while the call is in progress: it defers.
+    _ = pair.dw_h.get_publisher().create_datawriter(pair.dw_h.get_topic(), PairOptions.bestEffort().dw_qos, null, 0);
+    try settleIo(&runtime);
+    try testing.expectEqual(@as(u32, 0), matched.calls.load(.seq_cst));
+
+    data.release.set(io);
+    notifier.join();
+    try settleIo(&runtime);
+    try testing.expect(matched.calls.load(.seq_cst) > 0);
+    try testing.expect(!data.release_timed_out);
+
+    try pair.deinit();
+    try testing.expectEqual(rt.State.backend_stopped, runtime.getState());
+    runtime.deinit();
+}
+
 /// Deletes `held`'s reader from its own reader's listener, then releases
 /// `held`.
 const DeleteFromListener = struct {
@@ -2243,7 +2433,20 @@ const Overlap = struct {
         return .{ .listener_data = self, .on_offered_deadline_missed = onDeadlineMissed };
     }
 
+    fn subscriberListener(self: *Overlap) DDS.SubscriberListener {
+        return .{ .listener_data = self, .on_subscription_matched = onMatched };
+    }
+
+    fn participantListener(self: *Overlap) DDS.DomainParticipantListener {
+        return .{ .listener_data = self, .on_subscription_matched = onMatched };
+    }
+
     fn onData(_: *anyopaque, ld: ?*anyopaque) callconv(.c) void {
+        const self: *Overlap = @ptrCast(@alignCast(ld.?));
+        self.call();
+    }
+
+    fn onMatched(_: *anyopaque, _: *const DDS.SubscriptionMatchedStatus, ld: ?*anyopaque) callconv(.c) void {
         const self: *Overlap = @ptrCast(@alignCast(ld.?));
         self.call();
     }
