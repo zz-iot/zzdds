@@ -378,6 +378,14 @@ pub const Discovery = struct {
     vtable: *const Vtable,
 
     pub const Vtable = struct {
+        /// The plugin runs no thread of its own, so a participant on the
+        /// shared runtime may use it. There `wlp_tick` runs only when an
+        /// endpoint's timer check is due, not on a fixed period, so the
+        /// plugin must not depend on one. Removed with the `-Dshared-runtime`
+        /// migration option
+        /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
+        shared_runtime_ready: bool = false,
+
         /// Begin discovery. The plugin should start sending participant announcements
         /// and listening for remote announcements. Callbacks are stored and invoked
         /// as peers are discovered.

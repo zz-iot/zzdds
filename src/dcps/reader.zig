@@ -24,11 +24,13 @@ const waitset = @import("waitset.zig");
 const writer_mod = @import("writer.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
+const Hook = @import("../runtime/core.zig").Hook;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
 const subscriber_mod = @import("subscriber.zig");
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
+const listener_lane = @import("listener_lane.zig");
 const extensions_mod = @import("../c_abi/extensions.zig");
 
 const Guid = proto.Guid;
@@ -339,6 +341,9 @@ pub const DataReaderImpl = struct {
     /// must not reach application code; onFlushCb dispatches them once the
     /// lock is released. Only DATA_AVAILABLE and SAMPLE_REJECTED.
     pending_listeners: std.atomic.Value(DDS.StatusMask) = .init(0),
+    /// Automatic listener invocations, queued on the participant's listener
+    /// context when it has one (see `raise`).
+    listeners: listener_lane.PendingListeners = .{},
     status_cond: ?*waitset.StatusConditionImpl,
 
     /// Cumulative count of incompatible-QoS events; incompat_total_change/
@@ -376,6 +381,9 @@ pub const DataReaderImpl = struct {
 
     /// Clock used for deadline interval timers.
     timer_clock: time_mod.Clock,
+    /// The participant's, run when a deadline or lease may now fall due
+    /// sooner than its checks are armed for. Set once, at creation.
+    timers_changed: ?Hook = null,
 
     /// Monotonic timestamp of the last sample received; used by DEADLINE checks.
     /// Initialized to creation time so the first deadline window starts at entity creation.
@@ -576,7 +584,15 @@ pub const DataReaderImpl = struct {
             .last_received_ns = .init(timer_clock.nowNs()),
             .subscriber_presentation = subscriber_presentation,
             .seen_instances = .empty,
+            .listeners = .init(alloc, .{
+                .ctx = undefined,
+                .acquire = quiesceAcquireFn,
+                .release = quiesceReleaseFn,
+                .status = dispatchStatusFn,
+                .ready = dispatchReadyFn,
+            }),
         };
+        self.listeners.owner.ctx = self;
         errdefer alloc.destroy(self);
         self.listener_ex_box = try ListenerBox(ZZDDS.DataReaderListenerEx).create(alloc, listener);
         errdefer alloc.destroy(self.listener_ex_box);
@@ -617,6 +633,9 @@ pub const DataReaderImpl = struct {
     /// genuinely in flight, in which case that callback's own release runs
     /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
+        self.listeners.close();
+        // Hold no entity lock here: the listener may call back into it.
+        self.listeners.awaitIdle();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
@@ -645,6 +664,7 @@ pub const DataReaderImpl = struct {
 
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.listeners.deinit();
         self.listener_ex_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
@@ -842,8 +862,7 @@ pub const DataReaderImpl = struct {
         for (self.data_notifiers.items) |n| n.on_data(n.ctx);
         self.mu.unlock();
         self.last_received_ns.store(self.timer_clock.nowNs(), .monotonic);
-        if (self.status_cond) |sc| sc.notifyWakeup();
-        _ = self.dispatchDataAvailable();
+        self.raise(DDS.DATA_AVAILABLE_STATUS);
     }
 
     // ── Data delivery ─────────────────────────────────────────────────────────
@@ -888,26 +907,26 @@ pub const DataReaderImpl = struct {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
         const pending = self.pending_listeners.swap(0, .acq_rel);
-        if (pending & DDS.SAMPLE_REJECTED_STATUS != 0) {
-            // Resolved first, then claimed under `mu` -- see resolveListener.
-            // The rejection was counted when the data callback deferred it.
-            const target = self.resolveListener("on_sample_rejected", DDS.SAMPLE_REJECTED_STATUS);
-            defer if (target) |t| t.release();
-            self.mu.lock();
-            const status = DDS.SampleRejectedStatus{
-                .total_count = self.sample_rejected_total,
-                .total_count_change = self.sample_rejected_total_change,
-                .last_reason = self.sample_rejected_last_reason,
-                .last_instance_handle = self.sample_rejected_last_handle,
-            };
-            const claimed = self.claimStatusLocked(DDS.SAMPLE_REJECTED_STATUS, target != null);
-            if (claimed) self.sample_rejected_total_change = 0;
-            self.mu.unlock();
-            if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
-        }
-        if (pending & DDS.DATA_AVAILABLE_STATUS != 0) {
-            _ = self.dispatchDataAvailable();
-        }
+        // The rejection was counted when the data callback deferred it.
+        if (pending & DDS.SAMPLE_REJECTED_STATUS != 0) self.raise(DDS.SAMPLE_REJECTED_STATUS);
+        if (pending & DDS.DATA_AVAILABLE_STATUS != 0) self.raise(DDS.DATA_AVAILABLE_STATUS);
+    }
+
+    fn dispatchSampleRejected(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        const target = self.resolveListener("on_sample_rejected", DDS.SAMPLE_REJECTED_STATUS);
+        defer if (target) |t| t.release();
+        self.mu.lock();
+        const status = DDS.SampleRejectedStatus{
+            .total_count = self.sample_rejected_total,
+            .total_count_change = self.sample_rejected_total_change,
+            .last_reason = self.sample_rejected_last_reason,
+            .last_instance_handle = self.sample_rejected_last_handle,
+        };
+        const claimed = self.claimStatusLocked(DDS.SAMPLE_REJECTED_STATUS, target != null);
+        if (claimed) self.sample_rejected_total_change = 0;
+        self.mu.unlock();
+        if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
     /// Matches the DataCallback.on_eoc function pointer signature.  Called by
@@ -1432,6 +1451,7 @@ pub const DataReaderImpl = struct {
                 self.status_changes |= DDS.LIVELINESS_CHANGED_STATUS;
             }
             // else: re-announcement of an already-alive writer; update lease/timestamp only.
+            self.timersChanged();
         }
         if (is_new) self.subscriptionMatchedLocked(writer_mod.guidToHandle(info.guid), true);
     }
@@ -1451,8 +1471,8 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        self.dispatchSubscriptionMatched();
-        self.notifyLivelinessChanged();
+        self.raise(DDS.SUBSCRIPTION_MATCHED_STATUS);
+        self.raise(DDS.LIVELINESS_CHANGED_STATUS);
     }
 
     // DDS LivelinessQosPolicyKind enum ordinal order (dcps.idl).
@@ -1506,7 +1526,7 @@ pub const DataReaderImpl = struct {
                 }
             }
         }
-        if (liveliness_changed) self.notifyLivelinessChanged();
+        if (liveliness_changed) self.raise(DDS.LIVELINESS_CHANGED_STATUS);
     }
 
     /// WLP wire ingestion (RTPS §8.4.13): a remote participant's
@@ -1525,7 +1545,7 @@ pub const DataReaderImpl = struct {
             defer self.mu.unlock();
             self.refreshAllByPrefixAndKindLocked(prefix, kind, &liveliness_changed);
         }
-        if (liveliness_changed) self.notifyLivelinessChanged();
+        if (liveliness_changed) self.raise(DDS.LIVELINESS_CHANGED_STATUS);
     }
 
     /// Refresh every matched writer from remote participant `prefix` with
@@ -1551,6 +1571,7 @@ pub const DataReaderImpl = struct {
         entry.last_alive_ns = self.timer_clock.nowNs();
         if (!entry.is_alive) {
             entry.is_alive = true;
+            self.timersChanged();
             self.liveliness_alive_count += 1;
             self.liveliness_alive_count_change += 1;
             self.liveliness_not_alive_count -= 1;
@@ -1694,16 +1715,13 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        self.dispatchSubscriptionMatched();
-        self.notifyLivelinessChanged();
+        self.raise(DDS.SUBSCRIPTION_MATCHED_STATUS);
+        self.raise(DDS.LIVELINESS_CHANGED_STATUS);
         self.mu.lock();
         const no_writers = self.no_writers_pending;
         self.no_writers_pending = false;
         self.mu.unlock();
-        if (no_writers) {
-            if (self.status_cond) |sc| sc.notifyWakeup();
-            _ = self.dispatchDataAvailable();
-        }
+        if (no_writers) self.raise(DDS.DATA_AVAILABLE_STATUS);
     }
 
     /// Expose the OLDEST committed coherent set to `pending` (INSTANCE/TOPIC
@@ -2622,14 +2640,6 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        // Resolved first, then updated and claimed under `mu` -- see
-        // resolveListener. The snapshot is taken under the lock too:
-        // reading self.incompat_total/incompat_total_change after
-        // unlocking would race a concurrent call to this same function
-        // (e.g. two incompatible remote writers discovered around the same
-        // time) doing its own locked increment (confirmed via TSan).
-        const target = self.resolveListener("on_requested_incompatible_qos", DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS);
-        defer if (target) |t| t.release();
         self.mu.lock();
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
@@ -2637,17 +2647,28 @@ pub const DataReaderImpl = struct {
         // Release ordering: publishes the plain-field writes above (program
         // order on this thread) to any thread that observes this value via
         // a paired .acquire load, without requiring that thread to take `mu`.
-        const new_total = self.incompat_total.load(.monotonic) + 1;
-        self.incompat_total.store(new_total, .release);
+        self.incompat_total.store(self.incompat_total.load(.monotonic) + 1, .release);
+        self.mu.unlock();
+        self.raise(DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS);
+    }
+
+    fn dispatchIncompatibleQos(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        // The snapshot is taken under the lock too: reading
+        // self.incompat_total/incompat_total_change after unlocking would
+        // race a concurrent notifyIncompatibleQos (e.g. two incompatible
+        // remote writers discovered around the same time) doing its own
+        // locked increment (confirmed via TSan).
+        const target = self.resolveListener("on_requested_incompatible_qos", DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS);
+        defer if (target) |t| t.release();
+        self.mu.lock();
         var status = DDS.RequestedIncompatibleQosStatus{};
-        status.total_count = new_total;
+        status.total_count = self.incompat_total.load(.monotonic);
         status.total_count_change = self.incompat_total_change;
-        status.last_policy_id = policy_id;
+        status.last_policy_id = self.incompat_last_policy;
         const claimed = self.claimStatusLocked(DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS, target != null);
         if (claimed) self.incompat_total_change = 0;
         self.mu.unlock();
-
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
@@ -2677,7 +2698,7 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        self.dispatchSubscriptionMatched();
+        self.raise(DDS.SUBSCRIPTION_MATCHED_STATUS);
     }
 
     /// For tests: a writer matched or unmatched, without its proxy, then
@@ -2686,7 +2707,7 @@ pub const DataReaderImpl = struct {
         self.mu.lock();
         self.subscriptionMatchedLocked(remote_handle, added);
         self.mu.unlock();
-        self.dispatchSubscriptionMatched();
+        self.raise(DDS.SUBSCRIPTION_MATCHED_STATUS);
     }
 
     fn dispatchSubscriptionMatched(self: *Self) void {
@@ -2710,8 +2731,6 @@ pub const DataReaderImpl = struct {
             self.sub_matched_current_change = 0;
         }
         self.mu.unlock();
-
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
@@ -2724,14 +2743,19 @@ pub const DataReaderImpl = struct {
     pub fn notifySampleLost(self: *Self, count: i32) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        // Resolved first, then updated and claimed under `mu` -- see
-        // resolveListener.
-        const target = self.resolveListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS);
-        defer if (target) |t| t.release();
         self.mu.lock();
         self.sample_lost_total += count;
         self.sample_lost_total_change += count;
         self.status_changes |= DDS.SAMPLE_LOST_STATUS;
+        self.mu.unlock();
+        self.raise(DDS.SAMPLE_LOST_STATUS);
+    }
+
+    fn dispatchSampleLost(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        const target = self.resolveListener("on_sample_lost", DDS.SAMPLE_LOST_STATUS);
+        defer if (target) |t| t.release();
+        self.mu.lock();
         // Snapshot while still locked -- see dispatchSubscriptionMatched's
         // matching comment (same bug, same fix, confirmed via TSan).
         const status = DDS.SampleLostStatus{
@@ -2741,14 +2765,13 @@ pub const DataReaderImpl = struct {
         const claimed = self.claimStatusLocked(DDS.SAMPLE_LOST_STATUS, target != null);
         if (claimed) self.sample_lost_total_change = 0;
         self.mu.unlock();
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
     /// Dispatches LIVELINESS_CHANGED after a caller updated it under `mu`
-    /// (setting the changed bit there) and released the lock. Claims it only
-    /// if still changed: a getter in between consumed it.
-    fn notifyLivelinessChanged(self: *Self) void {
+    /// (setting the changed bit there) and raised it. Claims it only if
+    /// still changed: a getter in between consumed it.
+    fn dispatchLivelinessChanged(self: *Self) void {
         // Resolved first, then claimed under `mu` -- see resolveListener.
         const target = self.resolveListener("on_liveliness_changed", DDS.LIVELINESS_CHANGED_STATUS);
         defer if (target) |t| t.release();
@@ -2768,7 +2791,6 @@ pub const DataReaderImpl = struct {
             self.liveliness_not_alive_count_change = 0;
         }
         self.mu.unlock();
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
@@ -2778,14 +2800,19 @@ pub const DataReaderImpl = struct {
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        // Resolved first, then updated and claimed under `mu` -- see
-        // resolveListener.
-        const target = self.resolveListener("on_requested_deadline_missed", DDS.REQUESTED_DEADLINE_MISSED_STATUS);
-        defer if (target) |t| t.release();
         self.mu.lock();
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.REQUESTED_DEADLINE_MISSED_STATUS;
+        self.mu.unlock();
+        self.raise(DDS.REQUESTED_DEADLINE_MISSED_STATUS);
+    }
+
+    fn dispatchDeadlineMissed(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        const target = self.resolveListener("on_requested_deadline_missed", DDS.REQUESTED_DEADLINE_MISSED_STATUS);
+        defer if (target) |t| t.release();
+        self.mu.lock();
         // Snapshot while still locked -- see dispatchSubscriptionMatched's
         // matching comment (same bug, same fix, confirmed via TSan).
         var status = DDS.RequestedDeadlineMissedStatus{};
@@ -2794,7 +2821,6 @@ pub const DataReaderImpl = struct {
         const claimed = self.claimStatusLocked(DDS.REQUESTED_DEADLINE_MISSED_STATUS, target != null);
         if (claimed) self.deadline_missed_total_change = 0;
         self.mu.unlock();
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
@@ -2822,7 +2848,7 @@ pub const DataReaderImpl = struct {
     /// Checks DEADLINE and LIVELINESS lease expiry; fires notifications when thresholds exceeded.
     /// Called with participant.mu NOT held (checkTimers() collects the due
     /// callbacks under the lock, then releases it before calling any of
-    /// them) -- safe for this (and notifyDeadlineMissed/notifyLivelinessChanged
+    /// them) -- safe for this (and the deadline and liveliness listeners
     /// below, which this may call) to re-enter the participant, e.g. if a
     /// user listener reacts to a deadline-missed notification by deleting
     /// the reader/participant.
@@ -2862,7 +2888,31 @@ pub const DataReaderImpl = struct {
             }
         }
         self.mu.unlock();
-        if (liveliness_changed) self.notifyLivelinessChanged();
+        if (liveliness_changed) self.raise(DDS.LIVELINESS_CHANGED_STATUS);
+    }
+
+    /// The earliest time `checkTimersFn` would report anything, or null.
+    pub fn nextTimerDueFn(ctx: *anyopaque) ?i64 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        var next: ?i64 = null;
+        const dl = self.qos.deadline.period;
+        if (durationIsActive(dl)) {
+            const period_ns = @as(i64, dl.sec) * std.time.ns_per_s + @as(i64, dl.nanosec);
+            next = self.last_received_ns.load(.monotonic) + period_ns;
+        }
+        self.mu.lock();
+        defer self.mu.unlock();
+        var it = self.writer_liveliness.valueIterator();
+        while (it.next()) |entry| {
+            if (!entry.is_alive or entry.lease_ns <= 0) continue;
+            const due = entry.last_alive_ns + entry.lease_ns;
+            next = if (next) |n| @min(n, due) else due;
+        }
+        return next;
+    }
+
+    fn timersChanged(self: *Self) void {
+        if (self.timers_changed) |h| h.run(h.ctx);
     }
 
     /// Registered with the participant (see participant.zig's
@@ -3157,6 +3207,8 @@ pub const DataReaderImpl = struct {
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         self.qos.deinit(self.alloc);
         self.qos = new_qos;
+        // A shorter deadline may fall due sooner.
+        self.timersChanged();
         return DDS.RETCODE_OK;
     }
 
@@ -3194,7 +3246,7 @@ pub const DataReaderImpl = struct {
         const data_available_now = self.status_changes & DDS.DATA_AVAILABLE_STATUS != 0;
         self.mu.unlock();
         if (mask & DDS.DATA_AVAILABLE_STATUS != 0 and data_available_now) {
-            _ = self.dispatchDataAvailable();
+            if (!self.listeners.post(DDS.DATA_AVAILABLE_STATUS)) _ = self.dispatchDataAvailable();
         }
         return DDS.RETCODE_OK;
     }
@@ -3255,10 +3307,41 @@ pub const DataReaderImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        const event: listener_lane.ReadyEvent = .{ .guid = writer_guid, .ready = ready };
+        if (!self.listeners.postReady(event)) dispatchReadyFn(self, event);
+    }
+
+    fn dispatchReadyFn(ctx: *anyopaque, event: listener_lane.ReadyEvent) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
         const box = self.acquireListener();
         defer box.releaseRef(self.alloc);
         if (box.listener.on_reliable_writer_ready) |cb| {
-            cb(writer_mod.guidToHandle(writer_guid), ready, box.listener.listener_data);
+            if (!listener_lane.admit(box)) return;
+            cb(writer_mod.guidToHandle(event.guid), event.ready, box.listener.listener_data);
+        }
+    }
+
+    /// Wakes the StatusCondition for `kind`, which the caller changed, then
+    /// raises its listener: queued on the participant's listener context
+    /// when there is one, otherwise invoked here. The caller holds no lock
+    /// and this reader's `quiesce`.
+    fn raise(self: *Self, kind: DDS.StatusMask) void {
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        if (!self.listeners.post(kind)) dispatchStatusFn(self, kind);
+    }
+
+    /// Resolves, claims and invokes the listener for status `kind`.
+    fn dispatchStatusFn(ctx: *anyopaque, kind: DDS.StatusMask) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        switch (kind) {
+            DDS.DATA_AVAILABLE_STATUS => _ = self.dispatchDataAvailable(),
+            DDS.SAMPLE_REJECTED_STATUS => self.dispatchSampleRejected(),
+            DDS.SAMPLE_LOST_STATUS => self.dispatchSampleLost(),
+            DDS.SUBSCRIPTION_MATCHED_STATUS => self.dispatchSubscriptionMatched(),
+            DDS.LIVELINESS_CHANGED_STATUS => self.dispatchLivelinessChanged(),
+            DDS.REQUESTED_DEADLINE_MISSED_STATUS => self.dispatchDeadlineMissed(),
+            DDS.REQUESTED_INCOMPATIBLE_QOS_STATUS => self.dispatchIncompatibleQos(),
+            else => unreachable,
         }
     }
 
@@ -3269,21 +3352,29 @@ pub const DataReaderImpl = struct {
     /// The callback for `field` (a `DDS.DataReaderListener` callback) from
     /// the nearest level of the DDS 1.4 §2.2.4.1.5 "nearest enclosing
     /// non-null listener" chain: this reader, its Subscriber, then its
-    /// DomainParticipant. Not yet invoked, or null when no level has one;
+    /// DomainParticipant. Not yet invoked, or null when no level has one or
+    /// its identity is running elsewhere (`listener_lane.admit`);
     /// whichever level runs, it is invoked with this reader's own handle. The status notifiers
-    /// resolve first, then update the status and, when resolved, claim it
-    /// under `mu` (`claimStatusLocked`) and invoke after unlocking, so the
-    /// claim snapshots and resets the status at one boundary
+    /// update the status under `mu` and `raise` it; its dispatch resolves,
+    /// then claims it under `mu` (`claimStatusLocked`) and invokes after
+    /// unlocking, so the claim snapshots and resets the status at one boundary
     /// (`docs/design/concurrency/listeners.md#status-ordering-requirements`):
     /// an update during the callback stays pending, and a getter that runs
     /// first takes the change instead of the listener. Release the result
     /// with no lock held. The caller holds this reader's `quiesce`.
     fn resolveListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(StatusCb(field)) {
         const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
-        if (listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListener(), self.alloc)) |r| return r;
-        if (nil.isNil(self.subscriber)) return null;
-        const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
-        return sub.resolveReaderFallback(StatusCb(field), field, bit);
+        const r = listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListener(), self.alloc) orelse blk: {
+            if (nil.isNil(self.subscriber)) return null;
+            const sub: *subscriber_mod.SubscriberImpl = @ptrCast(@alignCast(self.subscriber.ptr));
+            break :blk sub.resolveReaderFallback(StatusCb(field), field, bit) orelse return null;
+        };
+        // Its identity running elsewhere parks this turn: nothing to invoke.
+        if (!listener_lane.admit(r)) {
+            r.release();
+            return null;
+        }
+        return r;
     }
 
     /// With `mu` held: claims status `bit` for a listener `resolved`, if it
@@ -3469,6 +3560,11 @@ pub const DataReaderImpl = struct {
                 @as(i64, max_wait.nanosec);
         };
 
+        // On a manual runtime, nothing else may be running it. A zero wait
+        // only checks.
+        if (self.listeners.runtimeOf()) |rt| if (!is_zero_wait and rt.canHelp()) {
+            return if (rt.helpUntil(deadline_ns, self, historicalReady)) DDS.RETCODE_OK else DDS.RETCODE_TIMEOUT;
+        };
         while (true) {
             if (self.proto_reader.historicalDelivered()) {
                 // historicalDelivered() reports the same vacuous `true` for
@@ -3491,6 +3587,12 @@ pub const DataReaderImpl = struct {
             }
             self.timer_clock.sleepNs(POLL_NS);
         }
+    }
+
+    /// A nonzero historical-data wait is over: see the comment in
+    /// `vtWaitForHistorical` on why it needs a matched writer.
+    fn historicalReady(self: *Self) bool {
+        return self.proto_reader.historicalDelivered() and self.proto_reader.hasMatchedWriters();
     }
 
     fn vtGetMatchedPubs(ctx: *anyopaque, handles: ?*DDS.InstanceHandleSeq) DDS.ReturnCode_t {

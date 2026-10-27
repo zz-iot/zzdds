@@ -19,6 +19,9 @@ const extensions_mod = @import("../c_abi/extensions.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
+const Hook = @import("../runtime/core.zig").Hook;
+const ListenerGroup = @import("listener_lane.zig").Group;
+const Runtime = @import("../runtime/core.zig").Runtime;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
@@ -82,6 +85,15 @@ pub const ParticipantCbs = struct {
     /// Clock passed to DataWriterImpl for DEADLINE and LIVELINESS interval timers.
     timer_clock: time_mod.Clock,
 
+    /// Given to each DataWriterImpl: run when something may fall due sooner than
+    /// the participant's timer checks are armed for.
+    timers_changed: ?Hook = null,
+
+    /// The participant's listener group on a shared runtime: each
+    /// DataWriterImpl runs its listeners on its own context in it. Null runs them
+    /// inline.
+    listener_group: ?*ListenerGroup = null,
+
     /// Register a timer-check callback (DEADLINE + LIVELINESS) for a writer.
     /// Called once per DataWriter after create_proto_writer succeeds.
     /// quiesce_acquire/quiesce_release let checkTimers() hold the writer's
@@ -92,6 +104,7 @@ pub const ParticipantCbs = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (notify_ctx: *anyopaque, now_ns: i64) void,
+        next_due_fn: *const fn (notify_ctx: *anyopaque) ?i64,
         quiesce_acquire: *const fn (notify_ctx: *anyopaque) bool,
         quiesce_release: *const fn (notify_ctx: *anyopaque) void,
     ) void,
@@ -196,7 +209,8 @@ pub const PublisherImpl = struct {
             .instance_handle = handle,
             .status_changes = 0,
             .status_cond = null,
-            .default_dw_qos = .{},
+            // The DDS RELIABILITY QoS default: a writer blocks up to 100 ms.
+            .default_dw_qos = .{ .reliability = .{ .max_blocking_time = .{ .sec = 0, .nanosec = 100 * std.time.ns_per_ms } } },
             .writers = .empty,
             .mu = .{},
             .coherent_depth = 0,
@@ -451,6 +465,8 @@ pub const PublisherImpl = struct {
             self.cbs.destroy_proto_writer(self.cbs.ctx, publication_handle);
             return nil.nil_datawriter;
         };
+        dw.timers_changed = self.cbs.timers_changed;
+        if (self.cbs.listener_group) |g| dw.listeners.attach(g);
         self.cbs.register_incompat_qos(
             self.cbs.ctx,
             publication_handle,
@@ -468,6 +484,7 @@ pub const PublisherImpl = struct {
             publication_handle,
             dw,
             writer_mod.DataWriterImpl.checkTimersFn,
+            writer_mod.DataWriterImpl.nextTimerDueFn,
             writer_mod.DataWriterImpl.quiesceAcquireFn,
             writer_mod.DataWriterImpl.quiesceReleaseFn,
         );
@@ -561,21 +578,26 @@ pub const PublisherImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.writers.items, 0..) |w, i| {
-            if (w.toDDSDataWriter().ptr == a_datawriter.ptr) {
-                // PRECONDITION_NOT_MET if the writer has outstanding
-                // write-loans -- check before touching anything.
-                const precondition = w.checkDeletePrecondition();
-                if (precondition != DDS.RETCODE_OK) return precondition;
-                _ = self.writers.swapRemove(i);
-                self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
-                w.deinit();
-                return DDS.RETCODE_OK;
+        const w = found: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (self.writers.items, 0..) |w, i| {
+                if (w.toDDSDataWriter().ptr == a_datawriter.ptr) {
+                    // PRECONDITION_NOT_MET if the writer has outstanding
+                    // write-loans -- check before touching anything.
+                    const precondition = w.checkDeletePrecondition();
+                    if (precondition != DDS.RETCODE_OK) return precondition;
+                    _ = self.writers.swapRemove(i);
+                    break :found w;
+                }
             }
-        }
-        return DDS.RETCODE_BAD_PARAMETER;
+            return DDS.RETCODE_BAD_PARAMETER;
+        };
+        // Torn down without `mu`: deinit waits for a running listener,
+        // which may call back into this Publisher.
+        self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
+        w.deinit();
+        return DDS.RETCODE_OK;
     }
 
     /// Checks every writer's delete precondition without tearing anything
@@ -615,15 +637,23 @@ pub const PublisherImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        const precondition = self.checkDeleteContainedPrecondition();
-        if (precondition != DDS.RETCODE_OK) return precondition;
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.writers.items) |w| {
+        var taken: std.ArrayListUnmanaged(*writer_mod.DataWriterImpl) = undefined;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (self.writers.items) |w| {
+                const precondition = w.checkDeletePrecondition();
+                if (precondition != DDS.RETCODE_OK) return precondition;
+            }
+            taken = self.writers;
+            self.writers = .empty;
+        }
+        // Torn down without `mu`, as in delete_datawriter.
+        for (taken.items) |w| {
             self.cbs.destroy_proto_writer(self.cbs.ctx, w.instance_handle);
             w.deinit();
         }
-        self.writers.clearRetainingCapacity();
+        taken.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }
 
@@ -842,32 +872,40 @@ pub const PublisherImpl = struct {
         }
         const self = cast(ctx);
         const POLL_NS: u64 = 1_000_000; // 1 ms
-        const deadline_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
+        const timeout_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
             timeout.nanosec == DDS.DURATION_INFINITE_NSEC)
             null
-        else blk: {
-            const now = time_mod.nanoTimestamp();
-            break :blk now +
-                @as(i64, timeout.sec) * std.time.ns_per_s +
-                @as(i64, timeout.nanosec);
-        };
+        else
+            @as(i64, timeout.sec) * std.time.ns_per_s + @as(i64, timeout.nanosec);
 
+        // On a manual runtime, nothing else may be running it.
+        if (self.helpingRuntime()) |rt| {
+            const deadline_ns = if (timeout_ns) |t| rt.clock.nowNs() +| t else null;
+            return if (rt.helpUntil(deadline_ns, self, allWritersAcked)) DDS.RETCODE_OK else DDS.RETCODE_TIMEOUT;
+        }
+        const deadline_ns = if (timeout_ns) |t| time_mod.nanoTimestamp() +| t else null;
         while (true) {
-            self.mu.lock();
-            var all_done = true;
-            for (self.writers.items) |w| {
-                if (w.qos.reliability.kind != .BEST_EFFORT_RELIABILITY_QOS and !w.allAcked()) {
-                    all_done = false;
-                    break;
-                }
-            }
-            self.mu.unlock();
-            if (all_done) return DDS.RETCODE_OK;
+            if (self.allWritersAcked()) return DDS.RETCODE_OK;
             if (deadline_ns) |dl| {
                 if (time_mod.nanoTimestamp() >= dl) return DDS.RETCODE_TIMEOUT;
             }
             time_mod.sleepNs(POLL_NS);
         }
+    }
+
+    fn allWritersAcked(self: *Self) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.writers.items) |w| {
+            if (w.qos.reliability.kind != .BEST_EFFORT_RELIABILITY_QOS and !w.allAcked()) return false;
+        }
+        return true;
+    }
+
+    /// The manual runtime a blocking call helps, if the participant is on one.
+    fn helpingRuntime(self: *Self) ?*Runtime {
+        const group = self.cbs.listener_group orelse return null;
+        return if (group.runtime.canHelp()) group.runtime else null;
     }
 
     // NOT gated on enabled state: a pure navigational getter (no side effect,

@@ -137,10 +137,15 @@ const Harness = struct {
     }
 
     fn reader(h: *Harness, topic_name: [:0]const u8, kind: DDS.ReliabilityQosPolicyKind) *DataReaderImpl {
+        return h.readerWith(topic_name, kind, .VOLATILE_DURABILITY_QOS);
+    }
+
+    fn readerWith(h: *Harness, topic_name: [:0]const u8, kind: DDS.ReliabilityQosPolicyKind, durability: DDS.DurabilityQosPolicyKind) *DataReaderImpl {
         const topic = h.dp.create_topic(topic_name, "T", .{}, null, 0);
         const desc = @as(*TopicImpl, @ptrCast(@alignCast(topic.ptr))).toTopicDescription();
         var qos = DDS.DataReaderQos{};
         qos.reliability.kind = kind;
+        qos.durability.kind = durability;
         // Every sample stays to be counted: the type is keyless, so all are
         // of one instance.
         qos.history.kind = .KEEP_ALL_HISTORY_QOS;
@@ -174,9 +179,15 @@ const Harness = struct {
     }
 
     fn announceWriter(h: *Harness, writer: Guid, topic_name: []const u8) void {
+        h.announceWriterWith(writer, topic_name, 0);
+    }
+
+    /// durability_kind: 0 = VOLATILE, 1 = TRANSIENT_LOCAL.
+    fn announceWriterWith(h: *Harness, writer: Guid, topic_name: []const u8, durability_kind: u8) void {
         var repr = [_]i16{2};
         var q = iface.DiscoveredWriterData{
             .reliability = .{ .kind = 2, .max_blocking_time = .{} },
+            .durabilityKind = durability_kind,
             .history = .{ .kind = 0, .depth = 1 },
             .dataRepresentation = .{ ._maximum = 1, ._length = 1, ._buffer = &repr, ._release = false },
         };
@@ -235,6 +246,29 @@ test "data from an unannounced writer is held once, taken by each reader that ma
     try h.inject(w, ANY_READER, &.{3});
     try testing.expectEqual(@as(usize, 3), delivered(be));
     try testing.expectEqual(@as(usize, 0), h.held());
+}
+
+test "a historical-data wait satisfied by history held before the match finds it in the reader" {
+    var clock = ManualClock.init(0);
+    var h: Harness = undefined;
+    try h.init(&clock);
+    defer h.deinit();
+    const r = h.readerWith("Held", .RELIABLE_RELIABILITY_QOS, .TRANSIENT_LOCAL_DURABILITY_QOS);
+    const dr = r.toDDSDataReader();
+
+    // A TRANSIENT_LOCAL writer that matched this reader first sends its
+    // history before the reader has matched it.
+    const w = writerGuid(0x52, 1);
+    try h.inject(w, eidBytes(r.guid.entity_id), &.{ 1, 2, 3 });
+    try testing.expectEqual(3 * PAYLOAD.len, h.held());
+
+    h.announceWriterWith(w, "Held", 1);
+    // No HEARTBEAT yet: the reader doesn't know how much history there is.
+    try testing.expectEqual(DDS.RETCODE_TIMEOUT, dr.vtable.wait_for_historical_data(dr.ptr, &.{ .sec = 0, .nanosec = 0 }));
+
+    r.proto_reader.handleHeartbeat(w, r.guid.entity_id, 1, 3, 1, true, false);
+    try testing.expectEqual(DDS.RETCODE_OK, dr.vtable.wait_for_historical_data(dr.ptr, &.{ .sec = 0, .nanosec = 0 }));
+    try testing.expectEqual(@as(usize, 3), delivered(r));
 }
 
 test "nothing is held from a writer once discovery has matched it, whether or not a reader did" {

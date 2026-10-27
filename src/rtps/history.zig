@@ -237,6 +237,17 @@ pub const HistoryCache = struct {
         }
     }
 
+    /// Remove and free a writer's changes with SN ≤ `up_to_sn`. For a
+    /// writer's cache only: sorted by SN (see hasWriterChangeIn), so they are
+    /// a prefix.
+    pub fn removeWriterChangesUpTo(self: *Self, up_to_sn: SequenceNumber) void {
+        var n: usize = 0;
+        while (n < self.changes.items.len and self.changes.items[n].sequence_number <= up_to_sn) : (n += 1) {
+            self.alloc.free(self.changes.items[n].data);
+        }
+        self.changes.replaceRangeAssumeCapacity(0, n, &.{});
+    }
+
     // ── SN range queries ──────────────────────────────────────────────────────
 
     /// Smallest SN in the cache, or 0 if empty.

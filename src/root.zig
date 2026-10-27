@@ -58,6 +58,7 @@ pub const process_config = @import("config/process.zig");
 pub const factory = @import("factory.zig");
 pub const rtps = @import("rtps/root.zig");
 pub const dcps = @import("dcps/root.zig");
+pub const runtime = @import("runtime/root.zig");
 pub const c_abi = @import("c_abi/root.zig");
 
 // Force c_abi files to be compiled into the binary so their pub export
@@ -124,6 +125,7 @@ pub const util = struct {
     pub const mutex = @import("util/mutex.zig");
     pub const condvar = @import("util/condvar.zig");
     pub const listener_box = @import("util/listener_box.zig");
+    pub const listener_identity = @import("util/listener_identity.zig");
 };
 
 test {
@@ -135,6 +137,7 @@ test {
     _ = @import("config/resolve.zig");
     _ = @import("config/process.zig");
     _ = @import("factory.zig");
+    _ = @import("runtime/core.zig");
     _ = @import("transport/interface.zig");
     _ = @import("transport/udp.zig");
     _ = @import("transport/tcp.zig");
@@ -163,6 +166,7 @@ test {
     _ = @import("util/guid_gen.zig");
     _ = @import("util/mutex.zig");
     _ = @import("util/listener_box.zig");
+    _ = @import("util/listener_identity.zig");
     _ = @import("util/entity_quiesce.zig");
     _ = @import("util/drain_queue.zig");
     _ = @import("dcps/qos_match.zig");

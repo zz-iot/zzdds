@@ -21,6 +21,7 @@
 //! itself or across `listener_lifecycle.release`.
 const std = @import("std");
 const listener_lifecycle = @import("listener_lifecycle.zig");
+const listener_identity = @import("listener_identity.zig");
 
 pub fn ListenerBox(comptime T: type) type {
     return struct {
@@ -28,6 +29,8 @@ pub fn ListenerBox(comptime T: type) type {
 
         listener: T,
         refcount: std.atomic.Value(usize),
+        /// Created at first use (see `identity`).
+        ident: std.atomic.Value(?*listener_identity.Identity) = .init(null),
 
         /// Refcount starts at 1: the "installed" reference held by the
         /// owning entity's own `listener_box` field.
@@ -45,6 +48,24 @@ pub fn ListenerBox(comptime T: type) type {
             return self;
         }
 
+        /// The listener's exclusion identity (listener_identity.zig): its
+        /// `listener_data`, or this registration when that is null. Null
+        /// without memory to record it. Call while holding a reference.
+        pub fn identity(self: *Self) ?*listener_identity.Identity {
+            if (self.ident.load(.acquire)) |id| return id;
+            const data: ?*anyopaque = self.listener.listener_data;
+            const key: listener_identity.Key = if (data) |d|
+                .{ .ptr = @intFromPtr(d), .kind = .context }
+            else
+                .{ .ptr = @intFromPtr(self), .kind = .registration };
+            const id = listener_identity.global.retain(key) catch return null;
+            if (self.ident.cmpxchgStrong(null, id, .acq_rel, .acquire)) |won| {
+                listener_identity.global.release(id);
+                return won;
+            }
+            return id;
+        }
+
         /// Call with no lock held: after finishing a dispatch acquired via
         /// `acquireLocked`, or to drop the "installed" reference during a
         /// swap/teardown. Frees the box — calling
@@ -52,6 +73,7 @@ pub fn ListenerBox(comptime T: type) type {
         /// the last outstanding reference.
         pub fn releaseRef(self: *Self, alloc: std.mem.Allocator) void {
             if (self.refcount.fetchSub(1, .acq_rel) == 1) {
+                if (self.ident.load(.acquire)) |id| listener_identity.global.release(id);
                 listener_lifecycle.release(self.listener);
                 alloc.destroy(self);
             }

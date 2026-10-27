@@ -24,6 +24,7 @@ public class Subscriber {
     static final int HISTORICAL_WAIT_TIMEOUT_S = 10;
     static final int RECEIVE_TIMEOUT_MS = 30000;
     static final int POLL_PERIOD_MS = 20;
+    static final int SHORTFALL_RECHECK_MS = 2000;
 
     // Pure readiness check -- does NOT set allDone itself. Callers decide
     // when it's safe to actually commit the flag: main() deletes the
@@ -64,6 +65,36 @@ public class Subscriber {
             }
         }
         return becameDone;
+    }
+
+    static int countHistorical(AtomicBoolean[] historicalReceived) {
+        int n = 0;
+        for (AtomicBoolean v : historicalReceived) {
+            if (v.get()) n++;
+        }
+        return n;
+    }
+
+    // After a historical shortfall: prints what the reader reports, then
+    // keeps taking for SHORTFALL_RECHECK_MS. Samples that turn up late mean
+    // the wait returned too early; lost ones mean the writer never sent them.
+    static void reportShortfall(Dcps.DDS.DataReader rawReader, HistoryEventDataReader reader,
+                                AtomicBoolean[] historicalReceived, AtomicBoolean[] liveReceived,
+                                AtomicBoolean historicalConfirmed, AtomicBoolean allDone) throws InterruptedException {
+        Dcps.DDS.SubscriptionMatchedStatus matched = new Dcps.DDS.SubscriptionMatchedStatus();
+        Dcps.DDS.SampleLostStatus lost = new Dcps.DDS.SampleLostStatus();
+        Dcps.DDS.SampleRejectedStatus rejected = new Dcps.DDS.SampleRejectedStatus();
+        rawReader.get_subscription_matched_status(matched);
+        rawReader.get_sample_lost_status(lost);
+        rawReader.get_sample_rejected_status(rejected);
+        System.err.println("DIAG: matched current=" + matched.get_current_count() + " total=" + matched.get_total_count()
+            + ", lost=" + lost.get_total_count() + ", rejected=" + rejected.get_total_count());
+        int before = countHistorical(historicalReceived);
+        for (int waitedMs = 0; waitedMs < SHORTFALL_RECHECK_MS && countHistorical(historicalReceived) < HISTORICAL_COUNT; waitedMs += POLL_PERIOD_MS) {
+            Thread.sleep(POLL_PERIOD_MS);
+            takeAvailable(reader, historicalReceived, liveReceived, historicalConfirmed, allDone);
+        }
+        System.err.println("DIAG: " + (countHistorical(historicalReceived) - before) + " more historical samples arrived after the wait returned");
     }
 
     static int parseDomain(String[] args) {
@@ -190,12 +221,10 @@ public class Subscriber {
         // Confirm the real guarantee, not just the return code: every
         // historical sample must be in the reader by now.
         takeAvailable(reader, historicalReceived, liveReceived, historicalConfirmed, allDone);
-        int historicalCount = 0;
-        for (AtomicBoolean v : historicalReceived) {
-            if (v.get()) historicalCount++;
-        }
+        int historicalCount = countHistorical(historicalReceived);
         if (historicalCount != HISTORICAL_COUNT) {
             System.err.println("FAIL: wait_for_historical_data() returned OK but only " + historicalCount + "/" + HISTORICAL_COUNT + " historical samples were actually received");
+            reportShortfall(rawReader, reader, historicalReceived, liveReceived, historicalConfirmed, allDone);
             System.exit(1);
         }
         System.out.println("HISTORICAL BATCH COMPLETE (" + HISTORICAL_COUNT + " samples)");

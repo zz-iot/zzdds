@@ -300,6 +300,19 @@ pub const UnmatchedCache = struct {
         self.expireLocked(now_ns);
     }
 
+    /// When `expire` next has anything to drop, or null when nothing is held.
+    pub fn nextExpiry(self: *Self) ?i64 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var next: ?i64 = null;
+        var it = self.writers.valueIterator();
+        while (it.next()) |w| {
+            for (w.samples.items) |sm| next = if (next) |n| @min(n, sm.expires_ns) else sm.expires_ns;
+            for (w.partials.items) |pt| next = if (next) |n| @min(n, pt.expires_ns) else pt.expires_ns;
+        }
+        return next;
+    }
+
     /// Bytes held, for tests.
     pub fn byteCount(self: *Self) usize {
         self.mu.lock();

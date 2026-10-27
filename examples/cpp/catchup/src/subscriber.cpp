@@ -38,6 +38,7 @@ constexpr int LIVE_COUNT = 5;
 constexpr int HISTORICAL_WAIT_TIMEOUT_S = 10;
 constexpr int RECEIVE_TIMEOUT_MS = 30000;
 constexpr int POLL_PERIOD_MS = 20;
+constexpr int SHORTFALL_RECHECK_MS = 2000;
 
 struct SubState {
     HistoryEventDataReader *reader = nullptr;
@@ -62,6 +63,14 @@ struct SubState {
             if (!v.load()) return false;
         }
         return true;
+    }
+
+    int count_historical() {
+        int n = 0;
+        for (auto &v : historical_received) {
+            if (v.load()) n++;
+        }
+        return n;
     }
 };
 
@@ -101,6 +110,26 @@ bool take_available(SubState *state) {
     }
 
     return became_done;
+}
+
+// After a historical shortfall: prints what the reader reports, then keeps
+// taking for SHORTFALL_RECHECK_MS. Samples that turn up late mean the wait
+// returned too early; lost ones mean the writer never sent them.
+void report_shortfall(SubState *state, ::DDS::DataReader &dr) {
+    ::DDS::SubscriptionMatchedStatus matched{};
+    ::DDS::SampleLostStatus lost{};
+    ::DDS::SampleRejectedStatus rejected{};
+    dr.get_subscription_matched_status(matched);
+    dr.get_sample_lost_status(lost);
+    dr.get_sample_rejected_status(rejected);
+    std::fprintf(stderr, "DIAG: matched current=%d total=%d, lost=%d, rejected=%d\n",
+                 matched.current_count, matched.total_count, lost.total_count, rejected.total_count);
+    int before = state->count_historical();
+    for (int waited_ms = 0; waited_ms < SHORTFALL_RECHECK_MS && state->count_historical() < HISTORICAL_COUNT; waited_ms += POLL_PERIOD_MS) {
+        sleep_ms(POLL_PERIOD_MS);
+        take_available(state);
+    }
+    std::fprintf(stderr, "DIAG: %d more historical samples arrived after the wait returned\n", state->count_historical() - before);
 }
 
 class SubListener : public ::DDS::DataReaderListenerBase {
@@ -212,12 +241,10 @@ int main(int argc, char **argv) {
     // Confirm the real guarantee, not just the return code: every
     // historical sample must be in the reader by now.
     take_available(&state);
-    int historical_count = 0;
-    for (auto &v : state.historical_received) {
-        if (v.load()) historical_count++;
-    }
+    int historical_count = state.count_historical();
     if (historical_count != HISTORICAL_COUNT) {
         std::fprintf(stderr, "FAIL: wait_for_historical_data() returned OK but only %d/%d historical samples were actually received\n", historical_count, HISTORICAL_COUNT);
+        report_shortfall(&state, *dr);
         return 1;
     }
     std::printf("HISTORICAL BATCH COMPLETE (%d samples)\n", HISTORICAL_COUNT);

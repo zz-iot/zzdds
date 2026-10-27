@@ -423,6 +423,35 @@ or an optimisation on an already-improved path):
   tests migrated to it. Keep public `TypeSupport`, `filter` (`FilterValue`/`CdrFieldGetter`,
   used by generated `getFieldFromCdr`) and the `nil_*`/`NIL_PTR` sentinels. Verify with
   `zig build test`, the strict examples suite and a `dds-rtps` rebuild.
+- **Listener identity in the C++ and Java bindings.** On a shared runtime, one listener
+  runs one call at a time wherever it is installed, and the core recognizes one listener
+  by its registration's `listener_data` (`src/util/listener_identity.zig`). C and Zig
+  callers pass one pointer per listener; the bindings do not yet
+  ([design](design/concurrency/listeners.md#binding-identity-and-ownership), and the
+  index's "Listener bridge ABI" open item):
+  - **C++** passes `this` as the specific `FooListenerBase*`, so an object deriving from
+    two listener bases registers under two addresses. Plan: a zidl annotation
+    `@shared_base` on a base interface, meaning its direct inheritors share one copy of
+    it. The C++ backend maps it to `public virtual` inheritance and rejects it on an
+    interface that declares operations (the generated `Base` classes' default overrides
+    would have no unique final overrider); other backends decide for themselves and
+    ignore it for now. `dcps.idl` marks `Listener` with it, and `c_listener()` passes
+    `static_cast<::DDS::Listener*>(this)` as a new identity field in the C listener
+    struct, which the core prefers over `listener_data`; dispatch keeps the base pointer.
+    The virtual base also gives a partly constructed object its final identity.
+  - **Java** allocates a native context with a new global reference per registration, so
+    one Java object set on two entities is two listeners. Plan: a binding-owned registry,
+    consulted only at `set_listener`/`create_*`, never per callback, mapping a Java object
+    (bucketed by `System.identityHashCode`, matched with `IsSameObject`) to one
+    reference-counted native context released through `release_listener_data`. An
+    optional generated base class holding the native handle could later skip the lookup
+    for applications that register often.
+  - **C++ listener lifetime (suspected, not reproduced).** `c_listener()` does not set
+    `release_listener_data`: the listener stays alive only through the entity wrapper's
+    stored `shared_ptr`, which `set_listener` overwrites at once, so replacing a listener
+    the application holds no other reference to may free it while a call is running or
+    queued. Fix: each registration owns a heap copy of the `shared_ptr`, deleted in
+    `release_listener_data`. Write the failing test first.
 - **Java: a few DCPS ops taking a bare `sequence<T>` parameter** (not inside a struct) throw
   `UnsupportedOperationException` (`get_datareaders`, some batch ops). `zzdds.idl`
   vendor-extension / cross-file type refs in zidl's Java backend may be partly stale versus
@@ -988,9 +1017,59 @@ now define the behavioral baseline (take-turns participant/endpoint contexts, on
 manual/hosted progress engine, listener exclusion with inline eligibility, operation
 results/waits, runtime ownership/retirement and the transport boundary). Their open
 design items, implementation gates and acceptance criteria are listed in that index.
-Remaining work is implementation: the first vertical slice (one reliable reader/writer
-pair under manual and hosted drivers, listeners, timed waits and automatic retirement),
-then broader endpoint migration, thread consolidation onto the shared runtime timers,
+The runtime core is in `src/runtime/`: take-turns contexts, the ready queue
+([publication handshake](design/concurrency/architecture.md#ready-queue-publication)),
+timers, the progress backend, the manual `drive` and hosted workers on `std.Io.Threaded`,
+and retirement. Participants use it only in a `-Dshared-runtime` build (a contributor
+migration switch, off by default): a factory may select the runtime, each participant holds
+an owner reference, and creation fails for transports or discovery plugins that run their
+own threads (only the in-process memory transport and direct discovery qualify so far).
+Received datagrams are copied into each participant's ingress context, bounded by count
+and bytes, and processed in runtime turns (which is what makes a RELIABLE pair over the
+memory transport work there); deleting a participant drops what is still queued. A
+writer's periodic HEARTBEAT is a runtime timer on the runtime clock rather than a thread,
+armed while a reliable reader is matched. The participant's DEADLINE, LIVELINESS and
+held-data expiry checks are one timer armed for the earliest time anything is due (no
+100 ms poll thread), and timed QoS runs on the runtime clock. Reader and writer
+listeners run as turns of the endpoint's own listener context, never on the stack that
+changed their status: the change wakes conditions and queues one request per endpoint,
+each status kind ordered by when it first became pending and claimed when the turn runs,
+and progress that runs internal work only passes them over. Direct discovery still
+matches synchronously on the caller's thread, but the listeners that follow run on the
+runtime. Deleting a reader or writer from application code waits for a listener
+running through it (as a runtime turn, or inline from `notify_datareaders`) to return;
+deleting it from any callback chain does not wait. Builtin-topic readers' listeners run
+the same way. One endpoint's listeners run one at a time, and different endpoints' may
+run at once on hosted workers, except that one listener runs one call at a time wherever
+it is installed, including as a parent's listener: the core identifies it by its
+`listener_data` (or the registration, when that is null), and a turn whose listener is
+running elsewhere leaves the runtime until it returns. `notify_datareaders` runs a reader's
+listener inline only when neither the reader's turn nor that listener is running elsewhere
+(its own callback chain excepted), and otherwise leaves it to the reader's turn, which
+waits for an inline call to return. The C++ and Java bindings do not yet
+pass one `listener_data` per application object (see [Bindings](#bindings)). Deleting a
+participant from one of its listeners, including one called by `notify_datareaders`,
+finishes once its other listeners in progress, and that traversal, return. On a manual runtime, blocking calls help: a WaitSet
+created with that runtime, `wait_for_acknowledgments` on a writer or publisher, and
+`wait_for_historical_data` run internal turns and due timers until they are satisfied or
+their deadline (on the runtime clock) passes, never listener turns, including when called
+from a listener; on a hosted runtime they only observe. A RELIABLE write that finds its
+history full (RESOURCE_LIMITS) waits the same way, for up to `max_blocking_time`, while
+readers acknowledge. Without a selection, creation
+uses the process's default runtime: a hosted one with two workers, started at the first
+such creation and retired with its last participant (the next creation starts another),
+unless the application installs a runtime of its own (creation then fails once that one
+retires, until it is replaced) or disables the default. A WaitSet created without a
+runtime helps the default for each wait when it is an installed manual runtime, and never
+starts one. The default's options are fixed (no configuration yet), and installation is
+a Zig call: an installed runtime is an unretained pointer, which the application keeps
+valid while it is installed and its waits run. It does not yet carry the operation effect states (commit and
+cancellation) or resource waits.
+The first vertical slice runs one reliable reader/writer pair through the same trace
+under a manual and a hosted driver: match, delivery, the acknowledgment and data waits, a
+missed deadline, and retirement begun from listeners, with the runtime's last owner
+deleted inside its own listener. Remaining work is implementation: the gaps above, then
+broader endpoint migration, thread consolidation onto the shared runtime timers,
 optional-profile builds and the measured latency/footprint work. The review-era
 synchronization prototype and bounded models stay on the `concurrency-broker-specs` branch
 (see the [evidence inventory](design/probes/README.md)). Advanced extension objects (explicit runtime owners/refs, listener groups, resource

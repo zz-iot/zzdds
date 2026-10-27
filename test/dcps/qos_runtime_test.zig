@@ -196,6 +196,73 @@ test "resource_limits: writer BEST_EFFORT — returns OutOfResources when cache 
     try testing.expectError(error.OutOfResources, err);
 }
 
+test "resource_limits: writer RELIABLE VOLATILE — acknowledged samples free space for later writes" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dw_qos.resource_limits.max_samples = 2;
+    // No blocking: in-process delivery acknowledges each write before it returns.
+    dw_qos.reliability.max_blocking_time = .{ .sec = 0, .nanosec = 0 };
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+    for (0..5) |_| try writeRaw(pair.dw, &PAYLOAD_A);
+    try testing.expectEqual(@as(usize, 0), pair.dw.proto_writer.cacheLen());
+
+    const samples = try drainSamples(alloc, pair.dr);
+    defer {
+        for (samples) |sample| alloc.free(sample);
+        alloc.free(samples);
+    }
+    try testing.expectEqual(@as(usize, 5), samples.len);
+}
+
+test "resource_limits: writer RELIABLE TRANSIENT_LOCAL — acknowledged samples stay, so a full cache times out" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var dw_qos = DDS.DataWriterQos{};
+    var dr_qos = DDS.DataReaderQos{};
+    dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+    dw_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+    dw_qos.resource_limits.max_samples = 2;
+    dw_qos.reliability.max_blocking_time = .{ .sec = 0, .nanosec = 0 };
+    dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+    dr_qos.history.kind = .KEEP_ALL_HISTORY_QOS;
+
+    const pair = fx.makeWriterReader(dw_qos, dr_qos);
+    try writeRaw(pair.dw, &PAYLOAD_A);
+    try writeRaw(pair.dw, &PAYLOAD_B);
+    // Kept for late joiners: the write blocks for max_blocking_time, then fails.
+    try testing.expectError(error.Timeout, pair.dw.writeRaw(
+        .alive,
+        RtpsTimestamp.now(),
+        history_mod.INSTANCE_HANDLE_NIL,
+        std.mem.zeroes([16]u8),
+        &PAYLOAD_C,
+    ));
+    try testing.expectEqual(@as(usize, 2), pair.dw.proto_writer.cacheLen());
+}
+
+test "a publisher's default writer QoS blocks a full RELIABLE write for 100 ms" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit();
+
+    var qos = DDS.DataWriterQos{};
+    defer qos.deinit(alloc);
+    try testing.expectEqual(DDS.RETCODE_OK, fx.pub_w.vtable.get_default_datawriter_qos(fx.pub_w.ptr, &qos));
+    try testing.expectEqual(DDS.Duration_t{ .sec = 0, .nanosec = 100_000_000 }, qos.reliability.max_blocking_time);
+}
+
 test "resource_limits: writer KEEP_LAST — limit never hit because cache depth evicts" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);

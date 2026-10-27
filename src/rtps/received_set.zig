@@ -76,6 +76,18 @@ pub const ReceivedSet = struct {
         if (self.ranges.items.len == 0) return 0;
         return self.ranges.items[self.ranges.items.len - 1].hi;
     }
+
+    /// How many SNs in [lo, hi] have been inserted.
+    pub fn countBetween(self: *const ReceivedSet, lo: SequenceNumber, hi: SequenceNumber) SequenceNumber {
+        var n: SequenceNumber = 0;
+        for (self.ranges.items) |r| {
+            if (r.lo > hi) break; // sorted: no later range overlaps
+            const a = @max(r.lo, lo);
+            const b = @min(r.hi, hi);
+            if (a <= b) n += b - a + 1;
+        }
+        return n;
+    }
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -181,4 +193,17 @@ test "ReceivedSet contains boundary cases" {
     try testing.expect(rs.contains(11));
     try testing.expect(rs.contains(12));
     try testing.expect(!rs.contains(13));
+}
+
+test "ReceivedSet countBetween counts only inserted SNs inside the bounds" {
+    var rs = ReceivedSet.empty;
+    defer rs.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(SequenceNumber, 0), rs.countBetween(1, 10));
+    // [2,4] [7,7] [9,12]
+    for ([_]SequenceNumber{ 2, 3, 4, 7, 9, 10, 11, 12 }) |sn| _ = try rs.insert(testing.allocator, sn);
+    try testing.expectEqual(@as(SequenceNumber, 8), rs.countBetween(1, 12));
+    try testing.expectEqual(@as(SequenceNumber, 4), rs.countBetween(3, 9));
+    try testing.expectEqual(@as(SequenceNumber, 0), rs.countBetween(5, 6));
+    try testing.expectEqual(@as(SequenceNumber, 1), rs.countBetween(12, 20));
 }

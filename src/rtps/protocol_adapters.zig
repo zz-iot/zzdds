@@ -19,6 +19,7 @@ const history_mod = @import("history.zig");
 const guid_mod = @import("guid.zig");
 const trace_mod = @import("../trace.zig");
 const time_mod = @import("../util/time.zig");
+const runtime_mod = @import("../runtime/core.zig");
 const submsg_mod = @import("message/submessage.zig");
 const msg_builder = @import("message/builder.zig");
 const sn_mod = @import("sequence_number.zig");
@@ -109,6 +110,15 @@ pub const RtpsProtocolWriter = struct {
         self.writer.setLifespan(ls);
     }
 
+    /// See `StatefulWriter.drop_acked`. Call before any reader matches.
+    pub fn setDropAcked(self: *Self, drop: bool) void {
+        self.writer.drop_acked = drop;
+    }
+
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) void {
+        self.writer.attachRuntime(rt);
+    }
+
     pub fn setKeyed(self: *Self, keyed: bool) void {
         self.writer.setKeyed(keyed);
     }
@@ -129,6 +139,7 @@ pub const RtpsProtocolWriter = struct {
         .all_acked = vtAllAcked,
         .wait_all_acked = vtWaitAllAcked,
         .cache_len = vtCacheLen,
+        .wait_cache_below = vtWaitCacheBelow,
         .begin_coherent_set = vtBeginCoherentSet,
         .coherent_window_count = vtCoherentWindowCount,
         .end_coherent_set = vtEndCoherentSet,
@@ -221,9 +232,14 @@ pub const RtpsProtocolWriter = struct {
         return self.writer.allProxiesAcked(target_sn);
     }
 
-    fn vtWaitAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber, deadline_ns: ?i64) bool {
+    fn vtWaitAllAcked(ctx: *anyopaque, target_sn: history_mod.SequenceNumber, timeout_ns: ?i64) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.writer.waitAllAcked(target_sn, deadline_ns);
+        return self.writer.waitAllAcked(target_sn, timeout_ns);
+    }
+
+    fn vtWaitCacheBelow(ctx: *anyopaque, limit: usize, timeout_ns: ?i64) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.writer.waitCacheBelow(limit, timeout_ns);
     }
 
     fn vtRemoveMatchedReader(ctx: *anyopaque, guid: Guid) void {
@@ -591,6 +607,7 @@ pub const RtpsProtocolReader = struct {
     fn vtRemoveMatchedWriter(ctx: *anyopaque, guid: Guid) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const r = self.removeWriter(guid);
+        if (r.removed.lost) |l| l.fn_ptr(l.ctx, l.count);
         if (r.removed.ready) |d| d.fn_ptr(d.ctx, guid, false);
         if (r.removed.removed) if (r.cb) |c| c.on_writer_unmatched(c.ctx, guid);
     }
@@ -606,6 +623,7 @@ pub const RtpsProtocolReader = struct {
         // instead of firing either.
         var result: protocol.DeferredUnmatchCallbacks = .{};
         if (r.removed.ready) |d| result.ready = .{ .ctx = d.ctx, .on_ready = d.fn_ptr };
+        if (r.removed.lost) |l| result.lost = .{ .ctx = l.ctx, .on_lost = l.fn_ptr, .count = l.count };
         if (r.removed.removed) if (r.cb) |c| {
             result.unmatched_ctx = c.ctx;
             result.unmatched_fn = c.on_writer_unmatched;

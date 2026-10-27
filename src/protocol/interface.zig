@@ -201,16 +201,27 @@ pub const ProtocolReadyCallback = struct {
     quiesce_release: ?*const fn (ctx: *anyopaque) void = null,
 };
 
+/// A pending SAMPLE_LOST report from a writer removal: `count` SNs of the
+/// writer's history that never arrived (see DeferredUnmatchCallbacks.lost).
+pub const DeferredSampleLost = struct {
+    ctx: *anyopaque,
+    on_lost: *const fn (ctx: *anyopaque, count: i32) void,
+    count: i32,
+};
+
 /// Bundle of callbacks pending from a *_matched_*_deferred removal call,
-/// none of them fired yet -- both can reach arbitrary application listener
+/// none of them fired yet -- all can reach arbitrary application listener
 /// code (on_reliable_writer_ready/on_reliable_reader_ready, and
 /// on_writer_unmatched/on_reader_unmatched can themselves synthesize a
 /// NOT_ALIVE_NO_WRITERS/NO_READERS sample and dispatch on_data_available),
-/// so the caller must fire both only after releasing whatever external lock
+/// so the caller must fire them only after releasing whatever external lock
 /// (e.g. DomainParticipantImpl.mu) protects the removal itself.
 pub const DeferredUnmatchCallbacks = struct {
     /// Set only when a proxy was removed.
     ready: ?ProtocolReadyCallback = null,
+    /// History the removed writer announced but never delivered, for
+    /// SAMPLE_LOST. Fired before the other two.
+    lost: ?DeferredSampleLost = null,
     unmatched_ctx: ?*anyopaque = null,
     unmatched_fn: ?*const fn (ctx: *anyopaque, guid: Guid) void = null,
 };
@@ -289,14 +300,19 @@ pub const ProtocolWriter = struct {
         all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber) bool,
 
         /// Block until every RELIABLE matched reader has acknowledged all changes
-        /// up to and including `target_sn`, or until `deadline_ns` (monotonic ns)
-        /// is reached.  Null `deadline_ns` waits indefinitely.
+        /// up to and including `target_sn`, or for `timeout_ns`, on the clock
+        /// the writer schedules by.  Null `timeout_ns` waits indefinitely.
         /// Returns true on success, false on timeout.
-        wait_all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber, deadline_ns: ?i64) bool,
+        wait_all_acked: *const fn (ctx: *anyopaque, target_sn: SequenceNumber, timeout_ns: ?i64) bool,
 
         /// Return the current number of samples in the writer's history cache.
         /// Used to enforce RESOURCE_LIMITS.max_samples before writing.
         cache_len: *const fn (ctx: *anyopaque) usize,
+
+        /// Block until the writer's history cache holds fewer than `limit`
+        /// samples, or for `timeout_ns`, on the clock the writer schedules
+        /// by. Null `timeout_ns` waits indefinitely. Returns false on timeout.
+        wait_cache_below: *const fn (ctx: *anyopaque, limit: usize, timeout_ns: ?i64) bool,
 
         /// Begin a coherent set: subsequent write() calls are deferred until
         /// end_coherent_set().  `is_coherent_window` must be true when called from
@@ -443,12 +459,16 @@ pub const ProtocolWriter = struct {
         return self.vtable.all_acked(self.ctx, target_sn);
     }
 
-    pub fn waitAllAcked(self: ProtocolWriter, target_sn: SequenceNumber, deadline_ns: ?i64) bool {
-        return self.vtable.wait_all_acked(self.ctx, target_sn, deadline_ns);
+    pub fn waitAllAcked(self: ProtocolWriter, target_sn: SequenceNumber, timeout_ns: ?i64) bool {
+        return self.vtable.wait_all_acked(self.ctx, target_sn, timeout_ns);
     }
 
     pub fn cacheLen(self: ProtocolWriter) usize {
         return self.vtable.cache_len(self.ctx);
+    }
+
+    pub fn waitCacheBelow(self: ProtocolWriter, limit: usize, timeout_ns: ?i64) bool {
+        return self.vtable.wait_cache_below(self.ctx, limit, timeout_ns);
     }
 
     pub fn beginCoherentSet(self: ProtocolWriter, is_coherent_window: bool) void {

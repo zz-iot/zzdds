@@ -16,6 +16,10 @@ const filter_mod = @import("filter.zig");
 const waitset = @import("waitset.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const time_mod = @import("../util/time.zig");
+const Hook = @import("../runtime/core.zig").Hook;
+const ListenerGroup = @import("listener_lane.zig").Group;
+const ListenerCall = @import("listener_lane.zig").Call;
+const ListenerTraversal = @import("listener_lane.zig").Traversal;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
@@ -77,6 +81,15 @@ pub const ParticipantCbs = struct {
     /// Clock passed to DataReaderImpl for DEADLINE interval timers.
     timer_clock: time_mod.Clock,
 
+    /// Given to each DataReaderImpl: run when something may fall due sooner than
+    /// the participant's timer checks are armed for.
+    timers_changed: ?Hook = null,
+
+    /// The participant's listener group on a shared runtime: each
+    /// DataReaderImpl runs its listeners on its own context in it. Null runs them
+    /// inline.
+    listener_group: ?*ListenerGroup = null,
+
     /// Register a timer-check callback (DEADLINE) for a reader.
     /// Called once per DataReader after create_proto_reader succeeds.
     /// quiesce_acquire/quiesce_release let checkTimers() hold the reader's
@@ -87,6 +100,7 @@ pub const ParticipantCbs = struct {
         handle: DDS.InstanceHandle_t,
         notify_ctx: *anyopaque,
         notify_fn: *const fn (notify_ctx: *anyopaque, now_ns: i64) void,
+        next_due_fn: *const fn (notify_ctx: *anyopaque) ?i64,
         quiesce_acquire: *const fn (notify_ctx: *anyopaque) bool,
         quiesce_release: *const fn (notify_ctx: *anyopaque) void,
     ) void,
@@ -411,6 +425,8 @@ pub const SubscriberImpl = struct {
             self.cbs.destroy_proto_reader(self.cbs.ctx, subscription_handle);
             return nil.nil_datareader;
         };
+        dr.timers_changed = self.cbs.timers_changed;
+        if (self.cbs.listener_group) |g| dr.listeners.attach(g);
         self.cbs.register_incompat_qos(
             self.cbs.ctx,
             subscription_handle,
@@ -428,6 +444,7 @@ pub const SubscriberImpl = struct {
             subscription_handle,
             dr,
             reader_mod.DataReaderImpl.checkTimersFn,
+            reader_mod.DataReaderImpl.nextTimerDueFn,
             reader_mod.DataReaderImpl.quiesceAcquireFn,
             reader_mod.DataReaderImpl.quiesceReleaseFn,
         );
@@ -526,21 +543,26 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.readers.items, 0..) |r, i| {
-            if (r.toDDSDataReader().ptr == a_datareader.ptr) {
-                // Spec §2.2.2.5.2.6: PRECONDITION_NOT_MET if the reader has
-                // outstanding loans -- check before touching anything.
-                const precondition = r.checkDeletePrecondition();
-                if (precondition != DDS.RETCODE_OK) return precondition;
-                _ = self.readers.swapRemove(i);
-                self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
-                r.deinit();
-                return DDS.RETCODE_OK;
+        const r = found: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (self.readers.items, 0..) |r, i| {
+                if (r.toDDSDataReader().ptr == a_datareader.ptr) {
+                    // Spec §2.2.2.5.2.6: PRECONDITION_NOT_MET if the reader has
+                    // outstanding loans -- check before touching anything.
+                    const precondition = r.checkDeletePrecondition();
+                    if (precondition != DDS.RETCODE_OK) return precondition;
+                    _ = self.readers.swapRemove(i);
+                    break :found r;
+                }
             }
-        }
-        return DDS.RETCODE_BAD_PARAMETER;
+            return DDS.RETCODE_BAD_PARAMETER;
+        };
+        // Torn down without `mu`: deinit waits for a running listener,
+        // which may call back into this Subscriber.
+        self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
+        r.deinit();
+        return DDS.RETCODE_OK;
     }
 
     /// Checks every reader's delete precondition without tearing anything
@@ -563,15 +585,23 @@ pub const SubscriberImpl = struct {
             if (rc != DDS.RETCODE_OK) return rc;
         }
         const self = cast(ctx);
-        const precondition = self.checkDeleteContainedPrecondition();
-        if (precondition != DDS.RETCODE_OK) return precondition;
-        self.mu.lock();
-        defer self.mu.unlock();
-        for (self.readers.items) |r| {
+        var taken: std.ArrayListUnmanaged(*reader_mod.DataReaderImpl) = undefined;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            for (self.readers.items) |r| {
+                const precondition = r.checkDeletePrecondition();
+                if (precondition != DDS.RETCODE_OK) return precondition;
+            }
+            taken = self.readers;
+            self.readers = .empty;
+        }
+        // Torn down without `mu`, as in delete_datareader.
+        for (taken.items) |r| {
             self.cbs.destroy_proto_reader(self.cbs.ctx, r.instance_handle);
             r.deinit();
         }
-        self.readers.clearRetainingCapacity();
+        taken.deinit(self.alloc);
         return DDS.RETCODE_OK;
     }
 
@@ -658,10 +688,21 @@ pub const SubscriberImpl = struct {
             };
         }
         self.mu.unlock();
+        // The participant's deletion waits for the whole traversal or, from
+        // one of its callbacks, follows it: the readers still pinned use
+        // its listener group, which they share.
+        var traversal: ListenerTraversal = .{};
+        traversal.begin(if (pinned.items.len > 0) pinned.items[0].listeners.group else null);
         for (pinned.items) |r| {
-            _ = r.dispatchDataAvailable();
+            // Tracked, so a deletion of `r` from outside a callback waits for it.
+            var call: ListenerCall = .{};
+            if (r.listeners.enter(&call, DDS.DATA_AVAILABLE_STATUS)) {
+                _ = r.dispatchDataAvailable();
+                r.listeners.leave(&call);
+            }
             r.releaseQuiesce();
         }
+        traversal.end();
         return DDS.RETCODE_OK;
     }
 
@@ -840,6 +881,7 @@ pub const SubscriberImpl = struct {
         if (has_data) {
             r.last_received_ns.store(r.timer_clock.nowNs(), .monotonic);
             if (r.status_cond) |sc| sc.notifyWakeup();
+            if (r.listeners.post(DDS.DATA_AVAILABLE_STATUS)) return;
             const resolution = self.resolveDataAvailableFallback(r);
             // Reserved before the claim, so a failed allocation leaves the
             // status changed for a later notification instead of consumed.

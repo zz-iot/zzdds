@@ -20,6 +20,8 @@ const time_mod = @import("../util/time.zig");
 const msg = @import("message/root.zig");
 const iface = @import("../transport/interface.zig");
 const locator_selector = @import("../transport/locator_selector.zig");
+const runtime_mod = @import("../runtime/core.zig");
+const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 
 const MessageBuilder = msg.builder.MessageBuilder;
 const SCRATCH_SIZE = msg.builder.SCRATCH_SIZE;
@@ -533,6 +535,15 @@ pub const StatefulWriter = struct {
     /// Null until the first reader proxy is added.
     hb_thread: ?std.Thread,
     hb_stopping: std.atomic.Value(bool),
+    /// With a runtime (`attachRuntime`), the periodic HEARTBEAT is a timer
+    /// firing in a writer-local context instead of a thread
+    /// (docs/design/concurrency/runtime.md#thread-mapping). `hb_armed` is
+    /// guarded by `mu`; the rest is set once, before any reader matches.
+    runtime: ?*runtime_mod.Runtime = null,
+    hb_ctx: runtime_mod.Context = undefined,
+    hb_timer: runtime_mod.Timer = undefined,
+    hb_latch: CloseLatch = .{},
+    hb_armed: bool = false,
     /// When true, write() defers DATA sends and accumulates SNs in
     /// coherent_pending_sns.  Cleared by endCoherentSet().
     coherent_active: bool,
@@ -551,6 +562,14 @@ pub const StatefulWriter = struct {
     /// Per-publisher group sequence number counter (starts at 0; first emitted GSN = 1).
     /// Incremented by N after each group coherent set of N samples is flushed.
     group_seq_num_counter: i64,
+    /// Drop each change once every reliable reader has acknowledged it: set
+    /// for a RELIABLE VOLATILE writer, which replays nothing to readers
+    /// matched later, so acknowledged changes only take RESOURCE_LIMITS space
+    /// (the DDS HISTORY QoS). Set once, before any reader matches.
+    drop_acked: bool = false,
+    /// Highest SN dropped as acknowledged; guarded by `mu`. With an empty
+    /// cache, HEARTBEATs announce up to it.
+    trimmed_through: SequenceNumber = 0,
     /// End marker allocated by endCoherentSet(defer_eoc=true) whose DATA the
     /// publisher has yet to send (takeEOCProxyInfos/sendCombinedEOCData).
     /// Cleared by flushGroupEOCHBOnly().
@@ -586,6 +605,7 @@ pub const StatefulWriter = struct {
 
     /// Interval between periodic HEARTBEAT probes.
     const HB_INTERVAL_MS: u64 = 200;
+    pub const HB_INTERVAL_NS: i64 = HB_INTERVAL_MS * std.time.ns_per_ms;
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -634,6 +654,43 @@ pub const StatefulWriter = struct {
     /// before any reader proxy is added.
     pub fn setKeyed(self: *Self, keyed: bool) void {
         self.keyed = keyed;
+    }
+
+    /// Runs the periodic HEARTBEAT as a timer on `rt`, on its clock, instead
+    /// of a thread. Call once, right after `init`, before any reader matches.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) void {
+        self.runtime = rt;
+        // Only timer fires run here, with internal credit.
+        self.hb_ctx = runtime_mod.Context.init(rt, 0);
+        self.hb_ctx.on_closed = self.hb_latch.hook();
+        self.hb_timer = runtime_mod.Timer.init(&self.hb_ctx, onHeartbeatTimer);
+    }
+
+    /// Arms the heartbeat timer if a reliable reader is matched and it is not
+    /// armed already. Caller holds `mu`.
+    fn armHeartbeatLocked(self: *Self, now_ns: i64) void {
+        if (self.hb_armed or self.hb_stopping.load(.acquire)) return;
+        if (!self.hasReliableProxyLocked()) return;
+        self.hb_armed = self.runtime.?.armTimer(&self.hb_timer, now_ns + HB_INTERVAL_NS);
+    }
+
+    fn hasReliableProxyLocked(self: *const Self) bool {
+        for (self.reader_proxies.items) |rp| if (rp.reliable) return true;
+        return false;
+    }
+
+    /// The timer counterpart of `heartbeatThread`'s loop body. Re-arms itself
+    /// while a reliable reader remains; recurrence stops once the runtime
+    /// retires.
+    fn onHeartbeatTimer(t: *runtime_mod.Timer, turn: *runtime_mod.Turn) void {
+        const self: *Self = @fieldParentPtr("hb_timer", t);
+        self.sendHeartbeat(false, false);
+        self.checkProbeDeadlines();
+        self.checkConnectionGenerations();
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.hb_armed = false;
+        self.armHeartbeatLocked(turn.now_ns);
     }
 
     pub fn setLifespan(self: *Self, ls: ?time_mod.RtpsDuration) void {
@@ -699,6 +756,18 @@ pub const StatefulWriter = struct {
     /// heartbeat thread fires that callback on its own schedule and doesn't
     /// otherwise know the target is gone.
     pub fn stopHeartbeat(self: *Self) void {
+        if (self.runtime) |rt| {
+            // Under `mu`, so no arming site can re-arm after the cancel.
+            self.mu.lock();
+            self.hb_stopping.store(true, .release);
+            self.hb_armed = false;
+            self.mu.unlock();
+            rt.cancelTimer(&self.hb_timer);
+            // A fire never runs code that deletes this writer.
+            const closed = self.hb_latch.close(&self.hb_ctx, discardFire);
+            std.debug.assert(closed);
+            return;
+        }
         self.hb_stopping.store(true, .release);
         // hb_thread itself is mu-guarded (addMatchedReader reads/writes it
         // under mu too, at its own spawn site) -- read-and-clear it under
@@ -714,8 +783,12 @@ pub const StatefulWriter = struct {
         if (maybe_thread) |t| t.join();
     }
 
+    /// A queued fire is the timer's own embedded request: nothing to free.
+    fn discardFire(_: *runtime_mod.Request) void {}
+
     pub fn deinit(self: *Self) void {
         self.stopHeartbeat();
+        if (self.runtime != null) self.hb_ctx.deinit();
         for (self.reader_proxies.items) |*rp| rp.deinit(self.alloc);
         self.reader_proxies.deinit(self.alloc);
         self.coherent_pending_sns.deinit(self.alloc);
@@ -744,11 +817,76 @@ pub const StatefulWriter = struct {
         return self.allProxiesAckedLocked(target_sn);
     }
 
+    /// Waits until the cache holds fewer than `limit` changes, for a write
+    /// blocked on RESOURCE_LIMITS, or for `timeout_ns` (null: no limit). Space
+    /// frees as readers acknowledge (`drop_acked`) or KEEP_LAST evicts. On a
+    /// manual runtime the wait runs the runtime's internal work meanwhile, on
+    /// its clock. Returns false on timeout.
+    pub fn waitCacheBelow(self: *Self, limit: usize, timeout_ns: ?i64) bool {
+        if (self.runtime) |rt| if (rt.canHelp()) {
+            const Wait = struct {
+                writer: *Self,
+                limit: usize,
+                fn done(w: *const @This()) bool {
+                    w.writer.mu.lock();
+                    defer w.writer.mu.unlock();
+                    return w.writer.cache.len() < w.limit;
+                }
+            };
+            const deadline_ns = if (timeout_ns) |t| rt.clock.nowNs() +| t else null;
+            return rt.helpUntil(deadline_ns, &Wait{ .writer = self, .limit = limit }, Wait.done);
+        };
+        const deadline_ns = if (timeout_ns) |t| time_mod.nanoTimestamp() +| t else null;
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (self.cache.len() >= limit) {
+            if (deadline_ns) |dl| {
+                const now = time_mod.nanoTimestamp();
+                if (now >= dl) return false;
+                self.ack_cond.timedWaitNs(&self.mu, @intCast(dl - now)) catch {};
+            } else {
+                self.ack_cond.wait(&self.mu);
+            }
+        }
+        return true;
+    }
+
+    /// With `drop_acked`, drops the changes every reliable reader has
+    /// acknowledged, never one not yet sent (the last flushed SN caps it: an
+    /// open coherent set's changes, or one being sent with `mu` released).
+    /// Caller must hold `mu`.
+    fn trimAckedLocked(self: *Self) void {
+        if (!self.drop_acked) return;
+        var floor = self.last_flushed_sn;
+        for (self.reader_proxies.items) |rp| {
+            if (rp.reliable) floor = @min(floor, rp.highest_acked_sn);
+        }
+        if (floor <= self.trimmed_through) return;
+        self.cache.removeWriterChangesUpTo(floor);
+        self.trimmed_through = floor;
+        // A write blocked on RESOURCE_LIMITS may proceed.
+        self.ack_cond.broadcast();
+        if (self.runtime) |rt| rt.wakeHelpers();
+    }
+
     /// Block until every RELIABLE matched reader has cumulatively acked all
-    /// changes up to and including `target_sn`, or until `deadline_ns`
-    /// (monotonic ns) is reached.  Null means wait indefinitely.
+    /// changes up to and including `target_sn`, or for `timeout_ns`.  Null
+    /// means wait indefinitely.  On a manual runtime the wait runs the
+    /// runtime's internal work meanwhile, on its clock.
     /// Returns true on success, false on timeout.
-    pub fn waitAllAcked(self: *Self, target_sn: SequenceNumber, deadline_ns: ?i64) bool {
+    pub fn waitAllAcked(self: *Self, target_sn: SequenceNumber, timeout_ns: ?i64) bool {
+        if (self.runtime) |rt| if (rt.canHelp()) {
+            const Wait = struct {
+                writer: *Self,
+                target_sn: SequenceNumber,
+                fn done(w: *const @This()) bool {
+                    return w.writer.allProxiesAcked(w.target_sn);
+                }
+            };
+            const deadline_ns = if (timeout_ns) |t| rt.clock.nowNs() +| t else null;
+            return rt.helpUntil(deadline_ns, &Wait{ .writer = self, .target_sn = target_sn }, Wait.done);
+        };
+        const deadline_ns = if (timeout_ns) |t| time_mod.nanoTimestamp() +| t else null;
         self.mu.lock();
         defer self.mu.unlock();
         while (true) {
@@ -888,7 +1026,9 @@ pub const StatefulWriter = struct {
         if (should_replay) self.replayHistoryToProxyUnlocked(new_rp) else if (new_rp.reliable) self.sendInitialHeartbeatUnlocked(new_rp);
         // Start the periodic heartbeat thread on the first matched reader so
         // that dropped DATA or HEARTBEAT packets can be recovered via NACK.
-        if (self.hb_thread == null) {
+        if (self.runtime) |rt| {
+            self.armHeartbeatLocked(rt.clock.nowNs());
+        } else if (self.hb_thread == null) {
             self.hb_thread = std.Thread.spawn(.{}, heartbeatThread, .{self}) catch null;
         }
         // Captured under the lock, not re-read from self after unlocking --
@@ -1498,9 +1638,13 @@ pub const StatefulWriter = struct {
             }
         }
         if (out.removed) if (unmatch) |u| u.remove(u.ctx, guid);
+        // The removed reader may have been the last to acknowledge.
+        if (out.removed) self.trimAckedLocked();
         // Wake any thread blocked in waitAllAcked: removing a reliable reader
         // may satisfy the all-acked condition even without an explicit ACKNACK.
+        // The removal may come from an application call rather than a turn.
         self.ack_cond.broadcast();
+        if (self.runtime) |rt| rt.wakeHelpers();
         if (!was_ready) return out;
         const f = self.protocol_ready_fn orelse return out;
         out.ready = .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
@@ -1535,6 +1679,8 @@ pub const StatefulWriter = struct {
             };
         } else if (self.cache.getChange(sn)) |ch| {
             self.sendChangeToAllLocked(ch, true);
+            // With no reliable reader to wait for, it is already acknowledged.
+            self.trimAckedLocked();
         }
         return sn;
     }
@@ -1707,6 +1853,7 @@ pub const StatefulWriter = struct {
             }
             rp.highest_acked_sn = @max(rp.highest_acked_sn, highest_sn);
             self.ack_cond.broadcast();
+            self.trimAckedLocked();
             self.retireEndMarkersLocked();
             // RELIABLE protocol-ready handshake: the first AckNack whose base
             // (next-expected SN) reaches the firstSN of the Heartbeat we sent
@@ -2388,18 +2535,20 @@ pub const StatefulWriter = struct {
     }
 
     /// Lowest SN this writer can still send: its oldest cached sample or
-    /// retained end marker.  0 when it has neither.
+    /// retained end marker.  With neither, one past the last change dropped
+    /// as acknowledged, or else 0.
     fn firstAvailableSnLocked(self: *const Self) SequenceNumber {
-        const cache_first = self.cache.minSn();
+        const min = self.cache.minSn();
+        const cache_first = if (min == 0 and self.trimmed_through > 0) self.trimmed_through + 1 else min;
         if (self.end_markers.items.len == 0) return cache_first;
         const marker_first = self.end_markers.items[0].sn;
         return if (cache_first == 0) marker_first else @min(cache_first, marker_first);
     }
 
-    /// Highest SN this writer can still send: its newest cached sample or
-    /// retained end marker.  0 when it has neither.
+    /// Highest SN this writer can still send, or has dropped as acknowledged:
+    /// its newest cached sample or retained end marker.  0 when it has neither.
     fn lastAvailableSnLocked(self: *const Self) SequenceNumber {
-        const cache_last = self.cache.maxSn();
+        const cache_last = @max(self.cache.maxSn(), self.trimmed_through);
         if (self.end_markers.items.len == 0) return cache_last;
         return @max(cache_last, self.end_markers.items[self.end_markers.items.len - 1].sn);
     }
@@ -2497,6 +2646,8 @@ pub const StatefulWriter = struct {
     pub fn endCoherentSet(self: *Self, mode: history_mod.CoherentFlushMode, resuspend: bool, publisher_gsn: ?*i64, group_set: ?history_mod.GroupCoherentSet, defer_eoc: bool) void {
         self.mu.lock();
         defer self.mu.unlock();
+        // Last before unlocking: what the set sent may already be acknowledged.
+        defer self.trimAckedLocked();
         self.coherent_active = false;
         defer if (resuspend) {
             self.coherent_active = true;

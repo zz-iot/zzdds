@@ -17,12 +17,14 @@ const proto = @import("../protocol/interface.zig");
 const history_mod = @import("../rtps/history.zig");
 const waitset = @import("waitset.zig");
 const time_mod = @import("../util/time.zig");
+const Hook = @import("../runtime/core.zig").Hook;
 const c_abi_handle = @import("../util/c_abi_handle.zig");
 const ListenerBox = @import("../util/listener_box.zig").ListenerBox;
 const listener_fallback = @import("../util/listener_fallback.zig");
 const publisher_mod = @import("publisher.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const EntityQuiesce = @import("../util/entity_quiesce.zig").EntityQuiesce;
+const listener_lane = @import("listener_lane.zig");
 const extensions_mod = @import("../c_abi/extensions.zig");
 
 const Guid = proto.Guid;
@@ -31,6 +33,15 @@ fn durationIsActive(d: DDS.Duration_t) bool {
     if (d.sec == 0 and d.nanosec == 0) return false;
     if (d.sec == DDS.DURATION_INFINITE_SEC and d.nanosec == DDS.DURATION_INFINITE_NSEC) return false;
     return true;
+}
+
+fn durationNs(d: DDS.Duration_t) i64 {
+    return @as(i64, d.sec) * std.time.ns_per_s + @as(i64, d.nanosec);
+}
+
+/// The earlier of `a` and `b`, where null is never.
+fn earlier(a: ?i64, b: i64) i64 {
+    return if (a) |x| @min(x, b) else b;
 }
 
 /// Build the unified listener representation from a plain `set_listener()`
@@ -99,6 +110,9 @@ pub const DataWriterImpl = struct {
     /// callback (RTPS heartbeat/receive, timer, discovery) racing
     /// `deinit()` — see entity_quiesce.zig.
     quiesce: EntityQuiesce = .{},
+    /// Automatic listener invocations, queued on the participant's listener
+    /// context when it has one (see `raise`).
+    listeners: listener_lane.PendingListeners = .{},
     /// Count of currently-outstanding write-loans (see `loanForWrite`/
     /// `publishLoan`/`cancelLoan`). Informational only -- feeds
     /// `checkDeletePrecondition()`'s PRECONDITION_NOT_MET check, not itself
@@ -164,6 +178,9 @@ pub const DataWriterImpl = struct {
 
     /// Clock used for deadline and liveliness interval timers.
     timer_clock: time_mod.Clock,
+    /// The participant's, run when a deadline may now fall due sooner than
+    /// its checks are armed for. Set once, at creation.
+    timers_changed: ?Hook = null,
 
     /// Monotonic timestamp of the last successful write; used by DEADLINE/LIVELINESS checks.
     /// Initialized to creation time so the first deadline window starts at entity creation.
@@ -246,7 +263,15 @@ pub const DataWriterImpl = struct {
             .last_write_ns = .init(now),
             .liveliness_last_ns = .init(now),
             .wlp_last_assert_ns = .init(now),
+            .listeners = .init(alloc, .{
+                .ctx = undefined,
+                .acquire = quiesceAcquireFn,
+                .release = quiesceReleaseFn,
+                .status = dispatchStatusFn,
+                .ready = dispatchReadyFn,
+            }),
         };
+        self.listeners.owner.ctx = self;
         errdefer alloc.destroy(self);
         self.listener_ex_box = try ListenerBox(ZZDDS.DataWriterListenerEx).create(alloc, listener);
         errdefer alloc.destroy(self.listener_ex_box);
@@ -277,6 +302,9 @@ pub const DataWriterImpl = struct {
     /// genuinely in flight, in which case that callback's own release runs
     /// it instead once it finishes (see entity_quiesce.zig).
     pub fn deinit(self: *Self) void {
+        self.listeners.close();
+        // Hold no entity lock here: the listener may call back into it.
+        self.listeners.awaitIdle();
         self.quiesce.beginTeardown(self, reallyDeinit);
     }
 
@@ -293,6 +321,7 @@ pub const DataWriterImpl = struct {
 
     fn reallyDeinit(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.listeners.deinit();
         self.listener_ex_box.releaseRef(self.alloc);
         if (self.status_cond) |sc| sc.deinit();
         self.c_abi.free(self.alloc);
@@ -346,13 +375,11 @@ pub const DataWriterImpl = struct {
                 if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) {
                     return error.OutOfResources;
                 }
-                // RELIABLE: poll until space frees up (1 ms sleep, 10 s timeout).
-                const deadline_ns = time_mod.nanoTimestamp() + 10 * std.time.ns_per_s;
-                while (self.proto_writer.cacheLen() >= limit) {
-                    if (time_mod.nanoTimestamp() >= deadline_ns)
-                        return error.Timeout;
-                    time_mod.sleepNs(1 * std.time.ns_per_ms);
-                }
+                // RELIABLE: block for up to max_blocking_time while readers
+                // acknowledge (the DDS RELIABILITY QoS).
+                const mbt = self.qos.reliability.max_blocking_time;
+                const timeout_ns: ?i64 = if (mbt.sec == DDS.DURATION_INFINITE_SEC and mbt.nanosec == DDS.DURATION_INFINITE_NSEC) null else durationNs(mbt);
+                if (!self.proto_writer.waitCacheBelow(limit, timeout_ns)) return error.Timeout;
             }
         }
 
@@ -574,7 +601,7 @@ pub const DataWriterImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        self.dispatchPublicationMatched();
+        self.raise(DDS.PUBLICATION_MATCHED_STATUS);
     }
 
     /// For tests: a reader matched or unmatched, without its proxy, then
@@ -583,7 +610,7 @@ pub const DataWriterImpl = struct {
         self.mu.lock();
         self.publicationMatchedLocked(remote_handle, added);
         self.mu.unlock();
-        self.dispatchPublicationMatched();
+        self.raise(DDS.PUBLICATION_MATCHED_STATUS);
     }
 
     fn dispatchPublicationMatched(self: *Self) void {
@@ -604,7 +631,6 @@ pub const DataWriterImpl = struct {
             self.pub_matched_current_change = 0;
         }
         self.mu.unlock();
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
@@ -616,10 +642,6 @@ pub const DataWriterImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        // Resolved first, then updated and claimed under `mu` -- see
-        // resolveListener.
-        const target = self.resolveListener("on_offered_incompatible_qos", DDS.OFFERED_INCOMPATIBLE_QOS_STATUS);
-        defer if (target) |t| t.release();
         self.mu.lock();
         self.incompat_total_change += 1;
         self.incompat_last_policy = policy_id;
@@ -627,16 +649,23 @@ pub const DataWriterImpl = struct {
         // Release ordering: publishes the plain-field writes above (program
         // order on this thread) to any thread that observes this value via
         // a paired .acquire load, without requiring that thread to take a lock.
-        const new_total = self.incompat_total.load(.monotonic) + 1;
-        self.incompat_total.store(new_total, .release);
+        self.incompat_total.store(self.incompat_total.load(.monotonic) + 1, .release);
+        self.mu.unlock();
+        self.raise(DDS.OFFERED_INCOMPATIBLE_QOS_STATUS);
+    }
+
+    fn dispatchIncompatibleQos(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        const target = self.resolveListener("on_offered_incompatible_qos", DDS.OFFERED_INCOMPATIBLE_QOS_STATUS);
+        defer if (target) |t| t.release();
+        self.mu.lock();
         var status = DDS.OfferedIncompatibleQosStatus{};
-        status.total_count = new_total;
+        status.total_count = self.incompat_total.load(.monotonic);
         status.total_count_change = self.incompat_total_change;
-        status.last_policy_id = policy_id;
+        status.last_policy_id = self.incompat_last_policy;
         const claimed = self.claimStatusLocked(DDS.OFFERED_INCOMPATIBLE_QOS_STATUS, target != null);
         if (claimed) self.incompat_total_change = 0;
         self.mu.unlock();
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
@@ -646,21 +675,25 @@ pub const DataWriterImpl = struct {
     pub fn notifyDeadlineMissed(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        // Resolved first, then updated and claimed under `mu` -- see
-        // resolveListener.
-        const target = self.resolveListener("on_offered_deadline_missed", DDS.OFFERED_DEADLINE_MISSED_STATUS);
-        defer if (target) |t| t.release();
         self.mu.lock();
         self.deadline_missed_total += 1;
         self.deadline_missed_total_change += 1;
         self.status_changes |= DDS.OFFERED_DEADLINE_MISSED_STATUS;
+        self.mu.unlock();
+        self.raise(DDS.OFFERED_DEADLINE_MISSED_STATUS);
+    }
+
+    fn dispatchDeadlineMissed(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        const target = self.resolveListener("on_offered_deadline_missed", DDS.OFFERED_DEADLINE_MISSED_STATUS);
+        defer if (target) |t| t.release();
+        self.mu.lock();
         var status = DDS.OfferedDeadlineMissedStatus{};
         status.total_count = self.deadline_missed_total;
         status.total_count_change = self.deadline_missed_total_change;
         const claimed = self.claimStatusLocked(DDS.OFFERED_DEADLINE_MISSED_STATUS, target != null);
         if (claimed) self.deadline_missed_total_change = 0;
         self.mu.unlock();
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
@@ -670,21 +703,25 @@ pub const DataWriterImpl = struct {
     pub fn notifyLivelinessLost(self: *Self) void {
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
-        // Resolved first, then updated and claimed under `mu` -- see
-        // resolveListener.
-        const target = self.resolveListener("on_liveliness_lost", DDS.LIVELINESS_LOST_STATUS);
-        defer if (target) |t| t.release();
         self.mu.lock();
         self.liveliness_lost_total += 1;
         self.liveliness_lost_total_change += 1;
         self.status_changes |= DDS.LIVELINESS_LOST_STATUS;
+        self.mu.unlock();
+        self.raise(DDS.LIVELINESS_LOST_STATUS);
+    }
+
+    fn dispatchLivelinessLost(self: *Self) void {
+        // Resolved first, then claimed under `mu` -- see resolveListener.
+        const target = self.resolveListener("on_liveliness_lost", DDS.LIVELINESS_LOST_STATUS);
+        defer if (target) |t| t.release();
+        self.mu.lock();
         var status = DDS.LivelinessLostStatus{};
         status.total_count = self.liveliness_lost_total;
         status.total_count_change = self.liveliness_lost_total_change;
         const claimed = self.claimStatusLocked(DDS.LIVELINESS_LOST_STATUS, target != null);
         if (claimed) self.liveliness_lost_total_change = 0;
         self.mu.unlock();
-        if (self.status_cond) |sc| sc.notifyWakeup();
         if (claimed) target.?.invoke(vtable.get_c_abi_handle(self), .{&status});
     }
 
@@ -698,10 +735,36 @@ pub const DataWriterImpl = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (!self.quiesce.acquire()) return;
         defer self.quiesce.release(self, reallyDeinit);
+        const event: listener_lane.ReadyEvent = .{ .guid = reader_guid, .ready = ready };
+        if (!self.listeners.postReady(event)) dispatchReadyFn(self, event);
+    }
+
+    fn dispatchReadyFn(ctx: *anyopaque, event: listener_lane.ReadyEvent) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
         const box = self.acquireListenerEx();
         defer box.releaseRef(self.alloc);
         if (box.listener.on_reliable_reader_ready) |cb| {
-            cb(guidToHandle(reader_guid), ready, box.listener.listener_data);
+            if (!listener_lane.admit(box)) return;
+            cb(guidToHandle(event.guid), event.ready, box.listener.listener_data);
+        }
+    }
+
+    /// Wakes the StatusCondition for `kind`, which the caller changed, then
+    /// raises its listener -- see `reader.zig`'s `raise`.
+    fn raise(self: *Self, kind: DDS.StatusMask) void {
+        if (self.status_cond) |sc| sc.notifyWakeup();
+        if (!self.listeners.post(kind)) dispatchStatusFn(self, kind);
+    }
+
+    /// Resolves, claims and invokes the listener for status `kind`.
+    fn dispatchStatusFn(ctx: *anyopaque, kind: DDS.StatusMask) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        switch (kind) {
+            DDS.PUBLICATION_MATCHED_STATUS => self.dispatchPublicationMatched(),
+            DDS.OFFERED_INCOMPATIBLE_QOS_STATUS => self.dispatchIncompatibleQos(),
+            DDS.OFFERED_DEADLINE_MISSED_STATUS => self.dispatchDeadlineMissed(),
+            DDS.LIVELINESS_LOST_STATUS => self.dispatchLivelinessLost(),
+            else => unreachable,
         }
     }
 
@@ -749,16 +812,24 @@ pub const DataWriterImpl = struct {
     /// callback, not a `DDS.StatusMask` status, with no
     /// `PublisherListener`/`DomainParticipantListener` equivalent.
     ///
-    /// The status notifiers resolve first, then update the status and,
-    /// when resolved, claim it under `mu` (`claimStatusLocked`) and invoke
-    /// after unlocking -- see `reader.zig`'s `resolveListener`. Release the
+    /// The status notifiers update the status under `mu` and `raise` it;
+    /// its dispatch resolves, then claims it under `mu`
+    /// (`claimStatusLocked`) and invokes after unlocking -- see
+    /// `reader.zig`'s `resolveListener`. Release the
     /// result with no lock held. The caller holds this writer's `quiesce`.
     fn resolveListener(self: *Self, comptime field: []const u8, bit: DDS.StatusMask) ?listener_fallback.Resolved(StatusCb(field)) {
         const mask = @atomicLoad(DDS.StatusMask, &self.listener_mask, .monotonic);
-        if (listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListenerEx(), self.alloc)) |r| return r;
-        if (nil.isNil(self.publisher)) return null;
-        const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
-        return pub_.resolveWriterFallback(StatusCb(field), field, bit);
+        const r = listener_fallback.resolveBox(StatusCb(field), field, mask, bit, self.acquireListenerEx(), self.alloc) orelse blk: {
+            if (nil.isNil(self.publisher)) return null;
+            const pub_: *publisher_mod.PublisherImpl = @ptrCast(@alignCast(self.publisher.ptr));
+            break :blk pub_.resolveWriterFallback(StatusCb(field), field, bit) orelse return null;
+        };
+        // Its identity running elsewhere parks this turn: nothing to invoke.
+        if (!listener_lane.admit(r)) {
+            r.release();
+            return null;
+        }
+        return r;
     }
 
     /// With `mu` held: claims status `bit` for a listener `resolved`, if it
@@ -793,7 +864,7 @@ pub const DataWriterImpl = struct {
     /// Checks DEADLINE and LIVELINESS; fires notifications when thresholds are exceeded.
     /// Called with participant.mu NOT held (checkTimers() collects the due
     /// callbacks under the lock, then releases it before calling any of
-    /// them) -- safe for this (and notifyDeadlineMissed/notifyLivelinessLost
+    /// them) -- safe for this (and the deadline and liveliness listeners
     /// below, which this may call) to re-enter the participant, e.g. if a
     /// user listener reacts to a deadline-missed notification by deleting
     /// the writer/participant.
@@ -821,6 +892,17 @@ pub const DataWriterImpl = struct {
                 self.notifyLivelinessLost();
             }
         }
+    }
+
+    /// The earliest time `checkTimersFn` would report anything, or null.
+    pub fn nextTimerDueFn(ctx: *anyopaque) ?i64 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        var next: ?i64 = null;
+        const dl = self.qos.deadline.period;
+        if (durationIsActive(dl)) next = earlier(next, self.last_write_ns.load(.monotonic) + durationNs(dl));
+        const ll = self.qos.liveliness.lease_duration;
+        if (durationIsActive(ll)) next = earlier(next, self.liveliness_last_ns.load(.monotonic) + durationNs(ll));
+        return next;
     }
 
     /// Called by participant.vtAssertLiveliness() to assert liveliness for
@@ -953,6 +1035,8 @@ pub const DataWriterImpl = struct {
         const new_qos = qos.clone(self.alloc) catch return DDS.RETCODE_OUT_OF_RESOURCES;
         self.qos.deinit(self.alloc);
         self.qos = new_qos;
+        // A shorter deadline may fall due sooner.
+        if (self.timers_changed) |h| h.run(h.ctx);
         return DDS.RETCODE_OK;
     }
 
@@ -995,16 +1079,12 @@ pub const DataWriterImpl = struct {
         if (self.qos.reliability.kind == .BEST_EFFORT_RELIABILITY_QOS) return DDS.RETCODE_OK;
         const last_sn = self.last_sn.load(.monotonic);
         if (last_sn == 0) return DDS.RETCODE_OK;
-        const deadline_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
+        const timeout_ns: ?i64 = if (timeout.sec == DDS.DURATION_INFINITE_SEC and
             timeout.nanosec == DDS.DURATION_INFINITE_NSEC)
             null
-        else blk: {
-            const now = time_mod.nanoTimestamp();
-            break :blk now +
-                @as(i64, timeout.sec) * std.time.ns_per_s +
-                @as(i64, @intCast(timeout.nanosec));
-        };
-        return if (self.proto_writer.waitAllAcked(last_sn, deadline_ns))
+        else
+            @as(i64, timeout.sec) * std.time.ns_per_s + @as(i64, @intCast(timeout.nanosec));
+        return if (self.proto_writer.waitAllAcked(last_sn, timeout_ns))
             DDS.RETCODE_OK
         else
             DDS.RETCODE_TIMEOUT;

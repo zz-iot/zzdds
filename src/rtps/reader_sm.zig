@@ -516,11 +516,21 @@ pub const StatefulReader = struct {
         ctx: *anyopaque,
     };
 
+    /// A pending on_sample_lost report, returned instead of fired
+    /// immediately -- see removeMatchedWriterDeferred.
+    pub const DeferredLost = struct {
+        fn_ptr: *const fn (ctx: *anyopaque, count: i32) void,
+        ctx: *anyopaque,
+        count: i32,
+    };
+
     /// What removeMatchedWriterDeferred did.
     pub const Removed = struct {
         /// A proxy was removed.
         removed: bool = false,
         ready: ?DeferredReady = null,
+        /// History the removed writer announced but never delivered.
+        lost: ?DeferredLost = null,
     };
 
     /// Like removeMatchedWriter, but performs the removal immediately (under
@@ -534,23 +544,31 @@ pub const StatefulReader = struct {
     /// fresh match) while still firing the callback only once that external
     /// lock is released. Caller must fire the returned transition itself.
     /// When a proxy is removed, `unmatch` (if given) removes the caller's own
-    /// state for the writer in the same critical section.
+    /// state for the writer in the same critical section. History the writer
+    /// announced but never delivered can no longer arrive, so it is returned
+    /// as lost: the historical-data wait stops counting the writer, and
+    /// SAMPLE_LOST shows what it never got.
     pub fn removeMatchedWriterDeferred(self: *Self, guid: Guid, unmatch: ?UnmatchCommit) Removed {
         self.mu.lock();
         defer self.mu.unlock();
         var out: Removed = .{};
         var was_ready = false;
+        var lost: i32 = 0;
         var i: usize = self.writer_proxies.items.len;
         while (i > 0) {
             i -= 1;
             if (self.writer_proxies.items[i].guid.eql(guid)) {
                 was_ready = was_ready or self.writer_proxies.items[i].protocol_ready;
+                lost +|= undeliveredHistory(&self.writer_proxies.items[i]);
                 self.writer_proxies.items[i].deinit(self.alloc);
                 _ = self.writer_proxies.swapRemove(i);
                 out.removed = true;
             }
         }
         if (out.removed) if (unmatch) |u| u.remove(u.ctx, guid);
+        if (lost > 0) if (self.callback) |cb| if (cb.on_sample_lost) |f| {
+            out.lost = .{ .fn_ptr = f, .ctx = cb.ctx, .count = lost };
+        };
         if (!was_ready) return out;
         const f = self.protocol_ready_fn orelse return out;
         out.ready = .{ .fn_ptr = f, .ctx = self.protocol_ready_ctx.? };
@@ -563,7 +581,26 @@ pub const StatefulReader = struct {
         // application using on_reliable_writer_ready know a writer it was
         // told is ready has gone away, rather than staying convinced it's
         // still ready indefinitely.
-        if (self.removeMatchedWriterDeferred(guid, null).ready) |d| d.fn_ptr(d.ctx, guid, false);
+        const r = self.removeMatchedWriterDeferred(guid, null);
+        if (r.lost) |l| l.fn_ptr(l.ctx, l.count);
+        if (r.ready) |d| d.fn_ptr(d.ctx, guid, false);
+    }
+
+    /// Samples up to `wp`'s history floor never delivered: those that never
+    /// arrived, plus those held behind them in `pending_changes`. SNs a GAP
+    /// already marked (and counted) lost are neither. Zero until the first
+    /// HEARTBEAT sets the floor, and for writers with no history to deliver
+    /// (their floor stays 0).
+    fn undeliveredHistory(wp: *const WriterProxy) i32 {
+        if (!wp.history_established) return 0;
+        const ack = wp.received.cumulativeAck();
+        const floor = wp.history_floor_sn;
+        if (floor <= ack) return 0;
+        var n = (floor - ack) - wp.received.countBetween(ack + 1, floor);
+        for (wp.pending_changes.items) |*ch| {
+            if (ch.sequence_number <= floor and !isEndMarker(ch)) n += 1;
+        }
+        return @intCast(@min(n, std.math.maxInt(i32)));
     }
 
     /// Returns true if the given GUID is currently in the writer proxy list.
