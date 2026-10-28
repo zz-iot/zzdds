@@ -210,6 +210,23 @@ const Node = struct {
     }
 };
 
+/// Drives `runtime` until `done(ctx)` or `limit_ns` on its clock; returns
+/// whether `done`.
+fn driveRuntimeUntil(runtime: *rt.Runtime, limit_ns: i64, ctx: anytype, comptime done: fn (@TypeOf(ctx)) anyerror!bool) !bool {
+    while (!try done(ctx)) {
+        const left = limit_ns - runtime.clock.nowNs();
+        if (left <= 0) return false;
+        _ = try runtime.drive(64, left);
+    }
+    return true;
+}
+
+/// Drives `runtime` to `until_ns` on its clock, running everything due.
+fn driveRuntimeTo(runtime: *rt.Runtime, until_ns: i64) !void {
+    while (runtime.clock.nowNs() < until_ns) _ = try runtime.drive(64, until_ns - runtime.clock.nowNs());
+    while ((try runtime.drive(64, 0)).turns > 0) {}
+}
+
 /// Two nodes on one bus and one manual runtime over the scripted backend,
 /// whose waits advance its clock to the next deadline. Must not move after
 /// `init`.
@@ -249,21 +266,12 @@ const Pair = struct {
         self.runtime.releaseOwner();
     }
 
-    /// Drives until `done(ctx)` or `limit_ns` on the runtime clock; returns
-    /// whether `done`.
     fn driveUntil(self: *Pair, limit_ns: i64, ctx: anytype, comptime done: fn (@TypeOf(ctx)) anyerror!bool) !bool {
-        while (!try done(ctx)) {
-            const left = limit_ns - self.now();
-            if (left <= 0) return false;
-            _ = try self.runtime.drive(64, left);
-        }
-        return true;
+        return driveRuntimeUntil(&self.runtime, limit_ns, ctx, done);
     }
 
-    /// Drives to `until_ns` on the runtime clock, running everything due.
     fn driveTo(self: *Pair, until_ns: i64) !void {
-        while (self.now() < until_ns) _ = try self.runtime.drive(64, until_ns - self.now());
-        while ((try self.runtime.drive(64, 0)).turns > 0) {}
+        return driveRuntimeTo(&self.runtime, until_ns);
     }
 
     fn bothDiscovered(self: *Pair) anyerror!bool {
@@ -444,35 +452,108 @@ test "deleting a participant disarms its discovery's timers, and the runtime run
     try testing.expectEqual(@as(usize, 0), try discoveredCount(p.b.dp));
 }
 
-test "a discovery plugin stays on the runtime it first ran on: a participant on another fails creation" {
+/// Matches a writer on `pub_dp` with a reader on `sub_dp` and delivers
+/// `samples_n` samples in order, driving `runtime`.
+fn exchangeOn(runtime: *rt.Runtime, pub_dp: DDS.DomainParticipant, sub_dp: DDS.DomainParticipant) !void {
+    var ep = Endpoints.init(pub_dp, sub_dp);
+    try testing.expect(try driveRuntimeUntil(runtime, runtime.clock.nowNs() + 5 * SEC, &ep, struct {
+        fn f(e: *Endpoints) anyerror!bool {
+            return e.matched();
+        }
+    }.f));
+    for (0..samples_n) |i| try ep.write(i);
+    var got: std.ArrayListUnmanaged(u8) = .empty;
+    defer got.deinit(alloc);
+    const deadline = runtime.clock.nowNs() + 10 * SEC;
+    while (got.items.len < samples_n and runtime.clock.nowNs() < deadline) {
+        _ = try runtime.drive(64, deadline - runtime.clock.nowNs());
+        try ep.takeInto(&got);
+    }
+    try expectInOrder(got.items);
+}
+
+/// `a`'s discovery announces each period and checks `b`'s lease on
+/// `runtime`'s clock.
+fn expectTimersRun(p: *Pair, runtime: *rt.Runtime) !void {
+    const before = p.a.gate.announcements;
+    try driveRuntimeTo(runtime, runtime.clock.nowNs() + 3 * SEC);
+    try testing.expect(p.a.gate.announcements >= before + 5);
+    p.b.gate.silent = true;
+    try testing.expect(try driveRuntimeUntil(runtime, runtime.clock.nowNs() + 10 * SEC, p, Pair.aLostB));
+}
+
+test "a participant created again on a running runtime, after the one before it was deleted, discovers its peer, announces and checks leases" {
     const prev = quietLogs();
     defer std.testing.log_level = prev;
-    const bus = try MemoryBus.init(alloc);
-    defer bus.deinit();
-    var node: Node = undefined;
-    try node.init(bus, 1_000);
-    defer {
-        node.factory.deinit();
-        node.deinitPlugins();
-    }
-    var sb_first = rt.ScriptedBackend.init(1_000);
-    var first = rt.Runtime.init(sb_first.clock(), sb_first.backend(), .{ .mode = .manual });
-    defer first.deinit();
-    var sb_second = rt.ScriptedBackend.init(1_000);
-    var second = rt.Runtime.init(sb_second.clock(), sb_second.backend(), .{ .mode = .manual });
+    var p: Pair = undefined;
+    try p.init(500);
+    defer p.deinit();
+    try p.create(10_000, 10_000);
+    try testing.expect(try p.driveUntil(p.now() + 5 * SEC, &p, Pair.bothDiscovered));
+
+    // `b` keeps the runtime running. It loses the deleted participant to
+    // a liveness probe, as nothing listens for the BYE on the in-process
+    // transport.
+    try p.a.delete();
+    try p.a.create(&p.runtime, 10_000);
+    try testing.expect(try p.driveUntil(p.now() + 15 * SEC, &p, Pair.bothDiscovered));
+    try exchangeOn(&p.runtime, p.a.dp, p.b.dp);
+    try expectTimersRun(&p, &p.runtime);
+}
+
+test "after their participants are deleted and their runtime retired, discovery plugins serve the next participants on another runtime" {
+    const prev = quietLogs();
+    defer std.testing.log_level = prev;
+    var p: Pair = undefined;
+    try p.init(500);
+    defer p.deinit();
+    try p.create(10_000, 10_000);
+    try testing.expect(try p.driveUntil(p.now() + 5 * SEC, &p, Pair.bothDiscovered));
+    try p.a.delete();
+    try p.b.delete();
+    while (p.runtime.getState() != .backend_stopped) _ = try p.runtime.drive(64, 0);
+
+    var sb = rt.ScriptedBackend.init(1_000);
+    var second = rt.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
     defer second.deinit();
-
-    try node.create(&first, 10_000);
-    first.releaseOwner();
-    try node.delete();
-    try testing.expectEqual(rt.State.backend_stopped, first.getState());
-
-    try node.factory.selectRuntime(&second);
-    try testing.expectEqual(nil_participant.ptr, node.factory.toDDSFactory().create_participant(0, .{}, null, 0).ptr);
-    try node.factory.selectRuntime(null);
-    // The failed creation took no owner reference.
+    try p.a.create(&second, 10_000);
+    try p.b.create(&second, 10_000);
     second.releaseOwner();
-    try testing.expectEqual(rt.State.backend_stopped, second.getState());
+    try testing.expect(try driveRuntimeUntil(&second, second.clock.nowNs() + 5 * SEC, &p, Pair.bothDiscovered));
+    try exchangeOn(&second, p.a.dp, p.b.dp);
+    try expectTimersRun(&p, &second);
+    try testing.expectEqual(@as(u64, 0), p.a.disc.spdp.rx.drops.load(.monotonic) + p.a.disc.sedp.rx.drops.load(.monotonic));
+
+    try p.a.delete();
+    try p.b.delete();
+    while (second.getState() != .backend_stopped) _ = try second.drive(64, 0);
+}
+
+test "a participant created disabled and deleted leaves its discovery plugin to the next participant, on another runtime" {
+    const prev = quietLogs();
+    defer std.testing.log_level = prev;
+    var p: Pair = undefined;
+    try p.init(500);
+    defer p.deinit();
+    var sb = rt.ScriptedBackend.init(1_000);
+    var other = rt.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
+    defer other.deinit();
+
+    // Attached to `other` at creation, never started.
+    const f = p.a.factory.toDDSFactory();
+    var disabled: DDS.DomainParticipantFactoryQos = .{};
+    disabled.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, f.set_qos(disabled));
+    try p.a.create(&other, 10_000);
+    try testing.expectEqual(DDS.RETCODE_OK, f.delete_participant(p.a.dp));
+    p.a.dp = nil_participant;
+    other.releaseOwner();
+    while (other.getState() != .backend_stopped) _ = try other.drive(64, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, f.set_qos(.{}));
+
+    try p.create(10_000, 10_000);
+    try testing.expect(try p.driveUntil(p.now() + 5 * SEC, &p, Pair.bothDiscovered));
+    try exchangeOn(&p.runtime, p.a.dp, p.b.dp);
 }
 
 // ── Over loopback UDP ─────────────────────────────────────────────────────────
@@ -486,13 +567,19 @@ const UdpPair = struct {
     dp: [2]DDS.DomainParticipant,
     ep: Endpoints,
 
-    /// The participants take `runtime`'s only owner references. A null
-    /// `runtime`: they resolve the default.
     fn init(self: *UdpPair, runtime: ?*rt.Runtime, pid_base: u32) !void {
         for (0..2) |i| {
             self.udp[i] = try UdpTransport.init(alloc, .{ .participant_id = pid_base + @as(u32, @intCast(i)) }, test_domain.get(), null);
             self.disc[i] = try SpdpSedpDiscovery.init(alloc, self.udp[i].transport(), test_domain.get(), 1_000);
             self.factory[i] = try DomainParticipantFactoryImpl.init(alloc, self.udp[i].transport(), self.disc[i].toDiscovery(), noop_security, .spec_random, .{});
+        }
+        try self.createParticipants(runtime);
+    }
+
+    /// The participants take `runtime`'s only owner references. A null
+    /// `runtime`: they resolve the default.
+    fn createParticipants(self: *UdpPair, runtime: ?*rt.Runtime) !void {
+        for (0..2) |i| {
             if (runtime) |r| try self.factory[i].selectRuntime(r);
             self.dp[i] = self.factory[i].toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
             try self.factory[i].selectRuntime(null);
@@ -555,17 +642,9 @@ test "over loopback UDP, RTPS discovery runs on a manual runtime driven by drive
     while (runtime.getState() != .backend_stopped) _ = try runtime.drive(64, 0);
 }
 
-test "over loopback UDP, RTPS discovery runs on the default runtime's hosted workers" {
-    if (!rt.poll_backend.supported) return error.SkipZigTest;
-    const registry = &rt.default_registry.global;
-    defer {
-        registry.clear();
-        registry.reap(true);
-    }
-    var pair: UdpPair = undefined;
-    try pair.init(null, 46);
-    defer pair.deinit();
-
+/// Matches the pair's writer and reader and delivers `samples_n` samples
+/// in order, waiting on a WaitSet while hosted workers do the work.
+fn exchangeHosted(pair: *UdpPair) !void {
     const ws = try zzdds.dcps.WaitSetImpl.init(alloc);
     defer ws.deinit();
     const waitset = ws.toDDSWaitSet();
@@ -592,5 +671,39 @@ test "over loopback UDP, RTPS discovery runs on the default runtime's hosted wor
     }
     try testing.expectEqual(DDS.RETCODE_OK, waitset.detach_condition(cond.as_Condition()));
     try expectInOrder(got.items);
+}
+
+test "over loopback UDP, RTPS discovery runs on the default runtime's hosted workers" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    const registry = &rt.default_registry.global;
+    defer {
+        registry.clear();
+        registry.reap(true);
+    }
+    var pair: UdpPair = undefined;
+    try pair.init(null, 46);
+    defer pair.deinit();
+    try exchangeHosted(&pair);
+    try pair.deleteParticipants();
+}
+
+test "over loopback UDP, participants created again from the same factories, after the default runtime retired, run on its next generation" {
+    if (!rt.poll_backend.supported) return error.SkipZigTest;
+    const registry = &rt.default_registry.global;
+    defer {
+        registry.clear();
+        registry.reap(true);
+    }
+    var pair: UdpPair = undefined;
+    try pair.init(null, 48);
+    defer pair.deinit();
+    const generation = registry.generations;
+    try exchangeHosted(&pair);
+    // The participants were the default runtime's last owners.
+    try pair.deleteParticipants();
+
+    try pair.createParticipants(null);
+    try testing.expectEqual(generation + 1, registry.generations);
+    try exchangeHosted(&pair);
     try pair.deleteParticipants();
 }

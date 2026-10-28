@@ -2205,6 +2205,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zzdds", .module = zzdds_mod_llvm_safe_shared_runtime },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+                    .{ .name = "test_domain", .module = test_domain_mod },
                 },
             }),
         });

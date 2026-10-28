@@ -1015,10 +1015,18 @@ pub const DomainParticipantImpl = struct {
 
     /// Stable heap address — passed to `discovery.start()`.
     disc_callbacks: disc.Callbacks,
+    /// `discovery.start()` succeeded: deinit stops it. A plugin serves one
+    /// participant at a time, so one that never started must not stop
+    /// another's.
+    discovery_started: bool = false,
 
     /// Port on which we listen for user DataWriter traffic.
-    /// 0 = not yet listening (before start()).  Used by deinit() to unlisten.
+    /// 0 = not yet chosen (before start()).
     data_listen_port: u16,
+    /// The listen on `data_listen_port` succeeded: deinit() unlistens it.
+    /// A start() that failed first must not unlisten the port, which may
+    /// be another participant's.
+    data_listening: bool = false,
 
     /// Metatraffic port userDataOnReceive was *also* registered on as a
     /// robustness fallback (see start()), if any. 0 = not registered there
@@ -1353,6 +1361,7 @@ pub const DomainParticipantImpl = struct {
                 .ctx = self,
                 .on_receive = userDataOnReceive,
             });
+            self.data_listening = true;
             var tcp_locs: std.ArrayListUnmanaged(Locator) = .empty;
             defer tcp_locs.deinit(self.alloc);
             try self.transport.unicastLocators(&tcp_locs, self.alloc);
@@ -1449,6 +1458,7 @@ pub const DomainParticipantImpl = struct {
             .data_reachable = data_reachable,
         };
         try self.discovery.start(&ann, &self.disc_callbacks);
+        self.discovery_started = true;
 
         // Listen on the data unicast port for user DataWriter traffic. When TCP
         // user-data is enabled this already happened above (binding was needed
@@ -1456,6 +1466,7 @@ pub const DomainParticipantImpl = struct {
         if (!self.config.transport.tcp.enabled and self.data_listen_port != 0) {
             const listen_loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
             try self.transport.listen(&listen_loc, self.userDataHandler());
+            self.data_listening = true;
         }
 
         // Also register userDataOnReceive on the metatraffic unicast port,
@@ -1591,10 +1602,10 @@ pub const DomainParticipantImpl = struct {
             }
             self.timer_thread = null;
         }
-        self.discovery.stop();
+        if (self.discovery_started) self.discovery.stop();
 
         // Stop receiving user data before tearing down readers.
-        if (self.data_listen_port != 0) {
+        if (self.data_listening and self.data_listen_port != 0) {
             const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
             self.transport.unlisten(&loc, self.userDataHandler());
         }

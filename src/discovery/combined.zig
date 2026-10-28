@@ -55,6 +55,10 @@ const DiscoveredFanout = struct {
 
 pub const SpdpSedpDiscovery = struct {
     alloc: std.mem.Allocator,
+    transport: Transport,
+    domain_id: u32,
+    announcement_period_ms: u32,
+    tracer: ?trace.Tracer = null,
     spdp: *spdp.SpdpEndpoints,
     sedp: *sedp.SedpEndpoints,
     wlp: *wlp_mod.WlpEndpoints,
@@ -68,7 +72,10 @@ pub const SpdpSedpDiscovery = struct {
     ingress_latch: CloseLatch = .{},
     timers: runtime_mod.Context = undefined,
     timers_latch: CloseLatch = .{},
-    started: bool = false,
+    /// The plugin serves one participant at a time. Once that participant
+    /// stops it, the next one gets fresh SPDP, SEDP and WLP state, on any
+    /// runtime.
+    phase: enum { fresh, started, stopped } = .fresh,
 
     /// Bound on the datagrams queued for ingress and not yet processed. A
     /// placeholder, as the participant's own.
@@ -84,28 +91,48 @@ pub const SpdpSedpDiscovery = struct {
         domain_id: u32,
         announcement_period_ms: u32,
     ) !*Self {
+        const self = try alloc.create(Self);
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .alloc = alloc,
+            .transport = transport,
+            .domain_id = domain_id,
+            .announcement_period_ms = announcement_period_ms,
+            .spdp = undefined,
+            .sedp = undefined,
+            .wlp = undefined,
+            .disc_fanout = undefined,
+        };
+        try self.initParts();
+        return self;
+    }
+
+    /// Creates and wires SPDP, SEDP and WLP.
+    fn initParts(self: *Self) !void {
+        const alloc = self.alloc;
         const sp = try spdp.SpdpEndpoints.init(
             alloc,
-            transport,
-            domain_id,
-            announcement_period_ms,
+            self.transport,
+            self.domain_id,
+            self.announcement_period_ms,
         );
         errdefer sp.deinit();
 
-        const se = try sedp.SedpEndpoints.init(alloc, transport);
+        const se = try sedp.SedpEndpoints.init(alloc, self.transport);
         errdefer se.deinit();
 
-        const wl = try wlp_mod.WlpEndpoints.init(alloc, transport);
+        const wl = try wlp_mod.WlpEndpoints.init(alloc, self.transport);
         errdefer wl.deinit();
 
-        const self = try alloc.create(Self);
-        self.* = .{
-            .alloc = alloc,
-            .spdp = sp,
-            .sedp = se,
-            .wlp = wl,
-            .disc_fanout = .{ .sedp = se, .wlp = wl },
-        };
+        self.spdp = sp;
+        self.sedp = se;
+        self.wlp = wl;
+        self.disc_fanout = .{ .sedp = se, .wlp = wl };
+        if (self.tracer) |t| {
+            sp.setTracer(t);
+            se.setTracer(t);
+            wl.setTracer(t);
+        }
 
         // Wire SPDP → SEDP+WLP fanout: on each participant discovery event,
         // both create proxy state machines so they can exchange traffic, and
@@ -129,11 +156,10 @@ pub const SpdpSedpDiscovery = struct {
         // Wire SEDP-traffic-seen → SPDP: stop targeted-retransmit once real SEDP
         // endpoint data has been received from a peer.
         se.setSedpSeenFn(sp, spdp.SpdpEndpoints.markSedpSeen);
-
-        return self;
     }
 
-    pub fn deinit(self: *Self) void {
+    /// Frees SPDP, SEDP and WLP and, with a runtime, its closed contexts.
+    fn deinitParts(self: *Self) void {
         self.wlp.deinit();
         self.sedp.deinit();
         self.spdp.deinit();
@@ -141,7 +167,35 @@ pub const SpdpSedpDiscovery = struct {
             self.ingress.deinit();
             self.timers.deinit();
         }
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.deinitParts();
         self.alloc.destroy(self);
+    }
+
+    /// Gives a participant after a stopped one, or one on another runtime
+    /// than a participant that never started, the state of a new plugin:
+    /// nothing of the earlier participant's peers, announcements or
+    /// runtime remains. Unstarted, the old parts have nothing armed or
+    /// queued.
+    fn reset(self: *Self) !void {
+        std.debug.assert(self.phase != .started);
+        const sp = self.spdp;
+        const se = self.sedp;
+        const wl = self.wlp;
+        try self.initParts();
+        wl.deinit();
+        se.deinit();
+        sp.deinit();
+        if (self.runtime != null) {
+            self.ingress.deinit();
+            self.timers.deinit();
+        }
+        self.runtime = null;
+        self.ingress_latch = .{};
+        self.timers_latch = .{};
+        self.phase = .fresh;
     }
 
     /// Runs discovery on `rt` instead of threads of its own: SPDP's
@@ -149,13 +203,20 @@ pub const SpdpSedpDiscovery = struct {
     /// are timers on its clock, and what discovery receives is queued for
     /// its ingress context (docs/design/concurrency/runtime.md#thread-mapping).
     /// Call before `start`; attaching the runtime already attached is a
-    /// no-op.
-    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) error{ AttachedElsewhere, AlreadyStarted }!void {
-        if (self.runtime) |cur| {
-            if (cur != rt) return error.AttachedElsewhere;
-            return;
+    /// no-op. A started plugin stays on its runtime until stopped; after
+    /// that, the next participant's runtime replaces it.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) error{ AttachedElsewhere, OutOfMemory }!void {
+        switch (self.phase) {
+            .started => {
+                if (self.runtime != rt) return error.AttachedElsewhere;
+                return;
+            },
+            .stopped => try self.reset(),
+            .fresh => if (self.runtime) |cur| {
+                if (cur == rt) return;
+                try self.reset();
+            },
         }
-        if (self.started) return error.AlreadyStarted;
         self.runtime = rt;
         self.ingress = runtime_mod.Context.init(rt, ingress_pending_limit);
         self.ingress.on_closed = self.ingress_latch.hook();
@@ -170,6 +231,7 @@ pub const SpdpSedpDiscovery = struct {
     /// Set the wire tracer on SPDP, SEDP, and WLP state machines.
     /// Call before the factory creates a participant (before `start()` is invoked).
     pub fn setTracer(self: *Self, t: trace.Tracer) void {
+        self.tracer = t;
         self.spdp.setTracer(t);
         self.sedp.setTracer(t);
         self.wlp.setTracer(t);
@@ -210,7 +272,15 @@ pub const SpdpSedpDiscovery = struct {
         cbs: *const Callbacks,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.started = true;
+        switch (self.phase) {
+            // Another participant's: one at a time.
+            .started => return error.AlreadyStarted,
+            .stopped => try self.reset(),
+            .fresh => {},
+        }
+        self.phase = .started;
+        // The participant stops only what started.
+        errdefer self.stopParts();
         // SEDP must be started first so its metatraffic unicast listen is active
         // before SPDP fires its initial announcement and the remote peer begins
         // sending SEDP traffic. WLP follows the same requirement for the same
@@ -274,6 +344,12 @@ pub const SpdpSedpDiscovery = struct {
 
     fn vtStop(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.phase != .started) return;
+        self.stopParts();
+    }
+
+    fn stopParts(self: *Self) void {
+        self.phase = .stopped;
         self.spdp.stop();
         self.wlp.stop();
         self.sedp.stop();

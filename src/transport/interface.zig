@@ -467,10 +467,11 @@ pub const Transport = struct {
 
         /// For a transport with sockets, on the shared runtime: from now on
         /// its sockets are sources of `backend`, which services them, and
-        /// it starts no receive threads. Called before the first `listen`.
-        /// Fails if the transport is attached to another backend, or if
-        /// `backend` waits on no sources. Null: the transport has no
-        /// sockets (memory, mock, lossy)
+        /// it starts no receive threads. Called for each participant before
+        /// it listens. Fails while sockets are open on another backend (or
+        /// on threads), or if `backend` waits on no sources; with none
+        /// open, `backend` replaces an earlier one, whose runtime may have
+        /// retired. Null: the transport has no sockets (memory, mock, lossy)
         /// (docs/design/concurrency/transport-adapters.md#progress-backend).
         attach_backend: ?*const fn (ctx: *anyopaque, backend: ProgressBackend) anyerror!void = null,
 

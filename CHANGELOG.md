@@ -16,6 +16,14 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 - Run resource authoring and configuration qualification against the released
   dependency in the native Debug/ReleaseSafe matrix and Linux ThreadSanitizer job.
   Include the optional frontend in LLVM coverage and Valgrind artifacts.
+- A factory whose participant was deleted creates a working participant again
+  with the same RTPS discovery plugin. The plugin gave the new participant the
+  deleted one's SPDP and SEDP state instead of fresh state: the earlier
+  announcement, built-in writers and readers were leaked and its peers kept.
+- A discovery plugin serves one participant at a time: creating a second
+  participant while another uses the factory's plugin now fails, instead of
+  taking over the running participant's discovery, and deleting a participant
+  whose discovery never started no longer stops another's.
 
 ## 2026-10-27
 

@@ -1595,3 +1595,160 @@ test "mock_loopback: disabled DataWriter never announces or matches until enable
     }
     try std.testing.expectEqual(@as(i32, 2), dr_impl.sub_matched_current);
 }
+
+// ── Creating again after deleting ─────────────────────────────────────────────
+
+/// Delivers rounds until `done(ctx)`, or for at most 20 s; returns whether
+/// `done`.
+fn pumpUntil(net: *MockNetwork, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool) bool {
+    const deadline = time_mod.nanoTimestamp() + 20 * std.time.ns_per_s;
+    while (!done(ctx)) {
+        if (time_mod.nanoTimestamp() >= deadline) return false;
+        net.deliverAll();
+        time_mod.sleepNs(20 * std.time.ns_per_ms);
+    }
+    return true;
+}
+
+/// A writer side and a reader side, each one factory over its own mock
+/// transport and RTPS discovery, kept across the participants they create.
+const Factories = struct {
+    net: *MockNetwork,
+    mock: [2]*MockTransport,
+    disc: [2]*SpdpSedpDiscovery,
+    factory: [2]*DomainParticipantFactoryImpl,
+
+    const W = 0;
+    const R = 1;
+
+    fn init(self: *Factories, alloc: std.mem.Allocator) !void {
+        self.net = try MockNetwork.init(alloc);
+        const locs = [2]Locator{ Locator.udp4(IP_W, PORT_META_W), Locator.udp4(IP_R, PORT_META_R) };
+        for (0..2) |i| {
+            self.mock[i] = try MockTransport.init(alloc, self.net, &.{locs[i]});
+            self.disc[i] = try SpdpSedpDiscovery.init(alloc, self.mock[i].transport(), 0, 100);
+            self.factory[i] = try DomainParticipantFactoryImpl.init(alloc, self.mock[i].transport(), self.disc[i].toDiscovery(), noop_security, .spec_random, .{});
+        }
+    }
+
+    fn deinit(self: *Factories) void {
+        for (0..2) |i| {
+            self.factory[i].deinit();
+            self.disc[i].deinit();
+            self.mock[i].deinit();
+        }
+        self.net.deinit();
+    }
+
+    fn create(self: *Factories, side: usize) !DDS.DomainParticipant {
+        const dp = self.factory[side].toDDSFactory().create_participant(0, .{}, null, 0);
+        try std.testing.expect(dp.ptr != nil.nil_participant.ptr);
+        return dp;
+    }
+
+    fn delete(self: *Factories, side: usize, dp: DDS.DomainParticipant) !void {
+        try std.testing.expectEqual(DDS.RETCODE_OK, self.factory[side].toDDSFactory().delete_participant(dp));
+    }
+};
+
+/// A topic, publisher and reliable TRANSIENT_LOCAL writer on one
+/// participant, and a topic, subscriber and matching reader on another.
+const Pubsub = struct {
+    publisher: DDS.Publisher,
+    subscriber: DDS.Subscriber,
+    topic_w: DDS.Topic,
+    topic_r: DDS.Topic,
+    dw: DDS.DataWriter,
+    dr: DDS.DataReader,
+    got: ?[]u8 = null,
+
+    fn create(dp_w: DDS.DomainParticipant, dp_r: DDS.DomainParticipant) Pubsub {
+        var dw_qos = DDS.DataWriterQos{};
+        dw_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+        dw_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+        var dr_qos = DDS.DataReaderQos{};
+        dr_qos.reliability.kind = .RELIABLE_RELIABILITY_QOS;
+        dr_qos.durability.kind = .TRANSIENT_LOCAL_DURABILITY_QOS;
+        const topic_w = dp_w.create_topic("MockTopic", "MockType", .{}, null, 0);
+        const topic_r = dp_r.create_topic("MockTopic", "MockType", .{}, null, 0);
+        const publisher = dp_w.create_publisher(.{}, null, 0);
+        const subscriber = dp_r.create_subscriber(.{}, null, 0);
+        const desc_r = @as(*TopicImpl, @ptrCast(@alignCast(topic_r.ptr))).toTopicDescription();
+        return .{
+            .publisher = publisher,
+            .subscriber = subscriber,
+            .topic_w = topic_w,
+            .topic_r = topic_r,
+            .dw = publisher.create_datawriter(topic_w, dw_qos, null, 0),
+            .dr = subscriber.create_datareader(desc_r, dr_qos, null, 0),
+        };
+    }
+
+    /// Writes `payload` and delivers until the reader takes it.
+    fn exchange(self: *Pubsub, net: *MockNetwork, payload: []const u8) !void {
+        const dw: *DataWriterImpl = @ptrCast(@alignCast(self.dw.ptr));
+        _ = try dw.writeRaw(.alive, RtpsTimestamp.now(), history_mod.INSTANCE_HANDLE_NIL, std.mem.zeroes([16]u8), payload);
+        try std.testing.expect(pumpUntil(net, self, struct {
+            fn f(s: *Pubsub) bool {
+                const dr: *DataReaderImpl = @ptrCast(@alignCast(s.dr.ptr));
+                if (s.got == null) {
+                    if (dr.takeRaw()) |sample| s.got = sample.data;
+                }
+                return s.got != null;
+            }
+        }.f));
+        const got = self.got.?;
+        self.got = null;
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualSlices(u8, payload, got);
+    }
+
+    /// Deletes everything `create` made, each with its own factory's
+    /// delete operation.
+    fn delete(self: *Pubsub, dp_w: DDS.DomainParticipant, dp_r: DDS.DomainParticipant) !void {
+        const OK = DDS.RETCODE_OK;
+        try std.testing.expectEqual(OK, self.publisher.delete_datawriter(self.dw));
+        try std.testing.expectEqual(OK, self.subscriber.delete_datareader(self.dr));
+        try std.testing.expectEqual(OK, dp_w.delete_publisher(self.publisher));
+        try std.testing.expectEqual(OK, dp_r.delete_subscriber(self.subscriber));
+        try std.testing.expectEqual(OK, dp_w.delete_topic(self.topic_w));
+        try std.testing.expectEqual(OK, dp_r.delete_topic(self.topic_r));
+    }
+};
+
+test "mock_loopback: each factory creates again after deleting all it created, and the new entities discover each other and exchange data" {
+    var f: Factories = undefined;
+    try f.init(std.testing.allocator);
+    defer f.deinit();
+    const payloads = [_][]const u8{ &PAYLOAD_A, &PAYLOAD_B };
+    // Participants twice from the same factories, which keep their
+    // discovery plugins; within each, topics, publishers, subscribers,
+    // writers and readers twice.
+    for (payloads) |round_payload| {
+        const dp_r = try f.create(Factories.R);
+        const dp_w = try f.create(Factories.W);
+        for (payloads) |payload| {
+            var ps = Pubsub.create(dp_w, dp_r);
+            try ps.exchange(f.net, payload);
+            try ps.exchange(f.net, round_payload);
+            try ps.delete(dp_w, dp_r);
+        }
+        try f.delete(Factories.W, dp_w);
+        try f.delete(Factories.R, dp_r);
+    }
+}
+
+test "mock_loopback: a participant from a factory whose discovery serves another fails creation, and the first keeps discovering" {
+    var f: Factories = undefined;
+    try f.init(std.testing.allocator);
+    defer f.deinit();
+    const dp_r = try f.create(Factories.R);
+    const dp_w = try f.create(Factories.W);
+    try std.testing.expectEqual(nil.nil_participant.ptr, f.factory[Factories.W].toDDSFactory().create_participant(0, .{}, null, 0).ptr);
+
+    var ps = Pubsub.create(dp_w, dp_r);
+    try ps.exchange(f.net, &PAYLOAD_A);
+    try ps.delete(dp_w, dp_r);
+    try f.delete(Factories.W, dp_w);
+    try f.delete(Factories.R, dp_r);
+}

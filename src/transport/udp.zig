@@ -1777,13 +1777,15 @@ pub const UdpTransport = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.backend) |b| {
-            if (b.ctx == backend.ctx) return;
-            return error.AttachedElsewhere;
+        if (self.sockets.items.len > 0) {
+            // Open sockets stay where they receive: another runtime's
+            // participant cannot use them, nor can sockets on threads move.
+            if (self.backend) |b| if (b.ctx == backend.ctx) return;
+            return if (self.backend != null) error.AttachedElsewhere else error.AlreadyListening;
         }
+        // With no socket open, nothing receives on an earlier backend, whose
+        // runtime may have retired: the next participant's replaces it.
         if (!backend.hasSources()) return error.BackendHasNoSources;
-        // Sockets already receiving on threads would keep them.
-        if (self.sockets.items.len > 0) return error.AlreadyListening;
         self.backend = backend;
     }
 };

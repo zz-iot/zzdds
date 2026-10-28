@@ -1043,16 +1043,19 @@ queued. On POSIX the default runtime, and any runtime built on the readiness bac
 sources of its participant's runtime instead of running receive threads. One waiter polls
 them with the runtime's wake descriptor and hands polling to another waiter when it stops,
 and servicing receives what is ready without blocking, round robin across sockets within
-its budget. A transport's sockets belong to one runtime, so creation on a second runtime,
-or on one whose backend waits on no sockets, fails. On the runtime, UDP does not yet
+its budget. A transport's open sockets belong to one runtime, so creation on a second
+runtime while they are open, or on one whose backend waits on no sockets, fails; once its
+participants are deleted, the next participant's runtime takes over. On the runtime, UDP does not yet
 re-poll interfaces (no poll thread is started), and sends are still synchronous `sendto`s
 of a flattened buffer. RTPS discovery runs on the participant's runtime too: SPDP's
 announcements and its lease and liveness-probe checks are timers on the runtime clock,
 armed for when each is next due (one for the next announcement, one for the earliest
 expiry or probe), the SEDP and WLP writers' heartbeats are writer timers, and what
 SPDP and SEDP receive is copied into a discovery ingress context, as user data is, rather
-than processed on the transport's stack. A discovery plugin belongs to the runtime it
-first ran on. A
+than processed on the transport's stack. A discovery plugin serves one participant at a
+time, on that participant's runtime; after it, the next participant, on any runtime, starts
+with fresh SPDP, SEDP and WLP state, so a factory creates participants again after
+deleting them (in every build). A
 writer's periodic HEARTBEAT is a runtime timer on the runtime clock rather than a thread,
 armed while a reliable reader is matched. The participant's DEADLINE, LIVELINESS and
 held-data expiry checks are one timer armed for the earliest time anything is due (no

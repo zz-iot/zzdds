@@ -66,7 +66,9 @@ ALLOWLIST = {
     # retroactively triggers the deferred announce and a real match follows
     # -- same net.deliverAll()-in-a-loop SPDP/SEDP polling pattern as every
     # other test in this file.
-    "test/dcps/mock_loopback_test.zig": (23, "SPDP timer-thread discovery polling"),
+    # 24th added with the create-again-after-deleting tests: one shared
+    # pumpUntil() helper, the same net.deliverAll()-in-a-loop polling.
+    "test/dcps/mock_loopback_test.zig": (24, "SPDP timer-thread discovery polling"),
     # Same MockNetwork/MockTransport-with-real-SPDP-timer-thread pattern as
     # mock_loopback_test.zig above -- see that file's own rationale. This
     # file's 5 sleeps, across its two full-stack scenarios: the baseline

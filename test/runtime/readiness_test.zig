@@ -503,7 +503,7 @@ test "a reliable pair over loopback UDP runs on the default runtime, whose hoste
     try pair.deleteParticipants();
 }
 
-test "a UDP transport refuses a runtime whose backend waits on no sockets, and a second runtime" {
+test "a UDP transport refuses a runtime whose backend waits on no sockets, and a second runtime while its sockets are open" {
     if (!rt.poll_backend.supported) return error.SkipZigTest;
     const prev = std.testing.log_level;
     std.testing.log_level = .err;
@@ -551,8 +551,14 @@ test "a UDP transport refuses a runtime whose backend waits on no sockets, and a
     try factory[1].selectRuntime(&polled[1]);
     try testing.expectEqual(nil_participant.ptr, factory[1].toDDSFactory().create_participant(test_domain.get(), .{}, null, 0).ptr);
 
-    for (factory) |f| try f.selectRuntime(null);
+    // Once they are closed, the next participant's runtime takes over.
     try testing.expectEqual(DDS.RETCODE_OK, factory[1].toDDSFactory().delete_participant(dp));
+    const next = factory[1].toDDSFactory().create_participant(test_domain.get(), .{}, null, 0);
+    try testing.expect(next.ptr != nil_participant.ptr);
+    try testing.expect(backends[1].pb.sourceCount() > 0);
+
+    for (factory) |f| try f.selectRuntime(null);
+    try testing.expectEqual(DDS.RETCODE_OK, factory[1].toDDSFactory().delete_participant(next));
     scripted.releaseOwner();
     for (&polled) |*r| {
         r.releaseOwner();
