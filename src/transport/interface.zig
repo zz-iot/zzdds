@@ -9,6 +9,7 @@
 //! given locator based on `can_reach`.
 
 const std = @import("std");
+const ProgressBackend = @import("../runtime/backend.zig").ProgressBackend;
 
 // ── LocatorKind ───────────────────────────────────────────────────────────────
 
@@ -464,6 +465,16 @@ pub const Transport = struct {
         /// (docs/design/concurrency/runtime.md#coexistence-during-migration).
         shared_runtime_ready: bool = false,
 
+        /// For a transport with sockets, on the shared runtime: from now on
+        /// its sockets are sources of `backend`, which services them, and
+        /// it starts no receive threads. Called for each participant before
+        /// it listens. Fails while sockets are open on another backend (or
+        /// on threads), or if `backend` waits on no sources; with none
+        /// open, `backend` replaces an earlier one, whose runtime may have
+        /// retired. Null: the transport has no sockets (memory, mock, lossy)
+        /// (docs/design/concurrency/transport-adapters.md#progress-backend).
+        attach_backend: ?*const fn (ctx: *anyopaque, backend: ProgressBackend) anyerror!void = null,
+
         /// Returns true if this transport can send to / receive from the given locator.
         can_reach: *const fn (ctx: *anyopaque, locator: *const Locator) bool,
 
@@ -530,6 +541,9 @@ pub const Transport = struct {
 
     pub fn capabilities(self: Transport) Capabilities {
         return self.vtable.capabilities;
+    }
+    pub fn attachBackend(self: Transport, backend: ProgressBackend) anyerror!void {
+        if (self.vtable.attach_backend) |f| return f(self.ctx, backend);
     }
     pub fn canReach(self: Transport, locator: *const Locator) bool {
         return self.vtable.can_reach(self.ctx, locator);

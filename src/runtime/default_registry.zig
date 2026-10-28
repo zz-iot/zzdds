@@ -17,7 +17,11 @@ const std = @import("std");
 const core = @import("core.zig");
 const Mutex = @import("../util/mutex.zig").Mutex;
 const IoBackend = @import("io_backend.zig").IoBackend;
+const poll_backend = @import("poll_backend.zig");
 const Hosted = @import("hosted.zig").Hosted;
+
+/// Waits on sockets too where the platform has the readiness backend.
+const Backend = if (poll_backend.supported) poll_backend.PollBackend else IoBackend;
 
 const Runtime = core.Runtime;
 
@@ -33,12 +37,14 @@ pub const AcquireError = error{
     OutOfMemory,
     /// The implicit runtime's workers could not be started.
     WorkersUnavailable,
+    /// The implicit runtime's wake descriptor could not be created.
+    SystemResources,
 };
 
 /// A runtime the registry created, with its hosted workers. Must not move.
 const Generation = struct {
     threaded: std.Io.Threaded,
-    backend: IoBackend,
+    backend: Backend,
     runtime: Runtime,
     hosted: Hosted,
     next: ?*Generation = null,
@@ -192,11 +198,18 @@ pub const Registry = struct {
         const g = try self.alloc.create(Generation);
         errdefer self.alloc.destroy(g);
         g.* = .{ .threaded = .init(self.alloc, .{}), .backend = undefined, .runtime = undefined, .hosted = undefined };
-        g.backend = IoBackend.init(g.threaded.io());
+        g.backend = if (poll_backend.supported)
+            Backend.init(self.alloc, g.threaded.io()) catch |err| {
+                g.threaded.deinit();
+                return err;
+            }
+        else
+            Backend.init(g.threaded.io());
         g.runtime = Runtime.init(g.backend.clock(), g.backend.backend(), .{ .mode = .hosted });
         g.hosted = Hosted.init(self.alloc, g.threaded.io(), &g.runtime, self.workers) catch {
             g.runtime.releaseOwner();
             g.runtime.deinit();
+            deinitBackend(g);
             g.threaded.deinit();
             return error.OutOfMemory;
         };
@@ -205,10 +218,15 @@ pub const Registry = struct {
             g.runtime.releaseOwner();
             g.hosted.join();
             g.runtime.deinit();
+            deinitBackend(g);
             g.threaded.deinit();
             return error.WorkersUnavailable;
         };
         return g;
+    }
+
+    fn deinitBackend(g: *Generation) void {
+        if (poll_backend.supported) g.backend.deinit();
     }
 
     /// Waits for each generation's workers to exit, then frees it. Each is
@@ -219,6 +237,7 @@ pub const Registry = struct {
             next = g.next;
             g.hosted.join();
             g.runtime.deinit();
+            deinitBackend(g);
             g.threaded.deinit();
             self.alloc.destroy(g);
         }

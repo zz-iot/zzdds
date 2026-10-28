@@ -147,6 +147,7 @@ test {
     _ = @import("transport/mock.zig");
     _ = @import("transport/memory.zig");
     _ = @import("transport/lossy.zig");
+    _ = @import("transport/queued_receive.zig");
     _ = @import("transport/monitor/polling.zig");
     _ = @import("discovery/interface.zig");
     _ = @import("discovery/builtin_endpoint.zig");

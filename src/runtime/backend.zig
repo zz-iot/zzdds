@@ -15,6 +15,18 @@ pub const ServiceResult = struct {
     more: bool = false,
 };
 
+/// An I/O source a readiness backend waits on and services: a socket the
+/// transport has set up, with the transport's handler for it
+/// (docs/design/concurrency/transport-adapters.md#socket-setup-and-data-path).
+pub const Source = struct {
+    /// The OS handle to wait on for input.
+    handle: std.posix.socket_t,
+    ctx: *anyopaque,
+    /// Nonblocking: handles at most `budget` inputs that are ready now and
+    /// returns how many it handled, 0 once none is ready.
+    service: *const fn (ctx: *anyopaque, budget: u32) u32,
+};
+
 pub const ProgressBackend = struct {
     ctx: *anyopaque,
     vtable: *const Vtable,
@@ -34,6 +46,12 @@ pub const ProgressBackend = struct {
         wait: *const fn (ctx: *anyopaque, deadline_ns: ?i64, token: u32) void,
         /// Nonblocking: turns ready I/O into runtime work, at most `budget`.
         service: *const fn (ctx: *anyopaque, budget: u32) ServiceResult,
+        /// Readiness backends only (null otherwise): waits on and services
+        /// `source` from now on. It stays valid until `unregister` returns.
+        register: ?*const fn (ctx: *anyopaque, source: *Source) error{OutOfMemory}!void = null,
+        /// Stops waiting on `source`, returning once no `service` of it is
+        /// running. Never from inside that service.
+        unregister: ?*const fn (ctx: *anyopaque, source: *Source) void = null,
     };
 
     pub fn wake(self: ProgressBackend) void {
@@ -50,6 +68,17 @@ pub const ProgressBackend = struct {
     }
     pub fn service(self: ProgressBackend, budget: u32) ServiceResult {
         return self.vtable.service(self.ctx, budget);
+    }
+    /// Whether the backend waits on I/O sources.
+    pub fn hasSources(self: ProgressBackend) bool {
+        return self.vtable.register != null;
+    }
+    pub fn register(self: ProgressBackend, source: *Source) error{ OutOfMemory, NoSources }!void {
+        const f = self.vtable.register orelse return error.NoSources;
+        return f(self.ctx, source);
+    }
+    pub fn unregister(self: ProgressBackend, source: *Source) void {
+        self.vtable.unregister.?(self.ctx, source);
     }
 };
 

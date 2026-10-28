@@ -1680,7 +1680,12 @@ pub fn build(b: *std.Build) void {
     zzdds_mod_shared_runtime.link_libc = true;
     const shared_runtime_test_files = [_][]const u8{
         "test/runtime/shared_runtime_test.zig",
+        "test/runtime/readiness_test.zig",
+        "test/runtime/rtps_discovery_test.zig",
     };
+    // Shared with the DCPS tests below: the readiness and discovery tests
+    // open real sockets, so each binary needs its own domain.
+    var dcps_test_domain: u32 = 1;
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -1690,11 +1695,12 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zzdds", .module = zzdds_mod_shared_runtime },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod },
+                    .{ .name = "test_domain", .module = test_domain_mod },
                 },
             }),
         });
         t.root_module.link_libc = true;
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        test_step.dependOn(&addTestRun(b, t, &dcps_test_domain).step);
         emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
@@ -1794,7 +1800,6 @@ pub fn build(b: *std.Build) void {
         "test/dcps/writer_vtable_test.zig",
         "test/dcps/discovery_race_test.zig",
     };
-    var dcps_test_domain: u32 = 1;
     const resource_test_step = b.step("test-resource-construction", "Test programmatic resource resolution and construction (requires -Dresource-construction=true)");
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
@@ -2200,6 +2205,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "zzdds", .module = zzdds_mod_llvm_safe_shared_runtime },
                     .{ .name = "zzdds_generated", .module = generated_dcps_mod_llvm_safe },
+                    .{ .name = "test_domain", .module = test_domain_mod },
                 },
             }),
         });
@@ -2341,6 +2347,7 @@ pub fn build(b: *std.Build) void {
     }));
     if (typesupport_enabled) zzdds_mod_tsan_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod_tsan));
     zzdds_mod_tsan_shared_runtime.link_libc = true;
+    var tsan_dcps_test_domain: u32 = 1;
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src),
@@ -2349,10 +2356,11 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zzdds", .module = zzdds_mod_tsan_shared_runtime },
                 .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
+                .{ .name = "test_domain", .module = test_domain_mod },
             },
         }), .use_llvm = true });
         t.root_module.link_libc = true;
-        tsan_step.dependOn(&b.addRunArtifact(t).step);
+        tsan_step.dependOn(&addTestRun(b, t, &tsan_dcps_test_domain).step);
     }
 
     // DCPS tests (TSan) — WaitSet thread test, loopback
@@ -2363,7 +2371,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zzdds_generated", .module = generated_dcps_mod_tsan },
         },
     });
-    var tsan_dcps_test_domain: u32 = 1;
     for (dcps_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(src),

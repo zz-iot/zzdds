@@ -200,12 +200,12 @@ test "SPDP: lease expiry fires on_participant_lost" {
 
     // T=99ms: not yet expired
     clock.set(99 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 0), tr.lost);
 
     // T=100ms: at expiry boundary → evicted
     clock.set(100 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), tr.lost);
     try testing.expect(tr.lost_guid != null);
     try testing.expect(tr.lost_guid.?.prefix.eql(peer));
@@ -242,12 +242,12 @@ test "SPDP: re-announcement before expiry refreshes lease" {
 
     // T=110ms: would have expired under old lease but not the refreshed one.
     clock.set(110 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 0), tr.lost);
 
     // T=180ms: now expired.
     clock.set(180 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), tr.lost);
 }
 
@@ -329,7 +329,7 @@ test "SPDP: checkLeases triggers probe when silence exceeds threshold" {
 
     // T=4001ms: silence = 4001-1001 = 3000ms = 3×1s → probe fires.
     clock.set(4001 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), pt.count);
     try testing.expect(pt.last_prefix.?.eql(peer));
     // Peer is NOT evicted (lease is 60s, only ~4s elapsed).
@@ -385,7 +385,7 @@ test "SPDP: same-SN redelivery does not skew observed interval or last_seen_ns" 
     // 3000ms = 3×1000ms → probe fires. Under the bug (anchor shifted to 1050ms)
     // silence would only be 2951ms and the probe would not fire yet.
     clock.set(4001 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), pt.count);
     try testing.expectEqual(@as(u32, 0), tr.lost);
 }
@@ -440,7 +440,7 @@ test "SPDP: implausibly-short interval floor does not skew last_seen_ns either" 
     // 3000ms = 3×1000ms → probe fires. Under the bug (anchor shifted to 1011ms)
     // silence would only be 2990ms and the probe would not fire yet.
     clock.set(4001 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), pt.count);
     try testing.expectEqual(@as(u32, 0), tr.lost);
 }
@@ -482,12 +482,12 @@ test "SPDP: checkLeases uses 5s fallback when no interval observed" {
 
     // T=4900ms: silence = 4899ms < 5000ms → no probe yet.
     clock.set(4_900 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 0), pt.count);
 
     // T=5001ms: silence = 5000ms >= 5s → probe fires.
     clock.set(5_001 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), pt.count);
     try testing.expectEqual(@as(u32, 0), tr.lost);
 }
@@ -531,7 +531,7 @@ test "SPDP: onProbeResult alive refreshes expiry and clears probe" {
 
     // T=4001ms: silence = 3000ms = 3×1s → probe fires.
     clock.set(4001 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), pt.count);
     try testing.expectEqual(@as(u32, 0), tr.lost);
 
@@ -541,7 +541,7 @@ test "SPDP: onProbeResult alive refreshes expiry and clears probe" {
 
     // Another checkLeases at T=4001ms: last_seen_ns updated to T=4001ms,
     // silence resets to 0 → no new probe.
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), pt.count);
 
     // Stale result (probe_active is false) → silently ignored.
@@ -587,7 +587,7 @@ test "SPDP: onProbeResult dead evicts participant" {
 
     // T=4001ms: probe fires (silence=3000ms=3×1s).
     clock.set(4001 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqual(@as(u32, 1), pt.count);
 
     // Probe result: alive=false → participant evicted.
@@ -904,7 +904,7 @@ test "SPDP: every way of losing a participant reports it to SEDP, then to DCPS, 
     spdp.processSpdpPayload(peer, 1, payload, .{ .bytes = .{ 0x00, 0x00 } });
     try testing.expectEqualStrings("++", log.take());
     clock.set(2_000 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expectEqualStrings("SD", log.take());
     try testing.expect(log.sedp_prefix.?.eql(peer));
 
@@ -955,7 +955,7 @@ test "SPDP: a failed probe that a re-announcement already answered loses nothing
     // Silence starts a probe; the peer re-announces before the SEDP writers'
     // probe deadline passes, and their failure report arrives afterwards.
     clock.set(4001 * std.time.ns_per_ms);
-    spdp.checkLeases();
+    _ = spdp.checkLeases();
     try testing.expect(spdp.known.get(peer).?.probe_active);
     clock.set(4100 * std.time.ns_per_ms);
     spdp.processSpdpPayload(peer, 3, payload, .{ .bytes = .{ 0x00, 0x00 } });
@@ -963,4 +963,49 @@ test "SPDP: a failed probe that a re-announcement already answered loses nothing
 
     try testing.expectEqual(@as(u32, 0), tr.lost);
     try testing.expect(spdp.known.contains(peer));
+}
+
+test "SPDP: checkLeases returns when the next check is due -- the earliest lease expiry or probe start -- and null once no participant remains" {
+    const alloc = testing.allocator;
+
+    const net = try MockNetwork.init(alloc);
+    defer net.deinit();
+    const mt = try MockTransport.init(alloc, net, &.{});
+    defer mt.deinit();
+
+    const spdp = try SpdpEndpoints.init(alloc, mt.transport(), 0, 3000);
+    defer spdp.deinit();
+
+    const ms = std.time.ns_per_ms;
+    // Not at 0: a participant last seen at 0 counts as never timed.
+    const t0 = 1_000 * ms;
+    var clock = ManualClock.init(t0);
+    spdp.setClock(clock.clock());
+
+    var tr = Tracker{};
+    const c = tr.cbs();
+    spdp.callbacks = &c;
+
+    // Short: its lease expires before any probe would start.
+    const short = try buildPayload(alloc, prefix(0xA1), 100);
+    defer alloc.free(short);
+    // Long: silent past the 5 s probe trigger long before its lease ends.
+    const long = try buildPayload(alloc, prefix(0xA2), 60_000);
+    defer alloc.free(long);
+    spdp.processSpdpPayload(prefix(0xA1), 1, short, .{ .bytes = .{ 0x00, 0x00 } });
+    spdp.processSpdpPayload(prefix(0xA2), 1, long, .{ .bytes = .{ 0x00, 0x00 } });
+
+    try testing.expectEqual(@as(?i64, t0 + 100 * ms), spdp.checkLeases());
+
+    clock.set(t0 + 100 * ms);
+    try testing.expectEqual(@as(?i64, t0 + 5_000 * ms), spdp.checkLeases());
+    try testing.expectEqual(@as(u32, 1), tr.lost);
+
+    // The probe starts; the lease is all that is left to check.
+    clock.set(t0 + 5_000 * ms);
+    try testing.expectEqual(@as(?i64, t0 + 60_000 * ms), spdp.checkLeases());
+
+    clock.set(t0 + 60_000 * ms);
+    try testing.expectEqual(@as(?i64, null), spdp.checkLeases());
+    try testing.expectEqual(@as(u32, 2), tr.lost);
 }

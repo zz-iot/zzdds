@@ -12,6 +12,7 @@
 //!   // Pass discovery to DomainParticipantFactoryImpl.init(...)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const iface = @import("interface.zig");
 const spdp = @import("spdp.zig");
 const sedp = @import("sedp.zig");
@@ -19,6 +20,10 @@ const wlp_mod = @import("wlp.zig");
 const tr = @import("../transport/interface.zig");
 const trace = @import("../trace.zig");
 const header_mod = @import("../rtps/message/header.zig");
+const runtime_mod = @import("../runtime/core.zig");
+const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
+const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
+const Mutex = @import("../util/mutex.zig").Mutex;
 
 pub const Discovery = iface.Discovery;
 pub const Callbacks = iface.Callbacks;
@@ -52,10 +57,42 @@ const DiscoveredFanout = struct {
 
 pub const SpdpSedpDiscovery = struct {
     alloc: std.mem.Allocator,
+    transport: Transport,
+    domain_id: u32,
+    announcement_period_ms: u32,
+    tracer: ?trace.Tracer = null,
     spdp: *spdp.SpdpEndpoints,
     sedp: *sedp.SedpEndpoints,
     wlp: *wlp_mod.WlpEndpoints,
     disc_fanout: DiscoveredFanout,
+
+    /// With a runtime (`attachRuntime`): the contexts that process received
+    /// datagrams, one at a time, and run the SPDP timers. Writers'
+    /// heartbeats run in contexts of their own.
+    runtime: ?*runtime_mod.Runtime = null,
+    ingress: runtime_mod.Context = undefined,
+    ingress_latch: CloseLatch = .{},
+    timers: runtime_mod.Context = undefined,
+    timers_latch: CloseLatch = .{},
+    /// The plugin serves one participant at a time. Once that participant
+    /// has stopped it, the next one gets fresh SPDP, SEDP and WLP state, on
+    /// any runtime.
+    phase: enum { fresh, started, stopping, stopped } = .fresh,
+    /// Guards `phase` and the replacement of the parts and runtime:
+    /// participants are created and deleted on different threads.
+    mu: Mutex = .{},
+    test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
+
+    /// Seams for deterministic tests of races; absent outside test builds.
+    pub const TestHooks = struct {
+        /// Runs once in `stop`, after the plugin is marked stopping and
+        /// before its parts stop.
+        while_stopping: ?*const fn (self: *Self) void = null,
+    };
+
+    /// Bound on the datagrams queued for ingress and not yet processed. A
+    /// placeholder, as the participant's own.
+    pub const ingress_pending_limit: u32 = 256;
 
     const Self = @This();
 
@@ -67,28 +104,48 @@ pub const SpdpSedpDiscovery = struct {
         domain_id: u32,
         announcement_period_ms: u32,
     ) !*Self {
+        const self = try alloc.create(Self);
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .alloc = alloc,
+            .transport = transport,
+            .domain_id = domain_id,
+            .announcement_period_ms = announcement_period_ms,
+            .spdp = undefined,
+            .sedp = undefined,
+            .wlp = undefined,
+            .disc_fanout = undefined,
+        };
+        try self.initParts();
+        return self;
+    }
+
+    /// Creates and wires SPDP, SEDP and WLP.
+    fn initParts(self: *Self) !void {
+        const alloc = self.alloc;
         const sp = try spdp.SpdpEndpoints.init(
             alloc,
-            transport,
-            domain_id,
-            announcement_period_ms,
+            self.transport,
+            self.domain_id,
+            self.announcement_period_ms,
         );
         errdefer sp.deinit();
 
-        const se = try sedp.SedpEndpoints.init(alloc, transport);
+        const se = try sedp.SedpEndpoints.init(alloc, self.transport);
         errdefer se.deinit();
 
-        const wl = try wlp_mod.WlpEndpoints.init(alloc, transport);
+        const wl = try wlp_mod.WlpEndpoints.init(alloc, self.transport);
         errdefer wl.deinit();
 
-        const self = try alloc.create(Self);
-        self.* = .{
-            .alloc = alloc,
-            .spdp = sp,
-            .sedp = se,
-            .wlp = wl,
-            .disc_fanout = .{ .sedp = se, .wlp = wl },
-        };
+        self.spdp = sp;
+        self.sedp = se;
+        self.wlp = wl;
+        self.disc_fanout = .{ .sedp = se, .wlp = wl };
+        if (self.tracer) |t| {
+            sp.setTracer(t);
+            se.setTracer(t);
+            wl.setTracer(t);
+        }
 
         // Wire SPDP → SEDP+WLP fanout: on each participant discovery event,
         // both create proxy state machines so they can exchange traffic, and
@@ -112,20 +169,85 @@ pub const SpdpSedpDiscovery = struct {
         // Wire SEDP-traffic-seen → SPDP: stop targeted-retransmit once real SEDP
         // endpoint data has been received from a peer.
         se.setSedpSeenFn(sp, spdp.SpdpEndpoints.markSedpSeen);
-
-        return self;
     }
 
-    pub fn deinit(self: *Self) void {
+    /// Frees SPDP, SEDP and WLP and, with a runtime, its closed contexts.
+    fn deinitParts(self: *Self) void {
         self.wlp.deinit();
         self.sedp.deinit();
         self.spdp.deinit();
+        if (self.runtime != null) {
+            self.ingress.deinit();
+            self.timers.deinit();
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.deinitParts();
         self.alloc.destroy(self);
+    }
+
+    /// Gives a participant after a stopped one, or one on another runtime
+    /// than a participant that never started, the state of a new plugin on
+    /// `rt`: nothing of the earlier participant's peers or announcements
+    /// remains. Unstarted or stopped, the old parts have nothing armed or
+    /// queued. With `mu` held.
+    fn reset(self: *Self, rt: ?*runtime_mod.Runtime) !void {
+        std.debug.assert(self.phase == .fresh or self.phase == .stopped);
+        const sp = self.spdp;
+        const se = self.sedp;
+        const wl = self.wlp;
+        try self.initParts();
+        wl.deinit();
+        se.deinit();
+        sp.deinit();
+        if (self.runtime != null) {
+            self.ingress.deinit();
+            self.timers.deinit();
+        }
+        self.runtime = null;
+        self.ingress_latch = .{};
+        self.timers_latch = .{};
+        self.phase = .fresh;
+        if (rt) |r| self.attachParts(r);
+    }
+
+    /// Runs discovery on `rt` instead of threads of its own: SPDP's
+    /// announcements and lease checks and the built-in writers' heartbeats
+    /// are timers on its clock, and what discovery receives is queued for
+    /// its ingress context (docs/design/concurrency/runtime.md#thread-mapping).
+    /// Call before `start`; attaching the runtime already attached is a
+    /// no-op. A started plugin stays on its runtime until it has stopped;
+    /// after that, the next participant's runtime replaces it.
+    pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) error{ AttachedElsewhere, OutOfMemory }!void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        switch (self.phase) {
+            .started, .stopping => if (self.runtime != rt) return error.AttachedElsewhere,
+            .stopped => try self.reset(rt),
+            .fresh => if (self.runtime) |cur| {
+                if (cur != rt) try self.reset(rt);
+            } else self.attachParts(rt),
+        }
+    }
+
+    /// Puts the parts' work on `rt`, in new contexts.
+    fn attachParts(self: *Self, rt: *runtime_mod.Runtime) void {
+        self.runtime = rt;
+        self.ingress = runtime_mod.Context.init(rt, ingress_pending_limit);
+        self.ingress.on_closed = self.ingress_latch.hook();
+        // Only timer fires run here, with internal credit.
+        self.timers = runtime_mod.Context.init(rt, 0);
+        self.timers.on_closed = self.timers_latch.hook();
+        self.spdp.attachRuntime(rt, &self.ingress, &self.timers);
+        self.sedp.attachRuntime(rt, &self.ingress);
+        self.wlp.attachRuntime(rt);
     }
 
     /// Set the wire tracer on SPDP, SEDP, and WLP state machines.
     /// Call before the factory creates a participant (before `start()` is invoked).
     pub fn setTracer(self: *Self, t: trace.Tracer) void {
+        self.tracer = t;
         self.spdp.setTracer(t);
         self.sedp.setTracer(t);
         self.wlp.setTracer(t);
@@ -138,6 +260,7 @@ pub const SpdpSedpDiscovery = struct {
     // ── Discovery vtable ──────────────────────────────────────────────────────
 
     const vtable = Discovery.Vtable{
+        .shared_runtime_ready = true,
         .start = vtStart,
         .stop = vtStop,
         .announce_writer = vtAnnounceWriter,
@@ -146,7 +269,13 @@ pub const SpdpSedpDiscovery = struct {
         .retract_reader = vtRetractReader,
         .deinit = vtDeinit,
         .wlp_tick = vtWlpTick,
+        .attach_runtime = vtAttachRuntime,
     };
+
+    fn vtAttachRuntime(ctx: *anyopaque, rt: *runtime_mod.Runtime) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.attachRuntime(rt);
+    }
 
     fn vtWlpTick(ctx: *anyopaque, now_ns: i64, info: iface.WlpTickInfo) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -159,6 +288,20 @@ pub const SpdpSedpDiscovery = struct {
         cbs: *const Callbacks,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            switch (self.phase) {
+                // Another participant's: one at a time.
+                .started, .stopping => return error.AlreadyStarted,
+                // On the runtime the participant attached, if any.
+                .stopped => try self.reset(self.runtime),
+                .fresh => {},
+            }
+            self.phase = .started;
+        }
+        // The participant stops only what started.
+        errdefer self.stopParts();
         // SEDP must be started first so its metatraffic unicast listen is active
         // before SPDP fires its initial announcement and the remote peer begins
         // sending SEDP traffic. WLP follows the same requirement for the same
@@ -222,10 +365,42 @@ pub const SpdpSedpDiscovery = struct {
 
     fn vtStop(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        self.stopParts();
+    }
+
+    fn stopParts(self: *Self) void {
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.phase != .started) return;
+            // Not replaced while they stop.
+            self.phase = .stopping;
+        }
+        if (builtin.is_test) {
+            if (self.test_hooks.while_stopping) |hook| {
+                self.test_hooks.while_stopping = null;
+                hook(self);
+            }
+        }
         self.spdp.stop();
         self.wlp.stop();
         self.sedp.stop();
+        if (self.runtime != null) {
+            // Unlistened and disarmed above: what is queued is dropped, and a
+            // turn running elsewhere finishes first. Never stopped from
+            // inside one of these turns: participant deletion does not run
+            // in discovery's work.
+            const ingress_closed = self.ingress_latch.close(&self.ingress, QueuedReceive.discard);
+            const timers_closed = self.timers_latch.close(&self.timers, discardTimer);
+            std.debug.assert(ingress_closed and timers_closed);
+        }
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.phase = .stopped;
     }
+
+    /// A queued fire is the timer's own embedded request: nothing to free.
+    fn discardTimer(_: *runtime_mod.Request) void {}
 
     fn vtAnnounceWriter(ctx: *anyopaque, info: *const iface.WriterAnnouncement) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));

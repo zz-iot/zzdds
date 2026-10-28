@@ -538,8 +538,12 @@ pub const DirectDiscovery = struct {
         callbacks: *const Callbacks,
     ) anyerror!void {
         const self: *DirectDiscovery = @ptrCast(@alignCast(ctx));
+        // Another participant's: one at a time.
+        if (self.started) return error.AlreadyStarted;
         self.participant_guid = local.guid;
         self.started = true;
+        // The participant stops only what started.
+        errdefer self.started = false;
         try self.bus.busStart(local, callbacks);
     }
 
@@ -958,6 +962,55 @@ test "participants on different domains do not discover each other" {
     disc0.toDiscovery().stop();
     try testing.expectEqual(@as(usize, 0), cb1.writers_lost.items.len);
     try testing.expectEqual(@as(usize, 0), cb1.readers_lost.items.len);
+}
+
+test "a plugin serving a participant refuses another's start, and serves the next once stopped" {
+    const alloc = testing.allocator;
+    const bus = try DiscoveryBus.init(alloc);
+    defer bus.deinit();
+    const disc1 = try DirectDiscovery.init(alloc, bus);
+    defer disc1.deinit();
+    const disc2 = try DirectDiscovery.init(alloc, bus);
+    defer disc2.deinit();
+    var cb1 = TestCallbacks.init(alloc);
+    defer cb1.deinit();
+    var cb2 = TestCallbacks.init(alloc);
+    defer cb2.deinit();
+    var cbs1 = cb1.callbacks();
+    var cbs2 = cb2.callbacks();
+
+    var anns: [3]ParticipantAnnouncement = undefined;
+    for (&anns, 1..) |*a, i| a.* = .{
+        .guid = makeGuid(@intCast(i)),
+        .domain_id = 0,
+        .name = "",
+        .metatraffic_unicast_locators = &.{},
+        .metatraffic_multicast_locators = &.{},
+        .default_unicast_locators = &.{},
+        .default_multicast_locators = &.{},
+        .lease_duration_ms = 30000,
+        .builtin_endpoint_set = 0,
+    };
+    try disc2.toDiscovery().start(&anns[1], &cbs2);
+    try disc1.toDiscovery().start(&anns[0], &cbs1);
+    try testing.expectError(error.AlreadyStarted, disc1.toDiscovery().start(&anns[2], &cbs1));
+
+    // Still the first participant's: its writer reaches the peer.
+    try disc1.toDiscovery().announceWriter(&WriterAnnouncement{
+        .guid = makeWriterGuid(1, 1),
+        .participant_guid = makeGuid(1),
+        .topic_name = "T",
+        .type_name = "M",
+        .qos = .{},
+        .type_object = &.{},
+        .type_info_cdr = &.{},
+    });
+    try testing.expectEqual(@as(usize, 1), cb2.writers_discovered.items.len);
+
+    disc1.toDiscovery().stop();
+    try disc1.toDiscovery().start(&anns[2], &cbs1);
+    disc1.toDiscovery().stop();
+    disc2.toDiscovery().stop();
 }
 
 test "stop retracts all local endpoints from peers" {

@@ -18,6 +18,7 @@ const std = @import("std");
 const transport = @import("../transport/interface.zig");
 const guid_mod = @import("../rtps/guid.zig");
 const header_mod = @import("../rtps/message/header.zig");
+const Runtime = @import("../runtime/core.zig").Runtime;
 const Locator = transport.Locator;
 const Transport = transport.Transport;
 
@@ -378,8 +379,9 @@ pub const Discovery = struct {
     vtable: *const Vtable,
 
     pub const Vtable = struct {
-        /// The plugin runs no thread of its own, so a participant on the
-        /// shared runtime may use it. There `wlp_tick` runs only when an
+        /// The plugin runs no thread of its own, or puts its work on the
+        /// runtime through `attach_runtime`, so a participant on the shared
+        /// runtime may use it. There `wlp_tick` runs only when an
         /// endpoint's timer check is due, not on a fixed period, so the
         /// plugin must not depend on one. Removed with the `-Dshared-runtime`
         /// migration option
@@ -388,7 +390,11 @@ pub const Discovery = struct {
 
         /// Begin discovery. The plugin should start sending participant announcements
         /// and listening for remote announcements. Callbacks are stored and invoked
-        /// as peers are discovered.
+        /// as peers are discovered. A plugin serves one participant at a
+        /// time: it fails while another participant's discovery runs or is
+        /// stopping, and once `stop` returns serves the next participant as
+        /// a new plugin would.
+        /// After a failure, nothing is left running and `stop` is not called.
         start: *const fn (
             ctx: *anyopaque,
             local: *const ParticipantAnnouncement,
@@ -396,7 +402,7 @@ pub const Discovery = struct {
         ) anyerror!void,
 
         /// Stop discovery and release resources. No callbacks will be invoked after
-        /// this returns.
+        /// this returns. Called only after a successful `start`.
         stop: *const fn (ctx: *anyopaque) void,
 
         /// Announce a new local DataWriter. Discovery propagates this to remote peers.
@@ -421,6 +427,16 @@ pub const Discovery = struct {
         /// thread rather than a dedicated one). No-op for plugins that don't
         /// implement WLP (standalone SpdpEndpoints, DirectDiscovery).
         wlp_tick: *const fn (ctx: *anyopaque, now_ns: i64, info: WlpTickInfo) void,
+
+        /// Puts the plugin's own work on the participant's runtime, before
+        /// `start`: its timers on the runtime clock, and what it receives
+        /// queued for runtime contexts. Fails while another participant's
+        /// discovery runs, or is stopping, on a different runtime; otherwise
+        /// the runtime replaces one an earlier participant used. Null for a plugin with
+        /// no work of its own.
+        /// Removed with the `-Dshared-runtime` migration option, once every
+        /// plugin runs on a runtime.
+        attach_runtime: ?*const fn (ctx: *anyopaque, rt: *Runtime) anyerror!void = null,
     };
 
     // Forwarding helpers
@@ -455,6 +471,10 @@ pub const Discovery = struct {
 
     pub fn wlpTick(self: Discovery, now_ns: i64, info: WlpTickInfo) void {
         self.vtable.wlp_tick(self.ctx, now_ns, info);
+    }
+
+    pub fn attachRuntime(self: Discovery, rt: *Runtime) anyerror!void {
+        if (self.vtable.attach_runtime) |f| try f(self.ctx, rt);
     }
 };
 

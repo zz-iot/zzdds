@@ -69,6 +69,10 @@ const IPV6_V6ONLY: i32 = switch (builtin.os.tag) {
 const IPPROTO_IPV6: i32 = 41;
 
 const iface = @import("interface.zig");
+const backend_mod = @import("../runtime/backend.zig");
+const ProgressBackend = backend_mod.ProgressBackend;
+const Source = backend_mod.Source;
+const poll_backend = @import("../runtime/poll_backend.zig");
 const schema = @import("../config/schema.zig");
 const polling = @import("monitor/polling.zig");
 
@@ -138,7 +142,11 @@ fn socketSendTo(fd: posix.socket_t, buf: []const u8, addr: *const posix.sockaddr
 }
 
 fn socketRecvFrom(fd: posix.socket_t, buf: []u8, src: *posix.sockaddr, src_len: *posix.socklen_t) !usize {
-    const n = c.recvfrom(fd, buf.ptr, buf.len, 0, src, src_len);
+    return socketRecvFromFlags(fd, buf, src, src_len, 0);
+}
+
+fn socketRecvFromFlags(fd: posix.socket_t, buf: []u8, src: *posix.sockaddr, src_len: *posix.socklen_t, flags: u32) !usize {
+    const n = c.recvfrom(fd, buf.ptr, buf.len, flags, src, src_len);
     if (n < 0) {
         const err = posix.errno(n);
         if (err == .AGAIN) return error.WouldBlock;
@@ -246,7 +254,13 @@ const SocketEntry = struct {
     /// For multicast: zeroes (INADDR_ANY / IN6ADDR_ANY).
     bound_ip: [16]u8,
     stopping: std.atomic.Value(bool),
-    thread: std.Thread,
+    /// What receives on the socket: its own thread, or the backend the
+    /// transport is attached to (UdpTransport.backend).
+    receiver: union(enum) {
+        none,
+        thread: std.Thread,
+        source: Source,
+    } = .none,
     transport: *UdpTransport,
     // Cached here so recvThread never needs to acquire transport.mu.
     // Eliminates a deadlock: vtUnlisten holds mu while calling thread.join(),
@@ -289,7 +303,12 @@ const SocketEntry = struct {
     /// every stop() (e.g. a plain vtUnlisten with no channel ever handed out
     /// still calls stop(), where notifying would be meaningless).
     fn joinAndClose(self: *SocketEntry) void {
-        self.thread.join();
+        switch (self.receiver) {
+            .none => {},
+            .thread => |t| t.join(),
+            .source => |*src| self.transport.backend.?.unregister(src),
+        }
+        self.receiver = .none;
         self.send_mu.lock();
         defer self.send_mu.unlock();
         socketClose(self.fd);
@@ -299,6 +318,21 @@ const SocketEntry = struct {
     fn stop(self: *SocketEntry) void {
         self.requestStop();
         self.joinAndClose();
+    }
+
+    /// Starts receiving: registers the socket with the transport's backend
+    /// when it has one, otherwise starts its receive thread. Under the
+    /// transport's `mu`.
+    fn start(self: *SocketEntry) !void {
+        if (self.transport.backend) |b| {
+            self.receiver = .{ .source = .{ .handle = self.fd, .ctx = self, .service = serviceSource } };
+            b.register(&self.receiver.source) catch |err| {
+                self.receiver = .none;
+                return err;
+            };
+            return;
+        }
+        self.receiver = .{ .thread = try std.Thread.spawn(.{}, recvThread, .{self}) };
     }
 };
 
@@ -668,6 +702,10 @@ pub const UdpTransport = struct {
     monitor: InterfaceMonitor,
     monitor_owned: bool,
     closing: std.atomic.Value(bool),
+    /// The shared runtime's backend, which services the sockets in place of
+    /// receive threads (vtAttachBackend). Set under `mu` before the first
+    /// socket opens, then fixed.
+    backend: ?ProgressBackend = null,
 
     const Self = @This();
 
@@ -761,7 +799,9 @@ pub const UdpTransport = struct {
             // enumerated once at startup only (PollingMonitor.vtStart does
             // this unconditionally), never re-polled -- interval_ms = 0 is
             // PollingMonitor's own sentinel for "no periodic re-poll thread".
-            const poll_interval: u32 = if (build_opts.interface_monitor) config.interface_poll_interval_ms else 0;
+            // The shared runtime has no re-poll yet: it must start no thread
+            // (docs/design/concurrency/runtime.md#thread-mapping).
+            const poll_interval: u32 = if (build_opts.interface_monitor and !build_opts.shared_runtime) config.interface_poll_interval_ms else 0;
             const pm = try alloc.create(polling.PollingMonitor);
             pm.* = polling.PollingMonitor.init(alloc, poll_interval);
             self.monitor = pm.monitor();
@@ -940,12 +980,11 @@ pub const UdpTransport = struct {
             .addr_kind = addr_kind,
             .bound_ip = bound_ip,
             .stopping = std.atomic.Value(bool).init(false),
-            .thread = undefined,
             .transport = self,
             .handler = handler,
             .generation = self.next_socket_generation,
         };
-        entry.thread = try std.Thread.spawn(.{}, recvThread, .{entry});
+        try entry.start();
         fd_needs_close = false;
         errdefer entry.stop();
         try self.sockets.append(self.alloc, entry);
@@ -1052,12 +1091,16 @@ pub const UdpTransport = struct {
             .addr_kind = addr_kind,
             .bound_ip = std.mem.zeroes([16]u8),
             .stopping = std.atomic.Value(bool).init(false),
-            .thread = undefined,
             .transport = self,
             .handler = handler,
             .generation = self.next_socket_generation,
         };
-        entry.thread = try std.Thread.spawn(.{}, recvThread, .{entry});
+        entry.start() catch |err| {
+            socketClose(fd);
+            self.alloc.destroy(entry);
+            return err;
+        };
+        errdefer entry.stop();
         try self.sockets.append(self.alloc, entry);
         return entry;
     }
@@ -1729,12 +1772,30 @@ pub const UdpTransport = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.deinit();
     }
+
+    fn vtAttachBackend(ctx: *anyopaque, backend: ProgressBackend) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.sockets.items.len > 0) {
+            // Open sockets stay where they receive: another runtime's
+            // participant cannot use them, nor can sockets on threads move.
+            if (self.backend) |b| if (b.ctx == backend.ctx) return;
+            return if (self.backend != null) error.AttachedElsewhere else error.AlreadyListening;
+        }
+        // With no socket open, nothing receives on an earlier backend, whose
+        // runtime may have retired: the next participant's replaces it.
+        if (!backend.hasSources()) return error.BackendHasNoSources;
+        self.backend = backend;
+    }
 };
 
 // ── Vtable singleton ──────────────────────────────────────────────────────────
 
 const udp_vtable = Transport.Vtable{
     .capabilities = .{ .unicast = true, .multicast = true },
+    .shared_runtime_ready = poll_backend.supported,
+    .attach_backend = UdpTransport.vtAttachBackend,
     .can_reach = UdpTransport.vtCanReach,
     .send = UdpTransport.vtSend,
     .send_on_channel = UdpTransport.vtSendOnChannel,
@@ -1746,6 +1807,38 @@ const udp_vtable = Transport.Vtable{
     .set_locator_change_handler = UdpTransport.vtSetLocatorChangeHandler,
     .close = UdpTransport.vtClose,
 };
+
+// ── Receiving on the backend ──────────────────────────────────────────────────
+
+/// Source.service for a socket on the backend: receives what is queued now,
+/// without blocking, into this executor's buffer, and dispatches it as
+/// recvThread does. The handlers (on the shared runtime, each participant's
+/// ingress) copy what they keep.
+fn serviceSource(ctx: *anyopaque, budget: u32) u32 {
+    const entry: *SocketEntry = @ptrCast(@alignCast(ctx));
+    var buf: [RECV_BUF]u8 = undefined;
+    var src_store: posix.sockaddr.storage = undefined;
+    var handled: u32 = 0;
+    while (handled < budget) {
+        var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        const dontwait = if (poll_backend.supported) posix.MSG.DONTWAIT else unreachable;
+        const n = socketRecvFromFlags(entry.fd, &buf, @ptrCast(&src_store), &src_len, dontwait) catch |err| switch (err) {
+            error.WouldBlock => break,
+            error.Interrupted => continue,
+            // Receiving took the socket's pending error (an ICMP report of
+            // an earlier send), so the socket is not left readable.
+            else => {
+                handled += 1;
+                continue;
+            },
+        };
+        const src_loc = sockaddrToLocator(@ptrCast(&src_store));
+        const channel = Channel{ .token = @intFromPtr(entry), .generation = entry.generation };
+        entry.handler.on_receive(entry.handler.ctx, buf[0..n], src_loc, channel);
+        handled += 1;
+    }
+    return handled;
+}
 
 // ── Receive thread ────────────────────────────────────────────────────────────
 
