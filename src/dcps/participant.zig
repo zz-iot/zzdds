@@ -1323,9 +1323,14 @@ pub const DomainParticipantImpl = struct {
         alloc.destroy(self);
     }
 
-    /// Start discovery. Call once after init(). The discovery plugin begins
+    /// Start discovery. Call after init(). The discovery plugin begins
     /// announcing the participant and delivering remote-endpoint callbacks.
+    /// A failure leaves nothing started, so `enable` can call it again.
     pub fn start(self: *Self) !void {
+        errdefer {
+            self.stopReceiving();
+            self.data_listen_port = 0;
+        }
         const udp_cfg = &self.config.transport.udp;
         const part_cfg = &self.config.participant;
 
@@ -1547,6 +1552,27 @@ pub const DomainParticipantImpl = struct {
         };
     }
 
+    /// Stops discovery and the receives `start` began, those it got to.
+    fn stopReceiving(self: *Self) void {
+        if (self.discovery_started) self.discovery.stop();
+        self.discovery_started = false;
+        if (self.data_listening and self.data_listen_port != 0) {
+            const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
+            self.transport.unlisten(&loc, self.userDataHandler());
+        }
+        self.data_listening = false;
+        // Mirror start()'s metatraffic-port fallback registration, if any --
+        // otherwise a packet arriving on that port after this point calls
+        // userDataOnReceive with a freed `self` (SEDP's own registration on
+        // the same PortEntry is unaffected; self.discovery.stop() above
+        // handles that side).
+        if (self.meta_userdata_listen_port != 0) {
+            const meta_loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.meta_userdata_listen_port);
+            self.discovery_transport.unlisten(&meta_loc, self.userDataHandler());
+        }
+        self.meta_userdata_listen_port = 0;
+    }
+
     /// Periodically calls checkTimers() to enforce DEADLINE/LIVELINESS QoS.
     /// Stopped by setting timer_stopping before calling timer_thread.join()
     /// (see deinit()) -- same shape as writer_sm.zig's heartbeatThread.
@@ -1602,22 +1628,8 @@ pub const DomainParticipantImpl = struct {
             }
             self.timer_thread = null;
         }
-        if (self.discovery_started) self.discovery.stop();
-
         // Stop receiving user data before tearing down readers.
-        if (self.data_listening and self.data_listen_port != 0) {
-            const loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.data_listen_port);
-            self.transport.unlisten(&loc, self.userDataHandler());
-        }
-        // Mirror start()'s metatraffic-port fallback registration, if any --
-        // otherwise a packet arriving on that port after this point calls
-        // userDataOnReceive with a freed `self` (SEDP's own registration on
-        // the same PortEntry is unaffected; self.discovery.stop() above
-        // handles that side).
-        if (self.meta_userdata_listen_port != 0) {
-            const meta_loc = Locator.udp4(.{ 0, 0, 0, 0 }, self.meta_userdata_listen_port);
-            self.discovery_transport.unlisten(&meta_loc, self.userDataHandler());
-        }
+        self.stopReceiving();
         // Nothing is delivered after the unlistens above; what was is dropped,
         // and a turn processing it finishes before entities are torn down,
         // unless this is that turn: then the participant is freed after it.

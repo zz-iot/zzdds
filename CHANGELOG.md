@@ -24,6 +24,8 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
   participant while another uses the factory's plugin now fails, instead of
   taking over the running participant's discovery, and deleting a participant
   whose discovery never started no longer stops another's.
+- A participant whose `enable()` fails after its discovery started now stops
+  what started, so `enable()` can be called again.
 
 ## 2026-10-27
 

@@ -1043,9 +1043,10 @@ queued. On POSIX the default runtime, and any runtime built on the readiness bac
 sources of its participant's runtime instead of running receive threads. One waiter polls
 them with the runtime's wake descriptor and hands polling to another waiter when it stops,
 and servicing receives what is ready without blocking, round robin across sockets within
-its budget. A transport's open sockets belong to one runtime, so creation on a second
-runtime while they are open, or on one whose backend waits on no sockets, fails; once its
-participants are deleted, the next participant's runtime takes over. On the runtime, UDP does not yet
+its budget. A factory's transport and discovery serve all its participants, so they share
+one runtime: creation on another runtime while any of them exists, even disabled, or on one
+whose backend waits on no sockets, fails; once they are all deleted, the next participant's
+runtime takes over. On the runtime, UDP does not yet
 re-poll interfaces (no poll thread is started), and sends are still synchronous `sendto`s
 of a flattened buffer. RTPS discovery runs on the participant's runtime too: SPDP's
 announcements and its lease and liveness-probe checks are timers on the runtime clock,

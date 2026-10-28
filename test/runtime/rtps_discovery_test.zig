@@ -188,6 +188,10 @@ const Node = struct {
     fn create(self: *Node, runtime: *rt.Runtime, lease_ms: u32) !void {
         var config = Config{};
         config.participant.lease_duration_ms = lease_ms;
+        try self.createWith(runtime, config);
+    }
+
+    fn createWith(self: *Node, runtime: *rt.Runtime, config: Config) !void {
         try self.factory.selectRuntime(runtime);
         defer self.factory.selectRuntime(null) catch {};
         const qos = DDS.DomainParticipantQos{};
@@ -552,6 +556,118 @@ test "a participant created disabled and deleted leaves its discovery plugin to 
     try testing.expectEqual(DDS.RETCODE_OK, f.set_qos(.{}));
 
     try p.create(10_000, 10_000);
+    try testing.expect(try p.driveUntil(p.now() + 5 * SEC, &p, Pair.bothDiscovered));
+    try exchangeOn(&p.runtime, p.a.dp, p.b.dp);
+}
+
+test "while a factory's participant exists, even disabled, another from it on a different runtime fails, and the first runs on its own" {
+    const prev = quietLogs();
+    defer std.testing.log_level = prev;
+    var p: Pair = undefined;
+    try p.init(500);
+    defer p.deinit();
+    var sb = rt.ScriptedBackend.init(1_000);
+    var other = rt.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
+    defer other.deinit();
+
+    const f = p.a.factory.toDDSFactory();
+    var disabled: DDS.DomainParticipantFactoryQos = .{};
+    disabled.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, f.set_qos(disabled));
+    try p.a.create(&p.runtime, 10_000);
+    try p.a.factory.selectRuntime(&other);
+    const refused = f.create_participant(0, .{}, null, 0);
+    try p.a.factory.selectRuntime(null);
+    try testing.expect(refused.ptr == nil_participant.ptr);
+    other.releaseOwner();
+    while (other.getState() != .backend_stopped) _ = try other.drive(64, 0);
+    try testing.expectEqual(DDS.RETCODE_OK, f.set_qos(.{}));
+
+    try testing.expectEqual(DDS.RETCODE_OK, p.a.dp.enable());
+    try p.b.create(&p.runtime, 10_000);
+    p.release();
+    try testing.expect(try p.driveUntil(p.now() + 5 * SEC, &p, Pair.bothDiscovered));
+    try exchangeOn(&p.runtime, p.a.dp, p.b.dp);
+}
+
+/// What the plugin answered while its participant's discovery stopped.
+const WhileStopping = struct {
+    var other: *rt.Runtime = undefined;
+    var spdp_before: *anyopaque = undefined;
+    var same_runtime: anyerror!void = {};
+    var other_runtime: anyerror!void = {};
+    var start: anyerror!void = {};
+    var parts_kept = false;
+
+    fn hook(d: *SpdpSedpDiscovery) void {
+        spdp_before = d.spdp;
+        same_runtime = d.attachRuntime(d.runtime.?);
+        other_runtime = d.attachRuntime(other);
+        // Refused before either is read.
+        var ann: zzdds.discovery.ParticipantAnnouncement = undefined;
+        var cbs: zzdds.discovery.Callbacks = undefined;
+        start = d.toDiscovery().start(&ann, &cbs);
+        parts_kept = @as(*anyopaque, d.spdp) == spdp_before;
+    }
+};
+
+test "while a participant's discovery stops, the plugin takes no other participant's runtime or start, and keeps its parts" {
+    const prev = quietLogs();
+    defer std.testing.log_level = prev;
+    var p: Pair = undefined;
+    try p.init(500);
+    defer p.deinit();
+    var sb = rt.ScriptedBackend.init(1_000);
+    var other = rt.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
+    defer other.deinit();
+    defer other.releaseOwner();
+
+    try p.create(10_000, 10_000);
+    try testing.expect(try p.driveUntil(p.now() + 5 * SEC, &p, Pair.bothDiscovered));
+    WhileStopping.other = &other;
+    p.a.disc.test_hooks.while_stopping = WhileStopping.hook;
+    try p.a.delete();
+    try WhileStopping.same_runtime;
+    try testing.expectError(error.AttachedElsewhere, WhileStopping.other_runtime);
+    try testing.expectError(error.AlreadyStarted, WhileStopping.start);
+    try testing.expect(WhileStopping.parts_kept);
+
+    try p.a.create(&p.runtime, 10_000);
+    try testing.expect(try p.driveUntil(p.now() + 15 * SEC, &p, Pair.bothDiscovered));
+}
+
+fn ignoreReceive(_: *anyopaque, _: []const u8, _: Locator, _: zzdds.transport.Channel) void {}
+
+test "a participant whose enable fails after its discovery started can be enabled again, and runs on its runtime" {
+    const prev = quietLogs();
+    defer std.testing.log_level = prev;
+    var p: Pair = undefined;
+    try p.init(500);
+    defer p.deinit();
+
+    const f = p.a.factory.toDDSFactory();
+    var disabled: DDS.DomainParticipantFactoryQos = .{};
+    disabled.entity_factory.autoenable_created_entities = false;
+    try testing.expectEqual(DDS.RETCODE_OK, f.set_qos(disabled));
+    var config = Config{};
+    config.participant.lease_duration_ms = 10_000;
+    config.transport.udp.data_unicast_port = 7_000;
+    try p.a.createWith(&p.runtime, config);
+    try testing.expectEqual(DDS.RETCODE_OK, f.set_qos(.{}));
+    try p.b.create(&p.runtime, 10_000);
+    p.release();
+
+    // Discovery starts, then the data port is taken.
+    const taken = Locator.udp4(.{ 0, 0, 0, 0 }, 7_000);
+    var dummy: u8 = 0;
+    const squatter = zzdds.transport.ReceiveHandler{ .ctx = &dummy, .on_receive = ignoreReceive };
+    const t = p.a.memory.transport();
+    try t.listen(&taken, squatter);
+    try testing.expectEqual(DDS.RETCODE_ERROR, p.a.dp.enable());
+    t.unlisten(&taken, squatter);
+
+    try testing.expectEqual(DDS.RETCODE_OK, p.a.dp.enable());
+    try testing.expect(p.a.disc.spdp.timer_thread == null);
     try testing.expect(try p.driveUntil(p.now() + 5 * SEC, &p, Pair.bothDiscovered));
     try exchangeOn(&p.runtime, p.a.dp, p.b.dp);
 }

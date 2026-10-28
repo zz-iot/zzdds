@@ -12,6 +12,7 @@
 //!   // Pass discovery to DomainParticipantFactoryImpl.init(...)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const iface = @import("interface.zig");
 const spdp = @import("spdp.zig");
 const sedp = @import("sedp.zig");
@@ -22,6 +23,7 @@ const header_mod = @import("../rtps/message/header.zig");
 const runtime_mod = @import("../runtime/core.zig");
 const CloseLatch = @import("../runtime/close_latch.zig").CloseLatch;
 const QueuedReceive = @import("../transport/queued_receive.zig").QueuedReceive;
+const Mutex = @import("../util/mutex.zig").Mutex;
 
 pub const Discovery = iface.Discovery;
 pub const Callbacks = iface.Callbacks;
@@ -73,9 +75,20 @@ pub const SpdpSedpDiscovery = struct {
     timers: runtime_mod.Context = undefined,
     timers_latch: CloseLatch = .{},
     /// The plugin serves one participant at a time. Once that participant
-    /// stops it, the next one gets fresh SPDP, SEDP and WLP state, on any
-    /// runtime.
-    phase: enum { fresh, started, stopped } = .fresh,
+    /// has stopped it, the next one gets fresh SPDP, SEDP and WLP state, on
+    /// any runtime.
+    phase: enum { fresh, started, stopping, stopped } = .fresh,
+    /// Guards `phase` and the replacement of the parts and runtime:
+    /// participants are created and deleted on different threads.
+    mu: Mutex = .{},
+    test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
+
+    /// Seams for deterministic tests of races; absent outside test builds.
+    pub const TestHooks = struct {
+        /// Runs once in `stop`, after the plugin is marked stopping and
+        /// before its parts stop.
+        while_stopping: ?*const fn (self: *Self) void = null,
+    };
 
     /// Bound on the datagrams queued for ingress and not yet processed. A
     /// placeholder, as the participant's own.
@@ -175,12 +188,12 @@ pub const SpdpSedpDiscovery = struct {
     }
 
     /// Gives a participant after a stopped one, or one on another runtime
-    /// than a participant that never started, the state of a new plugin:
-    /// nothing of the earlier participant's peers, announcements or
-    /// runtime remains. Unstarted, the old parts have nothing armed or
-    /// queued.
-    fn reset(self: *Self) !void {
-        std.debug.assert(self.phase != .started);
+    /// than a participant that never started, the state of a new plugin on
+    /// `rt`: nothing of the earlier participant's peers or announcements
+    /// remains. Unstarted or stopped, the old parts have nothing armed or
+    /// queued. With `mu` held.
+    fn reset(self: *Self, rt: ?*runtime_mod.Runtime) !void {
+        std.debug.assert(self.phase == .fresh or self.phase == .stopped);
         const sp = self.spdp;
         const se = self.sedp;
         const wl = self.wlp;
@@ -196,6 +209,7 @@ pub const SpdpSedpDiscovery = struct {
         self.ingress_latch = .{};
         self.timers_latch = .{};
         self.phase = .fresh;
+        if (rt) |r| self.attachParts(r);
     }
 
     /// Runs discovery on `rt` instead of threads of its own: SPDP's
@@ -203,20 +217,22 @@ pub const SpdpSedpDiscovery = struct {
     /// are timers on its clock, and what discovery receives is queued for
     /// its ingress context (docs/design/concurrency/runtime.md#thread-mapping).
     /// Call before `start`; attaching the runtime already attached is a
-    /// no-op. A started plugin stays on its runtime until stopped; after
-    /// that, the next participant's runtime replaces it.
+    /// no-op. A started plugin stays on its runtime until it has stopped;
+    /// after that, the next participant's runtime replaces it.
     pub fn attachRuntime(self: *Self, rt: *runtime_mod.Runtime) error{ AttachedElsewhere, OutOfMemory }!void {
+        self.mu.lock();
+        defer self.mu.unlock();
         switch (self.phase) {
-            .started => {
-                if (self.runtime != rt) return error.AttachedElsewhere;
-                return;
-            },
-            .stopped => try self.reset(),
+            .started, .stopping => if (self.runtime != rt) return error.AttachedElsewhere,
+            .stopped => try self.reset(rt),
             .fresh => if (self.runtime) |cur| {
-                if (cur == rt) return;
-                try self.reset();
-            },
+                if (cur != rt) try self.reset(rt);
+            } else self.attachParts(rt),
         }
+    }
+
+    /// Puts the parts' work on `rt`, in new contexts.
+    fn attachParts(self: *Self, rt: *runtime_mod.Runtime) void {
         self.runtime = rt;
         self.ingress = runtime_mod.Context.init(rt, ingress_pending_limit);
         self.ingress.on_closed = self.ingress_latch.hook();
@@ -272,13 +288,18 @@ pub const SpdpSedpDiscovery = struct {
         cbs: *const Callbacks,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        switch (self.phase) {
-            // Another participant's: one at a time.
-            .started => return error.AlreadyStarted,
-            .stopped => try self.reset(),
-            .fresh => {},
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            switch (self.phase) {
+                // Another participant's: one at a time.
+                .started, .stopping => return error.AlreadyStarted,
+                // On the runtime the participant attached, if any.
+                .stopped => try self.reset(self.runtime),
+                .fresh => {},
+            }
+            self.phase = .started;
         }
-        self.phase = .started;
         // The participant stops only what started.
         errdefer self.stopParts();
         // SEDP must be started first so its metatraffic unicast listen is active
@@ -344,12 +365,23 @@ pub const SpdpSedpDiscovery = struct {
 
     fn vtStop(ctx: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (self.phase != .started) return;
         self.stopParts();
     }
 
     fn stopParts(self: *Self) void {
-        self.phase = .stopped;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.phase != .started) return;
+            // Not replaced while they stop.
+            self.phase = .stopping;
+        }
+        if (builtin.is_test) {
+            if (self.test_hooks.while_stopping) |hook| {
+                self.test_hooks.while_stopping = null;
+                hook(self);
+            }
+        }
         self.spdp.stop();
         self.wlp.stop();
         self.sedp.stop();
@@ -362,6 +394,9 @@ pub const SpdpSedpDiscovery = struct {
             const timers_closed = self.timers_latch.close(&self.timers, discardTimer);
             std.debug.assert(ingress_closed and timers_closed);
         }
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.phase = .stopped;
     }
 
     /// A queued fire is the timer's own embedded request: nothing to free.

@@ -391,8 +391,9 @@ pub const Discovery = struct {
         /// Begin discovery. The plugin should start sending participant announcements
         /// and listening for remote announcements. Callbacks are stored and invoked
         /// as peers are discovered. A plugin serves one participant at a
-        /// time: it fails while another participant's discovery runs, and
-        /// after `stop` serves the next participant as a new plugin would.
+        /// time: it fails while another participant's discovery runs or is
+        /// stopping, and once `stop` returns serves the next participant as
+        /// a new plugin would.
         /// After a failure, nothing is left running and `stop` is not called.
         start: *const fn (
             ctx: *anyopaque,
@@ -430,8 +431,8 @@ pub const Discovery = struct {
         /// Puts the plugin's own work on the participant's runtime, before
         /// `start`: its timers on the runtime clock, and what it receives
         /// queued for runtime contexts. Fails while another participant's
-        /// discovery runs on a different runtime; otherwise the runtime
-        /// replaces one an earlier participant used. Null for a plugin with
+        /// discovery runs, or is stopping, on a different runtime; otherwise
+        /// the runtime replaces one an earlier participant used. Null for a plugin with
         /// no work of its own.
         /// Removed with the `-Dshared-runtime` migration option, once every
         /// plugin runs on a runtime.

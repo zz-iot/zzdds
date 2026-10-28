@@ -56,6 +56,13 @@ pub const DomainParticipantFactoryImpl = struct {
     /// creation resolves the default runtime
     /// (docs/design/concurrency/runtime.md#selected-selection-hierarchy).
     runtime: ?*runtime_mod.Runtime = null,
+    /// The runtime the transport and discovery run on, and how many
+    /// participants, made or being made and not yet freed, run on it;
+    /// guarded by `mu`. Both plugins serve every participant of the
+    /// factory, so they share one runtime: another replaces it only once
+    /// they are all freed.
+    attached_runtime: ?*runtime_mod.Runtime = null,
+    attached_users: u32 = 0,
 
     fac_c_abi: c_abi_handle.CachedCAbiHandle = .{},
 
@@ -108,7 +115,8 @@ pub const DomainParticipantFactoryImpl = struct {
 
     /// Selects the runtime for participants created from now on, taking an
     /// owner reference to it and releasing the previous selection's.
-    /// Existing participants keep theirs. Fails if `rt` is already retiring.
+    /// Existing participants keep theirs, and until they are all freed,
+    /// creation on another runtime fails. Fails if `rt` is already retiring.
     pub fn selectRuntime(self: *Self, rt: ?*runtime_mod.Runtime) error{ SharedRuntimeDisabled, Retiring }!void {
         if (!build_opts.shared_runtime) return error.SharedRuntimeDisabled;
         if (rt) |r| if (!r.tryRetainOwner()) return error.Retiring;
@@ -146,17 +154,47 @@ pub const DomainParticipantFactoryImpl = struct {
             log_mod.dcps.warn("create_participant: the selected runtime is retiring", .{});
             return null;
         }
-        self.transport.attachBackend(rt.backend) catch |err| {
-            log_mod.dcps.warn("create_participant: the transport cannot run on this runtime ({s})", .{@errorName(err)});
+        self.mu.lock();
+        self.attachPlugins(rt) catch {
+            self.mu.unlock();
             rt.releaseOwner();
             return null;
+        };
+        self.attached_runtime = rt;
+        self.attached_users += 1;
+        self.mu.unlock();
+        return rt;
+    }
+
+    /// Puts the transport and discovery on `rt`. With `mu` held.
+    fn attachPlugins(self: *Self, rt: *runtime_mod.Runtime) !void {
+        if (self.attached_users > 0 and self.attached_runtime != rt) {
+            log_mod.dcps.warn("create_participant: the factory's participants run on another runtime", .{});
+            return error.AttachedElsewhere;
+        }
+        self.transport.attachBackend(rt.backend) catch |err| {
+            log_mod.dcps.warn("create_participant: the transport cannot run on this runtime ({s})", .{@errorName(err)});
+            return err;
         };
         self.discovery.attachRuntime(rt) catch |err| {
             log_mod.dcps.warn("create_participant: the discovery plugin cannot run on this runtime ({s})", .{@errorName(err)});
-            rt.releaseOwner();
-            return null;
+            return err;
         };
-        return rt;
+    }
+
+    /// A participant from `acquireRuntimeFor` is freed.
+    fn releaseRuntimeUse(self: *Self) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.attached_users -= 1;
+        if (self.attached_users == 0) self.attached_runtime = null;
+    }
+
+    /// Frees `p`, made by this factory, and its use of the runtime.
+    fn freeParticipant(self: *Self, p: *participant_mod.DomainParticipantImpl) void {
+        const on_runtime = p.runtime != null;
+        p.deinit();
+        if (on_runtime) self.releaseRuntimeUse();
     }
 
     pub fn toDDSFactory(self: *Self) DDS.DomainParticipantFactory {
@@ -257,7 +295,10 @@ pub const DomainParticipantFactoryImpl = struct {
             // On a runtime, timed QoS runs on its clock.
             if (rt) |r| r.clock else timer_clock,
         ) catch {
-            if (rt) |r| r.releaseOwner();
+            if (rt) |r| {
+                r.releaseOwner();
+                self.releaseRuntimeUse();
+            }
             return null;
         };
         if (rt) |r| p.attachRuntime(r);
@@ -279,7 +320,7 @@ pub const DomainParticipantFactoryImpl = struct {
         // factory-level meaning here.
         if (self.factory_qos.entity_factory.autoenable_created_entities) {
             p.start() catch {
-                p.deinit();
+                self.freeParticipant(p);
                 return null;
             };
         }
@@ -287,7 +328,7 @@ pub const DomainParticipantFactoryImpl = struct {
         self.mu.lock();
         self.participants.append(self.alloc, p) catch {
             self.mu.unlock();
-            p.deinit();
+            self.freeParticipant(p);
             return null;
         };
         self.mu.unlock();
@@ -321,7 +362,7 @@ pub const DomainParticipantFactoryImpl = struct {
         self.mu.lock();
         _ = self.participants.swapRemove(found_idx.?);
         self.mu.unlock();
-        p.deinit();
+        self.freeParticipant(p);
         return DDS.RETCODE_OK;
     }
 
