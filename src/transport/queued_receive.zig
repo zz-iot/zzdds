@@ -7,6 +7,7 @@
 const std = @import("std");
 const iface = @import("interface.zig");
 const core = @import("../runtime/core.zig");
+const backend = @import("../runtime/backend.zig");
 
 const Locator = iface.Locator;
 const Channel = iface.Channel;
@@ -52,7 +53,7 @@ pub const QueuedReceive = struct {
             self.alloc.destroy(item);
             return self.drop(raw.len);
         };
-        item.* = .{ .queue = self, .src = src, .channel = channel, .data = data };
+        item.* = .{ .alloc = self.alloc, .queue = self, .src = src, .channel = channel, .data = data };
         item.req.on_done = Item.destroy;
         self.context.runtime.submit(null, self.context, &item.req) catch {
             discard(&item.req);
@@ -67,6 +68,7 @@ pub const QueuedReceive = struct {
 
     const Item = struct {
         req: core.Request = core.Request.init(run),
+        alloc: std.mem.Allocator,
         queue: *QueuedReceive,
         src: Locator,
         channel: Channel,
@@ -84,11 +86,53 @@ pub const QueuedReceive = struct {
             return .done;
         }
 
+        /// Does not touch the queue: once the turn has ended, its owner may
+        /// close the context and free it before this runs.
         fn destroy(req: *core.Request) void {
             const item = of(req);
-            const a = item.queue.alloc;
-            a.free(item.data);
-            a.destroy(item);
+            item.alloc.free(item.data);
+            item.alloc.destroy(item);
         }
     };
 };
+
+test "a datagram's buffer is freed after its turn without the queue, which its owner may already have freed" {
+    const alloc = std.testing.allocator;
+    var sb = backend.ScriptedBackend.init(1_000);
+    var runtime = core.Runtime.init(sb.clock(), sb.backend(), .{ .mode = .manual });
+    var ctx = core.Context.init(&runtime, 16);
+    const Owner = struct {
+        var queue: ?*QueuedReceive = null;
+        var received: usize = 0;
+
+        fn onReceive(_: *anyopaque, data: []const u8, _: Locator, _: Channel) void {
+            received += data.len;
+        }
+
+        /// Teardown between the turn's end and its cleanup: with nothing
+        /// queued or running, the context closes at once.
+        fn teardown(_: *core.Runtime, c: *core.Context, _: *core.Request) void {
+            const d = c.closeDiscarding();
+            std.debug.assert(d.closed and d.requests == null);
+            std.testing.allocator.destroy(queue.?);
+            queue = null;
+        }
+    };
+    Owner.received = 0;
+    const q = try alloc.create(QueuedReceive);
+    q.* = QueuedReceive.init(alloc, &ctx, .{ .ctx = q, .on_receive = Owner.onReceive });
+    Owner.queue = q;
+    const h = q.handler();
+    h.on_receive(h.ctx, "datagram", Locator.udp4(.{ 127, 0, 0, 1 }, 7400), .none);
+
+    runtime.test_hooks.before_on_done = Owner.teardown;
+    const r = try runtime.drive(10, 0);
+    try std.testing.expectEqual(@as(u32, 1), r.turns);
+    try std.testing.expectEqual(@as(usize, 8), Owner.received);
+    try std.testing.expect(Owner.queue == null);
+
+    ctx.deinit();
+    runtime.releaseOwner();
+    _ = try runtime.drive(10, 0);
+    runtime.deinit();
+}

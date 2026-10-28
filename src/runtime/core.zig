@@ -438,6 +438,9 @@ pub const Runtime = struct {
         /// Runs once in `fireDueTimers`, after a due timer leaves the heap and
         /// before its fire is submitted.
         after_timer_pop: ?*const fn (runtime: *Runtime, timer: *Timer) void = null,
+        /// Runs once in `runTurn`, after a turn has released its context and
+        /// before the request's `on_done`.
+        before_on_done: ?*const fn (runtime: *Runtime, ctx: *Context, req: *Request) void = null,
     };
 
     /// The creator holds the first operational-owner reference.
@@ -748,6 +751,12 @@ pub const Runtime = struct {
         if (scheduled) self.backend.wake();
         // What the turn changed may end a helper's wait.
         if (self.options.mode == .manual) self.wakeHelpers();
+        if (builtin.is_test) {
+            if (self.test_hooks.before_on_done) |hook| {
+                self.test_hooks.before_on_done = null;
+                hook(self, ctx, req);
+            }
+        }
         // Neither the request nor the context is touched after these.
         if (on_done) |f| f(req);
         if (on_closed) |h| h.run(h.ctx);
