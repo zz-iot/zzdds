@@ -100,6 +100,9 @@ invoke inherited listeners: the builder holds no mutex across those calls.
 A callback may request `cancel`, or call `destroy`, which requests cancellation
 and returns `ConstructionInProgress`. It never waits for its own constructor.
 Cancellation is checked after DDS calls; it does not interrupt one in progress.
+With the contributor `-Dshared-runtime=true` switch, listener callbacks run on
+queued lanes. A callback on another worker must send lifecycle requests to the
+instance's owner rather than calling this owner-serialized API concurrently.
 If a callback deletes the endpoint currently being created, #107's constructor
 returns nil and the graph build fails safely. General external lifecycle mutation,
 including deleting other already-created endpoints behind the builder, is unsupported.
@@ -133,9 +136,11 @@ depth is 1; limits are 32 samples, one instance and 32 samples per instance.
 Resolution rejects inconsistent limits/depth. Container and topic QoS use generated
 DDS defaults. No arbitrary QoS object/pointer is borrowed from authoring storage.
 
-Profile inheritance, partitions, additional representations/policies, provider
-libraries, persistent portable plan encoding, source provenance, incremental XRCE
-construction and configuration frontends follow separately. These concrete records
+The separate experimental [authoring frontend](resource-authoring.md) now adds
+TOML records, single-base profiles and source provenance into these same plans.
+Partitions, additional representations/policies, provider libraries, persistent
+portable plan encoding, incremental XRCE construction and standard XML/JSON
+frontends follow separately. These concrete records
 are intentionally smaller than the eventual catalog; they do not freeze TOML names
 or claim DDS-XML/DDS-JSON support. Future runtime migration must reuse its supported
 public APIs and capability checks, not bypass creation failures or select a fallback.

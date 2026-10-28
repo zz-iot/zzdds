@@ -8,6 +8,28 @@ see [`docs/implementation_status.md`](docs/implementation_status.md); for planne
 Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 `0.2.1-zig.0.16.0-dev`).
 
+## 2026-10-28
+
+- Pin zidl v0.3.23-zig.0.17.0 and enable the shared runtime configuration reader
+  by default, preserving resolver compatibility and allocator contracts. Keep
+  `-Dconfig-authoring=false` as an explicit legacy fallback.
+- Run resource authoring and configuration qualification against the released
+  dependency in the native Debug/ReleaseSafe matrix and Linux ThreadSanitizer job.
+  Include the optional frontend in LLVM coverage and Valgrind artifacts.
+
+## 2026-10-27
+
+- Add a development-only runtime configuration adapter (`-Dconfig-authoring=true`)
+  preserving existing resolver policies, with strict diagnostic companions and
+  conditional `_setting` support. Keep the released zidl pin and default path.
+
+- Extend the existing TOML parser with located records/arrays, quoted names, strict
+  duplicates and owned failure cleanup. Preserve its legacy accessor API.
+- Add experimental resource authoring with generated presence-aware records,
+  single-base writer/reader QoS profiles and provenance into concrete builder plans.
+  Development requires the coordinated zidl changes via an explicit local-source
+  override; the released dependency pin remains unchanged.
+
 ## 2026-10-26
 
 - Recover endpoint discovery after a participant is lost and rediscovered. A

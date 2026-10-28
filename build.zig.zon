@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zidl = .{
-            .url = "https://github.com/zz-iot/zidl/archive/refs/tags/v0.3.22-zig.0.17.0.tar.gz",
-            .hash = "zidl-0.3.22-zig.0.17.0-H6NwLrfXMABfGM8VbWNYDmJZ0aofV3LvbfypAokY__iK",
+            .url = "https://github.com/zz-iot/zidl/archive/refs/tags/v0.3.23-zig.0.17.0.tar.gz",
+            .hash = "zidl-0.3.23-zig.0.17.0-H6NwLlBRMQDGbuz0nWyu-Hn4-8FILSi3jh_nMyx0m6wf",
         },
     },
     .paths = .{
@@ -17,6 +17,11 @@
         "idl",
         "test",
         "examples/zig/typesupport-library",
+        // Runtime config migration tests compare the shipped example files.
+        "examples/config",
+        "examples/c/custom-allocator/zzdds.toml",
+        "examples/cpp/custom-allocator/zzdds.toml",
+        "examples/java/listener-pubsub/zzdds.toml",
         // build.zig runs scripts/fix_macos_dylib_exports.sh during a macOS
         // `-Dc-binding` install, so it must travel with the package.
         "scripts",

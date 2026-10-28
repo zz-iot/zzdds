@@ -10,6 +10,8 @@ comptime {
         @compileError("experimental resource construction currently requires the default -Dxtypes=true build");
 }
 
+pub const authoring = if (@import("build_options").resource_authoring) @import("authoring.zig") else struct {};
+
 pub const Type = struct { name: []const u8 };
 pub const Topic = struct { name: []const u8, topic_name: []const u8, type_ref: []const u8 };
 pub const Container = struct { name: []const u8 };
@@ -28,11 +30,18 @@ pub const EndpointQos = struct {
     max_instances: i32 = 1,
     max_samples_per_instance: i32 = 32,
 
-    fn validate(q: EndpointQos) !void {
-        if (q.history_depth <= 0 or q.max_samples <= 0 or q.max_instances <= 0 or
-            q.max_samples_per_instance <= 0 or q.history_depth > q.max_samples_per_instance or
-            q.max_samples_per_instance > q.max_samples or q.max_instances > q.max_samples)
-            return error.InvalidQos;
+    pub fn invalidField(q: EndpointQos) ?[]const u8 {
+        if (q.history_depth <= 0) return "history_depth";
+        if (q.max_samples <= 0) return "max_samples";
+        if (q.max_instances <= 0) return "max_instances";
+        if (q.max_samples_per_instance <= 0) return "max_samples_per_instance";
+        if (q.history_depth > q.max_samples_per_instance) return "history_depth";
+        if (q.max_samples_per_instance > q.max_samples) return "max_samples_per_instance";
+        if (q.max_instances > q.max_samples) return "max_instances";
+        return null;
+    }
+    pub fn validate(q: EndpointQos) !void {
+        if (q.invalidField() != null) return error.InvalidQos;
     }
     fn apply(q: EndpointQos, out: anytype) void {
         out.reliability.kind = q.reliability;

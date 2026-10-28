@@ -81,13 +81,13 @@ test "owned plans instantiate independent writer/reader graphs and exchange byte
     const reader = try ri.reader("main", "endpoint");
     const payload = [_]u8{ 0, 1, 0, 0, 42, 0, 0, 0 };
     try @import("resource_probe").ProbeDataWriter.init(w, testing.allocator).write(.{ .value = 42 }, 0);
-    const sample = zzdds.takeRaw(reader) orelse return error.NoSample;
+    const sample = try takeSample(reader);
     defer sample.deinit();
     try testing.expectEqualSlices(u8, &payload, sample.data);
     try wi.destroy();
     try testing.expectError(error.InvalidState, wi.writer("main", "endpoint"));
     try @import("resource_probe").ProbeDataWriter.init(w2, testing.allocator).write(.{ .value = 42 }, 0);
-    const second = zzdds.takeRaw(reader) orelse return error.NoSample;
+    const second = try takeSample(reader);
     defer second.deinit();
     try testing.expectEqualSlices(u8, &payload, second.data);
 }
@@ -205,6 +205,10 @@ const MatchAction = struct {
 };
 
 test "match callback deletes constructing writer or reader and requests graph destruction" {
+    // This fixture specifically exercises a callback inside create_datawriter /
+    // create_datareader. Shared-runtime listeners run on queued lanes instead;
+    // calling the owner-serialized builder from that worker is not this contract.
+    if (zzdds.runtime.enabled) return error.SkipZigTest;
     for ([_]bool{ true, false }) |writer| {
         const p = definition(writer);
         const peer_p = definition(!writer);
@@ -328,4 +332,24 @@ test "concrete QoS is applied through the public endpoint constructor" {
     try testing.expectEqual(@as(i32, 3), qos.history.depth);
     try testing.expectEqual(@as(i32, 6), qos.resource_limits.max_samples);
     try testing.expectEqual(@as(i16, 0), qos.data_representation.value._buffer.?[0]);
+}
+
+// Shared-runtime delivery may complete after write returns. Wait on the public
+// data-available condition rather than assuming synchronous sample delivery.
+fn takeSample(dr: zzdds.DDS.DataReader) !zzdds.OwnedRawSample {
+    const status = dr.get_statuscondition();
+    try testing.expectEqual(zzdds.DDS.RETCODE_OK, status.set_enabled_statuses(zzdds.DDS.DATA_AVAILABLE_STATUS));
+    const ws = try zzdds.dcps.WaitSetImpl.init(testing.allocator);
+    defer ws.deinit();
+    try testing.expectEqual(zzdds.DDS.RETCODE_OK, ws.toDDSWaitSet().attach_condition(status.as_Condition()));
+    var active: zzdds.DDS.ConditionSeq = .{};
+    defer if (active._buffer) |buffer| testing.allocator.free(buffer[0..active._maximum]);
+    while (true) {
+        while (zzdds.takeRaw(dr)) |sample| {
+            if (sample.info.valid_data) return sample;
+            // Deleting the first writer may enqueue lifecycle-only samples.
+            sample.deinit();
+        }
+        try testing.expectEqual(zzdds.DDS.RETCODE_OK, ws.toDDSWaitSet().wait(&active, .{ .sec = 5, .nanosec = 0 }));
+    }
 }

@@ -51,6 +51,7 @@ pub const protocol = @import("protocol/interface.zig");
 pub const security = @import("security/interface.zig");
 pub const noop_security = @import("security/noop.zig");
 pub const intraprocess = @import("delivery/intraprocess.zig");
+pub const toml = @import("config/toml.zig");
 pub const config = @import("config/schema.zig");
 pub const generated_config = @import("config/generated.zig");
 pub const resolve_config = @import("config/resolve.zig");

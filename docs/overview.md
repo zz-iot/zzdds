@@ -13,6 +13,9 @@
 |---|---|
 | [`typesupport-libraries.md`](typesupport-libraries.md) | Experimental library loading, immutable registration and generation retirement |
 | [`resource-construction.md`](resource-construction.md) | Experimental programmatic resource plans, static bindings and graph ownership |
+| [`resource-authoring.md`](resource-authoring.md) | Strict generated TOML records, source presence and shared QoS profile resolution |
+| [`config-migration-assessment.md`](config-migration-assessment.md) | Existing runtime configuration contracts, conditional settings and migration gates |
+| [`config-migration-plan.md`](config-migration-plan.md) | Reader migration decisions, qualification and zidl/zzdds release order |
 | [`testing.md`](testing.md) | How to run the test suite (all tiers) |
 | [`dev-notes.md`](dev-notes.md) | Zig 0.17.0 API notes, build dependency layout, generated code table |
 | [`roadmap.md`](roadmap.md) | Forward-looking: known gaps, planned features, design tasks, deferred items |
