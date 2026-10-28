@@ -57,15 +57,22 @@ pub const Table = struct {
     }
 };
 pub const Document = struct {
-    arena: std.heap.ArenaAllocator,
+    // Tables retain this allocator for legacy array views. The arena must stay
+    // at the same address when the document is returned or moved by its owner.
+    arena: *std.heap.ArenaAllocator,
     table: Table,
     pub fn deinit(self: *Document) void {
+        const a = self.arena.child_allocator;
         self.arena.deinit();
+        a.destroy(self.arena);
         self.* = undefined;
     }
 };
 pub fn parseOwned(a: std.mem.Allocator, src: []const u8, diag: *Diagnostic, limits: Limits) Error!Document {
-    var arena = std.heap.ArenaAllocator.init(a);
+    diag.* = .{};
+    const arena = try a.create(std.heap.ArenaAllocator);
+    errdefer a.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(a);
     errdefer arena.deinit();
     const table = try parseLocated(arena.allocator(), src, diag, limits);
     return .{ .arena = arena, .table = table };
@@ -547,8 +554,9 @@ test "owned parse rolls back every allocation failure" {
     const Run = struct {
         fn run(a: std.mem.Allocator) !void {
             var diag: Diagnostic = .{};
-            var doc = try parseOwned(a, "[[items]]\nname='a'\n[[items]]\nname='b'\nrecords=[{x=0},{x=1}]", &diag, .{});
+            var doc = try parseOwned(a, "labels=['a']\n[[items]]\nname='a'\n[[items]]\nname='b'\nrecords=[{x=0},{x=1}]", &diag, .{});
             defer doc.deinit();
+            try std.testing.expectEqualStrings("a", (try doc.table.getStringArray("labels")).?[0]);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
@@ -558,4 +566,30 @@ test "nesting budget combines header paths and nested values" {
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.LimitExceeded, parseOwned(std.testing.allocator, "[a.b]\nx=[[1]]", &diag, .{ .max_depth = 3 }));
     try std.testing.expectError(error.LimitExceeded, parseOwned(std.testing.allocator, "a={b.c.d=1}", &diag, .{ .max_depth = 3 }));
+}
+
+test "owned document array accessors remain valid after the document moves" {
+    var diag: Diagnostic = .{};
+    var original = try parseOwned(std.testing.allocator,
+        \\items=['a','b']
+        \\nested={items=['c'],empty=[],wrong=[1]}
+        \\records=[{items=['d']}]
+    , &diag, .{});
+    var doc = original;
+    original = undefined; // Transfer ownership; only doc is deinitialized.
+    defer doc.deinit();
+    // Verify lifetime without first allocating through a potentially stale pointer.
+    try std.testing.expectEqual(doc.arena.allocator().ptr, doc.table.allocator.?.ptr);
+    const nested = (try doc.table.getTable("nested")).?;
+    const record = doc.table.get("records").?.value.array[0].value.table;
+    try std.testing.expectEqual(doc.arena.allocator().ptr, nested.allocator.?.ptr);
+    try std.testing.expectEqual(doc.arena.allocator().ptr, record.allocator.?.ptr);
+    const items = (try doc.table.getStringArray("items")).?;
+    try std.testing.expectEqualStrings("a", items[0]);
+    try std.testing.expectEqualStrings("b", items[1]);
+    try std.testing.expectEqualStrings("c", (try nested.getStringArray("items")).?[0]);
+    try std.testing.expectEqualStrings("d", (try record.getStringArray("items")).?[0]);
+    try std.testing.expectEqual(@as(usize, 0), (try nested.getStringArray("empty")).?.len);
+    try std.testing.expectError(error.TypeMismatch, nested.getStringArray("wrong"));
+    try std.testing.expectEqualStrings("b", (try doc.table.getStringArray("items")).?[1]);
 }
