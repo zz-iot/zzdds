@@ -51,6 +51,7 @@ pub const protocol = @import("protocol/interface.zig");
 pub const security = @import("security/interface.zig");
 pub const noop_security = @import("security/noop.zig");
 pub const intraprocess = @import("delivery/intraprocess.zig");
+pub const toml = @import("config/toml.zig");
 pub const config = @import("config/schema.zig");
 pub const generated_config = @import("config/generated.zig");
 pub const resolve_config = @import("config/resolve.zig");
@@ -84,6 +85,8 @@ pub const createFactoryWithAllocator = factory.createFactoryWithAllocator;
 pub const raw_ops = @import("raw_ops.zig");
 /// Opt-in experimental loaded/static provider management and immutable registration.
 pub const typesupport = if (@import("build_options").typesupport_library) @import("typesupport.zig") else struct {};
+/// Opt-in experimental owned resource plans and native entity construction.
+pub const resources = if (@import("build_options").resource_construction) @import("resources/root.zig") else struct {};
 
 // Flat re-exports from raw_ops so callers can write _zzdds.writeRaw(...) directly.
 pub const writerUsesXcdr2 = raw_ops.writerUsesXcdr2;

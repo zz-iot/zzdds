@@ -1,0 +1,59 @@
+name: Experimental resource construction
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/resource-construction.yml'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'src/**'
+      - 'idl/**'
+      - 'test/resources/**'
+      - 'test/dcps/resource_construction_test.zig'
+      - 'test/dcps/resource_authoring_test.zig'
+      - 'test/config/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.optimize }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        optimize: [Debug, ReleaseSafe]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.0'
+      - name: Resolve, construct, exchange, cancel and clean up
+        run: zig build test-resource-construction -Dresource-construction=true -Doptimize=${{ matrix.optimize }} --summary all
+      - name: LLVM ThreadSanitizer lifecycle tests
+        if: runner.os == 'Linux' && matrix.optimize == 'Debug'
+        run: zig build test-resource-construction -Dresource-construction=true -Dsanitize-thread=true --summary all
+
+  authoring:
+    name: Authoring / ${{ matrix.os }} / ${{ matrix.optimize }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        optimize: [Debug, ReleaseSafe]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.0'
+      - name: Strict decoding, profiles and generated sample exchange
+        run: zig build test-resource-authoring -Dresource-authoring=true -Doptimize=${{ matrix.optimize }} --summary all
+      - name: LLVM ThreadSanitizer authoring and config tests
+        if: runner.os == 'Linux' && matrix.optimize == 'Debug'
+        run: zig build test-resource-authoring -Dresource-authoring=true -Dsanitize-thread=true --summary all

@@ -1,86 +1,27 @@
-//! Configuration resolution.
-//!
-//! Four functions, no hidden precedence: whichever one you call gives you back
-//! a concrete, ordinary config value with no further merging ever applied to
-//! it — `create_participant`/factory calls always use exactly the config object
-//! they're handed. Customize the result by mutating fields directly; there is
-//! no separate "programmatic overrides" layer (see project decision notes).
-//!
-//!   resolveParticipantConfig(alloc)              -> !DomainParticipantConfig
-//!     No file activity — just the IDL-declared @default values. Still runs
-//!     an (empty-table) applyToml pass rather than returning a bare literal;
-//!     see "Why every resolve function always calls applyToml" below. Only
-//!     fails on allocation failure.
-//!
-//!   resolveParticipantConfigFrom(alloc, path)     -> !DomainParticipantConfig
-//!     Reads `path`, applies it over the defaults. Any failure (missing file,
-//!     permission, malformed TOML, a value that doesn't fit its field) is a
-//!     real, propagated error — nothing here is silently swallowed, because a
-//!     caller who named a specific file almost certainly wants to know if it
-//!     didn't work.
-//!
-//!   resolveProcessConfig(alloc)                   -> !ProcessConfig
-//!     Tries "./zzdds.toml". A missing file is fine (falls back to defaults —
-//!     this is the expected common case, most processes have none); a file
-//!     that exists but fails to parse is NOT silently ignored, since that's
-//!     much more likely a real mistake than an intentional absence.
-//!
-//!   resolveProcessConfigFrom(alloc, path)         -> !ProcessConfig
-//!     Same fallible contract as resolveParticipantConfigFrom.
-//!
-//! Env vars are deliberately not part of this at all: they're one value per
-//! process, but config objects here are per-participant/per-factory, and this
-//! library explicitly supports many of each per process — a flat env var can't
-//! express "which one." An application that wants env-driven tweaks can read
-//! them itself and mutate the resolved struct, same as any other override.
-//!
-//! ## Why every resolve function always calls applyToml, even with nothing to apply
-//!
-//! `applyToml` (zidl-generated) unconditionally dupes every string field —
-//! including ones no TOML key overrides, using the field's *current* value as
-//! the fallback — specifically so every field ends up uniformly heap-owned
-//! after the call, never a mix of "heap" and "still a literal default"
-//! depending on which keys happened to be present. That's what lets the
-//! generated `deinit()`/`clone()` free/dupe every string field unconditionally,
-//! with no per-field ownership flag.
-//!
-//! That invariant only holds if applyToml actually ran. A bare `DomainParticipantConfig{}`
-//! that skipped it (several fields default to non-empty literals — e.g.
-//! `timer_clock_name = "default"`, `multicast_group_v4 = "239.255.0.1"`) is
-//! NOT safe to `.deinit()`: `deinit` would try to free those literals and
-//! crash. So every function here that can return a config someone might later
-//! `.deinit()` — including the "nothing to override" cases — runs it through
-//! `applyToml` (against an empty `toml.Table{}` when there's genuinely nothing
-//! to apply) rather than shortcutting to a bare struct literal.
-//!
-//! The corollary: don't hand-construct a bare `.{}` and pass it to
-//! `process.configure()` or call `.deinit()` on one directly — always go
-//! through one of the four functions here first, even if you don't need any
-//! overrides.
-//!
-//! One remaining sharp edge, inherent to `applyToml` itself, not particular to
-//! this file: if `applyToml` returns an error partway through (a value that
-//! doesn't fit its field, etc.), fields *after* the failure point were never
-//! reached and are still whatever literal the struct started with — `deinit()`
-//! is NOT safe to call on that partially-populated result. `resolveXFrom`
-//! propagate such errors via `try` without ever calling `.deinit()` themselves,
-//! so this doesn't arise internally; it only matters if you call `applyToml`
-//! yourself and it fails.
+//! Resolve ordinary owned config values. File defaults, caller field mutation,
+//! one-time process installation and factory snapshots retain their existing policy.
+//! The shared reader replaces only decoding; config-authoring=false selects legacy decoding.
+//! No profile merging, environment overrides or implicit participant file access.
+//! Explicit file failures propagate; ambient process lookup alone treats missing
+//! or inaccessible ./zzdds.toml as defaults. Generated clone/deinit own the returned
+//! fields independently of parsing/report storage.
 
 const std = @import("std");
 const ext = @import("zzdds_ext_generated").zzdds;
 const toml = @import("toml.zig");
+const rt = @import("zidl_rt");
+const reader = @import("read_options.zig");
+const modern = @import("build_options").config_authoring;
+pub const ReadOptions = reader.Options;
+pub const ReadDiagnostics = reader.Diagnostics;
 
 pub const DomainParticipantConfig = ext.DomainParticipantConfig;
 pub const ProcessConfig = ext.ProcessConfig;
 
-/// Just the IDL-declared defaults — no file, no ambient lookup. Still runs an
-/// applyToml pass (against an empty table) so every string field ends up
-/// uniformly heap-owned; see the module doc comment. Only fails on OOM.
+/// Just the IDL-declared defaults, with independently owned strings and lists.
+/// No file or ambient lookup. Only fails on OOM.
 pub fn resolveParticipantConfig(alloc: std.mem.Allocator) !DomainParticipantConfig {
-    var cfg: DomainParticipantConfig = .{};
-    try cfg.applyToml(alloc, toml.Table{});
-    return cfg;
+    return fromTable(DomainParticipantConfig, alloc, toml.Table{});
 }
 
 /// Read `path`, apply it over the defaults. Propagates every failure.
@@ -89,19 +30,17 @@ pub fn resolveParticipantConfigFrom(alloc: std.mem.Allocator, path: []const u8) 
 }
 
 /// The ambient default: try "./zzdds.toml"; a missing file falls back to
-/// defaults (still via applyToml, against an empty table — see the module doc
-/// comment), anything else (malformed content, a value of the wrong type,
-/// permission errors) propagates.
+/// defaults. AccessDenied also retains its established fallback; other errors propagate.
 pub fn resolveProcessConfig(alloc: std.mem.Allocator) !ProcessConfig {
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var buffer: [8192]u8 = undefined;
+    var scratch = std.heap.BufferFirstAllocator.init(&buffer, alloc);
+    var arena = std.heap.ArenaAllocator.init(scratch.allocator());
     defer arena.deinit();
     const table = toml.parseFile(arena.allocator(), "zzdds.toml") catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied => toml.Table{},
         else => |e| return e,
     };
-    var cfg: ProcessConfig = .{};
-    try cfg.applyToml(alloc, table);
-    return cfg;
+    return fromTable(ProcessConfig, alloc, table);
 }
 
 /// Read `path`, apply it over the defaults. Propagates every failure.
@@ -109,17 +48,123 @@ pub fn resolveProcessConfigFrom(alloc: std.mem.Allocator, path: []const u8) !Pro
     return resolveFrom(ProcessConfig, alloc, path);
 }
 
-/// Shared body for the `...From` functions: identical for every top-level
-/// config type, since neither the file I/O nor the generated `applyToml` call
-/// varies by type. The `table`'s own memory (an arena) never needs to outlive
-/// this call — `applyToml` dupes whatever it keeps into `alloc`.
+/// Read a temporary tree and return an independently owned config.
 fn resolveFrom(comptime T: type, alloc: std.mem.Allocator, path: []const u8) !T {
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var buffer: [8192]u8 = undefined;
+    var scratch = std.heap.BufferFirstAllocator.init(&buffer, alloc);
+    var arena = std.heap.ArenaAllocator.init(scratch.allocator());
     defer arena.deinit();
     const table = try toml.parseFile(arena.allocator(), path);
+    return fromTable(T, alloc, table);
+}
+fn fromTable(comptime T: type, alloc: std.mem.Allocator, table: toml.Table) !T {
+    if (comptime modern) return readOwned(T, alloc, table, .{ .unknown_fields = .ignore, .capture_skipped = false }, null);
     var cfg: T = .{};
     try cfg.applyToml(alloc, table);
     return cfg;
+}
+
+/// Strict ordinary-field checks by default; preserves legacy enum spelling.
+/// Requires the config-authoring build. Existing APIs keep their signatures and
+/// ignore unmarked unknowns for compatibility. Diagnostic data is independently owned.
+pub fn resolveParticipantConfigFromWithOptions(alloc: std.mem.Allocator, path: []const u8, options: ReadOptions, diagnostic: *ReadDiagnostics) !DomainParticipantConfig {
+    return resolveWithOptions(DomainParticipantConfig, alloc, path, options, diagnostic);
+}
+pub fn resolveProcessConfigFromWithOptions(alloc: std.mem.Allocator, path: []const u8, options: ReadOptions, diagnostic: *ReadDiagnostics) !ProcessConfig {
+    return resolveWithOptions(ProcessConfig, alloc, path, options, diagnostic);
+}
+fn resolveWithOptions(comptime T: type, alloc: std.mem.Allocator, path: []const u8, options: ReadOptions, diagnostic: *ReadDiagnostics) !T {
+    diagnostic.deinit();
+    if (comptime !modern) {
+        diagnostic.code = error.ConfigAuthoringUnavailable;
+        return error.ConfigAuthoringUnavailable;
+    }
+    var buffer: [8192]u8 = undefined;
+    var scratch = std.heap.BufferFirstAllocator.init(&buffer, alloc);
+    var arena = std.heap.ArenaAllocator.init(scratch.allocator());
+    defer arena.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena.allocator(), .limited(reader.file_limit)) catch |err| {
+        diagnostic.code = err;
+        return err;
+    };
+    var syntax: toml.Diagnostic = .{};
+    const table = toml.parseLocated(arena.allocator(), bytes, &syntax, .{ .max_values = options.max_elements, .max_depth = options.max_depth }) catch |err| {
+        diagnostic.code = err;
+        diagnostic.location = .{ .offset = syntax.location.offset, .line = syntax.location.line, .column = syntax.location.column };
+        return err;
+    };
+    return readOwned(T, alloc, table, options, diagnostic) catch |err| {
+        if (diagnostic.code == null) diagnostic.code = err;
+        return err;
+    };
+}
+fn copyPath(alloc: std.mem.Allocator, path: []const []const u8) ![]const []const u8 {
+    const result = try alloc.alloc([]const u8, path.len);
+    for (path, result) |part, *out| out.* = try alloc.dupe(u8, part);
+    return result;
+}
+fn readOwned(comptime T: type, alloc: std.mem.Allocator, table: toml.Table, options: ReadOptions, diagnostic: ?*ReadDiagnostics) !T {
+    if (comptime !modern) return error.ConfigAuthoringUnavailable;
+    var detail: rt.authoring.Diagnostic = .{};
+    // Small configs need no growing arena blocks from fixed-block allocators.
+    // Larger temporary work falls back only to the caller's allocator.
+    var buffer: [8192]u8 = undefined;
+    var scratch = std.heap.BufferFirstAllocator.init(&buffer, alloc);
+    var decoded = T.decodeToml(scratch.allocator(), table, .{
+        .conditional_members = options.conditional_members,
+        .unknown_fields = switch (options.unknown_fields) {
+            .reject => .reject,
+            .ignore => .ignore,
+        },
+        .enum_matching = switch (options.enum_matching) {
+            .canonical => .canonical,
+            .ascii_case_insensitive => .ascii_case_insensitive,
+        },
+        .capture_element_presence = false,
+        .capture_skipped = diagnostic != null and options.capture_skipped,
+        .max_depth = options.max_depth,
+        .max_string_bytes = options.max_string_bytes,
+        .max_elements = options.max_elements,
+        .max_path_bytes = options.max_path_bytes,
+        .max_skipped = options.max_skipped,
+    }, &detail) catch |err| {
+        const mapped = switch (err) {
+            error.OutOfRange, error.InvalidEnum => error.InvalidValue,
+            else => err,
+        };
+        if (diagnostic) |d| {
+            d.code = err;
+            d.location = .{ .offset = detail.location.offset, .line = detail.location.line, .column = detail.location.column };
+            d.path = detail.path;
+            d.path_len = detail.path_len;
+            d.path_truncated = detail.path_truncated;
+        }
+        return mapped;
+    };
+    defer decoded.deinit();
+    var result = try decoded.value.clone(alloc);
+    errdefer result.deinit(alloc);
+    if (diagnostic) |d| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const skipped = try a.alloc(reader.Skipped, decoded.skipped.len);
+        for (decoded.skipped, skipped) |source, *dest| dest.* = .{
+            .path = try copyPath(a, source.path),
+            .input_path = try copyPath(a, source.input_path),
+            .location = .{ .offset = source.location.offset, .line = source.location.line, .column = source.location.column },
+            .reason = switch (source.reason) {
+                .conditional_unknown => .conditional_unknown,
+                .compatibility_unknown => .compatibility_unknown,
+            },
+        };
+        d.arena = arena;
+        d.skipped = skipped;
+        d.skipped_count = decoded.skipped_count;
+        d.skipped_complete = decoded.skipped_complete;
+    }
+    return result;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -132,8 +177,8 @@ test "resolveParticipantConfig: pure defaults, safely deinit-able" {
     try std.testing.expectEqual(expected.participant.lease_duration_ms, cfg.participant.lease_duration_ms);
     try std.testing.expectEqual(expected.transport.udp.port_base, cfg.transport.udp.port_base);
     try std.testing.expectEqual(expected.discovery.kind, cfg.discovery.kind);
-    // Non-empty literal defaults (e.g. timer_clock_name) must have been duped,
-    // not left as the original literal, or deinit above would crash.
+    // Non-empty defaults must remain independently owned after temporary storage
+    // has been freed.
     try std.testing.expectEqualStrings("default", cfg.participant.timer_clock_name);
 }
 

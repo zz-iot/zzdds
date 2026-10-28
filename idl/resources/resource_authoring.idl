@@ -1,0 +1,40 @@
+// Authored DDS resources; separate from application sample IDL and native handles.
+// Optional QoS fields preserve absence through profile resolution.
+enum ResourceReliability { BEST_EFFORT_RELIABILITY_QOS, RELIABLE_RELIABILITY_QOS };
+struct ResourceQos {
+    @optional ResourceReliability reliability;
+    @optional long history_depth;
+    @optional long max_samples;
+    @optional long max_instances;
+    @optional long max_samples_per_instance;
+};
+struct ResourceProfile {
+    string name;
+    @optional string base;
+    ResourceQos writer_qos;
+    ResourceQos reader_qos;
+};
+struct ResourceType { string name; };
+struct ResourceTopic { string name; string topic_name; string type_ref; };
+struct ResourceContainer { string name; };
+struct ResourceEndpoint {
+    string name; string container_ref; string topic_ref;
+    @optional string profile_ref;
+    ResourceQos qos;
+};
+struct ResourceParticipant {
+    string name;
+    @optional long domain_id;
+    sequence<ResourceType> types;
+    sequence<ResourceTopic> topics;
+    sequence<ResourceContainer> publishers;
+    sequence<ResourceContainer> subscribers;
+    sequence<ResourceEndpoint> writers;
+    sequence<ResourceEndpoint> readers;
+};
+struct ResourceDocument {
+    unsigned long schema_version;
+    string name;
+    sequence<ResourceProfile> profiles;
+    sequence<ResourceParticipant> participants;
+};

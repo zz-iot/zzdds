@@ -853,7 +853,7 @@ jobs:
         # them under `valgrind --quiet`; identical source rebuilt via
         # emit-tests-llvm produced zero). See build.zig's emit-tests-llvm
         # step comment for the full rationale.
-        run: zig build emit-tests-llvm -Doptimize=Debug
+        run: zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
 
       - name: Run tests under Valgrind
         run: |
@@ -919,7 +919,7 @@ jobs:
         run: sudo install -m755 /tmp/kcov-build/src/kcov /usr/local/bin/kcov
 
       - name: Build test binaries
-        run: zig build emit-tests-llvm -Doptimize=Debug
+        run: zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
 
       - name: Run tests under kcov
         run: |

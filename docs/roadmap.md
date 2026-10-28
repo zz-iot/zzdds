@@ -201,6 +201,17 @@ Forward-looking only: known gaps, planned features, and open design questions.
   than its reader requests, and one moved to a non-matching partition, are both unmatched;
   the first is counted once as incompatible.
 
+### Entity cleanup lock order
+
+- Participant-wide `delete_contained_entities` preflights containers while holding
+  the participant mutex. Endpoint deletion acquires those locks in the reverse
+  order (container then participant), producing a TSan lock-order inversion when
+  a creation callback deletes its endpoint and graph cleanup subsequently runs.
+  Resolve the preflight/lifetime protocol with the concurrency work. The experimental
+  resource builder drains/deletes its recorded containers and topics explicitly
+  through public APIs, avoiding the participant-wide cascade; this does not fix
+  the general API's lock order.
+
 ### DCPS / QoS
 
 #### Optional DDS profile builds

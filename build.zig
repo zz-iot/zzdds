@@ -86,6 +86,29 @@ fn typesupportModule(b: *std.Build, package: std.Build.LazyPath, target: std.Bui
     });
 }
 
+// Development override replaces generator, runtime and package sources together.
+const ZidlSource = struct {
+    b: *std.Build,
+    dependency: *std.Build.Dependency,
+    source: ?[]const u8,
+    fn path(self: @This(), sub: []const u8) std.Build.LazyPath {
+        if (self.source) |root| return .{ .cwd_relative = std.fs.path.join(self.b.allocator, &.{ root, sub }) catch @panic("OOM") };
+        return self.dependency.path(sub);
+    }
+};
+fn localZidl(b: *std.Build, source: ZidlSource, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const xtypes = b.createModule(.{ .root_source_file = source.path("packages/zidl-xtypes/src/root.zig"), .target = b.graph.host, .optimize = optimize });
+    const compiler = b.createModule(.{ .root_source_file = source.path("src/root.zig"), .target = b.graph.host, .optimize = optimize, .imports = &.{.{ .name = "zidl_xtypes", .module = xtypes }} });
+    const options = b.addOptions();
+    options.addOption([]const u8, "version_string", "zidl local-development override");
+    return b.addExecutable(.{ .name = "zidl", .root_module = b.createModule(.{
+        .root_source_file = source.path("src/main.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "zidl", .module = compiler }, .{ .name = "build_options", .module = options.createModule() } },
+    }) });
+}
+
 pub fn build(b: *std.Build) void {
     // A native macOS target otherwise inherits the build host's current OS
     // version (for example 26.6.2), making release dylibs unusable to consumers
@@ -100,15 +123,18 @@ pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(target_query);
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
+    const config_authoring = b.option(bool, "config-authoring", "Use the shared runtime config reader (false selects legacy applyToml)") orelse true;
     const debug_allocator = b.option(bool, "debug-allocator", "Route the default (allocator=NULL) factory allocation path through std.heap.DebugAllocator instead of std.heap.c_allocator, for fast attributable double-free/UAF diagnostics") orelse false;
 
     // ── Dependencies ──────────────────────────────────────────────────────────
 
-    const zidl_dep = b.dependency("zidl", .{
+    const zidl_source = b.option([]const u8, "zidl-source", "Absolute local zidl checkout; replaces generator/runtime/package sources together");
+    if (zidl_source) |path| if (!std.fs.path.isAbsolute(path)) @panic("-Dzidl-source must be absolute");
+    const zidl_dep = ZidlSource{ .b = b, .source = zidl_source, .dependency = b.dependency("zidl", .{
         .target = target,
         .optimize = optimize,
         .@"sanitize-thread" = sanitize_thread,
-    });
+    }) };
     // Code generation runs on the build host, even when DDS targets another OS.
     // Keep the target runtime from zidl_dep; the compiler has its own host graph.
     const zidl_tool_dep = b.dependency("zidl", .{
@@ -116,8 +142,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .@"sanitize-thread" = sanitize_thread,
     });
-    const zidl_exe = zidl_tool_dep.artifact("zidl");
-    const zidl_rt_mod = zidl_dep.module("zidl_rt");
+    const zidl_exe = if (zidl_source != null) localZidl(b, zidl_dep, optimize) else zidl_tool_dep.artifact("zidl");
+    const zidl_rt_mod = if (zidl_source != null) b.createModule(.{
+        .root_source_file = zidl_dep.path("packages/zidl-rt/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    }) else zidl_dep.dependency.module("zidl_rt");
 
     // Re-expose zidl's own executable and `zidl_rt` module as zzdds's own, so
     // a downstream Zig consumer (e.g. a zzdds-examples zig/* example) can get
@@ -228,6 +259,7 @@ pub fn build(b: *std.Build) void {
         "--zig-generate-toml-config",
     });
     // See the matching comment on gen_dcps's --zig-generate-c-api above.
+    if (config_authoring) gen_zzdds_vendor.addArg("--zig-generate-authoring");
     if (need_c_abi) gen_zzdds_vendor.addArgs(&.{ "--zig-generate-c-api", "--zig-generate-c-api-cdr-allocator" });
     gen_zzdds_vendor.addArg("-o");
     const gen_zzdds_output_dir = gen_zzdds_vendor.addOutputDirectoryArg("zzdds-generated-ext");
@@ -331,6 +363,7 @@ pub fn build(b: *std.Build) void {
     const interface_monitor = b.option(bool, "interface-monitor", "Include interface change monitoring; if false, interfaces are enumerated once at startup (default: true)") orelse true;
     const wire_trace = b.option(bool, "wire-trace", "Include RTPS wire trace subsystem (default: false)") orelse false;
     const guid_filter = b.option(bool, "guid-filter", "Include GUID-prefix filtering in wire trace (default: false; only meaningful with wire-trace)") orelse false;
+
     const xtypes = b.option(bool, "xtypes", "Include partial DDS-XTypes support: DataRepresentationQosPolicy and optional PID_TYPE_INFORMATION in SEDP; no TypeLookup service (default: true)") orelse true;
     const content_subscription_profile = b.option(bool, "content-subscription-profile", "Enable Content-Subscription profile parser/evaluator for ContentFilteredTopic and QueryCondition; MultiTopic not implemented (DDS v1.4 Annex A, default: true)") orelse true;
     // Contributor-only migration switch (docs/design/concurrency/runtime.md#coexistence-during-migration):
@@ -342,6 +375,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     const build_options_shared_runtime = b.addOptions();
     for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| {
+        opts.addOption(bool, "config_authoring", config_authoring);
         opts.addOption(bool, "ipv4", ipv4);
         opts.addOption(bool, "ipv6", ipv6);
         opts.addOption(bool, "interface_monitor", interface_monitor);
@@ -367,9 +401,16 @@ pub fn build(b: *std.Build) void {
         if (!std.fs.path.isAbsolute(path)) @panic("-Dtypesupport-package must be absolute");
         break :blk .{ .cwd_relative = path };
     } else zidl_dep.path("packages/zidl-typesupport");
-    build_options.addOption(bool, "typesupport_library", typesupport_enabled);
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| opts.addOption(bool, "typesupport_library", typesupport_enabled);
+    const resource_authoring = b.option(bool, "resource-authoring", "Enable experimental strict TOML resources") orelse false;
+    const resources_enabled = b.option(bool, "resource-construction", "Enable experimental programmatic DDS resource construction") orelse resource_authoring;
+    if (resource_authoring and !resources_enabled) @panic("resource authoring requires resource construction");
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| {
+        opts.addOption(bool, "resource_authoring", resource_authoring);
+        opts.addOption(bool, "resource_construction", resources_enabled);
+    }
     const typesupport_dynamic = b.option(bool, "typesupport-dynamic", "Include OS dynamic loading (disable for static providers only)") orelse true;
-    build_options.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
+    for ([_]*std.Build.Step.Options{ build_options, build_options_shared_runtime }) |opts| opts.addOption(bool, "typesupport_dynamic", typesupport_dynamic);
     const typesupport_mod = if (typesupport_enabled)
         typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod)
     else
@@ -390,6 +431,23 @@ pub fn build(b: *std.Build) void {
     zzdds_mod.addOptions("build_options", build_options);
     if (typesupport_mod) |ts| zzdds_mod.addImport("zidl_typesupport", ts);
     zzdds_mod.link_libc = true;
+    var resource_authoring_source: ?std.Build.LazyPath = null;
+    if (resource_authoring) {
+        const gen = b.addRunArtifact(zidl_exe);
+        gen.addArgs(&.{ "-b", "zig", "--single-file", "--zig-generate-authoring", "--no-typesupport", "--no-typeobject-support", "-o" });
+        const output = gen.addOutputDirectoryArg("resource-authoring");
+        gen.addFileArg(b.path("idl/resources/resource_authoring.idl"));
+        resource_authoring_source = output.path(b, "resource_authoring.zig");
+        const schema = b.createModule(.{
+            .root_source_file = resource_authoring_source.?,
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod }},
+        });
+        zzdds_mod.addImport("resource_authoring_generated", schema);
+    }
+
     if (need_c_abi) {
         zzdds_mod.addCSourceFile(.{
             .file = zidl_dep.path("packages/zidl-cdr/src/zidl_cdr.c"),
@@ -1612,6 +1670,13 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_shared_runtime.addOptions("build_options", build_options_shared_runtime);
+    if (resource_authoring_source) |source| zzdds_mod_shared_runtime.addImport("resource_authoring_generated", b.createModule(.{
+        .root_source_file = source,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod }},
+    }));
+    if (typesupport_enabled) zzdds_mod_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod));
     zzdds_mod_shared_runtime.link_libc = true;
     const shared_runtime_test_files = [_][]const u8{
         "test/runtime/shared_runtime_test.zig",
@@ -1730,6 +1795,7 @@ pub fn build(b: *std.Build) void {
         "test/dcps/discovery_race_test.zig",
     };
     var dcps_test_domain: u32 = 1;
+    const resource_test_step = b.step("test-resource-construction", "Test programmatic resource resolution and construction (requires -Dresource-construction=true)");
     for (dcps_test_files) |src| {
         const t = b.addTest(.{
             .name = std.fs.path.stem(src),
@@ -1752,6 +1818,88 @@ pub fn build(b: *std.Build) void {
             .dest_dir = .{ .override = .{ .custom = "tests" } },
         }).step);
     }
+
+    var resource_probe_mod: ?*std.Build.Module = null;
+    var resource_probe_source: ?std.Build.LazyPath = null;
+    if (resources_enabled) {
+        const gen_probe = b.addRunArtifact(zidl_exe);
+        gen_probe.addArgs(&.{ "-b", "zig", "--generate-zzdds-wrappers", "-o" });
+        const probe_dir = gen_probe.addOutputDirectoryArg("resource-probe");
+        gen_probe.addFileArg(b.path("test/resources/resource_probe.idl"));
+        resource_probe_source = probe_dir.path(b, "resource_probe.zig");
+        const probe_mod = b.createModule(.{
+            .root_source_file = resource_probe_source.?,
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .imports = &.{
+                .{ .name = "zzdds", .module = zzdds_mod },
+                .{ .name = "zidl_rt", .module = zidl_rt_mod },
+            },
+        });
+        resource_probe_mod = probe_mod;
+        const t = b.addTest(.{
+            .name = "resource_construction_test",
+            .use_llvm = if (sanitize_thread) true else null,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/dcps/resource_construction_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+                .imports = &.{
+                    .{ .name = "zzdds", .module = zzdds_mod },
+                    .{ .name = "test_domain", .module = test_domain_mod },
+                    .{ .name = "resource_probe", .module = probe_mod },
+                },
+            }),
+        });
+        t.root_module.link_libc = true;
+        const run = addTestRun(b, t, &dcps_test_domain);
+        resource_test_step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
+    } else {
+        resource_test_step.dependOn(&b.addFail("Pass -Dresource-construction=true to run resource construction tests").step);
+    }
+
+    const authoring_tests = b.step("test-resource-authoring", "Test strict TOML authoring and profile resolution");
+    if (resource_authoring) {
+        const t = b.addTest(.{ .name = "resource_authoring_test", .use_llvm = if (sanitize_thread) true else null, .root_module = b.createModule(.{
+            .root_source_file = b.path("test/dcps/resource_authoring_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .imports = &.{ .{ .name = "zzdds", .module = zzdds_mod }, .{ .name = "test_domain", .module = test_domain_mod }, .{ .name = "resource_probe", .module = resource_probe_mod.? } },
+        }) });
+        t.root_module.link_libc = true;
+        const run = addTestRun(b, t, &dcps_test_domain);
+        authoring_tests.dependOn(&run.step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests" } },
+        }).step);
+        authoring_tests.dependOn(resource_test_step);
+        test_step.dependOn(&run.step);
+    } else authoring_tests.dependOn(&b.addFail("Pass -Dresource-authoring=true; see docs/resource-authoring.md").step);
+
+    const config_tests = b.step("test-config-authoring", "Check runtime config migration");
+    if (config_authoring) {
+        const t = b.addTest(.{ .name = "config_migration_test", .use_llvm = if (sanitize_thread) true else null, .root_module = b.createModule(.{
+            .root_source_file = b.path("test/config/migration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .imports = &.{.{ .name = "zzdds", .module = zzdds_mod }},
+        }) });
+        t.root_module.link_libc = true;
+        const run = b.addRunArtifact(t);
+        run.setCwd(b.path("."));
+        config_tests.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+        if (resource_authoring) authoring_tests.dependOn(&run.step);
+        emit_tests_step.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+    } else config_tests.dependOn(&b.addFail("Pass -Dconfig-authoring=true").step);
 
     // `zig build emit-tests-llvm` — like emit-tests above, but every binary
     // is forced onto the LLVM backend (see the identical .use_llvm = true
@@ -1788,7 +1936,11 @@ pub fn build(b: *std.Build) void {
         .target = target_llvm_safe,
         .optimize = optimize,
     });
-    const zidl_rt_mod_llvm_safe = zidl_dep_llvm_safe.module("zidl_rt");
+    const zidl_rt_mod_llvm_safe = if (zidl_source != null) b.createModule(.{
+        .root_source_file = zidl_dep.path("packages/zidl-rt/src/root.zig"),
+        .target = target_llvm_safe,
+        .optimize = optimize,
+    }) else zidl_dep_llvm_safe.module("zidl_rt");
 
     const generated_dcps_mod_llvm_safe = b.createModule(.{
         .root_source_file = gen_output_dir.path(b, "dcps.zig"),
@@ -1827,6 +1979,12 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_llvm_safe.addOptions("build_options", build_options);
+    if (resource_authoring_source) |source| zzdds_mod_llvm_safe.addImport("resource_authoring_generated", b.createModule(.{
+        .root_source_file = source,
+        .target = target_llvm_safe,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe }},
+    }));
     if (typesupport_enabled) zzdds_mod_llvm_safe.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, zidl_rt_mod_llvm_safe));
     zzdds_mod_llvm_safe.link_libc = true;
     if (target_llvm_safe.result.os.tag == .windows) {
@@ -1834,6 +1992,50 @@ pub fn build(b: *std.Build) void {
     }
 
     const emit_tests_llvm_step = b.step("emit-tests-llvm", "Build test binaries (LLVM backend, baseline CPU) for Valgrind and kcov");
+
+    if (config_authoring) {
+        const t = b.addTest(.{
+            .name = "config_migration_test",
+            .use_llvm = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/config/migration_test.zig"),
+                .target = target_llvm_safe,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zzdds", .module = zzdds_mod_llvm_safe }},
+            }),
+        });
+        t.root_module.link_libc = true;
+        emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+            .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+        }).step);
+    }
+
+    if (resource_probe_source) |source| {
+        const probe = b.createModule(.{
+            .root_source_file = source,
+            .target = target_llvm_safe,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "zzdds", .module = zzdds_mod_llvm_safe }, .{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe } },
+        });
+        inline for (.{ "resource_construction_test", "resource_authoring_test" }) |name| {
+            if (!std.mem.eql(u8, name, "resource_authoring_test") or resource_authoring) {
+                const t = b.addTest(.{
+                    .name = name,
+                    .use_llvm = true,
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path("test/dcps/" ++ name ++ ".zig"),
+                        .target = target_llvm_safe,
+                        .optimize = optimize,
+                        .imports = &.{ .{ .name = "zzdds", .module = zzdds_mod_llvm_safe }, .{ .name = "test_domain", .module = test_domain_mod }, .{ .name = "resource_probe", .module = probe } },
+                    }),
+                });
+                t.root_module.link_libc = true;
+                emit_tests_llvm_step.dependOn(&b.addInstallArtifact(t, .{
+                    .dest_dir = .{ .override = .{ .custom = "tests-llvm" } },
+                }).step);
+            }
+        }
+    }
 
     const zzdds_tests_llvm = b.addTest(.{
         .name = "zzdds_lib",
@@ -1980,6 +2182,13 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_llvm_safe_shared_runtime.addOptions("build_options", build_options_shared_runtime);
+    if (resource_authoring_source) |source| zzdds_mod_llvm_safe_shared_runtime.addImport("resource_authoring_generated", b.createModule(.{
+        .root_source_file = source,
+        .target = target_llvm_safe,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod_llvm_safe }},
+    }));
+    if (typesupport_enabled) zzdds_mod_llvm_safe_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target_llvm_safe, optimize, zidl_rt_mod_llvm_safe));
     zzdds_mod_llvm_safe_shared_runtime.link_libc = true;
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{
@@ -2011,7 +2220,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .@"sanitize-thread" = true,
     });
-    const zidl_rt_mod_tsan = zidl_dep_tsan.module("zidl_rt");
+    const zidl_rt_mod_tsan = if (zidl_source != null) b.createModule(.{
+        .root_source_file = zidl_dep.path("packages/zidl-rt/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = true,
+    }) else zidl_dep_tsan.module("zidl_rt");
 
     const generated_dcps_mod_tsan = b.createModule(.{
         .root_source_file = gen_output_dir.path(b, "dcps.zig"),
@@ -2054,6 +2268,13 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_tsan.addOptions("build_options", build_options);
+    if (resource_authoring_source) |source| zzdds_mod_tsan.addImport("resource_authoring_generated", b.createModule(.{
+        .root_source_file = source,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = true,
+        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod_tsan }},
+    }));
     if (typesupport_enabled) zzdds_mod_tsan.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod_tsan));
     zzdds_mod_tsan.link_libc = true;
 
@@ -2111,6 +2332,14 @@ pub fn build(b: *std.Build) void {
         },
     });
     zzdds_mod_tsan_shared_runtime.addOptions("build_options", build_options_shared_runtime);
+    if (resource_authoring_source) |source| zzdds_mod_tsan_shared_runtime.addImport("resource_authoring_generated", b.createModule(.{
+        .root_source_file = source,
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = true,
+        .imports = &.{.{ .name = "zidl_rt", .module = zidl_rt_mod_tsan }},
+    }));
+    if (typesupport_enabled) zzdds_mod_tsan_shared_runtime.addImport("zidl_typesupport", typesupportModule(b, typesupport_package, target, optimize, zidl_rt_mod_tsan));
     zzdds_mod_tsan_shared_runtime.link_libc = true;
     for (shared_runtime_test_files) |src| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
