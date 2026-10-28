@@ -10,6 +10,11 @@ Dated entries (no release tags past `v0.2.1-zig.0.16.0`; `build.zig.zon` is
 
 ## 2026-10-28
 
+- Add optional resource provider bindings: explicit per-participant selections,
+  pinned preparation, exact Minimal identifiers/capabilities, compiled adapters and
+  checked provider writes. Add multi-library startup with artifact hashes and an
+  offline validate/plan versus native inspect example. Keep the zidl pin unchanged.
+
 - Pin zidl v0.3.23-zig.0.17.0 and enable the shared runtime configuration reader
   by default, preserving resolver compatibility and allocator contracts. Keep
   `-Dconfig-authoring=false` as an explicit legacy fallback.

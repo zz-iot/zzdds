@@ -1,4 +1,4 @@
-//! Experimental concrete DDS resource plans. No parser, inheritance or loader.
+//! Experimental concrete DDS resource plans with optional authoring/provider adapters.
 //! Plans own their data. Instances borrow a plan and factory through successful
 //! deinit; all calls are owner-serialized, including reentrant cancel/destroy.
 const std = @import("std");
@@ -9,6 +9,8 @@ comptime {
     if (!@import("build_options").xtypes)
         @compileError("experimental resource construction currently requires the default -Dxtypes=true build");
 }
+
+pub const providers = if (@import("build_options").typesupport_library) @import("providers.zig") else struct {};
 
 pub const authoring = if (@import("build_options").resource_authoring) @import("authoring.zig") else struct {};
 
@@ -141,6 +143,11 @@ pub const Plan = struct {
         errdefer arena.deinit();
         return .{ .application = try copy(Application, arena.allocator(), app), .arena = arena };
     }
+    pub fn clone(self: *const Plan, alloc: std.mem.Allocator) !Plan {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        return .{ .application = try copy(Application, arena.allocator(), self.application), .arena = arena };
+    }
     pub fn deinit(self: *Plan) void {
         self.arena.deinit();
         self.* = undefined;
@@ -151,6 +158,8 @@ pub const Plan = struct {
 /// is borrowed only for build(); do not pass an owned context to registration
 /// repeatedly. No callback or native context appears in the portable Plan.
 pub const StaticBinding = struct {
+    /// Null applies to every participant; a name restricts this binding to that scope.
+    participant: ?[]const u8 = null,
     type_name: []const u8,
     context: ?*anyopaque = null,
     register: *const fn (?*anyopaque, DDS.DomainParticipant, []const u8) anyerror!void,
@@ -212,11 +221,12 @@ pub const Instance = struct {
         if (self.state != .empty) return error.InvalidState;
         // All bindings validated before entity creation, independent of input order.
         for (bindings, 0..) |b, i| for (bindings[0..i]) |other| {
-            if (std.mem.eql(u8, b.type_name, other.type_name)) return error.DuplicateBinding;
+            if (std.mem.eql(u8, b.type_name, other.type_name) and
+                (b.participant == null or other.participant == null or std.mem.eql(u8, b.participant.?, other.participant.?))) return error.DuplicateBinding;
         };
         for (self.plan.application.participants) |p| for (p.types) |t| {
             var found = false;
-            for (bindings) |b| if (std.mem.eql(u8, b.type_name, t.name)) {
+            for (bindings) |b| if (std.mem.eql(u8, b.type_name, t.name) and (b.participant == null or std.mem.eql(u8, b.participant.?, p.name))) {
                 found = true;
                 break;
             };
@@ -237,7 +247,7 @@ pub const Instance = struct {
             l.participant = dp;
             try self.checkpoint();
             for (p.types) |t| {
-                for (bindings) |b| if (std.mem.eql(u8, b.type_name, t.name)) {
+                for (bindings) |b| if (std.mem.eql(u8, b.type_name, t.name) and (b.participant == null or std.mem.eql(u8, b.participant.?, p.name))) {
                     try b.register(b.context, dp, t.name);
                     break;
                 };

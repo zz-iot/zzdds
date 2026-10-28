@@ -17,6 +17,7 @@
         "idl",
         "test",
         "examples/zig/typesupport-library",
+        "examples/zig/resource-inspect",
         // Runtime config migration tests compare the shipped example files.
         "examples/config",
         "examples/c/custom-allocator/zzdds.toml",

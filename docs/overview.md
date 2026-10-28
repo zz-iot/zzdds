@@ -13,6 +13,7 @@
 |---|---|
 | [`typesupport-libraries.md`](typesupport-libraries.md) | Experimental library loading, immutable registration and generation retirement |
 | [`resource-construction.md`](resource-construction.md) | Experimental programmatic resource plans, static bindings and graph ownership |
+| [`resource-providers.md`](resource-providers.md) | Explicit provider bindings, pinned preparations and offline/native inspection |
 | [`resource-authoring.md`](resource-authoring.md) | Strict generated TOML records, source presence and shared QoS profile resolution |
 | [`config-migration-assessment.md`](config-migration-assessment.md) | Existing runtime configuration contracts, conditional settings and migration gates |
 | [`config-migration-plan.md`](config-migration-plan.md) | Reader migration decisions, qualification and zidl/zzdds release order |

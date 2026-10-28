@@ -12,6 +12,8 @@ on:
       - 'test/dcps/resource_construction_test.zig'
       - 'test/dcps/resource_authoring_test.zig'
       - 'test/config/**'
+      - 'test/typesupport/**'
+      - 'examples/zig/resource-inspect/**'
   workflow_dispatch:
 
 permissions:
@@ -57,3 +59,25 @@ jobs:
       - name: LLVM ThreadSanitizer authoring and config tests
         if: runner.os == 'Linux' && matrix.optimize == 'Debug'
         run: zig build test-resource-authoring -Dresource-authoring=true -Dsanitize-thread=true --summary all
+
+  providers:
+    name: Provider bindings / ${{ matrix.os }} / ${{ matrix.optimize }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        optimize: [Debug, ReleaseSafe]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: '0.17.0'
+      - name: Multiple libraries, pinned generations, checked writes and offline CLI
+        run: zig build test-resource-providers test-resource-inspect -Dresource-authoring=true -Dtypesupport-library=true -Doptimize=${{ matrix.optimize }} --summary all
+      - name: Linked descriptors and ordinary compiled adapters without OS loading
+        run: zig build test-resource-providers -Dresource-construction=true -Dtypesupport-library=true -Dtypesupport-dynamic=false -Doptimize=${{ matrix.optimize }} --summary all
+      - name: LLVM ThreadSanitizer provider preparation
+        if: runner.os == 'Linux' && matrix.optimize == 'Debug'
+        run: zig build test-resource-providers -Dresource-construction=true -Dtypesupport-library=true -Dsanitize-thread=true --summary all

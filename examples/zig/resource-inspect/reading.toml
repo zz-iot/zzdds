@@ -1,0 +1,13 @@
+schema_version = 1
+name = "MultiProvider"
+[participants.main]
+domain_id = 42
+types = { "LibraryTest::Reading" = {}, "LibraryTest::Pulse" = {} }
+topics = { reading = { topic_name = "Reading", type_ref = "LibraryTest::Reading" }, pulse = { topic_name = "Pulse", type_ref = "LibraryTest::Pulse" } }
+publishers = { pub = {} }
+[participants.main.writers.reading]
+container_ref = "pub"
+topic_ref = "reading"
+[participants.main.writers.pulse]
+container_ref = "pub"
+topic_ref = "pulse"

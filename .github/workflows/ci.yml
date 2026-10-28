@@ -853,13 +853,15 @@ jobs:
         # them under `valgrind --quiet`; identical source rebuilt via
         # emit-tests-llvm produced zero). See build.zig's emit-tests-llvm
         # step comment for the full rationale.
-        run: zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
+        run: |
+          zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
+          zig build emit-provider-tests -Dresource-construction=true -Dtypesupport-library=true -Dcpu=baseline -Doptimize=Debug
 
       - name: Run tests under Valgrind
         run: |
           set -e
           ERRORS=0
-          for bin in zig-out/tests-llvm/*; do
+          for bin in zig-out/tests-llvm/* zig-out/provider-tests/*; do
             [ -x "$bin" ] || continue
             echo "=== valgrind: $(basename $bin) ==="
             if ! valgrind \
@@ -919,14 +921,16 @@ jobs:
         run: sudo install -m755 /tmp/kcov-build/src/kcov /usr/local/bin/kcov
 
       - name: Build test binaries
-        run: zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
+        run: |
+          zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
+          zig build emit-provider-tests -Dresource-construction=true -Dtypesupport-library=true -Dcpu=baseline -Doptimize=Debug
 
       - name: Run tests under kcov
         run: |
           set -euo pipefail
           test -d zig-out/tests-llvm
           count=0
-          for bin in zig-out/tests-llvm/*; do
+          for bin in zig-out/tests-llvm/* zig-out/provider-tests/*; do
             test -x "$bin"
             kcov --include-path="$(pwd)/src" --strip-path="$(pwd)" \
               --exclude-line=unreachable,@panic coverage/ "$bin"
