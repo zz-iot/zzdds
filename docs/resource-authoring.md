@@ -3,7 +3,9 @@
 Slice 2 extends the shared resource path with a bounded TOML frontend, generated
 presence-aware records and single-base QoS profile resolution. It creates the same
 concrete `resources.Plan` consumed by the programmatic builder. It does not load
-sample types: those still come from application IDL and explicit static bindings.
+sample types: those come from application IDL and explicit bindings. The optional
+[provider layer](resource-providers.md) adds multi-library selection and pinned
+preparations without putting artifact paths in portable resource TOML.
 
 The [migration assessment](config-migration-assessment.md) and
 [migration plan](config-migration-plan.md) preserve ordinary process, factory and

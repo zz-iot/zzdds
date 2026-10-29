@@ -1500,6 +1500,35 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run Zenzen DDS tests");
+    const inspect_step = b.step("resource-inspect", "Build offline plan validation and explicit multi-library inspection example");
+    var inspector: ?*std.Build.Step.Compile = null;
+    if (resource_authoring and typesupport_enabled) {
+        const exe_inspect = b.addExecutable(.{ .name = "resource-inspect", .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/zig/resource-inspect/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zzdds", .module = zzdds_mod }},
+        }) });
+        inspector = exe_inspect;
+        inspect_step.dependOn(&b.addInstallArtifact(exe_inspect, .{}).step);
+        const offline = b.addRunArtifact(exe_inspect);
+        offline.addArgs(&.{"validate"});
+        offline.addFileArg(b.path("examples/zig/resource-inspect/reading.toml"));
+        offline.addArgs(&.{ "--library", "project_a=/no-such-provider-a", "--library", "project_b=/no-such-provider-b", "--bind", "main/LibraryTest::Reading=project_b/LibraryTest::Reading", "--bind", "main/LibraryTest::Pulse=project_a/LibraryTest::Pulse" });
+        const inspect_tests = b.step("test-resource-inspect", "Check offline validation and resolved plan output");
+        inspect_tests.dependOn(&offline.step);
+        const plan_output = b.addRunArtifact(exe_inspect);
+        plan_output.addArg("plan");
+        plan_output.addFileArg(b.path("examples/zig/resource-inspect/reading.toml"));
+        plan_output.addArgs(&.{ "--library", "project_a=/no-such-provider-a", "--library", "project_b=/no-such-provider-b", "--bind", "main/LibraryTest::Reading=project_b/LibraryTest::Reading", "--bind", "main/LibraryTest::Pulse=project_a/LibraryTest::Pulse" });
+        plan_output.expectStdErrMatch("writer reading topic=reading reliability=RELIABLE_RELIABILITY_QOS depth=3 max_samples=24 max_instances=4 max_samples_per_instance=6");
+        plan_output.expectStdErrMatch("reader reading topic=reading reliability=BEST_EFFORT_RELIABILITY_QOS depth=2 max_samples=30 max_instances=5 max_samples_per_instance=6");
+        inspect_tests.dependOn(&plan_output.step);
+        test_step.dependOn(&plan_output.step);
+        test_step.dependOn(&offline.step);
+    } else inspect_step.dependOn(&b.addFail("Pass -Dresource-authoring=true -Dtypesupport-library=true").step);
+
     if (typesupport_mod) |ts| {
         const generator_override = b.option([]const u8, "typesupport-generator", "Absolute path to an alternate zidl generator");
         const generator: std.Build.LazyPath = if (generator_override) |path| blk: {
@@ -1513,7 +1542,7 @@ pub fn build(b: *std.Build) void {
             const fail = b.addFail("typesupport-example requires -Dtypesupport-dynamic=true");
             b.step("typesupport-example", "Build the dynamic typesupport example").dependOn(&fail.step);
         }
-        const integration = @import("test/typesupport/build.zig").addTests(b, zzdds_mod, generated_dcps_mod, zidl_rt_mod, ts, generator, target, optimize, typesupport_dynamic, typesupport_package);
+        const integration = @import("test/typesupport/build.zig").addTests(b, zzdds_mod, generated_dcps_mod, zidl_rt_mod, ts, generator, target, optimize, typesupport_dynamic, resources_enabled, typesupport_package, inspector);
         library_test_step.dependOn(integration);
         test_step.dependOn(integration);
     }

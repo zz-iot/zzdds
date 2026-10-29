@@ -168,3 +168,8 @@ allocation failures, missing bindings, registration failure, late failure after 
 earlier graph was built, retryable deletion, cancellation, and writer/reader deletion
 from a synchronous match callback. In-process delivery establishes local graph reuse;
 it is not evidence of UDP interoperability, broker readiness or manual runtime support.
+
+
+For explicit multi-library sources, generation-pinned preparation and participant-
+scoped bindings, see [resource provider bindings](resource-providers.md). Ordinary
+compiled registrations can continue using this API without the loadable library ABI.

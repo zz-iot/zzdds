@@ -823,13 +823,10 @@ jobs:
     name: Valgrind (memcheck)
     needs: test-linux
     runs-on: ubuntu-latest
-    # Was 15 -- loopback_test.zig's polling deadlines were just raised (5s/3s
-    # -> 20s/15s) to stop spurious failures on a busy shared runner (see that
-    # file's comments), which raises this job's own worst-case ceiling too.
-    # A normal passing run is unaffected either way (those deadlines only
-    # matter on the slow path); this just gives that slow path enough room
-    # to actually recover instead of getting killed by the job timeout first.
-    timeout-minutes: 25
+    # LLVM builds take about 10 minutes on hosted runners. Allow enough time
+    # for both the ordinary and provider suites under Memcheck, including
+    # slower loopback polling paths; the combined job exceeded 25 minutes.
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@v4
@@ -853,13 +850,15 @@ jobs:
         # them under `valgrind --quiet`; identical source rebuilt via
         # emit-tests-llvm produced zero). See build.zig's emit-tests-llvm
         # step comment for the full rationale.
-        run: zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
+        run: |
+          zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
+          zig build emit-provider-tests -Dresource-construction=true -Dtypesupport-library=true -Dcpu=baseline -Doptimize=Debug
 
       - name: Run tests under Valgrind
         run: |
           set -e
           ERRORS=0
-          for bin in zig-out/tests-llvm/*; do
+          for bin in zig-out/tests-llvm/* zig-out/provider-tests/*; do
             [ -x "$bin" ] || continue
             echo "=== valgrind: $(basename $bin) ==="
             if ! valgrind \
@@ -919,14 +918,16 @@ jobs:
         run: sudo install -m755 /tmp/kcov-build/src/kcov /usr/local/bin/kcov
 
       - name: Build test binaries
-        run: zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
+        run: |
+          zig build emit-tests-llvm -Dresource-authoring=true -Doptimize=Debug
+          zig build emit-provider-tests -Dresource-construction=true -Dtypesupport-library=true -Dcpu=baseline -Doptimize=Debug
 
       - name: Run tests under kcov
         run: |
           set -euo pipefail
           test -d zig-out/tests-llvm
           count=0
-          for bin in zig-out/tests-llvm/*; do
+          for bin in zig-out/tests-llvm/* zig-out/provider-tests/*; do
             test -x "$bin"
             kcov --include-path="$(pwd)/src" --strip-path="$(pwd)" \
               --exclude-line=unreachable,@panic coverage/ "$bin"
