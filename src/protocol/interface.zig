@@ -45,6 +45,9 @@ pub const DataFragSubmessage = submsg_mod.DataFragSubmessage;
 pub const EOCProxyInfo = struct {
     locator: Locator,
     reader_guid: Guid,
+    /// Which match of `reader_guid` the writer took this for: a reader
+    /// matched again before the flush is not held for it.
+    reader_match_id: u64 = 0,
     writer_guid: Guid,
     eoc_sn: SequenceNumber,
     /// GROUP scope: the End Coherent Set marker's group coherent set.

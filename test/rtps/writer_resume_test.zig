@@ -16,6 +16,7 @@ const transport = zzdds.transport;
 
 const StatefulWriter = rtps.StatefulWriter;
 const ReaderProxy = rtps.ReaderProxy;
+const ReaderMatch = rtps.ReaderMatch;
 const Guid = rtps.Guid;
 const SequenceNumber = rtps.SequenceNumber;
 const Locator = rtps.Locator;
@@ -271,6 +272,20 @@ const Fixture = struct {
     fn writeOne(ctx: *anyopaque) anyerror!void {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
         try self.write(1);
+    }
+
+    /// Removes reader 0xa1 and matches it again on PORT_A (Outbox.during_send).
+    fn rematchA(ctx: *anyopaque) anyerror!void {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        self.w.removeMatchedReader(makeGuid(0xa1));
+        try self.match(makeGuid(0xa1), PORT_A, false);
+    }
+
+    fn matchOf(self: *Fixture, guid: Guid) ?ReaderMatch {
+        self.w.mu.lock();
+        defer self.w.mu.unlock();
+        for (self.w.reader_proxies.items) |rp| if (rp.guid.eql(guid)) return rp.match();
+        return null;
     }
 
     fn held(self: *Fixture, guid: Guid) ?SequenceNumber {
@@ -538,13 +553,70 @@ test "a reader the publisher's combined end-marker send could not reach is held,
     try testing.expectEqual(@as(?SequenceNumber, 2), f.w.pending_eoc_sn);
     f.outbox.full_port = PORT_A;
     f.outbox.full = true;
-    f.w.flushGroupEOCHBOnly(&.{a});
+    f.w.flushGroupEOCHBOnly(&.{f.matchOf(a).?});
     try testing.expectEqual(@as(?SequenceNumber, 2), f.held(a));
     try testing.expectEqual(@as(?SequenceNumber, null), f.held(b));
 
     f.outbox.drain();
     try f.run();
     try expectSns(&range(1, 2), &f.outbox, PORT_A);
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
+}
+
+test "a send that ends after its reader was matched again leaves the new match alone" {
+    var f: Fixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    const a = makeGuid(0xa1);
+    try f.match(a, PORT_A, false);
+
+    // While SN 1 goes out, `a` is removed and matched again; then the send
+    // would block. That held up the old match, not the new one, which
+    // matched after SN 1 and is sent only what follows.
+    f.outbox.during_send = .{ .ctx = &f, .run = Fixture.rematchA, .then_full = true };
+    try f.write(1);
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
+
+    f.outbox.drain();
+    try f.run();
+    try f.write(1);
+    try expectSns(&.{2}, &f.outbox, PORT_A);
+}
+
+test "a history replay that ends after its reader was matched again leaves the new match alone" {
+    var f: Fixture = undefined;
+    try f.init(.{ .replay_on_match = true });
+    defer f.deinit();
+    try f.write(3);
+    const a = makeGuid(0xa1);
+
+    // While the replay sends SN 1, `a` is removed and matched again, and
+    // the new match's own replay sends it 1 to 3; then the first replay's
+    // send would block. The new match has its history: it is not held.
+    f.outbox.during_send = .{ .ctx = &f, .run = Fixture.rematchA, .then_full = true };
+    try f.match(a, PORT_A, false);
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
+
+    f.outbox.drain();
+    try f.run();
+    try expectSns(&range(1, 3), &f.outbox, PORT_A);
+}
+
+test "a reader matched again before the combined end-marker flush is not held for its old match" {
+    var f: Fixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    const a = makeGuid(0xa1);
+    try f.match(a, PORT_A, false);
+
+    f.w.beginCoherentSet(true);
+    try f.write(1);
+    f.w.endCoherentSet(.coherent_only, false, null, null, true);
+    // The combined send could not reach `a`, which is then matched again.
+    const old = f.matchOf(a).?;
+    try Fixture.rematchA(&f);
+    f.outbox.full = true;
+    f.w.flushGroupEOCHBOnly(&.{old});
     try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
 }
 

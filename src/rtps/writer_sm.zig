@@ -287,6 +287,12 @@ pub const StatelessWriter = struct {
 
 // ── ReaderProxy (StatefulWriter) ──────────────────────────────────────────────
 
+/// One match of a reader (ReaderProxy.match): what code that releases the
+/// writer's `mu` re-finds its proxy by, so a reader removed and matched
+/// again meanwhile is not taken for the match it began with
+/// (StatefulWriter.findMatchLocked).
+pub const ReaderMatch = struct { guid: Guid, id: u64 };
+
 /// State that a StatefulWriter tracks for each matched reader.
 pub const ReaderProxy = struct {
     guid: Guid,
@@ -412,6 +418,9 @@ pub const ReaderProxy = struct {
     /// that send, and its changes stay in the history in case it would block
     /// (StatefulWriter.deferToSenderLocked, trimAckedLocked).
     sending_sn: ?SequenceNumber = null,
+    /// Which match of `guid` this is (ReaderMatch): given by
+    /// addOrRefreshMatchedReaderWith, kept by a lease refresh.
+    match_id: u64 = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -466,6 +475,10 @@ pub const ReaderProxy = struct {
     /// (falling back to multicast_locators when unicast is empty), while still
     /// delivering to every distinct locator tied at that best tier/family (e.g.
     /// a peer advertising both a VPN and a LAN address on the same family).
+    pub fn match(self: *const ReaderProxy) ReaderMatch {
+        return .{ .guid = self.guid, .id = self.match_id };
+    }
+
     pub fn effectiveLocators(self: *const ReaderProxy) []const Locator {
         return self.selected_locators.items;
     }
@@ -592,6 +605,8 @@ pub const StatefulWriter = struct {
     resume_held: bool = false,
     resume_timer: runtime_mod.Timer = undefined,
     writable_waiter: WritableWaiter = .{ .on_writable = onWritable },
+    /// The last ReaderProxy.match_id given. Guarded by `mu`.
+    last_match_id: u64 = 0,
     /// When true, write() defers DATA sends and accumulates SNs in
     /// coherent_pending_sns.  Cleared by endCoherentSet().
     coherent_active: bool,
@@ -819,10 +834,10 @@ pub const StatefulWriter = struct {
         var waiting = false;
         var i: usize = 0;
         while (i < self.reader_proxies.items.len) : (i += 1) {
-            const guid = self.reader_proxies.items[i].guid;
+            const m = self.reader_proxies.items[i].match();
             while (true) {
                 // Re-found each batch: the send releases `mu`.
-                const rp = self.findReaderProxyLocked(guid) orelse break;
+                const rp = self.findMatchLocked(m) orelse break;
                 const from = rp.unsent_from_sn orelse break;
                 // A live send to it is under way: its end resumes it.
                 if (rp.sending_sn != null) break;
@@ -847,7 +862,7 @@ pub const StatefulWriter = struct {
                     rp.unsent_from_sn = null;
                     break;
                 };
-                const p = self.findReaderProxyLocked(guid) orelse break;
+                const p = self.findMatchLocked(m) orelse break;
                 budget -|= @max(1, sent.count);
                 // A live send to it begun before it was held, which would
                 // block too, may have lowered its start meanwhile.
@@ -1175,6 +1190,8 @@ pub const StatefulWriter = struct {
         };
         if (commit) |c| c.install(c.ctx, true);
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
+        self.last_match_id += 1;
+        new_rp.match_id = self.last_match_id;
         new_rp.last_seen_connection_generation = self.connectionGenerationSumLocked(new_rp);
         // Replay only applies when BOTH the writer offers TRANSIENT_LOCAL+ AND
         // this specific reader requested it. A VOLATILE-requesting reader has
@@ -1282,21 +1299,21 @@ pub const StatefulWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        // Collect GUIDs (not pointers) of proxies pending a replay retry
+        // Collect the matches (not pointers) of proxies pending a replay retry
         // during this first, fully-locked pass -- resyncIfGenerationChangedLocked
         // never unlocks, so this loop itself is safe.
-        var retry_guids_buf: [16]Guid = undefined;
+        var retry_buf: [16]ReaderMatch = undefined;
         var n_retry: usize = 0;
         for (self.reader_proxies.items) |*rp| {
             self.resyncIfGenerationChangedLocked(rp);
-            if (rp.pending_replay_retry and n_retry < retry_guids_buf.len) {
+            if (rp.pending_replay_retry and n_retry < retry_buf.len) {
                 rp.pending_replay_retry = false;
-                retry_guids_buf[n_retry] = rp.guid;
+                retry_buf[n_retry] = rp.match();
                 n_retry += 1;
             }
         }
 
-        // Replay each pending-retry proxy by re-finding it via GUID, not by
+        // Replay each pending-retry proxy by re-finding its match, not by
         // a pointer captured above: replayHistoryToProxyUnlocked releases
         // self.mu internally while sending, during which a concurrent
         // addMatchedReader could grow/reallocate self.reader_proxies and
@@ -1306,15 +1323,11 @@ pub const StatefulWriter = struct {
         // ch_sn vs. re-dereferencing ch). Re-reading self.reader_proxies.items
         // fresh on every outer iteration (rather than once before the loop)
         // keeps each lookup valid against the array's current backing
-        // storage; if a proxy disconnected during the unlocked window, the
-        // inner loop simply finds no match and moves on.
-        for (retry_guids_buf[0..n_retry]) |guid| {
-            for (self.reader_proxies.items) |*rp| {
-                if (rp.guid.eql(guid)) {
-                    self.replayHistoryToProxyUnlocked(rp);
-                    break;
-                }
-            }
+        // storage; if a proxy disconnected during the unlocked window, it is
+        // not found and is passed over, and a reader matched again since is
+        // replayed to by its new match.
+        for (retry_buf[0..n_retry]) |m| {
+            if (self.findMatchLocked(m)) |rp| self.replayHistoryToProxyUnlocked(rp);
         }
     }
 
@@ -1479,7 +1492,7 @@ pub const StatefulWriter = struct {
         // live send path skips) until the history, and whatever was
         // published while it went out, has been sent in SN order.
         rp.suppress_live_data = true;
-        const rp_guid = rp.guid;
+        const rp_match = rp.match();
         // The history retained when the replay starts always goes out whole,
         // however many batches it takes (each fragmented sample is one): the
         // cache bounds it, and every batch advances sent_through.
@@ -1487,10 +1500,11 @@ pub const StatefulWriter = struct {
         var sent_through: SequenceNumber = 0;
         var catch_up_rounds: usize = 0;
         while (true) {
-            // Re-found by GUID each round: replayBatchUnlocked releases
-            // self.mu, during which self.reader_proxies can be reallocated
-            // or the proxy removed.
-            const cur = self.findReaderProxyLocked(rp_guid) orelse return;
+            // Re-found each round: replayBatchUnlocked releases self.mu,
+            // during which self.reader_proxies can be reallocated or the
+            // proxy removed (and its reader matched again, replayed to by
+            // that match).
+            const cur = self.findMatchLocked(rp_match) orelse return;
             // Catch-up rounds, for what was published while the replay went
             // out, are bounded so a writer publishing faster than this
             // catches up can't hold the match here: past the bound, live
@@ -1507,7 +1521,7 @@ pub const StatefulWriter = struct {
                 // Live data stays held, so the retry (the next
                 // heartbeat-thread tick, see checkConnectionGenerations)
                 // still reaches the reader ahead of it.
-                if (self.findReaderProxyLocked(rp_guid)) |p| p.pending_replay_retry = true;
+                if (self.findMatchLocked(rp_match)) |p| p.pending_replay_retry = true;
                 log.rtps.warn("StatefulWriter({x}): OOM replaying history to a BEST_EFFORT proxy -- live data to it is held until the replay is retried on the next heartbeat tick", .{
                     self.guid.entity_id.entity_key,
                 });
@@ -1523,7 +1537,7 @@ pub const StatefulWriter = struct {
             if (sent.blocked) {
                 // The rest goes out as the proxy's resume once output is
                 // ready, holding live data the same way.
-                const p = self.findReaderProxyLocked(rp_guid) orelse return;
+                const p = self.findMatchLocked(rp_match) orelse return;
                 p.suppress_live_data = false;
                 self.holdUnsentLocked(p, sent.through + 1);
                 if (p.unsent_from_sn == sent.through + 1) p.unsent_frag = sent.next_frag;
@@ -1537,6 +1551,13 @@ pub const StatefulWriter = struct {
             if (rp.guid.eql(guid)) return rp;
         }
         return null;
+    }
+
+    /// The proxy of match `m`; null once that match is removed, though its
+    /// reader may have been matched again since.
+    fn findMatchLocked(self: *Self, m: ReaderMatch) ?*ReaderProxy {
+        const rp = self.findReaderProxyLocked(m.guid) orelse return null;
+        return if (rp.match_id == m.id) rp else null;
     }
 
     /// What a replayBatchUnlocked step sent.
@@ -1669,6 +1690,7 @@ pub const StatefulWriter = struct {
         const n_locs = @min(locs.len, locs_buf.len);
         @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
         const rp_guid = rp.guid;
+        const rp_match = rp.match();
         const rp_needs_marker_pid = rp.needs_pid_coherent_set_marker;
         const self_guid = self.guid;
         const self_lifespan = self.lifespan;
@@ -1682,7 +1704,7 @@ pub const StatefulWriter = struct {
         self.mu.unlock();
         defer {
             self.mu.lock();
-            if (self_hold) if (self.findReaderProxyLocked(rp_guid)) |p| {
+            if (self_hold) if (self.findMatchLocked(rp_match)) |p| {
                 p.sending_sn = null;
             };
         }
@@ -2379,6 +2401,7 @@ pub const StatefulWriter = struct {
             // comment for the other half of the cycle this closes.
             const ProxySnapshot = struct {
                 guid: Guid,
+                match_id: u64,
                 start_sn: SequenceNumber,
                 locs: [8]Locator = undefined,
                 n_locs: usize = 0,
@@ -2425,7 +2448,7 @@ pub const StatefulWriter = struct {
                     .data_len = @intCast(ch.data.len),
                 } });
                 var s = &snaps[n_snaps];
-                s.* = .{ .guid = rp.guid, .start_sn = rp.start_sn };
+                s.* = .{ .guid = rp.guid, .match_id = rp.match_id, .start_sn = rp.start_sn };
                 s.n_locs = @min(locs.len, s.locs.len);
                 @memcpy(s.locs[0..s.n_locs], locs[0..s.n_locs]);
                 // Follow each DATA with a non-final HEARTBEAT so the reader learns
@@ -2499,7 +2522,7 @@ pub const StatefulWriter = struct {
             self.mu.lock();
             if (ch_sn > self.last_flushed_sn) self.last_flushed_sn = ch_sn;
             if (self_hold) for (snaps[0..n_snaps]) |s| {
-                if (self.findReaderProxyLocked(s.guid)) |rp| self.endSendLocked(rp, ch_sn, s.blocked);
+                if (self.findMatchLocked(.{ .guid = s.guid, .id = s.match_id })) |rp| self.endSendLocked(rp, ch_sn, s.blocked);
             };
         }
     }
@@ -3056,18 +3079,18 @@ pub const StatefulWriter = struct {
     /// Phase 3 of a publisher-level combined end-marker flush (all coherent-access
     /// scopes).  Called after the publisher sent the markers' DATA through
     /// sendCombinedEOCData(): sends each reader a HEARTBEAT announcing the marker,
-    /// so one that missed it NACKs and gets it again.  `unsent` are the readers
-    /// the combined send could not send it to on any locator, as the send
-    /// would block: while the writer holds readers, each is held from the
+    /// so one that missed it NACKs and gets it again.  `unsent` are the matches
+    /// of the readers the combined send could not send it to on any locator,
+    /// as the send would block (one matched again since is left alone): while the writer holds readers, each is held from the
     /// marker, which its resume sends, as for a live marker; otherwise a
     /// best-effort one has lost it.  No-op if none is pending.
-    pub fn flushGroupEOCHBOnly(self: *Self, unsent: []const Guid) void {
+    pub fn flushGroupEOCHBOnly(self: *Self, unsent: []const ReaderMatch) void {
         self.mu.lock();
         defer self.mu.unlock();
         const eoc_sn = self.pending_eoc_sn orelse return;
         self.pending_eoc_sn = null;
-        if (self.resume_held) for (unsent) |guid| {
-            if (self.findReaderProxyLocked(guid)) |rp| self.holdUnsentLocked(rp, eoc_sn);
+        if (self.resume_held) for (unsent) |m| {
+            if (self.findMatchLocked(m)) |rp| self.holdUnsentLocked(rp, eoc_sn);
         };
         if (eoc_sn > self.last_flushed_sn) self.last_flushed_sn = eoc_sn;
         const last_sn = self.lastAvailableSnLocked();
@@ -3170,7 +3193,7 @@ const NullCtx = struct {
     fn close(_: *anyopaque) void {}
 };
 
-const null_vtable = Transport.Vtable{
+pub const test_null_vtable = Transport.Vtable{
     .capabilities = .{},
     .can_reach = NullCtx.canReach,
     .send = NullCtx.send,
@@ -3184,7 +3207,7 @@ const null_vtable = Transport.Vtable{
 };
 
 var null_ctx: NullCtx = .{};
-const null_transport = Transport{ .ctx = &null_ctx, .vtable = &null_vtable };
+const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
 
 test "StatelessWriter init/deinit" {
     const guid = makeGuid(1, 0xC3);

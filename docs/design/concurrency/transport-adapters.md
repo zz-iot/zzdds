@@ -220,7 +220,9 @@ sends the reader what it was not sent, in SN order, releasing the writer's lock 
 batch as the live path does. A best-effort reader's fragmented sample carries on from the
 fragment that would block. While a send to a reader runs with the lock released, nothing
 else is sent to it, so a concurrent write cannot overtake it: that write's change waits in
-the history, and the send resumes the reader when it ends. Protocol messages that would
+the history, and the send resumes the reader when it ends. A send ends for the match it
+began with: a reader removed and matched again meanwhile is a new match, which that send
+neither holds nor resumes. Protocol messages that would
 block are lost, as their content is sent again from current state.
 
 <a id="channels-and-lifetimes"></a>
