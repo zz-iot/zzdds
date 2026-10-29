@@ -38,6 +38,7 @@ pub const SequenceNumber = sn_mod.SequenceNumber;
 pub const RtpsTimestamp = time_mod.RtpsTimestamp;
 pub const Transport = iface.Transport;
 pub const Locator = iface.Locator;
+const WritableWaiter = iface.WritableWaiter;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -64,12 +65,12 @@ fn inlineKeyHash(keyed: bool, kh: [16]u8) ?[16]u8 {
 
 // ── Message send helper ───────────────────────────────────────────────────────
 
-/// Maximum flat buffer size for a single send. Each DATA_FRAG fragment is
-/// sized by `StatefulWriter.frag_size` (default 16384) which is well under
-/// this limit, so fragmented writes never hit it. Unfragmented sends
-/// (payload ≤ frag_size) still return error.MessageTooLarge if the total
-/// RTPS message exceeds 65536 bytes — that is the correct safety net.
-pub const MAX_SEND_BYTES: usize = 65536;
+/// Largest RTPS message sent. Each DATA_FRAG fragment is sized by
+/// `StatefulWriter.frag_size` (default 16384) which is well under this limit,
+/// so fragmented writes never hit it. Unfragmented sends (payload ≤
+/// frag_size) still return error.MessageTooLarge if the total RTPS message
+/// exceeds 65536 bytes — that is the correct safety net.
+pub const MAX_SEND_BYTES: usize = Transport.max_flattened_send;
 
 /// What a caller installs with a match of a remote endpoint, in the same
 /// critical section as its proxy, so the two are one update (see
@@ -100,17 +101,39 @@ pub const MatchResult = enum { added, refreshed, superseded };
 /// Default fragment size used when no explicit value is provided.
 pub const DEFAULT_FRAG_SIZE: u16 = 16384;
 
-/// Flatten scatter-gather iovecs into a stack buffer and deliver via transport.
+/// Sends one message given as a gather list. A send that would block is a
+/// lost datagram, counted by the transport; reliable endpoints repair it as
+/// any other (docs/design/concurrency/transport-adapters.md#output-submission).
+/// Protocol messages go this way: what a lost one said is sent again from
+/// current state. DATA to a matched reader goes through `sendDataIovecs`.
 pub fn sendIovecs(transport: Transport, locator: *const Locator, iovecs: []const IoVec) !void {
-    var buf: [MAX_SEND_BYTES]u8 = undefined;
-    var pos: usize = 0;
-    for (iovecs) |iov| {
-        const src = iov.base[0..iov.len];
-        if (pos + src.len > buf.len) return error.MessageTooLarge;
-        @memcpy(buf[pos..][0..src.len], src);
-        pos += src.len;
+    _ = try transport.sendGather(locator, iovecs);
+}
+
+/// Sends one DATA or DATA_FRAG message to each of a reader's locators.
+/// False when it would block, no locator took it and the writer holds
+/// readers (`hold`, StatefulWriter.resume_held): the reader did not get it,
+/// and is sent it again once output is ready. Otherwise a send that would
+/// block is lost as for `sendIovecs`. Any other failure is logged and counts
+/// as sent: holding the reader would not help.
+fn sendDataIovecs(transport: Transport, locs: []const Locator, iovecs: []const IoVec, hold: bool) bool {
+    var took = false;
+    var blocked = false;
+    for (locs) |*loc| {
+        const outcome = transport.sendGather(loc, iovecs) catch |err| {
+            switch (err) {
+                // SEDP already filtered proxy locators to those canReach(); this is defence-in-depth.
+                error.UnsupportedLocatorKind => {},
+                else => log.rtps.warn("StatefulWriter: DATA send error: {}", .{err}),
+            }
+            continue;
+        };
+        switch (outcome) {
+            .completed => took = true,
+            .would_block => blocked = true,
+        }
     }
-    try transport.send(locator, buf[0..pos]);
+    return took or !blocked or !hold;
 }
 
 // ── StatelessWriter ───────────────────────────────────────────────────────────
@@ -264,6 +287,12 @@ pub const StatelessWriter = struct {
 
 // ── ReaderProxy (StatefulWriter) ──────────────────────────────────────────────
 
+/// One match of a reader (ReaderProxy.match): what code that releases the
+/// writer's `mu` re-finds its proxy by, so a reader removed and matched
+/// again meanwhile is not taken for the match it began with
+/// (StatefulWriter.findMatchLocked).
+pub const ReaderMatch = struct { guid: Guid, id: u64 };
+
 /// State that a StatefulWriter tracks for each matched reader.
 pub const ReaderProxy = struct {
     guid: Guid,
@@ -372,6 +401,26 @@ pub const ReaderProxy = struct {
     /// where the change stays durably in self.cache for RELIABLE proxies to
     /// recover via HEARTBEAT/ACKNACK).
     pending_replay_retry: bool = false,
+    /// First SN this proxy has not been sent because a send to it would
+    /// block, while the writer waits for the transport's output; null
+    /// otherwise. Live data to it is held, and it is sent from here on in SN
+    /// order once output is ready (StatefulWriter.resumeHeldLocked), so
+    /// a full send buffer delays its data rather than losing it
+    /// (docs/design/concurrency/transport-adapters.md#output-submission).
+    unsent_from_sn: ?SequenceNumber = null,
+    /// When `unsent_from_sn` is a fragmented sample a best-effort reader was
+    /// sent part of: the first fragment it was not sent, where its resume
+    /// carries on. 1 otherwise.
+    unsent_frag: u32 = 1,
+    /// The first SN of a send to this proxy under way with the writer's `mu`
+    /// released, while the writer holds readers (`resume_held`); null
+    /// otherwise. Nothing else is sent to it meanwhile, so nothing overtakes
+    /// that send, and its changes stay in the history in case it would block
+    /// (StatefulWriter.deferToSenderLocked, trimAckedLocked).
+    sending_sn: ?SequenceNumber = null,
+    /// Which match of `guid` this is (ReaderMatch): given by
+    /// addOrRefreshMatchedReaderWith, kept by a lease refresh.
+    match_id: u64 = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -426,6 +475,10 @@ pub const ReaderProxy = struct {
     /// (falling back to multicast_locators when unicast is empty), while still
     /// delivering to every distinct locator tied at that best tier/family (e.g.
     /// a peer advertising both a VPN and a LAN address on the same family).
+    pub fn match(self: *const ReaderProxy) ReaderMatch {
+        return .{ .guid = self.guid, .id = self.match_id };
+    }
+
     pub fn effectiveLocators(self: *const ReaderProxy) []const Locator {
         return self.selected_locators.items;
     }
@@ -544,6 +597,16 @@ pub const StatefulWriter = struct {
     hb_timer: runtime_mod.Timer = undefined,
     hb_latch: CloseLatch = .{},
     hb_armed: bool = false,
+    /// With a runtime whose transport reports writability: a proxy whose
+    /// send would block is held (ReaderProxy.unsent_from_sn) rather than
+    /// losing the data, and `resume_timer` sends it what it was not sent
+    /// once `writable_waiter` reports the output ready. Set once, with
+    /// `runtime`; the timer fires in `hb_ctx`.
+    resume_held: bool = false,
+    resume_timer: runtime_mod.Timer = undefined,
+    writable_waiter: WritableWaiter = .{ .on_writable = onWritable },
+    /// The last ReaderProxy.match_id given. Guarded by `mu`.
+    last_match_id: u64 = 0,
     /// When true, write() defers DATA sends and accumulates SNs in
     /// coherent_pending_sns.  Cleared by endCoherentSet().
     coherent_active: bool,
@@ -664,6 +727,8 @@ pub const StatefulWriter = struct {
         self.hb_ctx = runtime_mod.Context.init(rt, 0);
         self.hb_ctx.on_closed = self.hb_latch.hook();
         self.hb_timer = runtime_mod.Timer.init(&self.hb_ctx, onHeartbeatTimer);
+        self.resume_timer = runtime_mod.Timer.init(&self.hb_ctx, onResumeTimer);
+        self.resume_held = self.transport.canNotifyWritable();
     }
 
     /// Arms the heartbeat timer if a reliable reader is matched and it is not
@@ -691,6 +756,140 @@ pub const StatefulWriter = struct {
         defer self.mu.unlock();
         self.hb_armed = false;
         self.armHeartbeatLocked(turn.now_ns);
+    }
+
+    /// Holds `rp`'s data from `sn` on, as a send of `sn` to it would block,
+    /// and waits for the transport's output. With `resume_held` only. Caller
+    /// holds `mu`.
+    fn holdUnsentLocked(self: *Self, rp: *ReaderProxy, sn: SequenceNumber) void {
+        std.debug.assert(self.resume_held);
+        markUnsent(rp, sn);
+        self.waitWritableLocked();
+    }
+
+    /// Lowers `rp`'s held start to `sn`. A new start begins at its first
+    /// fragment.
+    fn markUnsent(rp: *ReaderProxy, sn: SequenceNumber) void {
+        const from = if (rp.unsent_from_sn) |cur| @min(cur, sn) else sn;
+        if (rp.unsent_from_sn != from) rp.unsent_frag = 1;
+        rp.unsent_from_sn = from;
+    }
+
+    /// Whether a send to `rp` is under way with `mu` released (`sending_sn`).
+    /// Then `sn` is not sent to it now, which could overtake that send:
+    /// `rp` is held from `sn`, and the sender resumes it once its send ends
+    /// (endSendLocked). Caller holds `mu`.
+    pub fn deferToSenderLocked(rp: *ReaderProxy, sn: SequenceNumber) bool {
+        if (rp.sending_sn == null) return false;
+        markUnsent(rp, sn);
+        return true;
+    }
+
+    /// Ends a send of `sn` to `rp` made with `mu` released: holds it if the
+    /// send would block, else resumes what was deferred to the send
+    /// meanwhile. Caller holds `mu`.
+    fn endSendLocked(self: *Self, rp: *ReaderProxy, sn: SequenceNumber, blocked: bool) void {
+        rp.sending_sn = null;
+        if (blocked) {
+            self.holdUnsentLocked(rp, sn);
+        } else if (rp.unsent_from_sn != null and !self.hb_stopping.load(.acquire)) {
+            const rt = self.runtime.?;
+            _ = rt.armTimerNoLater(&self.resume_timer, rt.clock.nowNs());
+        }
+    }
+
+    /// Queues `writable_waiter`, unless stopping: stopHeartbeat cancels it
+    /// once, under the same `mu`. Caller holds `mu`.
+    fn waitWritableLocked(self: *Self) void {
+        if (self.hb_stopping.load(.acquire)) return;
+        self.transport.notifyWritable(&self.writable_waiter);
+    }
+
+    /// The transport may take output again: resume in this writer's context.
+    /// Runs on whatever thread found the output ready, so it only arms the
+    /// timer.
+    fn onWritable(w: *WritableWaiter) void {
+        const self: *Self = @fieldParentPtr("writable_waiter", w);
+        const rt = self.runtime.?;
+        _ = rt.armTimerNoLater(&self.resume_timer, rt.clock.nowNs());
+    }
+
+    fn onResumeTimer(t: *runtime_mod.Timer, turn: *runtime_mod.Turn) void {
+        const self: *Self = @fieldParentPtr("resume_timer", t);
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.resumeHeldLocked(turn.now_ns);
+    }
+
+    /// Changes a resume turn sends before it yields to other work.
+    const RESUME_BUDGET: usize = 64;
+
+    /// Sends each held proxy what it was not sent, in SN order, and stops
+    /// holding it once it has everything the live path has sent others. A
+    /// proxy whose send would block again stays held, and the writer waits
+    /// for output again. Past RESUME_BUDGET changes the turn ends and the
+    /// timer runs again. Caller holds `mu`, which is released while sending.
+    fn resumeHeldLocked(self: *Self, now_ns: i64) void {
+        var budget = RESUME_BUDGET;
+        var waiting = false;
+        var i: usize = 0;
+        while (i < self.reader_proxies.items.len) : (i += 1) {
+            const m = self.reader_proxies.items[i].match();
+            while (true) {
+                // Re-found each batch: the send releases `mu`.
+                const rp = self.findMatchLocked(m) orelse break;
+                const from = rp.unsent_from_sn orelse break;
+                // A live send to it is under way: its end resumes it.
+                if (rp.sending_sn != null) break;
+                if (budget == 0) {
+                    if (!self.hb_stopping.load(.acquire))
+                        _ = self.runtime.?.armTimerNoLater(&self.resume_timer, now_ns);
+                    self.trimAckedLocked();
+                    return;
+                }
+                const batch = self.replayBatchUnlocked(rp, from - 1, budget) catch {
+                    // Still held: the next heartbeat tick tries again.
+                    if (!self.hb_stopping.load(.acquire))
+                        _ = self.runtime.?.armTimerNoLater(&self.resume_timer, now_ns + HB_INTERVAL_NS);
+                    log.rtps.warn("StatefulWriter({x}): OOM resuming a held reader -- retrying on the next heartbeat tick", .{
+                        self.guid.entity_id.entity_key,
+                    });
+                    self.trimAckedLocked();
+                    return;
+                };
+                const sent = batch orelse {
+                    // Nothing left, and `mu` was not released.
+                    rp.unsent_from_sn = null;
+                    break;
+                };
+                const p = self.findMatchLocked(m) orelse break;
+                budget -|= @max(1, sent.count);
+                // A live send to it begun before it was held, which would
+                // block too, may have lowered its start meanwhile.
+                if (p.unsent_from_sn) |cur| {
+                    if (cur == from) {
+                        p.unsent_from_sn = sent.through + 1;
+                        p.unsent_frag = sent.next_frag;
+                    }
+                }
+                if (sent.blocked) {
+                    self.waitWritableLocked();
+                    waiting = true;
+                    break;
+                }
+            }
+        }
+        // The list may have changed while `mu` was released, passing over a
+        // held proxy. Output that becomes ready resumes every one; without
+        // that wait, another turn does. One with a send under way is resumed
+        // when that send ends (endSendLocked).
+        if (!waiting and !self.hb_stopping.load(.acquire)) {
+            for (self.reader_proxies.items) |rp| if (rp.unsent_from_sn != null and rp.sending_sn == null) {
+                _ = self.runtime.?.armTimerNoLater(&self.resume_timer, now_ns);
+                break;
+            };
+        }
+        self.trimAckedLocked();
     }
 
     pub fn setLifespan(self: *Self, ls: ?time_mod.RtpsDuration) void {
@@ -765,6 +964,10 @@ pub const StatefulWriter = struct {
             // A second call, from `deinit`, may come after the owner has
             // released the runtime, so it must not touch it.
             if (stopped) return;
+            // Nothing queues the waiter again once stopping (waitWritableLocked),
+            // and a resume it armed before this is cancelled with the timer.
+            self.transport.cancelWritable(&self.writable_waiter);
+            rt.cancelTimer(&self.resume_timer);
             rt.cancelTimer(&self.hb_timer);
             // A fire never runs code that deletes this writer.
             const closed = self.hb_latch.close(&self.hb_ctx, discardFire);
@@ -856,13 +1059,16 @@ pub const StatefulWriter = struct {
 
     /// With `drop_acked`, drops the changes every reliable reader has
     /// acknowledged, never one not yet sent (the last flushed SN caps it: an
-    /// open coherent set's changes, or one being sent with `mu` released).
-    /// Caller must hold `mu`.
+    /// open coherent set's changes; so does a held proxy, best effort too,
+    /// which is still to be sent what it was not, and a send under way with
+    /// `mu` released, which may yet hold its proxy). Caller must hold `mu`.
     fn trimAckedLocked(self: *Self) void {
         if (!self.drop_acked) return;
         var floor = self.last_flushed_sn;
         for (self.reader_proxies.items) |rp| {
             if (rp.reliable) floor = @min(floor, rp.highest_acked_sn);
+            if (rp.unsent_from_sn) |from| floor = @min(floor, from - 1);
+            if (rp.sending_sn) |sn| floor = @min(floor, sn - 1);
         }
         if (floor <= self.trimmed_through) return;
         self.cache.removeWriterChangesUpTo(floor);
@@ -984,6 +1190,8 @@ pub const StatefulWriter = struct {
         };
         if (commit) |c| c.install(c.ctx, true);
         const new_rp = &self.reader_proxies.items[self.reader_proxies.items.len - 1];
+        self.last_match_id += 1;
+        new_rp.match_id = self.last_match_id;
         new_rp.last_seen_connection_generation = self.connectionGenerationSumLocked(new_rp);
         // Replay only applies when BOTH the writer offers TRANSIENT_LOCAL+ AND
         // this specific reader requested it. A VOLATILE-requesting reader has
@@ -1091,21 +1299,21 @@ pub const StatefulWriter = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        // Collect GUIDs (not pointers) of proxies pending a replay retry
+        // Collect the matches (not pointers) of proxies pending a replay retry
         // during this first, fully-locked pass -- resyncIfGenerationChangedLocked
         // never unlocks, so this loop itself is safe.
-        var retry_guids_buf: [16]Guid = undefined;
+        var retry_buf: [16]ReaderMatch = undefined;
         var n_retry: usize = 0;
         for (self.reader_proxies.items) |*rp| {
             self.resyncIfGenerationChangedLocked(rp);
-            if (rp.pending_replay_retry and n_retry < retry_guids_buf.len) {
+            if (rp.pending_replay_retry and n_retry < retry_buf.len) {
                 rp.pending_replay_retry = false;
-                retry_guids_buf[n_retry] = rp.guid;
+                retry_buf[n_retry] = rp.match();
                 n_retry += 1;
             }
         }
 
-        // Replay each pending-retry proxy by re-finding it via GUID, not by
+        // Replay each pending-retry proxy by re-finding its match, not by
         // a pointer captured above: replayHistoryToProxyUnlocked releases
         // self.mu internally while sending, during which a concurrent
         // addMatchedReader could grow/reallocate self.reader_proxies and
@@ -1115,15 +1323,11 @@ pub const StatefulWriter = struct {
         // ch_sn vs. re-dereferencing ch). Re-reading self.reader_proxies.items
         // fresh on every outer iteration (rather than once before the loop)
         // keeps each lookup valid against the array's current backing
-        // storage; if a proxy disconnected during the unlocked window, the
-        // inner loop simply finds no match and moves on.
-        for (retry_guids_buf[0..n_retry]) |guid| {
-            for (self.reader_proxies.items) |*rp| {
-                if (rp.guid.eql(guid)) {
-                    self.replayHistoryToProxyUnlocked(rp);
-                    break;
-                }
-            }
+        // storage; if a proxy disconnected during the unlocked window, it is
+        // not found and is passed over, and a reader matched again since is
+        // replayed to by its new match.
+        for (retry_buf[0..n_retry]) |m| {
+            if (self.findMatchLocked(m)) |rp| self.replayHistoryToProxyUnlocked(rp);
         }
     }
 
@@ -1178,7 +1382,7 @@ pub const StatefulWriter = struct {
             for (self.cache.changes.items) |*ch| {
                 if (ch.data.len <= self.frag_size) continue;
                 self.hb_count += 1;
-                self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
+                _ = self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
                 break; // only the first fragmented change needs priming
             }
             return;
@@ -1191,7 +1395,7 @@ pub const StatefulWriter = struct {
             while (next_marker < self.end_markers.items.len and
                 self.end_markers.items[next_marker].sn < ch.sequence_number) : (next_marker += 1)
             {
-                self.sendEndMarkerToProxyLocked(rp, self.end_markers.items[next_marker], &scratch);
+                _ = self.sendEndMarkerToProxyLocked(rp, self.end_markers.items[next_marker], &scratch);
             }
             self.tracer.submit(.{ .send_data = .{
                 .src_prefix = self.guid.prefix,
@@ -1203,7 +1407,7 @@ pub const StatefulWriter = struct {
             } });
             if (ch.data.len > self.frag_size) {
                 self.hb_count += 1;
-                self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch);
+                _ = self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch, 1);
             } else {
                 var b = MessageBuilder.init(&scratch, self.guid.prefix);
                 b.addInfoDst(rp.guid.prefix);
@@ -1229,7 +1433,7 @@ pub const StatefulWriter = struct {
                 }
             }
         }
-        for (self.end_markers.items[next_marker..]) |m| self.sendEndMarkerToProxyLocked(rp, m, &scratch);
+        for (self.end_markers.items[next_marker..]) |m| _ = self.sendEndMarkerToProxyLocked(rp, m, &scratch);
     }
 
     /// Like replayHistoryToProxyLocked, but for addMatchedReader's
@@ -1274,7 +1478,7 @@ pub const StatefulWriter = struct {
             for (self.cache.changes.items) |*ch| {
                 if (ch.data.len <= self.frag_size) continue;
                 self.hb_count += 1;
-                self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
+                _ = self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
                 break; // only the first fragmented change needs priming
             }
             return;
@@ -1288,7 +1492,7 @@ pub const StatefulWriter = struct {
         // live send path skips) until the history, and whatever was
         // published while it went out, has been sent in SN order.
         rp.suppress_live_data = true;
-        const rp_guid = rp.guid;
+        const rp_match = rp.match();
         // The history retained when the replay starts always goes out whole,
         // however many batches it takes (each fragmented sample is one): the
         // cache bounds it, and every batch advances sent_through.
@@ -1296,10 +1500,11 @@ pub const StatefulWriter = struct {
         var sent_through: SequenceNumber = 0;
         var catch_up_rounds: usize = 0;
         while (true) {
-            // Re-found by GUID each round: replayBatchUnlocked releases
-            // self.mu, during which self.reader_proxies can be reallocated
-            // or the proxy removed.
-            const cur = self.findReaderProxyLocked(rp_guid) orelse return;
+            // Re-found each round: replayBatchUnlocked releases self.mu,
+            // during which self.reader_proxies can be reallocated or the
+            // proxy removed (and its reader matched again, replayed to by
+            // that match).
+            const cur = self.findMatchLocked(rp_match) orelse return;
             // Catch-up rounds, for what was published while the replay went
             // out, are bounded so a writer publishing faster than this
             // catches up can't hold the match here: past the bound, live
@@ -1312,11 +1517,11 @@ pub const StatefulWriter = struct {
                 }
                 catch_up_rounds += 1;
             }
-            const last = self.replayBatchUnlocked(cur, sent_through) catch {
+            const batch = self.replayBatchUnlocked(cur, sent_through, std.math.maxInt(usize)) catch {
                 // Live data stays held, so the retry (the next
                 // heartbeat-thread tick, see checkConnectionGenerations)
                 // still reaches the reader ahead of it.
-                if (self.findReaderProxyLocked(rp_guid)) |p| p.pending_replay_retry = true;
+                if (self.findMatchLocked(rp_match)) |p| p.pending_replay_retry = true;
                 log.rtps.warn("StatefulWriter({x}): OOM replaying history to a BEST_EFFORT proxy -- live data to it is held until the replay is retried on the next heartbeat tick", .{
                     self.guid.entity_id.entity_key,
                 });
@@ -1324,10 +1529,20 @@ pub const StatefulWriter = struct {
             };
             // null: nothing left, and self.mu was not released, so `cur`
             // is still valid.
-            sent_through = last orelse {
+            const sent = batch orelse {
                 cur.suppress_live_data = false;
                 return;
             };
+            sent_through = sent.through;
+            if (sent.blocked) {
+                // The rest goes out as the proxy's resume once output is
+                // ready, holding live data the same way.
+                const p = self.findMatchLocked(rp_match) orelse return;
+                p.suppress_live_data = false;
+                self.holdUnsentLocked(p, sent.through + 1);
+                if (p.unsent_from_sn == sent.through + 1) p.unsent_frag = sent.next_frag;
+                return;
+            }
         }
     }
 
@@ -1338,15 +1553,37 @@ pub const StatefulWriter = struct {
         return null;
     }
 
-    /// One step of a BEST_EFFORT history replay: sends `rp`, in SN order,
+    /// The proxy of match `m`; null once that match is removed, though its
+    /// reader may have been matched again since.
+    fn findMatchLocked(self: *Self, m: ReaderMatch) ?*ReaderProxy {
+        const rp = self.findReaderProxyLocked(m.guid) orelse return null;
+        return if (rp.match_id == m.id) rp else null;
+    }
+
+    /// What a replayBatchUnlocked step sent.
+    const Batch = struct {
+        /// Last SN the reader was sent: `after` when the first send would block.
+        through: SequenceNumber,
+        /// A send would block, so nothing after `through` was sent.
+        blocked: bool,
+        /// Samples and markers sent.
+        count: usize = 0,
+        /// With `blocked` at a fragmented sample sent to a best-effort
+        /// reader: the first fragment of `through + 1` not sent. 1 otherwise.
+        next_frag: u32 = 1,
+    };
+
+    /// One step of a BEST_EFFORT history replay or of a held proxy's resume
+    /// (resumeHeldLocked): sends `rp`, in SN order, at most `max_changes` of
     /// the samples and retained end markers above `after`, up to
     /// lastSentSnLocked (a coherent set still open goes out when it ends,
-    /// as live data), and returns the last SN sent, or null when there is
-    /// none.  The run stops before a fragmented sample; one at the head of
-    /// the run is sent on its own, under self.mu, as sendChangeToAllLocked's
-    /// fragmented branch is.  Otherwise self.mu is released while sending
-    /// (see replayHistoryToProxyUnlocked), so `rp` is invalid on return.
-    fn replayBatchUnlocked(self: *Self, rp: *ReaderProxy, after: SequenceNumber) !?SequenceNumber {
+    /// as live data), stopping at a send that would block. Returns null when
+    /// there is nothing to send.  The run stops before a fragmented sample;
+    /// one at the head of the run is sent on its own, under self.mu, as
+    /// sendChangeToAllLocked's fragmented branch is.  Otherwise self.mu is
+    /// released while sending (see replayHistoryToProxyUnlocked), so `rp` is
+    /// invalid on return.
+    fn replayBatchUnlocked(self: *Self, rp: *ReaderProxy, after: SequenceNumber, max_changes: usize) !?Batch {
         const locs = rp.effectiveLocators();
         if (locs.len == 0) return null;
         const through = self.lastSentSnLocked();
@@ -1374,16 +1611,22 @@ pub const StatefulWriter = struct {
         const markers = self.end_markers.items;
         var next_marker: usize = 0;
         while (next_marker < markers.len and markers[next_marker].sn <= after) next_marker += 1;
-        var stopped_at_frag = false;
+        // At a fragmented sample, or at `max_changes`.
+        var stopped = false;
         for (self.cache.changes.items) |*ch| {
             if (ch.sequence_number <= after) continue;
             if (ch.sequence_number > through) break;
             while (next_marker < markers.len and markers[next_marker].sn < ch.sequence_number) : (next_marker += 1) {
+                if (changes.items.len == max_changes) break;
                 try changes.append(self.alloc, markerSnapshot(ChangeSnapshot, markers[next_marker]));
+            }
+            if (changes.items.len == max_changes) {
+                stopped = true;
+                break;
             }
             if (ch.data.len > self.frag_size) {
                 if (changes.items.len > 0) {
-                    stopped_at_frag = true;
+                    stopped = true;
                     break;
                 }
                 self.tracer.submit(.{ .send_data = .{
@@ -1396,8 +1639,19 @@ pub const StatefulWriter = struct {
                 } });
                 var scratch: [SCRATCH_SIZE]u8 = undefined;
                 self.hb_count += 1;
-                self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch);
-                return ch.sequence_number;
+                // A reliable reader NACK_FRAGs the rest, as on the live path.
+                // A best-effort one carries on from the fragment a held
+                // resume stopped at, so a send buffer that drains less than
+                // a whole sample at a time still gets it all out.
+                if (rp.reliable) {
+                    const took = self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
+                    return .{ .through = if (took) ch.sequence_number else after, .blocked = !took, .count = @intFromBool(took) };
+                }
+                const first_frag = if (rp.unsent_from_sn == ch.sequence_number) rp.unsent_frag else 1;
+                if (self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch, first_frag)) |frag| {
+                    return .{ .through = after, .blocked = true, .next_frag = frag };
+                }
+                return .{ .through = ch.sequence_number, .blocked = false, .count = 1 };
             }
             const data_copy = try self.alloc.dupe(u8, ch.data);
             changes.append(self.alloc, .{
@@ -1423,27 +1677,39 @@ pub const StatefulWriter = struct {
                 .data_len = @intCast(ch.data.len),
             } });
         }
-        if (!stopped_at_frag) {
-            while (next_marker < markers.len and markers[next_marker].sn <= through) : (next_marker += 1) {
+        if (!stopped) {
+            while (next_marker < markers.len and markers[next_marker].sn <= through and
+                changes.items.len < max_changes) : (next_marker += 1)
+            {
                 try changes.append(self.alloc, markerSnapshot(ChangeSnapshot, markers[next_marker]));
             }
         }
         if (changes.items.len == 0) return null;
-        const last_sn = changes.items[changes.items.len - 1].sn;
 
         var locs_buf: [8]Locator = undefined;
         const n_locs = @min(locs.len, locs_buf.len);
         @memcpy(locs_buf[0..n_locs], locs[0..n_locs]);
         const rp_guid = rp.guid;
+        const rp_match = rp.match();
         const rp_needs_marker_pid = rp.needs_pid_coherent_set_marker;
         const self_guid = self.guid;
         const self_lifespan = self.lifespan;
         const self_transport = self.transport;
         const self_keyed = self.keyed;
+        const self_hold = self.resume_held;
+        // Live sends to it wait for this one (deferToSenderLocked), and its
+        // changes stay in the history in case it would block.
+        if (self_hold) rp.sending_sn = changes.items[0].sn;
 
         self.mu.unlock();
-        defer self.mu.lock();
+        defer {
+            self.mu.lock();
+            if (self_hold) if (self.findMatchLocked(rp_match)) |p| {
+                p.sending_sn = null;
+            };
+        }
 
+        var sent: Batch = .{ .through = after, .blocked = false };
         for (changes.items) |c| {
             var b_scratch: [SCRATCH_SIZE]u8 = undefined;
             var b = MessageBuilder.init(&b_scratch, self_guid.prefix);
@@ -1466,14 +1732,14 @@ pub const StatefulWriter = struct {
                     .lifespan = if (c.kind == .alive) self_lifespan else null,
                 }, c.data);
             }
-            for (locs_buf[0..n_locs]) |loc| {
-                sendIovecs(self_transport, &loc, b.iovecs()) catch |err| switch (err) {
-                    error.UnsupportedLocatorKind => {},
-                    else => log.rtps.warn("StatefulWriter.addMatchedReader: replay error: {}", .{err}),
-                };
+            if (!sendDataIovecs(self_transport, locs_buf[0..n_locs], b.iovecs(), self_hold)) {
+                sent.blocked = true;
+                break;
             }
+            sent.through = c.sn;
+            sent.count += 1;
         }
-        return last_sn;
+        return sent;
     }
 
     /// Sends the initial HEARTBEAT to a newly-matched reader proxy that
@@ -1941,7 +2207,7 @@ pub const StatefulWriter = struct {
                         if (frag_budget.* > 0) {
                             frag_budget.* -= 1;
                             w.hb_count += 1;
-                            w.sendFrag1ToProxyLocked(proxy, ch, w.hb_count, s);
+                            _ = w.sendFrag1ToProxyLocked(proxy, ch, w.hb_count, s);
                         } else {
                             w.hb_count += 1;
                             var b = MessageBuilder.init(s, w.guid.prefix);
@@ -1993,7 +2259,7 @@ pub const StatefulWriter = struct {
                         // marker, else GAP it so the reader stops asking.
                         if (sn < self.cache.next_sn) {
                             if (self.findEndMarkerLocked(sn)) |m| {
-                                self.sendEndMarkerToProxyLocked(rp, m, &scratch);
+                                _ = self.sendEndMarkerToProxyLocked(rp, m, &scratch);
                             } else {
                                 const gap_list = msg.submessage.SequenceNumberSet{
                                     .base = sn + 1,
@@ -2083,7 +2349,9 @@ pub const StatefulWriter = struct {
         if (fragmented) {
             var scratch: [SCRATCH_SIZE]u8 = undefined;
             for (self.reader_proxies.items) |*rp| {
-                if (rp.suppress_live_data) continue;
+                // A held proxy gets this from its resume, in SN order.
+                if (rp.suppress_live_data or rp.unsent_from_sn != null) continue;
+                if (deferToSenderLocked(rp, ch.sequence_number)) continue;
                 const locs = rp.effectiveLocators();
                 if (locs.len == 0) continue;
                 log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{
@@ -2103,9 +2371,12 @@ pub const StatefulWriter = struct {
                 // in the live path would saturate the reader's UDP recv buffer when
                 // a NACK_FRAG recovery burst (N-1 frags) is still in flight.
                 if (rp.reliable) {
-                    self.sendFrag1ToProxyLocked(rp, ch, hb_count_snap, &scratch);
-                } else {
-                    self.sendFragsToProxyLocked(rp, ch, hb_count_snap, &scratch);
+                    if (!self.sendFrag1ToProxyLocked(rp, ch, hb_count_snap, &scratch))
+                        self.holdUnsentLocked(rp, ch.sequence_number);
+                } else if (self.sendFragsToProxyLocked(rp, ch, hb_count_snap, &scratch, 1)) |frag| {
+                    // Its resume carries on from this fragment.
+                    self.holdUnsentLocked(rp, ch.sequence_number);
+                    rp.unsent_frag = frag;
                 }
             }
             // self.mu is held throughout this branch (no unlock above), so
@@ -2130,10 +2401,13 @@ pub const StatefulWriter = struct {
             // comment for the other half of the cycle this closes.
             const ProxySnapshot = struct {
                 guid: Guid,
+                match_id: u64,
                 start_sn: SequenceNumber,
                 locs: [8]Locator = undefined,
                 n_locs: usize = 0,
                 hb: ?struct { last_sn: SequenceNumber, cache_first: SequenceNumber, count: i32 } = null,
+                /// The DATA would block: hold the proxy once relocked.
+                blocked: bool = false,
             };
             const cache_last = self.lastAvailableSnLocked();
             const cache_first = self.firstAvailableSnLocked();
@@ -2144,10 +2418,21 @@ pub const StatefulWriter = struct {
                 return;
             };
             defer self.alloc.free(snaps);
+            // ch may become invalid once self.mu is released (e.g. a
+            // concurrent write() or KEEP_LAST eviction) -- copy its payload
+            // and fixed fields out now while still locked. Before the proxies
+            // are marked as being sent to, so a failure leaves none marked.
+            const data_copy = self.alloc.dupe(u8, ch.data) catch {
+                self.sendChangeToAllNonFragLockedFallback(ch);
+                if (ch.sequence_number > self.last_flushed_sn) self.last_flushed_sn = ch.sequence_number;
+                return;
+            };
+            defer self.alloc.free(data_copy);
             var n_snaps: usize = 0;
 
             for (self.reader_proxies.items) |*rp| {
-                if (rp.suppress_live_data) continue;
+                if (rp.suppress_live_data or rp.unsent_from_sn != null) continue;
+                if (deferToSenderLocked(rp, ch.sequence_number)) continue;
                 const locs = rp.effectiveLocators();
                 if (locs.len == 0) continue;
                 log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{
@@ -2163,7 +2448,7 @@ pub const StatefulWriter = struct {
                     .data_len = @intCast(ch.data.len),
                 } });
                 var s = &snaps[n_snaps];
-                s.* = .{ .guid = rp.guid, .start_sn = rp.start_sn };
+                s.* = .{ .guid = rp.guid, .match_id = rp.match_id, .start_sn = rp.start_sn };
                 s.n_locs = @min(locs.len, s.locs.len);
                 @memcpy(s.locs[0..s.n_locs], locs[0..s.n_locs]);
                 // Follow each DATA with a non-final HEARTBEAT so the reader learns
@@ -2179,18 +2464,11 @@ pub const StatefulWriter = struct {
                     self.hb_count += 1;
                     s.hb = .{ .last_sn = cache_last, .cache_first = cache_first, .count = self.hb_count };
                 }
+                // Until relocked, sends to it wait for this one.
+                if (self.resume_held) rp.sending_sn = ch.sequence_number;
                 n_snaps += 1;
             }
 
-            // ch may become invalid once self.mu is released (e.g. a
-            // concurrent write() or KEEP_LAST eviction) -- copy its payload
-            // and fixed fields out now while still locked.
-            const data_copy = self.alloc.dupe(u8, ch.data) catch {
-                self.sendChangeToAllNonFragLockedFallback(ch);
-                if (ch.sequence_number > self.last_flushed_sn) self.last_flushed_sn = ch.sequence_number;
-                return;
-            };
-            defer self.alloc.free(data_copy);
             const ch_sn = ch.sequence_number;
             const ch_key_hash = ch.key_hash;
             const ch_kind = ch.kind;
@@ -2203,10 +2481,11 @@ pub const StatefulWriter = struct {
             const self_lifespan = self.lifespan;
             const self_transport = self.transport;
             const self_keyed = self.keyed;
+            const self_hold = self.resume_held;
 
             self.mu.unlock();
 
-            for (snaps[0..n_snaps]) |s| {
+            for (snaps[0..n_snaps]) |*s| {
                 var scratch: [SCRATCH_SIZE]u8 = undefined;
                 var b = MessageBuilder.init(&scratch, self_guid.prefix);
                 b.addInfoDst(s.guid.prefix);
@@ -2224,12 +2503,9 @@ pub const StatefulWriter = struct {
                     .writer_group_info = ch_writer_group_info,
                     .lifespan = if (ch_kind == .alive) self_lifespan else null,
                 }, data_copy);
-                for (s.locs[0..s.n_locs]) |loc| {
-                    sendIovecs(self_transport, &loc, b.iovecs()) catch |err| switch (err) {
-                        // SEDP already filtered proxy locators to those canReach(); this is defence-in-depth.
-                        error.UnsupportedLocatorKind => {},
-                        else => log.rtps.warn("StatefulWriter.write: send error: {}", .{err}),
-                    };
+                if (!sendDataIovecs(self_transport, s.locs[0..s.n_locs], b.iovecs(), self_hold)) {
+                    s.blocked = true;
+                    continue;
                 }
                 if (s.hb) |hb| {
                     self.sendHeartbeatUnlocked(s.guid, s.start_sn, s.locs[0..s.n_locs], false, hb.last_sn, hb.count, hb.cache_first);
@@ -2245,6 +2521,9 @@ pub const StatefulWriter = struct {
             // held again (Greptile PR #64 finding -- confirmed real).
             self.mu.lock();
             if (ch_sn > self.last_flushed_sn) self.last_flushed_sn = ch_sn;
+            if (self_hold) for (snaps[0..n_snaps]) |s| {
+                if (self.findMatchLocked(.{ .guid = s.guid, .id = s.match_id })) |rp| self.endSendLocked(rp, ch_sn, s.blocked);
+            };
         }
     }
 
@@ -2319,24 +2598,28 @@ pub const StatefulWriter = struct {
         }
     }
 
-    /// Send a fragmented change to a single reader proxy as N DATA_FRAG datagrams
-    /// followed by one HEARTBEAT_FRAG (§8.4.14).  Called under self.mu.
+    /// Send a fragmented change to a single reader proxy as DATA_FRAG
+    /// datagrams, fragments `first_frag` to N, followed by one HEARTBEAT_FRAG
+    /// (§8.4.14).  Called under self.mu.  Returns the fragment that would
+    /// block (sendDataIovecs), which the reader is to be sent from, with
+    /// those after it; null once all are sent.
     fn sendFragsToProxyLocked(
         self: *Self,
         rp: *const ReaderProxy,
         ch: *const CacheChange,
         hb_count: i32,
         scratch: *[SCRATCH_SIZE]u8,
-    ) void {
+        first_frag: u32,
+    ) ?u32 {
         const locs = rp.effectiveLocators();
-        if (locs.len == 0) return;
+        if (locs.len == 0) return null;
 
         const frag_size: usize = self.frag_size;
         const data_size: u32 = @intCast(ch.data.len);
         const num_frags: u32 = @intCast((ch.data.len + frag_size - 1) / frag_size);
 
-        var frag_num: u32 = 1;
-        var offset: usize = 0;
+        var frag_num: u32 = first_frag;
+        var offset: usize = @as(usize, first_frag - 1) * frag_size;
         while (offset < ch.data.len) : ({
             frag_num += 1;
             offset += frag_size;
@@ -2363,10 +2646,7 @@ pub const StatefulWriter = struct {
                 .writer_group_info = if (frag_num == 1) ch.writer_group_info else null,
                 .lifespan = if (frag_num == 1 and ch.kind == .alive) self.lifespan else null,
             }, ch.data[offset..][0..this_len]);
-            for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
-                error.UnsupportedLocatorKind => {}, // same defence-in-depth as DATA path above
-                else => log.rtps.warn("StatefulWriter: DATA_FRAG {}/{} send error: {}", .{ frag_num, num_frags, err }),
-            };
+            if (!sendDataIovecs(self.transport, locs, b.iovecs(), self.resume_held)) return frag_num;
         }
 
         // HEARTBEAT_FRAG tells the reader all fragments 1..num_frags are available.
@@ -2374,21 +2654,23 @@ pub const StatefulWriter = struct {
         b.addInfoDst(rp.guid.prefix);
         b.addHeartbeatFrag(rp.guid.entity_id, self.guid.entity_id, ch.sequence_number, num_frags, hb_count);
         for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
+        return null;
     }
 
     /// Send only fragment 1 of a fragmented change followed by a HEARTBEAT_FRAG.
     /// Used for reliable readers in the live write path so that a NACK_FRAG
     /// recovery burst (frags 2..N) already in flight cannot overlap with a fresh
     /// full-fragment burst and overflow the reader's UDP recv buffer.
+    /// False when fragment 1 would block, as for sendFragsToProxyLocked.
     fn sendFrag1ToProxyLocked(
         self: *Self,
         rp: *const ReaderProxy,
         ch: *const CacheChange,
         hb_count: i32,
         scratch: *[SCRATCH_SIZE]u8,
-    ) void {
+    ) bool {
         const locs = rp.effectiveLocators();
-        if (locs.len == 0) return;
+        if (locs.len == 0) return true;
 
         const frag_size: usize = self.frag_size;
         const num_frags: u32 = @intCast((ch.data.len + frag_size - 1) / frag_size);
@@ -2413,10 +2695,7 @@ pub const StatefulWriter = struct {
                 .writer_group_info = ch.writer_group_info,
                 .lifespan = if (ch.kind == .alive) self.lifespan else null,
             }, ch.data[0..@min(frag_size, ch.data.len)]);
-            for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch |err| switch (err) {
-                error.UnsupportedLocatorKind => {},
-                else => log.rtps.warn("StatefulWriter: DATA_FRAG 1/{} send error: {}", .{ num_frags, err }),
-            };
+            if (!sendDataIovecs(self.transport, locs, b.iovecs(), self.resume_held)) return false;
         }
         {
             var hb = MessageBuilder.init(scratch, self.guid.prefix);
@@ -2424,6 +2703,7 @@ pub const StatefulWriter = struct {
             hb.addHeartbeatFrag(rp.guid.entity_id, self.guid.entity_id, ch.sequence_number, num_frags, hb_count);
             for (locs) |loc| sendIovecs(self.transport, &loc, hb.iovecs()) catch {};
         }
+        return true;
     }
 
     /// Handle an incoming NACK_FRAG from a matched reader.
@@ -2511,13 +2791,16 @@ pub const StatefulWriter = struct {
     /// A marker still waiting for the publisher's combined send
     /// (pending_eoc_sn) stays: takeEOCProxyInfos reads its group fields, and a
     /// GROUP writer that wrote nothing in the set, with only best-effort
-    /// readers, would otherwise lose it as soon as it was added.
+    /// readers, would otherwise lose it as soon as it was added. So does one
+    /// a held proxy is still to be sent.
     fn retireEndMarkersLocked(self: *Self) void {
         var i: usize = 0;
         while (i < self.end_markers.items.len) {
             const m = self.end_markers.items[i];
             const set_cached = self.cache.hasWriterChangeIn(m.first_sn, m.last_sn);
-            if (!set_cached and m.sn != self.pending_eoc_sn and self.allProxiesAckedLocked(m.sn)) {
+            if (!set_cached and m.sn != self.pending_eoc_sn and self.allProxiesAckedLocked(m.sn) and
+                !self.holdsLocked(m.sn))
+            {
                 _ = self.end_markers.orderedRemove(i);
             } else {
                 i += 1;
@@ -2535,6 +2818,16 @@ pub const StatefulWriter = struct {
                 excess -= 1;
             }
         }
+    }
+
+    /// Whether a held proxy is still to be sent `sn`, or a send under way may
+    /// hold one from `sn` or earlier. Caller holds `mu`.
+    fn holdsLocked(self: *const Self, sn: SequenceNumber) bool {
+        for (self.reader_proxies.items) |rp| {
+            if (rp.unsent_from_sn) |from| if (from <= sn) return true;
+            if (rp.sending_sn) |from| if (from <= sn) return true;
+        }
+        return false;
     }
 
     /// Lowest SN this writer can still send: its oldest cached sample or
@@ -2577,11 +2870,15 @@ pub const StatefulWriter = struct {
         return if (self.coherent_active) @min(last, self.last_flushed_sn) else last;
     }
 
-    fn sendEndMarkerToProxyLocked(self: *Self, rp: *const ReaderProxy, m: EndMarker, scratch: *[SCRATCH_SIZE]u8) void {
+    /// Sends `m` to `rp`. False when it would block and the writer holds
+    /// readers, as sendDataIovecs: the caller holds `rp` from `m.sn` where it
+    /// can, since a best-effort reader that misses a marker cannot have it
+    /// repaired.
+    fn sendEndMarkerToProxyLocked(self: *Self, rp: *const ReaderProxy, m: EndMarker, scratch: *[SCRATCH_SIZE]u8) bool {
         var b = MessageBuilder.init(scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
         b.addData(m.dataParams(rp.guid.entity_id, self.guid.entity_id, rp.needs_pid_coherent_set_marker), &.{});
-        for (rp.effectiveLocators()) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
+        return sendDataIovecs(self.transport, rp.effectiveLocators(), b.iovecs(), self.resume_held);
     }
 
     /// Returns true if `sn` is inside the current coherent window and should
@@ -2762,9 +3059,13 @@ pub const StatefulWriter = struct {
         if (defer_eoc) return;
         var eoc_scratch: [SCRATCH_SIZE]u8 = undefined;
         for (self.reader_proxies.items) |*rp| {
-            if (rp.suppress_live_data) continue;
+            // A held proxy gets the retained marker from its resume, after
+            // the set.
+            if (rp.suppress_live_data or rp.unsent_from_sn != null) continue;
+            if (deferToSenderLocked(rp, eoc_sn)) continue;
             if (rp.effectiveLocators().len == 0) continue;
-            self.sendEndMarkerToProxyLocked(rp, marker, &eoc_scratch);
+            if (!self.sendEndMarkerToProxyLocked(rp, marker, &eoc_scratch))
+                self.holdUnsentLocked(rp, eoc_sn);
         }
         if (eoc_sn > self.last_flushed_sn) self.last_flushed_sn = eoc_sn;
         // One heartbeat after the whole set, announcing the marker too, so a
@@ -2778,12 +3079,19 @@ pub const StatefulWriter = struct {
     /// Phase 3 of a publisher-level combined end-marker flush (all coherent-access
     /// scopes).  Called after the publisher sent the markers' DATA through
     /// sendCombinedEOCData(): sends each reader a HEARTBEAT announcing the marker,
-    /// so one that missed it NACKs and gets it again.  No-op if none is pending.
-    pub fn flushGroupEOCHBOnly(self: *Self) void {
+    /// so one that missed it NACKs and gets it again.  `unsent` are the matches
+    /// of the readers the combined send could not send it to on any locator,
+    /// as the send would block (one matched again since is left alone): while the writer holds readers, each is held from the
+    /// marker, which its resume sends, as for a live marker; otherwise a
+    /// best-effort one has lost it.  No-op if none is pending.
+    pub fn flushGroupEOCHBOnly(self: *Self, unsent: []const ReaderMatch) void {
         self.mu.lock();
         defer self.mu.unlock();
         const eoc_sn = self.pending_eoc_sn orelse return;
         self.pending_eoc_sn = null;
+        if (self.resume_held) for (unsent) |m| {
+            if (self.findMatchLocked(m)) |rp| self.holdUnsentLocked(rp, eoc_sn);
+        };
         if (eoc_sn > self.last_flushed_sn) self.last_flushed_sn = eoc_sn;
         const last_sn = self.lastAvailableSnLocked();
         const first_available = self.firstAvailableSnLocked();
@@ -2885,7 +3193,7 @@ const NullCtx = struct {
     fn close(_: *anyopaque) void {}
 };
 
-const null_vtable = Transport.Vtable{
+pub const test_null_vtable = Transport.Vtable{
     .capabilities = .{},
     .can_reach = NullCtx.canReach,
     .send = NullCtx.send,
@@ -2899,7 +3207,7 @@ const null_vtable = Transport.Vtable{
 };
 
 var null_ctx: NullCtx = .{};
-const null_transport = Transport{ .ctx = &null_ctx, .vtable = &null_vtable };
+const null_transport = Transport{ .ctx = &null_ctx, .vtable = &test_null_vtable };
 
 test "StatelessWriter init/deinit" {
     const guid = makeGuid(1, 0xC3);

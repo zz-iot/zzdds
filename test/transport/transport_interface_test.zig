@@ -218,3 +218,62 @@ test "Locator.isInvalidOrReserved: custom with non-reserved kind is not reserved
     const custom = Locator{ .custom = .{ .kind = 99, .port = 0, .address = @as([16]u8, @splat(0)) } };
     try testing.expect(!custom.isInvalidOrReserved());
 }
+
+// ── Transport.sendGather ──────────────────────────────────────────────────────
+
+/// A transport with only the flat `send`: records what it is given, or
+/// fails as a full send buffer would.
+const FlatOnly = struct {
+    got: [16]u8 = undefined,
+    got_len: usize = 0,
+    sends: u32 = 0,
+    would_block: bool = false,
+
+    const vtable: iface.Transport.Vtable = .{
+        .capabilities = .{ .unicast = true },
+        .can_reach = canReach,
+        .send = send,
+        .listen = undefined,
+        .join_multicast = undefined,
+        .leave_multicast = undefined,
+        .unlisten = undefined,
+        .unicast_locators = undefined,
+        .set_locator_change_handler = undefined,
+        .close = undefined,
+    };
+
+    fn transport(self: *FlatOnly) iface.Transport {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    fn canReach(_: *anyopaque, _: *const Locator) bool {
+        return true;
+    }
+    fn send(ctx: *anyopaque, _: *const Locator, data: []const u8) anyerror!void {
+        const self: *FlatOnly = @ptrCast(@alignCast(ctx));
+        self.sends += 1;
+        if (self.would_block) return error.WouldBlock;
+        @memcpy(self.got[0..data.len], data);
+        self.got_len = data.len;
+    }
+};
+
+test "sendGather flattens for a transport without send_gather, and reports its WouldBlock as an outcome" {
+    var flat: FlatOnly = .{};
+    const t = flat.transport();
+    const to = Locator.udp4(.{ 127, 0, 0, 1 }, 7400);
+    const parts = [_]iface.IoVec{
+        .{ .base = "ab", .len = 2 },
+        .{ .base = "cde", .len = 3 },
+    };
+    try testing.expectEqual(iface.SendOutcome.completed, try t.sendGather(&to, &parts));
+    try testing.expectEqualStrings("abcde", flat.got[0..flat.got_len]);
+
+    flat.would_block = true;
+    try testing.expectEqual(iface.SendOutcome.would_block, try t.sendGather(&to, &parts));
+
+    // Too large for one message: refused before reaching the transport.
+    const big: [iface.Transport.max_flattened_send]u8 = @splat(0);
+    const too_big = [_]iface.IoVec{ .{ .base = &big, .len = big.len }, .{ .base = "x", .len = 1 } };
+    try testing.expectError(error.MessageTooLarge, t.sendGather(&to, &too_big));
+    try testing.expectEqual(@as(u32, 2), flat.sends);
+}

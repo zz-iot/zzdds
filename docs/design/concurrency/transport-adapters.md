@@ -206,6 +206,25 @@ Sending becomes a submission with one of the four outcomes in
 * A TCP dial is nonblocking: the connection completes on output readiness, so a dial
   never blocks the executor that requested it.
 
+**Implemented so far.** `Transport.send_gather` takes the gather list and returns
+`completed` or `would_block`, or fails (rejected); UDP on POSIX sends it with `sendmsg`,
+nonblocking once its sockets are a backend's. The caller's bytes are lent for the call
+only, so accepted-pending is not offered yet. The owner registers for output readiness
+with `Transport.notifyWritable`: its waiter runs once a send socket that blocked can take
+output, or at once if none is blocked, so a drain between the send and the registration
+is not lost. UDP adds the blocked send socket to the backend as an output-only source,
+which the readiness backend polls for `POLLOUT` only while armed, once per arming. A
+`StatefulWriter` holds a reader whose DATA or end marker would block and keeps the bytes
+in its history rather than a lease: on the waiter it arms a timer in its own context, which
+sends the reader what it was not sent, in SN order, releasing the writer's lock for each
+batch as the live path does. A best-effort reader's fragmented sample carries on from the
+fragment that would block. While a send to a reader runs with the lock released, nothing
+else is sent to it, so a concurrent write cannot overtake it: that write's change waits in
+the history, and the send resumes the reader when it ends. A send ends for the match it
+began with: a reader removed and matched again meanwhile is a new match, which that send
+neither holds nor resumes. Protocol messages that would
+block are lost, as their content is sent again from current state.
+
 <a id="channels-and-lifetimes"></a>
 ### Channels and lifetimes
 

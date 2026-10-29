@@ -84,6 +84,9 @@ pub const ReceiveHandler = iface.ReceiveHandler;
 pub const LocatorChangeHandler = iface.LocatorChangeHandler;
 pub const Channel = iface.Channel;
 pub const InterfaceMonitor = iface.InterfaceMonitor;
+pub const IoVec = iface.IoVec;
+const WritableWaiter = iface.WritableWaiter;
+pub const SendOutcome = iface.SendOutcome;
 const MAX_RECEIVE_HANDLERS = iface.MAX_RECEIVE_HANDLERS;
 
 // ── Windows Winsock initialisation ───────────────────────────────────────────
@@ -132,13 +135,42 @@ fn socketBind(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.sockle
     if (c.bind(fd, addr, len) != 0) return error.BindFailed;
 }
 
-fn socketSendTo(fd: posix.socket_t, buf: []const u8, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
-    const n = c.sendto(fd, buf.ptr, buf.len, 0, addr, len);
+/// Sends the concatenation of `iovecs` as one datagram. With `flags`
+/// MSG_DONTWAIT a full send buffer is `would_block`.
+fn socketSendMsg(fd: posix.socket_t, iovecs: []const IoVec, addr: *const posix.sockaddr, len: posix.socklen_t, flags: u32) error{SendFailed}!SendOutcome {
+    if (comptime builtin.os.tag == .windows) {
+        // No sendmsg in the socket API used here: flatten.
+        var buf: [Transport.max_flattened_send]u8 = undefined;
+        var pos: usize = 0;
+        for (iovecs) |iov| {
+            if (pos + iov.len > buf.len) return error.SendFailed;
+            @memcpy(buf[pos..][0..iov.len], iov.base[0..iov.len]);
+            pos += iov.len;
+        }
+        const n = c.sendto(fd, buf[0..pos].ptr, pos, flags, addr, len);
+        if (n < 0) {
+            log.transport.warn("udp: sendto fd={} failed", .{fd});
+            return error.SendFailed;
+        }
+        return .completed;
+    }
+    const msg: c.msghdr_const = .{
+        .name = addr,
+        .namelen = len,
+        .iov = iovecs.ptr,
+        .iovlen = @intCast(iovecs.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const n = c.sendmsg(fd, &msg, flags);
     if (n < 0) {
         const e = posix.errno(n);
-        log.transport.warn("udp: sendto fd={} errno={}", .{ fd, e });
+        if (e == .AGAIN) return .would_block;
+        log.transport.warn("udp: sendmsg fd={} errno={}", .{ fd, e });
         return error.SendFailed;
     }
+    return .completed;
 }
 
 fn socketRecvFrom(fd: posix.socket_t, buf: []u8, src: *posix.sockaddr, src_len: *posix.socklen_t) !usize {
@@ -706,6 +738,31 @@ pub const UdpTransport = struct {
     /// receive threads (vtAttachBackend). Set under `mu` before the first
     /// socket opens, then fixed.
     backend: ?ProgressBackend = null,
+    /// Set with `backend`: sends do not block, and a full send buffer is
+    /// SendOutcome.would_block
+    /// (docs/design/concurrency/transport-adapters.md#output-submission).
+    send_nonblocking: std.atomic.Value(bool) = .init(false),
+    /// Datagrams not sent because the send buffer was full; one per
+    /// interface for a multicast send.
+    sends_would_block: std.atomic.Value(u64) = .init(0),
+    /// The send sockets as output-only sources of `backend`, so a producer
+    /// whose send would block can wait for them to drain
+    /// (vtNotifyWritable). Set up with `backend`; each is registered with
+    /// it on the first wait for it, and unregistered with the last port.
+    send_sources: [2]SendSource = @splat(.{}),
+    /// Guards `writable_waiters` and each send source's `registered`.
+    /// `on_writable` runs under it, so a waiter cancelled under it is not
+    /// running.
+    writable_mu: mutex_mod.Mutex = .{},
+    writable_waiters: ?*WritableWaiter = null,
+    test_hooks: if (builtin.is_test) TestHooks else void = if (builtin.is_test) .{} else {},
+
+    /// Seams for deterministic tests; absent outside test builds.
+    pub const TestHooks = struct {
+        /// Sees each datagram before it is sent, with the flags the send
+        /// passes. An outcome returned stands for the send, which is skipped.
+        before_send: ?*const fn (t: *UdpTransport, iovecs: []const IoVec, flags: u32) ?SendOutcome = null,
+    };
 
     const Self = @This();
 
@@ -835,6 +892,9 @@ pub const UdpTransport = struct {
 
         if (self.reserved_meta_fd) |fd| socketClose(fd);
         if (self.reserved_data_fd) |fd| socketClose(fd);
+
+        self.unregisterSendSources();
+        self.writable_mu.deinit();
 
         // Close the init-time send sockets. These are the sole send sockets for
         // the lifetime of this transport; Option B never promotes send_fd to a
@@ -1307,6 +1367,108 @@ pub const UdpTransport = struct {
     }
 
     fn vtSend(ctx: *anyopaque, loc: *const Locator, data: []const u8) anyerror!void {
+        const iov = [_]IoVec{.{ .base = data.ptr, .len = data.len }};
+        switch (try vtSendGather(ctx, loc, &iov)) {
+            .completed => {},
+            .would_block => return error.WouldBlock,
+        }
+    }
+
+    /// Sends one datagram on `fd`: nonblocking once attached to a backend,
+    /// and counted when it would block.
+    fn sendMsg(self: *Self, fd: posix.socket_t, iovecs: []const IoVec, addr: *const posix.sockaddr, len: posix.socklen_t) error{SendFailed}!SendOutcome {
+        const flags: u32 = if (comptime builtin.os.tag == .windows)
+            0
+        else if (self.send_nonblocking.load(.acquire)) posix.MSG.DONTWAIT else 0;
+        const hooked: ?SendOutcome = if (builtin.is_test)
+            if (self.test_hooks.before_send) |hook| hook(self, iovecs, flags) else null
+        else
+            null;
+        const outcome = hooked orelse try socketSendMsg(fd, iovecs, addr, len, flags);
+        if (outcome == .would_block) {
+            _ = self.sends_would_block.fetchAdd(1, .monotonic);
+            log.transport.debug("udp: send buffer full on fd={}, datagram not sent", .{fd});
+            for (&self.send_sources) |*ss| {
+                if (ss.fd == fd) ss.blocked.store(true, .seq_cst);
+            }
+        }
+        return outcome;
+    }
+
+    /// Queues `waiter` and waits for the send sockets that blocked to drain.
+    /// With none blocked, whatever blocked has drained already, so it runs
+    /// now. A would-block on a socket that is not a send source (a channel's,
+    /// or a temporary one) is not waited for: the waiter runs at once and
+    /// tries again.
+    fn vtNotifyWritable(ctx: *anyopaque, waiter: *WritableWaiter) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writable_mu.lock();
+        defer self.writable_mu.unlock();
+        if (!waiter.queued) {
+            waiter.next = self.writable_waiters;
+            self.writable_waiters = waiter;
+            waiter.queued = true;
+        }
+        var blocked = false;
+        for (&self.send_sources) |*ss| {
+            if (!ss.blocked.load(.seq_cst)) continue;
+            if (!ss.registered) {
+                // Without memory to wait for it, the waiter tries again now.
+                self.backend.?.register(&ss.source) catch continue;
+                ss.registered = true;
+            }
+            blocked = true;
+            self.backend.?.armOutput(&ss.source);
+        }
+        if (!blocked) self.runWritableLocked();
+    }
+
+    /// Takes the send sources off the backend: once the last port is
+    /// unlistened, as no producer of the transport waits any longer, and on
+    /// deinit. Not under `writable_mu`, which their `writable` takes.
+    fn unregisterSendSources(self: *Self) void {
+        var registered: [2]bool = undefined;
+        {
+            self.writable_mu.lock();
+            defer self.writable_mu.unlock();
+            for (&self.send_sources, &registered) |*ss, *r| {
+                r.* = ss.registered;
+                ss.registered = false;
+            }
+        }
+        for (&self.send_sources, registered) |*ss, r| if (r) self.backend.?.unregister(&ss.source);
+    }
+
+    fn vtCancelWritable(ctx: *anyopaque, waiter: *WritableWaiter) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.writable_mu.lock();
+        defer self.writable_mu.unlock();
+        if (!waiter.queued) return;
+        var link = &self.writable_waiters;
+        while (link.*) |w| : (link = &w.next) {
+            if (w == waiter) {
+                link.* = w.next;
+                break;
+            }
+        }
+        waiter.next = null;
+        waiter.queued = false;
+    }
+
+    /// Runs and dequeues every waiter: a send socket drained, and each tries
+    /// again, queuing itself again if it still blocks.
+    fn runWritableLocked(self: *Self) void {
+        var it = self.writable_waiters;
+        self.writable_waiters = null;
+        while (it) |w| {
+            it = w.next;
+            w.next = null;
+            w.queued = false;
+            w.on_writable(w);
+        }
+    }
+
+    fn vtSendGather(ctx: *anyopaque, loc: *const Locator, iovecs: []const IoVec) anyerror!SendOutcome {
         const self: *Self = @ptrCast(@alignCast(ctx));
         // Must NOT acquire self.mu here — see SocketEntry comment about the
         // vtUnlisten/thread.join() deadlock.  send_fd_v4/v6 are set under mu
@@ -1333,6 +1495,7 @@ pub const UdpTransport = struct {
                     if (self.mc_send_ifaces.load(.acquire)) |snap| {
                         if (snap.ifaces.len >= 1) {
                             var any_sent = false;
+                            var any_blocked = false;
                             {
                                 // Serialize the setsockopt+sendto pair against other concurrent
                                 // multicast sends on this shared fd — see mc_send_mu doc comment.
@@ -1340,26 +1503,29 @@ pub const UdpTransport = struct {
                                 defer self.mc_send_mu.unlock();
                                 for (snap.ifaces) |iface_ip| {
                                     sockOpt(fd, posix.IPPROTO.IP, @as(u32, @bitCast(IP_MULTICAST_IF)), &iface_ip) catch continue;
-                                    socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch continue;
-                                    any_sent = true;
+                                    switch (self.sendMsg(fd, iovecs, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch continue) {
+                                        .completed => any_sent = true,
+                                        .would_block => any_blocked = true,
+                                    }
                                 }
                             }
+                            // Sent on some interfaces only: not all-destinations
+                            // success (docs/design/concurrency/runtime.md#output-submission-and-completion).
+                            if (any_blocked) return .would_block;
                             // Every interface in the snapshot failed (e.g. all went down
                             // between snapshot and send) — fall back the same way the
                             // single-interface path below does, instead of silently
                             // reporting success for a datagram nothing actually carried.
-                            if (!any_sent) try sendUdp4(u.addr, u.port, data);
-                            return;
+                            if (!any_sent) return self.sendUdp4(u.addr, u.port, iovecs);
+                            return .completed;
                         }
                     }
                 }
                 if (fd != INVALID_SOCKET) {
-                    socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch {
-                        try sendUdp4(u.addr, u.port, data);
-                    };
-                } else {
-                    try sendUdp4(u.addr, u.port, data);
+                    return self.sendMsg(fd, iovecs, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) catch
+                        return self.sendUdp4(u.addr, u.port, iovecs);
                 }
+                return self.sendUdp4(u.addr, u.port, iovecs);
             },
             .udp_v6 => |u| {
                 if (!self.config.ipv6_enabled) return error.AddressFamilyDisabled;
@@ -1372,15 +1538,53 @@ pub const UdpTransport = struct {
                 };
                 const fd = self.send_fd_v6.load(.acquire);
                 if (fd != INVALID_SOCKET) {
-                    socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in6)) catch {
-                        try sendUdp6(u.addr, u.port, data);
-                    };
-                } else {
-                    try sendUdp6(u.addr, u.port, data);
+                    return self.sendMsg(fd, iovecs, @ptrCast(&dest), @sizeOf(posix.sockaddr.in6)) catch
+                        return self.sendUdp6(u.addr, u.port, iovecs);
                 }
+                return self.sendUdp6(u.addr, u.port, iovecs);
             },
             else => return error.UnsupportedLocatorKind,
         }
+    }
+
+    /// A send on a temporary socket, when the shared send socket is missing
+    /// or failed.
+    fn sendUdp4(self: *Self, dest_ip: [4]u8, port: u16, iovecs: []const IoVec) !SendOutcome {
+        const fd = try socketCreate(posix.AF.INET, posix.SOCK.DGRAM);
+        defer socketClose(fd);
+        // For multicast destinations, set IP_MULTICAST_IF to loopback so that this
+        // fallback path works on macOS VMs where the real interface has no multicast
+        // route.  The receive socket joins on loopback in vtJoinMulticast, so packets
+        // sent via loopback are delivered to local multicast group members.
+        const dest_u32: u32 = std.mem.readInt(u32, &dest_ip, .big);
+        if (dest_u32 & 0xF0000000 == 0xE0000000) { // 224.0.0.0/4
+            const lo: [4]u8 = .{ 127, 0, 0, 1 };
+            sockOpt(fd, posix.IPPROTO.IP, @as(u32, @bitCast(IP_MULTICAST_IF)), std.mem.asBytes(&lo)) catch {};
+        }
+        const dest = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast(dest_ip),
+        };
+        return self.sendMsg(fd, iovecs, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
+    }
+
+    fn sendUdp6(self: *Self, dest_ip: [16]u8, port: u16, iovecs: []const IoVec) !SendOutcome {
+        const fd = try socketCreate(posix.AF.INET6, posix.SOCK.DGRAM);
+        defer socketClose(fd);
+        // For multicast (ff00::/8), use loopback (interface index 1) as the outgoing
+        // interface so this fallback path works on macOS VMs without multicast routing.
+        if (dest_ip[0] == 0xFF) {
+            sockOptInt(fd, IPPROTO_IPV6, @as(u32, @bitCast(IPV6_MULTICAST_IF)), 1) catch {};
+        }
+        const dest = posix.sockaddr.in6{
+            .family = posix.AF.INET6,
+            .port = std.mem.nativeToBig(u16, port),
+            .flowinfo = 0,
+            .addr = dest_ip,
+            .scope_id = 0,
+        };
+        return self.sendMsg(fd, iovecs, @ptrCast(&dest), @sizeOf(posix.sockaddr.in6));
     }
 
     /// Send on the exact local socket `channel` identifies, to `locator`,
@@ -1392,7 +1596,7 @@ pub const UdpTransport = struct {
     /// pins the local socket; unlike TCP, one UDP socket serves many peers,
     /// so `locator` (the actual destination) is still required.
     fn vtSendOnChannel(ctx: *anyopaque, channel: Channel, loc: *const Locator, data: []const u8) anyerror!void {
-        _ = ctx;
+        const self: *Self = @ptrCast(@alignCast(ctx));
         if (channel.isNone()) return error.ChannelClosed;
         const entry: *SocketEntry = @ptrFromInt(channel.token);
         if (entry.generation != channel.generation) return error.ChannelClosed;
@@ -1401,6 +1605,7 @@ pub const UdpTransport = struct {
         defer entry.send_mu.unlock();
         if (entry.closed) return error.ChannelClosed;
 
+        const iov = [_]IoVec{.{ .base = data.ptr, .len = data.len }};
         switch (loc.*) {
             .udp_v4 => |u| {
                 const dest = posix.sockaddr.in{
@@ -1408,7 +1613,7 @@ pub const UdpTransport = struct {
                     .port = std.mem.nativeToBig(u16, u.port),
                     .addr = @bitCast(u.addr),
                 };
-                try socketSendTo(entry.fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
+                if (try self.sendMsg(entry.fd, &iov, @ptrCast(&dest), @sizeOf(posix.sockaddr.in)) == .would_block) return error.WouldBlock;
             },
             .udp_v6 => |u| {
                 const dest = posix.sockaddr.in6{
@@ -1418,7 +1623,7 @@ pub const UdpTransport = struct {
                     .addr = u.addr,
                     .scope_id = 0,
                 };
-                try socketSendTo(entry.fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in6));
+                if (try self.sendMsg(entry.fd, &iov, @ptrCast(&dest), @sizeOf(posix.sockaddr.in6)) == .would_block) return error.WouldBlock;
             },
             else => return error.UnsupportedLocatorKind,
         }
@@ -1706,6 +1911,12 @@ pub const UdpTransport = struct {
                 self.publishMcSendIfacesLocked();
             }
         }
+        if (fully_empty and self.backend != null) {
+            self.mu.lock();
+            const last = self.port_entries.count() == 0;
+            self.mu.unlock();
+            if (last) self.unregisterSendSources();
+        }
 
         // Outside `mu`: wait for any on_channel_closed notification a
         // *different*, concurrent caller already captured from this port's
@@ -1783,10 +1994,49 @@ pub const UdpTransport = struct {
             if (self.backend) |b| if (b.ctx == backend.ctx) return;
             return if (self.backend != null) error.AttachedElsewhere else error.AlreadyListening;
         }
-        // With no socket open, nothing receives on an earlier backend, whose
-        // runtime may have retired: the next participant's replaces it.
+        // With no socket open, nothing receives or waits to send on an
+        // earlier backend, whose runtime may have retired: the next
+        // participant's replaces it.
         if (!backend.hasSources()) return error.BackendHasNoSources;
+        const fds = [2]posix.socket_t{ self.owned_send_fd_v4, self.owned_send_fd_v6 };
+        for (&self.send_sources, fds) |*ss, fd| {
+            if (fd == INVALID_SOCKET) continue;
+            ss.* = .{ .transport = self, .fd = fd, .source = .{
+                .handle = fd,
+                .ctx = ss,
+                .service = SendSource.noInput,
+                .input = false,
+                .writable = SendSource.onWritable,
+            } };
+        }
         self.backend = backend;
+        // Publishes the send sources to sendMsg along with nonblocking sends.
+        self.send_nonblocking.store(true, .release);
+    }
+};
+
+/// A send socket as an output-only source of the transport's backend.
+const SendSource = struct {
+    transport: *UdpTransport = undefined,
+    /// The send socket, once the transport has a backend.
+    fd: posix.socket_t = INVALID_SOCKET,
+    source: Source = undefined,
+    /// Under the transport's `writable_mu`.
+    registered: bool = false,
+    /// A send on it would have blocked since it last drained.
+    blocked: std.atomic.Value(bool) = .init(false),
+
+    fn onWritable(ctx: *anyopaque) void {
+        const self: *SendSource = @ptrCast(@alignCast(ctx));
+        self.blocked.store(false, .seq_cst);
+        const t = self.transport;
+        t.writable_mu.lock();
+        defer t.writable_mu.unlock();
+        t.runWritableLocked();
+    }
+
+    fn noInput(_: *anyopaque, _: u32) u32 {
+        unreachable;
     }
 };
 
@@ -1798,6 +2048,9 @@ const udp_vtable = Transport.Vtable{
     .attach_backend = UdpTransport.vtAttachBackend,
     .can_reach = UdpTransport.vtCanReach,
     .send = UdpTransport.vtSend,
+    .send_gather = UdpTransport.vtSendGather,
+    .notify_writable = UdpTransport.vtNotifyWritable,
+    .cancel_writable = UdpTransport.vtCancelWritable,
     .send_on_channel = UdpTransport.vtSendOnChannel,
     .listen = UdpTransport.vtListen,
     .join_multicast = UdpTransport.vtJoinMulticast,
@@ -1981,46 +2234,6 @@ fn createMulticastSocket(addr_kind: i32, port: u16, recv_buf: u32) !posix.socket
         try socketBind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in6));
     }
     return fd;
-}
-
-// ── Send helpers ──────────────────────────────────────────────────────────────
-
-fn sendUdp4(dest_ip: [4]u8, port: u16, data: []const u8) !void {
-    const fd = try socketCreate(posix.AF.INET, posix.SOCK.DGRAM);
-    defer socketClose(fd);
-    // For multicast destinations, set IP_MULTICAST_IF to loopback so that this
-    // fallback path works on macOS VMs where the real interface has no multicast
-    // route.  The receive socket joins on loopback in vtJoinMulticast, so packets
-    // sent via loopback are delivered to local multicast group members.
-    const dest_u32: u32 = std.mem.readInt(u32, &dest_ip, .big);
-    if (dest_u32 & 0xF0000000 == 0xE0000000) { // 224.0.0.0/4
-        const lo: [4]u8 = .{ 127, 0, 0, 1 };
-        sockOpt(fd, posix.IPPROTO.IP, @as(u32, @bitCast(IP_MULTICAST_IF)), std.mem.asBytes(&lo)) catch {};
-    }
-    const dest = posix.sockaddr.in{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = @bitCast(dest_ip),
-    };
-    try socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in));
-}
-
-fn sendUdp6(dest_ip: [16]u8, port: u16, data: []const u8) !void {
-    const fd = try socketCreate(posix.AF.INET6, posix.SOCK.DGRAM);
-    defer socketClose(fd);
-    // For multicast (ff00::/8), use loopback (interface index 1) as the outgoing
-    // interface so this fallback path works on macOS VMs without multicast routing.
-    if (dest_ip[0] == 0xFF) {
-        sockOptInt(fd, IPPROTO_IPV6, @as(u32, @bitCast(IPV6_MULTICAST_IF)), 1) catch {};
-    }
-    const dest = posix.sockaddr.in6{
-        .family = posix.AF.INET6,
-        .port = std.mem.nativeToBig(u16, port),
-        .flowinfo = 0,
-        .addr = dest_ip,
-        .scope_id = 0,
-    };
-    try socketSendTo(fd, data, @ptrCast(&dest), @sizeOf(posix.sockaddr.in6));
 }
 
 // ── Multicast join/leave helpers ──────────────────────────────────────────────
@@ -2624,20 +2837,34 @@ test "vtJoinMulticast and vtLeaveMulticast IPv4 round-trip" {
 
 // ── sendUdp4 / sendUdp6 direct calls ─────────────────────────────────────────
 
+fn testIov(data: []const u8) [1]IoVec {
+    return .{.{ .base = data.ptr, .len = data.len }};
+}
+
+fn testSendTransport() !*UdpTransport {
+    return UdpTransport.init(std.testing.allocator, .{ .participant_id = 198, .bind_wildcard = true }, 0, null);
+}
+
 test "sendUdp4 unicast loopback send" {
     // Creates a transient socket, sends to 127.0.0.1 (no listener needed — UDP fire-and-forget).
-    try sendUdp4(.{ 127, 0, 0, 1 }, 55410, "udp4-unicast");
+    const udp = try testSendTransport();
+    defer udp.deinit();
+    _ = try udp.sendUdp4(.{ 127, 0, 0, 1 }, 55410, &testIov("udp4-unicast"));
 }
 
 test "sendUdp4 multicast destination sets IP_MULTICAST_IF" {
     // 239.255.0.x is in the 224/4 multicast range → triggers the MULTICAST_IF sockopt.
-    sendUdp4(.{ 239, 255, 0, 1 }, 55411, "udp4-mc") catch {};
+    const udp = try testSendTransport();
+    defer udp.deinit();
+    _ = udp.sendUdp4(.{ 239, 255, 0, 1 }, 55411, &testIov("udp4-mc")) catch {};
 }
 
 test "sendUdp6 unicast loopback send" {
     var lo6: [16]u8 = std.mem.zeroes([16]u8);
     lo6[15] = 1; // ::1
-    sendUdp6(lo6, 55412, "udp6-unicast") catch {};
+    const udp = try testSendTransport();
+    defer udp.deinit();
+    _ = udp.sendUdp6(lo6, 55412, &testIov("udp6-unicast")) catch {};
 }
 
 test "sendUdp6 multicast destination sets IPV6_MULTICAST_IF" {
@@ -2645,7 +2872,44 @@ test "sendUdp6 multicast destination sets IPV6_MULTICAST_IF" {
     mc6[0] = 0xFF;
     mc6[1] = 0x02;
     mc6[15] = 1; // ff02::1
-    sendUdp6(mc6, 55413, "udp6-mc") catch {};
+    const udp = try testSendTransport();
+    defer udp.deinit();
+    _ = udp.sendUdp6(mc6, 55413, &testIov("udp6-mc")) catch {};
+}
+
+test "socketSendMsg sends a gather list as one datagram, and with MSG_DONTWAIT a full receiver queue is would_block" {
+    // Unix datagram sockets: the receiver's queue fills when it does not
+    // read, which a UDP socket over loopback never does. The receiver has an
+    // abstract name, so the sender addresses it as UDP sends address peers.
+    // Linux only: abstract names are, and elsewhere a full queue is reported
+    // differently.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const rx = c.socket(posix.AF.UNIX, posix.SOCK.DGRAM, 0);
+    try std.testing.expect(rx >= 0);
+    defer socketClose(rx);
+    const tx = c.socket(posix.AF.UNIX, posix.SOCK.DGRAM, 0);
+    try std.testing.expect(tx >= 0);
+    defer socketClose(tx);
+    var peer: posix.sockaddr.un = .{ .path = @splat(0) };
+    const name = std.fmt.bufPrint(peer.path[1..], "zzdds-sendmsg-{d}", .{c.getpid()}) catch unreachable;
+    const peer_len: posix.socklen_t = @intCast(@offsetOf(posix.sockaddr.un, "path") + 1 + name.len);
+    try std.testing.expectEqual(@as(c_int, 0), c.bind(rx, @ptrCast(&peer), peer_len));
+
+    const parts = [_]IoVec{
+        .{ .base = "ab", .len = 2 },
+        .{ .base = "", .len = 0 },
+        .{ .base = "cde", .len = 3 },
+    };
+    try std.testing.expectEqual(SendOutcome.completed, try socketSendMsg(tx, &parts, @ptrCast(&peer), peer_len, 0));
+    var buf: [16]u8 = undefined;
+    const n = c.recv(rx, &buf, buf.len, posix.MSG.DONTWAIT);
+    try std.testing.expectEqualStrings("abcde", buf[0..@intCast(n)]);
+
+    var sent: usize = 0;
+    while (sent < 100_000) : (sent += 1) {
+        if (try socketSendMsg(tx, &parts, @ptrCast(&peer), peer_len, posix.MSG.DONTWAIT) == .would_block) break;
+    }
+    try std.testing.expect(sent > 0 and sent < 100_000);
 }
 
 // ── diffAdded pure-function tests ─────────────────────────────────────────────
@@ -2873,7 +3137,7 @@ test "sendOnChannel replies from the exact socket a datagram arrived on" {
         .port = std.mem.nativeToBig(u16, server_port),
         .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
     };
-    try socketSendTo(client_fd, "ping", @ptrCast(&server_addr), @sizeOf(posix.sockaddr.in));
+    _ = try socketSendMsg(client_fd, &testIov("ping"), @ptrCast(&server_addr), @sizeOf(posix.sockaddr.in), 0);
     sleepMs(100);
     try std.testing.expect(server_capture.isSet());
 
@@ -2949,7 +3213,7 @@ test "sendOnChannel replies from the exact socket a datagram arrived on (IPv6)" 
         .addr = loopback6,
         .scope_id = 0,
     };
-    try socketSendTo(client_fd, "ping", @ptrCast(&server_addr), @sizeOf(posix.sockaddr.in6));
+    _ = try socketSendMsg(client_fd, &testIov("ping"), @ptrCast(&server_addr), @sizeOf(posix.sockaddr.in6), 0);
     sleepMs(100);
     try std.testing.expect(server_capture.isSet());
 

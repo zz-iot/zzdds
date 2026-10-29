@@ -408,6 +408,42 @@ pub const Channel = struct {
     }
 };
 
+// ── Output ────────────────────────────────────────────────────────────────────
+
+/// One piece of a gather list. Matches POSIX `struct iovec`, so a list goes
+/// to `sendmsg` as is.
+pub const IoVec = std.posix.iovec_const;
+
+/// What a send submission did with its bytes
+/// (docs/design/concurrency/transport-adapters.md#output-submission). A
+/// rejected submission is an error return instead. A submission lends its
+/// bytes for the call only: an adapter that needs them afterwards copies
+/// them, so accepted-pending, which needs a lease on the caller's bytes, is
+/// not offered until an adapter keeps them.
+pub const SendOutcome = enum {
+    /// The adapter has finished with the bytes. Not proof of receipt.
+    completed,
+    /// Nothing was sent: the socket's send buffer is full and the transport
+    /// does not block. The caller keeps its data and may wait with
+    /// `Transport.notifyWritable` to send it again; otherwise RTPS treats
+    /// the message as lost, and a reliable writer repairs it as for any lost
+    /// datagram.
+    would_block,
+};
+
+/// A producer waiting for a transport's sends to stop blocking
+/// (docs/design/concurrency/transport-adapters.md#output-submission).
+pub const WritableWaiter = struct {
+    /// Runs once per `Transport.notifyWritable`, on whatever thread finds the
+    /// output ready, possibly inside `notifyWritable` itself. Must not block
+    /// or call into the transport; it hands the event to the producer's own
+    /// context.
+    on_writable: *const fn (waiter: *WritableWaiter) void,
+    // The transport's, under its lock.
+    next: ?*WritableWaiter = null,
+    queued: bool = false,
+};
+
 // ── Transport callbacks ───────────────────────────────────────────────────────
 
 /// Callback invoked by the transport on each received datagram.
@@ -478,8 +514,27 @@ pub const Transport = struct {
         /// Returns true if this transport can send to / receive from the given locator.
         can_reach: *const fn (ctx: *anyopaque, locator: *const Locator) bool,
 
-        /// Send `data` to `locator`. Non-blocking for small datagrams; may block briefly.
+        /// Send `data` to `locator`. Blocks briefly at most; on the shared
+        /// runtime it does not block, and fails with error.WouldBlock when
+        /// `send_gather` would return `would_block`.
         send: *const fn (ctx: *anyopaque, locator: *const Locator, data: []const u8) anyerror!void,
+
+        /// Send the concatenation of `iovecs` to `locator` as one message,
+        /// without flattening it first. On the shared runtime it never
+        /// blocks: a full send buffer is `would_block`. Null: `sendGather`
+        /// flattens the list and calls `send`.
+        send_gather: ?*const fn (ctx: *anyopaque, locator: *const Locator, iovecs: []const IoVec) anyerror!SendOutcome = null,
+
+        /// Runs `waiter.on_writable` once a send that returned `would_block`
+        /// could go ahead: when a socket that blocked can take output, or at
+        /// once if none is blocked now. Queuing a queued waiter does
+        /// nothing. Null: the transport cannot tell, and the caller treats
+        /// a send that would block as lost.
+        notify_writable: ?*const fn (ctx: *anyopaque, waiter: *WritableWaiter) void = null,
+
+        /// Dequeues `waiter`, returning once its `on_writable` is not running.
+        /// Required with `notify_writable`.
+        cancel_writable: ?*const fn (ctx: *anyopaque, waiter: *WritableWaiter) void = null,
 
         /// Send `data` on the specific local socket/connection identified by
         /// `channel`, to `locator`, bypassing normal locator->connection
@@ -550,6 +605,39 @@ pub const Transport = struct {
     }
     pub fn send(self: Transport, locator: *const Locator, data: []const u8) anyerror!void {
         return self.vtable.send(self.ctx, locator, data);
+    }
+    /// Largest message `sendGather` flattens for a transport without
+    /// `send_gather`.
+    pub const max_flattened_send: usize = 65536;
+
+    /// Sends one message given as a gather list. Fails with
+    /// error.MessageTooLarge past `max_flattened_send` bytes either way.
+    pub fn sendGather(self: Transport, locator: *const Locator, iovecs: []const IoVec) anyerror!SendOutcome {
+        var total: usize = 0;
+        for (iovecs) |iov| total += iov.len;
+        if (total > max_flattened_send) return error.MessageTooLarge;
+        if (self.vtable.send_gather) |f| return f(self.ctx, locator, iovecs);
+        var buf: [max_flattened_send]u8 = undefined;
+        var pos: usize = 0;
+        for (iovecs) |iov| {
+            @memcpy(buf[pos..][0..iov.len], iov.base[0..iov.len]);
+            pos += iov.len;
+        }
+        self.vtable.send(self.ctx, locator, buf[0..pos]) catch |err| switch (err) {
+            error.WouldBlock => return .would_block,
+            else => return err,
+        };
+        return .completed;
+    }
+    /// Whether `notifyWritable` can report when a blocked send could go ahead.
+    pub fn canNotifyWritable(self: Transport) bool {
+        return self.vtable.notify_writable != null;
+    }
+    pub fn notifyWritable(self: Transport, waiter: *WritableWaiter) void {
+        self.vtable.notify_writable.?(self.ctx, waiter);
+    }
+    pub fn cancelWritable(self: Transport, waiter: *WritableWaiter) void {
+        if (self.vtable.cancel_writable) |f| f(self.ctx, waiter);
     }
     /// Returns error.ChannelUnsupported if this transport has no channel
     /// concept (send_on_channel is null).

@@ -30,6 +30,7 @@ pub const InstanceHandle = history.InstanceHandle;
 pub const StatelessWriter = writer_sm.StatelessWriter;
 pub const StatefulWriter = writer_sm.StatefulWriter;
 pub const ReaderProxy = writer_sm.ReaderProxy;
+pub const ReaderMatch = writer_sm.ReaderMatch;
 pub const ReaderLocator = writer_sm.ReaderLocator;
 
 pub const StatelessReader = reader_sm.StatelessReader;

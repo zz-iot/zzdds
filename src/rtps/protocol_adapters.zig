@@ -332,11 +332,14 @@ pub const RtpsProtocolWriter = struct {
             if (m.sn == eoc_sn) break m.group;
         } else null;
         for (self.writer.reader_proxies.items) |*rp| {
-            if (rp.suppress_live_data) continue;
+            // A held proxy gets the retained marker from its resume.
+            if (rp.suppress_live_data or rp.unsent_from_sn != null) continue;
+            if (StatefulWriter.deferToSenderLocked(rp, eoc_sn)) continue;
             for (rp.effectiveLocators()) |loc| {
                 try out.append(alloc, .{
                     .locator = loc,
                     .reader_guid = rp.guid,
+                    .reader_match_id = rp.match_id,
                     .writer_guid = self.writer.guid,
                     .eoc_sn = eoc_sn,
                     .group = group,
@@ -348,7 +351,7 @@ pub const RtpsProtocolWriter = struct {
 
     fn vtSendCombinedEOCData(
         ctx: *anyopaque,
-        infos: [*]const protocol.EOCProxyInfo,
+        infos: [*]protocol.EOCProxyInfo,
         count: usize,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
@@ -386,13 +389,38 @@ pub const RtpsProtocolWriter = struct {
                 const marker = writer_sm.EndMarker{ .sn = entry.eoc_sn, .first_sn = 0, .last_sn = 0, .group = entry.group };
                 b.addData(marker.dataParams(entry.reader_guid.entity_id, entry.writer_guid.entity_id, entry.needs_pid_coherent_set_marker), &.{});
             }
-            writer_sm.sendIovecs(self.writer.transport, &entry0.locator, b.iovecs()) catch {};
+            const outcome = self.writer.transport.sendGather(&entry0.locator, b.iovecs()) catch continue;
+            if (outcome == .would_block) for (infos_slice) |*entry| {
+                if (entry.locator.eql(entry0.locator) and entry.reader_guid.prefix.eql(entry0.reader_guid.prefix))
+                    entry.blocked = true;
+            };
         }
     }
 
-    fn vtFlushGroupEOCHBOnly(ctx: *anyopaque) void {
+    fn vtFlushGroupEOCHBOnly(ctx: *anyopaque, infos: [*]const protocol.EOCProxyInfo, count: usize) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        self.writer.flushGroupEOCHBOnly();
+        var unsent: std.ArrayListUnmanaged(writer_sm.ReaderMatch) = .empty;
+        defer unsent.deinit(self.alloc);
+        // On OOM none is held: a best-effort reader whose marker would block
+        // loses it, as without a runtime.
+        unsentReaders(self.alloc, infos[0..count], self.writer.guid, &unsent) catch unsent.clearRetainingCapacity();
+        self.writer.flushGroupEOCHBOnly(unsent.items);
+    }
+
+    /// The matches of the readers of `writer_guid` in `infos` that none of
+    /// their entries reached: each blocked on every locator.
+    fn unsentReaders(alloc: std.mem.Allocator, infos: []const protocol.EOCProxyInfo, writer_guid: Guid, out: *std.ArrayListUnmanaged(writer_sm.ReaderMatch)) !void {
+        for (infos, 0..) |entry, i| {
+            if (!entry.writer_guid.eql(writer_guid)) continue;
+            const seen = for (infos[0..i]) |prev| {
+                if (prev.writer_guid.eql(writer_guid) and prev.reader_guid.eql(entry.reader_guid)) break true;
+            } else false;
+            if (seen) continue;
+            const reached = for (infos[i..]) |other| {
+                if (other.writer_guid.eql(writer_guid) and other.reader_guid.eql(entry.reader_guid) and !other.blocked) break true;
+            } else false;
+            if (!reached) try out.append(alloc, .{ .guid = entry.reader_guid, .id = entry.reader_match_id });
+        }
     }
 
     fn vtDeinit(ctx: *anyopaque) void {
@@ -849,4 +877,66 @@ test "RtpsProtocolReader: on_writer_matching installs with the proxy, and a supe
     try testing.expectEqual(@as(usize, 2), seen.matching);
     try testing.expectEqual(@as(?bool, false), seen.is_new);
     try testing.expectEqual(@as(usize, 2), seen.matched);
+}
+
+test "RtpsProtocolWriter: an end marker taken for the combined send names the reader's match" {
+    // The flush holds that match only, not the reader matched again since.
+    const testing = std.testing;
+    var null_ctx: u8 = 0;
+    const transport = writer_sm.Transport{ .ctx = &null_ctx, .vtable = &writer_sm.test_null_vtable };
+    const writer_guid = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0x22)) }, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x02 } };
+    const reader_guid = Guid{ .prefix = .{ .bytes = @as([12]u8, @splat(0x11)) }, .entity_id = .{ .entity_key = .{ 0, 0, 1 }, .entity_kind = 0x07 } };
+
+    const adapter = try RtpsProtocolWriter.init(testing.allocator, writer_guid, transport, .keep_all, 0, reader_guid.entity_id, writer_sm.DEFAULT_FRAG_SIZE, false);
+    defer adapter.deinit();
+    const w = adapter.writer;
+    const loc = protocol.Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+    try w.addMatchedReader(try writer_sm.ReaderProxy.init(testing.allocator, reader_guid, &.{loc}, &.{}, false, false));
+    w.beginCoherentSet(true);
+    _ = try w.write(.alive, .{ .seconds = 0, .fraction = 0 }, std.mem.zeroes(protocol.InstanceHandle), std.mem.zeroes([16]u8), "sample");
+    w.endCoherentSet(.coherent_only, false, null, null, true);
+
+    var infos: std.ArrayListUnmanaged(protocol.EOCProxyInfo) = .empty;
+    defer infos.deinit(testing.allocator);
+    try adapter.toProtocolWriter().takeEOCProxyInfos(testing.allocator, &infos);
+    try testing.expectEqual(@as(usize, 1), infos.items.len);
+    try testing.expect(infos.items[0].reader_match_id != 0);
+    try testing.expectEqual(w.reader_proxies.items[0].match_id, infos.items[0].reader_match_id);
+    adapter.toProtocolWriter().flushGroupEOCHBOnly(infos.items);
+}
+
+test "RtpsProtocolWriter: a reader the combined end-marker send reached on no locator is unsent" {
+    const testing = std.testing;
+    const g = struct {
+        fn guid(prefix_byte: u8, key: u8) Guid {
+            return .{ .prefix = .{ .bytes = @as([12]u8, @splat(prefix_byte)) }, .entity_id = .{ .entity_key = .{ 0, 0, key }, .entity_kind = 0x02 } };
+        }
+    };
+    const w = g.guid(0x10, 1);
+    const other_w = g.guid(0x10, 2);
+    const a = g.guid(0x20, 7);
+    const b = g.guid(0x30, 7);
+    const loc1 = protocol.Locator.udp4(.{ 127, 0, 0, 1 }, 7100);
+    const loc2 = protocol.Locator.udp4(.{ 127, 0, 0, 1 }, 7200);
+    const infos = [_]protocol.EOCProxyInfo{
+        // `a`: blocked on both of its locators.
+        .{ .locator = loc1, .reader_guid = a, .reader_match_id = 4, .writer_guid = w, .eoc_sn = 3, .blocked = true },
+        .{ .locator = loc2, .reader_guid = a, .reader_match_id = 4, .writer_guid = w, .eoc_sn = 3, .blocked = true },
+        // `b`: blocked on one, reached on the other.
+        .{ .locator = loc1, .reader_guid = b, .writer_guid = w, .eoc_sn = 3, .blocked = true },
+        .{ .locator = loc2, .reader_guid = b, .writer_guid = w, .eoc_sn = 3 },
+        // Another writer's reader is not this writer's to hold.
+        .{ .locator = loc1, .reader_guid = b, .writer_guid = other_w, .eoc_sn = 9, .blocked = true },
+    };
+    var unsent: std.ArrayListUnmanaged(writer_sm.ReaderMatch) = .empty;
+    defer unsent.deinit(testing.allocator);
+    try RtpsProtocolWriter.unsentReaders(testing.allocator, &infos, w, &unsent);
+    try testing.expectEqual(@as(usize, 1), unsent.items.len);
+    try testing.expect(unsent.items[0].guid.eql(a));
+    try testing.expectEqual(@as(u64, 4), unsent.items[0].id);
+
+    unsent.clearRetainingCapacity();
+    try RtpsProtocolWriter.unsentReaders(testing.allocator, &infos, other_w, &unsent);
+    try testing.expectEqual(@as(usize, 1), unsent.items.len);
+    try testing.expect(unsent.items[0].guid.eql(b));
 }

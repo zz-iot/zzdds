@@ -162,12 +162,26 @@ Forward-looking only: known gaps, planned features, and open design questions.
   so it waits on a "TCP for discovery too" mode (above) or the discovery broker; do it
   after the shared runtime's channel ownership exists
   ([channel integration requirements](design/concurrency/runtime.md#channel-integration-requirements)).
-- **Transport scatter-gather (`sendmsg`)** — the `Transport` vtable has no vectored-send
-  entry point; `MessageBuilder`'s iovec list is flattened into a single `[65536]u8` stack
-  buffer at the transport boundary before every send. See
-  `design/rtps-message-builder.md`. Planned with the readiness adapter, whose submissions
-  carry the gather list
-  ([output submission](design/concurrency/transport-adapters.md#output-submission)).
+- **Transport scatter-gather (`sendmsg`)** — done for UDP on POSIX: the `Transport`
+  vtable's `send_gather` takes `MessageBuilder`'s iovec list, which UDP passes to
+  `sendmsg`. TCP, UDP on Windows and the in-process transports still flatten it into a
+  `[65536]u8` stack buffer (`Transport.sendGather` does that for a transport without
+  `send_gather`). See `design/rtps-message-builder.md` and
+  [output submission](design/concurrency/transport-adapters.md#output-submission).
+- **A writer resumes when a full send buffer drains** — done for UDP on POSIX, on the
+  shared runtime, as the
+  [output contract](design/concurrency/runtime.md#output-submission-and-completion)
+  has it. A reader whose DATA would block is held (`ReaderProxy.unsent_from_sn`): live
+  data to it waits, the history keeps what it has yet to be sent, and the writer waits
+  for the transport's output (`Transport.notifyWritable`, which UDP serves by waiting
+  for `POLLOUT` on its send socket) and then sends it everything it missed, in SN order,
+  end markers included, a best-effort fragmented sample from the fragment that blocked.
+  An end marker that would block holds the reader too, the publisher's combined one
+  included. A best-effort history replay that would block finishes the same way, and a
+  write made while a send to the reader is under way waits for it rather than overtaking
+  it. HEARTBEAT, GAP and repair replies are not held: a lost one is regenerated from
+  current state. Left: TCP, whose partial frame is accepted-pending rather than would-block,
+  and Windows, whose UDP sends still block.
 - **A local endpoint's announcement is not ordered against its creation and deletion.**
   The rules are in
   [local endpoint publication, announcement and disposal](design/concurrency/architecture.md#local-endpoint-publication-announcement-and-disposal).
@@ -1047,8 +1061,12 @@ its budget. A factory's transport and discovery serve all its participants, so t
 one runtime: creation on another runtime while any of them exists, even disabled, or on one
 whose backend waits on no sockets, fails; once they are all deleted, the next participant's
 runtime takes over. On the runtime, UDP does not yet
-re-poll interfaces (no poll thread is started), and sends are still synchronous `sendto`s
-of a flattened buffer. RTPS discovery runs on the participant's runtime too: SPDP's
+re-poll interfaces (no poll thread is started). RTPS messages go to the transport as the
+builder's gather list, which UDP passes to `sendmsg` without copying it into one buffer,
+and on the runtime a UDP send never blocks: a full send buffer drops the datagram, counts
+it (`sends_would_block`) and reports `would_block`. A writer then holds that reader's
+DATA and sends it once the socket drains, best effort included, so nothing is lost to a
+full buffer; protocol messages that would block are lost and regenerated. RTPS discovery runs on the participant's runtime too: SPDP's
 announcements and its lease and liveness-probe checks are timers on the runtime clock,
 armed for when each is next due (one for the next announcement, one for the earliest
 expiry or probe), the SEDP and WLP writers' heartbeats are writer timers, and what
@@ -1115,8 +1133,9 @@ readiness adapter in [transport adapters](design/concurrency/transport-adapters.
 exists for UDP on POSIX: a manual runtime over `PollBackend` runs a reliable pair over
 loopback UDP through `drive()` alone, with no thread started by zzdds, and hosted workers
 service the same sockets in place of a thread per socket, and RTPS discovery runs there
-too, its announcements, lease checks and heartbeats on runtime timers. Next are
-gather-list sends with output outcomes, channel slots in place of the retained socket
+too, its announcements, lease checks and heartbeats on runtime timers. Sends take the
+builder's gather list and never block there, and a writer whose send would block resumes
+once the socket drains. Next are channel slots in place of the retained socket
 graveyards, TCP, and Windows. Outside that build, the UDP and TCP
 transports still call their handlers from their own receive threads. Now specified as the
 [ManualDriver/external-loop contract](design/concurrency/runtime.md#manual-runtime-driving-and-external-loop-integration)

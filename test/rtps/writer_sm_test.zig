@@ -1385,7 +1385,7 @@ test "endCoherentSet: an empty GROUP writer's marker waits for the combined send
     try testing.expectEqual(@as(?rtps.history.GroupCoherentSet, group_set), marker.group);
 
     // Once sent, it retires like any other.
-    w.flushGroupEOCHBOnly();
+    w.flushGroupEOCHBOnly(&.{});
     w.beginCoherentSet(true);
     w.endCoherentSet(.full, false, null, group_set, false);
     for (w.end_markers.items) |m| try testing.expect(m.sn != pending);
@@ -1537,7 +1537,7 @@ test "late match: a TRANSIENT_LOCAL reader with history before the open set is r
     // The GROUP flush: marker deferred to the publisher's combined send.
     rec.reset();
     w.endCoherentSet(.full, false, null, null, true);
-    w.flushGroupEOCHBOnly();
+    w.flushGroupEOCHBOnly(&.{});
     try testing.expectEqual(@as(usize, 0), countAllData(&rec));
     try testing.expectEqual(@as(SequenceNumber, 3), (findHeartbeat(&rec) orelse return error.NoHeartbeatFound).last_sn);
 
