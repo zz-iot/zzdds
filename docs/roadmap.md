@@ -175,8 +175,11 @@ Forward-looking only: known gaps, planned features, and open design questions.
   data to it waits, the history keeps what it has yet to be sent, and the writer waits
   for the transport's output (`Transport.notifyWritable`, which UDP serves by waiting
   for `POLLOUT` on its send socket) and then sends it everything it missed, in SN order,
-  end markers included. A best-effort history replay that would block finishes the same
-  way. HEARTBEAT, GAP and repair replies are not held: a lost one is regenerated from
+  end markers included, a best-effort fragmented sample from the fragment that blocked.
+  An end marker that would block holds the reader too, the publisher's combined one
+  included. A best-effort history replay that would block finishes the same way, and a
+  write made while a send to the reader is under way waits for it rather than overtaking
+  it. HEARTBEAT, GAP and repair replies are not held: a lost one is regenerated from
   current state. Left: TCP, whose partial frame is accepted-pending rather than would-block,
   and Windows, whose UDP sends still block.
 - **A local endpoint's announcement is not ordered against its creation and deletion.**

@@ -850,7 +850,7 @@ pub const PublisherImpl = struct {
                 if (eoc_infos.items.len > 0) {
                     self.writers.items[0].proto_writer.sendCombinedEOCData(eoc_infos.items);
                 }
-                for (self.writers.items) |w| w.proto_writer.flushGroupEOCHBOnly();
+                for (self.writers.items) |w| w.proto_writer.flushGroupEOCHBOnly(eoc_infos.items);
             }
         }
         return DDS.RETCODE_OK;

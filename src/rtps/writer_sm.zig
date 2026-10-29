@@ -402,6 +402,16 @@ pub const ReaderProxy = struct {
     /// a full send buffer delays its data rather than losing it
     /// (docs/design/concurrency/transport-adapters.md#output-submission).
     unsent_from_sn: ?SequenceNumber = null,
+    /// When `unsent_from_sn` is a fragmented sample a best-effort reader was
+    /// sent part of: the first fragment it was not sent, where its resume
+    /// carries on. 1 otherwise.
+    unsent_frag: u32 = 1,
+    /// The first SN of a send to this proxy under way with the writer's `mu`
+    /// released, while the writer holds readers (`resume_held`); null
+    /// otherwise. Nothing else is sent to it meanwhile, so nothing overtakes
+    /// that send, and its changes stay in the history in case it would block
+    /// (StatefulWriter.deferToSenderLocked, trimAckedLocked).
+    sending_sn: ?SequenceNumber = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -738,8 +748,39 @@ pub const StatefulWriter = struct {
     /// holds `mu`.
     fn holdUnsentLocked(self: *Self, rp: *ReaderProxy, sn: SequenceNumber) void {
         std.debug.assert(self.resume_held);
-        rp.unsent_from_sn = if (rp.unsent_from_sn) |from| @min(from, sn) else sn;
+        markUnsent(rp, sn);
         self.waitWritableLocked();
+    }
+
+    /// Lowers `rp`'s held start to `sn`. A new start begins at its first
+    /// fragment.
+    fn markUnsent(rp: *ReaderProxy, sn: SequenceNumber) void {
+        const from = if (rp.unsent_from_sn) |cur| @min(cur, sn) else sn;
+        if (rp.unsent_from_sn != from) rp.unsent_frag = 1;
+        rp.unsent_from_sn = from;
+    }
+
+    /// Whether a send to `rp` is under way with `mu` released (`sending_sn`).
+    /// Then `sn` is not sent to it now, which could overtake that send:
+    /// `rp` is held from `sn`, and the sender resumes it once its send ends
+    /// (endSendLocked). Caller holds `mu`.
+    pub fn deferToSenderLocked(rp: *ReaderProxy, sn: SequenceNumber) bool {
+        if (rp.sending_sn == null) return false;
+        markUnsent(rp, sn);
+        return true;
+    }
+
+    /// Ends a send of `sn` to `rp` made with `mu` released: holds it if the
+    /// send would block, else resumes what was deferred to the send
+    /// meanwhile. Caller holds `mu`.
+    fn endSendLocked(self: *Self, rp: *ReaderProxy, sn: SequenceNumber, blocked: bool) void {
+        rp.sending_sn = null;
+        if (blocked) {
+            self.holdUnsentLocked(rp, sn);
+        } else if (rp.unsent_from_sn != null and !self.hb_stopping.load(.acquire)) {
+            const rt = self.runtime.?;
+            _ = rt.armTimerNoLater(&self.resume_timer, rt.clock.nowNs());
+        }
     }
 
     /// Queues `writable_waiter`, unless stopping: stopHeartbeat cancels it
@@ -783,6 +824,8 @@ pub const StatefulWriter = struct {
                 // Re-found each batch: the send releases `mu`.
                 const rp = self.findReaderProxyLocked(guid) orelse break;
                 const from = rp.unsent_from_sn orelse break;
+                // A live send to it is under way: its end resumes it.
+                if (rp.sending_sn != null) break;
                 if (budget == 0) {
                     if (!self.hb_stopping.load(.acquire))
                         _ = self.runtime.?.armTimerNoLater(&self.resume_timer, now_ns);
@@ -809,7 +852,10 @@ pub const StatefulWriter = struct {
                 // A live send to it begun before it was held, which would
                 // block too, may have lowered its start meanwhile.
                 if (p.unsent_from_sn) |cur| {
-                    if (cur == from) p.unsent_from_sn = sent.through + 1;
+                    if (cur == from) {
+                        p.unsent_from_sn = sent.through + 1;
+                        p.unsent_frag = sent.next_frag;
+                    }
                 }
                 if (sent.blocked) {
                     self.waitWritableLocked();
@@ -820,9 +866,10 @@ pub const StatefulWriter = struct {
         }
         // The list may have changed while `mu` was released, passing over a
         // held proxy. Output that becomes ready resumes every one; without
-        // that wait, another turn does.
+        // that wait, another turn does. One with a send under way is resumed
+        // when that send ends (endSendLocked).
         if (!waiting and !self.hb_stopping.load(.acquire)) {
-            for (self.reader_proxies.items) |rp| if (rp.unsent_from_sn != null) {
+            for (self.reader_proxies.items) |rp| if (rp.unsent_from_sn != null and rp.sending_sn == null) {
                 _ = self.runtime.?.armTimerNoLater(&self.resume_timer, now_ns);
                 break;
             };
@@ -997,15 +1044,16 @@ pub const StatefulWriter = struct {
 
     /// With `drop_acked`, drops the changes every reliable reader has
     /// acknowledged, never one not yet sent (the last flushed SN caps it: an
-    /// open coherent set's changes, or one being sent with `mu` released; so
-    /// does a held proxy, best effort too, which is still to be sent what it
-    /// was not). Caller must hold `mu`.
+    /// open coherent set's changes; so does a held proxy, best effort too,
+    /// which is still to be sent what it was not, and a send under way with
+    /// `mu` released, which may yet hold its proxy). Caller must hold `mu`.
     fn trimAckedLocked(self: *Self) void {
         if (!self.drop_acked) return;
         var floor = self.last_flushed_sn;
         for (self.reader_proxies.items) |rp| {
             if (rp.reliable) floor = @min(floor, rp.highest_acked_sn);
             if (rp.unsent_from_sn) |from| floor = @min(floor, from - 1);
+            if (rp.sending_sn) |sn| floor = @min(floor, sn - 1);
         }
         if (floor <= self.trimmed_through) return;
         self.cache.removeWriterChangesUpTo(floor);
@@ -1334,7 +1382,7 @@ pub const StatefulWriter = struct {
             while (next_marker < self.end_markers.items.len and
                 self.end_markers.items[next_marker].sn < ch.sequence_number) : (next_marker += 1)
             {
-                self.sendEndMarkerToProxyLocked(rp, self.end_markers.items[next_marker], &scratch);
+                _ = self.sendEndMarkerToProxyLocked(rp, self.end_markers.items[next_marker], &scratch);
             }
             self.tracer.submit(.{ .send_data = .{
                 .src_prefix = self.guid.prefix,
@@ -1346,7 +1394,7 @@ pub const StatefulWriter = struct {
             } });
             if (ch.data.len > self.frag_size) {
                 self.hb_count += 1;
-                _ = self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch);
+                _ = self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch, 1);
             } else {
                 var b = MessageBuilder.init(&scratch, self.guid.prefix);
                 b.addInfoDst(rp.guid.prefix);
@@ -1372,7 +1420,7 @@ pub const StatefulWriter = struct {
                 }
             }
         }
-        for (self.end_markers.items[next_marker..]) |m| self.sendEndMarkerToProxyLocked(rp, m, &scratch);
+        for (self.end_markers.items[next_marker..]) |m| _ = self.sendEndMarkerToProxyLocked(rp, m, &scratch);
     }
 
     /// Like replayHistoryToProxyLocked, but for addMatchedReader's
@@ -1478,6 +1526,7 @@ pub const StatefulWriter = struct {
                 const p = self.findReaderProxyLocked(rp_guid) orelse return;
                 p.suppress_live_data = false;
                 self.holdUnsentLocked(p, sent.through + 1);
+                if (p.unsent_from_sn == sent.through + 1) p.unsent_frag = sent.next_frag;
                 return;
             }
         }
@@ -1498,6 +1547,9 @@ pub const StatefulWriter = struct {
         blocked: bool,
         /// Samples and markers sent.
         count: usize = 0,
+        /// With `blocked` at a fragmented sample sent to a best-effort
+        /// reader: the first fragment of `through + 1` not sent. 1 otherwise.
+        next_frag: u32 = 1,
     };
 
     /// One step of a BEST_EFFORT history replay or of a held proxy's resume
@@ -1567,11 +1619,18 @@ pub const StatefulWriter = struct {
                 var scratch: [SCRATCH_SIZE]u8 = undefined;
                 self.hb_count += 1;
                 // A reliable reader NACK_FRAGs the rest, as on the live path.
-                const took = if (rp.reliable)
-                    self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch)
-                else
-                    self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch);
-                return .{ .through = if (took) ch.sequence_number else after, .blocked = !took, .count = @intFromBool(took) };
+                // A best-effort one carries on from the fragment a held
+                // resume stopped at, so a send buffer that drains less than
+                // a whole sample at a time still gets it all out.
+                if (rp.reliable) {
+                    const took = self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
+                    return .{ .through = if (took) ch.sequence_number else after, .blocked = !took, .count = @intFromBool(took) };
+                }
+                const first_frag = if (rp.unsent_from_sn == ch.sequence_number) rp.unsent_frag else 1;
+                if (self.sendFragsToProxyLocked(rp, ch, self.hb_count, &scratch, first_frag)) |frag| {
+                    return .{ .through = after, .blocked = true, .next_frag = frag };
+                }
+                return .{ .through = ch.sequence_number, .blocked = false, .count = 1 };
             }
             const data_copy = try self.alloc.dupe(u8, ch.data);
             changes.append(self.alloc, .{
@@ -1616,9 +1675,17 @@ pub const StatefulWriter = struct {
         const self_transport = self.transport;
         const self_keyed = self.keyed;
         const self_hold = self.resume_held;
+        // Live sends to it wait for this one (deferToSenderLocked), and its
+        // changes stay in the history in case it would block.
+        if (self_hold) rp.sending_sn = changes.items[0].sn;
 
         self.mu.unlock();
-        defer self.mu.lock();
+        defer {
+            self.mu.lock();
+            if (self_hold) if (self.findReaderProxyLocked(rp_guid)) |p| {
+                p.sending_sn = null;
+            };
+        }
 
         var sent: Batch = .{ .through = after, .blocked = false };
         for (changes.items) |c| {
@@ -2170,7 +2237,7 @@ pub const StatefulWriter = struct {
                         // marker, else GAP it so the reader stops asking.
                         if (sn < self.cache.next_sn) {
                             if (self.findEndMarkerLocked(sn)) |m| {
-                                self.sendEndMarkerToProxyLocked(rp, m, &scratch);
+                                _ = self.sendEndMarkerToProxyLocked(rp, m, &scratch);
                             } else {
                                 const gap_list = msg.submessage.SequenceNumberSet{
                                     .base = sn + 1,
@@ -2262,6 +2329,7 @@ pub const StatefulWriter = struct {
             for (self.reader_proxies.items) |*rp| {
                 // A held proxy gets this from its resume, in SN order.
                 if (rp.suppress_live_data or rp.unsent_from_sn != null) continue;
+                if (deferToSenderLocked(rp, ch.sequence_number)) continue;
                 const locs = rp.effectiveLocators();
                 if (locs.len == 0) continue;
                 log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{
@@ -2280,11 +2348,14 @@ pub const StatefulWriter = struct {
                 // NACK_FRAGs the remaining fragments on demand.  Sending all N frags
                 // in the live path would saturate the reader's UDP recv buffer when
                 // a NACK_FRAG recovery burst (N-1 frags) is still in flight.
-                const took = if (rp.reliable)
-                    self.sendFrag1ToProxyLocked(rp, ch, hb_count_snap, &scratch)
-                else
-                    self.sendFragsToProxyLocked(rp, ch, hb_count_snap, &scratch);
-                if (!took) self.holdUnsentLocked(rp, ch.sequence_number);
+                if (rp.reliable) {
+                    if (!self.sendFrag1ToProxyLocked(rp, ch, hb_count_snap, &scratch))
+                        self.holdUnsentLocked(rp, ch.sequence_number);
+                } else if (self.sendFragsToProxyLocked(rp, ch, hb_count_snap, &scratch, 1)) |frag| {
+                    // Its resume carries on from this fragment.
+                    self.holdUnsentLocked(rp, ch.sequence_number);
+                    rp.unsent_frag = frag;
+                }
             }
             // self.mu is held throughout this branch (no unlock above), so
             // ch is still valid here -- unlike the non-fragmented branch
@@ -2324,10 +2395,21 @@ pub const StatefulWriter = struct {
                 return;
             };
             defer self.alloc.free(snaps);
+            // ch may become invalid once self.mu is released (e.g. a
+            // concurrent write() or KEEP_LAST eviction) -- copy its payload
+            // and fixed fields out now while still locked. Before the proxies
+            // are marked as being sent to, so a failure leaves none marked.
+            const data_copy = self.alloc.dupe(u8, ch.data) catch {
+                self.sendChangeToAllNonFragLockedFallback(ch);
+                if (ch.sequence_number > self.last_flushed_sn) self.last_flushed_sn = ch.sequence_number;
+                return;
+            };
+            defer self.alloc.free(data_copy);
             var n_snaps: usize = 0;
 
             for (self.reader_proxies.items) |*rp| {
                 if (rp.suppress_live_data or rp.unsent_from_sn != null) continue;
+                if (deferToSenderLocked(rp, ch.sequence_number)) continue;
                 const locs = rp.effectiveLocators();
                 if (locs.len == 0) continue;
                 log.rtps.debug("StatefulWriter({x}): sending sn={} to {} locator(s) reader_eid={x}|{x:0>2}", .{
@@ -2359,18 +2441,11 @@ pub const StatefulWriter = struct {
                     self.hb_count += 1;
                     s.hb = .{ .last_sn = cache_last, .cache_first = cache_first, .count = self.hb_count };
                 }
+                // Until relocked, sends to it wait for this one.
+                if (self.resume_held) rp.sending_sn = ch.sequence_number;
                 n_snaps += 1;
             }
 
-            // ch may become invalid once self.mu is released (e.g. a
-            // concurrent write() or KEEP_LAST eviction) -- copy its payload
-            // and fixed fields out now while still locked.
-            const data_copy = self.alloc.dupe(u8, ch.data) catch {
-                self.sendChangeToAllNonFragLockedFallback(ch);
-                if (ch.sequence_number > self.last_flushed_sn) self.last_flushed_sn = ch.sequence_number;
-                return;
-            };
-            defer self.alloc.free(data_copy);
             const ch_sn = ch.sequence_number;
             const ch_key_hash = ch.key_hash;
             const ch_kind = ch.kind;
@@ -2423,8 +2498,8 @@ pub const StatefulWriter = struct {
             // held again (Greptile PR #64 finding -- confirmed real).
             self.mu.lock();
             if (ch_sn > self.last_flushed_sn) self.last_flushed_sn = ch_sn;
-            for (snaps[0..n_snaps]) |s| if (s.blocked) {
-                if (self.findReaderProxyLocked(s.guid)) |rp| self.holdUnsentLocked(rp, ch_sn);
+            if (self_hold) for (snaps[0..n_snaps]) |s| {
+                if (self.findReaderProxyLocked(s.guid)) |rp| self.endSendLocked(rp, ch_sn, s.blocked);
             };
         }
     }
@@ -2500,26 +2575,28 @@ pub const StatefulWriter = struct {
         }
     }
 
-    /// Send a fragmented change to a single reader proxy as N DATA_FRAG datagrams
-    /// followed by one HEARTBEAT_FRAG (§8.4.14).  Called under self.mu.
-    /// False when a fragment would block (sendDataIovecs): the rest are not
-    /// sent, and the reader is to get the change again.
+    /// Send a fragmented change to a single reader proxy as DATA_FRAG
+    /// datagrams, fragments `first_frag` to N, followed by one HEARTBEAT_FRAG
+    /// (§8.4.14).  Called under self.mu.  Returns the fragment that would
+    /// block (sendDataIovecs), which the reader is to be sent from, with
+    /// those after it; null once all are sent.
     fn sendFragsToProxyLocked(
         self: *Self,
         rp: *const ReaderProxy,
         ch: *const CacheChange,
         hb_count: i32,
         scratch: *[SCRATCH_SIZE]u8,
-    ) bool {
+        first_frag: u32,
+    ) ?u32 {
         const locs = rp.effectiveLocators();
-        if (locs.len == 0) return true;
+        if (locs.len == 0) return null;
 
         const frag_size: usize = self.frag_size;
         const data_size: u32 = @intCast(ch.data.len);
         const num_frags: u32 = @intCast((ch.data.len + frag_size - 1) / frag_size);
 
-        var frag_num: u32 = 1;
-        var offset: usize = 0;
+        var frag_num: u32 = first_frag;
+        var offset: usize = @as(usize, first_frag - 1) * frag_size;
         while (offset < ch.data.len) : ({
             frag_num += 1;
             offset += frag_size;
@@ -2546,7 +2623,7 @@ pub const StatefulWriter = struct {
                 .writer_group_info = if (frag_num == 1) ch.writer_group_info else null,
                 .lifespan = if (frag_num == 1 and ch.kind == .alive) self.lifespan else null,
             }, ch.data[offset..][0..this_len]);
-            if (!sendDataIovecs(self.transport, locs, b.iovecs(), self.resume_held)) return false;
+            if (!sendDataIovecs(self.transport, locs, b.iovecs(), self.resume_held)) return frag_num;
         }
 
         // HEARTBEAT_FRAG tells the reader all fragments 1..num_frags are available.
@@ -2554,7 +2631,7 @@ pub const StatefulWriter = struct {
         b.addInfoDst(rp.guid.prefix);
         b.addHeartbeatFrag(rp.guid.entity_id, self.guid.entity_id, ch.sequence_number, num_frags, hb_count);
         for (locs) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
-        return true;
+        return null;
     }
 
     /// Send only fragment 1 of a fragmented change followed by a HEARTBEAT_FRAG.
@@ -2720,10 +2797,12 @@ pub const StatefulWriter = struct {
         }
     }
 
-    /// Whether a held proxy is still to be sent `sn`. Caller holds `mu`.
+    /// Whether a held proxy is still to be sent `sn`, or a send under way may
+    /// hold one from `sn` or earlier. Caller holds `mu`.
     fn holdsLocked(self: *const Self, sn: SequenceNumber) bool {
         for (self.reader_proxies.items) |rp| {
             if (rp.unsent_from_sn) |from| if (from <= sn) return true;
+            if (rp.sending_sn) |from| if (from <= sn) return true;
         }
         return false;
     }
@@ -2768,11 +2847,15 @@ pub const StatefulWriter = struct {
         return if (self.coherent_active) @min(last, self.last_flushed_sn) else last;
     }
 
-    fn sendEndMarkerToProxyLocked(self: *Self, rp: *const ReaderProxy, m: EndMarker, scratch: *[SCRATCH_SIZE]u8) void {
+    /// Sends `m` to `rp`. False when it would block and the writer holds
+    /// readers, as sendDataIovecs: the caller holds `rp` from `m.sn` where it
+    /// can, since a best-effort reader that misses a marker cannot have it
+    /// repaired.
+    fn sendEndMarkerToProxyLocked(self: *Self, rp: *const ReaderProxy, m: EndMarker, scratch: *[SCRATCH_SIZE]u8) bool {
         var b = MessageBuilder.init(scratch, self.guid.prefix);
         b.addInfoDst(rp.guid.prefix);
         b.addData(m.dataParams(rp.guid.entity_id, self.guid.entity_id, rp.needs_pid_coherent_set_marker), &.{});
-        for (rp.effectiveLocators()) |loc| sendIovecs(self.transport, &loc, b.iovecs()) catch {};
+        return sendDataIovecs(self.transport, rp.effectiveLocators(), b.iovecs(), self.resume_held);
     }
 
     /// Returns true if `sn` is inside the current coherent window and should
@@ -2956,8 +3039,10 @@ pub const StatefulWriter = struct {
             // A held proxy gets the retained marker from its resume, after
             // the set.
             if (rp.suppress_live_data or rp.unsent_from_sn != null) continue;
+            if (deferToSenderLocked(rp, eoc_sn)) continue;
             if (rp.effectiveLocators().len == 0) continue;
-            self.sendEndMarkerToProxyLocked(rp, marker, &eoc_scratch);
+            if (!self.sendEndMarkerToProxyLocked(rp, marker, &eoc_scratch))
+                self.holdUnsentLocked(rp, eoc_sn);
         }
         if (eoc_sn > self.last_flushed_sn) self.last_flushed_sn = eoc_sn;
         // One heartbeat after the whole set, announcing the marker too, so a
@@ -2971,12 +3056,19 @@ pub const StatefulWriter = struct {
     /// Phase 3 of a publisher-level combined end-marker flush (all coherent-access
     /// scopes).  Called after the publisher sent the markers' DATA through
     /// sendCombinedEOCData(): sends each reader a HEARTBEAT announcing the marker,
-    /// so one that missed it NACKs and gets it again.  No-op if none is pending.
-    pub fn flushGroupEOCHBOnly(self: *Self) void {
+    /// so one that missed it NACKs and gets it again.  `unsent` are the readers
+    /// the combined send could not send it to on any locator, as the send
+    /// would block: while the writer holds readers, each is held from the
+    /// marker, which its resume sends, as for a live marker; otherwise a
+    /// best-effort one has lost it.  No-op if none is pending.
+    pub fn flushGroupEOCHBOnly(self: *Self, unsent: []const Guid) void {
         self.mu.lock();
         defer self.mu.unlock();
         const eoc_sn = self.pending_eoc_sn orelse return;
         self.pending_eoc_sn = null;
+        if (self.resume_held) for (unsent) |guid| {
+            if (self.findReaderProxyLocked(guid)) |rp| self.holdUnsentLocked(rp, eoc_sn);
+        };
         if (eoc_sn > self.last_flushed_sn) self.last_flushed_sn = eoc_sn;
         const last_sn = self.lastAvailableSnLocked();
         const first_available = self.firstAvailableSnLocked();

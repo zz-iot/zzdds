@@ -55,6 +55,12 @@ const Outbox = struct {
     full_port: ?u16 = null,
     /// Once drained, this many DATA sends complete before it is full again.
     refill_after: ?usize = null,
+    /// Sends carrying DATA of this SN would block, until `drain`.
+    full_at_sn: ?SequenceNumber = null,
+    /// Once, in the next DATA send, before it completes: runs `run`, as
+    /// another thread can while the send runs with the writer's lock
+    /// released. Then the send would block if `then_full`.
+    during_send: ?struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void, then_full: bool = false } = null,
     /// Per send: the port, and the SN of each DATA or DATA_FRAG in it.
     sent: std.ArrayListUnmanaged(Sent) = .empty,
     blocked: usize = 0,
@@ -62,7 +68,8 @@ const Outbox = struct {
     cancels: usize = 0,
     notifies: bool = true,
 
-    const Sent = struct { port: u16, sn: SequenceNumber, frag: bool };
+    /// `frag`: the DATA_FRAG's fragment number; 0 for DATA.
+    const Sent = struct { port: u16, sn: SequenceNumber, frag: u32 = 0 };
 
     fn deinit(self: *Outbox) void {
         self.sent.deinit(alloc);
@@ -76,6 +83,7 @@ const Outbox = struct {
     fn drain(self: *Outbox) void {
         self.full = false;
         self.full_port = null;
+        self.full_at_sn = null;
         if (self.waiter) |w| {
             self.waiter = null;
             w.on_writable(w);
@@ -87,7 +95,7 @@ const Outbox = struct {
         var n: usize = 0;
         for (self.sent.items) |s| {
             if (s.port != port) continue;
-            if (s.frag and n > 0 and buf[n - 1] == s.sn) continue;
+            if (s.frag > 0 and n > 0 and buf[n - 1] == s.sn) continue;
             buf[n] = s.sn;
             n += 1;
         }
@@ -113,14 +121,25 @@ const Outbox = struct {
         var params: [32]InlineQosParam = undefined;
         while (try it.next(&params)) |sm| switch (sm) {
             .data => |d| {
-                datas[n] = .{ .port = port, .sn = d.writer_sn, .frag = false };
+                datas[n] = .{ .port = port, .sn = d.writer_sn };
                 n += 1;
             },
             .data_frag => |df| {
-                datas[n] = .{ .port = port, .sn = df.writer_sn, .frag = true };
+                datas[n] = .{ .port = port, .sn = df.writer_sn, .frag = df.fragment_starting_num };
                 n += 1;
             },
             else => {},
+        };
+        if (n > 0) if (self.during_send) |d| {
+            self.during_send = null;
+            try d.run(d.ctx);
+            if (d.then_full) self.full = true;
+        };
+        if (self.full_at_sn) |sn| for (datas[0..n]) |d| {
+            if (d.sn == sn) {
+                self.blocked += 1;
+                return .would_block;
+            }
         };
         if (self.full and (self.full_port == null or self.full_port == port)) {
             self.blocked += 1;
@@ -242,6 +261,16 @@ const Fixture = struct {
     /// Runs what is ready now, without letting the clock reach a heartbeat.
     fn run(self: *Fixture) !void {
         while ((try self.runtime.drive(64, 0)).turns > 0) {}
+    }
+
+    /// Writes one sample during the next DATA send (Outbox.during_send).
+    fn writeDuringSend(self: *Fixture, then_full: bool) void {
+        self.outbox.during_send = .{ .ctx = self, .run = writeOne, .then_full = then_full };
+    }
+
+    fn writeOne(ctx: *anyopaque) anyerror!void {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        try self.write(1);
     }
 
     fn held(self: *Fixture, guid: Guid) ?SequenceNumber {
@@ -376,7 +405,7 @@ test "a RELIABLE VOLATILE writer keeps the changes a held best-effort reader has
     try testing.expectEqual(@as(usize, 0), f.w.cache.len());
 }
 
-test "a fragmented sample whose fragments would block is sent again whole to a best-effort reader" {
+test "a fragmented sample's resume carries on from the fragment that would block, though output drains a fragment at a time" {
     var f: Fixture = undefined;
     try f.init(.{ .frag_size = 64 });
     defer f.deinit();
@@ -386,18 +415,137 @@ test "a fragmented sample whose fragments would block is sent again whole to a b
     f.outbox.full = true;
     _ = try f.w.write(.alive, ZERO_TS, NIL_IH, NIL_KH, &(@as([200]u8, @splat(7))));
     try testing.expectEqual(@as(?SequenceNumber, 1), f.held(a));
-    // Fragment 2 of 4 blocks: the sample is sent again from the start.
-    f.outbox.refill_after = 1;
-    f.outbox.drain();
-    try f.run();
-    try testing.expectEqual(@as(?SequenceNumber, 1), f.held(a));
-    f.outbox.drain();
-    try f.run();
+    // Each time output is ready it takes one fragment of four. Sent again
+    // from the start each time, the sample would never be sent whole.
+    for (0..4) |_| {
+        f.outbox.refill_after = 1;
+        f.outbox.drain();
+        try f.run();
+    }
     try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
-    var frags: usize = 0;
-    for (f.outbox.sent.items) |s| frags += @intFromBool(s.frag and s.sn == 1);
-    // Fragment 1 from the resume that blocked at fragment 2, then all four.
-    try testing.expectEqual(@as(usize, 5), frags);
+    var frags: [8]u32 = undefined;
+    var n: usize = 0;
+    for (f.outbox.sent.items) |sent| if (sent.sn == 1) {
+        frags[n] = sent.frag;
+        n += 1;
+    };
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, frags[0..n]);
+}
+
+test "a write while another write's send is under way does not overtake it, and keeps its change if that send would block" {
+    var f: Fixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    // Acknowledged changes are dropped, and with no reliable reader every
+    // change is acknowledged once sent.
+    f.w.drop_acked = true;
+    const a = makeGuid(0xa1);
+    try f.match(a, PORT_A, false);
+
+    // SN 2 is written while SN 1's send runs, which then would block.
+    f.writeDuringSend(true);
+    try f.write(1);
+    try testing.expectEqual(@as(?SequenceNumber, 1), f.held(a));
+    try expectSns(&.{}, &f.outbox, PORT_A);
+    try testing.expectEqual(@as(usize, 2), f.w.cache.len());
+
+    f.outbox.drain();
+    try f.run();
+    try expectSns(&range(1, 2), &f.outbox, PORT_A);
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
+}
+
+test "a write while another write's send is under way is sent after it once that send completes" {
+    var f: Fixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    const a = makeGuid(0xa1);
+    try f.match(a, PORT_A, false);
+
+    f.writeDuringSend(false);
+    try f.write(1);
+    try expectSns(&.{1}, &f.outbox, PORT_A);
+    try f.run();
+    try expectSns(&range(1, 2), &f.outbox, PORT_A);
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
+}
+
+test "a resume leaves a reader alone while a live send to it is under way" {
+    var f: Fixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    const a = makeGuid(0xa1);
+    const b = makeGuid(0xb1);
+    try f.match(a, PORT_A, false);
+    try f.match(b, PORT_B, false);
+    // `b` is held from SN 1, waiting for output.
+    f.outbox.full = true;
+    f.outbox.full_port = PORT_B;
+    try f.write(1);
+    try testing.expectEqual(@as(?SequenceNumber, 1), f.held(b));
+
+    // While SN 2 is being sent to `a`: SN 3 is written, which waits for that
+    // send, and output becomes ready, so the writer resumes.
+    const During = struct {
+        fn run(ctx: *anyopaque) anyerror!void {
+            const fx: *Fixture = @ptrCast(@alignCast(ctx));
+            try fx.write(1);
+            fx.outbox.drain();
+            try fx.run();
+        }
+    };
+    f.outbox.during_send = .{ .ctx = &f, .run = During.run };
+    try f.write(1);
+    try f.run();
+    try expectSns(&range(1, 3), &f.outbox, PORT_A);
+    try expectSns(&range(1, 3), &f.outbox, PORT_B);
+}
+
+test "an end marker whose send would block holds the reader, which is sent it once output is ready" {
+    var f: Fixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    const a = makeGuid(0xa1);
+    try f.match(a, PORT_A, false);
+
+    f.outbox.full_at_sn = 3;
+    f.w.beginCoherentSet(true);
+    try f.write(2);
+    f.w.endCoherentSet(.coherent_only, false, null, null, false);
+    try expectSns(&range(1, 2), &f.outbox, PORT_A);
+    try testing.expectEqual(@as(?SequenceNumber, 3), f.held(a));
+
+    f.outbox.drain();
+    try f.run();
+    try expectSns(&range(1, 3), &f.outbox, PORT_A);
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
+}
+
+test "a reader the publisher's combined end-marker send could not reach is held, and sent the marker once output is ready" {
+    var f: Fixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    const a = makeGuid(0xa1);
+    const b = makeGuid(0xb1);
+    try f.match(a, PORT_A, false);
+    try f.match(b, PORT_B, false);
+
+    // The marker (SN 2) is the publisher's to send; its send reached `b`
+    // but would have blocked for `a`.
+    f.w.beginCoherentSet(true);
+    try f.write(1);
+    f.w.endCoherentSet(.coherent_only, false, null, null, true);
+    try testing.expectEqual(@as(?SequenceNumber, 2), f.w.pending_eoc_sn);
+    f.outbox.full_port = PORT_A;
+    f.outbox.full = true;
+    f.w.flushGroupEOCHBOnly(&.{a});
+    try testing.expectEqual(@as(?SequenceNumber, 2), f.held(a));
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(b));
+
+    f.outbox.drain();
+    try f.run();
+    try expectSns(&range(1, 2), &f.outbox, PORT_A);
+    try testing.expectEqual(@as(?SequenceNumber, null), f.held(a));
 }
 
 test "a best-effort history replay whose send would block is finished by the resume, ahead of live data" {
@@ -458,6 +606,36 @@ test "an end marker a held reader is still to be sent stays, though its set has 
     f.w.beginCoherentSet(true);
     try f.write(1);
     f.w.endCoherentSet(.coherent_only, false, null, null, false);
+    f.outbox.drain();
+    try f.run();
+    try expectSns(&.{ 2, 3, 4 }, &f.outbox, PORT_A);
+}
+
+test "an end marker a history replay is sending stays, though another write retires its set meanwhile" {
+    var f: Fixture = undefined;
+    try f.init(.{ .replay_on_match = true, .history = .keep_last, .depth = 1 });
+    defer f.deinit();
+    // {1} + marker 2, before any reader.
+    f.w.beginCoherentSet(true);
+    try f.write(1);
+    f.w.endCoherentSet(.coherent_only, false, null, null, false);
+
+    // While the replay sends 1 and the marker: {3} + marker 4 is written,
+    // which evicts 1, so the first set has left the history; then the
+    // replay's send would block.
+    const During = struct {
+        fn run(ctx: *anyopaque) anyerror!void {
+            const fx: *Fixture = @ptrCast(@alignCast(ctx));
+            fx.w.beginCoherentSet(true);
+            try fx.write(1);
+            fx.w.endCoherentSet(.coherent_only, false, null, null, false);
+        }
+    };
+    f.outbox.during_send = .{ .ctx = &f, .run = During.run, .then_full = true };
+    const a = makeGuid(0xa1);
+    try f.match(a, PORT_A, false);
+    try testing.expectEqual(@as(?SequenceNumber, 1), f.held(a));
+
     f.outbox.drain();
     try f.run();
     try expectSns(&.{ 2, 3, 4 }, &f.outbox, PORT_A);

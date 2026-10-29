@@ -51,6 +51,9 @@ pub const EOCProxyInfo = struct {
     group: ?GroupCoherentSet = null,
     /// See MatchedReaderInfo.needs_pid_coherent_set_marker.
     needs_pid_coherent_set_marker: bool = false,
+    /// Set by send_combined_eoc_data: the send to `locator` would block, so
+    /// the marker was not sent there.
+    blocked: bool = false,
 };
 
 // ── Matched endpoint information ──────────────────────────────────────────────
@@ -348,16 +351,20 @@ pub const ProtocolWriter = struct {
         /// Send EOC DATAs for all entries in `infos[0..count]` grouped by
         /// (locator, destination participant prefix) as single UDP datagrams.
         /// Uses this writer's transport.  Called once on the "leader" writer after
-        /// all writers have called take_eoc_proxy_infos.
+        /// all writers have called take_eoc_proxy_infos.  Marks the entries
+        /// whose send would block (`blocked`).
         send_combined_eoc_data: *const fn (
             ctx: *anyopaque,
-            infos: [*]const EOCProxyInfo,
+            infos: [*]EOCProxyInfo,
             count: usize,
         ) void,
 
         /// Send per-proxy HBs using the EOC SN held in pending_eoc_sn, then clears it.
-        /// No-op if no EOC is pending.
-        flush_group_eoc_hb_only: *const fn (ctx: *anyopaque) void,
+        /// `infos[0..count]` are the entries send_combined_eoc_data sent: a
+        /// reader of this writer none of whose entries was sent is to get the
+        /// marker later, where the writer can hold it.  No-op if no EOC is
+        /// pending.
+        flush_group_eoc_hb_only: *const fn (ctx: *anyopaque, infos: [*]const EOCProxyInfo, count: usize) void,
 
         /// Destroy this writer and release its resources.
         deinit: *const fn (ctx: *anyopaque) void,
@@ -491,12 +498,12 @@ pub const ProtocolWriter = struct {
         return self.vtable.take_eoc_proxy_infos(self.ctx, alloc, out);
     }
 
-    pub fn sendCombinedEOCData(self: ProtocolWriter, infos: []const EOCProxyInfo) void {
+    pub fn sendCombinedEOCData(self: ProtocolWriter, infos: []EOCProxyInfo) void {
         self.vtable.send_combined_eoc_data(self.ctx, infos.ptr, infos.len);
     }
 
-    pub fn flushGroupEOCHBOnly(self: ProtocolWriter) void {
-        self.vtable.flush_group_eoc_hb_only(self.ctx);
+    pub fn flushGroupEOCHBOnly(self: ProtocolWriter, infos: []const EOCProxyInfo) void {
+        self.vtable.flush_group_eoc_hb_only(self.ctx, infos.ptr, infos.len);
     }
 
     pub fn deinit(self: ProtocolWriter) void {

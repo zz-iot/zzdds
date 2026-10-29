@@ -214,11 +214,14 @@ with `Transport.notifyWritable`: its waiter runs once a send socket that blocked
 output, or at once if none is blocked, so a drain between the send and the registration
 is not lost. UDP adds the blocked send socket to the backend as an output-only source,
 which the readiness backend polls for `POLLOUT` only while armed, once per arming. A
-`StatefulWriter` holds a reader whose DATA would block and keeps the bytes in its history
-rather than a lease: on the waiter it arms a timer in its own context, which sends the
-reader what it was not sent, in SN order, releasing the writer's lock for each batch as
-the live path does. Protocol messages that would block are lost, as their content is
-sent again from current state.
+`StatefulWriter` holds a reader whose DATA or end marker would block and keeps the bytes
+in its history rather than a lease: on the waiter it arms a timer in its own context, which
+sends the reader what it was not sent, in SN order, releasing the writer's lock for each
+batch as the live path does. A best-effort reader's fragmented sample carries on from the
+fragment that would block. While a send to a reader runs with the lock released, nothing
+else is sent to it, so a concurrent write cannot overtake it: that write's change waits in
+the history, and the send resumes the reader when it ends. Protocol messages that would
+block are lost, as their content is sent again from current state.
 
 <a id="channels-and-lifetimes"></a>
 ### Channels and lifetimes
