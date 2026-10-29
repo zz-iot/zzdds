@@ -91,8 +91,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("plan {s}: {d} participant(s), {d} explicit type binding(s), {d} skipped setting(s)\n", .{ resolved.plan.application.name, resolved.plan.application.participants.len, bindings.items.len, resolved.skipped.len });
     if (!std.mem.eql(u8, mode, "validate")) for (resolved.plan.application.participants) |participant| {
         std.debug.print("participant {s} domain={d} topics={d} writers={d} readers={d}\n", .{ participant.name, participant.domain_id, participant.topics.len, participant.writers.len, participant.readers.len });
-        for (participant.writers) |endpoint| std.debug.print("  writer {s} topic={s} reliability={s} depth={d}\n", .{ endpoint.name, endpoint.topic_ref, @tagName(endpoint.qos.reliability), endpoint.qos.history_depth });
-        for (participant.readers) |endpoint| std.debug.print("  reader {s} topic={s} reliability={s} depth={d}\n", .{ endpoint.name, endpoint.topic_ref, @tagName(endpoint.qos.reliability), endpoint.qos.history_depth });
+        for (participant.writers) |endpoint| std.debug.print("  writer {s} topic={s} reliability={s} depth={d} max_samples={d} max_instances={d} max_samples_per_instance={d}\n", .{ endpoint.name, endpoint.topic_ref, @tagName(endpoint.qos.reliability), endpoint.qos.history_depth, endpoint.qos.max_samples, endpoint.qos.max_instances, endpoint.qos.max_samples_per_instance });
+        for (participant.readers) |endpoint| std.debug.print("  reader {s} topic={s} reliability={s} depth={d} max_samples={d} max_instances={d} max_samples_per_instance={d}\n", .{ endpoint.name, endpoint.topic_ref, @tagName(endpoint.qos.reliability), endpoint.qos.history_depth, endpoint.qos.max_samples, endpoint.qos.max_instances, endpoint.qos.max_samples_per_instance });
     };
     if (!std.mem.eql(u8, mode, "inspect")) {
         std.debug.print("offline validation passed; provider code was not loaded; export identity/capabilities remain unchecked\n", .{});

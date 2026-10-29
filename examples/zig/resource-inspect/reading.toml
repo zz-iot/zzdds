@@ -1,13 +1,31 @@
 schema_version = 1
 name = "MultiProvider"
+[profiles.Bounded.writer_qos]
+reliability = "RELIABLE_RELIABILITY_QOS"
+history_depth = 3
+max_samples = 24
+max_instances = 4
+max_samples_per_instance = 6
+[profiles.Bounded.reader_qos]
+reliability = "BEST_EFFORT_RELIABILITY_QOS"
+history_depth = 2
+max_samples = 30
+max_instances = 5
+max_samples_per_instance = 6
 [participants.main]
 domain_id = 42
 types = { "LibraryTest::Reading" = {}, "LibraryTest::Pulse" = {} }
 topics = { reading = { topic_name = "Reading", type_ref = "LibraryTest::Reading" }, pulse = { topic_name = "Pulse", type_ref = "LibraryTest::Pulse" } }
 publishers = { pub = {} }
+subscribers = { sub = {} }
 [participants.main.writers.reading]
+profile_ref = "Bounded"
 container_ref = "pub"
 topic_ref = "reading"
 [participants.main.writers.pulse]
 container_ref = "pub"
 topic_ref = "pulse"
+[participants.main.readers.reading]
+container_ref = "sub"
+topic_ref = "reading"
+profile_ref = "Bounded"

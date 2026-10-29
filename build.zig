@@ -1516,7 +1516,16 @@ pub fn build(b: *std.Build) void {
         offline.addArgs(&.{"validate"});
         offline.addFileArg(b.path("examples/zig/resource-inspect/reading.toml"));
         offline.addArgs(&.{ "--library", "project_a=/no-such-provider-a", "--library", "project_b=/no-such-provider-b", "--bind", "main/LibraryTest::Reading=project_b/LibraryTest::Reading", "--bind", "main/LibraryTest::Pulse=project_a/LibraryTest::Pulse" });
-        b.step("test-resource-inspect", "Offline validation must not access provider files").dependOn(&offline.step);
+        const inspect_tests = b.step("test-resource-inspect", "Check offline validation and resolved plan output");
+        inspect_tests.dependOn(&offline.step);
+        const plan_output = b.addRunArtifact(exe_inspect);
+        plan_output.addArg("plan");
+        plan_output.addFileArg(b.path("examples/zig/resource-inspect/reading.toml"));
+        plan_output.addArgs(&.{ "--library", "project_a=/no-such-provider-a", "--library", "project_b=/no-such-provider-b", "--bind", "main/LibraryTest::Reading=project_b/LibraryTest::Reading", "--bind", "main/LibraryTest::Pulse=project_a/LibraryTest::Pulse" });
+        plan_output.expectStdErrMatch("writer reading topic=reading reliability=RELIABLE_RELIABILITY_QOS depth=3 max_samples=24 max_instances=4 max_samples_per_instance=6");
+        plan_output.expectStdErrMatch("reader reading topic=reading reliability=BEST_EFFORT_RELIABILITY_QOS depth=2 max_samples=30 max_instances=5 max_samples_per_instance=6");
+        inspect_tests.dependOn(&plan_output.step);
+        test_step.dependOn(&plan_output.step);
         test_step.dependOn(&offline.step);
     } else inspect_step.dependOn(&b.addFail("Pass -Dresource-authoring=true -Dtypesupport-library=true").step);
 
