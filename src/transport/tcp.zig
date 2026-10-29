@@ -1696,6 +1696,9 @@ fn acceptLoop(self: *TcpTransport) void {
             continue :outer;
         };
         self.conn_mu.unlock();
+        // Ahead of taking a slot, so a freed one is reused, and never this
+        // connection, which has no thread yet.
+        self.reapExited();
 
         setSockNoSigPipe(conn_fd);
 
@@ -1751,7 +1754,6 @@ fn acceptLoop(self: *TcpTransport) void {
         };
         self.registerLocked(conn);
         self.conn_mu.unlock();
-        self.reapExited();
     }
 }
 

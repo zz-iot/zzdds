@@ -1068,12 +1068,15 @@ test "tcp transport: accepted connections that close are freed by the next accep
         try waitExited(server);
     }
 
-    // Each accept reaped the connection before it, so two slots served
-    // every round, and only the last connection is left.
-    try testing.expectEqual(@as(usize, 2), server.channels.slotCount());
+    // Each accept reaped the connection before it ahead of taking a slot,
+    // so one slot served every round, with a new generation each time, and
+    // only the last connection is left.
+    try testing.expectEqual(@as(usize, 1), server.channels.slotCount());
     try testing.expectEqual(@as(usize, 1), server.channels.liveCount());
-    try testing.expectEqual(seen[0].token, seen[2].token);
-    try testing.expect(seen[0].generation != seen[2].generation);
+    for (seen[1..], seen[0 .. rounds - 1]) |ch, prev| {
+        try testing.expectEqual(prev.token, ch.token);
+        try testing.expect(prev.generation != ch.generation);
+    }
     for (seen) |ch| {
         try testing.expectError(error.ChannelClosed, st.sendOnChannel(ch, &lifecycle.src, "stale"));
     }

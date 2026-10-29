@@ -1348,7 +1348,7 @@ pub const StatefulWriter = struct {
         }
     }
 
-    fn replayHistoryToProxyLocked(self: *Self, rp: *const ReaderProxy) void {
+    fn replayHistoryToProxyLocked(self: *Self, rp: *ReaderProxy) void {
         const locs = rp.effectiveLocators();
         if (locs.len == 0) {
             log.rtps.debug("StatefulWriter({x}): replayHistory: no locator for proxy {x}", .{
@@ -1385,6 +1385,14 @@ pub const StatefulWriter = struct {
                 _ = self.sendFrag1ToProxyLocked(rp, ch, self.hb_count, &scratch);
                 break; // only the first fragmented change needs priming
             }
+            return;
+        }
+        // While the writer holds readers, the history goes out as the
+        // reader's resume, in SN order, so a send that would block (on a
+        // connection still dialing, say) delays it rather than losing it.
+        if (self.resume_held) {
+            const first = self.firstAvailableSnLocked();
+            if (first > 0) self.holdUnsentLocked(rp, first);
             return;
         }
         var scratch: [SCRATCH_SIZE]u8 = undefined;
