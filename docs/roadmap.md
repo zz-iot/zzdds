@@ -1442,7 +1442,11 @@ release notes).
 ### Still open, ranked
 
 1. **Real vendor/self RTPS interop** (Connext / Cyclone / CoreDX / self) runs only on Linux
-   x86_64 — no wire / discovery / CDR coverage on Windows, macOS, or ARM64.
+   x86_64 — no vendor interop on Windows, macOS, or ARM64. Windows does get zzdds-to-zzdds
+   wire and discovery coverage from the examples and the integration tests (every binding
+   pair). Self-interop through dds-rtps on Windows is deliberately not planned: its Python
+   harness is POSIX-only (`pexpect.spawnu`, `fork`, SIGINT), and porting it upstream buys
+   little over that coverage.
 2. **No Intel macOS coverage** — `macos-latest` is Apple Silicon only.
 3. **musl coverage is x86_64-only, and there is no static-`libzzdds` bundle** — the new lane
    (see *Landed*) cross-builds and runs `x86_64-linux-musl`; `aarch64-linux-musl` would need
